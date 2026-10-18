@@ -74,10 +74,10 @@ use crate::workers::helpers::sleep_ms;
 use connetto_client::away::Clock as _;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
-    AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, GateAskOutcome,
-    GateController, GateSink, ImportChoices, ImportOutcome, KeepaliveTimer, PolicyTables,
-    ResendTimer, ShareKeyTimer, SystemClock, WriterGrant, WriterRequest, replay_aborting,
-    replica_schema, subscription_is_aggregate, subscription_tables,
+    AffectedRow, ClientError, ClientEvent, ConnettoConnection, DrainTimer, ExportScope,
+    GateAskOutcome, GateController, GateSink, ImportChoices, ImportOutcome, KeepaliveTimer,
+    PolicyTables, ResendTimer, ShareKeyTimer, SystemClock, WriterGrant, WriterRequest,
+    replay_aborting, replica_schema, subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError, FatalErrorReason,
@@ -88,7 +88,7 @@ use connetto_core::messages::{
     TabShareKeyOutcome,
 };
 use connetto_core::traits::MaybeSend;
-use connetto_core::{Cursor, IncomingFrame, Transport};
+use connetto_core::{Cursor, IncomingFrame, Major, Transport};
 use connetto_file_client::http::ContentHttp;
 use connetto_file_client::{
     BrowserHttp, BrowserStore, ChunkScan, ContentArchive, ContentError, ContentFlush,
@@ -305,10 +305,10 @@ enum TabOut {
 /// A fault while handling one tab's frame: either close that tab, or a
 /// hub-fatal error.
 enum TabFault {
-    /// Close the tab with a typed refusal it can act on.
-    Refuse(FatalErrorReason),
     /// Close the offending tab, telling it why.
     Close(String),
+    /// Close the tab with a typed refusal it can act on.
+    Refuse(FatalErrorReason),
     /// The hub itself failed.
     Hub(RelayError),
 }
@@ -563,6 +563,9 @@ struct HubState {
     /// The share-key timer the hub last woke on, so an unmoved deadline is not
     /// slept on again.
     fired_key_timer: Option<ShareKeyTimer>,
+    /// The worker drain's owed dial, with the monotonic reading it falls due
+    /// at, kept the same way as the resend (R31).
+    drain: Option<(DrainTimer, Duration)>,
 }
 
 /// One resolve whose ticket request is in flight, kept in the hub state so
@@ -1214,6 +1217,8 @@ struct ContentRetry {
     attempt: u32,
     delay: Option<core::time::Duration>,
     flush: ContentFlushState,
+    /// The held-files drain walk's rotation and in-flight ticket (R31).
+    held_flush: ContentFlushState,
 }
 impl ContentRetry {
     fn schedule(&mut self, queued: bool, progressed: bool) {
@@ -1292,6 +1297,8 @@ enum Wake {
     Resend,
     /// The worker's keepalive deadline fell due.
     Keepalive(KeepaliveTimer),
+    /// The worker's drain of an older major's held work owes its dial (R31).
+    Drain,
     /// The worker's gate prompt resolved.
     Gate(Option<GateAskOutcome>),
     /// The worker's share-key work fell due.
@@ -1386,6 +1393,14 @@ where
         tokio::pin!(key_wait);
         let keepalive_wait = keepalive_wake(self.worker.keepalive_timer());
         tokio::pin!(keepalive_wait);
+        let drain_ms = drain_deadline_ms(&mut self.state, &self.worker);
+        let drain_wait = async {
+            match drain_ms {
+                Some(ms) => sleep_ms(ms).await,
+                None => core::future::pending().await,
+            }
+        };
+        tokio::pin!(drain_wait);
         // The in-flight gate prompt, if any, driven alongside the other
         // wakes and handed back to the controller when another wake wins.
         let mut ask = self.gate.take_ask();
@@ -1416,6 +1431,7 @@ where
                 () = &mut ticket_wait, if ticket_ms.is_some() => Wake::Ticket,
                 () = &mut resend_wait, if resend_ms.is_some() => Wake::Resend,
                 timer = &mut keepalive_wait => Wake::Keepalive(timer),
+                () = &mut drain_wait, if drain_ms.is_some() => Wake::Drain,
                 outcome = &mut ask_wait, if prompting => Wake::Gate(Some(outcome)),
                 () = &mut key_wait, if key_ms.is_some() => Wake::ShareKeys,
             }
@@ -1442,16 +1458,8 @@ where
                 expire_fetches(&mut self.state);
                 Ok(true)
             }
-            Wake::Resend => {
-                let Some((timer, _)) = self.state.resend.take() else {
-                    return Ok(true);
-                };
-                match self.worker.resend_deferred(timer).await {
-                    Ok(()) => Ok(true),
-                    // A failed send is the upstream failing, answered like any other.
-                    Err(err) => self.serve_upstream(reconnect, Err(err)).await,
-                }
-            }
+            Wake::Resend => self.dial_resend(reconnect).await,
+            Wake::Drain => self.dial_drain(reconnect).await,
             Wake::Keepalive(timer) => self.fire_keepalive(reconnect, timer).await,
             Wake::ShareKeys => self.serve_share_keys(key_timer).await,
         };
@@ -1461,6 +1469,62 @@ where
             restate_identity(&mut self.worker, &mut self.state)?;
         }
         served
+    }
+
+    /// Resends the deferred writes the timer has made due, answering a
+    /// failed send as an upstream failure.
+    async fn dial_resend<F, S>(
+        &mut self,
+        reconnect: Option<&mut HubReconnect<F, S>>,
+    ) -> Result<bool, RelayError>
+    where
+        U: MaybeSend + 'static,
+        F: TransportFactory<Transport = U>,
+        S: Sleeper,
+    {
+        let Some((timer, _)) = self.state.resend.take() else {
+            return Ok(true);
+        };
+        match self.worker.resend_deferred(timer).await {
+            Ok(()) => Ok(true),
+            // A failed send is the upstream failing, answered like any other.
+            Err(err) => self.serve_upstream(reconnect, Err(err)).await,
+        }
+    }
+
+    /// Dials the drain wire its dial has fallen due, attaching the held
+    /// major over the fresh transport (R31).
+    async fn dial_drain<F, S>(
+        &mut self,
+        reconnect: Option<&mut HubReconnect<F, S>>,
+    ) -> Result<bool, RelayError>
+    where
+        U: MaybeSend + 'static,
+        F: TransportFactory<Transport = U>,
+        S: Sleeper,
+    {
+        let Some((timer, _)) = self.state.drain.take() else {
+            return Ok(true);
+        };
+        // With no factory there is nothing to dial with, so the held
+        // work waits for a hub that has one.
+        let Some(driver) = reconnect else {
+            return Ok(true);
+        };
+        match driver.factory.connect().await {
+            Ok(transport) => {
+                if let Err(err) = self.worker.attach_drain(timer, transport).await {
+                    tracing::warn!(error = %err, "attaching the drain failed");
+                }
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "dialing the drain failed, backing off");
+                self.worker.drain_dial_failed(timer);
+            }
+        }
+        // The drain wire is now up, so the content walk may owe a turn (R31).
+        self.wake_content()?;
+        Ok(true)
     }
 
     /// Fire the worker's keepalive deadline, recovering as from any loss when
@@ -1630,7 +1694,7 @@ where
         if self.content.is_none() {
             return Ok(true);
         }
-        let (queued, progressed) = match self.flush_content().await? {
+        let (mut queued, mut progressed) = match self.flush_content().await? {
             ContentWalk::Complete { queued, progressed } => (queued, progressed),
             ContentWalk::Interrupted(Some(event)) => {
                 self.serve(event).await?;
@@ -1638,15 +1702,34 @@ where
                 return Ok(true);
             }
             ContentWalk::Interrupted(None) => return Ok(false),
-            ContentWalk::KeyDue => {
-                self.retry.schedule(true, true);
-                return Ok(true);
+        };
+        let held_interruption = match self.drive_held_content().await? {
+            Some(ContentWalk::Complete {
+                queued: held_queued,
+                progressed: held_progressed,
+            }) => {
+                queued |= held_queued;
+                progressed |= held_progressed;
+                None
             }
+            Some(ContentWalk::Interrupted(Some(event))) => {
+                self.serve(event).await?;
+                Some(true)
+            }
+            Some(ContentWalk::Interrupted(None)) => Some(false),
+            Some(ContentWalk::KeyDue) => Some(true),
+            None => None,
         };
         if progressed {
             // An uploaded file is no longer unsent, so retention can release it.
             self.walk.unswept = true;
             self.walk.sweep_waiting = false;
+        }
+        if let Some(keep_running) = held_interruption {
+            if keep_running {
+                self.retry.schedule(true, true);
+            }
+            return Ok(keep_running);
         }
         if !self.worker.is_connected() {
             let Some(driver) = reconnect else {
@@ -1704,13 +1787,9 @@ where
                 progressed: false,
             });
         };
-        let key_timer = worker.share_key_timer();
         let mut interrupted = None;
         let cancel = async {
-            interrupted = Some(tokio::select! {
-                event = events.recv() => ContentWalk::Interrupted(event),
-                () = wait_share_keys(key_timer) => ContentWalk::KeyDue,
-            });
+            interrupted = Some(events.recv().await);
         };
         let (start, observed) = content
             .archive()
@@ -1721,12 +1800,14 @@ where
         }
         let flush = match start {
             Ok(ContentFlushStart::Complete(ContentFlush::Interrupted)) => {
-                return Ok(interrupted.unwrap_or(ContentWalk::Interrupted(None)));
+                return Ok(ContentWalk::Interrupted(interrupted.unwrap_or(None)));
             }
             Ok(ContentFlushStart::Complete(flush)) => flush,
             Ok(ContentFlushStart::Upload(upload)) => {
-                finish_content_upload(worker, state, notices, content, events, walk, gate, &upload)
-                    .await?
+                finish_content_upload(
+                    worker, state, notices, content, events, walk, gate, &upload, None,
+                )
+                .await?
             }
             Err(err) => {
                 tracing::warn!(error = %err, "content outbox walk failed");
@@ -1737,6 +1818,74 @@ where
             queued: content.archive().sendable_files(worker)? > 0,
             progressed: flush == ContentFlush::Progressed,
         })
+    }
+
+    /// Attempt the next held file without dropping its pending ticket.
+    async fn drive_held_content(&mut self) -> Result<Option<ContentWalk>, RelayError> {
+        let Some(major) = self.worker.held_files_ready() else {
+            // Unsettled held writes keep the content walk scheduled.
+            return Ok(self.worker.draining_major().map(|_| ContentWalk::Complete {
+                queued: true,
+                progressed: false,
+            }));
+        };
+        let Self {
+            worker,
+            state,
+            notices,
+            content,
+            events,
+            retry,
+            gate,
+            walk,
+        } = self;
+        let Some(content) = content.as_ref() else {
+            return Ok(None);
+        };
+        let key_timer = worker.share_key_timer();
+        let mut interrupted = None;
+        let cancel = async {
+            interrupted = Some(tokio::select! {
+                event = events.recv() => ContentWalk::Interrupted(event),
+                () = wait_share_keys(key_timer) => ContentWalk::KeyDue,
+            });
+        };
+        let (start, observed) = content
+            .archive()
+            .begin_held_flush_next_or(worker, &mut retry.held_flush, major, cancel)
+            .await;
+        for event in observed {
+            handle_worker_event(worker, state, event)?;
+        }
+        let flush = match start {
+            Ok(ContentFlushStart::Complete(ContentFlush::Interrupted)) => {
+                return Ok(Some(interrupted.unwrap_or(ContentWalk::Interrupted(None))));
+            }
+            Ok(ContentFlushStart::Complete(flush)) => flush,
+            Ok(ContentFlushStart::Upload(upload)) => {
+                finish_content_upload(
+                    worker,
+                    state,
+                    notices,
+                    content,
+                    events,
+                    walk,
+                    gate,
+                    &upload,
+                    Some(major),
+                )
+                .await?
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "held content drain failed");
+                ContentFlush::Deferred
+            }
+        };
+        let queued = content.archive().held_files_pending(worker, major)?;
+        Ok(Some(ContentWalk::Complete {
+            queued,
+            progressed: flush == ContentFlush::Progressed,
+        }))
     }
 
     /// Queue the outbox for the integrity walk, which runs one file per turn.
@@ -1776,11 +1925,11 @@ where
     }
 
     fn wake_content(&mut self) -> Result<(), RelayError> {
-        if content_sendable_files(
-            &mut self.worker,
-            self.content.as_ref().map(HubContent::archive),
-        )? > 0
-        {
+        let content = self.content.as_ref().map(HubContent::archive);
+        let sendable = content_sendable_files(&mut self.worker, content)? > 0;
+        // A held file the drain wire has made ready also drives the walk (R31).
+        let held_ready = self.worker.held_files_ready().is_some();
+        if sendable || held_ready {
             self.retry.schedule(true, true);
         }
         Ok(())
@@ -1927,6 +2076,7 @@ async fn finish_content_upload<U>(
     walk: &mut WalkState,
     gate: &GateController,
     upload: &ContentUpload<BrowserStore>,
+    held_major: Option<Major>,
 ) -> Result<ContentFlush, RelayError>
 where
     U: Transport,
@@ -1937,6 +2087,8 @@ where
     let mut serving = true;
     let mut background = true;
     let mut event_error = None;
+    // A started upload is never cancelled: a failing local event only stops
+    // the service loop, and the transfer plus its bookkeeping still finish.
     let result = loop {
         if background {
             match worker.process_share_keys(!gate.is_locked()).await {
@@ -2014,10 +2166,15 @@ where
             }
         }
     };
-    let flush = content
-        .archive()
-        .finish_upload(worker, upload, result)
-        .await?;
+    let archive = content.archive();
+    let flush = match held_major {
+        Some(major) => {
+            archive
+                .finish_held_upload(worker, upload, major, result)
+                .await?
+        }
+        None => archive.finish_upload(worker, upload, result).await?,
+    };
     match event_error {
         Some(error) => Err(error),
         None => Ok(flush),
@@ -2127,6 +2284,7 @@ where
                     .iter()
                     .map(FileId::to_string)
                     .collect(),
+                held_files: worker.held_files_total()?,
             };
             let _ = reply.send(pending);
         }
@@ -4147,18 +4305,6 @@ async fn fetch_pinned_frame<U>(
     }
 }
 
-async fn wait_share_keys(timer: Option<connetto_client::ShareKeyTimer>) {
-    let Some(timer) = timer else {
-        return core::future::pending().await;
-    };
-    let ms = timer
-        .wait()
-        .as_nanos()
-        .div_ceil(1_000_000)
-        .clamp(1, u128::from(i32::MAX.unsigned_abs()));
-    sleep_ms(i32::try_from(ms).expect("the key wait is clamped to signed milliseconds")).await;
-}
-
 /// Frees the local bytes no pin keeps: the record eviction first, then the
 /// chunks the eviction left unreferenced.
 async fn serve_tidy_frame<U>(
@@ -4399,6 +4545,21 @@ fn wait_ms(deadline: Duration, now: Duration) -> i32 {
     i32::try_from(millis).unwrap_or(i32::MAX)
 }
 
+/// Milliseconds until the worker's drain owes its dial, `None` when none is
+/// owed, with a deadline kept the same way as the resend's (R31).
+fn drain_deadline_ms<U>(state: &mut HubState, worker: &ConnettoConnection<U>) -> Option<i32>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let armed = worker.drain_timer();
+    if armed != state.drain.map(|(timer, _)| timer) {
+        state.drain = armed.map(|timer| (timer, SystemClock.monotonic() + timer.wait()));
+    }
+    let (_, deadline) = state.drain?;
+    Some(wait_ms(deadline, SystemClock.monotonic()))
+}
+
 /// Milliseconds until the worker's share-key work falls due, rounded up, or
 /// `None` when nothing is armed or the armed deadline passed and already woke
 /// the hub without moving. A wake before the deadline keeps waiting on it.
@@ -4418,6 +4579,17 @@ async fn sleep_or_park(ms: Option<i32>) {
         Some(ms) => sleep_ms(ms).await,
         None => core::future::pending().await,
     }
+}
+async fn wait_share_keys(timer: Option<connetto_client::ShareKeyTimer>) {
+    let Some(timer) = timer else {
+        return core::future::pending().await;
+    };
+    let ms = timer
+        .wait()
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .clamp(1, u128::from(i32::MAX.unsigned_abs()));
+    sleep_ms(i32::try_from(ms).expect("the key wait is clamped to signed milliseconds")).await;
 }
 
 /// Whether the gate refuses application changes, as the tabs were told.
@@ -4637,7 +4809,6 @@ where
     }
     Ok(wake)
 }
-
 /// Handle one upstream event from the worker connection.
 fn handle_worker_event<U>(
     worker: &mut ConnettoConnection<U>,
@@ -4654,25 +4825,7 @@ where
             cursor,
             patchset_zstd,
             ..
-        } => {
-            let tables = patch_tables(&patchset_zstd)?;
-            // Each tab holds ONE replica, so a patch is forwarded at most
-            // once per tab, under the first subscription reading a touched
-            // table. The tab's own update hook refreshes every affected
-            // handle.
-            for tab in state.tabs.values_mut() {
-                let Some(sub) = tab.subs.iter().find(|sub| !sub.tables.is_disjoint(&tables)) else {
-                    continue;
-                };
-                let msg = BulkMessage::LivePatch(LivePatch::new(
-                    sub.sub_id.clone(),
-                    cursor.clone(),
-                    patchset_zstd.to_vec(),
-                ));
-                enqueue_tab_frame(tab, TabDeliverable::Rows(msg));
-            }
-            Ok(())
-        }
+        } => forward_live_patch(state, &cursor, &patchset_zstd),
         ClientEvent::MutationApplied { client_seq } => {
             // The server's durable confirmation for a forwarded tab write:
             // map it back so the tab retires its pending record.
@@ -4757,8 +4910,42 @@ where
             }
             Ok(())
         }
+        ClientEvent::Held(held) => {
+            // The worker owns the drain of an older major's held work, so
+            // every handshaken tab hears how it settled (R31).
+            for tab in state.tabs.values().filter(|tab| tab.handshaken) {
+                let _ = tab
+                    .out
+                    .send(TabOut::Control(ControlMessage::HeldWork(held.clone())));
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
+}
+
+/// Forward one patch to every tab that subscribes to a touched table.
+fn forward_live_patch(
+    state: &mut HubState,
+    cursor: &Cursor,
+    patchset_zstd: &Arc<[u8]>,
+) -> Result<(), RelayError> {
+    let tables = patch_tables(patchset_zstd)?;
+    // Each tab holds ONE replica, so a patch is forwarded at most
+    // once per tab, under the first subscription reading a touched
+    // table. The tab's own update hook refreshes every affected handle.
+    for tab in state.tabs.values_mut() {
+        let Some(sub) = tab.subs.iter().find(|sub| !sub.tables.is_disjoint(&tables)) else {
+            continue;
+        };
+        let msg = BulkMessage::LivePatch(LivePatch::new(
+            sub.sub_id.clone(),
+            cursor.clone(),
+            patchset_zstd.to_vec(),
+        ));
+        enqueue_tab_frame(tab, TabDeliverable::Rows(msg));
+    }
+    Ok(())
 }
 
 /// Record the worker's gate state and push it to the tabs that have finished
@@ -5397,6 +5584,7 @@ mod tests {
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     wasm_bindgen_test_configure!(run_in_dedicated_worker);
+
     /// The major line the test schema source declares.
     const SOURCE: &str = "-- connetto:major 1";
 

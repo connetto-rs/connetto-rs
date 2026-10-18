@@ -47,6 +47,8 @@ mod grouped_live;
 mod hardening;
 mod keepalive;
 
+mod held_drain;
+
 mod key_requirement;
 
 mod live_dispatch;
@@ -125,6 +127,8 @@ mod teardown;
 mod tier_majors;
 
 mod truncate_resync;
+
+mod two_majors;
 
 mod uuid_rls_default;
 

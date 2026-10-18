@@ -280,6 +280,34 @@ pub(crate) fn prepare_rebuild(
     drop_synced(db, Store::Account)
 }
 
+/// Whether a rebuild ever held work on this replica.
+///
+/// # Errors
+///
+/// A database failure.
+pub(crate) fn has_held(db: &mut SqliteConnection) -> Result<bool, ClientError> {
+    has_table(db, "_connetto_held_batch")
+}
+
+/// Forget the batch row of `major` and, through `content`, its files. Says how
+/// many files there were. The writes it captured live in the writer queues,
+/// which settle or lose them on their own.
+///
+/// # Errors
+///
+/// A database failure.
+pub(crate) fn forget_batch(
+    db: &mut SqliteConnection,
+    major: Major,
+    content: HeldContent,
+) -> Result<u64, ClientError> {
+    db.immediate_transaction(|db| {
+        let stored = i64::from(major.get());
+        diesel::delete(held_batch::table.filter(held_batch::major.eq(stored))).execute(db)?;
+        (content.forget)(db, major)
+    })
+}
+
 /// The file whose synced objects a rebuild replaces.
 #[derive(Clone, Copy)]
 pub(crate) enum Store {
