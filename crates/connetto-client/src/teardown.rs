@@ -509,6 +509,7 @@ mod tests {
         UnsyncedWrite {
             writer: WriterRef::Number(number),
             seq,
+            major: None,
         }
     }
 

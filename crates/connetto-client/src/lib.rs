@@ -84,6 +84,7 @@ mod hotspot;
 #[cfg(feature = "native-auth")]
 mod keyring;
 pub mod live;
+mod majors;
 mod memory_stores;
 #[cfg(all(feature = "peer", target_os = "android"))]
 mod multicast;
@@ -148,6 +149,7 @@ pub use live::{
     ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveValue,
     subscription_is_aggregate, subscription_tables,
 };
+pub use majors::HeldContent;
 pub use memory_stores::{MemoryKeyStore, MemoryRefreshStore};
 #[cfg(feature = "native-transport")]
 pub use reconnect::TokioSleeper;
@@ -253,6 +255,47 @@ pub enum ClientError {
         client: Major,
         /// The server's major.
         server: Major,
+    },
+    /// The replica on disk was built under a newer application schema major
+    /// than this build, which cannot read it (R31).
+    #[error("the replica records major {recorded}, newer than this build's {build}")]
+    ReplicaNewer {
+        /// The major the replica records.
+        recorded: Major,
+        /// This build's major.
+        build: Major,
+    },
+    /// The replica on disk records this build's major but was built from
+    /// another schema, so the schema changed without a new major (R31).
+    #[error(
+        "the replica records major {major} built from schema {recorded}, this build declares the same major for schema {build}"
+    )]
+    ReplicaSchemaChanged {
+        /// The major both declare.
+        major: Major,
+        /// The bundle hash the replica records.
+        recorded: SchemaVersion,
+        /// This build's bundle hash.
+        build: SchemaVersion,
+    },
+    /// The replica records a major and no bundle hash beside it, which no
+    /// open writes (R31).
+    #[error("the replica records major {recorded} without the schema it was built from")]
+    ReplicaRecordMissing {
+        /// The major the replica records.
+        recorded: Major,
+    },
+    /// A local data archive was made at another application schema major (R31).
+    #[error(
+        "the archive was made at application schema major {}, this build is major {}, so it cannot be restored here",
+        .archive.map_or_else(|| "none".to_owned(), |major| major.to_string()),
+        .build.map_or_else(|| "none".to_owned(), |major| major.to_string())
+    )]
+    ArchiveMajor {
+        /// The major the archive records.
+        archive: Option<Major>,
+        /// This build's major.
+        build: Option<Major>,
     },
     /// The operation needs a server and this connection has none.
     ///
@@ -455,13 +498,18 @@ pub enum PeerError {
 }
 
 /// One queued write awaiting its final answer, named by the writer and the
-/// sequence it is the writer's.
+/// sequence it is the writer's, with the application schema major it was
+/// captured under.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UnsyncedWrite {
     /// The writer the entry is queued under.
     pub writer: WriterRef,
     /// The entry's sequence in that writer's queue.
     pub seq: u64,
+    /// The major the write was captured under, absent for a build declaring
+    /// none. Only that major's server can apply it (R31).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub major: Option<Major>,
 }
 
 /// Why a sign-in switch was refused.
@@ -739,6 +787,14 @@ impl PolicyTables {
     /// The views the translation emitted.
     fn views(&self) -> &HashSet<String> {
         &self.views
+    }
+
+    /// Every split table as its `(physical, logical)` pair, which a replica
+    /// records so a later build can name its writes on the wire (R31).
+    pub(crate) fn renames(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.to_logical
+            .iter()
+            .map(|(physical, logical)| (physical.as_str(), logical.as_str()))
     }
 }
 
@@ -1100,6 +1156,15 @@ impl ClientConfig {
         self.custody = custody;
         self
     }
+}
+
+/// How an open finds its replica.
+#[derive(Clone, Copy)]
+enum Boot<'a> {
+    /// Created by this open from the build's replica DDL.
+    Fresh(&'a str),
+    /// Left by a previous run, with the build's replica DDL for a rebuild.
+    Existing(&'a str),
 }
 
 /// One observable outcome of [`ConnettoConnection::pump_one`].
@@ -1876,7 +1941,7 @@ const META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_meta \
     CREATE TABLE IF NOT EXISTS _connetto_pending \
     (writer TEXT NOT NULL, seq INTEGER NOT NULL, changeset BLOB NOT NULL, \
      entry_hash BLOB NOT NULL, position INTEGER NOT NULL, \
-     prov_writer TEXT, prov_seq INTEGER, \
+     prov_writer TEXT, prov_seq INTEGER, major INTEGER, \
      PRIMARY KEY (writer, seq)); \
     CREATE TABLE IF NOT EXISTS _connetto_retire \
     (writer TEXT NOT NULL PRIMARY KEY); \
@@ -1951,7 +2016,8 @@ diesel::table! {
         writer -> diesel::sql_types::Text,
         /// The sequence under the current writer.
         seq -> diesel::sql_types::BigInt,
-        /// The captured physical changeset.
+        /// The captured changeset, physical names under this build's major
+        /// and wire names under an older one.
         changeset -> diesel::sql_types::Binary,
         /// The logical changeset's chain hash.
         entry_hash -> diesel::sql_types::Binary,
@@ -1961,6 +2027,8 @@ diesel::table! {
         prov_writer -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
         /// The original writer's sequence.
         prov_seq -> diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+        /// The application schema major the entry was captured under (R31).
+        major -> diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
     }
 }
 
@@ -2392,9 +2460,17 @@ type ColumnMap = HashMap<String, Vec<String>>;
 
 fn validate_archive_compat(
     archive: &archive::Incoming,
+    major: Option<Major>,
     fingerprint: &str,
     account: Option<&str>,
 ) -> Result<(), ClientError> {
+    // Ahead of the fingerprint, since only the majors say which side to update.
+    if archive.major != major {
+        return Err(ClientError::ArchiveMajor {
+            archive: archive.major,
+            build: major,
+        });
+    }
     if archive.fingerprint != fingerprint {
         return Err(ClientError::Import(
             "the archive was made under a different schema than this build runs, so it cannot be restored here"
@@ -2772,7 +2848,8 @@ fn writer_from_id(id: &str) -> Option<WriterRef> {
 /// One queued write of one writer.
 #[derive(Debug, Clone)]
 struct PendingEntry {
-    /// The captured changeset, the physical table names a rollback applies.
+    /// The captured changeset, the physical table names a rollback applies,
+    /// or the wire names when an older major captured it (R31).
     changeset: Vec<u8>,
     /// This entry's chain hash, over the logical upload bytes and every
     /// entry queued before it.
@@ -2783,6 +2860,31 @@ struct PendingEntry {
     /// The writer and sequence this entry was first written under, set when
     /// the entry was imported or carried to a fresh writer.
     provenance: Option<Provenance>,
+    /// The application schema major the entry was captured under, which
+    /// alone can apply it (R31).
+    major: Option<Major>,
+}
+
+impl PendingEntry {
+    /// The entry as the bookkeeping stores it, borrowing its bytes.
+    fn record(&self) -> EntryRecord<'_> {
+        EntryRecord {
+            changeset: &self.changeset,
+            hash: self.hash,
+            position: self.position,
+            provenance: self.provenance,
+            major: self.major,
+        }
+    }
+}
+
+/// One queued entry's stored fields, the changeset borrowed.
+struct EntryRecord<'a> {
+    changeset: &'a [u8],
+    hash: [u8; 32],
+    position: u64,
+    provenance: Option<Provenance>,
+    major: Option<Major>,
 }
 
 struct CarriedEntry {
@@ -2863,18 +2965,15 @@ fn load_writer_states(
         .collect())
 }
 
-/// Record a queued entry durably, with its chain hash, append position and
-/// provenance, so a restart can replay it where it was made.
+/// Record a queued entry durably, with its chain hash, append position,
+/// provenance and capture major, so a restart can replay it where it was made.
 fn persist_pending(
     db: &mut SqliteConnection,
     writer: &WriterRef,
     seq: u64,
-    changeset: &[u8],
-    hash: [u8; 32],
-    provenance: Option<Provenance>,
-    position: u64,
+    entry: &EntryRecord<'_>,
 ) -> Result<(), ClientError> {
-    let (prov_writer, prov_seq) = match &provenance {
+    let (prov_writer, prov_seq) = match &entry.provenance {
         Some(prov) => (Some(writer_id(&prov.writer)), Some(seq_storage(prov.seq)?)),
         None => (None, None),
     };
@@ -2883,11 +2982,12 @@ fn persist_pending(
         .values((
             _connetto_pending::writer.eq(&id),
             _connetto_pending::seq.eq(seq_storage(seq)?),
-            _connetto_pending::changeset.eq(changeset),
-            _connetto_pending::entry_hash.eq(hash),
-            _connetto_pending::position.eq(seq_storage(position)?),
+            _connetto_pending::changeset.eq(entry.changeset),
+            _connetto_pending::entry_hash.eq(entry.hash),
+            _connetto_pending::position.eq(seq_storage(entry.position)?),
             _connetto_pending::prov_writer.eq(&prov_writer),
             _connetto_pending::prov_seq.eq(&prov_seq),
+            _connetto_pending::major.eq(entry.major.map(|major| i64::from(major.get()))),
         ))
         .execute(db)?;
     Ok(())
@@ -2936,13 +3036,14 @@ fn rekey_writer(
 }
 
 /// A queued entry as the bookkeeping stores it, sequence, changeset, chain
-/// hash, append position and provenance.
+/// hash, append position, provenance and capture major.
 struct LoadedEntry {
     seq: u64,
     changeset: Vec<u8>,
     hash: [u8; 32],
     position: u64,
     provenance: Option<Provenance>,
+    major: Option<Major>,
 }
 
 /// Every queued entry a previous run left, per writer in writer then
@@ -2959,6 +3060,7 @@ fn load_pending(
         position: i64,
         prov_writer: Option<String>,
         prov_seq: Option<i64>,
+        major: Option<i64>,
     }
     let rows: Vec<PendingRow> = _connetto_pending::table
         .select((
@@ -2969,6 +3071,7 @@ fn load_pending(
             _connetto_pending::position,
             _connetto_pending::prov_writer,
             _connetto_pending::prov_seq,
+            _connetto_pending::major,
         ))
         .order((
             _connetto_pending::writer.asc(),
@@ -2995,6 +3098,10 @@ fn load_pending(
             .zip(row.prov_seq)
             .and_then(|(writer, seq)| Some((writer_from_id(writer)?, u64::try_from(seq).ok()?)))
             .map(|(writer, seq)| Provenance { writer, seq });
+        let major = row
+            .major
+            .and_then(|major| u32::try_from(major).ok())
+            .and_then(Major::new);
         queues
             .entry(writer)
             .or_insert_with(Vec::new)
@@ -3004,6 +3111,7 @@ fn load_pending(
                 hash,
                 position,
                 provenance,
+                major,
             });
     }
     Ok(queues)
@@ -3093,6 +3201,7 @@ fn load_writer_queues(
                     hash: entry.hash,
                     position: entry.position,
                     provenance: entry.provenance,
+                    major: entry.major,
                 },
             );
         }
@@ -3797,12 +3906,15 @@ fn install_storage_layout<S: ReplicaStorage>(
     check_recorded_tables(db, SHARED_SCHEMA, &config.unrecorded_tables)
 }
 
-/// The schema and metadata tables an open installs, in dependency order.
+/// Install schema and metadata, returning the replica's previous major.
 #[deny(clippy::ref_patterns)]
-fn install_replica_schema(
+fn install_replica_schema<S: ReplicaStorage>(
     db: &mut SqliteConnection,
+    replica: &Replica<'_, S>,
+    boot: Boot<'_>,
     config: &ClientConfig,
-) -> Result<(), ClientError> {
+) -> Result<Option<Major>, ClientError> {
+    let prior = recorded_prior_major(db, replica, boot, config)?;
     // The views are what the map has to agree with.
     check_policy_tables(db, &config.policy_tables)?;
     // A rowid-only table records nothing, so a write to one uploads nothing and reports success (R62).
@@ -3821,7 +3933,55 @@ fn install_replica_schema(
     db.batch_execute(enrolment::CERTIFICATE_DDL)?;
     // A watch the previous run died still holding counts down from now.
     subscriptions::anchor_launch(db)?;
-    Ok(())
+    Ok(prior)
+}
+
+/// Apply the replica's build and return its previous major.
+fn recorded_prior_major<S: ReplicaStorage>(
+    db: &mut SqliteConnection,
+    replica: &Replica<'_, S>,
+    boot: Boot<'_>,
+    config: &ClientConfig,
+) -> Result<Option<Major>, ClientError> {
+    match boot {
+        Boot::Fresh(ddl) => {
+            install_storage_layout(db, replica, Some(ddl), config)?;
+            if let (Some(major), Some(version)) = (config.schema_major, &config.schema_version) {
+                majors::stamp(db, major, version, &config.policy_tables)?;
+            }
+            Ok(None)
+        }
+        Boot::Existing(ddl) => {
+            let prior = if let (Some(major), Some(version)) =
+                (config.schema_major, &config.schema_version)
+            {
+                match majors::read(db, major, version)? {
+                    majors::Record::Current => Some(major),
+                    majors::Record::Unrecorded => {
+                        majors::stamp(db, major, version, &config.policy_tables)?;
+                        None
+                    }
+                    majors::Record::Behind(from) => {
+                        db.set_foreign_keys_enabled(false)?;
+                        let rebuild = majors::rebuild(
+                            db,
+                            ddl,
+                            &from,
+                            (major, version, &config.policy_tables),
+                            HeldContent::NONE,
+                        );
+                        db.set_foreign_keys_enabled(true)?;
+                        rebuild?;
+                        Some(from.major)
+                    }
+                }
+            } else {
+                None
+            };
+            install_storage_layout(db, replica, None, config)?;
+            Ok(prior)
+        }
+    }
 }
 
 impl<T> ConnettoConnection<T>
@@ -3852,7 +4012,7 @@ where
         config: &ClientConfig,
         resume: Option<Cursor>,
     ) -> Result<Self, ClientError> {
-        let mut conn = Self::open_inner(replica, Some(sqlite_ddl), config, resume)?;
+        let mut conn = Self::open_inner(replica, Boot::Fresh(sqlite_ddl), config, resume)?;
         conn.notices
             .push_back(ClientEvent::SyncStatus(SyncStatus::Offline));
         Ok(conn)
@@ -3861,18 +4021,23 @@ where
     /// Open a replica that already carries its schema, with no server.
     ///
     /// [`open`](Self::open) for a replica a previous run created.
+    /// is this build's replica DDL, applied only when the replica records an
+    /// older application schema major and is rebuilt in place (R31).
     ///
     /// # Errors
     ///
     /// [`ClientError`] on a database, cipher or session failure.
     /// [`ClientError::ReplicaUndecryptable`] when the replica does not open
-    /// under the key given.
+    /// under the key given. [`ClientError::ReplicaNewer`] and
+    /// [`ClientError::ReplicaSchemaChanged`] when it records a build this one
+    /// cannot serve.
     pub(crate) fn open_existing<S: ReplicaStorage>(
         replica: &Replica<'_, S>,
+        sqlite_ddl: &str,
         config: &ClientConfig,
         resume: Option<Cursor>,
     ) -> Result<Self, ClientError> {
-        let mut conn = Self::open_inner(replica, None, config, resume)?;
+        let mut conn = Self::open_inner(replica, Boot::Existing(sqlite_ddl), config, resume)?;
         conn.notices
             .push_back(ClientEvent::SyncStatus(SyncStatus::Offline));
         Ok(conn)
@@ -3907,7 +4072,7 @@ where
     )]
     fn open_inner<S: ReplicaStorage>(
         replica: &Replica<'_, S>,
-        sqlite_ddl: Option<&str>,
+        boot: Boot<'_>,
         config: &ClientConfig,
         resume: Option<Cursor>,
     ) -> Result<Self, ClientError> {
@@ -3931,7 +4096,7 @@ where
         // table, so it is set on the create path alone: an existing replica
         // already carries it, and setting it after the first table is a silent
         // no-op (R15).
-        if sqlite_ddl.is_some() {
+        if matches!(boot, Boot::Fresh(_)) {
             db.set_auto_vacuum(None, AutoVacuumMode::Incremental)?;
         }
         // Before any statement carrying outside input, and before the first
@@ -3964,8 +4129,7 @@ where
         register_write_exemption(&mut db, &write_exempt)?;
         // A person carries the wildcard, and a bot login reads its list here (R99).
         register_bot_list(&mut db, connetto_core::BOT_LIST_WILDCARD.to_owned())?;
-        install_storage_layout(&mut db, replica, sqlite_ddl, config)?;
-        db.transaction(|db| install_replica_schema(db, config))?;
+        install_replica_schema(&mut db, replica, boot, config)?;
         // An explicit resume cursor wins. Otherwise the replica remembers
         // its own resume point, so reopening a persisted replica (a file, an
         // OPFS import) continues where the previous run stopped. The writer
@@ -4324,7 +4488,8 @@ where
     }
 
     /// Replays the bound writer's unacknowledged entries on the current
-    /// transport, each carrying its writer, its sequence and its provenance.
+    /// transport, each carrying its writer, its sequence and its provenance,
+    /// stopping at the first entry another major's entry holds back (R31).
     ///
     /// Calling this while offline leaves the durable queues untouched.
     ///
@@ -4341,9 +4506,14 @@ where
         else {
             return Ok(());
         };
+        let held_from = self.held_from();
         let replays: Vec<(u64, Vec<u8>, Option<Provenance>)> = queue
             .pending
             .iter()
+            .take_while(|(_, entry)| {
+                !self.held_major(entry.major)
+                    && held_from.is_none_or(|position| entry.position < position)
+            })
             .map(|(seq, entry)| (*seq, entry.changeset.clone(), entry.provenance))
             .collect();
         for (seq, changeset, provenance) in replays {
@@ -4351,6 +4521,18 @@ where
                 .await?;
         }
         Ok(())
+    }
+
+    /// The lowest append position among the queued entries another major
+    /// captured. This major's wire sends nothing queued at or after it, so no
+    /// write lands ahead of an earlier one only its own major can apply (R31).
+    fn held_from(&self) -> Option<u64> {
+        self.writers
+            .values()
+            .flat_map(|queue| queue.pending.values())
+            .filter(|entry| self.held_major(entry.major))
+            .map(|entry| entry.position)
+            .min()
     }
 
     /// The writer to present at the next handshake, with how much of it the
@@ -4841,7 +5023,7 @@ where
         for placement in &mut plan {
             let entry = &self.writers[&placement.source].pending[&placement.original_seq];
             placement.seq = next_seq;
-            placement.hash = entry_hash(&head, next_seq, &self.logical_for(&entry.changeset)?);
+            placement.hash = entry_hash(&head, next_seq, &self.chain_bytes(entry)?);
             next_seq += 1;
             head = placement.hash;
         }
@@ -4849,21 +5031,17 @@ where
         self.db.transaction::<(), ClientError, _>(|db| {
             for placement in &plan {
                 let entry = &self.writers[&placement.source].pending[&placement.original_seq];
-                let provenance = entry.provenance.or_else(|| {
-                    is_real_writer(&placement.source).then_some(Provenance {
-                        writer: placement.source,
-                        seq: placement.original_seq,
-                    })
-                });
-                persist_pending(
-                    db,
-                    target,
-                    placement.seq,
-                    &entry.changeset,
-                    placement.hash,
-                    provenance,
-                    entry.position,
-                )?;
+                let carried = EntryRecord {
+                    hash: placement.hash,
+                    provenance: entry.provenance.or_else(|| {
+                        is_real_writer(&placement.source).then_some(Provenance {
+                            writer: placement.source,
+                            seq: placement.original_seq,
+                        })
+                    }),
+                    ..entry.record()
+                };
+                persist_pending(db, target, placement.seq, &carried)?;
             }
             if !plan.is_empty() {
                 persist_writer_state(db, target, next_seq, &head)?;
@@ -4933,37 +5111,32 @@ where
         }
     }
 
-    /// Atomically appends an entry, its position and its writer frontier.
+    /// Atomically appends an entry captured under `major`, its position and
+    /// its writer frontier.
     fn append_entry(
         &mut self,
         writer: &WriterRef,
         changeset: &[u8],
         provenance: Option<Provenance>,
+        major: Option<Major>,
     ) -> Result<u64, ClientError> {
         let position = self.next_position;
         let (seq, head) = match self.writers.get(writer) {
             Some(queue) => (queue.next_seq, queue.head),
             None => (1, GENESIS),
         };
-        let hash = entry_hash(&head, seq, &self.logical_for(changeset)?);
+        let hash = entry_hash(&head, seq, &self.chain_bytes_of(changeset, major)?);
         let entry = PendingEntry {
             changeset: changeset.to_vec(),
             hash,
             position,
             provenance,
+            major,
         };
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         self.db.transaction::<(), ClientError, _>(|db| {
             persist_writer_state(db, writer, seq + 1, &hash)?;
-            persist_pending(
-                db,
-                writer,
-                seq,
-                &entry.changeset,
-                entry.hash,
-                entry.provenance,
-                position,
-            )?;
+            persist_pending(db, writer, seq, &entry.record())?;
             Ok(())
         })?;
         let queue = self
@@ -4975,6 +5148,33 @@ where
         queue.pending.insert(seq, entry);
         self.next_position = position + 1;
         Ok(seq)
+    }
+
+    /// Whether an entry captured under `major` waits for that major's drain,
+    /// its major being another than this build's (R31).
+    fn held_major(&self, major: Option<Major>) -> bool {
+        major != self.config.schema_major
+    }
+
+    /// The bytes the chain hashes an entry under, which are its upload bytes:
+    /// a split table's wire name under this build's major, or the stored
+    /// bytes as they stand for an entry an older major captured, which the
+    /// rebuild already renamed (R31).
+    fn chain_bytes_of<'a>(
+        &'a self,
+        changeset: &'a [u8],
+        major: Option<Major>,
+    ) -> Result<Cow<'a, [u8]>, ClientError> {
+        if self.held_major(major) {
+            Ok(Cow::Borrowed(changeset))
+        } else {
+            self.logical_for(changeset)
+        }
+    }
+
+    /// [`chain_bytes_of`](Self::chain_bytes_of) for a queued entry.
+    fn chain_bytes<'a>(&'a self, entry: &'a PendingEntry) -> Result<Cow<'a, [u8]>, ClientError> {
+        self.chain_bytes_of(&entry.changeset, entry.major)
     }
 
     /// Every device writer this replica still holds, in id order.
@@ -6017,9 +6217,10 @@ where
         self.writers
             .iter()
             .flat_map(|(writer, queue)| {
-                queue.pending.keys().map(move |seq| UnsyncedWrite {
+                queue.pending.iter().map(move |(seq, entry)| UnsyncedWrite {
                     writer: *writer,
                     seq: *seq,
+                    major: entry.major,
                 })
             })
             .collect()
@@ -6113,6 +6314,7 @@ where
             sink,
             &archive::Archive {
                 scope,
+                major: self.config.schema_major,
                 fingerprint: self.schema_fingerprint()?,
                 account: self.account(),
                 synced_rows,
@@ -6129,6 +6331,7 @@ where
                                         writer: *writer,
                                         seq: *seq,
                                         hash: entry.hash,
+                                        major: entry.major,
                                         changeset: entry.changeset.clone(),
                                         provenance: entry.provenance,
                                     },
@@ -6204,6 +6407,7 @@ where
         let (archive, reader) = archive::open(source)?;
         validate_archive_compat(
             &archive,
+            self.config.schema_major,
             &self.schema_fingerprint()?,
             self.account().as_deref(),
         )?;
@@ -6387,7 +6591,7 @@ where
                     seq: entry.seq,
                 })
             });
-            self.append_entry(&target, &entry.changeset, provenance)?;
+            self.append_entry(&target, &entry.changeset, provenance, entry.major)?;
             restored += 1;
         }
         Ok(restored)
@@ -7036,7 +7240,7 @@ where
             return Ok(None);
         }
         let writer = self.choose_writer();
-        let seq = self.append_entry(&writer, &changeset, None)?;
+        let seq = self.append_entry(&writer, &changeset, None, self.config.schema_major)?;
         // Reset capture: fresh sessions record only writes after this push.
         self.session.reset(&mut self.db)?;
         // With no server the write stays queued, which is the designed offline
@@ -7045,9 +7249,10 @@ where
         // error here would make every caller treat working offline as a fault.
         // A caller that needs to know asks `unsynced`, or reads the
         // connection-state event. A write under a writer the connection is
-        // not bound to waits for the connection to bind it, the replay sends
-        // it then.
-        if self.is_connected() && self.bound_writer == Some(writer) {
+        // not bound to waits for the connection to bind it, and a write behind
+        // another major's entry waits for that entry to settle, the replay
+        // sending it then.
+        if self.is_connected() && self.bound_writer == Some(writer) && self.held_from().is_none() {
             self.send_mutation(writer, seq, &changeset, None).await?;
         }
         Ok(Some(seq))
@@ -8469,14 +8674,14 @@ mod tests {
             .expect("local write");
         let changeset = conn.session.changeset().expect("capture the write");
         let first = conn
-            .append_entry(&writer, &changeset, None)
+            .append_entry(&writer, &changeset, None, None)
             .expect("queue the write");
         conn.db
             .batch_execute("INSERT INTO t (id) VALUES (2)")
             .expect("second local write");
         let changeset = conn.session.changeset().expect("capture the second write");
         let second = conn
-            .append_entry(&writer, &changeset, None)
+            .append_entry(&writer, &changeset, None, None)
             .expect("queue the second write");
         // A deferral whose writes went out again after its schedule had grown.
         let mut episode = RESEND_POLICY.start();
@@ -8617,6 +8822,7 @@ mod tests {
         let bytes = archive_bytes(&archive::Archive {
             scope: ExportScope::Unsynced,
             fingerprint,
+            major: conn.schema_major(),
             account: None,
             synced_rows: None,
             local_rows: Some(rows),
