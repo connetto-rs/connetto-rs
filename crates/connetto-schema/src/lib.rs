@@ -91,6 +91,9 @@ pub enum SchemaError {
         /// table it reads.
         policy: String,
     },
+    /// The schema source does not declare a usable major.
+    #[error("the schema source does not declare a usable major: {0}")]
+    Major(#[from] connetto_core::MajorError),
 }
 
 /// The tables the schema document creates, in document order.
@@ -329,7 +332,8 @@ fn reads_a_caller_setting(function: &Function) -> bool {
 /// # Errors
 ///
 /// [`SchemaError::Translate`] when a source does not parse or the translation
-/// fails, [`SchemaError::Sqlite`] when the replica DDL is not accepted.
+/// fails, [`SchemaError::Major`] when the schema source does not declare its
+/// major, and [`SchemaError::Sqlite`] when the replica DDL is not accepted.
 pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
     schema_sql: &str,
     policies_sql: &str,
@@ -398,7 +402,7 @@ fn translated<K: CapabilityKey, Id: BotRegistryIdSql>(
         pairs,
         views,
         None::<&str>,
-    )
+    )?
     .with_connection_ddl(connection_ddl)
     .with_shared_tables(shared.iter().cloned());
     if !shared.is_empty() {
@@ -889,6 +893,7 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
              POLICY_VIEWS.iter().copied(),\n\
              LOCAL_TIER_DDL,\n\
          )\n\
+         .expect(\"the build step translated this bundle\")\n\
          .with_shared_tables(SHARED_TABLES.iter().copied())\n\
          .with_connection_ddl(CONNECTION_DDL);\n\
          if let Some((both_fresh, main_fresh, shared_fresh, reopen)) = SHARED_LAYOUT {{\n\
@@ -932,6 +937,11 @@ mod tests {
     use super::*;
     use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
 
+    /// The major a test bundle's schema source declares, prepended to `source`.
+    fn majored(source: &str) -> String {
+        format!("{} 1\n{source}", connetto_core::MAJOR_DIRECTIVE)
+    }
+
     /// The views a translated tier's own catalogue reports after the DDL is
     /// applied, the ground truth the derivation is pinned against.
     fn sqlite_views(ddl: &str) -> Vec<String> {
@@ -950,8 +960,10 @@ mod tests {
     /// without it, and it reaches the registry tables connetto appends.
     #[test]
     fn cap_policies_cover_every_table_and_enable_rls_where_absent() {
-        let schema = "CREATE TABLE orders (id INT PRIMARY KEY, label TEXT); \
-                      CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);";
+        let schema = majored(
+            "CREATE TABLE orders (id INT PRIMARY KEY, label TEXT); \
+                              CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);",
+        );
         let policies = "ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
                         CREATE POLICY orders_p ON orders FOR ALL USING (true);";
         let list = |entry: &str| {
@@ -1002,7 +1014,7 @@ mod tests {
             ));
         }
         assert_eq!(
-            cap_policies::<connetto_core::bots::TextIds>(schema, policies)
+            cap_policies::<connetto_core::bots::TextIds>(&schema, policies)
                 .expect("the documents parse"),
             expected.join(";\n")
         );
@@ -1014,11 +1026,13 @@ mod tests {
     /// policy.
     #[test]
     fn a_schema_document_rls_enable_counts_as_secured() {
-        let schema = "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT); \
-                      ALTER TABLE notes ENABLE ROW LEVEL SECURITY;";
+        let schema = majored(
+            "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT); \
+                              ALTER TABLE notes ENABLE ROW LEVEL SECURITY;",
+        );
         let policies = "CREATE POLICY notes_p ON notes FOR ALL USING \
                         (owner = current_setting('app.user_id', true));";
-        let cap = cap_policies::<connetto_core::bots::TextIds>(schema, policies)
+        let cap = cap_policies::<connetto_core::bots::TextIds>(&schema, policies)
             .expect("the documents parse");
         assert!(
             !cap.contains("notes_connetto_open"),
@@ -1036,11 +1050,12 @@ mod tests {
     /// enforces the same rule its Postgres source holds.
     #[test]
     fn the_replica_carries_the_cap_through_the_bot_list_function() {
-        let schema = "CREATE TABLE items (id INT PRIMARY KEY, owner TEXT NOT NULL, label TEXT);";
+        let schema =
+            majored("CREATE TABLE items (id INT PRIMARY KEY, owner TEXT NOT NULL, label TEXT);");
         let policies = "ALTER TABLE items ENABLE ROW LEVEL SECURITY;\n\
                         CREATE POLICY items_p ON items FOR ALL USING \
                         (owner = current_setting('app.user_id', true));";
-        let bundle = translate::<String, connetto_core::bots::TextIds>(schema, policies)
+        let bundle = translate::<String, connetto_core::bots::TextIds>(&schema, policies)
             .expect("translates");
         assert!(
             bundle.replica_ddl().contains("current_bot_list"),
@@ -1116,13 +1131,14 @@ mod tests {
     #[test]
     fn render_embeds_the_bundle_contents() {
         let bundle = SchemaBundle::new(
-            "CREATE TABLE orders (id INT);",
+            majored("CREATE TABLE orders (id INT);"),
             "CREATE POLICY orders_p ON orders USING (true);",
             "CREATE TABLE orders_rls (id INTEGER);",
             [("orders", "orders_rls")],
             ["orders"],
             None::<&str>,
-        );
+        )
+        .expect("the source declares major 1");
         let source = render(&bundle, "");
         assert!(source.contains("pub mod connetto_schema_bundle"));
         assert!(source.contains("pub fn bundle() -> connetto_core::SchemaBundle"));
@@ -1138,13 +1154,14 @@ mod tests {
     #[test]
     fn render_keeps_the_tier_const_an_option_with_a_tier() {
         let bundle = SchemaBundle::new(
-            "CREATE TABLE orders (id INT);",
+            majored("CREATE TABLE orders (id INT);"),
             "",
             "CREATE TABLE orders (id INTEGER);",
             [] as [(&str, &str); 0],
             [] as [&str; 0],
             None::<&str>,
         )
+        .expect("the source declares major 1")
         .with_local_tier("CREATE TABLE notes (id INTEGER);");
         let source = render(&bundle, "");
         assert!(
@@ -1159,13 +1176,14 @@ mod tests {
     #[test]
     fn render_borrows_the_slice_consts() {
         let bundle = SchemaBundle::new(
-            "CREATE TABLE orders (id INT);",
+            majored("CREATE TABLE orders (id INT);"),
             "",
             "CREATE TABLE orders_rls (id INTEGER);",
             [("orders", "orders_rls")],
             ["orders"],
             None::<&str>,
-        );
+        )
+        .expect("the source declares major 1");
         let source = render(&bundle, "");
         assert!(
             source.contains(
@@ -1178,13 +1196,14 @@ mod tests {
             "the views const is a borrowed slice: {source}"
         );
         let empty = SchemaBundle::new(
-            "CREATE TABLE orders (id INT);",
+            majored("CREATE TABLE orders (id INT);"),
             "",
             "CREATE TABLE orders (id INTEGER);",
             [] as [(&str, &str); 0],
             [] as [&str; 0],
             None::<&str>,
-        );
+        )
+        .expect("the source declares major 1");
         let source = render(&empty, "");
         assert!(
             source.contains("pub const POLICY_TABLES: &[(&str, &str)] = &[];"),

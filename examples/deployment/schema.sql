@@ -17,6 +17,8 @@
 -- created_at names when the order was written. Every client insert supplies
 -- it, since a replica default leaves the changeset value NULL, and Postgres
 -- refuses that on the non-null column.
+-- The application schema major R31 routes and refuses connections by.
+-- connetto:major 1
 CREATE TABLE orders (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), owner_id TEXT NOT NULL, quantity BIGINT NOT NULL CHECK (quantity >= 0), created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 
 -- The lines of an order, keyed by the order and the line number together. It is
