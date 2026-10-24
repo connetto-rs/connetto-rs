@@ -350,6 +350,9 @@ pub enum ClientError {
     /// transport is dropped and the dial goes out again.
     #[error("the handshake drew no answer within the answer bound")]
     HandshakeUnanswered,
+    /// The drain awaits acknowledgement of its current share keys.
+    #[error("the drain is waiting for its current share keys")]
+    ShareKeysPending,
     /// The client's pump stopped on a fault no reconnect can cure, named here.
     #[error("the client stopped: {0}")]
     Stopped(String),
@@ -1784,7 +1787,7 @@ struct RelayShareKeyWait {
 }
 
 /// The next share-key wake for a pump driver.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShareKeyTimer {
     /// How many times the timer was armed, so a pump tells a fresh one from the
     /// one it sleeps on.
@@ -1802,13 +1805,7 @@ impl ShareKeyTimer {
     }
 }
 
-impl PartialEq for ShareKeyTimer {
-    fn eq(&self, other: &Self) -> bool {
-        self.armed == other.armed
-    }
-}
 
-impl Eq for ShareKeyTimer {}
 /// Conflict resolution for a rollback: a row a concurrent server patch already
 /// changed is left as the server left it, so only a cleanly-matching optimistic
 /// write is reverted.
@@ -3358,6 +3355,14 @@ struct HandshakeInput<'a> {
     cursor_subjects: Option<&'a [String]>,
 }
 
+fn live_share_grants(config: &ClientConfig, now: i64) -> impl Iterator<Item = &Grant> {
+    config
+        .subjects
+        .iter()
+        .flat_map(SubjectSource::grants)
+        .filter(move |grant| !grant_expiry::has_expired(grant, now))
+}
+
 /// Collect the login and unexpired share grants for a handshake.
 async fn presented_grants(
     config: &ClientConfig,
@@ -3378,14 +3383,7 @@ async fn presented_grants(
     // honest source of the signal R36 counts, so it is worth not sending. The
     // login grant is not filtered: its refresh is `token_source`'s job, and a
     // client with no fresh token still has to present what it has and be told.
-    grants.extend(
-        config
-            .subjects
-            .iter()
-            .flat_map(SubjectSource::grants)
-            .filter(|grant| !grant_expiry::has_expired(grant, now))
-            .cloned(),
-    );
+    grants.extend(live_share_grants(config, now).cloned());
     Ok(grants)
 }
 
@@ -5791,6 +5789,8 @@ where
         }
         self.send_share_key_protocol().await?;
         self.publish_coverage()?;
+        self.check_drain_deadline().await;
+        self.step_drain_share_keys().await?;
         Ok(changed)
     }
 
@@ -5798,10 +5798,14 @@ where
     /// [`process_share_keys`](Self::process_share_keys) when it lands.
     #[must_use]
     pub fn share_key_timer(&self) -> Option<ShareKeyTimer> {
-        self.share_key_deadline.map(|deadline| ShareKeyTimer {
-            armed: self.share_key_armed,
-            deadline,
-        })
+        self.share_key_deadline
+            .into_iter()
+            .chain(self.drain.authorization_deadline())
+            .min()
+            .map(|deadline| ShareKeyTimer {
+                armed: self.share_key_armed,
+                deadline,
+            })
     }
 
     /// Set the secret store before preparing the durable connection.
@@ -6218,13 +6222,7 @@ where
     /// Send the swap carrying every live held key, one in flight at a time.
     async fn send_share_key_replacement(&mut self) -> Result<(), ClientError> {
         let now = clock::now_secs(&mut self.db)?;
-        let keys = self
-            .config
-            .subjects
-            .iter()
-            .flat_map(|subjects| subjects.set.keys.iter().map(|(grant, _)| grant.clone()))
-            .filter(|grant| !grant_expiry::has_expired(grant, now))
-            .collect();
+        let keys = live_share_grants(&self.config, now).cloned().collect();
         let request_id = share_key_request_id();
         let generation = self.share_key_generation;
         self.wire()?
@@ -7298,6 +7296,7 @@ where
             self.step_share_keys().await?;
             self.check_writer_deadlines();
             self.check_drain_deadline().await;
+            self.step_drain_share_keys().await?;
             if let Some(notice) = self.notices.pop_front() {
                 return Ok(notice);
             }
@@ -7335,6 +7334,7 @@ where
         self.check_share_key_deadlines();
         self.step_share_keys().await?;
         self.check_drain_deadline().await;
+        self.step_drain_share_keys().await?;
         // Ahead of the transport, and ahead of the cancel, because a state
         // change already happened and holding it back would leave a caller
         // showing stale data with nothing to tell it otherwise.
