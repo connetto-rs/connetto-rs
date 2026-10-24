@@ -1328,6 +1328,9 @@ where
         S: Sleeper,
         CS: Sleeper,
     {
+        if let Err(error) = self.worker.process_share_keys(!self.gate.is_locked()).await {
+            return self.serve_upstream(reconnect, Err(error)).await;
+        }
         if self.walk.outbox_wake {
             // An import commits restored writes and files wherever it was served, so the
             // driver is told here rather than by whichever path served it.
@@ -1590,16 +1593,19 @@ where
         F: TransportFactory<Transport = U>,
         S: Sleeper,
     {
-        hub_recover(
-            &mut self.worker,
-            driver,
-            &mut self.state,
-            &self.notices,
-            self.content.as_ref().map(HubContent::archive),
-            &mut self.events,
-            &mut self.walk,
-        )
-        .await
+        let mut deferred = VecDeque::new();
+        let mut context = RecoveryContext {
+            worker: &mut self.worker,
+            state: &mut self.state,
+            notices: &self.notices,
+            content: self.content.as_ref().map(HubContent::archive),
+            events: &mut self.events,
+            deferred: &mut deferred,
+            walk: &mut self.walk,
+            gate: &self.gate,
+            min_wait: None,
+        };
+        hub_recover(&mut context, driver).await
     }
 
     /// Walk the content outbox once, then reschedule the driver from what the walk left.
@@ -2231,10 +2237,12 @@ where
     events: &'a mut UnboundedReceiver<HubEvent>,
     deferred: &'a mut VecDeque<HubEvent>,
     walk: &'a mut WalkState,
+    gate: &'a GateController,
     /// The wait floor a rate-limited refusal stated, kept across attempts so
     /// the next backoff floors on it.
     min_wait: Option<core::time::Duration>,
 }
+
 
 /// Send every attached tab the typed fatal that ends the hub, so a tab
 /// reads the reason rather than a channel that merely vanishes.
@@ -2281,13 +2289,8 @@ fn retry_after(err: &ClientError) -> Option<core::time::Duration> {
 }
 
 async fn hub_recover<U, F, S>(
-    worker: &mut ConnettoConnection<U>,
+    context: &mut RecoveryContext<'_, U>,
     driver: &mut HubReconnect<F, S>,
-    state: &mut HubState,
-    notices: &UnboundedSender<HubNotice>,
-    content: Option<&ContentArchive<BrowserStore>>,
-    events: &mut UnboundedReceiver<HubEvent>,
-    walk: &mut WalkState,
 ) -> Result<bool, RelayError>
 where
     U: Transport + MaybeSend + 'static,
@@ -2297,17 +2300,7 @@ where
 {
     let mut backoff = driver.policy.initial_backoff();
     let mut attempt: u32 = 0;
-    let mut deferred = VecDeque::new();
-    let mut recovery_io = RecoveryContext {
-        worker,
-        state,
-        notices,
-        content,
-        events,
-        deferred: &mut deferred,
-        walk,
-        min_wait: None,
-    };
+
     loop {
         attempt = attempt.saturating_add(1);
         if driver
@@ -2319,20 +2312,20 @@ where
         }
         tracing::warn!(attempt, "relay hub upstream reconnecting");
         // A rate-limited refusal from a past attempt states how long the server will take, so the next wait floors on it.
-        let wait = recovery_io
+        let wait = context
             .min_wait
             .take()
             .map_or(backoff, |floor| backoff.max(floor));
-        if !wait_recovery_backoff(&mut recovery_io, &mut driver.sleeper, wait).await? {
+        if !wait_recovery_backoff(context, &mut driver.sleeper, wait).await? {
             return Ok(false);
         }
         backoff = backoff.saturating_mul(2).min(driver.policy.max_backoff());
-        match finish_recovery(&mut recovery_io, &mut driver.factory, &driver.upstream).await? {
+        match finish_recovery(context, &mut driver.factory, &driver.upstream).await? {
             RecoveryCycle::Connected => return Ok(true),
             RecoveryCycle::Failed => {}
             RecoveryCycle::Closed => return Ok(false),
             RecoveryCycle::Mismatched(err) => {
-                refuse_tabs(recovery_io.state, &hub_mismatch_reason(&err));
+                refuse_tabs(context.state, &hub_mismatch_reason(&err));
                 return Ok(false);
             }
         }
@@ -2396,6 +2389,7 @@ where
     U: Transport + MaybeSend + 'static,
     U::Error: core::fmt::Display,
 {
+    let key_timer = context.worker.share_key_timer();
     let subscriptions = recovery_subscriptions(context.state, upstream);
     let worker = &mut *context.worker;
     let state = &mut *context.state;
@@ -2577,6 +2571,7 @@ where
     U: Transport + MaybeSend + 'static,
     U::Error: core::fmt::Display,
 {
+    let key_timer = context.worker.share_key_timer();
     let subscriptions = recovery_subscriptions(context.state, upstream);
     let worker = &mut *context.worker;
     let state = &mut *context.state;
@@ -4732,6 +4727,7 @@ fn forward_aggregate(
     }
 }
 
+
 /// Handle one upstream event from the worker connection.
 fn handle_worker_event<U>(
     worker: &mut ConnettoConnection<U>,
@@ -5554,6 +5550,233 @@ mod tests {
 
     fn test_gate() -> std::rc::Rc<GateController> {
         std::rc::Rc::new(GateController::new(std::sync::Arc::new(TestGateSink)))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the durable worker, gate and secret-store lifetimes in one scope"
+    )]
+    #[wasm_bindgen_test]
+    async fn a_locked_expiry_defers_its_secret_save_until_the_prompt_is_approved() {
+        use base64::Engine as _;
+        use connetto_client::share_keys::{ShareKeyFuture, ShareKeySet, ShareKeyStore};
+        use connetto_client::{
+            ClientBuilder, ClientError, ContentPlace, Custody, Gate, GateAskFuture, GateAskOutcome,
+            GateMechanism, Grant, HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema,
+        };
+        use connetto_core::auth::CapabilitySubject;
+        use connetto_core::messages::{
+            ControlMessage, HandshakeAck, ShareKeysReplaced, WriterGrant,
+        };
+        use connetto_core::traits::{ReplicaKeyStore, Transport};
+        use connetto_core::{Cursor, IncomingFrame, LoopbackTransport, SchemaBundle, loopback};
+        use parking_lot::Mutex;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        struct At(String);
+        impl ReplicaPlace for At {
+            fn locate(&self, name: &str) -> Result<Located, ClientError> {
+                Ok(Located::new(
+                    name,
+                    self.0.clone(),
+                    false,
+                    ContentPlace::InMemory,
+                ))
+            }
+        }
+        struct Holding(ReplicaKey);
+        impl ReplicaKeyStore for Holding {
+            type Error = ClientError;
+            fn load(
+                &self,
+                _name: &str,
+            ) -> impl Future<Output = Result<Option<ReplicaKey>, ClientError>> {
+                core::future::ready(Ok(Some(self.0.clone())))
+            }
+            fn store(
+                &self,
+                _name: &str,
+                _key: &ReplicaKey,
+            ) -> impl Future<Output = Result<(), ClientError>> {
+                core::future::ready(Ok(()))
+            }
+            fn clear(&self, _name: &str) -> impl Future<Output = Result<(), ClientError>> {
+                core::future::ready(Ok(()))
+            }
+            fn protection(&self) -> Custody {
+                Custody::Ephemeral
+            }
+        }
+        #[derive(Clone, Default)]
+        struct Recording(Rc<RefCell<Vec<ShareKeySet>>>);
+        impl ShareKeyStore for Recording {
+            type Error = ClientError;
+            fn load<'a>(
+                &'a self,
+                _record: &'a str,
+            ) -> ShareKeyFuture<'a, Option<ShareKeySet>, ClientError> {
+                Box::pin(async { Ok(None) })
+            }
+            fn save<'a>(
+                &'a self,
+                _record: &'a str,
+                set: &'a ShareKeySet,
+            ) -> ShareKeyFuture<'a, (), ClientError> {
+                Box::pin(async move {
+                    self.0.borrow_mut().push(set.clone());
+                    Ok(())
+                })
+            }
+            fn clear<'a>(&'a self, _record: &'a str) -> ShareKeyFuture<'a, (), ClientError> {
+                Box::pin(async { Ok(()) })
+            }
+            fn protection(&self) -> Custody {
+                Custody::Ephemeral
+            }
+        }
+        struct Prompt(Mutex<Option<futures_channel::oneshot::Receiver<GateAskOutcome>>>);
+        impl GateMechanism for Prompt {
+            fn lock(&self) {}
+            fn ask(&self) -> GateAskFuture {
+                let reply = self.0.lock().take().expect("one correlated prompt");
+                Box::pin(async move {
+                    tokio::select! {
+                        outcome = reply => outcome.expect("the prompt remains owned"),
+                        () = crate::workers::helpers::sleep_ms(12_000) => GateAskOutcome::Dismissed,
+                    }
+                })
+            }
+        }
+        async fn bounded<T>(future: impl Future<Output = T>) -> T {
+            tokio::select! {
+                value = future => value,
+                () = crate::workers::helpers::sleep_ms(6_000) => panic!("gate deadline observation expired"),
+            }
+        }
+
+        let storage = crate::storage::ReplicaStorage::install().await;
+        let name = "share-key-gate-deadline.sqlite";
+        storage.delete_db(name).expect("clear the fixture replica");
+        storage
+            .reserve(4)
+            .await
+            .expect("reserve the fixture replica");
+        let schema = SyncSchema::new(
+            SchemaBundle::new(
+                "-- connetto:major 1",
+                "",
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+                None::<&str>,
+            )
+            .expect("the source declares major 1"),
+        );
+        let version = schema.version();
+        let expiry = (js_sys::Date::now() / 1000.0).floor() + 3.0;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("{{\"exp\":{expiry:.0}}}"));
+        let store = Recording::default();
+        let mut worker = ClientBuilder::new(schema, || async {
+            Err::<LoopbackTransport, _>("no redial")
+        })
+        .with_share_keys([(
+            Grant::new(format!("header.{payload}.signature")),
+            CapabilitySubject::<String>::new("gate-subject"),
+        )])
+        .signed_in(HeldCredential::new(Grant::new("user:gate"), "gate").expect("identity"))
+        .durable(
+            At(storage.db_url(name)),
+            Holding(ReplicaKey::from_bytes([0x47; ReplicaKey::LEN])),
+            store.clone(),
+        )
+        .with_gate(Gate::off())
+        .open_driven()
+        .await
+        .expect("open the durable worker");
+        store.0.borrow_mut().clear();
+        let (transport, mut server) = loopback();
+        let answer = async {
+            let hello = bounded(server.recv()).await.expect("read the handshake");
+            assert!(matches!(
+                hello,
+                Some(IncomingFrame::Control(ControlMessage::Handshake(_)))
+            ));
+            server
+                .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                    connection_id: "gate-deadline".to_owned(),
+                    session_token: "gate-deadline".to_owned(),
+                    resume_token: "gate-deadline".to_owned(),
+                    current_cursor: Cursor::new(Vec::new()),
+                    schema_version: Some(version),
+                    initial_credits: 64,
+                    writer: Some(WriterGrant {
+                        number: 7,
+                        frontier: 0,
+                    }),
+                }))
+                .await
+                .expect("answer the handshake");
+        };
+        let (attached, ()) = tokio::join!(worker.attach(transport), answer);
+        attached.expect("attach the worker");
+        let (hub, pump, _notices) = super::RelayHub::new(worker, ":memory:").expect("open the hub");
+        let (approve, reply) = futures_channel::oneshot::channel();
+        hub.gate
+            .enable(None, Arc::new(Prompt(Mutex::new(Some(reply)))));
+        assert!(hub.gate.unlock());
+        {
+            tokio::pin!(pump);
+            let observation = async {
+                let frame = bounded(server.recv())
+                    .await
+                    .expect("read the expiry replacement");
+                let Some(IncomingFrame::Control(ControlMessage::ReplaceShareKeys(request))) = frame
+                else {
+                    panic!("expiry sends its correlated replacement");
+                };
+                assert!(
+                    request.keys.is_empty(),
+                    "the expired grant is no longer authorized"
+                );
+                assert!(
+                    store.0.borrow().is_empty(),
+                    "a locked gate defers secret writes"
+                );
+                server
+                    .send_control(ControlMessage::ShareKeysReplaced(ShareKeysReplaced {
+                        request_id: request.request_id,
+                    }))
+                    .await
+                    .expect("settle the replacement");
+                approve
+                    .send(GateAskOutcome::Approved)
+                    .expect("approve the held prompt");
+                bounded(async {
+                    while store.0.borrow().is_empty() {
+                        crate::workers::helpers::sleep_ms(10).await;
+                    }
+                })
+                .await;
+                assert_eq!(
+                    *store.0.borrow(),
+                    vec![ShareKeySet::new(
+                        Vec::<(Grant, CapabilitySubject<String>)>::new()
+                    )],
+                    "approval persists the reduced set exactly once",
+                );
+            };
+            tokio::select! {
+                result = &mut pump => panic!("the hub stopped before its gate observation: {result:?}"),
+                () = observation => {}
+            }
+        }
+        drop(hub);
+        storage
+            .delete_db(name)
+            .expect("release the fixture replica");
     }
 
     #[wasm_bindgen_test]
