@@ -1220,6 +1220,8 @@ fn borrowed_slice(names: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("&[{names}]")
+}
+
 /// The `bundle()` code that attaches the tier history a build with a tier
 /// read from its exports.
 fn history_call(history: &connetto_core::schema::TierHistory) -> String {
@@ -1660,6 +1662,8 @@ mod tests {
         assert_eq!(bundle.replica_ddl(), plain.replica_ddl());
         assert!(bundle.schema_source().contains("REFERENCES folders(id)"));
         assert!(bundle.schema_source().contains("REFERENCES notes(id)"));
+    }
+
     /// The source documents a build step reads, the schema source declaring
     /// `major`, written under `dir`. The last result is the DDL the same
     /// tier source translates to now.
