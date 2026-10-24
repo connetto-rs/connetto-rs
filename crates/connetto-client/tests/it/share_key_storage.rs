@@ -607,20 +607,17 @@ async fn a_locked_expiry_defers_its_secret_write_until_unlock() {
     let authority =
         connetto_server::TokenAuthority::generate(&connetto_server::AuthConfig::default())
             .expect("token authority");
+    let mut conn = durable_build("alice", dir.path(), keys, share.clone(), Vec::new())
+        .await
+        .expect("open durable replica");
+    seed(&mut conn);
+    conn.disconnect();
     let token = authority
         .mint_capability(&subject, SystemTime::now(), Duration::from_secs(3))
         .expect("short-lived key");
-    let mut conn = durable_build(
-        "alice",
-        dir.path(),
-        keys,
-        share.clone(),
-        vec![(Grant::new(token), subject)],
-    )
-    .await
-    .expect("open durable replica");
-    seed(&mut conn);
-    conn.disconnect();
+    conn.add_share_key(&Grant::new(token), &subject)
+        .await
+        .expect("add the expiry key");
     let wait = conn.share_key_timer().expect("expiry timer").wait();
     let previous = share.record(&share_record("alice")).expect("stored key");
     let (client, pump) = ConnettoClient::with_pump(conn);
@@ -717,20 +714,23 @@ async fn an_expiry_save_failure_hides_rows_and_stops_connected_or_offline_pumps(
         let authority =
             connetto_server::TokenAuthority::generate(&connetto_server::AuthConfig::default())
                 .expect("token authority");
-        let token = authority
-            .mint_capability(&subject, SystemTime::now(), Duration::from_secs(5))
-            .expect("short-lived key");
         let mut conn = durable_build(
             "alice",
             dir.path(),
             seeded_keys("alice").await,
             share.clone(),
-            vec![(Grant::new(token), subject)],
+            Vec::new(),
         )
         .await
         .expect("open durable replica");
         seed(&mut conn);
         conn.disconnect();
+        let token = authority
+            .mint_capability(&subject, SystemTime::now(), Duration::from_secs(5))
+            .expect("short-lived key");
+        conn.add_share_key(&Grant::new(token), &subject)
+            .await
+            .expect("add the expiry key");
         if connected {
             conn.attach(FakeTransport::accepting_but_silent())
                 .await
@@ -788,9 +788,6 @@ async fn an_expiry_save_failure_terminates_recovery_during_backoff_or_dial() {
         let authority =
             connetto_server::TokenAuthority::generate(&connetto_server::AuthConfig::default())
                 .expect("token authority");
-        let token = authority
-            .mint_capability(&subject, SystemTime::now(), Duration::from_secs(5))
-            .expect("short-lived key");
         let attempts = Arc::new(AtomicUsize::new(0));
         let probe = Arc::clone(&attempts);
         let factory = move || {
@@ -810,7 +807,6 @@ async fn an_expiry_save_failure_terminates_recovery_during_backoff_or_dial() {
             Duration::from_secs(30)
         };
         let (running, pump) = ClientBuilder::new(schema(), factory)
-            .with_share_keys([(Grant::new(token), subject)])
             .with_reconnect(
                 ReconnectPolicy::new()
                     .with_initial_backoff(delay)
@@ -833,6 +829,13 @@ async fn an_expiry_save_failure_terminates_recovery_during_backoff_or_dial() {
             .watch(visible::table.select(visible::id).order(visible::id))
             .await
             .expect("watch policy rows");
+        let token = authority
+            .mint_capability(&subject, SystemTime::now(), Duration::from_secs(5))
+            .expect("short-lived key");
+        client
+            .add_share_key(&Grant::new(token), &subject)
+            .await
+            .expect("add the expiry key");
         assert_eq!(query.rows(), vec![1]);
         let mut events = client.events();
         share.set_refusal("recovery expiry refused");
@@ -875,19 +878,16 @@ async fn an_unlocked_expiry_persists_the_reduced_set_before_restart() {
     let authority =
         connetto_server::TokenAuthority::generate(&connetto_server::AuthConfig::default())
             .expect("token authority");
+    let mut conn = durable_build("alice", dir.path(), keys.clone(), share.clone(), Vec::new())
+        .await
+        .expect("open durable replica");
+    seed(&mut conn);
     let token = authority
         .mint_capability(&subject, SystemTime::now(), Duration::from_secs(3))
         .expect("short-lived key");
-    let mut conn = durable_build(
-        "alice",
-        dir.path(),
-        keys.clone(),
-        share.clone(),
-        vec![(Grant::new(token), subject)],
-    )
-    .await
-    .expect("open durable replica");
-    seed(&mut conn);
+    conn.add_share_key(&Grant::new(token), &subject)
+        .await
+        .expect("add the expiry key");
     assert_eq!(visible_ids(&mut conn), vec![1]);
     let wait = conn.share_key_timer().expect("expiry timer").wait();
     tokio::time::sleep(wait + Duration::from_millis(20)).await;
