@@ -1312,9 +1312,9 @@ mod tests {
                        CREATE TABLE notes (id INT PRIMARY KEY, folder_id INT NOT NULL, \
                          code TEXT, label TEXT DEFAULT 'x' CHECK (label <> '')); \
                        CREATE TABLE pins (id INT PRIMARY KEY, note_id INT);";
-        let bundle = translate::<String, connetto_core::bots::TextIds>(with, "")
+        let bundle = translate::<String, connetto_core::bots::TextIds>(&majored(with), "")
             .expect("translates with references");
-        let plain = translate::<String, connetto_core::bots::TextIds>(without, "")
+        let plain = translate::<String, connetto_core::bots::TextIds>(&majored(without), "")
             .expect("translates without references");
         assert_eq!(bundle.replica_ddl(), plain.replica_ddl());
         assert!(bundle.schema_source().contains("REFERENCES folders(id)"));
