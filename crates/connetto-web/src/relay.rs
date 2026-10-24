@@ -1239,7 +1239,7 @@ impl ContentRetry {
 enum ContentWalk {
     Complete { queued: bool, progressed: bool },
     Interrupted(Option<HubEvent>),
-    KeyDue,
+    Prepare,
 }
 
 /// Everything one hub task owns: the worker connection, tab state, the notice
@@ -1286,8 +1286,8 @@ enum Wake {
     Content,
     /// A tab or application request arrived.
     Local(Option<HubEvent>),
-    /// The worker connection produced an event.
-    Upstream(Result<ClientEvent, ClientError>),
+    /// The worker connection completed a protocol step.
+    Upstream(Result<Option<ClientEvent>, ClientError>),
     /// The content integrity walk has a file left to check.
     Verify,
     /// A content ticket wait, for a resolve or a fetch, ran out while the hub
@@ -1424,7 +1424,13 @@ where
             tokio::select! {
                 () = &mut content_wait => Wake::Content,
                 event = events.recv() => Wake::Local(event),
-                event = worker.pump_one(), if !retry.flush.is_waiting() && !retry.held_flush.is_waiting() => Wake::Upstream(event),
+                event = async {
+                    if worker.is_connected() {
+                        worker.pump_one_or(core::future::pending()).await
+                    } else {
+                        worker.pump_one().await.map(Some)
+                    }
+                }, if !retry.flush.is_waiting() && !retry.held_flush.is_waiting() => Wake::Upstream(event),
                 // Always ready, so the walk shares the cycle with every other source
                 // rather than holding it or being starved by it.
                 () = core::future::ready(()), if unverified => Wake::Verify,
@@ -1445,7 +1451,12 @@ where
         let served = match wake {
             Wake::Content => self.drive_content(reconnect).await,
             Wake::Local(event) => self.serve_local(event).await,
-            Wake::Upstream(event) => self.serve_upstream(reconnect, event).await,
+            Wake::Upstream(Ok(Some(event))) => self.serve_upstream(reconnect, Ok(event)).await,
+            Wake::Upstream(Err(error)) => self.serve_upstream(reconnect, Err(error)).await,
+            Wake::Upstream(Ok(None)) => {
+                self.wake_content()?;
+                Ok(true)
+            }
             Wake::Gate(outcome) => {
                 // The controller applies the outcome and states the
                 // transition through its sink.
@@ -1702,6 +1713,10 @@ where
                 return Ok(true);
             }
             ContentWalk::Interrupted(None) => return Ok(false),
+            ContentWalk::Prepare => {
+                self.retry.schedule(true, true);
+                return Ok(true);
+            }
         };
         let held_interruption = match self.drive_held_content().await? {
             Some(ContentWalk::Complete {
@@ -1718,7 +1733,7 @@ where
                 None
             }
             Some(ContentWalk::Interrupted(None)) => Some(false),
-            Some(ContentWalk::KeyDue) => Some(true),
+            Some(ContentWalk::Prepare) => Some(true),
             None => None,
         };
         if progressed {
@@ -1788,9 +1803,13 @@ where
                 progressed: false,
             });
         };
+        let key_timer = worker.share_key_timer();
         let mut interrupted = None;
         let cancel = async {
-            interrupted = Some(events.recv().await);
+            interrupted = Some(tokio::select! {
+                event = events.recv() => ContentWalk::Interrupted(event),
+                () = wait_share_keys(key_timer) => ContentWalk::Prepare,
+            });
         };
         let (start, observed) = content
             .archive()
@@ -1801,7 +1820,7 @@ where
         }
         let flush = match start {
             Ok(ContentFlushStart::Complete(ContentFlush::Interrupted)) => {
-                return Ok(ContentWalk::Interrupted(interrupted.unwrap_or(None)));
+                return Ok(interrupted.unwrap_or(ContentWalk::Prepare));
             }
             Ok(ContentFlushStart::Complete(flush)) => flush,
             Ok(ContentFlushStart::Upload(upload)) => {
@@ -1823,7 +1842,12 @@ where
 
     /// Attempt the next held file without dropping its pending ticket.
     async fn drive_held_content(&mut self) -> Result<Option<ContentWalk>, RelayError> {
-        let Some(major) = self.worker.held_files_ready() else {
+        let major = if self.retry.held_flush.is_waiting() {
+            self.worker.draining_major()
+        } else {
+            self.worker.held_files_ready()
+        };
+        let Some(major) = major else {
             // Unsettled held writes keep the content walk scheduled.
             return Ok(self.worker.draining_major().map(|_| ContentWalk::Complete {
                 queued: true,
@@ -1848,7 +1872,7 @@ where
         let cancel = async {
             interrupted = Some(tokio::select! {
                 event = events.recv() => ContentWalk::Interrupted(event),
-                () = wait_share_keys(key_timer) => ContentWalk::KeyDue,
+                () = wait_share_keys(key_timer) => ContentWalk::Prepare,
             });
         };
         let (start, observed) = content
@@ -1860,7 +1884,7 @@ where
         }
         let flush = match start {
             Ok(ContentFlushStart::Complete(ContentFlush::Interrupted)) => {
-                return Ok(Some(interrupted.unwrap_or(ContentWalk::Interrupted(None))));
+                return Ok(Some(interrupted.unwrap_or(ContentWalk::Prepare)));
             }
             Ok(ContentFlushStart::Complete(flush)) => flush,
             Ok(ContentFlushStart::Upload(upload)) => {
