@@ -1270,11 +1270,7 @@ where
     ///
     /// # Errors
     ///
-    /// [`CertificateError::Offline`] with no server reachable,
-    /// [`CertificateError::OverCeiling`] for a lifetime the server refuses,
-    /// [`CertificateError::Revoked`] when this device's key was revoked, which
-    /// deletes it, [`CertificateError::Refused`] for any other refusal, and
-    /// [`CertificateError::NoIdentity`] for a build without a device identity.
+    /// [`CertificateError::Offline`] without a server connection, [`CertificateError::OverCeiling`] for a refused lifetime, [`CertificateError::Revoked`] when revocation deletes the key and prevents enrolment until the next build, [`CertificateError::Refused`] for another refusal, and [`CertificateError::NoIdentity`] without a device identity.
     #[cfg(feature = "device-identity")]
     pub async fn reissue_certificate(
         &self,
