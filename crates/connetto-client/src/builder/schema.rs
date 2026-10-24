@@ -24,6 +24,8 @@ pub struct SyncSchema {
     unrecorded: HashSet<String>,
     /// Both tiers as one main-schema DDL, for a relay tab's mirror.
     mirror_ddl: Option<String>,
+    /// Whether this is a relay tab's mirror.
+    relay: bool,
 }
 
 impl SyncSchema {
@@ -43,6 +45,7 @@ impl SyncSchema {
             sql_functions: uuidv4_installer(),
             unrecorded: HashSet::new(),
             mirror_ddl: None,
+            relay: false,
         }
     }
 
@@ -76,7 +79,15 @@ impl SyncSchema {
         if let Some(tier) = self.bundle.local_tier_ddl() {
             self.mirror_ddl = Some(format!("{}\n{tier}", self.bundle.replica_ddl()));
         }
+        self.relay = true;
         self
+    }
+
+    /// Whether this schema is a relay tab's mirror, whose worker holds the
+    /// share keys.
+    #[must_use]
+    pub(crate) fn is_relay_mirror(&self) -> bool {
+        self.relay
     }
 
     /// The translated replica DDL a first boot applies.

@@ -71,15 +71,16 @@ use crate::workers::helpers::sleep_ms;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
     AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, GateAskOutcome,
-    GateController, GateSink, ImportChoices, ImportOutcome, PolicyTables, ResendTimer, WriterGrant,
-    WriterRequest, subscription_is_aggregate, subscription_tables,
+    GateController, GateSink, ImportChoices, ImportOutcome, PolicyTables, ResendTimer,
+    ShareKeyTimer, WriterGrant, WriterRequest, subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError, FatalErrorReason,
     FullResyncReason, FullResyncRequired, GateState, HandshakeAck, LivePatch, MutationApplied,
     MutationConflict, MutationReject, MutationRejectReason, NonFatalError, Pong, RateLimited,
     SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
-    SubscriptionPriority, SubscriptionSpec, SyncStatus,
+    SubscriptionPriority, SubscriptionSpec, SyncStatus, TabShareKeyAnswer, TabShareKeyChange,
+    TabShareKeyOutcome,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Transport, quote_ident};
@@ -521,6 +522,12 @@ struct HubState {
     /// The worker's armed resend of writes the server deferred, with the
     /// `Date::now` instant it falls due, so arriving frames never restart it.
     resend: Option<(ResendTimer, f64)>,
+
+    /// The worker's share-key generation the tabs were last told about.
+    stated_generation: u64,
+    /// The share-key timer the hub last woke on, so an unmoved deadline is not
+    /// slept on again.
+    fired_key_timer: Option<ShareKeyTimer>,
 }
 
 /// One resolve whose ticket request is in flight, kept in the hub state so
@@ -1127,6 +1134,7 @@ where
         } else {
             SyncStatus::Offline
         },
+        stated_generation: worker.share_key_generation(),
         ..HubState::default()
     };
     if let Some(driver) = reconnect {
@@ -1223,6 +1231,8 @@ enum Wake {
     Resend,
     /// The worker's gate prompt resolved.
     Gate(Option<GateAskOutcome>),
+    /// The worker's share-key work fell due.
+    ShareKeys,
 }
 
 impl<U> HubRuntime<U>
@@ -1292,6 +1302,12 @@ where
             }
         };
         tokio::pin!(resend_wait);
+        // Key expiry and the swap's bounds run on the worker's own deadline,
+        // which a pump parked on the socket never reaches by itself.
+        let key_timer = self.worker.share_key_timer();
+        let key_ms = fresh_key_wait_ms(key_timer, self.state.fired_key_timer);
+        let key_wait = sleep_or_park(key_ms);
+        tokio::pin!(key_wait);
         // The in-flight gate prompt, if any, driven alongside the other
         // wakes and handed back to the controller when another wake wins.
         let mut ask = self.gate.take_ask();
@@ -1322,6 +1338,7 @@ where
                 () = &mut resolve_wait, if resolve_ms.is_some() => Wake::Resolve,
                 () = &mut resend_wait, if resend_ms.is_some() => Wake::Resend,
                 outcome = &mut ask_wait, if prompting => Wake::Gate(Some(outcome)),
+                () = &mut key_wait, if key_ms.is_some() => Wake::ShareKeys,
             }
         };
         // A losing wake keeps the prompt for the next cycle.
@@ -1330,7 +1347,7 @@ where
         {
             self.gate.restore_ask(ask);
         }
-        match wake {
+        let served = match wake {
             Wake::Content => self.drive_content(reconnect).await,
             Wake::Local(event) => self.serve_local(event).await,
             Wake::Upstream(event) => self.serve_upstream(reconnect, event).await,
@@ -1355,7 +1372,23 @@ where
                     Err(err) => self.serve_upstream(reconnect, Err(err)).await,
                 }
             }
+            Wake::ShareKeys => self.serve_share_keys(key_timer).await,
+        };
+        // Any wake may have moved the keys, an expiry inside a pump step
+        // included, so the tabs hear about it once here.
+        if matches!(served, Ok(true)) {
+            restate_identity(&mut self.worker, &mut self.state)?;
         }
+        served
+    }
+
+    /// Run the worker's due share-key work, deferring secret writes while locked.
+    async fn serve_share_keys(&mut self, fired: Option<ShareKeyTimer>) -> Result<bool, RelayError> {
+        self.state.fired_key_timer = fired;
+        self.worker
+            .process_share_keys(!hub_locked(&self.state))
+            .await?;
+        Ok(true)
     }
 
     async fn serve(&mut self, event: HubEvent) -> Result<(), RelayError> {
@@ -1922,6 +1955,11 @@ where
         // hub's own sync status is.
         HubEvent::Gate(gate) => {
             forward_gate_state(state, gate);
+            // Secret writes deferred while locked land before anything else.
+            if gate == GateState::Unlocked {
+                worker.process_share_keys(true).await?;
+                restate_identity(worker, state)?;
+            }
         }
     }
     Ok(())
@@ -2196,6 +2234,9 @@ where
     tokio::pin!(sleep);
     loop {
         let owes = walk_owes(context.walk);
+        // Keys expire offline too, and the tabs hear it from here.
+        let key_timer = context.worker.share_key_timer();
+        let key_wait = sleep_or_park(fresh_key_wait_ms(key_timer, context.state.fired_key_timer));
         let wake = {
             let events = &mut *context.events;
             tokio::select! {
@@ -2204,6 +2245,7 @@ where
                 // The walk reads only the replica and the chunk store, so the sleep is
                 // where it belongs rather than a pause until the server returns.
                 () = core::future::ready(()), if owes => IdleWake::Walk,
+                () = key_wait => IdleWake::ShareKeys,
             }
         };
         match wake {
@@ -2212,6 +2254,7 @@ where
             IdleWake::Walk => {
                 walk_recovery_turn(context).await;
             }
+            IdleWake::ShareKeys => idle_share_key_turn(context, key_timer).await?,
         }
     }
 }
@@ -2222,6 +2265,8 @@ enum IdleWake {
     Event(Option<HubEvent>),
     /// The content integrity walk owes a turn.
     Walk,
+    /// The worker's share-key work fell due.
+    ShareKeys,
 }
 
 /// One walk turn while the connection is idle.
@@ -2234,6 +2279,24 @@ where
     U::Error: core::fmt::Display,
 {
     let _ = walk_turn(context.worker, context.content, context.walk).await;
+}
+
+/// Share-key work while the connection is idle: keys expire offline too, and
+/// the tabs hear about it from here.
+async fn idle_share_key_turn<U>(
+    context: &mut RecoveryContext<'_, U>,
+    fired: Option<ShareKeyTimer>,
+) -> Result<(), RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    context.state.fired_key_timer = fired;
+    context
+        .worker
+        .process_share_keys(!hub_locked(context.state))
+        .await?;
+    restate_identity(context.worker, context.state)
 }
 
 async fn recovery_attempt<U, F>(
@@ -2268,6 +2331,8 @@ where
     tokio::pin!(connect);
     loop {
         let owes = walk_owes(context.walk);
+        let key_timer = context.worker.share_key_timer();
+        let key_wait = sleep_or_park(fresh_key_wait_ms(key_timer, context.state.fired_key_timer));
         let wake = {
             let events = &mut *context.events;
             tokio::select! {
@@ -2279,6 +2344,7 @@ where
                 }
                 event = events.recv() => IdleWake::Event(event),
                 () = core::future::ready(()), if owes => IdleWake::Walk,
+                () = key_wait => IdleWake::ShareKeys,
             }
         };
         match wake {
@@ -2287,6 +2353,7 @@ where
             IdleWake::Walk => {
                 walk_recovery_turn(context).await;
             }
+            IdleWake::ShareKeys => idle_share_key_turn(context, key_timer).await?,
         }
     }
 }
@@ -2452,6 +2519,10 @@ fn recovery_interrupts_attach(event: &HubEvent) -> bool {
     matches!(
         event,
         HubEvent::Unsynced(_)
+            | HubEvent::Frame(
+                _,
+                IncomingFrame::Control(ControlMessage::TabShareKeyChange(_))
+            )
             | HubEvent::Export(_, _)
             | HubEvent::Import(_, _)
             | HubEvent::ForgetRetired(_, _)
@@ -2791,6 +2862,10 @@ where
         ControlMessage::AckCredits(ack) if tab.handshaken => {
             tab.credits = tab.credits.saturating_add(ack.credits);
             flush_tab_bulk(tab);
+            Ok(())
+        }
+        ControlMessage::TabShareKeyChange(request) if tab.handshaken => {
+            serve_tab_share_key_change(worker, state, id, request).await?;
             Ok(())
         }
         ControlMessage::BindDevice(_) | ControlMessage::RetireWriter(_) => {
@@ -3787,6 +3862,91 @@ where
         reason = "clamped into i32 range and rounded up before the cast"
     )]
     Some(ms as i32)
+}
+
+/// Milliseconds until the worker's share-key work falls due, `None` when
+/// nothing is armed or the armed deadline already woke the hub without moving.
+fn fresh_key_wait_ms(armed: Option<ShareKeyTimer>, fired: Option<ShareKeyTimer>) -> Option<i32> {
+    let timer = armed.filter(|timer| Some(*timer) != fired)?;
+    Some(i32::try_from(timer.wait().as_millis()).unwrap_or(i32::MAX))
+}
+
+/// Sleep `ms` milliseconds, or park forever when there is nothing to wait for.
+async fn sleep_or_park(ms: Option<i32>) {
+    match ms {
+        Some(ms) => sleep_ms(ms).await,
+        None => core::future::pending().await,
+    }
+}
+
+/// Whether the gate refuses application changes, as the tabs were told.
+fn hub_locked(state: &HubState) -> bool {
+    matches!(
+        state.gate,
+        Some(GateState::Locked | GateState::UnlockDismissed)
+    )
+}
+
+/// State the worker's identity to every handshaken tab once its share keys
+/// moved, so each mirror answers its views as the worker's replica does.
+fn restate_identity<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+) -> Result<(), RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let generation = worker.share_key_generation();
+    if generation == state.stated_generation {
+        return Ok(());
+    }
+    let identity = worker.relay_identity()?;
+    for tab in state.tabs.values().filter(|tab| tab.handshaken) {
+        let _ = tab.out.send(TabOut::Control(ControlMessage::TabIdentity(
+            identity.clone(),
+        )));
+    }
+    state.stated_generation = generation;
+    Ok(())
+}
+
+/// Commit a tab's share-key change on the worker, state the moved identity to
+/// every tab, then answer the asking tab (R95 decision 17).
+async fn serve_tab_share_key_change<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    id: TabId,
+    request: TabShareKeyChange,
+) -> Result<(), RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let outcome = if hub_locked(state) {
+        TabShareKeyOutcome::Locked
+    } else {
+        match worker.apply_relay_share_key_change(&request.change).await {
+            Ok(_) => {
+                restate_identity(worker, state)?;
+                TabShareKeyOutcome::Changed
+            }
+            Err(ClientError::Locked) => TabShareKeyOutcome::Locked,
+            Err(ClientError::Auth(detail)) => TabShareKeyOutcome::StoreRefused(detail),
+            Err(other) => TabShareKeyOutcome::ReplicaRefused(other.to_string()),
+        }
+    };
+    if let Some(tab) = state.tabs.get(&id) {
+        let _ = tab
+            .out
+            .send(TabOut::Control(ControlMessage::TabShareKeyAnswer(
+                TabShareKeyAnswer {
+                    request_id: request.request_id,
+                    outcome,
+                },
+            )));
+    }
+    Ok(())
 }
 
 /// Answers `Unavailable` to every resolve whose wait ran out.
@@ -5824,5 +5984,86 @@ mod tests {
         );
         assert!(!rejected(&mut author), "the next write is accepted");
         assert_eq!(note_count(&mut worker), 3, "the next write committed");
+    }
+
+    /// A locked hub answers a tab's share-key change with `Locked` and holds
+    /// the set it held, stating nothing to any tab.
+    #[wasm_bindgen_test]
+    async fn a_locked_hub_refuses_a_tab_share_key_change() {
+        use connetto_core::messages::{
+            ControlMessage, GateState, ShareKeyChange, TabShareKeyChange, TabShareKeyOutcome,
+        };
+        let mut worker = offline_signed_in(DDL);
+        let mut state = super::HubState {
+            gate: Some(GateState::Locked),
+            ..super::HubState::default()
+        };
+        let (requester, mut answers) = tokio::sync::mpsc::unbounded_channel();
+        let (sibling, mut sibling_heard) = tokio::sync::mpsc::unbounded_channel();
+        super::attach_tab(&mut state, 1, requester);
+        super::attach_tab(&mut state, 2, sibling);
+        for tab in state.tabs.values_mut() {
+            tab.handshaken = true;
+        }
+        super::serve_tab_share_key_change(
+            &mut worker,
+            &mut state,
+            1,
+            TabShareKeyChange {
+                request_id: "locked".to_owned(),
+                change: ShareKeyChange::Add {
+                    grant: connetto_client::Grant::new("h.e30.s"),
+                    subject: "kept-out".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("the hub answers");
+        match answers.try_recv() {
+            Ok(super::TabOut::Control(ControlMessage::TabShareKeyAnswer(answer))) => {
+                assert_eq!(answer.request_id, "locked");
+                assert_eq!(answer.outcome, TabShareKeyOutcome::Locked);
+            }
+            _ => panic!("the asking tab is answered first and only"),
+        }
+        assert!(
+            answers.try_recv().is_err(),
+            "nothing else reaches the asker"
+        );
+        assert!(
+            sibling_heard.try_recv().is_err(),
+            "no tab hears a new identity"
+        );
+        assert_eq!(
+            worker.relay_identity().expect("identity").subjects,
+            None,
+            "the worker holds the set it held"
+        );
+    }
+
+    /// A share-key change is answered from the worker's replica with a tab
+    /// waiting on it, so it interrupts an attach like the other such requests.
+    #[wasm_bindgen_test]
+    fn a_tab_share_key_change_interrupts_an_attach() {
+        use connetto_core::messages::{ControlMessage, Ping, ShareKeyChange, TabShareKeyChange};
+        use connetto_core::traits::IncomingFrame;
+        let change = HubEvent::Frame(
+            1,
+            IncomingFrame::Control(ControlMessage::TabShareKeyChange(TabShareKeyChange {
+                request_id: "attach".to_owned(),
+                change: ShareKeyChange::Remove {
+                    subject: "gone".to_owned(),
+                },
+            })),
+        );
+        assert!(recovery_interrupts_attach(&change));
+        let ping = HubEvent::Frame(
+            1,
+            IncomingFrame::Control(ControlMessage::Ping(Ping { nonce: 1 })),
+        );
+        assert!(
+            !recovery_interrupts_attach(&ping),
+            "other tab frames keep their place"
+        );
     }
 }

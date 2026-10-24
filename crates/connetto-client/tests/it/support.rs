@@ -186,3 +186,26 @@ impl ReplicaKeyStore for SharedKeys {
         Custody::Unverified(NoGate::Unsupported)
     }
 }
+
+/// A scripted socket's receive: the next queued frame, idling while none is
+/// queued, and the end of the stream once the script closed.
+pub fn scripted_recv<E>(
+    frames: &std::sync::Arc<
+        parking_lot::Mutex<std::collections::VecDeque<connetto_core::traits::IncomingFrame>>,
+    >,
+    closed: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> impl Future<Output = Result<Option<connetto_core::traits::IncomingFrame>, E>> + use<E> {
+    let frames = std::sync::Arc::clone(frames);
+    let closed = std::sync::Arc::clone(closed);
+    async move {
+        loop {
+            if closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(None);
+            }
+            if let Some(frame) = frames.lock().pop_front() {
+                return Ok(Some(frame));
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+}
