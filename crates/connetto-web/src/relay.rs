@@ -1322,12 +1322,13 @@ where
         // The resolve and fetch waits ride a timer here rather than parking a
         // handler: when one fires, the sweep answers only the waits that have
         // truly elapsed and the loop keeps serving everything else in between.
-        let resolve_ms = resolve_deadline_ms(&self.state.pending_resolve);
-        let fetch_ms = fetch_deadline_ms(&self.state.pending_fetch);
-        let ticket_ms = match (resolve_ms, fetch_ms) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let ticket_ms = earliest_wait_ms(
+            self.state
+                .pending_resolve
+                .iter()
+                .map(|resolve| resolve.deadline)
+                .chain(self.state.pending_fetch.iter().map(|fetch| fetch.deadline)),
+        );
         let ticket_wait = async {
             match ticket_ms {
                 Some(ms) => sleep_ms(ms).await,
@@ -4307,10 +4308,10 @@ fn route_fetch_tickets(
     settled
 }
 
-/// Milliseconds until the earliest resolve wait must answer, `None` when no
-/// resolve waits. Never zero, so a cycle never busy-spins on an elapsed
-/// deadline the sweep has not yet collected.
-fn resolve_deadline_ms(pending: &[PendingHubResolve]) -> Option<i32> {
+/// Milliseconds until the earliest of the `Date::now` instants `deadlines`
+/// falls due, `None` when there are none. Never zero, so a cycle never
+/// busy-spins on an elapsed deadline the sweep has not yet collected.
+fn earliest_wait_ms(deadlines: impl Iterator<Item = f64>) -> Option<i32> {
     let now = js_sys::Date::now();
     // The floor is 1 ms and the ceiling is RESOLVE_WAIT_MS, the widest wait
     // this file ever queues, so the value is always in i32 range.
@@ -4318,29 +4319,9 @@ fn resolve_deadline_ms(pending: &[PendingHubResolve]) -> Option<i32> {
         clippy::cast_possible_truncation,
         reason = "clamped to [1.0, RESOLVE_WAIT_MS = 15_000]; sub-ms rounding is deliberate"
     )]
-    let ms = pending
-        .iter()
-        .map(|resolve| {
-            (resolve.deadline - now)
-                .clamp(1.0, f64::from(RESOLVE_WAIT_MS))
-                .ceil() as i32
-        })
-        .min();
-    ms
-}
-
-/// Milliseconds until the earliest fetch wait must answer, `None` when no
-/// fetch waits. Bounded the same way the resolve deadline is.
-fn fetch_deadline_ms(pending: &[PendingHubFetch]) -> Option<i32> {
-    let now = js_sys::Date::now();
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "clamped to [1.0, RESOLVE_WAIT_MS = 15_000]; sub-ms rounding is deliberate"
-    )]
-    let ms = pending
-        .iter()
-        .map(|fetch| {
-            (fetch.deadline - now)
+    let ms = deadlines
+        .map(|deadline| {
+            (deadline - now)
                 .clamp(1.0, f64::from(RESOLVE_WAIT_MS))
                 .ceil() as i32
         })
