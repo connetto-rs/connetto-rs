@@ -169,7 +169,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R92~~ | Synced tables without local references, with SQLite's own enforcement for the tier |
 | any | R93 | The file replica for bots. Needs R91's template, R71's headless custody is built |
 | done | ~~R94~~ | One client builder per platform from shared configuration pieces |
-| any | R95 | Share keys added and removed on a running client. Needs nothing since R94 |
+| done | ~~R95~~ | Share keys added and removed on a running client |
 | any | R105 | Answering a stolen account. Builds on R74's device list and R91's installations as they stand |
 | done | ~~R96~~ | One server builder for programs that embed the server, and R91 builds on it |
 | done | ~~R97~~ | The desktop login tab closes, or the app comes back to the front. Minted from the R53 proof, designed |
@@ -221,7 +221,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R92 synced tables carry no local references | **DONE** (2026-10-18, merged `e89f61e` #167, `e8b2694` #168, `46d2bef` #169), minted and designed 2026-09-22 by R21's decision 8 | nothing. Six decisions in the section | no |
 | R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R91. Two decisions in the section | no |
 | R94 one client builder per platform | **DONE** (2026-09-30, merged `5b7f616`, #110), minted and designed 2026-09-25 while planning R51 | nothing. Twenty-seven decisions in the section | no |
-| R95 share keys on a running client | BUILT 2026-10-24, steps 1 to 5 merged and steps 6 and 7 in #231. Minted 2026-09-25 by R94's decision 10, designed 2026-10-17 | nothing since R94 (2026-09-30). Seventeen decisions and seven pull requests in the section | no |
+| R95 share keys on a running client | **DONE** (2026-10-25), minted 2026-09-25 by R94's decision 10, designed 2026-10-17 | nothing. Merged as #177, #180, #181, #182, #219 and #231, seventeen decisions in the section | no |
 | R96 one server builder | **DONE** (2026-10-03), minted 2026-09-25 by R94's decision 11, designed 2026-10-03 | nothing. Nine decisions in the section | no |
 | R97 the desktop login tab | **DONE** (2026-10-04), built 2026-10-02, proven on Windows and macOS 2026-10-03 and on GNOME 2026-10-04 | nothing. GNOME on Wayland answers the raise with its notification that the app is ready, decided with the maintainer as the platform's answer | no |
 | R98 one schema contract | **DONE** (2026-10-05, #126) | nothing | no |
@@ -416,7 +416,7 @@ graph TD
   U8[upstream apple-native-keyring-store and security-framework:<br/>one authentication shared across keychain reads] -.->|patched until released| R51
   R94 --> R52
   U9[upstream android-native-keyring-store:<br/>one approval opens the store until locked] -.->|patched until released| R52
-  R94 --> R95[R95 share keys on a running client]
+  R94 --> R95[R95 share keys on a running client, DONE]
   R94 --> R74
   U10[upstream windows-native-keyring-store:<br/>a Windows Hello PRF named store] -.->|patched until released| R53
   R53 --> R97[R97 the desktop login tab]
@@ -6045,7 +6045,7 @@ Both platforms build their clients from one builder each over the shared pieces,
 
 ## R95: share keys added and removed on a running client
 
-**Status.** BUILT 2026-10-24, steps 1 to 5 merged and steps 6 and 7 in #231. STARTED 2026-10-18, minted 2026-09-25 by R94's decision 10 and designed 2026-10-17, the server's route and the aggregate notice decided with the maintainer and the rest from research reported to the maintainer. The wire is #177. The working record, with the tree facts, the prior art, the state tables of every event against every client and server situation and the sources read, is `plans/design-r95-share-keys.md`, copied to `~/.local/share/connetto-r88/notes/design-r95-share-keys.md` with the research reports in `notes/r95-research/`.
+**Status.** DONE 2026-10-25. Started 2026-10-18, minted 2026-09-25 by R94's decision 10 and designed 2026-10-17, the server's route and the aggregate notice decided with the maintainer and the rest from research reported to the maintainer. The seven steps merged in six pull requests, #231 carrying steps 6 and 7. The working record, with the tree facts, the prior art, the state tables of every event against every client and server situation and the sources read, is `plans/design-r95-share-keys.md`, copied to `~/.local/share/connetto-r88/notes/design-r95-share-keys.md` with the research reports in `notes/r95-research/`.
 
 **Blocked on nothing** since R94 landed on 2026-09-30. Its `Auth` holds the starting set this phase persists.
 
@@ -6077,15 +6077,15 @@ A share key usually reaches an application while it runs, when a user opens a sh
 
 ### Steps
 
-Seven pull requests, each building and passing CI on its own.
+Seven steps in six pull requests, each building and passing CI on its own.
 
-1. The wire. The set message and its answer and the handshake's optional cursor-subject checkpoint in `connetto-core`, with chapter 02.
-2. The aggregate notice. The client drops an aggregate's resting answer when `FullResyncRequired` names it (decision 14), which is safe ahead of the server because today the notice is a no-op for an aggregate.
-3. A key leaves an open connection at its expiry. The grant check reports each key's `exp`, the model reports which tables the keys reach, and the session swaps its keys under the dispatch gate, registers again what read them, resends what they reached and drops the frames of the old answer still waiting for credit (decision 8).
-4. The swap on request. `ReplaceShareKeys` with its metering and queued-only answer, and authorization snapshots for unknown or differing cursor coverage at resume (decisions 2, 5, 6 and 9).
+1. The wire. The set message and its answer and the handshake's optional cursor-subject checkpoint in `connetto-core`, with chapter 02. **Merged** as #177 (2026-10-18).
+2. The aggregate notice. The client drops an aggregate's resting answer when `FullResyncRequired` names it (decision 14), which is safe ahead of the server because today the notice is a no-op for an aggregate. **Merged** as #180 (2026-10-18).
+3. A key leaves an open connection at its expiry. The grant check reports each key's `exp`, the model reports which tables the keys reach, and the session swaps its keys under the dispatch gate, registers again what read them, resends what they reached and drops the frames of the old answer still waiting for credit (decision 8). **Merged** as #181 (2026-10-20).
+4. The swap on request. `ReplaceShareKeys` with its metering and queued-only answer, and authorization snapshots for unknown or differing cursor coverage at resume (decisions 2, 5, 6 and 9). **Merged** as #182 (2026-10-20).
 5. The native client. The add and remove call, persistence beside the refresh token under the gate, durable checkpoint invalidation and publication, the re-render and the client expiry timer. **Merged** as #219 (2026-10-23).
-6. The browser. The worker's call and durable checkpoint ownership, the tab relay request and `TabIdentity` after a swap, and the `IdbKeyStore` record. **Built** on `feat/r95-browser` (2026-10-23) under decision 17. The `IdbKeyStore` record and its wipe had landed with step 5.
-7. The documents. Chapters 12 and 13 with the carrying guidance. **Built** on `feat/r95-browser` (2026-10-24).
+6. The browser. The worker's call and durable checkpoint ownership, the tab relay request and `TabIdentity` after a swap, and the `IdbKeyStore` record, under decision 17. The `IdbKeyStore` record and its wipe landed with step 5. **Merged** as #231 (2026-10-25).
+7. The documents. Chapters 12 and 13 with the carrying guidance. **Merged** as #231 (2026-10-25).
 
 ### Proof
 
