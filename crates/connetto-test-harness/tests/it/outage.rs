@@ -178,7 +178,7 @@ async fn a_write_the_server_cannot_judge_is_not_called_unauthorized() {
             1,
             insert_changeset(
                 "items",
-                &["id", "owner", "label"],
+                &[("id", "INTEGER"), ("owner", "TEXT"), ("label", "TEXT")],
                 &[0],
                 vec![
                     RowValue::Integer(9),
