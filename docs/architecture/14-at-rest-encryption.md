@@ -281,7 +281,7 @@ R11's device-key slice may land with connetto's local codec statements. Their re
 | `diesel-sqlite-cipher` | Replace `cipher.rs`'s `raw_key_literal`, `unlock_statement`, `CIPHER_PRAGMAS` and raw codec probes with typed codec operations. Remove the local key formatting and codec-specific pragma SQL. |
 | `diesel-sqlite-cipher` | Replace the raw keyed attachment statement inside `harden::attach_keyed_in_window`. Keep connetto's attachment permission window and resealing on success and failure. |
 | Diesel | Replace raw `journal_mode`, `case_sensitive_like` and `defer_foreign_keys` statements in `connetto-client/src/lib.rs`, and the `schema_cookie` and `harden::attached_count` pragma queries, with typed APIs. Remove obsolete pragma result structs and formatting. |
-| Diesel | Replace `table_info` in `connetto-web/src/relay.rs`'s `tier_columns` and its transaction's `defer_foreign_keys` statement with typed APIs. Remove obsolete pragma result structs and formatting. |
+| Diesel | Replace `pragma_table_info` in `connetto-client/src/replay.rs`'s `table_shape`, its `defer_foreign_keys` read and writes, and the `defer_foreign_keys` statement of `connetto-web/src/relay.rs`'s local-tier transaction with typed APIs. Remove obsolete pragma result structs and formatting. |
 
 Connetto retains key custody, store naming, unlock ordering, wrong-key validation, attachment hardening and browser VFS selection. Existing typed Diesel calls stay typed. Deployment DDL emitted by pg2sqlite remains pg2sqlite's responsibility. Remove obsolete helpers and comments throughout the consumers without retaining a parallel raw-SQL path.
 

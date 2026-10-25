@@ -297,7 +297,7 @@ mod tests {
     /// A patchset naming a table with no primary key is refused, naming the table.
     #[test]
     fn a_row_with_no_primary_key_is_refused() {
-        let table = SimpleTable::new("things", &["a", "b"], &[]);
+        let table = SimpleTable::new("things", &[("a", ""), ("b", "")], &[]);
         let patchset: PatchSet<_, String, Vec<u8>> = PatchSet::new().insert(Insert::from(table));
         let bytes = Vec::<u8>::from(patchset);
         let mut known = HashMap::new();

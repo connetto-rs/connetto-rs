@@ -75,7 +75,7 @@ fn unique_base() -> i64 {
 fn snapshot_payload(rows: &[(rosetta_uuid::Uuid, i64)]) -> Vec<u8> {
     let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
     for (id, quantity) in rows {
-        let table = SimpleTable::new("orders", &["id", "quantity"], &[0]);
+        let table = SimpleTable::new("orders", &[("id", ""), ("quantity", "")], &[0]);
         // Encode the 16-byte UUID as a SQLite BLOB: <[u8; 16]>::from extracts
         // the raw bytes, matching what the server and changeset apply expect.
         let insert = Insert::<_, String, Vec<u8>>::from(table)

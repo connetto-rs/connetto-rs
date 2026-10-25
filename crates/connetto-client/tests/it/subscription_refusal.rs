@@ -62,7 +62,7 @@ enum Answer {
 fn photo_row() -> Vec<u8> {
     let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
         "photos",
-        &["id", "content_state"],
+        &[("id", ""), ("content_state", "")],
         &[0],
     ))
     .set(0, Value::Integer(1))

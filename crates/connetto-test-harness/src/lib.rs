@@ -2371,7 +2371,8 @@ pub fn insert_changeset(
     pk: &[usize],
     values: Vec<RowValue>,
 ) -> Vec<u8> {
-    let simple = SimpleTable::new(table, columns, pk);
+    let cols: Vec<(&str, &str)> = columns.iter().map(|name| (*name, "")).collect();
+    let simple = SimpleTable::new(table, &cols, pk);
     let mut insert = Insert::<_, String, Vec<u8>>::from(simple);
     for (index, value) in values.into_iter().enumerate() {
         insert = insert.set(index, value).expect("set column");

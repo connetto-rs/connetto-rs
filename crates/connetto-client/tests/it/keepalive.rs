@@ -64,12 +64,15 @@ fn ack() -> ControlMessage {
 
 /// Compressed one-row patchset bytes for the wire table shape.
 fn payload() -> Vec<u8> {
-    let insert =
-        Insert::<_, String, Vec<u8>>::from(SimpleTable::new("orders", &["id", "label"], &[0]))
-            .set(0, Value::Integer(1))
-            .expect("set id")
-            .set(1, Value::Text("seed".to_owned()))
-            .expect("set label");
+    let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
+        "orders",
+        &[("id", ""), ("label", "")],
+        &[0],
+    ))
+    .set(0, Value::Integer(1))
+    .expect("set id")
+    .set(1, Value::Text("seed".to_owned()))
+    .expect("set label");
     let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new().insert(insert);
     zstd::encode_all(patchset.build().as_slice(), 3).expect("compress payload")
 }

@@ -50,15 +50,18 @@ fn schema() -> SyncSchema {
 }
 
 fn payload(owner: &str, vocabulary_id: i64) -> Vec<u8> {
-    let word =
-        Insert::<_, String, Vec<u8>>::from(SimpleTable::new("vocabulary", &["id", "label"], &[0]))
-            .set(0, Value::Integer(vocabulary_id))
-            .unwrap()
-            .set(1, Value::Text(format!("word-{vocabulary_id}")))
-            .unwrap();
+    let word = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
+        "vocabulary",
+        &[("id", ""), ("label", "")],
+        &[0],
+    ))
+    .set(0, Value::Integer(vocabulary_id))
+    .unwrap()
+    .set(1, Value::Text(format!("word-{vocabulary_id}")))
+    .unwrap();
     let note = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
         "notes",
-        &["id", "vocabulary_id", "owner"],
+        &[("id", ""), ("vocabulary_id", ""), ("owner", "")],
         &[0],
     ))
     .set(0, Value::Integer(1))

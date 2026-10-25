@@ -231,7 +231,11 @@ diesel::table! {
 }
 
 fn orders_wire_table() -> SimpleTable {
-    SimpleTable::new("orders", &["id", "owner_id", "quantity"], &[0])
+    SimpleTable::new(
+        "orders",
+        &[("id", ""), ("owner_id", ""), ("quantity", "")],
+        &[0],
+    )
 }
 
 /// A snapshot payload naming the logical Postgres table, which is what the
