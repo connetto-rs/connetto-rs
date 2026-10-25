@@ -166,6 +166,32 @@ fn pending(db: &mut SqliteConnection) -> Vec<Pending> {
     .unwrap()
 }
 
+/// `queued` as an upgrade stores an older major's writes, named as the wire
+/// names the split shared table.
+fn wire_form(queued: &[Pending]) -> Vec<Pending> {
+    let (physical, wire) = (b"vocabulary_store\0", b"vocabulary\0");
+    queued
+        .iter()
+        .map(|write| {
+            let mut changeset = Vec::with_capacity(write.changeset.len());
+            let mut rest = write.changeset.as_slice();
+            while let Some(at) = rest.windows(physical.len()).position(|w| w == physical) {
+                changeset.extend_from_slice(&rest[..at]);
+                changeset.extend_from_slice(wire);
+                rest = &rest[at + physical.len()..];
+            }
+            changeset.extend_from_slice(rest);
+            Pending {
+                writer: write.writer.clone(),
+                seq: write.seq,
+                changeset,
+                entry_hash: write.entry_hash.clone(),
+                major: write.major,
+            }
+        })
+        .collect()
+}
+
 fn has_table(db: &mut SqliteConnection, store: &str, table: &str) -> bool {
     number(
         db,
@@ -458,7 +484,7 @@ async fn another_accounts_upgrade_preserves_queued_writes_and_rebuilds_the_share
     let mut alice = open(directory.path(), &keys, "alice", schema(2))
         .await
         .unwrap();
-    assert_eq!(pending(alice.conn()), queued);
+    assert_eq!(pending(alice.conn()), wire_form(&queued));
     assert_eq!(
         texts(
             alice.conn(),
