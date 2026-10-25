@@ -116,12 +116,12 @@ fn demo_app() -> Demo {
     APP.get().copied().unwrap_or_default()
 }
 
-/// The status line the demo stands on once it signed in. The Tauri demo's
-/// line carries the client events' words, and the dioxus demo stands
-/// `connected` from its setup.
+/// The line the demo shows once it signed in. The Tauri demo's status line
+/// carries whichever client event came last, so its account bar stands in,
+/// and the dioxus demo stands `connected` from its setup.
 fn signed_in_line() -> &'static str {
     match demo_app() {
-        Demo::Tauri => "status: online",
+        Demo::Tauri => "Signed in as ",
         Demo::Dioxus => "status: connected",
     }
 }
