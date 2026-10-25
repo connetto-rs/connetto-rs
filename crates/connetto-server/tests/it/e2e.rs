@@ -604,7 +604,7 @@ pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixt
     exec(
         pool,
         "CREATE TYPE connetto_auth_op AS ENUM (\
-         'logged_out', 'session_revoked', 'token_replayed', 'capability_minted', \
+         'logged_in', 'logged_out', 'session_revoked', 'token_replayed', 'capability_minted', \
          'permission_change', 'model_change', 'banned', 'ban_lifted', \
          'write_forked', 'write_redelivered')",
     )
@@ -615,7 +615,8 @@ pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixt
          at TIMESTAMPTZ NOT NULL DEFAULT now(), session UUID NOT NULL, user_id TEXT, \
          op connetto_auth_op NOT NULL, table_name TEXT, pk UUID, \
          writer BIGINT, seq BIGINT, \
-         path connetto_settle_path, other_path connetto_settle_path)",
+         path connetto_settle_path, other_path connetto_settle_path, \
+         provider TEXT, issuer TEXT)",
     )
     .await;
     exec(pool, PG_DDL).await;
@@ -1738,7 +1739,7 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
     assert_eq!(
         audit_ops(&pool).await,
         Vec::<String>::new(),
-        "logging in changes nobody's access, so it records nothing"
+        "starting the server changes nobody's access, so it records nothing"
     );
 
     let refresh_token = mint_refresh_token(&auth_base).await;
@@ -1752,17 +1753,17 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
         .expect("POST /auth/logout");
     assert!(logout.status().is_success(), "logout: {}", logout.status());
 
-    // The write is spawned, so it lands shortly after the response.
+    // The writes are spawned, so they land shortly after the response.
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut ops = audit_ops(&pool).await;
-    while ops.is_empty() && Instant::now() < deadline {
+    while !ops.iter().any(|op| op == "logged_out") && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
         ops = audit_ops(&pool).await;
     }
     assert_eq!(
         ops,
-        vec!["logged_out".to_owned()],
-        "a real logout leaves exactly one row, saying it was a logout"
+        vec!["logged_in".to_owned(), "logged_out".to_owned()],
+        "a sign-in and its logout leave one row each, the login first"
     );
 }
 

@@ -206,8 +206,7 @@ pub fn foreign_keys_are_on_for_every_replica() {
 
 /// The row a snapshot for `notes` carries: note 10 in folder 1.
 fn orphan_snapshot() -> Vec<u8> {
-    let table =
-        SimpleTable::with_rowid_alias("notes", &[("id", "INTEGER"), ("folder", "INTEGER")], 0);
+    let table = SimpleTable::new("notes", &[("id", ""), ("folder", "")], &[0]);
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(10))
         .expect("set id")

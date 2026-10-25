@@ -103,7 +103,12 @@ CREATE TABLE connetto_sessions (
     current_refresh_hash BYTEA NOT NULL,
     idle_deadline        TIMESTAMPTZ NOT NULL,
     absolute_deadline    TIMESTAMPTZ NOT NULL,
-    revoked              BOOLEAN NOT NULL DEFAULT FALSE
+    revoked              BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at           TIMESTAMPTZ NOT NULL,
+    refreshed_at         TIMESTAMPTZ,
+    provider             TEXT NOT NULL,
+    issuer               TEXT NOT NULL
+    -- one column per field of the session descriptor, when the deployment declares one
 );
 
 CREATE TABLE connetto_provider_tokens (
@@ -167,6 +172,10 @@ CREATE TABLE connetto_oplog_xids (
 );
 CREATE INDEX connetto_oplog_xids_lsn ON connetto_oplog_xids (commit_lsn);
 ```
+
+**A session records how it began. Built (R105, 2026-10-25).** `created_at` is stamped by the database's clock at the sign-in and `refreshed_at` at each refresh, absent until the first. `provider` is the configured provider name the sign-in came through and `issuer` the issuer its identity was verified from. A deployment may also declare a session descriptor, its own type mapped field by field onto extra columns through `connetto_schema!`'s `session_descriptor`, and the server then refuses to start without `ServerBuilder::session_describer`. That callback receives each sign-in's `LoginRequest`, the provider, the request's headers and the address the server saw, and returns the description the row keeps. The address itself is never stored (R36 decision 5), so an application wanting a coarse location derives it here. The server application describes the sign-in, never the client, because an intruder runs a client of their own choosing and a description it sent could claim to be the owner's phone. The address reaches the callback only when the server is served with connect info, which `ServerBuilder::serve` does. An embedder serving `ServerParts::router` itself serves it through `into_make_service_with_connect_info::<SocketAddr>()`.
+
+**The application hears of each sign-in. Built (R105, 2026-10-25).** `ServerBuilder::on_sign_in` receives `SignInNotice::SignedIn` with the new session's record after each sign-in, and `SignInNotice::DeviceEnrolled` with the session's record, the key and the device's descriptor after a key's first enrolment, never after a renewal. The application sends its own notice to the person. The hook fires whether or not the audit store is on, and each sign-in also leaves a `logged_in` row in `auth_events` naming its provider and issuer (`08-authorization.md`).
 
 The writer frontier keys on a server-issued writer number. A device writer additionally has a unique `device_key` and survives its enrolment connection. `user_id` is nullable for anonymous writers. `frontier` is the highest settled sequence and `head` its chain hash. `_connetto_settled` stores each `(writer, seq)` with its entry hash, `previous_hash`, outcome and delivery path. A retained entry verifies against its own predecessor evidence after pruning. Missing or malformed retained hashes fail redelivery explicitly.
 

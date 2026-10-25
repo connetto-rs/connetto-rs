@@ -324,10 +324,10 @@ async fn a_forged_changeset_at_a_settled_sequence_is_refused_forked() {
         let table = SimpleTable::new(
             "orders",
             &[
-                ("id", "BLOB"),
-                ("owner_id", "TEXT"),
-                ("quantity", "INTEGER"),
-                ("created_at", "TEXT"),
+                ("id", ""),
+                ("owner_id", ""),
+                ("quantity", ""),
+                ("created_at", ""),
             ],
             &[0],
         );

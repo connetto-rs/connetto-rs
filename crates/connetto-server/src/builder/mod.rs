@@ -15,6 +15,7 @@ mod ws;
 
 use std::fmt;
 use std::marker::PhantomData;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -30,7 +31,8 @@ use crate::ban::ConnettoBanSchema;
 use crate::bots::{ConnettoBotSchema, pg_bot_registry};
 use crate::defaults::ConnettoDefaults;
 use crate::device_cert::{
-    ConnettoEnrolmentSchema, DeviceCertConfig, DeviceEnrolment, StatusList, pg_enrolment_store,
+    ConnettoEnrolmentSchema, DeviceCertConfig, DeviceEnrolment, FirstEnrolment, FirstEnrolmentHook,
+    StatusList, pg_enrolment_store,
 };
 use crate::manager_builder::ManagerBuilder;
 use crate::materializer::Materializer;
@@ -63,10 +65,10 @@ use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 
 use crate::{
     AbuseConfig, Artifact, AuthConfig, AuthService, CallerMappings, CookieSameSite, DbAuthStore,
-    DefaultUuidResolver, GenericOidcProvider, IdentityResolver, OidcProviderConfig,
+    DefaultUuidResolver, GenericOidcProvider, IdentityResolver, LoginRequest, OidcProviderConfig,
     PgReadConnector, PgSnapshotSource, PgWriteTarget, ProviderRegistry, RedirectPolicy,
-    RequestGuard, RlsAuth, RuntimeWritableCatalog, TokenAuthority, auth_router, is_loopback_host,
-    pg_ban_store, pg_write_target, preflight,
+    RequestGuard, RlsAuth, RuntimeWritableCatalog, SessionDescriber, SignInHook, SignInNotice,
+    TokenAuthority, auth_router, is_loopback_host, pg_ban_store, pg_write_target, preflight,
 };
 
 /// The id-type marker a deployment's bot registry tables are declared with.
@@ -87,6 +89,9 @@ pub use content::{ContentBuildError, ContentSettings, StoreSpec};
 /// The auth service the assembled server runs, over the database store of
 /// the deployment's auth tables.
 type Service<D> = AuthService<DbAuthStore<D>>;
+
+/// The application's session descriptor the deployment's schema declares.
+type Desc<D> = <<D as ConnettoSchema>::Auth as ConnettoStoreSchema>::Descriptor;
 
 /// The Postgres pool every assembled server owns.
 type PgPool = Pool<AsyncPgConnection>;
@@ -460,6 +465,10 @@ pub enum BuildError {
     /// No identity provider is configured, so no client can log in.
     #[error("no identity providers configured, so no client can log in")]
     NoProviders,
+    /// The schema declares a session descriptor and no describe callback
+    /// supplies one.
+    #[error("the schema declares a session descriptor and no session_describer supplies it")]
+    Undescribed,
     /// A pool named no connections, which the pool builder panics on.
     #[error("the {what} is zero, and a pool needs at least one connection")]
     PoolSizeZero {
@@ -749,6 +758,8 @@ pub struct ServerBuilder<D: ConnettoSchema = ConnettoDefaults> {
     content: Option<ContentSettings>,
     device_identity: Option<DeviceCertConfig>,
     resolver: Resolver<D::Id>,
+    describer: Option<Describer<Desc<D>>>,
+    sign_in: Option<OnSignIn<D::Id, Desc<D>>>,
     deployment_schema: PhantomData<fn() -> D>,
 }
 
@@ -760,6 +771,32 @@ impl<Id> fmt::Debug for Resolver<Id> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Resolver(..)")
     }
+}
+
+/// The application's describe callback, opaque to the builder's `Debug`.
+struct Describer<Desc>(SessionDescriber<Desc>);
+
+impl<Desc> fmt::Debug for Describer<Desc> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Describer(..)")
+    }
+}
+
+/// The application's sign-in callback, opaque to the builder's `Debug`.
+struct OnSignIn<Id, Desc>(SignInHook<Id, Desc>);
+
+impl<Id, Desc> fmt::Debug for OnSignIn<Id, Desc> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OnSignIn(..)")
+    }
+}
+
+/// What the auth service tells and asks besides its callers: whether it
+/// records access changes, and the application's two sign-in callbacks.
+struct AuthHooks<D: ConnettoSchema> {
+    audit: bool,
+    describer: Option<Describer<Desc<D>>>,
+    sign_in: Option<SignInHook<D::Id, Desc<D>>>,
 }
 
 impl ServerBuilder {
@@ -801,6 +838,8 @@ impl ServerBuilder {
             content: None,
             device_identity: None,
             resolver: Resolver(Arc::new(DefaultUuidResolver)),
+            describer: None,
+            sign_in: None,
             deployment_schema: PhantomData,
         }
     }
@@ -846,6 +885,8 @@ where
             content,
             device_identity,
             resolver: _,
+            describer: _,
+            sign_in: _,
             deployment_schema: _,
         } = self;
         ServerBuilder {
@@ -876,6 +917,8 @@ where
             content,
             device_identity,
             resolver: Resolver(resolver),
+            describer: None,
+            sign_in: None,
             deployment_schema: PhantomData,
         }
     }
@@ -1050,6 +1093,37 @@ where
         self
     }
 
+    /// Describe each sign-in through `describe`, which reads the request's
+    /// headers and the address the server saw and returns the application's
+    /// own description, the one the session row keeps (R105 decision 2).
+    /// Required when the schema declares a session descriptor. Set it after
+    /// [`deployment_schema`](Self::deployment_schema), which starts from
+    /// none.
+    #[must_use]
+    pub fn session_describer<F, Fut>(mut self, describe: F) -> Self
+    where
+        F: Fn(LoginRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Desc<D>> + Send + 'static,
+    {
+        self.describer = Some(Describer(Arc::new(move |request| {
+            Box::pin(describe(request))
+        })));
+        self
+    }
+
+    /// Tell `hook` of each sign-in and each device key's first enrolment, so
+    /// the application can notify the person (R105 decision 9). Set it after
+    /// [`deployment_schema`](Self::deployment_schema), which starts from
+    /// none.
+    #[must_use]
+    pub fn on_sign_in(
+        mut self,
+        hook: impl Fn(SignInNotice<D::Id, Desc<D>>) + Send + Sync + 'static,
+    ) -> Self {
+        self.sign_in = Some(OnSignIn(Arc::new(hook)));
+        self
+    }
+
     /// Assemble the server from the named collaborators.
     ///
     /// Everything is built, checked and wired here so no setting is applied
@@ -1093,11 +1167,16 @@ where
             content,
             device_identity,
             resolver,
+            describer,
+            sign_in,
             deployment_schema: _,
         } = self;
 
         if oidc_providers.is_empty() {
             return Err(BuildError::NoProviders);
+        }
+        if describer.is_none() && <D::Auth as ConnettoStoreSchema>::undescribed().is_none() {
+            return Err(BuildError::Undescribed);
         }
 
         // The pool builder panics on a zero size and the gate on an overrun
@@ -1161,14 +1240,19 @@ where
         let connector = PgReadConnector::with_session_setup(reexec_pool.clone());
         let engine_connector = PgReadConnector::with_session_setup(reexec_pool.clone());
         let guard = build_guard::<D>(&pool, reader_reserve.gate(), &throttle, abuse, bans);
+        let sign_in = sign_in.map(|OnSignIn(hook)| hook);
         let (service, registry) = build_auth::<D>(
             &pool,
             resolver.0,
             Arc::clone(&guard),
-            audit,
             &oidc_providers,
             &keys,
             &auth_config,
+            AuthHooks {
+                audit,
+                describer,
+                sign_in: sign_in.clone(),
+            },
         )
         .await?;
         let authority: Arc<dyn HandshakeAuthority<D::Id>> = Arc::new(service.handshake_authority());
@@ -1229,8 +1313,9 @@ where
         }
         .build();
         wire_manager(&manager, &service, &guard, &pool, &feed).await?;
-        let status = device_identity
-            .map(|config| install_device_identity::<D>(&manager, &service, &pool, config));
+        let status = device_identity.map(|config| {
+            install_device_identity::<D>(&manager, &service, &pool, config, sign_in.clone())
+        });
 
         Ok(assemble_parts(
             Arc::clone(&manager),
@@ -1277,9 +1362,12 @@ where
         let router = parts.router;
         let mut change_stream = tokio::spawn(parts.change_stream);
         let mut http = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .await
-                .map_err(ServeError::Http)
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .map_err(ServeError::Http)
         });
         tokio::select! {
             outcome = &mut change_stream => {
@@ -1389,24 +1477,59 @@ fn install_device_identity<D: ConnettoSchema>(
     service: &Arc<Service<D>>,
     pool: &PgPool,
     config: DeviceCertConfig,
+    sign_in: Option<SignInHook<D::Id, Desc<D>>>,
 ) -> BackgroundTask {
-    let service = Arc::clone(service);
+    let revoking = Arc::clone(service);
     // The status list's fetch task starts with the server and stops with it.
     let list = StatusList::new(config.android_status().clone());
     let status = BackgroundTask::new(list.spawn());
     let enrolment = DeviceEnrolment::new(config, pg_enrolment_store::<D>(pool.clone()))
         .with_session_revoker(Arc::new(move |session| {
-            let service = Arc::clone(&service);
+            let service = Arc::clone(&revoking);
             Box::pin(async move {
                 if let Err(err) = service.revoke(session).await {
                     tracing::warn!(error = %err, "a revoked device's session was not revoked");
                 }
             })
         }));
+    let enrolment = match sign_in {
+        Some(hook) => enrolment.with_first_enrolment_hook(tell_first_enrolment(service, hook)),
+        None => enrolment,
+    };
     let enrolment = enrolment.with_status_list(list);
     // The manager was built a moment ago, so nothing installed one before.
     let _ = manager.install_device_enrolment(Arc::new(enrolment));
     status
+}
+
+/// Tell the application of a key's first enrolment with the session it
+/// enrolled during, read on a spawned task since the hook fires inside the
+/// enrolment.
+fn tell_first_enrolment<D: ConnettoSchema>(
+    service: &Arc<Service<D>>,
+    hook: SignInHook<D::Id, Desc<D>>,
+) -> FirstEnrolmentHook<D::Id> {
+    let service = Arc::clone(service);
+    Arc::new(move |first: FirstEnrolment<D::Id>| {
+        let service = Arc::clone(&service);
+        let hook = Arc::clone(&hook);
+        tokio::spawn(async move {
+            match service.session_record(first.session).await {
+                Ok(Some(session)) => hook(SignInNotice::DeviceEnrolled {
+                    session,
+                    key: first.key,
+                    device: first.descriptor,
+                    at: first.at,
+                }),
+                Ok(None) => {
+                    tracing::warn!("a device enrolled during a session the store does not hold");
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "a first enrolment went untold");
+                }
+            }
+        });
+    })
 }
 
 /// Check what the change stream needs, then set up the reconnect log and the
@@ -1487,10 +1610,10 @@ async fn build_auth<D: ConnettoSchema>(
     pool: &PgPool,
     resolver: Arc<dyn IdentityResolver<Id = D::Id>>,
     guard: Arc<RequestGuard<D::Id>>,
-    audit: bool,
     providers: &[OidcProvider],
     keys: &TokenKeys,
     config: &AuthConfig,
+    hooks: AuthHooks<D>,
 ) -> Result<(Arc<Service<D>>, Arc<ProviderRegistry>), BuildError> {
     let store = DbAuthStore::<D>::new(pool.clone(), config.refresh_lifetimes(), resolver);
     let authority = TokenAuthority::from_ed_pem(&keys.private, &keys.public, config)
@@ -1517,11 +1640,16 @@ async fn build_auth<D: ConnettoSchema>(
     }
     tracing::info!(providers = providers.len(), "identity providers registered");
     let registry = Arc::new(registry);
-    let service = Arc::new(
-        AuthService::new(Arc::new(authority), Arc::new(store), guard)
-            .with_registry(Arc::clone(&registry)),
-    );
-    if audit {
+    let service = AuthService::new(Arc::new(authority), Arc::new(store), guard)
+        .with_registry(Arc::clone(&registry));
+    let service = Arc::new(match hooks.describer {
+        Some(Describer(describer)) => service.with_session_describer(describer),
+        None => service,
+    });
+    if let Some(hook) = hooks.sign_in {
+        service.set_sign_in_hook(hook);
+    }
+    if hooks.audit {
         // The same sink on both, because a ban is detected in the guard and
         // every other access change is produced here.
         let hook = pg_audit_hook::<D>(pool.clone());

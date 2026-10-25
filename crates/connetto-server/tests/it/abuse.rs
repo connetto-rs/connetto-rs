@@ -122,15 +122,10 @@ impl SnapshotSource for KeyedSnapshot {
                 bytes: 0,
             });
         }
-        let table = SimpleTable::with_rowid_alias(
+        let table = SimpleTable::new(
             "orders",
-            &[
-                ("id", "INTEGER"),
-                ("price", "REAL"),
-                ("quantity", "INTEGER"),
-                ("status", "TEXT"),
-            ],
-            0,
+            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
+            &[0],
         );
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
@@ -244,7 +239,7 @@ async fn reset_tables(fixture: &Fixture) {
         format!("DROP TYPE IF EXISTS {AUTH_OP_TYPE}"),
         format!(
             "CREATE TYPE {AUTH_OP_TYPE} AS ENUM (\
-                'logged_out', 'session_revoked', 'token_replayed', \
+                'logged_in', 'logged_out', 'session_revoked', 'token_replayed', \
                 'capability_minted', 'permission_change', 'model_change', \
                 'banned', 'ban_lifted', 'write_forked', 'write_redelivered')"
         ),
@@ -264,7 +259,8 @@ async fn reset_tables(fixture: &Fixture) {
                 table_name TEXT, \
                 pk UUID, \
                 writer BIGINT, seq BIGINT, \
-                path connetto_settle_path, other_path connetto_settle_path)"
+                path connetto_settle_path, other_path connetto_settle_path, \
+                provider TEXT, issuer TEXT)"
         ),
     ] {
         fixture.exec(&statement).await;

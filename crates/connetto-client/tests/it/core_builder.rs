@@ -79,10 +79,10 @@ impl TransportFactory for OneShot {
 
 /// Compressed one-row patchset bytes for the wire table shape.
 fn payload(id: i64) -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::with_rowid_alias(
+    let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
         "orders",
-        &[("id", "INTEGER"), ("label", "TEXT")],
-        0,
+        &[("id", ""), ("label", "")],
+        &[0],
     ))
     .set(0, Value::Integer(id))
     .expect("set id")

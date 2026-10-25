@@ -88,9 +88,9 @@ mod memory_stores;
 #[cfg(all(feature = "peer", target_os = "android"))]
 mod multicast;
 pub mod reconnect;
+mod replay;
 pub mod replica;
 pub mod share_keys;
-mod shared_replay;
 mod subscriptions;
 
 #[cfg(feature = "peer")]
@@ -102,6 +102,7 @@ pub use bluetooth::{
 pub use enrolment::{CertificateError, DeviceEntry};
 #[cfg(feature = "peer")]
 pub use hotspot::{HotspotError, HotspotOffer, HotspotSecurity, JoinError, WifiPayloadError};
+pub use replay::replay_aborting;
 pub use subscriptions::{DEFAULT_GRACE, MAX_GRACE};
 pub mod teardown;
 
@@ -1651,20 +1652,104 @@ fn rollback_omit(_conflict: ConflictType) -> ConflictAction {
     ConflictAction::Omit
 }
 
-/// Suspends the capture session for the duration of a server-originated
-/// apply (a patch or a rollback), so the session never records what the
-/// server already knows, and holds the write exemption true for the same
-/// span, so the translated schema's fail-closed guards admit the write (the
-/// policy already judged it where it was authored). Re-enables capture and
-/// drops the exemption on drop, so no exit path can leave either switched.
-/// `set_enabled` is a plain setter and cannot panic.
+/// Tables written since the last push, in first-write order.
+type WriteOrder = Arc<Mutex<Vec<String>>>;
+
+/// The capture sessions of one connection, the shared store's apart because
+/// a session records one schema.
+struct Capture {
+    main: Session,
+    shared: Option<Session>,
+    order: Option<WriteOrder>,
+}
+
+impl Capture {
+    /// Open the sessions, the shared store's only when `order` is given.
+    fn open(db: &mut SqliteConnection, order: Option<WriteOrder>) -> Result<Self, ClientError> {
+        let session_err =
+            |e: diesel_sqlite_session::SessionError| ClientError::Session(e.to_string());
+        let mut main = db.create_session().map_err(session_err)?;
+        main.attach_all().map_err(session_err)?;
+        let shared = if order.is_some() {
+            let mut shared = db.create_session_on(SHARED_SCHEMA).map_err(session_err)?;
+            shared.attach_all().map_err(session_err)?;
+            Some(shared)
+        } else {
+            None
+        };
+        Ok(Self {
+            main,
+            shared,
+            order,
+        })
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.main.set_enabled(enabled);
+        if let Some(shared) = &mut self.shared {
+            shared.set_enabled(enabled);
+        }
+    }
+
+    /// Everything captured since the last reset, its table sections in
+    /// first-write order, the order one session gives when every table lives
+    /// in `main`.
+    ///
+    /// The server applies a mutation in section order and checks references
+    /// per statement, so a row may reference one written before it.
+    fn changeset(&mut self) -> Result<Vec<u8>, ClientError> {
+        let session_err =
+            |e: diesel_sqlite_session::SessionError| ClientError::Session(e.to_string());
+        let main = self.main.changeset().map_err(session_err)?;
+        let Some(shared) = &mut self.shared else {
+            return Ok(main);
+        };
+        let shared = shared.changeset().map_err(session_err)?;
+        if shared.is_empty() {
+            return Ok(main);
+        }
+        if main.is_empty() {
+            return Ok(shared);
+        }
+        let order = self
+            .order
+            .as_ref()
+            .and_then(|order| order.lock().ok().map(|order| order.clone()))
+            .unwrap_or_default();
+        let mut bytes = main;
+        bytes.extend_from_slice(&shared);
+        let mut parsed = ParsedDiffSet::parse(&bytes)
+            .map_err(|err| ClientError::Session(format!("merging the captures: {err:?}")))?;
+        parsed.sort_tables_by_key(|table| {
+            order
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(table.name()))
+                .unwrap_or(usize::MAX)
+        });
+        Ok(parsed.into())
+    }
+
+    /// Replace the sessions, so the next changeset holds only later writes.
+    fn reset(&mut self, db: &mut SqliteConnection) -> Result<(), ClientError> {
+        if let Some(order) = &self.order
+            && let Ok(mut order) = order.lock()
+        {
+            order.clear();
+        }
+        *self = Self::open(db, self.order.clone())?;
+        Ok(())
+    }
+}
+
+/// Suspends capture and holds the write exemption for a server-originated
+/// apply, restoring both on drop.
 struct SuspendedCapture<'s> {
-    session: &'s mut Session,
+    session: &'s mut Capture,
     exempt: Arc<AtomicBool>,
 }
 
 impl<'s> SuspendedCapture<'s> {
-    fn new(session: &'s mut Session, exempt: &Arc<AtomicBool>) -> Self {
+    fn new(session: &'s mut Capture, exempt: &Arc<AtomicBool>) -> Self {
         session.set_enabled(false);
         exempt.store(true, Ordering::Relaxed);
         Self {
@@ -1678,6 +1763,31 @@ impl Drop for SuspendedCapture<'_> {
     fn drop(&mut self) {
         self.exempt.store(false, Ordering::Relaxed);
         self.session.set_enabled(true);
+    }
+}
+
+/// Whether `table` is one the build shares, matched as SQLite matches names.
+fn is_shared<S: core::hash::BuildHasher>(shared_tables: &HashSet<String, S>, table: &str) -> bool {
+    shared_tables.contains(&table.to_lowercase())
+}
+
+/// Route a declared table into the shared store, leaving the rest to the
+/// native apply.
+fn shared_route(shared: &HashSet<String>) -> impl Fn(&str) -> Option<&'static str> + '_ {
+    move |table| is_shared(shared, table).then_some(SHARED_SCHEMA)
+}
+
+/// The schema a replica table lives in, the routing a replica write gives
+/// [`replay_aborting`].
+#[must_use]
+pub fn replica_schema<S: core::hash::BuildHasher>(
+    shared_tables: &HashSet<String, S>,
+    table: &str,
+) -> &'static str {
+    if is_shared(shared_tables, table) {
+        SHARED_SCHEMA
+    } else {
+        "main"
     }
 }
 
@@ -2282,9 +2392,12 @@ fn validate_archive_compat(
     Ok(())
 }
 
+/// The device-private tier's columns, and the columns of every replica table
+/// a restored write may name, the shared store's included.
 fn resolve_import_columns(
     db: &mut SqliteConnection,
     local_tables: &HashSet<String>,
+    shared_tables: &HashSet<String>,
     hidden: &HashSet<String>,
 ) -> Result<(ColumnMap, ColumnMap), ClientError> {
     let local_columns = if local_tables.is_empty() {
@@ -2292,8 +2405,16 @@ fn resolve_import_columns(
     } else {
         archive::schema_columns(db, LOCAL_SCHEMA, Some(local_tables), &HashSet::new())?
     };
-    let main_columns = archive::schema_columns(db, "main", None, hidden)?;
-    Ok((local_columns, main_columns))
+    let mut replica_columns = archive::schema_columns(db, "main", None, hidden)?;
+    if !shared_tables.is_empty() {
+        replica_columns.extend(archive::schema_columns(
+            db,
+            SHARED_SCHEMA,
+            Some(shared_tables),
+            hidden,
+        )?);
+    }
+    Ok((local_columns, replica_columns))
 }
 
 fn build_import_index(
@@ -3245,11 +3366,15 @@ async fn timer_wait(remaining: Duration) {
 /// `staging`. `apply_patch` merges staging into `applied_rows` only after the
 /// transaction commits, so a rolled-back apply leaves no phantom counts.
 /// One atomic load and one map bump per row, the O(1) the decision asked for.
+///
+/// With `order` given, it also appends each table capture writes, skipping
+/// suspended writes, to the first-write list [`Capture::changeset`] sorts by.
 fn install_change_tracker(
     conn: &mut SqliteConnection,
     changed: &Arc<Mutex<HashSet<String>>>,
     staging: &Arc<Mutex<HashMap<String, u64>>>,
     counting: &Arc<AtomicBool>,
+    order: Option<(WriteOrder, Arc<AtomicBool>)>,
 ) {
     let sink = Arc::clone(changed);
     let rows = Arc::clone(staging);
@@ -3264,6 +3389,14 @@ fn install_change_tracker(
                 && let Ok(mut counts) = rows.lock()
             {
                 *counts.entry(event.table_name.to_owned()).or_insert(0) += 1;
+            }
+            if let Some((order, exempt)) = &order
+                && !exempt.load(Ordering::Relaxed)
+                && !is_internal_table(event.table_name)
+                && let Ok(mut order) = order.lock()
+                && !order.iter().any(|name| name == event.table_name)
+            {
+                order.push(event.table_name.to_owned());
             }
         }),
     );
@@ -3441,9 +3574,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// How many handshakes this connection has completed.
     #[cfg(feature = "device-identity")]
     handshakes: u64,
-    // `session` is declared before `db` so it drops first: it holds a raw
-    // pointer into the connection's SQLite handle and must not outlive it.
-    session: Session,
+    // `session` is declared before `db` so it drops first: its sessions hold
+    // a raw pointer into the connection's SQLite handle and must not outlive
+    // it.
+    session: Capture,
     db: SqliteConnection,
     last_cursor: Option<Cursor>,
     /// The queues of the writers this replica has queued writes under.
@@ -3836,7 +3970,20 @@ where
         let apply_staging: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let apply_counting = Arc::new(AtomicBool::new(false));
         let dirty = Arc::new(AtomicBool::new(false));
-        install_change_tracker(&mut db, &changed, &apply_staging, &apply_counting);
+        // The store is attached exactly when the build shares tables.
+        let write_order = config
+            .shared_layout
+            .is_some()
+            .then(|| Arc::new(Mutex::new(Vec::new())));
+        install_change_tracker(
+            &mut db,
+            &changed,
+            &apply_staging,
+            &apply_counting,
+            write_order
+                .as_ref()
+                .map(|order| (Arc::clone(order), Arc::clone(&write_exempt))),
+        );
         {
             let dirty = Arc::clone(&dirty);
             db.on_commit(move || {
@@ -3844,12 +3991,7 @@ where
                 CommitDecision::Proceed
             });
         }
-        let mut session = db
-            .create_session()
-            .map_err(|e| ClientError::Session(e.to_string()))?;
-        session
-            .attach_all()
-            .map_err(|e| ClientError::Session(e.to_string()))?;
+        let session = Capture::open(&mut db, write_order)?;
 
         // Read after every statement this open applies, so the first write
         // re-checks only what the application changed since.
@@ -6047,10 +6189,14 @@ where
             &self.schema_fingerprint()?,
             self.account().as_deref(),
         )?;
-        let (local_columns, main_columns) =
-            resolve_import_columns(&mut self.db, &self.local_tables, &self.hidden_tables)?;
+        let (local_columns, replica_columns) = resolve_import_columns(
+            &mut self.db,
+            &self.local_tables,
+            &self.config.shared_tables,
+            &self.hidden_tables,
+        )?;
         for entry in &archive.pending {
-            pending_tables(&entry.changeset, &main_columns)?;
+            pending_tables(&entry.changeset, &replica_columns)?;
         }
         let (incoming, held) = build_import_index(
             &mut self.db,
@@ -6122,6 +6268,7 @@ where
             // Suspended for the whole apply, so restoring a write does not
             // capture a second write of the same rows.
             let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            let shared = &self.config.shared_tables;
             self.db.transaction::<(), ClientError, _>(|db| {
                 // Checked at the commit, so neither table order nor row order
                 // inside a self-referencing table can refuse a whole archive,
@@ -6153,6 +6300,17 @@ where
                         .map_err(|err| {
                             ClientError::Import(format!("applying a restored write: {err}"))
                         })?;
+                    if !shared.is_empty() {
+                        replay::apply(
+                            db,
+                            &entry.changeset,
+                            replay::Policy::Omit,
+                            &shared_route(shared),
+                        )
+                        .map_err(|err| {
+                            ClientError::Import(format!("applying a restored write: {err}"))
+                        })?;
+                    }
                     outcome.writes_restored += 1;
                 }
                 bookkeeping(db)?;
@@ -6855,24 +7013,14 @@ where
     /// connetto cannot record changes to since the last write.
     pub async fn push(&mut self) -> Result<Option<u64>, ClientError> {
         self.recheck_changed_schemas()?;
-        let changeset = self
-            .session
-            .changeset()
-            .map_err(|e| ClientError::Session(e.to_string()))?;
+        let changeset = self.session.changeset()?;
         if changeset.is_empty() {
             return Ok(None);
         }
         let writer = self.choose_writer();
         let seq = self.append_entry(&writer, &changeset, None)?;
-        // Reset capture: a fresh session records only writes after this push.
-        let mut fresh = self
-            .db
-            .create_session()
-            .map_err(|e| ClientError::Session(e.to_string()))?;
-        fresh
-            .attach_all()
-            .map_err(|e| ClientError::Session(e.to_string()))?;
-        self.session = fresh;
+        // Reset capture: fresh sessions record only writes after this push.
+        self.session.reset(&mut self.db)?;
         // With no server the write stays queued, which is the designed offline
         // state rather than a failure: it is already durable in
         // `_connetto_pending` above, and `attach` replays it. Returning an
@@ -6946,12 +7094,8 @@ where
         Ok(())
     }
 
-    /// Roll back the optimistic local write for `writer`'s `client_seq` after
-    /// the server rejected or conflicted it: decode the touched rows for the
-    /// event, invert the captured changeset, and apply the inverse with
-    /// capture suspended, so the rollback is never re-uploaded. A row a
-    /// concurrent server patch already changed is left alone. Returns the
-    /// touched rows, empty when the changeset is gone.
+    /// Undo `writer`'s rejected `client_seq` in both schemas with capture
+    /// suspended, leaving a row a later change touched, and return its rows.
     fn rollback(
         &mut self,
         writer: WriterRef,
@@ -6967,11 +7111,17 @@ where
         let rows = affected_rows(&changeset, &self.config.policy_tables)?;
         let inverse = invert_changeset(&changeset)
             .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?;
+        let shared = &self.config.shared_tables;
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        delete_pending(&mut self.db, &writer, client_seq)?;
-        self.db
-            .apply_changeset(&inverse, rollback_omit)
-            .map_err(|err| ClientError::Apply(err.to_string()))?;
+        self.db.transaction::<_, ClientError, _>(|db| {
+            delete_pending(db, &writer, client_seq)?;
+            db.apply_changeset(&inverse, rollback_omit)
+                .map_err(|err| ClientError::Apply(err.to_string()))?;
+            if !shared.is_empty() {
+                replay::apply(db, &inverse, replay::Policy::Omit, &shared_route(shared))?;
+            }
+            Ok(())
+        })?;
         Ok(rows)
     }
 
@@ -7837,11 +7987,20 @@ where
         if queued.is_empty() {
             return Ok(());
         }
+        let shared = &self.config.shared_tables;
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         self.db.transaction::<_, ClientError, _>(|conn| {
             for changeset in &queued {
                 conn.apply_changeset(changeset, server_wins)
                     .map_err(|err| ClientError::Apply(err.to_string()))?;
+                if !shared.is_empty() {
+                    replay::apply(
+                        conn,
+                        changeset,
+                        replay::Policy::ServerWins,
+                        &shared_route(shared),
+                    )?;
+                }
             }
             Ok(())
         })
@@ -7894,7 +8053,12 @@ where
                     .map_err(|e| ClientError::Apply(e.to_string()))?;
                 // The native apply reaches `main` only.
                 if !shared.is_empty() {
-                    shared_replay::apply(conn, bytes, shared)?;
+                    replay::apply(
+                        conn,
+                        bytes,
+                        replay::Policy::ServerWins,
+                        &shared_route(shared),
+                    )?;
                 }
             }
             if let Some(cursor) = cursor {

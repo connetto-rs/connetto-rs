@@ -1184,7 +1184,9 @@ impl Fixture {
             "CREATE TABLE connetto_sessions (\
              session_id UUID PRIMARY KEY, user_id TEXT NOT NULL, \
              current_refresh_hash BYTEA NOT NULL, idle_deadline TIMESTAMPTZ NOT NULL, \
-             absolute_deadline TIMESTAMPTZ NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE)",
+             absolute_deadline TIMESTAMPTZ NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE, \
+             created_at TIMESTAMPTZ NOT NULL, refreshed_at TIMESTAMPTZ, \
+             provider TEXT NOT NULL, issuer TEXT NOT NULL)",
             "CREATE TABLE connetto_provider_tokens (\
              session_id UUID PRIMARY KEY REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
              issuer TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, \
@@ -2396,15 +2398,8 @@ pub fn insert_changeset(
     pk: &[usize],
     values: Vec<RowValue>,
 ) -> Vec<u8> {
-    let simple = if pk.len() == 1
-        && columns
-            .get(pk[0])
-            .is_some_and(|&(_, declared)| declared.eq_ignore_ascii_case("INTEGER"))
-    {
-        SimpleTable::with_rowid_alias(table, columns, pk[0])
-    } else {
-        SimpleTable::new(table, columns, pk)
-    };
+    let cols: Vec<(&str, &str)> = columns.iter().map(|name| (*name, "")).collect();
+    let simple = SimpleTable::new(table, &cols, pk);
     let mut insert = Insert::<_, String, Vec<u8>>::from(simple);
     for (index, value) in values.into_iter().enumerate() {
         insert = insert.set(index, value).expect("set column");

@@ -365,12 +365,16 @@ And a refused write must **not** be reported as unauthorized. Rejecting it that 
 
 ```sql
 CREATE TYPE connetto_auth_op AS ENUM (
+    -- a login began
+    'logged_in',
     -- a login ended, and why matters more than the fact
     'logged_out', 'session_revoked', 'token_replayed',
     -- authorization
     'capability_minted', 'permission_change', 'model_change',
     -- abuse response
-    'banned', 'ban_lifted'
+    'banned', 'ban_lifted',
+    -- the writer frontier
+    'write_forked', 'write_redelivered'
 );
 
 CREATE TABLE auth_events (
@@ -379,7 +383,13 @@ CREATE TABLE auth_events (
     user_id    <IdSqlType>,
     op         connetto_auth_op NOT NULL,
     table_name TEXT,
-    pk         <RowKeySqlType>
+    pk         <RowKeySqlType>,
+    writer     BIGINT,
+    seq        BIGINT,
+    path       connetto_settle_path,
+    other_path connetto_settle_path,
+    provider   TEXT,
+    issuer     TEXT
 );
 ```
 
@@ -420,6 +430,8 @@ CREATE TABLE auth_events (
 **A ban's own row lives in `connetto_bans`, a fifth schema contract. Built (R36).** Current state with a nullable expiry, one row per banned identity, beside the append-only history here. It carries the session the crossing happened on, because this table's `session` column is `NOT NULL` and a lift performed months later has no run of its own to name.
 
 **`write_forked` and `write_redelivered` name the writer frontier's two non-error outcomes (R75).** They are state, not denials, and they sit in this table by the same split that keeps denials out. `write_forked` is written when a write the server had already settled under a different path is redelivered on a path that cannot both be true, which is a record of a split the deployment should investigate. `write_redelivered` is the benign twin, a replay the server answered from its settled record without re-applying. Both rows carry the four writer columns beside the usual ones: `writer` (the number the entry settled under) and `seq` (its sequence for that writer), `path` (the `connetto_settle_path` that settled it, `direct`, `restore` or `courier`) and `other_path` (the path that forked, on a `write_forked` row, null otherwise). `writer` and `seq` are `BIGINT`, both `path` columns are `connetto_settle_path`, and all four are nullable because every pre-R75 kind of row leaves them empty.
+
+**`logged_in` records a login beginning, with `provider` and `issuer` on its own row (R105, 2026-10-25).** The auth service writes one row per sign-in, naming the session, the person, the configured provider and the issuer the identity was verified from, so a takeover can be investigated afterwards. The two columns sit on the row itself, filled only by a login, so the row still reads on its own after a deployment prunes its session rows. A sign-in is a change to who can reach what, and its rate is one row per login rather than one per attempt, since a refused sign-in mints nothing and still goes to the log.
 
 **Recording is off unless asked for**, with `CONNETTO_AUDIT=database` in the reference binary, because the table belongs to the application and connetto creates nothing.
 

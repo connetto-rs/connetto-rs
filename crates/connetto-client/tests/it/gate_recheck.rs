@@ -605,10 +605,10 @@ struct Item {
 fn items_payload(rows: &[(i32, &str)]) -> Vec<u8> {
     let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
     for &(id, label) in rows {
-        let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::with_rowid_alias(
+        let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
             "items",
-            &[("id", "INTEGER"), ("label", "TEXT")],
-            0,
+            &[("id", ""), ("label", "")],
+            &[0],
         ))
         .set(0, Value::Integer(i64::from(id)))
         .expect("set the id")
