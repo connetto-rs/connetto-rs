@@ -284,6 +284,10 @@ async fn builder_close_ends_the_pump_and_closes_the_transport_with_clones_alive(
 /// would be a dial, and the bounded wait would catch it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn builder_plain_websocket_to_a_non_loopback_host_is_refused_before_a_socket_opens() {
+    #[expect(
+        clippy::large_futures,
+        reason = "The startup future is awaited directly without an extra heap allocation."
+    )]
     let error = match tokio::time::timeout(Duration::from_secs(5), async {
         NativeClientBuilder::new("ws://192.0.2.1:9", schema())
             .connect()
@@ -326,6 +330,10 @@ async fn builder_plain_websocket_to_loopback_connects() {
         while transport.recv().await.expect("quiet").is_some() {}
     });
 
+    #[expect(
+        clippy::large_futures,
+        reason = "The startup future is awaited directly without an extra heap allocation."
+    )]
     let client = NativeClientBuilder::new(format!("ws://{addr}"), schema())
         .connect()
         .await
@@ -382,6 +390,10 @@ async fn builder_wss_to_a_self_signed_listener_is_refused_by_certificate_verific
         let _ = acceptor.accept(stream).await;
     });
 
+    #[expect(
+        clippy::large_futures,
+        reason = "The startup future is awaited directly without an extra heap allocation."
+    )]
     let Err(error) = NativeClientBuilder::new(format!("wss://{addr}"), schema())
         .connect()
         .await
