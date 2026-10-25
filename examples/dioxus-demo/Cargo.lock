@@ -1311,7 +1311,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "socket2",
- "sqlite-diff-rs 0.15.0",
+ "sqlite-diff-rs",
  "sqlite-wasm-rs",
  "sqlparser",
  "subql",
@@ -1569,7 +1569,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "sha2 0.10.9",
- "sqlite-diff-rs 0.15.0",
+ "sqlite-diff-rs",
  "sqlparser",
  "subql",
  "subtle",
@@ -1615,7 +1615,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sqlite-diff-rs 0.15.0",
+ "sqlite-diff-rs",
  "sqlparser",
  "subql",
  "testcontainers",
@@ -1650,7 +1650,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "sqlite-diff-rs 0.15.0",
+ "sqlite-diff-rs",
  "sqlite-wasm-rs",
  "sqlite-wasm-vfs",
  "thiserror 2.0.20",
@@ -9065,17 +9065,6 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a3feca792d8f7372e3a79a16703d53648ffd8b2d3ccfe5398ebd2cbdb1eb7b4"
-dependencies = [
- "hashbrown 0.17.1",
- "indexmap 2.14.2",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "sqlite-diff-rs"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4a8b5a943c0d72e94795ef8d10977f9ad611eb6efd0a65ce2ffa9cc59416b0d"
@@ -9312,7 +9301,7 @@ dependencies = [
  "slab",
  "sql-scalar-text",
  "sql-traits",
- "sqlite-diff-rs 0.16.1",
+ "sqlite-diff-rs",
  "sqlparser",
  "sqlparser-canonicalize",
  "thiserror 2.0.20",
