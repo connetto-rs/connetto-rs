@@ -2476,6 +2476,54 @@ mod registry_write_tests {
 }
 
 #[cfg(test)]
+mod widen_tests {
+    //! Which subscription shapes the server widens to whole rows.
+
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    use super::widen_column_subset;
+
+    fn widened(sql: &str) -> String {
+        let mut statement = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+            .expect("the test SQL parses")
+            .remove(0);
+        widen_column_subset(&mut statement);
+        statement.to_string()
+    }
+
+    /// Plain columns, aliased or qualified by the table read, widen to `*`.
+    #[test]
+    fn a_plain_column_list_widens_to_whole_rows() {
+        assert_eq!(
+            widened("SELECT id, title FROM docs WHERE owner = $1"),
+            "SELECT * FROM docs WHERE owner = $1"
+        );
+        assert_eq!(
+            widened("SELECT d.id AS i, d.title FROM docs AS d"),
+            "SELECT * FROM docs AS d"
+        );
+    }
+
+    /// A shape whose list is its result keeps it.
+    #[test]
+    fn aggregates_groupings_distinct_and_set_operations_keep_their_list() {
+        for sql in [
+            "SELECT COUNT(*) FROM docs",
+            "SELECT owner, COUNT(*) FROM docs GROUP BY owner",
+            "SELECT owner FROM docs GROUP BY owner HAVING COUNT(*) > 1",
+            "SELECT DISTINCT title FROM docs",
+            "SELECT DISTINCT ON (title) id FROM docs",
+            "SELECT id + 1 FROM docs",
+            "SELECT id FROM docs UNION SELECT id FROM pages",
+            "INSERT INTO docs (id) VALUES (1)",
+        ] {
+            assert_eq!(widened(sql), sql, "{sql} keeps its own list");
+        }
+    }
+}
+
+#[cfg(test)]
 mod wire_contract {
     //! Pin the exact JSON string [`value_to_json`] emits for each
     //! [`PgValue`] variant. The client aggregate decoders in
