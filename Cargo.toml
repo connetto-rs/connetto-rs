@@ -148,11 +148,6 @@ android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/and
 # R53 and R74, until released: the fork's `future` branch, the sealed and
 # Windows Hello store stack merged with the TPM signing key (upstream #19).
 windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/windows-native-keyring-store", rev = "8a8ffde9913b36bd464c8cd5dd24bf80e39dce37" }
-# R6 decision 4, until released: a key-only old tuple leaves its non-key
-# cells absent instead of NULL (isdaniel/pg-walstream#121), so a table
-# switched to `REPLICA IDENTITY DEFAULT` mid-run is refused. subql takes
-# pg_walstream from crates.io, so this reaches it too.
-pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", rev = "962f9c1c4db3695b82789807079a27b24e818c0e" }
 
 # diesel-sqlite-session takes diesel from git, which [patch.crates-io] does not reach.
 [patch."https://github.com/diesel-rs/diesel"]
