@@ -1370,6 +1370,70 @@ async fn a_shared_walk_resyncs_only_the_resume_retention_passed() {
     expect_patches(&mut c.transport, &events[3..]).await;
 }
 
+/// A wave too large to match member by member reaches exactly the consumers, and the departures, that matching each alone finds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shared_match_agrees_with_matching_each_consumer() {
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    let mut events = Vec::new();
+    for sql in [
+        "INSERT INTO orders VALUES (1, 1.0, 1, 'row'), (2, 2.0, 2, 'row'), (3, 3.0, 3, 'paid')",
+        "UPDATE orders SET quantity = 3, status = 'paid' WHERE id = 1",
+        "UPDATE orders SET quantity = 0 WHERE id = 2",
+        "UPDATE orders SET id = 7, quantity = 4 WHERE id = 3",
+        "DELETE FROM orders WHERE id = 1",
+        "INSERT INTO orders VALUES (8, NULL, 5, 'row')",
+    ] {
+        source.execute_sql(sql).expect("execute dml");
+        while let Some(item) = source.next_item().await.expect("poll source") {
+            if let SourceItem::Event(event) = item {
+                events.push(event);
+            }
+        }
+    }
+    let mut materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let queries = [
+        "SELECT * FROM orders WHERE quantity > 0",
+        "SELECT * FROM orders WHERE quantity = 1",
+        "SELECT * FROM orders WHERE quantity = 2",
+        "SELECT * FROM orders WHERE quantity > 2",
+        "SELECT * FROM orders WHERE quantity BETWEEN 2 AND 4",
+        "SELECT * FROM orders WHERE status = 'paid'",
+        "SELECT * FROM orders WHERE quantity >= 0 AND status = 'row'",
+        "SELECT * FROM orders WHERE price IS NULL",
+    ];
+    for (consumer, query) in (1..).zip(queries) {
+        materializer.register(consumer, query).expect("register");
+    }
+    for wave in [
+        std::collections::HashSet::from([1, 2, 3, 4, 5, 6, 7, 8]),
+        std::collections::HashSet::from([2, 3, 5, 6, 8]),
+    ] {
+        let mut members: Vec<u64> = wave.iter().copied().collect();
+        members.sort_unstable();
+        for event in &events {
+            let mut alone = Vec::new();
+            for &consumer in &members {
+                if let Some(departing) = materializer
+                    .replay_match(event, consumer)
+                    .expect("match one")
+                {
+                    alone.push((consumer, departing));
+                }
+            }
+            assert_eq!(
+                materializer
+                    .replay_matches(event, &wave)
+                    .expect("match the wave"),
+                alone,
+                "event at {:?}",
+                event.position()
+            );
+        }
+    }
+}
+
 /// Its own log table, shared by the manager before the restart and the one after it.
 const RESTART_OPLOG: &str = "connetto_oplog_restart";
 
