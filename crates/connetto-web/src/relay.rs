@@ -1234,6 +1234,7 @@ impl ContentRetry {
 enum ContentWalk {
     Complete { queued: bool, progressed: bool },
     Interrupted(Option<HubEvent>),
+    KeyDue,
 }
 
 /// Everything one hub task owns: the worker connection, tab state, the notice
@@ -1637,6 +1638,10 @@ where
                 return Ok(true);
             }
             ContentWalk::Interrupted(None) => return Ok(false),
+            ContentWalk::KeyDue => {
+                self.retry.schedule(true, true);
+                return Ok(true);
+            }
         };
         if progressed {
             // An uploaded file is no longer unsent, so retention can release it.
@@ -1690,7 +1695,7 @@ where
             content,
             events,
             retry,
-            gate: _,
+            gate,
             walk,
         } = self;
         let Some(content) = content.as_ref() else {
@@ -1699,9 +1704,13 @@ where
                 progressed: false,
             });
         };
+        let key_timer = worker.share_key_timer();
         let mut interrupted = None;
         let cancel = async {
-            interrupted = Some(events.recv().await);
+            interrupted = Some(tokio::select! {
+                event = events.recv() => ContentWalk::Interrupted(event),
+                () = wait_share_keys(key_timer) => ContentWalk::KeyDue,
+            });
         };
         let (start, observed) = content
             .archive()
@@ -1712,11 +1721,11 @@ where
         }
         let flush = match start {
             Ok(ContentFlushStart::Complete(ContentFlush::Interrupted)) => {
-                return Ok(ContentWalk::Interrupted(interrupted.unwrap_or(None)));
+                return Ok(interrupted.unwrap_or(ContentWalk::Interrupted(None)));
             }
             Ok(ContentFlushStart::Complete(flush)) => flush,
             Ok(ContentFlushStart::Upload(upload)) => {
-                finish_content_upload(worker, state, notices, content, events, walk, &upload)
+                finish_content_upload(worker, state, notices, content, events, walk, gate, &upload)
                     .await?
             }
             Err(err) => {
@@ -1904,7 +1913,11 @@ where
     WalkTurn::Taken
 }
 
-/// One granted upload, run to completion while local events keep being served.
+/// One granted upload, run to completion while local and authorization work keep progressing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the signed transfer borrows independent hub state"
+)]
 async fn finish_content_upload<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
@@ -1912,6 +1925,7 @@ async fn finish_content_upload<U>(
     content: &HubContent,
     events: &mut UnboundedReceiver<HubEvent>,
     walk: &mut WalkState,
+    gate: &GateController,
     upload: &ContentUpload<BrowserStore>,
 ) -> Result<ContentFlush, RelayError>
 where
@@ -1921,13 +1935,50 @@ where
     let transfer = upload.transfer(&content.http);
     tokio::pin!(transfer);
     let mut serving = true;
+    let mut background = true;
     let mut event_error = None;
-    // A started upload is never cancelled: a failing local event only stops
-    // the service loop, and the transfer plus its bookkeeping still finish.
     let result = loop {
-        match transfer_step(&mut transfer, events, serving).await {
+        if background {
+            match worker.process_share_keys(!gate.is_locked()).await {
+                Ok(_) => {}
+                Err(ClientError::Transport(_) | ClientError::NotConnected) => worker.disconnect(),
+                Err(error) => {
+                    event_error = Some(error.into());
+                    serving = false;
+                    background = false;
+                }
+            }
+        }
+        let timer = background.then(|| worker.share_key_timer()).flatten();
+        let connected = background && worker.is_connected();
+        let mut ask = if background { gate.take_ask() } else { None };
+        let prompting = ask.is_some();
+        let step = {
+            let ask_wait = async {
+                match ask.as_mut() {
+                    Some(prompt) => prompt.await,
+                    None => core::future::pending().await,
+                }
+            };
+            tokio::pin!(ask_wait);
+            tokio::select! {
+                step = transfer_step(&mut transfer, events, serving) => step,
+                () = wait_share_keys(timer), if background => TransferStep::Key,
+                event = worker.pump_one(), if connected => TransferStep::Upstream(event),
+                outcome = &mut ask_wait, if prompting => TransferStep::Gate(Some(outcome)),
+            }
+        };
+        if !matches!(step, TransferStep::Gate(_))
+            && let Some(ask) = ask.take()
+        {
+            gate.restore_ask(ask);
+        }
+        match step {
             TransferStep::Done(result) => break result,
-            TransferStep::Event(None) => serving = false,
+            TransferStep::Event(None) => {
+                serving = false;
+                background = false;
+            }
             TransferStep::Event(Some(event)) => {
                 if let Err(error) =
                     handle_hub_event(worker, state, notices, Some(content.archive()), walk, event)
@@ -1935,7 +1986,31 @@ where
                 {
                     event_error = Some(error);
                     serving = false;
+                    background = false;
                 }
+            }
+            TransferStep::Key => {}
+            TransferStep::Gate(outcome) => {
+                gate.apply_outcome(&mut ask, outcome);
+            }
+            TransferStep::Upstream(
+                Ok(ClientEvent::Closed | ClientEvent::ServerClosed { .. })
+                | Err(ClientError::Transport(_) | ClientError::NotConnected),
+            ) => worker.disconnect(),
+            TransferStep::Upstream(Ok(event)) => {
+                match serve_worker_event(worker, state, Some(content), event) {
+                    Ok(wake) => walk.outbox_wake |= wake,
+                    Err(error) => {
+                        event_error = Some(error);
+                        serving = false;
+                        background = false;
+                    }
+                }
+            }
+            TransferStep::Upstream(Err(error)) => {
+                event_error = Some(error.into());
+                serving = false;
+                background = false;
             }
         }
     };
@@ -1949,10 +2024,13 @@ where
     }
 }
 
-/// What happened first: the transfer finished, or a local request arrived.
+/// An upload's next completion, local request or background wake.
 enum TransferStep {
     Done(Result<(), ContentError>),
     Event(Option<HubEvent>),
+    Key,
+    Upstream(Result<ClientEvent, ClientError>),
+    Gate(Option<GateAskOutcome>),
 }
 
 /// Serves a queued local event before the transfer, or the transfer alone once local
@@ -4069,6 +4147,18 @@ async fn fetch_pinned_frame<U>(
     }
 }
 
+async fn wait_share_keys(timer: Option<connetto_client::ShareKeyTimer>) {
+    let Some(timer) = timer else {
+        return core::future::pending().await;
+    };
+    let ms = timer
+        .wait()
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .clamp(1, u128::from(i32::MAX.unsigned_abs()));
+    sleep_ms(i32::try_from(ms).expect("the key wait is clamped to signed milliseconds")).await;
+}
+
 /// Frees the local bytes no pin keeps: the record eviction first, then the
 /// chunks the eviction left unreferenced.
 async fn serve_tidy_frame<U>(
@@ -4504,6 +4594,42 @@ fn forward_aggregate(
                 },
             )));
     }
+}
+
+/// Route worker progress and report whether the content outbox needs a turn.
+fn serve_worker_event<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    content: Option<&HubContent>,
+    event: ClientEvent,
+) -> Result<bool, RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let mut wake = matches!(
+        &event,
+        ClientEvent::Reconnected
+            | ClientEvent::SyncStatus(SyncStatus::Connected)
+            | ClientEvent::MutationApplied { .. }
+    );
+    let rows_changed = matches!(
+        &event,
+        ClientEvent::LivePatch { .. }
+            | ClientEvent::SnapshotEnd { .. }
+            | ClientEvent::FullResync { .. }
+    );
+    handle_worker_event(worker, state, event)?;
+    if rows_changed
+        && let Some(content) = content
+        && content.archive().heals_lost()
+    {
+        match content.archive().queue_lost(worker) {
+            Ok(queued) => wake |= !queued.is_empty(),
+            Err(error) => tracing::warn!(error = %error, "queueing lost content failed"),
+        }
+    }
+    Ok(wake)
 }
 
 /// Handle one upstream event from the worker connection.
