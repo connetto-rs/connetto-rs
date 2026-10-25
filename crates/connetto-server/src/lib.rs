@@ -100,18 +100,18 @@ pub use authn::http::{
 pub use authn::{
     AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
     ConnettoHandshakeAuthority, DefaultUuidResolver, GenericOidcProvider, IdentityProvider,
-    IdentityResolver, InMemoryAuthStore, IssuedAuthCode, IssuedSession, LoginRedirect,
-    LoginRequest, OidcProviderConfig, PendingLogin, PendingLogins, ProviderError, ProviderRegistry,
-    RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture, ResolvedIdentity,
-    RetainedProviderToken, SessionDescriber, SessionOrigin, SessionRecord, SessionRow, SignInHook,
-    SignInNotice, StoredProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedClaims,
-    VerifiedLogin, VerifiedSession,
+    IdentityResolver, InMemoryAuthStore, IssuedAuthCode, IssuedSession, LivenessError,
+    LoginRedirect, LoginRequest, OidcProviderConfig, PendingLogin, PendingLogins, ProviderError,
+    ProviderRegistry, RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture,
+    ResolvedIdentity, RetainedProviderToken, SessionDescriber, SessionOrigin, SessionRecord,
+    SessionRow, SignInHook, SignInNotice, StoredProviderToken, TokenAuthority, TokenError,
+    TokenPair, VerifiedClaims, VerifiedLogin, VerifiedSession,
 };
 pub use authn::{ConnettoStoreSchema, DbAuthStore};
 pub use builder::{
     BuildError, ChangeStream, ContentBuildError, ContentSettings, ContentSigner,
     ContentSignerError, PoolError, SHUTDOWN_GRACE, SYNC_PATH, ServeError, ServerBuilder,
-    ServerHandle, ServerParts,
+    ServerHandle, ServerParts, SessionsError, SignedInPlace,
 };
 pub use connetto_core::SessionId;
 pub use connetto_core::transport::{

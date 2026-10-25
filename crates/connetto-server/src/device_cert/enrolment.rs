@@ -83,6 +83,8 @@ pub struct Device {
     pub last_seen: SystemTime,
     /// When the key was revoked.
     pub revoked_at: Option<SystemTime>,
+    /// The session that last enrolled or renewed it.
+    pub session: SessionId,
     /// The descriptor the device last sent.
     pub descriptor: Vec<u8>,
 }
@@ -298,6 +300,7 @@ impl<Id: Clone + PartialEq + Send + Sync + 'static> EnrolmentStore<Id> for Memor
                 enrolled_at: row.enrolled_at,
                 last_seen: row.last_seen,
                 revoked_at: row.revoked_at,
+                session: row.session,
                 descriptor: row.descriptor.clone(),
             })
             .collect();
@@ -681,6 +684,12 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
                 },
             )
         })
+    }
+
+    /// `user`'s enrolments, revoked ones included, each with the session it
+    /// last enrolled under.
+    pub(crate) async fn enrolled(&self, user: &Id) -> Result<Vec<Device>, EnrolmentError> {
+        self.store.devices(user).await
     }
 
     /// `user`'s devices, as the device list shows them.

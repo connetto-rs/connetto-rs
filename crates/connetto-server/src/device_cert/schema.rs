@@ -121,6 +121,8 @@ pub struct DeviceRow<D> {
     pub last_seen: SystemTime,
     /// When the key was revoked.
     pub revoked_at: Option<SystemTime>,
+    /// The session that last enrolled or renewed it.
+    pub session: SessionId,
     /// The descriptor the device last sent.
     pub descriptor: D,
 }
@@ -311,6 +313,7 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                         enrolled_at: row.enrolled_at,
                         last_seen: row.last_seen,
                         revoked_at: row.revoked_at,
+                        session: row.session,
                         descriptor: rmp_serde::to_vec_named(&row.descriptor)
                             .map_err(EnrolmentError::Descriptor)?,
                     })
@@ -673,6 +676,7 @@ macro_rules! connetto_enrolment_tables {
                         $crate::ban::Instant,
                         $crate::ban::Instant,
                         Option<$crate::ban::Instant>,
+                        $crate::SessionId,
                         $( $crate::__connetto_type_hole!($field), )*
                     )> = RunQueryDsl::load(
                         QueryDsl::select(
@@ -685,6 +689,7 @@ macro_rules! connetto_enrolment_tables {
                                 connetto_device_enrolments::enrolled_at,
                                 connetto_device_enrolments::last_seen,
                                 connetto_device_enrolments::revoked_at,
+                                connetto_device_enrolments::session_id,
                                 $( connetto_device_enrolments::$field, )*
                             ),
                         ),
@@ -692,12 +697,13 @@ macro_rules! connetto_enrolment_tables {
                     )
                     .await?;
                     rows.into_iter()
-                        .map(|(key, enrolled_at, last_seen, revoked_at, $($field,)*)| {
+                        .map(|(key, enrolled_at, last_seen, revoked_at, session, $($field,)*)| {
                             Ok($crate::device_cert::DeviceRow {
                                 key: $crate::device_cert::__key_id(&key)?,
                                 enrolled_at: enrolled_at.into(),
                                 last_seen: last_seen.into(),
                                 revoked_at: revoked_at.map(Into::into),
+                                session,
                                 descriptor: $($shape)*,
                             })
                         })

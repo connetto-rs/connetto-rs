@@ -44,7 +44,7 @@ diesel::table! {
 }
 
 /// The next control frame that is not a pushed revocation list.
-async fn reply(client: &mut WebSocketTransport<TcpStream>) -> ControlMessage {
+pub(super) async fn reply(client: &mut WebSocketTransport<TcpStream>) -> ControlMessage {
     loop {
         match next_control(client).await {
             ControlMessage::RevocationUpdate(_) => {}
@@ -54,7 +54,7 @@ async fn reply(client: &mut WebSocketTransport<TcpStream>) -> ControlMessage {
 }
 
 /// A fresh enrolment nonce the server hands to the session.
-async fn challenge_nonce(client: &mut WebSocketTransport<TcpStream>) -> [u8; 32] {
+pub(super) async fn challenge_nonce(client: &mut WebSocketTransport<TcpStream>) -> [u8; 32] {
     client
         .send_control(ControlMessage::EnrolChallengeRequest(
             EnrolChallengeRequest {
@@ -70,7 +70,7 @@ async fn challenge_nonce(client: &mut WebSocketTransport<TcpStream>) -> [u8; 32]
 }
 
 /// Enrol `key` with `attestation` against the challenge `nonce` carries.
-async fn enrol_request(
+pub(super) async fn enrol_request(
     client: &mut WebSocketTransport<TcpStream>,
     key: &rcgen::KeyPair,
     nonce: [u8; 32],

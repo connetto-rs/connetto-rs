@@ -70,6 +70,50 @@ fn origin() -> SessionOrigin<()> {
     }
 }
 
+/// The database store keeps the list-and-end contract, a session past its
+/// idle deadline no longer listed as a place anyone is signed in.
+#[tokio::test]
+async fn db_store_lists_and_ends_one_persons_sessions() {
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    reset_auth_tables(fixture.admin()).await;
+    let store = build_store(fixture.admin());
+    let mut frank = Vec::new();
+    for _ in 0..4 {
+        frank.push(
+            store
+                .create_session(&identity("frank"), origin())
+                .await
+                .expect("create"),
+        );
+    }
+    let grace = store
+        .create_session(&identity("grace"), origin())
+        .await
+        .expect("create");
+    let mut conn = fixture.admin().get().await.expect("connection");
+    sql_query(
+        "UPDATE connetto_sessions SET idle_deadline = now() - interval '1 minute' \
+         WHERE session_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(frank[3].session_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("lapse a session");
+
+    super::session_contract::ends_only_the_persons_sessions(
+        &store,
+        &frank[0].context.user_id,
+        [
+            frank[0].session_id,
+            frank[1].session_id,
+            frank[2].session_id,
+        ],
+        grace.session_id,
+    )
+    .await;
+}
+
 /// A session records how it began by the database's clock, and a refresh
 /// stamps its last refresh time.
 #[tokio::test]

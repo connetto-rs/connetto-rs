@@ -369,6 +369,8 @@ CREATE TYPE connetto_auth_op AS ENUM (
     'logged_in',
     -- a login ended, and why matters more than the fact
     'logged_out', 'session_revoked', 'token_replayed',
+    -- a person ended their own sessions from their list of signed-in places
+    'ended_by_owner', 'ended_all', 'ended_others',
     -- authorization
     'capability_minted', 'permission_change', 'model_change',
     -- abuse response
@@ -432,6 +434,8 @@ CREATE TABLE auth_events (
 **`write_forked` and `write_redelivered` name the writer frontier's two non-error outcomes (R75).** They are state, not denials, and they sit in this table by the same split that keeps denials out. `write_forked` is written when a write the server had already settled under a different path is redelivered on a path that cannot both be true, which is a record of a split the deployment should investigate. `write_redelivered` is the benign twin, a replay the server answered from its settled record without re-applying. Both rows carry the four writer columns beside the usual ones: `writer` (the number the entry settled under) and `seq` (its sequence for that writer), `path` (the `connetto_settle_path` that settled it, `direct`, `restore` or `courier`) and `other_path` (the path that forked, on a `write_forked` row, null otherwise). `writer` and `seq` are `BIGINT`, both `path` columns are `connetto_settle_path`, and all four are nullable because every pre-R75 kind of row leaves them empty.
 
 **`logged_in` records a login beginning, with `provider` and `issuer` on its own row (R105, 2026-10-25).** The auth service writes one row per sign-in, naming the session, the person, the configured provider and the issuer the identity was verified from, so a takeover can be investigated afterwards. The two columns sit on the row itself, filled only by a login, so the row still reads on its own after a deployment prunes its session rows. A sign-in is a change to who can reach what, and its rate is one row per login rather than one per attempt, since a refused sign-in mints nothing and still goes to the log.
+
+**`ended_by_owner`, `ended_all` and `ended_others` record a person ending their own sessions (R105, 2026-10-25).** One row per ended session, naming the session and the person. `ended_by_owner` is one entry of the person's list of signed-in places, `ended_others` every session but the current one, and `ended_all` every session. They sit beside `session_revoked`, the application revoking for its own reasons, because the person's choice and the application's read differently when a takeover is investigated.
 
 **Recording is off unless asked for**, with `CONNETTO_AUDIT=database` in the reference binary, because the table belongs to the application and connetto creates nothing.
 

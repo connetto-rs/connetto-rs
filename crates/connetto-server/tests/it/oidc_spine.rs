@@ -581,6 +581,31 @@ impl AuthStore for OutageStore {
         self.0.session_record(session_id)
     }
 
+    fn sessions_of(
+        &self,
+        user: &Self::Id,
+    ) -> impl Future<
+        Output = Result<Vec<connetto_server::SessionRecord<Self::Id, ()>>, AuthStoreError>,
+    > + Send {
+        self.0.sessions_of(user)
+    }
+
+    fn end_owned(
+        &self,
+        user: &Self::Id,
+        session: connetto_server::SessionId,
+    ) -> impl Future<Output = Result<bool, AuthStoreError>> + Send {
+        self.0.end_owned(user, session)
+    }
+
+    fn end_all_of(
+        &self,
+        user: &Self::Id,
+        keep: Option<connetto_server::SessionId>,
+    ) -> impl Future<Output = Result<Vec<connetto_server::SessionId>, AuthStoreError>> + Send {
+        self.0.end_all_of(user, keep)
+    }
+
     fn session_is_live(
         &self,
         session_id: connetto_server::SessionId,
