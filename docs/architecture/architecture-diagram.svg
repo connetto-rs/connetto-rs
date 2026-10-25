@@ -151,7 +151,7 @@
       <rect width="300" height="56" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="56" rx="1" fill="#4CAF50" />
       <text x="150" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">Capabilities</text>
-      <text x="150" y="31" text-anchor="middle" font-size="8.5" fill="#555">mint with write-level shares, key subjects</text>
+      <text x="150" y="31" text-anchor="middle" font-size="8.5" fill="#555">mint write-level shares, key subjects swapped live (R95)</text>
       <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#555">caller binding first in every RLS transaction</text>
     </g>
 
@@ -370,7 +370,7 @@
       <rect width="4" height="56" rx="1" fill="#4CAF50" />
       <text x="150" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Sync engine</text>
       <text x="150" y="36" text-anchor="middle" font-size="10" font-family="monospace" fill="#4CAF50">tokio-tungstenite</text>
-      <text x="150" y="50" text-anchor="middle" font-size="9" fill="#888">reconnect loop, exponential backoff</text>
+      <text x="150" y="50" text-anchor="middle" font-size="9" fill="#888">reconnect loop, backoff, keys changed live (R95)</text>
     </g>
     <g transform="translate(1325, 252)">
       <rect width="300" height="56" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
@@ -508,7 +508,7 @@
       <text x="148" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#2E7D32">DB worker (connetto-web)</text>
       <text x="148" y="32" text-anchor="middle" font-size="8.5" fill="#888">WebClientBuilder boot, OPFS sahpool replica</text>
       <text x="148" y="47" text-anchor="middle" font-size="8.5" fill="#888">upstream ConnettoClient plus capture</text>
-      <text x="148" y="62" text-anchor="middle" font-size="8.5" fill="#888">RelayHub fan-out to tab mirrors</text>
+      <text x="148" y="62" text-anchor="middle" font-size="8.5" fill="#888">RelayHub fan-out, tab key changes (R95)</text>
     </g>
     <g transform="translate(1320, 962)">
       <rect width="296" height="76" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
