@@ -12,14 +12,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use connetto_client::{
-    ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, Grant, SyncSchema,
-};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, Grant};
 use connetto_core::Cursor;
 use connetto_core::auth::CapabilitySubject;
 use connetto_core::messages::{
-    AggregateUpdate, ControlMessage, FullResyncReason, FullResyncRequired, Handshake, Pong,
-    RateLimited, ReplaceShareKeys, ShareKeysReplaced, SnapshotBegin, SnapshotEnd,
+    AggregateUpdate, ControlMessage, FullResyncReason, FullResyncRequired, Handshake, HandshakeAck,
+    Pong, RateLimited, ReplaceShareKeys, ShareKeysReplaced, SnapshotBegin, SnapshotEnd,
+    WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport as _};
 use diesel::prelude::*;
@@ -78,22 +77,6 @@ fn snapshot_end(sub_id: &str) -> IncomingFrame {
     }))
 }
 
-fn schema() -> SyncSchema {
-    SyncSchema::new(
-        connetto_core::SchemaBundle::new(
-            "-- connetto:major 1",
-            "",
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
-         CREATE VIEW visible AS SELECT * FROM notes \
-         WHERE owner = current_app_user() \
-            OR instr(',' || current_app_subjects() || ',', ',' || owner || ',') > 0;",
-            Vec::<(String, String)>::new(),
-            vec!["visible".to_owned()],
-            None::<&str>,
-        )
-        .expect("the source declares major 1"),
-    )
-}
 /// base64url without padding, for minting the JWT-shaped grants this suite holds.
 fn b64(text: &str) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

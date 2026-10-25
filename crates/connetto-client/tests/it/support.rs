@@ -340,15 +340,18 @@ pub fn handshake_ack() -> IncomingFrame {
 /// One `notes` table behind a `visible` view showing the caller's rows and the
 /// rows of every share-key subject it holds.
 pub fn key_gated_notes() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
+    SyncSchema::new(
+        SchemaBundle::new(
+            "-- connetto:major 1",
+            "",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
          CREATE VIEW visible AS SELECT * FROM notes \
          WHERE owner = current_app_user() \
             OR instr(',' || current_app_subjects() || ',', ',' || owner || ',') > 0;",
-        Vec::<(String, String)>::new(),
-        vec!["visible".to_owned()],
-        None::<&str>,
-    ))
+            Vec::<(String, String)>::new(),
+            vec!["visible".to_owned()],
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
