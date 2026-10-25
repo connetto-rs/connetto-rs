@@ -1346,7 +1346,7 @@ mod tests {
 
     /// The schema the layout consumer tests translate, a shareable table and a
     /// caller-private one.
-    const SHARED_CONSUMER_SCHEMA: &str = "CREATE TABLE words (id INT PRIMARY KEY, word TEXT); \
+    const SHARED_CONSUMER_SCHEMA: &str = "-- connetto:major 1\nCREATE TABLE words (id INT PRIMARY KEY, word TEXT); \
                                           CREATE TABLE notes (id INT PRIMARY KEY, \
                                             word_id INT NOT NULL, owner_id TEXT NOT NULL, \
                                             body TEXT);";
