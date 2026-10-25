@@ -2380,13 +2380,8 @@ impl Client {
 
 /// Build a compressed-on-upload changeset that inserts one fully specified row.
 ///
-/// `columns` gives the row's columns in order as `(name, declared type)`
-/// pairs, with `""` for a column whose SQL schema declares no type, `pk`
-/// gives the primary-key column indices, and `values` gives one value per
-/// column in `columns` order.
-///
-/// A lone primary-key column declared `INTEGER` is carried as the rowid
-/// alias SQLite gives it.
+/// `columns` names the row's columns in order, `pk` gives the primary-key
+/// column indices, and `values` gives one value per column in `columns` order.
 ///
 /// # Panics
 ///
@@ -2394,7 +2389,7 @@ impl Client {
 #[must_use]
 pub fn insert_changeset(
     table: &str,
-    columns: &[(&str, &str)],
+    columns: &[&str],
     pk: &[usize],
     values: Vec<RowValue>,
 ) -> Vec<u8> {

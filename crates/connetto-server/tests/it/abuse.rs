@@ -880,12 +880,7 @@ async fn an_offline_queue_of_rejected_writes_does_not_reach_the_threshold() {
     for seq in 1..=FLUSHED {
         let changeset = insert_changeset(
             "orders",
-            &[
-                ("id", "INTEGER"),
-                ("price", "REAL"),
-                ("quantity", "INTEGER"),
-                ("status", "TEXT"),
-            ],
+            &["id", "price", "quantity", "status"],
             &[0],
             vec![
                 RowValue::Integer(i64::try_from(seq).expect("a small sequence fits")),
