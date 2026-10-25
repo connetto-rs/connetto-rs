@@ -63,7 +63,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::auth::PendingWork;
-use crate::content_wire::{ContentFrame, WirePins, WireResolve, mime_from_code};
+use crate::content_wire::{
+    ContentFrame, WireFetch, WirePins, WireQueue, WireResolve, mime_from_code,
+};
 use crate::frames::{
     InternalInbound, InternalLane, MessageSink, MessageTransport, MessageTransportError,
 };
@@ -73,8 +75,8 @@ use connetto_client::away::Clock as _;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
     AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, GateAskOutcome,
-    GateController, GateSink, ImportChoices, ImportOutcome, PolicyTables, ResendTimer,
-    ShareKeyTimer, SystemClock, WriterGrant, WriterRequest, subscription_is_aggregate,
+    GateController, GateSink, ImportChoices, ImportOutcome, KeepaliveTimer, PolicyTables,
+    ResendTimer, ShareKeyTimer, SystemClock, WriterGrant, WriterRequest, subscription_is_aggregate,
     subscription_tables,
 };
 use connetto_core::messages::{
@@ -87,11 +89,13 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Transport, quote_ident};
+use connetto_file_client::http::ContentHttp;
 use connetto_file_client::{
     BrowserHttp, BrowserStore, ChunkScan, ContentArchive, ContentError, ContentFlush,
     ContentFlushStart, ContentFlushState, ContentUpload, FileId, PendingConnectionResolve,
     ResolveRoute, ResolveStart, Resolved, ScanStep, StageCommitError,
 };
+use connetto_file_core::MimeClass;
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -523,10 +527,24 @@ struct HubState {
     /// `SnapshotEnd` triggers the tab re-snapshot, which carries that reason on
     /// rather than restating one cause as another.
     resyncing: HashMap<String, FullResyncReason>,
+    /// Upstream subscriptions the server has refused, keyed by the worker's
+    /// upstream sub id, each with the tables that subscription backs. A tab
+    /// reading a table every upstream for it has been refused gets the
+    /// server's fixed phrase instead of a snapshot that never arrives.
+    refused_upstreams: HashMap<String, HashSet<String>>,
 
     /// Resolves waiting on a server ticket answer, each with the tab and
     /// request to answer and the `performance.now` instant its wait ends.
     pending_resolve: Vec<PendingHubResolve>,
+
+    /// Fetches waiting on a server ticket answer, each with the tab and
+    /// request to answer and the `performance.now` instant its wait ends.
+    pending_fetch: Vec<PendingHubFetch>,
+
+    /// Files a fetch request already restored, keyed by the tab and request
+    /// it arrived for, so the answer can list them beside the tickets still
+    /// in flight.
+    fetch_arrived: HashMap<(TabId, u64), Vec<FileId>>,
 
     /// The worker's armed resend of writes the server deferred, with the
     /// monotonic reading it falls due at, so arriving frames never restart it.
@@ -546,6 +564,17 @@ struct PendingHubResolve {
     request_id: u64,
     ticket: PendingConnectionResolve,
     /// The monotonic reading by which the tab hears at the latest.
+    deadline: Duration,
+}
+
+/// One fetched-file ticket still in flight for a `FetchPinned` request, kept
+/// in the hub state so the wait costs a slot rather than the event loop.
+struct PendingHubFetch {
+    tab: TabId,
+    request_id: u64,
+    file_id: FileId,
+    ticket: PendingConnectionResolve,
+    /// The monotonic reading by which the request hears at the latest.
     deadline: Duration,
 }
 
@@ -1154,6 +1183,15 @@ where
                 state.resync_tables.insert(sub_id.clone(), tables);
             }
         }
+        // The worker already recorded the upstream subscriptions the server
+        // refused before the hub existed, so later tabs learn of them.
+        for sub_id in worker.refused_subscriptions() {
+            if let Some(tables) = state.resync_tables.get(sub_id) {
+                state
+                    .refused_upstreams
+                    .insert(sub_id.clone(), tables.clone());
+            }
+        }
     }
     state
 }
@@ -1234,10 +1272,13 @@ enum Wake {
     Upstream(Result<ClientEvent, ClientError>),
     /// The content integrity walk has a file left to check.
     Verify,
-    /// A resolve's ticket wait ran out while the hub served everything else.
-    Resolve,
+    /// A content ticket wait, for a resolve or a fetch, ran out while the hub
+    /// served everything else.
+    Ticket,
     /// The worker's resend of the writes the server deferred fell due.
     Resend,
+    /// The worker's keepalive deadline fell due.
+    Keepalive(KeepaliveTimer),
     /// The worker's gate prompt resolved.
     Gate(Option<GateAskOutcome>),
     /// The worker's share-key work fell due.
@@ -1266,6 +1307,10 @@ where
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one select arms every timer, the keepalive and share-key deadlines among them, beside the gate prompt"
+    )]
     async fn cycle<F, S, CS>(
         &mut self,
         reconnect: Option<&mut HubReconnect<F, S>>,
@@ -1292,17 +1337,23 @@ where
             }
         };
         tokio::pin!(content_wait);
-        // The resolve waits ride a timer here rather than parking a handler:
-        // when one fires, the sweep answers only the waits that have truly
-        // elapsed and the loop keeps serving everything else in between.
-        let resolve_ms = resolve_deadline_ms(&self.state.pending_resolve);
-        let resolve_wait = async {
-            match resolve_ms {
+        // The resolve and fetch waits ride a timer here rather than parking a
+        // handler: when one fires, the sweep answers only the waits that have
+        // truly elapsed and the loop keeps serving everything else in between.
+        let ticket_ms = earliest_wait_ms(
+            self.state
+                .pending_resolve
+                .iter()
+                .map(|resolve| resolve.deadline)
+                .chain(self.state.pending_fetch.iter().map(|fetch| fetch.deadline)),
+        );
+        let ticket_wait = async {
+            match ticket_ms {
                 Some(ms) => sleep_ms(ms).await,
                 None => core::future::pending().await,
             }
         };
-        tokio::pin!(resolve_wait);
+        tokio::pin!(ticket_wait);
         let resend_ms = resend_deadline_ms(&mut self.state, &self.worker);
         let resend_wait = async {
             match resend_ms {
@@ -1317,6 +1368,8 @@ where
         let key_ms = fresh_key_wait_ms(key_timer, self.state.fired_key_timer);
         let key_wait = sleep_or_park(key_ms);
         tokio::pin!(key_wait);
+        let keepalive_wait = keepalive_wake(self.worker.keepalive_timer());
+        tokio::pin!(keepalive_wait);
         // The in-flight gate prompt, if any, driven alongside the other
         // wakes and handed back to the controller when another wake wins.
         let mut ask = self.gate.take_ask();
@@ -1344,8 +1397,9 @@ where
                 // Always ready, so the walk shares the cycle with every other source
                 // rather than holding it or being starved by it.
                 () = core::future::ready(()), if unverified => Wake::Verify,
-                () = &mut resolve_wait, if resolve_ms.is_some() => Wake::Resolve,
+                () = &mut ticket_wait, if ticket_ms.is_some() => Wake::Ticket,
                 () = &mut resend_wait, if resend_ms.is_some() => Wake::Resend,
+                timer = &mut keepalive_wait => Wake::Keepalive(timer),
                 outcome = &mut ask_wait, if prompting => Wake::Gate(Some(outcome)),
                 () = &mut key_wait, if key_ms.is_some() => Wake::ShareKeys,
             }
@@ -1367,8 +1421,9 @@ where
                 Ok(true)
             }
             Wake::Verify => self.verify_turn().await,
-            Wake::Resolve => {
+            Wake::Ticket => {
                 expire_resolves(&mut self.state);
+                expire_fetches(&mut self.state);
                 Ok(true)
             }
             Wake::Resend => {
@@ -1381,6 +1436,7 @@ where
                     Err(err) => self.serve_upstream(reconnect, Err(err)).await,
                 }
             }
+            Wake::Keepalive(timer) => self.fire_keepalive(reconnect, timer).await,
             Wake::ShareKeys => self.serve_share_keys(key_timer).await,
         };
         // Any wake may have moved the keys, an expiry inside a pump step
@@ -1389,6 +1445,28 @@ where
             restate_identity(&mut self.worker, &mut self.state)?;
         }
         served
+    }
+
+    /// Fire the worker's keepalive deadline, recovering as from any loss when
+    /// an unanswered probe dropped the transport.
+    async fn fire_keepalive<F, S>(
+        &mut self,
+        reconnect: Option<&mut HubReconnect<F, S>>,
+        timer: KeepaliveTimer,
+    ) -> Result<bool, RelayError>
+    where
+        U: MaybeSend + 'static,
+        F: TransportFactory<Transport = U>,
+        S: Sleeper,
+    {
+        match self.worker.keepalive_fire(timer).await {
+            Ok(()) if self.worker.is_connected() => Ok(true),
+            Ok(()) => {
+                self.serve_upstream(reconnect, Err(ClientError::NotConnected))
+                    .await
+            }
+            Err(err) => self.serve_upstream(reconnect, Err(err)).await,
+        }
     }
 
     /// Run the worker's due share-key work, deferring secret writes while locked.
@@ -1437,6 +1515,17 @@ where
                 let Some(driver) = reconnect else {
                     return Ok(false);
                 };
+                // The drop queued its `Offline` on the worker, and the tabs must hear it
+                // before a redial that can hang for as long as the server stays frozen.
+                while let Some(notice) = self
+                    .worker
+                    .pump_one_or(core::future::ready(()))
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    handle_worker_event(&mut self.worker, &mut self.state, notice)?;
+                }
                 if !self.recover(driver).await? {
                     return Ok(false);
                 }
@@ -1457,7 +1546,11 @@ where
                         | ClientEvent::SnapshotEnd { .. }
                         | ClientEvent::FullResync { .. }
                 );
+                let settled_fetches = route_fetch_tickets(&mut self.state, &event);
                 handle_worker_event(&mut self.worker, &mut self.state, event)?;
+                if !settled_fetches.is_empty() {
+                    self.settle_fetches(settled_fetches).await;
+                }
                 if rows_changed && let Some(content) = &self.content {
                     let archive = content.archive();
                     if archive.heals_lost() {
@@ -1538,6 +1631,30 @@ where
         }
         self.retry.schedule(queued, progressed);
         Ok(true)
+    }
+
+    /// Runs settled fetch tickets past the downloads they name, answering
+    /// every request whose last ticket has settled.
+    async fn settle_fetches(
+        &mut self,
+        settled: Vec<(TabId, u64, FileId, Result<String, ContentError>)>,
+    ) {
+        let Self {
+            worker,
+            state,
+            content,
+            ..
+        } = self;
+        for (tab, request_id, file_id, result) in settled {
+            if let Some(content) = content.as_ref() {
+                if let Ok(url) = result {
+                    fetch_settle_one(worker, content, state, tab, request_id, file_id, &url).await;
+                } else {
+                    tracing::warn!(tab = %tab, request_id, "the pinned file's ticket did not reach a grant");
+                }
+            }
+            finish_fetch_if_last(state, tab, request_id);
+        }
     }
 
     /// One outbox attempt, serving local events across its HTTP transfer.
@@ -1898,7 +2015,7 @@ where
             handle_tab_frame(worker, state, notices, content, walk, id, frame).await?;
         }
         HubEvent::Internal(id, frame, blob) => {
-            handle_tab_internal(worker, state, content, id, frame, blob).await?;
+            handle_tab_internal(worker, state, content, walk, id, frame, blob).await?;
         }
         HubEvent::Unsynced(reply) => {
             let pending = PendingWork {
@@ -2052,6 +2169,8 @@ where
 {
     state.tabs.remove(&id);
     state.pending_resolve.retain(|resolve| resolve.tab != id);
+    state.pending_fetch.retain(|fetch| fetch.tab != id);
+    state.fetch_arrived.retain(|(tab, _), _| *tab != id);
     let upstreams: Vec<String> = state
         .agg_routes
         .iter()
@@ -2542,7 +2661,12 @@ fn recovery_interrupts_attach(event: &HubEvent) -> bool {
                 ContentFrame::Resolve { .. }
                     | ContentFrame::Pin { .. }
                     | ContentFrame::Unpin { .. }
-                    | ContentFrame::ListPins { .. },
+                    | ContentFrame::ListPins { .. }
+                    | ContentFrame::RefusedContent { .. }
+                    | ContentFrame::RetryRefused { .. }
+                    | ContentFrame::RetiredContent { .. }
+                    | ContentFrame::ForgetRetiredContent { .. }
+                    | ContentFrame::Tidy { .. },
                 _
             )
     )
@@ -2599,6 +2723,8 @@ where
                 )));
             }
             state.pending_resolve.retain(|resolve| resolve.tab != id);
+            state.pending_fetch.retain(|fetch| fetch.tab != id);
+            state.fetch_arrived.retain(|(tab, _), _| *tab != id);
             Ok(())
         }
         Err(TabFault::Hub(err)) => Err(err),
@@ -2692,11 +2818,16 @@ where
 /// its sub id, leaving the tab and its siblings alive, mirroring the direct
 /// server. An aggregate registers a private upstream sub. A row subscription is
 /// answered from the worker replica and its tables recorded for later routing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the subscription needs the worker, the routes, the blank state, the local tables and the refused tables, none of which belongs on another's struct"
+)]
 async fn handle_tab_subscribe<U>(
     worker: &mut ConnettoConnection<U>,
     agg_routes: &mut HashMap<String, AggRoute>,
     blank: &mut BlankState,
     local_tables: &HashSet<String>,
+    refused_tables: &HashSet<String>,
     tab: &mut TabState,
     id: TabId,
     subscribe: Subscribe,
@@ -2721,6 +2852,14 @@ where
                     return Ok(());
                 }
             };
+            // The server itself refuses any subscription reading a table it
+            // cannot serve, so the hub answers the same fixed phrase and no
+            // snapshot, rather than an empty one.
+            if !tables.is_disjoint(refused_tables) {
+                tracing::warn!(tab = %id, sub_id = %subscribe.sub_id, "tab subscription reads a fully refused upstream");
+                send_tab_nonfatal(tab, &subscribe.sub_id, SUBSCRIPTION_REFUSED);
+                return Ok(());
+            }
             if let Err(err) = serve_snapshot(
                 worker,
                 blank,
@@ -2745,6 +2884,29 @@ where
     }
 }
 
+/// The tables whose covering upstream subscriptions the server has all
+/// refused, so the hub can never serve them a snapshot and answers a tab
+/// reading one with the server's fixed phrase.
+fn fully_refused_tables(state: &HubState) -> HashSet<String> {
+    let mut coverers: HashMap<String, HashSet<String>> = HashMap::new();
+    for (sub_id, tables) in &state.resync_tables {
+        for table in tables {
+            coverers
+                .entry(table.clone())
+                .or_default()
+                .insert(sub_id.clone());
+        }
+    }
+    coverers
+        .into_iter()
+        .filter(|(_, subs)| {
+            subs.iter()
+                .all(|sub_id| state.refused_upstreams.contains_key(sub_id))
+        })
+        .map(|(table, _)| table)
+        .collect()
+}
+
 /// Handle one control frame from a tab.
 #[expect(
     clippy::too_many_lines,
@@ -2761,6 +2923,7 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
+    let refused_tables = fully_refused_tables(state);
     let Some(tab) = state.tabs.get_mut(&id) else {
         return Ok(());
     };
@@ -2844,6 +3007,7 @@ where
                 &mut state.agg_routes,
                 &mut state.blank,
                 &state.local_tables,
+                &refused_tables,
                 tab,
                 id,
                 subscribe,
@@ -3603,6 +3767,7 @@ async fn handle_tab_internal<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
     content: Option<&ContentArchive<BrowserStore>>,
+    walk: &mut WalkState,
     id: TabId,
     frame: ContentFrame,
     blob: Option<web_sys::Blob>,
@@ -3646,44 +3811,7 @@ where
             request_id,
             file_id,
         } => {
-            let start = match content {
-                Some(content) => {
-                    match content
-                        .start_resolve_connection(worker, FileId::from_bytes(file_id))
-                        .await
-                    {
-                        Ok(start) => Some(start),
-                        Err(err) => {
-                            tracing::warn!(
-                                tab = %id,
-                                ?err,
-                                "the resolve's ticket request could not go out"
-                            );
-                            None
-                        }
-                    }
-                }
-                None => None,
-            };
-            match start {
-                Some(ResolveStart::Waiting(ticket)) => {
-                    state.pending_resolve.push(PendingHubResolve {
-                        tab: id,
-                        request_id,
-                        ticket,
-                        deadline: SystemClock.monotonic() + RESOLVE_WAIT,
-                    });
-                }
-                Some(ResolveStart::Answered(Resolved::Remote { url })) => {
-                    answer_resolve(state, id, request_id, WireResolve::Remote { url }, None);
-                }
-                Some(ResolveStart::Answered(Resolved::Local { bytes, .. })) => {
-                    answer_resolve(state, id, request_id, WireResolve::Local, Some(bytes));
-                }
-                Some(ResolveStart::Answered(Resolved::Unavailable)) | None => {
-                    answer_resolve(state, id, request_id, WireResolve::Unavailable, None);
-                }
-            }
+            resolve_frame(worker, state, content, id, request_id, file_id).await;
             Ok(())
         }
         pin @ (ContentFrame::Pin { .. }
@@ -3692,7 +3820,79 @@ where
             serve_pin_frame(worker, state, content, id, pin);
             Ok(())
         }
-        ContentFrame::ResolveReply { .. } | ContentFrame::PinReply { .. } => Ok(()),
+        queue @ (ContentFrame::RefusedContent { .. }
+        | ContentFrame::RetryRefused { .. }
+        | ContentFrame::RetiredContent { .. }
+        | ContentFrame::ForgetRetiredContent { .. }) => {
+            serve_queue_frame(worker, state, content, walk, id, queue);
+            Ok(())
+        }
+        ContentFrame::FetchPinned { request_id } => {
+            fetch_pinned_frame(worker, state, content, id, request_id).await;
+            Ok(())
+        }
+        ContentFrame::Tidy { request_id } => {
+            serve_tidy_frame(worker, state, content, id, request_id).await;
+            Ok(())
+        }
+        ContentFrame::ResolveReply { .. }
+        | ContentFrame::PinReply { .. }
+        | ContentFrame::QueueReply { .. }
+        | ContentFrame::FetchPinnedReply { .. }
+        | ContentFrame::TidyReply { .. } => Ok(()),
+    }
+}
+
+/// Answers a tab's resolve with the local check, a ticket it sends out or
+/// an unavailable, the way the tab's own lane settles a resolve.
+async fn resolve_frame<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    content: Option<&ContentArchive<BrowserStore>>,
+    id: TabId,
+    request_id: u64,
+    file_id: [u8; 32],
+) where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let start = match content {
+        Some(content) => {
+            match content
+                .start_resolve_connection(worker, FileId::from_bytes(file_id))
+                .await
+            {
+                Ok(start) => Some(start),
+                Err(err) => {
+                    tracing::warn!(
+                        tab = %id,
+                        ?err,
+                        "the resolve's ticket request could not go out"
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    match start {
+        Some(ResolveStart::Waiting(ticket)) => {
+            state.pending_resolve.push(PendingHubResolve {
+                tab: id,
+                request_id,
+                ticket,
+                deadline: SystemClock.monotonic() + RESOLVE_WAIT,
+            });
+        }
+        Some(ResolveStart::Answered(Resolved::Remote { url })) => {
+            answer_resolve(state, id, request_id, WireResolve::Remote { url }, None);
+        }
+        Some(ResolveStart::Answered(Resolved::Local { bytes, .. })) => {
+            answer_resolve(state, id, request_id, WireResolve::Local, Some(bytes));
+        }
+        Some(ResolveStart::Answered(Resolved::Unavailable)) | None => {
+            answer_resolve(state, id, request_id, WireResolve::Unavailable, None);
+        }
     }
 }
 
@@ -3713,41 +3913,133 @@ fn serve_pin_frame<U: Transport>(
         } => (
             request_id,
             with_archive(content, |archive| {
-                archive
-                    .pin_content(worker, &name, &query, &file_id_column)
-                    .map(|()| WirePins::Done)
-            }),
+                archive.pin_content(worker, &name, &query, &file_id_column)
+            })
+            .map_or_else(WirePins::Refused, |()| WirePins::Done),
         ),
         ContentFrame::Unpin { request_id, name } => (
             request_id,
-            with_archive(content, |archive| {
-                archive
-                    .unpin_content(worker, &name)
-                    .map(|()| WirePins::Done)
-            }),
+            with_archive(content, |archive| archive.unpin_content(worker, &name))
+                .map_or_else(WirePins::Refused, |()| WirePins::Done),
         ),
         ContentFrame::ListPins { request_id } => (
             request_id,
-            with_archive(content, |archive| {
-                archive.content_pins(worker).map(WirePins::Pins)
-            }),
+            with_archive(content, |archive| archive.content_pins(worker))
+                .map_or_else(WirePins::Refused, WirePins::Pins),
         ),
         ContentFrame::Stage { .. }
         | ContentFrame::Resolve { .. }
         | ContentFrame::ResolveReply { .. }
-        | ContentFrame::PinReply { .. } => return,
+        | ContentFrame::PinReply { .. }
+        | ContentFrame::RefusedContent { .. }
+        | ContentFrame::RetryRefused { .. }
+        | ContentFrame::RetiredContent { .. }
+        | ContentFrame::ForgetRetiredContent { .. }
+        | ContentFrame::QueueReply { .. }
+        | ContentFrame::FetchPinned { .. }
+        | ContentFrame::Tidy { .. }
+        | ContentFrame::FetchPinnedReply { .. }
+        | ContentFrame::TidyReply { .. } => return,
     };
     answer_pins(state, tab, request_id, answer);
 }
 
-/// Runs `pin` against the archive, refusing when content is disabled.
-fn with_archive(
+/// Answers a tab's queue read or action from the replica.
+fn serve_queue_frame<U: Transport>(
+    worker: &mut ConnettoConnection<U>,
+    state: &HubState,
     content: Option<&ContentArchive<BrowserStore>>,
-    pin: impl FnOnce(&ContentArchive<BrowserStore>) -> Result<WirePins, ContentError>,
-) -> WirePins {
+    walk: &mut WalkState,
+    tab: TabId,
+    frame: ContentFrame,
+) {
+    let (request_id, answer) = match frame {
+        ContentFrame::RefusedContent { request_id } => (
+            request_id,
+            with_archive(content, |archive| archive.refused_content(worker)).map_or_else(
+                WireQueue::Refused,
+                |refusals| {
+                    WireQueue::Refusals(
+                        refusals
+                            .into_iter()
+                            .map(|(file_id, detail)| (*file_id.as_bytes(), detail))
+                            .collect(),
+                    )
+                },
+            ),
+        ),
+        ContentFrame::RetryRefused {
+            request_id,
+            file_id,
+        } => {
+            let cleared = with_archive(content, |archive| {
+                archive.retry_refused(worker, FileId::from_bytes(file_id))
+            });
+            if cleared.is_ok() {
+                // Wake the outbox driver wherever this request was served, so
+                // neither a reconnect nor an import is needed to attempt the entry.
+                walk.outbox_wake = true;
+            }
+            (
+                request_id,
+                cleared.map_or_else(WireQueue::Refused, |()| WireQueue::Done),
+            )
+        }
+        ContentFrame::RetiredContent { request_id } => (
+            request_id,
+            with_archive(content, |archive| archive.retired_content(worker)).map_or_else(
+                WireQueue::Refused,
+                |retired| {
+                    WireQueue::Retired(
+                        retired
+                            .into_iter()
+                            .map(|file_id| *file_id.as_bytes())
+                            .collect(),
+                    )
+                },
+            ),
+        ),
+        ContentFrame::ForgetRetiredContent {
+            request_id,
+            file_ids,
+        } => {
+            let files: Vec<FileId> = file_ids
+                .iter()
+                .map(|file_id| FileId::from_bytes(*file_id))
+                .collect();
+            (
+                request_id,
+                with_archive(content, |archive| {
+                    archive.forget_retired_content(worker, &files)
+                })
+                .map_or_else(WireQueue::Refused, |()| WireQueue::Done),
+            )
+        }
+        ContentFrame::Stage { .. }
+        | ContentFrame::Resolve { .. }
+        | ContentFrame::ResolveReply { .. }
+        | ContentFrame::Pin { .. }
+        | ContentFrame::Unpin { .. }
+        | ContentFrame::ListPins { .. }
+        | ContentFrame::PinReply { .. }
+        | ContentFrame::QueueReply { .. }
+        | ContentFrame::FetchPinned { .. }
+        | ContentFrame::Tidy { .. }
+        | ContentFrame::FetchPinnedReply { .. }
+        | ContentFrame::TidyReply { .. } => return,
+    };
+    answer_queue(state, tab, request_id, answer);
+}
+
+/// Runs `run` against the archive, refusing with the reason when content is
+/// disabled or the record cannot be served.
+fn with_archive<T>(
+    content: Option<&ContentArchive<BrowserStore>>,
+    run: impl FnOnce(&ContentArchive<BrowserStore>) -> Result<T, ContentError>,
+) -> Result<T, String> {
     match content {
-        Some(archive) => pin(archive).unwrap_or_else(|err| WirePins::Refused(err.to_string())),
-        None => WirePins::Refused("content is not enabled on this worker".to_owned()),
+        Some(archive) => run(archive).map_err(|err| err.to_string()),
+        None => Err("content is not enabled on this worker".to_owned()),
     }
 }
 
@@ -3755,6 +4047,14 @@ fn with_archive(
 fn answer_pins(state: &HubState, tab: TabId, request_id: u64, answer: WirePins) {
     if let Some(entry) = state.tabs.get(&tab) {
         let reply = ContentFrame::PinReply { request_id, answer };
+        let _ = entry.out.send(TabOut::Internal(reply.to_json(), None));
+    }
+}
+
+/// Answers a tab's queue frame on its content lane.
+fn answer_queue(state: &HubState, tab: TabId, request_id: u64, answer: WireQueue) {
+    if let Some(entry) = state.tabs.get(&tab) {
+        let reply = ContentFrame::QueueReply { request_id, answer };
         let _ = entry.out.send(TabOut::Internal(reply.to_json(), None));
     }
 }
@@ -3786,6 +4086,253 @@ fn answer_resolve(
     });
     if let Some(entry) = state.tabs.get(&tab) {
         let _ = entry.out.send(TabOut::Internal(reply.to_json(), blob));
+    }
+}
+
+/// Fetches every pinned file whose bytes are missing locally, the way the
+/// native client's fetch pass does. A ticket still in flight holds the
+/// answer until the grant settles; files the server cannot serve are absent
+/// from the list.
+async fn fetch_pinned_frame<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    content: Option<&ContentArchive<BrowserStore>>,
+    tab: TabId,
+    request_id: u64,
+) where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let Some(content) = content else {
+        answer_fetch(
+            state,
+            tab,
+            &ContentFrame::FetchPinnedReply {
+                request_id,
+                answer: WireFetch::Refused("content is not enabled on this worker".to_owned()),
+            },
+        );
+        return;
+    };
+    let archive = content;
+    let pinned = match archive.pinned_files(worker) {
+        Ok(pinned) => pinned,
+        Err(err) => {
+            answer_fetch(
+                state,
+                tab,
+                &ContentFrame::FetchPinnedReply {
+                    request_id,
+                    answer: WireFetch::Refused(err.to_string()),
+                },
+            );
+            return;
+        }
+    };
+    let mut arrived = Vec::new();
+    for file_id in pinned {
+        let local = match archive.resolve_local(worker, file_id).await {
+            Ok(local) => local,
+            Err(err) => {
+                answer_fetch(
+                    state,
+                    tab,
+                    &ContentFrame::FetchPinnedReply {
+                        request_id,
+                        answer: WireFetch::Refused(err.to_string()),
+                    },
+                );
+                return;
+            }
+        };
+        if local.is_some() {
+            continue;
+        }
+        match archive.start_resolve_connection(worker, file_id).await {
+            Ok(ResolveStart::Waiting(ticket)) => {
+                state.pending_fetch.push(PendingHubFetch {
+                    tab,
+                    request_id,
+                    file_id,
+                    ticket,
+                    deadline: SystemClock.monotonic() + RESOLVE_WAIT,
+                });
+            }
+            Ok(ResolveStart::Answered(Resolved::Local { .. })) => arrived.push(file_id),
+            // A remote grant cannot arrive here: the start answers `Local`
+            // or `Unavailable` from the local check before it ever sends a
+            // ticket, and a sent ticket leaves a `Waiting` handle instead.
+            Ok(ResolveStart::Answered(Resolved::Unavailable | Resolved::Remote { .. })) => {}
+            Err(err) => {
+                tracing::warn!(
+                    tab = %tab,
+                    file_id = %file_id,
+                    ?err,
+                    "the pinned file's ticket request could not go out"
+                );
+            }
+        }
+    }
+    if state
+        .pending_fetch
+        .iter()
+        .any(|fetch| fetch.tab == tab && fetch.request_id == request_id)
+    {
+        if !arrived.is_empty() {
+            state
+                .fetch_arrived
+                .entry((tab, request_id))
+                .or_default()
+                .extend(arrived);
+        }
+    } else {
+        let arrived: Vec<[u8; 32]> = arrived.iter().map(|file_id| *file_id.as_bytes()).collect();
+        answer_fetch(
+            state,
+            tab,
+            &ContentFrame::FetchPinnedReply {
+                request_id,
+                answer: WireFetch::Arrived(arrived),
+            },
+        );
+    }
+}
+
+/// Frees the local bytes no pin keeps: the record eviction first, then the
+/// chunks the eviction left unreferenced.
+async fn serve_tidy_frame<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    content: Option<&ContentArchive<BrowserStore>>,
+    tab: TabId,
+    request_id: u64,
+) where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let Some(content) = content else {
+        answer_fetch(
+            state,
+            tab,
+            &ContentFrame::TidyReply {
+                request_id,
+                answer: WireFetch::Refused("content is not enabled on this worker".to_owned()),
+            },
+        );
+        return;
+    };
+    let archive = content;
+    let evicted = match archive.evict_uncovered(worker) {
+        Ok(evicted) => evicted,
+        Err(err) => {
+            answer_fetch(
+                state,
+                tab,
+                &ContentFrame::TidyReply {
+                    request_id,
+                    answer: WireFetch::Refused(err.to_string()),
+                },
+            );
+            return;
+        }
+    };
+    match archive.reclaim_orphans(worker).await {
+        Ok(_) => answer_fetch(
+            state,
+            tab,
+            &ContentFrame::TidyReply {
+                request_id,
+                answer: WireFetch::Tidied(evicted),
+            },
+        ),
+        Err(err) => answer_fetch(
+            state,
+            tab,
+            &ContentFrame::TidyReply {
+                request_id,
+                answer: WireFetch::Refused(err.to_string()),
+            },
+        ),
+    }
+}
+
+/// Downloads one granted read, re-chunks it into the store and records its
+/// manifest, the restore a fetch pass applies per file.
+async fn fetch_settle_one<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: &HubContent,
+    state: &mut HubState,
+    tab: TabId,
+    request_id: u64,
+    file_id: FileId,
+    url: &str,
+) -> bool
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let bytes = match content.http.get(url, None).await {
+        Ok(reply) if reply.status == 200 => reply.body,
+        Ok(reply) => {
+            tracing::warn!(
+                tab = %tab,
+                file_id = %file_id,
+                status = reply.status,
+                "the pinned file's read did not serve its bytes"
+            );
+            return false;
+        }
+        Err(err) => {
+            tracing::warn!(tab = %tab, file_id = %file_id, ?err, "the pinned file's download failed");
+            return false;
+        }
+    };
+    let manifest = match content
+        .archive()
+        .chunk_file(std::io::Cursor::new(&bytes), MimeClass::Generic)
+        .await
+    {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            tracing::warn!(
+                tab = %tab,
+                file_id = %file_id,
+                ?err,
+                "the fetched bytes could not be re-chunked"
+            );
+            return false;
+        }
+    };
+    if manifest.file_id() != file_id {
+        tracing::warn!(
+            tab = %tab,
+            expected = %file_id,
+            actual = %manifest.file_id(),
+            "the fetched bytes are not the pinned file"
+        );
+        return false;
+    }
+    if let Err(err) = content.archive().record_fetched(worker, &manifest) {
+        tracing::warn!(
+            tab = %tab,
+            file_id = %file_id,
+            ?err,
+            "the fetched manifest could not be recorded"
+        );
+        return false;
+    }
+    state
+        .fetch_arrived
+        .entry((tab, request_id))
+        .or_default()
+        .push(file_id);
+    true
+}
+
+/// Answers a tab's fetch or tidy frame on its content lane.
+fn answer_fetch(state: &HubState, tab: TabId, reply: &ContentFrame) {
+    if let Some(entry) = state.tabs.get(&tab) {
+        let _ = entry.out.send(TabOut::Internal(reply.to_json(), None));
     }
 }
 
@@ -3821,15 +4368,46 @@ fn route_resolves(state: &mut HubState, event: &ClientEvent) {
     }
 }
 
-/// Milliseconds until the earliest resolve wait must answer, `None` when no
-/// resolve waits. Never zero, so a cycle never busy-spins on an elapsed
-/// deadline the sweep has not yet collected.
-fn resolve_deadline_ms(pending: &[PendingHubResolve]) -> Option<i32> {
+/// Runs one upstream event past the fetches waiting on tickets, settling
+/// each wait the grant answers for the caller to download.
+fn route_fetch_tickets(
+    state: &mut HubState,
+    event: &ClientEvent,
+) -> Vec<(TabId, u64, FileId, Result<String, ContentError>)> {
+    let mut settled = Vec::new();
+    if state.pending_fetch.is_empty() {
+        return settled;
+    }
+    let mut waiting = Vec::new();
+    for fetch in std::mem::take(&mut state.pending_fetch) {
+        match fetch.ticket.route(event) {
+            ResolveRoute::Settled(result) => {
+                settled.push((fetch.tab, fetch.request_id, fetch.file_id, result));
+            }
+            ResolveRoute::Other => waiting.push(fetch),
+        }
+    }
+    state.pending_fetch = waiting;
+    settled
+}
+
+/// Milliseconds until the earliest of the monotonic `deadlines` falls due,
+/// `None` when there are none. Never zero, so a cycle never busy-spins on an
+/// elapsed deadline the sweep has not yet collected.
+fn earliest_wait_ms(deadlines: impl Iterator<Item = Duration>) -> Option<i32> {
     let now = SystemClock.monotonic();
-    pending
-        .iter()
-        .map(|resolve| wait_ms(resolve.deadline, now))
-        .min()
+    deadlines.map(|deadline| wait_ms(deadline, now)).min()
+}
+
+/// Resolve with the worker's keepalive deadline once it falls due, never when
+/// no socket stands. The wait is at least one millisecond, so a due deadline
+/// still yields to the other wakes.
+async fn keepalive_wake(timer: Option<KeepaliveTimer>) -> KeepaliveTimer {
+    let Some(timer) = timer else {
+        return core::future::pending().await;
+    };
+    sleep_ms(i32::try_from(timer.wait().as_millis().max(1)).unwrap_or(i32::MAX)).await;
+    timer
 }
 
 /// Milliseconds until the worker's armed resend falls due, `None` when none is
@@ -3967,6 +4545,54 @@ fn expire_resolves(state: &mut HubState) {
     }
 }
 
+/// Answers the arrivals to every fetch request whose wait ran out.
+fn expire_fetches(state: &mut HubState) {
+    if state.pending_fetch.is_empty() {
+        return;
+    }
+    let now = SystemClock.monotonic();
+    let mut settled = Vec::new();
+    let mut waiting = Vec::new();
+    for fetch in std::mem::take(&mut state.pending_fetch) {
+        if now >= fetch.deadline {
+            settled.push((fetch.tab, fetch.request_id));
+        } else {
+            waiting.push(fetch);
+        }
+    }
+    state.pending_fetch = waiting;
+    for (tab, request_id) in settled {
+        tracing::warn!(tab = %tab, request_id, "the pinned file's ticket did not answer in time");
+        finish_fetch_if_last(state, tab, request_id);
+    }
+}
+
+/// Answers a fetch request once no ticket the hub holds for it is left.
+fn finish_fetch_if_last(state: &mut HubState, tab: TabId, request_id: u64) {
+    if state
+        .pending_fetch
+        .iter()
+        .any(|fetch| fetch.tab == tab && fetch.request_id == request_id)
+    {
+        return;
+    }
+    let arrived = state
+        .fetch_arrived
+        .remove(&(tab, request_id))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|file_id| *file_id.as_bytes())
+        .collect();
+    answer_fetch(
+        state,
+        tab,
+        &ContentFrame::FetchPinnedReply {
+            request_id,
+            answer: WireFetch::Arrived(arrived),
+        },
+    );
+}
+
 /// Rewrite a tab's logical-named changeset onto the physical backing tables,
 /// returning the bytes unchanged when no table was split.
 fn rename_to_physical(changeset: &[u8], map: &PolicyTables) -> Result<Vec<u8>, RelayError> {
@@ -4094,6 +4720,7 @@ where
             Ok(())
         }
         ClientEvent::SnapshotEnd { sub_id } => {
+            state.refused_upstreams.remove(&sub_id);
             if let Some(reason) = state.resyncing.remove(&sub_id) {
                 resnapshot_after_resync(worker, state, &sub_id, &reason)?;
             }
@@ -4310,8 +4937,9 @@ fn send_tab_rate_limited(tab: &TabState, related_to: &str, retry_after_ms: u64) 
 /// tab subscription. A row upstream maps to every tab subscription reading one
 /// of its tables, mirroring the resync fan-out, so a rejected replica feed
 /// surfaces on each affected tab rather than vanishing. An error the hub cannot
-/// correlate to a tab is dropped.
-fn forward_worker_nonfatal(state: &HubState, related_to: Option<&str>, detail: &str) {
+/// correlate to a tab is dropped. A refusal of one of its own upstream
+/// subscriptions is also recorded, so a tab arriving later learns of it.
+fn forward_worker_nonfatal(state: &mut HubState, related_to: Option<&str>, detail: &str) {
     let Some(upstream) = related_to else {
         return;
     };
@@ -4321,12 +4949,17 @@ fn forward_worker_nonfatal(state: &HubState, related_to: Option<&str>, detail: &
         }
         return;
     }
-    let Some(tables) = state.resync_tables.get(upstream) else {
+    let Some(tables) = state.resync_tables.get(upstream).cloned() else {
         return;
     };
+    if detail == SUBSCRIPTION_REFUSED {
+        state
+            .refused_upstreams
+            .insert(upstream.to_owned(), tables.clone());
+    }
     for tab in state.tabs.values() {
         for sub in &tab.subs {
-            if !sub.tables.is_disjoint(tables) {
+            if !sub.tables.is_disjoint(&tables) {
                 send_tab_nonfatal(tab, &sub.sub_id, detail);
             }
         }
@@ -5384,6 +6017,7 @@ mod tests {
             &mut HashMap::new(),
             &mut blank,
             &local,
+            &std::collections::HashSet::new(),
             &mut tab,
             1,
             subscribe,

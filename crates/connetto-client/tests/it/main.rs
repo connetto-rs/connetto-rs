@@ -45,6 +45,7 @@ mod gate_recheck;
 mod grouped_live;
 
 mod hardening;
+mod keepalive;
 
 mod key_requirement;
 
@@ -104,6 +105,7 @@ mod shared_reads;
 mod shared_store;
 
 mod sql_functions;
+mod subscription_refusal;
 
 mod synced_references;
 
