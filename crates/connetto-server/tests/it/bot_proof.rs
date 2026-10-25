@@ -65,7 +65,7 @@ diesel::table! {
 fn insert_t(id: i32) -> Vec<u8> {
     insert_changeset(
         "t",
-        &["id", "file_id", "label"],
+        &[("id", "INTEGER"), ("file_id", "BLOB"), ("label", "TEXT")],
         &[0],
         vec![
             RowValue::Integer(i64::from(id)),

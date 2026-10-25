@@ -75,7 +75,7 @@ async fn await_registered(server: &Server, expected: usize) {
 fn note(id: i64, body: &str) -> Vec<u8> {
     insert_changeset(
         "notes",
-        &["id", "body", "edited_at"],
+        &[("id", "INTEGER"), ("body", "TEXT"), ("edited_at", "TEXT")],
         &[0],
         vec![
             Value::Integer(id),

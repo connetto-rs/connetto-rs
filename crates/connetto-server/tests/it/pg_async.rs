@@ -81,7 +81,11 @@ diesel::table! {
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
 
 fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
-    let table = SimpleTable::new("notes", &["id", "body", "edited_at"], &[0]);
+    let table = SimpleTable::with_rowid_alias(
+        "notes",
+        &[("id", "INTEGER"), ("body", "TEXT"), ("edited_at", "TEXT")],
+        0,
+    );
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(id))
         .expect("set id")

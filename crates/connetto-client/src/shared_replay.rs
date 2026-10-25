@@ -437,7 +437,11 @@ mod tests {
     const CHECKED: &str = "(id INTEGER PRIMARY KEY, val INTEGER, CHECK (val > 0))";
 
     fn notes_schema() -> SimpleTable {
-        SimpleTable::new("notes", &["id", "title", "body"], &[0])
+        SimpleTable::with_rowid_alias(
+            "notes",
+            &[("id", "INTEGER"), ("title", "TEXT"), ("body", "TEXT")],
+            0,
+        )
     }
 
     fn shared_set() -> HashSet<String> {
@@ -604,7 +608,16 @@ mod tests {
     fn a_wider_frame_is_skipped_like_native() {
         // The local table has three columns; the frame section has four, so
         // both sides must skip it and leave the seeded row standing.
-        let wide = SimpleTable::new("notes", &["id", "title", "body", "extra"], &[0]);
+        let wide = SimpleTable::with_rowid_alias(
+            "notes",
+            &[
+                ("id", "INTEGER"),
+                ("title", "TEXT"),
+                ("body", "TEXT"),
+                ("extra", ""),
+            ],
+            0,
+        );
         let frame: Vec<u8> = Patchset::new()
             .insert(
                 PatchInsert::from(wide.clone())
@@ -686,7 +699,11 @@ mod tests {
 
     #[test]
     fn nulls_and_blobs_match_native() {
-        let schema = SimpleTable::new("notes", &["id", "payload", "label"], &[0]);
+        let schema = SimpleTable::with_rowid_alias(
+            "notes",
+            &[("id", "INTEGER"), ("payload", "BLOB"), ("label", "TEXT")],
+            0,
+        );
         let frame: Vec<u8> = Patchset::new()
             .insert(
                 PatchInsert::from(schema.clone())
@@ -739,7 +756,7 @@ mod tests {
 
     #[test]
     fn composite_keys_match_native() {
-        let schema = SimpleTable::new("notes", &["a", "b", "c"], &[0, 1]);
+        let schema = SimpleTable::new("notes", &[("a", "TEXT"), ("b", "INTEGER"), ("c", "TEXT")], &[0, 1]);
         let comp_insert = |schema: &SimpleTable, a: &str, b: i64, c: &str| {
             PatchInsert::from(schema.clone())
                 .set(0, a)
@@ -796,7 +813,7 @@ mod tests {
 
     #[test]
     fn a_check_violation_is_omitted_like_native() {
-        let schema = SimpleTable::new("notes", &["id", "val"], &[0]);
+        let schema = SimpleTable::with_rowid_alias("notes", &[("id", "INTEGER"), ("val", "INTEGER")], 0);
         let checked_insert = |schema: &SimpleTable, id: i64, val: i64| {
             PatchInsert::from(schema.clone())
                 .set(0, id)
@@ -834,7 +851,7 @@ mod tests {
     fn a_replace_conflict_omitted_by_check_matches_native() {
         // A stored id 1 meets an incoming id 1 the CHECK refuses: the native
         // apply is the oracle for whether the stored row survives.
-        let schema = SimpleTable::new("notes", &["id", "val"], &[0]);
+        let schema = SimpleTable::with_rowid_alias("notes", &[("id", "INTEGER"), ("val", "INTEGER")], 0);
         let frame: Vec<u8> = Patchset::new()
             .insert(
                 PatchInsert::from(schema)

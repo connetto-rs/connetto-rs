@@ -65,7 +65,7 @@ diesel-async = { version = "0.9", default-features = false, features = [
   "bb8",
 ] }
 # Building the mutation changeset a client uploads.
-sqlite-diff-rs = { version = "0.15", default-features = false }
+sqlite-diff-rs = { version = "0.16", default-features = false }
 # Compressing the uploaded changeset, matching the wire format.
 zstd = "0.13"
 # Naming the Postgres dialect when parsing the catalog DDL for the CDC source.
@@ -124,7 +124,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # The smoke test reads a table back through the admin pool with a typed row.
 diesel = { workspace = true, features = ["postgres_backend"] }
 # Building the row a mutation uploads, in the outage proof.
-sqlite-diff-rs = { version = "0.15", default-features = false }
+sqlite-diff-rs = { version = "0.16", default-features = false }
 # A stand-in adb for the Android proof's offline-recovery tests.
 tempfile = "3"
 

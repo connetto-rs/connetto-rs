@@ -73,7 +73,11 @@ impl SnapshotSource for SeedSnapshot {
         _auth: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
-        let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
+        let table = SimpleTable::with_rowid_alias(
+            "orders",
+            &[("id", "INTEGER"), ("price", "REAL"), ("quantity", "INTEGER"), ("status", "TEXT")],
+            0,
+        );
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
             .expect("set id")
@@ -503,7 +507,11 @@ impl SnapshotSource for SeedReadings {
     ) -> Result<SnapshotPage, Self::Error> {
         let table = SimpleTable::new(
             "readings",
-            &["tenant_id", "reading_id", "quantity"],
+            &[
+                ("tenant_id", "INTEGER"),
+                ("reading_id", "INTEGER"),
+                ("quantity", "INTEGER"),
+            ],
             &[0, 1],
         );
         let row1 = Insert::<_, String, Vec<u8>>::from(table.clone())

@@ -606,7 +606,11 @@ fn items_payload(rows: &[(i32, &str)]) -> Vec<u8> {
     let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
     for &(id, label) in rows {
         let insert =
-            Insert::<_, String, Vec<u8>>::from(SimpleTable::new("items", &["id", "label"], &[0]))
+            Insert::<_, String, Vec<u8>>::from(SimpleTable::with_rowid_alias(
+                "items",
+                &[("id", "INTEGER"), ("label", "TEXT")],
+                0,
+            ))
                 .set(0, Value::Integer(i64::from(id)))
                 .expect("set the id")
                 .set(1, Value::Text(label.to_owned()))

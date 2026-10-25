@@ -2358,8 +2358,13 @@ impl Client {
 
 /// Build a compressed-on-upload changeset that inserts one fully specified row.
 ///
-/// `columns` names the row's columns in order, `pk` gives the primary-key
-/// column indices, and `values` gives one value per column in `columns` order.
+/// `columns` gives the row's columns in order as `(name, declared type)`
+/// pairs, with `""` for a column whose SQL schema declares no type, `pk`
+/// gives the primary-key column indices, and `values` gives one value per
+/// column in `columns` order.
+///
+/// A lone primary-key column declared `INTEGER` is carried as the rowid
+/// alias SQLite gives it.
 ///
 /// # Panics
 ///
@@ -2367,11 +2372,19 @@ impl Client {
 #[must_use]
 pub fn insert_changeset(
     table: &str,
-    columns: &[&str],
+    columns: &[(&str, &str)],
     pk: &[usize],
     values: Vec<RowValue>,
 ) -> Vec<u8> {
-    let simple = SimpleTable::new(table, columns, pk);
+    let simple = if pk.len() == 1
+        && columns
+            .get(pk[0])
+            .is_some_and(|&(_, declared)| declared.eq_ignore_ascii_case("INTEGER"))
+    {
+        SimpleTable::with_rowid_alias(table, columns, pk[0])
+    } else {
+        SimpleTable::new(table, columns, pk)
+    };
     let mut insert = Insert::<_, String, Vec<u8>>::from(simple);
     for (index, value) in values.into_iter().enumerate() {
         insert = insert.set(index, value).expect("set column");

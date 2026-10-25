@@ -60,10 +60,10 @@ enum Answer {
 
 /// Compressed changeset bytes inserting the one served photo.
 fn photo_row() -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
+    let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::with_rowid_alias(
         "photos",
-        &["id", "content_state"],
-        &[0],
+        &[("id", "INTEGER"), ("content_state", "TEXT")],
+        0,
     ))
     .set(0, Value::Integer(1))
     .expect("set id")

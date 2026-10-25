@@ -44,7 +44,11 @@ diesel::table! {
 fn snapshot_payload(table: &str, rows: &[(i64, i64)]) -> Vec<u8> {
     let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
     for &(id, quantity) in rows {
-        let table = SimpleTable::new(table, &["id", "quantity"], &[0]);
+        let table = SimpleTable::with_rowid_alias(
+            table,
+            &[("id", "INTEGER"), ("quantity", "INTEGER")],
+            0,
+        );
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(id))
             .expect("set id")
