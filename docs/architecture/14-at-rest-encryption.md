@@ -120,6 +120,8 @@ A re-check that fires pauses the application and keeps the session. The client r
 
 The input is **one fixed value, not per identity**, producing one key-encryption key that unwraps per-identity records. R23's original argument for a fixed input was that the refresh store must open before any identity is known, and R90 deletes the store that needed it (**Decided (R90, 2026-09-22)**). The decision stands on the reason that outlives the store: erasing one account without touching another is the job per-identity keys actually have, the per-identity wrapped records already provide it, and one gesture on a shared profile must open every account's replica rather than the remembered one.
 
+Each enrolment uses a fresh random WebAuthn `user.id`, so independent origins or browser profiles sharing an authenticator retain separate credentials even when their relying-party domain matches. The stored credential identifier selects the passkey on later launches. After boot verifies the user, the relay gate starts open and asks again only under the configured away-and-return policy.
+
 Storage becomes:
 
 | Store | Contents |
@@ -177,7 +179,7 @@ The reason the reporting surface carries must nonetheless distinguish the two, b
 | gated and open | durable, key opened through the gate | `Verified` | the gate's prompt approved |
 | gated and locked | durable, key behind the gate | `Verified`, since only access is paused | a launch before approval, whether a browser boot or a native first sign-in that has verified nothing yet, or a re-check that fired |
 
-The inputs. Went away and came back are moments, each a sleep-counting monotonic reading and a wall reading, and the client keeps at most one pending away moment. Time away is the larger of the two deltas, a negative one read as zero. The grace is `Gate`'s re-check setting. Absent means once per launch, zero means every return, and otherwise a return re-checks when time away exceeds it. The browser worker counts the application away when no tab of the origin is visible, and `connetto-dioxus` reports window focus on the desktop and tao's `Suspended` and `Resumed` on iOS and Android.
+The inputs. Went away and came back are moments, each a sleep-counting monotonic reading and a wall reading, and the client keeps at most one pending away moment. Time away is the larger of the two deltas, a negative one read as zero. Chapter 21 names each platform's sleep-counting clock, and the wall reading covers a browser whose `performance.now()` stops in sleep. The grace is `Gate`'s re-check setting. Absent means once per launch, zero means every return, and otherwise a return re-checks when time away exceeds it. The browser worker counts the application away when no tab of the origin is visible, and `connetto-dioxus` reports window focus on the desktop and tao's `Suspended` and `Resumed` on iOS and Android.
 
 | Event | anonymous | signed in without a gate | gated and open | gated and locked |
 |---|---|---|---|---|

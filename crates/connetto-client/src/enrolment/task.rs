@@ -12,6 +12,7 @@ use std::collections::HashMap;
 #[cfg(feature = "peer")]
 use std::net::SocketAddr;
 
+use connetto_core::clock::DEVICE_SKEW;
 #[cfg(feature = "peer")]
 use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::device_cert::{
@@ -27,7 +28,7 @@ use connetto_peer::{CloseReason, DiscoveryEvent, EXCHANGE_BOUND, LinkError, Peer
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use super::{Answer, Held, KeptList, Standing, TOLERANCE, half_life};
+use super::{Answer, Held, KeptList, Standing, half_life};
 #[cfg(feature = "peer")]
 use crate::PeerError;
 #[cfg(feature = "peer")]
@@ -37,7 +38,7 @@ use crate::device_key::{ChipError, ChipKeys, KeyRecords, OpenedKey};
 use crate::hotspot::{HOST_BOUND, HotspotError, HotspotOffer, JOIN_BOUND, JoinError, MARGIN};
 #[cfg(all(feature = "peer", target_os = "android"))]
 use crate::multicast::MulticastLock;
-use crate::{ClientError, ClientEvent};
+use crate::{ClientError, ClientEvent, ConnectionNumber};
 
 /// How long one answer is waited for.
 const ANSWER_WAIT: Duration = Duration::from_secs(30);
@@ -125,8 +126,9 @@ pub(crate) trait Link: Send + Sync + 'static {
     fn emit(&self, event: ClientEvent);
     /// Resolves once the pump has ended.
     fn ended(&self) -> impl Future<Output = ()> + Send;
-    /// Whether a transport is attached.
-    fn connected(&self) -> impl Future<Output = bool> + Send;
+    /// The number of the connection a transport stands on, `None` while no
+    /// transport is attached.
+    fn connection(&self) -> impl Future<Output = Option<ConnectionNumber>> + Send;
     /// Send `msg`, answered quoting `request_id`.
     fn ask(
         &self,
@@ -658,11 +660,11 @@ pub(super) fn next_look(held: Option<&Held>, now: SystemTime) -> Duration {
         // The expiry wake reaches the exact moment, so a link never outlives
         // the window by the look's slack (R76 decision 9), and the hourly look
         // still retries a renewal and catches a jumped clock.
-        Standing::Aging => (end + TOLERANCE)
+        Standing::Aging => (end + DEVICE_SKEW)
             .duration_since(now)
             .unwrap_or_default()
             .min(RECHECK),
-        Standing::ClockOff => (start - TOLERANCE)
+        Standing::ClockOff => (start - DEVICE_SKEW)
             .duration_since(now)
             .unwrap_or_default()
             .min(RECHECK),
@@ -730,6 +732,9 @@ struct Run<L: Link> {
     attestation_refused: bool,
     /// Revocation is terminal for this open.
     revoked: bool,
+    /// The connection the task last acted on as a connection, so the notice
+    /// of a connection it already read as up asks nothing.
+    acted: Option<ConnectionNumber>,
     /// The peer node the task drives, its listener address and the standing
     /// it last acted on (R76).
     #[cfg(feature = "peer")]
@@ -1249,6 +1254,9 @@ impl<L: Link> Run<L> {
     /// "Wall clock changes, or the hourly look"). The hourly look never
     /// renews a certificate the local clock puts outside its window.
     async fn on_connected(&mut self, by_look: bool) {
+        if !by_look {
+            self.acted = self.link.connection().await;
+        }
         // A refused level cannot change, so a refused device asks again only
         // on its next connection, never on the hourly look (lifecycle row
         // "Refused as attestation required").
@@ -1317,6 +1325,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         withdrawn: None,
         attestation_refused: false,
         revoked: false,
+        acted: None,
         #[cfg(feature = "peer")]
         peer: peer.node,
         #[cfg(feature = "peer")]
@@ -1346,7 +1355,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
     }
     // Lifecycle row "Opened with the replica".
     let _ = run.stand_by().await;
-    let mut due = run.link.connected().await;
+    let mut due = run.link.connection().await.is_some();
     let mut by_look = false;
     let mut steering = true;
     loop {
@@ -1374,8 +1383,11 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
             () = run.link.ended() => break,
             event = events.recv() => match event {
                 Ok(ClientEvent::SyncStatus(SyncStatus::Connected)) | Err(RecvError::Lagged(_)) => {
-                    run.attestation_refused = false;
-                    due = true;
+                    let connection = run.link.connection().await;
+                    if connection.is_some() && connection != run.acted {
+                        run.attestation_refused = false;
+                        due = true;
+                    }
                 }
                 Ok(ClientEvent::ServerClosed { reason: FatalErrorReason::DeviceRevoked }) => {
                     run.revoked().await;
@@ -1385,7 +1397,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
             },
             command = run.enroller.commands.recv(), if steering => match command {
                 Some(Command::Reissue { lifetime, reply }) => {
-                    let outcome = if run.link.connected().await {
+                    let outcome = if run.link.connection().await.is_some() {
                         run.request(Some(lifetime), false).await
                     } else {
                         Err(CertificateError::Offline)
@@ -1400,7 +1412,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 }
                 Some(Command::WriterRetired) => {
                     run.retired_writer().await;
-                    due = run.link.connected().await;
+                    due = run.link.connection().await.is_some();
                 }
                 #[cfg(feature = "peer")]
                 Some(Command::CertificateExpired) => {
@@ -1411,7 +1423,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
             Some(lists) = run.enroller.lists.recv() => {
                 run.take_lists(lists).await;
                 if run.withdrawn.is_some() {
-                    due = run.link.connected().await;
+                    due = run.link.connection().await.is_some();
                 }
             }
             peer = run.peer_events.next() => {
@@ -1428,7 +1440,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                         PeerEvent::ListReceived { list, signer } => {
                             run.take_lists(vec![SignedList { list, signer }]).await;
                             if run.withdrawn.is_some() {
-                                due = run.link.connected().await;
+                                due = run.link.connection().await.is_some();
                             }
                         }
                     }
@@ -1454,7 +1466,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
             },
             () = tokio::time::sleep(look) => {
                 let _ = run.stand_by().await;
-                due = run.link.connected().await;
+                due = run.link.connection().await.is_some();
                 by_look = true;
             }
         }

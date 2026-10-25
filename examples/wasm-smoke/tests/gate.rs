@@ -87,40 +87,23 @@ fn first_credential(data: &wasm_bindgen::JsValue) -> String {
 /// The worker calls `db_worker_gate_boot()` instead of the stock
 /// `db_worker_boot()`. The bootstrap is a blob module so no extra script file
 /// is needed, mirroring the `WorkerBootstrap::Generated` pattern.
-fn spawn_gate_worker(glue_url: &str, grace_ms: u32) -> Worker {
+fn spawn_gate_worker(
+    glue_url: &str,
+    grace_ms: u32,
+) -> (Worker, connetto_web::workers::BootIdentity) {
     spawn_gate_worker_calling(glue_url, &format!("db_worker_gate_boot({grace_ms})"))
 }
 
 /// Spawn a gate worker whose bootstrap awaits `call` on the glue module.
-fn spawn_gate_worker_calling(glue_url: &str, call: &str) -> Worker {
-    let wasm_url = glue_url
-        .strip_suffix(".js")
-        .map_or_else(|| format!("{glue_url}_bg.wasm"), |b| format!("{b}_bg.wasm"));
-    // This blob carries no boot identity, so its failures reach the debug channel only.
-    let source = format!(
-        "try {{\
-         \n  const mod = await import(\"{g}\");\
-         \n  await mod.default({{ module_or_path: \"{w}\" }});\
-         \n  await mod.{call};\
-         \n}} catch (err) {{\
-         \n  new BroadcastChannel(\"connetto-debug\").postMessage(\"db worker FAILED: \" + err);\
-         \n  throw err;\
-         \n}}\n",
-        g = glue_url,
-        w = wasm_url,
-    );
-    let parts = js_sys::Array::of1(&wasm_bindgen::JsValue::from_str(&source));
-    let blob_opts = web_sys::BlobPropertyBag::new();
-    blob_opts.set_type("text/javascript");
-    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &blob_opts)
-        .expect("bootstrap blob");
-    let url = web_sys::Url::create_object_url_with_blob(&blob).expect("bootstrap url");
-    let worker_opts = web_sys::WorkerOptions::new();
-    worker_opts.set_type(web_sys::WorkerType::Module);
-    worker_opts.set_name("connetto-db-gate");
-    let worker = web_sys::Worker::new_with_options(&url, &worker_opts).expect("spawn gate worker");
-    let _ = web_sys::Url::revoke_object_url(&url);
-    worker
+fn spawn_gate_worker_calling(
+    glue_url: &str,
+    call: &str,
+) -> (Worker, connetto_web::workers::BootIdentity) {
+    connetto_web::workers::spawn_db_worker(
+        glue_url,
+        &connetto_web::workers::WorkerBootstrap::GeneratedCalling(call.to_owned()),
+    )
+    .expect("spawn the gate worker")
 }
 
 /// Install the one-time `onmessage` handler on `worker` that answers its
@@ -330,7 +313,7 @@ async fn spawn_worker_with_prompt_handler(
     grace_ms: u32,
 ) -> (Worker, Rc<RefCell<Option<wasm_bindgen::JsValue>>>) {
     let prompts: Rc<RefCell<Option<wasm_bindgen::JsValue>>> = Rc::new(RefCell::new(None));
-    let worker = spawn_gate_worker(&glue_url(), grace_ms);
+    let (worker, _boot) = spawn_gate_worker(&glue_url(), grace_ms);
     install_prompt_handler(&worker, Rc::clone(&prompts));
     (worker, prompts)
 }
@@ -347,11 +330,14 @@ async fn a_durable_boot_with_no_gate_setting_is_gated() {
     plant_enrolled_credential(SEED, 0x05).await;
     common::play_the_tab();
     let prompts: Rc<RefCell<Option<wasm_bindgen::JsValue>>> = Rc::new(RefCell::new(None));
-    let worker = spawn_gate_worker_calling(&glue_url(), "db_worker_default_gate_boot()");
+    let (worker, _boot) = spawn_gate_worker_calling(&glue_url(), "db_worker_default_gate_boot()");
     install_prompt_handler(&worker, Rc::clone(&prompts));
     await_db_worker_ready(&[])
         .await
         .expect("the default boot unlocks through the ceremony and is ready");
+    let tab = connect_gate_tab("gate-tab-default").await;
+    assert_open(&tab).await;
+    assert!(prompts.borrow().is_none(), "boot needs one approval");
     worker.terminate();
     stage("gate test: done");
 }
@@ -367,8 +353,9 @@ async fn a_locked_gate_refuses_the_tabs_that_attach_while_it_is_locked() {
     stage("gate test: waiting for worker ready");
     await_db_worker_ready(&[]).await.expect("db worker ready");
 
-    // Hold the gate's launch prompt unanswered, so the gate stays locked.
-    stage("gate test: holding the launch prompt");
+    post_visibility("gate-tab-a", true);
+    post_visibility("gate-tab-a", false);
+    post_visibility("gate-tab-a", true);
     await_prompt(&prompts).await;
 
     let tab_a = connect_gate_tab("gate-tab-a").await;
@@ -392,13 +379,9 @@ async fn tab_visibility_aggregates_the_gate_lock_on_every_return() {
     stage("gate test: aggregation");
     plant_enrolled_credential(SEED, 0x02).await;
     common::play_the_tab();
-    let (worker, prompts) = spawn_worker_with_prompt_handler(0).await;
+    let (worker, _prompts) = spawn_worker_with_prompt_handler(0).await;
 
     await_db_worker_ready(&[]).await.expect("db worker ready");
-    stage("gate test: answering the launch prompt");
-    await_prompt(&prompts).await;
-    let launch = prompts.borrow_mut().take().expect("the launch prompt");
-    answer_prompt(&worker, launch).await;
 
     let tab_a = connect_gate_tab("gate-tab-agga").await;
     let tab_b = connect_gate_tab("gate-tab-aggb").await;
@@ -441,12 +424,9 @@ async fn a_closing_tab_counts_as_hidden_for_the_gate() {
     stage("gate test: closing tab counts as hidden");
     plant_enrolled_credential(SEED, 0x03).await;
     common::play_the_tab();
-    let (worker, prompts) = spawn_worker_with_prompt_handler(0).await;
+    let (worker, _prompts) = spawn_worker_with_prompt_handler(0).await;
 
     await_db_worker_ready(&[]).await.expect("db worker ready");
-    await_prompt(&prompts).await;
-    let launch = prompts.borrow_mut().take().expect("the launch prompt");
-    answer_prompt(&worker, launch).await;
 
     let tab_a = connect_gate_tab("gate-tab-clsa").await;
     let tab_b = connect_gate_tab("gate-tab-clsb").await;
@@ -487,9 +467,6 @@ async fn an_approval_unlocks_every_tab() {
     let (worker, prompts) = spawn_worker_with_prompt_handler(0).await;
 
     await_db_worker_ready(&[]).await.expect("db worker ready");
-    await_prompt(&prompts).await;
-    let launch = prompts.borrow_mut().take().expect("the launch prompt");
-    answer_prompt(&worker, launch).await;
 
     let tab_a = connect_gate_tab("gate-tab-unla").await;
     let tab_b = connect_gate_tab("gate-tab-unlb").await;

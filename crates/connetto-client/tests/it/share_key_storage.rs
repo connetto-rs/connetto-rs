@@ -825,17 +825,19 @@ async fn an_expiry_save_failure_terminates_recovery_during_backoff_or_dial() {
             .expect("open offline replica");
         let client = running.client();
         client.with_conn(seed).await.expect("seed cached rows");
-        let query: connetto_client::LiveQuery<i32> = client
-            .watch(visible::table.select(visible::id).order(visible::id))
-            .await
-            .expect("watch policy rows");
+        // The key's five seconds start after setup, so a slow setup cannot
+        // spend them before recovery runs.
         let token = authority
             .mint_capability(&subject, SystemTime::now(), Duration::from_secs(5))
             .expect("short-lived key");
         client
             .add_share_key(&Grant::new(token), &subject)
             .await
-            .expect("add the expiry key");
+            .expect("hold the short-lived key");
+        let query: connetto_client::LiveQuery<i32> = client
+            .watch(visible::table.select(visible::id).order(visible::id))
+            .await
+            .expect("watch policy rows");
         assert_eq!(query.rows(), vec![1]);
         let mut events = client.events();
         share.set_refusal("recovery expiry refused");

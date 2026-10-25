@@ -3,9 +3,10 @@
 
 use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, ConnettoClient, DataDir, MemoryRefreshStore,
+    SyncStatus,
 };
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, LivePatch, WriterGrant,
+    BulkMessage, ControlMessage, FatalError, FatalErrorReason, LivePatch,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use diesel::connection::SimpleConnection;
@@ -17,6 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tempfile::tempdir;
+
+use super::support::handshake_ack as ack;
 
 const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 const BOUND: Duration = Duration::from_secs(5);
@@ -112,21 +115,6 @@ impl Transport for Script {
         self.closed.store(true, Ordering::Release);
         ready(Ok(()))
     }
-}
-
-fn ack() -> IncomingFrame {
-    IncomingFrame::Control(ControlMessage::HandshakeAck(HandshakeAck {
-        connection_id: "script".to_owned(),
-        session_token: "script".to_owned(),
-        resume_token: "script".to_owned(),
-        current_cursor: connetto_core::Cursor::from(Vec::new()),
-        schema_version: None,
-        initial_credits: 64,
-        writer: Some(WriterGrant {
-            number: 1,
-            frontier: 0,
-        }),
-    }))
 }
 
 async fn client() -> (
@@ -350,7 +338,9 @@ async fn a_local_fault_on_the_drain_side_stops_the_pump_the_same_way() {
 }
 
 /// Every event up to the driver's first redial, refusing a stop on the way.
-async fn until_reconnecting(events: &mut tokio::sync::broadcast::Receiver<ClientEvent>) {
+async fn until_reconnecting(
+    events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
+) -> Vec<ClientEvent> {
     let mut seen = Vec::new();
     loop {
         let event = tokio::time::timeout(BOUND, events.recv())
@@ -362,14 +352,16 @@ async fn until_reconnecting(events: &mut tokio::sync::broadcast::Receiver<Client
             "a lost socket is recovered, never a stop, saw {seen:?} then {event:?}"
         );
         if matches!(event, ClientEvent::Reconnecting { .. }) {
-            return;
+            return seen;
         }
         seen.push(event);
     }
 }
 
-/// The socket dies as a local write is uploaded. That is a transport to go
-/// and find, so the driver redials and the pump never announces a stop.
+/// The socket dies as a local write is uploaded, and the redial keeps
+/// failing. That is a transport to go and find, so the driver redials, the
+/// pump never announces a stop, and the app hears the client is offline
+/// before the first redial rather than once one lands.
 #[tokio::test]
 async fn a_socket_lost_while_uploading_a_write_is_recovered() {
     let (client, script, _dir, _pump) = client().await;
@@ -384,7 +376,11 @@ async fn a_socket_lost_while_uploading_a_write_is_recovered() {
         })
         .await
         .expect("the write lands locally");
-    until_reconnecting(&mut events).await;
+    let seen = until_reconnecting(&mut events).await;
+    assert!(
+        seen.contains(&ClientEvent::SyncStatus(SyncStatus::Offline)),
+        "the loss is announced before the redial, saw {seen:?}"
+    );
 }
 
 /// The server ends the session with no reconnect driver to resume it, so the

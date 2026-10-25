@@ -13,8 +13,9 @@ use connetto_client::{
     TransportFactory,
 };
 use connetto_core::ReplicaKey;
+use connetto_core::messages::ControlMessage;
 use connetto_core::schema::SchemaBundle;
-use connetto_core::traits::{MaybeSend, ReplicaKeyStore, Transport};
+use connetto_core::traits::{IncomingFrame, MaybeSend, ReplicaKeyStore, Transport};
 use connetto_server::openfga::{GrantMove, StoreUpkeep, UpkeepError};
 
 /// Authorization metadata for static policies that do not depend on share keys.
@@ -185,4 +186,163 @@ impl ReplicaKeyStore for SharedKeys {
     fn protection(&self) -> Custody {
         Custody::Unverified(NoGate::Unsupported)
     }
+}
+
+/// One row of the durable pending queue, read raw because `_connetto_pending`
+/// is an internal table the typed schema does not name.
+#[derive(diesel::QueryableByName)]
+struct PendingRow {
+    #[diesel(sql_type = diesel::sql_types::Binary)]
+    changeset: Vec<u8>,
+}
+
+/// The tables a captured changeset names, read from the durable pending record.
+///
+/// # Panics
+///
+/// When the record is absent or does not parse as a changeset.
+#[must_use]
+pub fn captured_tables(replica: &mut diesel::SqliteConnection, seq: u64) -> Vec<String> {
+    use diesel::RunQueryDsl as _;
+    use sqlite_diff_rs::ParsedDiffSet;
+
+    // The test sequence is a small counter, so it fits the pending i64 column.
+    let seq: i64 = i64::try_from(seq).expect("a test sequence fits an i64");
+    let row: PendingRow =
+        diesel::sql_query("SELECT changeset FROM _connetto_pending WHERE seq = ?")
+            .bind::<diesel::sql_types::BigInt, _>(seq)
+            .get_result(replica)
+            .expect("the pending record is durable");
+    let ParsedDiffSet::Changeset(set) =
+        ParsedDiffSet::parse(&row.changeset).expect("a captured changeset parses")
+    else {
+        panic!("the captured record is not a changeset");
+    };
+    set.iter().map(|op| op.table().name().to_owned()).collect()
+}
+
+/// A scripted server or relay that records every control frame the client
+/// sends and serves the frames a test queues, idling while none are queued.
+#[derive(Clone, Default)]
+pub struct Script {
+    frames: std::sync::Arc<parking_lot::Mutex<std::collections::VecDeque<IncomingFrame>>>,
+    sent: std::sync::Arc<parking_lot::Mutex<Vec<ControlMessage>>>,
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The scripted socket after a close.
+#[derive(Debug, thiserror::Error)]
+pub enum Gone {
+    #[error("the scripted socket is gone")]
+    Closed,
+}
+
+impl Script {
+    /// Queue `frame` for the client's next receive.
+    pub fn say(&self, frame: IncomingFrame) {
+        self.frames.lock().push_back(frame);
+    }
+
+    /// Drop the wire from the script's side, as a lost socket does.
+    pub fn hang_up(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether either side closed the wire.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The sent control frames `pick` selects, in the order they were sent.
+    pub fn sent<T>(&self, pick: impl FnMut(&ControlMessage) -> Option<T>) -> Vec<T> {
+        self.sent.lock().iter().filter_map(pick).collect()
+    }
+
+    /// The share-key replacements the client sent.
+    pub fn replacements(&self) -> Vec<connetto_core::messages::ReplaceShareKeys> {
+        self.sent(|message| match message {
+            ControlMessage::ReplaceShareKeys(replacement) => Some(replacement.clone()),
+            _ => None,
+        })
+    }
+}
+
+impl Transport for Script {
+    type Error = Gone;
+
+    fn send_control(
+        &mut self,
+        message: ControlMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        self.sent.lock().push(message);
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            std::future::ready(Err(Gone::Closed))
+        } else {
+            std::future::ready(Ok(()))
+        }
+    }
+
+    fn send_bulk(
+        &mut self,
+        _message: connetto_core::messages::BulkMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        std::future::ready(Ok(()))
+    }
+
+    fn recv(&mut self) -> impl Future<Output = Result<Option<IncomingFrame>, Self::Error>> {
+        let frames = std::sync::Arc::clone(&self.frames);
+        let closed = std::sync::Arc::clone(&self.closed);
+        async move {
+            loop {
+                if closed.load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(None);
+                }
+                if let Some(frame) = frames.lock().pop_front() {
+                    return Ok(Some(frame));
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        std::future::ready(Ok(()))
+    }
+}
+
+/// The handshake answer a scripted server gives, granting writer number 1.
+pub fn handshake_ack() -> IncomingFrame {
+    IncomingFrame::Control(ControlMessage::HandshakeAck(
+        connetto_core::messages::HandshakeAck {
+            connection_id: "script".to_owned(),
+            session_token: "script".to_owned(),
+            resume_token: "script".to_owned(),
+            current_cursor: connetto_core::Cursor::from(Vec::new()),
+            schema_version: None,
+            initial_credits: 64,
+            writer: Some(connetto_core::messages::WriterGrant {
+                number: 1,
+                frontier: 0,
+            }),
+        },
+    ))
+}
+
+/// One `notes` table behind a `visible` view showing the caller's rows and the
+/// rows of every share-key subject it holds.
+pub fn key_gated_notes() -> SyncSchema {
+    SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
+         CREATE VIEW visible AS SELECT * FROM notes \
+         WHERE owner = current_app_user() \
+            OR instr(',' || current_app_subjects() || ',', ',' || owner || ',') > 0;",
+        Vec::<(String, String)>::new(),
+        vec!["visible".to_owned()],
+        None::<&str>,
+    ))
 }

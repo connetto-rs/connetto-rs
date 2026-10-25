@@ -21,7 +21,8 @@ use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
     ControlMessage, FatalErrorReason, GateState, Handshake, MutationHeader, MutationPatch,
     MutationReject, MutationRejectReason, Ping, Provenance, ReplaceShareKeys, RetireWriter,
-    Subscribe, SubscriptionSpec, TabIdentity, Unsubscribe, WriterAnswer,
+    SUBSCRIPTION_REFUSED, ShareKeyChange, Subscribe, SubscriptionSpec, TabIdentity,
+    TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, Unsubscribe, WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -87,6 +88,7 @@ mod multicast;
 pub mod reconnect;
 pub mod replica;
 pub mod share_keys;
+mod shared_replay;
 mod subscriptions;
 
 #[cfg(feature = "peer")]
@@ -183,6 +185,12 @@ pub enum ClientError {
     /// (R91), so the app's transaction rolls back whole and nothing uploads.
     #[error("the install was refused: {0}")]
     InstallRefused(String),
+    /// The server refused the handle's subscription with the wire's one fixed
+    /// phrase. The snapshot never arrives, so a live handle's `changed`
+    /// returns this instead of waiting, and the text is the phrase itself, so
+    /// a display reads what the wire said.
+    #[error("subscription refused")]
+    SubscriptionRefused,
     /// The SQLite capture session failed.
     #[error("session error: {0}")]
     Session(String),
@@ -229,6 +237,10 @@ pub enum ClientError {
     /// meets this keeps working and retries when a transport arrives.
     #[error("not connected: this operation needs a server")]
     NotConnected,
+    /// The opening handshake drew no answer within the answer bound, so the
+    /// transport is dropped and the dial goes out again.
+    #[error("the handshake drew no answer within the answer bound")]
+    HandshakeUnanswered,
     /// The client's pump stopped on a fault no reconnect can cure, named here.
     #[error("the client stopped: {0}")]
     Stopped(String),
@@ -845,6 +857,12 @@ pub(crate) struct ClientConfig {
     /// land, so reporting anything stronger would claim protection connetto
     /// does not yet provide.
     custody: Custody,
+    shared_layout: Option<Arc<connetto_core::schema::SharedLayout>>,
+    shared_tables: HashSet<String>,
+    connection_ddl: Option<Arc<str>>,
+    /// Whether this connection mirrors a relay's worker, which holds the share
+    /// keys, so a key change travels to the relay instead of committing here.
+    relay_mirror: bool,
 }
 
 impl ClientConfig {
@@ -863,7 +881,22 @@ impl ClientConfig {
             subjects: None,
             tuning: SyncTuning::default(),
             custody: Custody::Unverified(NoGate::Unsupported),
+            shared_layout: None,
+            shared_tables: HashSet::new(),
+            connection_ddl: None,
+            relay_mirror: false,
         }
+    }
+
+    /// Fold the device's storage layout into the open configuration.
+    fn with_storage_schema(mut self, schema: &SyncSchema) -> Self {
+        self.shared_layout = schema.shared_layout().cloned().map(Arc::new);
+        if self.shared_layout.is_some() {
+            self.shared_tables = schema.shared_tables().map(str::to_lowercase).collect();
+        }
+        self.connection_ddl =
+            (!schema.connection_ddl().is_empty()).then(|| Arc::from(schema.connection_ddl()));
+        self
     }
 
     /// The login grant, when somebody is signed in.
@@ -925,6 +958,13 @@ impl ClientConfig {
             function: SUBJECTS_FUNCTION.to_owned(),
             set: ShareKeySet::rendered(separator, keys),
         });
+        self
+    }
+
+    /// Mark the connection as a relay tab's mirror (R95 decision 17).
+    #[must_use]
+    pub(crate) fn with_relay_mirror(mut self, relay_mirror: bool) -> Self {
+        self.relay_mirror = relay_mirror;
         self
     }
 
@@ -1400,6 +1440,12 @@ fn server_wins(conflict: ConflictType) -> ConflictAction {
     }
 }
 
+/// The inbound silence after which a connected client probes the transport.
+pub const DEFAULT_PROBE_AFTER: Duration = Duration::from_secs(15);
+
+/// The time a probe (and the opening handshake) waits for an answer.
+pub const DEFAULT_ANSWER_WITHIN: Duration = Duration::from_secs(10);
+
 /// The schedule a deferred write is sent again on. Uncapped, because a write
 /// the server could not settle is kept like an offline one.
 static RESEND_POLICY: std::sync::LazyLock<RetryPolicy> = std::sync::LazyLock::new(RetryPolicy::new);
@@ -1433,6 +1479,56 @@ impl ResendTimer {
     }
 }
 
+/// The keepalive phase of a live connection.
+///
+/// The clock is the time since the last inbound frame, and any inbound frame,
+/// a `Pong` among them, restarts it.
+enum KeepalivePhase {
+    /// No probe out. The `probe_after` deadline runs from `last_inbound`.
+    Idle {
+        /// The moment of the last inbound frame.
+        last_inbound: Moment,
+    },
+    /// A probe out carries `nonce`. The `answer_within` deadline runs from
+    /// `anchor`, which a later frame moves.
+    Probed {
+        /// The nonce the probe carries.
+        nonce: u64,
+        /// The moment the answer deadline runs from, the probe send or a
+        /// frame that arrived after it.
+        anchor: Moment,
+    },
+}
+
+/// One armed keepalive deadline, for whoever drives the pump to sleep on
+/// before calling [`ConnettoConnection::keepalive_fire`].
+///
+/// Two timers are equal when they stand for the same armed deadline, so a
+/// pump keeps the sleep it holds until a frame or a probe re-arms it.
+#[derive(Debug, Clone, Copy)]
+pub struct KeepaliveTimer {
+    /// How many deadlines were armed when this one stood.
+    armed: u64,
+    /// The wait left on the deadline when the timer was read.
+    wait: Duration,
+}
+
+impl KeepaliveTimer {
+    /// How long to wait before firing the deadline.
+    #[must_use]
+    pub const fn wait(&self) -> Duration {
+        self.wait
+    }
+}
+
+impl PartialEq for KeepaliveTimer {
+    fn eq(&self, other: &Self) -> bool {
+        self.armed == other.armed
+    }
+}
+
+impl Eq for KeepaliveTimer {}
+
 /// Computed declarations awaiting a correlated server-processing fence.
 #[derive(Debug, Clone)]
 struct DeclarationFence {
@@ -1454,6 +1550,15 @@ struct ShareKeyRequest {
     request_id: String,
     /// The generation the swap carried.
     generation: u64,
+    /// The instant the answer bound expires.
+    deadline: Duration,
+}
+
+/// A tab's share-key change awaiting its relay's answer.
+#[derive(Debug)]
+struct RelayShareKeyWait {
+    /// Where the outcome goes.
+    answer: tokio::sync::oneshot::Sender<Result<(), ClientError>>,
     /// The instant the answer bound expires.
     deadline: Duration,
 }
@@ -1484,7 +1589,6 @@ impl PartialEq for ShareKeyTimer {
 }
 
 impl Eq for ShareKeyTimer {}
-
 /// Conflict resolution for a rollback: a row a concurrent server patch already
 /// changed is left as the server left it, so only a cleanly-matching optimistic
 /// write is reverted.
@@ -1600,6 +1704,7 @@ const META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_meta \
 /// SQL never names it, since bare table names resolve across attached
 /// databases and duplicate names across tiers are a generation-time error.
 const LOCAL_SCHEMA: &str = "connetto_local";
+const SHARED_SCHEMA: &str = "connetto_shared";
 
 /// A table name row from an attached schema's catalog.
 #[derive(diesel::QueryableByName)]
@@ -1705,12 +1810,14 @@ fn check_policy_tables(
     db: &mut SqliteConnection,
     tables: &PolicyTables,
 ) -> Result<(), ClientError> {
-    let present: HashSet<String> = sqlite_catalog::table
-        .select(sqlite_catalog::name)
-        .filter(sqlite_catalog::kind.eq("view"))
-        .load::<String>(db)?
+    let rows: Vec<SchemaTableRow> = diesel::sql_query(
+        "SELECT name FROM main.sqlite_master WHERE type = 'view' \
+         UNION SELECT name FROM temp.sqlite_master WHERE type = 'view'",
+    )
+    .load(db)?;
+    let present: HashSet<String> = rows
         .into_iter()
-        .map(|name| name.to_lowercase())
+        .map(|row| row.name.to_lowercase())
         .collect();
     let declared = tables.views();
     if &present == declared {
@@ -2838,10 +2945,6 @@ struct HandshakeInput<'a> {
 
 /// Run the opening handshake and read the ack, shared by the first connect
 /// and every resume.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The opening exchange keeps its ordered protocol checks together."
-)]
 async fn exchange_handshake<T>(
     transport: &mut T,
     input: HandshakeInput<'_>,
@@ -2907,10 +3010,10 @@ where
     // The server opens every connection with a challenge (R91) the handshake answers nothing with.
     #[cfg(feature = "device-identity")]
     let mut challenge: Option<[u8; 32]> = None;
-    let frame = transport
-        .recv()
-        .await
-        .map_err(|e| ClientError::Transport(e.to_string()))?;
+    // The bound runs from the Handshake send to the ack, so a frozen server
+    // cannot hold a dial open.
+    let bound = Moment::now(&SystemClock).after(config.tuning.answer_within());
+    let frame = bounded_recv(transport, bound).await?;
     let frame = match frame {
         Some(IncomingFrame::Control(ControlMessage::Challenge(challenge_frame))) => {
             #[cfg(feature = "device-identity")]
@@ -2921,10 +3024,7 @@ where
             {
                 let _ = challenge_frame;
             }
-            transport
-                .recv()
-                .await
-                .map_err(|e| ClientError::Transport(e.to_string()))?
+            bounded_recv(transport, bound).await?
         }
         other => other,
     };
@@ -2964,6 +3064,89 @@ where
         Some(_) => Err(ClientError::Protocol("expected handshake ack".into())),
         None => Err(ClientError::Protocol("connection closed before ack".into())),
     }
+}
+
+/// Read one frame under the handshake's answer bound, in real elapsed time.
+///
+/// A frame that arrives first wins, and a bound that fires late from a
+/// throttled timer only errors when the real clock says the bound is past.
+async fn bounded_recv<T>(
+    transport: &mut T,
+    bound: Moment,
+) -> Result<Option<IncomingFrame>, ClientError>
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    let recv = transport.recv();
+    tokio::pin!(recv);
+    loop {
+        let remaining = Moment::now(&SystemClock).until(bound);
+        if remaining.is_zero() {
+            return Err(ClientError::HandshakeUnanswered);
+        }
+        tokio::select! {
+            biased;
+            frame = &mut recv => {
+                return frame
+                    .map_err(|e| ClientError::Transport(e.to_string()));
+            }
+            () = timer_wait(remaining) => {}
+        }
+    }
+}
+
+/// The platform wait, raced by the handshake receive against its bound and
+/// slept by a build's default backoff and keepalive timers.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+async fn timer_wait(remaining: Duration) {
+    tokio::time::sleep(remaining).await;
+}
+
+/// The browser's wait, a `setTimeout` that fires a channel polled beside the
+/// receive. The closure lives beside the receiver, so it stays valid until
+/// the wait ends either way, and dropping the future invalidates it.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+async fn timer_wait(remaining: Duration) {
+    use js_sys::wasm_bindgen::JsCast;
+
+    use js_sys::wasm_bindgen::JsValue;
+    use js_sys::wasm_bindgen::closure::Closure;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // The u32 clamp keeps the JS delay finite, so `try_from` cannot fail.
+    let ms = f64::from(
+        u32::try_from(remaining.as_millis().min(u128::from(u32::MAX))).unwrap_or(u32::MAX),
+    );
+    // The sender sits in a shared cell so the callback stays `Fn` (it takes
+    // the sender at most once) and the fallback below can still settle a
+    // page with no `setTimeout`.
+    let sender = std::rc::Rc::new(core::cell::RefCell::new(Some(tx)));
+    let callback_sender = std::rc::Rc::clone(&sender);
+    // The Function owns the callback and lives across the await, so the timer
+    // fires into a live closure, and an abandoned wait detaches it and the
+    // pending timer resolves into a no-op.
+    let callback: js_sys::Function<fn() -> JsValue> =
+        js_sys::Function::from_closure(Closure::<dyn Fn() -> JsValue>::new(move || {
+            if let Some(tx) = callback_sender.take() {
+                let _ = tx.send(());
+            }
+            JsValue::UNDEFINED
+        }));
+    let scheduled = {
+        let global = js_sys::global();
+        js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
+            .ok()
+            .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+            .is_some_and(|set_timeout| {
+                set_timeout
+                    .call2(&global, &JsValue::from(&callback), &JsValue::from_f64(ms))
+                    .is_ok()
+            })
+    };
+    if !scheduled && let Some(tx) = sender.take() {
+        let _ = tx.send(());
+    }
+    let _ = rx.await;
 }
 
 /// Install an update hook recording the name of every table whose rows change on
@@ -3059,6 +3242,23 @@ struct Wire<T> {
     /// The connection's challenge nonce, the device bind signs it.
     #[cfg(feature = "device-identity")]
     challenge: Option<[u8; 32]>,
+    /// Which of the connection's handshakes attached this wire.
+    #[cfg(feature = "device-identity")]
+    number: ConnectionNumber,
+}
+
+/// Which handshake of a [`ConnettoConnection`] a wire came from, counted from
+/// one, so no two wires of the same connection share a number.
+#[cfg(feature = "device-identity")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectionNumber(u64);
+
+#[cfg(all(test, feature = "device-identity"))]
+impl ConnectionNumber {
+    /// The number `n`, for a fake link standing on its own connections.
+    pub(crate) const fn new(n: u64) -> Self {
+        Self(n)
+    }
 }
 
 /// The bind or retirement a connection sent and has not been answered for.
@@ -3152,6 +3352,9 @@ pub struct ConnettoConnection<T: Transport> {
     /// State changes waiting to be handed to the application, drained ahead of
     /// the transport so an offline connection can still report itself.
     notices: VecDeque<ClientEvent>,
+    /// How many handshakes this connection has completed.
+    #[cfg(feature = "device-identity")]
+    handshakes: u64,
     // `session` is declared before `db` so it drops first: it holds a raw
     // pointer into the connection's SQLite handle and must not outlive it.
     session: Session,
@@ -3219,6 +3422,14 @@ pub struct ConnettoConnection<T: Transport> {
     resend: Resend,
     /// How many resends were ever armed, so a pump tells a fresh timer from the one it sleeps on.
     resends_armed: u64,
+    /// Where the keepalive stands, the silence since the last inbound frame
+    /// and the probe out if there is one.
+    keepalive: KeepalivePhase,
+    /// How many keepalive deadlines were ever armed, so a pump tells a fresh
+    /// timer from the one it sleeps on.
+    keepalive_armed: u64,
+    /// The nonce the next probe carries, fresh for every probe.
+    next_probe_nonce: u64,
     /// Identity presented at handshake, kept for re-handshakes on resume.
     config: ClientConfig,
     /// Optional source of fresh access tokens, consulted on every resume so a
@@ -3237,6 +3448,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// re-apply (R48 decision 3). Held per subscription because two can be
     /// replaced at once, and cleared when each one's `SnapshotEnd` lands.
     resyncing: HashSet<String>,
+    /// Subscriptions the server has refused with the one fixed phrase and has
+    /// not served or released since. A reader that builds on the connection (a
+    /// relay hub, at construction) reads them to refuse what the server would.
+    refused: HashSet<String>,
     /// Whether this connection already emptied every subscribed table for a
     /// cursor past where its timeline ended (R73).
     history_cleared: bool,
@@ -3266,6 +3481,8 @@ pub struct ConnettoConnection<T: Transport> {
     share_key_persistence: Option<ShareKeyPersistence>,
     /// A changed share-key set still owed its save to the store.
     share_key_save_pending: bool,
+    /// A relay mirror's share-key changes awaiting their answers, by request id.
+    relay_share_key_waits: HashMap<String, RelayShareKeyWait>,
     /// The earliest parsed expiry of a held key, refreshed at every set
     /// change, so an unrelated frame never parses a grant.
     share_key_expiry: Option<i64>,
@@ -3295,16 +3512,59 @@ pub struct ConnettoConnection<T: Transport> {
     list_sink: Option<tokio::sync::mpsc::UnboundedSender<Vec<connetto_core::messages::SignedList>>>,
 }
 
+/// Attach the shared store when the build shares tables, then run the program
+/// for the files this open finds fresh, or the reopen program when neither is.
+fn install_storage_layout<S: ReplicaStorage>(
+    db: &mut SqliteConnection,
+    replica: &Replica<'_, S>,
+    sqlite_ddl: Option<&str>,
+    config: &ClientConfig,
+) -> Result<(), ClientError> {
+    use diesel::OptionalExtension as _;
+    let Some(layout) = &config.shared_layout else {
+        // One transaction, because committing each of a replica schema's statements on its own
+        // takes seconds on the browser's OPFS storage.
+        if let Some(ddl) = sqlite_ddl.or(config.connection_ddl.as_deref()) {
+            db.transaction::<_, ClientError, _>(|db| Ok(db.batch_execute(ddl)?))?;
+        }
+        return Ok(());
+    };
+    match (replica.shared_store(), replica.key()) {
+        (Some((path, key)), _) => harden::attach_keyed_in_window(
+            db,
+            path,
+            SHARED_SCHEMA,
+            harden::AttachPermits::CreateAndWrite,
+            key,
+        )?,
+        // Nothing at rest, so the shared store lives as long as the connection.
+        (None, None) => {
+            harden::attach_in_window(db, ":memory:", SHARED_SCHEMA, harden::AttachPermits::Write)?;
+        }
+        (None, Some(_)) => return Err(ClientError::ReplicaKeyMissing),
+    }
+    let fresh_shared = diesel::sql_query(
+        "SELECT 1 AS present FROM connetto_shared.sqlite_master WHERE type = 'table' LIMIT 1",
+    )
+    .get_result::<Present>(db)
+    .optional()?
+    .is_none();
+    if fresh_shared {
+        db.set_auto_vacuum(Some(SHARED_SCHEMA), AutoVacuumMode::Incremental)?;
+    }
+    db.transaction::<_, ClientError, _>(|db| {
+        db.batch_execute(layout.sql(sqlite_ddl.is_some(), fresh_shared))?;
+        Ok(())
+    })?;
+    check_recorded_tables(db, SHARED_SCHEMA, &config.unrecorded_tables)
+}
+
 /// The schema and metadata tables an open installs, in dependency order.
 #[deny(clippy::ref_patterns)]
 fn install_replica_schema(
     db: &mut SqliteConnection,
-    sqlite_ddl: Option<&str>,
     config: &ClientConfig,
 ) -> Result<(), ClientError> {
-    if let Some(ddl) = sqlite_ddl {
-        db.batch_execute(ddl)?;
-    }
     // The views are what the map has to agree with.
     check_policy_tables(db, &config.policy_tables)?;
     // A rowid-only table records nothing, so a write to one uploads nothing and reports success (R62).
@@ -3390,10 +3650,13 @@ where
     #[cfg(feature = "native-auth")]
     pub(crate) fn emptied(&self) -> Result<Self, ClientError> {
         // The stand-in has no schema, so the build's policy views are absent by design.
-        let config = self
+        let mut config = self
             .config
             .clone()
             .with_policy_tables(PolicyTables::default());
+        config.shared_layout = None;
+        config.shared_tables.clear();
+        config.connection_ddl = None;
         Self::open(&Replica::in_memory(), "", &config, None)
     }
 
@@ -3463,7 +3726,8 @@ where
         register_write_exemption(&mut db, &write_exempt)?;
         // A person carries the wildcard, and a bot login reads its list here (R99).
         register_bot_list(&mut db, connetto_core::BOT_LIST_WILDCARD.to_owned())?;
-        install_replica_schema(&mut db, sqlite_ddl, config)?;
+        install_storage_layout(&mut db, replica, sqlite_ddl, config)?;
+        db.transaction(|db| install_replica_schema(db, config))?;
         // An explicit resume cursor wins. Otherwise the replica remembers
         // its own resume point, so reopening a persisted replica (a file, an
         // OPFS import) continues where the previous run stopped. The writer
@@ -3510,6 +3774,8 @@ where
             run: None,
             attach_replay: AttachReplay::Idle,
             notices: VecDeque::new(),
+            #[cfg(feature = "device-identity")]
+            handshakes: 0,
             session,
             db,
             last_cursor: resume,
@@ -3538,11 +3804,17 @@ where
             transaction_state: AnsiTransactionManager::default(),
             resend: Resend::Idle,
             resends_armed: 0,
+            keepalive: KeepalivePhase::Idle {
+                last_inbound: Moment::now(&SystemClock),
+            },
+            keepalive_armed: 0,
+            next_probe_nonce: 1,
             config: config.clone(),
             token_source: None,
             local_tables: HashSet::new(),
             hidden_tables: HashSet::new(),
             resyncing: HashSet::new(),
+            refused: HashSet::new(),
             history_cleared: false,
             cursor_subjects,
             open_snapshots: HashSet::new(),
@@ -3556,6 +3828,7 @@ where
             share_key_retry_at: None,
             share_key_persistence: None,
             share_key_save_pending: false,
+            relay_share_key_waits: HashMap::new(),
             share_key_expiry: None,
             share_key_deadline: None,
             share_key_armed: 0,
@@ -3729,12 +4002,23 @@ where
             resume_token: ack.resume_token,
             schema_version: ack.schema_version,
         });
+        #[cfg(feature = "device-identity")]
+        {
+            self.handshakes += 1;
+        }
         self.wire = Some(Wire {
             transport,
             connection_id: ack.connection_id,
             #[cfg(feature = "device-identity")]
             challenge: ack.challenge,
+            #[cfg(feature = "device-identity")]
+            number: ConnectionNumber(self.handshakes),
         });
+        // The ack is the first inbound frame, so the clock starts with it.
+        self.keepalive = KeepalivePhase::Idle {
+            last_inbound: Moment::now(&SystemClock),
+        };
+        self.keepalive_armed += 1;
         self.history_cleared = false;
         self.bound_writer = bound;
         self.share_key_settled = self.share_key_generation;
@@ -4573,6 +4857,106 @@ where
         };
     }
 
+    /// The next keepalive deadline, `None` while no socket stands.
+    ///
+    /// A pump that owns a timer sleeps for its [`KeepaliveTimer::wait`] and
+    /// then calls [`keepalive_fire`](Self::keepalive_fire). A frame that
+    /// arrives in between arms a fresh one, which a pump reads on its next
+    /// step and a fire rejects through the `armed` mark.
+    #[must_use]
+    pub fn keepalive_timer(&self) -> Option<KeepaliveTimer> {
+        if !self.is_connected() {
+            return None;
+        }
+        let deadline = match &self.keepalive {
+            KeepalivePhase::Idle { last_inbound } => {
+                last_inbound.after(self.config.tuning.probe_after())
+            }
+            KeepalivePhase::Probed { anchor, .. } => {
+                anchor.after(self.config.tuning.answer_within())
+            }
+        };
+        Some(KeepaliveTimer {
+            armed: self.keepalive_armed,
+            wait: Moment::now(&SystemClock).until(deadline),
+        })
+    }
+
+    /// Fire one armed keepalive deadline, sending the probe the `probe_after`
+    /// bound owes or dropping the transport the `answer_within` bound owes
+    /// through the same path a transport error takes.
+    ///
+    /// A deadline a frame has re-armed is a no-op, and the fire compares real
+    /// elapsed time, so a late fire from a throttled timer never touches a
+    /// link that drew a frame in real time.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the probe cannot be sent.
+    pub async fn keepalive_fire(&mut self, timer: KeepaliveTimer) -> Result<(), ClientError> {
+        if timer.armed != self.keepalive_armed || !self.is_connected() {
+            return Ok(());
+        }
+        match self.keepalive {
+            KeepalivePhase::Idle { last_inbound } => {
+                let due = last_inbound.after(self.config.tuning.probe_after());
+                if !Moment::now(&SystemClock).until(due).is_zero() {
+                    return Ok(());
+                }
+                let nonce = self.next_probe_nonce;
+                self.next_probe_nonce += 1;
+                match self
+                    .wire()?
+                    .transport
+                    .send_control(ControlMessage::Ping(Ping { nonce }))
+                    .await
+                {
+                    // The probe send is the anchor a later frame would move.
+                    Ok(()) => {
+                        self.keepalive = KeepalivePhase::Probed {
+                            nonce,
+                            anchor: Moment::now(&SystemClock),
+                        };
+                        self.keepalive_armed += 1;
+                        Ok(())
+                    }
+                    // A probe that cannot be sent is the link dying, dropped
+                    // like any send failure.
+                    Err(e) => {
+                        self.disconnected();
+                        Err(ClientError::Transport(e.to_string()))
+                    }
+                }
+            }
+            KeepalivePhase::Probed { anchor, .. } => {
+                let due = anchor.after(self.config.tuning.answer_within());
+                if !Moment::now(&SystemClock).until(due).is_zero() {
+                    return Ok(());
+                }
+                self.disconnected();
+                Ok(())
+            }
+        }
+    }
+
+    /// Note one inbound frame. The silence clock restarts from it, a probe
+    /// answered by its own nonce clears, and a stale-nonce answer restarts the
+    /// clock and leaves the probe out.
+    fn note_inbound(&mut self, pong_nonce: Option<u64>) {
+        let now = Moment::now(&SystemClock);
+        self.keepalive = match self.keepalive {
+            KeepalivePhase::Idle { .. } => KeepalivePhase::Idle { last_inbound: now },
+            KeepalivePhase::Probed { nonce, .. } => {
+                if Some(nonce) == pong_nonce {
+                    KeepalivePhase::Idle { last_inbound: now }
+                } else {
+                    KeepalivePhase::Probed { nonce, anchor: now }
+                }
+            }
+        };
+        self.keepalive_armed += 1;
+    }
+
     /// The live socket, or the not-connected refusal.
     ///
     /// Every method that speaks to the server goes through this, so the offline
@@ -4598,6 +4982,11 @@ where
         self.attach_replay = AttachReplay::Idle;
         // A fresh transport replays every pending write, so no resend stays owed.
         self.resend = Resend::Idle;
+        // No socket means no clock to keep, and no probe stays owed.
+        self.keepalive = KeepalivePhase::Idle {
+            last_inbound: Moment::now(&SystemClock),
+        };
+        self.keepalive_armed += 1;
         // The writer identity a connection bound to is per-connection; a fresh
         // handshake rebinds, and a held bind re-signs against the fresh nonce.
         self.bound_writer = None;
@@ -4609,6 +4998,8 @@ where
         }
         #[cfg(feature = "device-identity")]
         self.enrol_waiters.clear();
+        // A relay answer can no longer arrive, so each waiting tab call fails now.
+        self.relay_share_key_waits.clear();
         // Desired keys and durable coverage survive a transport failure.
         self.share_key_request = None;
         self.declaration_fence = None;
@@ -4734,25 +5125,52 @@ where
                 None => Some(fence.deadline),
             };
         }
+        if let Some(relay) = self
+            .relay_share_key_waits
+            .values()
+            .map(|wait| wait.deadline)
+            .min()
+        {
+            deadline = Some(deadline.map_or(relay, |armed| armed.min(relay)));
+        }
         if deadline != self.share_key_deadline {
             self.share_key_deadline = deadline;
             self.share_key_armed += 1;
         }
     }
 
-    /// Drop the connection when a share-key answer overran its bound.
+    /// Drop the connection when a share-key answer overran its bound, and end
+    /// every relay wait past its own bound with an unknown outcome.
     fn check_share_key_deadlines(&mut self) {
+        let now = crate::away::SystemClock.monotonic();
+        let overdue: Vec<String> = self
+            .relay_share_key_waits
+            .iter()
+            .filter(|(_, wait)| now >= wait.deadline)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let expired = !overdue.is_empty();
+        for id in overdue {
+            if let Some(wait) = self.relay_share_key_waits.remove(&id) {
+                let _ = wait.answer.send(Err(ClientError::Transport(
+                    "the relay did not answer the share-key change in time, so its outcome is unknown"
+                        .to_owned(),
+                )));
+            }
+        }
         if self
             .share_key_request
             .as_ref()
-            .is_some_and(|request| crate::away::SystemClock.monotonic() >= request.deadline)
+            .is_some_and(|request| now >= request.deadline)
             || self
                 .declaration_fence
                 .as_ref()
-                .is_some_and(|fence| crate::away::SystemClock.monotonic() >= fence.deadline)
+                .is_some_and(|fence| now >= fence.deadline)
         {
             tracing::warn!("a share-key answer overran its bound, dropping the connection");
             self.disconnected();
+        } else if expired {
+            self.recompute_share_key_deadline();
         }
     }
 
@@ -4878,15 +5296,82 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Session`] when the replica rejects the write and
-    /// [`ClientError::Auth`] when the store refuses the save. A failed change
-    /// leaves the held set unchanged.
+    /// [`ClientError::Session`] when the replica rejects the write or this
+    /// connection is a relay tab's mirror, which changes keys through
+    /// [`ConnettoClient`], and [`ClientError::Auth`]
+    /// when the store refuses the save. A failed change leaves the held set
+    /// unchanged.
     pub async fn add_share_key<K: CapabilityKey>(
         &mut self,
         grant: &Grant,
         subject: &CapabilitySubject<K>,
     ) -> Result<(), ClientError> {
-        let rendered = subject.key().to_string();
+        self.refuse_relay_mirror_change()?;
+        self.add_rendered_share_key(grant, subject.key().to_string())
+            .await
+            .map(drop)
+    }
+
+    /// Drop every key `subject` renders as from the durable share-key set.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_share_key`](Self::add_share_key).
+    pub async fn remove_share_key<K: CapabilityKey>(
+        &mut self,
+        subject: &CapabilitySubject<K>,
+    ) -> Result<(), ClientError> {
+        self.refuse_relay_mirror_change()?;
+        self.remove_rendered_share_key(&subject.key().to_string())
+            .await
+            .map(drop)
+    }
+
+    /// Apply a relay tab's change to the keys this worker holds, reporting
+    /// whether the subjects its replica answers moved.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_share_key`](Self::add_share_key).
+    pub async fn apply_relay_share_key_change(
+        &mut self,
+        change: &ShareKeyChange,
+    ) -> Result<bool, ClientError> {
+        self.refuse_relay_mirror_change()?;
+        match change {
+            ShareKeyChange::Add { grant, subject } => {
+                self.add_rendered_share_key(grant, subject.clone()).await
+            }
+            ShareKeyChange::Remove { subject } => self.remove_rendered_share_key(subject).await,
+        }
+    }
+
+    /// A count that moves whenever the held share-key set changes, so a relay
+    /// restates its identity to its tabs only after it moved.
+    #[must_use]
+    pub fn share_key_generation(&self) -> u64 {
+        self.share_key_generation
+    }
+
+    /// Whether this connection mirrors a relay's worker.
+    pub(crate) fn is_relay_mirror(&self) -> bool {
+        self.config.relay_mirror
+    }
+
+    fn refuse_relay_mirror_change(&self) -> Result<(), ClientError> {
+        if self.config.relay_mirror {
+            return Err(ClientError::Session(
+                "a relay tab changes share keys through its ConnettoClient".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn add_rendered_share_key(
+        &mut self,
+        grant: &Grant,
+        rendered: String,
+    ) -> Result<bool, ClientError> {
         let changed = match &mut self.config.subjects {
             Some(source) => {
                 if source
@@ -4904,7 +5389,7 @@ where
             None => false,
         };
         if !changed {
-            return Ok(());
+            return Ok(false);
         }
         if let Err(error) = self.commit_share_key_change().await {
             if let Some(source) = &mut self.config.subjects {
@@ -4912,31 +5397,20 @@ where
             }
             return Err(error);
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// Drop every key `subject` renders as from the durable share-key set.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Session`] when the replica rejects the write and
-    /// [`ClientError::Auth`] when the store refuses the save. A failed change
-    /// leaves the held set unchanged.
-    pub async fn remove_share_key<K: CapabilityKey>(
-        &mut self,
-        subject: &CapabilitySubject<K>,
-    ) -> Result<(), ClientError> {
-        let rendered = subject.key().to_string();
+    async fn remove_rendered_share_key(&mut self, rendered: &str) -> Result<bool, ClientError> {
         let removed: Vec<(Grant, String)> = match &mut self.config.subjects {
             Some(source) => source
                 .set
                 .keys
-                .extract_if(.., |(_, subject_held)| *subject_held == rendered)
+                .extract_if(.., |(_, subject_held)| subject_held == rendered)
                 .collect(),
             None => Vec::new(),
         };
         if removed.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         if let Err(error) = self.commit_share_key_change().await {
             if let Some(source) = &mut self.config.subjects {
@@ -4944,7 +5418,53 @@ where
             }
             return Err(error);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Send a relay tab's change to its worker and the receiver its outcome
+    /// arrives on, within [`SHARE_KEY_REQUEST_WAIT`].
+    ///
+    /// The receiver fails at once when the connection drops.
+    pub(crate) async fn ask_relay_share_key(
+        &mut self,
+        change: ShareKeyChange,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), ClientError>>, ClientError> {
+        let request_id = share_key_request_id();
+        self.wire()?
+            .transport
+            .send_control(ControlMessage::TabShareKeyChange(TabShareKeyChange {
+                request_id: request_id.clone(),
+                change,
+            }))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        let (answer, receiver) = tokio::sync::oneshot::channel();
+        self.relay_share_key_waits.insert(
+            request_id,
+            RelayShareKeyWait {
+                answer,
+                deadline: crate::away::SystemClock.monotonic() + SHARE_KEY_REQUEST_WAIT,
+            },
+        );
+        self.recompute_share_key_deadline();
+        Ok(receiver)
+    }
+
+    /// Hand a relay's answer to the change waiting on it. An answer nobody
+    /// waits for arrived after its wait ended, and is dropped.
+    fn settle_relay_share_key(&mut self, answer: TabShareKeyAnswer) {
+        let Some(wait) = self.relay_share_key_waits.remove(&answer.request_id) else {
+            tracing::debug!(request_id = %answer.request_id, "a share-key answer arrived after its wait");
+            return;
+        };
+        let outcome = match answer.outcome {
+            TabShareKeyOutcome::Changed => Ok(()),
+            TabShareKeyOutcome::Locked => Err(ClientError::Locked),
+            TabShareKeyOutcome::StoreRefused(detail) => Err(ClientError::Auth(detail)),
+            TabShareKeyOutcome::ReplicaRefused(detail) => Err(ClientError::Session(detail)),
+        };
+        let _ = wait.answer.send(outcome);
+        self.recompute_share_key_deadline();
     }
 
     /// Send the swap carrying every live held key, one in flight at a time.
@@ -5087,12 +5607,25 @@ where
         self.wire.is_some()
     }
 
+    /// The oldest state change waiting for the application, for a driver
+    /// that stops stepping the connection and hands them on itself.
+    pub(crate) fn take_notice(&mut self) -> Option<ClientEvent> {
+        self.notices.pop_front()
+    }
+
     /// The per-connection routing label from the handshake ack, or `None` while
     /// no server has been reached. This is not identity and must not be treated
     /// as such.
     #[must_use]
     pub fn connection_id(&self) -> Option<&str> {
         self.wire.as_ref().map(|wire| wire.connection_id.as_str())
+    }
+
+    /// The number of the handshake that attached the live wire, or `None`
+    /// while no server is reachable.
+    #[cfg(feature = "device-identity")]
+    pub(crate) fn connection_number(&self) -> Option<ConnectionNumber> {
+        self.wire.as_ref().map(|wire| wire.number)
     }
 
     /// The durable session handle from the handshake ack, or `None` while no
@@ -5164,6 +5697,12 @@ where
     #[must_use]
     pub fn policy_tables(&self) -> &PolicyTables {
         &self.config.policy_tables
+    }
+
+    /// The physical tables held in the device-wide public store.
+    #[must_use]
+    pub fn shared_tables(&self) -> &HashSet<String> {
+        &self.config.shared_tables
     }
 
     /// Who this connection answers its policy views as, which a relay states
@@ -5759,9 +6298,17 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Session`] when the replica cannot be read.
+    /// [`ClientError::Session`] when the replica cannot be read or written.
     pub fn expired_subscriptions(&mut self) -> Result<Vec<String>, ClientError> {
+        self.reanchor_subscriptions()?;
         subscriptions::expired(&mut self.db)
+    }
+
+    /// Re-anchor every stop moment a stepped-back wall clock left ahead of the
+    /// replica clock, with capture suspended so the write never rides an upload.
+    fn reanchor_subscriptions(&mut self) -> Result<(), ClientError> {
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        subscriptions::reanchor_ahead(&mut self.db)
     }
 
     /// The current wall time in seconds since the epoch, from the replica's
@@ -5851,10 +6398,11 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Session`] when the replica cannot be read.
+    /// [`ClientError::Session`] when the replica cannot be read or written.
     pub fn declared_subscriptions(
         &mut self,
     ) -> Result<Vec<(String, SubscriptionSpec)>, ClientError> {
+        self.reanchor_subscriptions()?;
         Ok(subscriptions::declared(&mut self.db)?
             .into_iter()
             .map(|record| (record.sub_id, record.spec))
@@ -5869,6 +6417,7 @@ where
     /// the second kind is live at launch and re-claimed as screens mount, so
     /// there is no second case to write here.
     async fn replay_subscriptions(&mut self) -> Result<(), ClientError> {
+        self.reanchor_subscriptions()?;
         for record in subscriptions::declared(&mut self.db)? {
             if record.live {
                 self.send_subscribe(&record.sub_id, record.spec).await?;
@@ -5918,10 +6467,18 @@ where
             let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
             subscriptions::end(&mut self.db, sub_id)?;
         }
+        self.refused.remove(sub_id);
         self.open_snapshots.remove(sub_id);
         self.resyncing.remove(sub_id);
         self.unfenced_computed.remove(sub_id);
         Ok(())
+    }
+
+    /// The subscriptions the server has refused with the one fixed phrase and
+    /// not served or released since, as of this connection's last frame.
+    #[must_use]
+    pub fn refused_subscriptions(&self) -> &HashSet<String> {
+        &self.refused
     }
 
     /// Read one inbound frame, apply it if it is a patch, and report what
@@ -5993,6 +6550,14 @@ where
         &mut self,
         frame: Option<IncomingFrame>,
     ) -> Result<Option<ClientEvent>, ClientError> {
+        // Any inbound frame, a Pong among them, restarts the silence clock.
+        let pong_nonce = match &frame {
+            Some(IncomingFrame::Control(ControlMessage::Pong(pong))) => Some(pong.nonce),
+            _ => None,
+        };
+        if frame.is_some() {
+            self.note_inbound(pong_nonce);
+        }
         let event = match frame {
             // A peer that closed cleanly is as gone as one that failed, so the
             // wire goes and the change is announced behind this event.
@@ -6033,6 +6598,10 @@ where
                 self.push_revocations(update.lists);
                 #[cfg(not(feature = "device-identity"))]
                 drop(update);
+                return Ok(None);
+            }
+            Some(IncomingFrame::Control(ControlMessage::TabShareKeyAnswer(answer))) => {
+                self.settle_relay_share_key(answer);
                 return Ok(None);
             }
             Some(IncomingFrame::Control(msg)) => {
@@ -6495,6 +7064,9 @@ where
                 if self.resyncing.remove(&end.sub_id) {
                     self.reapply_pending()?;
                 }
+                // A plain end means the read was served, so a refusal
+                // correlated to this sub is answered.
+                self.refused.remove(&end.sub_id);
                 self.publish_coverage()?;
                 Ok(ClientEvent::SnapshotEnd { sub_id: end.sub_id })
             }
@@ -6581,6 +7153,11 @@ where
                 url: grant.url,
             }),
             ControlMessage::NonFatalError(err) => {
+                if let Some(id) = &err.related_to
+                    && err.detail == SUBSCRIPTION_REFUSED
+                {
+                    self.refused.insert(id.clone());
+                }
                 self.refuse_declaration(err.related_to.as_deref());
                 Ok(ClientEvent::NonFatal {
                     related_to: err.related_to,
@@ -7207,6 +7784,7 @@ where
         // The coverage the cursor carries, materialized before the closure so
         // the pair writes in the same statement as the cursor.
         let coverage = self.cursor_subjects.as_deref();
+        let shared = &self.config.shared_tables;
         let applied = self.db.transaction::<_, ClientError, _>(|conn| {
             // The cursor advances even when every op was withheld. A departure
             // this replica declined to act on is still an event it has seen,
@@ -7214,6 +7792,10 @@ where
             if let Some(bytes) = apply.as_deref() {
                 conn.apply_patchset(bytes, server_wins)
                     .map_err(|e| ClientError::Apply(e.to_string()))?;
+                // The native apply reaches `main` only.
+                if !shared.is_empty() {
+                    shared_replay::apply(conn, bytes, shared)?;
+                }
             }
             if let Some(cursor) = cursor {
                 persist_cursor_and_subjects(conn, cursor, coverage)?;
@@ -7557,6 +8139,34 @@ mod tests {
         assert_eq!(conn.custody(), Custody::Unverified(NoGate::Offerable));
         conn.set_custody(Custody::Verified);
         assert_eq!(conn.custody(), Custody::Verified);
+    }
+
+    /// A first boot whose schema fails partway leaves none of its earlier tables in the file.
+    #[test]
+    fn a_schema_failing_partway_leaves_no_table_behind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("partial.db");
+        let path_str = path.to_str().expect("path is utf-8");
+        let key = || ReplicaKey::from_bytes([0x42; ReplicaKey::LEN]);
+        let replica = Replica::encrypted_file(path_str, Some(key())).expect("replica");
+        let failing = "CREATE TABLE first (id INTEGER PRIMARY KEY);
+             CREATE TABLE first (id INTEGER PRIMARY KEY);";
+        let config = ClientConfig::new("partial-test");
+        assert!(
+            ConnettoConnection::<FakeTransport>::open(&replica, failing, &config, None).is_err(),
+            "a schema naming one table twice fails the open"
+        );
+        let mut db = SqliteConnection::establish(path_str).expect("reopen the file");
+        cipher::unlock(&mut db, &key()).expect("unlock");
+        let left = sqlite_catalog::table
+            .filter(sqlite_catalog::name.eq("first"))
+            .count()
+            .get_result::<i64>(&mut db)
+            .expect("read the catalogue");
+        assert_eq!(
+            left, 0,
+            "the first statement was rolled back with the second"
+        );
     }
 
     /// A resent write the server refuses settles the deferral, so the next outage starts its resend from the first wait.

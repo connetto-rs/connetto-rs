@@ -43,7 +43,10 @@ use sqlite_diff_rs::{
     ChangesetOp, DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK,
     TableSchema, Value,
 };
-use sqlparser::ast::{BinaryOperator, Expr, GroupByExpr, SetExpr, Statement};
+use sqlparser::ast::{
+    BinaryOperator, Distinct, Expr, GroupByExpr, SelectItem, SetExpr, Statement,
+    WildcardAdditionalOptions,
+};
 use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use subql::EventKind;
@@ -629,9 +632,10 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             }
         }
         let context = TranslationContext::new(&options);
-        let pg = statement
+        let mut pg = statement
             .reverse_translate(&self.catalog, &context)
             .map_err(|err| MaterializerError::Translate(format!("{err}")))?;
+        widen_column_subset(&mut pg);
         Ok(pg.to_string())
     }
 
@@ -2106,6 +2110,39 @@ fn answers_one_value(pg_sql: &str) -> bool {
             if exprs.is_empty() && mods.is_empty())
 }
 
+/// Rewrite a select list naming only plain columns to `*`.
+///
+/// The replica holds the application's whole table, so a subscription naming
+/// fewer columns still has to bring whole rows, or the left-out columns land
+/// empty and the changes to them alone never arrive. The client runs the query
+/// as written against its replica, which keeps the columns the caller asked for.
+/// Aggregates, groupings, `DISTINCT` and expressions keep their own list.
+fn widen_column_subset(statement: &mut Statement) {
+    let Statement::Query(query) = statement else {
+        return;
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return;
+    };
+    let grouped = !matches!(&select.group_by, GroupByExpr::Expressions(exprs, mods)
+        if exprs.is_empty() && mods.is_empty());
+    let distinct = matches!(select.distinct, Some(Distinct::Distinct | Distinct::On(_)));
+    if grouped || distinct || select.having.is_some() {
+        return;
+    }
+    let plain = |expr: &Expr| matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_));
+    let all_plain = !select.projection.is_empty()
+        && select.projection.iter().all(|item| match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => plain(expr),
+            SelectItem::Wildcard(_)
+            | SelectItem::QualifiedWildcard(..)
+            | SelectItem::ExprWithAliases { .. } => false,
+        });
+    if all_plain {
+        select.projection = vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())];
+    }
+}
+
 /// Decoded group values as a JSON array string, in `GROUP BY` order (R84).
 fn values_json(values: &[PgValue<Postgres>]) -> String {
     serde_json::Value::Array(values.iter().map(value_json).collect()).to_string()
@@ -2434,6 +2471,54 @@ mod registry_write_tests {
                 !registry_table(table),
                 "{table} is written by the server only"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod widen_tests {
+    //! Which subscription shapes the server widens to whole rows.
+
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    use super::widen_column_subset;
+
+    fn widened(sql: &str) -> String {
+        let mut statement = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+            .expect("the test SQL parses")
+            .remove(0);
+        widen_column_subset(&mut statement);
+        statement.to_string()
+    }
+
+    /// Plain columns, aliased or qualified by the table read, widen to `*`.
+    #[test]
+    fn a_plain_column_list_widens_to_whole_rows() {
+        assert_eq!(
+            widened("SELECT id, title FROM docs WHERE owner = $1"),
+            "SELECT * FROM docs WHERE owner = $1"
+        );
+        assert_eq!(
+            widened("SELECT d.id AS i, d.title FROM docs AS d"),
+            "SELECT * FROM docs AS d"
+        );
+    }
+
+    /// A shape whose list is its result keeps it.
+    #[test]
+    fn aggregates_groupings_distinct_and_set_operations_keep_their_list() {
+        for sql in [
+            "SELECT COUNT(*) FROM docs",
+            "SELECT owner, COUNT(*) FROM docs GROUP BY owner",
+            "SELECT owner FROM docs GROUP BY owner HAVING COUNT(*) > 1",
+            "SELECT DISTINCT title FROM docs",
+            "SELECT DISTINCT ON (title) id FROM docs",
+            "SELECT id + 1 FROM docs",
+            "SELECT id FROM docs UNION SELECT id FROM pages",
+            "INSERT INTO docs (id) VALUES (1)",
+        ] {
+            assert_eq!(widened(sql), sql, "{sql} keeps its own list");
         }
     }
 }

@@ -75,10 +75,9 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable toolchain with llvm-tools
-        run: |
-          rustup toolchain install stable \
-            --profile minimal \
-            --component llvm-tools-preview
+        uses: $/.github/actions/install-rust
+        with:
+          components: llvm-tools-preview
 
       - name: Install keyring helpers
         run: |
@@ -88,12 +87,12 @@ jobs:
       # --all-features turns on connetto-dioxus's desktop feature.
       - name: Install desktop dependencies
         if: matrix.name == 'rest'
-        uses: ./.github/actions/install-desktop-deps
+        uses: $/.github/actions/install-desktop-deps
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
 
-      - uses: ./.github/actions/pull-test-images
+      - uses: $/.github/actions/pull-test-images
 
       # testfast is release without the fat link: instrumentation on top of
       # lto and one codegen unit more than doubles the build.
@@ -174,10 +173,9 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable toolchain with llvm-tools
-        run: |
-          rustup toolchain install stable \
-            --profile minimal \
-            --component llvm-tools-preview
+        uses: $/.github/actions/install-rust
+        with:
+          components: llvm-tools-preview
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
@@ -197,7 +195,7 @@ jobs:
           # The archive carries the server's own binary but not the client's.
           cp target/testfast/connetto-client coverage-server/
 
-      - uses: ./.github/actions/put-files
+      - uses: $/.github/actions/put-files
         with:
           name: coverage-server
           path: coverage-server
@@ -219,10 +217,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install stable toolchain with llvm-tools
-        run: |
-          rustup toolchain install stable \
-            --profile minimal \
-            --component llvm-tools-preview
+        uses: $/.github/actions/install-rust
+        with:
+          components: llvm-tools-preview
 
       - name: Install keyring helpers
         run: |
@@ -232,12 +229,12 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
 
-      - uses: ./.github/actions/get-files
+      - uses: $/.github/actions/get-files
         with:
           name: coverage-server
           path: ${{ runner.temp }}/coverage-server
 
-      - uses: ./.github/actions/pull-test-images
+      - uses: $/.github/actions/pull-test-images
 
       # Extracted into the checkout, where the tests' compiled-in binary
       # paths and the report expect the target directory.
@@ -327,10 +324,9 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable clippy
-        run: |
-          rustup toolchain install stable \
-            --profile minimal \
-            --component clippy
+        uses: $/.github/actions/install-rust
+        with:
+          components: clippy
 
       - name: SonarQube scan
         uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0

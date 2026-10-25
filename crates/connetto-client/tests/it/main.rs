@@ -25,6 +25,8 @@ mod builder_schema;
 
 mod core_builder;
 
+mod column_subset;
+
 mod changed_signal;
 
 mod coverage_resync;
@@ -43,6 +45,7 @@ mod gate_recheck;
 mod grouped_live;
 
 mod hardening;
+mod keepalive;
 
 mod key_requirement;
 
@@ -94,12 +97,15 @@ mod schema_handshake;
 mod secret_stores;
 
 mod share_key_protocol;
+mod share_key_relay;
 #[cfg(feature = "native-transport")]
 mod share_key_storage;
 mod share_keys;
+mod shared_reads;
 mod shared_store;
 
 mod sql_functions;
+mod subscription_refusal;
 
 mod synced_references;
 

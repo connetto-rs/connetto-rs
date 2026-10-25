@@ -31,11 +31,7 @@ use crate::builder::sign_in::HeldCredential;
 use crate::builder::tuning::SyncTuning;
 use crate::cipher::ReplicaKey;
 use crate::live::ConnettoClient;
-#[cfg(not(feature = "native-transport"))]
-use crate::reconnect::NoSleep;
-#[cfg(feature = "native-transport")]
-use crate::reconnect::TokioSleeper;
-use crate::reconnect::{ReconnectPolicy, Sleeper};
+use crate::reconnect::ReconnectPolicy;
 use crate::replica::Encrypted;
 #[cfg(feature = "native-transport")]
 use crate::replica::provision_replica_key;
@@ -173,28 +169,11 @@ type SleeperFn =
 #[cfg(not(feature = "native-transport"))]
 type SleeperFn = Box<dyn FnMut(Duration) -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
 
-/// The backoff sleep a build that named none rides. Native takes the ambient
-/// runtime's timer. Wasm names its own, because the built-in sleep is instant
-/// and turns the backoff into a retry loop with no pause.
+/// The backoff sleep a build that named none rides, the platform timer the
+/// handshake bound waits on. An instant sleep would turn the backoff and the
+/// keepalive wait into a loop that never yields.
 fn default_sleeper() -> SleeperFn {
-    #[cfg(feature = "native-transport")]
-    {
-        Box::new(|d| {
-            Box::pin(async move {
-                let mut sleeper = TokioSleeper;
-                sleeper.sleep(d).await;
-            })
-        })
-    }
-    #[cfg(not(feature = "native-transport"))]
-    {
-        Box::new(|d| {
-            Box::pin(async move {
-                let mut sleeper = NoSleep;
-                sleeper.sleep(d).await;
-            })
-        })
-    }
+    Box::new(|d| Box::pin(crate::timer_wait(d)))
 }
 
 /// The fields every stage carries and moves into the next.
@@ -379,6 +358,8 @@ pub(crate) fn build_config(
         .with_unrecorded_tables(schema.unrecorded_tables().iter().cloned())
         .with_tuning(*tuning)
         .with_custody(custody)
+        .with_storage_schema(schema)
+        .with_relay_mirror(schema.is_relay_mirror())
 }
 
 /// The share keys the build folds into the base config after it, applied on
@@ -912,6 +893,8 @@ struct DurableResolved<T: Transport, C> {
     located: Located,
     /// The device-private tier, when the build has one.
     ddl: Option<String>,
+    /// The device-wide public file and its independent key.
+    shared: Option<(Located, ReplicaKey)>,
     /// The custody the stores' claims fold into.
     custody: Custody,
     /// The away-and-return gate and its mechanism, when the gate is on.
@@ -969,11 +952,13 @@ where
             key,
             located,
             ddl,
+            shared,
             custody,
             gate,
             share_key_store,
         } = self.resolve().await?;
-        let replica = open_encrypted_replica(&located.url, &key, !located.exists, ddl.as_ref())?;
+        let replica =
+            open_encrypted_replica(&located.url, &key, !located.exists, ddl.as_ref(), shared)?;
         run_core(
             &replica,
             base,
@@ -1009,6 +994,19 @@ where
             None if located.exists => return Err(ClientError::ReplicaKeyMissing),
             None => mint_key(&self.key_store, &located.record).await?,
         };
+        let shared = if self.base.schema.shared_layout().is_some() {
+            let located = self
+                .place
+                .locate(&crate::shared_store_name(REPLICA_PREFIX))?;
+            let key = match self.key_store.load(&located.record).await? {
+                Some(key) => key,
+                None if located.exists => return Err(ClientError::ReplicaKeyMissing),
+                None => mint_key(&self.key_store, &located.record).await?,
+            };
+            Some((located, key))
+        } else {
+            None
+        };
         let mut claims = self.claims;
         claims.push(self.key_store.protection());
         claims.push(self.share_key_store.protection());
@@ -1030,6 +1028,7 @@ where
             key,
             located,
             ddl,
+            shared,
             custody,
             gate,
             share_key_store,
@@ -1084,12 +1083,17 @@ fn open_encrypted_replica<'a>(
     key: &ReplicaKey,
     fresh: bool,
     ddl: Option<&'a String>,
+    shared: Option<(Located, ReplicaKey)>,
 ) -> Result<Replica<'a, Encrypted>, ClientError> {
     let replica = Replica::encrypted_file(location, Some(key.clone()))?;
-    Ok(match (fresh, ddl) {
+    let replica = match (fresh, ddl) {
         (true, Some(ddl)) => replica.with_tier(ddl),
         (false, Some(_)) => replica.with_existing_tier(),
         (_, None) => replica,
+    };
+    Ok(match shared {
+        Some((located, key)) => replica.with_shared_store(located.url, key),
+        None => replica,
     })
 }
 
@@ -1138,6 +1142,7 @@ where
             token_source,
             key,
             located,
+            shared,
             custody,
             share_key_store,
             ..
@@ -1149,7 +1154,11 @@ where
             caller: Some(caller),
             custody,
             token_source,
-            replica: DrivenReplica::Encrypted { located, key },
+            replica: DrivenReplica::Encrypted {
+                located,
+                key,
+                shared: shared.map(Box::new),
+            },
             share_key_store: Some(share_key_store),
         })
     }
@@ -1160,7 +1169,11 @@ enum DrivenReplica {
     /// In process, with the device-private tier when the schema has one.
     InMemory,
     /// The located file under its key.
-    Encrypted { located: Located, key: ReplicaKey },
+    Encrypted {
+        located: Located,
+        key: ReplicaKey,
+        shared: Option<Box<(Located, ReplicaKey)>>,
+    },
 }
 
 /// The owned inputs every driven terminal runs, so the connect and the open
@@ -1221,9 +1234,19 @@ where
                 )
                 .await
             }
-            DrivenReplica::Encrypted { located, key } => {
+            DrivenReplica::Encrypted {
+                located,
+                key,
+                shared,
+            } => {
                 let fresh = !located.exists;
-                let replica = open_encrypted_replica(&located.url, &key, fresh, tier.as_ref())?;
+                let replica = open_encrypted_replica(
+                    &located.url,
+                    &key,
+                    fresh,
+                    tier.as_ref(),
+                    shared.map(|shared| *shared),
+                )?;
                 offline_connect_core(
                     &replica,
                     &base.schema,
@@ -1262,9 +1285,19 @@ where
                     share_key_store,
                 )
             }
-            DrivenReplica::Encrypted { located, key } => {
+            DrivenReplica::Encrypted {
+                located,
+                key,
+                shared,
+            } => {
                 let fresh = !located.exists;
-                let replica = open_encrypted_replica(&located.url, &key, fresh, tier.as_ref())?;
+                let replica = open_encrypted_replica(
+                    &located.url,
+                    &key,
+                    fresh,
+                    tier.as_ref(),
+                    shared.map(|shared| *shared),
+                )?;
                 open_driven_core(
                     &replica,
                     &base.schema,
@@ -1298,9 +1331,10 @@ pub(crate) enum FirstDial {
 }
 
 /// The shared connect opens the replica so local reads answer at once, then
-/// tries one dial and attaches it on success. A refusal no retry can cure fails
-/// the build either way, and any other failure follows `first_dial`. The
-/// replica is opened by the caller, which knows its storage.
+/// tries one dial and attaches it on success. A refusal no retry can cure
+/// fails the build either way, an unanswered handshake starts offline when a
+/// reconnect loop will redial, and any other failure follows `first_dial`.
+/// The replica is opened by the caller, which knows its storage.
 #[expect(
     clippy::too_many_arguments,
     reason = "Replica, credentials and first-dial policy are independent inputs."
@@ -1336,7 +1370,19 @@ where
         conn.prepare_share_keys().await?;
     }
     match dialer.connect().await {
-        Ok(transport) => conn.attach(transport).await?,
+        Ok(transport) => match conn.attach(transport).await {
+            Err(err)
+                if matches!(err, ClientError::HandshakeUnanswered)
+                    && first_dial == FirstDial::MayFail =>
+            {
+                tracing::warn!(
+                    error = %err,
+                    "the handshake drew no answer, starting offline"
+                );
+            }
+            Err(err) => return Err(err),
+            Ok(()) => {}
+        },
         Err(err) => {
             if err.is_permanent() || first_dial == FirstDial::Required {
                 return Err(dial_error(err));

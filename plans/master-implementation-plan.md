@@ -155,7 +155,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R87~~ | Storage quotas and deployment ceilings |
 | done | ~~R71~~ | Linux key custody across a reboot, which R74's device key shares on Linux |
 | any | R70 | Backup and restore. Step 2's frontier leg waits on R75, whose frontier is what it demonstrates against |
-| any | R72 | Clock discipline. Independent, and it absorbs the certificate clock rule R74 states |
+| done | ~~R72~~ | Clock discipline, which absorbs the certificate clock rule R74 states |
 | any | R74 | Device identity and certificates, first of the peer phases. Needs nothing since R94, whose builders take the device key's store, the certificate lifetime setting and the enrolment step |
 | any | R75 | The per-device applied frontier. Needs R74 |
 | any | R76 | The peer link. Needs R74 |
@@ -170,6 +170,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R93 | The file replica for bots. Needs R91's template, R71's headless custody is built |
 | done | ~~R94~~ | One client builder per platform from shared configuration pieces |
 | any | R95 | Share keys added and removed on a running client. Needs nothing since R94 |
+| any | R105 | Answering a stolen account. Builds on R74's device list and R91's installations as they stand |
 | done | ~~R96~~ | One server builder for programs that embed the server, and R91 builds on it |
 | done | ~~R97~~ | The desktop login tab closes, or the app comes back to the front. Minted from the R53 proof, designed |
 | done | ~~R98~~ | One schema contract for every deployment-owned table, merged as #126 (2026-10-05) |
@@ -220,7 +221,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R92 synced tables carry no local references | **DONE** (2026-10-18, merged `e89f61e` #167, `e8b2694` #168, `46d2bef` #169), minted and designed 2026-09-22 by R21's decision 8 | nothing. Six decisions in the section | no |
 | R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R91. Two decisions in the section | no |
 | R94 one client builder per platform | **DONE** (2026-09-30, merged `5b7f616`, #110), minted and designed 2026-09-25 while planning R51 | nothing. Twenty-seven decisions in the section | no |
-| R95 share keys on a running client | STARTED 2026-10-18, minted 2026-09-25 by R94's decision 10, designed 2026-10-17 | nothing since R94 (2026-09-30). Fifteen decisions and seven planned pull requests in the section | no |
+| R95 share keys on a running client | BUILT 2026-10-24, steps 1 to 5 merged and steps 6 and 7 in #231. Minted 2026-09-25 by R94's decision 10, designed 2026-10-17 | nothing since R94 (2026-09-30). Seventeen decisions and seven pull requests in the section | no |
 | R96 one server builder | **DONE** (2026-10-03), minted 2026-09-25 by R94's decision 11, designed 2026-10-03 | nothing. Nine decisions in the section | no |
 | R97 the desktop login tab | **DONE** (2026-10-04), built 2026-10-02, proven on Windows and macOS 2026-10-03 and on GNOME 2026-10-04 | nothing. GNOME on Wayland answers the raise with its notification that the app is ready, decided with the maintainer as the platform's answer | no |
 | R98 one schema contract | **DONE** (2026-10-05, #126) | nothing | no |
@@ -250,7 +251,8 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R18 SQLite hardening surface | **DONE** (2026-08-18) | nothing | no |
 | R60 a limited request syncs the whole table and blocks its cleanup | **DONE** (2026-09-02) | nothing. The defect dissolved at the `3d75cca` pin, steps 4 to 6 landed 2026-09-02 and are proven by `crates/connetto-client/tests/it/residual.rs`. The plan carried this row as IN PROGRESS until 2026-09-12 | no longer: the upstream request superseded itself, never sent |
 | R11 shared public store | NOT STARTED, designed (2026-10-17), sliced into seven pull requests | nothing. Seven decisions in the section, slice 2 opens with decision 3's capability rule | no |
-| R61 the portability download | NOT STARTED, fully designed (2026-08-22) | wanting it: the deadline is the first real deployment. The file half needs `R65` | no |
+| R61 the portability download | NOT STARTED, fully designed (2026-08-22), revised (2026-10-25) | wanting it: the deadline is the first real deployment. Ten decisions in the section | no |
+| R105 answering a stolen account | NOT STARTED, designed (2026-10-25) | nothing. Ten decisions in the section, the slicing proposed for the maintainer's review | no |
 | R62 refuse a table with no declared primary key | **DONE** (2026-08-22) | nothing. Four decisions: three before any code, the fourth (the tier is re-checked before a write too) taken in execution | no |
 | R63 rewire the membership term onto subql's own APIs | **DONE** (2026-08-30) | nothing. Steps 1 to 3 landed 2026-08-23, step 4 (caller bind retired onto the self-seeding term) and decision 3's proof landed 2026-08-30 in the pin-move working tree | landed: `TermDescription::Caller` since subql `1e5382f` |
 | R86 adopt the re-run path so the boot refusal asks the real question | **DONE** (2026-08-31) | nothing | landed and adopted: composite-join grading plus the unqualified-table fix, rls2fga `bbe4f57a` |
@@ -270,7 +272,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R69 files in every demo | **DONE** (A through G complete 2026-09-19), designed (2026-09-12) | nothing. A is #28, B is #29, C is #30, G is #31, the browser stack boots the executable's file half with the online photo flow proven by `photo_flow.rs` and F's offline and two-viewer proofs by `photo_offline.rs` and `photo_visibility.rs`. E is #34, the photos surface in both web demos, and D is #35, the desktop photos surface on the native content client proven by the Docker-gated `demo_photos_flow.rs` | no |
 | R70 backup and restore story | STARTED 2026-09-22, nineteen decisions taken, steps 1 and 2's pre-R75 legs written into chapter 20, the chunk-store fix built (boot reconcile, `lost`, healing on native and browser, one content retention rule and pin API on both, heal entries in the outbox) | R75 for step 2's frontier leg. Decision 6 is built (2026-10-06, merged 2026-10-18 as #131), every adopted boot reconciling the whole store through subql's `OpenFgaPolicy::reconcile_store`. Decisions 4, 5, 8, 10, 18 and 19 are built, so every restore method resyncs its clients and revokes every session. Chapter 20 is shared with R73 | no |
 | R71 Linux key custody survives reboot | **DONE** (2026-09-29) | nothing. Sixteen decisions in the section. KDE Wallet loses a write made in the 5 s before `ksecretd` is stopped, `upstream/kwallet-sigterm-loses-recent-writes.md`, pursued upstream on `upstream/ksecretd-sigterm-flush` (2026-09-29) | no, R71 holds without it |
-| R72 clock discipline (X6) | NOT STARTED | nothing | no |
+| R72 clock discipline (X6) | **DONE** (2026-10-24) | nothing. Merged as #211, #212, #214 and #215, chapter 21 states the rule per timer class and X6 is closed | no |
 | R74 device identity and certificates | IN PROGRESS, merged (2026-10-06, #130) with the follow-ups #139 (2026-10-12), #138 (2026-10-14), #146 (2026-10-15), #161 (2026-10-16) and #132 (2026-10-18), and step 7's peer half with proofs 3, 4 and 6's peer half built by R76's slices 1 and 2 (2026-10-07, merged 2026-10-14 as #134 and #135) | proof 5's Windows and Linux `unproven` records, which R76's home run produces | no |
 | R75 the per-device applied frontier | IN PROGRESS, every step built, slices 1 to 5 merged as #196, #197, #199, #200 and #206 (2026-10-20) | R74. Touches the R2 watermark contract and the R56 import. The Done when's three proofs stand in the `writer_frontier` and `courier_frontier` suites with their audit records, for a device writer and a number writer, the courier replay the one a device author alone signs, and the section's closing record is what remains | no |
 | R76 the peer link | IN PROGRESS, sliced into pull requests 2026-10-06 (its section's **Slices**), the Android slices first. Slices 1 to 4 merged 2026-10-14 as #134, #135, #136 and #137, slices 5 to 8 merged 2026-10-15 as #140, #141, #142 and #143, slice 9a, iPhone hosting and iPad joining, merged 2026-10-16 as #148, slice 9b, Linux, and slice 9c, macOS, merged 2026-10-18 as #162 and #163, slice 9f, three handhelds over one hotspot with the Bonjour discovery on iOS, merged 2026-10-20 as #204, with the duplicate close's keep across a reset as #158 (2026-10-15) | nothing. Slice 9d (Windows) is not started, and 9e's home run needs every local machine in one place | no |
@@ -370,7 +372,7 @@ graph TD
   R70[R70 backup and restore story]
   R65 -.->|content backup split| R70
   R71[R71 Linux key custody survives reboot]
-  R72[R72 clock discipline]
+  R72[R72 clock discipline, DONE]
   R73[R73 failover verification]
   R58 -.->|the bound it extends| R81[R81 aggregate read time bound]
   R30 --> R82[R82 grouped and re-executed delivery]
@@ -427,6 +429,13 @@ graph TD
   R60[R60 a limited request syncs the whole table]
   R26 --> R61[R61 the portability download]
   R65 -.->|the files/ half| R61
+  R61 -.->|both extend connetto_auth_op| R78
+  R105[R105 answering a stolen account]
+  R74 -->|the device list| R105
+  R91 -->|installations to uninstall| R105
+  R36 -.->|the ban it widens| R105
+  R105 -.->|both extend connetto_auth_op| R61
+  R105 -.->|both extend connetto_auth_op| R78
   R62[R62 refuse an undeclared primary key]
   U5[upstream subql:<br/>term planning and seeding, landed] --> R63[R63 membership-term rewire]
   R27 --> R63
@@ -3226,25 +3235,27 @@ A `LIMIT n` request registers as a computed read and holds no replica rows, raw 
 
 ## R61: the portability download, whose scope only the application knows
 
-**Status.** NOT STARTED, fully designed 2026-08-22. Split out of `R26` on 2026-08-21 when the maintainer separated moving data between devices from handing a person all their data. All three open questions were settled with the maintainer on 2026-08-22, and its build waits on the same deadline class as `R31`: the first real deployment. The file half needs `R65`.
+**Status.** NOT STARTED, fully designed 2026-08-22 and revised with the maintainer 2026-10-25 against the tree and current regulator guidance (decisions 4 to 8). Split out of `R26` on 2026-08-21 when the maintainer separated moving data between devices from handing a person all their data. Its build waits on the same deadline class as `R31`, the first real deployment.
 
-**Blocked on nothing technically.** Blocked on wanting it: nothing in the tree needs it and no deployment exists to be obliged by it.
+**Blocked on nothing technically.** Blocked on wanting it: nothing in the tree needs it and no deployment exists to be obliged by it. The file half builds on `R65` to `R69`, all done.
 
-**Changes state.** Client tables: none. Server tables: none, the query list registration sitting on the server configuration. Wire messages: none. Archive format: none, the download zip a terminal artifact with no version that nothing ever machine-reads back (question 3).
+**Changes state.** Client tables: none. Server tables: the audit contract's `connetto_auth_op` enum gains a download value and an erasure value, and `auth_events` gains the query-list hash and the archive size (decision 8). Wire messages: none. Archive format: none, the download zip a terminal artifact with no version that nothing ever machine-reads back (question 3).
 
 ### Purpose
 
 A deployment has to be able to hand a person all their data and to erase it. `R26`'s device export cannot serve that, and not because of its format: the replica only ever held what its subscriptions covered, so rows the person may read but never subscribed to were never on the device at all. And connetto cannot define the scope, because only the application knows which rows are that person's, which is what `R26` step 3 already decided when it excluded a generic server-side export as a blind library default.
 
+The archive answers the data half of a request. A complete answer to a GDPR access request also carries the information on the processing (purposes, categories, recipients, retention, Art. 15(1)), which the application supplies, and both GDPR's one month and CCPA's 45 days count the export's own run time.
+
 ### The shape agreed 2026-08-21
 
-The application registers the queries that name a person's data. connetto authenticates the caller, runs them under that identity so the deployment's own row-level security applies, and writes the results out as plain SQLite. The application owns the scope, connetto owns the plumbing and the identity. **Plain SQLite is right here for the reason it was wrong for `R56`:** this audience is a person or a regulator, so readable with any tool is the promise that matters.
+The application registers the queries that name a person's data. connetto runs them under that person's identity, so the deployment's own row-level security bounds them unless a query declares otherwise (decision 6), and writes the results out as plain SQLite. The application owns the scope and decides who may ask for whom, connetto owns the plumbing and the identity binding. **Plain SQLite is right here for the reason it was wrong for `R56`:** this audience is a person or a regulator, so readable with any tool is the promise that matters.
 
 ### What connetto already contributes to erasure, so this phase does not rebuild it
 
 - **The local copy.** `teardown` gives `purge_replica`, `wipe_replica` and `forget_device`, and `R17` made the device-private tier die with the replica.
 - **Propagation, unaided.** An application deleting a person's rows in Postgres produces ordinary change events, and `R44`'s departure machinery removes them from every device that held them. No API, nothing new, and it is the part an application would otherwise build by hand.
-- **Files, corrected 2026-08-22.** This bullet used to say documents and photos are outside connetto by decision, which `R24`'s conclusion superseded: the file programme (chapter 18, `R64` to `R69`) is connetto's own, the person's file bytes live in the deployment's chunk store, and their erasure also needs nothing new, because deleting the metadata rows drops the chunk reference counts and chapter 18's sweep reclaims the bytes.
+- **Files.** The file programme (chapter 18, `R64` to `R69`) is connetto's own, the person's file bytes live in the deployment's chunk store, and their erasure needs nothing new, because deleting the metadata rows drops the chunk references and chapter 18's sweep reclaims the bytes at its next pass.
 
 So the only missing piece is the scope, and it is the same missing piece for both halves: the query list.
 
@@ -3252,24 +3263,34 @@ So the only missing piece is the scope, and it is the same missing piece for bot
 
 1. ~~**Does connetto build this at all, and now?**~~ **Dissolved as a scheduling attribute, not a design question:** the phase is fully defined here, sits at `any`, and its natural deadline is the first real deployment, the `R31` class. Deleting the phase was considered and rejected, the obligation is structural.
 2. ~~**Does erasure get a surface of its own?**~~ **DECIDED: no function, document the recipe.** Delete the person's rows with ordinary SQL, sync's departures remove every device's copies, the chunk GC reclaims their file bytes, and the person's own device is wiped by the existing teardown APIs. Rejected: an `erase person` convenience over the registered query list, because connetto cannot verify the list's completeness, and an erasure of an incomplete list fails silently while the function's name claims success, a compliance trap wearing a convenience. A download of an incomplete list is visibly incomplete, which is why the same list is acceptable for the download half.
-3. ~~**What does the file promise?**~~ **DECIDED: one zip, three plain parts.** The rows as a plain SQLite file, a `files/` directory holding each referenced file reassembled from the chunk store under a human-usable name, and a provenance manifest naming whose data it is, when it was generated, by which deployment, and the query list that produced it, which is what makes coverage inspectable in a dispute rather than implied. No format version: nothing ever machine-reads the archive back, and versioning a terminal artifact is ceremony. The earlier rows-only "plain SQLite" wording predates the file programme and is superseded by this shape, the `R26` zip precedent with plain contents because the audience is a person, not a re-importer.
+3. ~~**What does the file promise?**~~ **DECIDED: one zip, three plain parts.** The rows as a plain SQLite file, a `files/` directory holding each referenced file reassembled from the chunk store under a human-usable name, and a provenance manifest naming whose data it is, when it was generated, by which deployment, and the query list that produced it, which is what makes coverage inspectable in a dispute rather than implied. No format version: nothing ever machine-reads the archive back, and versioning a terminal artifact is ceremony. It is the `R26` zip precedent with plain contents, because the audience is a person, not a re-importer.
+
+### Decisions taken with the maintainer on 2026-10-25
+
+4. **The rows part is SQLite only.** SQLite is read by every language and tool, keeps the application's declared tables with their keys and types, and keeps binary columns as blobs, which CSV or JSON would turn into text. That meets the "structured, commonly used and machine-readable" bar of WP242 and EDPB 01/2022 paragraph 149, since free tools open it everywhere. Rejected: a JSON or CSV copy beside it, and JSON in its place, the formats the large services ship.
+5. **A registered query is a single-table `SELECT` that `subql` accepts, with its column list and binds.** The same form a subscription takes (chapter 4), `SELECT *` or an explicit list of the table's columns (`subql`'s `QueryProjection::Columns`), a `WHERE` in `subql`'s operator set, and `?` placeholders with the person's id among the bound values. The list carries the primary key, so decision 7's paging can resume on it. `subql`'s parser validates each query at registration with stand-in values of the bound types. A column the list leaves out never leaves the server, so a column the application adds later stays out until a query names it, and the manifest names each query's columns. Rejected: `SELECT *` with an excluded-column list, which exports a newly added sensitive column until someone excludes it, and whole rows only, which pushes redaction into views the application maintains.
+6. **Row-level security bounds a query by default, and a query may declare that it reads as owner.** GDPR access covers all personal data concerning the person (EDPB 01/2022 paragraphs 35 and 99), including records about them their own identity cannot read, such as moderation notes or a bot's records. A query so declared runs on the owner pool, and the manifest names every query that did. The application holds owner access to its database already, so the declaration adds no reach and keeps the choice visible. A query under row-level security binds the identity alone, never the session's share keys, so the subjects setting holds the absent marker, because a share key is a capability a session holds and the rows it opens belong to their owner (`R95`). Rejected: row-level security as a hard ceiling, which leaves an access answer short by construction, and the owner role for every query, which removes the backstop against a predicate that would leak other people's rows.
+7. **All queries read one snapshot, paged by key.** One `REPEATABLE READ READ ONLY` transaction on the reader pool, and an owner query's transaction imports its snapshot through `pg_export_snapshot()` and `SET TRANSACTION SNAPSHOT`, so the whole archive is one moment, recorded in the manifest with the server that served it. Each query is read in keyset pages on its primary key, each page a statement under `R58`'s statement limit, and `R58`'s single-row byte ceiling refuses a row too wide to hold. The cost is a reader connection held for the whole download and a vacuum horizon held back meanwhile, which a deployment can move off its primary by pointing the reader at a hot standby. Rejected: one moment per query with `R58`'s own paging, which mixes moments in one archive, and one unpaged statement per query under a longer timeout, which holds the largest table in memory.
+8. **Every download and every erasure leaves an audit record in `auth_events`.** The contract gains a download value and an erasure value in `connetto_auth_op`, and the event gains the query-list hash and the archive size beside the invoking session and the person. A download waits for its record and fails when the insert fails, because the record exists for disputes, and the erasure record is written by a library call the application makes once its recipe has run. Chapter 20 says that a deployment answering data requests keeps the audit store on. `R78` adds its courier value to the same enum, and whichever of the two lands second takes the other's values. Rejected: the fire-and-forget insert every other audit row uses, a separate data-access table beside `auth_events`, and no record in connetto.
+9. **The runner refuses a download unless the session asking for it is live in the session store, and the application may opt out.** A full download is what someone holding a stolen session wants, and an application that checks an access token's signature alone sees a revocation only when the token expires. So the call takes the invoking session beside the person's identity and refuses a session the store holds revoked or expired, the same liveness check a handshake makes. The opt-out serves an operator path that holds no session, such as staff answering a regulator's request, and the audit record names the session or the opt-out. The check needs nothing an offline machine lacks, since the download runs where the session store is, and a machine with no server exports through `R26`'s device export. Rejected: trusting the application's check alone, and a check with no opt-out, which leaves the operator path outside connetto.
+10. **A ban does not refuse a download.** A ban (`R36`, widened by `R105` decision 8) shuts an abusive identity out and leaves the person's data and right of access in place, and the application decides who may ask for whom, a banned person's request going through decision 9's operator path. Rejected: refusing a banned identity, with or without an override. Responding to a stolen account is a session matter, since the intruder holds the owner's identity, and its session surfaces are `R105`'s.
 
 ### Steps
 
-1. **The registration surface:** the application registers the person-scope query list on the server configuration, chain-built like every other setting.
-2. **The runner:** authenticate the caller, run the list under that identity through the reader role so row-level security bounds every result, with the statement time limits `R58` established applying to these reads too.
-3. **Rows out:** write the results into a fresh plain SQLite file whose schema comes from the same `pg2sqlite` translation the client build already uses, as the plain application tables (recorded 2026-09-12): never R40's backing-table-plus-view split, because a regulator wants the schema the application declares, and the file is read by people rather than by a policy evaluator.
-4. **Files out (needs `R65`):** the registration of step 1 names, per query, the column holding the file identity, the same `(query, column)` shape `pin_content` takes, because connetto never knows the application's metadata column (R67 decision 7, recorded here 2026-09-12). For each row of a query so registered, reassemble the content from the chunk store into `files/`, named from the metadata with the file id disambiguating collisions, hash-verified against the row's `blake3` identity.
-5. **The manifest and the zip:** provenance as decided in question 3, zipped by a server-side writer (the `R26` archive is the format precedent only, its writer is client code this phase does not share), returned to the application, which owns delivery, since the channel a deployment hands a person their data over is not connetto's.
-6. **Document the erasure recipe** per question 2, in the chapter the maintainer names when it is time.
+1. **The registration surface:** the application registers the query list on `ServerBuilder`, each entry the query of decision 5, a description of its table for the manifest, the column holding a file identity when its rows name files, and whether it reads as owner (decision 6). Registration validates every entry through `subql`'s parser and refuses a query whose list lacks the primary key.
+2. **The runner:** one library call on the built server taking the person's identity (`D::Id`) and the invoking session, or the operator opt-out of decision 9, since the application decides who may ask, the person or someone acting for them. It refuses a session the store does not hold live, opens the snapshot of decision 7, binds the identity as decision 6 states, and reads each query in pages. It never consults bans (decision 10).
+3. **Rows out:** write the pages into a fresh plain SQLite file whose schema comes from the same `pg2sqlite` translation the client build already uses, as the plain application tables restricted to each query's columns (recorded 2026-09-12): never R40's backing-table-plus-view split, because a regulator wants the schema the application declares, and the file is read by people rather than by a policy evaluator. The translation is the schema of the `R31` major the serving server speaks.
+4. **Files out:** the registration of step 1 names, per query, the column holding the file identity, the same `(query, column)` shape `pin_content` takes, because connetto never knows the application's metadata column (R67 decision 7, recorded here 2026-09-12). For each row of a query so registered, walk the file's manifest chunk by chunk through `ChunkStore::read_chunk` into its entry in `files/`, verifying the row's `blake3` identity as the bytes pass, so memory holds one chunk rather than one file. Each entry is named from the metadata with the file id disambiguating collisions. The file server holds the chunks in the clear, since only the device stores are encrypted, so the reassembly needs no key.
+5. **The manifest and the zip:** provenance as decided in question 3, with the snapshot moment and serving server of decision 7, each query with its columns, its table's description and whether it read as owner. The zip is written as a stream (zip64, since a person's files can pass 4 GB or 65,535 entries) into an async sink the application supplies, which owns delivery, since the channel a deployment hands a person their data over is not connetto's. The archive holds the person's rows and files in the clear by question 3, so it is a bearer document whose protection in transit is the application's. The audit record of decision 8 is written before the call returns.
+6. **Document the erasure recipe** per question 2 in chapter 20 (`20-deployment.md`), whose inventory of what a deployment holds is the list the recipe walks. The recipe covers the application's tables and connetto's own person-bearing tables (sessions, provider tokens, enrolments with their application-defined descriptors, installations, file manifests by uploader), which reach further than the download, since the download covers the registered queries only. It never deletes `_connetto_writers` or `_connetto_settled` rows with plain SQL, because they hold the exactly-once frontier and a writer whose row is gone reads as new. Writers leave through retirement and the writer sweep. It states that file bytes go at the next sweep pass, that backups taken before the erasure hold the person's rows and manifests until their retention ends and that a restore is followed by the erasure again, that recipients the data was disclosed to are told (GDPR Art. 17(2) and 19), and that the erasure record of decision 8 is written. Its claim that sync removes every device's copy covers server-mediated sync, and the peer copies of `R77` and `R78` follow the same rule once those phases land. The chapter also states that rows a bot wrote under a person's grant are the application's to classify, and that a registered predicate can express a time window such as CCPA's twelve months.
 
 ### Proof
 
-A fixture deployment with rows and files for two identities yields, for one of them, an archive whose SQLite opens in an ordinary tool holding exactly the rows that identity may read, whose `files/` contents match their metadata hashes, and whose manifest names the queries, while nothing of the second identity appears anywhere in it.
+A fixture deployment with rows and files for two identities yields, for one of them, an archive whose SQLite opens in an ordinary tool holding exactly the rows and columns its registered queries select, whose `files/` contents match their metadata hashes, and whose manifest names the queries, their columns and the snapshot moment. A row the person reaches only through a share key they hold is absent, a row only an owner-declared query reaches is present and the manifest names that query, a column no query lists is absent, and nothing of the second identity appears anywhere in it. The download leaves its audit record, a failing audit insert fails the download, a revoked invoking session is refused, and the operator opt-out serves the same archive with the opt-out recorded.
 
 ### Done when
 
-The archive of the proof is produced by one library call from the registered list, the erasure recipe is documented, and a row or file invisible to the identity provably never leaves the server.
+The archive of the proof is produced by one library call from the registered list, the erasure recipe and the erasure record call are documented in chapter 20, a revoked session cannot download, and a row, column or file the registered queries do not select provably never leaves the server.
 
 ---
 
@@ -4318,6 +4339,8 @@ R19 bounds how *much* a caller may ask for. Nothing anywhere reacts to *what* th
    **The one real burst is an expired key**, which does fail the check and is re-presented on every reconnect. Its fix is not on the wire: the client can read `exp` out of its own token, since a grant is an EdDSA JWT whose payload is base64url and not encrypted, and simply not present a dead key. **That fix has no phase yet** (see Parked), so until it lands the daily tally must clear a caller reconnecting with one expired key. At ordinary reconnect rates that is far below 1000 a day, and a caller in a tight reconnect loop crosses the connection limit long before the ban threshold.
 4. **A ban takes effect immediately and is refused at the door afterwards.** The live connection closes the moment the ban lands, reusing `SessionManager::close_session(id, reason)` exactly as the revocation hook already does from `connetto-server.rs:446` (the plan cited 421, which has since drifted), fired on a spawned task so nothing blocks. Later connections are refused at handshake. **Next-connection-only was rejected**: connections here are long-lived by design, so a ban the target outlasts by simply not reconnecting is useless against the case it exists for.
 
+   **Amended 2026-10-25 by R105 decision 8.** A ban also revokes every session of the banned identity. The token endpoints' refusal of a banned caller, stated below, is not built, since login and refresh never read the ban list and only the sync handshake does, and R105 decision 8 builds it.
+
    **The close was left as a literal blank, and is settled 2026-08-06: the caller is told nothing that distinguishes a ban.** No `FatalErrorReason` variant is added. The socket is dropped without a reason and the ban goes to the structured log, which is R38's split applied here. OWASP's Authentication Cheat Sheet is the normative support: an application "must respond with a generic error message regardless of whether ... the account is locked or disabled", and it names a failure message that says the account is disabled as an incorrect disclosure. Practice agrees by majority rather than unanimously: Pusher collapses everything to `4009 unauthorized`, Ably and Supabase define no ban-specific code, and only Centrifugo distinguishes (`3503 force disconnect` against `3500 invalid token`). At the token endpoints a banned caller gets plain `401`, identical to any refused credential, which needs no new status.
 
    **The expectation that a banned reconnect draws a `401` before the HTTP upgrade was tested and does not survive**, recorded in `docs/research-websocket-auth-placement.md`. Refusing at the upgrade is standards-grounded (RFC 6455 4.2.2 names both 401 and 403), but connetto authenticates in the first frame, nothing identifies the caller earlier, and a browser has exactly three carriers on an upgrade: the URL, the subprotocol field, and cookies. Decisively, **a browser cannot read the status code of a refused upgrade at all**, so a `401` there conveys nothing to a browser caller and buys only cheaper refusal and cleaner logs. The check therefore runs one frame later, where the grant resolves, and the cost of a refused attempt is one socket and one frame against the session, store reads and snapshot a served connection buys.
@@ -5116,11 +5139,26 @@ A fresh Linux session reopens the replica and the device tier without re-minting
 
 ## R72: clock discipline
 
-**Status.** NOT STARTED. X6 given an owner 2026-08-21 by the full review.
+**Status.** DONE 2026-10-24. X6 given an owner 2026-08-21 by the full review. Started 2026-10-20, held at the maintainer's word until R75 and R76's slice 9f merged so the inventory covers their timers. Every timer falls in one of eight classes with its rule stated in chapter 21, the code matches the rule wherever the inventory found a disagreement, and X6 is closed. The four slices merged on 2026-10-24 as #211, #212, #214 and #215.
 
-**Blocked on nothing.**
+**Blocked on nothing.** Two decisions were taken with the maintainer on 2026-10-20 and one on 2026-10-24, listed below.
 
-**Changes state.** Client tables: the revocation list in the enrolment store (step 6), which every identity on the device prunes on a `RevocationUpdate` and which decides whether a peer's device key is used. Server tables: the `connetto_device_certificates` and `connetto_device_enrolments` schema, built with the step 7 inventory. Wire messages: the `RevocationUpdate` carrying the list hash and a reason, which every connected client receives. Archive format: none.
+### Decisions
+
+1. **A wall deadline signed on one machine and checked on another allows a skew sized to the clocks involved** (2026-10-20). `connetto_core::clock::DEVICE_SKEW`, five minutes, wherever a device or peer clock is on either side (R74 step 7's tolerance), and `SERVER_SKEW`, 60 seconds, for a token or content ticket deployment servers both sign and check. Rejected: one five-minute tolerance everywhere, which keeps a stolen access token or ticket usable five minutes past its `exp` against servers that run NTP.
+2. **The rules go into a new chapter, `21-clocks.md`** (2026-10-20), which owns the per-class table, and chapters 11, 14, 15, 18 and 19 cite it where they meet a timer.
+3. **The browser worker's deadlines read `connetto_client::SystemClock.monotonic()`** (2026-10-24), the `performance.now()` reading the away gate already takes in a worker, so the page reads one monotonic clock. Rejected: a helper of its own in `connetto-web` reading the same clock.
+
+The evidence settled the other classes without a question, each recorded in chapter 21 with its sources. A deadline Postgres stores is decided by the database clock, the rule `audit.rs` already states for `auth_events`.
+
+### Slices
+
+One pull request each, stacked in this order.
+
+1. **The shared skew constants and the client side.** `connetto_core::clock`, the peer link and the client's enrolment on `DEVICE_SKEW`, the watch grace re-anchored when the wall clock steps back, the browser worker's deadlines on `performance.now()`, and the `away.rs` and `clock.rs` doc corrections.
+2. **The server's skew and sweeps.** Token leeway and ticket expiry on `SERVER_SKEW`, revoked serials kept until expiry plus `DEVICE_SKEW`, certificate liveness and the file server's stored times on the database clock, and the writer and content sweeps on `MissedTickBehavior::Delay`.
+3. **The server's stored deadlines on the database clock.** The auth store's session deadlines, bans, retained provider tokens and a registration code's `used_at`, each written and compared on Postgres `now()`, the in-memory stores keeping the process clock, and a registration code's device-written expiry judged with `DEVICE_SKEW`.
+4. **The record.** Chapter 21, its citations in chapters 11, 14, 15, 18 and 19, X6 closed, and this section and the status table brought to DONE.
 
 ### Purpose
 
@@ -6007,7 +6045,7 @@ Both platforms build their clients from one builder each over the shared pieces,
 
 ## R95: share keys added and removed on a running client
 
-**Status.** STARTED 2026-10-18, minted 2026-09-25 by R94's decision 10 and designed 2026-10-17, the server's route and the aggregate notice decided with the maintainer and the rest from research reported to the maintainer. The wire is #177. The working record, with the tree facts, the prior art, the state tables of every event against every client and server situation and the sources read, is `plans/design-r95-share-keys.md`, copied to `~/.local/share/connetto-r88/notes/design-r95-share-keys.md` with the research reports in `notes/r95-research/`.
+**Status.** BUILT 2026-10-24, steps 1 to 5 merged and steps 6 and 7 in #231. STARTED 2026-10-18, minted 2026-09-25 by R94's decision 10 and designed 2026-10-17, the server's route and the aggregate notice decided with the maintainer and the rest from research reported to the maintainer. The wire is #177. The working record, with the tree facts, the prior art, the state tables of every event against every client and server situation and the sources read, is `plans/design-r95-share-keys.md`, copied to `~/.local/share/connetto-r88/notes/design-r95-share-keys.md` with the research reports in `notes/r95-research/`.
 
 **Blocked on nothing** since R94 landed on 2026-09-30. Its `Auth` holds the starting set this phase persists.
 
@@ -6031,9 +6069,11 @@ A share key usually reaches an application while it runs, when a user opens a sh
 10. **The browser persists a signed-in durable client's set in `IdbKeyStore`**, one wrapped record per identity under the replica key's non-extractable key-encryption key and passkey gate. That is decision 1 under R90, which left `IdbKeyStore` as the browser's only gated store for secrets, and its limits are the replica key's (chapter 14, RFC 10017 sections 8.5 and 8.6). `wipe_replica` removes it. Anonymous clients and in-memory bots store nothing (R94 decision 20). Rejected: a set kept server-side for the browser session, which re-delivers application credentials across chapter 12's delivery boundary and dies with the session while the key and the replica outlive it. Rejected: no browser persistence, which fails this phase's restart proof.
 11. **A change while the client is locked is refused with `ClientError::Locked`**, as the gate refuses every other application call.
 12. **In a relay the worker holds the set.** A tab's add or remove travels to the worker as a relay request whose reply quotes its id, and after the swap the worker states `TabIdentity` to every tab, which the tab's mirror already applies.
-13. **Chapter 12 gains carrying guidance, and delivery stays the application's.** The key goes in the URL fragment, which RFC 3986 keeps out of the request and so out of logs and the Referer header, links open through Universal Links or verified App Links rather than a custom scheme (RFC 8252 section 8.2), and the browser strips the fragment with `history.replaceState` after reading it.
+13. **Chapter 12 gains carrying guidance, and delivery stays the application's.** The key goes in the URL fragment, which RFC 3986 keeps out of the request and so out of logs and the Referer header, links open through Universal Links or verified App Links rather than a custom scheme (RFC 8252 section 7.2), and the browser strips the fragment with `history.replaceState` after reading it.
 14. **A swap replaces a per-viewer aggregate behind the resend notice** (decided with the maintainer 2026-10-18). An aggregate over a key-gated table registers per viewer (R85), so a swap registers it again, and a grouped answer's re-bootstrap arrives one group at a time and would leave a group the removed key revealed. So `FullResyncRequired` naming an aggregate tells the client to drop that aggregate's resting answer before the full re-bootstrap follows, as Electric's must-refetch discards a shape. Rejected: the server reading the old registration's groups and removing each one absent from the new answer, an extra read per swap repeating the diff the engine already makes on re-execution.
 15. **A swap holds the dispatch of change events while it replaces the principal.** The swap runs on the session's task and the fan-out on the ingest task, so without a shared gate a patch filtered under the old keys could be queued behind the swap's resends and put back a row they took away. R7 needs none, because its moves are produced on the ingest task itself.
+16. **A durable native client signed in with a held credential names an explicit share-key secret store.** Provider sign-ins reuse their credential store. The share keys remain behind the client's gate and outside the encrypted replica. Anonymous clients and in-memory clients persist no share keys.
+17. **A tab changes share keys through the same call as every other client** (decided with the maintainer 2026-10-23). `ConnettoClient::add_share_key` and `remove_share_key` on a tab's mirror send a relay-only control message carrying a request id and the change, and the worker's hub answers with a relay-only message quoting the id, as `TabIdentity` and `GateState` already travel. The hub commits the change on the worker's connection, states `TabIdentity` to every tab, then answers. Rejected: web-only calls on the tab handle over the content lane, which would give browser applications a second spelling and leave bare-wire tabs unable to change keys.
 
 ### Steps
 
@@ -6043,9 +6083,9 @@ Seven pull requests, each building and passing CI on its own.
 2. The aggregate notice. The client drops an aggregate's resting answer when `FullResyncRequired` names it (decision 14), which is safe ahead of the server because today the notice is a no-op for an aggregate.
 3. A key leaves an open connection at its expiry. The grant check reports each key's `exp`, the model reports which tables the keys reach, and the session swaps its keys under the dispatch gate, registers again what read them, resends what they reached and drops the frames of the old answer still waiting for credit (decision 8).
 4. The swap on request. `ReplaceShareKeys` with its metering and queued-only answer, and authorization snapshots for unknown or differing cursor coverage at resume (decisions 2, 5, 6 and 9).
-5. The native client. The add and remove call, persistence beside the refresh token under the gate, durable checkpoint invalidation and publication, the re-render and the client expiry timer.
-6. The browser. The worker's call and durable checkpoint ownership, the tab relay request and `TabIdentity` after a swap, and the `IdbKeyStore` record.
-7. The documents. Chapters 12 and 13 with the carrying guidance.
+5. The native client. The add and remove call, persistence beside the refresh token under the gate, durable checkpoint invalidation and publication, the re-render and the client expiry timer. **Merged** as #219 (2026-10-23).
+6. The browser. The worker's call and durable checkpoint ownership, the tab relay request and `TabIdentity` after a swap, and the `IdbKeyStore` record. **Built** on `feat/r95-browser` (2026-10-23) under decision 17. The `IdbKeyStore` record and its wipe had landed with step 5.
+7. The documents. Chapters 12 and 13 with the carrying guidance. **Built** on `feat/r95-browser` (2026-10-24).
 
 ### Proof
 
@@ -6421,6 +6461,51 @@ Both withdrawal tests are green against a real Postgres and a real `OpenFGA`, th
 ### Done when
 
 A share that spans two tables boots, stays correct when it is withdrawn, and costs a measured amount to keep so. connetto proves both withdrawals for itself instead of borrowing upstream's, and no document claims a refusal that no longer fires or machinery that no longer sits unreachable.
+
+---
+
+## R105: answering a stolen account
+
+**Status.** NOT STARTED, designed with the maintainer 2026-10-25. Raised during the R61 review by a concrete case: an owner in Milan sees an access from Berlin of unknown origin and wants it cut off with nothing left reachable through it. Ten decisions below.
+
+**Blocked on nothing.** Decision 4's list joins R74's device list and decision 5 uninstalls through R91's installations, so it builds on those as they stand.
+
+**Changes state.** Client tables: none, the replica and its keys deleted when the device key is revoked (decision 10). Server tables: `connetto_sessions` gains its creation time, its last refresh time, the provider and issuer, and an application description (decision 2), `connetto_auth_op` gains a login value and a cause for each new revocation (decisions 1 and 3), the provider tokens of a revoked session are deleted (decision 5), and a ban is read at refresh and sign-in (decision 8). Wire messages: none, the client answering the existing `DeviceRevoked` close by wiping (decision 10). Archive format: none.
+
+### Purpose
+
+connetto cannot show a person where they are signed in, cannot end one person's sessions together, and keeps no record that a session ever began, so a stolen account cannot be seen, cut off or investigated through it. What the tree has is one session's revocation by the application (`AuthService::revoke`), every session of the deployment for R70's restore case, the theft defence on a replayed refresh token, R74's device list and `revoke_device`, and R36's ban, which refuses sync only. A browser never enrols a device key, so a browser intruder is only a session. Data already synced to an intruder's own device stays there, since the replica and its keys are on their machine.
+
+### Decisions taken with the maintainer on 2026-10-25
+
+1. **A login leaves a record.** A login value in `auth_events`, one row per sign-in naming the session, the person, the provider and issuer, and the time, so every takeover can be investigated afterwards. Rejected: an application hook in its place, and no record.
+2. **A session records its creation time, its last refresh time, the provider and issuer, and a description the application supplies at login**, the shape of R74's device descriptor. Addresses stay out of connetto (R36 decision 5), and an application may put a coarse location in its description. Rejected: times and provider alone, which leave two browsers on one provider alike, and storing the address.
+3. **Four session surfaces, as server library calls.** List one person's sessions, revoke one of them, revoke all of them, and revoke all but the current one, each recording its own cause in `auth_events`. The application exposes them from its own handlers, the share mint's shape (chapter 12), and connetto adds no endpoint. Rejected: listing and revoking all only, and leaving all four to the application.
+4. **One list of signed-in places.** Each entry is a session, showing its enrolled device when one exists. Revoking an entry ends the session and, for a device, revokes its key too. Rejected: separate lists of sessions and devices, which leave a person to know that a browser shows only as a session.
+5. **Revoking lists what the revoked sessions left behind, and the person chooses.** The call returns the share keys those sessions minted, found through their `CapabilityMinted` rows, and the apps they installed, and separate calls withdraw a share key or uninstall an app. connetto deletes its retained provider tokens for every revoked session, the only copy it can reach. Rejected: withdrawing everything automatically, which also removes legitimate shares the owner made from a revoked session, and leaving it to the application.
+6. **connetto attributes writes, and reverting is the application's.** A library call lists which writers a session wrote as, R75's device keys and numbers, and their settled ranges, so the application can find the rows and decide what undoing means. Rejected: a generic revert over stored inverse changesets, which costs storage on every write and ignores what the application means by undo, and keeping the attribution internal.
+7. **Application handlers get a liveness check.** One library call verifies an access token and confirms its session is live in the store, the check the sync handshake makes, so a revoked session is refused at once wherever a handler calls it instead of when its access token expires. Rejected: a shorter access token lifetime in its place, and leaving it to the application.
+8. **A ban shuts off everything.** It revokes every session of the banned identity, refuses its refresh and its next sign-in, and refuses its sync, so decision 7's call fails for it too. R36 decision 4 already states that the token endpoints answer a banned caller with a plain `401`, and login and refresh never read the ban list today, so that half completes R36 and the session revocation extends it. A ban fits an abusive identity, and a stolen account is answered through decisions 3 and 4, since its intruder holds the owner's identity. A data request for a banned person goes through R61's operator path, because R61 decision 9 needs a live session. Rejected: leaving sign-in open, and sync only.
+9. **A login callback on the server tells the application.** connetto calls an application callback at each sign-in and each device enrolment with the session's description, provider and time, and the application sends its own notice. Rejected: filtering the audit hook, which fires only when the audit store is configured, and polling `auth_events`.
+10. **A client deletes its replica when its device key is revoked**, the replica and its keys, which covers a stolen phone running the real application. A device revoked by mistake loses its unsynced writes, and the docs say so. The docs also state that data synced to a device an attacker controls cannot be taken back. Rejected: deleting on session revocation too, which would wipe every other device on a sign-out everywhere, and documenting only.
+
+### Slices
+
+Proposed for the maintainer's review, one pull request each.
+
+1. **The session record.** Decision 2's columns, decision 1's login value, and decision 9's callback.
+2. **The session surfaces.** Decision 3's four calls with their causes, decision 4's list, decision 5's leftovers with the withdraw and uninstall calls and the provider token deletion, and decision 7's liveness call.
+3. **The ban.** Decision 8, with R36's section amended.
+4. **Write attribution.** Decision 6's call.
+5. **The client and the record.** Decision 10's deletion on revocation, and the chapter 11 and 12 text: what a person sees, what each call does, and what stays out of reach.
+
+### Proof
+
+A fixture with one person signed in twice, through two providers with two descriptions, one session minting a share key and installing an app. The list shows both entries with their times, providers and descriptions, and a native device's entry shows its device. Revoking the second session closes its live connection, refuses its refresh, fails decision 7's call for its token, returns its share key and installation, and deletes its provider tokens, while the first session keeps working. Withdrawing the returned key and uninstalling the app take effect. A banned identity cannot refresh or sign in. A real client whose device key is revoked deletes its replica. The login callback fires with the session's description, and `auth_events` holds the login row and each revocation's cause. The attribution call names the writers the revoked session wrote as.
+
+### Done when
+
+A person can see every place they are signed in, end any of them or all but the current one, and withdraw what an ended session left behind, a ban leaves the banned identity no way back in, a revoked device deletes its replica, and the chapters say what stays out of reach.
 
 ---
 

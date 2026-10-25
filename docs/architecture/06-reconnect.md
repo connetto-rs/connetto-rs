@@ -64,14 +64,23 @@ CREATE TABLE oplog (
 );
 
 CREATE TABLE oplog_commit (
-    only_row   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),
-    commit_lsn BIGINT NOT NULL,
-    xid        BIGINT NOT NULL,
-    end_lsn    BIGINT NOT NULL
+    only_row    BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),
+    commit_lsn  BIGINT NOT NULL,
+    xid         BIGINT NOT NULL,
+    end_lsn     BIGINT NOT NULL,
+    xid_horizon BIGINT
 );
+
+CREATE TABLE oplog_xids (
+    xid        BIGINT PRIMARY KEY,
+    commit_lsn BIGINT NOT NULL
+);
+CREATE INDEX oplog_xids_lsn ON oplog_xids (commit_lsn);
 ```
 
 **Built (2026-09-26): an entry is keyed by its commit position.** subql stamps every Postgres row event with `PgCommitPosition`, the commit LSN its transaction's begin names, the transaction's id and the row's ordinal in that transaction, so positions strictly increase in the order changes commit. A change's own WAL record position does not, since an older transaction that commits after a newer one arrives second with the lower record position, and the cursor advance refuses any position below the one it holds. A snapshot's cursor is `PgCommitPosition::before_commit` of the position read before its transaction followed by the snapshot's fence, since a commit flushed before that position can still be invisible to the snapshot. `entries_since`, `min_position`, `current_position` and `forget_through` all compare the triple, and `entries_of` finds a fence's running transactions by id, so a client holding a transaction's first row still catches up its second, and an entry appended twice, which a source resuming after a failed dispatch delivers, is kept once. `crates/connetto-test-harness/tests/it/interleaved_commit.rs` proves the interleaved shape end to end.
+
+**Built (2026-10-25): the log knows which transactions it dropped.** A snapshot cursor's fence names the transactions its read could not see, the ones it lists as running and every one from its `xmax` on, and their rows sit below the cursor, so the window reaching the cursor does not prove it still holds them. The ingest therefore records each transaction's commit position by full transaction id in `oplog_xids`, in the statement that records the commit, widening the 32-bit id a change carries against the server's next id. After every 1,024 pruned entries it forgets the transactions older than the oldest one whose rows the log still holds, moving `oplog_commit.xid_horizon` to that id in the same statement, so at most about that many recorded transactions trail the window. This is how Postgres keeps its commit log, with a status per transaction and a truncation horizon below which an id is unknown (`TransactionIdInRecentPast` in `xid8funcs.c`). A fenced resume, and the replay a fenced snapshot owes, take Case 2 with `CursorOutsideRetention` when a transaction the fence names lies below the horizon, the range from its `xmax` starts below it, or a known one committed its first row before the oldest retained entry. The index is read after the window, so a transaction pruned meanwhile is still in it or behind the horizon. An unknown id at or above the horizon wrote no row the log holds, and the resume goes on.
 
 **Built (2026-09-26): the log records where the slot resumes.** The source yields each transaction's rows and then its commit, which carries the commit's position and where its record ends. The ingest writes that commit into the one-row `oplog_commit` table and only then acknowledges it, and acknowledging a commit is the only thing that moves the slot, to exactly that end. So before every connect, a slot whose confirmed position is past the recorded end names changes the log never received, and one at or behind it does not. A reconnect in the same process starts right after the last row or commit the ingest handled (`ResumePoint`), so no engine cursor sees a position twice, and a changed timeline or a declared gap clears it, so the slot's own position decides.
 
@@ -135,6 +144,8 @@ HandshakeAck {
 **Built (R3).** A grant that fails to resolve does not end the connection. The handshake succeeds on whatever resolved. See chapter 12.
 
 After `HandshakeAck`, the client re-sends all its `Subscribe` messages.
+
+**Built: a silent peer is noticed on both sides.** The handshake waits at most `SyncTuning::answer_within` (10 s) from the `Handshake` send to the `HandshakeAck`, so a server frozen mid-dial costs one backoff and a redial. Once connected, the client sends `Ping` after `probe_after` (15 s) with no inbound frame and drops the transport after `answer_within` more with none, which shows the application `SyncStatus::Offline` and starts this flow. Every deadline compares real elapsed time, so a timer a throttled tab fires late never drops a link that received a frame. The server closes a session that sent nothing for `SessionConfig::idle_limit` (60 s) through the exit a dropped socket takes, releasing its registration and subscriptions.
 
 ---
 

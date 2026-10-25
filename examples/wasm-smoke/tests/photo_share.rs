@@ -12,15 +12,14 @@ mod common;
 mod harness;
 
 use connetto_client::dsl::Watchable;
-use connetto_wasm_smoke::build::{self, Once};
+use connetto_wasm_smoke::build;
 use connetto_wasm_smoke::workers::demo_schema;
 
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery};
-use connetto_wasm_smoke::workers::{announce_tab, await_db_worker_ready};
+use connetto_wasm_smoke::workers::await_db_worker_ready;
 use connetto_wasm_smoke::{MessageTransport, locks};
 use diesel::prelude::*;
 use futures_channel::oneshot;
-use js_sys::Array;
 use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::BroadcastChannel;
@@ -49,40 +48,21 @@ struct Photo {
 }
 
 /// Boot the photo tier in a worker holding the stack's share key.
-fn spawn_share_worker(glue_url: &str) -> web_sys::Worker {
-    let wasm_url = glue_url.strip_suffix(".js").map_or_else(
-        || format!("{glue_url}_bg.wasm"),
-        |base| format!("{base}_bg.wasm"),
-    );
-    let source = format!(
-        "const debug = new BroadcastChannel(\"connetto-debug\");\ntry {{\n  const mod = await import(\"{g}\");\n  await mod.default({{ module_or_path: \"{w}\" }});\n  await mod.db_worker_share_boot();\n  debug.postMessage(\"db worker: serving\");\n}} catch (err) {{\n  debug.postMessage(\"db worker FAILED: \" + err);\n  throw err;\n}}\n",
-        g = glue_url,
-        w = wasm_url,
-    );
-    let parts = Array::of1(&wasm_bindgen::JsValue::from_str(&source));
-    let blob_opts = web_sys::BlobPropertyBag::new();
-    blob_opts.set_type("text/javascript");
-    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &blob_opts)
-        .expect("bootstrap blob");
-    let url = web_sys::Url::create_object_url_with_blob(&blob).expect("bootstrap url");
-    let worker_opts = web_sys::WorkerOptions::new();
-    worker_opts.set_type(web_sys::WorkerType::Module);
-    worker_opts.set_name("connetto-db-share");
-    let worker = web_sys::Worker::new_with_options(&url, &worker_opts).expect("spawn share worker");
-    let _ = web_sys::Url::revoke_object_url(&url);
-    worker
+fn spawn_share_worker(glue_url: &str) -> (web_sys::Worker, connetto_web::workers::BootIdentity) {
+    connetto_web::workers::spawn_db_worker(
+        glue_url,
+        &connetto_web::workers::WorkerBootstrap::GeneratedCalling(
+            "db_worker_share_boot()".to_owned(),
+        ),
+    )
+    .expect("spawn the share worker")
 }
 
 /// A tab of the worker booted with the key. The worker states who it is and
 /// the keys it holds to the tab, so the tab's mirror answers its views as the
 /// worker's replica does.
 async fn connect_tab(client_id: &str) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
-    let wire = format!("connetto-wire-{client_id}");
-    announce_tab(&wire).await.expect("announce the tab");
-    let transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
-    ClientBuilder::new(demo_schema().relay_mirror(), Once::new(transport))
-        .with_client_id(client_id)
-        .connect_driven()
+    connetto_wasm_smoke::workers::connect_relay_tab(client_id)
         .await
         .expect("tab connect through the wire channel")
 }
@@ -103,8 +83,10 @@ async fn a_key_holder_sees_the_row_its_key_owns() {
         .await
         .expect("the browser stack serves the share key it minted");
 
-    let worker = spawn_share_worker(&harness::glue_url());
-    await_db_worker_ready(&[]).await.expect("db worker ready");
+    let (worker, boot) = spawn_share_worker(&harness::glue_url());
+    await_db_worker_ready(&[boot])
+        .await
+        .expect("db worker ready");
 
     let (_, identity) = common::mint_session().await;
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
