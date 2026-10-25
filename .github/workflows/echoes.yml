@@ -35,6 +35,8 @@ jobs:
             cwd: examples/wasm-smoke
           - name: webauthn-unlock
             cwd: examples/webauthn-unlock
+          - name: leptos-demo
+            cwd: examples/leptos-demo
           - name: yew-web-demo
             cwd: examples/yew-web-demo
     steps:

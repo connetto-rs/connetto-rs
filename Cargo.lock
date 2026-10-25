@@ -1377,6 +1377,8 @@ dependencies = [
  "diesel",
  "js-sys",
  "rosetta-uuid",
+ "serde",
+ "thiserror 2.0.20",
  "tracing",
  "wasm-bindgen",
  "web-sys",

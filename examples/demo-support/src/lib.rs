@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use connetto_client::teardown::ExpiryWarning;
-use connetto_client::{ClientError, ClientEvent, ConnettoClient, SyncSchema};
+use connetto_client::{
+    ClientError, ClientEvent, ConnettoClient, LiveGroups, LiveQuery, LiveValue, SyncSchema,
+    Watchable,
+};
 use connetto_core::messages::{FatalErrorReason, FullResyncReason, SyncStatus};
 use connetto_core::traits::{MaybeSend, Transport};
 use connetto_file_core::{FileId, MimeClass};
@@ -361,19 +364,31 @@ pub fn stage_photo_row(
 
 /// The visible orders rows, newest first, the pane's list subscription.
 #[must_use]
-pub fn orders_newest_first() -> impl diesel::query_builder::Query {
+pub fn orders_newest_first<T>() -> impl Watchable<T, Order, Handle = LiveQuery<Order>>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
     orders::table.order((orders::created_at.desc(), orders::id.desc()))
 }
 
 /// The orders `COUNT(*)` the server pushes.
 #[must_use]
-pub fn orders_count() -> impl diesel::query_builder::Query {
+pub fn orders_count<T>() -> impl Watchable<T, i64, Handle = LiveValue<i64>>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
     orders::table.count()
 }
 
 /// The orders `COUNT(*)` grouped by quantity.
 #[must_use]
-pub fn orders_counts_by_quantity() -> impl diesel::query_builder::Query {
+pub fn orders_counts_by_quantity<T>() -> impl Watchable<T, (i64, i64), Handle = LiveGroups<i64, i64>>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
     orders::table
         .group_by(orders::quantity)
         .select((orders::quantity, diesel::dsl::count_star()))
@@ -381,13 +396,21 @@ pub fn orders_counts_by_quantity() -> impl diesel::query_builder::Query {
 
 /// The notes rows, oldest first, the pane's list subscription.
 #[must_use]
-pub fn notes_rows() -> impl diesel::query_builder::Query {
+pub fn notes_rows<T>() -> impl Watchable<T, Note, Handle = LiveQuery<Note>>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
     notes::table.order(notes::id.asc())
 }
 
 /// The photos rows, oldest first, the pane's list subscription.
 #[must_use]
-pub fn photos_rows() -> impl diesel::query_builder::Query {
+pub fn photos_rows<T>() -> impl Watchable<T, Photo, Handle = LiveQuery<Photo>>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
     photos::table.order(photos::id.asc())
 }
 
@@ -655,9 +678,10 @@ pub fn expiry_warn_line(warn: &ExpiryWarning, now: SystemTime) -> String {
 }
 
 /// The shared standing of the logout controls.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LogoutState {
     /// Showing the two logout buttons.
+    #[default]
     Idle,
     /// A delete would lose local writes, so asking for the go ahead.
     ConfirmDelete {

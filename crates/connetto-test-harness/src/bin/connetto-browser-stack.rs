@@ -718,6 +718,9 @@ async fn run_default_browser_suites(services: &Services, shard: Option<Shard>) -
     for test in test_files(&["examples", "yew-web-demo", "tests"])? {
         suite_args.push(per_test_args("examples/yew-web-demo", test));
     }
+    for test in test_files(&["examples", "leptos-demo", "tests"])? {
+        suite_args.push(per_test_args("examples/leptos-demo", test));
+    }
 
     let total = suite_args.len();
     if let Some(shard) = shard {
