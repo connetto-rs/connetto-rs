@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use connetto_client::teardown::expiry_warning;
+use connetto_client::teardown::{ForgetError, expiry_warning};
 use connetto_client::{
     AccountChoice, Auth, ClientError, ClientEvent, ConnettoClient, Custody, ImportChoices,
     KeyringAuth, KeyringStore, NativeAuthenticator, NativeClient, NativeClientBuilder, NoGate,
@@ -973,7 +973,9 @@ impl Ops {
         self.logout_wipe(state).await;
     }
 
-    /// Wipe the replica and start over, discarding the unsent work.
+    /// Wipe the replica and start over, discarding the unsent work. A refused
+    /// wipe keeps the session, and one that closed the client starts over
+    /// showing what it left undone.
     async fn logout_wipe(&self, mut state: Signal<LogoutState>) {
         let Some(sp) = self.parts.peek().clone() else {
             state.set(LogoutState::Error("no session in this build".to_owned()));
@@ -981,7 +983,13 @@ impl Ops {
         };
         match sp.0.native.forget_device(true).await {
             Ok(()) => self.restart.request(),
-            Err(err) => state.set(LogoutState::Error(format!("logout error: {err}"))),
+            Err(ForgetError::Refused(refusal)) => {
+                state.set(LogoutState::Error(format!("logout error: {refusal}")));
+            }
+            Err(ForgetError::Incomplete(report)) => {
+                state.set(LogoutState::Error(format!("logout error: {report}")));
+                self.restart.request();
+            }
         }
     }
 
