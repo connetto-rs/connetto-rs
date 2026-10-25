@@ -312,10 +312,10 @@ pub(crate) fn drop_synced(db: &mut SqliteConnection, store: Store) -> Result<(),
     let objects = diesel::sql_query(query).load::<SchemaObject>(db)?;
     for (kind, keyword) in [("trigger", "TRIGGER"), ("view", "VIEW"), ("table", "TABLE")] {
         for object in objects.iter().filter(|object| {
-            object.kind == kind
-                && !object.name.starts_with("sqlite_")
-                && !(matches!(store, Store::Account) && object.name.starts_with("_connetto_held_"))
-                && !kept.contains(&object.name.as_str())
+            !(object.kind != kind
+                || object.name.starts_with("sqlite_")
+                || (matches!(store, Store::Account) && object.name.starts_with("_connetto_held_"))
+                || kept.contains(&object.name.as_str()))
         }) {
             db.batch_execute(&format!(
                 "DROP {keyword} IF EXISTS {schema}.{}",
