@@ -474,7 +474,9 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
         "CREATE TABLE connetto_sessions (\
          session_id UUID PRIMARY KEY, user_id UUID NOT NULL, \
          current_refresh_hash BYTEA NOT NULL, idle_deadline TIMESTAMPTZ NOT NULL, \
-         absolute_deadline TIMESTAMPTZ NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE)",
+         absolute_deadline TIMESTAMPTZ NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE, \
+         created_at TIMESTAMPTZ NOT NULL, refreshed_at TIMESTAMPTZ, \
+         provider TEXT NOT NULL, issuer TEXT NOT NULL)",
         "CREATE TABLE connetto_provider_tokens (\
          session_id UUID PRIMARY KEY REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
          issuer TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, \

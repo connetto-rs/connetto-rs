@@ -18,6 +18,7 @@ pub mod provider;
 pub mod provider_oidc;
 pub mod schema;
 pub mod service;
+pub mod sign_in;
 pub mod store;
 pub mod token;
 
@@ -31,10 +32,12 @@ pub use provider::{
 };
 pub use provider_oidc::{GenericOidcProvider, OidcProviderConfig};
 pub use service::{AuthError, AuthService, ConnettoHandshakeAuthority, TokenPair};
+pub use sign_in::{LoginRequest, SessionDescriber, SignInHook, SignInNotice};
 pub use store::{
     AuthStore, AuthStoreError, InMemoryAuthStore, IssuedSession, RefreshOutcome, ResolvedIdentity,
+    SessionOrigin,
 };
 pub use token::{AuthConfig, RefreshLifetimes, TokenAuthority, TokenError, VerifiedSession};
 
-pub use schema::{ConnettoStoreSchema, SessionRow};
+pub use schema::{ConnettoStoreSchema, SessionRecord, SessionRow};
 pub use store::DbAuthStore;

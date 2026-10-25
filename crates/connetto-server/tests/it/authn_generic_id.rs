@@ -27,6 +27,14 @@ fn identity(subject: &str) -> ResolvedIdentity {
     }
 }
 
+/// A sign-in through the provider configured as `test`.
+fn origin() -> connetto_server::SessionOrigin<()> {
+    connetto_server::SessionOrigin {
+        provider: "test".to_owned(),
+        description: (),
+    }
+}
+
 /// The deterministic v5 uuid over `issuer|subject`, mapped into the demo
 /// `rosetta_uuid::Uuid`.
 fn expected_id(subject: &str) -> Uuid {
@@ -60,11 +68,11 @@ async fn in_memory_store_carries_a_typed_user_id() {
     let store = store();
 
     let first = store
-        .create_session(&identity("dave"))
+        .create_session(&identity("dave"), origin())
         .await
         .expect("first session");
     let second = store
-        .create_session(&identity("dave"))
+        .create_session(&identity("dave"), origin())
         .await
         .expect("second session");
 
@@ -77,7 +85,7 @@ async fn in_memory_store_carries_a_typed_user_id() {
 
     // A different identity resolves to a different typed id.
     let other = store
-        .create_session(&identity("erin"))
+        .create_session(&identity("erin"), origin())
         .await
         .expect("other session");
     assert_ne!(other.context.user_id, first.context.user_id);
@@ -88,7 +96,7 @@ async fn typed_id_survives_rotation_and_revocation() {
     let store = store();
 
     let issued = store
-        .create_session(&identity("frank"))
+        .create_session(&identity("frank"), origin())
         .await
         .expect("create");
     assert!(

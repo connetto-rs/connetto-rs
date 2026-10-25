@@ -3,7 +3,7 @@
 //! Exercises the [`ConnettoAuditSchema`] default `connetto_schema!`
 //! generates: that a deployment can create the documented table, that
 //! every `op` value survives a round trip through the Postgres enum, and that
-//! the row a share mint names is preserved.
+//! the row a share mint names and the provider a login names are preserved.
 
 use connetto_core::SessionId;
 use connetto_server::audit::{AUTH_OP_TYPE, AuthEvent, AuthOp, ConnettoAuditSchema};
@@ -32,7 +32,7 @@ async fn reset_audit_table(pool: &Pool<AsyncPgConnection>) {
         format!("DROP TYPE IF EXISTS {AUTH_OP_TYPE}"),
         format!(
             "CREATE TYPE {AUTH_OP_TYPE} AS ENUM (\
-                'logged_out', 'session_revoked', 'token_replayed', \
+                'logged_in', 'logged_out', 'session_revoked', 'token_replayed', \
                 'capability_minted', 'permission_change', 'model_change', \
                 'banned', 'ban_lifted', 'write_forked', 'write_redelivered')"
         ),
@@ -45,7 +45,8 @@ async fn reset_audit_table(pool: &Pool<AsyncPgConnection>) {
                 table_name TEXT, \
                 pk UUID, \
                 writer BIGINT, seq BIGINT, \
-                path connetto_settle_path, other_path connetto_settle_path)"
+                path connetto_settle_path, other_path connetto_settle_path, \
+                provider TEXT, issuer TEXT)"
         ),
     ] {
         sql_query(stmt).execute(&mut conn).await.expect("ddl");
@@ -67,6 +68,7 @@ async fn every_auth_op_round_trips_through_postgres() {
     let mut conn = fixture.admin().get().await.expect("connection");
 
     let all = [
+        AuthOp::LoggedIn,
         AuthOp::LoggedOut,
         AuthOp::SessionRevoked,
         AuthOp::TokenReplayed,
@@ -185,6 +187,48 @@ async fn a_mint_names_its_row_and_a_logout_does_not() {
         .expect("read logout");
     assert_eq!(table_name, None, "a logout names no row");
     assert_eq!(pk, None, "a logout names no row");
+}
+
+/// A login names its provider and issuer on its own row, and a logout names
+/// neither.
+#[tokio::test]
+async fn a_login_names_its_provider_and_a_logout_does_not() {
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    reset_audit_table(fixture.admin()).await;
+    let mut conn = fixture.admin().get().await.expect("connection");
+
+    let session = SessionId::from_uuid(uuid::Uuid::new_v4());
+    for event in [
+        AuthEvent::new(session, Some("alice".to_owned()), AuthOp::LoggedIn)
+            .about_login("google", "https://accounts.google.com"),
+        AuthEvent::new(session, Some("alice".to_owned()), AuthOp::LoggedOut),
+    ] {
+        diesel_async::RunQueryDsl::execute(ConnettoAudit::audit_insert(event), &mut conn)
+            .await
+            .expect("insert");
+    }
+
+    let rows: Vec<(AuthOp, Option<String>, Option<String>)> = diesel_async::RunQueryDsl::load(
+        auth_events::table
+            .filter(auth_events::session.eq(session))
+            .order(auth_events::at)
+            .select((auth_events::op, auth_events::provider, auth_events::issuer)),
+        &mut conn,
+    )
+    .await
+    .expect("read back");
+    let login = rows
+        .iter()
+        .find(|(op, _, _)| *op == AuthOp::LoggedIn)
+        .expect("the login row");
+    assert_eq!(login.1.as_deref(), Some("google"));
+    assert_eq!(login.2.as_deref(), Some("https://accounts.google.com"));
+    let logout = rows
+        .iter()
+        .find(|(op, _, _)| *op == AuthOp::LoggedOut)
+        .expect("the logout row");
+    assert_eq!((logout.1.as_deref(), logout.2.as_deref()), (None, None));
 }
 
 /// The database clock stamps the row, not the emitting process.

@@ -11,7 +11,8 @@ use connetto_core::Subject;
 use connetto_core::messages::Grant;
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
 use connetto_server::{
-    AuthConfig, AuthService, InMemoryAuthStore, RequestGuard, ResolvedIdentity, TokenAuthority,
+    AuthConfig, AuthService, InMemoryAuthStore, RequestGuard, ResolvedIdentity, SessionOrigin,
+    SignInNotice, TokenAuthority, TokenPair,
 };
 
 /// Collects what connetto emitted, in order.
@@ -28,14 +29,20 @@ impl Captured {
         self.0.lock().expect("sink").iter().map(|e| e.op).collect()
     }
 
+    /// The one event after the login row the fixture's sign-in recorded.
     fn only(&self) -> AuthEvent<String> {
         let events = self.0.lock().expect("sink");
         assert_eq!(
-            events.len(),
-            1,
-            "expected exactly one event, got {events:?}"
+            events.first().map(|e| e.op),
+            Some(AuthOp::LoggedIn),
+            "the sign-in recorded its login first"
         );
-        events[0].clone()
+        assert_eq!(
+            events.len(),
+            2,
+            "expected exactly one event after the login, got {events:?}"
+        );
+        events[1].clone()
     }
 }
 
@@ -80,11 +87,74 @@ fn identity(subject: &str) -> ResolvedIdentity {
     }
 }
 
+/// Sign `subject` in through the provider configured as `google`.
+async fn login(svc: &AuthService<InMemoryAuthStore>, subject: &str) -> TokenPair<String> {
+    svc.login(
+        &identity(subject),
+        SessionOrigin {
+            provider: "google".to_owned(),
+            description: (),
+        },
+    )
+    .await
+    .expect("login")
+}
+
+/// A sign-in is `logged_in`, naming the provider and issuer it came through
+/// on the row itself, so the row reads on its own once the session row is
+/// gone.
+#[tokio::test]
+async fn a_login_records_its_provider_and_issuer() {
+    let (authority, svc, captured) = service();
+    let pair = login(&svc, "erin").await;
+
+    let events = captured.0.lock().expect("sink").clone();
+    let [event] = events.as_slice() else {
+        panic!("expected exactly the login row, got {events:?}");
+    };
+    assert_eq!(event.op, AuthOp::LoggedIn);
+    assert_eq!(event.session, session_of(&authority, &pair.access_token));
+    assert_eq!(event.user_id.as_ref(), Some(&pair.user_id));
+    assert_eq!(event.provider.as_deref(), Some("google"));
+    assert_eq!(event.issuer.as_deref(), Some("https://issuer.example"));
+}
+
+/// The application's sign-in callback hears of each sign-in with the
+/// session it created, so it can tell the person.
+#[tokio::test]
+async fn a_sign_in_tells_the_application() {
+    let (authority, svc, _captured) = service();
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&told);
+    svc.set_sign_in_hook(Arc::new(move |notice| {
+        sink.lock().expect("sink").push(notice);
+    }));
+    let before = std::time::SystemTime::now();
+    let pair = login(&svc, "frank").await;
+
+    let told = told.lock().expect("sink").clone();
+    let [SignInNotice::SignedIn(session)] = told.as_slice() else {
+        panic!("expected one sign-in notice, got {told:?}");
+    };
+    assert_eq!(
+        session.session_id,
+        session_of(&authority, &pair.access_token)
+    );
+    assert_eq!(session.user_id, pair.user_id);
+    assert_eq!(session.provider, "google");
+    assert_eq!(session.issuer, "https://issuer.example");
+    assert!(
+        session.created_at >= before,
+        "the notice carries the sign-in time"
+    );
+    assert_eq!(session.refreshed_at, None);
+}
+
 /// A caller ending their own login is `logged_out`, not the generic revocation.
 #[tokio::test]
 async fn logout_records_logged_out() {
     let (_authority, svc, captured) = service();
-    let pair = svc.login(&identity("alice")).await.expect("login");
+    let pair = login(&svc, "alice").await;
 
     assert!(svc.logout(&pair.refresh_token).await.expect("logout"));
 
@@ -98,7 +168,7 @@ async fn logout_records_logged_out() {
 #[tokio::test]
 async fn an_application_revoke_records_session_revoked() {
     let (authority, svc, captured) = service();
-    let pair = svc.login(&identity("bob")).await.expect("login");
+    let pair = login(&svc, "bob").await;
     let session = session_of(&authority, &pair.access_token);
 
     svc.revoke(session).await.expect("revoke");
@@ -113,7 +183,7 @@ async fn an_application_revoke_records_session_revoked() {
 #[tokio::test]
 async fn token_reuse_records_token_replayed() {
     let (_authority, svc, captured) = service();
-    let pair = svc.login(&identity("mallory")).await.expect("login");
+    let pair = login(&svc, "mallory").await;
     svc.refresh(&pair.refresh_token).await.expect("rotate");
 
     assert!(
@@ -138,7 +208,7 @@ async fn token_reuse_records_token_replayed() {
 #[tokio::test]
 async fn a_logout_that_revoked_nothing_records_nothing() {
     let (_authority, svc, captured) = service();
-    let _ = svc.login(&identity("carol")).await.expect("login");
+    let _ = login(&svc, "carol").await;
 
     assert!(
         !svc.logout("connetto-not-a-real-token")
@@ -147,10 +217,10 @@ async fn a_logout_that_revoked_nothing_records_nothing() {
         "the token names no live session"
     );
 
-    assert!(
-        captured.ops().is_empty(),
-        "nothing changed, so nothing is recorded: {:?}",
-        captured.ops()
+    assert_eq!(
+        captured.ops(),
+        [AuthOp::LoggedIn],
+        "nothing changed after the login, so nothing more is recorded"
     );
 }
 
@@ -162,10 +232,10 @@ async fn a_logout_that_revoked_nothing_records_nothing() {
 #[tokio::test]
 async fn denials_never_reach_the_audit_table() {
     let (_authority, svc, captured) = service();
-    let pair = svc.login(&identity("dave")).await.expect("login");
+    let pair = login(&svc, "dave").await;
     svc.logout(&pair.refresh_token).await.expect("logout");
     let before = captured.ops();
-    assert_eq!(before, vec![AuthOp::LoggedOut]);
+    assert_eq!(before, vec![AuthOp::LoggedIn, AuthOp::LoggedOut]);
 
     // Every refusal available on this surface: a rotated token for a dead
     // session, a refresh of a token that never existed, and a second logout.

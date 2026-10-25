@@ -557,13 +557,28 @@ struct OutageStore(InMemoryAuthStore);
 
 impl AuthStore for OutageStore {
     type Id = String;
+    type Descriptor = ();
+
+    fn undescribed() -> Option<()> {
+        Some(())
+    }
 
     fn create_session(
         &self,
         identity: &connetto_server::ResolvedIdentity,
+        origin: connetto_server::SessionOrigin<()>,
     ) -> impl Future<Output = Result<connetto_server::IssuedSession<Self::Id>, AuthStoreError>> + Send
     {
-        self.0.create_session(identity)
+        self.0.create_session(identity, origin)
+    }
+
+    fn session_record(
+        &self,
+        session_id: connetto_server::SessionId,
+    ) -> impl Future<
+        Output = Result<Option<connetto_server::SessionRecord<Self::Id, ()>>, AuthStoreError>,
+    > + Send {
+        self.0.session_record(session_id)
     }
 
     fn session_is_live(

@@ -402,6 +402,26 @@ pub(crate) struct PendingChallenge {
 pub type SessionRevoker =
     Arc<dyn Fn(SessionId) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// A device key the account never had, granted its first certificate.
+#[derive(Debug, Clone)]
+pub struct FirstEnrolment<Id> {
+    /// The account the key enrolled under.
+    pub user: Id,
+    /// The session the key enrolled during.
+    pub session: SessionId,
+    /// The enrolled key.
+    pub key: KeyId,
+    /// The descriptor the device sent.
+    pub descriptor: Vec<u8>,
+    /// When the certificate was issued.
+    pub at: SystemTime,
+}
+
+/// Observes a key's first enrolment, never a renewal. Fired synchronously
+/// after the enrolment is recorded, so async work belongs on a spawned task
+/// inside the hook.
+pub type FirstEnrolmentHook<Id> = Arc<dyn Fn(FirstEnrolment<Id>) + Send + Sync>;
+
 /// Why a device could not be revoked.
 #[derive(Debug, thiserror::Error)]
 pub enum RevokeError {
@@ -440,6 +460,8 @@ pub struct DeviceEnrolment<Id> {
     random: Box<dyn RandomSource>,
     lists: tokio::sync::Mutex<Option<Vec<SignedList>>>,
     revoker: Option<SessionRevoker>,
+    /// Told of each key's first enrolment.
+    first_enrolment: Option<FirstEnrolmentHook<Id>>,
     /// The attestation status list an Android chain's serials are checked against.
     status: Option<StatusList>,
     /// The time a certificate is issued at.
@@ -462,6 +484,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
             random: Box::new(SystemRandom::new()),
             lists: tokio::sync::Mutex::new(None),
             revoker: None,
+            first_enrolment: None,
             clock: SystemTime::now,
             status: None,
         }
@@ -491,6 +514,14 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
     #[must_use]
     pub fn with_session_revoker(mut self, revoker: SessionRevoker) -> Self {
         self.revoker = Some(revoker);
+        self
+    }
+
+    /// Tell `hook` of each key's first enrolment, so the deployment can tell
+    /// the person a new device signed in (R105 decision 9).
+    #[must_use]
+    pub fn with_first_enrolment_hook(mut self, hook: FirstEnrolmentHook<Id>) -> Self {
+        self.first_enrolment = Some(hook);
         self
     }
 
@@ -553,7 +584,9 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         }
         let key = KeyId::of_public_key(csr.public_key());
         // The level the first enrolment recorded stands, whatever a renewal sends.
-        let level = match self.store.stored_attestation(user, key).await {
+        let stored = self.store.stored_attestation(user, key).await;
+        let first = matches!(stored, Ok(None));
+        let level = match stored {
             Ok(Some(stored)) => stored,
             Ok(None) => verify(
                 &self.config,
@@ -607,12 +640,18 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
             descriptor: request.descriptor,
             attestation: level,
         };
+        let told = first.then(|| self.told(&enrolment)).flatten();
         match self.store.record(enrolment).await {
-            Ok(Recorded::Granted) => Ok(EnrolGrant {
-                request_id: request.request_id,
-                chain: vec![leaf.into(), issuer.certificate().to_vec().into()],
-                revocation_lists: self.lists().await.unwrap_or_default(),
-            }),
+            Ok(Recorded::Granted) => {
+                if let Some((hook, first)) = told {
+                    hook(first);
+                }
+                Ok(EnrolGrant {
+                    request_id: request.request_id,
+                    chain: vec![leaf.into(), issuer.certificate().to_vec().into()],
+                    revocation_lists: self.lists().await.unwrap_or_default(),
+                })
+            }
             Ok(Recorded::Revoked) => Err(EnrolRefusal::Revoked),
             Ok(Recorded::HeldElsewhere | Recorded::UnreadableDescriptor) => {
                 Err(EnrolRefusal::InvalidRequest)
@@ -622,6 +661,26 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
                 Err(EnrolRefusal::IssuerUnavailable)
             }
         }
+    }
+
+    /// The first-enrolment hook with what it is told about `enrolment`,
+    /// `None` when no hook is attached.
+    fn told(
+        &self,
+        enrolment: &Enrolment<Id>,
+    ) -> Option<(&FirstEnrolmentHook<Id>, FirstEnrolment<Id>)> {
+        self.first_enrolment.as_ref().map(|hook| {
+            (
+                hook,
+                FirstEnrolment {
+                    user: enrolment.user.clone(),
+                    session: enrolment.session,
+                    key: enrolment.key,
+                    descriptor: enrolment.descriptor.clone(),
+                    at: enrolment.issued_at,
+                },
+            )
+        })
     }
 
     /// `user`'s devices, as the device list shows them.

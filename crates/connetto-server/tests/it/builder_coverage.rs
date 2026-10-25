@@ -1484,17 +1484,17 @@ async fn a_logout_revokes_the_live_session_and_the_audit_records_it() {
         other => panic!("the session's last frame says {other:?}"),
     }
 
-    // The write is spawned, so it lands shortly after the response.
+    // The writes are spawned, so they land shortly after the response.
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut ops = audit_ops(&pool).await;
-    while ops.is_empty() && Instant::now() < deadline {
+    while !ops.iter().any(|op| op == "logged_out") && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
         ops = audit_ops(&pool).await;
     }
     assert_eq!(
         ops,
-        vec!["logged_out".to_owned()],
-        "a real logout leaves exactly one row, saying it was a logout"
+        vec!["logged_in".to_owned(), "logged_out".to_owned()],
+        "a sign-in and its logout leave one row each, the login first"
     );
     stream.abort();
     http.abort();

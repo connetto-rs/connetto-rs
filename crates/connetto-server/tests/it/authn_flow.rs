@@ -98,6 +98,14 @@ fn identity(subject: &str) -> ResolvedIdentity {
     }
 }
 
+/// A sign-in through the provider configured as `test`.
+fn origin() -> connetto_server::SessionOrigin<()> {
+    connetto_server::SessionOrigin {
+        provider: "test".to_owned(),
+        description: (),
+    }
+}
+
 fn service() -> (Arc<TokenAuthority>, Arc<AuthService<InMemoryAuthStore>>) {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("generate keypair"));
@@ -138,7 +146,10 @@ fn manager_with(
 async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     let fixture = Fixture::acquire().await;
     let (authority, svc) = service();
-    let pair = svc.login(&identity("alice")).await.expect("login");
+    let pair = svc
+        .login(&identity("alice"), origin())
+        .await
+        .expect("login");
 
     // A login-minted access token opens the handshake, and the identity that
     // reaches the session is the token's, not the id the client claims.
@@ -263,7 +274,7 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
 async fn logout_closes_the_live_connection_it_revoked() {
     let fixture = Fixture::acquire().await;
     let (_authority, svc) = service();
-    let pair = svc.login(&identity("dave")).await.expect("login");
+    let pair = svc.login(&identity("dave"), origin()).await.expect("login");
     let manager = manager_with(
         Arc::new(svc.handshake_authority()),
         CapturingSnapshot::default(),
@@ -335,7 +346,10 @@ async fn logout_closes_the_live_connection_it_revoked() {
 async fn token_reuse_closes_the_live_connection_it_revoked() {
     let fixture = Fixture::acquire().await;
     let (_authority, svc) = service();
-    let pair = svc.login(&identity("mallory")).await.expect("login");
+    let pair = svc
+        .login(&identity("mallory"), origin())
+        .await
+        .expect("login");
     let manager = manager_with(
         Arc::new(svc.handshake_authority()),
         CapturingSnapshot::default(),
@@ -395,7 +409,7 @@ async fn token_reuse_closes_the_live_connection_it_revoked() {
 #[tokio::test]
 async fn refresh_rotates_and_reusing_the_old_token_revokes_the_session() {
     let (authority, svc) = service();
-    let pair = svc.login(&identity("bob")).await.expect("login");
+    let pair = svc.login(&identity("bob"), origin()).await.expect("login");
 
     let rotated = svc.refresh(&pair.refresh_token).await.expect("refresh");
     assert_ne!(rotated.refresh_token, pair.refresh_token, "token rotates");
@@ -441,7 +455,10 @@ async fn expired_access_token_is_refused() {
         Arc::clone(&store),
         Arc::new(RequestGuard::default()),
     );
-    let pair = svc.login(&identity("carol")).await.expect("login");
+    let pair = svc
+        .login(&identity("carol"), origin())
+        .await
+        .expect("login");
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
@@ -476,7 +493,7 @@ async fn an_access_token_within_server_skew_of_expiry_verifies() {
         Arc::clone(&store),
         Arc::new(RequestGuard::default()),
     );
-    let pair = svc.login(&identity("dora")).await.expect("login");
+    let pair = svc.login(&identity("dora"), origin()).await.expect("login");
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
@@ -508,7 +525,7 @@ async fn an_access_token_beyond_server_skew_of_expiry_is_refused() {
         Arc::clone(&store),
         Arc::new(RequestGuard::default()),
     );
-    let pair = svc.login(&identity("dora")).await.expect("login");
+    let pair = svc.login(&identity("dora"), origin()).await.expect("login");
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
@@ -543,7 +560,7 @@ async fn a_token_from_another_key_is_refused() {
     // A different authority (different signing key) mints a token for the same
     // session id, simulating a forged credential.
     let other = TokenAuthority::generate(&config).expect("keypair b");
-    let pair = svc.login(&identity("dave")).await.expect("login");
+    let pair = svc.login(&identity("dave"), origin()).await.expect("login");
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
@@ -1331,14 +1348,32 @@ struct LookupOutageStore {
 
 impl connetto_server::AuthStore for LookupOutageStore {
     type Id = String;
+    type Descriptor = ();
+
+    fn undescribed() -> Option<()> {
+        Some(())
+    }
 
     fn create_session(
         &self,
         identity: &ResolvedIdentity,
+        origin: connetto_server::SessionOrigin<()>,
     ) -> impl Future<
         Output = Result<connetto_server::IssuedSession<Self::Id>, connetto_server::AuthStoreError>,
     > + Send {
-        self.inner.create_session(identity)
+        self.inner.create_session(identity, origin)
+    }
+
+    fn session_record(
+        &self,
+        session_id: connetto_server::SessionId,
+    ) -> impl Future<
+        Output = Result<
+            Option<connetto_server::SessionRecord<Self::Id, ()>>,
+            connetto_server::AuthStoreError,
+        >,
+    > + Send {
+        self.inner.session_record(session_id)
     }
 
     fn session_is_live(
@@ -1562,7 +1597,7 @@ async fn in_memory_store_spends_a_provider_token_inside_the_margin() {
 
     let store = InMemoryAuthStore::new(AuthConfig::default().refresh_lifetimes());
     let issued = store
-        .create_session(&identity("ines"))
+        .create_session(&identity("ines"), origin())
         .await
         .expect("create");
     for (lifetime, usable) in [

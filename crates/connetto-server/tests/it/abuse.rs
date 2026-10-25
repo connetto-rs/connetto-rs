@@ -235,7 +235,7 @@ async fn reset_tables(fixture: &Fixture) {
         format!("DROP TYPE IF EXISTS {AUTH_OP_TYPE}"),
         format!(
             "CREATE TYPE {AUTH_OP_TYPE} AS ENUM (\
-                'logged_out', 'session_revoked', 'token_replayed', \
+                'logged_in', 'logged_out', 'session_revoked', 'token_replayed', \
                 'capability_minted', 'permission_change', 'model_change', \
                 'banned', 'ban_lifted', 'write_forked', 'write_redelivered')"
         ),
@@ -255,7 +255,8 @@ async fn reset_tables(fixture: &Fixture) {
                 table_name TEXT, \
                 pk UUID, \
                 writer BIGINT, seq BIGINT, \
-                path connetto_settle_path, other_path connetto_settle_path)"
+                path connetto_settle_path, other_path connetto_settle_path, \
+                provider TEXT, issuer TEXT)"
         ),
     ] {
         fixture.exec(&statement).await;
