@@ -162,6 +162,8 @@ After `HandshakeAck`, the client re-sends all its `Subscribe` messages.
 
 The worker reads each fenced member's missed transactions and retains only records that member missed at or below its cursor and ceiling. It pages the ordinary shared gap through `Oplog::entries_page` with at most 1,000 records per page. In-memory pages seek to their lower bound with binary search. A wave of at most four subscriptions matches each through subql's `matches_consumer`, and a larger one matches every reached subscription at once through the read-only `match_rows`, with at most 64 records per materializer-lock hold.
 
+After its first retention read the worker asks the transaction index about each open fenced member, and a member a missed transaction may have left the log for takes the `CursorOutsideRetention` resync before any of its records, as a single resume would.
+
 Each session drains its own matched deliveries under its own credits. A resync outcome releases that session immediately, independently of other members' work. Closing its receiver wakes the worker, removes that caller from pending visibility questions and retries, and interrupts pending backend work when no live recipient needs it.
 
 Transient authorization failures pause the reached members and retry the same record. A permanent policy failure ends those members with `AuthorizationUnanswerable` while other members and queued waves continue.

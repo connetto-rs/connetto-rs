@@ -336,7 +336,11 @@ pub trait Oplog: Send + Sync {
     /// # Errors
     ///
     /// Implementation-defined: a backing-store read failure.
-    async fn commits_of(&self, unseen: &UnseenIds, through: PgLsn) -> Result<Commits, Self::Error>;
+    fn commits_of(
+        &self,
+        unseen: &UnseenIds,
+        through: PgLsn,
+    ) -> impl Future<Output = Result<Commits, Self::Error>> + Send;
 
     /// The earliest retained position, or `None` when the log holds no entries.
     ///

@@ -8353,6 +8353,9 @@ where
             }
             if first {
                 first = false;
+                if let Some(min) = min {
+                    self.end_fence_dropped(members, &mut budget, min).await?;
+                }
                 let missed: Vec<ChangeRecord> = std::mem::take(&mut missed).into_values().collect();
                 self.walk_records(members, &index, &consumers, &missed, true)
                     .await?;
@@ -8368,6 +8371,44 @@ where
             }
             after = Some(last);
         }
+    }
+
+    /// End each open fenced member a transaction its fence missed may have left the log for, asked after the missed read and the window that would have returned it.
+    async fn end_fence_dropped(
+        &self,
+        members: &mut [Member<Id, Key>],
+        budget: &mut Duration,
+        min: PgCommitPosition,
+    ) -> Result<(), WaveFailed> {
+        for at in 0..members.len() {
+            let Some(fence) = members[at]
+                .is_open()
+                .then(|| members[at].enrollment.fence.clone())
+                .flatten()
+            else {
+                continue;
+            };
+            let unseen = fence.unseen_ids();
+            let Some(result) = self
+                .catchup_work(
+                    || !members[at].is_open(),
+                    read_log::<O, _, _>(budget, || {
+                        self.oplog.commits_of(&unseen, min.commit_lsn())
+                    }),
+                )
+                .await
+            else {
+                continue;
+            };
+            match result {
+                Ok(commits) if commits.may_have_dropped(&unseen, min) => {
+                    members[at].end(WaveEnd::Resync(FullResyncReason::CursorOutsideRetention));
+                }
+                Ok(_) => {}
+                Err(err) => return Err(fail_wave(members, &err)),
+            }
+        }
+        Ok(())
     }
 
     /// Read and deduplicate the transactions each live member's snapshot missed.
