@@ -123,8 +123,6 @@ pub(crate) struct Recorded {
     pub(crate) major: Major,
     /// The bundle hash it was built from.
     pub(crate) version: SchemaVersion,
-    /// Its split tables' wire names, physical to logical.
-    renames: HashMap<String, String>,
 }
 
 /// One `user_version` reading.
@@ -180,37 +178,12 @@ pub(crate) fn read(
     let Some(hash) = hash else {
         return Err(ClientError::ReplicaRecordMissing { recorded: major });
     };
-    let recorded_version = SchemaVersion::from_hash(hash);
-    if major > build {
-        return Err(ClientError::ReplicaNewer {
-            recorded: major,
-            build,
-        });
-    }
-    if major == build {
-        return if &recorded_version == version {
-            Ok(Record::Current)
-        } else {
-            Err(ClientError::ReplicaSchemaChanged {
-                major,
-                recorded: recorded_version,
-                build: version.clone(),
-            })
-        };
-    }
-    let renames = if has_table(db, "_connetto_build_renames")? {
-        build_renames::table
-            .select((build_renames::physical, build_renames::logical))
-            .load::<(String, String)>(db)?
-            .into_iter()
-            .collect()
-    } else {
-        HashMap::new()
+    let Some(recorded_version) = prior_version(major, hash, build, version)? else {
+        return Ok(Record::Current);
     };
     Ok(Record::Behind(Recorded {
         major,
         version: recorded_version,
-        renames,
     }))
 }
 
@@ -255,42 +228,36 @@ pub(crate) fn stamp(
     Ok(())
 }
 
-/// Rebuild the replica in place for `build`, in one transaction: turn the old
-/// major's queued writes into their wire form and hold its unsent content,
-/// drop every synced object and connetto's resume point, apply `ddl`, and
-/// stamp the new record. The writer queues stay where they are, each entry
-/// keeping the major it was captured under, so the old major's writes drain
-/// in their chains.
-///
-/// # Errors
-///
-/// The first failure, after which nothing has changed.
-pub(crate) fn rebuild(
+/// Hold the old major's work and clear its account schema inside the installation transaction.
+pub(crate) fn prepare_rebuild(
     db: &mut SqliteConnection,
-    ddl: &str,
     from: &Recorded,
-    build: (Major, &SchemaVersion, &PolicyTables),
     content: HeldContent,
 ) -> Result<(), ClientError> {
-    let (build, version, tables) = build;
-    db.immediate_transaction(|db| {
-        db.batch_execute(HELD_DDL)?;
-        let old_major = i64::from(from.major.get());
-        let writes: Vec<(String, i64, Vec<u8>)> = _connetto_pending::table
-            .filter(_connetto_pending::major.eq(old_major))
-            .select((
-                _connetto_pending::writer,
-                _connetto_pending::seq,
-                _connetto_pending::changeset,
-            ))
-            .load(db)?;
-        let held_writes = !writes.is_empty();
-        if !from.renames.is_empty() {
+    db.batch_execute(HELD_DDL)?;
+    let old_major = i64::from(from.major.get());
+    let held_writes = diesel::select(diesel::dsl::exists(
+        _connetto_pending::table.filter(_connetto_pending::major.eq(old_major)),
+    ))
+    .get_result::<bool>(db)?;
+    if held_writes && has_table(db, "_connetto_build_renames")? {
+        let renames: HashMap<String, String> = build_renames::table
+            .select((build_renames::physical, build_renames::logical))
+            .load::<(String, String)>(db)?
+            .into_iter()
+            .collect();
+        if !renames.is_empty() {
+            let writes: Vec<(String, i64, Vec<u8>)> = _connetto_pending::table
+                .filter(_connetto_pending::major.eq(old_major))
+                .select((
+                    _connetto_pending::writer,
+                    _connetto_pending::seq,
+                    _connetto_pending::changeset,
+                ))
+                .load(db)?;
             for (writer, seq, changeset) in writes {
-                // The same rename the old build's upload applied, so the bytes are the ones its chain hash covers.
-                let wire = rename_diffset(changeset, |name| {
-                    from.renames.get(&name.to_lowercase()).cloned()
-                })?;
+                let wire =
+                    rename_diffset(changeset, |name| renames.get(&name.to_lowercase()).cloned())?;
                 diesel::update(
                     _connetto_pending::table
                         .filter(_connetto_pending::writer.eq(&writer))
@@ -300,42 +267,208 @@ pub(crate) fn rebuild(
                 .execute(db)?;
             }
         }
-        let held_content = (content.hold)(db, from.major)?;
-        if held_writes || held_content {
-            diesel::insert_into(held_batch::table)
-                .values((
-                    held_batch::major.eq(old_major),
-                    held_batch::version.eq(from.version.hash()),
-                ))
-                .execute(db)?;
-        }
-        drop_synced(db)?;
-        db.batch_execute(ddl)?;
-        stamp(db, build, version, tables)
-    })
+    }
+    let held_content = (content.hold)(db, from.major)?;
+    if held_writes || held_content {
+        diesel::insert_into(held_batch::table)
+            .values((
+                held_batch::major.eq(old_major),
+                held_batch::version.eq(from.version.hash()),
+            ))
+            .execute(db)?;
+    }
+    drop_synced(db, Store::Account)
 }
 
-/// Drop every object in `main` except SQLite's own, the held work and the
-/// kept tables: triggers first, then views, then tables, whose indexes go with
-/// them.
-fn drop_synced(db: &mut SqliteConnection) -> Result<(), ClientError> {
-    let objects: Vec<(String, String)> = sqlite_catalog::table
-        .select((sqlite_catalog::kind, sqlite_catalog::name))
-        .load(db)?;
-    for kind in ["trigger", "view", "table"] {
-        for (_, name) in objects.iter().filter(|(found, name)| {
-            found == kind
-                && !name.starts_with("sqlite_")
-                && !name.starts_with("_connetto_held_")
-                && !KEPT.contains(&name.as_str())
+/// The file whose synced objects a rebuild replaces.
+#[derive(Clone, Copy)]
+pub(crate) enum Store {
+    Account,
+    Shared,
+}
+
+#[derive(QueryableByName)]
+struct SchemaObject {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    kind: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+}
+
+/// Clear one cache while retaining its build record and any account-owned work.
+pub(crate) fn drop_synced(db: &mut SqliteConnection, store: Store) -> Result<(), ClientError> {
+    let (schema, query, kept): (&str, &str, &[&str]) = match store {
+        Store::Account => (
+            "main",
+            "SELECT type AS kind, name FROM main.sqlite_master",
+            &KEPT,
+        ),
+        Store::Shared => (
+            crate::SHARED_SCHEMA,
+            "SELECT type AS kind, name FROM connetto_shared.sqlite_master",
+            &["_connetto_build"],
+        ),
+    };
+    let objects = diesel::sql_query(query).load::<SchemaObject>(db)?;
+    for (kind, keyword) in [("trigger", "TRIGGER"), ("view", "VIEW"), ("table", "TABLE")] {
+        for object in objects.iter().filter(|object| {
+            object.kind == kind
+                && !object.name.starts_with("sqlite_")
+                && !(matches!(store, Store::Account) && object.name.starts_with("_connetto_held_"))
+                && !kept.contains(&object.name.as_str())
         }) {
-            // DDL naming a catalogue object, which the typed DSL cannot express.
             db.batch_execute(&format!(
-                "DROP {} IF EXISTS main.{}",
-                kind.to_uppercase(),
-                quote_ident(name)
+                "DROP {keyword} IF EXISTS {schema}.{}",
+                quote_ident(&object.name)
             ))?;
         }
     }
     Ok(())
+}
+
+fn prior_version(
+    recorded: Major,
+    hash: Vec<u8>,
+    build: Major,
+    version: &SchemaVersion,
+) -> Result<Option<SchemaVersion>, ClientError> {
+    if recorded > build {
+        return Err(ClientError::ReplicaNewer { recorded, build });
+    }
+    if recorded == build {
+        return if hash == version.hash() {
+            Ok(None)
+        } else {
+            Err(ClientError::ReplicaSchemaChanged {
+                major: recorded,
+                recorded: SchemaVersion::from_hash(hash),
+                build: version.clone(),
+            })
+        };
+    }
+    Ok(Some(SchemaVersion::from_hash(hash)))
+}
+
+/// A shared file's cache lifetime, independent of its application major.
+#[derive(QueryableByName)]
+pub(crate) struct SharedGeneration {
+    #[diesel(sql_type = diesel::sql_types::Binary)]
+    generation: Vec<u8>,
+}
+
+/// The shared file's independently validated installation state.
+pub(crate) enum SharedRecord {
+    Fresh,
+    Unrecorded,
+    Current(SharedGeneration),
+    Behind,
+}
+
+#[derive(QueryableByName)]
+struct SharedBuild {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
+    version: Option<Vec<u8>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
+    generation: Option<Vec<u8>>,
+}
+
+/// Validate the attached shared file before changing either file's schema.
+pub(crate) fn read_shared(
+    db: &mut SqliteConnection,
+    build: Major,
+    version: &SchemaVersion,
+) -> Result<SharedRecord, ClientError> {
+    let reading: UserVersion =
+        diesel::sql_query("PRAGMA connetto_shared.user_version").get_result(db)?;
+    let Some(recorded) = u32::try_from(reading.user_version)
+        .ok()
+        .and_then(Major::new)
+    else {
+        let present = diesel::sql_query(
+            "SELECT 1 AS present FROM connetto_shared.sqlite_master WHERE type = 'table' LIMIT 1",
+        )
+        .get_result::<crate::Present>(db)
+        .optional()?;
+        return Ok(if present.is_some() {
+            SharedRecord::Unrecorded
+        } else {
+            SharedRecord::Fresh
+        });
+    };
+    let columns = diesel::sql_query("PRAGMA connetto_shared.table_info(_connetto_build)")
+        .load::<crate::SchemaTableRow>(db)?;
+    if !["version", "generation"]
+        .iter()
+        .all(|name| columns.iter().any(|column| column.name == *name))
+    {
+        return Err(ClientError::ReplicaRecordMissing { recorded });
+    }
+    let Some(row) = diesel::sql_query(
+        "SELECT version, generation FROM connetto_shared._connetto_build WHERE id = 1",
+    )
+    .get_result::<SharedBuild>(db)
+    .optional()?
+    else {
+        return Err(ClientError::ReplicaRecordMissing { recorded });
+    };
+    let (Some(hash), Some(generation)) = (row.version, row.generation) else {
+        return Err(ClientError::ReplicaRecordMissing { recorded });
+    };
+    Ok(
+        if prior_version(recorded, hash, build, version)?.is_some() {
+            SharedRecord::Behind
+        } else {
+            SharedRecord::Current(SharedGeneration { generation })
+        },
+    )
+}
+
+/// Record a shared cache's build and mint its independent lifetime token.
+pub(crate) fn stamp_shared(
+    db: &mut SqliteConnection,
+    build: Major,
+    version: &SchemaVersion,
+) -> Result<SharedGeneration, ClientError> {
+    db.batch_execute(
+        "CREATE TABLE IF NOT EXISTS connetto_shared._connetto_build \
+         (id INTEGER PRIMARY KEY CHECK (id = 1), version BLOB NOT NULL, generation BLOB NOT NULL)",
+    )?;
+    let generation = diesel::sql_query(
+        "INSERT INTO connetto_shared._connetto_build (id, version, generation) \
+         VALUES (1, ?, randomblob(16)) ON CONFLICT(id) DO UPDATE SET \
+         version = excluded.version, generation = excluded.generation RETURNING generation",
+    )
+    .bind::<diesel::sql_types::Binary, _>(version.hash())
+    .get_result(db)?;
+    db.batch_execute(&format!(
+        "PRAGMA connetto_shared.user_version = {}",
+        build.get()
+    ))?;
+    Ok(generation)
+}
+
+/// Invalidate stale resume state while retaining query registrations and queued work.
+pub(crate) fn remember_shared_generation(
+    db: &mut SqliteConnection,
+    attached: &SharedGeneration,
+) -> Result<bool, ClientError> {
+    db.batch_execute(
+        "CREATE TABLE IF NOT EXISTS _connetto_shared_generation \
+         (id INTEGER PRIMARY KEY CHECK (id = 1), generation BLOB NOT NULL)",
+    )?;
+    let saved =
+        diesel::sql_query("SELECT generation FROM _connetto_shared_generation WHERE id = 1")
+            .get_result::<SharedGeneration>(db)
+            .optional()?;
+    if saved.is_some_and(|saved| saved.generation == attached.generation) {
+        return Ok(false);
+    }
+    db.batch_execute("DELETE FROM _connetto_meta; DELETE FROM _connetto_aggregates")?;
+    diesel::sql_query(
+        "INSERT INTO _connetto_shared_generation (id, generation) VALUES (1, ?) \
+         ON CONFLICT(id) DO UPDATE SET generation = excluded.generation",
+    )
+    .bind::<diesel::sql_types::Binary, _>(&attached.generation)
+    .execute(db)?;
+    Ok(true)
 }

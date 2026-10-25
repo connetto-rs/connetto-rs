@@ -3859,23 +3859,12 @@ pub struct ConnettoConnection<T: Transport> {
     list_sink: Option<tokio::sync::mpsc::UnboundedSender<Vec<connetto_core::messages::SignedList>>>,
 }
 
-/// Attach the shared store when the build shares tables, then run the program
-/// for the files this open finds fresh, or the reopen program when neither is.
-fn install_storage_layout<S: ReplicaStorage>(
+/// Attach and unlock the shared store before inspecting either build record.
+fn attach_shared_store<S: ReplicaStorage>(
     db: &mut SqliteConnection,
     replica: &Replica<'_, S>,
-    sqlite_ddl: Option<&str>,
-    config: &ClientConfig,
-) -> Result<(), ClientError> {
+) -> Result<bool, ClientError> {
     use diesel::OptionalExtension as _;
-    let Some(layout) = &config.shared_layout else {
-        // One transaction, because committing each of a replica schema's statements on its own
-        // takes seconds on the browser's OPFS storage.
-        if let Some(ddl) = sqlite_ddl.or(config.connection_ddl.as_deref()) {
-            db.transaction::<_, ClientError, _>(|db| Ok(db.batch_execute(ddl)?))?;
-        }
-        return Ok(());
-    };
     match (replica.shared_store(), replica.key()) {
         (Some((path, key)), _) => harden::attach_keyed_in_window(
             db,
@@ -3884,47 +3873,64 @@ fn install_storage_layout<S: ReplicaStorage>(
             harden::AttachPermits::CreateAndWrite,
             key,
         )?,
-        // Nothing at rest, so the shared store lives as long as the connection.
         (None, None) => {
             harden::attach_in_window(db, ":memory:", SHARED_SCHEMA, harden::AttachPermits::Write)?;
         }
         (None, Some(_)) => return Err(ClientError::ReplicaKeyMissing),
     }
-    let fresh_shared = diesel::sql_query(
+    let fresh = diesel::sql_query(
         "SELECT 1 AS present FROM connetto_shared.sqlite_master WHERE type = 'table' LIMIT 1",
     )
     .get_result::<Present>(db)
     .optional()?
     .is_none();
-    if fresh_shared {
+    if fresh {
         db.set_auto_vacuum(Some(SHARED_SCHEMA), AutoVacuumMode::Incremental)?;
     }
-    db.transaction::<_, ClientError, _>(|db| {
-        db.batch_execute(layout.sql(sqlite_ddl.is_some(), fresh_shared))?;
-        Ok(())
-    })?;
-    check_recorded_tables(db, SHARED_SCHEMA, &config.unrecorded_tables)
+    Ok(fresh)
 }
 
-/// Install schema and metadata, returning the replica's previous major.
-#[deny(clippy::ref_patterns)]
-fn install_replica_schema<S: ReplicaStorage>(
+/// Execute the single layout selected for the account and shared files.
+fn install_storage_layout(
     db: &mut SqliteConnection,
-    replica: &Replica<'_, S>,
     boot: Boot<'_>,
     config: &ClientConfig,
-) -> Result<Option<Major>, ClientError> {
-    let prior = recorded_prior_major(db, replica, boot, config)?;
+    fresh_main: bool,
+    fresh_shared: bool,
+) -> Result<(), ClientError> {
+    if let Some(layout) = &config.shared_layout {
+        db.batch_execute(layout.sql(fresh_main, fresh_shared))?;
+        check_recorded_tables(db, SHARED_SCHEMA, &config.unrecorded_tables)?;
+    } else if fresh_main {
+        let (Boot::Fresh(ddl) | Boot::Existing(ddl)) = boot;
+        db.batch_execute(ddl)?;
+    } else if let Some(ddl) = &config.connection_ddl {
+        db.batch_execute(ddl)?;
+    }
+    Ok(())
+}
+
+/// Install account metadata after its selected application layout.
+#[deny(clippy::ref_patterns)]
+fn install_replica_metadata(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+) -> Result<(), ClientError> {
     // The views are what the map has to agree with.
     check_policy_tables(db, &config.policy_tables)?;
     // A rowid-only table records nothing, so a write to one uploads nothing and reports success (R62).
     check_recorded_tables(db, "main", &config.unrecorded_tables)?;
     db.batch_execute(META_DDL)?;
-    match db.batch_execute("ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB") {
-        Ok(()) => {}
-        Err(diesel::result::Error::DatabaseError(_, info))
-            if info.message().contains("duplicate column name") => {}
-        Err(error) => return Err(error.into()),
+    for ddl in [
+        "ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB",
+        "ALTER TABLE _connetto_pending ADD COLUMN major INTEGER",
+    ] {
+        match db.batch_execute(ddl) {
+            Ok(()) => {}
+            Err(diesel::result::Error::DatabaseError(_, info))
+                if info.message().contains("duplicate column name") => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
     // After the subscription tables, since it references `_connetto_query`.
@@ -3933,55 +3939,85 @@ fn install_replica_schema<S: ReplicaStorage>(
     db.batch_execute(enrolment::CERTIFICATE_DDL)?;
     // A watch the previous run died still holding counts down from now.
     subscriptions::anchor_launch(db)?;
-    Ok(prior)
+    Ok(())
 }
 
-/// Apply the replica's build and return its previous major.
-fn recorded_prior_major<S: ReplicaStorage>(
+/// Install the versioned layouts in one transaction and report the prior major and invalidated resume state.
+fn install_replica_schema<S: ReplicaStorage>(
     db: &mut SqliteConnection,
     replica: &Replica<'_, S>,
     boot: Boot<'_>,
     config: &ClientConfig,
-) -> Result<Option<Major>, ClientError> {
-    match boot {
-        Boot::Fresh(ddl) => {
-            install_storage_layout(db, replica, Some(ddl), config)?;
-            if let (Some(major), Some(version)) = (config.schema_major, &config.schema_version) {
-                majors::stamp(db, major, version, &config.policy_tables)?;
-            }
-            Ok(None)
-        }
-        Boot::Existing(ddl) => {
-            let prior = if let (Some(major), Some(version)) =
-                (config.schema_major, &config.schema_version)
-            {
-                match majors::read(db, major, version)? {
-                    majors::Record::Current => Some(major),
-                    majors::Record::Unrecorded => {
-                        majors::stamp(db, major, version, &config.policy_tables)?;
-                        None
-                    }
-                    majors::Record::Behind(from) => {
-                        db.set_foreign_keys_enabled(false)?;
-                        let rebuild = majors::rebuild(
-                            db,
-                            ddl,
-                            &from,
-                            (major, version, &config.policy_tables),
-                            HeldContent::NONE,
-                        );
-                        db.set_foreign_keys_enabled(true)?;
-                        rebuild?;
-                        Some(from.major)
-                    }
-                }
-            } else {
-                None
-            };
-            install_storage_layout(db, replica, None, config)?;
-            Ok(prior)
-        }
+) -> Result<(Option<Major>, bool), ClientError> {
+    let shared_fresh = if config.shared_layout.is_some() {
+        Some(attach_shared_store(db, replica)?)
+    } else {
+        None
+    };
+    let (Some(build), Some(version)) = (config.schema_major, &config.schema_version) else {
+        return db.immediate_transaction(|db| {
+            install_storage_layout(
+                db,
+                boot,
+                config,
+                matches!(boot, Boot::Fresh(_)),
+                shared_fresh.unwrap_or(false),
+            )?;
+            install_replica_metadata(db, config)?;
+            Ok((None, false))
+        });
+    };
+    majors::read(db, build, version)?;
+    if shared_fresh.is_some() {
+        majors::read_shared(db, build, version)?;
     }
+    db.set_foreign_keys_enabled(false)?;
+    let installed: Result<_, ClientError> = db.immediate_transaction(|db| {
+        let account = majors::read(db, build, version)?;
+        let shared = if shared_fresh.is_some() {
+            Some(majors::read_shared(db, build, version)?)
+        } else {
+            None
+        };
+        let rebuild_main = matches!(&account, majors::Record::Behind(_));
+        let fresh_main = rebuild_main
+            || (matches!(boot, Boot::Fresh(_)) && matches!(&account, majors::Record::Unrecorded));
+        let fresh_shared = matches!(
+            &shared,
+            Some(majors::SharedRecord::Fresh | majors::SharedRecord::Behind)
+        );
+        let prior = match &account {
+            majors::Record::Current => Some(build),
+            majors::Record::Unrecorded => None,
+            majors::Record::Behind(from) => {
+                majors::prepare_rebuild(db, from, HeldContent::NONE)?;
+                Some(from.major)
+            }
+        };
+        if matches!(&shared, Some(majors::SharedRecord::Behind)) {
+            majors::drop_synced(db, majors::Store::Shared)?;
+        }
+        install_storage_layout(db, boot, config, fresh_main, fresh_shared)?;
+        if !matches!(&account, majors::Record::Current) {
+            majors::stamp(db, build, version, &config.policy_tables)?;
+        }
+        install_replica_metadata(db, config)?;
+        let generation_changed = match shared {
+            Some(majors::SharedRecord::Current(generation)) => {
+                majors::remember_shared_generation(db, &generation)?
+            }
+            Some(_) => {
+                let generation = majors::stamp_shared(db, build, version)?;
+                majors::remember_shared_generation(db, &generation)?
+            }
+            None => false,
+        };
+        Ok((prior, rebuild_main || generation_changed))
+    });
+    let restored = db.set_foreign_keys_enabled(true);
+    let outcome = installed?;
+    restored?;
+    Ok(outcome)
 }
 
 impl<T> ConnettoConnection<T>
@@ -4129,7 +4165,8 @@ where
         register_write_exemption(&mut db, &write_exempt)?;
         // A person carries the wildcard, and a bot login reads its list here (R99).
         register_bot_list(&mut db, connetto_core::BOT_LIST_WILDCARD.to_owned())?;
-        install_replica_schema(&mut db, replica, boot, config)?;
+        let (_, reset_resume) = install_replica_schema(&mut db, replica, boot, config)?;
+        let resume = if reset_resume { None } else { resume };
         // An explicit resume cursor wins. Otherwise the replica remembers
         // its own resume point, so reopening a persisted replica (a file, an
         // OPFS import) continues where the previous run stopped. The writer
