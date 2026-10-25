@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use connetto_client::{ClientBuilder, ClientEvent, ReconnectPolicy, SyncSchema};
+use connetto_client::{ClientBuilder, ClientEvent, ReconnectPolicy, SyncSchema, SyncTuning};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalErrorReason, HandshakeAck, WriterGrant, WriterRequest,
 };
@@ -21,6 +21,10 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, Major};
 
 const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
+
+/// A probe bound far past every reconnect wait, since keepalive deadlines
+/// share the injected sleeper.
+const PROBE_AFTER: Duration = Duration::from_secs(3600);
 
 /// The major-1 bundle [`super::support::bundle`] builds, as a number.
 fn major_one() -> Major {
@@ -426,6 +430,7 @@ async fn a_rate_limited_refusal_floors_the_next_wait() {
     };
     let (client, pump) = ClientBuilder::new(super::support::bundle(DDL), factory)
         .with_reconnect(fast_policy(5))
+        .with_tuning(SyncTuning::default().with_probe_after(PROBE_AFTER))
         .with_sleeper({
             let waits = Arc::clone(&waits);
             move |d| {
@@ -452,7 +457,13 @@ async fn a_rate_limited_refusal_floors_the_next_wait() {
             break;
         }
     }
-    let waits = waits.lock().expect("the waits lock").to_vec();
+    let waits: Vec<Duration> = waits
+        .lock()
+        .expect("the waits lock")
+        .iter()
+        .copied()
+        .filter(|wait| *wait < PROBE_AFTER / 2)
+        .collect();
     assert_eq!(waits.len(), 2, "a wait before every dial, got {waits:?}");
     assert!(
         waits[0] < Duration::from_millis(5000),
