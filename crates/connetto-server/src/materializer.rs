@@ -89,6 +89,9 @@ type RowDlt = RowDelta<DefaultIds, Postgres, subql::PgCommitPosition>;
 /// versus speed tradeoff for patchset-sized blobs.
 const ZSTD_LEVEL: i32 = 3;
 
+/// A replay for at most this many consumers matches each alone, which costs no more than one shared match even when every subscriber it reaches is one of them.
+const REPLAY_MATCH_EACH_MAX: usize = 4;
+
 /// Failure surfaced by the materializer core.
 #[derive(Debug, thiserror::Error)]
 pub enum MaterializerError {
@@ -1498,6 +1501,49 @@ where
         let departing = matches!(event.kind(), EventKind::Update) && match_.deleted();
         let matched = match_.inserted() || match_.updated() || match_.deleted();
         Ok(matched.then_some(departing))
+    }
+
+    /// Which of `consumers` a logged event reaches on replay, each with whether
+    /// as a departure, in ascending consumer order.
+    ///
+    /// A few consumers are matched each through [`replay_match`](Self::replay_match),
+    /// more through one read-only evaluation of the event through the table's
+    /// index for every consumer it reaches. Neither folds aggregates, fires
+    /// re-execution triggers or moves membership or activity, so a replay in
+    /// any order leaves the engine as it found it.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Dispatch`] when the event cannot be matched.
+    pub fn replay_matches(
+        &mut self,
+        event: &PgChangeEvent,
+        consumers: &HashSet<u64>,
+    ) -> Result<Vec<(u64, bool)>, MaterializerError> {
+        if consumers.len() <= REPLAY_MATCH_EACH_MAX {
+            let mut matched = Vec::with_capacity(consumers.len());
+            for &consumer in consumers {
+                if let Some(departing) = self.replay_match(event, consumer)? {
+                    matched.push((consumer, departing));
+                }
+            }
+            matched.sort_unstable_by_key(|&(consumer, _)| consumer);
+            return Ok(matched);
+        }
+        let reached = self.engine.match_rows(event)?;
+        let update = matches!(event.kind(), EventKind::Update);
+        let mut matched: std::collections::BTreeMap<u64, bool> = std::collections::BTreeMap::new();
+        for &consumer in reached.inserted().iter().chain(reached.updated()) {
+            if consumers.contains(&consumer) {
+                matched.entry(consumer).or_insert(false);
+            }
+        }
+        for &consumer in reached.deleted() {
+            if consumers.contains(&consumer) {
+                matched.insert(consumer, update);
+            }
+        }
+        Ok(matched.into_iter().collect())
     }
 
     /// The compressed departure notice for the row `event` moved out of a
