@@ -33,9 +33,10 @@
 //! `user_id` selects the cookie by exact name, and a rotated pair naming a
 //! different account revokes the presented session before the generic `401`.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -51,7 +52,8 @@ use crate::authn::provider::{
     AuthCodes, IssuedAuthCode, PendingLogin, PendingLogins, ProviderError, ProviderRegistry,
 };
 use crate::authn::service::{AuthError, AuthService, TokenPair};
-use crate::authn::store::{AuthStore, split_refresh};
+use crate::authn::sign_in::LoginRequest;
+use crate::authn::store::{AuthStore, SessionOrigin, split_refresh};
 
 /// Which client redirect URIs the auth endpoints may deliver a minted
 /// authorization code to.
@@ -311,7 +313,8 @@ impl IntoResponse for AuthApiError {
             Self::Service(AuthError::RateLimited(_)) => StatusCode::TOO_MANY_REQUESTS,
             Self::Service(
                 AuthError::Store(crate::authn::store::AuthStoreError::Backend(_))
-                | AuthError::Token(_),
+                | AuthError::Token(_)
+                | AuthError::Undescribed,
             ) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Service(AuthError::Store(_)) | Self::InvalidCredential => {
                 StatusCode::UNAUTHORIZED
@@ -504,6 +507,8 @@ async fn login_start<S: AuthStore + 'static>(
 async fn callback<S: AuthStore + 'static>(
     State(state): State<AuthState<S>>,
     Query(query): Query<CallbackQuery>,
+    headers: HeaderMap,
+    extensions: axum::http::Extensions,
 ) -> Result<Response, AuthApiError> {
     let pending = state
         .pending
@@ -517,9 +522,28 @@ async fn callback<S: AuthStore + 'static>(
         .complete_login(&query.code, &pending.pkce_verifier, &pending.nonce)
         .await
         .map_err(AuthApiError::Provider)?;
+    // The application describes the sign-in from the request the server saw,
+    // its address among it, and the session keeps only the description.
+    let description = state
+        .service
+        .describe(LoginRequest {
+            provider: pending.provider.clone(),
+            headers,
+            peer: extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ConnectInfo(peer)| *peer),
+        })
+        .await
+        .map_err(AuthApiError::Service)?;
     let pair = state
         .service
-        .login_with_provider(&verified)
+        .login_with_provider(
+            &verified,
+            SessionOrigin {
+                provider: pending.provider,
+                description,
+            },
+        )
         .await
         .map_err(AuthApiError::Service)?;
 

@@ -154,10 +154,10 @@ fn writable_catalog() -> RuntimeWritableCatalog {
 }
 
 fn note_table() -> SimpleTable {
-    SimpleTable::with_rowid_alias(
+    SimpleTable::new(
         "notes",
-        &[("id", "INTEGER"), ("body", "TEXT"), ("edited_at", "TEXT")],
-        0,
+        &[("id", ""), ("body", ""), ("edited_at", "")],
+        &[0],
     )
 }
 

@@ -37,6 +37,24 @@
 //! }
 //! ```
 //!
+//! A session carries the application's own description of where its sign-in
+//! came from, which the server's describe callback returns and the session
+//! table holds one column per field:
+//!
+//! ```
+//! #[derive(Clone)]
+//! pub struct AppSession {
+//!     pub place: String,
+//! }
+//!
+//! connetto_server::connetto_schema! {
+//!     pub struct AppSchema;
+//!     id: String => diesel::sql_types::Text,
+//!     audit_row_key: uuid::Uuid => diesel::sql_types::Uuid,
+//!     session_descriptor: AppSession { place: diesel::sql_types::Text },
+//! }
+//! ```
+//!
 //! A field list that disagrees with the type does not compile:
 //!
 //! ```compile_fail
@@ -136,23 +154,25 @@ pub trait ConnettoSchema: Send + Sync + 'static {
 /// The default tables of every member and a unit struct `$name` naming them
 /// as a [`ConnettoSchema`], over the identity `id` and the audit log's row key
 /// `audit_row_key`, each with its SQL type, and optionally the application's
-/// device descriptor with each field's SQL type.
+/// device descriptor and session descriptor with each field's SQL type.
 ///
 /// Invoked at module scope with `diesel` and `diesel_async` in scope. The
 /// member structs it emits are `ConnettoAuthSchema`, `ConnettoWriters`,
 /// `ConnettoAudit`, `ConnettoBans`, `ConnettoEnrolments` and `ConnettoBots`,
-/// and the file member is the file server's `_cfs_` tables. The descriptor is the
-/// application's own type, destructured field by field, so a field list that
-/// disagrees with it does not compile, and without one it is `()`.
+/// and the file member is the file server's `_cfs_` tables. Each descriptor is
+/// the application's own type, destructured field by field, so a field list
+/// that disagrees with it does not compile, and without one it is `()`.
 #[macro_export]
 macro_rules! connetto_schema {
     (
         $vis:vis struct $name:ident;
         id: $id:ty => $id_sql:ty,
         audit_row_key: $pk:ty => $pk_sql:ty
-        $(, device_descriptor: $($desc:ident)::+ { $($field:ident : $field_sql:ty),* $(,)? })? $(,)?
+        $(, device_descriptor: $($desc:ident)::+ { $($field:ident : $field_sql:ty),* $(,)? })?
+        $(, session_descriptor: $($sdesc:ident)::+ { $($sfield:ident : $sfield_sql:ty),* $(,)? })?
+        $(,)?
     ) => {
-        $crate::connetto_auth_tables!($id, $id_sql);
+        $crate::connetto_auth_tables!($id, $id_sql; $($($sdesc)::+ { $($sfield : $sfield_sql),* })?);
         $crate::connetto_writers_table!($id, $id_sql);
         $crate::connetto_audit_table!($id, $id_sql, $pk, $pk_sql);
         $crate::connetto_ban_table!($id, $id_sql);

@@ -1,5 +1,5 @@
-//! R11 slice 3 in the browser: what a late tab reads when the device stores
-//! some tables once for every account.
+//! R11 in the browser: what a late tab reads and writes when the device
+//! stores some tables once for every account.
 //!
 //! Runs in a dedicated worker against real OPFS, because the shared store is
 //! one OPFS file behind one page codec handle, and only the sahpool VFS gives
@@ -9,16 +9,18 @@
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
+use core::cell::RefCell;
 use core::time::Duration;
+use std::rc::Rc;
 
 use connetto_client::{
     ClientBuilder, ClientError, ConnettoConnection, ContentPlace, Custody, FirstThen, Gate, Grant,
     HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema,
 };
-use connetto_core::messages::SubscriptionSpec;
+use connetto_core::messages::{BulkMessage, ControlMessage, SubscriptionSpec};
 use connetto_core::schema::{SchemaBundle, SharedLayout};
-use connetto_core::test_support::FakeTransport;
-use connetto_core::traits::{ReplicaKeyStore, Transport};
+use connetto_core::test_support::{FakeTransport, FakeTransportError};
+use connetto_core::traits::{IncomingFrame, ReplicaKeyStore, Transport};
 use connetto_web::MessageTransport;
 use connetto_web::storage::ReplicaStorage;
 use diesel::prelude::*;
@@ -190,9 +192,27 @@ async fn connect(
     key: ReplicaKey,
     shared: bool,
 ) -> Result<connetto_client::ConnettoConnection<FakeTransport>, ClientError> {
-    let schema = SyncSchema::new(bundle()).with_shared_store(shared);
     // A default accepting() closes the upstream after its frames, and the hub's pump would drop the tabs with it.
-    ClientBuilder::new(schema, once(FakeTransport::accepting_but_silent()))
+    connect_over(
+        storage,
+        id,
+        key,
+        shared,
+        FakeTransport::accepting_but_silent(),
+    )
+    .await
+}
+
+/// [`connect`] over `upstream`.
+async fn connect_over<T: Transport + 'static>(
+    storage: &ReplicaStorage,
+    id: &str,
+    key: ReplicaKey,
+    shared: bool,
+    upstream: T,
+) -> Result<connetto_client::ConnettoConnection<T>, ClientError> {
+    let schema = SyncSchema::new(bundle()).with_shared_store(shared);
+    ClientBuilder::new(schema, once(upstream))
         .signed_in(
             HeldCredential::new(Grant::new(format!("user:{id}")), id)
                 .expect("a string identity serializes"),
@@ -221,8 +241,8 @@ fn join(tab: &mut ConnettoConnection<MessageTransport<MessagePort>>) -> Vec<(Str
 
 /// A hub over `worker`, the tab end of a real message channel, and a signed-in
 /// tab client attached to it.
-async fn hub_with_late_tab(
-    worker: connetto_client::ConnettoConnection<FakeTransport>,
+async fn hub_with_late_tab<U: Transport + 'static>(
+    worker: connetto_client::ConnettoConnection<U>,
 ) -> (
     connetto_web::RelayHub,
     ConnettoConnection<MessageTransport<MessagePort>>,
@@ -420,5 +440,99 @@ async fn a_disabled_shared_store_never_serves_store_rows() {
         got,
         [("one".to_owned(), "carol".to_owned())],
         "the same names serve from the replica when the store is off"
+    );
+}
+
+/// An upstream that accepts the handshake, stays open, and keeps every
+/// mutation the worker sends it, decompressed.
+struct Recording {
+    inner: FakeTransport,
+    sent: Rc<RefCell<Vec<Vec<u8>>>>,
+}
+
+impl Transport for Recording {
+    type Error = FakeTransportError;
+
+    async fn send_control(&mut self, message: ControlMessage) -> Result<(), Self::Error> {
+        self.inner.send_control(message).await
+    }
+
+    async fn send_bulk(&mut self, message: BulkMessage) -> Result<(), Self::Error> {
+        if let BulkMessage::MutationPatch(patch) = &message {
+            let bytes = zstd::decode_all(patch.patchset_zstd.as_slice()).expect("decompress");
+            self.sent.borrow_mut().push(bytes);
+        }
+        self.inner.send_bulk(message).await
+    }
+
+    async fn recv(&mut self) -> Result<Option<IncomingFrame>, Self::Error> {
+        self.inner.recv().await
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.inner.close().await
+    }
+}
+
+/// A tab's write to a shared and a private table lands in the worker's
+/// shared store and replica and goes upstream as one mutation in the order
+/// the tab first wrote each table.
+#[wasm_bindgen_test]
+async fn a_tabs_write_to_a_shared_table_goes_upstream_in_first_write_order() {
+    let storage = ReplicaStorage::install().await;
+    let dave_name = connetto_client::replica_db_name(connetto_client::REPLICA_PREFIX, "dave")
+        .expect("a replica name");
+    for name in [dave_name.as_str(), shared_record().as_str()] {
+        storage.delete_db(name).expect("clear the entry");
+    }
+    storage.reserve(3).await.expect("room in the pool");
+
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let upstream = Recording {
+        inner: FakeTransport::accepting_but_silent(),
+        sent: Rc::clone(&sent),
+    };
+    let dave = connect_over(
+        &storage,
+        "dave",
+        ReplicaKey::from_bytes([0x55; ReplicaKey::LEN]),
+        true,
+        upstream,
+    )
+    .await
+    .expect("dave connects");
+    let (_hub, mut tab) = hub_with_late_tab(dave).await;
+    tab.conn()
+        .transaction::<_, diesel::result::Error, _>(|conn| {
+            diesel::insert_into(entries::table)
+                .values((entries::id.eq(1), entries::author.eq("dave")))
+                .execute(conn)?;
+            diesel::insert_into(orders::table)
+                .values((orders::id.eq(1), orders::label.eq("one")))
+                .execute(conn)
+        })
+        .expect("the tab writes both tables");
+    tab.push().await.expect("the tab sends its write");
+    for _ in 0..100 {
+        if !sent.borrow().is_empty() {
+            break;
+        }
+        let _ = tab
+            .pump_one_or(connetto_web::workers::sleep(Duration::from_millis(50)))
+            .await
+            .ok();
+    }
+    let sent = sent.borrow();
+    assert_eq!(sent.len(), 1, "the worker uploads the tab's write once");
+    let parsed = sqlite_diff_rs::ParsedDiffSet::parse(&sent[0]).expect("a changeset");
+    let order: Vec<&str> = parsed
+        .table_schemas()
+        .into_iter()
+        .map(|table| table.name().as_str())
+        .collect();
+    assert_eq!(
+        order,
+        ["entries", "orders"],
+        "the shared table's capture reaches the upload ahead of the private one"
     );
 }

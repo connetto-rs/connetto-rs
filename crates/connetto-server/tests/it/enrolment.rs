@@ -327,6 +327,41 @@ async fn a_signed_in_device_enrols_and_is_recorded() {
     assert_eq!(records[0].descriptor, vec![0x91, 0x01]);
 }
 
+/// A key's first enrolment tells the application, and its renewal tells
+/// nothing more (R105 decision 9).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_keys_first_enrolment_tells_the_application() {
+    let fixture = Fixture::acquire().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (_, issuer) = issuer();
+    let told = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&told);
+    let enrolment = DeviceEnrolment::new(DeviceCertConfig::new(issuer), Arc::clone(&store) as _)
+        .with_first_enrolment_hook(Arc::new(move |first| sink.lock().push(first)));
+    let manager = enrolling_manager(&fixture, Some(enrolment)).await;
+    let mut client = connect(&manager, Some("alice")).await;
+    let key = device_key();
+
+    let handed = nonce(&mut client).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![0x91, 0x01]).await;
+    assert!(matches!(reply, ControlMessage::EnrolGrant(_)), "{reply:?}");
+    let handed = nonce(&mut client).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![0x91, 0x02]).await;
+    assert!(matches!(reply, ControlMessage::EnrolGrant(_)), "{reply:?}");
+
+    let told = told.lock().clone();
+    let [first] = told.as_slice() else {
+        panic!("expected the first enrolment alone, got {told:?}");
+    };
+    assert_eq!(first.user, "alice");
+    assert_eq!(
+        first.key,
+        KeyId::of_public_key(&key.subject_public_key_info())
+    );
+    assert_eq!(first.descriptor, vec![0x91, 0x01]);
+    assert_eq!(first.session, store.records()[0].session);
+}
+
 /// The serial a held draw hands the enrolment, its leading zero a
 /// certificate cannot carry.
 const ZERO_LEADING: [u8; 16] = [

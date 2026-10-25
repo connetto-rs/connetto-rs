@@ -45,15 +45,10 @@ diesel::table! {
 }
 
 fn orders_table() -> SimpleTable {
-    SimpleTable::with_rowid_alias(
+    SimpleTable::new(
         "orders",
-        &[
-            ("id", "INTEGER"),
-            ("price", "REAL"),
-            ("quantity", "INTEGER"),
-            ("status", "TEXT"),
-        ],
-        0,
+        &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
+        &[0],
     )
 }
 

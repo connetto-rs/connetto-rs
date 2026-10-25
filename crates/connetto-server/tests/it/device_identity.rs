@@ -10,8 +10,8 @@ use connetto_core::messages::{
     EnrolRefusal, EnrolRequest,
 };
 use connetto_core::traits::Transport;
-use connetto_server::WebSocketTransport;
 use connetto_server::device_cert::{AndroidStatus, DeviceCertConfig};
+use connetto_server::{SignInNotice, WebSocketTransport};
 use connetto_test_harness::{Fixture, isolated_session_keyring};
 use diesel::QueryableByName;
 use diesel::{ExpressionMethods as _, OptionalExtension as _, QueryDsl as _};
@@ -192,6 +192,85 @@ async fn a_built_server_enrols_a_device_into_the_deployment_tables() {
         }
         other => panic!("the device list answered {other:?}"),
     }
+    stream.abort();
+    http.abort();
+}
+
+/// The application hears of a key's first enrolment with the session it
+/// enrolled during, the one its sign-in notice named (R105 decision 9).
+#[tokio::test]
+async fn a_built_server_tells_the_application_of_a_first_enrolment() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    connetto_test_harness::stack::provision_enrolment_tables(&fixture).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a listener");
+    let port = listener.local_addr().expect("local address").port();
+    let (builder, _idp, _keys) = builder_over(&fixture, port).await;
+    let (_, _, issuer) = rooted_issuer();
+    let told = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&told);
+    let parts = builder
+        .device_identity(Some(DeviceCertConfig::new(issuer)))
+        .on_sign_in(move |notice| sink.lock().push(notice))
+        .build()
+        .await
+        .expect("the deployment with device identity assembles");
+    let stream = tokio::spawn(parts.change_stream);
+    let http = tokio::spawn(async move { axum::serve(listener, parts.router).await });
+    let base = format!("http://127.0.0.1:{port}");
+    wait_ready(&base).await;
+
+    let (token, user_id) = mint_token(&base).await;
+    let mut client = live_session(&format!("127.0.0.1:{port}"), &token).await;
+    let key = device_key();
+    let nonce = challenge_nonce(&mut client).await;
+    let reply = enrol_request(&mut client, &key, nonce, None).await;
+    assert!(matches!(reply, ControlMessage::EnrolGrant(_)), "{reply:?}");
+
+    // The enrolment notice reads the session on a spawned task.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while told.lock().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first enrolment went untold: {:?}",
+            told.lock()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let told = told.lock().clone();
+    let [
+        SignInNotice::SignedIn(signed_in),
+        SignInNotice::DeviceEnrolled {
+            session,
+            key: enrolled,
+            device,
+            ..
+        },
+    ] = told.as_slice()
+    else {
+        panic!("expected the sign-in and then the enrolment, got {told:?}");
+    };
+    assert_eq!(
+        session, signed_in,
+        "the enrolment names its sign-in's session"
+    );
+    assert_eq!(session.user_id, user_id);
+    assert_eq!(
+        *enrolled,
+        KeyId::of_public_key(&key.subject_public_key_info())
+    );
+    assert_eq!(
+        *device,
+        rmp_serde::to_vec_named(&()).expect("encode"),
+        "the device's own descriptor"
+    );
     stream.abort();
     http.abort();
 }

@@ -15,7 +15,7 @@ use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, PatchSet, SimpleTable, Value};
 /// A patchset inserting one row of `table`, built by hand so the target need
 /// not have the table at all.
 fn one_insert(table: &str) -> Vec<u8> {
-    let schema = SimpleTable::with_rowid_alias(table, &[("id", "INTEGER"), ("body", "TEXT")], 0);
+    let schema = SimpleTable::new(table, &[("id", ""), ("body", "")], &[0]);
     PatchSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(
             Insert::from(schema)
@@ -30,7 +30,7 @@ fn one_insert(table: &str) -> Vec<u8> {
 /// A changeset inserting two rows of `table`, the second colliding with a row
 /// the target already holds.
 fn two_inserts(table: &str) -> Vec<u8> {
-    let schema = SimpleTable::with_rowid_alias(table, &[("id", "INTEGER"), ("body", "TEXT")], 0);
+    let schema = SimpleTable::new(table, &[("id", ""), ("body", "")], &[0]);
     ChangeSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(
             Insert::from(schema.clone())
