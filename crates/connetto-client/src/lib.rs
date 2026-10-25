@@ -21,9 +21,8 @@ use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
     ControlMessage, FatalErrorReason, GateState, Handshake, HeldWork, MutationHeader,
     MutationPatch, MutationReject, MutationRejectReason, Ping, Provenance, ReplaceShareKeys,
-    RetireWriter, SUBSCRIPTION_REFUSED, ShareKeyChange, Subscribe, SubscriptionSpec,
-    TabIdentity, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, Unsubscribe,
-    WriterAnswer,
+    RetireWriter, SUBSCRIPTION_REFUSED, ShareKeyChange, Subscribe, SubscriptionSpec, TabIdentity,
+    TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, Unsubscribe, WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -1804,7 +1803,6 @@ impl ShareKeyTimer {
             .saturating_sub(crate::away::SystemClock.monotonic())
     }
 }
-
 
 /// Conflict resolution for a rollback: a row a concurrent server patch already
 /// changed is left as the server left it, so only a cleanly-matching optimistic
