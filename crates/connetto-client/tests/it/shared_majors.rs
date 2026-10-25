@@ -176,17 +176,17 @@ fn has_table(db: &mut SqliteConnection, store: &str, table: &str) -> bool {
 }
 
 fn snapshot(db: &mut SqliteConnection, store: &str) -> Vec<String> {
+    #[derive(QueryableByName)]
+    struct Version {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        user_version: i32,
+    }
     let mut rows = texts(
         db,
         format!(
             "SELECT type || ' ' || name || ' ' || COALESCE(sql, '') AS text FROM {store}.sqlite_master ORDER BY type, name",
         ),
     );
-    #[derive(QueryableByName)]
-    struct Version {
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        user_version: i32,
-    }
     let major = diesel::sql_query(format!("PRAGMA {store}.user_version"))
         .get_result::<Version>(db)
         .unwrap()
@@ -254,6 +254,71 @@ async fn raw(
     db
 }
 
+/// Both stores' contents before an open, for a refusal to leave untouched.
+struct Before {
+    main: Option<Vec<String>>,
+    shared: Option<Vec<String>>,
+}
+
+/// Assert `error` names the record `refusal` broke and both stores kept `before`.
+async fn assert_refused_unchanged(
+    directory: &std::path::Path,
+    keys: &SharedKeys,
+    refusal: State,
+    error: ClientError,
+    before: Before,
+    label: &str,
+) {
+    assert!(
+        matches!(
+            (refusal, error),
+            (
+                State::HashMismatch,
+                ClientError::ReplicaSchemaChanged { .. }
+            ) | (State::Newer, ClientError::ReplicaNewer { .. })
+                | (State::Missing, ClientError::ReplicaRecordMissing { .. })
+        ),
+        "wrong refusal for {label}"
+    );
+    let mut db = raw(directory, keys, "account", before.shared.is_some()).await;
+    match before.main {
+        Some(main) => assert_eq!(snapshot(&mut db, "main"), main, "{label}"),
+        None => assert_eq!(snapshot(&mut db, "main"), ["major 0"]),
+    }
+    if let Some(shared) = before.shared {
+        assert_eq!(snapshot(&mut db, "connetto_shared"), shared, "{label}");
+    }
+}
+
+/// Open `owner` at `built`, queue one private write, then add a cached word
+/// and a resume cursor behind the client's back, returning the raw files.
+async fn seed(
+    directory: &std::path::Path,
+    keys: &SharedKeys,
+    owner: &str,
+    built: SyncSchema,
+    shared: bool,
+) -> SqliteConnection {
+    let mut client = open(directory, keys, owner, built).await.unwrap();
+    client
+        .conn()
+        .batch_execute("INSERT INTO notes VALUES (1, 'private')")
+        .unwrap();
+    client.push().await.unwrap().unwrap();
+    drop(client);
+    let words = if shared {
+        "connetto_shared.vocabulary_store"
+    } else {
+        "vocabulary_store"
+    };
+    let mut db = raw(directory, keys, owner, shared).await;
+    db.batch_execute(&format!("INSERT INTO {words} VALUES (1, 'cached')"))
+        .unwrap();
+    db.batch_execute("INSERT INTO _connetto_meta (id, cursor) VALUES (1, X'0102')")
+        .unwrap();
+    db
+}
+
 #[tokio::test]
 async fn every_account_and_shared_record_combination_preserves_work_or_refuses_without_mutation() {
     let current = schema(2);
@@ -268,24 +333,14 @@ async fn every_account_and_shared_record_combination_preserves_work_or_refuses_w
             } else {
                 "account"
             };
-            let mut seed = open(directory.path(), &keys, owner, built.clone())
-                .await
-                .unwrap();
-            let words = if shared.is_some() {
-                "connetto_shared.vocabulary_store"
-            } else {
-                "vocabulary_store"
-            };
-            seed.conn()
-                .batch_execute("INSERT INTO notes VALUES (1, 'private')")
-                .unwrap();
-            seed.push().await.unwrap().unwrap();
-            drop(seed);
-            let mut db = raw(directory.path(), &keys, owner, shared.is_some()).await;
-            db.batch_execute(&format!("INSERT INTO {words} VALUES (1, 'cached')"))
-                .unwrap();
-            db.batch_execute("INSERT INTO _connetto_meta (id, cursor) VALUES (1, X'0102')")
-                .unwrap();
+            let mut db = seed(
+                directory.path(),
+                &keys,
+                owner,
+                built.clone(),
+                shared.is_some(),
+            )
+            .await;
             if !matches!(account, State::Fresh) {
                 set_state(&mut db, "main", account, previous.version().hash());
             }
@@ -306,49 +361,26 @@ async fn every_account_and_shared_record_combination_preserves_work_or_refuses_w
                 shared.filter(|state| state.refuses())
             };
             let result = open(directory.path(), &keys, "account", built).await;
+            let label = format!("account {account:?}, shared {shared:?}");
             if let Some(refusal) = refused {
-                let error = match result {
-                    Err(error) => error,
-                    Ok(_) => panic!("opened refused account {account:?}, shared {shared:?}"),
+                let Err(error) = result else {
+                    panic!("opened refused {label}");
                 };
-                assert!(
-                    matches!(
-                        (refusal, error),
-                        (
-                            State::HashMismatch,
-                            ClientError::ReplicaSchemaChanged { .. }
-                        ) | (State::Newer, ClientError::ReplicaNewer { .. })
-                            | (State::Missing, ClientError::ReplicaRecordMissing { .. })
-                    ),
-                    "wrong refusal for account {account:?}, shared {shared:?}"
-                );
-                let mut db = raw(directory.path(), &keys, "account", shared.is_some()).await;
-                if let Some(before) = before_main {
-                    assert_eq!(
-                        snapshot(&mut db, "main"),
-                        before,
-                        "account {account:?}, shared {shared:?}"
-                    );
-                } else {
-                    assert_eq!(snapshot(&mut db, "main"), ["major 0"]);
-                }
-                if let Some(before) = before_shared {
-                    assert_eq!(
-                        snapshot(&mut db, "connetto_shared"),
-                        before,
-                        "account {account:?}, shared {shared:?}"
-                    );
-                }
+                let before = Before {
+                    main: before_main,
+                    shared: before_shared,
+                };
+                assert_refused_unchanged(directory.path(), &keys, refusal, error, before, &label)
+                    .await;
                 continue;
             }
-            let mut client = result
-                .unwrap_or_else(|error| panic!("account {account:?}, shared {shared:?}: {error}"));
+            let mut client = result.unwrap_or_else(|error| panic!("{label}: {error}"));
             let fresh_main = matches!(account, State::Fresh | State::Behind);
             let fresh_shared = matches!(shared, Some(State::Fresh | State::Behind));
             assert_eq!(
                 count(client.conn(), "notes"),
                 i64::from(!fresh_main),
-                "account {account:?}, shared {shared:?}"
+                "{label}"
             );
             let kept_words = if shared.is_some() {
                 !fresh_shared
@@ -358,16 +390,12 @@ async fn every_account_and_shared_record_combination_preserves_work_or_refuses_w
             assert_eq!(
                 count(client.conn(), "vocabulary"),
                 i64::from(kept_words),
-                "account {account:?}, shared {shared:?}"
+                "{label}"
             );
             if matches!(account, State::Fresh) {
-                assert!(client.unsynced().is_empty());
+                assert_eq!(client.unsynced(), [] as [connetto_client::UnsyncedWrite; 0]);
             } else {
-                assert_eq!(
-                    pending(client.conn()),
-                    before_pending,
-                    "account {account:?}, shared {shared:?}"
-                );
+                assert_eq!(pending(client.conn()), before_pending, "{label}");
                 assert_eq!(
                     texts(
                         client.conn(),
@@ -384,7 +412,7 @@ async fn every_account_and_shared_record_combination_preserves_work_or_refuses_w
             assert_eq!(
                 count(client.conn(), "_connetto_meta"),
                 i64::from(resume_kept),
-                "account {account:?}, shared {shared:?}"
+                "{label}"
             );
         }
     }
