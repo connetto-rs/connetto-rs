@@ -34,7 +34,7 @@ use connetto_server::{
     OplogConfig, PageSpec, PgOplog, RuntimeWritableCatalog, SessionConfig, SessionManager,
     SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
-use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID, wire_tables};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -68,11 +68,7 @@ struct SnapshotData {
 /// The one-row `orders` seed snapshot both snapshot sources serve, so a
 /// recording source and the plain seed stay byte-identical.
 fn seed_snapshot() -> SnapshotData {
-    let table = SimpleTable::new(
-        "orders",
-        &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-        &[0],
-    );
+    let table = wire_tables::orders_table();
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(1))
         .expect("set id")
@@ -442,11 +438,7 @@ impl SnapshotSource for GatedSnapshot {
         self.release.notified().await;
         let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
         for row in &self.rows {
-            let table = SimpleTable::new(
-                "orders",
-                &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-                &[0],
-            );
+            let table = wire_tables::orders_table();
             let insert = Insert::<_, String, Vec<u8>>::from(table)
                 .set(0, Value::Integer(row.id))
                 .expect("set id")
@@ -4122,11 +4114,7 @@ impl SnapshotSource for StatusSnapshot {
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
-        let table = SimpleTable::new(
-            "orders",
-            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-            &[0],
-        );
+        let table = wire_tables::orders_table();
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
             .expect("set id")

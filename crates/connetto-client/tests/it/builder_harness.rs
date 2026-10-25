@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use connetto_client::{
     Custody, Grant, HeldCredential, MemoryKeyStore, MemoryRefreshStore, NativeClientBuilder,
-    NoGate, SyncSchema, TransportFactory,
+    NoGate, SyncSchema,
 };
 use connetto_core::messages::{ControlMessage, HandshakeAck, Pong};
 use connetto_core::traits::{IncomingFrame, MaybeSend, ReplicaKeyStore, Transport};
@@ -49,29 +49,6 @@ struct Order {
     id: i32,
     owner: Option<String>,
     body: Option<String>,
-}
-
-/// The refusal a one-shot dialer hands back after it has handed out its
-/// transport.
-#[derive(Debug, thiserror::Error)]
-enum DialRefused {
-    #[error("the dialer handed out its last transport")]
-    Exhausted,
-}
-
-/// A dialer that hands out exactly one transport, the one the test attached.
-struct OneShot {
-    transport: Option<LoopbackTransport>,
-}
-
-impl TransportFactory for OneShot {
-    type Transport = LoopbackTransport;
-    type Error = DialRefused;
-
-    fn connect(&mut self) -> impl Future<Output = Result<LoopbackTransport, DialRefused>> + Send {
-        let transport = self.transport.take().ok_or(DialRefused::Exhausted);
-        async move { transport }
-    }
 }
 
 /// A transport that answers the handshake and the keepalives, then goes quiet
@@ -205,9 +182,7 @@ async fn builder_anonymous_connect_reads_a_synced_row() {
             .expect("translate the sources"),
     );
     let client = NativeClientBuilder::new("ws://127.0.0.1:1", schema)
-        .with_dialer(OneShot {
-            transport: Some(server.attach()),
-        })
+        .with_dialer(super::support::Once::new(server.attach()))
         .connect()
         .await
         .expect("an anonymous build connects");
@@ -284,9 +259,7 @@ async fn builder_held_credential_reads_the_callers_own_row() {
             .expect("translate the sources"),
     );
     let client = NativeClientBuilder::new("ws://127.0.0.1:1", schema)
-        .with_dialer(OneShot {
-            transport: Some(server.attach()),
-        })
+        .with_dialer(super::support::Once::new(server.attach()))
         .signed_in(
             HeldCredential::new(Grant::new("user:alice"), "alice").expect("the credential holds"),
         )
@@ -345,9 +318,7 @@ async fn builder_durable_replica_reopens_offline_and_reports_its_custody() {
 
     let client = Box::pin(
         NativeClientBuilder::new("ws://127.0.0.1:1", schema.clone())
-            .with_dialer(OneShot {
-                transport: Some(quiet_transport()),
-            })
+            .with_dialer(super::support::Once::new(quiet_transport()))
             .signed_in(
                 HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
             )
@@ -378,9 +349,7 @@ async fn builder_durable_replica_reopens_offline_and_reports_its_custody() {
     // reads back is the one the first build wrote.
     let client = Box::pin(
         NativeClientBuilder::new("ws://127.0.0.1:1", schema)
-            .with_dialer(OneShot {
-                transport: Some(quiet_transport()),
-            })
+            .with_dialer(super::support::Once::new(quiet_transport()))
             .signed_in(
                 HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
             )

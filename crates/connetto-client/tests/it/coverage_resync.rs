@@ -24,6 +24,7 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
+use connetto_test_harness::wire_tables;
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
@@ -44,20 +45,12 @@ diesel::table! {
     }
 }
 
-fn orders_table() -> SimpleTable {
-    SimpleTable::new(
-        "orders",
-        &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-        &[0],
-    )
-}
-
 /// Raw insert-patchset bytes for one snapshot's rows, compressed the way the
 /// wire carries a `SnapshotPatch`.
 fn snapshot_payload(rows: &[(i64, i64)]) -> Vec<u8> {
     let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
     for &(id, quantity) in rows {
-        let insert = Insert::<_, String, Vec<u8>>::from(orders_table())
+        let insert = Insert::<_, String, Vec<u8>>::from(wire_tables::orders_table())
             .set(0, Value::Integer(id))
             .expect("set id")
             .set(1, Value::Real(1.0))

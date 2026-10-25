@@ -31,7 +31,7 @@ use connetto_server::{
     RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
     SnapshotSource, ThrottleConfig, loopback, pg_write_target,
 };
-use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth};
+use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, wire_tables};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -153,17 +153,9 @@ fn writable_catalog() -> RuntimeWritableCatalog {
         .build()
 }
 
-fn note_table() -> SimpleTable {
-    SimpleTable::new(
-        "notes",
-        &[("id", ""), ("body", ""), ("edited_at", "")],
-        &[0],
-    )
-}
-
 /// A changeset that inserts one full row.
 fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(note_table())
+    let insert = Insert::<_, String, Vec<u8>>::from(wire_tables::notes_table())
         .set(0, Value::Integer(id))
         .expect("set id")
         .set(1, Value::Text(body.to_owned()))

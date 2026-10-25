@@ -17,6 +17,7 @@ use connetto_core::messages::ControlMessage;
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, MaybeSend, ReplicaKeyStore, Transport};
 use connetto_server::openfga::{GrantMove, StoreUpkeep, UpkeepError};
+use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 /// Authorization metadata for static policies that do not depend on share keys.
 pub struct KeyIndependentUpkeep;
@@ -118,6 +119,23 @@ impl<T: Transport + MaybeSend + 'static> TransportFactory for Once<T> {
     fn connect(&mut self) -> impl Future<Output = Result<T, DialExhausted>> + MaybeSend {
         std::future::ready(self.transport.take().ok_or(DialExhausted))
     }
+}
+
+/// Compressed one-row `orders (id, label)` patchset bytes, the wire table shape
+/// the suite's snapshots carry.
+#[must_use]
+pub fn labelled_order_payload(id: i64) -> Vec<u8> {
+    let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
+        "orders",
+        &[("id", ""), ("label", "")],
+        &[0],
+    ))
+    .set(0, Value::Integer(id))
+    .expect("set id")
+    .set(1, Value::Text("seed".to_owned()))
+    .expect("set label");
+    let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new().insert(insert);
+    zstd::encode_all(patchset.build().as_slice(), 3).expect("compress payload")
 }
 
 /// The refusal a dialer that never reaches a server hands back.

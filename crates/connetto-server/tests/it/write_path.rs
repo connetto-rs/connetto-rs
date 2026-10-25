@@ -31,7 +31,9 @@ use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog, SessionConfig,
     SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{
+    Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID, wire_tables,
+};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -206,17 +208,9 @@ fn writable_catalog() -> RuntimeWritableCatalog {
         .build()
 }
 
-fn note_table() -> SimpleTable {
-    SimpleTable::new(
-        "notes",
-        &[("id", ""), ("body", ""), ("edited_at", "")],
-        &[0],
-    )
-}
-
 /// A changeset that inserts one full row.
 fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(note_table())
+    let insert = Insert::<_, String, Vec<u8>>::from(wire_tables::notes_table())
         .set(0, Value::Integer(id))
         .expect("set id")
         .set(1, Value::Text(body.to_owned()))
@@ -236,7 +230,7 @@ fn update_changeset(
     old_edited_at: &str,
     new_edited_at: &str,
 ) -> Vec<u8> {
-    let update = Update::<_, ChangesetFormat, String, Vec<u8>>::from(note_table())
+    let update = Update::<_, ChangesetFormat, String, Vec<u8>>::from(wire_tables::notes_table())
         .set(0, Value::Integer(id), Value::Integer(id))
         .expect("set id")
         .set(

@@ -8,6 +8,7 @@
 
 use connetto_core::messages::MutationPatch;
 use connetto_server::Materializer;
+use connetto_test_harness::wire_tables;
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -94,11 +95,7 @@ fn mutation_insert(
     quantity: i64,
     status: &str,
 ) -> MutationPatch {
-    let table = SimpleTable::new(
-        "orders",
-        &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-        &[0],
-    );
+    let table = wire_tables::orders_table();
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(id))
         .expect("set id")

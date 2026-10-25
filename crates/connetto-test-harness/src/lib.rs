@@ -60,6 +60,7 @@ pub mod roster;
 pub mod stack;
 pub mod standby;
 pub mod star;
+pub mod wire_tables;
 
 mod native;
 use native::NativeCluster;

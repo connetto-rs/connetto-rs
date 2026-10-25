@@ -6,7 +6,7 @@
 //! the real manager in `connetto-server`'s `bot_registration` suite.
 
 use connetto_client::bot::{Registration, register};
-use connetto_client::{ClientBuilder, ClientError, ClientEvent, SyncSchema, TransportFactory};
+use connetto_client::{ClientBuilder, ClientError, ClientEvent, SyncSchema};
 use connetto_core::messages::{
     BotListEntry, BotRegistered, BulkMessage, Challenge, ControlMessage, FatalErrorReason,
     HandshakeAck, SnapshotBegin, SnapshotEnd, SnapshotPatch, SubscriptionPriority,
@@ -17,7 +17,6 @@ use connetto_core::{Cursor, LoopbackTransport, SchemaBundle, loopback};
 use diesel::prelude::*;
 use ring::rand::SystemRandom;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
-use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use uuid::Uuid;
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT);";
@@ -42,41 +41,6 @@ fn bundle() -> SyncSchema {
         Vec::<String>::new(),
         None::<&str>,
     ))
-}
-
-/// The refusal a one-shot dialer hands back after it has handed out its
-/// transport.
-#[derive(Debug, thiserror::Error)]
-#[error("the one-shot dialer has no second transport")]
-struct DialRefused;
-
-/// A dialer that hands out exactly one transport, the one the test attached.
-struct OneShot {
-    transport: Option<LoopbackTransport>,
-}
-
-impl TransportFactory for OneShot {
-    type Transport = LoopbackTransport;
-    type Error = DialRefused;
-
-    fn connect(&mut self) -> impl Future<Output = Result<LoopbackTransport, DialRefused>> + Send {
-        std::future::ready(self.transport.take().ok_or(DialRefused))
-    }
-}
-
-/// Compressed one-row patchset bytes for the wire table shape.
-fn payload(id: i64) -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
-        "orders",
-        &[("id", ""), ("label", "")],
-        &[0],
-    ))
-    .set(0, Value::Integer(id))
-    .expect("set id")
-    .set(1, Value::Text("seed".to_owned()))
-    .expect("set label");
-    let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new().insert(insert);
-    zstd::encode_all(patchset.build().as_slice(), 3).expect("compress payload")
 }
 
 /// A scripted server that opens the connection with the real manager's
@@ -121,7 +85,7 @@ fn challenged_server() -> LoopbackTransport {
                 server
                     .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
                         sub_id: sub.sub_id.clone(),
-                        patchset_zstd: payload(1),
+                        patchset_zstd: super::support::labelled_order_payload(1),
                     }))
                     .await
                     .expect("snapshot patch");
@@ -144,12 +108,7 @@ fn challenged_server() -> LoopbackTransport {
 /// is the existing behavior the skip must not break.
 #[tokio::test]
 async fn a_persons_client_ignores_the_leading_challenge() {
-    let builder = ClientBuilder::new(
-        bundle(),
-        OneShot {
-            transport: Some(challenged_server()),
-        },
-    );
+    let builder = ClientBuilder::new(bundle(), super::support::Once::new(challenged_server()));
     let mut conn = builder.connect_driven().await.expect("connect driven");
     conn.subscribe("sub", "SELECT * FROM orders")
         .await
@@ -399,20 +358,6 @@ impl Transport for ResetSocket {
     }
 }
 
-/// A dialer that hands out exactly one transport, the one the test attached.
-struct OneShotSocket {
-    transport: Option<ResetSocket>,
-}
-
-impl TransportFactory for OneShotSocket {
-    type Transport = ResetSocket;
-    type Error = DialRefused;
-
-    fn connect(&mut self) -> impl Future<Output = Result<ResetSocket, DialRefused>> + Send {
-        std::future::ready(self.transport.take().ok_or(DialRefused))
-    }
-}
-
 /// A first frame that is a control frame other than the challenge is a broken
 /// exchange, because the signature `register` mints binds the challenge's
 /// nonce, and there is none.
@@ -579,9 +524,7 @@ async fn register_with_the_connection_closed_first_is_a_protocol_error() {
 async fn a_socket_down_on_the_first_read_is_a_transport_error() {
     let builder = ClientBuilder::new(
         bundle(),
-        OneShotSocket {
-            transport: Some(ResetSocket::down_on_first_read()),
-        },
+        super::support::Once::new(ResetSocket::down_on_first_read()),
     );
     let Err(dead) = builder.connect_driven().await else {
         panic!("the socket dies mid handshake, so the connect fails")
@@ -601,9 +544,7 @@ async fn a_socket_down_on_the_first_read_is_a_transport_error() {
 async fn a_socket_down_after_the_challenge_is_a_transport_error() {
     let builder = ClientBuilder::new(
         bundle(),
-        OneShotSocket {
-            transport: Some(ResetSocket::down_after_challenge([0x49; 32])),
-        },
+        super::support::Once::new(ResetSocket::down_after_challenge([0x49; 32])),
     );
     let Err(dead) = builder.connect_driven().await else {
         panic!("the socket dies mid handshake, so the connect fails")
