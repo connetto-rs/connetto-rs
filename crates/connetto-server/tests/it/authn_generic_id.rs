@@ -124,3 +124,38 @@ async fn typed_id_survives_rotation_and_revocation() {
             .expect("post-revoke live check")
     );
 }
+
+/// The in-memory store records how a session began and stamps each refresh,
+/// as the database store does.
+#[tokio::test]
+async fn in_memory_store_records_how_a_session_began() {
+    let store = store();
+    let issued = store
+        .create_session(&identity("gina"), origin())
+        .await
+        .expect("create");
+
+    let began = store
+        .session_record(issued.session_id)
+        .await
+        .expect("read")
+        .expect("the session is recorded");
+    assert_eq!(began.user_id, expected_id("gina"));
+    assert_eq!(began.provider, "test");
+    assert_eq!(began.issuer, "https://issuer.example");
+    assert_eq!(began.created_at, issued.created_at);
+    assert_eq!(began.refreshed_at, None, "never refreshed yet");
+
+    store
+        .rotate_refresh(&issued.refresh_token)
+        .await
+        .expect("rotate");
+    let refreshed = store
+        .session_record(issued.session_id)
+        .await
+        .expect("read")
+        .expect("the session is recorded")
+        .refreshed_at
+        .expect("the refresh is stamped");
+    assert!(refreshed >= began.created_at);
+}
