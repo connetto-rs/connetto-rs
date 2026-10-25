@@ -37,8 +37,6 @@
 //! - `CONNETTO_AUTH`: the login machinery. Only `database` is served, which
 //!   stores sessions and provider tokens in Postgres and signs users in
 //!   through the identity providers below.
-//! - `CONNETTO_AUDIT`: set to `database` to record every access change in
-//!   the application's own table.
 //! - `CONNETTO_JWT_PRIVATE_KEY_FILE` and `CONNETTO_JWT_PUBLIC_KEY_FILE`:
 //!   the persisted Ed25519 signing keypair, PKCS8 PEM, required. A token
 //!   minted under one key must verify after a restart, so the deployment
@@ -507,7 +505,6 @@ async fn builder_from_env() -> Result<ServerBuilder> {
             ));
         }
     }
-    let audit = database_toggle("CONNETTO_AUDIT")?;
     let bans = database_toggle("CONNETTO_BANS")?;
     let database = Database::new(
         std::env::var("DATABASE_URL").context("set DATABASE_URL")?,
@@ -543,7 +540,6 @@ async fn builder_from_env() -> Result<ServerBuilder> {
         )?)))
         .reader_reserve(reader_reserve()?)
         .oidc_providers(providers)
-        .audit(audit)
         .bans(bans)
         .redirect_allowlist(comma_list(&var_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")))
         .cors_origins(comma_list(&var_or("CONNETTO_AUTH_CORS_ORIGINS", "")))

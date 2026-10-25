@@ -93,6 +93,7 @@ pub use subql::visibility::WriteOp;
 // Re-exported so `connetto_schema!` can name it as
 // `$crate::SessionId` in a consumer's crate, which need not depend on
 // connetto-core directly.
+pub use audit::MintedKey;
 pub use authn::http::{
     BROWSER_CLIENT, CLIENT_KIND_HEADER, CookieSameSite, RedirectPolicy, auth_router,
     is_loopback_host,
@@ -108,6 +109,8 @@ pub use authn::{
     TokenPair, VerifiedClaims, VerifiedLogin, VerifiedSession,
 };
 pub use authn::{ConnettoStoreSchema, DbAuthStore};
+pub use bots::InstalledApp;
+pub use builder::Ended;
 pub use builder::{
     BuildError, ChangeStream, ContentBuildError, ContentSettings, ContentSigner,
     ContentSignerError, PoolError, SHUTDOWN_GRACE, SYNC_PATH, ServeError, ServerBuilder,

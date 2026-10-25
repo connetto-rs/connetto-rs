@@ -11,7 +11,7 @@ pub mod schema;
 
 pub use schema::{__public_key, __verb};
 pub use schema::{
-    BotFacts, CodeFacts, ConnettoBotSchema, Installation, ListEntry, ListRow, NewBot,
+    BotFacts, CodeFacts, ConnettoBotSchema, Installation, InstalledApp, ListEntry, ListRow, NewBot,
     PgBotRegistry, Registered, RegistryError, Statement, Verb, pg_bot_registry,
 };
 #[doc(hidden)]

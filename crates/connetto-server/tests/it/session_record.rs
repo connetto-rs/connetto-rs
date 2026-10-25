@@ -99,7 +99,6 @@ async fn a_sign_in_records_where_it_came_from_and_tells_the_application() {
     let sink = Arc::clone(&told);
     let builder = builder
         .deployment_schema::<app::Described>(Arc::new(DefaultUuidResolver))
-        .audit(true)
         .session_describer(|request: LoginRequest| async move {
             app::Place {
                 place: format!(

@@ -99,7 +99,13 @@ fn issuer(pool: &Pool<AsyncPgConnection>) -> Issuer {
         PgSnapshotSource::from_ddl(pool.clone(), CATALOG_DDL).expect("build snapshot source"),
     );
     let authority = Arc::new(TokenAuthority::generate(&AuthConfig::default()).expect("keypair"));
-    CapabilityIssuer::new(authority, auth, rows, &AuthConfig::default())
+    CapabilityIssuer::new(
+        authority,
+        auth,
+        rows,
+        &AuthConfig::default(),
+        Arc::new(|_| {}),
+    )
 }
 
 /// A caller who may read a row but not change it may not certify a change.

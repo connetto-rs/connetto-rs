@@ -221,6 +221,16 @@ pub trait ConnettoStoreSchema: Send + Sync + 'static {
         conn: &mut AsyncPgConnection,
         session_id: SessionId,
     ) -> Statement<'_, Option<StoredProviderToken>>;
+
+    /// Delete the retained provider tokens of `sessions`, the only copy
+    /// connetto holds, once those sessions are revoked.
+    fn forget_provider_tokens(
+        conn: &mut AsyncPgConnection,
+        sessions: Vec<SessionId>,
+    ) -> Statement<'_, ()>;
+
+    /// Delete every retained provider token, once every session is revoked.
+    fn forget_every_provider_token(conn: &mut AsyncPgConnection) -> Statement<'_, ()>;
 }
 
 /// Generate the default connetto auth tables and their [`ConnettoStoreSchema`]
@@ -713,6 +723,37 @@ macro_rules! connetto_auth_tables {
                     .set(connetto_sessions::revoked.eq(true))
                     .execute(conn)
                     .await
+                })
+            }
+
+            fn forget_provider_tokens(
+                conn: &mut diesel_async::AsyncPgConnection,
+                sessions: Vec<$crate::SessionId>,
+            ) -> $crate::authn::schema::Statement<'_, ()> {
+                Box::pin(async move {
+                    use diesel::ExpressionMethods as _;
+                    diesel_async::RunQueryDsl::execute(
+                        diesel::delete(diesel::QueryDsl::filter(
+                            connetto_provider_tokens::table,
+                            connetto_provider_tokens::session_id.eq_any(sessions),
+                        )),
+                        conn,
+                    )
+                    .await?;
+                    Ok(())
+                })
+            }
+
+            fn forget_every_provider_token(
+                conn: &mut diesel_async::AsyncPgConnection,
+            ) -> $crate::authn::schema::Statement<'_, ()> {
+                Box::pin(async move {
+                    diesel_async::RunQueryDsl::execute(
+                        diesel::delete(connetto_provider_tokens::table),
+                        conn,
+                    )
+                    .await?;
+                    Ok(())
                 })
             }
 

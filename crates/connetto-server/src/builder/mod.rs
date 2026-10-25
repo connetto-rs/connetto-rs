@@ -25,10 +25,10 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowCredentials, AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
-use crate::audit::{ConnettoAuditSchema, pg_audit_hook};
+use crate::audit::{ConnettoAuditSchema, MintedKey, pg_audit_hook};
 use crate::authn::schema::ConnettoStoreSchema;
 use crate::ban::ConnettoBanSchema;
-use crate::bots::{ConnettoBotSchema, pg_bot_registry};
+use crate::bots::{ConnettoBotSchema, InstalledApp, pg_bot_registry};
 use crate::defaults::ConnettoDefaults;
 use crate::device_cert::{
     ConnettoEnrolmentSchema, Device, DeviceCertConfig, DeviceEnrolment, FirstEnrolment,
@@ -93,6 +93,9 @@ type Service<D> = AuthService<DbAuthStore<D>>;
 
 /// The application's session descriptor the deployment's schema declares.
 type Desc<D> = <<D as ConnettoSchema>::Auth as ConnettoStoreSchema>::Descriptor;
+
+/// The type the deployment's audit table stores a shared row's key as.
+type RowKey<D> = <<D as ConnettoSchema>::Audit as ConnettoAuditSchema>::RowKey;
 
 /// The Postgres pool every assembled server owns.
 type PgPool = Pool<AsyncPgConnection>;
@@ -659,6 +662,7 @@ where
 {
     manager: Arc<ServerManager<D>>,
     service: Arc<Service<D>>,
+    pool: PgPool,
     lag_watch: Option<BackgroundTask>,
     sweep: Option<BackgroundTask>,
     status: Option<BackgroundTask>,
@@ -673,6 +677,7 @@ where
         Self {
             manager: Arc::clone(&self.manager),
             service: Arc::clone(&self.service),
+            pool: self.pool.clone(),
             lag_watch: self.lag_watch.clone(),
             sweep: self.sweep.clone(),
             status: self.status.clone(),
@@ -692,6 +697,32 @@ pub struct SignedInPlace<Id, Desc> {
     pub device: Option<Device>,
 }
 
+/// What ending sessions answers: the sessions it ended and what they left
+/// behind, for the person to withdraw (R105 decision 5).
+#[derive(Debug, Clone)]
+pub struct Ended<Id, RowKey> {
+    /// The sessions it ended, none when nothing ended.
+    pub sessions: Vec<SessionId>,
+    /// The share keys those sessions minted. The application withdraws one
+    /// by deleting its own relation row granting the key.
+    pub share_keys: Vec<MintedKey<RowKey>>,
+    /// Every installation the person owns, since an installation records no
+    /// session. The person removes one they did not make by deleting its
+    /// row.
+    pub installations: Vec<InstalledApp<Id>>,
+}
+
+impl<Id, RowKey> Ended<Id, RowKey> {
+    /// The answer when no session ended.
+    const fn nothing() -> Self {
+        Self {
+            sessions: Vec::new(),
+            share_keys: Vec::new(),
+            installations: Vec::new(),
+        }
+    }
+}
+
 /// Why a session surface could not answer.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionsError {
@@ -704,6 +735,9 @@ pub enum SessionsError {
     /// A device's key could not be revoked.
     #[error(transparent)]
     Revoke(#[from] crate::device_cert::RevokeError),
+    /// What the ended sessions left behind could not be read.
+    #[error("reading what the ended sessions left behind: {0}")]
+    LeftBehind(String),
 }
 
 impl<D> ServerHandle<D>
@@ -778,20 +812,21 @@ where
             .collect())
     }
 
-    /// End `user`'s session `session`, recording `ended_by_owner`. When a
-    /// device enrolled during it, its key is revoked first and the device is
-    /// closed with `DeviceRevoked`. Answers whether the session was `user`'s
-    /// and live, and ends nothing otherwise.
+    /// End `user`'s session `session`, recording `ended_by_owner`, and answer
+    /// what it left behind. When a device enrolled during it, its key is
+    /// revoked first and the device is closed with `DeviceRevoked`. A session
+    /// that is not `user`'s or not live ends nothing, and the answer is
+    /// empty.
     ///
     /// # Errors
     ///
-    /// [`SessionsError`] when the auth store, the enrolment table or the
-    /// issuer fails.
+    /// [`SessionsError`] when the auth store, the enrolment table, the issuer
+    /// or the audit and registry tables fail.
     pub async fn end_session(
         &self,
         user: &D::Id,
         session: SessionId,
-    ) -> Result<bool, SessionsError> {
+    ) -> Result<Ended<D::Id, RowKey<D>>, SessionsError> {
         let owned = self
             .service
             .sessions_of(user)
@@ -799,39 +834,77 @@ where
             .iter()
             .any(|record| record.session_id == session);
         if !owned {
-            return Ok(false);
+            return Ok(Ended::nothing());
         }
         for device in self.live_devices_of(user).await? {
             if device.session == session {
                 self.manager.revoke_device_of(user, device.key).await?;
             }
         }
-        Ok(self.service.end_session(user, session).await?)
+        let ended = if self.service.end_session(user, session).await? {
+            vec![session]
+        } else {
+            Vec::new()
+        };
+        self.left_behind(user, ended).await
     }
 
-    /// End every session of `user`, recording `ended_all`, and revoke no
-    /// device key, so a sign-out everywhere wipes no device. Answers how many
-    /// ended.
+    /// End every session of `user`, recording `ended_all`, and answer what
+    /// they left behind. No device key is revoked, so a sign-out everywhere
+    /// wipes no device.
     ///
     /// # Errors
     ///
-    /// [`SessionsError::Auth`] when the auth store fails.
-    pub async fn end_all_sessions(&self, user: &D::Id) -> Result<usize, SessionsError> {
-        Ok(self.service.end_sessions(user, None).await?)
+    /// [`SessionsError`] when the auth store or the audit and registry
+    /// tables fail.
+    pub async fn end_all_sessions(
+        &self,
+        user: &D::Id,
+    ) -> Result<Ended<D::Id, RowKey<D>>, SessionsError> {
+        let ended = self.service.end_sessions(user, None).await?;
+        self.left_behind(user, ended).await
     }
 
     /// End every session of `user` but `current`, recording `ended_others`,
-    /// and revoke no device key. Answers how many ended.
+    /// and answer what they left behind. No device key is revoked.
     ///
     /// # Errors
     ///
-    /// [`SessionsError::Auth`] when the auth store fails.
+    /// [`SessionsError`] when the auth store or the audit and registry
+    /// tables fail.
     pub async fn end_other_sessions(
         &self,
         user: &D::Id,
         current: SessionId,
-    ) -> Result<usize, SessionsError> {
-        Ok(self.service.end_sessions(user, Some(current)).await?)
+    ) -> Result<Ended<D::Id, RowKey<D>>, SessionsError> {
+        let ended = self.service.end_sessions(user, Some(current)).await?;
+        self.left_behind(user, ended).await
+    }
+
+    /// The share keys `sessions` minted and every installation `user` owns,
+    /// nothing when no session ended.
+    async fn left_behind(
+        &self,
+        user: &D::Id,
+        sessions: Vec<SessionId>,
+    ) -> Result<Ended<D::Id, RowKey<D>>, SessionsError> {
+        if sessions.is_empty() {
+            return Ok(Ended::nothing());
+        }
+        let failed = |err: &dyn fmt::Display| SessionsError::LeftBehind(err.to_string());
+        let mut conn = self.pool.get().await.map_err(|err| failed(&err))?;
+        let share_keys = <D::Audit as ConnettoAuditSchema>::minted_by(&mut conn, sessions.clone())
+            .await
+            .map_err(|err| failed(&err))?;
+        let installations =
+            <D::Bots as ConnettoBotSchema>::installations_of(&mut conn, user.clone())
+                .await
+                .map_err(|err| failed(&err))?;
+        Ok(Ended {
+            sessions,
+            share_keys,
+            installations,
+        })
     }
 
     /// `user`'s devices whose keys are not revoked.
@@ -879,7 +952,6 @@ pub struct ServerBuilder<D: ConnettoSchema = ConnettoDefaults> {
     reader_reserve: ReaderReserve,
     throttle: ThrottleConfig,
     abuse: AbuseConfig,
-    audit: bool,
     bans: bool,
     oidc_providers: Vec<OidcProvider>,
     auth_config: AuthConfig,
@@ -926,10 +998,8 @@ impl<Id, Desc> fmt::Debug for OnSignIn<Id, Desc> {
     }
 }
 
-/// What the auth service tells and asks besides its callers: whether it
-/// records access changes, and the application's two sign-in callbacks.
+/// The application's two sign-in callbacks, handed to the auth service.
 struct AuthHooks<D: ConnettoSchema> {
-    audit: bool,
     describer: Option<Describer<Desc<D>>>,
     sign_in: Option<SignInHook<D::Id, Desc<D>>>,
 }
@@ -959,7 +1029,6 @@ impl ServerBuilder {
             reader_reserve: ReaderReserve::new(),
             throttle: ThrottleConfig::default(),
             abuse: AbuseConfig::default(),
-            audit: false,
             bans: false,
             oidc_providers: Vec::new(),
             auth_config: AuthConfig::default(),
@@ -1006,7 +1075,6 @@ where
             reader_reserve,
             throttle,
             abuse,
-            audit,
             bans,
             oidc_providers,
             auth_config,
@@ -1038,7 +1106,6 @@ where
             reader_reserve,
             throttle,
             abuse,
-            audit,
             bans,
             oidc_providers,
             auth_config,
@@ -1128,13 +1195,6 @@ where
     #[must_use]
     pub fn abuse(mut self, config: AbuseConfig) -> Self {
         self.abuse = config;
-        self
-    }
-
-    /// Record access changes to `auth_events` when set.
-    #[must_use]
-    pub fn audit(mut self, record: bool) -> Self {
-        self.audit = record;
         self
     }
 
@@ -1288,7 +1348,6 @@ where
             reader_reserve,
             throttle,
             abuse,
-            audit,
             bans,
             oidc_providers,
             auth_config,
@@ -1353,7 +1412,7 @@ where
         }
 
         let pool = build_pool(&database.owner_url, owner_pool_size).await?;
-        require_schema_tables::<D>(&pool, audit, bans, device_identity.is_some()).await?;
+        require_schema_tables::<D>(&pool, bans, device_identity.is_some()).await?;
         require_cap_policies::<D>(&pool, &schema.pg_ddl).await?;
         let (oplog, lag_watch) = prepare_change_log(
             &pool,
@@ -1384,7 +1443,6 @@ where
             &keys,
             &auth_config,
             AuthHooks {
-                audit,
                 describer,
                 sign_in: sign_in.clone(),
             },
@@ -1550,13 +1608,13 @@ where
 }
 
 /// Refuse a deployment missing a table its schema's members name, the auth,
-/// watermark and bot registry tables always, since every connection can
-/// register a bot, and the ban, audit and enrolment tables when turned on.
-/// The file member is the file server's preflight to check. Only names are
-/// checked, never columns.
+/// watermark, audit and bot registry tables always, since every connection
+/// can register a bot and every server records access changes (R105
+/// decision 5), and the ban and enrolment tables when turned on. The file
+/// member is the file server's preflight to check. Only names are checked,
+/// never columns.
 async fn require_schema_tables<D: ConnettoSchema>(
     pool: &PgPool,
-    audit: bool,
     bans: bool,
     devices: bool,
 ) -> Result<(), BuildError> {
@@ -1564,7 +1622,7 @@ async fn require_schema_tables<D: ConnettoSchema>(
         (<D::Auth as ConnettoStoreSchema>::TABLES, true),
         (<D::Writers as ConnettoWriterSchema>::TABLES, true),
         (<D::Bans as ConnettoBanSchema>::TABLES, bans),
-        (<D::Audit as ConnettoAuditSchema>::TABLES, audit),
+        (<D::Audit as ConnettoAuditSchema>::TABLES, true),
         (<D::Enrolments as ConnettoEnrolmentSchema>::TABLES, devices),
         (<D::Bots as ConnettoBotSchema>::TABLES, true),
     ];
@@ -1780,14 +1838,11 @@ async fn build_auth<D: ConnettoSchema>(
     if let Some(hook) = hooks.sign_in {
         service.set_sign_in_hook(hook);
     }
-    if hooks.audit {
-        // The same sink on both, because a ban is detected in the guard and
-        // every other access change is produced here.
-        let hook = pg_audit_hook::<D>(pool.clone());
-        service.guard().set_audit_hook(Arc::clone(&hook));
-        service.set_audit_hook(hook);
-        tracing::info!("recording access changes to auth_events");
-    }
+    // The same sink on both, because a ban is detected in the guard and
+    // every other access change is produced here.
+    let audit = pg_audit_hook::<D>(pool.clone());
+    service.guard().set_audit_hook(Arc::clone(&audit));
+    service.set_audit_hook(audit);
     Ok((service, registry))
 }
 
@@ -2284,13 +2339,14 @@ fn assemble_parts<D: ConnettoSchema>(
         change_stream: change_stream(
             Arc::clone(&manager),
             Arc::clone(&service),
-            pool,
+            pool.clone(),
             wiring.feed,
             wiring.policy,
         ),
         handle: ServerHandle {
             manager,
             service,
+            pool,
             lag_watch: wiring.lag_watch,
             sweep: wiring.sweep,
             status: wiring.status,

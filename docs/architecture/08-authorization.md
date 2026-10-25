@@ -386,6 +386,7 @@ CREATE TABLE auth_events (
     op         connetto_auth_op NOT NULL,
     table_name TEXT,
     pk         <RowKeySqlType>,
+    subject    TEXT,
     writer     BIGINT,
     seq        BIGINT,
     path       connetto_settle_path,
@@ -437,7 +438,7 @@ CREATE TABLE auth_events (
 
 **`ended_by_owner`, `ended_all` and `ended_others` record a person ending their own sessions (R105, 2026-10-25).** One row per ended session, naming the session and the person. `ended_by_owner` is one entry of the person's list of signed-in places, `ended_others` every session but the current one, and `ended_all` every session. They sit beside `session_revoked`, the application revoking for its own reasons, because the person's choice and the application's read differently when a takeover is investigated.
 
-**Recording is off unless asked for**, with `CONNETTO_AUDIT=database` in the reference binary, because the table belongs to the application and connetto creates nothing.
+**Recording is always on. Decided (R105, 2026-10-25).** Ending a person's sessions answers the share keys those sessions minted, read back from their `capability_minted` rows, so a deployment without the table could miss an intruder's keys without anyone noticing. The server refuses to start without `auth_events`, the reference binary has no switch for it, and `CapabilityIssuer::new` takes its audit hook, so no mint goes unrecorded. A mint's row names the key it issued in `subject`, the string the application's grant row names, so the application withdraws exactly that grant. connetto reads the table back for nothing else.
 
 Audit writing is off the synchronous hot path: the sink is fired synchronously and the supplied Postgres implementation spawns the write, so a slow or failing sink never delays the caller and never fails the logout, revocation or mint that produced it.
 
@@ -471,7 +472,7 @@ No benchmark infrastructure exists in the workspace: no `benches` directory, no 
 - **A translated attribute condition may only earn a wildcard subject when the value it compares against is a literal.** A standalone column-versus-literal predicate means "visible to everyone while it holds", so the wildcard is correct. A pattern admitting a caller-derived right-hand side under the same emission would hand everyone access to rows scoped to one caller, which is the one way the compilation can widen rather than narrow. Like the exclusion invariant above, it is asserted and tested upstream (`only_a_literal_constant_earns_the_attribute_wildcard`) rather than assumed here. Recorded because it arrived with the 2026-08-07 coverage work and is the only new way a translated policy can leak.
 - **The revocation promise**: immediate for writes, within the read cache TTL for reads, immediate for both on teardown.
 - **Precomputation is out.** Demand-driven caching with changelog invalidation is the mechanism, and a local negative filter is a contingency with a measured trigger.
-- **Audit table is `auth_events`, and it holds state changes, not denials.** A rejected grant is a denial and goes to structured logging, which is the only place it is visible because the wire says nothing about it. **Built (R13, 2026-08-06)**: a schema trait and macro beside the other two, eight event kinds of which six now have a producer, and recording off unless `CONNETTO_AUDIT` asks for it.
+- **Audit table is `auth_events`, and it holds state changes, not denials.** A rejected grant is a denial and goes to structured logging, which is the only place it is visible because the wire says nothing about it. **Built (R13, 2026-08-06)**: a schema trait and macro beside the other two. **Recording is always on (R105, 2026-10-25)**, since ending a session reads back the keys it minted.
 - **An identity that keeps naming something and being told no is banned, and connetto asks the application what that costs.** Built (R36, 2026-08-06): four signals, tallied per person over a day and per connection within one socket, with a fifth deployment-facing schema contract (`connetto_bans`) holding current state and a nullable expiry. Reads drive no counter, by principle 4 and because their volume measures the database rather than anyone's behaviour. A banned caller is told nothing, at the handshake or mid-connection. The check reads on the owner pool and fails closed, since on the reader pool an invisible row is zero rows rather than an error and the ban would silently not apply.
 - **A refusal on the subscribe path discloses nothing, and silence includes frame ordering.** Built (R38, 2026-08-06): one fixed refusal text on the server and the relay, no frame ahead of a refusal (`SnapshotBegin` and `FullResyncRequired` follow the successful read), the cause to the structured log. A side effect worth having on its own: the client no longer discards its rows on a resync notice whose snapshot then fails.
 - **The measurement is phase R0, with acceptance assertions rather than a number to be interpreted.** The subscriber-independence requirement is expressed as a CI-gating test rather than a benchmark figure, because a figure nobody compares drifts.

@@ -237,13 +237,6 @@ async fn reset_tables(fixture: &Fixture) {
         "DROP TABLE IF EXISTS connetto_bans".to_owned(),
         "DROP TABLE IF EXISTS auth_events".to_owned(),
         format!("DROP TYPE IF EXISTS {AUTH_OP_TYPE}"),
-        format!(
-            "CREATE TYPE {AUTH_OP_TYPE} AS ENUM (\
-                'logged_in', 'logged_out', 'session_revoked', 'token_replayed', \
-                'ended_by_owner', 'ended_all', 'ended_others', \
-                'capability_minted', 'permission_change', 'model_change', \
-                'banned', 'ban_lifted', 'write_forked', 'write_redelivered')"
-        ),
         "CREATE TABLE connetto_bans (\
             user_id TEXT PRIMARY KEY, \
             session UUID NOT NULL, \
@@ -251,18 +244,7 @@ async fn reset_tables(fixture: &Fixture) {
             banned_at TIMESTAMPTZ NOT NULL, \
             expires_at TIMESTAMPTZ)"
             .to_owned(),
-        format!(
-            "CREATE TABLE auth_events (\
-                at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-                session UUID NOT NULL, \
-                user_id TEXT, \
-                op {AUTH_OP_TYPE} NOT NULL, \
-                table_name TEXT, \
-                pk UUID, \
-                writer BIGINT, seq BIGINT, \
-                path connetto_settle_path, other_path connetto_settle_path, \
-                provider TEXT, issuer TEXT)"
-        ),
+        connetto_test_harness::AUDIT_DDL.to_owned(),
     ] {
         fixture.exec(&statement).await;
     }
