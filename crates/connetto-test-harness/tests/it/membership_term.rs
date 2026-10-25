@@ -406,7 +406,16 @@ async fn no_live_past(
 
 /// A compressed patchset inserting one `items` row, as a frame carries it.
 fn items_patch(id: i64, label: &str) -> Vec<u8> {
-    let table = SimpleTable::new("items", &["id", "owner", "team_id", "label"], &[0]);
+    let table = SimpleTable::with_rowid_alias(
+        "items",
+        &[
+            ("id", "INTEGER"),
+            ("owner", "TEXT"),
+            ("team_id", "INTEGER"),
+            ("label", "TEXT"),
+        ],
+        0,
+    );
     let mut insert = Insert::<_, String, Vec<u8>>::from(table);
     for (index, value) in [
         WireValue::Integer(id),

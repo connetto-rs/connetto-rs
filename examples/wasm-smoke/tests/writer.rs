@@ -323,7 +323,12 @@ async fn a_forged_changeset_at_a_settled_sequence_is_refused_forked() {
     let insert_patch = |id: rosetta_uuid::Uuid| {
         let table = SimpleTable::new(
             "orders",
-            &["id", "owner_id", "quantity", "created_at"],
+            &[
+                ("id", "BLOB"),
+                ("owner_id", "TEXT"),
+                ("quantity", "INTEGER"),
+                ("created_at", "TEXT"),
+            ],
             &[0],
         );
         let insert = Insert::<_, String, Vec<u8>>::from(table)

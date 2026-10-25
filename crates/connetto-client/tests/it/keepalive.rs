@@ -65,7 +65,11 @@ fn ack() -> ControlMessage {
 /// Compressed one-row patchset bytes for the wire table shape.
 fn payload() -> Vec<u8> {
     let insert =
-        Insert::<_, String, Vec<u8>>::from(SimpleTable::new("orders", &["id", "label"], &[0]))
+        Insert::<_, String, Vec<u8>>::from(SimpleTable::with_rowid_alias(
+            "orders",
+            &[("id", "INTEGER"), ("label", "TEXT")],
+            0,
+        ))
             .set(0, Value::Integer(1))
             .expect("set id")
             .set(1, Value::Text("seed".to_owned()))

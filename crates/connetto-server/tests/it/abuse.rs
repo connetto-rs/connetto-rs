@@ -122,7 +122,11 @@ impl SnapshotSource for KeyedSnapshot {
                 bytes: 0,
             });
         }
-        let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
+        let table = SimpleTable::with_rowid_alias(
+            "orders",
+            &[("id", "INTEGER"), ("price", "REAL"), ("quantity", "INTEGER"), ("status", "TEXT")],
+            0,
+        );
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
             .expect("set id")
@@ -875,7 +879,7 @@ async fn an_offline_queue_of_rejected_writes_does_not_reach_the_threshold() {
     for seq in 1..=FLUSHED {
         let changeset = insert_changeset(
             "orders",
-            &["id", "price", "quantity", "status"],
+            &[("id", "INTEGER"), ("price", "REAL"), ("quantity", "INTEGER"), ("status", "TEXT")],
             &[0],
             vec![
                 RowValue::Integer(i64::try_from(seq).expect("a small sequence fits")),

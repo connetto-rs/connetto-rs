@@ -181,7 +181,11 @@ fn writable_catalog() -> RuntimeWritableCatalog {
 }
 
 fn note_table() -> SimpleTable {
-    SimpleTable::new("notes", &["id", "body", "edited_at"], &[0])
+    SimpleTable::with_rowid_alias(
+        "notes",
+        &[("id", "INTEGER"), ("body", "TEXT"), ("edited_at", "TEXT")],
+        0,
+    )
 }
 
 /// A changeset that inserts one full row.
@@ -2238,7 +2242,13 @@ async fn seed_multi(fixture: &Fixture) {
 fn multi_table() -> SimpleTable {
     SimpleTable::new(
         "multi",
-        &["key", "weight", "tag", "body", "edited_at"],
+        &[
+            ("key", "TEXT"),
+            ("weight", "REAL"),
+            ("tag", "BLOB"),
+            ("body", "TEXT"),
+            ("edited_at", "TEXT"),
+        ],
         &[0, 1, 2],
     )
 }
