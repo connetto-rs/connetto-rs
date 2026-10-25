@@ -3709,6 +3709,10 @@ fn pump_finished<T: Transport>(shared: &Shared<T>) {
 /// and an error from either loses none. A due drain dial is returned for the
 /// caller to dial outside the state lock (R31). A resolved prompt is
 /// captured in `ask_outcome` for the caller to apply under the state lock.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The cancellation boundary borrows independently pinned timers and gate state."
+)]
 async fn step_or_resend_or_keepalive<T, F, G>(
     conn: &mut ConnettoConnection<T>,
     wake: &Notify,
