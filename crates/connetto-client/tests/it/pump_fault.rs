@@ -3,6 +3,7 @@
 
 use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, ConnettoClient, DataDir, MemoryRefreshStore,
+    SyncStatus,
 };
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, LivePatch,
@@ -337,7 +338,9 @@ async fn a_local_fault_on_the_drain_side_stops_the_pump_the_same_way() {
 }
 
 /// Every event up to the driver's first redial, refusing a stop on the way.
-async fn until_reconnecting(events: &mut tokio::sync::broadcast::Receiver<ClientEvent>) {
+async fn until_reconnecting(
+    events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
+) -> Vec<ClientEvent> {
     let mut seen = Vec::new();
     loop {
         let event = tokio::time::timeout(BOUND, events.recv())
@@ -349,14 +352,16 @@ async fn until_reconnecting(events: &mut tokio::sync::broadcast::Receiver<Client
             "a lost socket is recovered, never a stop, saw {seen:?} then {event:?}"
         );
         if matches!(event, ClientEvent::Reconnecting { .. }) {
-            return;
+            return seen;
         }
         seen.push(event);
     }
 }
 
-/// The socket dies as a local write is uploaded. That is a transport to go
-/// and find, so the driver redials and the pump never announces a stop.
+/// The socket dies as a local write is uploaded, and the redial keeps
+/// failing. That is a transport to go and find, so the driver redials, the
+/// pump never announces a stop, and the app hears the client is offline
+/// before the first redial rather than once one lands.
 #[tokio::test]
 async fn a_socket_lost_while_uploading_a_write_is_recovered() {
     let (client, script, _dir, _pump) = client().await;
@@ -371,7 +376,11 @@ async fn a_socket_lost_while_uploading_a_write_is_recovered() {
         })
         .await
         .expect("the write lands locally");
-    until_reconnecting(&mut events).await;
+    let seen = until_reconnecting(&mut events).await;
+    assert!(
+        seen.contains(&ClientEvent::SyncStatus(SyncStatus::Offline)),
+        "the loss is announced before the redial, saw {seen:?}"
+    );
 }
 
 /// The server ends the session with no reconnect driver to resume it, so the
