@@ -1,16 +1,21 @@
-//! The person's data download (R61 slice 2), each test over its own fixture
-//! through the one construction path.
+//! The person's data download (R61 slices 2 and 3), each test over its own
+//! fixture through the one construction path.
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io;
+use std::path::Path;
 use std::pin::Pin;
+use std::time::Duration;
 
 use connetto_core::messages::BindValue;
 use connetto_server::builder::{
-    BuildError, Database, OidcProvider, OpenFga, ServerBuilder, ServerSchema, TokenKeys,
+    BuildError, ContentSettings, Database, OidcProvider, OpenFga, ServerBuilder, ServerSchema,
+    StoreSpec, TokenKeys,
 };
 use connetto_server::portability::{
-    DataRequestError, DataRequester, PortabilityBind, PortabilityError, PortabilityList,
-    PortabilityQuery,
+    DataRequestError, DataRequester, PortabilityBind, PortabilityError, PortabilityFile,
+    PortabilityList, PortabilityQuery,
 };
 use connetto_server::{
     OidcProviderConfig, RuntimeWritableCatalog, SessionId, ThrottleConfig, TierLimits,
@@ -29,6 +34,7 @@ use tempfile::{NamedTempFile, TempDir};
 use tokio::io::AsyncWrite;
 use uuid::Uuid;
 
+use super::builder_coverage::apply_content_deployment;
 use super::e2e::{PG_SERIAL, exec, reset_audit_table, signing_keys, with_user_url};
 use super::lifecycle::admin_pool;
 
@@ -37,9 +43,11 @@ const PG_DDL: &str = "-- connetto:major 1\n\
                       CREATE TABLE records (id INT PRIMARY KEY, owner TEXT, body TEXT, secret TEXT, \
                                             score DOUBLE PRECISION, avatar BYTEA);\
                       CREATE TABLE mod_notes (id INT PRIMARY KEY, about TEXT, kind TEXT, body TEXT);\
-                      CREATE TABLE stamps (at TIMESTAMPTZ PRIMARY KEY, owner TEXT, body TEXT);";
-/// A record is visible to its owner or a named share key; a note only when it
-/// is kind `visible`, which the owner-declared query overrides.
+                      CREATE TABLE stamps (at TIMESTAMPTZ PRIMARY KEY, owner TEXT, body TEXT);\
+                      CREATE TABLE media (id INT PRIMARY KEY, owner TEXT, content_id BYTEA, title TEXT);";
+/// A record is visible to its owner or a named share key, a note only when it
+/// is kind `visible`, which the owner-declared query overrides, and a stamp
+/// or a media row to its owner.
 const POLICIES: &str = "ALTER TABLE records ENABLE ROW LEVEL SECURITY;\n\
      CREATE POLICY records_p ON records USING (\
          owner = current_setting('app.user_id', true) \
@@ -48,7 +56,9 @@ const POLICIES: &str = "ALTER TABLE records ENABLE ROW LEVEL SECURITY;\n\
      CREATE POLICY notes_p ON mod_notes USING (\
          about = current_setting('app.user_id', true) AND kind = 'visible');\n\
      ALTER TABLE stamps ENABLE ROW LEVEL SECURITY;\n\
-     CREATE POLICY stamps_p ON stamps USING (owner = current_setting('app.user_id', true));";
+     CREATE POLICY stamps_p ON stamps USING (owner = current_setting('app.user_id', true));\n\
+     ALTER TABLE media ENABLE ROW LEVEL SECURITY;\n\
+     CREATE POLICY media_p ON media USING (owner = current_setting('app.user_id', true));";
 
 diesel::table! {
     records (id) {
@@ -65,6 +75,43 @@ diesel::table! {
         about -> Nullable<Text>,
         kind -> Nullable<Text>,
         body -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    media (id) {
+        id -> Integer,
+        owner -> Text,
+        content_id -> Binary,
+        title -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    _cfs_manifests (file_id, uploaded_by) {
+        file_id -> Binary,
+        total_len -> BigInt,
+        accepted_bytes -> BigInt,
+        committed -> Bool,
+        uploaded_by -> Text,
+    }
+}
+
+diesel::table! {
+    _cfs_manifest_chunks (file_id, uploaded_by, position) {
+        file_id -> Binary,
+        uploaded_by -> Text,
+        position -> Integer,
+        chunk_hash -> Binary,
+        chunk_len -> BigInt,
+        stored -> Bool,
+    }
+}
+
+diesel::table! {
+    _cfs_chunk_registry (chunk_hash) {
+        chunk_hash -> Binary,
+        state -> Text,
     }
 }
 
@@ -105,6 +152,7 @@ async fn reset_portability_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fix
     exec(pool, "DROP TABLE IF EXISTS records CASCADE").await;
     exec(pool, "DROP TABLE IF EXISTS mod_notes CASCADE").await;
     exec(pool, "DROP TABLE IF EXISTS stamps CASCADE").await;
+    exec(pool, "DROP TABLE IF EXISTS media CASCADE").await;
     exec(pool, "DROP TABLE IF EXISTS _connetto_settled").await;
     exec(pool, "DROP TABLE IF EXISTS _connetto_writers").await;
     exec(pool, "DROP TABLE IF EXISTS _connetto_session_writers").await;
@@ -126,7 +174,7 @@ async fn reset_portability_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fix
     exec(pool, "GRANT USAGE ON SCHEMA public TO app_reader").await;
     exec(
         pool,
-        "GRANT SELECT ON records, mod_notes, stamps TO app_reader",
+        "GRANT SELECT ON records, mod_notes, stamps, media TO app_reader",
     )
     .await;
     exec(
@@ -185,7 +233,7 @@ async fn reset_portability_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fix
         .await
         .expect("seed notes");
     fixture
-        .start_replication(&["records", "mod_notes", "stamps"])
+        .start_replication(&["records", "mod_notes", "stamps", "media"])
         .await;
 }
 
@@ -352,27 +400,36 @@ struct AuditRow {
     acted_by: Option<String>,
 }
 
-/// The archive's `data.sqlite` and `manifest.json` entries.
-fn unzip(bytes: &[u8]) -> (Vec<u8>, serde_json::Value) {
+/// Every entry of the archive by name.
+fn unzip(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
     let mut archive = zip::ZipArchive::new(io::Cursor::new(bytes)).expect("the archive is a zip");
-    let mut data = None;
-    let mut manifest = None;
-    for index in 0..archive.len() {
-        let mut file = archive.by_index(index).expect("an entry");
-        let name = file.name().to_owned();
-        let mut content = Vec::new();
-        io::Read::read_to_end(&mut file, &mut content).expect("read the entry");
-        match name.as_str() {
-            "data.sqlite" => data = Some(content),
-            "manifest.json" => {
-                manifest = Some(serde_json::from_slice(&content).expect("the manifest is JSON"));
-            }
-            other => panic!("unexpected archive entry {other:?}"),
-        }
-    }
+    (0..archive.len())
+        .map(|index| {
+            let mut file = archive.by_index(index).expect("an entry");
+            let mut content = Vec::new();
+            io::Read::read_to_end(&mut file, &mut content).expect("read the entry");
+            (file.name().to_owned(), content)
+        })
+        .collect()
+}
+
+/// The archive's `data.sqlite` and `manifest.json`, with no other entry.
+fn unzip_rows(bytes: &[u8]) -> (Vec<u8>, serde_json::Value) {
+    let mut entries = unzip(bytes);
+    let data = entries
+        .remove("data.sqlite")
+        .expect("the archive holds data.sqlite");
+    let manifest = entries
+        .remove("manifest.json")
+        .expect("the archive holds manifest.json");
+    assert!(
+        entries.is_empty(),
+        "no files were named: {:?}",
+        entries.keys()
+    );
     (
-        data.expect("the archive holds data.sqlite"),
-        manifest.expect("the archive holds manifest.json"),
+        data,
+        serde_json::from_slice(&manifest).expect("the manifest is JSON"),
     )
 }
 
@@ -508,7 +565,7 @@ async fn a_download_carries_only_the_rows_the_queries_reach() {
         "the receipt counts what the sink received"
     );
 
-    let (data, manifest) = unzip(&sink.bytes);
+    let (data, manifest) = unzip_rows(&sink.bytes);
     assert_alice_archive(&data);
     assert_manifest(&manifest, &receipt.query_list_hash);
     assert_eq!(
@@ -584,7 +641,7 @@ async fn an_operator_download_leaves_the_same_archive_and_names_who_acted() {
         .await
         .expect("the operator's download finishes");
 
-    let (data, manifest) = unzip(&sink.bytes);
+    let (data, manifest) = unzip_rows(&sink.bytes);
     assert_alice_archive(&data);
     assert_manifest(&manifest, &receipt.query_list_hash);
     assert_eq!(
@@ -766,51 +823,64 @@ async fn a_download_refuses_when_no_query_is_registered() {
     assert!(sink.bytes.is_empty(), "no archive was written");
 }
 
+/// A server over unreachable collaborators, refusing at registration before
+/// it would connect to any.
+fn unconnected_builder(list: PortabilityList, content: Option<ContentSettings>) -> ServerBuilder {
+    let keys = TempDir::new().expect("a key dir");
+    let (private, public) = signing_keys(&keys);
+    ServerBuilder::new(
+        Database::new(
+            "postgres://connetto:connetto@127.0.0.1:1/connetto",
+            "postgres://connetto:connetto@127.0.0.1:1/connetto",
+        ),
+        ServerSchema::new(PG_DDL, ""),
+        TokenKeys::from_pem(
+            std::fs::read(&private).expect("read the private half"),
+            std::fs::read(&public).expect("read the public half"),
+        ),
+        OpenFga::new("http://127.0.0.1:1", "store"),
+    )
+    .oidc_providers(vec![OidcProvider::Generic(OidcProviderConfig::new(
+        MOCK_OAUTH_PROVIDER,
+        MOCK_OAUTH_CLIENT_ID,
+        "http://127.0.0.1:1/issuer",
+        "http://127.0.0.1:1/auth/callback",
+    ))])
+    .content(content)
+    .portability(list)
+}
+
+/// The build's refusal, which comes before its first await, so one poll
+/// settles it.
+fn refused(builder: ServerBuilder, what: &str) -> BuildError {
+    match builder.build().now_or_never().expect(what) {
+        Ok(_) => panic!("{what}"),
+        Err(err) => err,
+    }
+}
+
 #[tokio::test]
 async fn a_bad_query_refuses_the_build_naming_it() {
-    let builder = |list: PortabilityList| {
-        let keys = TempDir::new().expect("a key dir");
-        let (private, public) = signing_keys(&keys);
-        ServerBuilder::new(
-            Database::new(
-                "postgres://connetto:connetto@127.0.0.1:1/connetto",
-                "postgres://connetto:connetto@127.0.0.1:1/connetto",
-            ),
-            ServerSchema::new(PG_DDL, ""),
-            TokenKeys::from_pem(
-                std::fs::read(&private).expect("read the private half"),
-                std::fs::read(&public).expect("read the public half"),
-            ),
-            OpenFga::new("http://127.0.0.1:1", "store"),
-        )
-        .oidc_providers(vec![OidcProvider::Generic(OidcProviderConfig::new(
-            MOCK_OAUTH_PROVIDER,
-            MOCK_OAUTH_CLIENT_ID,
-            "http://127.0.0.1:1/issuer",
-            "http://127.0.0.1:1/auth/callback",
-        ))])
-        .portability(list)
-    };
-    // The refusal comes before build's first await, so one poll settles it.
-    let refused = |builder: ServerBuilder, what: &str| -> BuildError {
-        match builder.build().now_or_never().expect(what) {
-            Ok(_) => panic!("{what}"),
-            Err(err) => err,
-        }
-    };
-    let unknown_table = builder(PortabilityList::new("d").query(PortabilityQuery::new(
-        "SELECT * FROM nowhere",
-        "the missing table",
-    )));
+    let builder = unconnected_builder;
+    let unknown_table = builder(
+        PortabilityList::new("d").query(PortabilityQuery::new(
+            "SELECT * FROM nowhere",
+            "the missing table",
+        )),
+        None,
+    );
     let err = refused(unknown_table, "an unknown table refuses");
     assert!(
         matches!(&err, BuildError::Portability { name, .. } if name == "the missing table"),
         "the refusal names the query: {err}"
     );
-    let no_key = builder(PortabilityList::new("d").query(PortabilityQuery::new(
-        "SELECT body FROM records",
-        "the keyless list",
-    )));
+    let no_key = builder(
+        PortabilityList::new("d").query(PortabilityQuery::new(
+            "SELECT body FROM records",
+            "the keyless list",
+        )),
+        None,
+    );
     let err = refused(no_key, "a column list without the key refuses");
     assert!(
         matches!(&err, BuildError::Portability { name, .. } if name == "the keyless list"),
@@ -823,16 +893,20 @@ async fn a_bad_query_refuses_the_build_naming_it() {
                 "first",
             ))
             .query(PortabilityQuery::new("SELECT * FROM records", "second")),
+        None,
     );
     let err = refused(duplicate, "two queries on one table refuse");
     assert!(
         matches!(&err, BuildError::Portability { name, .. } if name == "second"),
         "the refusal names the second query: {err}"
     );
-    let count = builder(PortabilityList::new("d").query(PortabilityQuery::new(
-        "SELECT COUNT(*) FROM records",
-        "the count",
-    )));
+    let count = builder(
+        PortabilityList::new("d").query(PortabilityQuery::new(
+            "SELECT COUNT(*) FROM records",
+            "the count",
+        )),
+        None,
+    );
     let err = refused(count, "an aggregate reads no rows and refuses");
     assert!(
         matches!(
@@ -842,10 +916,13 @@ async fn a_bad_query_refuses_the_build_naming_it() {
         ),
         "the refusal names the aggregate: {err}"
     );
-    let two = builder(PortabilityList::new("d").query(PortabilityQuery::new(
-        "SELECT * FROM records; SELECT * FROM mod_notes",
-        "two statements",
-    )));
+    let two = builder(
+        PortabilityList::new("d").query(PortabilityQuery::new(
+            "SELECT * FROM records; SELECT * FROM mod_notes",
+            "two statements",
+        )),
+        None,
+    );
     let err = refused(two, "a query holding two statements refuses");
     assert!(
         matches!(
@@ -908,7 +985,7 @@ async fn a_download_pages_through_more_rows_than_one_read_holds() {
         .await
         .expect("the download finishes");
 
-    let (data, _manifest) = unzip(&sink.bytes);
+    let (data, _manifest) = unzip_rows(&sink.bytes);
     let (mut db, _file) = archive_db(&data);
     let records: Vec<RecordRow> = diesel::RunQueryDsl::load(
         diesel::sql_query("SELECT id, owner, body FROM records ORDER BY id"),
@@ -1041,7 +1118,7 @@ async fn a_download_pages_through_a_table_keyed_by_a_timestamp() {
         .await
         .expect("the download finishes");
 
-    let (data, _manifest) = unzip(&sink.bytes);
+    let (data, _manifest) = unzip_rows(&sink.bytes);
     let (mut db, _file) = archive_db(&data);
     let bodies: Vec<Body> = diesel::RunQueryDsl::load(
         diesel::sql_query("SELECT body FROM stamps ORDER BY at"),
@@ -1119,7 +1196,7 @@ async fn a_download_binds_fixed_values_and_keeps_each_value_typed() {
         .await
         .expect("the download finishes");
 
-    let (data, _manifest) = unzip(&sink.bytes);
+    let (data, _manifest) = unzip_rows(&sink.bytes);
     let (mut db, _file) = archive_db(&data);
     let rows: Vec<TypedRow> = diesel::RunQueryDsl::load(
         diesel::sql_query(
@@ -1186,5 +1263,459 @@ async fn a_row_over_the_ceiling_fails_the_download() {
         audit_rows(&pool).await,
         Vec::new(),
         "a download that failed is not recorded as one"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_file_column_refuses_the_build_naming_it() {
+    let store = TempDir::new().expect("a store directory");
+    let media_files = |file: PortabilityFile| {
+        PortabilityList::new("d").query(
+            PortabilityQuery::new("SELECT id, owner, content_id, title FROM media", "photos")
+                .file(file),
+        )
+    };
+    let err = refused(
+        unconnected_builder(media_files(PortabilityFile::new("content_id")), None),
+        "files without a content store refuse",
+    );
+    assert!(
+        matches!(&err, BuildError::Portability { name, source: PortabilityError::NoContentStore }
+            if name == "photos"),
+        "the refusal names the query: {err}"
+    );
+    let err = refused(
+        unconnected_builder(
+            media_files(PortabilityFile::new("owner").named_by("title")),
+            Some(content_settings(store.path())),
+        ),
+        "a text column cannot hold a file id",
+    );
+    assert!(
+        matches!(&err, BuildError::Portability {
+            source: PortabilityError::FileColumnType { column, .. }, ..
+        } if column == "owner"),
+        "the refusal names the column: {err}"
+    );
+    let err = refused(
+        unconnected_builder(
+            media_files(PortabilityFile::new("content_id").named_by("caption")),
+            Some(content_settings(store.path())),
+        ),
+        "a name column the query does not read refuses",
+    );
+    assert!(
+        matches!(&err, BuildError::Portability {
+            source: PortabilityError::FileColumn { column }, ..
+        } if column == "caption"),
+        "the refusal names the column: {err}"
+    );
+}
+
+/// File settings over a file-system store at `store`, with the sweep idle
+/// for the length of a test.
+fn content_settings(store: &Path) -> ContentSettings {
+    ContentSettings {
+        base_url: "http://127.0.0.1:8099".to_owned(),
+        ttl: Duration::from_secs(60),
+        read_ceiling: 1 << 20,
+        grace: Duration::from_secs(3600),
+        cadence: Duration::from_secs(3600),
+        quota_identity: 0,
+        storage_ceiling: 0,
+        bandwidth_ceiling: 0,
+        bandwidth_window_days: 30,
+        warn_fraction: 0.8,
+        ceiling_refresh: Duration::from_secs(10),
+        owner_pool_size: 2,
+        store: StoreSpec::Fs(store.to_path_buf()),
+        key: ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+            .expect("a ticket key")
+            .as_ref()
+            .to_vec(),
+    }
+}
+
+/// Lowercase hex of `bytes`.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
+/// Where the file-system store keeps the chunk `hash`.
+fn chunk_path(store: &Path, hash: &[u8]) -> std::path::PathBuf {
+    let hash = hex(hash);
+    store.join(&hash[..2]).join(&hash[2..4]).join(&hash)
+}
+
+/// A file committed by `uploader` whose bytes are `chunks`, each written
+/// where the file-system store keeps it and registered stored. Returns its
+/// id, the BLAKE3 hash of the whole file.
+async fn seed_file(
+    pool: &Pool<AsyncPgConnection>,
+    store: &Path,
+    uploader: &str,
+    chunks: &[&[u8]],
+) -> Vec<u8> {
+    let mut whole = blake3::Hasher::new();
+    for chunk in chunks {
+        whole.update(chunk);
+    }
+    let id = whole.finalize().as_bytes().to_vec();
+    let total = i64::try_from(chunks.iter().map(|chunk| chunk.len()).sum::<usize>())
+        .expect("the size fits");
+    let mut conn = pool.get().await.expect("a connection");
+    diesel::insert_into(_cfs_manifests::table)
+        .values((
+            _cfs_manifests::file_id.eq(&id),
+            _cfs_manifests::total_len.eq(total),
+            _cfs_manifests::accepted_bytes.eq(total),
+            _cfs_manifests::committed.eq(true),
+            _cfs_manifests::uploaded_by.eq(uploader),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("the manifest lands");
+    for (position, chunk) in chunks.iter().enumerate() {
+        let hash = blake3::hash(chunk).as_bytes().to_vec();
+        let path = chunk_path(store, &hash);
+        std::fs::create_dir_all(path.parent().expect("the chunk parents"))
+            .expect("make the chunk parents");
+        std::fs::write(&path, chunk).expect("store the chunk");
+        diesel::insert_into(_cfs_chunk_registry::table)
+            .values((
+                _cfs_chunk_registry::chunk_hash.eq(&hash),
+                _cfs_chunk_registry::state.eq("stored"),
+            ))
+            .on_conflict_do_nothing()
+            .execute(&mut conn)
+            .await
+            .expect("the chunk registers");
+        diesel::insert_into(_cfs_manifest_chunks::table)
+            .values((
+                _cfs_manifest_chunks::file_id.eq(&id),
+                _cfs_manifest_chunks::uploaded_by.eq(uploader),
+                _cfs_manifest_chunks::position.eq(i32::try_from(position).expect("a position")),
+                _cfs_manifest_chunks::chunk_hash.eq(&hash),
+                _cfs_manifest_chunks::chunk_len
+                    .eq(i64::try_from(chunk.len()).expect("the length fits")),
+                _cfs_manifest_chunks::stored.eq(true),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("the chunk row lands");
+    }
+    id
+}
+
+/// One media row.
+async fn seed_media(
+    pool: &Pool<AsyncPgConnection>,
+    id: i32,
+    owner: &str,
+    file: &[u8],
+    title: Option<&str>,
+) {
+    let mut conn = pool.get().await.expect("a connection");
+    diesel::insert_into(media::table)
+        .values((
+            media::id.eq(id),
+            media::owner.eq(owner),
+            media::content_id.eq(file),
+            media::title.eq(title),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("the media row lands");
+}
+
+/// The download of a person's photos and the files they name.
+fn photo_list() -> PortabilityList {
+    PortabilityList::new("r61-fixture").query(
+        PortabilityQuery::new("SELECT id, owner, content_id, title FROM media", "photos")
+            .file(PortabilityFile::new("content_id").named_by("title")),
+    )
+}
+
+#[tokio::test]
+async fn a_download_carries_each_file_its_rows_name_once() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_portability_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    apply_content_deployment(&pool).await;
+    let store = TempDir::new().expect("a store directory");
+    let beach = seed_file(&pool, store.path(), "alice", &[b"sand and ", b"sea"]).await;
+    let other_beach = seed_file(&pool, store.path(), "alice", &[b"another beach"]).await;
+    let untitled = seed_file(&pool, store.path(), "alice", &[b"no title"]).await;
+    let climbing = seed_file(&pool, store.path(), "alice", &[b"up and out"]).await;
+    let lost = seed_file(&pool, store.path(), "alice", &[b"soon unreadable"]).await;
+    let bobs = seed_file(&pool, store.path(), "bob", &[b"bob's photo"]).await;
+    let never = vec![7_u8; 32];
+    seed_media(&pool, 1, "alice", &beach, Some("beach.jpg")).await;
+    seed_media(&pool, 2, "alice", &beach, Some("copy of beach.jpg")).await;
+    seed_media(&pool, 3, "alice", &other_beach, Some("Beach.jpg")).await;
+    seed_media(&pool, 4, "alice", &never, Some("draft.png")).await;
+    seed_media(&pool, 5, "alice", &untitled, None).await;
+    seed_media(&pool, 6, "alice", &climbing, Some("../up.txt")).await;
+    seed_media(&pool, 7, "alice", &lost, Some("gone.txt")).await;
+    seed_media(&pool, 8, "bob", &bobs, Some("bob.jpg")).await;
+    let alice_session = live_session(&pool, "alice").await;
+
+    let (builder, _idp, _keys) = portability_builder(&fixture, photo_list()).await;
+    let parts = builder
+        .content(Some(content_settings(store.path())))
+        .build()
+        .await
+        .expect("the deployment assembles");
+    // The lost file's only chunk leaves the store after the boot reconcile.
+    std::fs::remove_file(chunk_path(
+        store.path(),
+        blake3::hash(b"soon unreadable").as_bytes(),
+    ))
+    .expect("lose the chunk");
+    let mut sink = BytesSink::default();
+    let receipt = parts
+        .handle
+        .download_data(
+            "alice".to_owned(),
+            &DataRequester::Session(alice_session),
+            &mut sink,
+        )
+        .await
+        .expect("the download finishes");
+
+    let mut entries = unzip(&sink.bytes);
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &entries
+            .remove("manifest.json")
+            .expect("the archive holds manifest.json"),
+    )
+    .expect("the manifest is JSON");
+    let data = entries
+        .remove("data.sqlite")
+        .expect("the archive holds data.sqlite");
+    let beach_short = format!("files/Beach ({}).jpg", &hex(&other_beach)[..8]);
+    assert_eq!(
+        entries,
+        BTreeMap::from([
+            ("files/beach.jpg".to_owned(), b"sand and sea".to_vec()),
+            (beach_short.clone(), b"another beach".to_vec()),
+            (format!("files/{}", hex(&untitled)), b"no title".to_vec()),
+            ("files/_up.txt".to_owned(), b"up and out".to_vec()),
+        ]),
+        "each file once under its first row's title, a clashing title gaining \
+         the head of its id, an untitled one under its id, a title that climbs \
+         out kept inside, and nothing of bob's"
+    );
+    assert_eq!(
+        manifest["files"],
+        json!([
+            {"file_id": hex(&beach), "path": "beach.jpg"},
+            {"file_id": hex(&other_beach), "path": beach_short.trim_start_matches("files/")},
+            {"file_id": hex(&untitled), "path": hex(&untitled)},
+            {"file_id": hex(&climbing), "path": "_up.txt"},
+        ])
+    );
+    assert_eq!(
+        manifest["missing_files"],
+        json!([
+            {"file_id": hex(&never), "reason": "not_uploaded"},
+            {"file_id": hex(&lost), "reason": "unreadable"},
+        ])
+    );
+    assert_eq!(manifest["queries"][0]["file_column"], "content_id");
+    assert_eq!(manifest["queries"][0]["name_column"], "title");
+    assert_eq!(manifest["query_list_hash"], receipt.query_list_hash);
+
+    let rows = archive_media(&data);
+    assert_eq!(
+        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5, 6, 7],
+        "every row of alice's stays in the table, the ones whose file is missing too"
+    );
+    assert_eq!(rows[1].1, beach, "the row keeps the id the manifest maps");
+}
+
+/// The archive's media rows, by id, with the file id each holds.
+fn archive_media(data: &[u8]) -> Vec<(i32, Vec<u8>)> {
+    #[derive(QueryableByName)]
+    struct MediaRow {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        id: i32,
+        #[diesel(sql_type = diesel::sql_types::Binary)]
+        content_id: Vec<u8>,
+    }
+    let (mut db, _file) = archive_db(data);
+    let rows: Vec<MediaRow> = diesel::RunQueryDsl::load(
+        diesel::sql_query("SELECT id, content_id FROM media ORDER BY id"),
+        &mut db,
+    )
+    .expect("read the media rows");
+    rows.into_iter()
+        .map(|row| (row.id, row.content_id))
+        .collect()
+}
+
+/// A row naming no file adds none, a cell that is no file id and a file
+/// whose first chunk is not the one its manifest names are listed as not
+/// produced, and an empty file is carried as an empty entry.
+#[tokio::test]
+async fn a_download_lists_what_it_cannot_produce_and_carries_an_empty_file() {
+    #[derive(QueryableByName)]
+    struct IdRow {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        id: i32,
+    }
+
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_portability_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    apply_content_deployment(&pool).await;
+    let store = TempDir::new().expect("a store directory");
+    let empty = seed_file(&pool, store.path(), "alice", &[]).await;
+    let tampered = seed_file(&pool, store.path(), "alice", &[b"original bytes"]).await;
+    let short = [1_u8, 2, 3];
+    seed_media(&pool, 1, "alice", &empty, Some("empty.txt")).await;
+    seed_media(&pool, 2, "alice", &tampered, Some("tampered.txt")).await;
+    seed_media(&pool, 3, "alice", &short, Some("short.txt")).await;
+    exec(
+        &pool,
+        "INSERT INTO media (id, owner, content_id, title) VALUES (4, 'alice', NULL, 'none')",
+    )
+    .await;
+    let alice_session = live_session(&pool, "alice").await;
+
+    let (builder, _idp, _keys) = portability_builder(&fixture, photo_list()).await;
+    let parts = builder
+        .content(Some(content_settings(store.path())))
+        .build()
+        .await
+        .expect("the deployment assembles");
+    // The tampered file's only chunk changes on disk after the boot reconcile.
+    std::fs::write(
+        chunk_path(store.path(), blake3::hash(b"original bytes").as_bytes()),
+        b"tampered bytes",
+    )
+    .expect("tamper with the chunk");
+    let mut sink = BytesSink::default();
+    parts
+        .handle
+        .download_data(
+            "alice".to_owned(),
+            &DataRequester::Session(alice_session),
+            &mut sink,
+        )
+        .await
+        .expect("the download finishes");
+
+    let mut entries = unzip(&sink.bytes);
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &entries
+            .remove("manifest.json")
+            .expect("the archive holds manifest.json"),
+    )
+    .expect("the manifest is JSON");
+    let data = entries
+        .remove("data.sqlite")
+        .expect("the archive holds data.sqlite");
+    assert_eq!(
+        entries,
+        BTreeMap::from([("files/empty.txt".to_owned(), Vec::new())]),
+        "the empty file is the only one produced"
+    );
+    assert_eq!(
+        manifest["files"],
+        json!([{"file_id": hex(&empty), "path": "empty.txt"}])
+    );
+    let mut missing: Vec<(String, String)> = manifest["missing_files"]
+        .as_array()
+        .expect("the manifest lists the missing files")
+        .iter()
+        .map(|file| {
+            (
+                file["file_id"].as_str().expect("an id").to_owned(),
+                file["reason"].as_str().expect("a reason").to_owned(),
+            )
+        })
+        .collect();
+    missing.sort_unstable();
+    let mut expected = vec![
+        (hex(&short), "not_a_file_id".to_owned()),
+        (hex(&tampered), "corrupt".to_owned()),
+    ];
+    expected.sort_unstable();
+    assert_eq!(
+        missing, expected,
+        "the short cell and the tampered file are listed, the row naming no file is not"
+    );
+
+    let (mut db, _file) = archive_db(&data);
+    let ids: Vec<IdRow> = diesel::RunQueryDsl::load(
+        diesel::sql_query("SELECT id FROM media ORDER BY id"),
+        &mut db,
+    )
+    .expect("read the media rows");
+    assert_eq!(
+        ids.into_iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4],
+        "every row of alice's stays in the table, whatever its file"
+    );
+}
+
+#[tokio::test]
+async fn a_chunk_lost_inside_a_file_fails_the_download() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_portability_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    apply_content_deployment(&pool).await;
+    let store = TempDir::new().expect("a store directory");
+    let torn = seed_file(
+        &pool,
+        store.path(),
+        "alice",
+        &[b"the first half, ", b"the second"],
+    )
+    .await;
+    seed_media(&pool, 1, "alice", &torn, Some("torn.txt")).await;
+
+    let (builder, _idp, _keys) = portability_builder(&fixture, photo_list()).await;
+    let parts = builder
+        .content(Some(content_settings(store.path())))
+        .build()
+        .await
+        .expect("the deployment assembles");
+    std::fs::remove_file(chunk_path(
+        store.path(),
+        blake3::hash(b"the second").as_bytes(),
+    ))
+    .expect("lose the second chunk");
+    let mut sink = BytesSink::default();
+    let refused = parts
+        .handle
+        .download_data(
+            "alice".to_owned(),
+            &DataRequester::Operator("staff:marco".to_owned()),
+            &mut sink,
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(DataRequestError::FileBytes { file, .. }) if *file == hex(&torn)),
+        "a file whose entry began cannot be taken back, so the download fails: {refused:?}"
+    );
+    assert_eq!(
+        audit_rows(&pool).await,
+        Vec::new(),
+        "a failed download leaves no audit row"
     );
 }

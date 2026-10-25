@@ -1,5 +1,5 @@
-//! The download's archive: the SQLite file the rows land in, its manifest,
-//! and the zip both are streamed in.
+//! The download's archive: the SQLite file the rows land in, the person's
+//! files, its manifest, and the zip all three are streamed in.
 //!
 //! Synchronous throughout, so it runs on blocking tasks and talks to the
 //! async reads over channels.
@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+use bytes::Bytes;
 use connetto_core::quote_ident;
 use connetto_core::schema::SchemaBundle;
 use diesel::connection::SimpleConnection as _;
@@ -19,6 +20,7 @@ use tokio::sync::mpsc;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+use super::files::{MissingFile, PlacedFile};
 use super::{DataRequestError, PortabilityError};
 
 /// One cell as the client replica stores it.
@@ -34,10 +36,12 @@ pub(super) struct Batch {
     pub(super) rows: Vec<Vec<Cell>>,
 }
 
-/// One archive table: its creation and the insert each row takes.
+/// One archive table: its creation, the insert each row takes, and each
+/// column's declared replica type, in the query's column order.
 pub(super) struct TableShape {
     create: String,
     insert: String,
+    pub(super) declared: Vec<String>,
 }
 
 /// The client's replica schema, applied to a scratch in-memory database so
@@ -93,12 +97,14 @@ impl Replica {
             column: column.to_owned(),
         };
         let mut definitions = Vec::with_capacity(columns.len() + 1);
+        let mut declared = Vec::with_capacity(columns.len());
         for column in columns {
             let found = info
                 .iter()
                 .find(|info| &info.name == column)
                 .ok_or_else(|| missing(column))?;
             definitions.push(format!("{} {}", quote_ident(column), found.declared));
+            declared.push(found.declared.clone());
         }
         let mut key: Vec<&ColumnInfo> = info.iter().filter(|info| info.pk > 0).collect();
         key.sort_by_key(|info| info.pk);
@@ -122,6 +128,7 @@ impl Replica {
                 quote_ident(table),
                 names.join(", ")
             ),
+            declared,
         })
     }
 }
@@ -184,6 +191,8 @@ pub(super) struct Manifest<'a> {
     pub(super) snapshot: &'a str,
     pub(super) queries: Vec<ManifestQuery<'a>>,
     pub(super) query_list_hash: &'a str,
+    pub(super) files: &'a [PlacedFile],
+    pub(super) missing_files: &'a [MissingFile],
 }
 
 /// One registered query as the manifest names it.
@@ -194,6 +203,19 @@ pub(super) struct ManifestQuery<'a> {
     pub(super) columns: &'a [String],
     pub(super) description: &'a str,
     pub(super) read_as_owner: bool,
+    pub(super) file_column: Option<&'a str>,
+    pub(super) name_column: Option<&'a str>,
+}
+
+/// What the async side hands the zip after `data.sqlite`: each file's entry
+/// and its bytes in order, then the manifest, which ends the archive.
+pub(super) enum ZipPart {
+    /// Begin `files/<path>`.
+    File(String),
+    /// The next bytes of the file begun last.
+    Bytes(Bytes),
+    /// `manifest.json`, the last entry.
+    Manifest(Vec<u8>),
 }
 
 /// A writer handing its bytes to the async side in chunks.
@@ -228,11 +250,12 @@ impl Write for ChannelWriter {
     }
 }
 
-/// Stream `data.sqlite` and `manifest.json` as one zip into `chunks`, stored
-/// rather than compressed and with zip64 on so no size is too large.
+/// Stream `data.sqlite`, the files `parts` hands over, and `manifest.json`
+/// as one zip into `chunks`, stored rather than compressed and with zip64 on
+/// so no size is too large.
 pub(super) fn zip(
     file: &NamedTempFile,
-    manifest: &[u8],
+    mut parts: mpsc::Receiver<ZipPart>,
     chunks: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), DataRequestError> {
     let mut zip = ZipWriter::new_stream(ChannelWriter {
@@ -246,9 +269,20 @@ pub(super) fn zip(
         .map_err(DataRequestError::Zip)?;
     let mut data = file.reopen().map_err(DataRequestError::Io)?;
     io::copy(&mut data, &mut zip).map_err(DataRequestError::Io)?;
+    let manifest = loop {
+        match parts.blocking_recv() {
+            Some(ZipPart::File(path)) => zip
+                .start_file(format!("files/{path}"), options)
+                .map_err(DataRequestError::Zip)?,
+            Some(ZipPart::Bytes(bytes)) => zip.write_all(&bytes).map_err(DataRequestError::Io)?,
+            Some(ZipPart::Manifest(manifest)) => break manifest,
+            // The reads stopped before the manifest, so their own error explains it.
+            None => return Err(DataRequestError::WriterStopped),
+        }
+    };
     zip.start_file("manifest.json", options)
         .map_err(DataRequestError::Zip)?;
-    zip.write_all(manifest).map_err(DataRequestError::Io)?;
+    zip.write_all(&manifest).map_err(DataRequestError::Io)?;
     let mut writer = zip.finish().map_err(DataRequestError::Zip)?.into_inner();
     writer.flush().map_err(DataRequestError::Io)
 }
