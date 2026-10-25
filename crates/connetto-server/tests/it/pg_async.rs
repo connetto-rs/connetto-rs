@@ -21,7 +21,7 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
     CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, ChangeRecord, ManagerBuilder, Materializer, Oplog,
     OplogConfig, PageSpec, PgOplog, PgReadConnector, PgSnapshotSource, ReadBudget,
-    RuntimeWritableCatalog, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback,
+    RuntimeWritableCatalog, SnapshotEstimate, SnapshotPage, SnapshotSource, UnseenIds, loopback,
     pg_write_target, split_snapshot_cursor,
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
@@ -742,7 +742,11 @@ fn two_transactions() -> (Vec<ChangeRecord>, Vec<PgCommit>) {
 /// A fresh `PgOplog` over `table`, whose window keeps at most `max_entries` rows.
 async fn fresh_oplog(pool: &Pool<AsyncPgConnection>, table: &str, max_entries: usize) -> PgOplog {
     let mut conn = pool.get().await.expect("get connection");
-    for drop in [table.to_owned(), PgOplog::commit_table(table)] {
+    for drop in [
+        table.to_owned(),
+        PgOplog::commit_table(table),
+        PgOplog::xid_table(table),
+    ] {
         sql_query(format!("DROP TABLE IF EXISTS {drop}"))
             .execute(&mut *conn)
             .await
@@ -865,6 +869,109 @@ async fn pg_oplog_keeps_the_later_of_two_recorded_commits() {
             .await
             .expect("drop oplog table");
     }
+}
+
+/// One single-row transaction `n` at commit `0x100 * n`, as the change stream numbers its row.
+fn single_row(n: u32) -> (ChangeRecord, PgCommit) {
+    let commit_lsn = PgLsn(0x100 * u64::from(n));
+    let mut data = pg_walstream::RowData::with_capacity(1);
+    data.push(
+        Arc::from("id"),
+        pg_walstream::ColumnValue::text(&n.to_string()),
+    );
+    let change = pg_walstream::ChangeEvent::insert(
+        "public",
+        "orders",
+        1,
+        data,
+        pg_walstream::Lsn::new(commit_lsn.0),
+    );
+    let record = ChangeRecord::new(
+        "orders",
+        n.to_be_bytes().to_vec(),
+        subql::PgChangeEvent::new(change, PgCommitPosition::new(commit_lsn, PgXid(n), 1)),
+        Vec::new(),
+    );
+    let commit = PgCommit::new(
+        PgCommitPosition::at_commit(commit_lsn, PgXid(n)),
+        PgLsn(commit_lsn.0 + 0x30),
+    );
+    (record, commit)
+}
+
+/// Whether the Postgres log says rows of a transaction a fence listing `running` and `from` could not see may be gone.
+async fn pg_dropped(oplog: &PgOplog, running: &[u64], from: u64) -> bool {
+    let min = oplog
+        .min_position()
+        .await
+        .expect("min")
+        .expect("a non-empty log");
+    let unseen = UnseenIds {
+        running: running.to_vec(),
+        from,
+    };
+    oplog
+        .commits_of(&unseen, min.commit_lsn())
+        .await
+        .expect("read")
+        .may_have_dropped(&unseen, min)
+}
+
+/// The Postgres transaction index counts a fence's missed transaction as gone exactly when its rows were pruned, and its horizon forgets old ones in the same statement that moves it.
+#[tokio::test]
+async fn pg_oplog_tells_a_pruned_missed_transaction_from_a_retained_one() {
+    let fixture = Fixture::acquire().await;
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(fixture.admin_url());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    let oplog = fresh_oplog(&pool, "connetto_oplog_xids", 10).await;
+    for n in 1..=20 {
+        let (record, commit) = single_row(n);
+        oplog.append(record).await.expect("append");
+        oplog.record_commit(commit).await.expect("record");
+    }
+    assert!(
+        pg_dropped(&oplog, &[5], 21).await,
+        "pruned and still indexed"
+    );
+    assert!(!pg_dropped(&oplog, &[15], 21).await, "retained");
+    assert!(!pg_dropped(&oplog, &[4_000], 21).await, "never wrote a row");
+    assert!(
+        pg_dropped(&oplog, &[], 5).await,
+        "a pruned one from xmax on"
+    );
+
+    for n in 21..=1_100 {
+        let (record, commit) = single_row(n);
+        oplog.append(record).await.expect("append");
+        oplog.record_commit(commit).await.expect("record");
+    }
+    let unseen = UnseenIds {
+        running: Vec::new(),
+        from: u64::MAX >> 1,
+    };
+    let horizon = oplog
+        .commits_of(&unseen, PgLsn(0))
+        .await
+        .expect("read")
+        .horizon;
+    assert_eq!(
+        horizon,
+        Some(1_025),
+        "the oldest transaction whose rows the log held at the truncation"
+    );
+    assert!(
+        pg_dropped(&oplog, &[5], 1_101).await,
+        "forgotten behind the horizon"
+    );
+    assert!(
+        pg_dropped(&oplog, &[1_050], 1_101).await,
+        "pruned since the truncation and still indexed"
+    );
+    assert!(!pg_dropped(&oplog, &[1_095], 1_101).await, "retained");
+    assert!(
+        pg_dropped(&oplog, &[], 1_000).await,
+        "a range from xmax that starts behind the horizon"
+    );
 }
 
 /// Subscribe to an aggregate and return the bootstrap value the server seeds

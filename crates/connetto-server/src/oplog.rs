@@ -29,7 +29,7 @@
 //! (default one million entries or 72 hours). Both are configurable per
 //! deployment.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::io::Write as _;
 use std::sync::Arc;
@@ -41,14 +41,18 @@ use diesel::pg::{Pg, PgValue};
 use diesel::serialize::{self, IsNull, Output, ToSql};
 use parking_lot::Mutex;
 use subql::backend::CdcEvent;
-use subql::{ClockHandle, EventKind, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, StdClock};
+use subql::{
+    ClockHandle, EventKind, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgXid, StdClock,
+};
 
-use crate::fence::Unseen;
+use crate::fence::{Unseen, UnseenIds};
 
 /// Default retention age: 72 hours (`06-reconnect.md` line 69).
 const DEFAULT_MAX_AGE: Duration = Duration::from_hours(72);
 /// Default retention count: one million entries (`06-reconnect.md` line 69).
 const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
+/// How many recorded commits pass between two truncations of the transaction index.
+const XID_TRUNCATION_PERIOD: u64 = 1024;
 
 /// Retention window for an [`Oplog`]: entries older than either bound are
 /// pruned, whichever bound is hit first.
@@ -302,6 +306,15 @@ pub trait Oplog: Send + Sync {
     /// Implementation-defined: a backing-store read failure.
     async fn entries_of(&self, unseen: &Unseen) -> Result<Vec<ChangeRecord>, Self::Error>;
 
+    /// The recorded transactions among those `unseen` names that committed at or before `through`, with the index's horizon.
+    ///
+    /// A snapshot cursor's fence names the transactions its read could not see, and this is what proves none of their rows left the window (`06-reconnect.md`).
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backing-store read failure.
+    async fn commits_of(&self, unseen: &UnseenIds, through: PgLsn) -> Result<Commits, Self::Error>;
+
     /// The earliest retained position, or `None` when the log holds no entries.
     ///
     /// # Errors
@@ -402,6 +415,51 @@ pub enum CatchupDecision {
     FullResync,
 }
 
+/// What the log still knows about some transactions, by full transaction id.
+///
+/// The log records every transaction whose rows it appended, and forgets the oldest ones in id order behind a horizon that only advances, the way Postgres truncates its commit log behind `oldestClogXid`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Commits {
+    /// Every recorded transaction from this id on is still known, `None` while none was forgotten.
+    pub horizon: Option<u64>,
+    /// The asked-for transactions the log recorded, with the commit position of each.
+    pub commits: Vec<(u64, PgLsn)>,
+}
+
+impl Commits {
+    /// Whether rows of any transaction `unseen` names may have left a window whose oldest entry is `min`.
+    ///
+    /// An id below the horizon is unknown and counts as gone, and so does the whole range from `unseen.from` when the horizon passed it. A known transaction is gone once its first row, ordinal 1 as the change stream numbers them, precedes `min`.
+    #[must_use]
+    pub fn may_have_dropped(&self, unseen: &UnseenIds, min: PgCommitPosition) -> bool {
+        let forgotten = self.horizon.is_some_and(|horizon| {
+            unseen.from < horizon || unseen.running.iter().any(|&xid| xid < horizon)
+        });
+        forgotten
+            || self.commits.iter().any(|&(xid, commit_lsn)| {
+                (xid >= unseen.from || unseen.running.contains(&xid))
+                    && PgCommitPosition::new(commit_lsn, low_xid(xid), 1) < min
+            })
+    }
+}
+
+/// The 32 bits of `xid` a change carries.
+fn low_xid(xid: u64) -> PgXid {
+    PgXid(u32::try_from(xid & u64::from(u32::MAX)).unwrap_or_default())
+}
+
+/// The full id whose low 32 bits are `xid`, the one nearest `near`.
+fn widen_xid(near: u64, xid: PgXid) -> u64 {
+    let back = low_xid(near).0.wrapping_sub(xid.0);
+    if back < 1 << 31
+        && let Some(widened) = near.checked_sub(u64::from(back))
+    {
+        widened
+    } else {
+        near.saturating_add(u64::from(xid.0.wrapping_sub(low_xid(near).0)))
+    }
+}
+
 /// One retained entry plus the clock reading taken when it was appended.
 struct Entry {
     appended_micros: u64,
@@ -416,6 +474,14 @@ struct Inner {
     max_position: Option<PgCommitPosition>,
     /// The last commit recorded, the one ending furthest along the log.
     last_commit: Option<PgCommit>,
+    /// Each recorded transaction's commit position, by full id.
+    xids: BTreeMap<u64, PgLsn>,
+    /// Every recorded transaction from this id on is in `xids`.
+    horizon: Option<u64>,
+    /// The newest full id recorded, the reference a 32-bit id widens against.
+    newest_xid: u64,
+    /// Commits recorded since `xids` was last truncated.
+    since_truncation: u64,
 }
 
 /// An in-memory ring-buffer [`Oplog`] for Docker-free tests and single-node use.
@@ -445,6 +511,10 @@ impl InMemoryOplog {
                 entries: VecDeque::new(),
                 max_position: None,
                 last_commit: None,
+                xids: BTreeMap::new(),
+                horizon: None,
+                newest_xid: 0,
+                since_truncation: 0,
             }),
             config,
             clock,
@@ -461,10 +531,35 @@ impl InMemoryOplog {
             let too_many = inner.entries.len() > self.config.max_entries;
             if too_old || too_many {
                 inner.entries.pop_front();
+                inner.since_truncation += 1;
             } else {
                 break;
             }
         }
+        if inner.since_truncation >= XID_TRUNCATION_PERIOD {
+            inner.since_truncation = 0;
+            Self::truncate_xids_locked(inner);
+        }
+    }
+
+    /// Forget recorded transactions older than every one whose rows the log still holds, advancing the horizon first.
+    fn truncate_xids_locked(inner: &mut Inner) {
+        let Some(front) = inner.entries.front() else {
+            return;
+        };
+        let oldest = front.record.position().commit_lsn();
+        let Some(floor) = inner
+            .xids
+            .iter()
+            .filter(|&(_, &commit_lsn)| commit_lsn >= oldest)
+            .map(|(&xid, _)| xid)
+            .min()
+        else {
+            return;
+        };
+        let horizon = inner.horizon.map_or(floor, |horizon| horizon.max(floor));
+        inner.horizon = Some(horizon);
+        inner.xids = inner.xids.split_off(&horizon);
     }
 }
 
@@ -558,7 +653,35 @@ impl Oplog for InMemoryOplog {
         {
             inner.last_commit = Some(commit);
         }
+        // A boundary [`forget_through`](Oplog::forget_through) records carries no transaction.
+        let xid = commit.position().xid();
+        if xid != PgXid::INVALID {
+            let full = widen_xid(inner.newest_xid, xid);
+            inner.newest_xid = inner.newest_xid.max(full);
+            inner.xids.insert(full, commit.position().commit_lsn());
+        }
         Ok(())
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn commits_of(&self, unseen: &UnseenIds, through: PgLsn) -> Result<Commits, Infallible> {
+        let inner = self.inner.lock();
+        let running = unseen
+            .running
+            .iter()
+            .filter(|&&xid| xid < unseen.from)
+            .filter_map(|xid| inner.xids.get_key_value(xid));
+        Ok(Commits {
+            horizon: inner.horizon,
+            commits: running
+                .chain(inner.xids.range(unseen.from..))
+                .filter(|&(_, &commit_lsn)| commit_lsn <= through)
+                .map(|(&xid, &commit_lsn)| (xid, commit_lsn))
+                .collect(),
+        })
     }
 
     #[expect(
@@ -586,13 +709,13 @@ pub use pg::{PgOplog, PgOplogError};
 
 mod pg {
     use connetto_core::quote_ident;
-    use diesel::sql_types::{Array, BigInt, Binary, Bool, Text};
+    use diesel::sql_types::{Array, BigInt, Binary, Bool, Nullable, Text};
     use diesel::{QueryableByName, sql_query};
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::bb8::Pool;
     use subql::{ChangeEvent, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgXid};
 
-    use crate::fence::Unseen;
+    use crate::fence::{Unseen, UnseenIds};
 
     use super::{CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, ChangeRecord, Oplog, OplogConfig};
 
@@ -617,7 +740,9 @@ mod pg {
     /// A Postgres-table [`Oplog`], the production target.
     ///
     /// The last recorded commit lives in a one-row companion table named after
-    /// the log with `_commit` appended ([`PgOplog::commit_table`]).
+    /// the log with `_commit` appended ([`PgOplog::commit_table`]), beside the
+    /// horizon of the transaction index named with `_xids` appended
+    /// ([`PgOplog::xid_table`]).
     ///
     /// The log is a single table, which a promoted standby carries with every
     /// other table. The row image plus routing metadata
@@ -629,6 +754,8 @@ mod pg {
         pool: Pool<diesel_async::AsyncPgConnection>,
         table: String,
         config: OplogConfig,
+        /// Commits recorded since the transaction index was last truncated.
+        since_truncation: std::sync::atomic::AtomicU64,
     }
 
     /// A row read back from the oplog table.
@@ -659,6 +786,17 @@ mod pg {
         xid: i64,
         #[diesel(sql_type = BigInt)]
         end_lsn: i64,
+    }
+
+    /// One recorded transaction, or the index's horizon, read back by [`Oplog::commits_of`].
+    #[derive(QueryableByName)]
+    struct XidRow {
+        #[diesel(sql_type = Nullable<BigInt>)]
+        xid: Option<i64>,
+        #[diesel(sql_type = Nullable<BigInt>)]
+        commit_lsn: Option<i64>,
+        #[diesel(sql_type = Nullable<BigInt>)]
+        horizon: Option<i64>,
     }
 
     /// One end of the retained window, read back from an ordered single-row query.
@@ -711,6 +849,7 @@ mod pg {
                 pool,
                 table: table.into(),
                 config,
+                since_truncation: std::sync::atomic::AtomicU64::new(0),
             }
         }
 
@@ -720,7 +859,32 @@ mod pg {
             format!("{table}_commit")
         }
 
-        /// Create the `op` enum type, the oplog table and its commit table if any is absent.
+        /// The companion table recording each transaction's commit position by full id, the log's name with `_xids` appended.
+        #[must_use]
+        pub fn xid_table(table: &str) -> String {
+            format!("{table}_xids")
+        }
+
+        /// Forget recorded transactions older than every one whose rows the log still holds, advancing the horizon in the same statement.
+        async fn truncate_xids(&self) -> Result<(), PgOplogError> {
+            let mut conn = self.pool.get().await.map_err(pool_err)?;
+            let sql = format!(
+                "WITH floor AS (\
+                     SELECT min(x.xid) AS xid FROM {xids} x \
+                     WHERE x.commit_lsn >= (SELECT min(commit_lsn) FROM {log})), \
+                 moved AS (\
+                     UPDATE {commit} SET xid_horizon = GREATEST(xid_horizon, (SELECT xid FROM floor)) \
+                     WHERE (SELECT xid FROM floor) IS NOT NULL RETURNING xid_horizon) \
+                 DELETE FROM {xids} WHERE xid < (SELECT xid_horizon FROM moved)",
+                xids = quote_ident(&Self::xid_table(&self.table)),
+                log = quote_ident(&self.table),
+                commit = quote_ident(&Self::commit_table(&self.table)),
+            );
+            sql_query(sql).execute(&mut *conn).await?;
+            Ok(())
+        }
+
+        /// Create the `op` enum type, the oplog table, its commit table and its transaction index if any is absent.
         ///
         /// Postgres has no `CREATE TYPE IF NOT EXISTS`, so the type goes in
         /// through a `DO` block that swallows only `duplicate_object`.
@@ -770,10 +934,25 @@ mod pg {
                      only_row BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row), \
                      commit_lsn BIGINT NOT NULL, \
                      xid BIGINT NOT NULL, \
-                     end_lsn BIGINT NOT NULL)",
+                     end_lsn BIGINT NOT NULL, \
+                     xid_horizon BIGINT)",
                 table = quote_ident(&Self::commit_table(&self.table)),
             );
             sql_query(commit_ddl).execute(&mut *conn).await?;
+            let xid_ddl = format!(
+                "CREATE TABLE IF NOT EXISTS {table} (\
+                     xid BIGINT PRIMARY KEY, \
+                     commit_lsn BIGINT NOT NULL)",
+                table = quote_ident(&Self::xid_table(&self.table)),
+            );
+            sql_query(xid_ddl).execute(&mut *conn).await?;
+            // The lookup and the truncation both select by commit position, the part behind the window being small.
+            let xid_lsn_index = format!(
+                "CREATE INDEX IF NOT EXISTS {index} ON {table} (commit_lsn)",
+                index = quote_ident(&format!("{}_lsn", Self::xid_table(&self.table))),
+                table = quote_ident(&Self::xid_table(&self.table)),
+            );
+            sql_query(xid_lsn_index).execute(&mut *conn).await?;
             Ok(())
         }
 
@@ -816,7 +995,7 @@ mod pg {
                      SELECT commit_lsn, xid, ordinal FROM {table} \
                      ORDER BY commit_lsn DESC, xid DESC, ordinal DESC OFFSET $1)",
             );
-            sql_query(by_count)
+            let by_count = sql_query(by_count)
                 .bind::<BigInt, _>(keep)
                 .execute(&mut *conn)
                 .await?;
@@ -825,10 +1004,24 @@ mod pg {
             let by_age = format!(
                 "DELETE FROM {table} WHERE appended_at < now() - make_interval(secs => $1)"
             );
-            sql_query(by_age)
+            let by_age = sql_query(by_age)
                 .bind::<BigInt, _>(secs)
                 .execute(&mut *conn)
                 .await?;
+            drop(conn);
+            let pruned = u64::try_from(by_count + by_age).unwrap_or(u64::MAX);
+            if pruned == 0 {
+                return Ok(());
+            }
+            let since = self
+                .since_truncation
+                .fetch_add(pruned, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(pruned);
+            if since >= super::XID_TRUNCATION_PERIOD {
+                self.since_truncation
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                self.truncate_xids().await?;
+            }
             Ok(())
         }
     }
@@ -938,11 +1131,19 @@ mod pg {
             let end_lsn = part_to_i64(commit.end_lsn().0)?;
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let table = quote_ident(&Self::commit_table(&self.table));
+            // The 32-bit id a change carries widens to the full id nearest below the server's next one, and a boundary commit carries none.
             let sql = format!(
-                "INSERT INTO {table} (commit_lsn, xid, end_lsn) VALUES ($1, $2, $3) \
+                "WITH recorded AS (\
+                     INSERT INTO {xids} (xid, commit_lsn) \
+                     SELECT next.id - ((next.id % 4294967296) - $2 + 4294967296) % 4294967296, $1 \
+                     FROM (SELECT pg_snapshot_xmax(pg_current_snapshot())::text::bigint AS id) next \
+                     WHERE $2 <> 0 \
+                     ON CONFLICT (xid) DO UPDATE SET commit_lsn = EXCLUDED.commit_lsn) \
+                 INSERT INTO {table} (commit_lsn, xid, end_lsn) VALUES ($1, $2, $3) \
                  ON CONFLICT (only_row) DO UPDATE SET \
                  commit_lsn = EXCLUDED.commit_lsn, xid = EXCLUDED.xid, end_lsn = EXCLUDED.end_lsn \
                  WHERE {table}.end_lsn < EXCLUDED.end_lsn",
+                xids = quote_ident(&Self::xid_table(&self.table)),
             );
             sql_query(sql)
                 .bind::<BigInt, _>(commit_lsn)
@@ -951,6 +1152,48 @@ mod pg {
                 .execute(&mut *conn)
                 .await?;
             Ok(())
+        }
+
+        async fn commits_of(
+            &self,
+            unseen: &UnseenIds,
+            through: PgLsn,
+        ) -> Result<super::Commits, PgOplogError> {
+            let running: Vec<i64> = unseen
+                .running
+                .iter()
+                .filter_map(|&xid| i64::try_from(xid).ok())
+                .collect();
+            let from = i64::try_from(unseen.from).unwrap_or(i64::MAX);
+            let through = part_to_i64(through.0)?;
+            let mut conn = self.pool.get().await.map_err(pool_err)?;
+            // One statement, so a truncation that dropped a row also moved the horizon, and the scan starts from the few transactions behind the window.
+            let sql = format!(
+                "WITH behind AS MATERIALIZED (\
+                     SELECT xid, commit_lsn FROM {xids} WHERE commit_lsn <= $3) \
+                 SELECT xid, commit_lsn, NULL::bigint AS horizon FROM behind \
+                 WHERE xid = ANY($1) OR xid >= $2 \
+                 UNION ALL SELECT NULL, NULL, xid_horizon FROM {commit}",
+                xids = quote_ident(&Self::xid_table(&self.table)),
+                commit = quote_ident(&Self::commit_table(&self.table)),
+            );
+            let rows: Vec<XidRow> = sql_query(sql)
+                .bind::<Array<BigInt>, _>(running)
+                .bind::<BigInt, _>(from)
+                .bind::<BigInt, _>(through)
+                .load(&mut *conn)
+                .await?;
+            let mut known = super::Commits::default();
+            for row in rows {
+                match (row.xid, row.commit_lsn, row.horizon) {
+                    (Some(xid), Some(commit_lsn), _) => known.commits.push((
+                        u64::try_from(xid).unwrap_or(0),
+                        PgLsn(u64::try_from(commit_lsn).unwrap_or(0)),
+                    )),
+                    (_, _, horizon) => known.horizon = horizon.and_then(|h| u64::try_from(h).ok()),
+                }
+            }
+            Ok(known)
         }
 
         async fn last_commit(&self) -> Result<Option<PgCommit>, PgOplogError> {
@@ -1145,6 +1388,113 @@ mod tests {
                 .expect("read")
                 .len(),
             1
+        );
+    }
+
+    /// A 32-bit id widens to the full id of its epoch nearest the reference, across a wrap in either direction.
+    #[test]
+    fn an_id_widens_to_the_epoch_nearest_its_reference() {
+        let epoch = 1_u64 << 32;
+        assert_eq!(widen_xid(epoch + 10, PgXid(7)), epoch + 7);
+        assert_eq!(widen_xid(epoch + 10, PgXid(12)), epoch + 12);
+        assert_eq!(
+            widen_xid(epoch + 3, PgXid(u32::MAX)),
+            epoch - 1,
+            "an id just before the wrap"
+        );
+        assert_eq!(
+            widen_xid(epoch - 1, PgXid(2)),
+            epoch + 2,
+            "an id just past the wrap"
+        );
+        assert_eq!(widen_xid(0, PgXid(5)), 5);
+    }
+
+    /// One single-row transaction `n` at commit `0x100 * n`, appended and committed.
+    async fn commit_one(log: &InMemoryOplog, n: u32) {
+        let commit_lsn = PgLsn(0x100 * u64::from(n));
+        log.append(row(
+            i64::from(n),
+            PgCommitPosition::new(commit_lsn, PgXid(n), 1),
+        ))
+        .await
+        .expect("append");
+        log.record_commit(PgCommit::new(
+            PgCommitPosition::at_commit(commit_lsn, PgXid(n)),
+            PgLsn(commit_lsn.0 + 0x30),
+        ))
+        .await
+        .expect("record");
+    }
+
+    /// What the log says about the transactions a fence listing `running` and `from` could not see.
+    async fn dropped(log: &InMemoryOplog, running: &[u64], from: u64) -> bool {
+        let min = log
+            .min_position()
+            .await
+            .expect("min")
+            .expect("a non-empty log");
+        let unseen = UnseenIds {
+            running: running.to_vec(),
+            from,
+        };
+        log.commits_of(&unseen, min.commit_lsn())
+            .await
+            .expect("read")
+            .may_have_dropped(&unseen, min)
+    }
+
+    /// A fence's missed transaction counts as gone exactly when its rows were pruned, before and after the index forgets old transactions behind its horizon.
+    #[tokio::test]
+    async fn a_missed_transaction_counts_as_gone_only_once_its_rows_were_pruned() {
+        let log = InMemoryOplog::new(OplogConfig::default().with_max_entries(10));
+        for n in 1..=20 {
+            commit_one(&log, n).await;
+        }
+        assert!(dropped(&log, &[5], 21).await, "pruned and still indexed");
+        assert!(!dropped(&log, &[15], 21).await, "retained");
+        assert!(!dropped(&log, &[4_000], 21).await, "never wrote a row");
+        assert!(dropped(&log, &[], 5).await, "a pruned one from xmax on");
+        assert!(
+            !dropped(&log, &[], 15).await,
+            "every one from xmax on retained"
+        );
+
+        for n in 21..=1_100 {
+            commit_one(&log, n).await;
+        }
+        let horizon = log
+            .commits_of(
+                &UnseenIds {
+                    running: Vec::new(),
+                    from: u64::MAX,
+                },
+                PgLsn(0),
+            )
+            .await
+            .expect("read")
+            .horizon;
+        assert_eq!(
+            horizon,
+            Some(1_025),
+            "the oldest transaction whose rows the log held at the truncation"
+        );
+        assert!(
+            dropped(&log, &[5], 1_101).await,
+            "forgotten behind the horizon"
+        );
+        assert!(
+            dropped(&log, &[1_050], 1_101).await,
+            "pruned since the truncation and still indexed"
+        );
+        assert!(!dropped(&log, &[1_095], 1_101).await, "retained");
+        assert!(
+            dropped(&log, &[], 1_000).await,
+            "a range from xmax that starts behind the horizon"
+        );
+        assert!(
+            !dropped(&log, &[], 1_095).await,
+            "a range from xmax whose transactions are all retained"
         );
     }
 }

@@ -34,7 +34,7 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     ChangeRecord, InMemoryOplog, LoopbackTransport, ManagerBuilder, Materializer, NoConnector,
     Oplog, OplogConfig, PageSpec, PgOplog, Position, ReadFence, SessionConfig, SessionManager,
-    SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory, Unseen, loopback,
+    SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory, Unseen, UnseenIds, loopback,
     pg_write_target,
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
@@ -873,6 +873,18 @@ impl Oplog for ScriptedOplog {
             .map_err(|never| match never {})
     }
 
+    async fn commits_of(
+        &self,
+        unseen: &UnseenIds,
+        through: PgLsn,
+    ) -> Result<connetto_server::Commits, Refused> {
+        self.gate("commits_of").await?;
+        self.inner
+            .commits_of(unseen, through)
+            .await
+            .map_err(|never| match never {})
+    }
+
     async fn min_position(&self) -> Result<Option<PgCommitPosition>, Refused> {
         self.gate("min_position").await?;
         self.inner
@@ -1580,4 +1592,150 @@ async fn a_fenced_cursor_catches_up_what_its_snapshot_missed_and_nothing_it_held
         .await
         .expect("re-deliver a held transaction");
     expect_idle(&mut client).await;
+}
+
+/// Items a test drained from the emulator, handed to [`SessionManager::ingest`] as a source.
+struct Replay(std::collections::VecDeque<SourceItem<PgChangeEvent, PgCommit>>);
+
+impl CdcSource for Replay {
+    type Commit = PgCommit;
+    type Event = PgChangeEvent;
+    type Error = std::io::Error;
+
+    fn next_item(
+        &mut self,
+    ) -> impl std::future::Future<
+        Output = Result<Option<SourceItem<PgChangeEvent, PgCommit>>, std::io::Error>,
+    > + Send {
+        std::future::ready(Ok(self.0.pop_front()))
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn ack(&mut self, _upto: PgCommitPosition) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+}
+
+/// A fenced manager whose log keeps two entries, fed three single-row transactions through the change stream so each commit is recorded, returning their events.
+async fn pruned_fenced_manager(
+    fixture: &Fixture,
+    seed: FencedSeed,
+) -> (Arc<FencedManager>, [PgChangeEvent; 3]) {
+    let manager: Arc<FencedManager> = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
+        seed,
+        RosterAuth::granting("client-a").withholding(WITHHELD_ID),
+        test_verifier(),
+        NoConnector,
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
+    )
+    .with_oplog(InMemoryOplog::new(
+        OplogConfig::default().with_max_entries(2),
+    ))
+    .build();
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    let mut items = Vec::new();
+    for id in 1..=3 {
+        source
+            .execute_sql(&format!(
+                "INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 1.0, 2, 'paid')"
+            ))
+            .expect("execute dml");
+        // Draining per statement closes its transaction, so each insert commits on its own.
+        items.extend(source.drain().expect("drain"));
+    }
+    let events: Vec<PgChangeEvent> = items
+        .iter()
+        .filter_map(|item| match item {
+            SourceItem::Event(event) => Some(event.clone()),
+            SourceItem::Commit(_) => None,
+        })
+        .collect();
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0].position().xid() != pair[1].position().xid()),
+        "each insert is its own transaction"
+    );
+    manager
+        .ingest(&mut Replay(items.into()), &mut |_| {})
+        .await
+        .expect("ingest");
+    (manager, events.try_into().expect("three inserts"))
+}
+
+/// The fence of a read after `held`'s commit that saw it while `missed` was still invisible, and the read position its cursor names.
+fn read_missing(missed: &PgChangeEvent, held: &PgChangeEvent) -> (ReadFence, PgCommitPosition) {
+    let xid = |event: &PgChangeEvent| event.position().xid().0;
+    let read_lsn = PgLsn(held.position().commit_lsn().0 + 1);
+    let fence = ReadFence::parse(
+        &format!("{}:{}:{}", xid(missed), xid(held) + 1, xid(missed)),
+        read_lsn,
+    )
+    .expect("fence");
+    (fence, PgCommitPosition::before_commit(read_lsn))
+}
+
+/// A fenced cursor whose snapshot missed a transaction the log has since pruned, while the log still reaches the cursor itself, is replaced rather than caught up without that transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fenced_cursor_whose_missed_transaction_was_pruned_resyncs() {
+    let fixture = Fixture::acquire().await;
+    let (manager, [missed, held, _later]) =
+        pruned_fenced_manager(&fixture, FencedSeed::default()).await;
+    let (fence, read) = read_missing(&missed, &held);
+    let mut client = open_fenced_session(&manager, Some(fenced_cursor(read, Some(&fence)))).await;
+    subscribe(&mut client).await;
+    let ControlMessage::FullResyncRequired(resync) = next_control_bounded(&mut client).await else {
+        panic!("expected the subscription to be replaced");
+    };
+    assert_eq!(resync.reason, FullResyncReason::CursorOutsideRetention);
+}
+
+/// A fenced cursor whose snapshot missed a transaction the log still holds catches up on it, so the index tells pruned apart from retained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fenced_cursor_whose_missed_transaction_is_retained_catches_up() {
+    let fixture = Fixture::acquire().await;
+    let (manager, [_first, missed, held]) =
+        pruned_fenced_manager(&fixture, FencedSeed::default()).await;
+    let (fence, read) = read_missing(&missed, &held);
+    let mut client = open_fenced_session(&manager, Some(fenced_cursor(read, Some(&fence)))).await;
+    subscribe(&mut client).await;
+    let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+        panic!("expected the missed transaction as a catchup patch");
+    };
+    assert_eq!(live.cursor, cursor_of(&missed));
+    let ControlMessage::SnapshotEnd(_) = next_control_bounded(&mut client).await else {
+        panic!("expected catchup completion");
+    };
+}
+
+/// A fresh snapshot whose fence missed a transaction the log pruned before the snapshot could replay it is replaced rather than left without that row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_whose_missed_transaction_was_pruned_resyncs() {
+    let fixture = Fixture::acquire().await;
+    let seed = FencedSeed::default();
+    let (manager, [missed, held, _later]) = pruned_fenced_manager(&fixture, seed.clone()).await;
+    let (fence, read) = read_missing(&missed, &held);
+    *seed.cursor.lock() = connetto_server::snapshot_cursor(read, Some(&fence));
+    let mut client = open_fenced_session(&manager, None).await;
+    subscribe(&mut client).await;
+    let ControlMessage::SnapshotBegin(_) = next_control(&mut client).await else {
+        panic!("expected snapshot begin");
+    };
+    let BulkMessage::SnapshotPatch(_) = next_bulk(&mut client).await else {
+        panic!("expected the seed page");
+    };
+    let ControlMessage::SnapshotEnd(_) = next_control(&mut client).await else {
+        panic!("expected snapshot end");
+    };
+    let ControlMessage::FullResyncRequired(resync) = next_control_bounded(&mut client).await else {
+        panic!("expected the subscription to be replaced");
+    };
+    assert_eq!(resync.reason, FullResyncReason::CursorOutsideRetention);
 }
