@@ -70,7 +70,12 @@ struct SnapshotData {
 fn seed_snapshot() -> SnapshotData {
     let table = SimpleTable::with_rowid_alias(
         "orders",
-        &[("id", "INTEGER"), ("price", "REAL"), ("quantity", "INTEGER"), ("status", "TEXT")],
+        &[
+            ("id", "INTEGER"),
+            ("price", "REAL"),
+            ("quantity", "INTEGER"),
+            ("status", "TEXT"),
+        ],
         0,
     );
     let insert = Insert::<_, String, Vec<u8>>::from(table)
@@ -444,7 +449,12 @@ impl SnapshotSource for GatedSnapshot {
         for row in &self.rows {
             let table = SimpleTable::with_rowid_alias(
                 "orders",
-                &[("id", "INTEGER"), ("price", "REAL"), ("quantity", "INTEGER"), ("status", "TEXT")],
+                &[
+                    ("id", "INTEGER"),
+                    ("price", "REAL"),
+                    ("quantity", "INTEGER"),
+                    ("status", "TEXT"),
+                ],
                 0,
             );
             let insert = Insert::<_, String, Vec<u8>>::from(table)
@@ -4124,7 +4134,12 @@ impl SnapshotSource for StatusSnapshot {
     ) -> Result<SnapshotPage, Self::Error> {
         let table = SimpleTable::with_rowid_alias(
             "orders",
-            &[("id", "INTEGER"), ("price", "REAL"), ("quantity", "INTEGER"), ("status", "TEXT")],
+            &[
+                ("id", "INTEGER"),
+                ("price", "REAL"),
+                ("quantity", "INTEGER"),
+                ("status", "TEXT"),
+            ],
             0,
         );
         let insert = Insert::<_, String, Vec<u8>>::from(table)
