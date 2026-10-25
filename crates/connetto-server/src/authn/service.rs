@@ -528,12 +528,12 @@ impl<S: AuthStore> AuthService<S> {
 
     /// End every live session of `user` but `keep`, closing each live
     /// connection and recording `ended_others`, or `ended_all` when nothing
-    /// is kept. Answers how many ended.
+    /// is kept. Answers the sessions it ended.
     pub(crate) async fn end_sessions(
         &self,
         user: &S::Id,
         keep: Option<SessionId>,
-    ) -> Result<usize, AuthError> {
+    ) -> Result<Vec<SessionId>, AuthError> {
         let op = if keep.is_some() {
             crate::audit::AuthOp::EndedOthers
         } else {
@@ -543,7 +543,7 @@ impl<S: AuthStore> AuthService<S> {
         for session in &ended {
             self.ended(user, *session, op);
         }
-        Ok(ended.len())
+        Ok(ended)
     }
 
     /// Close an ended session's live connection and record why it ended.

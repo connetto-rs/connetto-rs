@@ -10,14 +10,17 @@ use std::time::{Duration, Instant};
 
 use connetto_core::device_cert::KeyId;
 use connetto_core::messages::{ControlMessage, FatalError, FatalErrorReason};
+use connetto_server::audit::{AuthEvent, AuthOp, ConnettoAuditSchema};
+use connetto_server::defaults::ConnettoAudit;
 use connetto_server::device_cert::DeviceCertConfig;
-use connetto_server::{LivenessError, ServerHandle, ServerParts};
+use connetto_server::{InstalledApp, LivenessError, MintedKey, ServerHandle, ServerParts};
 use connetto_test_harness::{Fixture, isolated_session_keyring};
 use diesel::QueryableByName;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl as _;
 use diesel_async::pooled_connection::bb8::Pool;
 use rcgen::PublicKeyData as _;
+use subql::backend::Value;
 use tokio::net::TcpListener;
 
 use super::device_identity::{challenge_nonce, enrol_request};
@@ -25,8 +28,48 @@ use super::e2e::{PG_SERIAL, audit_ops, mint_tokens, reset_fixture};
 use super::enrolment::{device_key, rooted_issuer};
 use super::lifecycle::{admin_pool, builder_over, live_session, next_control, wait_ready};
 
-/// A server with device identity and the audit store on, serving on its own
-/// port, and the admin pool to read its tables.
+/// Record that `session` of `user` minted `subject` over `orders` row `row`,
+/// as a mint through `CapabilityIssuer` records it.
+async fn minted(
+    pool: &Pool<AsyncPgConnection>,
+    session: connetto_server::SessionId,
+    user: &str,
+    subject: &str,
+    row: uuid::Uuid,
+) {
+    diesel_async::RunQueryDsl::execute(
+        ConnettoAudit::audit_insert(
+            AuthEvent::new(session, Some(user.to_owned()), AuthOp::CapabilityMinted)
+                .about_row("orders", vec![Value::Uuid(row)])
+                .about_key(subject),
+        ),
+        &mut pool.get().await.expect("a connection"),
+    )
+    .await
+    .expect("record the mint");
+}
+
+/// How many provider token rows `session` still has.
+async fn provider_tokens(
+    pool: &Pool<AsyncPgConnection>,
+    session: connetto_server::SessionId,
+) -> i64 {
+    #[derive(QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let count: Count = diesel::sql_query(
+        "SELECT count(*) AS n FROM connetto_provider_tokens WHERE session_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(session.as_uuid())
+    .get_result(&mut pool.get().await.expect("a connection"))
+    .await
+    .expect("count the provider tokens");
+    count.n
+}
+/// A server with device identity, serving on its own port, and the admin
+/// pool to read its tables.
 struct Served {
     pool: Pool<AsyncPgConnection>,
     handle: ServerHandle,
@@ -61,7 +104,6 @@ async fn served(fixture: &Fixture) -> Served {
         ..
     } = builder
         .device_identity(Some(DeviceCertConfig::new(issuer)))
-        .audit(true)
         .build()
         .await
         .expect("the deployment assembles");
@@ -165,16 +207,24 @@ async fn ending_a_device_entry_revokes_its_key_and_spares_the_others() {
         "a browser shows as a session alone"
     );
 
+    let ended = handle
+        .end_session(&user, stranger_session)
+        .await
+        .expect("end");
     assert!(
-        !handle
-            .end_session(&user, stranger_session)
-            .await
-            .expect("end"),
-        "a session of someone else ends nothing"
+        ended.sessions.is_empty() && ended.share_keys.is_empty(),
+        "a session of someone else ends nothing: {ended:?}"
     );
     assert!(handle.verify_live(&stranger).await.is_ok());
 
-    assert!(handle.end_session(&user, phone_session).await.expect("end"));
+    assert_eq!(
+        handle
+            .end_session(&user, phone_session)
+            .await
+            .expect("end")
+            .sessions,
+        vec![phone_session]
+    );
     assert_eq!(
         closed_with(&mut on_phone).await,
         FatalErrorReason::DeviceRevoked,
@@ -230,7 +280,9 @@ async fn ending_the_others_and_then_all_ends_sessions_and_revokes_no_key() {
         handle
             .end_other_sessions(&user, current_session)
             .await
-            .expect("end the others"),
+            .expect("end the others")
+            .sessions
+            .len(),
         2
     );
     assert_eq!(
@@ -249,7 +301,14 @@ async fn ending_the_others_and_then_all_ends_sessions_and_revokes_no_key() {
         "the current place stays"
     );
 
-    assert_eq!(handle.end_all_sessions(&user).await.expect("end all"), 1);
+    assert_eq!(
+        handle
+            .end_all_sessions(&user)
+            .await
+            .expect("end all")
+            .sessions,
+        vec![current_session]
+    );
     assert_eq!(
         closed_with(&mut on_current).await,
         FatalErrorReason::SessionRevoked
@@ -303,4 +362,82 @@ async fn the_liveness_check_refuses_what_is_not_a_live_login() {
         served.handle.verify_live("not-a-token").await,
         Err(LivenessError::Refused)
     ));
+}
+
+#[tokio::test]
+async fn ending_sessions_answers_what_they_left_behind_and_forgets_their_provider_tokens() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let served = served(&fixture).await;
+    let handle = &served.handle;
+
+    let (phone, user, _) = mint_tokens(&served.base, "milan").await;
+    let (laptop, _, _) = mint_tokens(&served.base, "milan").await;
+    let phone_session = handle.verify_live(&phone).await.expect("live").session_id;
+    let laptop_session = handle.verify_live(&laptop).await.expect("live").session_id;
+    let (shared, also_shared) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    minted(&served.pool, phone_session, &user, "key:berlin", shared).await;
+    minted(
+        &served.pool,
+        laptop_session,
+        &user,
+        "key:milan",
+        also_shared,
+    )
+    .await;
+    let bot = uuid::Uuid::new_v4();
+    for statement in [
+        format!(
+            "INSERT INTO connetto_bots (id, owner, name, public_key, list_version) \
+             VALUES ('{bot}', 'someone', 'Reminders', decode(repeat('00', 32), 'hex'), 1)"
+        ),
+        format!(
+            "INSERT INTO connetto_installations (id, bot, owner, accepted_version) \
+             VALUES ('mine', '{bot}', '{user}', 1), ('theirs', '{bot}', 'someone', 1)"
+        ),
+    ] {
+        super::e2e::exec(&served.pool, &statement).await;
+    }
+    assert_eq!(provider_tokens(&served.pool, phone_session).await, 1);
+
+    let ended = handle.end_session(&user, phone_session).await.expect("end");
+    assert_eq!(ended.sessions, vec![phone_session]);
+    assert_eq!(
+        ended.share_keys,
+        vec![MintedKey {
+            session: phone_session,
+            subject: "key:berlin".to_owned(),
+            table: "orders".to_owned(),
+            row: Some(shared),
+        }],
+        "the key the ended session minted, and not the laptop's"
+    );
+    assert_eq!(
+        ended.installations,
+        vec![InstalledApp {
+            installation: "mine".to_owned(),
+            app: bot,
+            app_name: "Reminders".to_owned(),
+        }],
+        "every installation of the person, and nobody else's"
+    );
+    assert_eq!(
+        provider_tokens(&served.pool, phone_session).await,
+        0,
+        "an ended session's provider tokens are forgotten"
+    );
+    assert_eq!(provider_tokens(&served.pool, laptop_session).await, 1);
+
+    let ended = handle.end_all_sessions(&user).await.expect("end all");
+    assert_eq!(ended.sessions, vec![laptop_session]);
+    assert_eq!(
+        ended
+            .share_keys
+            .iter()
+            .map(|key| key.subject.as_str())
+            .collect::<Vec<_>>(),
+        vec!["key:milan"]
+    );
+    assert_eq!(provider_tokens(&served.pool, laptop_session).await, 0);
 }

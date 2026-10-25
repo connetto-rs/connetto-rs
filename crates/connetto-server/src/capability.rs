@@ -406,9 +406,10 @@ pub struct CapabilityIssuer<P, R, Id> {
     rows: Arc<R>,
     ttl: Duration,
     max_ttl: Duration,
-    /// Sink for the durable record of a successful mint. `None` records
-    /// nothing. It also fixes `Id`, so no separate marker is needed.
-    audit: Option<crate::audit::AuditHook<Id>>,
+    /// Sink for the durable record of a successful mint, which ending the
+    /// minting session reads back (R105 decision 5). It also fixes `Id`, so
+    /// no separate marker is needed.
+    audit: crate::audit::AuditHook<Id>,
     /// The reader-pool gate the mint's reads take a share permit from. `None`
     /// leaves them ungated, the pre-R39 behaviour.
     reader: Option<ReaderGate>,
@@ -416,14 +417,20 @@ pub struct CapabilityIssuer<P, R, Id> {
 
 impl<P, R, Id> CapabilityIssuer<P, R, Id> {
     /// Build over the token authority, the visibility policy, the row source
-    /// the shared row is read through, and the lifetimes the deployment
-    /// configured.
+    /// the shared row is read through, the lifetimes the deployment
+    /// configured, and the audit sink every successful mint is recorded in,
+    /// usually [`pg_audit_hook`](crate::audit::pg_audit_hook).
+    ///
+    /// Unlike the revocation paths, a mint's row names its user: the mint
+    /// runs as the caller and so already holds the identity, with no extra
+    /// round trip.
     #[must_use]
     pub fn new(
         authority: Arc<TokenAuthority>,
         policy: Arc<P>,
         rows: Arc<R>,
         config: &AuthConfig,
+        audit: crate::audit::AuditHook<Id>,
     ) -> Self {
         Self {
             authority,
@@ -431,19 +438,9 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
             rows,
             ttl: config.capability_ttl(),
             max_ttl: config.capability_max_ttl(),
-            audit: None,
+            audit,
             reader: None,
         }
-    }
-
-    /// Record every successful mint through `hook`.
-    ///
-    /// Unlike the revocation paths, this row names its user: the mint runs as
-    /// the caller and so already holds the identity, with no extra round trip.
-    #[must_use]
-    pub fn with_audit(mut self, hook: crate::audit::AuditHook<Id>) -> Self {
-        self.audit = Some(hook);
-        self
     }
 
     /// Bound this issuer's reads by the reader pool's reserved split (R39).
@@ -564,12 +561,11 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
                 });
             }
         }
-        // Paired with the hook below in one `Option`, so the captured row and
-        // the decision to record cannot disagree. Captured here because `key` is
-        // shadowed by the minted subject on the next line. The values travel as
-        // read: what type the audit table stores a row key as is the
-        // application's, through `ConnettoAuditSchema::row_key`.
-        let recording = self.audit.as_ref().map(|hook| (hook, key.to_vec()));
+        // Captured here because `key` is shadowed by the minted subject on
+        // the next line. The values travel as read: what type the audit table
+        // stores a row key as is the application's, through
+        // `ConnettoAuditSchema::row_key`.
+        let shared_row = key.to_vec();
         let key = CapabilitySubject::<Key>::new(Key::mint());
         if key.key().to_string().contains(Key::SEPARATOR) {
             return Err(ShareError::SeparatorInKey {
@@ -580,16 +576,15 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
         let token = self.authority.mint_capability(&key, issued_at, ttl)?;
         // After the mint, so a refused request records nothing: this table
         // holds what happened, and denials go to the log.
-        if let Some((hook, shared_row)) = recording {
-            hook(
-                crate::audit::AuthEvent::new(
-                    caller.session_id(),
-                    caller.identity().map(|ctx| ctx.user_id.clone()),
-                    crate::audit::AuthOp::CapabilityMinted,
-                )
-                .about_row(table, shared_row),
-            );
-        }
+        (self.audit)(
+            crate::audit::AuthEvent::new(
+                caller.session_id(),
+                caller.identity().map(|ctx| ctx.user_id.clone()),
+                crate::audit::AuthOp::CapabilityMinted,
+            )
+            .about_row(table, shared_row)
+            .about_key(key.key().to_string()),
+        );
         Ok(IssuedCapability {
             key,
             token,

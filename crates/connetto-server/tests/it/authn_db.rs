@@ -70,6 +70,90 @@ fn origin() -> SessionOrigin<()> {
     }
 }
 
+/// Every way a session is revoked forgets its retained provider tokens, the
+/// only copy connetto can reach (R105 decision 5).
+#[tokio::test]
+async fn db_store_forgets_the_provider_tokens_of_every_revoked_session() {
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    reset_auth_tables(fixture.admin()).await;
+    let store = build_store(fixture.admin());
+    let token = RetainedProviderToken {
+        issuer: "https://issuer.example".to_owned(),
+        access_token: "provider-access".to_owned(),
+        refresh_token: Some("provider-refresh".to_owned()),
+        expires_in: None,
+    };
+    let mut sessions = Vec::new();
+    for subject in ["revoked", "owned", "others", "stolen", "restored"] {
+        let issued = store
+            .create_session(&identity(subject), origin())
+            .await
+            .expect("create");
+        store
+            .set_retained_provider_token(issued.session_id, &token)
+            .await
+            .expect("retain");
+        sessions.push(issued);
+    }
+    let [revoked, owned, others, stolen, restored] = sessions.as_slice() else {
+        unreachable!("five sessions");
+    };
+
+    store
+        .revoke_session(revoked.session_id)
+        .await
+        .expect("revoke");
+    assert!(
+        store
+            .end_owned(&owned.context.user_id, owned.session_id)
+            .await
+            .expect("end")
+    );
+    assert_eq!(
+        store
+            .end_all_of(&others.context.user_id, None)
+            .await
+            .expect("end all"),
+        vec![others.session_id]
+    );
+    store
+        .rotate_refresh(&stolen.refresh_token)
+        .await
+        .expect("rotate");
+    assert!(matches!(
+        store.rotate_refresh(&stolen.refresh_token).await,
+        Err(AuthStoreError::Reuse { .. })
+    ));
+    for session in [revoked, owned, others, stolen] {
+        assert!(
+            store
+                .retained_provider_token(session.session_id)
+                .await
+                .expect("read")
+                .is_none(),
+            "a revoked session keeps no provider token"
+        );
+    }
+    assert!(
+        store
+            .retained_provider_token(restored.session_id)
+            .await
+            .expect("read")
+            .is_some(),
+        "a live session keeps its provider token"
+    );
+    store.revoke_every_session().await.expect("revoke every");
+    assert!(
+        store
+            .retained_provider_token(restored.session_id)
+            .await
+            .expect("read")
+            .is_none(),
+        "revoking every session forgets every provider token"
+    );
+}
+
 /// The database store keeps the list-and-end contract, a session past its
 /// idle deadline no longer listed as a place anyone is signed in.
 #[tokio::test]

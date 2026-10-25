@@ -498,6 +498,7 @@ impl<
         Ok(match sessions.get_mut(&session) {
             Some(stored) if stored.context.user_id == *user && !stored.revoked => {
                 stored.revoked = true;
+                stored.retained = None;
                 true
             }
             _ => false,
@@ -519,6 +520,7 @@ impl<
         for (session_id, stored) in sessions.iter_mut() {
             if stored.context.user_id == *user && stored.live_at(now) && keep != Some(*session_id) {
                 stored.revoked = true;
+                stored.retained = None;
                 ended.push(*session_id);
             }
         }
@@ -560,6 +562,7 @@ impl<
         if !hashes_match(&hash_secret(secret), &record.current_refresh_hash) {
             // A rotated-out token for a live session: treat as theft.
             record.revoked = true;
+            record.retained = None;
             return Err(AuthStoreError::Reuse { session_id });
         }
         let new_secret = new_refresh_secret();
@@ -586,6 +589,7 @@ impl<
             .get_mut(&session_id)
         {
             record.revoked = true;
+            record.retained = None;
         }
         Ok(())
     }
@@ -604,6 +608,7 @@ impl<
             .filter(|record| !record.revoked)
         {
             record.revoked = true;
+            record.retained = None;
             revoked += 1;
         }
         Ok(revoked)
@@ -729,6 +734,17 @@ mod db {
                 resolver,
             }
         }
+
+        /// Delete the retained provider tokens of `sessions`, which were just
+        /// revoked in the same transaction (R105 decision 5).
+        async fn forget(
+            conn: &mut AsyncPgConnection,
+            sessions: Vec<SessionId>,
+        ) -> Result<(), AuthStoreError> {
+            <D::Auth as ConnettoStoreSchema>::forget_provider_tokens(conn, sessions)
+                .await
+                .map_err(backend)
+        }
     }
 
     fn backend<E: core::fmt::Display>(err: E) -> AuthStoreError {
@@ -808,9 +824,17 @@ mod db {
             session: SessionId,
         ) -> Result<bool, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            <D::Auth as ConnettoStoreSchema>::end_owned(&mut conn, user.clone(), session)
-                .await
-                .map_err(backend)
+            let user = user.clone();
+            conn.transaction::<_, AuthStoreError, _>(async move |conn| {
+                let ended = <D::Auth as ConnettoStoreSchema>::end_owned(conn, user, session)
+                    .await
+                    .map_err(backend)?;
+                if ended {
+                    Self::forget(conn, vec![session]).await?;
+                }
+                Ok(ended)
+            })
+            .await
         }
 
         async fn end_all_of(
@@ -819,9 +843,15 @@ mod db {
             keep: Option<SessionId>,
         ) -> Result<Vec<SessionId>, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            <D::Auth as ConnettoStoreSchema>::end_all_of(&mut conn, user.clone(), keep)
-                .await
-                .map_err(backend)
+            let user = user.clone();
+            conn.transaction::<_, AuthStoreError, _>(async move |conn| {
+                let ended = <D::Auth as ConnettoStoreSchema>::end_all_of(conn, user, keep)
+                    .await
+                    .map_err(backend)?;
+                Self::forget(conn, ended.clone()).await?;
+                Ok(ended)
+            })
+            .await
         }
 
         async fn session_is_live(&self, session_id: SessionId) -> Result<bool, AuthStoreError> {
@@ -889,26 +919,41 @@ mod db {
                 .await
             };
             if matches!(outcome, Err(AuthStoreError::Reuse { .. })) {
-                <D::Auth as ConnettoStoreSchema>::revoke_update(&mut conn, session_id)
-                    .await
-                    .map_err(backend)?;
+                conn.transaction::<_, AuthStoreError, _>(async move |conn| {
+                    <D::Auth as ConnettoStoreSchema>::revoke_update(conn, session_id)
+                        .await
+                        .map_err(backend)?;
+                    Self::forget(conn, vec![session_id]).await
+                })
+                .await?;
             }
             outcome
         }
 
         async fn revoke_session(&self, session_id: SessionId) -> Result<(), AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            <D::Auth as ConnettoStoreSchema>::revoke_update(&mut conn, session_id)
-                .await
-                .map_err(backend)?;
-            Ok(())
+            conn.transaction::<_, AuthStoreError, _>(async move |conn| {
+                <D::Auth as ConnettoStoreSchema>::revoke_update(conn, session_id)
+                    .await
+                    .map_err(backend)?;
+                Self::forget(conn, vec![session_id]).await
+            })
+            .await
         }
 
         async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let revoked = <D::Auth as ConnettoStoreSchema>::revoke_every_update(&mut conn)
-                .await
-                .map_err(backend)?;
+            let revoked = conn
+                .transaction::<_, AuthStoreError, _>(async move |conn| {
+                    let revoked = <D::Auth as ConnettoStoreSchema>::revoke_every_update(conn)
+                        .await
+                        .map_err(backend)?;
+                    <D::Auth as ConnettoStoreSchema>::forget_every_provider_token(conn)
+                        .await
+                        .map_err(backend)?;
+                    Ok(revoked)
+                })
+                .await?;
             Ok(u64::try_from(revoked).unwrap_or(u64::MAX))
         }
 
