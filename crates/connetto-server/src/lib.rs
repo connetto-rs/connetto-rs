@@ -101,10 +101,11 @@ pub use authn::{
     AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
     ConnettoHandshakeAuthority, DefaultUuidResolver, GenericOidcProvider, IdentityProvider,
     IdentityResolver, InMemoryAuthStore, IssuedAuthCode, IssuedSession, LoginRedirect,
-    OidcProviderConfig, PendingLogin, PendingLogins, ProviderError, ProviderRegistry,
+    LoginRequest, OidcProviderConfig, PendingLogin, PendingLogins, ProviderError, ProviderRegistry,
     RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture, ResolvedIdentity,
-    RetainedProviderToken, SessionRow, StoredProviderToken, TokenAuthority, TokenError, TokenPair,
-    VerifiedClaims, VerifiedLogin, VerifiedSession,
+    RetainedProviderToken, SessionDescriber, SessionOrigin, SessionRecord, SessionRow, SignInHook,
+    SignInNotice, StoredProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedClaims,
+    VerifiedLogin, VerifiedSession,
 };
 pub use authn::{ConnettoStoreSchema, DbAuthStore};
 pub use builder::{

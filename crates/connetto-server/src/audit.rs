@@ -11,7 +11,7 @@
 //! **This table holds state changes, never denials.** A caller probing keys
 //! generates one refusal per attempt, so refusals go to structured logging and
 //! would drown this table at exactly the moment it matters. What lands here is
-//! the rare and durable: a login ended, a share key was issued, a ban was
+//! the durable: a login began or ended, a share key was issued, a ban was
 //! imposed. The split is normative in `08-authorization.md` and
 //! `denials_never_reach_the_audit_table` pins it.
 //!
@@ -51,6 +51,9 @@ pub struct AuthOpSql;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AsExpression, FromSqlRow)]
 #[diesel(sql_type = AuthOpSql)]
 pub enum AuthOp {
+    /// A sign-in created a session, the row naming the provider and issuer it
+    /// came through.
+    LoggedIn,
     /// The caller ended their own login through the logout endpoint.
     LoggedOut,
     /// The embedding application revoked the login itself.
@@ -86,6 +89,7 @@ impl AuthOp {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::LoggedIn => "logged_in",
             Self::LoggedOut => "logged_out",
             Self::SessionRevoked => "session_revoked",
             Self::TokenReplayed => "token_replayed",
@@ -110,6 +114,7 @@ impl ToSql<AuthOpSql, Pg> for AuthOp {
 impl FromSql<AuthOpSql, Pg> for AuthOp {
     fn from_sql(bytes: PgValue<'_>) -> deserialize::Result<Self> {
         match bytes.as_bytes() {
+            b"logged_in" => Ok(Self::LoggedIn),
             b"logged_out" => Ok(Self::LoggedOut),
             b"session_revoked" => Ok(Self::SessionRevoked),
             b"token_replayed" => Ok(Self::TokenReplayed),
@@ -161,6 +166,12 @@ pub struct AuthEvent<Id> {
     pub path: Option<SettlePath>,
     /// The arriving write's path.
     pub other_path: Option<SettlePath>,
+    /// The configured provider a sign-in came through, absent for everything
+    /// else.
+    pub provider: Option<String>,
+    /// The issuer a sign-in's identity was verified from, absent for
+    /// everything else.
+    pub issuer: Option<String>,
 }
 
 impl<Id> AuthEvent<Id> {
@@ -177,6 +188,8 @@ impl<Id> AuthEvent<Id> {
             seq: None,
             path: None,
             other_path: None,
+            provider: None,
+            issuer: None,
         }
     }
 
@@ -202,6 +215,15 @@ impl<Id> AuthEvent<Id> {
         self.seq = Some(seq);
         self.path = Some(path);
         self.other_path = Some(other_path);
+        self
+    }
+
+    /// Name the provider and issuer a sign-in came through, the shape a login
+    /// row carries.
+    #[must_use]
+    pub fn about_login(mut self, provider: impl Into<String>, issuer: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
+        self.issuer = Some(issuer.into());
         self
     }
 }
@@ -345,6 +367,10 @@ macro_rules! connetto_audit_table {
                 path -> diesel::sql_types::Nullable<$crate::writer_schema::SettlePathSql>,
                 /// The arriving write's path.
                 other_path -> diesel::sql_types::Nullable<$crate::writer_schema::SettlePathSql>,
+                /// The configured provider a sign-in came through.
+                provider -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                /// The issuer a sign-in's identity was verified from.
+                issuer -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
             }
         }
 
@@ -362,6 +388,8 @@ macro_rules! connetto_audit_table {
             seq: Option<i64>,
             path: Option<$crate::writer_schema::SettlePath>,
             other_path: Option<$crate::writer_schema::SettlePath>,
+            provider: Option<String>,
+            issuer: Option<String>,
         }
 
         /// The default connetto audit schema over the deployment's `Id` type.
@@ -398,6 +426,8 @@ macro_rules! connetto_audit_table {
                     seq: event.seq,
                     path: event.path,
                     other_path: event.other_path,
+                    provider: event.provider,
+                    issuer: event.issuer,
                 })
             }
         }

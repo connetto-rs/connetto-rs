@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::authn::identity::{IdentityResolver, ResolveError, VerifiedClaims};
+use crate::authn::schema::SessionRecord;
 use crate::authn::token::RefreshLifetimes;
 
 /// A caller identity resolved from a verified credential, ready to mint a
@@ -55,6 +56,17 @@ impl ResolvedIdentity {
     }
 }
 
+/// Where a sign-in came from, beside the identity it verified: the
+/// configured provider it came through and the application's description of
+/// it.
+#[derive(Debug, Clone)]
+pub struct SessionOrigin<Desc> {
+    /// The configured provider name, such as `google`.
+    pub provider: String,
+    /// The application's description, which its describe callback returned.
+    pub description: Desc,
+}
+
 /// A newly minted session: its id, the identity it carries, and the first
 /// refresh token to hand the client.
 #[derive(Debug, Clone)]
@@ -69,6 +81,8 @@ pub struct IssuedSession<Id = String> {
     /// smaller of the idle deadline and the absolute ceiling. The client
     /// keeps it to warn before an offline session lapses with unsynced data.
     pub session_expires_at: SystemTime,
+    /// When the session began, by the store's clock.
+    pub created_at: SystemTime,
 }
 
 /// The result of a successful refresh: the rotated token plus the identity to
@@ -141,12 +155,34 @@ pub trait AuthStore: Send + Sync {
         + Sync
         + 'static;
 
-    /// Resolve `identity` to a `user_id`, create a session, and return it
-    /// with its first refresh token.
+    /// The application's description of a session, which every session row
+    /// carries.
+    type Descriptor: Clone + Send + Sync + 'static;
+
+    /// The description every session carries when the deployment declares
+    /// none, `None` when a describe callback must supply one.
+    fn undescribed() -> Option<Self::Descriptor>;
+
+    /// Resolve `identity` to a `user_id`, create a session recording where
+    /// it came from, and return it with its first refresh token.
     fn create_session(
         &self,
         identity: &ResolvedIdentity,
+        origin: SessionOrigin<Self::Descriptor>,
     ) -> impl Future<Output = Result<IssuedSession<Self::Id>, AuthStoreError>> + Send;
+
+    /// How the session began and when it last refreshed, `None` when the id
+    /// names no session.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the trait spells its future's output in full, as every method beside it does"
+    )]
+    fn session_record(
+        &self,
+        session_id: SessionId,
+    ) -> impl Future<
+        Output = Result<Option<SessionRecord<Self::Id, Self::Descriptor>>, AuthStoreError>,
+    > + Send;
 
     /// Whether the session still exists, is not revoked, and is within its
     /// absolute ceiling. This is the handshake liveness check that makes
@@ -257,21 +293,26 @@ pub(crate) fn split_refresh(token: &str) -> Option<(SessionId, &str)> {
 /// (deterministic UUID v5 by default), so no lookup and no linking table.
 ///
 /// It serves one process, so its deadlines live on the process clock, held
-/// in a seam that defaults to `SystemTime::now` (chapter 21).
+/// in a seam that defaults to `SystemTime::now` (chapter 21). Its sessions
+/// carry no application description.
 pub struct InMemoryAuthStore<Id = String> {
     lifetimes: RefreshLifetimes,
-    sessions: std::sync::Mutex<std::collections::HashMap<SessionId, SessionRecord<Id>>>,
+    sessions: std::sync::Mutex<std::collections::HashMap<SessionId, StoredSession<Id>>>,
     resolver: std::sync::Arc<dyn IdentityResolver<Id = Id>>,
     clock: std::sync::Arc<dyn Fn() -> SystemTime + Send + Sync>,
 }
 
-struct SessionRecord<Id> {
+struct StoredSession<Id> {
     context: AuthContext<Id>,
     current_refresh_hash: [u8; 32],
     idle_deadline: SystemTime,
     absolute_deadline: SystemTime,
     revoked: bool,
     retained: Option<RetainedRecord>,
+    provider: String,
+    issuer: String,
+    created_at: SystemTime,
+    refreshed_at: Option<SystemTime>,
 }
 
 /// The store's own copy of a session's retained provider tokens, stamped with
@@ -326,23 +367,33 @@ impl<
 > AuthStore for InMemoryAuthStore<Id>
 {
     type Id = Id;
+    type Descriptor = ();
+
+    fn undescribed() -> Option<()> {
+        Some(())
+    }
 
     async fn create_session(
         &self,
         identity: &ResolvedIdentity,
+        origin: SessionOrigin<()>,
     ) -> Result<IssuedSession<Id>, AuthStoreError> {
         let now = (self.clock)();
         let user_id = self.resolver.resolve(&identity.verified_claims()).await?;
         let context = AuthContext { user_id };
         let session_id = new_session_id();
         let secret = new_refresh_secret();
-        let record = SessionRecord {
+        let record = StoredSession {
             context: context.clone(),
             current_refresh_hash: hash_secret(&secret),
             idle_deadline: now + self.lifetimes.idle_window(),
             absolute_deadline: now + self.lifetimes.absolute_ceiling(),
             revoked: false,
             retained: None,
+            provider: origin.provider,
+            issuer: identity.issuer.clone(),
+            created_at: now,
+            refreshed_at: None,
         };
         self.sessions
             .lock()
@@ -355,7 +406,28 @@ impl<
             refresh_token,
             session_expires_at: (now + self.lifetimes.idle_window())
                 .min(now + self.lifetimes.absolute_ceiling()),
+            created_at: now,
         })
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn session_record(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionRecord<Id, ()>>, AuthStoreError> {
+        let sessions = self.sessions.lock().expect("auth store lock");
+        Ok(sessions.get(&session_id).map(|stored| SessionRecord {
+            session_id,
+            user_id: stored.context.user_id.clone(),
+            provider: stored.provider.clone(),
+            issuer: stored.issuer.clone(),
+            description: (),
+            created_at: stored.created_at,
+            refreshed_at: stored.refreshed_at,
+        }))
     }
 
     #[expect(
@@ -398,6 +470,7 @@ impl<
         let new_secret = new_refresh_secret();
         record.current_refresh_hash = hash_secret(&new_secret);
         record.idle_deadline = (now + self.lifetimes.idle_window()).min(record.absolute_deadline);
+        record.refreshed_at = Some(now);
         Ok(RefreshOutcome {
             session_id,
             context: record.context.clone(),
@@ -527,12 +600,15 @@ mod db {
     use diesel_async::{AsyncConnection, AsyncPgConnection};
 
     use super::{
-        AuthStore, AuthStoreError, IssuedSession, RefreshOutcome, ResolvedIdentity, format_refresh,
-        hash_secret, hashes_match, new_refresh_secret, new_session_id, split_refresh,
+        AuthStore, AuthStoreError, IssuedSession, RefreshOutcome, ResolvedIdentity, SessionOrigin,
+        format_refresh, hash_secret, hashes_match, new_refresh_secret, new_session_id,
+        split_refresh,
     };
     use crate::authn::identity::IdentityResolver;
     use crate::authn::provider::RetainedProviderToken;
-    use crate::authn::schema::{ConnettoStoreSchema, SessionRow};
+    use crate::authn::schema::{
+        ConnettoStoreSchema, NewSession, SessionRecord, SessionRow, SessionStamps,
+    };
     use crate::authn::token::RefreshLifetimes;
     use crate::schema::ConnettoSchema;
 
@@ -566,35 +642,59 @@ mod db {
 
     impl<D: ConnettoSchema> AuthStore for DbAuthStore<D> {
         type Id = <D::Auth as ConnettoStoreSchema>::Id;
+        type Descriptor = <D::Auth as ConnettoStoreSchema>::Descriptor;
+
+        fn undescribed() -> Option<Self::Descriptor> {
+            <D::Auth as ConnettoStoreSchema>::undescribed()
+        }
 
         async fn create_session(
             &self,
             identity: &ResolvedIdentity,
-        ) -> Result<IssuedSession<<D::Auth as ConnettoStoreSchema>::Id>, AuthStoreError> {
+            origin: SessionOrigin<Self::Descriptor>,
+        ) -> Result<IssuedSession<Self::Id>, AuthStoreError> {
             let user_id = self.resolver.resolve(&identity.verified_claims()).await?;
             let secret = new_refresh_secret();
-            let refresh_hash = hash_secret(&secret).to_vec();
             let session_id = new_session_id();
             let mut conn = self.pool.get().await.map_err(backend)?;
-            // The deadlines are stamped by the database's clock, not this
-            // process's (chapter 21).
-            let (idle_deadline, absolute_deadline) = <D::Auth as ConnettoStoreSchema>::new_session(
+            // The creation time and the deadlines are stamped by the
+            // database's clock, not this process's (chapter 21).
+            let SessionStamps {
+                created_at,
+                idle_deadline,
+                absolute_deadline,
+            } = <D::Auth as ConnettoStoreSchema>::new_session(
                 &mut conn,
-                session_id,
-                user_id.clone(),
-                refresh_hash,
-                self.lifetimes.idle_window(),
-                self.lifetimes.absolute_ceiling(),
+                NewSession {
+                    session_id,
+                    user_id: user_id.clone(),
+                    current_refresh_hash: hash_secret(&secret).to_vec(),
+                    idle_window: self.lifetimes.idle_window(),
+                    absolute_ceiling: self.lifetimes.absolute_ceiling(),
+                    provider: origin.provider,
+                    issuer: identity.issuer.clone(),
+                    description: origin.description,
+                },
             )
             .await
             .map_err(backend)?;
-            let context = AuthContext { user_id };
             Ok(IssuedSession {
                 session_id,
-                context,
+                context: AuthContext { user_id },
                 refresh_token: format_refresh(session_id, &secret),
                 session_expires_at: idle_deadline.min(absolute_deadline).into(),
+                created_at: created_at.into(),
             })
+        }
+
+        async fn session_record(
+            &self,
+            session_id: SessionId,
+        ) -> Result<Option<SessionRecord<Self::Id, Self::Descriptor>>, AuthStoreError> {
+            let mut conn = self.pool.get().await.map_err(backend)?;
+            <D::Auth as ConnettoStoreSchema>::session_record(&mut conn, session_id)
+                .await
+                .map_err(backend)
         }
 
         async fn session_is_live(&self, session_id: SessionId) -> Result<bool, AuthStoreError> {

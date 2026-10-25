@@ -24,8 +24,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::authn::provider::{
     ProviderError, ProviderRegistry, RetainedProviderToken, VerifiedLogin,
 };
+use crate::authn::schema::SessionRecord;
+use crate::authn::sign_in::{LoginRequest, SessionDescriber, SignInHook, SignInNotice};
 use crate::authn::store::{
-    AuthStore, AuthStoreError, IssuedSession, ResolvedIdentity, split_refresh,
+    AuthStore, AuthStoreError, IssuedSession, ResolvedIdentity, SessionOrigin, split_refresh,
 };
 use crate::authn::token::{TokenAuthority, TokenError};
 use crate::guard::RequestGuard;
@@ -76,6 +78,10 @@ pub enum AuthError {
     /// The caller's refresh quota is exhausted. Wait at least this long before retrying.
     #[error("rate limited")]
     RateLimited(Duration),
+    /// The deployment declares a session description and no describe
+    /// callback supplies one.
+    #[error("no describe callback supplies the session description")]
+    Undescribed,
 }
 
 /// Mints and rotates connetto tokens over an [`AuthStore`].
@@ -99,6 +105,12 @@ pub struct AuthService<S: AuthStore> {
     /// Sink for the durable record of access changes, set once at startup.
     /// `None` records nothing, which is what an in-memory deployment wants.
     audit_hook: std::sync::OnceLock<crate::audit::AuditHook<S::Id>>,
+    /// The application's sign-in callback, set once at startup. `None`
+    /// tells nobody.
+    sign_in_hook: std::sync::OnceLock<SignInHook<S::Id, S::Descriptor>>,
+    /// The application's describe callback, `None` when the deployment
+    /// declares no description.
+    describer: Option<SessionDescriber<S::Descriptor>>,
     /// Every counter connetto keeps about a caller, shared with the session
     /// manager because the failed-renewal signal fires here and the other three
     /// fire there.
@@ -108,6 +120,24 @@ pub struct AuthService<S: AuthStore> {
 /// Observes a session revocation. Fired synchronously after the store revoke
 /// succeeds, so an async close belongs on a spawned task inside the hook.
 pub type SessionRevocationHook = Arc<dyn Fn(SessionId) + Send + Sync>;
+
+/// What a login row and a sign-in notice say about how a session began,
+/// taken before the store consumes the origin.
+struct Started<Desc> {
+    provider: String,
+    issuer: String,
+    description: Desc,
+}
+
+impl<Desc: Clone> Started<Desc> {
+    fn of(identity: &ResolvedIdentity, origin: &SessionOrigin<Desc>) -> Self {
+        Self {
+            provider: origin.provider.clone(),
+            issuer: identity.issuer.clone(),
+            description: origin.description.clone(),
+        }
+    }
+}
 
 impl<S: AuthStore> AuthService<S> {
     /// Build over a shared token authority and store, with no provider registry.
@@ -127,6 +157,8 @@ impl<S: AuthStore> AuthService<S> {
             refresh_locks: Mutex::new(HashMap::new()),
             revocation_hook: std::sync::OnceLock::new(),
             audit_hook: std::sync::OnceLock::new(),
+            sign_in_hook: std::sync::OnceLock::new(),
+            describer: None,
             guard,
         }
     }
@@ -135,6 +167,14 @@ impl<S: AuthStore> AuthService<S> {
     #[must_use]
     pub fn with_registry(mut self, registry: Arc<ProviderRegistry>) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Attach the application's describe callback, which every sign-in asks
+    /// for the session's description.
+    #[must_use]
+    pub fn with_session_describer(mut self, describer: SessionDescriber<S::Descriptor>) -> Self {
+        self.describer = Some(describer);
         self
     }
 
@@ -160,6 +200,12 @@ impl<S: AuthStore> AuthService<S> {
         let _ = self.audit_hook.set(hook);
     }
 
+    /// Attach the application's sign-in callback, once, after construction. A
+    /// second call is ignored, matching the audit sink beside it.
+    pub fn set_sign_in_hook(&self, hook: SignInHook<S::Id, S::Descriptor>) {
+        let _ = self.sign_in_hook.set(hook);
+    }
+
     /// Record one access change, if a sink is attached.
     fn record(&self, event: crate::audit::AuthEvent<S::Id>) {
         if let Some(hook) = self.audit_hook.get() {
@@ -167,15 +213,44 @@ impl<S: AuthStore> AuthService<S> {
         }
     }
 
+    /// The application's description of the sign-in `request` completes,
+    /// from its describe callback, or the deployment's fixed one when it
+    /// declares none.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Undescribed`] when the deployment declares a description
+    /// and no describe callback is attached.
+    pub async fn describe(&self, request: LoginRequest) -> Result<S::Descriptor, AuthError> {
+        match &self.describer {
+            Some(describer) => Ok(describer(request).await),
+            None => S::undescribed().ok_or(AuthError::Undescribed),
+        }
+    }
+
+    /// How `session_id` began and when it last refreshed, `None` when it
+    /// names no session.
+    pub(crate) async fn session_record(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionRecord<S::Id, S::Descriptor>>, AuthError> {
+        Ok(self.store.session_record(session_id).await?)
+    }
+
     /// Create a session for a verified identity and mint its first token pair.
     ///
     /// # Errors
     ///
     /// [`AuthError`] if the store or the mint fails.
-    pub async fn login(&self, identity: &ResolvedIdentity) -> Result<TokenPair<S::Id>, AuthError> {
+    pub async fn login(
+        &self,
+        identity: &ResolvedIdentity,
+        origin: SessionOrigin<S::Descriptor>,
+    ) -> Result<TokenPair<S::Id>, AuthError> {
         let now = SystemTime::now();
-        let issued = self.store.create_session(identity).await?;
-        self.finish_login(issued, now, |issued| {
+        let started = Started::of(identity, &origin);
+        let issued = self.store.create_session(identity, origin).await?;
+        self.finish_login(issued, now, started, |issued| {
             tracing::info!(
                 session = %issued.session_id,
                 user = %issued.context.user_id,
@@ -186,8 +261,8 @@ impl<S: AuthStore> AuthService<S> {
 
     /// Create a session for a verified login and retain its provider tokens.
     ///
-    /// The phase-3 login callback uses this: the identity and the provider
-    /// tokens both come from the provider's verified response.
+    /// The login callback uses this: the identity and the provider tokens
+    /// both come from the provider's verified response.
     ///
     /// # Errors
     ///
@@ -195,13 +270,15 @@ impl<S: AuthStore> AuthService<S> {
     pub async fn login_with_provider(
         &self,
         login: &VerifiedLogin,
+        origin: SessionOrigin<S::Descriptor>,
     ) -> Result<TokenPair<S::Id>, AuthError> {
         let now = SystemTime::now();
-        let issued = self.store.create_session(&login.identity).await?;
+        let started = Started::of(&login.identity, &origin);
+        let issued = self.store.create_session(&login.identity, origin).await?;
         self.store
             .set_retained_provider_token(issued.session_id, &login.retained)
             .await?;
-        self.finish_login(issued, now, |issued| {
+        self.finish_login(issued, now, started, |issued| {
             tracing::info!(
                 session = %issued.session_id,
                 user = %issued.context.user_id,
@@ -212,7 +289,8 @@ impl<S: AuthStore> AuthService<S> {
     }
 
     /// Mint the first token pair for a freshly created session, register its
-    /// owner with the guard, and assemble the response.
+    /// owner with the guard, record the login, tell the application, and
+    /// assemble the response.
     ///
     /// `announce` runs once the mint has succeeded, so a failed mint still
     /// logs nothing. The owner registration is what R19 attributes later abuse
@@ -221,6 +299,7 @@ impl<S: AuthStore> AuthService<S> {
         &self,
         issued: IssuedSession<S::Id>,
         now: SystemTime,
+        started: Started<S::Descriptor>,
         announce: impl FnOnce(&IssuedSession<S::Id>),
     ) -> Result<TokenPair<S::Id>, AuthError> {
         let access_token = self
@@ -229,6 +308,25 @@ impl<S: AuthStore> AuthService<S> {
         announce(&issued);
         self.guard
             .learn_owner(issued.session_id, &issued.context.user_id);
+        self.record(
+            crate::audit::AuthEvent::new(
+                issued.session_id,
+                Some(issued.context.user_id.clone()),
+                crate::audit::AuthOp::LoggedIn,
+            )
+            .about_login(started.provider.clone(), started.issuer.clone()),
+        );
+        if let Some(hook) = self.sign_in_hook.get() {
+            hook(SignInNotice::SignedIn(SessionRecord {
+                session_id: issued.session_id,
+                user_id: issued.context.user_id.clone(),
+                provider: started.provider,
+                issuer: started.issuer,
+                description: started.description,
+                created_at: issued.created_at,
+                refreshed_at: None,
+            }));
+        }
         Ok(TokenPair {
             access_token,
             refresh_token: issued.refresh_token,

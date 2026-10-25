@@ -53,6 +53,8 @@ mod enrolment_store;
 
 mod revocation;
 
+mod session_record;
+
 mod epoch;
 
 mod grants;

@@ -139,15 +139,10 @@ impl SnapshotSource for NoSnapshot {
 
 /// A changeset inserting one fully-specified `notes` row.
 pub(crate) fn insert_changeset(id: i64, owner: &str, body: &str, edited_at: &str) -> Vec<u8> {
-    let table = SimpleTable::with_rowid_alias(
+    let table = SimpleTable::new(
         "notes",
-        &[
-            ("id", "INTEGER"),
-            ("owner", "TEXT"),
-            ("body", "TEXT"),
-            ("edited_at", "TEXT"),
-        ],
-        0,
+        &[("id", ""), ("owner", ""), ("body", ""), ("edited_at", "")],
+        &[0],
     );
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(id))
@@ -166,15 +161,10 @@ pub(crate) fn insert_changeset(id: i64, owner: &str, body: &str, edited_at: &str
 /// A changeset that reassigns one row's owner, carrying the old image so the
 /// version basis and the pre-update owner both reach Postgres.
 fn reassign_changeset(id: i64, old_owner: &str, new_owner: &str, edited_at: &str) -> Vec<u8> {
-    let table = SimpleTable::with_rowid_alias(
+    let table = SimpleTable::new(
         "notes",
-        &[
-            ("id", "INTEGER"),
-            ("owner", "TEXT"),
-            ("body", "TEXT"),
-            ("edited_at", "TEXT"),
-        ],
-        0,
+        &[("id", ""), ("owner", ""), ("body", ""), ("edited_at", "")],
+        &[0],
     );
     let update = Update::<_, ChangesetFormat, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(id), Value::Integer(id))

@@ -1,14 +1,14 @@
 //! Needs Docker: the fixture starts its own Postgres.
 //!
 //! Exercises [`DbAuthStore`]: identity resolution through the resolver,
-//! session creation and liveness, rotating refresh with reuse detection, and
-//! revocation.
+//! session creation and liveness, how a session began and when it last
+//! refreshed, rotating refresh with reuse detection, and revocation.
 
 use std::time::Duration;
 
 use connetto_server::{
     AuthConfig, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver, ResolvedIdentity,
-    RetainedProviderToken,
+    RetainedProviderToken, SessionOrigin,
 };
 use connetto_test_harness::Fixture;
 use diesel::sql_query;
@@ -30,7 +30,9 @@ async fn reset_auth_tables(pool: &Pool<AsyncPgConnection>) {
         "CREATE TABLE connetto_sessions (\
             session_id UUID PRIMARY KEY, user_id TEXT NOT NULL, \
             current_refresh_hash BYTEA NOT NULL, idle_deadline TIMESTAMPTZ NOT NULL, \
-            absolute_deadline TIMESTAMPTZ NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE)",
+            absolute_deadline TIMESTAMPTZ NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE, \
+            created_at TIMESTAMPTZ NOT NULL, refreshed_at TIMESTAMPTZ, \
+            provider TEXT NOT NULL, issuer TEXT NOT NULL)",
         "CREATE TABLE connetto_provider_tokens (\
             session_id UUID PRIMARY KEY, issuer TEXT NOT NULL, access_token TEXT NOT NULL, \
             refresh_token TEXT, expires_at TIMESTAMPTZ)",
@@ -60,6 +62,64 @@ fn identity(subject: &str) -> ResolvedIdentity {
     }
 }
 
+/// A sign-in through the provider configured as `google`.
+fn origin() -> SessionOrigin<()> {
+    SessionOrigin {
+        provider: "google".to_owned(),
+        description: (),
+    }
+}
+
+/// A session records how it began by the database's clock, and a refresh
+/// stamps its last refresh time.
+#[tokio::test]
+async fn db_store_records_how_a_session_began_and_when_it_last_refreshed() {
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    reset_auth_tables(fixture.admin()).await;
+    let store = build_store(fixture.admin());
+    let issued = store
+        .create_session(&identity("iris"), origin())
+        .await
+        .expect("create");
+
+    let began = store
+        .session_record(issued.session_id)
+        .await
+        .expect("read")
+        .expect("the session is recorded");
+    assert_eq!(began.session_id, issued.session_id);
+    assert_eq!(began.user_id, issued.context.user_id);
+    assert_eq!(began.provider, "google");
+    assert_eq!(began.issuer, "https://issuer.example");
+    assert_eq!(began.created_at, issued.created_at);
+    assert_eq!(began.refreshed_at, None, "never refreshed yet");
+
+    store
+        .rotate_refresh(&issued.refresh_token)
+        .await
+        .expect("rotate");
+    let refreshed = store
+        .session_record(issued.session_id)
+        .await
+        .expect("read")
+        .expect("the session is recorded")
+        .refreshed_at
+        .expect("the refresh is stamped");
+    assert!(
+        refreshed >= began.created_at,
+        "a refresh follows the sign-in"
+    );
+    assert!(
+        store
+            .session_record(connetto_server::SessionId::from_uuid(uuid::Uuid::new_v4()))
+            .await
+            .expect("read")
+            .is_none(),
+        "an unknown session has no record"
+    );
+}
+
 // The two tests share one set of auth tables, so their `CREATE TABLE`s race on
 // `pg_type_typname_nsp_index` when run concurrently. Serialize them.
 static PG_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
@@ -75,11 +135,11 @@ async fn db_store_creates_resolves_rotates_and_revokes() {
     // Two logins for the same (issuer, subject) resolve to one deployment-owned
     // user id through the deterministic resolver, and each is its own live session.
     let first = store
-        .create_session(&identity("frank"))
+        .create_session(&identity("frank"), origin())
         .await
         .expect("first");
     let second = store
-        .create_session(&identity("frank"))
+        .create_session(&identity("frank"), origin())
         .await
         .expect("second");
     assert_eq!(
@@ -143,7 +203,7 @@ async fn db_store_retains_and_replaces_provider_tokens() {
     reset_auth_tables(fixture.admin()).await;
     let store = build_store(fixture.admin());
     let issued = store
-        .create_session(&identity("grace"))
+        .create_session(&identity("grace"), origin())
         .await
         .expect("create");
 
@@ -230,7 +290,7 @@ async fn db_store_refuses_a_session_whose_deadline_lapsed_in_the_database() {
     reset_auth_tables(fixture.admin()).await;
     let store = build_store(fixture.admin());
     let issued = store
-        .create_session(&identity("harry"))
+        .create_session(&identity("harry"), origin())
         .await
         .expect("create");
 

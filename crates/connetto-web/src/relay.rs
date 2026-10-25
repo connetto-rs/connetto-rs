@@ -76,8 +76,8 @@ use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
     AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, GateAskOutcome,
     GateController, GateSink, ImportChoices, ImportOutcome, KeepaliveTimer, PolicyTables,
-    ResendTimer, ShareKeyTimer, SystemClock, WriterGrant, WriterRequest, subscription_is_aggregate,
-    subscription_tables,
+    ResendTimer, ShareKeyTimer, SystemClock, WriterGrant, WriterRequest, replay_aborting,
+    replica_schema, subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError, FatalErrorReason,
@@ -88,7 +88,7 @@ use connetto_core::messages::{
     TabShareKeyOutcome,
 };
 use connetto_core::traits::MaybeSend;
-use connetto_core::{Cursor, IncomingFrame, Transport, quote_ident};
+use connetto_core::{Cursor, IncomingFrame, Transport};
 use connetto_file_client::http::ContentHttp;
 use connetto_file_client::{
     BrowserHttp, BrowserStore, ChunkScan, ContentArchive, ContentError, ContentFlush,
@@ -99,12 +99,10 @@ use connetto_file_core::MimeClass;
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
-use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_query;
-use diesel::sqlite::Sqlite;
-use diesel_sqlite_session::{ConflictAction, SqliteSessionExt};
+use diesel_sqlite_session::SqliteSessionExt;
 use futures_util::StreamExt;
-use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, TableSchema, Value};
+use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 /// Zstd level for relayed snapshot payloads, matching the client library default.
 const ZSTD_LEVEL: i32 = 3;
@@ -401,9 +399,17 @@ impl From<diesel::result::Error> for TabApplyError {
     }
 }
 
-/// DDL for the hub's durable per-tab mutation watermark. It lives in an
-/// ATTACHED schema: the worker's capture session tracks only `main`, so
-/// watermark writes never ride the worker's own uploads.
+impl From<ClientError> for TabApplyError {
+    fn from(err: ClientError) -> Self {
+        match err {
+            ClientError::Db(err) => Self::Db(err),
+            refusal => Self::Apply(refusal.to_string()),
+        }
+    }
+}
+
+/// DDL for the hub's durable per-tab mutation watermark, attached apart from
+/// `main` and the shared store so the worker's capture never uploads it.
 const HUB_META_DDL: &str = "CREATE TABLE IF NOT EXISTS connetto_hub._tab_mutations \
     (client_id BLOB NOT NULL PRIMARY KEY, last_seq BIGINT NOT NULL)";
 
@@ -3129,252 +3135,6 @@ where
     .await
 }
 
-/// Bind one changeset value at its own SQLite storage class.
-///
-/// `Value::Null` never reaches here: a null is written into the predicate as
-/// `IS NULL` and into an assignment as the literal, because a bind has no
-/// type to carry.
-fn bind_value<'a>(
-    query: BoxedSqlQuery<'a, Sqlite, SqlQuery>,
-    value: &Value<String, Vec<u8>>,
-) -> BoxedSqlQuery<'a, Sqlite, SqlQuery> {
-    match value {
-        Value::Null => query,
-        Value::Integer(v) => query.bind::<diesel::sql_types::BigInt, _>(*v),
-        Value::Real(v) => query.bind::<diesel::sql_types::Double, _>(*v),
-        Value::Text(v) => query.bind::<diesel::sql_types::Text, _>(v.clone()),
-        Value::Blob(v) => query.bind::<diesel::sql_types::Binary, _>(v.clone()),
-    }
-}
-
-/// Column names of one device-private table, in the order a changeset records
-/// them, which is the table's own column order.
-///
-/// `PRAGMA table_info` is a vendor pragma with no typed form, and it takes no
-/// bind parameter for the table, so the name is quoted into it. Every name
-/// reaching here came from `local_tables`, which connetto read out of the
-/// attached catalogue itself.
-fn tier_columns(conn: &mut SqliteConnection, table: &str) -> Result<Vec<String>, TabApplyError> {
-    #[derive(QueryableByName)]
-    struct ColumnRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        name: String,
-    }
-    let rows: Vec<ColumnRow> =
-        sql_query(format!("PRAGMA table_info({})", quote_ident(table))).load(conn)?;
-    if rows.is_empty() {
-        return Err(TabApplyError::Apply(format!("no such table: {table}")));
-    }
-    Ok(rows.into_iter().map(|row| row.name).collect())
-}
-
-/// Replay one changeset into the attached device-private tables.
-///
-/// SQLite's own `sqlite3changeset_apply` takes a connection and no schema, so
-/// it can only ever write into `main`, which here is the synced replica. These
-/// tables live in an attached database on that same connection, so the change
-/// list is replayed as ordinary statements instead. Table names are written
-/// bare on purpose: a bare name resolves across attached databases, and a name
-/// shared between the two tiers is a generation-time error.
-///
-/// **The conflict rule is `ConflictAction::Abort`'s, kept exactly.** Every
-/// column the changeset carries an old value for goes into the predicate, so
-/// one affected row means the row was there and still held what the writer
-/// saw. Anything else is a conflict, which covers both a row that has gone and
-/// a row somebody else has changed underneath, and both abort the whole
-/// transaction exactly as they do today. An insert onto an occupied key raises
-/// a constraint error, which is the same refusal by another route.
-fn apply_local_changeset(
-    conn: &mut SqliteConnection,
-    changeset: &[u8],
-) -> Result<(), TabApplyError> {
-    let parsed = ParsedDiffSet::parse(changeset)
-        .map_err(|err| TabApplyError::Apply(format!("unparsable changeset: {err:?}")))?;
-    let ParsedDiffSet::Changeset(diff) = parsed else {
-        // A patchset carries no old values, so it cannot be replayed under the
-        // conflict rule above. Tabs capture with `changeset()`, so this is a
-        // client that is not connetto's.
-        return Err(TabApplyError::Apply(
-            "a local tier mutation must be a changeset, not a patchset".to_owned(),
-        ));
-    };
-    let mut columns: HashMap<String, Vec<String>> = HashMap::new();
-    for op in diff.iter() {
-        let table = op.table().name().to_owned();
-        if !columns.contains_key(&table) {
-            let names = tier_columns(conn, &table)?;
-            columns.insert(table.clone(), names);
-        }
-        let names = &columns[&table];
-        let (sql, binds) = render_local_op(&op, &table, names)?;
-        let mut query = sql_query(sql).into_boxed::<Sqlite>();
-        for value in &binds {
-            query = bind_value(query, value);
-        }
-        let affected = query
-            .execute(conn)
-            .map_err(|err| TabApplyError::Apply(err.to_string()))?;
-        if affected != 1 {
-            return Err(TabApplyError::Apply(format!(
-                "conflict on {table}: the row was not there or no longer held what the writer saw"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// One rendered statement and the values to bind, in order.
-type RenderedOp = (String, Vec<Value<String, Vec<u8>>>);
-
-/// One `column IS ?` term, or `column IS NULL` when the value is null. A null
-/// is written rather than bound, because a bind carries no type to compare.
-fn predicate_term(
-    terms: &mut Vec<String>,
-    binds: &mut Vec<Value<String, Vec<u8>>>,
-    column: &str,
-    value: &Value<String, Vec<u8>>,
-) {
-    if matches!(value, Value::Null) {
-        terms.push(format!("{} IS NULL", quote_ident(column)));
-    } else {
-        terms.push(format!("{} IS ?", quote_ident(column)));
-        binds.push(value.clone());
-    }
-}
-
-/// The column a changeset names at `index`, or a refusal when the changeset
-/// and the table disagree about the table's width.
-fn column_at<'a>(
-    columns: &'a [String],
-    index: usize,
-    table: &str,
-) -> Result<&'a str, TabApplyError> {
-    columns.get(index).map(String::as_str).ok_or_else(|| {
-        TabApplyError::Apply(format!(
-            "{table}: the changeset names column {index} and the table has {}",
-            columns.len()
-        ))
-    })
-}
-
-/// Render one changeset operation as SQL plus the values to bind, in order.
-fn render_local_op(
-    op: &ChangesetOp<'_, TableSchema<String>, String, Vec<u8>>,
-    table: &str,
-    columns: &[String],
-) -> Result<RenderedOp, TabApplyError> {
-    match op {
-        ChangesetOp::Insert { values, .. } => render_insert(values, table, columns),
-        ChangesetOp::Update { values, .. } => render_update(values, table, columns),
-        ChangesetOp::Delete { old_values, .. } => render_delete(old_values, table, columns),
-    }
-}
-
-fn render_insert(
-    values: &[Value<String, Vec<u8>>],
-    table: &str,
-    columns: &[String],
-) -> Result<RenderedOp, TabApplyError> {
-    if values.len() != columns.len() {
-        return Err(TabApplyError::Apply(format!(
-            "{table}: the changeset has {} columns and the table has {}",
-            values.len(),
-            columns.len()
-        )));
-    }
-    let mut binds: Vec<Value<String, Vec<u8>>> = Vec::new();
-    let names = columns
-        .iter()
-        .map(|column| quote_ident(column))
-        .collect::<Vec<_>>();
-    let slots = values
-        .iter()
-        .map(|value| {
-            if matches!(value, Value::Null) {
-                "NULL".to_owned()
-            } else {
-                binds.push(value.clone());
-                "?".to_owned()
-            }
-        })
-        .collect::<Vec<_>>();
-    Ok((
-        format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            quote_ident(table),
-            names.join(", "),
-            slots.join(", ")
-        ),
-        binds,
-    ))
-}
-
-fn render_update(
-    values: &[sqlite_diff_rs::ChangesetUpdatePair<String, Vec<u8>>],
-    table: &str,
-    columns: &[String],
-) -> Result<RenderedOp, TabApplyError> {
-    let mut binds: Vec<Value<String, Vec<u8>>> = Vec::new();
-    let mut assignments: Vec<String> = Vec::new();
-    let mut terms: Vec<String> = Vec::new();
-    let mut predicate_binds: Vec<Value<String, Vec<u8>>> = Vec::new();
-    for (index, pair) in values.iter().enumerate() {
-        let column = column_at(columns, index, table)?;
-        if let Some(new) = pair.1.as_ref() {
-            if matches!(new, Value::Null) {
-                assignments.push(format!("{} = NULL", quote_ident(column)));
-            } else {
-                assignments.push(format!("{} = ?", quote_ident(column)));
-                binds.push(new.clone());
-            }
-        }
-        if let Some(old) = pair.0.as_ref() {
-            predicate_term(&mut terms, &mut predicate_binds, column, old);
-        }
-    }
-    if assignments.is_empty() || terms.is_empty() {
-        return Err(TabApplyError::Apply(format!(
-            "{table}: an update with nothing to set or nothing to match"
-        )));
-    }
-    binds.extend(predicate_binds);
-    Ok((
-        format!(
-            "UPDATE {} SET {} WHERE {}",
-            quote_ident(table),
-            assignments.join(", "),
-            terms.join(" AND ")
-        ),
-        binds,
-    ))
-}
-
-fn render_delete(
-    old_values: &[Value<String, Vec<u8>>],
-    table: &str,
-    columns: &[String],
-) -> Result<RenderedOp, TabApplyError> {
-    let mut binds: Vec<Value<String, Vec<u8>>> = Vec::new();
-    let mut terms: Vec<String> = Vec::new();
-    for (index, value) in old_values.iter().enumerate() {
-        let column = column_at(columns, index, table)?;
-        predicate_term(&mut terms, &mut binds, column, value);
-    }
-    if terms.is_empty() {
-        return Err(TabApplyError::Apply(format!(
-            "{table}: a delete with nothing to match"
-        )));
-    }
-    Ok((
-        format!(
-            "DELETE FROM {} WHERE {}",
-            quote_ident(table),
-            terms.join(" AND ")
-        ),
-        binds,
-    ))
-}
-
 /// Apply one pure local tier mutation and fan out what it changed.
 ///
 /// The changeset commits into the attached device-private tables together
@@ -3439,7 +3199,7 @@ where
                 |err: diesel_sqlite_session::SessionError| TabApplyError::Session(err.to_string());
             let mut record = conn.create_session_on(LOCAL_SCHEMA).map_err(session_err)?;
             record.attach_all().map_err(session_err)?;
-            apply_local_changeset(conn, changeset)?;
+            replay_aborting(conn, changeset, &|_| LOCAL_SCHEMA)?;
             // Taken before the watermark write, which lives in the same schema.
             record.changeset().map_err(session_err)?
         };
@@ -3566,18 +3326,17 @@ where
         )));
         return Ok(());
     }
-    // The tab sent this under logical names, exactly as it would to the
-    // server, because its own send path renames split tables back. Applying
-    // raw would hit a split table's view, which the changeset apply refuses
-    // row by row. Rename to the physical backing tables first, mirroring the
-    // client's own apply direction.
+    // The tab sent logical names, and a split table's view refuses the replay.
     let map = worker.policy_tables().clone();
     let changeset = rename_to_physical(changeset, &map)?;
+    let shared = worker.shared_tables().clone();
     let Ok(seq) = i64::try_from(tab_seq) else {
         return Err(TabFault::Close("sequence overflows storage".to_owned()));
     };
     if let Some(staged) = staged {
-        match commit_staged_mutation(worker, content, staged, &changeset, client_id, seq).await {
+        match commit_staged_mutation(worker, content, staged, &changeset, &shared, client_id, seq)
+            .await
+        {
             Ok(()) => {
                 // The commit left an outbox entry the driver has not been
                 // told about, and no upstream event may arrive to tell it.
@@ -3590,8 +3349,8 @@ where
         }
     } else {
         let applied = worker.conn().transaction::<_, TabApplyError, _>(|conn| {
-            conn.apply_changeset(&changeset, |_conflict| ConflictAction::Abort)
-                .map_err(|err| TabApplyError::Apply(err.to_string()))?;
+            // One replay keeps the tab's first-write order across both schemas.
+            replay_aborting(conn, &changeset, &|table| replica_schema(&shared, table))?;
             record_tab_watermark(conn, client_id, seq)?;
             Ok(())
         });
@@ -3629,6 +3388,7 @@ async fn commit_staged_mutation<U>(
     content: Option<&ContentArchive<BrowserStore>>,
     staged: StagedContent,
     changeset: &[u8],
+    shared: &HashSet<String>,
     client_id: rosetta_uuid::Uuid,
     seq: i64,
 ) -> Result<(), String>
@@ -3657,10 +3417,9 @@ where
                     "staged bytes hash to {worker_id}, the mutation names {declared}"
                 )));
             }
-            conn.apply_changeset(changeset, |_conflict| ConflictAction::Abort)
-                .map_err(|err| {
-                    StageCommitError::Row(format!("worker replica apply failed: {err}"))
-                })?;
+            replay_aborting(conn, changeset, &|table| replica_schema(shared, table)).map_err(
+                |err| StageCommitError::Row(format!("worker replica apply failed: {err}")),
+            )?;
             record_tab_watermark(conn, client_id, seq)?;
             Ok(())
         })
@@ -5383,9 +5142,9 @@ fn session_err<E: core::fmt::Display>(err: E) -> RelayError {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserHttp, ContentFrame, GateController, GateSink, HubContent, HubEvent, TabApplyError,
-        apply_local_changeset, changeset_blob_values, recovery_interrupts_attach,
-        recovery_serves_idle, schedule_recovery_event,
+        BrowserHttp, ContentFrame, GateController, GateSink, HubContent, HubEvent,
+        changeset_blob_values, recovery_interrupts_attach, recovery_serves_idle,
+        schedule_recovery_event,
     };
     use connetto_file_core::FileId;
     use diesel::connection::SimpleConnection;
@@ -5739,16 +5498,6 @@ mod tests {
         conn
     }
 
-    /// Capture the changeset a tab would ship for `statement`, against a row
-    /// that starts at `from`.
-    fn captured(from: &str, statement: &str) -> Vec<u8> {
-        let mut conn = seeded(from);
-        let mut session = conn.create_session().expect("session");
-        session.attach_all().expect("attach");
-        conn.batch_execute(statement).expect("write");
-        session.changeset().expect("changeset")
-    }
-
     fn body(conn: &mut SqliteConnection) -> Option<String> {
         #[derive(diesel::QueryableByName)]
         struct Row {
@@ -5761,99 +5510,6 @@ mod tests {
             .into_iter()
             .next()
             .and_then(|row| row.body)
-    }
-
-    /// The rule `ConflictAction::Abort` gave and the replay has to keep: a
-    /// write lands only onto the row the writer actually saw.
-    #[wasm_bindgen_test]
-    fn an_update_lands_when_the_row_still_holds_what_the_writer_saw() {
-        let changeset = captured("first", "UPDATE drafts SET body = 'second' WHERE id = 1");
-        let mut target = seeded("first");
-        apply_local_changeset(&mut target, &changeset).expect("the update applies");
-        assert_eq!(body(&mut target).as_deref(), Some("second"));
-    }
-
-    /// The case that separates a changeset replay from a blind key match: the
-    /// row is there, its key matches, and somebody else has changed it.
-    #[wasm_bindgen_test]
-    fn an_update_onto_a_row_somebody_else_changed_is_refused() {
-        let changeset = captured("first", "UPDATE drafts SET body = 'second' WHERE id = 1");
-        let mut target = seeded("somebody-elses-edit");
-        let outcome = apply_local_changeset(&mut target, &changeset);
-        assert!(
-            matches!(outcome, Err(TabApplyError::Apply(_))),
-            "a stale update must be refused, got {outcome:?}"
-        );
-        assert_eq!(
-            body(&mut target).as_deref(),
-            Some("somebody-elses-edit"),
-            "and must leave the row alone"
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn a_delete_of_a_row_that_has_gone_is_refused() {
-        let changeset = captured("first", "DELETE FROM drafts WHERE id = 1");
-        let mut target = SqliteConnection::establish(":memory:").expect("open");
-        target.batch_execute(DDL).expect("schema");
-        let outcome = apply_local_changeset(&mut target, &changeset);
-        assert!(
-            matches!(outcome, Err(TabApplyError::Apply(_))),
-            "a delete of a vanished row must be refused, got {outcome:?}"
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn an_insert_onto_an_occupied_key_is_refused() {
-        let mut source = SqliteConnection::establish(":memory:").expect("open");
-        source.batch_execute(DDL).expect("schema");
-        let mut session = source.create_session().expect("session");
-        session.attach_all().expect("attach");
-        source
-            .batch_execute("INSERT INTO drafts VALUES (1, 'mine')")
-            .expect("write");
-        let changeset = session.changeset().expect("changeset");
-
-        let mut target = seeded("already-here");
-        let outcome = apply_local_changeset(&mut target, &changeset);
-        assert!(
-            matches!(outcome, Err(TabApplyError::Apply(_))),
-            "an insert onto an occupied key must be refused, got {outcome:?}"
-        );
-    }
-
-    /// A null is written into the predicate rather than bound, so a row whose
-    /// old value was null still has to match exactly.
-    #[wasm_bindgen_test]
-    fn a_null_old_value_matches_only_a_null() {
-        let changeset = captured_null();
-        let mut holds_null = SqliteConnection::establish(":memory:").expect("open");
-        holds_null.batch_execute(DDL).expect("schema");
-        holds_null
-            .batch_execute("INSERT INTO drafts VALUES (1, NULL)")
-            .expect("seed");
-        apply_local_changeset(&mut holds_null, &changeset).expect("the update applies");
-        assert_eq!(body(&mut holds_null).as_deref(), Some("filled"));
-
-        let mut holds_text = seeded("not-null");
-        let outcome = apply_local_changeset(&mut holds_text, &changeset);
-        assert!(
-            matches!(outcome, Err(TabApplyError::Apply(_))),
-            "a null old value must not match a row holding text, got {outcome:?}"
-        );
-    }
-
-    /// The changeset for filling a null column.
-    fn captured_null() -> Vec<u8> {
-        let mut conn = SqliteConnection::establish(":memory:").expect("open");
-        conn.batch_execute(DDL).expect("schema");
-        conn.batch_execute("INSERT INTO drafts VALUES (1, NULL)")
-            .expect("seed");
-        let mut session = conn.create_session().expect("session");
-        session.attach_all().expect("attach");
-        conn.batch_execute("UPDATE drafts SET body = 'filled' WHERE id = 1")
-            .expect("write");
-        session.changeset().expect("changeset")
     }
 
     /// R18: the generic snapshot's scratch database still attaches, even though

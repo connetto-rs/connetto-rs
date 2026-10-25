@@ -64,6 +64,14 @@ fn signing_key() -> CoreRsaPrivateSigningKey {
     CoreRsaPrivateSigningKey::from_pem(TEST_RSA_PEM, None).expect("load test key")
 }
 
+/// A sign-in through the provider configured as `test`.
+fn origin() -> connetto_server::SessionOrigin<()> {
+    connetto_server::SessionOrigin {
+        provider: "test".to_owned(),
+        description: (),
+    }
+}
+
 fn http() -> openidconnect::reqwest::Client {
     openidconnect::reqwest::ClientBuilder::new()
         .build()
@@ -229,7 +237,10 @@ async fn accessor_refreshes_an_expired_provider_token() {
     let (authority, service, mut login, _idp) = service_with_real_provider().await;
     login.retained.access_token = "stale".to_owned();
     login.retained.expires_in = Some(Duration::ZERO);
-    let pair = service.login_with_provider(&login).await.expect("login");
+    let pair = service
+        .login_with_provider(&login, origin())
+        .await
+        .expect("login");
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
@@ -268,7 +279,10 @@ async fn accessor_returns_a_still_valid_token_unrefreshed() {
     let (authority, service, mut login, _idp) = service_with_real_provider().await;
     login.retained.access_token = "still-good".to_owned();
     login.retained.expires_in = Some(Duration::from_secs(3600));
-    let pair = service.login_with_provider(&login).await.expect("login");
+    let pair = service
+        .login_with_provider(&login, origin())
+        .await
+        .expect("login");
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")

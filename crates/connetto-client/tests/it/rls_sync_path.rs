@@ -231,14 +231,10 @@ diesel::table! {
 }
 
 fn orders_wire_table() -> SimpleTable {
-    SimpleTable::with_rowid_alias(
+    SimpleTable::new(
         "orders",
-        &[
-            ("id", "INTEGER"),
-            ("owner_id", "TEXT"),
-            ("quantity", "INTEGER"),
-        ],
-        0,
+        &[("id", ""), ("owner_id", ""), ("quantity", "")],
+        &[0],
     )
 }
 

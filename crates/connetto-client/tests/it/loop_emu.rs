@@ -68,15 +68,10 @@ struct SnapshotData {
 /// The one-row `orders` seed snapshot both snapshot sources serve, so a
 /// recording source and the plain seed stay byte-identical.
 fn seed_snapshot() -> SnapshotData {
-    let table = SimpleTable::with_rowid_alias(
+    let table = SimpleTable::new(
         "orders",
-        &[
-            ("id", "INTEGER"),
-            ("price", "REAL"),
-            ("quantity", "INTEGER"),
-            ("status", "TEXT"),
-        ],
-        0,
+        &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
+        &[0],
     );
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(1))
@@ -383,7 +378,7 @@ impl SnapshotSource for GadgetSeed {
         for row in &self.rows {
             let table = SimpleTable::new(
                 "gadgets",
-                &[("id", "BLOB"), ("active", "INTEGER"), ("label", "TEXT")],
+                &[("id", ""), ("active", ""), ("label", "")],
                 &[0],
             );
             let insert = Insert::<_, String, Vec<u8>>::from(table)
@@ -447,15 +442,10 @@ impl SnapshotSource for GatedSnapshot {
         self.release.notified().await;
         let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
         for row in &self.rows {
-            let table = SimpleTable::with_rowid_alias(
+            let table = SimpleTable::new(
                 "orders",
-                &[
-                    ("id", "INTEGER"),
-                    ("price", "REAL"),
-                    ("quantity", "INTEGER"),
-                    ("status", "TEXT"),
-                ],
-                0,
+                &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
+                &[0],
             );
             let insert = Insert::<_, String, Vec<u8>>::from(table)
                 .set(0, Value::Integer(row.id))
@@ -4132,15 +4122,10 @@ impl SnapshotSource for StatusSnapshot {
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
-        let table = SimpleTable::with_rowid_alias(
+        let table = SimpleTable::new(
             "orders",
-            &[
-                ("id", "INTEGER"),
-                ("price", "REAL"),
-                ("quantity", "INTEGER"),
-                ("status", "TEXT"),
-            ],
-            0,
+            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
+            &[0],
         );
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))

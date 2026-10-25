@@ -94,15 +94,10 @@ fn mutation_insert(
     quantity: i64,
     status: &str,
 ) -> MutationPatch {
-    let table = SimpleTable::with_rowid_alias(
+    let table = SimpleTable::new(
         "orders",
-        &[
-            ("id", "INTEGER"),
-            ("price", "REAL"),
-            ("quantity", "INTEGER"),
-            ("status", "TEXT"),
-        ],
-        0,
+        &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
+        &[0],
     );
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(id))
