@@ -192,7 +192,9 @@ pub async fn provision_auth_tables(fixture: &Fixture) {
             "CREATE TABLE connetto_sessions (\
              session_id UUID PRIMARY KEY, user_id TEXT NOT NULL, \
              current_refresh_hash BYTEA NOT NULL, idle_deadline TIMESTAMPTZ NOT NULL, \
-             absolute_deadline TIMESTAMPTZ NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE)",
+             absolute_deadline TIMESTAMPTZ NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE, \
+             created_at TIMESTAMPTZ NOT NULL, refreshed_at TIMESTAMPTZ, \
+             provider TEXT NOT NULL, issuer TEXT NOT NULL)",
         )
         .await;
     fixture
