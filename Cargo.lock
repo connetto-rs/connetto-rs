@@ -1567,6 +1567,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "base64 0.22.1",
+ "blake3",
  "chrono",
  "ciborium",
  "connetto-client",
@@ -1614,6 +1615,7 @@ dependencies = [
  "uuid",
  "x509-parser",
  "zeroize",
+ "zip",
  "zstd",
 ]
 

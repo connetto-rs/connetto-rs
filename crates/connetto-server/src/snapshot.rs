@@ -209,6 +209,7 @@ pub trait RowSource<Id = String, Key = String> {
 }
 
 pub use pg::PgSnapshotSource;
+pub(crate) use pg::{BinaryRows, attach_binds};
 
 mod pg {
     use core::fmt::Display;
@@ -412,7 +413,7 @@ mod pg {
     /// page of a million narrow rows paid a million allocations to say the same
     /// five words.
     #[derive(Default)]
-    struct BinaryRows {
+    pub(crate) struct BinaryRows {
         names: Vec<String>,
         rows: Vec<Vec<Option<Vec<u8>>>>,
     }
@@ -423,7 +424,7 @@ mod pg {
         /// Uses diesel-async's own row stream rather than a deserialized row
         /// type, because the column names are on the row and a deserialized
         /// type has nowhere to put them once.
-        async fn load(
+        pub(crate) async fn load(
             conn: &mut AsyncPgConnection,
             query: Boxed<'_>,
         ) -> Result<Self, diesel::result::Error> {
@@ -458,15 +459,32 @@ mod pg {
         }
 
         /// The column names as the encoder wants them.
-        fn column_names(&self) -> Vec<&str> {
+        pub(crate) fn column_names(&self) -> Vec<&str> {
             self.names.iter().map(String::as_str).collect()
         }
 
         /// The rows as the encoder wants them.
-        fn cells(&self) -> Vec<Vec<Option<&[u8]>>> {
+        pub(crate) fn cells(&self) -> Vec<Vec<Option<&[u8]>>> {
             self.rows
                 .iter()
                 .map(|row| row.iter().map(|cell| cell.as_deref()).collect())
+                .collect()
+        }
+
+        /// How many rows the read held.
+        pub(crate) fn row_count(&self) -> usize {
+            self.rows.len()
+        }
+
+        /// The raw wire bytes per row, the download's width budget counts these.
+        pub(crate) fn row_widths(&self) -> Vec<usize> {
+            self.rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| cell.as_deref().map_or(0, <[u8]>::len))
+                        .sum()
+                })
                 .collect()
         }
     }
@@ -561,7 +579,7 @@ mod pg {
 
     /// Attach the wire binds to `query` in placeholder order, each with its
     /// natural Postgres type.
-    fn attach_binds(query: Boxed<'_>, binds: Vec<BindValue>) -> Boxed<'_> {
+    pub(crate) fn attach_binds(query: Boxed<'_>, binds: Vec<BindValue>) -> Boxed<'_> {
         binds.into_iter().fold(query, |query, bind| match bind {
             BindValue::Null => query.bind::<Nullable<Text>, _>(None::<String>),
             BindValue::Integer(value) => query.bind::<BigInt, _>(value),

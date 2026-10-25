@@ -440,20 +440,23 @@ pub async fn record_awaited<D>(
 where
     D: crate::schema::ConnettoSchema,
 {
-    let mut conn = pool
-        .get()
-        .await
-        .map_err(|error| AuditWriteError(error.to_string()))?;
+    let mut conn = pool.get().await.map_err(AuditWriteError::Connection)?;
     ExecuteDsl::execute(D::Audit::audit_insert(event), &mut conn)
         .await
         .map(drop)
-        .map_err(|error| AuditWriteError(error.to_string()))
+        .map_err(AuditWriteError::Insert)
 }
 
 /// An awaited audit row could not be written.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("the audit row could not be written: {0}")]
-pub struct AuditWriteError(pub String);
+#[derive(Debug, thiserror::Error)]
+pub enum AuditWriteError {
+    /// No connection could be had from the audit pool.
+    #[error("no connection for the audit row")]
+    Connection(#[source] diesel_async::pooled_connection::bb8::RunError),
+    /// The insert failed.
+    #[error("the audit row could not be inserted")]
+    Insert(#[source] diesel::result::Error),
+}
 
 /// Generate the default `auth_events` table and its [`ConnettoAuditSchema`]
 /// impl, parameterized by the deployment's `Id` type and the type it stores a

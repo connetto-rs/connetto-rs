@@ -39,7 +39,10 @@ use crate::manager_builder::ManagerBuilder;
 use crate::materializer::Materializer;
 use crate::openfga::{Counted, FgaAuth, ModelState, ModelSubject, SetupError, Translated};
 use crate::oplog::{OplogConfig, PgOplog};
-use crate::portability::{DataRequestError, DataRequester};
+use crate::portability::{
+    DataRequestError, DataRequester, DownloadReceipt, PortabilityError, PortabilityList,
+    PortabilityState, ReaderCheckError, ValidatedList, reader_in_recovery,
+};
 use crate::reach::GrantReach;
 use crate::reserve::{ReaderGate, ReaderReserve};
 use crate::schema::ConnettoSchema;
@@ -47,7 +50,7 @@ use crate::session::{
     ReconnectEvent, ReconnectPolicy, ResumePoint, SessionConfig, SessionError, SessionManager,
     StreamCheck, StreamCheckError,
 };
-use crate::throttle::ThrottleConfig;
+use crate::throttle::{ThrottleConfig, Tier};
 use crate::writer_schema::ConnettoWriterSchema;
 use connetto_core::auth::{CapabilityKey, DEFAULT_USER_SETTING};
 use connetto_core::device_cert::KeyId;
@@ -65,6 +68,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaPolicy;
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
+use tokio::io::AsyncWrite;
 
 use crate::{
     AbuseConfig, Artifact, AuthConfig, AuthService, CallerMappings, CookieSameSite, DbAuthStore,
@@ -505,6 +509,27 @@ pub enum BuildError {
     /// The replica schema documents did not translate.
     #[error(transparent)]
     Schema(#[from] connetto_schema::SchemaError),
+    /// A registered download query was refused.
+    #[error("download query {name:?} refused")]
+    Portability {
+        /// The query's description.
+        name: String,
+        /// Why it was refused.
+        #[source]
+        source: PortabilityError,
+    },
+    /// The client replica schema the download writes its archive in does
+    /// not apply.
+    #[error("the download's archive schema does not apply")]
+    PortabilityReplica(#[source] PortabilityError),
+    /// An owner download query is registered while the reader is a hot
+    /// standby, whose snapshot the owner role on the primary cannot import
+    /// (R61 decision 12).
+    #[error("an owner download query needs the reader on the primary, and it is a standby")]
+    OwnerReadStandby,
+    /// The reader's recovery state could not be read.
+    #[error("the reader's recovery state could not be read")]
+    ReaderRecovery(#[source] ReaderCheckError),
     /// The reader role's second opinion failed to build.
     #[error("building the reader second opinion: {0}")]
     SecondOpinion(String),
@@ -670,6 +695,8 @@ where
     sweep: Option<BackgroundTask>,
     status: Option<BackgroundTask>,
     writer_sweep: BackgroundTask,
+    /// The registered download, absent when none is registered.
+    portability: Option<Arc<PortabilityState>>,
 }
 
 impl<D> Clone for ServerHandle<D>
@@ -685,6 +712,7 @@ where
             sweep: self.sweep.clone(),
             status: self.status.clone(),
             writer_sweep: self.writer_sweep.clone(),
+            portability: self.portability.clone(),
         }
     }
 }
@@ -1003,6 +1031,66 @@ where
         record_awaited::<D>(&self.pool, requester.event(person, AuthOp::DataErased)).await?;
         Ok(())
     }
+
+    /// Write `person`'s data archive to `sink` and record the download (R61).
+    ///
+    /// The archive is a zip holding `data.sqlite`, the rows the registered
+    /// queries reach for `person` under one snapshot, and `manifest.json`
+    /// naming the queries and that moment. A session requester must be live,
+    /// bans are not consulted, and the call returns once the audit row is
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// [`DataRequestError::SessionNotLive`] for a session the store does not
+    /// hold live, [`DataRequestError::NoQueries`] when no query is
+    /// registered, [`DataRequestError::RowTooWide`] for a row over the
+    /// identified tier's ceiling, [`DataRequestError::Audit`] when the row
+    /// cannot be written, and the read, archive or sink failure otherwise.
+    pub async fn download_data<W>(
+        &self,
+        person: D::Id,
+        requester: &DataRequester,
+        mut sink: W,
+    ) -> Result<DownloadReceipt, DataRequestError>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
+        let session = match requester {
+            DataRequester::Session(session) => {
+                let live = self
+                    .service
+                    .session_is_live(*session)
+                    .await
+                    .map_err(DataRequestError::Liveness)?;
+                if !live {
+                    return Err(DataRequestError::SessionNotLive);
+                }
+                Some(*session)
+            }
+            DataRequester::Operator(_) => None,
+        };
+        let state = self
+            .portability
+            .as_ref()
+            .filter(|state| !state.is_empty())
+            .ok_or(DataRequestError::NoQueries)?;
+        let archive_bytes = state
+            .download(&person.to_string(), session, &mut sink)
+            .await?;
+        let query_list_hash = state.query_list_hash().to_owned();
+        let event = requester
+            .event(person, AuthOp::DataDownloaded)
+            .about_download(
+                query_list_hash.clone(),
+                i64::try_from(archive_bytes).unwrap_or(i64::MAX),
+            );
+        record_awaited::<D>(&self.pool, event).await?;
+        Ok(DownloadReceipt {
+            archive_bytes,
+            query_list_hash,
+        })
+    }
 }
 
 async fn close_every_session<D: ConnettoSchema>(manager: &Arc<ServerManager<D>>) {
@@ -1054,6 +1142,7 @@ pub struct ServerBuilder<D: ConnettoSchema = ConnettoDefaults> {
     second_opinion: bool,
     content: Option<ContentSettings>,
     device_identity: Option<DeviceCertConfig>,
+    portability: Option<PortabilityList>,
     resolver: Resolver<D::Id>,
     describer: Option<Describer<Desc<D>>>,
     sign_in: Option<OnSignIn<D::Id, Desc<D>>>,
@@ -1131,6 +1220,7 @@ impl ServerBuilder {
             second_opinion: false,
             content: None,
             device_identity: None,
+            portability: None,
             resolver: Resolver(Arc::new(DefaultUuidResolver)),
             describer: None,
             sign_in: None,
@@ -1177,6 +1267,7 @@ where
             second_opinion,
             content,
             device_identity,
+            portability,
             resolver: _,
             describer: _,
             sign_in: _,
@@ -1208,6 +1299,7 @@ where
             second_opinion,
             content,
             device_identity,
+            portability,
             resolver: Resolver(resolver),
             describer: None,
             sign_in: None,
@@ -1288,6 +1380,14 @@ where
         self
     }
 
+    /// Answer a person's data download with `list`'s queries (R61). Each is
+    /// validated at [`build`](Self::build), which refuses the first that
+    /// does not read one table's whole rows or key-carrying columns.
+    #[must_use]
+    pub fn portability(mut self, list: PortabilityList) -> Self {
+        self.portability = Some(list);
+        self
+    }
     /// Ban an identity that crosses an abuse threshold, reading and writing
     /// `connetto_bans` on the owner pool, when set.
     #[must_use]
@@ -1450,6 +1550,7 @@ where
             second_opinion,
             content,
             device_identity,
+            portability,
             resolver,
             describer,
             sign_in,
@@ -1501,6 +1602,20 @@ where
             );
         }
 
+        // A refused download query stops the build before anything connects.
+        let portability = portability
+            .map(|list| {
+                let replica =
+                    connetto_schema::translate::<String, RegistryIds<D>>(&schema.pg_ddl, "")?;
+                crate::portability::validate(
+                    list,
+                    &schema.engine_ddl::<RegistryIds<D>>(),
+                    &replica,
+                    &caller_mapping(),
+                )
+            })
+            .transpose()?;
+
         let pool = build_pool(&database.owner_url, owner_pool_size).await?;
         require_schema_tables::<D>(&pool, bans, device_identity.is_some()).await?;
         require_cap_policies::<D>(&pool, &schema.pg_ddl).await?;
@@ -1515,6 +1630,15 @@ where
         .await?;
         let reader_pool_size = reader_reserve.total();
         let reader_pool = build_pool(&database.reader_url, reader_pool_size).await?;
+        if portability
+            .as_ref()
+            .is_some_and(ValidatedList::reads_as_owner)
+            && reader_in_recovery(&reader_pool)
+                .await
+                .map_err(BuildError::ReaderRecovery)?
+        {
+            return Err(BuildError::OwnerReadStandby);
+        }
         // The computed reads the session and the engine run under a viewer's
         // binding, so both take the reader role, where the viewer's policies
         // scope the rows. Their own pool, sized at the owner pool's, keeps a
@@ -1525,6 +1649,13 @@ where
         let engine_connector = PgReadConnector::with_session_setup(reexec_pool.clone());
         let guard = build_guard::<D>(&pool, reader_reserve.gate(), &throttle, abuse, bans);
         let sign_in = sign_in.map(|OnSignIn(hook)| hook);
+        let portability = portability.map(|list| {
+            Arc::new(list.serve(
+                reader_pool.clone(),
+                pool.clone(),
+                guard.read_limits(Tier::Identified),
+            ))
+        });
         let (service, registry) = build_auth::<D>(
             &pool,
             resolver.0,
@@ -1604,6 +1735,7 @@ where
             Arc::clone(&manager),
             Arc::clone(&service),
             pool,
+            portability,
             registry,
             Routes {
                 redirect_allowlist,
@@ -2430,6 +2562,7 @@ fn assemble_parts<D: ConnettoSchema>(
     manager: Arc<ServerManager<D>>,
     service: Arc<Service<D>>,
     pool: PgPool,
+    portability: Option<Arc<PortabilityState>>,
     registry: Arc<ProviderRegistry>,
     settings: Routes,
     wiring: StreamWiring,
@@ -2446,6 +2579,7 @@ fn assemble_parts<D: ConnettoSchema>(
     let router = sync_routes.clone().merge(http_routes.clone());
     // The writer sweep is always on (R75 decision 5).
     let writer_sweep = spawn_writer_sweep(Arc::clone(&manager));
+
     ServerParts {
         router,
         sync_routes,
@@ -2465,6 +2599,7 @@ fn assemble_parts<D: ConnettoSchema>(
             sweep: wiring.sweep,
             status: wiring.status,
             writer_sweep,
+            portability,
         },
     }
 }

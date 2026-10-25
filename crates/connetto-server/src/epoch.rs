@@ -64,16 +64,7 @@ pub enum EpochError {
 ///
 /// [`EpochError`] when the pool or the read fails, or the row is malformed.
 pub async fn compare(pool: &Pool<AsyncPgConnection>, system: u64) -> Result<Epoch, EpochError> {
-    let mut conn = pool
-        .get()
-        .await
-        .map_err(|err| EpochError::Pool(err.to_string()))?;
-    let recorded: Option<String> = connetto_epoch::table
-        .select(connetto_epoch::system_identifier)
-        .first(&mut conn)
-        .await
-        .optional()?;
-    match recorded {
+    match recorded(pool).await? {
         None => Ok(Epoch::First),
         Some(recorded) if recorded == system.to_string() => Ok(Epoch::Same),
         Some(recorded) => recorded
@@ -81,6 +72,24 @@ pub async fn compare(pool: &Pool<AsyncPgConnection>, system: u64) -> Result<Epoc
             .map(|recorded| Epoch::Changed { recorded })
             .map_err(|_| EpochError::Malformed(recorded)),
     }
+}
+
+/// The recorded cluster's system identifier in decimal, `None` before the
+/// first boot recorded one.
+///
+/// # Errors
+///
+/// [`EpochError`] when the pool or the read fails.
+pub async fn recorded(pool: &Pool<AsyncPgConnection>) -> Result<Option<String>, EpochError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|err| EpochError::Pool(err.to_string()))?;
+    Ok(connetto_epoch::table
+        .select(connetto_epoch::system_identifier)
+        .first(&mut conn)
+        .await
+        .optional()?)
 }
 
 /// Record `system` as the cluster the deployment serves from.
