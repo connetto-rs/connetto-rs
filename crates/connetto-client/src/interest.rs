@@ -110,9 +110,6 @@ pub(crate) fn record_spare(
     config: &ClientConfig,
     spare: &HashMap<String, Vec<String>>,
 ) -> Result<(), ClientError> {
-    if config.shared_tables.is_empty() {
-        return Ok(());
-    }
     let rows: Vec<_> = spare
         .iter()
         .filter(|(table, _)| is_shared(&config.shared_tables, table))
