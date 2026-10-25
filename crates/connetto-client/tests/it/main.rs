@@ -101,6 +101,7 @@ mod share_key_relay;
 #[cfg(feature = "native-transport")]
 mod share_key_storage;
 mod share_keys;
+mod shared_coverage;
 mod shared_reads;
 mod shared_store;
 mod shared_writes;

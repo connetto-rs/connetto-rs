@@ -79,6 +79,7 @@ mod grant_expiry;
 pub mod harden;
 #[cfg(feature = "peer")]
 mod hotspot;
+mod interest;
 #[cfg(feature = "native-auth")]
 mod keyring;
 pub mod live;
@@ -3688,6 +3689,7 @@ fn install_storage_layout<S: ReplicaStorage>(
     }
     db.transaction::<_, ClientError, _>(|db| {
         db.batch_execute(layout.sql(sqlite_ddl.is_some(), fresh_shared))?;
+        db.batch_execute(interest::INTEREST_DDL)?;
         Ok(())
     })?;
     check_recorded_tables(db, SHARED_SCHEMA, &config.unrecorded_tables)
@@ -3990,6 +3992,10 @@ where
         conn.attach_tier(replica.tier())?;
         conn.refresh_share_key_expiry();
         conn.recompute_share_key_deadline();
+        // A shared file created fresh under an existing replica holds none of
+        // this identity's interest or unsent writes yet.
+        conn.change_subscriptions(|_| Ok(()))?;
+        conn.record_spare()?;
         Ok(conn)
     }
 
@@ -4848,20 +4854,22 @@ where
             position,
             provenance,
         };
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        self.db.transaction::<(), ClientError, _>(|db| {
-            persist_writer_state(db, writer, seq + 1, &hash)?;
-            persist_pending(
-                db,
-                writer,
-                seq,
-                &entry.changeset,
-                entry.hash,
-                entry.provenance,
-                position,
-            )?;
-            Ok(())
-        })?;
+        {
+            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            self.db.transaction::<(), ClientError, _>(|db| {
+                persist_writer_state(db, writer, seq + 1, &hash)?;
+                persist_pending(
+                    db,
+                    writer,
+                    seq,
+                    &entry.changeset,
+                    entry.hash,
+                    entry.provenance,
+                    position,
+                )?;
+                Ok(())
+            })?;
+        }
         let queue = self
             .writers
             .entry(*writer)
@@ -4870,6 +4878,7 @@ where
         queue.head = hash;
         queue.pending.insert(seq, entry);
         self.next_position = position + 1;
+        self.record_spare()?;
         Ok(seq)
     }
 
@@ -6355,10 +6364,7 @@ where
         // sent. A subscription declared with no server reachable is a
         // declaration, not a failure, and it takes effect on the first
         // connection.
-        {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-            subscriptions::remember(&mut self.db, sub_id, &spec, grace)?;
-        }
+        self.change_subscriptions(|db| subscriptions::remember(db, sub_id, &spec, grace))?;
         if self.is_connected() {
             self.send_subscribe(sub_id, spec).await?;
         }
@@ -6404,8 +6410,7 @@ where
         sub_id: &str,
         spec: &SubscriptionSpec,
     ) -> Result<(), ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        subscriptions::pin(&mut self.db, name, sub_id, spec)
+        self.change_subscriptions(|db| subscriptions::pin(db, name, sub_id, spec))
     }
 
     /// End the pin under `name`, leaving its subscription on the ordinary
@@ -6415,8 +6420,7 @@ where
     ///
     /// [`ClientError::Session`] when the replica rejects the write.
     pub fn unpin_subscription(&mut self, name: &str) -> Result<(), ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        subscriptions::unpin(&mut self.db, name)
+        self.change_subscriptions(|db| subscriptions::unpin(db, name))
     }
 
     /// Every pin, as name and query, in name order.
@@ -6437,8 +6441,7 @@ where
     ///
     /// [`ClientError::Session`] when the replica rejects the write.
     pub fn release_subscription(&mut self, sub_id: &str) -> Result<(), ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        subscriptions::release(&mut self.db, sub_id)
+        self.change_subscriptions(|db| subscriptions::release(db, sub_id))
     }
 
     /// Stop the grace countdown on `sub_id`, because a handle holds it again.
@@ -6447,8 +6450,7 @@ where
     ///
     /// [`ClientError::Session`] when the replica rejects the write.
     pub fn hold_subscription(&mut self, sub_id: &str) -> Result<(), ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        subscriptions::hold(&mut self.db, sub_id)
+        self.change_subscriptions(|db| subscriptions::hold(db, sub_id))
     }
 
     /// Every subscription whose grace has run out. Reading this ends nothing:
@@ -6463,10 +6465,33 @@ where
     }
 
     /// Re-anchor every stop moment a stepped-back wall clock left ahead of the
-    /// replica clock, with capture suspended so the write never rides an upload.
+    /// replica clock. The pump asks on every step, so the interest is
+    /// rewritten only when a record moved.
     fn reanchor_subscriptions(&mut self) -> Result<(), ClientError> {
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        subscriptions::reanchor_ahead(&mut self.db)
+        let config = &self.config;
+        self.db.transaction(|db| {
+            if subscriptions::reanchor_ahead(db)? {
+                interest::record(db, config)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Change the subscription record with capture suspended, and rewrite
+    /// this identity's interest in the shared store in the same transaction
+    /// so the other identities' passes see the change.
+    fn change_subscriptions<R>(
+        &mut self,
+        change: impl FnOnce(&mut SqliteConnection) -> Result<R, ClientError>,
+    ) -> Result<R, ClientError> {
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let config = &self.config;
+        self.db.transaction(|db| {
+            let changed = change(db)?;
+            interest::record(db, config)?;
+            Ok(changed)
+        })
     }
 
     /// The current wall time in seconds since the epoch, from the replica's
@@ -6586,8 +6611,7 @@ where
                 // D3). The server never saw it on this connection, so there is
                 // nothing to unsubscribe.
                 self.evict_subscription_rows(&record.sub_id)?;
-                let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-                subscriptions::forget(&mut self.db, &record.sub_id)?;
+                self.change_subscriptions(|db| subscriptions::forget(db, &record.sub_id))?;
             }
         }
         Ok(())
@@ -6610,10 +6634,7 @@ where
     pub async fn unsubscribe(&mut self, sub_id: &str) -> Result<(), ClientError> {
         if self.is_connected() {
             self.evict_subscription_rows(sub_id)?;
-            {
-                let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-                subscriptions::forget(&mut self.db, sub_id)?;
-            }
+            self.change_subscriptions(|db| subscriptions::forget(db, sub_id))?;
             self.wire()?
                 .transport
                 .send_control(ControlMessage::Unsubscribe(Unsubscribe {
@@ -6622,8 +6643,7 @@ where
                 .await
                 .map_err(|e| ClientError::Transport(e.to_string()))?;
         } else {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-            subscriptions::end(&mut self.db, sub_id)?;
+            self.change_subscriptions(|db| subscriptions::end(db, sub_id))?;
         }
         self.refused.remove(sub_id);
         self.open_snapshots.remove(sub_id);
@@ -7012,16 +7032,19 @@ where
         let inverse = invert_changeset(&changeset)
             .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?;
         let shared = &self.config.shared_tables;
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        self.db.transaction::<_, ClientError, _>(|db| {
-            delete_pending(db, &writer, client_seq)?;
-            db.apply_changeset(&inverse, rollback_omit)
-                .map_err(|err| ClientError::Apply(err.to_string()))?;
-            if !shared.is_empty() {
-                replay::apply(db, &inverse, replay::Policy::Omit, &shared_route(shared))?;
-            }
-            Ok(())
-        })?;
+        {
+            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            self.db.transaction::<_, ClientError, _>(|db| {
+                delete_pending(db, &writer, client_seq)?;
+                db.apply_changeset(&inverse, rollback_omit)
+                    .map_err(|err| ClientError::Apply(err.to_string()))?;
+                if !shared.is_empty() {
+                    replay::apply(db, &inverse, replay::Policy::Omit, &shared_route(shared))?;
+                }
+                Ok(())
+            })?;
+        }
+        self.record_spare()?;
         Ok(rows)
     }
 
@@ -7416,8 +7439,11 @@ where
                 .and_then(|queue| queue.pending.remove(&client_seq))
                 .is_some();
             if removed {
-                let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-                delete_pending(&mut self.db, &writer, client_seq)?;
+                {
+                    let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                    delete_pending(&mut self.db, &writer, client_seq)?;
+                }
+                self.record_spare()?;
             }
         }
         self.settle_resend();
@@ -7578,7 +7604,10 @@ where
     /// delete. `spare` holds extra keep-clauses per physical table (the eviction
     /// pass passes its pending-write keys, a resync passes none). `stale` names
     /// the tables that delete whole regardless of a survivor's filter, because
-    /// their every row may be gone upstream (R48, R73). Returns the rows removed.
+    /// their every row may be gone upstream (R48, R73). A shared table also
+    /// keeps what every other identity on the device covers or has unsent,
+    /// stale or not, since only that identity's own resync may judge its rows
+    /// (R11 decision 6). Returns the rows removed.
     ///
     /// Capture is suspended so the deletes are never re-uploaded as a local
     /// mutation.
@@ -7614,6 +7643,7 @@ where
                 }
             }
         }
+        let others = interest::others(&mut self.db, &self.config)?;
 
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         let tables = self.config.policy_tables.clone();
@@ -7621,27 +7651,33 @@ where
             let mut removed = 0usize;
             for table in scope {
                 let truncated = stale.covers(table);
-                if untouchable.contains(table.as_str()) && !truncated {
-                    continue;
-                }
                 // A split table is cleared at its backing table, not through the
                 // policy view: the view yields only rows the local policy admits,
                 // so deleting through it would strand every row the policy hides.
                 // The predicates name plain columns of the logical table and the
                 // backing table carries the same columns in the same order.
                 let target = tables.physical(table).unwrap_or(table);
+                let key = target.to_lowercase();
+                if others.whole.contains(&key)
+                    || (untouchable.contains(table.as_str()) && !truncated)
+                {
+                    continue;
+                }
                 let quoted = quote_ident(target);
                 // Survivor predicates plus any spared pending-write keys: a row
-                // matching any of them stays. A truncate ignores both, since
-                // every row of an emptied table is stale.
+                // matching any of them stays. A truncate ignores this identity's
+                // own, since every row of an emptied table is stale to it.
                 let mut kept: Vec<String> = Vec::new();
                 if !truncated {
                     if let Some(surviving) = clauses.get(table.as_str()) {
                         kept.extend(surviving.iter().map(|clause| format!("({clause})")));
                     }
-                    if let Some(spared) = spare.get(&target.to_lowercase()) {
+                    if let Some(spared) = spare.get(&key) {
                         kept.extend(spared.iter().cloned());
                     }
+                }
+                if let Some(kept_by_others) = others.clauses.get(&key) {
+                    kept.extend(kept_by_others.iter().cloned());
                 }
                 // The table and the predicates are chosen at runtime from the
                 // subscriptions' own parsed queries, so diesel's compile-time
@@ -7662,8 +7698,9 @@ where
     /// not yet had the server acknowledge.
     ///
     /// Keyed by the lowercased physical table the delete runs against, each
-    /// value a list of `(col IS literal AND ...)` clauses. Decoded from
-    /// `self.pending` the same way [`affected_rows`] reads a changeset's touched
+    /// value a list of `(col IS literal AND ...)` clauses. Decoded from every
+    /// writer queue's pending entries the same way [`affected_rows`] reads a
+    /// changeset's touched
     /// keys, so the protection is bounded by the queue's cap and clears itself
     /// when an ack retires the mutation. A captured mutation is a changeset,
     /// whose op carries the backing table's own schema, so the primary-key
@@ -7712,6 +7749,17 @@ where
             }
         }
         Ok(spare)
+    }
+
+    /// Rewrite the shared rows this identity's unacknowledged writes touched,
+    /// so another identity's pass spares them.
+    fn record_spare(&mut self) -> Result<(), ClientError> {
+        if self.config.shared_tables.is_empty() {
+            return Ok(());
+        }
+        let spare = self.pending_spare()?;
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        interest::record_spare(&mut self.db, &self.config, &spare)
     }
 
     /// Return freelist pages to the filesystem: reclaim in
@@ -8099,8 +8147,9 @@ where
         Ok(any.then(|| kept.build()))
     }
 
-    /// Whether some subscription other than `addressed_to` still wants the row
-    /// `pk` identifies in `table`.
+    /// Whether some subscription other than `addressed_to`, or another
+    /// identity's coverage of a shared table, still wants the row `pk`
+    /// identifies in `table`.
     ///
     /// `table` is the wire's logical name, so the subscription match below is
     /// on that, while the row itself is read from the backing table when the
@@ -8132,6 +8181,20 @@ where
                 Some(predicate) => clauses.push(format!("({predicate})")),
             }
         }
+        let physical = self
+            .config
+            .policy_tables
+            .physical(&name)
+            .unwrap_or(table.name())
+            .to_owned();
+        let others = interest::others(&mut self.db, &self.config)?;
+        let key = physical.to_lowercase();
+        if others.whole.contains(&key) {
+            return Ok(true);
+        }
+        if let Some(kept_by_others) = others.clauses.get(&key) {
+            clauses.extend(kept_by_others.iter().cloned());
+        }
         if clauses.is_empty() {
             return Ok(false);
         }
@@ -8139,12 +8202,6 @@ where
         // The key is matched by ordinal, because the wire format carries a
         // primary key's positions and never its column names. The replica's own
         // catalog supplies the names for those positions.
-        let physical = self
-            .config
-            .policy_tables
-            .physical(&name)
-            .unwrap_or(table.name())
-            .to_owned();
         let columns = replica_columns(&mut self.db, &physical)?;
         let mut wheres = Vec::with_capacity(pk.len());
         for (position, value) in pk_ordinals(table).into_iter().zip(pk) {
