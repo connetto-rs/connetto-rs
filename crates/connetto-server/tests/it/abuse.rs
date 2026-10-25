@@ -236,6 +236,7 @@ async fn reset_tables(fixture: &Fixture) {
         format!(
             "CREATE TYPE {AUTH_OP_TYPE} AS ENUM (\
                 'logged_in', 'logged_out', 'session_revoked', 'token_replayed', \
+                'ended_by_owner', 'ended_all', 'ended_others', \
                 'capability_minted', 'permission_change', 'model_change', \
                 'banned', 'ban_lifted', 'write_forked', 'write_redelivered')"
         ),

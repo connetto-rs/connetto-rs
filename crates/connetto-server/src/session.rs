@@ -5139,6 +5139,13 @@ where
         session: SessionId,
         lists: Vec<SignedList>,
     ) {
+        self.announce_revocation(session, lists).await;
+        enrolment.revoke_session(session).await;
+    }
+
+    /// Close the revoked device's connection with `DeviceRevoked` and push
+    /// the new lists to every identified connection.
+    async fn announce_revocation(&self, session: SessionId, lists: Vec<SignedList>) {
         self.close_session(session, FatalErrorReason::DeviceRevoked)
             .await;
         let update = ControlMessage::RevocationUpdate(RevocationUpdate { lists });
@@ -5147,7 +5154,6 @@ where
                 let _ = live.tx.send(Outbound::Control(update.clone()));
             }
         }
-        enrolment.revoke_session(session).await;
     }
 
     /// Revoke the device key `key` whoever it belongs to, as the deployment's
@@ -5168,6 +5174,31 @@ where
         let (fresh, session, lists) = enrolment.revoke(None, key).await?;
         self.after_revocation(enrolment, session, lists).await;
         Ok(fresh)
+    }
+
+    /// `user`'s enrolled devices with the session each last enrolled under,
+    /// none when no enrolment is installed.
+    pub(crate) async fn devices_of(
+        &self,
+        user: &Id,
+    ) -> Result<Vec<crate::device_cert::Device>, crate::device_cert::EnrolmentError> {
+        match self.device_enrolment.get() {
+            Some(enrolment) => enrolment.enrolled(user).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Revoke `user`'s device key `key`, publishing the list and closing its
+    /// connection with `DeviceRevoked`, and leave its auth-store session to
+    /// the caller, which ends it with its own cause.
+    pub(crate) async fn revoke_device_of(&self, user: &Id, key: KeyId) -> Result<(), RevokeError> {
+        let enrolment = self
+            .device_enrolment
+            .get()
+            .ok_or(RevokeError::NotInstalled)?;
+        let (_, session, lists) = enrolment.revoke(Some(user), key).await?;
+        self.announce_revocation(session, lists).await;
+        Ok(())
     }
 
     /// The installed enrolment and the account enrolling, or why this session cannot enrol.

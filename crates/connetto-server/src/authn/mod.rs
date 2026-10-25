@@ -31,7 +31,7 @@ pub use provider::{
     VerifiedLogin,
 };
 pub use provider_oidc::{GenericOidcProvider, OidcProviderConfig};
-pub use service::{AuthError, AuthService, ConnettoHandshakeAuthority, TokenPair};
+pub use service::{AuthError, AuthService, ConnettoHandshakeAuthority, LivenessError, TokenPair};
 pub use sign_in::{LoginRequest, SessionDescriber, SignInHook, SignInNotice};
 pub use store::{
     AuthStore, AuthStoreError, InMemoryAuthStore, IssuedSession, RefreshOutcome, ResolvedIdentity,

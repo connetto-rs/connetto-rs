@@ -605,6 +605,7 @@ pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixt
         pool,
         "CREATE TYPE connetto_auth_op AS ENUM (\
          'logged_in', 'logged_out', 'session_revoked', 'token_replayed', 'capability_minted', \
+         'ended_by_owner', 'ended_all', 'ended_others', \
          'permission_change', 'model_change', 'banned', 'ban_lifted', \
          'write_forked', 'write_redelivered')",
     )

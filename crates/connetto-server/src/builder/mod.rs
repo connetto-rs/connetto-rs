@@ -31,8 +31,8 @@ use crate::ban::ConnettoBanSchema;
 use crate::bots::{ConnettoBotSchema, pg_bot_registry};
 use crate::defaults::ConnettoDefaults;
 use crate::device_cert::{
-    ConnettoEnrolmentSchema, DeviceCertConfig, DeviceEnrolment, FirstEnrolment, FirstEnrolmentHook,
-    StatusList, pg_enrolment_store,
+    ConnettoEnrolmentSchema, Device, DeviceCertConfig, DeviceEnrolment, FirstEnrolment,
+    FirstEnrolmentHook, StatusList, pg_enrolment_store,
 };
 use crate::manager_builder::ManagerBuilder;
 use crate::materializer::Materializer;
@@ -65,10 +65,11 @@ use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 
 use crate::{
     AbuseConfig, Artifact, AuthConfig, AuthService, CallerMappings, CookieSameSite, DbAuthStore,
-    DefaultUuidResolver, GenericOidcProvider, IdentityResolver, LoginRequest, OidcProviderConfig,
-    PgReadConnector, PgSnapshotSource, PgWriteTarget, ProviderRegistry, RedirectPolicy,
-    RequestGuard, RlsAuth, RuntimeWritableCatalog, SessionDescriber, SignInHook, SignInNotice,
-    TokenAuthority, auth_router, is_loopback_host, pg_ban_store, pg_write_target, preflight,
+    DefaultUuidResolver, GenericOidcProvider, IdentityResolver, LivenessError, LoginRequest,
+    OidcProviderConfig, PgReadConnector, PgSnapshotSource, PgWriteTarget, ProviderRegistry,
+    RedirectPolicy, RequestGuard, RlsAuth, RuntimeWritableCatalog, SessionDescriber, SessionId,
+    SessionRecord, SignInHook, SignInNotice, TokenAuthority, VerifiedSession, auth_router,
+    is_loopback_host, pg_ban_store, pg_write_target, preflight,
 };
 
 /// The id-type marker a deployment's bot registry tables are declared with.
@@ -650,12 +651,14 @@ fn spawn_writer_sweep<D: ConnettoSchema>(manager: Arc<ServerManager<D>>) -> Back
     }))
 }
 
-/// The shutdown half of a built server.
+/// The running half of a built server: its shutdown, and the session
+/// surfaces an application calls from its own handlers (R105).
 pub struct ServerHandle<D = ConnettoDefaults>
 where
     D: ConnettoSchema,
 {
     manager: Arc<ServerManager<D>>,
+    service: Arc<Service<D>>,
     lag_watch: Option<BackgroundTask>,
     sweep: Option<BackgroundTask>,
     status: Option<BackgroundTask>,
@@ -669,12 +672,38 @@ where
     fn clone(&self) -> Self {
         Self {
             manager: Arc::clone(&self.manager),
+            service: Arc::clone(&self.service),
             lag_watch: self.lag_watch.clone(),
             sweep: self.sweep.clone(),
             status: self.status.clone(),
             writer_sweep: self.writer_sweep.clone(),
         }
     }
+}
+
+/// One place a person is signed in: a live session, with the device that
+/// enrolled its key during it when one did.
+#[derive(Debug, Clone)]
+pub struct SignedInPlace<Id, Desc> {
+    /// How the session began and when it last refreshed.
+    pub session: SessionRecord<Id, Desc>,
+    /// The device whose key last enrolled or renewed during the session,
+    /// absent for a browser and for a device that never enrolled.
+    pub device: Option<Device>,
+}
+
+/// Why a session surface could not answer.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionsError {
+    /// The auth store failed.
+    #[error(transparent)]
+    Auth(#[from] crate::AuthError),
+    /// The enrolment table could not be read.
+    #[error(transparent)]
+    Devices(#[from] crate::device_cert::EnrolmentError),
+    /// A device's key could not be revoked.
+    #[error(transparent)]
+    Revoke(#[from] crate::device_cert::RevokeError),
 }
 
 impl<D> ServerHandle<D>
@@ -704,6 +733,112 @@ where
     /// How many sessions are live right now.
     pub async fn live_connections(&self) -> usize {
         self.manager.live_connections().await
+    }
+
+    /// The person and session a login access token names, once its
+    /// signature verifies and its session is live, the check the sync
+    /// handshake makes, so a handler refuses an ended session at once
+    /// (R105 decision 7).
+    ///
+    /// # Errors
+    ///
+    /// [`LivenessError::Refused`] for anything but a valid login access
+    /// token, [`LivenessError::Revoked`] when its session ended, and
+    /// [`LivenessError::Store`] when the store cannot answer.
+    pub async fn verify_live(
+        &self,
+        access_token: &str,
+    ) -> Result<VerifiedSession<D::Id>, LivenessError> {
+        self.service.verify_live(access_token).await
+    }
+
+    /// Every place `user` is signed in, oldest first, each a live session
+    /// showing the device that enrolled during it (R105 decision 4).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionsError`] when the auth store or the enrolment table fails.
+    pub async fn signed_in_places(
+        &self,
+        user: &D::Id,
+    ) -> Result<Vec<SignedInPlace<D::Id, Desc<D>>>, SessionsError> {
+        let devices = self.live_devices_of(user).await?;
+        Ok(self
+            .service
+            .sessions_of(user)
+            .await?
+            .into_iter()
+            .map(|session| SignedInPlace {
+                device: devices
+                    .iter()
+                    .find(|device| device.session == session.session_id)
+                    .cloned(),
+                session,
+            })
+            .collect())
+    }
+
+    /// End `user`'s session `session`, recording `ended_by_owner`. When a
+    /// device enrolled during it, its key is revoked first and the device is
+    /// closed with `DeviceRevoked`. Answers whether the session was `user`'s
+    /// and live, and ends nothing otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionsError`] when the auth store, the enrolment table or the
+    /// issuer fails.
+    pub async fn end_session(
+        &self,
+        user: &D::Id,
+        session: SessionId,
+    ) -> Result<bool, SessionsError> {
+        let owned = self
+            .service
+            .sessions_of(user)
+            .await?
+            .iter()
+            .any(|record| record.session_id == session);
+        if !owned {
+            return Ok(false);
+        }
+        for device in self.live_devices_of(user).await? {
+            if device.session == session {
+                self.manager.revoke_device_of(user, device.key).await?;
+            }
+        }
+        Ok(self.service.end_session(user, session).await?)
+    }
+
+    /// End every session of `user`, recording `ended_all`, and revoke no
+    /// device key, so a sign-out everywhere wipes no device. Answers how many
+    /// ended.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionsError::Auth`] when the auth store fails.
+    pub async fn end_all_sessions(&self, user: &D::Id) -> Result<usize, SessionsError> {
+        Ok(self.service.end_sessions(user, None).await?)
+    }
+
+    /// End every session of `user` but `current`, recording `ended_others`,
+    /// and revoke no device key. Answers how many ended.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionsError::Auth`] when the auth store fails.
+    pub async fn end_other_sessions(
+        &self,
+        user: &D::Id,
+        current: SessionId,
+    ) -> Result<usize, SessionsError> {
+        Ok(self.service.end_sessions(user, Some(current)).await?)
+    }
+
+    /// `user`'s devices whose keys are not revoked.
+    async fn live_devices_of(&self, user: &D::Id) -> Result<Vec<Device>, SessionsError> {
+        let mut devices = self.manager.devices_of(user).await?;
+        devices.retain(|device| device.revoked_at.is_none());
+        Ok(devices)
     }
 }
 
@@ -2148,13 +2283,14 @@ fn assemble_parts<D: ConnettoSchema>(
         http_routes,
         change_stream: change_stream(
             Arc::clone(&manager),
-            service,
+            Arc::clone(&service),
             pool,
             wiring.feed,
             wiring.policy,
         ),
         handle: ServerHandle {
             manager,
+            service,
             lag_watch: wiring.lag_watch,
             sweep: wiring.sweep,
             status: wiring.status,

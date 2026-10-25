@@ -58,6 +58,13 @@ pub enum AuthOp {
     LoggedOut,
     /// The embedding application revoked the login itself.
     SessionRevoked,
+    /// The person ended one of their sessions from their list of signed-in
+    /// places.
+    EndedByOwner,
+    /// The person ended every one of their sessions.
+    EndedAll,
+    /// The person ended every one of their sessions but the current one.
+    EndedOthers,
     /// The theft defence saw a rotated-out refresh token presented and killed
     /// the login.
     TokenReplayed,
@@ -92,6 +99,9 @@ impl AuthOp {
             Self::LoggedIn => "logged_in",
             Self::LoggedOut => "logged_out",
             Self::SessionRevoked => "session_revoked",
+            Self::EndedByOwner => "ended_by_owner",
+            Self::EndedAll => "ended_all",
+            Self::EndedOthers => "ended_others",
             Self::TokenReplayed => "token_replayed",
             Self::CapabilityMinted => "capability_minted",
             Self::PermissionChange => "permission_change",
@@ -117,6 +127,9 @@ impl FromSql<AuthOpSql, Pg> for AuthOp {
             b"logged_in" => Ok(Self::LoggedIn),
             b"logged_out" => Ok(Self::LoggedOut),
             b"session_revoked" => Ok(Self::SessionRevoked),
+            b"ended_by_owner" => Ok(Self::EndedByOwner),
+            b"ended_all" => Ok(Self::EndedAll),
+            b"ended_others" => Ok(Self::EndedOthers),
             b"token_replayed" => Ok(Self::TokenReplayed),
             b"capability_minted" => Ok(Self::CapabilityMinted),
             b"permission_change" => Ok(Self::PermissionChange),
