@@ -19,14 +19,17 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    ManagerBuilder, Materializer, NoConnector, PageSpec, ReconnectEvent, RlsAuthError,
-    SessionError, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, PgReadConnector, PgSnapshotSource,
+    ReconnectEvent, RlsAuthError, SessionError, SnapshotEstimate, SnapshotPage, SnapshotSource,
+    loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoDefaults, Fixture};
+use connetto_test_harness::{Client, ConnettoDefaults, Fixture, committed_at};
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaError;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{CdcSource, PgSqliteEmuSource};
+
+use crate::one_event::OneEvent;
 
 const PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, data TEXT);";
 
@@ -680,4 +683,130 @@ async fn a_row_level_security_refusal_ends_ingest_instead_of_retrying() {
         0,
         "a refusal the deployment fixes is never retried"
     );
+}
+
+/// Auth policy whose first `may_see` fails as an outage and whose later calls
+/// allow every watcher.
+struct FailsFirstSee {
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl VisibilityPolicy for FailsFirstSee {
+    type Watcher = Arc<Principal>;
+    type Error = io::Error;
+    type Backend = Postgres;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn may_see<R>(
+        &self,
+        _row: &R,
+        _watchers: &[Self::Watcher],
+        verdicts: &mut [Verdict],
+    ) -> Result<(), Self::Error>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        if !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::Error::other("auth service unreachable"));
+        }
+        verdicts.fill(Verdict::Allow);
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn may_write<R>(
+        &self,
+        _write: RowWrite<'_, R>,
+        _watcher: &Self::Watcher,
+    ) -> Result<Verdict, Self::Error>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        Ok(Verdict::Allow)
+    }
+}
+
+/// An authorization outage while rows fan out holds the event, and the retry
+/// answers the held question without folding the event a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_auth_outage_retry_folds_the_held_event_once() {
+    let fixture = Fixture::acquire().await;
+    fixture.exec("DROP TABLE IF EXISTS items CASCADE").await;
+    fixture.exec(PG_DDL).await;
+    let pool = fixture.admin().clone();
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
+            .build()
+            .expect("materializer"),
+        PgSnapshotSource::from_ddl(pool.clone(), PG_DDL).expect("snapshot source"),
+        FailsFirstSee {
+            failed: std::sync::atomic::AtomicBool::new(false),
+        },
+        Arc::new(TestGrantChecker),
+        PgReadConnector::with_session_setup(pool.clone()),
+        pg_write_target::<ConnettoDefaults>(pool, PG_DDL).expect("build write target"),
+    )
+    .build();
+    let connect = || {
+        let (server, client) = loopback();
+        tokio::spawn(manager.clone().serve(server));
+        Client::new(client)
+    };
+    let mut rows = connect();
+    rows.handshake_with("rows", "user:rows").await;
+    rows.subscribe("items", "SELECT * FROM items").await;
+    rows.expect_snapshot("items").await;
+    let mut counter = connect();
+    counter.handshake_with("counter", "user:counter").await;
+    counter
+        .subscribe("count", "SELECT COUNT(*) FROM items")
+        .await;
+    let ControlMessage::AggregateUpdate(seed) = counter.next_control().await else {
+        panic!("expected the count seed");
+    };
+    assert_eq!(seed.result_json.as_deref(), Some("0"));
+
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO items (id, data) VALUES (1, 'held')")
+        .expect("execute dml");
+    let insert = source
+        .next_item()
+        .await
+        .expect("poll source")
+        .and_then(subql::SourceItem::into_event)
+        .expect("one event");
+    fixture
+        .exec("INSERT INTO items (id, data) VALUES (1, 'held')")
+        .await;
+    let insert = committed_at(insert, fixture.commit_now().await);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.ingest(&mut OneEvent(Some(insert)), &mut |_| {}),
+    )
+    .await
+    .expect("ingest drains the source")
+    .expect("ingest succeeds after the outage");
+
+    let mut counts = Vec::new();
+    loop {
+        let control =
+            tokio::time::timeout(Duration::from_millis(500), counter.next_control()).await;
+        match control {
+            Err(_) => break,
+            Ok(ControlMessage::AggregateUpdate(update)) => counts.push(update.result_json),
+            Ok(ControlMessage::DeliveryPaused { .. } | ControlMessage::DeliveryResumed) => {}
+            Ok(other) => panic!("unexpected control {other:?}"),
+        }
+    }
+    assert_eq!(counts, [Some("1".to_owned())]);
+    let live = rows.wait_for_live(Duration::from_secs(5)).await;
+    assert_eq!(live.sub_id, "items");
 }

@@ -73,6 +73,8 @@ mod inprocess_loop;
 mod lifecycle;
 mod logging;
 
+mod one_event;
+
 mod macro_hygiene;
 
 mod oidc_spine;

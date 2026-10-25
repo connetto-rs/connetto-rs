@@ -82,9 +82,9 @@ use crate::courier::{CourierDelivery, CourierEntry, CourierRefusal};
 use crate::fence::{ReadFence, split_snapshot_cursor};
 use crate::guard::RequestGuard;
 use crate::materializer::{
-    ComputedCapture, ComputedChange, MatchedPatch, Materializer, MaterializerError, PlannedWrite,
-    ReadConnector, Registration, RuntimeWritableCatalog, SeedPlan, TermMove, TermSeed, compress,
-    narrowed_sql, typed_subscriber,
+    ComputedCapture, ComputedChange, Dispatched, MatchedPatch, Materializer, MaterializerError,
+    PlannedWrite, ReadConnector, Registration, RuntimeWritableCatalog, SeedPlan, TermMove,
+    TermSeed, UnbuiltPatch, compress, narrowed_sql, typed_subscriber,
 };
 use crate::openfga::{GrantHolder, GrantMove};
 use crate::oplog::{CatchupDecision, ChangeRecord, InMemoryOplog, Oplog, catchup_decision};
@@ -780,6 +780,67 @@ impl ResumePoint {
 
     fn set(&self, position: Option<PgCommitPosition>) {
         *self.0.lock() = position;
+    }
+}
+
+/// How far one source event has got through dispatch, so a retry resumes where the last attempt stopped.
+struct EventProgress {
+    /// The event's position, which identifies it when the ingest loop resumes.
+    position: PgCommitPosition,
+    /// Whether the grant store was brought level for this event.
+    levelled: bool,
+    /// The moves that levelling produced, which the membership fan-out still gates on.
+    grant_moves: Vec<GrantMove>,
+    /// The work the engine produced, present once the event is applied.
+    applied: Option<Applied>,
+}
+
+impl EventProgress {
+    const fn new(position: PgCommitPosition) -> Self {
+        Self {
+            position,
+            levelled: false,
+            grant_moves: Vec::new(),
+            applied: None,
+        }
+    }
+}
+
+/// The work an applied event still owes.
+struct Applied {
+    /// The oplog record, absent once taken for an append.
+    record: Option<ChangeRecord>,
+    /// Whether the oplog holds the event or never needed it.
+    logged: bool,
+    /// Row patches not yet sent.
+    patches: Vec<MatchedPatch>,
+    /// Matched consumers whose patch is still to be encoded.
+    unbuilt: Vec<UnbuiltPatch>,
+    /// Membership moves, absent once fanned out.
+    narrowings: Option<Vec<TermMove>>,
+    /// Computed changes not yet delivered, in delivery order.
+    computed: VecDeque<ComputedChange>,
+    /// The read failure still to be answered.
+    failure: Option<MaterializerError>,
+    /// Whether queued reads remain to be drained.
+    drain_due: bool,
+    /// Unknown-class read failures counted per subscription.
+    unknown_attempts: HashMap<SubscriptionId, u32>,
+}
+
+impl Applied {
+    fn new(dispatched: Dispatched) -> Self {
+        Self {
+            logged: dispatched.record.is_none(),
+            record: dispatched.record,
+            patches: dispatched.patches,
+            unbuilt: dispatched.unbuilt,
+            narrowings: Some(dispatched.narrowings),
+            computed: dispatched.computed.into(),
+            failure: dispatched.failure,
+            drain_due: false,
+            unknown_attempts: HashMap::new(),
+        }
     }
 }
 
@@ -2015,6 +2076,8 @@ pub struct SessionManager<
     history: parking_lot::RwLock<Option<TimelineHistory>>,
     /// Where a reconnect of the change feed resumes, the last row or commit the ingest finished handling.
     resume: ResumePoint,
+    /// The ingest loop's unfinished event, kept across pause retries and stream reconnects so no stage runs twice.
+    held: Mutex<Option<EventProgress>>,
     /// Run loops that have started and not yet ended, which the shutdown
     /// grace counts because the registry drains at the moment of the close.
     open_sessions: Arc<AtomicUsize>,
@@ -2116,6 +2179,7 @@ where
         signer,
         history: parking_lot::RwLock::new(None),
         resume: ResumePoint::default(),
+        held: Mutex::new(None),
         open_sessions: Arc::new(AtomicUsize::new(0)),
         shutting_down: AtomicBool::new(false),
         bot_registry,
@@ -2657,25 +2721,87 @@ where
     /// (`docs/upstream-subql-nonblocking-read-tier-drive.md` is the recorded
     /// exit from that).
     ///
+    /// The engine applies the event once per call. Calling again with the same
+    /// event after an error applies it again, which the ingest loop never does.
+    ///
     /// # Errors
     ///
     /// [`SessionError`] when dispatch, a triggered read, a cursor advance, or
     /// the oplog append fails.
     pub async fn dispatch_event(&self, event: &PgChangeEvent) -> Result<(), SessionError> {
-        self.dispatch_with_grants(event, &[]).await
+        self.dispatch_with_grants(event, &mut EventProgress::new(event.position()))
+            .await
     }
 
-    /// [`dispatch_event`](Self::dispatch_event) with this event's grant moves,
-    /// as the ingest loop computed them before dispatching: a membership
-    /// move-out may withdraw rows only when the same event moved a grant
-    /// reaching the subscribed table for that watcher, because only then did
-    /// policy visibility of held rows flip (see `move_out`).
+    /// [`dispatch_event`](Self::dispatch_event) resuming `progress` at its first
+    /// unfinished stage, with the grant moves the ingest loop recorded there: a
+    /// membership move-out may withdraw rows only when the same event moved a
+    /// grant reaching the subscribed table for that watcher, because only then
+    /// did policy visibility of held rows flip (see `move_out`).
     async fn dispatch_with_grants(
         &self,
         event: &PgChangeEvent,
-        grant_moves: &[GrantMove],
+        progress: &mut EventProgress,
     ) -> Result<(), SessionError> {
         let _gate = self.dispatch_gate.lock().await;
+        let applied = match &mut progress.applied {
+            Some(applied) => applied,
+            slot => {
+                let dispatched = counters::timed_lock(&self.materializer)
+                    .await
+                    .dispatch(event)
+                    .await?;
+                slot.insert(Applied::new(dispatched))
+            }
+        };
+
+        // Record the event in the oplog before fan-out. The append is per event,
+        // not per consumer, since reconnect catchup re-filters per client, and
+        // the record carries the patch dispatch built so catchup never folds
+        // the event again. A failed append consumed its record, so the retry
+        // folds a fresh one, and an append is idempotent by position.
+        if !applied.logged {
+            let record = match applied.record.take() {
+                Some(record) => Some(record),
+                None => counters::timed_lock(&self.materializer)
+                    .await
+                    .oplog_record(event)?,
+            };
+            if let Some(record) = record {
+                self.oplog.append(record).await.map_err(oplog_err)?;
+            }
+            applied.logged = true;
+        }
+
+        if !applied.unbuilt.is_empty() {
+            let built = counters::timed_lock(&self.materializer)
+                .await
+                .build_patches(event, &applied.unbuilt)?;
+            applied.unbuilt.clear();
+            applied.patches.extend(built);
+        }
+        // Every patch still owed, paired with the route it goes to now.
+        // Collected before the visibility question because that question names
+        // every watcher at once.
+        if !applied.patches.is_empty() {
+            let mut deliveries = Vec::with_capacity(applied.patches.len());
+            for patch in applied.patches.drain(..) {
+                let route = { self.routes.lock().await.get(&patch.consumer_id).cloned() };
+                let Some(route) = route else { continue };
+                counters::add(&counters::FANOUT_ROUTE_CLONES, 1);
+                deliveries.push((patch, route));
+            }
+            if let Err((err, unsent)) = self.fan_out_rows(event, deliveries).await {
+                applied.patches = unsent.into_iter().map(|(patch, _)| patch).collect();
+                return Err(err);
+            }
+        }
+        if let Some(narrowings) = applied.narrowings.take() {
+            self.fan_out_moves(event, narrowings, &progress.grant_moves)
+                .await;
+        }
+        self.deliver_owed(applied).await;
+
         // Three classes, three dispositions (R89 decision 1). A timeout is
         // policy and ends its subscription, retrying it replaces nothing. The
         // unknown class gets one retry per subscription and a second failure
@@ -2685,78 +2811,66 @@ where
         // escalating schedule, so one poisoned migration ending many
         // subscriptions costs one short wait each. A transient failure
         // returns to the ingest loop, which pauses delivery in place (R89
-        // decision 2), never a change-stream teardown. Each pass ends at most
-        // one subscription, so the loop terminates.
-        let mut unknown_attempts: HashMap<SubscriptionId, u32> = HashMap::new();
-        let mut dispatched = loop {
-            let outcome = {
-                counters::timed_lock(&self.materializer)
-                    .await
-                    .dispatch(event)
-                    .await
-            };
-            match outcome {
-                Ok(dispatched) => break dispatched,
-                Err(MaterializerError::Read {
-                    subscription,
-                    class: ReadFailure::Timeout,
-                    detail,
-                }) => {
-                    self.refuse_computed(subscription, ReadFailure::Timeout, 1, &detail)
-                        .await;
-                }
-                Err(MaterializerError::Read {
-                    subscription,
-                    class: ReadFailure::Other,
-                    detail,
-                }) => {
-                    let seen = unknown_attempts.entry(subscription).or_insert(0);
-                    *seen = seen.saturating_add(1);
-                    if *seen > Self::UNKNOWN_READ_RETRIES {
-                        self.refuse_computed(subscription, ReadFailure::Other, *seen, &detail)
+        // decision 2), never a change-stream teardown. A retry drains the
+        // queued reads and never applies the event again. Each pass ends at
+        // most one subscription or spends one retry, so the loop terminates.
+        loop {
+            if let Some(failure) = applied.failure.take() {
+                applied.drain_due = true;
+                match failure {
+                    MaterializerError::Read {
+                        subscription,
+                        class: ReadFailure::Timeout,
+                        detail,
+                    } => {
+                        self.refuse_computed(subscription, ReadFailure::Timeout, 1, &detail)
                             .await;
-                    } else if let Some(wait) = self.read_retry.start().next_wait() {
-                        tokio::time::sleep(wait).await;
                     }
+                    MaterializerError::Read {
+                        subscription,
+                        class: ReadFailure::Other,
+                        detail,
+                    } => {
+                        let seen = applied.unknown_attempts.entry(subscription).or_insert(0);
+                        *seen = seen.saturating_add(1);
+                        if *seen > Self::UNKNOWN_READ_RETRIES {
+                            self.refuse_computed(subscription, ReadFailure::Other, *seen, &detail)
+                                .await;
+                        } else if let Some(wait) = self.read_retry.start().next_wait() {
+                            tokio::time::sleep(wait).await;
+                        }
+                    }
+                    MaterializerError::Read {
+                        class: ReadFailure::Transient,
+                        detail,
+                        ..
+                    } => return Err(SessionError::ReadUnavailable(detail)),
+                    err => return Err(err.into()),
                 }
-                Err(MaterializerError::Read {
-                    class: ReadFailure::Transient,
-                    detail,
-                    ..
-                }) => return Err(SessionError::ReadUnavailable(detail)),
-                Err(err) => return Err(err.into()),
             }
-        };
-
-        // Record the event in the oplog before fan-out. The append is per event,
-        // not per consumer, since reconnect catchup re-filters per client, and
-        // the record carries the patch dispatch built so catchup never folds
-        // the event again.
-        if let Some(record) = dispatched.record.take() {
-            self.oplog.append(record).await.map_err(oplog_err)?;
+            if !applied.drain_due {
+                return Ok(());
+            }
+            let drained = counters::timed_lock(&self.materializer)
+                .await
+                .resolve_reads()
+                .await;
+            applied.drain_due = false;
+            applied.computed.extend(drained.computed);
+            applied.failure = drained.failure;
+            self.deliver_owed(applied).await;
         }
+    }
 
-        // Every patch this event produced, paired with the route it goes to.
-        // Collected before the visibility question because that question names
-        // every watcher at once.
-        let mut deliveries = Vec::with_capacity(dispatched.patches.len());
-        for patch in dispatched.patches {
-            let route = { self.routes.lock().await.get(&patch.consumer_id).cloned() };
-            let Some(route) = route else { continue };
-            counters::add(&counters::FANOUT_ROUTE_CLONES, 1);
-            deliveries.push((patch, route));
-        }
-        self.fan_out_rows(event, deliveries).await?;
-        self.fan_out_moves(event, dispatched.narrowings, grant_moves)
-            .await;
-
-        // Computed results are global by construction (subql refuses shared
-        // state on RLS tables), so no per-row read filter applies: deliver
-        // each change unconditionally to its owning session.
-        for change in dispatched.computed {
+    /// Deliver every computed change an applied event still owes.
+    ///
+    /// Computed results are global by construction (subql refuses shared state
+    /// on RLS tables), so no per-row read filter applies: each change goes
+    /// unconditionally to its owning session.
+    async fn deliver_owed(&self, applied: &mut Applied) {
+        while let Some(change) = applied.computed.pop_front() {
             self.deliver_computed(change).await;
         }
-        Ok(())
     }
 
     /// Decide what one event does to every matched caller's copy of the row, and
@@ -2772,12 +2886,13 @@ where
     /// [`SessionError::AuthUnavailable`] when the policy could not answer, so the
     /// ingest loop holds the event, [`SessionError::ChangeStreamUnusable`] when
     /// the stream cannot report the previous version at all, and
-    /// [`SessionError::Materializer`] when a cursor advance fails.
+    /// [`SessionError::Materializer`] when a cursor advance fails, each with the
+    /// deliveries not yet sent.
     async fn fan_out_rows(
         &self,
         event: &PgChangeEvent,
         deliveries: Vec<(MatchedPatch, Route<Id, Key>)>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(), (SessionError, Vec<(MatchedPatch, Route<Id, Key>)>)> {
         let watchers: Vec<_> = deliveries
             .iter()
             .map(|(_, route)| Arc::clone(&route.principal))
@@ -2808,7 +2923,7 @@ where
         }
         let mut verdicts = Transitions::new();
         if !watchers.is_empty() {
-            transitions(
+            if let Err(err) = transitions(
                 &self.auth,
                 event,
                 self.catalog.as_ref(),
@@ -2816,7 +2931,9 @@ where
                 &mut verdicts,
             )
             .await
-            .map_err(|err| self.transition_refusal(event, err))?;
+            {
+                return Err((self.transition_refusal(event, err), deliveries));
+            }
             self.ask_second_opinion(event, &watchers, verdicts.get())
                 .await;
         }
@@ -2835,29 +2952,32 @@ where
         } else {
             let built = counters::timed_lock(&self.materializer)
                 .await
-                .withdrawal_patch(event)?;
-            Some(built.ok_or_else(|| {
-                MaterializerError::Emit(
-                    "a row has to be taken back from a caller and the event folded to no \
-                     operation to take it back with"
-                        .to_owned(),
-                )
-            })?)
+                .withdrawal_patch(event);
+            match built {
+                Ok(Some(bytes)) => Some(bytes),
+                Ok(None) => {
+                    let err = MaterializerError::Emit(
+                        "a row has to be taken back from a caller and the event folded to no \
+                         operation to take it back with"
+                            .to_owned(),
+                    );
+                    return Err((err.into(), deliveries));
+                }
+                Err(err) => return Err((err.into(), deliveries)),
+            }
         };
 
-        for ((patch, route), verdict) in deliveries.into_iter().zip(verdicts.get().iter().copied())
-        {
+        let mut pending = deliveries.into_iter().zip(verdicts.get().iter().copied());
+        while let Some(((patch, route), verdict)) = pending.next() {
             // R44's departure notice is no longer exempt from the visibility
             // question, and retiring that exemption is R6's decision 6. The
             // exemption existed because a denied subscriber would otherwise be
             // told nothing and keep the row for ever, which the withdrawal above
             // now answers properly. What it cost was the notice carrying a key to
             // a caller who could never see the row.
-            let payload = match verdict {
-                Transition::Nothing => continue,
-                Transition::Deliver => patch.payload_zstd,
-                Transition::Withdraw => withdrawal.clone().unwrap_or(patch.payload_zstd),
-            };
+            if verdict == Transition::Nothing {
+                continue;
+            }
             let cursor = self.stamp_opaque(&patch.cursor);
             let advanced = {
                 counters::timed_lock(&self.materializer)
@@ -2879,8 +2999,16 @@ where
                     }
                     tracing::debug!(sub_id = %route.label, position = ?event.position(), "delivering a transaction the route's snapshot missed below its cursor");
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => {
+                    let mut unsent = vec![(patch, route)];
+                    unsent.extend(pending.map(|(delivery, _)| delivery));
+                    return Err((err.into(), unsent));
+                }
             }
+            let payload = match verdict {
+                Transition::Withdraw => withdrawal.clone().unwrap_or(patch.payload_zstd),
+                _ => patch.payload_zstd,
+            };
             let live = LivePatch::new(route.label, Cursor::new(cursor), payload);
             // A dropped session receiver just means the client is gone.
             let _ = route.tx.send(Outbound::Live(live));
@@ -3318,26 +3446,30 @@ where
                     let mut auth_backoff = self.auth_retry.start();
                     let mut read_backoff = self.read_retry.start();
                     let mut paused: Option<PauseCause> = None;
-                    // Applied once, then only the question is retried. See
-                    // `keep_store_current` for why re-applying is refused.
-                    let mut levelled = false;
-                    // Remembered across auth retries: the store is levelled
-                    // once, so the moves exist only on the first attempt, and
-                    // a retried dispatch still owes the withdrawal they gate.
-                    let mut grant_moves: Vec<GrantMove> = Vec::new();
                     loop {
                         let attempt = async {
-                            if !levelled {
-                                // Announced here rather than after dispatch, so
-                                // the notice cannot be produced twice by the
-                                // retry that re-asks the question, and so the
-                                // replacement is read against a level store.
-                                let moved = self.keep_store_current(&event).await?;
-                                levelled = true;
-                                self.announce_grant_moves(&event, &moved).await;
-                                grant_moves = moved;
+                            // Kept across pauses and reconnects so no stage of the event runs twice.
+                            let mut held = self.held.lock().await;
+                            if held
+                                .as_ref()
+                                .is_some_and(|progress| progress.position != event.position())
+                            {
+                                *held = None;
                             }
-                            self.dispatch_with_grants(&event, &grant_moves).await
+                            let progress =
+                                held.get_or_insert_with(|| EventProgress::new(event.position()));
+                            if !progress.levelled {
+                                // Levelled and announced once, before dispatch, so a retry
+                                // neither re-applies the store (see `keep_store_current`) nor
+                                // repeats the notice, and the replacement reads a level store.
+                                let moved = self.keep_store_current(&event).await?;
+                                progress.levelled = true;
+                                self.announce_grant_moves(&event, &moved).await;
+                                progress.grant_moves = moved;
+                            }
+                            self.dispatch_with_grants(&event, progress).await?;
+                            *held = None;
+                            Ok(())
                         };
                         match attempt.await {
                             Ok(()) => {

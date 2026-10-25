@@ -128,9 +128,10 @@ pub use manager_builder::ManagerBuilder;
 #[cfg(feature = "test-seams")]
 pub use materializer::MaterializerBuilder;
 pub use materializer::{
-    CallerMappings, ComputedCapture, ComputedChange, Dispatched, FoldSeeded, MatchedPatch,
+    CallerMappings, ComputedCapture, ComputedChange, Dispatched, Drained, FoldSeeded, MatchedPatch,
     Materializer, MaterializerError, ReadConnector, Registration, RuntimeVersionColumn,
     RuntimeWritableCatalog, RuntimeWritableCatalogBuilder, SeedPlan, SqliteRegistration,
+    UnbuiltPatch,
 };
 pub use oplog::{
     CHANGE_OP_TYPE, CatchupDecision, ChangeOp, ChangeOpSql, ChangeRecord, Commits, InMemoryOplog,
