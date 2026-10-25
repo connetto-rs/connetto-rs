@@ -4,7 +4,6 @@
 
 [![CI](https://github.com/connetto-rs/connetto-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/connetto-rs/connetto-rs/actions/workflows/ci.yml)
 [![Coverage](https://codecov.io/gh/connetto-rs/connetto-rs/graph/badge.svg)](https://codecov.io/gh/connetto-rs/connetto-rs)
-[![Quality gate](https://sonarcloud.io/api/project_badges/measure?project=LucaCappelletti94_connetto-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=LucaCappelletti94_connetto-rs)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 connetto is the core of a data-driven application, built once so that each application does not have to build it. A team writes its PostgreSQL schema with the row-level security policies that say who sees what, its UI, and whatever the service itself does. connetto takes care of everything between the database and the screen.
