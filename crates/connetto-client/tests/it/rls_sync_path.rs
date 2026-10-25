@@ -233,7 +233,11 @@ diesel::table! {
 fn orders_wire_table() -> SimpleTable {
     SimpleTable::with_rowid_alias(
         "orders",
-        &[("id", "INTEGER"), ("owner_id", "TEXT"), ("quantity", "INTEGER")],
+        &[
+            ("id", "INTEGER"),
+            ("owner_id", "TEXT"),
+            ("quantity", "INTEGER"),
+        ],
         0,
     )
 }

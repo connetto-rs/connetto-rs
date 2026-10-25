@@ -141,7 +141,12 @@ impl SnapshotSource for NoSnapshot {
 pub(crate) fn insert_changeset(id: i64, owner: &str, body: &str, edited_at: &str) -> Vec<u8> {
     let table = SimpleTable::with_rowid_alias(
         "notes",
-        &[("id", "INTEGER"), ("owner", "TEXT"), ("body", "TEXT"), ("edited_at", "TEXT")],
+        &[
+            ("id", "INTEGER"),
+            ("owner", "TEXT"),
+            ("body", "TEXT"),
+            ("edited_at", "TEXT"),
+        ],
         0,
     );
     let insert = Insert::<_, String, Vec<u8>>::from(table)
@@ -163,7 +168,12 @@ pub(crate) fn insert_changeset(id: i64, owner: &str, body: &str, edited_at: &str
 fn reassign_changeset(id: i64, old_owner: &str, new_owner: &str, edited_at: &str) -> Vec<u8> {
     let table = SimpleTable::with_rowid_alias(
         "notes",
-        &[("id", "INTEGER"), ("owner", "TEXT"), ("body", "TEXT"), ("edited_at", "TEXT")],
+        &[
+            ("id", "INTEGER"),
+            ("owner", "TEXT"),
+            ("body", "TEXT"),
+            ("edited_at", "TEXT"),
+        ],
         0,
     );
     let update = Update::<_, ChangesetFormat, String, Vec<u8>>::from(table)

@@ -518,7 +518,12 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
     let mut client = live_session(&format!("127.0.0.1:{port}"), &token).await;
     let changeset = insert_changeset(
         "orders",
-        &[("id", "INTEGER"), ("price", "REAL"), ("quantity", "INTEGER"), ("status", "TEXT")],
+        &[
+            ("id", "INTEGER"),
+            ("price", "REAL"),
+            ("quantity", "INTEGER"),
+            ("status", "TEXT"),
+        ],
         &[0],
         vec![
             RowValue::Integer(1000),

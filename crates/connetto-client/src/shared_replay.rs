@@ -756,7 +756,11 @@ mod tests {
 
     #[test]
     fn composite_keys_match_native() {
-        let schema = SimpleTable::new("notes", &[("a", "TEXT"), ("b", "INTEGER"), ("c", "TEXT")], &[0, 1]);
+        let schema = SimpleTable::new(
+            "notes",
+            &[("a", "TEXT"), ("b", "INTEGER"), ("c", "TEXT")],
+            &[0, 1],
+        );
         let comp_insert = |schema: &SimpleTable, a: &str, b: i64, c: &str| {
             PatchInsert::from(schema.clone())
                 .set(0, a)
@@ -813,7 +817,8 @@ mod tests {
 
     #[test]
     fn a_check_violation_is_omitted_like_native() {
-        let schema = SimpleTable::with_rowid_alias("notes", &[("id", "INTEGER"), ("val", "INTEGER")], 0);
+        let schema =
+            SimpleTable::with_rowid_alias("notes", &[("id", "INTEGER"), ("val", "INTEGER")], 0);
         let checked_insert = |schema: &SimpleTable, id: i64, val: i64| {
             PatchInsert::from(schema.clone())
                 .set(0, id)
@@ -851,7 +856,8 @@ mod tests {
     fn a_replace_conflict_omitted_by_check_matches_native() {
         // A stored id 1 meets an incoming id 1 the CHECK refuses: the native
         // apply is the oracle for whether the stored row survives.
-        let schema = SimpleTable::with_rowid_alias("notes", &[("id", "INTEGER"), ("val", "INTEGER")], 0);
+        let schema =
+            SimpleTable::with_rowid_alias("notes", &[("id", "INTEGER"), ("val", "INTEGER")], 0);
         let frame: Vec<u8> = Patchset::new()
             .insert(
                 PatchInsert::from(schema)
