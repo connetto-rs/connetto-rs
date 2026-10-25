@@ -124,12 +124,7 @@ async fn write_lands_under_rls_and_fans_out_over_cdc() {
         1,
         insert_changeset(
             "notes",
-            &[
-                ("id", "INTEGER"),
-                ("owner", "TEXT"),
-                ("body", "TEXT"),
-                ("edited_at", "TEXT"),
-            ],
+            &["id", "owner", "body", "edited_at"],
             &[0],
             vec![
                 Value::Integer(1),
