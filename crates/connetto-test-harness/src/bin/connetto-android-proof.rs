@@ -116,6 +116,42 @@ fn demo_app() -> Demo {
     APP.get().copied().unwrap_or_default()
 }
 
+/// The status line the demo stands on once it signed in. The Tauri demo's
+/// line carries the client events' words, and the dioxus demo stands
+/// `connected` from its setup.
+fn signed_in_line() -> &'static str {
+    match demo_app() {
+        Demo::Tauri => "status: online",
+        Demo::Dioxus => "status: connected",
+    }
+}
+
+/// The orders write button the sync step clicks, which only the Tauri demo
+/// names as its backend writer.
+fn insert_backend_label() -> &'static str {
+    match demo_app() {
+        Demo::Tauri => "Insert via Postgres (backend writer)",
+        Demo::Dioxus => "Add order",
+    }
+}
+
+/// A `DevTools` session on the demo's page, retried while the `WebView`
+/// stands up after a launch or a screen rebuild.
+///
+/// # Errors
+///
+/// When the page does not stand within the retry bound.
+async fn app_page(device: &Device) -> Result<PageSession> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match device.app().await {
+            Ok(app) => return Ok(app),
+            Err(err) if Instant::now() >= deadline => return Err(err),
+            Err(_) => sleep(Duration::from_millis(500)).await,
+        }
+    }
+}
+
 /// The second phone's account in the peer proof, so each page's `linked:`
 /// line names the other phone unambiguously.
 const PEER_USER: &str = "bob";
@@ -343,13 +379,22 @@ async fn prove(
 
     step("sign in");
     device.launch().await?;
+    // The Tauri demo parks the login URL and opens the login on the Sign in
+    // click, so the tab the driver types into opens with the click.
+    if matches!(demo_app(), Demo::Tauri) {
+        let mut app = app_page(device).await?;
+        app.wait_for_text("Sign in to begin.", Duration::from_secs(90))
+            .await?;
+        app.click_when_enabled("Sign in", Duration::from_secs(90))
+            .await?;
+    }
     let mut tab = device.login_tab(&stack.issuer).await?;
     device.screenshot(evidence, "login-page").await?;
     submit_login(&mut tab, USER).await?;
     drop(tab);
     unlock.approve(device, evidence, "launch-unlock").await?;
-    let mut app = device.app().await?;
-    app.wait_for_text("status: connected", Duration::from_secs(90))
+    let mut app = app_page(device).await?;
+    app.wait_for_text(signed_in_line(), Duration::from_secs(90))
         .await?;
     app.wait_for_text(
         "custody: released only after user verification",
@@ -367,7 +412,7 @@ async fn prove(
 
     step("sync a backend write");
     let before = order_count(&stack.pg_url).await?;
-    app.click("Insert via Postgres (backend writer)").await?;
+    app.click(insert_backend_label()).await?;
     wait_for_count(&stack.pg_url, before + 1).await?;
     app.wait_for_text(
         &format!("COUNT(*) pushed by the server: {}", before + 1),
@@ -382,7 +427,7 @@ async fn prove(
     app.wait_for_text("status: reconnecting", Duration::from_secs(60))
         .await?;
     let offline = order_count(&stack.pg_url).await?;
-    app.click("Insert locally (client write)").await?;
+    app.click("Add order").await?;
     sleep(Duration::from_secs(3)).await;
     if order_count(&stack.pg_url).await? != offline {
         bail!("an offline write reached Postgres");
@@ -411,34 +456,58 @@ async fn prove(
         rebuild_the_screen(device).await?;
     }
     recheck_after_time_away(device, evidence, unlock).await?;
-    let mut app = device.app().await?;
+    let mut app = app_page(device).await?;
     sign_out(device, &mut app, evidence).await?;
     sign_in_across_a_killed_process(device, &stack.issuer, evidence, unlock).await?;
     step("proof complete");
     Ok(())
 }
 
-/// Sign out, which revokes the session and destroys the replica key, and see
-/// the demo start over. Only a successful sign-out starts over, since any
-/// failure is shown in the session panel instead.
+/// Sign out, which wipes the replica and revokes the session, and see the
+/// demo start over at its sign-in banner. A delete with unsent local writes
+/// asks for confirmation first, and a refusal stands in the session panel in
+/// place of the start over.
 async fn sign_out(device: &Device, app: &mut PageSession, evidence: &Path) -> Result<()> {
     step("sign out");
-    app.click("Sign out (wipe local replica)").await?;
-    app.wait_for_outcome(
-        "Signing in",
-        &["logout error", "not yet synced"],
-        Duration::from_secs(60),
-    )
-    .await?;
+    app.click("Delete local data and log out").await?;
+    confirm_the_delete(app).await?;
+    app.wait_for_outcome("Sign in to begin.", &["Error: "], Duration::from_secs(60))
+        .await?;
     device.screenshot(evidence, "signed-out").await
 }
 
+/// The delete asks for confirmation while local writes are still unsent, so
+/// the confirmation stands until the click, and the signed-out banner stands
+/// when it does not.
+///
+/// # Errors
+///
+/// When neither stands within the bound.
+async fn confirm_the_delete(app: &mut PageSession) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let page = app.page_text().await?;
+        if page.contains("Confirm: delete and log out") {
+            app.click("Confirm: delete and log out").await?;
+            return Ok(());
+        }
+        if page.contains("Sign in to begin.") || page.contains("Error: ") {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "the sign out asked neither for confirmation nor to sign out, the page shows:\n{page}"
+            );
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// The system may kill the app while its login is open in the browser tab.
-/// Sign-out leaves the demo opening a fresh login, so the driver kills the
-/// backgrounded app the way low memory does, then finishes the login in the
-/// tab. The redirect starts a new process, and only one that finishes the
-/// persisted login reaches `connected`, since a restarted login would open a
-/// tab nobody types into.
+/// The driver kills the backgrounded app the way low memory does, then
+/// finishes the login in the tab. The redirect starts a new process, and only
+/// one that finishes the persisted login reaches the signed-in line, since a
+/// restarted login would open a tab nobody types into.
 async fn sign_in_across_a_killed_process(
     device: &Device,
     issuer: &str,
@@ -446,6 +515,16 @@ async fn sign_in_across_a_killed_process(
     unlock: Unlock<'_>,
 ) -> Result<()> {
     step("sign in across a killed process");
+    // The signed-out demo stands at its sign-in banner, and the Tauri demo
+    // opens its login on the sign-in click, so the tab the driver types into
+    // opens with the click.
+    if matches!(demo_app(), Demo::Tauri) {
+        let mut app = app_page(device).await?;
+        app.wait_for_text("Sign in to begin.", Duration::from_secs(90))
+            .await?;
+        app.click_when_enabled("Sign in", Duration::from_secs(90))
+            .await?;
+    }
     let mut tab = device.login_tab(issuer).await?;
     let killed = device
         .adb(&["shell", "pidof", demo_app().package()])
@@ -474,17 +553,10 @@ async fn sign_in_across_a_killed_process(
     submit_login(&mut tab, USER).await?;
     drop(tab);
     unlock.approve(device, evidence, "restart-unlock").await?;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut app = loop {
-        match device.app().await {
-            Ok(app) => break app,
-            Err(err) if Instant::now() >= deadline => {
-                return Err(err.context("the redirect never started the app again"));
-            }
-            Err(_) => sleep(Duration::from_millis(500)).await,
-        }
-    };
-    app.wait_for_text("status: connected", Duration::from_secs(90))
+    let mut app = app_page(device)
+        .await
+        .context("the redirect never started the app again")?;
+    app.wait_for_text(signed_in_line(), Duration::from_secs(90))
         .await?;
     device.screenshot(evidence, "resumed").await
 }
@@ -494,9 +566,10 @@ async fn sign_in_across_a_killed_process(
 const FONT_SCALE: &str = "font_scale";
 
 /// Change the text size and change it back. Android rebuilds the demo's screen
-/// inside the running process each time, and the re-check after time away
-/// that follows then has to prompt on the rebuilt screen. The step fails when
-/// no rebuild shows in the events buffer, so it never passes unexercised.
+/// inside the running process each time, and the rebuilt page reloads the demo
+/// and stands signed in again, so the re-check after time away that follows
+/// has to prompt on the rebuilt screen. The step fails when no rebuild shows
+/// in the events buffer or the rebuilt page does not stand signed in.
 async fn rebuild_the_screen(device: &Device) -> Result<()> {
     step("rebuild the screen");
     let pid = device
@@ -522,7 +595,12 @@ async fn rebuild_the_screen(device: &Device) -> Result<()> {
     rebuilt?;
     cleared?;
     restored?;
-    wait_for_rebuild(device, pid).await
+    wait_for_rebuild(device, pid).await?;
+    // The rebuilt page reloads the demo and asks the core for its view, and
+    // stands signed in again.
+    let mut app = app_page(device).await?;
+    app.wait_for_text("Signed in as ", Duration::from_secs(60))
+        .await
 }
 
 /// The demo's re-check grace, `RECHECK_AFTER` in its source.
@@ -543,7 +621,7 @@ async fn recheck_after_time_away(
     sleep(RECHECK_AFTER + Duration::from_secs(30)).await;
     device.launch().await?;
     unlock.approve(device, evidence, "recheck-unlock").await?;
-    let mut app = device.app().await?;
+    let mut app = app_page(device).await?;
     app.wait_for_text("gate: open", Duration::from_secs(30))
         .await?;
     device.screenshot(evidence, "unlocked").await

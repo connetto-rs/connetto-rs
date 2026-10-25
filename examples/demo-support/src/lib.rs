@@ -20,7 +20,9 @@ include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
 
 pub use connetto_demo_deployment::{AUTH_BASE, DEMO_WS_URL, auth_landing};
 
-#[cfg(target_arch = "wasm32")]
+pub mod view;
+
+#[cfg(all(target_arch = "wasm32", feature = "web"))]
 pub mod web;
 
 /// The one orders subscription every window drives, the visible rows only.

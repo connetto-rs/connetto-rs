@@ -2,37 +2,45 @@
 //!
 //! The client lives here, in the native core, which keeps running while the
 //! platform pauses the WebView. The core turns the client's state into one
-//! `View` and emits it to the Leptos UI on every change, and the UI calls
-//! back through the commands below. The platform lifecycle drives the
-//! client's away input directly, with no UI engine in between.
+//! `View` from `connetto-demo-support` and emits it to the Leptos UI on every
+//! change, and the UI calls back through the commands below. The platform
+//! lifecycle drives the client's away input directly, with no UI engine in
+//! between.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use connetto_client::teardown::{ForgetError, ForgetRefusal};
 use connetto_client::{
-    Auth, ClientError, ClientEvent, ConnettoClient, Gate, KeyringAuth, LiveHandle as _, Moment,
-    NativeClient, NativeClientBuilder, NativeTransport, SyncSchema, SyncTuning, SystemClock,
+    AccountChoice, AccountChooser, Auth, ClientError, ClientEvent, ConnettoClient, ExportScope,
+    Gate, ImportChoices, KeyringAuth, KeyringStore, LiveHandle as _, Moment, NativeAuthenticator,
+    NativeClient, NativeClientBuilder, NativeTransport, SyncTuning, SystemClock,
     dsl::Watchable as _,
 };
-use connetto_core::messages::FatalErrorReason;
+use connetto_demo_support as support;
+use connetto_file_client::FileId;
+use connetto_file_client::{
+    Content as ContentPiece, ContentClient, ContentEvent, ContentHandle, FsStore, ReqwestHttp,
+    Resolved,
+};
 use diesel::prelude::*;
 use parking_lot::Mutex;
+use rosetta_uuid::Uuid;
 use serde::Serialize;
+use support::view::{Action, LogoutState, Session, View};
 use tauri::{AppHandle, Emitter as _, Manager as _, RunEvent, WindowEvent};
-use tokio::sync::mpsc;
+use tauri_plugin_dialog::DialogExt as _;
+use tauri_plugin_fs::{FilePath, FsExt as _, OpenOptions};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
-include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
-
-diesel::table! {
-    orders (id) {
-        id -> rosetta_uuid::sql_types::Uuid,
-        owner_id -> diesel::sql_types::Text,
-        quantity -> diesel::sql_types::BigInt,
-        created_at -> diesel::sql_types::Timestamp,
-    }
-}
+/// The deployment root this build ships, which every device certificate and
+/// revocation list must chain to.
+#[cfg(feature = "device-identity")]
+const DEVICE_ROOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/device-root.der"));
 
 const DEFAULT_WS: &str = "ws://127.0.0.1:7777/sync";
 const DEFAULT_AUTH_ORIGIN: &str = "http://127.0.0.1:7777";
@@ -44,78 +52,32 @@ const KEYRING_SERVICE: &str = "connetto-tauri-demo";
 #[cfg(any(target_os = "android", target_os = "ios"))]
 const APP_REDIRECT: &str = "dev.connetto.tauridemo:/oauth2redirect";
 /// The demo's re-check grace, matching the dioxus demo's.
-const RECHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+const RECHECK_AFTER: Duration = Duration::from_secs(30);
 const LOG_FILTER: &str = "info,connetto_client::away=debug,connetto_tauri_demo::away=debug";
 
-#[cfg(feature = "device-identity")]
-const DEVICE_ROOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/device-root.der"));
-
 type Ws = NativeTransport;
+type Content = Arc<ContentClient<Ws, FsStore, ReqwestHttp>>;
 
-/// Everything the UI shows, emitted whole as the `view` event.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct View {
-    /// `starting`, `ready` or `failed`.
-    stage: &'static str,
-    /// Why setup failed, when it did.
-    detail: Option<String>,
-    /// The signed-in user id, as the server minted it.
-    user: String,
-    status: String,
-    custody: String,
-    gate: &'static str,
-    device: String,
-    /// `COUNT(*)` over the replica's orders, pushed by the server.
-    count: Option<i64>,
-    /// A live query or write that failed.
-    error: Option<String>,
-    wipe: Wipe,
-    /// What a sign-out that closed the client left undone, shown while signing in again.
-    notice: Option<String>,
-}
-
-impl Default for View {
-    fn default() -> Self {
-        Self {
-            stage: "starting",
-            detail: None,
-            user: String::new(),
-            status: "connected".to_owned(),
-            custody: String::new(),
-            gate: "open",
-            device: String::new(),
-            count: None,
-            error: None,
-            wipe: Wipe::Idle,
-            notice: None,
-        }
-    }
-}
-
-/// Where signing out stands.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-enum Wipe {
-    Idle,
-    /// The replica holds writes the server has not acknowledged, which only
-    /// a confirmed sign-out discards.
-    ConfirmForce {
-        unsynced: usize,
-    },
-    Failed {
-        message: String,
-    },
-}
-
-enum BackendCmd {
-    Insert,
-}
-
-/// One signed-in session. Dropping it aborts the tasks feeding the view.
-struct Session {
-    native: NativeClient<Ws>,
+/// One signed-in session. Dropping it aborts the tasks feeding the view and
+/// closes the client.
+struct Parts {
+    native: NativeClient<Ws, ContentHandle<Ws>>,
+    content: Content,
+    authenticator: Option<NativeAuthenticator>,
     backend: mpsc::UnboundedSender<BackendCmd>,
+    holds: Arc<Holds>,
     _tasks: JoinSet<()>,
+}
+
+impl Drop for Parts {
+    fn drop(&mut self) {
+        let client = self.native.client().clone();
+        // The wipe path already closed the client, so this is a second close,
+        // which the client answers as a no-op.
+        tauri::async_runtime::spawn(async move {
+            client.close().await;
+        });
+    }
 }
 
 /// Where the core's session stands, as `plans/tauri-leptos-demos.md` tables it.
@@ -124,16 +86,51 @@ struct Session {
 enum Slot {
     #[default]
     Empty,
-    Ready(Arc<Session>),
+    Ready(Arc<Parts>),
     /// `forget_device` runs on the session, which only the lifecycle reaches.
-    SigningOut(Arc<Session>),
+    SigningOut(Arc<Parts>),
+}
+
+/// The per-session values the feeds share, which the view does not hold.
+struct Holds {
+    newest_order: Mutex<Option<Uuid>>,
+    covered: Mutex<Option<usize>>,
+    covered_orders: AtomicUsize,
+    covered_notes: AtomicUsize,
+    covered_photos: AtomicUsize,
+    thumb_refresh: AtomicU64,
+}
+
+impl Default for Holds {
+    fn default() -> Self {
+        Self {
+            newest_order: Mutex::new(None),
+            covered: Mutex::new(None),
+            covered_orders: AtomicUsize::new(0),
+            covered_notes: AtomicUsize::new(0),
+            covered_photos: AtomicUsize::new(0),
+            thumb_refresh: AtomicU64::new(0),
+        }
+    }
+}
+
+enum BackendCmd {
+    Insert,
 }
 
 /// The core's state, managed by Tauri.
-#[derive(Default)]
 struct Core {
     view: Mutex<View>,
     slot: Mutex<Slot>,
+    /// The parked login URL, `None` while no login stands parked.
+    parked: watch::Sender<Option<String>>,
+    /// The phone's tab login waits on the parked URL clearing.
+    #[expect(dead_code, reason = "the phone's tab login waits on it")]
+    parked_rx: watch::Receiver<Option<String>>,
+    /// The parked account picker's answer channel, `None` while none stands.
+    picker: Mutex<Option<mpsc::UnboundedSender<Option<String>>>>,
+    /// Whether a setup task is running, so a second request starts nothing.
+    starting: AtomicBool,
 }
 
 impl Core {
@@ -149,7 +146,7 @@ impl Core {
     }
 
     /// The session, while it is ready to serve commands.
-    fn session(&self) -> Option<Arc<Session>> {
+    fn session(&self) -> Option<Arc<Parts>> {
         match &*self.slot.lock() {
             Slot::Ready(session) => Some(Arc::clone(session)),
             Slot::Empty | Slot::SigningOut(_) => None,
@@ -173,7 +170,7 @@ impl Core {
 
     /// Move a ready session to signing out and hand it over, or `None` when
     /// no session is ready, a sign-out already in progress included.
-    fn begin_sign_out(&self) -> Option<Arc<Session>> {
+    fn begin_sign_out(&self) -> Option<Arc<Parts>> {
         let mut slot = self.slot.lock();
         let Slot::Ready(session) = &*slot else {
             return None;
@@ -200,7 +197,7 @@ enum CommandError {
     #[error(transparent)]
     Client(#[from] ClientError),
     #[error(transparent)]
-    Query(#[from] diesel::result::Error),
+    Content(#[from] connetto_file_client::ContentError),
 }
 
 impl Serialize for CommandError {
@@ -216,8 +213,114 @@ fn view(app: AppHandle, core: tauri::State<'_, Arc<Core>>) {
     emit_view(&app, &core.view.lock());
 }
 
+/// Every action the UI sends, served under the view and session the core holds.
 #[tauri::command]
-fn insert_backend(core: tauri::State<'_, Arc<Core>>) -> Result<(), CommandError> {
+async fn act(
+    app: AppHandle,
+    core: tauri::State<'_, Arc<Core>>,
+    action: Action,
+) -> Result<(), CommandError> {
+    serve(&app, &core, action).await
+}
+
+async fn serve(app: &AppHandle, core: &Arc<Core>, action: Action) -> Result<(), CommandError> {
+    match action {
+        Action::SignIn => sign_in(app, core).await,
+        Action::Unlock => unlock(app, core).await,
+        Action::ChooseAccount { account } => {
+            choose_account(app, core, account);
+            Ok(())
+        }
+        Action::AddAccount => add_account(app, core).await,
+        Action::InsertBackend => insert_backend(core),
+        Action::SwitchAccount { account } => switch_account(app, core, account).await,
+        Action::EnrolGate => Ok(()),
+        Action::LogOutKeep => log_out_keep(app, core).await,
+        Action::LogOutDelete => log_out_delete(app, core).await,
+        Action::ConfirmDelete => confirm_delete(app, core).await,
+        Action::ForceDelete => Ok(()),
+        Action::AddOrder => add_order(core).await,
+        Action::RemoveNewest => remove_newest(core).await,
+        Action::CancelLogout => {
+            cancel_logout(app, core);
+            Ok(())
+        }
+        Action::StagePhoto { name, bytes } => stage_photo(app, core, name, bytes).await,
+        Action::Pin => pin_content(app, core).await,
+        Action::Unpin => unpin_content(app, core).await,
+        Action::FetchPinned => fetch_pinned(app, core).await,
+        Action::TidyContent => tidy_content(app, core).await,
+        Action::RetryUpload { file_id } => retry_upload(app, core, file_id).await,
+        Action::AcknowledgeLost => acknowledge_lost(app, core).await,
+        Action::SaveNote { body } => save_note(app, core, body).await,
+        Action::FreeUpSpace => free_up_space(app, core).await,
+        Action::Export => export(app, core).await,
+        Action::Import { bytes, .. } => import(app, core, bytes).await,
+    }
+}
+
+/// Start the parked login the moment the user asks. The system browser on a
+/// desktop, the platform's auth session on a phone, or a re-run of the setup
+/// when no login is parked yet.
+async fn sign_in(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
+    match core.parked.borrow().clone() {
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        Some(_) => {
+            core.update(app, |v| v.status = "the browser page is open".to_owned());
+            // Clearing the parked URL is what the parked login waits for, so
+            // the platform's auth session opens on this click.
+            let _ = core.parked.send(None);
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        Some(url) => {
+            core.update(app, |v| v.status = "the browser page is open".to_owned());
+            let opener = connetto_client::system_browser_opener();
+            if let Err(err) = opener(&url) {
+                core.update(app, |v| {
+                    v.logout = LogoutState::Error(format!("opening the browser: {err}"));
+                });
+            }
+        }
+        None => {
+            let slot_empty = matches!(*core.slot.lock(), Slot::Empty);
+            if slot_empty && !core.starting.load(Ordering::Acquire) {
+                start(app.clone(), core, AccountChoice::LastUsed);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn unlock(_app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
+    let client = core.client().ok_or(CommandError::NotReady)?;
+    client.unlock().await;
+    Ok(())
+}
+
+/// Answer the parked account picker. The view returns to connecting until the
+/// sign-in it triggered lands or fails.
+fn choose_account(app: &AppHandle, core: &Arc<Core>, account: Option<String>) {
+    if let Some(answer) = core.picker.lock().take() {
+        let _ = answer.send(account);
+        core.update(app, |v| {
+            v.picking = None;
+            v.session = Session::Connecting;
+        });
+    }
+}
+
+/// End the session and sign in as a new account, through a fresh login.
+async fn add_account(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
+    let session = core.begin_sign_out().ok_or(CommandError::NotReady)?;
+    let client = session.native.client().clone();
+    client.close().await;
+    *core.slot.lock() = Slot::Empty;
+    drop(session);
+    start(app.clone(), core, AccountChoice::New);
+    Ok(())
+}
+
+fn insert_backend(core: &Arc<Core>) -> Result<(), CommandError> {
     let session = core.session().ok_or(CommandError::NotReady)?;
     session
         .backend
@@ -225,84 +328,422 @@ fn insert_backend(core: tauri::State<'_, Arc<Core>>) -> Result<(), CommandError>
         .map_err(|_| CommandError::BackendGone)
 }
 
-#[tauri::command]
-async fn insert_local(core: tauri::State<'_, Arc<Core>>) -> Result<(), CommandError> {
-    let session = core.session().ok_or(CommandError::NotReady)?;
-    let client = session.native.client().clone();
-    // The deployment policy names the owner on the row.
-    let user = session
-        .native
-        .session()
-        .map_or_else(String::new, |session| session.user_id().to_owned());
-    let quantity = demo_quantity();
-    client
-        .with_conn(move |conn| {
-            diesel::insert_into(orders::table)
-                .values((orders::owner_id.eq(user), orders::quantity.eq(quantity)))
-                .execute(conn.conn())
-        })
-        .await??;
-    Ok(())
-}
-
-#[tauri::command]
-async fn unlock(core: tauri::State<'_, Arc<Core>>) -> Result<(), CommandError> {
-    let client = core.client().ok_or(CommandError::NotReady)?;
-    client.unlock().await;
-    Ok(())
-}
-
-/// Revoke the session, wipe the replica and sign in again. Unsynced writes
-/// block the wipe until `discard_unsynced` confirms losing them. A refused
-/// sign-out keeps the session, and one that closed the client signs in again
-/// whatever it left undone.
-#[tauri::command(rename_all = "snake_case")]
-async fn sign_out(
-    app: AppHandle,
-    core: tauri::State<'_, Arc<Core>>,
-    discard_unsynced: bool,
+/// Start over as another stored account, refused while local writes are unsent.
+async fn switch_account(
+    app: &AppHandle,
+    core: &Arc<Core>,
+    key: String,
 ) -> Result<(), CommandError> {
     let session = core.begin_sign_out().ok_or(CommandError::NotReady)?;
-    let notice = match session.native.forget_device(discard_unsynced).await {
-        Ok(()) => None,
-        Err(ForgetError::Incomplete(report)) => Some(format!("logout error: {report}")),
-        Err(ForgetError::Refused(refusal)) => {
-            let wipe = match refusal {
-                ForgetRefusal::Unsynced(unsynced) if !discard_unsynced => Wipe::ConfirmForce {
-                    unsynced: unsynced.len(),
-                },
-                refusal => Wipe::Failed {
-                    message: format!("logout error: {refusal}"),
-                },
-            };
+    let client = session.native.client().clone();
+    match client.unsynced().await {
+        Ok(unsynced) if unsynced.is_empty() => {
+            client.close().await;
+            *core.slot.lock() = Slot::Empty;
+            drop(session);
+            start(app.clone(), core, AccountChoice::Account(key));
+            Ok(())
+        }
+        Ok(unsynced) => {
             *core.slot.lock() = Slot::Ready(session);
-            core.update(&app, |view| view.wipe = wipe);
+            core.update(app, |v| {
+                v.logout = LogoutState::Error(format!(
+                    "Cannot change account: {} write(s) not yet synced.",
+                    unsynced.len()
+                ));
+            });
+            Ok(())
+        }
+        Err(err) => {
+            *core.slot.lock() = Slot::Ready(session);
+            core.update(app, |v| {
+                v.logout = LogoutState::Error(format!("Cannot change account: {err}"));
+            });
+            Ok(())
+        }
+    }
+}
+
+/// Log out, keeping the local data. The session is revoked and the stored
+/// credential cleared, and the app starts over from the persisted cursor.
+async fn log_out_keep(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
+    let session = core.begin_sign_out().ok_or(CommandError::NotReady)?;
+    core.update(app, |v| v.logout = LogoutState::Working);
+    if let Some(authenticator) = &session.authenticator
+        && let Err(err) = authenticator.logout().await
+    {
+        // The local clear stands either way, so the session drops and the
+        // app starts over. The server keeps the session until it lapses.
+        tracing::warn!(error = %err, "revoking the session");
+    }
+    let client = session.native.client().clone();
+    client.close().await;
+    *core.slot.lock() = Slot::Empty;
+    drop(session);
+    start(app.clone(), core, AccountChoice::LastUsed);
+    Ok(())
+}
+
+/// Delete the local data and log out. `forget_device(false)` refuses while
+/// writes are still unsent, which asks the user to confirm losing them.
+async fn log_out_delete(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
+    let session = core.begin_sign_out().ok_or(CommandError::NotReady)?;
+    core.update(app, |v| v.logout = LogoutState::Working);
+    wipe(app, core, session, false).await;
+    Ok(())
+}
+
+/// The confirmed delete, discarding the unsent work.
+async fn confirm_delete(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
+    let session = core.begin_sign_out().ok_or(CommandError::NotReady)?;
+    core.update(app, |v| v.logout = LogoutState::Working);
+    wipe(app, core, session, true).await;
+    Ok(())
+}
+
+/// Wipe the replica and start over, discarding the unsent work. A refused
+/// wipe keeps the session, and one that closed the client starts over.
+async fn wipe(app: &AppHandle, core: &Arc<Core>, session: Arc<Parts>, force: bool) {
+    match session.native.forget_device(force).await {
+        Ok(()) => {
+            *core.slot.lock() = Slot::Empty;
+            drop(session);
+            start(app.clone(), core, AccountChoice::LastUsed);
+        }
+        Err(ForgetError::Refused(ForgetRefusal::Unsynced(unsynced))) => {
+            *core.slot.lock() = Slot::Ready(session);
+            core.update(app, |v| {
+                v.logout = LogoutState::ConfirmDelete {
+                    unsynced_count: u64::try_from(unsynced.len()).unwrap_or(u64::MAX),
+                };
+            });
+        }
+        Err(ForgetError::Refused(refusal)) => {
+            *core.slot.lock() = Slot::Ready(session);
+            core.update(app, |v| {
+                v.logout = LogoutState::Error(format!("logout error: {refusal}"));
+            });
+        }
+        Err(ForgetError::Incomplete(report)) => {
+            *core.slot.lock() = Slot::Empty;
+            drop(session);
+            tracing::error!(%report, "the wipe left a report");
+            start(app.clone(), core, AccountChoice::LastUsed);
+        }
+    }
+}
+
+fn cancel_logout(app: &AppHandle, core: &Arc<Core>) {
+    core.update(app, |v| v.logout = LogoutState::Idle);
+}
+
+async fn add_order(core: &Arc<Core>) -> Result<(), CommandError> {
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let client = session.native.client().clone();
+    let identity = user_id(&session);
+    support::add_order(&client, &identity, support::fresh_quantity()).await?;
+    Ok(())
+}
+
+async fn remove_newest(core: &Arc<Core>) -> Result<(), CommandError> {
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let client = session.native.client().clone();
+    let Some(id) = *session.holds.newest_order.lock() else {
+        return Ok(());
+    };
+    support::remove_newest_order(&client, id).await?;
+    Ok(())
+}
+
+async fn stage_photo(
+    app: &AppHandle,
+    core: &Arc<Core>,
+    name: String,
+    bytes: Vec<u8>,
+) -> Result<(), CommandError> {
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let identity = user_id(&session);
+    let line = match support::mime_from_extension(std::path::Path::new(&name)) {
+        None => "not an image: only .jpg .jpeg .png are accepted".to_owned(),
+        Some(mime) => {
+            let outcome = session
+                .content
+                .stage(bytes.as_slice(), mime, |conn, file_id| {
+                    support::stage_photo_row(conn, file_id, &identity)
+                })
+                .await;
+            match outcome {
+                Ok(_) => format!("staged: {name}"),
+                Err(err) => format!("stage failed: {err}"),
+            }
+        }
+    };
+    core.update(app, |v| v.stage_line = Some(line));
+    Ok(())
+}
+
+async fn pin_content(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let line = session
+        .content
+        .pin_content("photos", support::PIN_PHOTOS_QUERY, "content_id")
+        .await
+        .map_or_else(support::pin_failed, |_| support::PIN_OK.to_owned());
+    core.update(app, |v| v.content_line = Some(line));
+    Ok(())
+}
+
+async fn unpin_content(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let line = session
+        .content
+        .unpin_content("photos")
+        .await
+        .map_or_else(support::unpin_failed, |_| support::UNPIN_OK.to_owned());
+    core.update(app, |v| v.content_line = Some(line));
+    Ok(())
+}
+
+async fn fetch_pinned(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let line = session
+        .content
+        .fetch_pinned()
+        .await
+        .map_or_else(support::fetch_failed, |ids| support::fetch_ok(ids.len()));
+    session.holds.thumb_refresh.fetch_add(1, Ordering::Release);
+    core.update(app, |v| v.content_line = Some(line));
+    Ok(())
+}
+
+async fn tidy_content(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let line = session
+        .content
+        .tidy_content()
+        .await
+        .map_or_else(support::tidy_failed, support::tidy_ok);
+    core.update(app, |v| v.content_line = Some(line));
+    Ok(())
+}
+
+async fn retry_upload(app: &AppHandle, core: &Arc<Core>, hex: String) -> Result<(), CommandError> {
+    let Some(file_id) = file_id_from_hex(&hex) else {
+        return Ok(());
+    };
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let short = support::short_hex(file_id.as_bytes());
+    match session.content.retry_refused(file_id).await {
+        Ok(()) => core.update(app, |v| {
+            v.refused_uploads.retain(|(id, _)| *id != short);
+        }),
+        Err(err) => core.update(app, |v| {
+            v.content_line = Some(format!("retry failed: {err}"))
+        }),
+    }
+    Ok(())
+}
+
+async fn acknowledge_lost(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let ids: Vec<FileId> = {
+        let view = core.view.lock();
+        view.lost_bytes
+            .iter()
+            .filter_map(|hex| file_id_from_hex(hex))
+            .collect()
+    };
+    if ids.is_empty() {
+        return Ok(());
+    }
+    match session.content.forget_retired_content(&ids).await {
+        Ok(()) => core.update(app, |v| v.lost_bytes.clear()),
+        Err(err) => core.update(app, |v| {
+            v.content_line = Some(format!("acknowledge failed: {err}"))
+        }),
+    }
+    Ok(())
+}
+
+async fn save_note(app: &AppHandle, core: &Arc<Core>, body: String) -> Result<(), CommandError> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let client = session.native.client().clone();
+    match support::save_note(&client, &body).await {
+        Ok(_) => core.update(app, |v| v.notes_saved += 1),
+        Err(err) => tracing::warn!(error = %err, "the note save failed"),
+    }
+    Ok(())
+}
+
+async fn free_up_space(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let client = session.native.client().clone();
+    if let Err(err) = client.tidy().await {
+        tracing::warn!(error = %err, "the trim pass failed");
+    }
+    let (pages, free) = support::replica_footprint(&client).await;
+    core.update(app, |v| {
+        v.pages = pages;
+        v.free_pages = free;
+    });
+    Ok(())
+}
+
+/// Offer the Save As window, then write the archive where it points. A
+/// dismissed window leaves the view unchanged.
+async fn export(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let content = Arc::clone(&session.content);
+    let (offer, pick) = oneshot::channel::<Option<FilePath>>();
+    app.dialog()
+        .file()
+        .set_file_name("connetto-local-data.zip")
+        .save_file(move |path| {
+            let _ = offer.send(path);
+        });
+    let path = match pick.await {
+        Ok(Some(path)) => path,
+        Ok(None) | Err(_) => return Ok(()),
+    };
+    let line = export_to(app, content, path).await;
+    core.update(app, |v| v.export_line = Some(line));
+    Ok(())
+}
+
+/// Write the archive to the path the Save As window chose, answering with the
+/// line the pane shows. The fs plugin opens Android content URIs.
+async fn export_to(app: &AppHandle, content: Content, path: FilePath) -> String {
+    let display = match &path {
+        FilePath::Path(p) => p.display().to_string(),
+        FilePath::Url(u) => u.to_string(),
+    };
+    let mut options = OpenOptions::new();
+    options.read(false).write(true).create(true).truncate(true);
+    let file = match &path {
+        FilePath::Path(p) => app.fs().open(p.as_path(), options),
+        FilePath::Url(u) => app.fs().open(u.clone(), options),
+    };
+    let file = match file {
+        Ok(file) => file,
+        Err(err) => return format!("export failed: {err}"),
+    };
+    let file = match content
+        .export_local_data(ExportScope::Everything, file)
+        .await
+    {
+        Ok(file) => file,
+        Err(err) => {
+            // A failed export leaves no empty archive behind where a path names
+            // it. A content URI stays with the document provider that made it.
+            if let FilePath::Path(p) = &path {
+                let _ = std::fs::remove_file(p);
+            }
+            return format!("export failed: {err}");
+        }
+    };
+    match file.metadata() {
+        Ok(meta) => format!("Wrote {} bytes to {display}", meta.len()),
+        Err(err) => format!("export failed: {err}"),
+    }
+}
+
+/// Restore one archive, keeping the file's version of every clash, and answer
+/// with the line the pane shows.
+async fn import(app: &AppHandle, core: &Arc<Core>, bytes: Vec<u8>) -> Result<(), CommandError> {
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let content = Arc::clone(&session.content);
+    let source = std::io::Cursor::new(bytes);
+    let mut plan = match content.prepare_local_data_import(source).await {
+        Ok(plan) => plan,
+        Err(err) => {
+            core.update(app, |v| v.import_line = Some(format!("refused: {err}")));
             return Ok(());
         }
     };
-    *core.slot.lock() = Slot::Empty;
-    drop(session);
-    core.update(&app, |view| {
-        *view = View {
-            notice,
-            ..View::default()
-        };
-    });
-    start(app, Arc::clone(&core));
+    let clash_count = plan.replica_plan().collisions().len();
+    let choices = ImportChoices::keeping_the_file();
+    let outcome = match content.apply_local_data_import(&mut plan, &choices).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            core.update(app, |v| {
+                v.import_line = Some(format!("apply failed: {err}"))
+            });
+            return Ok(());
+        }
+    };
+    let mut line = format!(
+        "{} row(s) restored, {} kept, {} write(s) restored, {} content file(s)",
+        outcome.rows_restored,
+        outcome.rows_kept,
+        outcome.writes_restored,
+        plan.content_files(),
+    );
+    if clash_count > 0 {
+        line.push_str(&format!(" ({clash_count} clash(es) resolved to the file)"));
+    }
+    core.update(app, |v| v.import_line = Some(line));
     Ok(())
 }
 
-/// Back to the sign-out button after a refused or failed sign-out.
-#[tauri::command]
-fn dismiss_wipe(app: AppHandle, core: tauri::State<'_, Arc<Core>>) {
-    core.update(&app, |view| view.wipe = Wipe::Idle);
+/// The identity a client write names on the row, empty while none is live.
+fn user_id(session: &Parts) -> String {
+    session
+        .native
+        .session()
+        .map_or_else(String::new, |session| session.user_id().to_owned())
 }
 
-fn demo_quantity() -> i64 {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    i64::try_from(millis % 9).unwrap_or(0) * 5 + 5
+/// A file id from its 64-hex spelling, `None` on any other length or digit.
+fn file_id_from_hex(hex: &str) -> Option<FileId> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0_u8; 32];
+    for (i, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(FileId::from_bytes(bytes))
+}
+
+/// The status line for one content event.
+fn content_label(event: &ContentEvent) -> String {
+    match event {
+        ContentEvent::Uploaded { file_id } => {
+            format!("uploaded {}", support::short_hex(file_id.as_bytes()))
+        }
+        ContentEvent::UploadDeferred { file_id, detail } => {
+            format!(
+                "deferred {}: {detail}",
+                support::short_hex(file_id.as_bytes())
+            )
+        }
+        ContentEvent::UploadRefused { file_id, detail } => {
+            format!(
+                "refused {}: {detail}",
+                support::short_hex(file_id.as_bytes())
+            )
+        }
+        ContentEvent::BytesLost {
+            file_id,
+            unreadable,
+        } => format!(
+            "bytes lost {} ({unreadable} unreadable chunks)",
+            support::short_hex(file_id.as_bytes())
+        ),
+        ContentEvent::Fetched { file_id } => {
+            format!("fetched {}", support::short_hex(file_id.as_bytes()))
+        }
+        ContentEvent::LostRequeued { file_id } => {
+            format!(
+                "re-uploading lost {}",
+                support::short_hex(file_id.as_bytes())
+            )
+        }
+        ContentEvent::IntegrityPassFailed { detail } => format!("integrity check failed: {detail}"),
+    }
 }
 
 /// An endpoint as the running environment sets it, else as the build
@@ -314,18 +755,34 @@ fn endpoint(runtime: Option<String>, built: Option<&'static str>, default: &str)
 }
 
 #[cfg(target_os = "android")]
-fn platform_sign_in(auth: KeyringAuth) -> KeyringAuth {
-    auth.with_claimed_redirect(APP_REDIRECT, Arc::new(mobile::TabSession))
-        .with_keystore_prompt(Arc::new(android::KeystoreUnlock))
+fn platform_sign_in(app: AppHandle, core: &Arc<Core>, auth: KeyringAuth) -> KeyringAuth {
+    auth.with_claimed_redirect(
+        APP_REDIRECT,
+        Arc::new(mobile::TabSession {
+            app,
+            core: Arc::clone(core),
+            parked: core.parked.clone(),
+            parked_rx: core.parked_rx.clone(),
+        }),
+    )
+    .with_keystore_prompt(Arc::new(android::KeystoreUnlock))
 }
 
 #[cfg(target_os = "ios")]
-fn platform_sign_in(auth: KeyringAuth) -> KeyringAuth {
-    auth.with_claimed_redirect(APP_REDIRECT, Arc::new(mobile::TabSession))
+fn platform_sign_in(app: AppHandle, core: &Arc<Core>, auth: KeyringAuth) -> KeyringAuth {
+    auth.with_claimed_redirect(
+        APP_REDIRECT,
+        Arc::new(mobile::TabSession {
+            app,
+            core: Arc::clone(core),
+            parked: core.parked.clone(),
+            parked_rx: core.parked_rx.clone(),
+        }),
+    )
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn platform_sign_in(auth: KeyringAuth) -> KeyringAuth {
+fn platform_sign_in(_app: AppHandle, _core: &Arc<Core>, auth: KeyringAuth) -> KeyringAuth {
     auth
 }
 
@@ -337,12 +794,28 @@ mod mobile {
     const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
 
     /// The Custom Tab on Android or the authentication session on iOS, and
-    /// the app's redirect, through `connetto-auth-session`.
-    pub(crate) struct TabSession;
+    /// the app's redirect, through `connetto-auth-session`. The session opens
+    /// when the Sign in click clears the parked URL, so a boot starts no
+    /// in-app browser.
+    pub(crate) struct TabSession {
+        pub(crate) app: tauri::AppHandle,
+        pub(crate) core: std::sync::Arc<super::Core>,
+        pub(crate) parked: tokio::sync::watch::Sender<Option<String>>,
+        pub(crate) parked_rx: tokio::sync::watch::Receiver<Option<String>>,
+    }
 
     impl connetto_client::AuthorizationSession for TabSession {
         fn authorize(&self, url: String) -> connetto_client::SessionFuture {
+            let mut waiting = self.parked_rx.clone();
+            let parked = self.parked.clone();
+            let app = self.app.clone();
+            let core = std::sync::Arc::clone(&self.core);
             Box::pin(async move {
+                // The login stands parked until the Sign in click clears the
+                // parked URL, which is what the web's popup opening is.
+                let _ = parked.send(Some(url.clone()));
+                core.update(&app, |v| v.session = super::Session::SignInOffered);
+                let _ = waiting.wait_for(|parked| parked.is_none());
                 connetto_auth_session::authorize(&url, LOGIN_WINDOW)
                     .await
                     .map_err(|err| ClientError::Auth(err.to_string()))
@@ -382,6 +855,7 @@ mod android {
             .map_err(|err| ClientError::Auth(err.to_string()))
         }
     }
+
     /// Writes each formatted log line to logcat, since an Android app's
     /// stdout goes nowhere.
     pub(crate) struct Logcat;
@@ -395,10 +869,11 @@ mod android {
                 .filter(|byte| *byte != 0 && *byte != b'\n')
                 .collect();
             let message = std::ffi::CString::new(line).expect("NUL bytes were removed");
-            // The discriminants are logcat's priorities, 0 to 8, so the cast never truncates.
+            // The discriminants are logcat's priorities, 0 to 8, so the cast
+            // never truncates.
             let priority = android_log_sys::LogPriority::INFO as std::ffi::c_int;
-            // SAFETY: both pointers are NUL-terminated strings that live until
-            // the call returns, and logcat only reads them.
+            // SAFETY: both pointers are NUL-terminated strings that live
+            // until the call returns, and logcat only reads them.
             unsafe {
                 android_log_sys::__android_log_write(
                     priority,
@@ -415,36 +890,10 @@ mod android {
     }
 }
 
-fn status_label(event: &ClientEvent) -> Option<String> {
-    match event {
-        ClientEvent::Reconnecting { attempt } => Some(format!("reconnecting (attempt {attempt})")),
-        ClientEvent::Reconnected => Some("reconnected".to_owned()),
-        ClientEvent::MutationApplied { client_seq } => {
-            Some(format!("mutation {client_seq} applied"))
-        }
-        ClientEvent::MutationRejected {
-            client_seq, reason, ..
-        } => Some(format!("mutation {client_seq} rejected: {reason}")),
-        ClientEvent::MutationConflict { client_seq, .. } => {
-            Some(format!("mutation {client_seq} conflicted"))
-        }
-        ClientEvent::ServerClosed { reason } => Some(match reason {
-            FatalErrorReason::RateLimited { retry_after_ms } => format!(
-                "connection closed: rate limit exceeded (server suggests {retry_after_ms}ms wait)"
-            ),
-            other => format!("server closed the connection: {other:?}"),
-        }),
-        ClientEvent::Stopped { detail } => Some(format!("the client stopped: {detail}")),
-        ClientEvent::Closed => Some("connection closed".to_owned()),
-        ClientEvent::AuthenticationRequired => {
-            Some("session expired, sign out and sign in again".to_owned())
-        }
-        _ => None,
-    }
-}
-
+/// The device line, the identity and certificate standing a build with a
+/// device identity reports.
 #[cfg(feature = "device-identity")]
-fn device_label(native: &NativeClient<Ws>) -> String {
+fn device_label(native: &NativeClient<Ws, ContentHandle<Ws>>) -> String {
     use connetto_core::device_cert::KeyHome;
 
     let home = match native.device_key_home() {
@@ -469,15 +918,47 @@ fn device_label(native: &NativeClient<Ws>) -> String {
 }
 
 #[cfg(not(feature = "device-identity"))]
-fn device_label(_native: &NativeClient<Ws>) -> String {
+fn device_label(_native: &NativeClient<Ws, ContentHandle<Ws>>) -> String {
     "no device identity in this build".to_owned()
 }
 
+/// The account chooser, parked in the view while it waits for the choice.
+fn account_chooser(app: &AppHandle, core: &Arc<Core>) -> AccountChooser {
+    let app = app.clone();
+    let core = Arc::clone(core);
+    Arc::new(move |accounts: Vec<String>| {
+        let app = app.clone();
+        let core = Arc::clone(&core);
+        Box::pin(async move {
+            if accounts.len() <= 1 {
+                return AccountChoice::LastUsed;
+            }
+            let (answer, mut waiting) = mpsc::unbounded_channel::<Option<String>>();
+            *core.picker.lock() = Some(answer);
+            core.update(&app, |v| {
+                v.session = Session::PickingAccount;
+                v.picking = Some(accounts);
+            });
+            match waiting.recv().await {
+                Some(Some(key)) => AccountChoice::Account(key),
+                Some(None) => AccountChoice::New,
+                None => AccountChoice::LastUsed,
+            }
+        })
+    })
+}
+
 /// Sign in, open the replica and start the pump, then feed the view.
-async fn setup(app: AppHandle, core: Arc<Core>, data_dir: PathBuf) -> anyhow::Result<()> {
+async fn setup(
+    app: AppHandle,
+    core: Arc<Core>,
+    data_dir: PathBuf,
+    choice: AccountChoice,
+) -> anyhow::Result<()> {
     use anyhow::Context as _;
     #[cfg(target_os = "android")]
     connetto_auth_session::initialize_tls()?;
+
     let server = endpoint(
         std::env::var("CONNETTO_DEMO_WS").ok(),
         option_env!("CONNETTO_DEMO_BUILD_WS"),
@@ -493,60 +974,172 @@ async fn setup(app: AppHandle, core: Arc<Core>, data_dir: PathBuf) -> anyhow::Re
         option_env!("CONNETTO_DEMO_BUILD_AUTH_ORIGIN"),
         DEFAULT_AUTH_ORIGIN,
     );
-    let sign_in = platform_sign_in(Auth::new(auth_origin, AUTH_PROVIDER).keyring(KEYRING_SERVICE));
+
+    // Park the loopback login URL instead of opening a browser, so the Sign in
+    // control runs it when the user asks. A valid stored credential resolves
+    // before the opener runs, so a restore launches nothing.
+    let opener = {
+        let app = app.clone();
+        let core = Arc::clone(&core);
+        let data_dir = data_dir.clone();
+        Arc::new(move |url: &str| {
+            tracing::info!("parked the loopback login: {url}");
+            // The demo proof reads the parked URL to complete a login a
+            // stand-in browser will not, so it also lands beside the replica.
+            let _ = std::fs::write(data_dir.join("parked-login"), url);
+            let _ = core.parked.send(Some(url.to_owned()));
+            core.update(&app, |v| v.session = Session::SignInOffered);
+            Ok(())
+        })
+    };
+
+    let sign_in = platform_sign_in(
+        app.clone(),
+        &core,
+        Auth::new(auth_origin.clone(), AUTH_PROVIDER)
+            .with_account(choice)
+            .keyring(KEYRING_SERVICE)
+            .with_browser_opener(opener)
+            .with_account_chooser(account_chooser(&app, &core)),
+    );
+
     tokio::fs::create_dir_all(&data_dir)
         .await
         .context("creating the application data directory")?;
 
-    let builder =
-        NativeClientBuilder::new(server, SyncSchema::new(connetto_schema_bundle::bundle()))
-            .with_tuning(SyncTuning::default().with_trim_threshold(5))
-            .signed_in(sign_in)
-            .durable(&data_dir)
-            .with_gate(Gate::default().with_recheck(Some(RECHECK_AFTER)));
+    let builder = NativeClientBuilder::new(server, support::demo_schema())
+        .with_tuning(SyncTuning::default().with_trim_threshold(5))
+        .with_content(ContentPiece::new().with_heal_lost(
+            "SELECT content_id FROM photos WHERE content_state = 'lost'",
+            "content_id",
+        ))
+        .signed_in(sign_in)
+        .durable(&data_dir)
+        .with_gate(Gate::default().with_recheck(Some(RECHECK_AFTER)));
     #[cfg(feature = "device-identity")]
     let builder = builder.with_deployment_roots([DEVICE_ROOT.to_vec()]);
     #[cfg(all(feature = "device-identity", target_os = "android"))]
     let builder = builder.with_java_access(connetto_auth_session::java_access());
-    let (native, pump) = builder
-        .connect_with_pump()
-        .await
-        .context("opening the encrypted replica")?;
+    let (native, pump) = builder.connect_with_pump().await.map_err(|err| match err {
+        ClientError::Auth(_) => {
+            anyhow::anyhow!(
+                "the server refused the credential; check CONNETTO_AUTH and OIDC settings"
+            )
+        }
+        other => anyhow::anyhow!("opening the encrypted replica: {other}"),
+    })?;
     let client = native.client().clone();
-    let custody = native.custody().to_string();
-    let user = native
-        .session()
-        .map_or_else(String::new, |session| session.user_id().to_owned());
+    let content = match native.content() {
+        Some(ContentHandle::Durable(content)) => Arc::clone(content),
+        _ => anyhow::bail!("a durable build keeps its files beside the replica"),
+    };
+
+    // The authenticator the logout controls use to revoke the session without
+    // touching the replica, which the wipe path destroys instead.
+    let authenticator = native.session().map(|session| {
+        NativeAuthenticator::new(
+            auth_origin,
+            AUTH_PROVIDER,
+            Arc::new(KeyringStore::new(KEYRING_SERVICE)),
+            Some(session.account().to_owned()),
+        )
+    });
 
     // Reset before the tasks start, since the count is pushed only on change.
-    core.update(&app, |view| {
-        *view = View {
-            stage: "ready",
-            user: user.clone(),
-            custody,
-            ..View::default()
-        };
+    let session = native.session();
+    let (user, account, accounts) = match session {
+        Some(session) => (
+            session.user_id().to_owned(),
+            session.account().to_owned(),
+            session.accounts().to_vec(),
+        ),
+        None => (String::new(), String::new(), Vec::new()),
+    };
+    let custody = native.custody();
+    let gate = if custody.is_verified() {
+        "open"
+    } else {
+        "none, local data opens without user verification"
+    };
+    core.update(&app, |v| {
+        *v = View::initial();
+        v.session = Session::SignedIn;
+        v.attached = true;
+        v.identity = Some(user.clone());
+        v.account = Some(account);
+        v.known_accounts = accounts;
+        v.status = "connected".to_owned();
+        v.gate_line = Some(format!("gate: {gate}"));
+        v.custody_line = Some(format!("custody: {custody}"));
+        v.device_line = device_label(&native);
+        // Only a lock the gate reports later offers the unlock, and a build
+        // with no gate never locks.
+        v.offers_unlock = false;
+        v.backend_writer = true;
     });
+
     let (backend, commands) = mpsc::unbounded_channel::<BackendCmd>();
-    let session = Arc::new_cyclic(|session| {
+    let holds = Arc::new(Holds::default());
+    let parts = Arc::new_cyclic(|parts| {
         let mut tasks = JoinSet::new();
         tasks.spawn(pump);
         tasks.spawn(feed_events(app.clone(), Arc::clone(&core), client.clone()));
-        tasks.spawn(feed_count(app.clone(), Arc::clone(&core), client));
+        tasks.spawn(feed_count(app.clone(), Arc::clone(&core), client.clone()));
+        tasks.spawn(feed_grouped(app.clone(), Arc::clone(&core), client.clone()));
+        tasks.spawn(feed_orders(
+            app.clone(),
+            Arc::clone(&core),
+            client.clone(),
+            Arc::clone(&holds),
+        ));
+        tasks.spawn(feed_notes(
+            app.clone(),
+            Arc::clone(&core),
+            client.clone(),
+            Arc::clone(&holds),
+        ));
+        tasks.spawn(feed_photos(
+            app.clone(),
+            Arc::clone(&core),
+            client.clone(),
+            Arc::clone(&content),
+            Arc::clone(&holds),
+        ));
+        tasks.spawn(feed_device(app.clone(), Arc::clone(&core), parts.clone()));
+        tasks.spawn(feed_content(
+            app.clone(),
+            Arc::clone(&core),
+            Arc::clone(&content),
+        ));
         tasks.spawn(write_backend(pg_url, user, commands));
-        tasks.spawn(feed_device(app, Arc::clone(&core), Weak::clone(session)));
-        Session {
+        Parts {
             native,
+            content,
+            authenticator,
             backend,
+            holds,
             _tasks: tasks,
         }
     });
-    let mut slot = core.slot.lock();
-    // Only setup fills an empty slot, and only one setup runs at a time.
-    if !matches!(*slot, Slot::Empty) {
-        anyhow::bail!("a second session started");
+    {
+        let mut slot = core.slot.lock();
+        // Only setup fills an empty slot, and only one setup runs at a time.
+        if !matches!(*slot, Slot::Empty) {
+            anyhow::bail!("a second session started");
+        }
+        *slot = Slot::Ready(Arc::clone(&parts));
     }
-    *slot = Slot::Ready(session);
+
+    // The footprint is read once here, since the feeds re-read it only when
+    // the covered rows move.
+    let (app, client) = (app.clone(), client.clone());
+    tauri::async_runtime::spawn(async move {
+        let (pages, free) = support::replica_footprint(&client).await;
+        core.update(&app, |v| {
+            v.pages = pages;
+            v.free_pages = free;
+        });
+    });
     Ok(())
 }
 
@@ -560,13 +1153,14 @@ async fn feed_events(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>
             ClientEvent::Unlocked => Some("open"),
             _ => None,
         };
-        let status = status_label(&event);
-        core.update(&app, |view| {
+        let status = support::status_label(&event);
+        core.update(&app, |v| {
             if let Some(gate) = gate {
-                view.gate = gate;
+                v.gate_line = Some(format!("gate: {gate}"));
+                v.offers_unlock = gate != "open";
             }
             if let Some(status) = status {
-                view.status = status;
+                v.status = status;
             }
         });
         // The stop names its cause, and the `Closed` that follows it would
@@ -579,17 +1173,244 @@ async fn feed_events(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>
 
 /// The server-pushed count.
 async fn feed_count(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>) {
-    match orders::table.count().live(&client).await {
-        Ok(mut handle) => loop {
-            let count = handle.snapshot();
-            core.update(&app, |view| view.count = count);
-            if let Err(err) = handle.changed().await {
-                core.update(&app, |view| view.error = Some(err.to_string()));
-                return;
-            }
-        },
-        Err(err) => core.update(&app, |view| view.error = Some(err.to_string())),
+    let mut handle = match support::orders_count::<Ws>().live(&client).await {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(error = %err, "the order count subscription stopped");
+            return;
+        }
+    };
+    loop {
+        if let Some(count) = handle.snapshot() {
+            core.update(&app, |v| v.server_count = Some(count));
+        }
+        if handle.changed().await.is_err() {
+            break;
+        }
     }
+}
+
+/// The server-pushed grouped count.
+async fn feed_grouped(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>) {
+    let mut handle = match support::orders_counts_by_quantity::<Ws>()
+        .live(&client)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(error = %err, "the grouped count subscription stopped");
+            return;
+        }
+    };
+    loop {
+        let counts = handle.snapshot();
+        core.update(&app, |v| v.grouped = support::grouped_label(&counts));
+        if handle.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// The visible orders rows, newest first, and the newest id the remove button
+/// reaches.
+async fn feed_orders(
+    app: AppHandle,
+    core: Arc<Core>,
+    client: ConnettoClient<Ws>,
+    holds: Arc<Holds>,
+) {
+    let mut handle = match support::orders_newest_first::<Ws>().live(&client).await {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(error = %err, "the orders list stopped");
+            return;
+        }
+    };
+    loop {
+        let rows = handle.snapshot();
+        let orders: Vec<support::view::OrderRow> = rows
+            .iter()
+            .map(|row| support::view::OrderRow {
+                id: row.id.to_string(),
+                quantity: row.quantity,
+            })
+            .collect();
+        *holds.newest_order.lock() = rows.first().map(|row| row.id);
+        holds.covered_orders.store(rows.len(), Ordering::Release);
+        mirror(&core, &app, &client, &holds);
+        core.update(&app, |v| v.orders = orders);
+        if handle.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// The device-private notes rows.
+async fn feed_notes(
+    app: AppHandle,
+    core: Arc<Core>,
+    client: ConnettoClient<Ws>,
+    holds: Arc<Holds>,
+) {
+    let mut handle = match support::notes_rows::<Ws>().live(&client).await {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(error = %err, "the notes list stopped");
+            return;
+        }
+    };
+    loop {
+        let rows = handle.snapshot();
+        let notes: Vec<support::view::NoteRow> = rows
+            .iter()
+            .map(|row| support::view::NoteRow {
+                id: row.id.to_string(),
+                body: row.body.clone(),
+            })
+            .collect();
+        holds.covered_notes.store(rows.len(), Ordering::Release);
+        mirror(&core, &app, &client, &holds);
+        core.update(&app, |v| v.notes = notes);
+        if handle.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// The photos rows and their display sources, re-resolved when the rows or
+/// the pinned fetches move.
+async fn feed_photos(
+    app: AppHandle,
+    core: Arc<Core>,
+    client: ConnettoClient<Ws>,
+    content: Content,
+    holds: Arc<Holds>,
+) {
+    let mut handle = match support::photos_rows::<Ws>().live(&client).await {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(error = %err, "the photos list stopped");
+            return;
+        }
+    };
+    let mut key: (Vec<support::Photo>, u64) = (Vec::new(), 0);
+    loop {
+        let rows = handle.snapshot();
+        let photos: Vec<support::view::PhotoRow> = rows
+            .iter()
+            .map(|row| support::view::PhotoRow {
+                id: row.id.to_string(),
+                state: support::photo_state(row.content_state.as_deref()).to_owned(),
+            })
+            .collect();
+        let refresh = holds.thumb_refresh.load(Ordering::Acquire);
+        holds.covered_photos.store(rows.len(), Ordering::Release);
+        mirror(&core, &app, &client, &holds);
+        core.update(&app, |v| v.photos = photos);
+        if key.0 != rows || key.1 != refresh {
+            // The spawned task owns its snapshot, so the key keeps the rows.
+            let rows_for_thumbs = rows.clone();
+            key = (rows, refresh);
+            let (app, core, content) = (app.clone(), Arc::clone(&core), Arc::clone(&content));
+            tauri::async_runtime::spawn(async move {
+                let thumbs = thumbs(rows_for_thumbs, content).await;
+                // A landed session is someone else's when this one is gone,
+                // so only a live session's thumbs may reach the view.
+                if core.session().is_some() {
+                    core.update(&app, |v| v.photo_thumbs = thumbs);
+                }
+            });
+        }
+        if handle.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// The display source of each row, a server URL or local bytes as a `data:`
+/// URL.
+async fn thumbs(rows: Vec<support::Photo>, content: Content) -> HashMap<String, String> {
+    use base64::Engine as _;
+
+    let mut srcs = HashMap::new();
+    for row in &rows {
+        let Some(file_id) = support::photo_file_id(&row.content_id) else {
+            continue;
+        };
+        let available = row.content_state.as_deref() == Some("available");
+        match content.resolve(file_id).await {
+            Ok(Resolved::Local { bytes, .. }) => {
+                let enc = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                srcs.insert(row.id.to_string(), format!("data:image/jpeg;base64,{enc}"));
+            }
+            Ok(Resolved::Remote { url }) if available => {
+                srcs.insert(row.id.to_string(), url);
+            }
+            _ => {}
+        }
+    }
+    srcs
+}
+
+/// The device line, read again every second since enrolment runs beside the
+/// pump. It holds the session weakly, since the session owns this task.
+async fn feed_device(app: AppHandle, core: Arc<Core>, session: Weak<Parts>) {
+    loop {
+        let Some(session) = session.upgrade() else {
+            return;
+        };
+        let label = device_label(&session.native);
+        core.update(&app, |v| v.device_line = label);
+        drop(session);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// The content events drive the content line, the refused uploads and the
+/// lost files.
+async fn feed_content(app: AppHandle, core: Arc<Core>, content: Content) {
+    let mut events = content.events();
+    while let Ok(event) = events.recv().await {
+        let line = content_label(&event);
+        core.update(&app, |v| {
+            v.content_line = Some(line);
+            match &event {
+                ContentEvent::UploadRefused { file_id, detail } => {
+                    let id = support::short_hex(file_id.as_bytes());
+                    if !v.refused_uploads.iter().any(|(hex, _)| *hex == id) {
+                        v.refused_uploads.push((id, detail.clone()));
+                    }
+                }
+                ContentEvent::BytesLost { file_id, .. } => {
+                    let id = support::short_hex(file_id.as_bytes());
+                    if !v.lost_bytes.contains(&id) {
+                        v.lost_bytes.push(id);
+                    }
+                }
+                _ => {}
+            }
+        });
+    }
+}
+
+/// The covered rows moved, so the pane line and the mirror's footprint re-read.
+fn mirror(core: &Arc<Core>, app: &AppHandle, client: &ConnettoClient<Ws>, holds: &Holds) {
+    let total = holds.covered_orders.load(Ordering::Acquire)
+        + holds.covered_notes.load(Ordering::Acquire)
+        + holds.covered_photos.load(Ordering::Acquire);
+    let changed = holds.covered.lock().replace(total) != Some(total);
+    if !changed {
+        return;
+    }
+    core.update(app, |v| v.covered_rows = total);
+    let (core, app, client) = (Arc::clone(core), app.clone(), client.clone());
+    tauri::async_runtime::spawn(async move {
+        let (pages, free) = support::replica_footprint(&client).await;
+        core.update(&app, |v| {
+            v.pages = pages;
+            v.free_pages = free;
+        });
+    });
 }
 
 /// The backend writer, straight to Postgres, as the signed-in user, since
@@ -609,10 +1430,10 @@ async fn write_backend(
     };
     while let Some(BackendCmd::Insert) = commands.recv().await {
         let insert = diesel_async::RunQueryDsl::execute(
-            diesel::insert_into(orders::table)
+            diesel::insert_into(support::orders::table)
                 .values((
-                    orders::owner_id.eq(user.as_str()),
-                    orders::quantity.eq(demo_quantity()),
+                    support::orders::owner_id.eq(user.as_str()),
+                    support::orders::quantity.eq(support::fresh_quantity()),
                 ))
                 .on_conflict_do_nothing(),
             &mut pg,
@@ -624,47 +1445,57 @@ async fn write_backend(
     }
 }
 
-/// The device line, read again every second since enrolment runs beside the
-/// pump. It holds the session weakly, since the session owns this task.
-async fn feed_device(app: AppHandle, core: Arc<Core>, session: Weak<Session>) {
-    loop {
-        let Some(label) = session
-            .upgrade()
-            .map(|session| device_label(&session.native))
-        else {
-            return;
-        };
-        core.update(&app, |view| view.device = label);
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-}
-
 /// Run setup in the background, showing its failure.
-fn start(app: AppHandle, core: Arc<Core>) {
+fn start(app: AppHandle, core: &Arc<Core>, choice: AccountChoice) {
+    // Only one setup runs at a time, so a double-tapped control starts nothing.
+    if core
+        .starting
+        .compare_exchange(false, true, Ordering::Release, Ordering::Acquire)
+        .is_err()
+    {
+        tracing::warn!("a setup is already running; the request is dropped");
+        return;
+    }
+    // The panes and the account bar belong to the session that ended, so a
+    // new setup shows only the header until its own session lands.
+    core.update(&app, |v| {
+        *v = View {
+            status: std::mem::take(&mut v.status),
+            gate_line: v.gate_line.take(),
+            custody_line: v.custody_line.take(),
+            device_line: std::mem::take(&mut v.device_line),
+            ..View::initial()
+        };
+    });
+    let core = Arc::clone(core);
     tauri::async_runtime::spawn(async move {
         let data_dir = match app.path().app_data_dir() {
             Ok(dir) => dir.join("connetto-tauri-demo"),
             Err(err) => {
                 fail(&app, &core, &anyhow::Error::from(err));
+                core.starting.store(false, Ordering::Release);
                 return;
             }
         };
-        if let Err(err) = setup(app.clone(), Arc::clone(&core), data_dir).await {
+        if let Err(err) = setup(app.clone(), core.clone(), data_dir, choice).await {
             fail(&app, &core, &err);
         }
+        core.starting.store(false, Ordering::Release);
     });
 }
 
-fn fail(app: &AppHandle, core: &Core, err: &anyhow::Error) {
+fn fail(app: &AppHandle, core: &Arc<Core>, err: &anyhow::Error) {
     let detail = err
         .chain()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ");
-    tracing::error!(%detail, "setup failed");
-    core.update(app, |view| {
-        view.stage = "failed";
-        view.detail = Some(detail);
+    tracing::error!(%detail, "the setup failed");
+    *core.picker.lock() = None;
+    core.update(app, |v| {
+        v.session = Session::Connecting;
+        v.status = format!("boot failed: {detail}");
+        v.picking = None;
     });
 }
 
@@ -721,20 +1552,23 @@ fn feed_away(core: &Arc<Core>, event: &WindowEvent) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_logging();
-    let core = Arc::new(Core::default());
+    let (parked, parked_rx) = watch::channel(None::<String>);
+    let core = Arc::new(Core {
+        view: Mutex::new(View::initial()),
+        slot: Mutex::new(Slot::Empty),
+        parked,
+        parked_rx,
+        picker: Mutex::new(None),
+        starting: AtomicBool::new(false),
+    });
     let lifecycle = Arc::clone(&core);
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .manage(Arc::clone(&core))
-        .invoke_handler(tauri::generate_handler![
-            view,
-            insert_backend,
-            insert_local,
-            unlock,
-            sign_out,
-            dismiss_wipe
-        ])
+        .invoke_handler(tauri::generate_handler![view, act])
         .setup(move |app| {
-            start(app.handle().clone(), Arc::clone(&core));
+            start(app.handle().clone(), &core, AccountChoice::LastUsed);
             Ok(())
         })
         .build(tauri::generate_context!())

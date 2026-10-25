@@ -110,6 +110,15 @@ fn demo() -> Demo {
     DEMO.get().copied().unwrap_or_default()
 }
 
+/// The orders write button the sync step clicks, which only the Tauri demo
+/// names as its backend writer.
+fn insert_backend_label() -> &'static str {
+    match demo() {
+        Demo::Tauri => "Insert via Postgres (backend writer)",
+        Demo::Dioxus => "Add order",
+    }
+}
+
 /// The demo's bundle identifier.
 fn bundle() -> &'static str {
     match demo() {
@@ -493,7 +502,7 @@ async fn prove(
 
     step("sync a backend write");
     let before = order_count(&stack.pg_url).await?;
-    app.click("Insert via Postgres (backend writer)").await?;
+    app.click(insert_backend_label()).await?;
     wait_for_count(&stack.pg_url, before + 1).await?;
     app.wait_for_text(
         &format!("COUNT(*) pushed by the server: {}", before + 1),
@@ -507,7 +516,7 @@ async fn prove(
     app.wait_for_text("status: reconnecting", Duration::from_secs(60))
         .await?;
     let offline = order_count(&stack.pg_url).await?;
-    app.click("Insert locally (client write)").await?;
+    app.click("Add order").await?;
     sleep(Duration::from_secs(3)).await;
     if order_count(&stack.pg_url).await? != offline {
         bail!("an offline write reached Postgres");
@@ -550,6 +559,9 @@ async fn sign_in(
     evidence: &Path,
     user: &str,
 ) -> Result<PageSession> {
+    if matches!(demo(), Demo::Tauri) {
+        return sign_in_tauri(target, inspector, login_prefix, evidence, user).await;
+    }
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut demo = String::from("no demo page");
     let observe = async {
@@ -604,14 +616,108 @@ async fn sign_in(
     }
 }
 
+/// Sign in the Tauri demo, which parks the login URL and opens the login on
+/// the sign-in click, and return the demo's page.
+async fn sign_in_tauri(
+    target: &Target,
+    inspector: &mut Inspector,
+    login_prefix: &str,
+    evidence: &Path,
+    user: &str,
+) -> Result<PageSession> {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut shown = String::from("no demo page");
+    let observe = async {
+        let mut submitted = false;
+        loop {
+            if !submitted
+                && let Some(mut login) = inspector
+                    .try_page(|url| url.starts_with(login_prefix))
+                    .await?
+            {
+                target.screenshot(evidence, "login-page").await?;
+                submit_login(&mut login, user).await?;
+                submitted = true;
+                continue;
+            }
+            if let Some(mut app) = inspector.try_page(is_demo_page).await? {
+                match app.page_text().await {
+                    Ok(text) => {
+                        if !submitted && text.contains("Sign in to begin.") {
+                            // The click opens the login once the demo has
+                            // parked its URL, and a refused click retries on
+                            // the next poll.
+                            let _ = app
+                                .click_when_enabled("Sign in", Duration::from_secs(5))
+                                .await;
+                            continue;
+                        }
+                        if submitted
+                            && text.contains("Signed in as ")
+                            && text.contains("custody: released only after user verification")
+                        {
+                            return Ok::<_, anyhow::Error>(app);
+                        }
+                        shown = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    }
+                    Err(err) => {
+                        shown = format!("a page that did not answer ({err:#})");
+                        eprintln!("{shown}, reattaching the inspector");
+                        inspector.restart_at = Instant::now();
+                    }
+                }
+            }
+            inspector.keep_alive().await?;
+            sleep(Duration::from_secs(1)).await;
+        }
+    };
+    if let Ok(outcome) = tokio::time::timeout_at(deadline, observe).await {
+        outcome
+    } else {
+        let shown: String = shown.chars().take(400).collect();
+        bail!(
+            "sign-in did not finish within 90s, the demo showed {shown:?}, {}",
+            inspector.state()
+        );
+    }
+}
+
+/// Sign out, which wipes the replica and revokes the session, and see the
+/// demo start over at its sign-in banner. A delete with unsent local writes
+/// asks for confirmation first, and a refusal stands in the session panel in
+/// place of the start over.
 async fn sign_out(app: &mut PageSession) -> Result<()> {
-    app.click("Sign out (wipe local replica)").await?;
-    app.wait_for_outcome(
-        "Signing in",
-        &["logout error", "not yet synced"],
-        Duration::from_secs(60),
-    )
-    .await
+    app.click("Delete local data and log out").await?;
+    confirm_the_delete(app).await?;
+    app.wait_for_outcome("Sign in to begin.", &["Error: "], Duration::from_secs(60))
+        .await
+}
+
+/// The delete asks for confirmation while local writes are still unsent, so
+/// the confirmation stands until the click, and the signed-out banner stands
+/// when it does not.
+///
+/// # Errors
+///
+/// When neither stands within the bound.
+async fn confirm_the_delete(app: &mut PageSession) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let page = app.page_text().await?;
+        if page.contains("Confirm: delete and log out") {
+            app.click("Confirm: delete and log out").await?;
+            return Ok(());
+        }
+        if page.contains("Sign in to begin.") || page.contains("Error: ") {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "the sign out asked neither for confirmation nor to sign out, the page shows:\n{page}"
+            );
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// Sign the demo out on `phone` when it stands signed in, so a run leaves no
@@ -620,7 +726,7 @@ async fn sign_out(app: &mut PageSession) -> Result<()> {
 async fn leave_signed_out(phone: &Target, evidence: &Path) -> Result<()> {
     let mut inspector = Inspector::start(phone, evidence).await?;
     let mut app = inspector.page(is_demo_page).await?;
-    if app.page_text().await?.contains("Signed in as:") {
+    if app.page_text().await?.contains("Signed in as ") {
         sign_out(&mut app).await?;
     }
     Ok(())
@@ -670,7 +776,7 @@ async fn recheck_after_time_away(
         .await?;
     // The session outlived the lock: a backend write still reaches the page.
     let before = order_count(&stack.pg_url).await?;
-    app.click("Insert via Postgres (backend writer)").await?;
+    app.click(insert_backend_label()).await?;
     app.wait_for_text(
         &format!("COUNT(*) pushed by the server: {}", before + 1),
         Duration::from_secs(30),

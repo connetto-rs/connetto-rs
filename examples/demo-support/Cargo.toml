@@ -23,17 +23,24 @@ serde = { version = "1", features = ["derive"] }
 thiserror = { version = "2" }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
+[features]
+default = ["web"]
 # The browser platform, meaning the transport, the leader election, the relay
-# hub and the DB worker, reached through its WebClientBuilder.
+# hub and the DB worker, reached through its WebClientBuilder. A webview UI
+# that drives a native core over IPC leaves it off.
+web = ["dep:connetto-web", "dep:wasm-bindgen", "dep:web-sys"]
+
+# The browser clock and random source every wasm build reads, and the
+# browser platform behind the `web` feature.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 connetto-client = { path = "../../crates/connetto-client", default-features = false }
-connetto-web = { path = "../../crates/connetto-web" }
+connetto-web = { path = "../../crates/connetto-web", optional = true }
 js-sys = "0.3"
-wasm-bindgen = "0.2"
+wasm-bindgen = { version = "0.2", optional = true }
 # `Blob` and `Url` back the export download, `BroadcastChannel` the
 # worker-to-page channels, `Storage` the last signed-in account across
 # reloads, a non-secret identifier.
-web-sys = { version = "0.3", features = [
+web-sys = { version = "0.3", optional = true, features = [
   "Blob",
   "BroadcastChannel",
   "Document",
