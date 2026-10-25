@@ -6266,7 +6266,7 @@ mod tests {
     /// tables as ordinary tables for a relay tab's mirror.
     fn shared_bundle() -> connetto_core::schema::SchemaBundle {
         connetto_core::schema::SchemaBundle::new(
-            "",
+            "-- connetto:major 1",
             "",
             "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT); \
              CREATE TABLE entries (id INTEGER PRIMARY KEY, author TEXT); \
@@ -6276,6 +6276,7 @@ mod tests {
             ["public"],
             None::<&str>,
         )
+        .expect("the fixture declares its major")
         .with_shared_tables(["entries", "public"])
         .with_shared_layout(connetto_core::schema::SharedLayout::new(
             format!("{SHARED_FIXTURE_ORDERS}; {SHARED_FIXTURE_TEMP}; {SHARED_FIXTURE_SHARED}"),
@@ -6354,6 +6355,7 @@ mod tests {
                 panic!("the hub closed the tab: {detail}")
             }
             Err(super::TabFault::Hub(err)) => panic!("the hub failed: {err}"),
+            Err(super::TabFault::Refuse(reason)) => panic!("the hub refused the tab with {reason:?}"),
         }
         let mut rows = Vec::new();
         loop {
