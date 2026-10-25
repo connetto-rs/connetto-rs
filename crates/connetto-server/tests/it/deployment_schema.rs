@@ -510,10 +510,7 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
         .first(&mut pool.get().await.expect("a connection"))
         .await
         .expect("the login stored its session");
-    assert_eq!(
-        stored, user_id,
-        "the session row carries the resolver's uuid"
-    );
+    assert_eq!(stored, user_id);
 
     let mut client = live_session(&format!("127.0.0.1:{port}"), &token).await;
     let changeset = insert_changeset(
