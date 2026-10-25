@@ -1422,6 +1422,7 @@ async fn prepare_change_log(
     // healthy (R32), and a table without its previous image cannot answer
     // whether a caller could see the version that just went (R6).
     let commit_table = PgOplog::commit_table(oplog_table);
+    let xid_table = PgOplog::xid_table(oplog_table);
     preflight::require(
         pool,
         &[
@@ -1433,6 +1434,11 @@ async fn prepare_change_log(
                 column: "payload",
             },
             Artifact::Table(&commit_table),
+            Artifact::TableColumn {
+                table: &commit_table,
+                column: "xid_horizon",
+            },
+            Artifact::Table(&xid_table),
             Artifact::PreviousImages { publication },
         ],
     )

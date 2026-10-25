@@ -49,6 +49,15 @@ impl Unseen {
     }
 }
 
+/// The transactions a snapshot did not see, by full id: `running`, and every one from `from` on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnseenIds {
+    /// The transactions the snapshot lists as running.
+    pub running: Vec<u64>,
+    /// The snapshot's `xmax`, the first transaction it treats as not yet completed.
+    pub from: u64,
+}
+
 /// An id printed in `pg_snapshot` text reduced to the 32 bits a change carries.
 fn low_bits(xid: &str) -> Option<PgXid> {
     let xid = xid.parse::<u64>().ok()?;
@@ -93,6 +102,23 @@ impl ReadFence {
             .filter_map(low_bits)
             .collect();
         Unseen { running, from }
+    }
+
+    /// The transactions a change the snapshot missed can come from, by full id, as [`unseen`](Self::unseen) names them.
+    #[must_use]
+    pub fn unseen_ids(&self) -> UnseenIds {
+        let mut fields = self.snapshot.split(':').skip(1);
+        let from = fields
+            .next()
+            .and_then(|xid| xid.parse().ok())
+            .unwrap_or_default();
+        let running = fields
+            .next()
+            .into_iter()
+            .flat_map(|list| list.split(','))
+            .filter_map(|xid| xid.parse().ok())
+            .collect();
+        UnseenIds { running, from }
     }
 
     /// Append the encoded fence: the insert position, then the snapshot text.

@@ -85,7 +85,7 @@ pub use ban::{Ban, BanError, BanFuture, BanStore, ConnettoBanSchema, NewBan, pg_
 pub use capability::{CapabilityIssuer, IssuedCapability, ShareError, ShareLevel};
 pub use connetto_core::auth::CapabilityKey;
 pub use courier::{CourierDelivery, CourierEntry, CourierRefusal};
-pub use fence::{ReadFence, Unseen, snapshot_cursor, split_snapshot_cursor};
+pub use fence::{ReadFence, Unseen, UnseenIds, snapshot_cursor, split_snapshot_cursor};
 pub use guard::{PersonCloseHook, RequestGuard};
 // Re-exported because `ShareError::NotWritable` names one, so an application
 // matching on a refused verb can spell its type.
@@ -129,8 +129,8 @@ pub use materializer::{
     RuntimeWritableCatalog, RuntimeWritableCatalogBuilder, SeedPlan, SqliteRegistration,
 };
 pub use oplog::{
-    CHANGE_OP_TYPE, CatchupDecision, ChangeOp, ChangeOpSql, ChangeRecord, InMemoryOplog, Oplog,
-    OplogConfig, catchup_decision,
+    CHANGE_OP_TYPE, CatchupDecision, ChangeOp, ChangeOpSql, ChangeRecord, Commits, InMemoryOplog,
+    Oplog, OplogConfig, catchup_decision,
 };
 pub use oplog::{PgOplog, PgOplogError};
 pub use preflight::{Artifact, PreflightError};

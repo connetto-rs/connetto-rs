@@ -59,7 +59,8 @@ use subql::visibility::transition::{Transition, TransitionError, Transitions, tr
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
 use subql::{
     AdvanceCursorError, CdcSource, Checkpoint, DatabaseLike, EventKind, OpaqueCheckpoint, ParserDB,
-    PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, Seen, SourceItem, SubscriptionId, TableLike,
+    PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgXid, Seen, SourceItem, SubscriptionId,
+    TableLike,
 };
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
@@ -7367,6 +7368,20 @@ where
                 self.oplog.entries_of(&unseen)
             })
             .await?;
+            let min =
+                read_log::<O, _, _>(&mut state.resume_read_budget, || self.oplog.min_position())
+                    .await?;
+            if self.fence_dropped(state, &replay.fence, min).await? {
+                self.resnapshot_row(
+                    transport,
+                    state,
+                    &replay.label,
+                    &FullResyncReason::CursorOutsideRetention,
+                    None,
+                )
+                .await?;
+                continue;
+            }
             let watchers = [Arc::clone(&state.principal)];
             let mut verdicts = Transitions::new();
             let mut payloads = Vec::new();
@@ -7414,6 +7429,27 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Whether rows of a transaction `fence` could not see may have left a log whose oldest entry is `min`, asked after the reads that would have returned them.
+    async fn fence_dropped(
+        &self,
+        state: &mut SessionState<Id, Key>,
+        fence: &ReadFence,
+        min: Option<PgCommitPosition>,
+    ) -> Result<bool, SessionError> {
+        // An empty log holds none of their rows, so every one it recorded is gone.
+        let min = min.unwrap_or(PgCommitPosition::new(
+            PgLsn(i64::MAX.unsigned_abs()),
+            PgXid(u32::MAX),
+            u64::MAX,
+        ));
+        let unseen = fence.unseen_ids();
+        let commits = read_log::<O, _, _>(&mut state.resume_read_budget, || {
+            self.oplog.commits_of(&unseen, min.commit_lsn())
+        })
+        .await?;
+        Ok(commits.may_have_dropped(&unseen, min))
     }
 
     /// The cursor a read's `SnapshotEnd` carries, from its first page's, and the replay its fence owes.
@@ -7721,7 +7757,10 @@ where
         if matches!(
             catchup_decision(from, min, ceiling),
             CatchupDecision::FullResync
-        ) {
+        ) || match fence.as_deref() {
+            Some(fence) => self.fence_dropped(state, fence, min).await?,
+            None => false,
+        } {
             return self
                 .resnapshot_row(
                     transport,

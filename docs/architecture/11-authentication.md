@@ -154,16 +154,23 @@ CREATE TABLE connetto_oplog (
 );
 
 CREATE TABLE connetto_oplog_commit (
-    only_row   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),
-    commit_lsn BIGINT NOT NULL,
-    xid        BIGINT NOT NULL,
-    end_lsn    BIGINT NOT NULL
+    only_row    BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),
+    commit_lsn  BIGINT NOT NULL,
+    xid         BIGINT NOT NULL,
+    end_lsn     BIGINT NOT NULL,
+    xid_horizon BIGINT
 );
+
+CREATE TABLE connetto_oplog_xids (
+    xid        BIGINT PRIMARY KEY,
+    commit_lsn BIGINT NOT NULL
+);
+CREATE INDEX connetto_oplog_xids_lsn ON connetto_oplog_xids (commit_lsn);
 ```
 
 The writer frontier keys on a server-issued writer number. A device writer additionally has a unique `device_key` and survives its enrolment connection. `user_id` is nullable for anonymous writers. `frontier` is the highest settled sequence and `head` its chain hash. `_connetto_settled` stores each `(writer, seq)` with its entry hash, `previous_hash`, outcome and delivery path. A retained entry verifies against its own predecessor evidence after pruning. Missing or malformed retained hashes fail redelivery explicitly.
 
-**The reconnect log is on this list as of R32 (2026-08-09), and the server refuses to start without it.** It holds what a returning client missed, and it used to live only in the server's memory, so it was empty on every boot and answered "you have missed nothing" to every client that came back after a restart, which sent them nothing and left them silently stale. Durable, it answers from evidence. `CONNETTO_OPLOG_TABLE` names it, defaulting to `connetto_oplog`, and `PgOplog::ensure_schema` creates this schema for a scratch database, each object only when it is absent. The boot check refuses a table that predates the compressed patch, naming the table and the column it lacks.
+**The reconnect log is on this list as of R32 (2026-08-09), and the server refuses to start without it.** It holds what a returning client missed, and it used to live only in the server's memory, so it was empty on every boot and answered "you have missed nothing" to every client that came back after a restart, which sent them nothing and left them silently stale. Durable, it answers from evidence. `CONNETTO_OPLOG_TABLE` names it, defaulting to `connetto_oplog`, and `PgOplog::ensure_schema` creates this schema for a scratch database, each object only when it is absent. The boot check refuses a log table that predates the compressed patch and a commit table without `xid_horizon`, naming the table and the column it lacks, and refuses a missing transaction index (`06-reconnect.md`).
 
 **The writer tables reference nothing.** `user_id` is a plain column, not a foreign key into `connetto_sessions`, for the same reason an earlier watermark column was dropped. Every run has a writer, and only a login has a row in `connetto_sessions`, so a foreign key would refuse the first write by an anonymous caller. Widening `connetto_sessions` to hold an unidentified visit was considered and rejected: its `user_id` and `current_refresh_hash` would both have to become nullable, which weakens the shape for every real login. So `user_id` is nullable and unkeyed. A deployment that wants a hard link can add the constraint in its own migration, but connetto's reference does not, and an anonymous write stays exactly-once either way.
 
