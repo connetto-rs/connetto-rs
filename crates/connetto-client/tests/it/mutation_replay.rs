@@ -23,81 +23,17 @@ use connetto_core::messages::{ControlMessage, HandshakeAck};
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, ReplicaKeyStore, Transport};
 use connetto_core::{Cursor, test_support::TestGrantChecker};
 use connetto_server::{
-    LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    LoopbackTransport, ManagerBuilder, Materializer, NoConnector, RuntimeWritableCatalog,
+    SessionManager, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, SeedSnapshot, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
-use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
 const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
-
-/// A snapshot source returning one seed row. No test here subscribes, but
-/// the manager requires one.
-struct SeedSnapshot;
-
-impl SnapshotSource for SeedSnapshot {
-    type Error = std::convert::Infallible;
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn estimate(
-        &self,
-        _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
-        _caller: &connetto_core::Principal,
-    ) -> Result<SnapshotEstimate, Self::Error> {
-        Ok(SnapshotEstimate {
-            rows: 0.0,
-            width: 0,
-        })
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn snapshot_page(
-        &self,
-        _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
-        _caller: &connetto_core::Principal,
-        _page: &PageSpec,
-    ) -> Result<SnapshotPage, Self::Error> {
-        let table = SimpleTable::new(
-            "orders",
-            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-            &[0],
-        );
-        let insert = Insert::<_, String, Vec<u8>>::from(table)
-            .set(0, Value::Integer(1))
-            .expect("set id")
-            .set(1, Value::Real(1.0))
-            .expect("set price")
-            .set(2, Value::Integer(3))
-            .expect("set quantity")
-            .set(3, Value::Text("seed".to_owned()))
-            .expect("set status");
-        let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new()
-            .insert(insert)
-            .build();
-        Ok(SnapshotPage {
-            patchset,
-            cursor: Cursor::new(Vec::new()),
-            next: None,
-            filled: false,
-            widest_row: 0,
-            rows: 0,
-            bytes: 0,
-        })
-    }
-}
 
 // The client replica schema (SQLite): local writes and the pending-record read.
 diesel::table! {

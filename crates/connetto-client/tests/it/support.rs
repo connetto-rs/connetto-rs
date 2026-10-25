@@ -346,3 +346,44 @@ pub fn key_gated_notes() -> SyncSchema {
         None::<&str>,
     ))
 }
+
+/// Answer subscription `sub_id` with a complete snapshot of one `orders (id,
+/// label)` row, `(1, 'seed')`, as a scripted server does.
+pub async fn send_seed_snapshot<T: Transport>(server: &mut T, sub_id: &str) {
+    use connetto_core::messages::{
+        BulkMessage, SnapshotBegin, SnapshotEnd, SnapshotPatch, SubscriptionPriority,
+    };
+    use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
+    let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
+        "orders",
+        &[("id", ""), ("label", "")],
+        &[0],
+    ))
+    .set(0, Value::Integer(1))
+    .expect("set id")
+    .set(1, Value::Text("seed".to_owned()))
+    .expect("set label");
+    let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new().insert(insert);
+    let payload = zstd::encode_all(patchset.build().as_slice(), 3).expect("compress payload");
+    server
+        .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
+            sub_id: sub_id.to_owned(),
+            priority: SubscriptionPriority::default(),
+        }))
+        .await
+        .expect("snapshot begin");
+    server
+        .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
+            sub_id: sub_id.to_owned(),
+            patchset_zstd: payload,
+        }))
+        .await
+        .expect("snapshot patch");
+    server
+        .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
+            sub_id: sub_id.to_owned(),
+            cursor: connetto_core::Cursor::new(vec![1]),
+        }))
+        .await
+        .expect("snapshot end");
+}

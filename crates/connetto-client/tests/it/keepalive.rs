@@ -16,14 +16,10 @@ use connetto_client::{
     GateMechanism, MemoryRefreshStore, Moment, ReconnectPolicy, SyncStatus, SyncTuning,
     SystemClock, TransportFactory,
 };
-use connetto_core::messages::{
-    BulkMessage, ControlMessage, HandshakeAck, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch,
-    SubscriptionPriority,
-};
+use connetto_core::messages::{BulkMessage, ControlMessage, HandshakeAck, Pong};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
 use parking_lot::Mutex;
-use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use tempfile::tempdir;
 use tokio::sync::oneshot;
 
@@ -60,21 +56,6 @@ fn ack() -> ControlMessage {
             frontier: 0,
         }),
     })
-}
-
-/// Compressed one-row patchset bytes for the wire table shape.
-fn payload() -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
-        "orders",
-        &[("id", ""), ("label", "")],
-        &[0],
-    ))
-    .set(0, Value::Integer(1))
-    .expect("set id")
-    .set(1, Value::Text("seed".to_owned()))
-    .expect("set label");
-    let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new().insert(insert);
-    zstd::encode_all(patchset.build().as_slice(), 3).expect("compress payload")
 }
 
 /// The test tuning: a probe shortly after the silence, a short answer bound.
@@ -130,27 +111,7 @@ impl TransportFactory for Scripted {
                             }
                         }
                         IncomingFrame::Control(ControlMessage::Subscribe(sub)) => {
-                            server
-                                .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
-                                    sub_id: sub.sub_id.clone(),
-                                    priority: SubscriptionPriority::default(),
-                                }))
-                                .await
-                                .expect("snapshot begin");
-                            server
-                                .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
-                                    sub_id: sub.sub_id.clone(),
-                                    patchset_zstd: payload(),
-                                }))
-                                .await
-                                .expect("snapshot patch");
-                            server
-                                .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
-                                    sub_id: sub.sub_id.clone(),
-                                    cursor: Cursor::new(vec![1]),
-                                }))
-                                .await
-                                .expect("snapshot end");
+                            super::support::send_seed_snapshot(&mut server, &sub.sub_id).await;
                         }
                         _ => {}
                     }
@@ -649,27 +610,7 @@ async fn a_busy_link_is_never_probed() {
                             pings_task.fetch_add(1, Ordering::Relaxed);
                         }
                         IncomingFrame::Control(ControlMessage::Subscribe(sub)) => {
-                            server
-                                .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
-                                    sub_id: sub.sub_id.clone(),
-                                    priority: SubscriptionPriority::default(),
-                                }))
-                                .await
-                                .expect("snapshot begin");
-                            server
-                                .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
-                                    sub_id: sub.sub_id.clone(),
-                                    patchset_zstd: payload(),
-                                }))
-                                .await
-                                .expect("snapshot patch");
-                            server
-                                .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
-                                    sub_id: sub.sub_id.clone(),
-                                    cursor: Cursor::new(vec![1]),
-                                }))
-                                .await
-                                .expect("snapshot end");
+                            super::support::send_seed_snapshot(&mut server, &sub.sub_id).await;
                         }
                         _ => {}
                     }

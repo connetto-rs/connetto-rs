@@ -9,15 +9,13 @@ use connetto_client::bot::{Registration, register};
 use connetto_client::{ClientBuilder, ClientError, ClientEvent, SyncSchema, TransportFactory};
 use connetto_core::messages::{
     BotListEntry, BotRegistered, BulkMessage, Challenge, ControlMessage, FatalErrorReason,
-    HandshakeAck, SnapshotBegin, SnapshotEnd, SnapshotPatch, SubscriptionPriority,
-    bot_registration_message,
+    HandshakeAck, SnapshotPatch, bot_registration_message,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaBundle, loopback};
 use diesel::prelude::*;
 use ring::rand::SystemRandom;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
-use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use uuid::Uuid;
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT);";
@@ -64,21 +62,6 @@ impl TransportFactory for OneShot {
     }
 }
 
-/// Compressed one-row patchset bytes for the wire table shape.
-fn payload(id: i64) -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
-        "orders",
-        &[("id", ""), ("label", "")],
-        &[0],
-    ))
-    .set(0, Value::Integer(id))
-    .expect("set id")
-    .set(1, Value::Text("seed".to_owned()))
-    .expect("set label");
-    let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new().insert(insert);
-    zstd::encode_all(patchset.build().as_slice(), 3).expect("compress payload")
-}
-
 /// A scripted server that opens the connection with the real manager's
 /// leading challenge and then answers the handshake the way a settled session
 /// does, with a one-row snapshot per subscription.
@@ -111,27 +94,7 @@ fn challenged_server() -> LoopbackTransport {
             .expect("ack the handshake");
         while let Ok(Some(frame)) = server.recv().await {
             if let IncomingFrame::Control(ControlMessage::Subscribe(sub)) = frame {
-                server
-                    .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
-                        sub_id: sub.sub_id.clone(),
-                        priority: SubscriptionPriority::default(),
-                    }))
-                    .await
-                    .expect("snapshot begin");
-                server
-                    .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
-                        sub_id: sub.sub_id.clone(),
-                        patchset_zstd: payload(1),
-                    }))
-                    .await
-                    .expect("snapshot patch");
-                server
-                    .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
-                        sub_id: sub.sub_id.clone(),
-                        cursor: Cursor::new(vec![1]),
-                    }))
-                    .await
-                    .expect("snapshot end");
+                super::support::send_seed_snapshot(&mut server, &sub.sub_id).await;
             }
         }
     });

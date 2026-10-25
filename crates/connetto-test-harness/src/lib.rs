@@ -2404,6 +2404,69 @@ pub fn insert_changeset(
         .build()
 }
 
+/// A snapshot source answering every read with one seeded `orders` row, for a
+/// session manager whose test subscribes rarely or never.
+pub struct SeedSnapshot;
+
+impl connetto_server::SnapshotSource for SeedSnapshot {
+    type Error = std::convert::Infallible;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn estimate(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &Principal,
+    ) -> Result<connetto_server::SnapshotEstimate, Self::Error> {
+        Ok(connetto_server::SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &Principal,
+        _page: &connetto_server::PageSpec,
+    ) -> Result<connetto_server::SnapshotPage, Self::Error> {
+        let table = SimpleTable::new(
+            "orders",
+            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
+            &[0],
+        );
+        let insert = Insert::<_, String, Vec<u8>>::from(table)
+            .set(0, Value::Integer(1))
+            .expect("set id")
+            .set(1, Value::Real(1.0))
+            .expect("set price")
+            .set(2, Value::Integer(3))
+            .expect("set quantity")
+            .set(3, Value::Text("seed".to_owned()))
+            .expect("set status");
+        let patchset = sqlite_diff_rs::PatchSet::<SimpleTable, String, Vec<u8>>::new()
+            .insert(insert)
+            .build();
+        Ok(connetto_server::SnapshotPage {
+            patchset,
+            cursor: Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
+        })
+    }
+}
+
 /// The rows the given snapshot patch frames actually carry, decoded from each
 /// zstd-compressed patchset and counted as inserts.
 ///
