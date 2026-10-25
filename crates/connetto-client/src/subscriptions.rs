@@ -173,6 +173,9 @@ pub(crate) struct Declared {
     /// Whether the subscription still wants its rows: a pin always, a watch
     /// while held and until its grace runs out.
     pub live: bool,
+    /// When a released watch stops wanting its rows, in the replica clock's
+    /// seconds, `None` for a pin or a held watch.
+    pub covers_until: Option<i64>,
 }
 
 /// Record `spec` under `sub_id`, replacing any record already there.
@@ -380,8 +383,11 @@ pub(crate) fn declared(db: &mut SqliteConnection) -> Result<Vec<Declared>, Clien
         // handle drops until the grace runs out. Nothing runs to end it: the
         // comparison is the expiry, which is how ban expiry and provider token
         // refresh already work in this codebase.
-        let live = pin_name.is_some()
-            || stopped_at.is_none_or(|stopped| now.saturating_sub(stopped) < grace_secs);
+        let covers_until = match (&pin_name, stopped_at) {
+            (Some(_), _) | (None, None) => None,
+            (None, Some(stopped)) => Some(stopped.saturating_add(grace_secs)),
+        };
+        let live = covers_until.is_none_or(|until| now < until);
         out.push(Declared {
             sub_id,
             spec: SubscriptionSpec {
@@ -390,6 +396,7 @@ pub(crate) fn declared(db: &mut SqliteConnection) -> Result<Vec<Declared>, Clien
                 binds,
             },
             live,
+            covers_until,
         });
     }
     Ok(out)
@@ -566,20 +573,22 @@ pub(crate) fn pins(db: &mut SqliteConnection) -> Result<Vec<(String, String)>, C
 /// clock has not reached, a wall clock stepped back, so its countdown runs from
 /// `now` and outlives a restart (`docs/architecture/21-clocks.md`). The caller
 /// holds capture suspended, as for every other `_connetto_subscription` write.
+/// Returns whether any record moved.
 ///
 /// # Errors
 ///
 /// [`ClientError::Session`] when the replica rejects the read or the write.
-pub(crate) fn reanchor_ahead(db: &mut SqliteConnection) -> Result<(), ClientError> {
+pub(crate) fn reanchor_ahead(db: &mut SqliteConnection) -> Result<bool, ClientError> {
     let now = now_secs(db)?;
     let ahead = subscription::table.filter(subscription::stopped_at.gt(Some(now)));
     // The pump asks on every step, so the write lock is taken only on a step.
-    if diesel::select(diesel::dsl::exists(ahead)).get_result::<bool>(db)? {
-        diesel::update(ahead)
-            .set(subscription::stopped_at.eq(Some(now)))
-            .execute(db)?;
+    if !diesel::select(diesel::dsl::exists(ahead)).get_result::<bool>(db)? {
+        return Ok(false);
     }
-    Ok(())
+    diesel::update(ahead)
+        .set(subscription::stopped_at.eq(Some(now)))
+        .execute(db)?;
+    Ok(true)
 }
 
 /// Every watch whose grace has run out, so the caller can unsubscribe each and
