@@ -262,7 +262,7 @@ async fn settle<T: Transport>(client: &mut T) -> ControlMessage {
 
 /// Upload one insert of `fast_rows` row 2 as `client_seq`, without waiting.
 async fn send_mutation<T: Transport>(client: &mut T, client_seq: u64) {
-    let table = SimpleTable::new("fast_rows", &["id", "body"], &[0]);
+    let table = SimpleTable::new("fast_rows", &[("id", ""), ("body", "")], &[0]);
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(2))
         .expect("set id")
@@ -412,7 +412,7 @@ async fn an_identified_caller_completes_under_anonymous_saturation() {
     // settle, so this rejection (which never checks out a pool connection) does
     // not affect the counts the test measured above.
     {
-        let table = SimpleTable::new("fast_rows", &["id", "body"], &[0]);
+        let table = SimpleTable::new("fast_rows", &[("id", ""), ("body", "")], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(WITHHELD_ID))
             .expect("set withheld id")

@@ -144,7 +144,7 @@ impl SnapshotSource for SeedOneOrder {
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
-        let table = SimpleTable::new("orders", &["id", "quantity"], &[0]);
+        let table = SimpleTable::new("orders", &[("id", ""), ("quantity", "")], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
             .expect("set id")

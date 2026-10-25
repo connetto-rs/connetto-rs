@@ -68,7 +68,11 @@ struct SnapshotData {
 /// The one-row `orders` seed snapshot both snapshot sources serve, so a
 /// recording source and the plain seed stay byte-identical.
 fn seed_snapshot() -> SnapshotData {
-    let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
+    let table = SimpleTable::new(
+        "orders",
+        &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
+        &[0],
+    );
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(1))
         .expect("set id")
@@ -372,7 +376,11 @@ impl SnapshotSource for GadgetSeed {
     ) -> Result<SnapshotPage, Self::Error> {
         let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
         for row in &self.rows {
-            let table = SimpleTable::new("gadgets", &["id", "active", "label"], &[0]);
+            let table = SimpleTable::new(
+                "gadgets",
+                &[("id", ""), ("active", ""), ("label", "")],
+                &[0],
+            );
             let insert = Insert::<_, String, Vec<u8>>::from(table)
                 .set(0, Value::Blob(<[u8; 16]>::from(row.id).to_vec()))
                 .expect("set id")
@@ -434,7 +442,11 @@ impl SnapshotSource for GatedSnapshot {
         self.release.notified().await;
         let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
         for row in &self.rows {
-            let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
+            let table = SimpleTable::new(
+                "orders",
+                &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
+                &[0],
+            );
             let insert = Insert::<_, String, Vec<u8>>::from(table)
                 .set(0, Value::Integer(row.id))
                 .expect("set id")
@@ -4110,7 +4122,11 @@ impl SnapshotSource for StatusSnapshot {
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
-        let table = SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0]);
+        let table = SimpleTable::new(
+            "orders",
+            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
+            &[0],
+        );
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
             .expect("set id")

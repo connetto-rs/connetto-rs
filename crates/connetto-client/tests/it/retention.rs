@@ -52,7 +52,11 @@ diesel::table! {
 }
 
 fn orders_table() -> SimpleTable {
-    SimpleTable::new("orders", &["id", "price", "quantity", "status"], &[0])
+    SimpleTable::new(
+        "orders",
+        &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
+        &[0],
+    )
 }
 
 /// Compressed insert-patchset bytes for one snapshot's rows.
