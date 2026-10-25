@@ -260,3 +260,52 @@ async fn a_departure_another_identity_still_covers_is_withheld() {
         "the row alice covers stays, the other leaves"
     );
 }
+
+#[tokio::test]
+async fn a_tidy_keeps_every_row_of_a_table_another_identity_wants_whole() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = super::support::SharedKeys::default();
+    let mut alice = connect(
+        directory.path(),
+        keys.clone(),
+        "alice",
+        vec![snapshot("a", &[1, 3])],
+    )
+    .await;
+    subscribe(&mut alice, "a", "SELECT * FROM tags").await;
+    let mut bob = connect(directory.path(), keys, "bob", vec![snapshot("b", &[2])]).await;
+    subscribe(&mut bob, "b", "SELECT * FROM tags WHERE id = 2").await;
+    bob.tidy().unwrap();
+    assert_eq!(ids(&mut bob), [1, 2, 3], "alice wants the table whole");
+}
+
+#[tokio::test]
+async fn a_departure_from_a_table_another_identity_wants_whole_is_withheld() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = super::support::SharedKeys::default();
+    let mut alice = connect(
+        directory.path(),
+        keys.clone(),
+        "alice",
+        vec![snapshot("a", &[1])],
+    )
+    .await;
+    subscribe(&mut alice, "a", "SELECT * FROM tags").await;
+    let mut bob = connect(
+        directory.path(),
+        keys,
+        "bob",
+        vec![
+            snapshot("b", &[1]),
+            IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+                "b".to_owned(),
+                Cursor::new(vec![1]),
+                departures(&[1]),
+            ))),
+        ],
+    )
+    .await;
+    subscribe(&mut bob, "b", "SELECT * FROM tags WHERE id = 1").await;
+    drain(&mut bob).await;
+    assert_eq!(ids(&mut bob), [1], "alice still wants the row");
+}
