@@ -12,14 +12,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use connetto_client::{
-    ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, Grant, SyncSchema,
-};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, Grant};
 use connetto_core::Cursor;
 use connetto_core::auth::CapabilitySubject;
 use connetto_core::messages::{
-    AggregateUpdate, ControlMessage, FullResyncReason, FullResyncRequired, Handshake, Pong,
-    RateLimited, ReplaceShareKeys, ShareKeysReplaced, SnapshotBegin, SnapshotEnd,
+    AggregateUpdate, ControlMessage, FullResyncReason, FullResyncRequired, Handshake, HandshakeAck,
+    Pong, RateLimited, ReplaceShareKeys, ShareKeysReplaced, SnapshotBegin, SnapshotEnd,
+    WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport as _};
 use diesel::prelude::*;
