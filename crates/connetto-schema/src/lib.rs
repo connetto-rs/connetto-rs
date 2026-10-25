@@ -783,7 +783,7 @@ fn translate_tier<K: CapabilityKey>(tier_sql: &str) -> Result<String, SchemaErro
     let report = tier
         .translate_with_report(&options)
         .map_err(|err| SchemaError::Translate(err.to_string()))?;
-    let ddl = statements_to_ddl(&report.script);
+    let ddl = statements_to_ddl(report.script.iter());
     validate(&ddl, "local tier")?;
     Ok(ddl)
 }
@@ -1705,7 +1705,7 @@ mod tests {
         let (schema, policies, _, _) = emit_inputs(dir.path(), 1);
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
-        emit_to::<String, TextIds>(&schema, &policies, None, &out).expect("emits");
+        emit_to::<String, TextIds>(&schema, &policies, None, &[], &out).expect("emits");
         let rendered =
             std::fs::read_to_string(out.join("connetto-schema.rs")).expect("the bundle file");
         assert!(
@@ -1734,7 +1734,7 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        emit_to::<String, TextIds>(&schema, &policies, Some(&source), &out)
+        emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
             .expect("emits with the history");
         let rendered =
             std::fs::read_to_string(out.join("connetto-schema.rs")).expect("the bundle file");
@@ -1759,7 +1759,7 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, dir.path().join("absent"));
-        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &out)
+        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
             .expect_err("an absent history directory refuses");
         match err {
             SchemaError::MissingHistoryDir { dir: reported } => {
@@ -1785,7 +1785,7 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &out)
+        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
             .expect_err("a stale export refuses");
         match err {
             SchemaError::StaleExport { major, path, .. } => {
@@ -1806,7 +1806,7 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &out)
+        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
             .expect_err("a missing export refuses");
         match err {
             SchemaError::MissingExport { major, path, .. } => {
@@ -1830,7 +1830,7 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &out)
+        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
             .expect_err("a gap refuses");
         match err {
             SchemaError::HistoryGap { dir, missing, .. } => {
