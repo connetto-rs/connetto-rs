@@ -3239,6 +3239,14 @@ where
     F: TransportFactory<Transport = T> + MaybeSend + 'static,
     S: Sleeper + MaybeSend + 'static,
 {
+    // The loss queued its status for the next pump step, which a redial that
+    // keeps failing never reaches, so the app hears it before the backoff.
+    {
+        let mut state = shared.state.lock().await;
+        while let Some(notice) = state.conn.take_notice() {
+            let _ = route_step_result(&mut state, shared, Ok(Some(notice)), reconnect.is_some());
+        }
+    }
     let outcome = match reconnect.as_mut() {
         Some(driver) => recover(shared, driver, alive, key_timer).await,
         None => Recovery::Exhausted,

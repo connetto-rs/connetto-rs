@@ -5338,6 +5338,12 @@ where
         self.wire.is_some()
     }
 
+    /// The oldest state change waiting for the application, for a driver
+    /// that stops stepping the connection and hands them on itself.
+    pub(crate) fn take_notice(&mut self) -> Option<ClientEvent> {
+        self.notices.pop_front()
+    }
+
     /// The per-connection routing label from the handshake ack, or `None` while
     /// no server has been reached. This is not identity and must not be treated
     /// as such.
