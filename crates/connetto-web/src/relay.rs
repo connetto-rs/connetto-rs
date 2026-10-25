@@ -2212,6 +2212,7 @@ enum RecoveryAttempt {
     Connected,
     Failed,
     Interrupted(HubEvent),
+    ShareKeys(Option<ShareKeyTimer>),
     Closed,
     /// The attach drew a refusal the hub's build can never attach under.
     Mismatched(ClientError),
@@ -2381,6 +2382,14 @@ where
                     recovery_attempt(context, factory, upstream).await?
                 };
             }
+            RecoveryAttempt::ShareKeys(timer) => {
+                idle_share_key_turn(context, timer).await?;
+                attempt = if context.worker.is_connected() {
+                    finish_attached_during_recovery(context, upstream).await
+                } else {
+                    RecoveryAttempt::Failed
+                };
+            }
             RecoveryAttempt::Closed => return Ok(RecoveryCycle::Closed),
         }
     }
@@ -2395,6 +2404,7 @@ where
     U::Error: core::fmt::Display,
 {
     let key_timer = context.worker.share_key_timer();
+    let key_wait = sleep_or_park(fresh_key_wait_ms(key_timer, context.state.fired_key_timer));
     let subscriptions = recovery_subscriptions(context.state, upstream);
     let worker = &mut *context.worker;
     let state = &mut *context.state;
@@ -2405,6 +2415,7 @@ where
         restore_recovery_subscriptions(worker, &subscriptions).await
     };
     tokio::pin!(recovery);
+    tokio::pin!(key_wait);
     loop {
         tokio::select! {
             result = &mut recovery => {
@@ -2417,6 +2428,7 @@ where
                     }
                 };
             }
+            () = &mut key_wait => return RecoveryAttempt::ShareKeys(key_timer),
             event = events.recv() => match event {
                 Some(event) => {
                     if let Some(local) = attach_during_recovery(state, deferred, event) {
@@ -2490,8 +2502,7 @@ where
     let _ = walk_turn(context.worker, context.content, context.walk).await;
 }
 
-/// Share-key work while the connection is idle: keys expire offline too, and
-/// the tabs hear about it from here.
+/// Processes due share-key work without bypassing the gate.
 async fn idle_share_key_turn<U>(
     context: &mut RecoveryContext<'_, U>,
     fired: Option<ShareKeyTimer>,
@@ -2501,10 +2512,17 @@ where
     U::Error: core::fmt::Display,
 {
     context.state.fired_key_timer = fired;
-    context
+    match context
         .worker
-        .process_share_keys(!hub_locked(context.state))
-        .await?;
+        .process_share_keys(!context.gate.is_locked())
+        .await
+    {
+        Ok(_) => {}
+        Err(ClientError::Transport(_) | ClientError::NotConnected) => {
+            context.worker.disconnect();
+        }
+        Err(error) => return Err(error.into()),
+    }
     restate_identity(context.worker, context.state)
 }
 
@@ -2577,6 +2595,7 @@ where
     U::Error: core::fmt::Display,
 {
     let key_timer = context.worker.share_key_timer();
+    let key_wait = sleep_or_park(fresh_key_wait_ms(key_timer, context.state.fired_key_timer));
     let subscriptions = recovery_subscriptions(context.state, upstream);
     let worker = &mut *context.worker;
     let state = &mut *context.state;
@@ -2587,6 +2606,7 @@ where
         restore_recovery_subscriptions(worker, &subscriptions).await
     };
     tokio::pin!(recovery);
+    tokio::pin!(key_wait);
     loop {
         tokio::select! {
             result = &mut recovery => {
@@ -2599,6 +2619,7 @@ where
                     }
                 };
             }
+            () = &mut key_wait => return RecoveryAttempt::ShareKeys(key_timer),
             event = events.recv() => match event {
                 Some(event) => {
                     if let Some(local) = attach_during_recovery(state, deferred, event) {
