@@ -17,6 +17,9 @@
 
 #![cfg(target_arch = "wasm32")]
 
+mod common;
+
+use common::snapshot_payload;
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::messages::{
     BulkMessage, ConflictRow, ControlMessage, HandshakeAck, MutationConflict, SnapshotBegin,
@@ -27,7 +30,6 @@ use connetto_core::{Cursor, LoopbackTransport, loopback};
 use connetto_wasm_smoke::RelayHub;
 use connetto_wasm_smoke::build::{Once, raw_schema};
 use diesel::prelude::*;
-use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -61,23 +63,6 @@ fn unique_base() -> i64 {
     // Date::now() returns milliseconds since epoch as f64; fits i64 until year 285428751.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     (millis as i64)
-}
-
-/// Build the compressed insert-patchset the wire carries for one snapshot.
-fn snapshot_payload(rows: &[(rosetta_uuid::Uuid, i64)]) -> Vec<u8> {
-    let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
-    for (id, quantity) in rows {
-        let table = SimpleTable::new("orders", &[("id", ""), ("quantity", "")], &[0]);
-        // Encode the 16-byte UUID as a SQLite BLOB: <[u8; 16]>::from extracts
-        // the raw bytes, matching what the server and changeset apply expect.
-        let insert = Insert::<_, String, Vec<u8>>::from(table)
-            .set(0, Value::Blob(<[u8; 16]>::from(*id).to_vec()))
-            .expect("set id")
-            .set(1, Value::Integer(*quantity))
-            .expect("set quantity");
-        patchset = patchset.insert(insert);
-    }
-    zstd::encode_all(patchset.build().as_slice(), 3).expect("compress snapshot")
 }
 
 /// Send one begin, patch, end triple for `UPSTREAM_SUB`.

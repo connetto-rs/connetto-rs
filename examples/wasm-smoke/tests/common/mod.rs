@@ -223,3 +223,21 @@ pub async fn mint_session_as(username: &str) -> (String, String) {
     storage.delete_db(&db_name).ok();
     (session.access_token, session.user_id)
 }
+
+/// The compressed patchset inserting each `(id, quantity)` pair as an
+/// `orders` row, as a scripted server's snapshot frame carries it. The UUID
+/// goes as its 16-byte blob, the form the server and the apply expect.
+pub fn snapshot_payload(rows: &[(rosetta_uuid::Uuid, i64)]) -> Vec<u8> {
+    use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
+    let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
+    for (id, quantity) in rows {
+        let table = SimpleTable::new("orders", &[("id", ""), ("quantity", "")], &[0]);
+        let insert = Insert::<_, String, Vec<u8>>::from(table)
+            .set(0, Value::Blob(<[u8; 16]>::from(*id).to_vec()))
+            .expect("set id")
+            .set(1, Value::Integer(*quantity))
+            .expect("set quantity");
+        patchset = patchset.insert(insert);
+    }
+    zstd::encode_all(patchset.build().as_slice(), 3).expect("compress snapshot")
+}
