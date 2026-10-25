@@ -1190,13 +1190,12 @@ async fn a_reissue_refused_as_revoked_deletes_the_key_and_reports_revoked() {
     run.await.expect("the run ends");
 }
 
-/// A revoked device stays a spectator when the pump redials and says
-/// connected on a new connection, and the record the revocation deleted is
-/// not rewritten under a fresh key.
+/// Revocation prevents enrolment and key writes until the client is rebuilt.
 #[tokio::test]
 async fn a_revoked_device_stays_spectator_when_its_pump_says_connected_again() {
     let authority = authority(SystemTime::now()).await;
     let records = Arc::new(Memory::default());
+    let record = crate::device_key_record(ALICE);
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events_tx, _events_rx) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
@@ -1241,13 +1240,7 @@ async fn a_revoked_device_stays_spectator_when_its_pump_says_connected_again() {
 
     poll_until(|| state.lock().requests.len() == 1).await;
     poll_until(|| !state.lock().stored.is_empty()).await;
-    assert!(
-        records
-            .0
-            .lock()
-            .contains_key(&crate::device_key_record(ALICE)),
-        "the enrolment stores its key record"
-    );
+    assert!(records.0.lock().contains_key(&record));
 
     let outcome = handle.reissue(HOUR).await;
     assert!(
@@ -1262,24 +1255,11 @@ async fn a_revoked_device_stays_spectator_when_its_pump_says_connected_again() {
             .any(|event| matches!(event, ClientEvent::DeviceRevoked))
     })
     .await;
-    assert!(
-        !records
-            .0
-            .lock()
-            .contains_key(&crate::device_key_record(ALICE)),
-        "the revocation deletes the key record"
-    );
-    assert!(
-        state.lock().stored.is_empty(),
-        "the revoked device stores nothing"
-    );
-    assert!(
-        handle.certificate().is_none(),
-        "the device holds no certificate"
-    );
+    assert!(!records.0.lock().contains_key(&record));
+    assert!(state.lock().stored.is_empty());
+    assert!(handle.certificate().is_none());
 
-    // The pump redials, so the notice stands on a new connection number,
-    // not the one the run already acted on.
+    // A new connection must remain revoked after generation deduplication.
     state.lock().connection += 1;
     events_tx
         .send(ClientEvent::SyncStatus(SyncStatus::Connected))
@@ -1293,17 +1273,8 @@ async fn a_revoked_device_stays_spectator_when_its_pump_says_connected_again() {
         2,
         "a revoked device asks for no fresh enrolment"
     );
-    assert!(
-        !records
-            .0
-            .lock()
-            .contains_key(&crate::device_key_record(ALICE)),
-        "the deleted key record is not rewritten"
-    );
-    assert!(
-        handle.certificate().is_none(),
-        "the device holds no certificate"
-    );
+    assert!(!records.0.lock().contains_key(&record));
+    assert!(handle.certificate().is_none());
 
     let again = handle.reissue(HOUR).await;
     assert!(
@@ -1315,17 +1286,8 @@ async fn a_revoked_device_stays_spectator_when_its_pump_says_connected_again() {
         2,
         "the reissue sends no enrolment"
     );
-    assert!(
-        !records
-            .0
-            .lock()
-            .contains_key(&crate::device_key_record(ALICE)),
-        "the reissue mints no key"
-    );
-    assert!(
-        handle.certificate().is_none(),
-        "the reissue publishes nothing"
-    );
+    assert!(!records.0.lock().contains_key(&record));
+    assert!(handle.certificate().is_none());
 
     end_tx.send(()).expect("the run ends");
     run.await.expect("the run ends");
