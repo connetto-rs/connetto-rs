@@ -70,8 +70,8 @@ fn origin() -> SessionOrigin<()> {
     }
 }
 
-/// The store lists one person's live sessions and ends one of them, all of
-/// them or all but one, never touching another person's.
+/// The database store keeps the list-and-end contract, a session past its
+/// idle deadline no longer listed as a place anyone is signed in.
 #[tokio::test]
 async fn db_store_lists_and_ends_one_persons_sessions() {
     let _serial = PG_SERIAL.lock().await;
@@ -91,72 +91,27 @@ async fn db_store_lists_and_ends_one_persons_sessions() {
         .create_session(&identity("grace"), origin())
         .await
         .expect("create");
-    let user = frank[0].context.user_id.clone();
-    let listed = |sessions: Vec<connetto_server::SessionRecord<String, ()>>| {
-        let mut ids: Vec<_> = sessions
-            .into_iter()
-            .map(|record| record.session_id)
-            .collect();
-        ids.sort_by_key(|id| *id.as_uuid());
-        ids
-    };
-    let ids = |issued: &[&connetto_server::IssuedSession<String>]| {
-        let mut ids: Vec<_> = issued.iter().map(|issued| issued.session_id).collect();
-        ids.sort_by_key(|id| *id.as_uuid());
-        ids
-    };
-
-    // A session past its idle deadline is no longer a place anyone is
-    // signed in.
     let mut conn = fixture.admin().get().await.expect("connection");
-    sql_query("UPDATE connetto_sessions SET idle_deadline = now() - interval '1 minute' WHERE session_id = $1")
-        .bind::<diesel::sql_types::Uuid, _>(frank[3].session_id.as_uuid())
-        .execute(&mut conn)
-        .await
-        .expect("lapse a session");
-    assert_eq!(
-        listed(store.sessions_of(&user).await.expect("list")),
-        ids(&[&frank[0], &frank[1], &frank[2]]),
-        "the person's live sessions, not the lapsed one, not grace's"
-    );
+    sql_query(
+        "UPDATE connetto_sessions SET idle_deadline = now() - interval '1 minute' \
+         WHERE session_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(frank[3].session_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("lapse a session");
 
-    assert!(
-        !store.end_owned(&user, grace.session_id).await.expect("end"),
-        "another person's session ends nothing"
-    );
-    assert!(
-        store
-            .end_owned(&user, frank[0].session_id)
-            .await
-            .expect("end")
-    );
-    assert!(
-        !store
-            .end_owned(&user, frank[0].session_id)
-            .await
-            .expect("end"),
-        "an ended session ends once"
-    );
-    assert_eq!(
-        store
-            .end_all_of(&user, Some(frank[2].session_id))
-            .await
-            .expect("end the others"),
-        vec![frank[1].session_id]
-    );
-    assert_eq!(
-        listed(store.sessions_of(&user).await.expect("list")),
-        ids(&[&frank[2]])
-    );
-    assert_eq!(
-        store.end_all_of(&user, None).await.expect("end all"),
-        vec![frank[2].session_id]
-    );
-    assert_eq!(store.sessions_of(&user).await.expect("list"), Vec::new());
-    assert!(
-        store.session_is_live(grace.session_id).await.expect("live"),
-        "grace's session is untouched"
-    );
+    super::session_contract::ends_only_the_persons_sessions(
+        &store,
+        &frank[0].context.user_id,
+        [
+            frank[0].session_id,
+            frank[1].session_id,
+            frank[2].session_id,
+        ],
+        grace.session_id,
+    )
+    .await;
 }
 
 /// A session records how it began by the database's clock, and a refresh
