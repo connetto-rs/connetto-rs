@@ -2465,7 +2465,6 @@ where
     tokio::pin!(sleep);
     loop {
         context.prepare_share_keys().await?;
-        let key_timer = context.worker.share_key_timer();
         let owes = walk_owes(context.walk);
         // Keys expire offline too, and the tabs hear it from here.
         let key_timer = context.worker.share_key_timer();
@@ -2568,7 +2567,6 @@ where
     tokio::pin!(connect);
     loop {
         context.prepare_share_keys().await?;
-        let key_timer = context.worker.share_key_timer();
         let owes = walk_owes(context.walk);
         let key_timer = context.worker.share_key_timer();
         let key_wait = sleep_or_park(fresh_key_wait_ms(key_timer, context.state.fired_key_timer));
