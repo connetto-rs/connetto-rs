@@ -12,8 +12,8 @@
 //! generates one refusal per attempt, so refusals go to structured logging and
 //! would drown this table at exactly the moment it matters. What lands here is
 //! the durable: a login began or ended, a share key was issued, a ban was
-//! imposed. The split is normative in `08-authorization.md` and
-//! `denials_never_reach_the_audit_table` pins it.
+//! imposed, a person's data was downloaded or erased. The split is normative
+//! in `08-authorization.md` and `denials_never_reach_the_audit_table` pins it.
 //!
 //! The insert is laundered as an associated type, and one read is a
 //! statement function: the keys a set of sessions minted, which ending those
@@ -92,6 +92,13 @@ pub enum AuthOp {
     /// answered from the settled record. State, because the cross-path
     /// delivery is the trace the courier needs.
     WriteRedelivered,
+    /// A person's data left the server as a portability download (R61). The
+    /// row names the query-list hash and the archive size.
+    DataDownloaded,
+    /// The application finished erasing a person's data and recorded it
+    /// (R61). connetto deletes nothing itself, so this records the
+    /// application's act.
+    DataErased,
 }
 
 impl AuthOp {
@@ -115,6 +122,8 @@ impl AuthOp {
             Self::BanLifted => "ban_lifted",
             Self::WriteForked => "write_forked",
             Self::WriteRedelivered => "write_redelivered",
+            Self::DataDownloaded => "data_downloaded",
+            Self::DataErased => "data_erased",
         }
     }
 }
@@ -144,6 +153,8 @@ impl FromSql<AuthOpSql, Pg> for AuthOp {
             b"ban_lifted" => Ok(Self::BanLifted),
             b"write_forked" => Ok(Self::WriteForked),
             b"write_redelivered" => Ok(Self::WriteRedelivered),
+            b"data_downloaded" => Ok(Self::DataDownloaded),
+            b"data_erased" => Ok(Self::DataErased),
             other => Err(format!(
                 "unrecognised connetto_auth_op label {:?}",
                 String::from_utf8_lossy(other)
@@ -159,9 +170,10 @@ impl FromSql<AuthOpSql, Pg> for AuthOp {
 /// decides rather than whichever process happened to emit.
 #[derive(Debug, Clone)]
 pub struct AuthEvent<Id> {
-    /// The session the change concerns. Always present, because every run has a
-    /// handle whether or not anyone is logged in.
-    pub session: SessionId,
+    /// The session the change concerns. Absent only on a data request staff
+    /// made with no session behind it, where [`acted_by`](Self::acted_by)
+    /// names who acted instead.
+    pub session: Option<SessionId>,
     /// Who it concerns, absent when the caller has no identity.
     pub user_id: Option<Id>,
     /// What changed.
@@ -194,6 +206,15 @@ pub struct AuthEvent<Id> {
     /// The key a share mint issued, as its grant row names it, absent for
     /// everything else.
     pub subject: Option<String>,
+    /// The hash of the registered query list a download ran, absent for
+    /// everything else.
+    pub query_list_hash: Option<String>,
+    /// The size in bytes of the archive a download produced, absent for
+    /// everything else.
+    pub archive_bytes: Option<i64>,
+    /// Who acted on a data request made with no session, as the application
+    /// names them, absent for everything else.
+    pub acted_by: Option<String>,
 }
 
 impl<Id> AuthEvent<Id> {
@@ -201,7 +222,7 @@ impl<Id> AuthEvent<Id> {
     #[must_use]
     pub const fn new(session: SessionId, user_id: Option<Id>, op: AuthOp) -> Self {
         Self {
-            session,
+            session: Some(session),
             user_id,
             op,
             table_name: None,
@@ -213,7 +234,45 @@ impl<Id> AuthEvent<Id> {
             provider: None,
             issuer: None,
             subject: None,
+            query_list_hash: None,
+            archive_bytes: None,
+            acted_by: None,
         }
+    }
+
+    /// An event staff caused through a data request with no session behind
+    /// it, naming who acted as the application names them.
+    #[must_use]
+    pub fn by_operator(user_id: Option<Id>, op: AuthOp, acted_by: impl Into<String>) -> Self {
+        Self {
+            session: None,
+            user_id,
+            op,
+            table_name: None,
+            pk: None,
+            writer: None,
+            seq: None,
+            path: None,
+            other_path: None,
+            provider: None,
+            issuer: None,
+            subject: None,
+            query_list_hash: None,
+            archive_bytes: None,
+            acted_by: Some(acted_by.into()),
+        }
+    }
+
+    /// Name the query-list hash and the archive size a download row carries.
+    #[must_use]
+    pub fn about_download(
+        mut self,
+        query_list_hash: impl Into<String>,
+        archive_bytes: i64,
+    ) -> Self {
+        self.query_list_hash = Some(query_list_hash.into());
+        self.archive_bytes = Some(archive_bytes);
+        self
     }
 
     /// Name the row this event concerns.
@@ -365,6 +424,37 @@ where
     })
 }
 
+/// Append one event through the deployment's audit table and wait for it.
+///
+/// For the data requests of R61, whose row exists for disputes: unlike
+/// [`pg_audit_hook`], a failure is returned rather than logged, so the request
+/// that produced the event fails with it.
+///
+/// # Errors
+///
+/// [`AuditWriteError`] when no connection can be had or the insert fails.
+pub async fn record_awaited<D>(
+    pool: &Pool<AsyncPgConnection>,
+    event: AuthEvent<D::Id>,
+) -> Result<(), AuditWriteError>
+where
+    D: crate::schema::ConnettoSchema,
+{
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|error| AuditWriteError(error.to_string()))?;
+    ExecuteDsl::execute(D::Audit::audit_insert(event), &mut conn)
+        .await
+        .map(drop)
+        .map_err(|error| AuditWriteError(error.to_string()))
+}
+
+/// An awaited audit row could not be written.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the audit row could not be written: {0}")]
+pub struct AuditWriteError(pub String);
+
 /// Generate the default `auth_events` table and its [`ConnettoAuditSchema`]
 /// impl, parameterized by the deployment's `Id` type and the type it stores a
 /// shared row's key as, each with the diesel SQL type it maps to.
@@ -397,13 +487,13 @@ macro_rules! connetto_audit_table {
         diesel::table! {
             /// The durable record of changes to who can reach what. Holds state
             /// changes only: denials go to structured logging.
-            auth_events (at, session) {
+            auth_events (at, op) {
                 /// When it happened, defaulted by the column so one clock
                 /// decides rather than whichever process emitted.
                 at -> diesel::sql_types::Timestamptz,
-                /// The session the change concerns, always present because every
-                /// run has a handle whether or not anyone is logged in.
-                session -> diesel::sql_types::Uuid,
+                /// The session the change concerns, absent only on a data
+                /// request staff made with no session behind it.
+                session -> diesel::sql_types::Nullable<diesel::sql_types::Uuid>,
                 /// Who it concerns, absent when the caller has no identity.
                 user_id -> diesel::sql_types::Nullable<$id_sql>,
                 /// What changed, as a closed set both ends agree on.
@@ -426,6 +516,12 @@ macro_rules! connetto_audit_table {
                 provider -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
                 /// The issuer a sign-in's identity was verified from.
                 issuer -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                /// The hash of the query list a download ran.
+                query_list_hash -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                /// The size in bytes of the archive a download produced.
+                archive_bytes -> diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+                /// Who acted on a data request made with no session.
+                acted_by -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
             }
         }
 
@@ -434,7 +530,7 @@ macro_rules! connetto_audit_table {
         #[derive(diesel::Insertable)]
         #[diesel(table_name = auth_events)]
         pub struct ConnettoNewAuthEvent {
-            session: $crate::SessionId,
+            session: Option<$crate::SessionId>,
             user_id: Option<$id>,
             op: $crate::audit::AuthOp,
             table_name: Option<String>,
@@ -446,6 +542,9 @@ macro_rules! connetto_audit_table {
             provider: Option<String>,
             issuer: Option<String>,
             subject: Option<String>,
+            query_list_hash: Option<String>,
+            archive_bytes: Option<i64>,
+            acted_by: Option<String>,
         }
 
         /// The default connetto audit schema over the deployment's `Id` type.
@@ -485,6 +584,9 @@ macro_rules! connetto_audit_table {
                     provider: event.provider,
                     issuer: event.issuer,
                     subject: event.subject,
+                    query_list_hash: event.query_list_hash,
+                    archive_bytes: event.archive_bytes,
+                    acted_by: event.acted_by,
                 })
             }
 
@@ -497,7 +599,7 @@ macro_rules! connetto_audit_table {
                     use diesel::BoolExpressionMethods as _;
                     use diesel::ExpressionMethods as _;
                     let rows: Vec<(
-                        $crate::SessionId,
+                        Option<$crate::SessionId>,
                         Option<String>,
                         Option<String>,
                         Option<$pk>,
@@ -523,7 +625,7 @@ macro_rules! connetto_audit_table {
                         .into_iter()
                         .filter_map(|(session, subject, table, row)| {
                             Some($crate::audit::MintedKey {
-                                session,
+                                session: session?,
                                 subject: subject?,
                                 table: table?,
                                 row,

@@ -23,6 +23,7 @@ use connetto_server::builder::{
     ServerBuilder, ServerParts, ServerSchema, StoreSpec, TokenKeys,
 };
 use connetto_server::device_cert::DeviceCertConfig;
+use connetto_server::portability::DataRequester;
 use connetto_server::{
     AbuseLimits, AuthConfig, ConnectionLimits, OidcProviderConfig, OplogConfig, PersonLimits,
     PreflightError, ReaderReserve, ReconnectPolicy, RuntimeWritableCatalog, SessionConfig,
@@ -1494,6 +1495,71 @@ async fn a_logout_revokes_the_live_session_and_the_audit_records_it() {
     );
     stream.abort();
     http.abort();
+}
+
+/// The erasure record names the person and who asked, a signed-in session or
+/// the staff member acting without one.
+#[tokio::test]
+async fn an_erasure_record_names_who_asked() {
+    #[derive(QueryableByName, Debug, PartialEq, Eq)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+        session: Option<uuid::Uuid>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        user_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        op: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        acted_by: Option<String>,
+    }
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    let (builder, _idp, _keys) = builder_over(&fixture, 0).await;
+    let parts = builder.build().await.expect("the deployment assembles");
+
+    let session = connetto_server::SessionId::from_uuid(uuid::Uuid::new_v4());
+    parts
+        .handle
+        .record_erasure("anna".to_owned(), &DataRequester::Session(session))
+        .await
+        .expect("a session's erasure is recorded");
+    parts
+        .handle
+        .record_erasure(
+            "bruno".to_owned(),
+            &DataRequester::Operator("staff:marco".to_owned()),
+        )
+        .await
+        .expect("a staff erasure is recorded");
+    let mut conn = pool.get().await.expect("connection");
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT session, user_id, CAST(op AS TEXT) AS op, acted_by \
+         FROM auth_events ORDER BY user_id",
+    )
+    .get_results(&mut conn)
+    .await
+    .expect("read auth_events");
+    assert_eq!(
+        rows,
+        vec![
+            Row {
+                session: Some(*session.as_uuid()),
+                user_id: Some("anna".to_owned()),
+                op: "data_erased".to_owned(),
+                acted_by: None,
+            },
+            Row {
+                session: None,
+                user_id: Some("bruno".to_owned()),
+                op: "data_erased".to_owned(),
+                acted_by: Some("staff:marco".to_owned()),
+            },
+        ]
+    );
 }
 
 /// A cluster whose identifier changed since the boot is a restore: at the

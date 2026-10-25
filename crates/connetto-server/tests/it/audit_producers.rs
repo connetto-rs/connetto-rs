@@ -113,7 +113,10 @@ async fn a_login_records_its_provider_and_issuer() {
         panic!("expected exactly the login row, got {events:?}");
     };
     assert_eq!(event.op, AuthOp::LoggedIn);
-    assert_eq!(event.session, session_of(&authority, &pair.access_token));
+    assert_eq!(
+        event.session,
+        Some(session_of(&authority, &pair.access_token))
+    );
     assert_eq!(event.user_id.as_ref(), Some(&pair.user_id));
     assert_eq!(event.provider.as_deref(), Some("google"));
     assert_eq!(event.issuer.as_deref(), Some("https://issuer.example"));
@@ -175,7 +178,7 @@ async fn an_application_revoke_records_session_revoked() {
 
     let event = captured.only();
     assert_eq!(event.op, AuthOp::SessionRevoked);
-    assert_eq!(event.session, session);
+    assert_eq!(event.session, Some(session));
 }
 
 /// The theft defence is `token_replayed`, and that is the whole point of the

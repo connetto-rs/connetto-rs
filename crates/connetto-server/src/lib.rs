@@ -62,6 +62,7 @@ pub mod openfga;
 pub mod oplog;
 pub mod parity;
 pub mod pk;
+pub mod portability;
 pub mod preflight;
 pub mod reach;
 pub mod reexec;

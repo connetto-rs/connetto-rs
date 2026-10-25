@@ -6,7 +6,10 @@
 //! the row a share mint names and the provider a login names are preserved.
 
 use connetto_core::SessionId;
-use connetto_server::audit::{AUTH_OP_TYPE, AuthEvent, AuthOp, ConnettoAuditSchema};
+use connetto_server::audit::{
+    AUTH_OP_TYPE, AuthEvent, AuthOp, ConnettoAuditSchema, record_awaited,
+};
+use connetto_server::defaults::ConnettoDefaults;
 use connetto_test_harness::Fixture;
 use diesel::prelude::*;
 use diesel::sql_query;
@@ -66,6 +69,8 @@ async fn every_auth_op_round_trips_through_postgres() {
         AuthOp::BanLifted,
         AuthOp::WriteForked,
         AuthOp::WriteRedelivered,
+        AuthOp::DataDownloaded,
+        AuthOp::DataErased,
     ];
     for op in all {
         let session = SessionId::from_uuid(uuid::Uuid::new_v4());
@@ -264,5 +269,96 @@ async fn the_database_clock_stamps_the_row() {
         skew.secs.abs() < 5,
         "the row is stamped by the database clock, skew {}s",
         skew.secs
+    );
+}
+
+/// A download names the query list it ran and the archive's size, and a
+/// staff request with no session behind it leaves the session empty and
+/// names who acted.
+#[tokio::test]
+async fn a_download_names_its_scope_and_a_staff_row_names_who_acted() {
+    type Row = (
+        Option<SessionId>,
+        Option<String>,
+        AuthOp,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    );
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    reset_audit_table(fixture.admin()).await;
+    let mut conn = fixture.admin().get().await.expect("connection");
+
+    let session = SessionId::from_uuid(uuid::Uuid::new_v4());
+    for event in [
+        AuthEvent::new(session, Some("anna".to_owned()), AuthOp::DataDownloaded)
+            .about_download("ab12", 4096),
+        AuthEvent::by_operator(Some("anna".to_owned()), AuthOp::DataErased, "staff:marco"),
+    ] {
+        diesel_async::RunQueryDsl::execute(ConnettoAudit::audit_insert(event), &mut conn)
+            .await
+            .expect("insert");
+    }
+
+    let mut rows: Vec<Row> = diesel_async::RunQueryDsl::load(
+        auth_events::table.select((
+            auth_events::session,
+            auth_events::user_id,
+            auth_events::op,
+            auth_events::query_list_hash,
+            auth_events::archive_bytes,
+            auth_events::acted_by,
+        )),
+        &mut conn,
+    )
+    .await
+    .expect("read rows");
+    rows.sort_by_key(|row| row.2.label());
+    assert_eq!(
+        rows,
+        vec![
+            (
+                Some(session),
+                Some("anna".to_owned()),
+                AuthOp::DataDownloaded,
+                Some("ab12".to_owned()),
+                Some(4096),
+                None,
+            ),
+            (
+                None,
+                Some("anna".to_owned()),
+                AuthOp::DataErased,
+                None,
+                None,
+                Some("staff:marco".to_owned()),
+            ),
+        ]
+    );
+}
+
+/// An awaited row that cannot be written fails its caller, where the hook
+/// would only log it.
+#[tokio::test]
+async fn an_awaited_row_that_cannot_be_written_fails_the_caller() {
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    reset_audit_table(fixture.admin()).await;
+    let event = AuthEvent::by_operator(Some("anna".to_owned()), AuthOp::DataErased, "staff:marco");
+
+    record_awaited::<ConnettoDefaults>(fixture.admin(), event.clone())
+        .await
+        .expect("the row is written while the table exists");
+    let mut conn = fixture.admin().get().await.expect("connection");
+    sql_query("DROP TABLE auth_events")
+        .execute(&mut conn)
+        .await
+        .expect("drop");
+    assert!(
+        record_awaited::<ConnettoDefaults>(fixture.admin(), event)
+            .await
+            .is_err(),
+        "a row that cannot be written is an error"
     );
 }
