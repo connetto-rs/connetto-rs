@@ -36,7 +36,7 @@ SubscriptionSpec {
 }
 ```
 
-An earlier sketch here showed `table`, `filter`, `columns`, `order_by`, and `limit` as struct fields. That shape predates Q4.1: the table and the filter became the SQL text itself, column projection is deferred by Q4.5, and ordering or pagination (`LIMIT` with any `OFFSET`) ride inside `query`, where pagination shapes the snapshot only and live updates ignore it (see the design note at the end of this chapter).
+An earlier sketch here showed `table`, `filter`, `columns`, `order_by`, and `limit` as struct fields. That shape predates Q4.1: the table and the filter became the SQL text itself, a column list rides inside `query` like everything else (Q4.5), and ordering or pagination (`LIMIT` with any `OFFSET`) ride inside `query`, where pagination shapes the snapshot only and live updates ignore it (see the design note at the end of this chapter).
 
 ### Predicate
 
@@ -239,7 +239,7 @@ If the LSN is outside the window, or if the server does not support catchup patc
 2. ~~**Subscription count limits**: should the server enforce a maximum number of subscriptions per session? What happens when the limit is hit?~~ **Decided (Q4.2):** Not a connetto concern. Subscription registry memory management is owned by `subql` (`subql.md`, "Subscription registry limits (Q4.2)"). connetto imposes no limits of its own.
 3. ~~**Snapshot parallelism**: should the server deliver snapshots for multiple subscriptions concurrently, or serially? Concurrency helps latency but increases server load.~~ **Decided (Q4.3):** Priority-tiered delivery. Higher-priority tiers complete before lower-priority tiers begin. Within a tier, subscriptions are delivered concurrently, interleaved on the WebSocket and tagged by `sub_id` (the PowerSync model).
 4. ~~**Catchup patch optimization**: is the "deliver catchup patch instead of full snapshot on reconnect" optimization in scope for v1?~~ **Decided (Q4.4):** Yes, in scope. On reconnect, if the client's LSN falls within the oplog retention window, the server delivers only changes since that LSN rather than a full snapshot.
-5. ~~**Column projection**: if a client subscribes with `columns: Some([...])`, does the server track only those columns for matching, or does it always track all columns and project at delivery time?~~ **Decided (Q4.5):** Deferred. Column projection is an optimization layerable at delivery time. The subscription language is SQL WHERE clauses via `subql`, which operates on full rows, so projection does not affect the core design.
+5. ~~**Column projection**: if a client subscribes with `columns: Some([...])`, does the server track only those columns for matching, or does it always track all columns and project at delivery time?~~ **Decided (Q4.5), amended 2026-10-25:** a subscription may name a subset of a table's columns, and the server widens it to whole rows before `subql` registers it and before the snapshot reads, because the replica holds the application's whole table. The client runs the query as written against its replica, so the caller sees the columns it named, while the columns it left out travel and are stored as any whole-row subscription on the table stores them. Trimming rows to the named columns at delivery was rejected: the replica's other columns would land empty, a required one would drop the row, and `subql` reports no change that touches only a column the list leaves out.
 
 ---
 
