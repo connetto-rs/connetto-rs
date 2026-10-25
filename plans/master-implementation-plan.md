@@ -170,6 +170,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R93 | The file replica for bots. Needs R91's template, R71's headless custody is built |
 | done | ~~R94~~ | One client builder per platform from shared configuration pieces |
 | any | R95 | Share keys added and removed on a running client. Needs nothing since R94 |
+| any | R105 | Answering a stolen account. Builds on R74's device list and R91's installations as they stand |
 | done | ~~R96~~ | One server builder for programs that embed the server, and R91 builds on it |
 | done | ~~R97~~ | The desktop login tab closes, or the app comes back to the front. Minted from the R53 proof, designed |
 | done | ~~R98~~ | One schema contract for every deployment-owned table, merged as #126 (2026-10-05) |
@@ -251,6 +252,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R60 a limited request syncs the whole table and blocks its cleanup | **DONE** (2026-09-02) | nothing. The defect dissolved at the `3d75cca` pin, steps 4 to 6 landed 2026-09-02 and are proven by `crates/connetto-client/tests/it/residual.rs`. The plan carried this row as IN PROGRESS until 2026-09-12 | no longer: the upstream request superseded itself, never sent |
 | R11 shared public store | NOT STARTED, designed (2026-10-17), sliced into seven pull requests | nothing. Seven decisions in the section, slice 2 opens with decision 3's capability rule | no |
 | R61 the portability download | NOT STARTED, fully designed (2026-08-22), revised (2026-10-25) | wanting it: the deadline is the first real deployment. Ten decisions in the section | no |
+| R105 answering a stolen account | NOT STARTED, designed (2026-10-25) | nothing. Ten decisions in the section, the slicing proposed for the maintainer's review | no |
 | R62 refuse a table with no declared primary key | **DONE** (2026-08-22) | nothing. Four decisions: three before any code, the fourth (the tier is re-checked before a write too) taken in execution | no |
 | R63 rewire the membership term onto subql's own APIs | **DONE** (2026-08-30) | nothing. Steps 1 to 3 landed 2026-08-23, step 4 (caller bind retired onto the self-seeding term) and decision 3's proof landed 2026-08-30 in the pin-move working tree | landed: `TermDescription::Caller` since subql `1e5382f` |
 | R86 adopt the re-run path so the boot refusal asks the real question | **DONE** (2026-08-31) | nothing | landed and adopted: composite-join grading plus the unqualified-table fix, rls2fga `bbe4f57a` |
@@ -428,6 +430,12 @@ graph TD
   R26 --> R61[R61 the portability download]
   R65 -.->|the files/ half| R61
   R61 -.->|both extend connetto_auth_op| R78
+  R105[R105 answering a stolen account]
+  R74 -->|the device list| R105
+  R91 -->|installations to uninstall| R105
+  R36 -.->|the ban it widens| R105
+  R105 -.->|both extend connetto_auth_op| R61
+  R105 -.->|both extend connetto_auth_op| R78
   R62[R62 refuse an undeclared primary key]
   U5[upstream subql:<br/>term planning and seeding, landed] --> R63[R63 membership-term rewire]
   R27 --> R63
@@ -3265,7 +3273,7 @@ So the only missing piece is the scope, and it is the same missing piece for bot
 7. **All queries read one snapshot, paged by key.** One `REPEATABLE READ READ ONLY` transaction on the reader pool, and an owner query's transaction imports its snapshot through `pg_export_snapshot()` and `SET TRANSACTION SNAPSHOT`, so the whole archive is one moment, recorded in the manifest with the server that served it. Each query is read in keyset pages on its primary key, each page a statement under `R58`'s statement limit, and `R58`'s single-row byte ceiling refuses a row too wide to hold. The cost is a reader connection held for the whole download and a vacuum horizon held back meanwhile, which a deployment can move off its primary by pointing the reader at a hot standby. Rejected: one moment per query with `R58`'s own paging, which mixes moments in one archive, and one unpaged statement per query under a longer timeout, which holds the largest table in memory.
 8. **Every download and every erasure leaves an audit record in `auth_events`.** The contract gains a download value and an erasure value in `connetto_auth_op`, and the event gains the query-list hash and the archive size beside the invoking session and the person. A download waits for its record and fails when the insert fails, because the record exists for disputes, and the erasure record is written by a library call the application makes once its recipe has run. Chapter 20 says that a deployment answering data requests keeps the audit store on. `R78` adds its courier value to the same enum, and whichever of the two lands second takes the other's values. Rejected: the fire-and-forget insert every other audit row uses, a separate data-access table beside `auth_events`, and no record in connetto.
 9. **The runner refuses a download unless the session asking for it is live in the session store, and the application may opt out.** A full download is what someone holding a stolen session wants, and an application that checks an access token's signature alone sees a revocation only when the token expires. So the call takes the invoking session beside the person's identity and refuses a session the store holds revoked or expired, the same liveness check a handshake makes. The opt-out serves an operator path that holds no session, such as staff answering a regulator's request, and the audit record names the session or the opt-out. The check needs nothing an offline machine lacks, since the download runs where the session store is, and a machine with no server exports through `R26`'s device export. Rejected: trusting the application's check alone, and a check with no opt-out, which leaves the operator path outside connetto.
-10. **A ban does not refuse a download.** A ban (`R36`) refuses the sync handshake of an abusive identity and leaves the person's data and right of access in place, and the application decides who may ask for whom. Rejected: refusing a banned identity, with or without an override. Responding to a stolen account is a session matter, since the intruder holds the owner's identity, and the session surfaces it needs, listing one person's sessions and revoking all of them, are left to a phase of their own.
+10. **A ban does not refuse a download.** A ban (`R36`, widened by `R105` decision 8) shuts an abusive identity out and leaves the person's data and right of access in place, and the application decides who may ask for whom, a banned person's request going through decision 9's operator path. Rejected: refusing a banned identity, with or without an override. Responding to a stolen account is a session matter, since the intruder holds the owner's identity, and its session surfaces are `R105`'s.
 
 ### Steps
 
@@ -4330,6 +4338,8 @@ R19 bounds how *much* a caller may ask for. Nothing anywhere reacts to *what* th
 
    **The one real burst is an expired key**, which does fail the check and is re-presented on every reconnect. Its fix is not on the wire: the client can read `exp` out of its own token, since a grant is an EdDSA JWT whose payload is base64url and not encrypted, and simply not present a dead key. **That fix has no phase yet** (see Parked), so until it lands the daily tally must clear a caller reconnecting with one expired key. At ordinary reconnect rates that is far below 1000 a day, and a caller in a tight reconnect loop crosses the connection limit long before the ban threshold.
 4. **A ban takes effect immediately and is refused at the door afterwards.** The live connection closes the moment the ban lands, reusing `SessionManager::close_session(id, reason)` exactly as the revocation hook already does from `connetto-server.rs:446` (the plan cited 421, which has since drifted), fired on a spawned task so nothing blocks. Later connections are refused at handshake. **Next-connection-only was rejected**: connections here are long-lived by design, so a ban the target outlasts by simply not reconnecting is useless against the case it exists for.
+
+   **Amended 2026-10-25 by R105 decision 8.** A ban also revokes every session of the banned identity. The token endpoints' refusal of a banned caller, stated below, is not built, since login and refresh never read the ban list and only the sync handshake does, and R105 decision 8 builds it.
 
    **The close was left as a literal blank, and is settled 2026-08-06: the caller is told nothing that distinguishes a ban.** No `FatalErrorReason` variant is added. The socket is dropped without a reason and the ban goes to the structured log, which is R38's split applied here. OWASP's Authentication Cheat Sheet is the normative support: an application "must respond with a generic error message regardless of whether ... the account is locked or disabled", and it names a failure message that says the account is disabled as an incorrect disclosure. Practice agrees by majority rather than unanimously: Pusher collapses everything to `4009 unauthorized`, Ably and Supabase define no ban-specific code, and only Centrifugo distinguishes (`3503 force disconnect` against `3500 invalid token`). At the token endpoints a banned caller gets plain `401`, identical to any refused credential, which needs no new status.
 
@@ -6451,6 +6461,51 @@ Both withdrawal tests are green against a real Postgres and a real `OpenFGA`, th
 ### Done when
 
 A share that spans two tables boots, stays correct when it is withdrawn, and costs a measured amount to keep so. connetto proves both withdrawals for itself instead of borrowing upstream's, and no document claims a refusal that no longer fires or machinery that no longer sits unreachable.
+
+---
+
+## R105: answering a stolen account
+
+**Status.** NOT STARTED, designed with the maintainer 2026-10-25. Raised during the R61 review by a concrete case: an owner in Milan sees an access from Berlin of unknown origin and wants it cut off with nothing left reachable through it. Ten decisions below.
+
+**Blocked on nothing.** Decision 4's list joins R74's device list and decision 5 uninstalls through R91's installations, so it builds on those as they stand.
+
+**Changes state.** Client tables: none, the replica and its keys deleted when the device key is revoked (decision 10). Server tables: `connetto_sessions` gains its creation time, its last refresh time, the provider and issuer, and an application description (decision 2), `connetto_auth_op` gains a login value and a cause for each new revocation (decisions 1 and 3), the provider tokens of a revoked session are deleted (decision 5), and a ban is read at refresh and sign-in (decision 8). Wire messages: none, the client answering the existing `DeviceRevoked` close by wiping (decision 10). Archive format: none.
+
+### Purpose
+
+connetto cannot show a person where they are signed in, cannot end one person's sessions together, and keeps no record that a session ever began, so a stolen account cannot be seen, cut off or investigated through it. What the tree has is one session's revocation by the application (`AuthService::revoke`), every session of the deployment for R70's restore case, the theft defence on a replayed refresh token, R74's device list and `revoke_device`, and R36's ban, which refuses sync only. A browser never enrols a device key, so a browser intruder is only a session. Data already synced to an intruder's own device stays there, since the replica and its keys are on their machine.
+
+### Decisions taken with the maintainer on 2026-10-25
+
+1. **A login leaves a record.** A login value in `auth_events`, one row per sign-in naming the session, the person, the provider and issuer, and the time, so every takeover can be investigated afterwards. Rejected: an application hook in its place, and no record.
+2. **A session records its creation time, its last refresh time, the provider and issuer, and a description the application supplies at login**, the shape of R74's device descriptor. Addresses stay out of connetto (R36 decision 5), and an application may put a coarse location in its description. Rejected: times and provider alone, which leave two browsers on one provider alike, and storing the address.
+3. **Four session surfaces, as server library calls.** List one person's sessions, revoke one of them, revoke all of them, and revoke all but the current one, each recording its own cause in `auth_events`. The application exposes them from its own handlers, the share mint's shape (chapter 12), and connetto adds no endpoint. Rejected: listing and revoking all only, and leaving all four to the application.
+4. **One list of signed-in places.** Each entry is a session, showing its enrolled device when one exists. Revoking an entry ends the session and, for a device, revokes its key too. Rejected: separate lists of sessions and devices, which leave a person to know that a browser shows only as a session.
+5. **Revoking lists what the revoked sessions left behind, and the person chooses.** The call returns the share keys those sessions minted, found through their `CapabilityMinted` rows, and the apps they installed, and separate calls withdraw a share key or uninstall an app. connetto deletes its retained provider tokens for every revoked session, the only copy it can reach. Rejected: withdrawing everything automatically, which also removes legitimate shares the owner made from a revoked session, and leaving it to the application.
+6. **connetto attributes writes, and reverting is the application's.** A library call lists which writers a session wrote as, R75's device keys and numbers, and their settled ranges, so the application can find the rows and decide what undoing means. Rejected: a generic revert over stored inverse changesets, which costs storage on every write and ignores what the application means by undo, and keeping the attribution internal.
+7. **Application handlers get a liveness check.** One library call verifies an access token and confirms its session is live in the store, the check the sync handshake makes, so a revoked session is refused at once wherever a handler calls it instead of when its access token expires. Rejected: a shorter access token lifetime in its place, and leaving it to the application.
+8. **A ban shuts off everything.** It revokes every session of the banned identity, refuses its refresh and its next sign-in, and refuses its sync, so decision 7's call fails for it too. R36 decision 4 already states that the token endpoints answer a banned caller with a plain `401`, and login and refresh never read the ban list today, so that half completes R36 and the session revocation extends it. A ban fits an abusive identity, and a stolen account is answered through decisions 3 and 4, since its intruder holds the owner's identity. A data request for a banned person goes through R61's operator path, because R61 decision 9 needs a live session. Rejected: leaving sign-in open, and sync only.
+9. **A login callback on the server tells the application.** connetto calls an application callback at each sign-in and each device enrolment with the session's description, provider and time, and the application sends its own notice. Rejected: filtering the audit hook, which fires only when the audit store is configured, and polling `auth_events`.
+10. **A client deletes its replica when its device key is revoked**, the replica and its keys, which covers a stolen phone running the real application. A device revoked by mistake loses its unsynced writes, and the docs say so. The docs also state that data synced to a device an attacker controls cannot be taken back. Rejected: deleting on session revocation too, which would wipe every other device on a sign-out everywhere, and documenting only.
+
+### Slices
+
+Proposed for the maintainer's review, one pull request each.
+
+1. **The session record.** Decision 2's columns, decision 1's login value, and decision 9's callback.
+2. **The session surfaces.** Decision 3's four calls with their causes, decision 4's list, decision 5's leftovers with the withdraw and uninstall calls and the provider token deletion, and decision 7's liveness call.
+3. **The ban.** Decision 8, with R36's section amended.
+4. **Write attribution.** Decision 6's call.
+5. **The client and the record.** Decision 10's deletion on revocation, and the chapter 11 and 12 text: what a person sees, what each call does, and what stays out of reach.
+
+### Proof
+
+A fixture with one person signed in twice, through two providers with two descriptions, one session minting a share key and installing an app. The list shows both entries with their times, providers and descriptions, and a native device's entry shows its device. Revoking the second session closes its live connection, refuses its refresh, fails decision 7's call for its token, returns its share key and installation, and deletes its provider tokens, while the first session keeps working. Withdrawing the returned key and uninstalling the app take effect. A banned identity cannot refresh or sign in. A real client whose device key is revoked deletes its replica. The login callback fires with the session's description, and `auth_events` holds the login row and each revocation's cause. The attribution call names the writers the revoked session wrote as.
+
+### Done when
+
+A person can see every place they are signed in, end any of them or all but the current one, and withdraw what an ended session left behind, a ban leaves the banned identity no way back in, a revoked device deletes its replica, and the chapters say what stays out of reach.
 
 ---
 
