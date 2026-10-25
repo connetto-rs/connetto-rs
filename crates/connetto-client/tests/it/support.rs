@@ -517,3 +517,29 @@ pub async fn relay_tab() -> (
     let (client, pump) = connetto_client::ConnettoClient::with_pump(conn);
     (client, script, tokio::spawn(pump))
 }
+
+/// Answer subscription `sub_id` with a complete snapshot of one `orders (id,
+/// label)` row, `(1, 'seed')`, as a scripted server does.
+pub async fn send_seed_snapshot<T: Transport>(server: &mut T, sub_id: &str) {
+    use connetto_core::messages::{BulkMessage, SnapshotBegin, SnapshotEnd, SnapshotPatch};
+    server
+        .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
+            sub_id: sub_id.to_owned(),
+        }))
+        .await
+        .expect("snapshot begin");
+    server
+        .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
+            sub_id: sub_id.to_owned(),
+            patchset_zstd: labelled_order_payload(1),
+        }))
+        .await
+        .expect("snapshot patch");
+    server
+        .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
+            sub_id: sub_id.to_owned(),
+            cursor: connetto_core::Cursor::new(vec![1]),
+        }))
+        .await
+        .expect("snapshot end");
+}

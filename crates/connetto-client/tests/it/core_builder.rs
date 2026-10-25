@@ -11,15 +11,12 @@ use connetto_client::{
     ClientBuilder, ClientEvent, FirstThen, Grant, LiveQuery, MemoryRefreshStore, ReconnectPolicy,
     SyncSchema, SyncStatus, SyncTuning, TransportFactory,
 };
-use connetto_core::messages::{
-    BulkMessage, ControlMessage, HandshakeAck, Pong, RateLimited, SnapshotBegin, SnapshotEnd,
-    SnapshotPatch, TabIdentity,
-};
+use connetto_core::messages::{ControlMessage, HandshakeAck, Pong, RateLimited, TabIdentity};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaBundle, loopback};
 use diesel::prelude::*;
 
-use super::support::{NeverDial, Once, labelled_order_payload};
+use super::support::{NeverDial, Once};
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT);";
 /// The major line the schema source declares.
@@ -94,26 +91,7 @@ fn snapshot_server() -> LoopbackTransport {
         while let Ok(Some(frame)) = server.recv().await {
             match frame {
                 IncomingFrame::Control(ControlMessage::Subscribe(sub)) => {
-                    server
-                        .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
-                            sub_id: sub.sub_id.clone(),
-                        }))
-                        .await
-                        .expect("snapshot begin");
-                    server
-                        .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
-                            sub_id: sub.sub_id.clone(),
-                            patchset_zstd: labelled_order_payload(1),
-                        }))
-                        .await
-                        .expect("snapshot patch");
-                    server
-                        .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
-                            sub_id: sub.sub_id.clone(),
-                            cursor: Cursor::new(vec![1]),
-                        }))
-                        .await
-                        .expect("snapshot end");
+                    super::support::send_seed_snapshot(&mut server, &sub.sub_id).await;
                 }
                 IncomingFrame::Control(ControlMessage::Ping(ping)) => {
                     server

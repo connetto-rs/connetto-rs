@@ -16,14 +16,11 @@ use connetto_client::{
     Moment, ReconnectPolicy, SyncStatus, SyncTuning, SystemClock, TransportFactory,
 };
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, Pong, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch,
+    BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, Pong,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
 use tempfile::tempdir;
-
-use super::support::labelled_order_payload;
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT);";
 
@@ -115,26 +112,7 @@ impl TransportFactory for Scripted {
                             }
                         }
                         IncomingFrame::Control(ControlMessage::Subscribe(sub)) => {
-                            server
-                                .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
-                                    sub_id: sub.sub_id.clone(),
-                                }))
-                                .await
-                                .expect("snapshot begin");
-                            server
-                                .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
-                                    sub_id: sub.sub_id.clone(),
-                                    patchset_zstd: labelled_order_payload(1),
-                                }))
-                                .await
-                                .expect("snapshot patch");
-                            server
-                                .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
-                                    sub_id: sub.sub_id.clone(),
-                                    cursor: Cursor::new(vec![1]),
-                                }))
-                                .await
-                                .expect("snapshot end");
+                            super::support::send_seed_snapshot(&mut server, &sub.sub_id).await;
                         }
                         _ => {}
                     }
@@ -633,26 +611,7 @@ async fn a_busy_link_is_never_probed() {
                             pings_task.fetch_add(1, Ordering::Relaxed);
                         }
                         IncomingFrame::Control(ControlMessage::Subscribe(sub)) => {
-                            server
-                                .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
-                                    sub_id: sub.sub_id.clone(),
-                                }))
-                                .await
-                                .expect("snapshot begin");
-                            server
-                                .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
-                                    sub_id: sub.sub_id.clone(),
-                                    patchset_zstd: labelled_order_payload(1),
-                                }))
-                                .await
-                                .expect("snapshot patch");
-                            server
-                                .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
-                                    sub_id: sub.sub_id.clone(),
-                                    cursor: Cursor::new(vec![1]),
-                                }))
-                                .await
-                                .expect("snapshot end");
+                            super::support::send_seed_snapshot(&mut server, &sub.sub_id).await;
                         }
                         _ => {}
                     }
