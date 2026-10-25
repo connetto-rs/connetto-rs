@@ -159,3 +159,69 @@ async fn in_memory_store_records_how_a_session_began() {
         .expect("the refresh is stamped");
     assert!(refreshed >= began.created_at);
 }
+
+/// The in-memory store lists one person's live sessions and ends one, all
+/// or all but one, never another person's, as the database store does.
+#[tokio::test]
+async fn in_memory_store_lists_and_ends_one_persons_sessions() {
+    let store = store();
+    let mut hana = Vec::new();
+    for _ in 0..3 {
+        hana.push(
+            store
+                .create_session(&identity("hana"), origin())
+                .await
+                .expect("create"),
+        );
+    }
+    let ivan = store
+        .create_session(&identity("ivan"), origin())
+        .await
+        .expect("create");
+    let user = expected_id("hana");
+    let listed = |records: Vec<connetto_server::SessionRecord<Uuid, ()>>| {
+        let mut ids: Vec<_> = records
+            .into_iter()
+            .map(|record| record.session_id)
+            .collect();
+        ids.sort_by_key(|id| *id.as_uuid());
+        ids
+    };
+    let mut all: Vec<_> = hana.iter().map(|issued| issued.session_id).collect();
+    all.sort_by_key(|id| *id.as_uuid());
+    assert_eq!(listed(store.sessions_of(&user).await.expect("list")), all);
+
+    assert!(
+        !store.end_owned(&user, ivan.session_id).await.expect("end"),
+        "another person's session ends nothing"
+    );
+    assert!(
+        store
+            .end_owned(&user, hana[0].session_id)
+            .await
+            .expect("end")
+    );
+    assert!(
+        !store
+            .end_owned(&user, hana[0].session_id)
+            .await
+            .expect("end"),
+        "an ended session ends once"
+    );
+    assert_eq!(
+        store
+            .end_all_of(&user, Some(hana[2].session_id))
+            .await
+            .expect("end the others"),
+        vec![hana[1].session_id]
+    );
+    assert_eq!(
+        store.end_all_of(&user, None).await.expect("end all"),
+        vec![hana[2].session_id]
+    );
+    assert_eq!(store.sessions_of(&user).await.expect("list"), Vec::new());
+    assert!(
+        store.session_is_live(ivan.session_id).await.expect("live"),
+        "ivan's session is untouched"
+    );
+}
