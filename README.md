@@ -30,7 +30,7 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 97 phases, 85 done, 7 started and 5 not started, a phase built in parts counting once. The core is built and proven, and the app system's registry and registration are built with it. What remains is the last mile around it, plus the app system's bot template and demo apps, the extension where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
+The plan in `plans/master-implementation-plan.md` tracks 101 phases, 86 done, 7 started and 8 not started, a phase built in parts counting once. The core is built and proven, and the app system's bot registry, registration and list cap are built with it. What remains is the last mile around it, plus the app system's bot login, runtime, template and demos, where a person mints a one-time code, a program registers with it, its public key and the tables and verbs it uses, an admin adds it to an owner, and Postgres holds it to that list (chapter 12), and queries an app keeps while closed with the wake that tells it they changed.
 
 | Remaining | Phases |
 |---|---|
@@ -38,7 +38,8 @@ The plan in `plans/master-implementation-plan.md` tracks 97 phases, 85 done, 7 s
 | Failures classified by SQLSTATE, waiting on diesel_async | R106 |
 | Shared public store | R11 |
 | Demo gaps | R57 |
-| Apps, installations and the bot template, the file replica for bots | R91, R93 |
+| Bot login, the standard ownership schema, the bot runtime and template, the demos for apps and bots | R99, R100, R103, R104 |
+| Queries kept while an app is closed, and waking it | R101 |
 | Device identity, missing only a Windows device's enrolment record | R74 |
 | Device-to-device sync without a server | R76 to R80 |
 

@@ -166,15 +166,20 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R89~~ | A failing re-execution read ends its subscription, not live delivery |
 | blocked | R106 | Database failures classified by their SQLSTATE. diesel's half is merged on diesel `main`, and slices 2 and 3 are blocked on `diesel_async` answering `sqlstate()`, open as diesel-rs/diesel_async#306 and #307 |
 | done | ~~R90~~ | The browser's refresh token into an `HttpOnly` cookie |
-| any | R91 | Apps, installations and the bot template. Needs nothing since the caller fixes of 2026-09-20 (PRs #41 and #42). The file replica for bots is R93's |
+| done | ~~R91~~ | The bot registry and the list cap |
 | done | ~~R92~~ | Synced tables without local references, with SQLite's own enforcement for the tier |
-| any | R93 | The file replica for bots. Needs R91's template, R71's headless custody is built |
+| absorbed | ~~R93~~ | The file replica for bots, absorbed into R103 (2026-10-05) |
 | done | ~~R94~~ | One client builder per platform from shared configuration pieces |
 | done | ~~R95~~ | Share keys added and removed on a running client |
 | done | ~~R105~~ | Answering a stolen account. Builds on R74's device list and R91's installations as they stand |
 | done | ~~R96~~ | One server builder for programs that embed the server, and R91 builds on it |
 | done | ~~R97~~ | The desktop login tab closes, or the app comes back to the front. Minted from the R53 proof, designed |
 | done | ~~R98~~ | One schema contract for every deployment-owned table, merged as #126 (2026-10-05) |
+| first | R101 | Live-query lifetimes and waking a closed client, opened by an iPhone and Android experiment. First of the R91 redesign's phases by the maintainer's priority (2026-10-05) |
+| any | R99 | Bot login and lifetime. Needs nothing since R91 merged (2026-10-14), built after R101 by the maintainer's priority |
+| blocked | R100 | The standard ownership schema. Needs rls2fga to read a membership through a second table, which its 2026-10-06 measurement sent upstream |
+| any | R103 | The bot runtime and template, with the file replica for bots (R93 absorbed). Needs R99 and R101 |
+| any | R104 | The demos for apps and bots. Needs R100 and R103 |
 | done | ~~R73~~ | Failover verification and the deployment recipe, built ahead of its `last` place at the maintainer's word |
 
 ## Status and blockers
@@ -219,14 +224,19 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no. The SQLSTATE follow-up that removes the timeout text match is R106 |
 | R106 database failures classified by their SQLSTATE | IN PROGRESS, minted 2026-10-28 from R89's upstream cleanup note, designed with the maintainer 2026-10-30, four decisions in the section | `diesel_async` answering `DatabaseErrorInformation::sqlstate`, open as [diesel-rs/diesel_async#306](https://github.com/diesel-rs/diesel_async/pull/306) (Postgres) and [#307](https://github.com/diesel-rs/diesel_async/pull/307) (MySQL-like). diesel's half is on diesel `main` | **yes, diesel_async** |
 | R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section and two settled in its review rounds (the cookie's lifetime, credentials for listed origins only), the 2026-08-06 parked BFF entry absorbed | no |
-| R91 apps, installations and the bot template | IN PROGRESS, designed and reviewed 2026-09-18, unblocked when R96 landed (2026-10-04, #122), and the registry and registration built 2026-10-13 to 2026-10-14 and merged as #152, #153 and #154 (2026-10-14) | nothing. The registry's five tables and the cap that holds a bot to its declared tables and verbs, the challenge on every connection and the bot registration over it, and `bots::install` and `create_registration_code` with the registry in the schema document are merged, and the bot template, the two demo apps and the design's app-token login exchange remain. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R93's. Every decision is in `plans/apps-and-bots.md` | no |
+| R91 the bot registry and the list cap | **DONE** (2026-10-14, merged as #152, #153 and #154), redesigned 2026-10-05 replacing the 2026-09-18 design, split with R99, R100, R101, R103 and R104 | nothing. The registry's five tables, the four generated `AS RESTRICTIVE` cap policies per synced and registry table with the startup refusal, registration over the connection's challenge, and `bots::install` and `bots::create_registration_code` with the registry in the schema document. Every decision is in `plans/apps-and-bots.md` | no, rls2fga and pg2sqlite took the cap rule as measured 2026-10-06 |
 | R92 synced tables carry no local references | **DONE** (2026-10-18, merged `e89f61e` #167, `e8b2694` #168, `46d2bef` #169), minted and designed 2026-09-22 by R21's decision 8 | nothing. Six decisions in the section | no |
-| R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R91. Two decisions in the section | no |
+| ~~R93 the file replica for bots~~ | **ABSORBED** into R103 (2026-10-05) | n/a. Its two decisions carry over as amended in its section | no |
 | R94 one client builder per platform | **DONE** (2026-09-30, merged `5b7f616`, #110), minted and designed 2026-09-25 while planning R51 | nothing. Twenty-seven decisions in the section | no |
 | R95 share keys on a running client | **DONE** (2026-10-25), minted 2026-09-25 by R94's decision 10, designed 2026-10-17 | nothing. Merged as #177, #180, #181, #182, #219 and #231, seventeen decisions in the section | no |
 | R96 one server builder | **DONE** (2026-10-03), minted 2026-09-25 by R94's decision 11, designed 2026-10-03 | nothing. Nine decisions in the section | no |
 | R97 the desktop login tab | **DONE** (2026-10-04), built 2026-10-02, proven on Windows and macOS 2026-10-03 and on GNOME 2026-10-04 | nothing. GNOME on Wayland answers the raise with its notification that the app is ready, decided with the maintainer as the platform's answer | no |
 | R98 one schema contract | **DONE** (2026-10-05, #126) | nothing | no |
+| R99 bot login and lifetime | NOT STARTED, minted and designed 2026-10-05 by the R91 redesign | nothing since R91 merged (2026-10-14), built after R101 by the maintainer's priority. Six decisions in the section | no |
+| R100 the standard ownership schema | NOT STARTED, minted and designed 2026-10-05 by the R91 redesign, measured 2026-10-06 | rls2fga reading a membership through a second table, the closure table the measurement chose, requested in `upstream/rls2fga-membership-through-a-second-table.md` | yes, rls2fga |
+| R101 live-query lifetimes and waking a closed client | IN PROGRESS, minted 2026-10-05 by the R91 redesign, first by the maintainer's priority | the design's second build step, the server's durable engine, waits on `AlignedSnapshot::capture` in a released `pg-walstream`, proposed upstream as a three-PR stack from `isdaniel/pg-walstream` #136, and on subql's durable engine changes. The reconnect storm the experiment measured is addressed by #151 and #201, the first build step is pushed as `fix/r101-dispatch-applies-once`, and the kept-query and notification design is in `plans/design-r101-kept-query-core.md` | yes, `pg-walstream` and subql |
+| R103 the bot runtime and template | NOT STARTED, minted and designed 2026-10-05 by the R91 redesign, R93 absorbed | R99, R101. Four decisions in the section and R93's two | no |
+| R104 the demos for apps and bots | NOT STARTED, minted and designed 2026-10-05 by the R91 redesign | R100, R103 | no |
 | R53 Windows gate | **DONE** (2026-10-02) | nothing. `HelloStore` is taken from the upstream branch at `3109f4d` through a pinned patch until released. Fingerprint-change survival unmeasured | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
@@ -400,8 +410,19 @@ graph TD
   R77 --> R80[R80 peer sync in every demo]
   R78 --> R80
   R79 --> R80
-  R71 --> R93[R93 the file replica for bots]
-  R91[R91 apps, installations and the bot template] --> R93
+  R71 --> R103
+  R98 --> R91[R91 the bot registry and the list cap, DONE]
+  R91 --> R99[R99 bot login and lifetime]
+  R100[R100 the standard ownership schema]
+  URF[upstream rls2fga:<br/>a membership read through a second table] -->|the closure table| R100
+  R101[R101 live-query lifetimes and wake]
+  UPW[upstream pg-walstream:<br/>AlignedSnapshot::capture, isdaniel/pg-walstream 136] -.->|released before the durable engine step| R101
+  R91 --> R103[R103 the bot runtime and template]
+  R99 --> R103
+  R101 --> R103
+  R93[R93 the file replica for bots, absorbed into R103] -.-> R103
+  R100 --> R104[R104 the demos for apps and bots]
+  R103 --> R104
   R92[R92 synced tables carry no local references]
   U7[upstream libsqlite3-sys and sqlite-wasm-rs:<br/>SQLite3MC feature, one option set] -.->|fork until released| R21
   RQ1908[rusqlite discussion 1908:<br/>maintainers agree on the shared cipher source crates] --> R21
@@ -439,6 +460,9 @@ graph TD
   R36 -.->|the ban it widens| R105
   R105 -.->|both extend connetto_auth_op| R61
   R105 -.->|both extend connetto_auth_op| R78
+  R99 -.->|both extend connetto_auth_op| R61
+  R99 -.->|both extend connetto_auth_op| R78
+  R99 -.->|both extend connetto_auth_op| R105
   R62[R62 refuse an undeclared primary key]
   U5[upstream subql:<br/>term planning and seeding, landed] --> R63[R63 membership-term rewire]
   R27 --> R63
@@ -6074,46 +6098,170 @@ No durable credential exists in browser storage, the three auth endpoints serve 
 
 ---
 
-## R91: apps, installations and the bot template
+## R91: the bot registry and the list cap
 
-**Status.** IN PROGRESS. Designed 2026-09-18 with the maintainer over one session, after an earlier attempt drifted, then reviewed twice the same night and corrected, recorded as decisions 2, 3, 11 and 12 below. Unblocked 2026-09-20 when the two caller fixes it waited on landed. The bot registry and the cap that holds a bot to its declared tables and verbs (#152), the challenge on every connection and the bot registration over it (#153), and apps adding bots and minting registration codes with the registry synced to every replica (#154) merged 2026-10-14. The bot template, the two demo apps and the app-token login exchange remain. The design record is `plans/apps-and-bots.md`, which carries every settled point with its date, the state table, the superseded shapes and the reasons, and outranks this section where they differ. `docs/prompt-apps-and-bots.md` is the superseded starting prompt.
+**Status.** DONE 2026-10-14, merged as #152 (the registry and the cap), #153 (the challenge on every connection and the bot registration over it) and #154 (apps adding bots and minting registration codes, with the registry in the schema document every replica carries). Redesigned 2026-10-05 with the maintainer, replacing the 2026-09-18 design whole (the token exchange, the shared and isolated views, `connetto_app_grants` and the connetto-side manifest filter are superseded and recorded as such). The design record is `plans/apps-and-bots.md`, section "Redesign, 2026-10-05", points 1 to 24 and "R91 design, agreed 2026-10-05", which outranks this section where they differ. One of six phases the redesign split R91 into, with R99, R100, R101, R103 and R104. A rotation code replaces the stored key, and R99's key login is where the old key is refused.
 
-**Built on R96** (decided with the maintainer 2026-10-03). The login exchange route and the session manager's registry cache are server construction, so they go on R96's `ServerBuilder` and its `ManagerBuilder` rather than into the binary. R96 merged as #122 (2026-10-04), so nothing gates the phase.
+**Blocked on nothing.** R98's `ConnettoSchema` (#126) is where its tables are named.
 
-**Its other prerequisites are met.** The content-ticket caller fix (PR #41, 2026-09-20) carries both caller halves on the ticket and in the file server's rechecks, so an isolated session whose visibility comes from `inst:<id>` uploads with nothing more. The grant-move narrowing (PR #42, 2026-09-20) announces a moved grant to the subject it names, so an isolated uninstall resyncs that installation's session and no other. Both settings are always bound since PR #41's correction of chapter 08, a half the caller does not hold taking the absent marker, and every meter charges `meter_key` since the same day, which decision 10 overrides for a bot session. The file replica for bots is gated on R71 and ships with it, not here.
-
-**Changes state.** Client tables: none. Server tables: `connetto_apps`, `connetto_app_grants`, `connetto_installations`, `connetto_app_bots` and `connetto_installation_sessions`. Wire messages: `Challenge`, `RegisterBot` and `BotRegistered`, the bot's registration over the challenge. Archive format: none.
+**Changes state.** Client tables: the five registry tables, synced into every replica through the schema document. Server tables: `connetto_bots`, `connetto_registration_codes`, `connetto_bot_lists`, `connetto_installations` and `connetto_installation_optional_tables`, and the four `AS RESTRICTIVE` cap policies on every synced and registry table. Wire messages: `Challenge`, `RegisterBot`, `BotRegistered` and `RegistrationRefused`. Archive format: none.
 
 ### Purpose
 
-connetto has no way for a program to hold a query, be told when it changed and write values back under rights a user granted it. This phase gives a deployment the backend and shared logic for that, registering apps, installing them, and running them, and leaves the screens to the deployment. Three entities. An app is code, one private key and a manifest, a row in `connetto_apps` at every deployment where it is registered. A bot is the app's user at one deployment, so lab A's grant to app X and lab B's are two bots sharing a key and nothing else. An installation is one resource owner at that deployment granting the bot a view of what they own, a row in `connetto_installations` plus the deployment's own sharing rows. A bot is a user, authorship is its identity in the audit row, ownership is the row's owner column.
+An app is reusable software that states the schema it needs as a trait of properties, which a deployment implements for its own tables (the macros are synql's, after connetto's part). A deployed bot is user-like. It registers at a deployment with a one-time code a signed-in person created, its public key and its list (the tables it uses and the verbs on each), and an admin of a team, project or organization adds it there as a member under the deployment's own rules. This phase builds the registry and holds every bot to its list inside Postgres on every path.
 
-### Decided, 2026-09-18
+### Decisions, 2026-10-05
 
-1. **Two views, the share row chooses.** A bot session binds the bot user as identity and, for an isolated login, the installation as capability subject, rendered `inst:<id>` so it can never spell a share key. A share row naming the bot user admits every login of the bot, the shared view, one login per deployment, the Slack bot-user shape. A share row naming `inst:<id>` admits that installation's login and no other, the isolated view, one login per installation, the GitHub installation-token shape. No view lets a bot see an owner's rows without that owner's own share row, the view decides only whether grants already received land in one session or one per installation. Rejected: identity only, which loses isolation, and capability only, which loses the shared view and authorship.
-2. **Registry as synced tables under row-level security, one route.** `connetto_apps`, `connetto_app_grants` and `connetto_installations` are policy-bearing synced tables in the publication with `REPLICA IDENTITY FULL`, carrying only what clients write. `connetto_app_bots` and `connetto_installation_sessions` are server-only, unpublished, written by the exchange on the privileged connection. No column privileges, `owner` and `installer` are immutable through `WITH CHECK`, the generation through the trigger, and grant rows repeat `owner` so their policy settles from the row. Who may publish, install and see what are those policies and nothing else. Publish and install are plain inserts, nothing is minted at insert, and the one route on `app_router` beside `auth_router`, backed by `AppRegistry`, is the login exchange. Rejected: a config switch for who may register, routes for every operation, library calls only, install as a route minting a capability key, publish minting the bot through mutation inspection, server-written columns on the synced tables under column privileges.
-3. **The bot is resolved at first login** through the deployment's `IdentityResolver` with connetto's issuer and the app id as subject, and the exchange writes `connetto_app_bots`, as it writes `connetto_installation_sessions` at an isolated login.
-4. **The manifest is the child table** `connetto_app_grants (app, owner, table_name, verb, accepted)`, tables and verbs only, verbs read and write only, columns never, the one connetto check being that the table exists. The effective filter is the accepted rows, a narrowing bites at once, a widening waits for acceptance. Rejected: a share verb, since connetto serves no mint route and could not enforce it.
-5. **Login is the exchange** at `POST /auth/app-token`, an EdDSA assertion with `iss`, `sub` (the app for shared, the installation for isolated), `aud` the deployment's issuer, `sid` to resume, `jti` refused on replay, producing a `GrantClaims::User` grant with `gen` and `inst` claims against a session the bot keeps across restarts. An exchange slides the idle window, the bot never refreshes, the ninety-day ceiling stands. A login without `sid` replaces an isolated installation's session and adds a shared one. Rejected: one session per process, one session per installation always.
-6. **Rotation is a generation bump** by trigger on the public key, held grants below it refused at handshake, live sessions evicted with a re-login reason distinct from `SessionRevoked` so the credential keeps its `sid`, sessions survive. Rejected: rotation as revocation.
-7. **Ban and departure.** A ban on the owner refuses every login of the app, a ban on an installer refuses and evicts that installer's isolated logins and leaves shared-view grants as share links are left, a ban on the bot user itself is the operator's lever to disable an app at their deployment, lifting restores any. Deletion of an installer is the deployment's cascade on the installation row.
-8. **`react` takes the whole snapshot**, `diff_by_key` is a helper.
-9. **Bots run on `Replica::in_memory()`** per login. A bot with device-local tables needs the file replica, which is R93's, after R71 and this phase. A bot builds its client through R94's builder, its key being one more implementation of R94's sealed `SignIn` trait (R94 decision 12).
-10. **Budgets, two keys and none for the bot.** Every meter charges `meter_key` (`capability.rs`, since 2026-09-20), `user:<identity>` for a caller holding one, and any user may publish, so a bucket per bot would hand one user a bucket per app. A bot session overrides the key by its kind. An isolated session meters under `user:<installer>` as if the user had acted. A shared session meters under `app:<owner>`, a bucket separate from the owner's personal `user:<owner>` that every shared-view session of the owner's apps draws from, defaulting to one identity's allowance and raised by the deployment for a vendor it accepted. The bot identity carries no bucket. R87's quotas follow the same keys. Rejected: charging the bot alone, which multiplies, and charging the owner's personal bucket, which makes a publisher pay for their users.
-11. **The handshake reads no table.** The session manager keeps a registry cache of key generation, accepted grant rows and installations, seeded at boot and maintained by the change-log hook on the three synced tables, the same hook that revokes on uninstall and deletion and evicts on rotation. The three registry tables are exempt from the manifest filter so the bot's own installations query runs.
-12. **Audit.** `BotLogin` from the exchange on session open or resume after a gap, `Uninstalled`, `KeyRotated` and `AppDeleted` from the hook with the session it touched. Publish and install are the rows' own existence.
+1. **The list is derived from source and held by Postgres.** Each entry names a table, any of the verbs read, insert, update and delete, and whether it is optional. Every synced table carries one generated `AS RESTRICTIVE` policy per verb calling `connetto_bot_may(table, verb)`, which reads a server-set session setting holding the connection's effective list and is true when the setting is absent, so people are untouched. Startup refuses a synced table missing any of its rules. rls2fga, `RowPolicy` and pg2sqlite treat the function as connetto-known, answered from the session's list and the event's relation, so the cap never depends on parsing a bot's query. Rejected: a connetto-side filter per path, which leaves every new path to remember it. **Amended 2026-10-06 from the first measurement, and built so.** The setting is `app.bot_list`, the connection's effective list as `table:verb` entries joined by commas, connetto binds `*` on every person's connection, and a connection carrying no list sees and writes nothing. Each policy reads the setting directly with `string_to_array`. rls2fga takes the setting as a set attribute beside `app.subjects`, and connetto-schema maps it to `current_bot_list()`, a function the client registers on the replica.
+2. **Registration needs a fresh one-time code from the bot's owner** for the first list, every later list and every key rotation, so a person stands behind each, and goes over the connection after the challenge (code, public key, list, signature). A list naming a table or verb outside the synced catalog, a bad code and a bad signature get one undisclosing refusal.
+3. **Adding is one transaction from the admin's client**, the installation record and the deployment's membership row naming the installation as member, refused whole by the deployment's membership rule. The installation, not the bot, is the member, so connetto pauses, narrows and bills one installation without knowing the deployment's ownership.
+4. **A different list is a different bot.** Every owner it was added to is asked to accept. Optional entries are accepted or declined per installation, so adding one pauses nobody.
+5. **Files follow their rows.** A file's bytes are reachable exactly when a row referencing it is, and `connetto_visible_files` runs under the same rules, the cap included.
+6. **The registry is a `ConnettoSchema` member**, `type Bots: ConnettoBotSchema<Id = Self::Id>`, with registration codes, bots, bot lists per version and installations as synced tables whose policies are the deployment's (R100 writes the standard ones), each reported in `const TABLES`.
+7. **A bot may also connect as itself**, reading only connetto's rows about itself, to follow its installations.
 
 ### Steps
 
-Each test-first, in this order. First, before any DDL, the grading: a unit test hands the three registry policies as drafted to rls2fga and each must classify at or above the threshold connetto boots with, the two that join across rows (the bot's `SELECT` arm on `connetto_installations` through `connetto_app_bots`, and the grant-row owner policy) being the ones expected to fail first, rewritten in the record and the test until they grade, the test kept as the guard against a later rls2fga tightening. Then the registry DDL with its five tables, policies and the generation trigger, and the catalog check on grant rows at mutation inspection. The `gen` and `inst` claims, the idle-slide and revoke-by-user store operations on both stores. `AppRegistry` and `app_router` with the exchange, bot resolution at first login, the two server-only writes and `jti` refusal. The registry cache and its change-log hook. The accepted-rows filter at a site in `SessionManager` where the existing authorization check has already answered, with the registry exemption. The two budget keys on every meter. The app credential, the two-halves caller, `Reactor`, `diff_by_key`, `insert_awaited` and `testing` in `connetto-client`. `examples/bot-template` green in all four commands. The two demo apps, the isolated importer and the shared totaliser, with the browser-stack scenario. The four-place sync, chapters 01, 11, 12 and 13.
+Each test-first. First, before any code, rls2fga's grade and pg2sqlite's translation of a policy set carrying the restrictive rules, any refusal written to `upstream/` and launched with the maintainer's consent. Then the member and its tables, the function and the rule generator with the startup refusal, the executors' handling of the function, registration over the connection, and the add, accept and optional flows.
 
 ### Proof
 
-Every row of the record's state table has a test. The three registry policies grade under rls2fga at or above the boot threshold. A refused publish is refused and an admitted one syncs to a live query, a grant row naming an unknown table is refused, an owner cannot reassign their app nor a client set its generation, the first login resolves and writes the bot user, a banned owner's, a banned installer's and a banned bot's logins are refused and evicted, a lost-credential login replaces an isolated session, a replayed assertion is refused, real client sessions receive `SessionRevoked` on uninstall and deletion and the re-login reason on rotation and stay quiet otherwise. The filter is proven by four tests against a real bot session: a subscription on a table the accepted rows do not name is refused at subscribe with the refusal frame the test names, a mutation touching a table or verb outside the rows is refused per op with the rest of the plan not applied, a subscription open when its grant row is deleted or un-accepted is torn down with `FullResyncRequired` and does not return on resubscribe, and the bot's own query on `connetto_installations` passes with no grant row naming it. An isolated session's bytes land on its installer's meter and a shared session's on its owner's app budget with the bot and the owner's personal meters untouched, fifty isolated logins subscribing at startup fit their installers' allowances, a thousand self-published shared apps share one app budget, and in the browser stack the importer's session for one installer never sees the other's rows while the totaliser's sees both.
+For an unlisted table and for an undeclared verb on a listed one: an empty snapshot, a mutation refused at apply and by `may_write`, no live delivery, and a file referenced only from that table hidden by `connetto_visible_files`. A person's session on the same tables is unaffected. A synced table missing a rule refuses startup naming it. Bad codes, unknown tables and bad signatures are refused identically. A second list version leaves earlier acceptances untouched, a rotation makes the old key fail, and the add transaction is refused whole when the membership rule refuses.
 
 ### Done when
 
-The template's scripted, semantics, property and bench targets pass in CI, the two demo apps run in the browser stack through registration, install, rotation, narrowing, uninstall and deletion as the state table says, and a second bot written from the template by someone other than the author needed no change to `connetto-client`.
+Every synced table of a deployment carries the cap and every path obeys it, and a bot can be registered and added through the registry with no hand-written row.
+
+---
+
+## R99: bot login and lifetime
+
+**Status.** NOT STARTED, minted and designed 2026-10-05 by the R91 redesign. Design in `plans/apps-and-bots.md`, "R99 design, agreed 2026-10-05".
+
+**Blocked on nothing** since R91 merged (2026-10-14). Built after R101 by the maintainer's priority of 2026-10-05.
+
+**Changes state.** Client tables: none. Server tables: the audit contract's `connetto_auth_op` enum gains `BotRegistered`, `BotListRegistered`, `BotKeyRotated`, `BotRemoved` and `BotLoginRefused` (decision 6), the registry cache answering the handshake from memory. Wire messages: the bot's login answer to `Challenge`, its bot id, the installation or none and its signature (decision 1), and the "awaiting acceptance" refusal and close reason (decision 2). Archive format: none.
+
+### Decisions, 2026-10-05
+
+1. **Key login at connect.** The server challenges every new connection and the bot signs with its registered key, naming the installation or none. No route, no access token, no session id, no replay memory, nothing shared between server processes. The registry cache answers the handshake so it reads no table. Rejected: the token exchange at `/auth/app-token`, whose replay memory breaks with two server processes.
+2. **An installation connection binds `app.user_id` to the installation id** and the cap setting to its effective list. A new list whose required entries grew refuses that installation's logins with an "awaiting acceptance" reason until its admin accepts, a list that only adds optional entries or narrows does not.
+3. **One connection per installation**, a newer one evicting the older.
+4. **Removal, a ban on the bot or on one installation, a deleted bot and a key rotation close the affected connections at once.** R19's throttle counts failed logins.
+5. **Metering.** An installation connection bills the owner it serves (`owner:<id>`), a bot-level connection the bot's owner. The bot identity holds no bucket.
+6. **Audit.** `BotRegistered`, `BotListRegistered`, `BotKeyRotated`, `BotRemoved` and `BotLoginRefused`. Successful logins are not audited, since a woken bot logs in on every wake.
+
+### Proof
+
+Every row of the record's R99 state table (add, remove, new list, accept, rotation, bans, deletion, store down, against no connection, an installation connection and a bot-level connection) against a real server. A replayed signature on a second connection is refused, a newer connection evicts the older, installation traffic lands on its owner's bucket.
+
+### Done when
+
+A bot logs in for any of its installations and as itself, and every event of the state table has its tested outcome.
+
+---
+
+## R100: the standard ownership schema
+
+**Status.** NOT STARTED, minted and designed 2026-10-05 by the R91 redesign. Design in `plans/apps-and-bots.md`, "R100 design, agreed 2026-10-05".
+
+**Blocked on rls2fga reading a membership through a second table.** The first measurement (2026-10-06) chose a closure table `ownable_ancestors (ownable, owner)` joined to `memberships`, which rls2fga grades D because it recognises a membership read from one table only. The request is `upstream/rls2fga-membership-through-a-second-table.md` in the r91 worktree, and no pull request for it is open.
+
+**Changes state.** Client tables: none of connetto's, the standard document's tables syncing as a deployment's own. Server tables: none of connetto's, the document offering `ownables`, `owners`, `users`, `teams`, `projects`, `organizations`, `principals`, `memberships` and `ownable_ancestors` for a deployment to adopt, with the policies of R91's registry tables written against them. Wire messages: none. Archive format: none.
+
+### Purpose
+
+A ready-to-use Postgres document holding ownership, membership and their policies, plus the policies of R91's registry tables written against it. Any deployment may adopt it and none is held to it.
+
+### Decisions, 2026-10-05
+
+1. **Assets descend from `ownables`**, which holds the owner. Owners descend from ownables, and users, teams, projects and organizations descend from owners, so ownership chains. Principals are what can be members, users and bot installations, and an installation is never an owner.
+2. **Memberships carry read, write or admin.** A principal's role on a row is its highest role on any owner up the row's chain. Adding a member or a bot needs admin.
+3. **Registry policies.** Any signed-in user may create a registration code and see registered bots with their lists, installations are visible to the admins of the owner they serve and to their own bot.
+
+### Steps
+
+First the measurement. The asset rule reads `ownables` and the chain, the shape rls2fga refused as `MembershipTableGuarded` on 2026-10-04. The chain as a recursive query in the rule, a trigger-kept ancestor table with no rule of its own, and a definer function are graded in that order, the first that rls2fga grades and pg2sqlite translates is built, and if none does the finding goes upstream. Then the document and its grading guard.
+
+### Proof
+
+A reader of an organization sees orders two levels down, a writer of a team edits its orders and cannot add a member or a bot, its admin can, a principal outside the chain sees nothing, an installation added as read cannot insert, and moving a project between teams moves its orders' visibility at once.
+
+### Done when
+
+The document boots a server, grades under rls2fga, translates under pg2sqlite, and the proof passes against it.
+
+---
+
+## R101: live-query lifetimes and waking a closed client
+
+**Status.** IN PROGRESS, minted 2026-10-05 by the R91 redesign, first of the redesign's phases by the maintainer's priority. Research and design in `plans/apps-and-bots.md`, "R101, research before design" and "R101 design, agreed 2026-10-05". Step 0's experiment is recorded in `plans/design-r101-wake-experiment.md`, its markers and rendering in `plans/design-r101-lifetimes.md`. The reconnect storm it measured, 1,000 apps each missing one change, is addressed by #151 (2026-10-14, each catch-up patch built once and matched only against the reconnecting consumer) and #201 (2026-10-25, one catch-up walk shared across reconnecting subscriptions). Step 1's kept-query and notification design is in `plans/design-r101-kept-query-core.md`, which lists its open points, and its build order's first step is pushed as `fix/r101-dispatch-applies-once` with no pull request.
+
+**Blocked on** a released `pg-walstream` carrying `AlignedSnapshot::capture`, proposed upstream as a three-PR stack from `isdaniel/pg-walstream` #136, which the build order's second step, the server's durable engine (`plans/design-r101-step2-durable-engine.md`), needs to register a waking query while the stream runs, and on subql's durable engine changes that step relies on.
+
+**Changes state.** Client tables: the local declaration store (caller binding, name, typed key, query specification, marker, rendering policy, observed revision and pending operation or retirement intent) and the notification store (notification keys, trusted sender public keys, opaque ownership bindings and replay state), both in `plans/design-r101-kept-query-core.md`. Server tables: a deployment-owned table set holding declarations, verified ownership facts, endpoint bindings and generations, per-instance dirty, notified and acknowledged high-water marks, detector capacity failures, delivery claims and replay checkpoints, and the durable engine's receipt row with its changed-instance and failure tables and a first-receipt flag in connetto's one-row commit table (`plans/design-r101-step2-durable-engine.md`). Wire messages: the waking declaration and its release, the endpoint binding, the sender key distributed over the authenticated connection, and catch-up acknowledgements naming instance revisions. Archive format: not yet settled by the design.
+
+### Purpose
+
+An app wants updates while a screen element exists, while it runs, or even when closed, and a closed app must be woken when a query it cares about changes. Bots use the same mechanism in R103.
+
+### Decisions, 2026-10-05
+
+1. **Three lifetimes per live query.** The first two are Rust and Dioxus scope (a query held by a component, a query held at the app root). The third outlives the process, so it is a named registration the server keeps and evaluates while the client is away, woken per parked query and never per table.
+2. **The API comes out of a device experiment**, in a Dioxus app on an iPhone and on the Galaxy M52, swiped away. On iOS a closed app is reached only by an alert notification, rewritten within about 30 seconds by a notification service extension, while background notifications are throttled and dropped for force-quit apps. On Android a data message wakes the app's service for about 10 seconds. The maintainer expects upstream findings, each through the upstream procedure.
+3. **The iPhone and Android channels belong here.** Web Push here or in a later phase as the experiment shows. The bot's wake URL is R103's.
+
+### Steps
+
+0. The experiment, measuring delivery, latency, what Rust runs in the iOS extension and how scoped queries read as hooks.
+1. The design brought back for agreement, covering the client API, the parked-query store as a `ConnettoSchema` member, evaluation for away clients through the existing fan-out, coalescing and the payload per platform.
+
+### Done when
+
+Set after step 1's design is agreed.
+
+---
+
+## R103: the bot runtime and template
+
+**Status.** NOT STARTED, minted and designed 2026-10-05 by the R91 redesign. Design in `plans/apps-and-bots.md`, "R103 design, agreed 2026-10-05".
+
+**Blocked on R99 and R101**, R91 having merged (2026-10-14). R93 is absorbed here (2026-10-05), its two decisions carried over as amended in its section, and R71's headless custody, which it needed, is built.
+
+**Changes state.** Client tables: one encrypted file replica per installation, named from the installation id, with each reactor's previous answer stored beside it (decisions 2 and 3). Server tables: the wake URL on `connetto_bots`, which R91 left empty for this phase. Wire messages: the server's public key on the registration answer, which the bot pins to verify wake notes (decision 4), the notes themselves arriving over HTTP. Archive format: none.
+
+### Decisions, 2026-10-05
+
+1. **A `connetto-bot` crate on top of `connetto-client`** with the bot trait (name and list, by hand until synql generates it), the `register --code` entry point reading the operator's key file, the installation loop, reactors and the wake receiver. Supersedes "no bot crate" of 2026-09-18.
+2. **One encrypted file replica per installation**, named from the installation id and wiped on removal (R93's decisions as amended), opened for every woken bot and for any bot declaring device-local tables, in memory for a connected bot without them.
+3. **Reactors are parked queries per installation.** The runtime persists each one's previous answer beside the replica and passes the diff and the current answer, exact across restarts and wakes, at least once. Supersedes the whole snapshot of 2026-09-18.
+4. **Two running modes**, connected or woken, with the same reactors. The wake URL receives server-signed notes naming an installation and a parked query, never data, verified against the server key pinned at registration.
+
+### Proof
+
+Two installations never see each other's rows on disk or in memory, a restart between two changes yields the exact diff, a wake reconnects only the named installation, a failed run repeats with the same diff, removal wipes the replica. The template's scripted, semantics, property and bench targets pass.
+
+### Done when
+
+A second bot written from the template by someone other than the author needs no change to `connetto-bot`.
+
+---
+
+## R104: the demos for apps and bots
+
+**Status.** NOT STARTED, minted and designed 2026-10-05 by the R91 redesign. Design in `plans/apps-and-bots.md`, "R104 design".
+
+**Blocked on R100 and R103.**
+
+**Changes state.** Client tables: none, the demo apps' replicas holding the deployment's own tables. Server tables: none of connetto's, `examples/deployment` adopting R100's document. Wire messages: none. Archive format: none.
+
+### Purpose and decisions, 2026-10-05
+
+`examples/deployment` on R100's standard schema (organization "lab A", two teams, projects owning `orders`, `order_lines` and `photos`). In dioxus-web and yew-web, the desktop demo unchanged: registration codes, the bot catalogue, adding a bot with its consent screen and optional toggles, installed bots with pending requests and removal. Two bots from the template, the importer added per team and running connected, the totaliser added to the organization and running woken.
+
+### Done when
+
+One scripted browser-stack scenario passes: register, add, import, totals follow, an optional-table list pauses nobody, a required-table list pauses team T until accepted, removal wipes the replica, and a raw query on an unlisted table is refused.
 
 ---
 
@@ -6180,9 +6328,7 @@ Synced tables carry no references on either backend, enforcement is on at every 
 
 ## R93: the file replica for bots
 
-**Status.** NOT STARTED, designed 2026-09-22. Minted the same day by R71's decision 8.
-
-**Blocked on** R91 for the bot template. R71's durable headless custody is built. Two decisions, listed below.
+**Status.** **ABSORBED** into R103 (2026-10-05), by the maintainer's decision, since R103 now creates the bot runtime this phase edits and R103's woken mode needs the file replica. Designed 2026-09-22, minted the same day by R71's decision 8. The decisions below stand as amended and are built in R103.
 
 **Changes state.** Client tables: none, the bot's identity living in its own replica. Server tables: the bot rows in the registry R91 owns, one template per bot (decision 3). Wire messages: none, the template arriving through the registry sync. Archive format: none.
 
@@ -6194,6 +6340,8 @@ A bot's replica is `Replica::in_memory()` per login (R91 decision 9). A bot that
 
 1. **An isolated login's replica is named from the bot user and the installation, domain-separated** (2026-09-22). `replica_db_name` derives the name from the identity, and every isolated login of one bot carries the bot user as its identity (R91 decision 1), so two installations' logins would open one file and read each other's rows. The isolated name hashes, through SHA-256 as today's names do, a fixed label beginning with a NUL byte followed by the bot user's and the installation id's JSON encodings, each length-prefixed. An identity-only name hashes `serde_json::to_vec` of the identity, and JSON text never begins with a NUL byte, so the two inputs can never coincide, whatever shape the identity type serializes to. A shared-view login keeps the identity-only name, one login per deployment. The key record, the tier and the content directory all derive from the replica name, so they separate with it, which extends chapter 14's rule that a wrong identity opens a different file rather than adopting another's rows. Rejected: hashing the bare pair, whose JSON array an identity serializing as a sequence can reproduce, and an operator-chosen path per login, which makes the collision representable again.
 2. **Uninstall wipes the isolated login's replica** (2026-09-22). On the session-revoked close R91 sends at uninstall and at deletion, the bot runs `wipe_replica` for that installation's replica, key first, then tier, replica and content, so no uninstalled user's data outlives the uninstall on the bot's host. Rejected: leaving the files for the operator.
+
+**Amended by the R91 redesign (2026-10-05).** An installation connection's identity is now the installation id itself (R91 decision 3, R99 decision 2), so decision 1's domain-separated pair is no longer needed, the ordinary identity-only name of the installation id already gives each installation its own file, and the bot-level connection's replica is named from the bot id. Decision 2's trigger becomes the close R99 sends at removal and at the bot's deletion. A woken bot (R101, R103) wants its replica kept between wakes, so the runtime opens the encrypted file replica for every woken bot, not only for bots declaring device-local tables, and stays in memory for a connected bot without them.
 
 ### Steps
 
