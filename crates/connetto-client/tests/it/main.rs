@@ -25,6 +25,8 @@ mod builder_schema;
 
 mod core_builder;
 
+mod column_subset;
+
 mod changed_signal;
 
 mod coverage_resync;

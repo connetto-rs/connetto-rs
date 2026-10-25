@@ -43,7 +43,10 @@ use sqlite_diff_rs::{
     ChangesetOp, DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK,
     TableSchema, Value,
 };
-use sqlparser::ast::{BinaryOperator, Expr, GroupByExpr, SetExpr, Statement};
+use sqlparser::ast::{
+    BinaryOperator, Distinct, Expr, GroupByExpr, SelectItem, SetExpr, Statement,
+    WildcardAdditionalOptions,
+};
 use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use subql::EventKind;
@@ -629,9 +632,10 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             }
         }
         let context = TranslationContext::new(&options);
-        let pg = statement
+        let mut pg = statement
             .reverse_translate(&self.catalog, &context)
             .map_err(|err| MaterializerError::Translate(format!("{err}")))?;
+        widen_column_subset(&mut pg);
         Ok(pg.to_string())
     }
 
@@ -2104,6 +2108,39 @@ fn answers_one_value(pg_sql: &str) -> bool {
     select.projection.len() == 1
         && matches!(&select.group_by, GroupByExpr::Expressions(exprs, mods)
             if exprs.is_empty() && mods.is_empty())
+}
+
+/// Rewrite a select list naming only plain columns to `*`.
+///
+/// The replica holds the application's whole table, so a subscription naming
+/// fewer columns still has to bring whole rows, or the left-out columns land
+/// empty and the changes to them alone never arrive. The client runs the query
+/// as written against its replica, which keeps the columns the caller asked for.
+/// Aggregates, groupings, `DISTINCT` and expressions keep their own list.
+fn widen_column_subset(statement: &mut Statement) {
+    let Statement::Query(query) = statement else {
+        return;
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return;
+    };
+    let grouped = !matches!(&select.group_by, GroupByExpr::Expressions(exprs, mods)
+        if exprs.is_empty() && mods.is_empty());
+    let distinct = matches!(select.distinct, Some(Distinct::Distinct | Distinct::On(_)));
+    if grouped || distinct || select.having.is_some() {
+        return;
+    }
+    let plain = |expr: &Expr| matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_));
+    let all_plain = !select.projection.is_empty()
+        && select.projection.iter().all(|item| match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => plain(expr),
+            SelectItem::Wildcard(_)
+            | SelectItem::QualifiedWildcard(..)
+            | SelectItem::ExprWithAliases { .. } => false,
+        });
+    if all_plain {
+        select.projection = vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())];
+    }
 }
 
 /// Decoded group values as a JSON array string, in `GROUP BY` order (R84).
