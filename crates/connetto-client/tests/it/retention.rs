@@ -286,11 +286,11 @@ async fn a_pin_keeps_its_rows_until_unpin() {
     );
 }
 
-/// Step 4 guard: a row an un-acknowledged local write touches survives a pass
-/// that would otherwise evict it, and becomes evictable once the server
-/// acknowledges the write.
+/// Step 4 guard: a row a local write touches survives a pass that would
+/// otherwise evict it, both before the write is pushed and while it waits for
+/// its acknowledgement, and becomes evictable once the server acknowledges it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_pending_write_survives_until_it_is_acknowledged() {
+async fn a_local_write_survives_until_it_is_acknowledged() {
     let (mut server, client_end) = loopback();
     tokio::spawn(async move {
         ack_handshake(&mut server).await;
@@ -338,7 +338,17 @@ async fn a_pending_write_survives_until_it_is_acknowledged() {
         ))
         .execute(conn.conn())
         .expect("local insert");
-    conn.push().await.expect("push").expect("a sequence");
+
+    conn.tidy().expect("tidy before the push");
+    assert_eq!(
+        replica_ids(&mut conn),
+        vec![1],
+        "the unpushed write is spared",
+    );
+    conn.push()
+        .await
+        .expect("push")
+        .expect("the write still uploads");
 
     conn.tidy().expect("tidy while the write is un-acked");
     assert_eq!(

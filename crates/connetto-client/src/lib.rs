@@ -7657,25 +7657,32 @@ where
         })
     }
 
-    /// The pending, un-acknowledged writes as per-table primary-key match
-    /// clauses, so the eviction pass spares a row this client has written but
-    /// not yet had the server acknowledge.
+    /// This client's own writes the server has not acknowledged, as per-table
+    /// primary-key match clauses, so the eviction pass spares a row this
+    /// client wrote whether or not the write was pushed yet.
     ///
     /// Keyed by the lowercased physical table the delete runs against, each
-    /// value a list of `(col IS literal AND ...)` clauses. Decoded from
-    /// `self.pending` the same way [`affected_rows`] reads a changeset's touched
-    /// keys, so the protection is bounded by the queue's cap and clears itself
-    /// when an ack retires the mutation. A captured mutation is a changeset,
-    /// whose op carries the backing table's own schema, so the primary-key
-    /// columns and ordinals come straight from it.
+    /// value a list of `(col IS literal AND ...)` clauses. Decoded from every
+    /// writer queue's pending entries and from the capture sessions the same
+    /// way [`affected_rows`] reads a changeset's touched keys, so the
+    /// protection is bounded by the queue's cap and clears itself when an ack
+    /// retires the mutation. A write not yet pushed lives only in the capture,
+    /// whose changeset reads each row's current state, so a row deleted before
+    /// the push would leave nothing to upload. A captured mutation is a
+    /// changeset, whose op carries the backing table's own schema, so the
+    /// primary-key columns and ordinals come straight from it.
     fn pending_spare(&mut self) -> Result<HashMap<String, Vec<String>>, ClientError> {
         let mut spare: HashMap<String, Vec<String>> = HashMap::new();
-        let changesets: Vec<Vec<u8>> = self
+        let mut changesets: Vec<Vec<u8>> = self
             .writers
             .values()
             .flat_map(|queue| queue.pending.values())
             .map(|entry| entry.changeset.clone())
             .collect();
+        let captured = self.session.changeset()?;
+        if !captured.is_empty() {
+            changesets.push(captured);
+        }
         for changeset in &changesets {
             let ParsedDiffSet::Changeset(diff) =
                 ParsedDiffSet::parse(changeset).map_err(|err| {
