@@ -788,9 +788,6 @@ async fn an_expiry_save_failure_terminates_recovery_during_backoff_or_dial() {
         let authority =
             connetto_server::TokenAuthority::generate(&connetto_server::AuthConfig::default())
                 .expect("token authority");
-        let token = authority
-            .mint_capability(&subject, SystemTime::now(), Duration::from_secs(5))
-            .expect("short-lived key");
         let attempts = Arc::new(AtomicUsize::new(0));
         let probe = Arc::clone(&attempts);
         let factory = move || {
@@ -810,7 +807,6 @@ async fn an_expiry_save_failure_terminates_recovery_during_backoff_or_dial() {
             Duration::from_secs(30)
         };
         let (running, pump) = ClientBuilder::new(schema(), factory)
-            .with_share_keys([(Grant::new(token), subject)])
             .with_reconnect(
                 ReconnectPolicy::new()
                     .with_initial_backoff(delay)
@@ -829,6 +825,15 @@ async fn an_expiry_save_failure_terminates_recovery_during_backoff_or_dial() {
             .expect("open offline replica");
         let client = running.client();
         client.with_conn(seed).await.expect("seed cached rows");
+        // The key's five seconds start after setup, so a slow setup cannot
+        // spend them before recovery runs.
+        let token = authority
+            .mint_capability(&subject, SystemTime::now(), Duration::from_secs(5))
+            .expect("short-lived key");
+        client
+            .add_share_key(&Grant::new(token), &subject)
+            .await
+            .expect("hold the short-lived key");
         let query: connetto_client::LiveQuery<i32> = client
             .watch(visible::table.select(visible::id).order(visible::id))
             .await
