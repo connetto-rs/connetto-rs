@@ -2243,7 +2243,6 @@ where
     min_wait: Option<core::time::Duration>,
 }
 
-
 /// Send every attached tab the typed fatal that ends the hub, so a tab
 /// reads the reason rather than a channel that merely vanishes.
 fn refuse_tabs(state: &HubState, reason: &FatalErrorReason) {
@@ -4727,7 +4726,6 @@ fn forward_aggregate(
     }
 }
 
-
 /// Handle one upstream event from the worker connection.
 fn handle_worker_event<U>(
     worker: &mut ConnettoConnection<U>,
@@ -6355,7 +6353,9 @@ mod tests {
                 panic!("the hub closed the tab: {detail}")
             }
             Err(super::TabFault::Hub(err)) => panic!("the hub failed: {err}"),
-            Err(super::TabFault::Refuse(reason)) => panic!("the hub refused the tab with {reason:?}"),
+            Err(super::TabFault::Refuse(reason)) => {
+                panic!("the hub refused the tab with {reason:?}")
+            }
         }
         let mut rows = Vec::new();
         loop {

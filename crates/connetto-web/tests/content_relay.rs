@@ -5,7 +5,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-
 use connetto_core::messages::{
     ContentTicketGrant, ControlMessage, MutationReject, MutationRejectReason,
 };
@@ -37,7 +36,6 @@ use fixture::{
 use support::{install_content_transport, timeout_ms, until};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
-
 
 const TEST_LOCK: &str = "connetto-content-relay-test";
 

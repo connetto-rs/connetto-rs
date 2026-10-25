@@ -9,13 +9,13 @@ use std::rc::Rc;
 
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientBuilder, FirstThen, Grant, HeldCredential, SyncSchema};
-use connetto_core::{Cursor, Major, PROTOCOL_VERSION};
 use connetto_core::messages::{
     BulkMessage, CONTENT_TICKET_REFUSED, ContentTicketGrant, ControlMessage, Handshake,
     HandshakeAck, MutationHeader, MutationPatch, NonFatalError, WriterGrant,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_core::{Cursor, Major, PROTOCOL_VERSION};
 use connetto_file_client::{BrowserHttp, BrowserStore, ContentArchive};
 use connetto_file_core::{FileId, FileIdHasher, MimeClass};
 use connetto_web::MessageTransport;
