@@ -28,7 +28,7 @@ jobs:
     name: Check ${{ matrix.name }}
     # Only pushes and same-repository pull requests may reach the self-hosted
     # runners on emi. LINUX_LIGHT names their scale set, and unset it means GitHub's.
-    runs-on: &light-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT || 'ubuntu-latest' }}
+    runs-on: &light-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT || 'ubuntu-26.04' }}
     timeout-minutes: 40
     # --all-features turns on the demo's device-identity feature, whose build
     # embeds a deployment root. These jobs never run the demo, so any file serves.
@@ -503,7 +503,7 @@ jobs:
     name: Rust tests ${{ matrix.name }}
     # Only pushes and same-repository pull requests may reach the self-hosted
     # runners on emi. LINUX_HEAVY names their scale set, and unset it means GitHub's.
-    runs-on: &heavy-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_HEAVY || 'ubuntu-latest' }}
+    runs-on: &heavy-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_HEAVY || 'ubuntu-26.04' }}
     # A same-repository pull request runs these suites once, instrumented, in
     # coverage.yml. Forks and Dependabot get no Codecov token, and main runs
     # them here in release.
@@ -587,7 +587,7 @@ jobs:
       - name: Install keyring helpers
         run: |
           sudo apt-get update
-          sudo apt-get install -y keyutils dbus gnome-keyring
+          sudo apt-get install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
 
       # --all-features turns on connetto-dioxus's desktop feature.
       - name: Install desktop dependencies
@@ -674,7 +674,7 @@ jobs:
       - name: Install keyring helpers
         run: |
           sudo apt-get update
-          sudo apt-get install -y keyutils dbus gnome-keyring
+          sudo apt-get install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
 
       - uses: taiki-e/install-action@nextest
 
@@ -736,7 +736,7 @@ jobs:
     # This job hands its binaries to the shards and the Android proof, so all
     # of them run on emi only while both scale-set variables name emi pools,
     # since put-files and get-files must pick the same store.
-    runs-on: &paired-heavy-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_LIGHT && vars.LINUX_HEAVY || 'ubuntu-latest' }}
+    runs-on: &paired-heavy-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(vars.LINUX_LIGHT, 'ubuntu-') && !startsWith(vars.LINUX_HEAVY, 'ubuntu-') && vars.LINUX_LIGHT && vars.LINUX_HEAVY || 'ubuntu-26.04' }}
     # The server and the topology test binary, built once here instead of in
     # every shard, where they were most of the budget. Pull requests build
     # them in testfast like the Rust test jobs, and the harness reads the same
@@ -771,6 +771,11 @@ jobs:
 
       - name: Install stable browser toolchain
         uses: $/.github/actions/install-rust
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Build the browser stack
         run: |
@@ -834,7 +839,7 @@ jobs:
     name: Browser tests ${{ matrix.shard }}/4
     needs: browser-build
     # Light VMs sit idle once the checks finish, while the heavy ones still run the suites.
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_HEAVY && vars.LINUX_LIGHT || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(vars.LINUX_LIGHT, 'ubuntu-') && !startsWith(vars.LINUX_HEAVY, 'ubuntu-') && vars.LINUX_HEAVY && vars.LINUX_LIGHT || 'ubuntu-26.04' }}
     # A shard runs a quarter of the suites against its own machine-local
     # stack from the prebuilt binaries, so the serial rule inside one process
     # holds while the wall clock divides by four.
