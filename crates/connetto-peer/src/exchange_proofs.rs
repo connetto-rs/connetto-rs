@@ -600,6 +600,7 @@ fn lone_leaf(deployment: &Deployment, now: SystemTime, serial: [u8; 16]) -> (Rcg
             DAY,
             CertificateSerial::new(serial).expect("the serial is positive"),
             AttestationLevel::Unproven,
+            connetto_core::BOT_LIST_WILDCARD,
         )
         .expect("the leaf issues");
     (key, leaf)

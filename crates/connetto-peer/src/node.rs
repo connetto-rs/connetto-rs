@@ -131,7 +131,12 @@ pub(crate) enum SlotState {
     Live(LinkSlot),
     /// A link to the peer that just closed with `Duplicate`, waiting for the
     /// kept link to register.
-    AwaitingKeeper(DeviceIdentity),
+    AwaitingKeeper {
+        /// What the peer's certificate names.
+        peer: DeviceIdentity,
+        /// The bot list the peer's certificate carries.
+        bot_list: Option<String>,
+    },
 }
 
 /// A linked peer and the remote address of the link the node keeps to it.
@@ -139,6 +144,10 @@ pub(crate) enum SlotState {
 pub struct PeerLink {
     /// What the peer's certificate names.
     pub peer: DeviceIdentity,
+    /// The bot list the peer's certificate carries, `None` for a
+    /// certificate without the extension, which readers bind as `NULL`
+    /// (R77 decision 12).
+    pub bot_list: Option<String>,
     /// The kept link's remote address, `None` while a duplicate close waits for its keeper.
     pub remote: Option<SocketAddr>,
 }
@@ -159,6 +168,8 @@ pub(crate) struct LinkSlot {
     pub(crate) leaf: Vec<u8>,
     /// The peer's issuer, DER.
     pub(crate) issuer: Vec<u8>,
+    /// The bot list the peer's certificate carries.
+    pub(crate) bot_list: Option<String>,
     /// The revocation list numbers the peer has, by issuer key id.
     pub(crate) numbers: BTreeMap<[u8; 32], u64>,
     /// The key id of the side that dialed this connection.
@@ -395,10 +406,12 @@ impl Node {
             .map(|slot_state| match slot_state {
                 SlotState::Live(slot) => PeerLink {
                     peer: slot.peer.clone(),
+                    bot_list: slot.bot_list.clone(),
                     remote: Some(slot.remote),
                 },
-                SlotState::AwaitingKeeper(peer) => PeerLink {
+                SlotState::AwaitingKeeper { peer, bot_list } => PeerLink {
                     peer: peer.clone(),
+                    bot_list: bot_list.clone(),
                     remote: None,
                 },
             })
@@ -514,16 +527,17 @@ impl Node {
             };
             (leaf.to_vec(), issuer.to_vec())
         };
-        let peer = DeviceCertificate::parse(&leaf)
-            .expect("the profile was verified at the handshake")
-            .identity()
-            .clone();
+        let certificate =
+            DeviceCertificate::parse(&leaf).expect("the profile was verified at the handshake");
+        let peer = certificate.identity().clone();
+        let bot_list = certificate.bot_list().map(str::to_owned);
         let mut tls = tls;
         let (peer_numbers, _peer_dial) = exchange_hello(&mut tls, &self.state, dial).await?;
         register_link(
             &self.state,
             Handshaken {
                 peer: peer.clone(),
+                bot_list,
                 leaf,
                 issuer,
                 numbers: peer_numbers,
@@ -686,7 +700,7 @@ fn stop_state(state: &NodeState, reason: CloseReason) {
                     })
                     .ok();
             }
-            SlotState::AwaitingKeeper(peer) => {
+            SlotState::AwaitingKeeper { peer, .. } => {
                 state.events.send(PeerEvent::Unlinked { peer, reason }).ok();
             }
         }
@@ -938,13 +952,15 @@ async fn inbound(state: Arc<NodeState>, tcp: TcpStream, remote: SocketAddr, iden
         };
         (leaf.to_vec(), issuer.to_vec())
     };
-    let peer = match DeviceCertificate::parse(&leaf) {
-        Ok(certificate) => certificate.identity().clone(),
+    let certificate = match DeviceCertificate::parse(&leaf) {
+        Ok(certificate) => certificate,
         Err(err) => {
             warn!(%err, "the peer's certificate failed the profile");
             return;
         }
     };
+    let peer = certificate.identity().clone();
+    let bot_list = certificate.bot_list().map(str::to_owned);
     let mut tls = tls;
     let (peer_numbers, dial) = match exchange_hello(&mut tls, &state, 0).await {
         Ok(pair) => pair,
@@ -960,6 +976,7 @@ async fn inbound(state: Arc<NodeState>, tcp: TcpStream, remote: SocketAddr, iden
         &state,
         Handshaken {
             peer,
+            bot_list,
             leaf,
             issuer,
             numbers: peer_numbers,
@@ -1051,6 +1068,8 @@ pub(crate) async fn exchange_hello<S: AsyncRead + AsyncWrite + Unpin>(
 struct Handshaken {
     /// What the peer's certificate names.
     peer: DeviceIdentity,
+    /// The bot list the peer's certificate carries.
+    bot_list: Option<String>,
     /// The peer's leaf, DER.
     leaf: Vec<u8>,
     /// The peer's issuer, DER.
@@ -1100,6 +1119,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 ) -> Result<(), LinkError> {
     let Handshaken {
         peer,
+        bot_list,
         leaf,
         issuer,
         numbers,
@@ -1133,7 +1153,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
         let fresh = links.get(&peer_key).is_none();
         let keep_new = match links.get(&peer_key) {
-            None | Some(SlotState::AwaitingKeeper(_)) => true,
+            None | Some(SlotState::AwaitingKeeper { .. }) => true,
             Some(SlotState::Live(existing)) => {
                 if existing.dialer == dialer {
                     dial > existing.dial
@@ -1159,6 +1179,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 remote: SocketAddr::new(remote.ip().to_canonical(), remote.port()),
                 leaf,
                 issuer,
+                bot_list,
                 numbers,
                 dialer,
                 dial,

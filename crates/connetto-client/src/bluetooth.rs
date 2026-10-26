@@ -2208,6 +2208,7 @@ mod tests {
                     DAY,
                     CertificateSerial::new(serial).expect("the test serial is positive"),
                     AttestationLevel::Unproven,
+                    connetto_core::BOT_LIST_WILDCARD,
                 )
                 .expect("the certificate issues");
             DeviceCertificate::parse(&leaf).expect("the profile holds");

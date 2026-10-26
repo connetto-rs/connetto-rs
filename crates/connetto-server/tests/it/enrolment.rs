@@ -327,6 +327,112 @@ async fn a_signed_in_device_enrols_and_is_recorded() {
     assert_eq!(records[0].descriptor, vec![0x91, 0x01]);
 }
 
+/// A session presenting the login grant `grant`, on `manager`, a distinct
+/// connection from the ones `connect` opens.
+async fn connect_granted(manager: &Arc<TicketManager<OkSigner>>, grant: &str) -> LoopbackTransport {
+    static NEXT: AtomicU32 = AtomicU32::new(10_000);
+    let (server_end, mut client) = loopback();
+    tokio::spawn(Arc::clone(manager).serve(server_end));
+    let handle = format!("conn-granted-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    do_handshake_with(&mut client, &handle, &[grant]).await;
+    client
+}
+
+/// A person session's enrolled certificate carries the wildcard its
+/// connection binds, and a bot session's carries exactly the list its login
+/// resolved (R77 decision 12).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_enrolled_certificate_carries_the_sessions_bot_list() {
+    let fixture = Fixture::acquire().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (_, issuer) = issuer();
+    let manager = enrolling_manager(
+        &fixture,
+        Some(DeviceEnrolment::new(
+            DeviceCertConfig::new(issuer),
+            Arc::clone(&store) as _,
+        )),
+    )
+    .await;
+
+    let key = device_key();
+    let mut person = connect(&manager, Some("alice")).await;
+    let handed = nonce(&mut person).await;
+    let reply = enrol(&mut person, &key, handed, None, vec![0x91, 0x01]).await;
+    let ControlMessage::EnrolGrant(EnrolGrant { chain, .. }) = reply else {
+        panic!("expected a grant, got {reply:?}");
+    };
+    let leaf = DeviceCertificate::parse(&chain[0]).expect("the leaf meets the profile");
+    assert_eq!(
+        leaf.bot_list(),
+        Some(connetto_core::BOT_LIST_WILDCARD),
+        "the person's certificate carries the wildcard"
+    );
+
+    let key = device_key();
+    let mut bot = connect_granted(&manager, "bot:alice#orders:read").await;
+    let handed = nonce(&mut bot).await;
+    let reply = enrol(&mut bot, &key, handed, None, vec![0x91, 0x01]).await;
+    let ControlMessage::EnrolGrant(EnrolGrant { chain, .. }) = reply else {
+        panic!("expected a grant, got {reply:?}");
+    };
+    let leaf = DeviceCertificate::parse(&chain[0]).expect("the leaf meets the profile");
+    assert_eq!(
+        leaf.bot_list(),
+        Some("orders:read"),
+        "the bot's certificate carries its list"
+    );
+}
+
+/// A renewal after the list changed carries the current list, keeping the
+/// attestation level the first enrolment recorded (R77 decision 12).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renewal_carries_the_changed_bot_list_and_keeps_the_level() {
+    let fixture = Fixture::acquire().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (_, issuer) = issuer();
+    let manager = enrolling_manager(
+        &fixture,
+        Some(DeviceEnrolment::new(
+            DeviceCertConfig::new(issuer),
+            Arc::clone(&store) as _,
+        )),
+    )
+    .await;
+    let key = device_key();
+
+    let mut first = connect_granted(&manager, "bot:alice#orders:read").await;
+    let handed = nonce(&mut first).await;
+    let reply = enrol(&mut first, &key, handed, None, vec![0x91, 0x01]).await;
+    let ControlMessage::EnrolGrant(EnrolGrant { chain, .. }) = reply else {
+        panic!("expected a grant, got {reply:?}");
+    };
+    let first = DeviceCertificate::parse(&chain[0]).expect("the leaf meets the profile");
+    assert_eq!(
+        first.bot_list(),
+        Some("orders:read"),
+        "the first enrolment carries the list"
+    );
+
+    let mut second = connect_granted(&manager, "bot:alice#orders:read,orders:insert").await;
+    let handed = nonce(&mut second).await;
+    let reply = enrol(&mut second, &key, handed, None, vec![0x91, 0x02]).await;
+    let ControlMessage::EnrolGrant(EnrolGrant { chain, .. }) = reply else {
+        panic!("the renewal is a grant, got {reply:?}");
+    };
+    let renewed = DeviceCertificate::parse(&chain[0]).expect("the leaf meets the profile");
+    assert_eq!(
+        renewed.bot_list(),
+        Some("orders:read,orders:insert"),
+        "the renewal carries the changed list"
+    );
+    assert_eq!(
+        renewed.attestation(),
+        first.attestation(),
+        "the renewal keeps the recorded level"
+    );
+}
+
 /// A key's first enrolment tells the application, and its renewal tells
 /// nothing more (R105 decision 9).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

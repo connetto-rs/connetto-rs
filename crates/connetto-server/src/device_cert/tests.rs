@@ -147,6 +147,7 @@ fn a_thousand_random_serials_read_back_as_issued() {
                 DAY,
                 serial,
                 AttestationLevel::Unproven,
+                connetto_core::BOT_LIST_WILDCARD,
             )
             .expect("issued");
         let parsed = DeviceCertificate::parse(&leaf).expect("the profile");

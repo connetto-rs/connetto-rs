@@ -50,6 +50,20 @@ fn serial(byte: u8) -> CertificateSerial {
     CertificateSerial::new([byte; 16]).expect("the test serial is positive")
 }
 
+/// The one profile shape a device certificate asks for, under `identity`.
+fn leaf_profile(identity: &DeviceIdentity) -> CertificateParams {
+    let mut p = CertificateParams::default();
+    p.distinguished_name = DistinguishedName::new();
+    p.is_ca = IsCa::ExplicitNoCa;
+    p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    p.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    p.subject_alt_names = vec![SanType::URI(identity.uri().try_into().expect("uri"))];
+    p
+}
+
 fn verify_chain(
     root: &RootCa,
     issuer: &DeviceIssuer,
@@ -149,6 +163,7 @@ fn an_issued_certificate_carries_exactly_the_profile() {
             DAY,
             serial(9),
             AttestationLevel::ChipProven,
+            crate::BOT_LIST_WILDCARD,
         )
         .expect("issue");
 
@@ -180,6 +195,115 @@ fn an_issued_certificate_carries_exactly_the_profile() {
 }
 
 #[test]
+fn a_certificate_carries_the_bot_list_the_issuer_bound() {
+    let start = at(1_800_000_000);
+    let (_, issuer) = authorities(start);
+    let (_, csr) = device_request(&[7; 32]);
+    let request = CertificateRequest::parse(&csr).expect("parse");
+    // A list over the short DER length's reach, past 127 bytes.
+    let long = "orders:read".repeat(20);
+    for text in [
+        crate::BOT_LIST_WILDCARD,
+        "orders:read",
+        "orders:read,orders:insert",
+        long.as_str(),
+    ] {
+        let leaf = issuer
+            .issue(
+                &request,
+                "acct",
+                start,
+                DAY,
+                serial(7),
+                AttestationLevel::Unproven,
+                text,
+            )
+            .expect("issue");
+        let cert = DeviceCertificate::parse(&leaf).expect("the profile");
+        assert_eq!(
+            cert.bot_list(),
+            Some(text),
+            "the leaf carries the bound list"
+        );
+    }
+}
+
+#[test]
+fn a_certificate_without_the_bot_list_extension_carries_none() {
+    let issuer_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("key");
+    let issuer_params = {
+        let mut p = CertificateParams::default();
+        p.is_ca = IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        p
+    };
+    let signer = rcgen::Issuer::new(issuer_params, &issuer_key);
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
+    let identity = DeviceIdentity::new(
+        deployment(),
+        "acct",
+        KeyId::of_public_key(&leaf_key.subject_public_key_info()),
+    )
+    .expect("identity");
+    let mut p = CertificateParams::default();
+    p.distinguished_name = DistinguishedName::new();
+    p.is_ca = IsCa::ExplicitNoCa;
+    p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    p.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    p.subject_alt_names = vec![SanType::URI(identity.uri().try_into().expect("uri"))];
+    let leaf = p
+        .signed_by(&leaf_key, &signer)
+        .expect("sign")
+        .der()
+        .to_vec();
+    let cert = DeviceCertificate::parse(&leaf).expect("the profile");
+    assert_eq!(cert.bot_list(), None, "an absent extension reads as absent");
+}
+
+#[test]
+fn a_bot_list_extension_outside_its_form_is_refused() {
+    let issuer_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("key");
+    let issuer_params = {
+        let mut p = CertificateParams::default();
+        p.is_ca = IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        p
+    };
+    let signer = rcgen::Issuer::new(issuer_params, &issuer_key);
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
+    let identity = DeviceIdentity::new(
+        deployment(),
+        "acct",
+        KeyId::of_public_key(&leaf_key.subject_public_key_info()),
+    )
+    .expect("identity");
+    let profile = || leaf_profile(&identity);
+    // The inner values the extension may be built with outside its form.
+    for value in [
+        vec![0x13, 0x03, b'o', b'r', b'd'], // an IA5String, not a UTF8String
+        vec![0x0c, 0x02, 0xff, 0xfe],       // a UTF8String of invalid UTF-8
+        vec![0x0c, 0x05, b'h', b'i'],       // a length past the content
+    ] {
+        let mut p = profile();
+        p.custom_extensions = vec![rcgen::CustomExtension::from_oid_content(
+            BOT_LIST_EXTENSION,
+            value,
+        )];
+        let leaf = p
+            .signed_by(&leaf_key, &signer)
+            .expect("sign")
+            .der()
+            .to_vec();
+        assert_eq!(
+            DeviceCertificate::parse(&leaf),
+            Err(ProfileError::BotList),
+            "an extension outside its form is refused"
+        );
+    }
+}
+
+#[test]
 fn a_serial_the_integer_cannot_carry_is_refused() {
     assert!(CertificateSerial::new([0x00; 16]).is_none());
     assert!(CertificateSerial::new([0x80; 16]).is_none());
@@ -203,6 +327,7 @@ fn boundary_serials_read_back_as_issued() {
                 DAY,
                 serial,
                 AttestationLevel::Unproven,
+                crate::BOT_LIST_WILDCARD,
             )
             .expect("issue");
         let cert = DeviceCertificate::parse(&leaf).expect("the profile");
@@ -234,6 +359,7 @@ fn fields_the_request_asks_for_are_ignored() {
             DAY,
             serial(3),
             AttestationLevel::Unproven,
+            crate::BOT_LIST_WILDCARD,
         )
         .expect("issue");
     assert!(DeviceCertificate::parse(&leaf).is_ok());
@@ -288,7 +414,8 @@ fn a_certificate_outliving_its_issuer_is_not_issued() {
                 start + YEAR,
                 31 * DAY,
                 serial(3),
-                AttestationLevel::Unproven
+                AttestationLevel::Unproven,
+                crate::BOT_LIST_WILDCARD
             )
             .err(),
         Some(IssueError::OutlivesIssuer)
@@ -331,18 +458,7 @@ fn a_certificate_outside_the_profile_is_refused() {
         KeyId::of_public_key(&leaf_key.subject_public_key_info()),
     )
     .expect("identity");
-    let profile = || {
-        let mut p = CertificateParams::default();
-        p.distinguished_name = DistinguishedName::new();
-        p.is_ca = IsCa::ExplicitNoCa;
-        p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        p.extended_key_usages = vec![
-            ExtendedKeyUsagePurpose::ServerAuth,
-            ExtendedKeyUsagePurpose::ClientAuth,
-        ];
-        p.subject_alt_names = vec![SanType::URI(identity.uri().try_into().expect("uri"))];
-        p
-    };
+    let profile = || leaf_profile(&identity);
     let sign = |p: CertificateParams| {
         p.signed_by(&leaf_key, &signer)
             .expect("sign")
@@ -481,6 +597,7 @@ fn a_device_key_requests_a_certificate_naming_it() {
             DAY,
             serial(5),
             AttestationLevel::Unproven,
+            crate::BOT_LIST_WILDCARD,
         )
         .expect("issue");
     let cert = DeviceCertificate::parse(&leaf).expect("profile");
@@ -520,6 +637,7 @@ fn issued(issuer: &DeviceIssuer, start: SystemTime, serial: u8) -> Vec<u8> {
             DAY,
             CertificateSerial::new([serial; 16]).expect("the test serial is positive"),
             AttestationLevel::Unproven,
+            crate::BOT_LIST_WILDCARD,
         )
         .expect("issue")
 }

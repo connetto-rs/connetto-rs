@@ -565,13 +565,16 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         Ok((nonce, window))
     }
 
-    /// Issue and record the certificate `request` asks for on behalf of `user`.
+    /// Issue and record the certificate `request` asks for on behalf of
+    /// `user`, carrying `bot_list`, the list the enrolling session's
+    /// connection binds (R77 decision 12).
     pub(crate) async fn enrol(
         &self,
         user: &Id,
         session: SessionId,
         pending: &mut Option<PendingChallenge>,
         request: EnrolRequest,
+        bot_list: &str,
     ) -> Result<EnrolGrant, EnrolRefusal> {
         let challenge = pending.take();
         if request.descriptor.len() > DESCRIPTOR_LIMIT {
@@ -623,7 +626,15 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         let not_before = (self.clock)();
         let issuer = self.config.issuer();
         let leaf = issuer
-            .issue(&csr, &user.to_string(), not_before, lifetime, serial, level)
+            .issue(
+                &csr,
+                &user.to_string(),
+                not_before,
+                lifetime,
+                serial,
+                level,
+                bot_list,
+            )
             .map_err(|err| match err {
                 IssueError::Identity(_) => EnrolRefusal::Unidentified,
                 IssueError::OutlivesIssuer | IssueError::Validity | IssueError::Sign(_) => {

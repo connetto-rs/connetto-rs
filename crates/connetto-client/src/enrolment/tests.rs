@@ -112,6 +112,7 @@ async fn held(not_before: SystemTime, lifetime: Duration) -> Held {
             lifetime,
             CertificateSerial::new([3; 16]).expect("the serial is positive"),
             AttestationLevel::Unproven,
+            connetto_core::BOT_LIST_WILDCARD,
         )
         .expect("issue");
     Held {
@@ -558,6 +559,7 @@ impl Link for FakeLink {
                                     12 * HOUR,
                                     serial,
                                     AttestationLevel::Unproven,
+                                    connetto_core::BOT_LIST_WILDCARD,
                                 )
                                 .expect("the grant issues");
                             Answer::Grant(vec![leaf, certificate], state.grant_lists.clone())
@@ -679,6 +681,7 @@ fn issue_for(
             lifetime,
             serial,
             AttestationLevel::Unproven,
+            connetto_core::BOT_LIST_WILDCARD,
         )
         .expect("the issuer signs");
     Held {

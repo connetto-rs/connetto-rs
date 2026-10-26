@@ -1,12 +1,13 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use x509_parser::certificate::X509Certificate;
-use x509_parser::extensions::{GeneralName, ParsedExtension};
+use x509_parser::extensions::{GeneralName, ParsedExtension, X509Extension};
 use x509_parser::oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY};
 use x509_parser::prelude::FromDer;
 use x509_parser::x509::SubjectPublicKeyInfo;
 
 use super::attestation::{ATTESTATION_EXTENSION, AttestationLevel};
+use super::bot_list::{self, BOT_LIST_EXTENSION};
 use super::identity::{DeviceIdentity, IdentityError, KeyId};
 
 /// A device certificate whose profile has been checked.
@@ -20,6 +21,7 @@ pub struct DeviceCertificate {
     not_after: SystemTime,
     serial: Vec<u8>,
     attestation: AttestationLevel,
+    bot_list: Option<String>,
 }
 
 /// How a certificate departs from the device profile.
@@ -58,6 +60,9 @@ pub enum ProfileError {
     /// The attestation extension is critical or names no level.
     #[error("the attestation extension is critical or names no level")]
     Attestation,
+    /// The bot list extension is critical or carries no valid text.
+    #[error("the bot list extension is critical or carries no valid text")]
+    BotList,
 }
 
 impl DeviceCertificate {
@@ -81,6 +86,7 @@ impl DeviceCertificate {
 
         let mut identity = None;
         let mut attestation = AttestationLevel::Unproven;
+        let mut bot_list = None;
         let (mut key_usage, mut extended_key_usage) = (false, false);
         for extension in cert.extensions() {
             if extension
@@ -93,6 +99,14 @@ impl DeviceCertificate {
                 }
                 attestation = AttestationLevel::from_extension_value(extension.value)
                     .ok_or(ProfileError::Attestation)?;
+                continue;
+            }
+            if extension
+                .oid
+                .iter()
+                .is_some_and(|arcs| arcs.eq(BOT_LIST_EXTENSION.iter().copied()))
+            {
+                bot_list = Some(bot_list_of(extension)?);
                 continue;
             }
             match extension.parsed_extension() {
@@ -155,6 +169,7 @@ impl DeviceCertificate {
             not_after: from_timestamp(validity.not_after.timestamp())?,
             serial,
             attestation,
+            bot_list,
         })
     }
 
@@ -163,6 +178,17 @@ impl DeviceCertificate {
     #[must_use]
     pub const fn attestation(&self) -> AttestationLevel {
         self.attestation
+    }
+
+    /// The bot list the certificate carries, `None` for a certificate
+    /// without the extension.
+    ///
+    /// A peer judging the holder's writes binds `None` as `NULL`, so a
+    /// certificate that does not say which list it holds fails closed (R77
+    /// decision 12).
+    #[must_use]
+    pub fn bot_list(&self) -> Option<&str> {
+        self.bot_list.as_deref()
     }
 
     /// The device the certificate names.
@@ -188,6 +214,15 @@ impl DeviceCertificate {
     pub fn serial(&self) -> &[u8] {
         &self.serial
     }
+}
+
+/// The list a bot-list extension carries, the profile's refusal when it is
+/// critical or carries no valid text.
+fn bot_list_of(extension: &X509Extension<'_>) -> Result<String, ProfileError> {
+    if extension.critical {
+        return Err(ProfileError::BotList);
+    }
+    bot_list::from_extension_value(extension.value).ok_or(ProfileError::BotList)
 }
 
 fn from_timestamp(secs: i64) -> Result<SystemTime, ProfileError> {
