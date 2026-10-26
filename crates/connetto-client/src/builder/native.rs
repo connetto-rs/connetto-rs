@@ -14,9 +14,13 @@ use std::sync::Arc;
 use connetto_core::auth::CapabilityKey;
 use connetto_core::auth::CapabilitySubject;
 use connetto_core::messages::Grant;
+#[cfg(feature = "native-auth")]
+use connetto_core::traits::RefreshTokenStore;
 use connetto_core::traits::{MaybeSend, ReplicaKeyStore, Transport};
 use connetto_core::{DialError, NativeStream, WebSocketTransport, dial};
 
+#[cfg(feature = "device-identity")]
+use crate::ClientEvent;
 use crate::GateMechanism;
 #[cfg(feature = "peer")]
 use crate::PeerError;
@@ -55,7 +59,7 @@ use crate::teardown::{
 };
 use crate::{ClientError, ConnettoClient, Custody};
 #[cfg(feature = "peer")]
-use crate::{ClientEvent, HotspotError, HotspotOffer, JoinError};
+use crate::{HotspotError, HotspotOffer, JoinError};
 #[cfg(feature = "peer")]
 use connetto_core::device_cert::AttestationLevel;
 #[cfg(feature = "device-identity")]
@@ -791,56 +795,28 @@ where
         self
     }
 
-    /// Finish every device wipe a revoked key left pending under the data
-    /// directory, before anything is signed into or opened (R105 decision
-    /// 10). Each part is idempotent, so running one that already stood again
-    /// is harmless.
+    /// Every device wipe a revoked key left pending under the data directory,
+    /// with the stores each one clears, read before any of them runs so the
+    /// completion borrows nothing of the build but its key store (R105
+    /// decision 10).
     #[cfg(feature = "native-auth")]
-    async fn complete_pending_wipes(&self) -> Result<(), ClientError> {
+    fn pending_wipes(&self) -> Result<Vec<PreparedWipe>, ClientError> {
         let pending = PendingWipe::every(&self.data_dir).map_err(|err| {
             ClientError::Session(format!("reading the pending device wipes: {err}"))
         })?;
-        for wipe in pending {
-            let mut report = ForgetIncomplete::default();
-            if let (Some(account), Some(store)) = (&wipe.account, self.storage.refresh_store()) {
-                report.credential = store.clear(account).await.err();
-            }
-            report.wipe = wipe_replica(
-                &self.data_dir.join(&wipe.name),
-                &self.key_store,
-                &wipe.name,
-                &[],
-                true,
-            )
-            .await
-            .err();
-            if report.wipe.is_none() {
-                report.share_keys = match share_keys(self.share_key_store.as_ref(), &self.storage) {
-                    Ok(store) => store.clear(&share_key_record(&wipe.name)).await.err(),
-                    Err(err) => Some(err),
-                };
+        Ok(pending
+            .into_iter()
+            .map(|wipe| PreparedWipe {
+                refresh: self.storage.refresh_store(),
+                share_keys: share_keys(self.share_key_store.as_ref(), &self.storage),
                 #[cfg(feature = "device-identity")]
-                if let Some(service) = self.storage.device_service() {
-                    report.device_key = match self.device.keys(service, &wipe.name) {
-                        Ok(keys) => keys.delete().await.err(),
-                        Err(err) => Some(err),
-                    };
-                }
-            }
-            if let Some(hook) = &self.wipe_hook {
-                report.application = hook(wipe.name.clone())
-                    .await
-                    .err()
-                    .map(ApplicationWipeError);
-            }
-            if !report.is_complete() {
-                return Err(ClientError::WipePending(Box::new(report)));
-            }
-            wipe.clear(&self.data_dir).map_err(|err| {
-                ClientError::Session(format!("removing a completed device wipe's marker: {err}"))
-            })?;
-        }
-        Ok(())
+                device_keys: self
+                    .storage
+                    .device_service()
+                    .map(|service| self.device.keys(service, &wipe.name)),
+                wipe,
+            })
+            .collect())
     }
 
     /// The away-and-return gate, on by default.
@@ -899,7 +875,16 @@ where
         // A wipe a revoked key left pending is finished before anything is
         // signed into or opened (R105 decision 10).
         #[cfg(feature = "native-auth")]
-        this.complete_pending_wipes().await?;
+        {
+            let pending = this.pending_wipes()?;
+            complete_pending_wipes(
+                pending,
+                &this.data_dir,
+                &this.key_store,
+                this.wipe_hook.as_ref(),
+            )
+            .await?;
+        }
         #[cfg(feature = "native-auth")]
         let hook = this.wipe_hook.take();
         #[cfg(feature = "device-identity")]
@@ -1347,6 +1332,75 @@ async fn wipe_revoked<T>(
     let _ = client.event_sender().send(ClientEvent::DeviceRevoked {
         failed: report.failed(),
     });
+}
+
+/// A pending device wipe and the stores it clears, read off the build before
+/// it runs.
+#[cfg(feature = "native-auth")]
+struct PreparedWipe {
+    wipe: PendingWipe,
+    refresh: Option<Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync>>,
+    share_keys: Result<ErasedShareKeyStore, ClientError>,
+    #[cfg(feature = "device-identity")]
+    device_keys: Option<Result<Arc<dyn DeviceKeys>, ClientError>>,
+}
+
+/// Finish every pending device wipe under `dir` before anything is signed
+/// into or opened (R105 decision 10). Each part is idempotent, so one that
+/// already stood runs again harmlessly. The first wipe a part still fails
+/// refuses the start.
+#[cfg(feature = "native-auth")]
+async fn complete_pending_wipes<KS>(
+    pending: Vec<PreparedWipe>,
+    dir: &std::path::Path,
+    key_store: &KS,
+    hook: Option<&DeviceWipeHook>,
+) -> Result<(), ClientError>
+where
+    KS: ReplicaKeyStore<Error = ClientError> + Send + Sync + 'static,
+{
+    for prepared in pending {
+        let PreparedWipe {
+            wipe,
+            refresh,
+            share_keys,
+            #[cfg(feature = "device-identity")]
+            device_keys,
+        } = prepared;
+        let mut report = ForgetIncomplete::default();
+        if let (Some(account), Some(store)) = (&wipe.account, refresh) {
+            report.credential = store.clear(account).await.err();
+        }
+        report.wipe = wipe_replica(&dir.join(&wipe.name), key_store, &wipe.name, &[], true)
+            .await
+            .err();
+        if report.wipe.is_none() {
+            report.share_keys = match share_keys {
+                Ok(store) => store.clear(&share_key_record(&wipe.name)).await.err(),
+                Err(err) => Some(err),
+            };
+            #[cfg(feature = "device-identity")]
+            if let Some(keys) = device_keys {
+                report.device_key = match keys {
+                    Ok(keys) => keys.delete().await.err(),
+                    Err(err) => Some(err),
+                };
+            }
+        }
+        if let Some(hook) = hook {
+            report.application = hook(wipe.name.clone())
+                .await
+                .err()
+                .map(ApplicationWipeError);
+        }
+        if !report.is_complete() {
+            return Err(ClientError::WipePending(Box::new(report)));
+        }
+        wipe.clear(dir).map_err(|err| {
+            ClientError::Session(format!("removing a completed device wipe's marker: {err}"))
+        })?;
+    }
+    Ok(())
 }
 
 /// The share-key store a durable build names, the refresh store standing in
