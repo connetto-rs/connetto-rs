@@ -20,6 +20,7 @@ pub use retention::RetentionPane;
 pub use your_data::YourDataPane;
 
 use connetto_client::AccountChoice;
+use connetto_demo_support as support;
 use dioxus::prelude::*;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::{
@@ -28,50 +29,6 @@ use dioxus_free_icons::icons::fa_solid_icons::{
 };
 
 use crate::platform::{Client, DemoContent, Ops};
-
-/// The one stylesheet, identical text in this demo and the yew demo.
-pub const CSS: &str = r#"
-:root { --accent: #2f6feb; --accent-hover: #2559c7; --danger: #b42318; --border: #d0d7de; --muted: #57606a; --surface: #f6f8fa; }
-body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; color: #1f2328; background: #fff; }
-.wrap { padding: 16px; max-width: 960px; margin: 0 auto; }
-h1 { font-size: 1.4em; margin: 0 0 8px; }
-h1, h2 { display: flex; align-items: center; gap: 8px; }
-.panes { display: flex; gap: 16px; flex-wrap: wrap; }
-.pane { flex: 1 1 300px; border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: #fff; }
-.pane h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 1.05em; }
-.badge { font-size: 0.7em; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
-.synced { background: #ddf4ff; color: #0a3069; }
-.local { background: #ffebe9; color: #82071e; }
-.trim { background: #dafbe1; color: #116329; }
-.status { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
-.id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; background: var(--surface); border-radius: 4px; padding: 0 4px; }
-table { border-collapse: collapse; width: 100%; margin-top: 8px; }
-th, td { border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left; }
-th { font-size: 0.85em; color: var(--muted); font-weight: 600; }
-input { font: inherit; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; }
-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
-button { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 0.9em; font-weight: 500; padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: #1f2328; cursor: pointer; transition: background-color .12s, border-color .12s; }
-button svg { flex: none; fill: currentColor; }
-button:hover:not(:disabled) { background: #eaeef2; border-color: #afb8c1; }
-button:active:not(:disabled) { background: #dde3e9; }
-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-button:disabled { opacity: .5; cursor: not-allowed; }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
-button.danger { background: #fff; color: var(--danger); border-color: #f5c2bd; }
-button.danger:hover:not(:disabled) { background: #fff1f0; border-color: var(--danger); }
-input[type=file]::file-selector-button { font: inherit; font-size: 0.9em; padding: 6px 12px; margin-right: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
-input[type=file] { border: none; padding: 0; }
-.row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
-.auth-banner { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; background: var(--surface); }
-.auth-banner p { margin: 0; }
-.confirm { background: #fff8c5; border: 1px solid #d4a72c; border-radius: 8px; padding: 8px 12px; }
-.confirm p { margin: 0 0 6px; }
-.warn { color: #7d4e00; background: #fff8c5; border: 1px solid #d4a72c; border-radius: 6px; padding: 4px 8px; margin: 4px 0; }
-.error { color: var(--danger); }
-.peer { border: 1px solid var(--border); border-radius: 10px; padding: 8px 14px; margin-bottom: 12px; }
-img.thumb { max-height: 60px; border-radius: 4px; }
-"#;
 
 /// The app's own status line, set by the platform's event loop.
 #[derive(Clone, Copy)]
@@ -222,13 +179,13 @@ fn AccountBar() -> Element {
     let account = account_key.read().clone();
     let dup = account
         .as_deref()
-        .map(crate::account_label)
+        .map(support::account_label)
         .filter(|label| *label == uid);
     let accounts_now = accounts.read().clone();
     let account_tag: Option<String> = account
         .as_deref()
         .filter(|_| dup.is_none())
-        .map(crate::account_label);
+        .map(support::account_label);
     let picker_now = *picker_active.read();
 
     let picker_html: Element = if picker_now {
@@ -296,10 +253,10 @@ fn AccountBar() -> Element {
                 }
                 p {
                     "Signed in as "
-                    code { class: "id", title: uid.clone(), {crate::short_id(&uid)} }
+                    code { class: "id", title: uid.clone(), {support::short_id(&uid)} }
                     if let Some(label) = account_tag.clone() {
                         " (account: "
-                        code { class: "id", title: label.clone(), {crate::short_id(&label)} }
+                        code { class: "id", title: label.clone(), {support::short_id(&label)} }
                         ")"
                     }
                 }
@@ -369,19 +326,6 @@ fn AccountBar() -> Element {
     }
 }
 
-/// The shared standing of the logout controls on every platform.
-#[derive(Clone, PartialEq)]
-pub enum LogoutState {
-    /// Showing the two logout buttons.
-    Idle,
-    /// A delete would lose local writes, so asking for the go ahead.
-    ConfirmDelete { unsynced_count: u64 },
-    /// A logout or unsynced-count request is in flight.
-    Working,
-    /// The request failed.
-    Error(String),
-}
-
 /// The logout controls, one set on every platform. Keeping the local data
 /// revokes the session and leaves the replica and its key, so a returning
 /// user resumes from the persisted cursor. Deleting wipes the replica and
@@ -395,6 +339,7 @@ fn LogoutControls() -> Element {
     let cancel_ops = ops.clone();
     let dismiss_ops = ops.clone();
     let state = ops.logout_state();
+    let refused = ops.refused_pending();
 
     let on_keep = move |_| {
         let ops = keep_ops.clone();
@@ -417,51 +362,70 @@ fn LogoutControls() -> Element {
         spawn(async move { ops.dismiss().await });
     };
 
-    match state.read().clone() {
-        LogoutState::Idle => rsx! {
-            div { class: "row",
-                button {
-                    onclick: on_keep,
-                    Icon { icon: FaRightFromBracket, width: 14, height: 14 }
-                    "Log out, keep local data"
-                }
-                button {
-                    class: "danger",
-                    onclick: on_delete,
-                    Icon { icon: FaTrashCan, width: 14, height: 14 }
-                    "Delete local data and log out"
-                }
-            }
-        },
-        LogoutState::ConfirmDelete { unsynced_count } => rsx! {
+    if let Some(pending) = *refused.read() {
+        rsx! {
             div { class: "confirm",
-                p {
-                    "You have {unsynced_count} pending local item(s) that would be permanently lost."
-                }
+                p { {support::logout_refused_line(pending)} }
                 div { class: "row",
                     button {
                         class: "danger",
                         onclick: on_confirm,
-                        Icon { icon: FaCheck, width: 14, height: 14 }
-                        "Confirm: delete and log out"
+                        Icon { icon: FaTrashCan, width: 14, height: 14 }
+                        "Force delete"
                     }
                     button {
-                        onclick: on_cancel,
+                        onclick: on_dismiss,
                         Icon { icon: FaXmark, width: 14, height: 14 }
                         "Cancel"
                     }
                 }
             }
-        },
-        LogoutState::Working => rsx! { p { "Working..." } },
-        LogoutState::Error(msg) => rsx! {
-            p { class: "error", "Error: {msg}" }
-            button {
-                onclick: on_dismiss,
-                Icon { icon: FaXmark, width: 14, height: 14 }
-                "Dismiss"
-            }
-        },
+        }
+    } else {
+        match state.read().clone() {
+            support::LogoutState::Idle => rsx! {
+                div { class: "row",
+                    button {
+                        onclick: on_keep,
+                        Icon { icon: FaRightFromBracket, width: 14, height: 14 }
+                        "Log out, keep local data"
+                    }
+                    button {
+                        class: "danger",
+                        onclick: on_delete,
+                        Icon { icon: FaTrashCan, width: 14, height: 14 }
+                        "Delete local data and log out"
+                    }
+                }
+            },
+            support::LogoutState::ConfirmDelete { unsynced_count } => rsx! {
+                div { class: "confirm",
+                    p { {support::logout_confirm_line(unsynced_count)} }
+                    div { class: "row",
+                        button {
+                            class: "danger",
+                            onclick: on_confirm,
+                            Icon { icon: FaCheck, width: 14, height: 14 }
+                            "Confirm: delete and log out"
+                        }
+                        button {
+                            onclick: on_cancel,
+                            Icon { icon: FaXmark, width: 14, height: 14 }
+                            "Cancel"
+                        }
+                    }
+                }
+            },
+            support::LogoutState::Working => rsx! { p { "Working..." } },
+            support::LogoutState::Error(msg) => rsx! {
+                p { class: "error", "Error: {msg}" }
+                button {
+                    onclick: on_dismiss,
+                    Icon { icon: FaXmark, width: 14, height: 14 }
+                    "Dismiss"
+                }
+            },
+        }
     }
 }
 
@@ -479,37 +443,37 @@ fn PanesSkeleton() -> Element {
     rsx! {
         div { class: "panes",
             div { class: "pane",
-                h2 { "orders " span { class: "badge synced", "synced" } }
-                p { "count 0, total quantity 0. Newest first. Converges across every window through Postgres." }
+                h2 { {support::ORDERS_PANE_TITLE} " " span { class: "badge synced", {support::ORDERS_BADGE} } }
+                p { {support::orders_readout(0, 0)} }
                 table {
                     thead { tr { th { "id" } th { "quantity" } } }
                     tbody {}
                 }
             }
             div { class: "pane",
-                h2 { "photos " span { class: "badge synced", "synced" } }
-                p { "count 0. Pick an image file to stage and upload through the content route." }
+                h2 { {support::PHOTOS_PANE_TITLE} " " span { class: "badge synced", {support::PHOTOS_BADGE} } }
+                p { {support::photos_readout(0)} }
                 table {
                     thead { tr { th { "id" } th { "state" } th { "image" } } }
                     tbody {}
                 }
             }
             div { class: "pane",
-                h2 { "notes " span { class: "badge local", "device-only" } }
-                p { "count 0. Converges across this device's windows through the DB worker, never the server." }
+                h2 { {support::NOTES_PANE_TITLE} " " span { class: "badge local", {support::NOTES_BADGE} } }
+                p { {support::notes_readout(0)} }
                 table {
                     thead { tr { th { "id" } th { "body" } } }
                     tbody {}
                 }
             }
             div { class: "pane",
-                h2 { "retention " span { class: "badge trim", "trim" } }
-                p { "Replica mirror: 0 pages (~0 KB), 0 free to reclaim." }
-                p { "Ending a subscription evicts the rows no live subscription still covers, and the trimming pass hands the freed pages back to storage." }
+                h2 { {support::RETENTION_PANE_TITLE} " " span { class: "badge trim", {support::RETENTION_BADGE} } }
+                p { {support::retention_readout(0, 0, 0)} }
+                p { {support::RETENTION_EXPLAINER} }
             }
             div { class: "pane",
-                h2 { "your data " span { class: "badge local", "device-only" } }
-                p { "Save a zip archive of this device's local data. The archive is not encrypted and holds every row the device can read: whoever holds the file holds the data." }
+                h2 { {support::YOUR_DATA_PANE_TITLE} " " span { class: "badge local", {support::YOUR_DATA_BADGE} } }
+                p { {support::YOUR_DATA_INTRO} }
             }
         }
     }
@@ -534,7 +498,7 @@ fn Panes() -> Element {
 #[component]
 pub fn Page(ready: bool, restoring: bool, peer: Option<Element>) -> Element {
     rsx! {
-        style { {CSS} }
+        style { {support::CSS} }
         div { class: "wrap",
             Header {}
             AccountBar {}

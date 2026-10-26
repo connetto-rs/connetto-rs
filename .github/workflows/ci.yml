@@ -72,7 +72,7 @@ jobs:
           - name: demo-support wasm
             cwd: examples/demo-support
             target: --target wasm32-unknown-unknown
-            flags: --all-features
+            flags: --features web
           - name: webauthn-unlock wasm
             cwd: examples/webauthn-unlock
             target: --target wasm32-unknown-unknown
@@ -212,7 +212,7 @@ jobs:
           examples/yew-web-demo --all-features --target=wasm32-unknown-unknown
           examples/leptos-demo --target=wasm32-unknown-unknown
           examples/leptos-demo --no-default-features --features=tauri --target=wasm32-unknown-unknown
-          examples/demo-support --all-features --target=wasm32-unknown-unknown
+          examples/demo-support --features=web --target=wasm32-unknown-unknown
           examples/webauthn-unlock --all-features --target=wasm32-unknown-unknown
           examples/dioxus-demo --all-features
           examples/tauri-leptos-demo --all-features

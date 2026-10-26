@@ -11,15 +11,13 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-anyhow = "1"
-# The deployment every build here runs against, documents and all.
-connetto-demo-deployment = { path = "../deployment" }
+# The demos' shared core, holding the schema, its rows and queries, the pane
+# wording and helpers, and the browser and native pieces every build carries.
+connetto-demo-support = { path = "../demo-support", default-features = false }
 connetto-core = { path = "../../crates/connetto-core", features = ["logging"] }
 connetto-dioxus = { path = "../../crates/connetto-dioxus" }
-# FileId and MimeClass for the staging row and the mime guess, on every target.
+# FileId the staging row and the refused and lost lists name, on every target.
 connetto-file-core = { path = "../../crates/connetto-file-core" }
-chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
-diesel = { version = "2", features = ["sqlite", "chrono"] }
 # The renderer is a feature so `dx` can pick it per platform: `desktop` by
 # default, `web` for the browser build, `mobile` for the phone builds.
 dioxus = { version = "0.7.9" }
@@ -43,9 +41,9 @@ connetto-web = { path = "../../crates/connetto-web" }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-# `Blob` and `Url` back the export download, `File` the import picker,
-# `BroadcastChannel` the tab-to-worker transport, and `Storage` the last
-# signed-in account across reloads, a non-secret identifier.
+# `Blob`, `File` and `FileList` back the photo and import file inputs,
+# `BroadcastChannel` the tab-to-worker transport, and the browser test target
+# the worker spawn, the fetches and the object URLs it drives.
 web-sys = { version = "0.3", features = [
   "Blob",
   "BlobPropertyBag",
@@ -55,18 +53,14 @@ web-sys = { version = "0.3", features = [
   "Element",
   "File",
   "FileList",
-  "HtmlAnchorElement",
-  "HtmlElement",
   "HtmlInputElement",
+  "MessageEvent",
   "Request",
   "RequestInit",
   "Response",
-  "Storage",
-  "UrlSearchParams",
   "Url",
   "Window",
   "Worker",
-  "WorkerGlobalScope",
   "WorkerOptions",
   "WorkerType",
   "console",
@@ -81,11 +75,9 @@ connetto-file-client = { path = "../../crates/connetto-file-client" }
 # The runtime the native pumps run on.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 connetto-dioxus = { path = "../../crates/connetto-dioxus", features = ["desktop"] }
-
 # The app's private data directory on a phone, read through the activity
-# context, plus the in-app browser sign-in and the log file a proof copies off.
+# context, plus the log file a proof copies off.
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
-connetto-auth-session = { path = "../../crates/connetto-auth-session" }
 robius-directories = "6"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
@@ -108,18 +100,19 @@ connetto-peer-apple = { path = "../../crates/connetto-peer-apple" }
 default = ["desktop"]
 # The web leg builds with `--no-default-features`, which drops the desktop
 # renderer whose websocket bridge links OpenSSL, which a wasm target has none of.
-web = ["dioxus/web", "dioxus/lib", "dioxus/launch", "dioxus/logger", "dioxus/devtools"]
-desktop = ["dioxus/desktop"]
-mobile = ["dioxus/mobile"]
+web = ["dioxus/web", "dioxus/lib", "dioxus/launch", "dioxus/logger", "dioxus/devtools", "connetto-demo-support/web"]
+desktop = ["dioxus/desktop", "connetto-demo-support/native"]
+mobile = ["dioxus/mobile", "connetto-demo-support/native"]
 # Enrols this device under the deployment root `CONNETTO_DEMO_BUILD_DEVICE_ROOT`
 # names at build time, which `connetto-demo-stack` mints (R74 decision 30).
-device-identity = ["connetto-client/device-identity", "connetto-auth-session/device-identity"]
+device-identity = ["connetto-demo-support/device-identity"]
 # The peer link and the hotspot it hosts and joins (R76): the device identity
 # the link proves with, and the demo's peer panel.
 peer = ["connetto-client/peer", "dep:qrcode"]
 # The end-to-end fixture the native proof runs, on the targets that carry it;
-# the wasm leg's test suite needs none of it.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# The provisioning documents the native proof applies to its own Postgres.
+connetto-demo-deployment = { path = "../deployment" }
 connetto-test-harness = { path = "../../crates/connetto-test-harness" }
 connetto-file-server = { path = "../../crates/connetto-file-server" }
 connetto-server = { path = "../../crates/connetto-server", features = ["test-seams"] }
@@ -129,6 +122,8 @@ tempfile = "3"
 axum = "0.8"
 
 [dev-dependencies]
+# The photo surface tests keep their own tables and row structs.
+diesel = { version = "2", features = ["sqlite"] }
 wasm-bindgen-test = "0.3"
 futures-channel = "0.3"
 serde_json = "1"
@@ -137,12 +132,6 @@ serde_json = "1"
 name = "demo_photos_flow"
 path = "tests/demo_photos_flow.rs"
 required-features = []
-
-# The schema step: translates the deployment's shared schema and policies plus
-# the demo's local tier into the bundle the app includes and the version it
-# presents at handshake.
-[build-dependencies]
-connetto-schema = { path = "../../crates/connetto-schema" }
 
 [workspace]
 

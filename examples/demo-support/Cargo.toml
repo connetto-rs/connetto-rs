@@ -43,6 +43,24 @@ client = [
   "dep:thiserror",
   "dep:tracing",
 ]
+# The native pieces the desktop and phone demo builds share. They exist on
+# non-wasm targets only, and a wasm build ignores the feature.
+native = [
+  "client",
+  "connetto-client/native-auth",
+  "dep:anyhow",
+  "dep:connetto-auth-session",
+  "dep:connetto-file-client",
+  "dep:manganis",
+  "dep:tokio",
+]
+# Device certificates for the native builds. A wasm build never turns it on,
+# since the certificate stack does not build for wasm.
+device-identity = [
+  "native",
+  "connetto-client/device-identity",
+  "connetto-auth-session?/device-identity",
+]
 # The browser platform, meaning the transport, the leader election, the relay
 # hub and the DB worker, reached through its WebClientBuilder.
 web = ["client", "dep:connetto-web", "dep:wasm-bindgen", "dep:web-sys"]
@@ -69,10 +87,24 @@ web-sys = { version = "0.3", optional = true, features = [
   "Window",
 ] }
 
-# The native builds take the client with its native transport, the browser one
-# leaves it off, since a wasm target has no native WebSocket.
+# The native builds take the client with its native transport and its native
+# sign-in, the browser one leaves both off, since a wasm target has no native
+# WebSocket and no platform keyring.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 connetto-client = { path = "../../crates/connetto-client", optional = true }
+# The builder chain the `native` feature serves, its error lines and the
+# content event lines it feeds.
+anyhow = { version = "1", optional = true }
+connetto-file-client = { path = "../../crates/connetto-file-client", optional = true }
+tokio = { version = "1", features = ["fs", "sync"], optional = true }
+
+# The phone sign-in the `native` feature reaches, on the targets that carry it.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+connetto-auth-session = { path = "../../crates/connetto-auth-session", optional = true }
+
+# The Keystore unlock prompt's JNI types, on the target that carries it.
+[target.'cfg(target_os = "android")'.dependencies]
+manganis = { version = "0.7.10", optional = true }
 
 # The schema step. It translates the deployment's shared schema and policies
 # plus the demos' local tier into the bundle the client builds include and the

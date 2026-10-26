@@ -1,7 +1,8 @@
 //! The core the demos share. It holds the view and the actions, the wording
 //! and helpers every pane renders, and behind the `client` feature the demo
-//! schema, its rows and queries, and the browser pieces the demos carry
-//! identically.
+//! schema, its rows and queries, the browser pieces the demos carry
+//! identically, and behind the `native` feature the pieces the native demo
+//! builds carry identically.
 
 use std::collections::HashMap;
 
@@ -14,6 +15,9 @@ pub mod view;
 
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
 pub mod web;
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+pub mod native;
 
 /// The part of an id before its first `-`, or the whole string when it has none.
 #[must_use]

@@ -1,12 +1,10 @@
 //! The notes pane: the device-private rows, which never leave the device.
 
-use diesel::prelude::*;
+use connetto_demo_support as support;
+use connetto_dioxus::use_live;
 use dioxus::prelude::*;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::{FaFloppyDisk, FaNoteSticky};
-
-use crate::notes;
-use connetto_dioxus::use_live;
 
 use super::ClientSlot;
 
@@ -16,8 +14,8 @@ pub fn NotesPane() -> Element {
     let ClientSlot(client_slot) = use_context::<ClientSlot>();
     let client = client_slot.read().clone().expect("mounted with a client");
 
-    let notes_live = use_live::<_, _, crate::Note>(&client, notes::table.order(notes::id.asc()));
-    let rows: Vec<crate::Note> = notes_live.value().read().iter().cloned().collect();
+    let notes_live = use_live::<_, _, support::Note>(&client, support::notes_rows());
+    let rows: Vec<support::Note> = notes_live.value().read().iter().cloned().collect();
     let notes_error = notes_live.error().read().clone();
 
     let note_text = use_signal(String::new);
@@ -33,14 +31,14 @@ pub fn NotesPane() -> Element {
         div { class: "pane",
             h2 {
                 Icon { icon: FaNoteSticky, width: 14, height: 14 }
-                "notes "
-                span { class: "badge local", "device-only" }
+                {support::NOTES_PANE_TITLE} " "
+                span { class: "badge local", {support::NOTES_BADGE} }
             }
-            p { "count {rows.len()}. Converges across this device's windows through the DB worker, never the server." }
+            p { {support::notes_readout(rows.len())} }
             div { class: "row",
                 input {
                     r#type: "text",
-                    placeholder: "a note that stays on this device",
+                    placeholder: support::NOTES_PLACEHOLDER,
                     value: note_text.read().clone(),
                     oninput: on_note_input,
                 }
@@ -55,15 +53,7 @@ pub fn NotesPane() -> Element {
                         let note_text = note_text;
                         spawn(async move {
                             let mut note_text = note_text;
-                            let id = crate::fresh_note_id();
-                            let result = client
-                                .with_conn(move |conn| {
-                                    diesel::insert_into(notes::table)
-                                        .values((notes::id.eq(id), notes::body.eq(body)))
-                                        .execute(conn.conn())
-                                })
-                                .await;
-                            match result {
+                            match support::save_note(&client, &body).await {
                                 Ok(_) => note_text.set(String::new()),
                                 Err(err) => tracing::error!(error = %err, "note save failed"),
                             }

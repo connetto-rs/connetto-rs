@@ -1,6 +1,7 @@
 //! The your-data pane: export the device's local data to an archive and
 //! restore an archive back, the file's version winning every clash.
 
+use connetto_demo_support as support;
 use dioxus::prelude::*;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::{FaDatabase, FaFileExport};
@@ -26,10 +27,10 @@ pub fn YourDataPane() -> Element {
         div { class: "pane",
             h2 {
                 Icon { icon: FaDatabase, width: 14, height: 14 }
-                "your data "
-                span { class: "badge local", "device-only" }
+                {support::YOUR_DATA_PANE_TITLE} " "
+                span { class: "badge local", {support::YOUR_DATA_BADGE} }
             }
-            p { "Save a zip archive of this device's local data. The archive is not encrypted and holds every row the device can read: whoever holds the file holds the data." }
+            p { {support::YOUR_DATA_INTRO} }
             div { class: "row",
                 button {
                     onclick: {
@@ -51,7 +52,7 @@ pub fn YourDataPane() -> Element {
             if let Some(message) = export_msg {
                 p { class: "status", {message} }
             }
-            p { "Restore an archive from this account. The file's version wins every clash." }
+            p { {support::YOUR_DATA_IMPORT_INTRO} }
             div { class: "row",
                 input {
                     id: "import-file-input",
