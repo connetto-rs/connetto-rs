@@ -219,7 +219,7 @@
       <text x="142" y="13" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Re-execution read tier</text>
       <text x="142" y="25" text-anchor="middle" font-size="8" fill="#555">MIN, MAX, joins, row shapes via the server's connector</text>
       <text x="142" y="37" text-anchor="middle" font-size="8" fill="#4CAF50">per-viewer runs on RLS tables: each viewer's own answer</text>
-      <text x="142" y="49" text-anchor="middle" font-size="8" fill="#C62828">a failing read ends its subscription, not live delivery: R89</text>
+      <text x="142" y="49" text-anchor="middle" font-size="8" fill="#4CAF50">built: a failing read ends its subscription, not live delivery (R89)</text>
     </g>
 
     <g transform="translate(558, 724)">

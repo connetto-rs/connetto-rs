@@ -57,6 +57,7 @@ async fn every_auth_op_round_trips_through_postgres() {
         AuthOp::EndedByOwner,
         AuthOp::EndedAll,
         AuthOp::EndedOthers,
+        AuthOp::EndedByBan,
         AuthOp::TokenReplayed,
         AuthOp::CapabilityMinted,
         AuthOp::PermissionChange,

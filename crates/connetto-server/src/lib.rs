@@ -86,7 +86,7 @@ pub use capability::{CapabilityIssuer, IssuedCapability, ShareError, ShareLevel}
 pub use connetto_core::auth::CapabilityKey;
 pub use courier::{CourierDelivery, CourierEntry, CourierRefusal};
 pub use fence::{ReadFence, Unseen, UnseenIds, snapshot_cursor, split_snapshot_cursor};
-pub use guard::{PersonCloseHook, RequestGuard};
+pub use guard::{BanHook, PersonCloseHook, RequestGuard};
 // Re-exported because `ShareError::NotWritable` names one, so an application
 // matching on a refused verb can spell its type.
 pub use subql::visibility::WriteOp;

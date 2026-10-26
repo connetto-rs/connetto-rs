@@ -314,9 +314,10 @@ impl IntoResponse for AuthApiError {
             Self::Service(
                 AuthError::Store(crate::authn::store::AuthStoreError::Backend(_))
                 | AuthError::Token(_)
-                | AuthError::Undescribed,
+                | AuthError::Undescribed
+                | AuthError::BanList(_),
             ) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Service(AuthError::Store(_)) | Self::InvalidCredential => {
+            Self::Service(AuthError::Store(_) | AuthError::Banned) | Self::InvalidCredential => {
                 StatusCode::UNAUTHORIZED
             }
             Self::Service(AuthError::Provider(err)) | Self::Provider(err) => match err {

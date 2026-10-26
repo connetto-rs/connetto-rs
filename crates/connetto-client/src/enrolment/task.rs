@@ -730,6 +730,8 @@ struct Run<L: Link> {
     /// Whether the deployment refused the device's attestation level, so it
     /// asks again only on its next connection (decision 33).
     attestation_refused: bool,
+    /// Revocation is terminal for this open.
+    revoked: bool,
     /// The connection the task last acted on as a connection, so the notice
     /// of a connection it already read as up asks nothing.
     acted: Option<ConnectionNumber>,
@@ -887,6 +889,9 @@ impl<L: Link> Run<L> {
         lifetime: Option<Duration>,
         renewal: bool,
     ) -> Result<(), CertificateError> {
+        if self.revoked {
+            return Err(CertificateError::Revoked);
+        }
         let mut lifetime = lifetime;
         let outcome = match self.exchange(lifetime).await {
             Err(Failed::Refused(EnrolRefusal::OverCeiling { ceiling_secs })) if renewal => {
@@ -1009,6 +1014,7 @@ impl<L: Link> Run<L> {
         self.enroller.home.send_replace(None);
         self.held = None;
         self.publish();
+        self.revoked = true;
         self.link.emit(ClientEvent::DeviceRevoked);
         #[cfg(feature = "peer")]
         self.peer_stop(CloseReason::Revoked);
@@ -1257,6 +1263,9 @@ impl<L: Link> Run<L> {
         if self.attestation_refused {
             return;
         }
+        if self.revoked {
+            return;
+        }
         let outcome = match self.stand_by().await {
             Standing::Fresh => return,
             Standing::ClockOff if by_look => return,
@@ -1315,6 +1324,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         kept,
         withdrawn: None,
         attestation_refused: false,
+        revoked: false,
         acted: None,
         #[cfg(feature = "peer")]
         peer: peer.node,
