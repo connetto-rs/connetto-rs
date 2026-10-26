@@ -266,7 +266,10 @@ async fn serve(app: &AppHandle, core: &Arc<Core>, action: Action) -> Result<(), 
 /// desktop, the platform's auth session on a phone, or a re-run of the setup
 /// when no login is parked yet.
 async fn sign_in(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
-    match core.parked.borrow().clone() {
+    // The borrow ends here, since clearing the parked URL below takes the
+    // write side of the same lock.
+    let parked = core.parked.borrow().clone();
+    match parked {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         Some(_) => {
             core.update(app, |v| v.status = "the browser page is open".to_owned());
