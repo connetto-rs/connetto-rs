@@ -217,32 +217,39 @@ impl EntryNames {
     /// A name loses every path separator and control character and its
     /// leading dots, so no entry escapes `files/` or hides itself. A name
     /// another file already took gains the head of this file's id before its
-    /// extension, and the whole id when even that is taken.
+    /// extension, then the whole id, then a counter after the id, so every
+    /// name returned is one no earlier file holds.
     pub(super) fn place(&mut self, id: &FileKey, name: Option<&str>) -> String {
         let id_hex = hex(id);
-        let cleaned = name.map(clean).filter(|name| !name.is_empty());
-        let Some(cleaned) = cleaned else {
-            self.taken.insert(id_hex.clone());
-            return id_hex;
-        };
-        let (stem, extension) = match cleaned.rfind('.') {
-            Some(dot) if dot > 0 => cleaned.split_at(dot),
-            _ => (cleaned.as_str(), ""),
+        let base = name
+            .map(clean)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| id_hex.clone());
+        if self.taken.insert(base.to_lowercase()) {
+            return base;
+        }
+        let (stem, extension) = match base.rfind('.') {
+            Some(dot) if dot > 0 => base.split_at(dot),
+            _ => (base.as_str(), ""),
         };
         let short = format!("{stem} ({}){extension}", &id_hex[..8]);
-        if self.taken.insert(cleaned.to_lowercase()) {
-            return cleaned;
+        if self.taken.insert(short.to_lowercase()) {
+            return short;
         }
-        self.take_or(short, || format!("{stem} ({id_hex}){extension}"))
-    }
-
-    fn take_or(&mut self, first: String, fallback: impl FnOnce() -> String) -> String {
-        if self.taken.insert(first.to_lowercase()) {
-            return first;
+        let whole = format!("{stem} ({id_hex}){extension}");
+        if self.taken.insert(whole.to_lowercase()) {
+            return whole;
         }
-        let fallback = fallback();
-        self.taken.insert(fallback.to_lowercase());
-        fallback
+        // Each taken candidate adds one name, so the count of names taken
+        // bounds the search.
+        let mut n = 2_usize;
+        loop {
+            let numbered = format!("{stem} ({id_hex} {n}){extension}");
+            if self.taken.insert(numbered.to_lowercase()) {
+                return numbered;
+            }
+            n += 1;
+        }
     }
 }
 
@@ -308,5 +315,26 @@ mod tests {
             format!("notes ({})", hex(&A2)),
             "a short form another file took falls back to the whole id"
         );
+    }
+
+    /// Titles the person controls can spell every fallback in advance, the
+    /// bare id of an untitled file included, and the files still land on
+    /// distinct names.
+    #[test]
+    fn entry_names_stay_distinct_when_titles_spell_the_fallbacks() {
+        let mut names = EntryNames::default();
+        let whole = format!("notes ({})", hex(&A2));
+        let mut placed = vec![
+            names.place(&A, Some("notes")),
+            names.place(&C, Some("notes (abababab)")),
+            names.place(&E, Some(&whole)),
+            names.place(&A2, Some("notes")),
+            names.place(&[0x11; 32], Some(&hex(&[0x22; 32]))),
+            names.place(&[0x22; 32], None),
+        ];
+        let count = placed.len();
+        placed.sort_by_key(|name| name.to_lowercase());
+        placed.dedup_by_key(|name| name.to_lowercase());
+        assert_eq!(placed.len(), count, "two files share a name: {placed:?}");
     }
 }
