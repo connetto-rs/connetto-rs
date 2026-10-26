@@ -467,3 +467,69 @@ pub(crate) fn drop_table(db: &mut SqliteConnection, table: &str) -> Result<(), C
         .execute(db)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_key, encode_key};
+    use crate::KeyValue;
+
+    /// Every column kind round-trips, alone and inside a composite key.
+    #[test]
+    fn every_key_column_kind_round_trips() {
+        let columns = [
+            KeyValue::Null,
+            KeyValue::Int(-7),
+            KeyValue::Real(2.5),
+            KeyValue::Text("pk é".to_owned()),
+            KeyValue::Blob(vec![0, 255, 1]),
+        ];
+        for column in &columns {
+            let key = vec![column.clone()];
+            let bytes = encode_key(&key).expect("encode");
+            assert_eq!(decode_key(&bytes).expect("decode"), key);
+        }
+        let bytes = encode_key(&columns).expect("encode");
+        assert_eq!(decode_key(&bytes).expect("decode"), columns);
+    }
+
+    /// Keys SQLite tells apart encode apart, so two rows never share a record.
+    #[test]
+    fn distinct_keys_encode_distinctly() {
+        let keys = [
+            vec![KeyValue::Int(1)],
+            vec![KeyValue::Real(1.0)],
+            vec![KeyValue::Text("1".to_owned())],
+            vec![KeyValue::Blob(b"1".to_vec())],
+            vec![KeyValue::Text("ab".to_owned())],
+            vec![
+                KeyValue::Text("a".to_owned()),
+                KeyValue::Text("b".to_owned()),
+            ],
+        ];
+        let encoded: Vec<Vec<u8>> = keys
+            .iter()
+            .map(|key| encode_key(key).expect("encode"))
+            .collect();
+        for (index, bytes) in encoded.iter().enumerate() {
+            assert!(
+                !encoded[index + 1..].contains(bytes),
+                "{:?} shares its encoding with a later key",
+                keys[index]
+            );
+        }
+    }
+
+    /// Bytes outside the encoding are refused, never read as another key.
+    #[test]
+    fn malformed_key_bytes_are_refused() {
+        for bytes in [
+            vec![1, 0, 0, 0],                // an integer cut short
+            vec![3, 5, 0],                   // a text length cut short
+            vec![4, 5, 0, 0, 0, 1, 2],       // a blob shorter than its length
+            vec![3, 2, 0, 0, 0, 0xff, 0xfe], // text that is not UTF-8
+            vec![9],                         // an undefined tag
+        ] {
+            assert!(decode_key(&bytes).is_err(), "{bytes:?} decoded");
+        }
+    }
+}
