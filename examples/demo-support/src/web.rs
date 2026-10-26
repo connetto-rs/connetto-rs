@@ -2,9 +2,12 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use connetto_client::{Auth, ExportScope, NoGate, SyncTuning, reconnect::ReconnectPolicy};
+use connetto_client::{
+    AccountChoice, Auth, ExportScope, NoGate, SyncTuning, reconnect::ReconnectPolicy,
+    teardown::expiry_warning,
+};
 use connetto_core::Custody;
 use connetto_web::auth::{AuthError, LogoutOutcome, PendingWork};
 use connetto_web::builder::WebClientBuilder;
@@ -28,6 +31,8 @@ pub const AUTH_PROVIDER: &str = "dev-idp";
 pub const EXPORT_FILE_NAME: &str = "connetto-local-data.zip";
 /// The `localStorage` key holding the account the last successful sign-in used.
 pub const STORED_ACCOUNT_KEY: &str = "connetto-demo-last-account";
+/// The channel the worker uses to broadcast the booted session to every page.
+pub const UID_CHANNEL: &str = "connetto-demo-uid";
 
 /// The one build the worker boots from and every window attaches through.
 pub fn demo_builder() -> WebClientBuilder {
@@ -168,6 +173,200 @@ impl LoginUrlListener {
     }
 }
 
+/// What a page posts on [`UID_CHANNEL`] to ask for the booted session, so a
+/// window opened after the boot learns it as well.
+pub const SESSION_ASK: &str = "session?";
+
+/// The booted session's uid, account key and deadline as one JS object.
+fn session_object(
+    identity: Option<&str>,
+    account: Option<&str>,
+    session_expires_at: Option<u64>,
+) -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    if let Some(uid) = identity {
+        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("uid"), &JsValue::from_str(uid));
+    }
+    if let Some(acc) = account {
+        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("account"), &JsValue::from_str(acc));
+    }
+    if let Some(secs) = session_expires_at {
+        // Unix seconds fit f64 exactly, 2^53 is far above any plausible deadline.
+        debug_assert!(
+            secs <= (1u64 << 53),
+            "session_expires_at exceeds f64 exact range"
+        );
+        let _ = js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("session_expires_at"),
+            &JsValue::from_f64(secs as f64),
+        );
+    }
+    obj
+}
+
+/// The worker's channel and handler answering [`SESSION_ASK`].
+type SessionAnswer = (BroadcastChannel, Closure<dyn FnMut(MessageEvent)>);
+
+thread_local! {
+    /// The worker's answer to the pages' session asks, armed once its boot lands.
+    static SESSION_ANSWER: RefCell<Option<SessionAnswer>> = const { RefCell::new(None) };
+}
+
+/// The worker side of the boot-session broadcast. It posts the booted
+/// session's uid, account key and deadline to every page in one JS object,
+/// and answers every later [`SESSION_ASK`] with the same object for the rest
+/// of the worker's life.
+pub fn broadcast_boot_session(
+    identity: Option<&str>,
+    account: Option<&str>,
+    session_expires_at: Option<u64>,
+) {
+    let Ok(channel) = BroadcastChannel::new(UID_CHANNEL) else {
+        return;
+    };
+    let session = session_object(identity, account, session_expires_at);
+    let _ = channel.post_message(&session);
+    let answer = channel.clone();
+    let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+        if e.data().as_string().as_deref() == Some(SESSION_ASK) {
+            let _ = answer.post_message(&session);
+        }
+    });
+    channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    SESSION_ANSWER.with(|cell| {
+        if let Some((previous, _)) = cell.borrow_mut().replace((channel, on_message)) {
+            previous.close();
+        }
+    });
+}
+
+/// A JS number as the whole seconds it names, `0` when it cannot round-trip
+/// safely, so a malformed broadcast cannot forge a far-future deadline.
+fn f64_to_u64(v: f64) -> u64 {
+    // `u64::MAX as f64` rounds up to 2^64, so a value at or above it would
+    // saturate on `as u64` and must be rejected.
+    const MAX: f64 = u64::MAX as f64;
+    if v.is_finite() && (0.0..MAX).contains(&v) {
+        v as u64 // deliberate truncation, fractional part dropped
+    } else {
+        0
+    }
+}
+
+/// The page side of the boot-session broadcast, passing the worker's uid,
+/// account key and deadline to a callback.
+pub struct BootSessionListener {
+    channel: BroadcastChannel,
+    on_message: Closure<dyn FnMut(MessageEvent)>,
+}
+
+impl BootSessionListener {
+    /// Listen on the boot channel and call `on_session` with the broadcast's
+    /// uid, account key and deadline, each `None` when absent, then ask a
+    /// worker that already booted to post its session again.
+    #[must_use]
+    pub fn new<F>(on_session: F) -> Self
+    where
+        F: FnMut(Option<String>, Option<String>, Option<u64>) + 'static,
+    {
+        let channel = BroadcastChannel::new(UID_CHANNEL).expect("boot session channel");
+        let on_session = RefCell::new(on_session);
+        let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+            let data = e.data();
+            // Another page's ask arrives here too, and carries no session.
+            if !data.is_object() {
+                return;
+            }
+            let uid = js_sys::Reflect::get(&data, &JsValue::from_str("uid"))
+                .ok()
+                .and_then(|v| v.as_string());
+            let account = js_sys::Reflect::get(&data, &JsValue::from_str("account"))
+                .ok()
+                .and_then(|v| v.as_string());
+            let expires_at = js_sys::Reflect::get(&data, &JsValue::from_str("session_expires_at"))
+                .ok()
+                .and_then(|v| v.as_f64())
+                .map(f64_to_u64);
+            on_session.borrow_mut()(uid, account, expires_at);
+        });
+        channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        let _ = channel.post_message(&JsValue::from_str(SESSION_ASK));
+        Self {
+            channel,
+            on_message,
+        }
+    }
+
+    /// Stop listening and close the channel.
+    pub fn close(self) {
+        self.channel.set_onmessage(None);
+        self.channel.close();
+        drop(self.on_message);
+    }
+}
+
+/// The answer the user gives a parked account picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccountAnswer {
+    /// Sign in as the named stored account.
+    Stored(String),
+    /// Start a fresh interactive login.
+    New,
+}
+
+/// The account-choice policy every browser demo runs. A single stored
+/// account signs in directly, and several park until the user answers,
+/// polling the answer source every 50 ms.
+pub async fn choose_account(
+    accounts: &[String],
+    offer: impl Fn(),
+    mut answer: impl FnMut() -> Option<AccountAnswer>,
+) -> AccountChoice {
+    if accounts.len() <= 1 {
+        return AccountChoice::LastUsed;
+    }
+    offer();
+    loop {
+        if let Some(choice) = answer() {
+            return match choice {
+                AccountAnswer::Stored(key) => AccountChoice::Account(key),
+                AccountAnswer::New => AccountChoice::New,
+            };
+        }
+        workers::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// How far ahead of the session deadline the expiry warning starts.
+const EXPIRY_LEAD: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Ask the worker for the expiry warning line for the session that lapses at
+/// `secs` unix seconds, the browser wording, `None` to clear the warning.
+pub async fn expiry_warn_for_session(secs: u64) -> Option<String> {
+    let Ok(pending) = connetto_web::auth::request_unsynced().await else {
+        return None;
+    };
+    let now_f64 = js_sys::Date::now();
+    // `Date::now()` is always finite and non-negative, milliseconds since the epoch.
+    debug_assert!(
+        now_f64.is_finite() && now_f64 >= 0.0,
+        "Date::now() must be finite"
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_millis(f64_to_u64(now_f64));
+    let expires = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+    let warning = expiry_warning(
+        now,
+        expires,
+        EXPIRY_LEAD,
+        pending.unsynced,
+        pending.content_files,
+    );
+    warning
+        .as_ref()
+        .map(|warn| crate::expiry_warn_line(warn, now))
+}
+
 /// The account the last successful sign-in on this origin used, read before the worker re-acquires the session.
 #[must_use]
 pub fn read_stored_account() -> Option<String> {
@@ -225,17 +424,47 @@ pub fn download_blob(name: &str, blob: &web_sys::Blob) -> Result<(), JsValue> {
     web_sys::Url::revoke_object_url(&url)
 }
 
+/// The worker's refusal of an export request, one line the pane shows.
+#[derive(Debug, thiserror::Error)]
+#[error("export failed: {0}")]
+pub struct ExportRefusal(pub connetto_web::ExportRefused);
+
+/// The export success line for the download delivery.
+#[must_use]
+pub fn export_offered_line(bytes: f64) -> String {
+    format!("{bytes} bytes offered as {EXPORT_FILE_NAME}")
+}
+
+/// The export success line for the save-picker delivery.
+#[must_use]
+pub fn export_saved_line(bytes: f64) -> String {
+    format!("{bytes} bytes saved as {EXPORT_FILE_NAME}")
+}
+
+/// The export failure line when the download delivery itself is refused.
+#[must_use]
+pub fn download_refused_line(err: &JsValue) -> String {
+    format!("download refused: {err:?}")
+}
+
+/// The export archive from the worker, before any delivery.
+pub async fn export_archive() -> Result<web_sys::Blob, ExportRefusal> {
+    workers::request_export(ExportScope::Everything)
+        .await
+        .map_err(ExportRefusal)
+}
+
 /// Export this device's local data through the worker and offer the archive as a download, answering with the line the pane shows.
 pub async fn export_data() -> String {
-    match workers::request_export(ExportScope::Everything).await {
+    match export_archive().await {
         Ok(blob) => {
             let size = blob.size();
             match download_blob(EXPORT_FILE_NAME, &blob) {
-                Ok(()) => format!("{size} bytes offered as {EXPORT_FILE_NAME}"),
-                Err(err) => format!("download refused: {err:?}"),
+                Ok(()) => export_offered_line(size),
+                Err(err) => download_refused_line(&err),
             }
         }
-        Err(err) => format!("export failed: {err}"),
+        Err(refusal) => refusal.to_string(),
     }
 }
 

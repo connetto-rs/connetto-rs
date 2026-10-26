@@ -19,6 +19,8 @@ diesel = { version = "2", features = ["sqlite", "chrono"] }
 # uuid from a single schema, minted with the browser CSPRNG through getrandom's
 # wasm_js backend on wasm.
 rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = { version = "2" }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 # The browser platform, meaning the transport, the leader election, the relay

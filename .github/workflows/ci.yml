@@ -57,6 +57,10 @@ jobs:
             cwd: examples/dioxus-demo
             target: --target wasm32-unknown-unknown
             flags: --no-default-features --features web
+          - name: leptos-demo wasm
+            cwd: examples/leptos-demo
+            target: --target wasm32-unknown-unknown
+            flags: --all-features
           - name: yew-web-demo wasm
             cwd: examples/yew-web-demo
             target: --target wasm32-unknown-unknown
@@ -206,6 +210,7 @@ jobs:
           examples/wasm-smoke --all-features --target=wasm32-unknown-unknown
           examples/dioxus-demo --no-default-features --features=web --target=wasm32-unknown-unknown
           examples/yew-web-demo --all-features --target=wasm32-unknown-unknown
+          examples/leptos-demo --all-features --target=wasm32-unknown-unknown
           examples/demo-support --all-features --target=wasm32-unknown-unknown
           examples/webauthn-unlock --all-features --target=wasm32-unknown-unknown
           examples/dioxus-demo --all-features

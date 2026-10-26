@@ -1,0 +1,6 @@
+[build]
+target = "index.html"
+
+[serve]
+# Pinned because trunk does not fall back to another port when this one is taken.
+port = 7836
