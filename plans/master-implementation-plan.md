@@ -430,7 +430,7 @@ graph TD
   R26 --> R61[R61 the portability download]
   R65 -.->|the files/ half| R61
   R61 -.->|both extend connetto_auth_op| R78
-  R105[R105 answering a stolen account]
+  R105[R105 answering a stolen account, DONE]
   R74 -->|the device list| R105
   R91 -->|the installations it lists| R105
   R36 -.->|the ban it widens| R105
