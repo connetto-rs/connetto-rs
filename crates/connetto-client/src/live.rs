@@ -2511,6 +2511,43 @@ where
         })
     }
 
+    /// The provenance of a peer-applied row, standing it back from the
+    /// table, since the broadcast event stream can drop events (R77).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, and the
+    /// [`ClientError`] the read surfaces.
+    #[cfg(feature = "peer")]
+    pub async fn provenance(
+        &self,
+        table: &str,
+        key: &[crate::KeyValue],
+    ) -> Result<Option<crate::provisional::ProvisionalRow>, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
+        state.conn.provenance(table, key)
+    }
+
+    /// Every provenance row the replica holds, keyed order (R77).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, and the
+    /// [`ClientError`] the read surfaces.
+    #[cfg(feature = "peer")]
+    pub async fn provisional_rows(
+        &self,
+    ) -> Result<Vec<crate::provisional::ProvisionalRow>, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
+        state.conn.provisional_rows()
+    }
+
     /// Run a closure against the shared connection: one-off diesel reads and
     /// captured writes. Local writes committed here are auto-submitted by the
     /// pump's next flush, and any live query reading the written tables

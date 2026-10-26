@@ -1603,6 +1603,35 @@ where
             .map_or_else(Vec::new, EnrolHandle::linked_peers)
     }
 
+    /// The provenance of a peer-applied row, as the client's connection
+    /// answers it (R77).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, and the
+    /// [`ClientError`] the read surfaces.
+    #[cfg(feature = "peer")]
+    pub async fn provenance(
+        &self,
+        table: &str,
+        key: &[crate::KeyValue],
+    ) -> Result<Option<crate::provisional::ProvisionalRow>, ClientError> {
+        self.client().provenance(table, key).await
+    }
+
+    /// Every provenance row the replica holds (R77).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, and the
+    /// [`ClientError`] the read surfaces.
+    #[cfg(feature = "peer")]
+    pub async fn provisional_rows(
+        &self,
+    ) -> Result<Vec<crate::provisional::ProvisionalRow>, ClientError> {
+        self.client().provisional_rows().await
+    }
+
     /// Dial `addr`, refusing by this device's standing before any socket
     /// opens and handing back the peer's identity once the link is live
     /// (R76).
