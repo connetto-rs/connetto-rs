@@ -125,7 +125,8 @@ async fn setup(fixture: &Fixture) -> (Pool<AsyncPgConnection>, Pool<AsyncPgConne
         ));
     }
     out.push(
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_writer"
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+         _connetto_session_writers TO app_writer"
             .to_owned(),
     );
     let refs: Vec<&str> = out.iter().map(String::as_str).collect();

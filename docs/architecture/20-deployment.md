@@ -14,7 +14,7 @@
 |---|---|---|---|
 | Application tables | `CONNETTO_PG_DDL` | Yes | The deployment's own concern |
 | `connetto_sessions`, `connetto_provider_tokens` | `ConnettoSchema::Auth`, emitted by `connetto_schema!` | Yes | Refused by `preflight::require` (`Artifact::Table`) |
-| `_connetto_writers` and `_connetto_settled`, the per-writer applied frontier (R75) | `ConnettoSchema::Writers`, emitted by `connetto_schema!` | Yes | Refused by `preflight::require` (`Artifact::Table`) |
+| `_connetto_writers`, `_connetto_settled` and `_connetto_session_writers`, the per-writer applied frontier (R75) and each session's binds (R105) | `ConnettoSchema::Writers`, emitted by `connetto_schema!` | Yes | Refused by `preflight::require` (`Artifact::Table`) |
 | `connetto_bans`, only under `CONNETTO_BANS=database` | `ConnettoSchema::Bans` | Yes | Refused by `preflight::require` (`Artifact::Table`) when bans are on |
 | The audit table `auth_events` | `ConnettoSchema::Audit` | Yes | Refused by `preflight::require` (`Artifact::Table`), always (R105) |
 | `connetto_device_enrolments`, `connetto_device_certificates`, `connetto_device_lists`, only with device identity (R74) | `ConnettoSchema::Enrolments` | Yes | Refused by `preflight::require` (`Artifact::Table`) when device identity is on |

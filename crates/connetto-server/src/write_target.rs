@@ -303,6 +303,21 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
             .map_err(WriteError::from)
     }
 
+    /// Record that the identified session `session_id` bound `writer` at
+    /// `frontier`, so its writes start at the next sequence (R105 decision
+    /// 6). A session's later binds of the writer keep its first.
+    pub(crate) async fn record_bind(
+        &self,
+        session_id: &uuid::Uuid,
+        writer: i64,
+        frontier: i64,
+    ) -> Result<(), WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::bind_session(&mut conn, session_id, writer, frontier.saturating_add(1))
+            .await
+            .map_err(WriteError::from)
+    }
+
     /// Retire the writer `writer`, reporting whether this call retired it.
     pub(crate) async fn mark_writer_retired(
         &self,
@@ -449,6 +464,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                     return Ok(WriteOutcome::Settled(Settlement { row, forked: false }));
                 }
                 binding.apply(c).await?;
+                crate::capability::bind_writer::<D::Writers>(c, settle.writer, seq).await?;
                 for op in &plan.ops {
                     let Some(conflict) = &op.conflict else {
                         continue;

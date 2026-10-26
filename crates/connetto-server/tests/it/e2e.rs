@@ -596,6 +596,7 @@ pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixt
     // mutations, so recreate the writer tables fresh.
     exec(pool, "DROP TABLE IF EXISTS _connetto_settled").await;
     exec(pool, "DROP TABLE IF EXISTS _connetto_writers").await;
+    exec(pool, "DROP TABLE IF EXISTS _connetto_session_writers").await;
     connetto_test_harness::provision_writers(pool).await;
     // The audit table every server appends access changes to, dropped and
     // recreated per run.
@@ -618,7 +619,8 @@ pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixt
     .await;
     exec(
         pool,
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+         _connetto_session_writers TO app_reader",
     )
     .await;
     exec(pool, "INSERT INTO orders VALUES (1, 1.0, 3, 'seed')").await;
@@ -1048,7 +1050,8 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     connetto_test_harness::provision_writers(&admin).await;
     exec(
         &admin,
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_writer",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+         _connetto_session_writers TO app_writer",
     )
     .await;
     provision_cap_policies(&admin, OWNED_PG_DDL, OWNED_POLICIES).await;

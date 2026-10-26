@@ -142,6 +142,14 @@ CREATE TABLE _connetto_settled (
     PRIMARY KEY (writer, seq)
 );
 
+CREATE TABLE _connetto_session_writers (
+    session_id UUID NOT NULL,
+    writer     BIGINT NOT NULL,
+    first_seq  BIGINT NOT NULL,
+    bound_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (session_id, writer)
+);
+
 CREATE TYPE connetto_change_op AS ENUM ('insert', 'update', 'delete', 'truncate');
 
 CREATE TABLE connetto_oplog (
@@ -180,6 +188,8 @@ CREATE INDEX connetto_oplog_xids_lsn ON connetto_oplog_xids (commit_lsn);
 **A person sees and ends their sessions. Built (R105, 2026-10-25).** The built server's `ServerHandle` carries the calls an application makes from its own handlers, so connetto adds no endpoint. `verify_live` checks an access token's signature and confirms its session is live in the store, the check the sync handshake makes, and answers the person and session it names, so a handler refuses an ended session at once instead of when its access token expires. `signed_in_places` lists a person's live sessions, oldest first, each with the device whose key last enrolled or renewed during it. `end_session` ends one of that person's sessions, and when a device enrolled during it the device's key is revoked first and the device is closed with `DeviceRevoked`. `end_other_sessions` and `end_all_sessions` end sessions only and revoke no key, so a sign-out everywhere wipes no device. A session of another person ends nothing, and each ended session closes its live connection and records its cause in `auth_events`.
 
 **Ending sessions answers what they left behind. Built (R105, 2026-10-25).** `end_session`, `end_other_sessions` and `end_all_sessions` each answer an `Ended`: the sessions it ended, the share keys those sessions minted with the key, the table and the row of each, and every installation the person owns with its app, since an installation records no session. The application withdraws a key by deleting its own relation row granting that key and removes an installation by deleting its row, at the person's choice, because a revoked session may have shared or installed something the owner meant. Every revocation, whatever its cause, also deletes the session's retained provider tokens in the same transaction, the only copy connetto can reach.
+
+**A session's writes are attributed to it. Built (R105, 2026-10-26).** A device key or a browser's number outlives any one login, so a writer alone cannot tell the owner's writes from an intruder's on the same device. Each time an identified session binds a writer, at the handshake or at a later device bind, the server records the pair with the writer's frontier plus one as the session's first sequence, once per pair, through `ConnettoWriterSchema::bind_session`. An anonymous run records none, since its number already carries its run handle. `ServerHandle::writes_of(session)` answers every writer the session bound, its device key when it is one, whether it retired, and the sequences the session settled under it, which run from its first sequence to just before the next session's bind of that writer, or to the writer's frontier. Recording costs one insert per bind and nothing per write. Every write transaction binds its writer and sequence beside `app.user_id`, under `ConnettoWriterSchema::WRITER_SETTING` and `SEQ_SETTING`, `app.writer` and `app.writer_seq` by default, so a deployment that wants its rows findable stamps them with a column default or a trigger reading those settings and finds a session's rows by its range. Undoing them is the application's, because only it knows what undo means for its data. connetto never prunes the table.
 
 The writer frontier keys on a server-issued writer number. A device writer additionally has a unique `device_key` and survives its enrolment connection. `user_id` is nullable for anonymous writers. `frontier` is the highest settled sequence and `head` its chain hash. `_connetto_settled` stores each `(writer, seq)` with its entry hash, `previous_hash`, outcome and delivery path. A retained entry verifies against its own predecessor evidence after pruning. Missing or malformed retained hashes fail redelivery explicitly.
 

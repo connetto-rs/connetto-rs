@@ -113,7 +113,8 @@ async fn setup(fixture: &Fixture, snail_secs: f64) -> Pool<AsyncPgConnection> {
             "CREATE POLICY slow_p ON slow_rows FOR SELECT USING (reserve_snail())",
             "GRANT USAGE ON SCHEMA public TO app_reserve",
             "GRANT SELECT ON slow_rows, fast_rows TO app_reserve",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reserve",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+             _connetto_session_writers TO app_reserve",
         ])
         .await;
     let mut conn = fixture.admin().get().await.expect("admin connection");
