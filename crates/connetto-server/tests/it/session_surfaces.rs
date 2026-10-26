@@ -266,7 +266,7 @@ async fn ending_the_others_and_then_all_ends_sessions_and_revokes_no_key() {
 
     let (current, user, _) = mint_tokens(&served.base, "milan").await;
     let (phone, _, _) = mint_tokens(&served.base, "milan").await;
-    let (elsewhere, _, _) = mint_tokens(&served.base, "milan").await;
+    let (elsewhere, _, elsewhere_refresh) = mint_tokens(&served.base, "milan").await;
     let current_session = handle.verify_live(&current).await.expect("live").session_id;
 
     let mut on_phone = live_session(&served.addr, &phone).await;
@@ -299,6 +299,11 @@ async fn ending_the_others_and_then_all_ends_sessions_and_revokes_no_key() {
     assert!(
         handle.verify_live(&current).await.is_ok(),
         "the current place stays"
+    );
+    assert_eq!(
+        super::ban_doors::refresh_status(&served.base, &elsewhere_refresh).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "an ended session's refresh token renews nothing"
     );
 
     assert_eq!(

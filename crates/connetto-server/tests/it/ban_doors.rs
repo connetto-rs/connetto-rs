@@ -137,7 +137,7 @@ pub(super) async fn sign_in_status(base: &str, subject: &str) -> reqwest::Status
 }
 
 /// The status `POST /auth/refresh` answers `refresh_token`.
-async fn refresh_status(base: &str, refresh_token: &str) -> reqwest::StatusCode {
+pub(super) async fn refresh_status(base: &str, refresh_token: &str) -> reqwest::StatusCode {
     reqwest::Client::new()
         .post(format!("{base}/auth/refresh"))
         .json(&serde_json::json!({ "refresh_token": refresh_token }))

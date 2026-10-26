@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 use connetto_client::{
     AccountChoice, Auth, BrowserOpener, CertificateError, ClientEvent, Keyring, KeyringAuth,
     KeyringKeyStore, KeyringStore, NativeClient, NativeClientBuilder, NativeDurable,
-    REPLICA_PREFIX, SyncStatus, device_key_record, replica_db_name,
+    REPLICA_PREFIX, SyncStatus, WipePart, device_key_record, replica_db_name,
 };
 use connetto_core::device_cert::{
     AttestationLevel, CertificateSerial, DeploymentId, DeviceCertificate, DeviceIssuer, KeyHome,
@@ -26,6 +26,7 @@ use connetto_core::device_cert::{
 };
 use connetto_core::messages::{EnrolRefusal, WriterAnswer, WriterOutcome, WriterRef};
 use connetto_core::test_support::TestGrantChecker;
+use connetto_core::traits::ReplicaKeyStore as _;
 use connetto_core::traits::{HandshakeAuthority, RefreshTokenStore};
 use connetto_server::device_cert::{
     DeviceCertConfig, DeviceEnrolment, Enrolment, MemoryEnrolments,
@@ -76,6 +77,8 @@ const APP_RENEW: &str = "r74-renewal";
 const APP_REISSUE: &str = "r74-reissue";
 const APP_CAP: &str = "r74-cap";
 const APP_REVOKE: &str = "r74-revoke";
+const APP_REVOKE_RETRY: &str = "r105-revoke-retry";
+const APP_REVOKE_CRASHED: &str = "r105-revoke-crashed";
 const APP_NONE: &str = "r74-no-issuer";
 const APP_RESTART: &str = "r74-restart";
 const APP_OFFLINE: &str = "r74-offline";
@@ -152,6 +155,8 @@ async fn enrolment_phase() {
         "reissue" => Box::pin(reissue()).await,
         "cap" => Box::pin(cap()).await,
         "revoke" => Box::pin(revoke()).await,
+        "revoke-retry" => Box::pin(revoke_retry()).await,
+        "revoke-crashed" => Box::pin(revoke_crashed()).await,
         "spectator" => Box::pin(spectator()).await,
         "restart" => Box::pin(restart()).await,
         "offline" => Box::pin(offline()).await,
@@ -1037,11 +1042,82 @@ async fn cap() {
     client.close().await;
 }
 
-/// A revoked key is refused as revoked, the device deletes itself and says so,
-/// and the next build re-enrols under a fresh key the server records.
+/// A revoked key is refused as revoked, and the device wipes itself and says so:
+/// the replica, its key and the stored credential go, the application's own
+/// wipe runs once, and the client stops (R105 decision 10). Only a fresh
+/// sign-in brings the device back, under a fresh key the server records.
 #[test]
-fn a_revoked_key_is_refused_and_the_next_build_enrols_fresh() {
+fn a_revoked_key_wipes_the_device_and_the_next_build_enrols_fresh() {
     run_phase("revoke");
+}
+
+/// The replicas a test wipe hook was asked to wipe.
+type Wiped = Arc<parking_lot::Mutex<Vec<String>>>;
+
+/// What a test wipe hook answers.
+type WipeAnswer = std::future::Ready<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
+
+/// A device wipe hook counting the replicas it was asked to wipe, failing while
+/// `failing` is set.
+fn wipe_hook(failing: bool) -> (Wiped, impl Fn(String) -> WipeAnswer + Send + Sync + 'static) {
+    let wiped = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&wiped);
+    (wiped, move |replica: String| {
+        seen.lock().push(replica);
+        std::future::ready(if failing {
+            Err("the application's store is locked".into())
+        } else {
+            Ok(())
+        })
+    })
+}
+
+/// The device key, the replica key and the replica file of `replica` under
+/// `dir` are all gone from the keyring `app_id` names.
+async fn assert_wiped(dir: &Path, replica: &str, app_id: &str) {
+    assert!(
+        KeyringStore::new(app_id)
+            .load(&device_key_record(replica))
+            .await
+            .expect("keyring read")
+            .is_none(),
+        "the device key is gone"
+    );
+    assert!(
+        KeyringKeyStore::new(app_id)
+            .load(replica)
+            .await
+            .expect("keyring read")
+            .is_none(),
+        "the replica key is gone, so any copy of the file is inert"
+    );
+    assert!(!dir.join(replica).exists(), "the replica file is gone");
+}
+
+/// Whether a silent sign-back-in of `app_id` over `dir` found no stored
+/// credential and asked for an interactive login, which its opener records
+/// and refuses.
+async fn asks_for_login(addr: std::net::SocketAddr, base: &str, app_id: &str, dir: &Path) -> bool {
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let asking = Arc::clone(&asked);
+    let refusing: BrowserOpener = Arc::new(move |_url: &str| {
+        // Read once the build returned, which the opener's call happens
+        // before, and the flag guards no other data.
+        asking.store(true, std::sync::atomic::Ordering::Relaxed);
+        Err(connetto_client::ClientError::Auth(
+            "no browser here".to_owned(),
+        ))
+    });
+    let silent = Auth::new(base, MOCK_OAUTH_PROVIDER)
+        .keyring(app_id)
+        .with_browser_opener(refusing);
+    assert!(
+        Box::pin(signed_in(addr, silent, dir).connect())
+            .await
+            .is_err(),
+        "no silent sign-back-in"
+    );
+    asked.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 async fn revoke() {
@@ -1056,6 +1132,7 @@ async fn revoke() {
     )
     .await;
     let dir = tempdir().expect("a data directory");
+    let (wiped, hook) = wipe_hook(false);
 
     let client = Box::pin(
         signed_in(
@@ -1063,10 +1140,20 @@ async fn revoke() {
             fresh_login(&base, APP_REVOKE, "enrol-user"),
             dir.path(),
         )
+        .with_device_wipe(hook)
         .connect(),
     )
     .await
     .expect("the signed-in build connects");
+    let replica = replica_db_name(
+        REPLICA_PREFIX,
+        client
+            .session()
+            .expect("a provider build reports its session")
+            .user_id(),
+    )
+    .expect("a user id serializes");
+    assert!(dir.path().join(&replica).exists(), "the replica is on disk");
 
     let first = wait_for_certificate(&client, BOUND)
         .await
@@ -1082,42 +1169,42 @@ async fn revoke() {
         ),
         "the revoked key is refused as revoked"
     );
+    assert_eq!(
+        next_event(&mut events, BOUND, |event| matches!(
+            event,
+            ClientEvent::DeviceRevoked { .. }
+        ))
+        .await,
+        Some(ClientEvent::DeviceRevoked { failed: Vec::new() }),
+        "the device says it was revoked once every part of the wipe stood"
+    );
     assert!(
         client.device_certificate().is_none(),
         "the certificate is gone"
     );
-    assert!(
-        matches!(
-            next_event(&mut events, BOUND, |event| matches!(
-                event,
-                ClientEvent::DeviceRevoked
-            ))
-            .await,
-            Some(ClientEvent::DeviceRevoked)
-        ),
-        "the device says it was revoked"
-    );
 
-    let session = client
-        .session()
-        .expect("a provider build reports its session");
-    let record = device_record(session.user_id());
-    let keys = KeyringStore::new(APP_REVOKE);
+    assert_wiped(dir.path(), &replica, APP_REVOKE).await;
+    assert_eq!(
+        *wiped.lock(),
+        vec![replica.clone()],
+        "the application wiped its own content once"
+    );
     assert!(
-        keys.load(&record).await.expect("keyring read").is_none(),
-        "the key record is gone"
+        asks_for_login(addr, &base, APP_REVOKE, dir.path()).await,
+        "the stored credential is gone, so the sign-in asked for a login"
     );
     client.close().await;
 
     let second = Box::pin(
-        NativeClientBuilder::new(format!("ws://{addr}/"), super::support::bundle(SQLITE_DDL))
-            .signed_in(last_used(&base, APP_REVOKE))
-            .durable(dir.path())
-            .with_deployment_roots([root()])
-            .connect(),
+        signed_in(
+            addr,
+            fresh_login(&base, APP_REVOKE, "enrol-user"),
+            dir.path(),
+        )
+        .connect(),
     )
     .await
-    .expect("the second build signs back in and connects");
+    .expect("a fresh sign-in connects");
     let second_cert = wait_for_certificate(&second, BOUND)
         .await
         .expect("the fresh key enrols");
@@ -1132,6 +1219,181 @@ async fn revoke() {
     assert_eq!(records[1].key, second_cert.identity().key());
     assert_eq!(&records[1].serial[..], second_cert.serial());
     second.close().await;
+}
+
+/// A start after a crash mid-wipe finishes the wipe the marker records, with no
+/// application wipe registered: the credential, the replica with its key and
+/// the device key go before anything opens, so only a fresh sign-in comes back,
+/// under a fresh key (R105 decision 10).
+#[test]
+fn a_start_after_a_crash_mid_wipe_finishes_it() {
+    run_phase("revoke-crashed");
+}
+
+async fn revoke_crashed() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, _server) = sync_server(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let dir = tempdir().expect("a data directory");
+
+    let client = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_REVOKE_CRASHED, "crashed-user"),
+            dir.path(),
+        )
+        .connect(),
+    )
+    .await
+    .expect("the signed-in build connects");
+    let first = wait_for_certificate(&client, BOUND)
+        .await
+        .expect("the enrolment grants");
+    let session = client.session().expect("a provider build");
+    let replica = replica_db_name(REPLICA_PREFIX, session.user_id()).expect("a user id serializes");
+    let account = session.account().to_owned();
+    client.close().await;
+    drop(client);
+    // What the wipe records before its first part runs, left by a crash.
+    std::fs::write(dir.path().join(format!("{replica}.wipe-pending")), &account)
+        .expect("the marker a wipe leaves");
+
+    assert!(
+        asks_for_login(addr, &base, APP_REVOKE_CRASHED, dir.path()).await,
+        "the start finished the wipe, so the stored credential is gone"
+    );
+    assert_wiped(dir.path(), &replica, APP_REVOKE_CRASHED).await;
+    assert!(
+        !dir.path().join(format!("{replica}.wipe-pending")).exists(),
+        "a finished wipe leaves no marker"
+    );
+
+    let second = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_REVOKE_CRASHED, "crashed-user"),
+            dir.path(),
+        )
+        .connect(),
+    )
+    .await
+    .expect("a fresh sign-in connects");
+    let second_cert = wait_for_certificate(&second, BOUND)
+        .await
+        .expect("the fresh key enrols");
+    assert_ne!(
+        second_cert.identity().key(),
+        first.identity().key(),
+        "the wiped device key is not reused"
+    );
+    second.close().await;
+}
+
+/// A wipe part that fails is named on the event and left pending: the next
+/// start refuses while it still fails and completes it once it can, before
+/// it opens anything (R105 decision 10).
+#[test]
+fn a_failed_wipe_part_is_reported_and_completed_by_the_next_start() {
+    run_phase("revoke-retry");
+}
+
+async fn revoke_retry() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, _server) = sync_server(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let dir = tempdir().expect("a data directory");
+
+    let (failed_once, hook) = wipe_hook(true);
+    let client = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_REVOKE_RETRY, "retry-user"),
+            dir.path(),
+        )
+        .with_device_wipe(hook)
+        .connect(),
+    )
+    .await
+    .expect("the signed-in build connects");
+    let first = wait_for_certificate(&client, BOUND)
+        .await
+        .expect("the enrolment grants");
+    store.revoke_key(first.identity().key());
+    let mut events = client.client().events();
+    let _ = client.reissue_certificate(Duration::from_secs(3600)).await;
+    assert_eq!(
+        next_event(&mut events, BOUND, |event| matches!(
+            event,
+            ClientEvent::DeviceRevoked { .. }
+        ))
+        .await,
+        Some(ClientEvent::DeviceRevoked {
+            failed: vec![WipePart::Application],
+        }),
+        "the part that failed is named"
+    );
+    assert_eq!(failed_once.lock().len(), 1);
+    client.close().await;
+
+    let (failed_again, hook) = wipe_hook(true);
+    assert!(
+        Box::pin(
+            signed_in(
+                addr,
+                fresh_login(&base, APP_REVOKE_RETRY, "retry-user"),
+                dir.path(),
+            )
+            .with_device_wipe(hook)
+            .connect(),
+        )
+        .await
+        .is_err(),
+        "a start refuses while the pending wipe still fails"
+    );
+    assert_eq!(failed_again.lock().len(), 1, "the start retried the wipe");
+
+    let (completed, hook) = wipe_hook(false);
+    let third = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_REVOKE_RETRY, "retry-user"),
+            dir.path(),
+        )
+        .with_device_wipe(hook)
+        .connect(),
+    )
+    .await
+    .expect("the start completes the pending wipe and connects");
+    assert_eq!(completed.lock().len(), 1, "the wipe completed once");
+    let (again, hook) = wipe_hook(false);
+    third.close().await;
+    let fourth = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_REVOKE_RETRY, "retry-user"),
+            dir.path(),
+        )
+        .with_device_wipe(hook)
+        .connect(),
+    )
+    .await
+    .expect("a later start connects");
+    assert!(again.lock().is_empty(), "a completed wipe is not run again");
+    fourth.close().await;
 }
 
 /// A server without enrolment installed still syncs the client, which stays a
@@ -1441,7 +1703,7 @@ async fn report() {
     assert!(
         next_event(&mut phone_events, BOUND, |event| matches!(
             event,
-            ClientEvent::DeviceRevoked
+            ClientEvent::DeviceRevoked { .. }
         ))
         .await
         .is_some(),
@@ -1540,7 +1802,7 @@ async fn learned_at_connect() {
     assert!(
         next_event(&mut events, BOUND, |event| matches!(
             event,
-            ClientEvent::DeviceRevoked
+            ClientEvent::DeviceRevoked { .. }
         ))
         .await
         .is_some(),
@@ -2597,10 +2859,11 @@ async fn wd_retiring() {
     third.close().await;
 }
 
-/// A device key revoked while the build is away deletes it on the next
-/// handshake and re-queues its tail under a number, provenance intact.
+/// A device key revoked while the build is away is learned on the next
+/// handshake, and the device wipes itself, so the tail it never sent is lost
+/// with the replica (R105 decision 10).
 #[test]
-fn a_revoked_device_tail_requeues_under_a_number() {
+fn a_device_revoked_while_away_loses_its_tail_with_the_replica() {
     run_phase("wd-revoked");
 }
 
@@ -2664,32 +2927,32 @@ async fn wd_revoked() {
         manager.revoke_device(old_key).await.expect("revoke"),
         "the operator revokes the key"
     );
-    // The third run signs back in, deletes the revoked key, and re-queues the
-    // tail under a number.
+    // The third run signs back in, learns its key was revoked and wipes the
+    // device, the unsent tail with the replica (R105 decision 10).
     let (third, pump) =
         Box::pin(signed_in(addr, last_used(&base, APP_WD_REVOKED), dir.path()).connect_with_pump())
             .await
             .expect("signs back in again");
+    let replica = replica_db_name(
+        REPLICA_PREFIX,
+        third.session().expect("a provider build").user_id(),
+    )
+    .expect("a user id serializes");
     let mut events = third.client().events();
     tokio::spawn(pump);
-    assert!(
+    assert_eq!(
         next_event(&mut events, BOUND, |event| matches!(
             event,
-            ClientEvent::DeviceRevoked
+            ClientEvent::DeviceRevoked { .. }
         ))
-        .await
-        .is_some(),
-        "the revocation reaches the build"
+        .await,
+        Some(ClientEvent::DeviceRevoked { failed: Vec::new() }),
+        "the revocation reaches the build and wipes it"
     );
     assert!(third.device_certificate().is_none(), "the key is deleted");
-    let carried = wait_for_unsynced(&third, BOUND)
-        .await
-        .expect("the tail re-queues");
     assert!(
-        carried
-            .iter()
-            .all(|entry| matches!(entry.writer, WriterRef::Number(_))),
-        "the tail re-queues under a number"
+        !dir.path().join(&replica).exists(),
+        "the replica is gone, and the unsent tail with it"
     );
     third.close().await;
 }
