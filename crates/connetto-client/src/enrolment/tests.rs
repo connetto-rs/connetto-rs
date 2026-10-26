@@ -1,7 +1,7 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::time::Duration;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
@@ -42,6 +42,7 @@ use connetto_peer::test_support::loopback_multicast;
 
 const HOUR: Duration = Duration::from_hours(1);
 const MINUTE: Duration = Duration::from_mins(1);
+const ALICE: &str = "alice";
 
 #[derive(Default)]
 struct Memory(Mutex<HashMap<String, String>>);
@@ -389,11 +390,41 @@ impl DeviceKeys for RunKeys {
     }
 }
 
+/// The keys the run opens from a record map, like the real store. An open
+/// with no stored record creates a fresh key and writes the record back.
+struct StoredKeys {
+    records: Arc<Memory>,
+}
+
+impl DeviceKeys for StoredKeys {
+    fn open(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<OpenedKey<Box<dyn DeviceKey>>, ClientError>> + Send + '_>>
+    {
+        let records = Arc::clone(&self.records);
+        Box::pin(async move {
+            let opened = open_software_key(records.as_ref(), ALICE).await?;
+            let key: Box<dyn DeviceKey> = Box::new(opened.key);
+            Ok(OpenedKey {
+                key,
+                created: opened.created,
+            })
+        })
+    }
+
+    fn delete(&self) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + '_>> {
+        let records = Arc::clone(&self.records);
+        Box::pin(async move { records.delete(&crate::device_key_record(ALICE)).await })
+    }
+}
+
 /// What the fake link observes, in order.
 #[derive(Default)]
 struct FakeState {
     /// The attestation each `EnrolRequest` carried.
     requests: Vec<Option<DeviceAttestation>>,
+    /// The enrolment answers scripted in order, before the link's own answer.
+    script: VecDeque<Ask>,
     /// The events the run emitted.
     emitted: Vec<ClientEvent>,
     /// The certificates the run stored.
@@ -490,10 +521,11 @@ impl Link for FakeLink {
                 }
                 (_, ControlMessage::EnrolRequest(request)) => {
                     let (tx, rx) = oneshot::channel();
-                    {
+                    let ask = {
                         let mut state = state.lock();
                         state.requests.push(request.attestation);
-                    }
+                        state.script.pop_front().unwrap_or(ask)
+                    };
                     let answer = match ask {
                         Ask::Refused(refusal) => {
                             if let Some(gate) = &gate {
@@ -1151,6 +1183,104 @@ async fn a_reissue_refused_as_revoked_deletes_the_key_and_reports_revoked() {
         state.lock().stored.is_empty(),
         "a revoked device stores nothing"
     );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// Revocation prevents enrolment and key writes until the client is rebuilt.
+#[tokio::test]
+async fn a_revoked_device_stays_spectator_when_its_pump_says_connected_again() {
+    let authority = authority(SystemTime::now()).await;
+    let records = Arc::new(Memory::default());
+    let record = crate::device_key_record(ALICE);
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events_tx, _events_rx) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events: events_tx.clone(),
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Grant,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(StoredKeys {
+            records: Arc::clone(&records),
+        }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        None,
+        Vec::new(),
+        inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
+    );
+    state
+        .lock()
+        .script
+        .extend([Ask::Grant, Ask::Refused(EnrolRefusal::Revoked), Ask::Grant]);
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| state.lock().requests.len() == 1).await;
+    poll_until(|| !state.lock().stored.is_empty()).await;
+    assert!(records.0.lock().contains_key(&record));
+
+    let outcome = handle.reissue(HOUR).await;
+    assert!(
+        matches!(outcome, Err(CertificateError::Revoked)),
+        "the caller gets the revocation"
+    );
+    tokio::time::timeout(Duration::from_secs(10), handle.revoked())
+        .await
+        .expect("the task hands the device's wipe to the client");
+    assert!(!records.0.lock().contains_key(&record));
+    assert!(state.lock().stored.is_empty());
+    assert!(handle.certificate().is_none());
+
+    // A new connection must remain revoked after generation deduplication.
+    state.lock().connection += 1;
+    events_tx
+        .send(ClientEvent::SyncStatus(SyncStatus::Connected))
+        .expect("the run listens");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline && state.lock().requests.len() < 3 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        state.lock().requests.len(),
+        2,
+        "a revoked device asks for no fresh enrolment"
+    );
+    assert!(!records.0.lock().contains_key(&record));
+    assert!(handle.certificate().is_none());
+
+    let again = handle.reissue(HOUR).await;
+    assert!(
+        matches!(again, Err(CertificateError::Revoked)),
+        "a reissue of the same open keeps answering revoked"
+    );
+    assert_eq!(
+        state.lock().requests.len(),
+        2,
+        "the reissue sends no enrolment"
+    );
+    assert!(!records.0.lock().contains_key(&record));
+    assert!(handle.certificate().is_none());
 
     end_tx.send(()).expect("the run ends");
     run.await.expect("the run ends");

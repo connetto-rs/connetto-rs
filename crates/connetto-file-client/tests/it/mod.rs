@@ -2,9 +2,11 @@
 #![cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 
 mod archive;
+mod bookkeeping_write;
 mod builder_content;
 mod negotiation;
 mod offline_photo;
+mod photo_fixture;
 mod resolving;
 mod retention;
 mod staging;
