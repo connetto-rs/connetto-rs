@@ -1899,6 +1899,253 @@ mod tests {
         );
     }
 
+    /// An export whose schema source carries no major directive refuses with
+    /// the major error.
+    #[test]
+    fn export_tier_refuses_a_schema_without_the_major_directive() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let schema = dir.path().join("schema.sql");
+        let tier = dir.path().join("tier.sql");
+        std::fs::write(&schema, "CREATE TABLE orders (id INT);").expect("the source writes");
+        std::fs::write(&tier, "CREATE TABLE notes (id INT);").expect("the source writes");
+        let err =
+            export_tier::<String, TextIds>(&schema, &tier, &dir.path().join("tier_history"), false)
+                .expect_err("a source without the directive refuses");
+        assert!(matches!(
+            err,
+            SchemaError::Major(connetto_core::MajorError::Missing)
+        ));
+    }
+
+    /// An export whose tier source is missing, unparseable or refused by the
+    /// translation refuses with the matching error.
+    #[test]
+    fn export_tier_refuses_a_missing_or_untranslatable_tier_source() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let schema = dir.path().join("schema.sql");
+        let tier = dir.path().join("tier.sql");
+        std::fs::write(&schema, majored("CREATE TABLE orders (id INT);"))
+            .expect("the schema source writes");
+        let history = dir.path().join("tier_history");
+        let err = export_tier::<String, TextIds>(&schema, &tier, &history, false)
+            .expect_err("a missing source refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+        std::fs::write(&tier, "not a Postgres document").expect("the source writes");
+        let err = export_tier::<String, TextIds>(&schema, &tier, &history, false)
+            .expect_err("an unparseable source refuses");
+        assert!(matches!(err, SchemaError::Translate(_)));
+        std::fs::write(
+            &tier,
+            "CREATE TABLE notes (id INT PRIMARY KEY); \
+             ALTER TABLE notes ENABLE ROW LEVEL SECURITY; \
+             ALTER TABLE notes RENAME TO notes_v2;",
+        )
+        .expect("the source writes");
+        let err = export_tier::<String, TextIds>(&schema, &tier, &history, false)
+            .expect_err("a refused translation refuses the export");
+        assert!(matches!(err, SchemaError::Translate(_)));
+    }
+    /// An export whose tier declares a column twice refuses with the
+    /// translation error, before it writes anything.
+    #[test]
+    fn export_tier_refuses_a_tier_that_declares_a_column_twice() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let schema = dir.path().join("schema.sql");
+        let tier = dir.path().join("tier.sql");
+        std::fs::write(&schema, majored("CREATE TABLE orders (id INT);"))
+            .expect("the schema source writes");
+        std::fs::write(&tier, "CREATE TABLE notes (id INT PRIMARY KEY, id INT);")
+            .expect("the tier source writes");
+        let err =
+            export_tier::<String, TextIds>(&schema, &tier, &dir.path().join("tier_history"), false)
+                .expect_err("the duplicated column refuses the export");
+        assert!(matches!(
+            err,
+            SchemaError::Translate(detail) if detail.contains("`id` already exists")
+        ));
+        assert!(
+            !dir.path().join("tier_history").exists(),
+            "the refusal writes nothing"
+        );
+    }
+
+    /// An export whose history holds a directory where the export should be
+    /// reports the read error, not a missing or stale export.
+    #[test]
+    fn export_tier_reports_a_read_error_when_the_export_is_a_directory() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let schema = dir.path().join("schema.sql");
+        let tier = dir.path().join("tier.sql");
+        std::fs::write(&schema, majored("CREATE TABLE orders (id INT);"))
+            .expect("the schema source writes");
+        std::fs::write(&tier, "CREATE TABLE notes (id INT);").expect("the tier source writes");
+        let history = dir.path().join("tier_history");
+        std::fs::create_dir_all(history.join("1.sql")).expect("the directory writes");
+        let err = export_tier::<String, TextIds>(&schema, &tier, &history, false)
+            .expect_err("a directory where the export should be refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+    }
+
+    /// An export whose history directory cannot be created reports the
+    /// error.
+    #[test]
+    fn export_tier_reports_a_write_error_when_the_history_cannot_be_created() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let schema = dir.path().join("schema.sql");
+        let tier = dir.path().join("tier.sql");
+        std::fs::write(&schema, majored("CREATE TABLE orders (id INT);"))
+            .expect("the schema source writes");
+        std::fs::write(&tier, "CREATE TABLE notes (id INT);").expect("the tier source writes");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "a file in the way").expect("the blocker writes");
+        let err = export_tier::<String, TextIds>(&schema, &tier, &blocker.join("history"), false)
+            .expect_err("a history that cannot be created refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+    }
+
+    /// A build whose tier source is missing or does not translate refuses
+    /// before it writes its bundle.
+    #[test]
+    fn emit_refuses_a_tier_source_that_is_missing_or_untranslatable() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, tier, _) = emit_inputs(dir.path(), 1);
+        let history = dir.path().join("tier_history");
+        std::fs::create_dir_all(&history).expect("the history directory writes");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        let source = TierSource::new(&tier, &history);
+        std::fs::remove_file(&tier).expect("the source deletes");
+        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+            .expect_err("a missing tier source refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+        std::fs::write(&tier, "not a Postgres document").expect("the source writes");
+        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+            .expect_err("an untranslatable tier source refuses");
+        assert!(matches!(err, SchemaError::Translate(_)));
+    }
+
+    /// A build whose history directory it cannot read refuses with the
+    /// error, not a missing directory.
+    #[test]
+    #[cfg(unix)]
+    fn emit_refuses_a_history_directory_it_cannot_read() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, tier, _) = emit_inputs(dir.path(), 1);
+        let history = dir.path().join("tier_history");
+        std::fs::create_dir_all(&history).expect("the history directory writes");
+        std::fs::set_permissions(
+            &history,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .expect("the permissions apply");
+        let source = TierSource::new(&tier, &history);
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        let result = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out);
+        std::fs::set_permissions(
+            &history,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("the permissions apply");
+        let err = result.expect_err("a history it cannot read refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+    }
+
+    /// The entry point refuses outside a build script, where `OUT_DIR` is
+    /// unset.
+    #[test]
+    fn emit_refuses_outside_a_build_script() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, _, _) = emit_inputs(dir.path(), 1);
+        assert!(
+            std::env::var("OUT_DIR").is_err(),
+            "cargo leaves OUT_DIR unset for tests"
+        );
+        let err = emit::<String, TextIds>(&schema, &policies, None, &[])
+            .expect_err("without OUT_DIR the entry point refuses");
+        assert!(matches!(err, SchemaError::MissingOutDir));
+    }
+
+    /// An output path a directory already occupies refuses the write.
+    #[test]
+    fn emit_to_refuses_an_output_file_that_is_a_directory() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, _, _) = emit_inputs(dir.path(), 1);
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(out.join("connetto-cap-policies.sql"))
+            .expect("the blocking directory writes");
+        let err = emit_to::<String, TextIds>(&schema, &policies, None, &[], &out)
+            .expect_err("a directory where the cap file should be refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+        let out = dir.path().join("out2");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        std::fs::create_dir_all(out.join("connetto-schema.rs"))
+            .expect("the blocking directory writes");
+        let err = emit_to::<String, TextIds>(&schema, &policies, None, &[], &out)
+            .expect_err("a directory where the bundle file should be refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+    }
+
+    /// The rendered bundle attaches the tier history the build read, its
+    /// boundaries included.
+    #[test]
+    fn render_attaches_the_tier_history_with_its_boundaries() {
+        let bundle = SchemaBundle::new(
+            format!(
+                "{} 2\nCREATE TABLE orders (id INT);",
+                connetto_core::MAJOR_DIRECTIVE
+            ),
+            "",
+            "CREATE TABLE orders_rls (id INTEGER);",
+            [] as [(&str, &str); 0],
+            [] as [&str; 0],
+            None::<&str>,
+        )
+        .expect("the source declares major 2")
+        .with_local_tier("CREATE TABLE notes (id INTEGER);")
+        .with_tier_history(connetto_core::TierHistory::new(
+            connetto_core::Major::new(1).expect("major 1"),
+            Some(connetto_core::Major::new(2).expect("major 2")),
+            vec![connetto_core::TierBoundary::new(
+                connetto_core::Major::new(1).expect("major 1"),
+                "ALTER TABLE notes ADD COLUMN body TEXT;",
+            )],
+        ))
+        .expect("the history reaches the build's major");
+        let source = render(&bundle, "");
+        assert!(source.contains("connetto_core::TierHistory::new("));
+        assert!(source.contains("connetto_core::TierBoundary::new("));
+        assert!(source.contains("connetto_core::Major::new(1)"));
+        assert!(source.contains("connetto_core::Major::new(2)"));
+        assert!(source.contains(r#"r"ALTER TABLE notes ADD COLUMN body TEXT;""#));
+    }
+
+    /// A history whose builds carry no tier before the build's own renders
+    /// the first tier as `None`, the same gap the history it names carries.
+    #[test]
+    fn render_marks_a_history_without_a_earlier_tier() {
+        let bundle = SchemaBundle::new(
+            majored("CREATE TABLE orders (id INT);"),
+            "",
+            "CREATE TABLE orders_rls (id INTEGER);",
+            [] as [(&str, &str); 0],
+            [] as [&str; 0],
+            None::<&str>,
+        )
+        .expect("the source declares major 1")
+        .with_local_tier("CREATE TABLE notes (id INTEGER);")
+        .with_tier_history(connetto_core::TierHistory::new(
+            connetto_core::Major::new(1).expect("major 1"),
+            None,
+            Vec::new(),
+        ))
+        .expect("the history reaches the build's major");
+        let source = render(&bundle, "");
+        assert!(
+            source.contains(",\nNone,\nvec!["),
+            "no earlier tier renders as None: {source}"
+        );
+    }
     // The consumer behavior of the shared store layout, read through the
     // replica's logical names the way an application does.
 

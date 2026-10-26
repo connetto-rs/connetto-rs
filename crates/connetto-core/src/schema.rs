@@ -869,6 +869,29 @@ mod tests {
         );
     }
 
+    /// A bundle that already records a first tier keeps it when the build
+    /// gives it the tier again.
+    #[test]
+    fn a_bundle_that_already_has_a_first_tier_keeps_it_when_given_the_tier() {
+        let history = TierHistory::new(
+            major(1),
+            Some(major(2)),
+            vec![
+                TierBoundary::new(major(1), ""),
+                TierBoundary::new(major(2), ""),
+            ],
+        );
+        let bundle = at_major(3)
+            .with_tier_history(history)
+            .expect("the history reaches the build")
+            .with_local_tier("another translation of the tier");
+        assert_eq!(
+            bundle.tier_history().first_with_tier(),
+            Some(major(2)),
+            "the first tier it already recorded stays"
+        );
+    }
+
     #[test]
     fn the_shared_tables_do_not_change_the_version() {
         let without = reference();

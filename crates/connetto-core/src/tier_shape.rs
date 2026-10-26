@@ -754,7 +754,10 @@ mod tests {
     /// only one side holds, and nothing when the shapes agree.
     #[test]
     fn a_diff_reports_column_and_table_differences_readably() {
-        let mut here = open("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);");
+        let mut here = open(
+            "CREATE TABLE s (x INTEGER PRIMARY KEY);
+             CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);",
+        );
         let mut there = open(
             "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT DEFAULT 'x');
              CREATE TABLE extra (x INTEGER PRIMARY KEY);",
@@ -825,5 +828,162 @@ mod tests {
                 ShapeDifference::ViewOnlyHere { view } if view == "v"
             )
         }));
+    }
+
+    /// A diff names every column property it saw move, with the values it
+    /// moved between, and the columns each side dropped or added.
+    #[test]
+    fn a_diff_names_every_column_property_and_membership_change() {
+        let mut here = open(
+            "CREATE TABLE t (
+                 k INTEGER,
+                 a INTEGER PRIMARY KEY,
+                 b TEXT NOT NULL DEFAULT 'x',
+                 c INTEGER,
+                 dropped INTEGER);",
+        );
+        let mut there = open(
+            "CREATE TABLE t (
+                 k INTEGER,
+                 a TEXT,
+                 b TEXT,
+                 c INTEGER GENERATED ALWAYS AS (1) VIRTUAL,
+                 added INTEGER);",
+        );
+        let here_shape = read_tier_shape(&mut here).expect("read the first");
+        let there_shape = read_tier_shape(&mut there).expect("read the second");
+        let diff = here_shape.diff(&there_shape);
+        let detail = diff
+            .iter()
+            .find_map(|difference| match difference {
+                ShapeDifference::ColumnsDiffer { table, detail } if table == "t" => {
+                    Some(detail.as_str())
+                }
+                _ => None,
+            })
+            .expect("the columns are reported");
+        for note in [
+            "column a type changed from INTEGER to TEXT",
+            "column a primary key position changed from 1 to none",
+            "column b NOT NULL changed from true to false",
+            "column b default changed from 'x' to none",
+            "column c hidden flag changed from 0 to 2",
+            "column dropped was dropped",
+            "column added was added",
+        ] {
+            assert!(detail.contains(note), "missing {note:?}: {detail}");
+        }
+        assert!(
+            !detail.contains("column k"),
+            "an unchanged column names no note: {detail}"
+        );
+    }
+
+    /// A diff names every index property it saw move and the indexes each
+    /// side dropped or added, with no note for an index that holds.
+    #[test]
+    fn a_diff_names_every_index_property_and_membership_change() {
+        let mut here = open(
+            "CREATE TABLE t (k INTEGER, b TEXT);
+             CREATE UNIQUE INDEX t_b ON t(b) WHERE k > 0;
+             CREATE INDEX t_k ON t(k);
+             CREATE INDEX t_gone ON t(b);",
+        );
+        let mut there = open(
+            "CREATE TABLE t (k INTEGER, b TEXT);
+             CREATE INDEX t_b ON t(b);
+             CREATE INDEX t_k ON t(k);
+             CREATE INDEX t_new ON t(b);",
+        );
+        let here_shape = read_tier_shape(&mut here).expect("read the first");
+        let there_shape = read_tier_shape(&mut there).expect("read the second");
+        let diff = here_shape.diff(&there_shape);
+        let detail = diff
+            .iter()
+            .find_map(|difference| match difference {
+                ShapeDifference::IndexesDiffer { table, detail } if table == "t" => {
+                    Some(detail.as_str())
+                }
+                _ => None,
+            })
+            .expect("the indexes are reported");
+        for note in [
+            "index t_b unique changed from true to false",
+            "index t_b partial changed from true to false",
+            "index t_gone was dropped",
+            "index t_new was added",
+        ] {
+            assert!(detail.contains(note), "missing {note:?}: {detail}");
+        }
+        assert!(
+            !detail.contains("t_k"),
+            "an unchanged index names no note: {detail}"
+        );
+        assert!(
+            diff.iter()
+                .all(|difference| { !matches!(difference, ShapeDifference::ColumnsDiffer { .. }) }),
+            "the columns agree, so no column difference is reported"
+        );
+    }
+
+    /// A diff skips the triggers and views both sides agree on, names the
+    /// objects each side holds alone, and names a view whose SQL differs.
+    #[test]
+    fn a_diff_skips_agreeing_triggers_and_views_and_names_the_rest() {
+        let mut here = open(
+            "CREATE TABLE t (a INTEGER PRIMARY KEY);
+             CREATE TRIGGER same AFTER INSERT ON t BEGIN SELECT 1; END;
+             CREATE TRIGGER here_only AFTER INSERT ON t BEGIN SELECT 2; END;
+             CREATE VIEW v_same AS SELECT a FROM t;
+             CREATE VIEW v_diff AS SELECT a FROM t;
+             CREATE VIEW v_here AS SELECT a + 1 FROM t;",
+        );
+        let mut there = open(
+            "CREATE TABLE t (a INTEGER PRIMARY KEY);
+             CREATE TRIGGER same AFTER INSERT ON t BEGIN SELECT 1; END;
+             CREATE TRIGGER there_only AFTER INSERT ON t BEGIN SELECT 3; END;
+             CREATE VIEW v_same AS SELECT a FROM t;
+             CREATE VIEW v_diff AS SELECT a - 1 FROM t;
+             CREATE VIEW v_there AS SELECT a * 2 FROM t;",
+        );
+        let here_shape = read_tier_shape(&mut here).expect("read the first");
+        let there_shape = read_tier_shape(&mut there).expect("read the second");
+        assert_eq!(
+            here_shape.diff(&there_shape),
+            vec![
+                ShapeDifference::TriggerOnlyHere {
+                    trigger: "here_only".to_string(),
+                },
+                ShapeDifference::TriggerOnlyThere {
+                    trigger: "there_only".to_string(),
+                },
+                ShapeDifference::ViewSqlDiffer {
+                    view: "v_diff".to_string(),
+                },
+                ShapeDifference::ViewOnlyHere {
+                    view: "v_here".to_string(),
+                },
+                ShapeDifference::ViewOnlyThere {
+                    view: "v_there".to_string(),
+                },
+            ],
+            "the agreeing objects skip the diff, the rest name themselves"
+        );
+    }
+
+    /// A trigger whose table is the database's own machinery is not a table
+    /// the shape holds, so the trigger stays out of the shape.
+    #[test]
+    fn a_trigger_on_internal_machinery_is_not_in_the_shape() {
+        let mut conn = open(
+            "CREATE TABLE _connetto_build (hash TEXT);
+             CREATE TRIGGER build_touch AFTER INSERT ON _connetto_build \
+             BEGIN SELECT 1; END;",
+        );
+        let shape = read_tier_shape(&mut conn).expect("read the shape");
+        assert!(
+            shape.triggers.is_empty(),
+            "the machinery's trigger stays out of the shape"
+        );
     }
 }
