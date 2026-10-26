@@ -26,7 +26,7 @@ jobs:
     name: Coverage ${{ matrix.name }}
     # Only pushes and same-repository pull requests may reach the self-hosted
     # runners on emi. LINUX_HEAVY names their scale set, and unset it means GitHub's.
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_HEAVY || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_HEAVY || 'ubuntu-26.04' }}
     # The discovery proofs fail here, never skip, when loopback multicast is
     # missing (R76 slice 3).
     env:
@@ -82,7 +82,7 @@ jobs:
       - name: Install keyring helpers
         run: |
           sudo apt-get update
-          sudo apt-get install -y keyutils dbus gnome-keyring
+          sudo apt-get install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
 
       # --all-features turns on connetto-dioxus's desktop feature.
       - name: Install desktop dependencies
@@ -140,7 +140,7 @@ jobs:
     # The partitions read this job's archive, so both run on emi only while
     # both scale-set variables name emi pools, since put-files and get-files
     # must pick the same store.
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_LIGHT && vars.LINUX_HEAVY || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(vars.LINUX_LIGHT, 'ubuntu-') && !startsWith(vars.LINUX_HEAVY, 'ubuntu-') && vars.LINUX_LIGHT && vars.LINUX_HEAVY || 'ubuntu-26.04' }}
     timeout-minutes: 60
     if: >-
       github.event_name == 'push' ||
@@ -164,6 +164,11 @@ jobs:
         uses: $/.github/actions/install-rust
         with:
           components: llvm-tools-preview
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
@@ -192,7 +197,7 @@ jobs:
     name: Coverage server ${{ matrix.partition }}/${{ strategy.job-total }}
     needs: coverage-server-build
     # Running the archive compiles nothing, so a light VM is enough.
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_HEAVY && vars.LINUX_LIGHT || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(vars.LINUX_LIGHT, 'ubuntu-') && !startsWith(vars.LINUX_HEAVY, 'ubuntu-') && vars.LINUX_HEAVY && vars.LINUX_LIGHT || 'ubuntu-26.04' }}
     env:
       CONNETTO_REQUIRE_MULTICAST: "1"
     timeout-minutes: 60
@@ -200,7 +205,7 @@ jobs:
       fail-fast: false
       # One suite layout on both runner kinds, with more partitions on emi.
       matrix:
-        partition: ${{ fromJSON(vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_LIGHT && vars.LINUX_HEAVY && '[1, 2, 3, 4]' || '[1, 2, 3]') }}
+        partition: ${{ fromJSON(!startsWith(vars.LINUX_LIGHT, 'ubuntu-') && !startsWith(vars.LINUX_HEAVY, 'ubuntu-') && vars.LINUX_LIGHT && vars.LINUX_HEAVY && '[1, 2, 3, 4]' || '[1, 2, 3]') }}
     steps:
       - uses: actions/checkout@v7
 
