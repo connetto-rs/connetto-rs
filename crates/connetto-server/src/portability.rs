@@ -1,6 +1,7 @@
 //! A person's data requests (R61): who asks, the queries a download runs, the
-//! archive it writes, and the records a download and an erasure leave in
-//! `auth_events`.
+//! archive it writes, the records a download and an erasure leave in
+//! `auth_events`, and the sign-out the erasure runs before it deletes the
+//! person's rows.
 //!
 //! Both records are written and awaited, never fired and forgotten, because
 //! they exist for disputes, so a request whose record cannot be written fails.
@@ -363,6 +364,15 @@ impl DataRequestError {
             KeyError::Unsupported { table, kind } => Self::UnsupportedKey { table, kind },
         }
     }
+}
+
+/// What a person's sign-out ended (R61).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonEnded {
+    /// The live sessions the person held, now revoked.
+    pub sessions: u64,
+    /// The device keys the person's account enrolled, now revoked.
+    pub devices: u64,
 }
 
 /// The reader's recovery state could not be read at startup.

@@ -42,8 +42,8 @@ use crate::openfga::{
 };
 use crate::oplog::{OplogConfig, PgOplog};
 use crate::portability::{
-    DataRequestError, DataRequester, DownloadReceipt, PortabilityError, PortabilityList,
-    PortabilityState, ReaderCheckError, ValidatedList, reader_in_recovery,
+    DataRequestError, DataRequester, DownloadReceipt, PersonEnded, PortabilityError,
+    PortabilityList, PortabilityState, ReaderCheckError, ValidatedList, reader_in_recovery,
 };
 use crate::reach::GrantReach;
 use crate::reserve::{ReaderGate, ReaderReserve};
@@ -1091,6 +1091,31 @@ where
         Ok(DownloadReceipt {
             archive_bytes,
             query_list_hash,
+        })
+    }
+
+    /// Sign the person out everywhere, the step the erasure recipe runs
+    /// before it deletes the person's rows (chapter 20).
+    ///
+    /// Every live session the person holds is revoked first, each live
+    /// connection closed with `SessionRevoked` and each revocation recorded as
+    /// `session_revoked`, and then every device key the person's account
+    /// enrolled, which publishes the revocation and closes that device's
+    /// connection.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionsError`] when the auth store, the enrolment table or the
+    /// issuer fails.
+    pub async fn end_person(&self, person: &D::Id) -> Result<PersonEnded, SessionsError> {
+        let sessions = self.service.revoke_person(person).await?;
+        let devices = self.live_devices_of(person).await?;
+        for device in &devices {
+            self.manager.revoke_device_of(person, device.key).await?;
+        }
+        Ok(PersonEnded {
+            sessions: u64::try_from(sessions.len()).unwrap_or(u64::MAX),
+            devices: u64::try_from(devices.len()).unwrap_or(u64::MAX),
         })
     }
 }
