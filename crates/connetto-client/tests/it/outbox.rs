@@ -279,3 +279,103 @@ async fn a_row_rewritten_by_connetto_before_the_push_still_pushes() {
 
     assert_eq!(conn.push().await.expect("push"), Some(1));
 }
+
+/// The queue entry and the deletion of the records it covers commit
+/// together, so a push whose clearing fails queues nothing and keeps every
+/// record for the next push, cancelled writes included.
+#[tokio::test]
+async fn a_push_that_cannot_clear_the_outbox_queues_nothing() {
+    let mut conn = open(DDL);
+    conn.batch_execute(
+        "CREATE TEMP TRIGGER refuse_clearing BEFORE DELETE ON main._connetto_outbox \
+         BEGIN SELECT RAISE(ABORT, 'clearing refused'); END",
+    )
+    .expect("make clearing the outbox fail");
+
+    conn.batch_execute("INSERT INTO items (id) VALUES (1); DELETE FROM items WHERE id = 1")
+        .expect("write and undo");
+    let refused = conn
+        .push()
+        .await
+        .expect_err("the cancelled writes cannot be cleared");
+    assert!(
+        refused.to_string().contains("clearing refused"),
+        "{refused}"
+    );
+    assert_eq!(
+        recorded(&mut conn).len(),
+        2,
+        "the cancelled writes keep their records"
+    );
+
+    conn.batch_execute("INSERT INTO items (id) VALUES (2)")
+        .expect("write");
+    let refused = conn.push().await.expect_err("the write cannot be cleared");
+    assert!(
+        refused.to_string().contains("clearing refused"),
+        "{refused}"
+    );
+    assert!(conn.unsynced().is_empty(), "nothing was queued");
+    assert_eq!(recorded(&mut conn).len(), 3, "every record is kept");
+
+    conn.batch_execute("DROP TRIGGER temp.refuse_clearing")
+        .expect("let clearing succeed");
+    assert_eq!(conn.push().await.expect("push"), Some(1));
+    assert_eq!(conn.unsynced().len(), 1, "the write is queued once");
+    assert_eq!(recorded(&mut conn), Vec::new(), "and its records are gone");
+}
+
+/// DDL that fails partway changes nothing, and the triggers the schema change
+/// dropped before it come back with the rollback.
+#[tokio::test]
+async fn a_failing_schema_change_keeps_recording() {
+    let mut conn = open(DDL);
+    conn.change_schema(
+        "ALTER TABLE items ADD COLUMN extra TEXT; CREATE TABLE items (id INTEGER PRIMARY KEY)",
+    )
+    .expect_err("the second statement names a table that exists");
+    conn.batch_execute("INSERT INTO items (id) VALUES (1)")
+        .expect("write");
+
+    assert_eq!(
+        recorded(&mut conn),
+        vec![row(
+            "items",
+            "I",
+            None,
+            Some(r#"{"id":1,"label":null,"weight":null,"data":null}"#)
+        )]
+    );
+}
+
+/// A schema change whose triggers cannot be created, here because a trigger
+/// already holds the name connetto gives one, changes nothing, and the
+/// tables recorded before it stay recorded.
+#[tokio::test]
+async fn a_schema_change_that_cannot_create_its_triggers_changes_nothing() {
+    let mut conn = open(DDL);
+    conn.batch_execute(
+        "CREATE TEMP TRIGGER \"_connetto_outbox_I_later\" AFTER INSERT ON main.items \
+         BEGIN SELECT 1; END",
+    )
+    .expect("a trigger holding connetto's name for the new table");
+    conn.change_schema("CREATE TABLE later (id INTEGER PRIMARY KEY)")
+        .expect_err("the new table's trigger cannot be created");
+    assert!(
+        conn.batch_execute("INSERT INTO later (id) VALUES (1)")
+            .is_err(),
+        "the table was not created"
+    );
+    conn.batch_execute("INSERT INTO items (id) VALUES (1)")
+        .expect("write");
+
+    assert_eq!(
+        recorded(&mut conn),
+        vec![row(
+            "items",
+            "I",
+            None,
+            Some(r#"{"id":1,"label":null,"weight":null,"data":null}"#)
+        )]
+    );
+}

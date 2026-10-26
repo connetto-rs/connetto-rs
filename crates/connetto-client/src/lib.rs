@@ -5300,15 +5300,15 @@ where
     }
 
     /// Atomically appends an entry captured under `major`, its position and
-    /// its writer frontier, deleting the outbox's records through
-    /// `recorded_through`, the writes the entry carries.
+    /// its writer frontier, and, with `clears_outbox`, deletes the outbox's
+    /// records, which are then the writes the entry carries.
     fn append_entry(
         &mut self,
         writer: &WriterRef,
         changeset: &[u8],
         provenance: Option<Provenance>,
         major: Option<Major>,
-        recorded_through: Option<i64>,
+        clears_outbox: bool,
     ) -> Result<u64, ClientError> {
         let position = self.next_position;
         let (seq, head) = match self.writers.get(writer) {
@@ -5327,8 +5327,8 @@ where
         self.db.transaction::<(), ClientError, _>(|db| {
             persist_writer_state(db, writer, seq + 1, &hash)?;
             persist_pending(db, writer, seq, &entry.record())?;
-            if let Some(last) = recorded_through {
-                outbox::clear_through(db, last)?;
+            if clears_outbox {
+                outbox::clear(db)?;
             }
             Ok(())
         })?;
@@ -6806,7 +6806,7 @@ where
                     seq: entry.seq,
                 })
             });
-            self.append_entry(&target, &entry.changeset, provenance, entry.major, None)?;
+            self.append_entry(&target, &entry.changeset, provenance, entry.major, false)?;
             restored += 1;
         }
         Ok(restored)
@@ -7460,21 +7460,14 @@ where
                 .unwrap_or_default();
             outbox::assert_matches(&mut self.db, &changeset, &exempt_written)?;
         }
-        let recorded_through = outbox::last_seq(&mut self.db)?;
+        // Nothing writes between the capture above and the queueing below,
+        // so every record the outbox holds now is a write this push carries.
         if changeset.is_empty() {
-            if let Some(last) = recorded_through {
-                outbox::clear_through(&mut self.db, last)?;
-            }
+            outbox::clear(&mut self.db)?;
             return Ok(None);
         }
         let writer = self.choose_writer();
-        let seq = self.append_entry(
-            &writer,
-            &changeset,
-            None,
-            self.config.schema_major,
-            recorded_through,
-        )?;
+        let seq = self.append_entry(&writer, &changeset, None, self.config.schema_major, true)?;
         // Reset capture: fresh sessions record only writes after this push.
         self.session.reset(&mut self.db)?;
         // With no server the write stays queued, which is the designed offline
@@ -8908,14 +8901,14 @@ mod tests {
             .expect("local write");
         let changeset = conn.session.changeset().expect("capture the write");
         let first = conn
-            .append_entry(&writer, &changeset, None, None, None)
+            .append_entry(&writer, &changeset, None, None, false)
             .expect("queue the write");
         conn.db
             .batch_execute("INSERT INTO t (id) VALUES (2)")
             .expect("second local write");
         let changeset = conn.session.changeset().expect("capture the second write");
         let second = conn
-            .append_entry(&writer, &changeset, None, None, None)
+            .append_entry(&writer, &changeset, None, None, false)
             .expect("queue the second write");
         // A deferral whose writes went out again after its schedule had grown.
         let mut episode = RESEND_POLICY.start();

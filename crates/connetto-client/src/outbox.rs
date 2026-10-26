@@ -88,23 +88,38 @@ fn recorded_tables(db: &mut SqliteConnection) -> Result<Vec<(String, Vec<Column>
 
 /// Drop every outbox trigger, so DDL can change a table its triggers name.
 ///
+/// The tables recorded now are the ones the triggers were made for, since a
+/// table changes only through [`change_schema`](crate::ConnettoConnection::change_schema),
+/// which runs this before its DDL.
+///
 /// # Errors
 ///
 /// [`ClientError`] when the catalog cannot be read or a trigger dropped.
 pub(crate) fn drop_triggers(db: &mut SqliteConnection) -> Result<(), ClientError> {
-    #[derive(diesel::QueryableByName)]
-    struct Trigger {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        name: String,
-    }
-    let triggers: Vec<Trigger> = diesel::sql_query(format!(
-        "SELECT name FROM temp.sqlite_master WHERE type = 'trigger' AND name GLOB '{TRIGGER_PREFIX}*'"
-    ))
-    .load(db)?;
-    for trigger in triggers {
-        db.batch_execute(&format!("DROP TRIGGER temp.{}", quote_ident(&trigger.name)))?;
-    }
+    let drops = recorded_tables(db)?
+        .iter()
+        .flat_map(|(table, _)| {
+            OPS.iter().map(move |(op, ..)| {
+                format!("DROP TRIGGER IF EXISTS temp.{}; ", trigger_name(op, table))
+            })
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    db.batch_execute(&drops)?;
     Ok(())
+}
+
+/// The writes each table gets a trigger for: the operation's letter, the
+/// event, and which rows the record carries as old and new.
+const OPS: [(&str, &str, Option<&str>, Option<&str>); 3] = [
+    ("I", "INSERT", None, Some("NEW")),
+    ("U", "UPDATE", Some("OLD"), Some("NEW")),
+    ("D", "DELETE", Some("OLD"), None),
+];
+
+/// The quoted name of `table`'s trigger for `op`.
+fn trigger_name(op: &str, table: &str) -> String {
+    quote_ident(&format!("{TRIGGER_PREFIX}{op}_{table}"))
 }
 
 /// Create the outbox triggers for every keyed application table in `main`
@@ -124,25 +139,20 @@ pub(crate) fn install(db: &mut SqliteConnection) -> Result<(), ClientError> {
 fn triggers(table: &str, columns: &[Column]) -> String {
     let target = format!("main.{}", quote_ident(table));
     let literal = table.replace('\'', "''");
-    [
-        ("I", "INSERT", None, Some("NEW")),
-        ("U", "UPDATE", Some("OLD"), Some("NEW")),
-        ("D", "DELETE", Some("OLD"), None),
-    ]
-    .into_iter()
-    .map(|(op, event, old, new)| {
-        let name = quote_ident(&format!("{TRIGGER_PREFIX}{op}_{table}"));
-        let old = old.map_or_else(|| "NULL".to_owned(), |row| encoded(row, columns));
-        let new = new.map_or_else(|| "NULL".to_owned(), |row| encoded(row, columns));
-        format!(
-            "CREATE TEMP TRIGGER {name} AFTER {event} ON {target} \
+    OPS.into_iter()
+        .map(|(op, event, old, new)| {
+            let name = trigger_name(op, table);
+            let old = old.map_or_else(|| "NULL".to_owned(), |row| encoded(row, columns));
+            let new = new.map_or_else(|| "NULL".to_owned(), |row| encoded(row, columns));
+            format!(
+                "CREATE TEMP TRIGGER {name} AFTER {event} ON {target} \
              WHEN NOT {WRITE_EXEMPTION_FUNCTION}() BEGIN \
              INSERT INTO _connetto_outbox (tbl, op, old, new) \
              VALUES ('{literal}', '{op}', {old}, {new}); END; "
-        )
-    })
-    .collect::<Vec<_>>()
-    .concat()
+            )
+        })
+        .collect::<Vec<_>>()
+        .concat()
 }
 
 /// The SQL encoding the value of `value`, an SQL expression, as JSON text.
@@ -213,34 +223,6 @@ impl Drop for SchemaWindow<'_> {
     fn drop(&mut self) {
         self.open.store(false, Ordering::Relaxed);
     }
-}
-
-/// Delete the recorded writes up to and including `last`.
-///
-/// # Errors
-///
-/// [`ClientError`] when the outbox cannot be written.
-pub(crate) fn clear_through(db: &mut SqliteConnection, last: i64) -> Result<(), ClientError> {
-    diesel::sql_query("DELETE FROM main._connetto_outbox WHERE seq <= ?")
-        .bind::<diesel::sql_types::BigInt, _>(last)
-        .execute(db)?;
-    Ok(())
-}
-
-/// The newest recorded write's place in the outbox, if any.
-///
-/// # Errors
-///
-/// [`ClientError`] when the outbox cannot be read.
-pub(crate) fn last_seq(db: &mut SqliteConnection) -> Result<Option<i64>, ClientError> {
-    #[derive(diesel::QueryableByName)]
-    struct Last {
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
-        last: Option<i64>,
-    }
-    let rows: Vec<Last> =
-        diesel::sql_query("SELECT max(seq) AS last FROM main._connetto_outbox").load(db)?;
-    Ok(rows.first().and_then(|row| row.last))
 }
 
 /// Delete every recorded write.
