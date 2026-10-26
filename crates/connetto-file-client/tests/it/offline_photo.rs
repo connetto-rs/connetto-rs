@@ -465,8 +465,8 @@ async fn provision(fixture: &Fixture) {
     connetto_test_harness::provision_writers(fixture.admin()).await;
     fixture
         .exec(
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled \
-             TO app_writer",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+             _connetto_session_writers TO app_writer",
         )
         .await;
 }

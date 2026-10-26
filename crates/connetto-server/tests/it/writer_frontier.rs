@@ -37,7 +37,7 @@ use connetto_core::messages::{
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport as _};
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
-use connetto_server::defaults::{_connetto_settled, _connetto_writers};
+use connetto_server::defaults::{_connetto_session_writers, _connetto_settled, _connetto_writers};
 use connetto_server::device_cert::{
     DeviceCertConfig, DeviceEnrolment, Enrolment, EnrolmentStore, MemoryEnrolments,
 };
@@ -157,6 +157,7 @@ async fn seed_notes(fixture: &Fixture) {
         .setup(&[
             "DROP TABLE IF EXISTS notes CASCADE",
             "DROP TABLE IF EXISTS _connetto_settled",
+            "DROP TABLE IF EXISTS _connetto_session_writers",
             "DROP TABLE IF EXISTS _connetto_writers",
             "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
         ])
@@ -758,6 +759,120 @@ async fn a_good_bind_binds_a_live_enrolment_and_rebinds_at_its_frontier() {
     let facts = writer_facts(fixture.admin(), writer).await;
     assert_eq!(facts.frontier, 3);
     assert!(!facts.retired);
+}
+
+/// The `(session, first sequence)` pairs recorded on `writer`, in bind order.
+async fn session_binds(pool: &Pool<AsyncPgConnection>, writer: i64) -> Vec<(uuid::Uuid, i64)> {
+    let mut conn = pool.get().await.expect("admin connection");
+    _connetto_session_writers::table
+        .filter(_connetto_session_writers::writer.eq(writer))
+        .order(_connetto_session_writers::bound_at)
+        .select((
+            _connetto_session_writers::session_id,
+            _connetto_session_writers::first_seq,
+        ))
+        .load(&mut *conn)
+        .await
+        .expect("read the session binds")
+}
+
+/// A device bind records the session it ran under with the first sequence
+/// still to settle, once however often that session rebinds, and an
+/// anonymous run's number records nothing (R105 decision 6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_bind_records_its_session_once_and_an_anonymous_run_records_none() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let store = Enrolments::new();
+    let device = store
+        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .await;
+    let manager = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(store.installable()),
+        SessionConfig::default(),
+    );
+
+    // One login binds the key twice and writes between the binds.
+    for (run, writes) in [("one-a", 2_u64), ("one-b", 0)] {
+        let (server_transport, client) = loopback();
+        let server = tokio::spawn(manager.clone().serve(server_transport));
+        let mut client = Client::new(client);
+        let (challenge, _) = client
+            .handshake_challenge_writing(
+                run,
+                &["user:alice#one"],
+                None,
+                WriterRequest::Device,
+                None,
+            )
+            .await;
+        client
+            .bind_device("b", device.1, device.0.signature(&challenge.nonce))
+            .await;
+        for seq in 1..=writes {
+            let id = i64::try_from(seq).expect("a small id") + 1;
+            client.upload(seq, insert_changeset(id, "one", "t1")).await;
+            expect_applied(&mut client, seq).await;
+        }
+        client.close().await;
+        server.await.expect("join").expect("session ok");
+    }
+
+    // Another login of the same person binds the key at its frontier.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let (challenge, _) = client
+        .handshake_challenge_writing(
+            "two",
+            &["user:alice#two"],
+            None,
+            WriterRequest::Device,
+            None,
+        )
+        .await;
+    client
+        .bind_device("b", device.1, device.0.signature(&challenge.nonce))
+        .await;
+    client.close().await;
+    server.await.expect("join").expect("session ok");
+
+    // A caller with no identity is issued a number and records no session.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client
+        .handshake_writing("anon", &[], None, WriterRequest::Issue, None)
+        .await;
+    let anonymous = ack.writer.expect("an anonymous caller is issued a number");
+    client.close().await;
+    server.await.expect("join").expect("session ok");
+
+    let run = |grant: &str| *SessionId::from_token_hash(grant).as_uuid();
+    assert_eq!(
+        session_binds(
+            fixture.admin(),
+            writer_for_key(fixture.admin(), device.1).await
+        )
+        .await,
+        vec![(run("user:alice#one"), 1), (run("user:alice#two"), 3)],
+        "each login records its first bind, at the frontier plus one"
+    );
+    assert_eq!(
+        session_binds(
+            fixture.admin(),
+            i64::try_from(anonymous.number).expect("a stored number")
+        )
+        .await,
+        Vec::new(),
+        "an anonymous run's number carries its run already"
+    );
 }
 
 /// A signature over anything but this connection's challenge message

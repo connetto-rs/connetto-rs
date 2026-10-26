@@ -695,11 +695,17 @@ pub const WRITERS_DDL: &str = "DO $$ BEGIN \
      outcome TEXT NOT NULL, \
      path connetto_settle_path NOT NULL, \
      settled_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-     PRIMARY KEY (writer, seq))";
+     PRIMARY KEY (writer, seq)); \
+    CREATE TABLE IF NOT EXISTS _connetto_session_writers \
+    (session_id UUID NOT NULL, \
+     writer BIGINT NOT NULL, \
+     first_seq BIGINT NOT NULL, \
+     bound_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+     PRIMARY KEY (session_id, writer))";
 
 /// Create the reference settle-path enum and writer tables if missing, as
 /// admin. A restricted writer role needs `SELECT, INSERT, UPDATE, DELETE` on
-/// both tables, granted separately.
+/// all three tables, granted separately.
 pub async fn provision_writers(pool: &Pool<AsyncPgConnection>) {
     exec(pool, WRITERS_DDL).await;
 }

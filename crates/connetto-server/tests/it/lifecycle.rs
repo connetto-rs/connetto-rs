@@ -416,7 +416,8 @@ async fn an_unusable_change_stream_on_a_model_table_refuses_to_serve() {
     connetto_test_harness::provision_writers(&pool).await;
     exec(
         &pool,
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+         _connetto_session_writers TO app_reader",
     )
     .await;
     provision_cap_policies(&pool, OWNED_PG_DDL, OWNED_POLICIES).await;

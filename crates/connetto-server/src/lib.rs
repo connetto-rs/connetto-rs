@@ -114,7 +114,7 @@ pub use builder::Ended;
 pub use builder::{
     BuildError, ChangeStream, ContentBuildError, ContentSettings, ContentSigner,
     ContentSignerError, PoolError, SHUTDOWN_GRACE, SYNC_PATH, ServeError, ServerBuilder,
-    ServerHandle, ServerParts, SessionsError, SignedInPlace,
+    ServerHandle, ServerParts, SessionWrites, SessionsError, SignedInPlace,
 };
 pub use connetto_core::SessionId;
 pub use connetto_core::transport::{

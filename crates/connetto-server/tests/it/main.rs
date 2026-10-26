@@ -136,6 +136,8 @@ mod throttle;
 
 mod write_path;
 
+mod write_attribution;
+
 mod writer_frontier;
 
 mod courier_frontier;
