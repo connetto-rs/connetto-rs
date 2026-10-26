@@ -1354,14 +1354,22 @@ impl connetto_server::AuthStore for LookupOutageStore {
         Some(())
     }
 
-    fn create_session(
+    fn resolve(
         &self,
+        identity: &ResolvedIdentity,
+    ) -> impl Future<Output = Result<String, connetto_server::AuthStoreError>> + Send {
+        self.inner.resolve(identity)
+    }
+
+    fn create_session_for(
+        &self,
+        user_id: String,
         identity: &ResolvedIdentity,
         origin: connetto_server::SessionOrigin<()>,
     ) -> impl Future<
         Output = Result<connetto_server::IssuedSession<Self::Id>, connetto_server::AuthStoreError>,
     > + Send {
-        self.inner.create_session(identity, origin)
+        self.inner.create_session_for(user_id, identity, origin)
     }
 
     fn session_record(

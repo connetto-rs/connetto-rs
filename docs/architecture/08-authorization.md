@@ -369,8 +369,9 @@ CREATE TYPE connetto_auth_op AS ENUM (
     'logged_in',
     -- a login ended, and why matters more than the fact
     'logged_out', 'session_revoked', 'token_replayed',
-    -- a person ended their own sessions from their list of signed-in places
-    'ended_by_owner', 'ended_all', 'ended_others',
+    -- a person ended their own sessions from their list of signed-in places,
+    -- or a ban ended them
+    'ended_by_owner', 'ended_all', 'ended_others', 'ended_by_ban',
     -- authorization
     'capability_minted', 'permission_change', 'model_change',
     -- abuse response
@@ -437,6 +438,8 @@ CREATE TABLE auth_events (
 **`logged_in` records a login beginning, with `provider` and `issuer` on its own row (R105, 2026-10-25).** The auth service writes one row per sign-in, naming the session, the person, the configured provider and the issuer the identity was verified from, so a takeover can be investigated afterwards. The two columns sit on the row itself, filled only by a login, so the row still reads on its own after a deployment prunes its session rows. A sign-in is a change to who can reach what, and its rate is one row per login rather than one per attempt, since a refused sign-in mints nothing and still goes to the log.
 
 **`ended_by_owner`, `ended_all` and `ended_others` record a person ending their own sessions (R105, 2026-10-25).** One row per ended session, naming the session and the person. `ended_by_owner` is one entry of the person's list of signed-in places, `ended_others` every session but the current one, and `ended_all` every session. They sit beside `session_revoked`, the application revoking for its own reasons, because the person's choice and the application's read differently when a takeover is investigated.
+
+**`ended_by_ban` records a ban ending a session (R105, 2026-10-25).** One row per session of the banned identity, beside the ban's own `banned` row. The guard tells the auth service the identity once the ban is written, and the service ends every live session of it, closing each connection. Sign-in, refresh and the liveness check read the ban list too, failing closed, so a banned identity cannot come back through the token endpoints, which answer it the plain `401` every refused credential gets.
 
 **Recording is always on. Decided (R105, 2026-10-25).** Ending a person's sessions answers the share keys those sessions minted, read back from their `capability_minted` rows, so a deployment without the table could miss an intruder's keys without anyone noticing. The server refuses to start without `auth_events`, the reference binary has no switch for it, and `CapabilityIssuer::new` takes its audit hook, so no mint goes unrecorded. A mint's row names the key it issued in `subject`, the string the application's grant row names, so the application withdraws exactly that grant. connetto reads the table back for nothing else.
 

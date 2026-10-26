@@ -66,6 +66,9 @@ pub enum AuthOp {
     EndedAll,
     /// The person ended every one of their sessions but the current one.
     EndedOthers,
+    /// A ban ended the session, one row per session of the banned identity
+    /// beside the ban's own row.
+    EndedByBan,
     /// The theft defence saw a rotated-out refresh token presented and killed
     /// the login.
     TokenReplayed,
@@ -103,6 +106,7 @@ impl AuthOp {
             Self::EndedByOwner => "ended_by_owner",
             Self::EndedAll => "ended_all",
             Self::EndedOthers => "ended_others",
+            Self::EndedByBan => "ended_by_ban",
             Self::TokenReplayed => "token_replayed",
             Self::CapabilityMinted => "capability_minted",
             Self::PermissionChange => "permission_change",
@@ -131,6 +135,7 @@ impl FromSql<AuthOpSql, Pg> for AuthOp {
             b"ended_by_owner" => Ok(Self::EndedByOwner),
             b"ended_all" => Ok(Self::EndedAll),
             b"ended_others" => Ok(Self::EndedOthers),
+            b"ended_by_ban" => Ok(Self::EndedByBan),
             b"token_replayed" => Ok(Self::TokenReplayed),
             b"capability_minted" => Ok(Self::CapabilityMinted),
             b"permission_change" => Ok(Self::PermissionChange),
