@@ -145,7 +145,7 @@ impl FailedRead for DieselAsyncError {
 }
 
 /// Bounded floor until the SQLSTATE reaches a diesel error
-/// (`upstream/diesel-sqlstate-not-recoverable-from-database-error-information.md`).
+/// (<https://github.com/diesel-rs/diesel/pull/5232>).
 /// Deadlock arrives as `Unknown`, so it classifies as `Other`, one retry rather than an outage loop.
 pub(crate) fn diesel_failure(err: &diesel::result::Error) -> ReadFailure {
     use diesel::result::{DatabaseErrorKind, Error};
