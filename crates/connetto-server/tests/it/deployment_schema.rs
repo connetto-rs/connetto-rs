@@ -25,7 +25,7 @@ use super::lifecycle::{admin_pool, builder_over, live_session, next_control, wai
 mod app {
     use connetto_server::schema::ConnettoSchema;
     use connetto_server::writer_schema::{
-        ConnettoWriterSchema, SettlePath, SettledRow, Statement, WriterRow,
+        ConnettoWriterSchema, SessionBind, SettlePath, SettledRow, Statement, WriterRow,
     };
     use diesel_async::AsyncPgConnection;
 
@@ -59,6 +59,20 @@ mod app {
         }
     }
 
+    diesel::table! {
+        app_session_writers (session_id, writer) {
+            session_id -> Uuid,
+            writer -> BigInt,
+            first_seq -> BigInt,
+            bound_at -> Timestamptz,
+        }
+    }
+
+    diesel::joinable!(app_session_writers -> app_writers (writer));
+    diesel::allow_tables_to_appear_in_same_query!(app_session_writers, app_writers);
+
+    type Instant = connetto_server::authn::schema::Instant;
+
     /// The `app_writers` row as the columns the queries select.
     type WriterRowTuple = (
         i64,
@@ -66,14 +80,35 @@ mod app {
         Option<Vec<u8>>,
         i64,
         Option<Vec<u8>>,
-        Option<connetto_server::authn::schema::Instant>,
+        Option<Instant>,
     );
+
+    /// The deployment's own writer tables and the reader's grant on them.
+    pub const WRITERS_DDL: [&str; 5] = [
+        "CREATE TABLE app_writers (\
+         writer BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY, \
+         user_id UUID, session_id UUID, device_key BYTEA UNIQUE, \
+         frontier BIGINT NOT NULL DEFAULT 0, head BYTEA, retired_at TIMESTAMPTZ)",
+        "CREATE TABLE app_settled (\
+         writer BIGINT NOT NULL, seq BIGINT NOT NULL, entry_hash BYTEA NOT NULL, \
+         previous_hash BYTEA NOT NULL, \
+         outcome TEXT NOT NULL, path connetto_settle_path NOT NULL, \
+         settled_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+         PRIMARY KEY (writer, seq))",
+        "DROP TABLE IF EXISTS app_session_writers",
+        "CREATE TABLE app_session_writers (\
+         session_id UUID NOT NULL, writer BIGINT NOT NULL, first_seq BIGINT NOT NULL, \
+         bound_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (session_id, writer))",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON app_writers, app_settled, app_session_writers \
+         TO app_reader",
+    ];
 
     pub struct AppWriters;
 
     impl ConnettoWriterSchema for AppWriters {
         type Id = uuid::Uuid;
-        const TABLES: &'static [&'static str] = &["app_writers", "app_settled"];
+        const TABLES: &'static [&'static str] =
+            &["app_writers", "app_settled", "app_session_writers"];
 
         fn issue(
             conn: &mut AsyncPgConnection,
@@ -389,6 +424,87 @@ mod app {
                 RunQueryDsl::load(query, &mut *conn).await
             })
         }
+
+        fn bind_session<'c>(
+            conn: &'c mut AsyncPgConnection,
+            session_id: &'c uuid::Uuid,
+            writer: i64,
+            first_seq: i64,
+        ) -> Statement<'c, ()> {
+            Box::pin(async move {
+                use diesel::ExpressionMethods as _;
+                use diesel_async::RunQueryDsl as _;
+                diesel::insert_into(app_session_writers::table)
+                    .values((
+                        app_session_writers::session_id.eq(*session_id),
+                        app_session_writers::writer.eq(writer),
+                        app_session_writers::first_seq.eq(first_seq),
+                    ))
+                    .on_conflict((app_session_writers::session_id, app_session_writers::writer))
+                    .do_nothing()
+                    .execute(&mut *conn)
+                    .await
+                    .map(drop)
+            })
+        }
+
+        fn binds_of<'c>(
+            conn: &'c mut AsyncPgConnection,
+            session_id: &'c uuid::Uuid,
+        ) -> Statement<'c, Vec<SessionBind<Self::Id>>> {
+            Box::pin(async move {
+                use diesel::{ExpressionMethods, QueryDsl};
+                use diesel_async::RunQueryDsl;
+                let writers: Vec<i64> = app_session_writers::table
+                    .filter(app_session_writers::session_id.eq(*session_id))
+                    .select(app_session_writers::writer)
+                    .load(&mut *conn)
+                    .await?;
+                let rows: Vec<(uuid::Uuid, i64, Instant, WriterRowTuple)> =
+                    app_session_writers::table
+                        .inner_join(app_writers::table)
+                        .filter(app_session_writers::writer.eq_any(writers))
+                        .order(app_session_writers::bound_at)
+                        .select((
+                            app_session_writers::session_id,
+                            app_session_writers::first_seq,
+                            app_session_writers::bound_at,
+                            (
+                                app_writers::writer,
+                                app_writers::user_id,
+                                app_writers::device_key,
+                                app_writers::frontier,
+                                app_writers::head,
+                                app_writers::retired_at,
+                            ),
+                        ))
+                        .load(&mut *conn)
+                        .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(
+                        |(
+                            session_id,
+                            first_seq,
+                            bound_at,
+                            (writer, user_id, device_key, frontier, head, retired_at),
+                        )| SessionBind {
+                            session_id,
+                            first_seq,
+                            bound_at: bound_at.into(),
+                            writer: WriterRow {
+                                writer,
+                                user_id,
+                                device_key,
+                                frontier,
+                                head,
+                                retired_at: retired_at.map(From::from),
+                            },
+                        },
+                    )
+                    .collect())
+            })
+        }
     }
 
     pub struct AppSchema;
@@ -460,17 +576,6 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
     for stmt in [
         "DROP TABLE _connetto_settled",
         "DROP TABLE _connetto_writers",
-        "CREATE TABLE app_writers (\
-         writer BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY, \
-         user_id UUID, session_id UUID, device_key BYTEA UNIQUE, \
-         frontier BIGINT NOT NULL DEFAULT 0, head BYTEA, retired_at TIMESTAMPTZ)",
-        "CREATE TABLE app_settled (\
-         writer BIGINT NOT NULL, seq BIGINT NOT NULL, entry_hash BYTEA NOT NULL, \
-         previous_hash BYTEA NOT NULL, \
-         outcome TEXT NOT NULL, path connetto_settle_path NOT NULL, \
-         settled_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-         PRIMARY KEY (writer, seq))",
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON app_writers, app_settled TO app_reader",
         "CREATE TABLE connetto_sessions (\
          session_id UUID PRIMARY KEY, user_id UUID NOT NULL, \
          current_refresh_hash BYTEA NOT NULL, idle_deadline TIMESTAMPTZ NOT NULL, \
@@ -487,6 +592,9 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
         "DROP TABLE connetto_registration_codes",
         "DROP TABLE connetto_bots",
     ] {
+        exec(&pool, stmt).await;
+    }
+    for stmt in app::WRITERS_DDL {
         exec(&pool, stmt).await;
     }
     recreate_registry_over_uuid(&pool).await;

@@ -1,0 +1,118 @@
+[package]
+name = "connetto-leptos-demo"
+description = "Leptos web demo of the connetto browser topology: windows converging a synced orders list through Postgres and a device-private notes list through the DB worker."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["web"]
+# The browser layer, which drives connetto-web in the page and boots the DB
+# worker in a dedicated worker.
+web = [
+    "connetto-demo-support/web",
+    "dep:base64",
+    "dep:connetto-client",
+    "dep:connetto-file-core",
+    "dep:connetto-web",
+    "dep:rosetta-uuid",
+]
+# The Tauri layer, which sends every action over invoke to the native core in
+# `examples/tauri-leptos-demo/src-tauri` and renders the view it emits.
+tauri = ["dep:serde", "dep:serde-wasm-bindgen"]
+
+[dependencies]
+# The shared demo core, holding the view and the actions, the schema rows and
+# queries, the pane wording, and the browser pieces every browser demo carries.
+connetto-demo-support = { path = "../demo-support", default-features = false }
+# The browser platform with its transports, leader election, locks, the
+# relay hub and the DB worker orchestration, booted and attached through its
+# WebClientBuilder.
+connetto-web = { path = "../../crates/connetto-web", optional = true }
+# The client types the window drives (builder pieces, client, events), with
+# default features off for a wasm build with a browser transport.
+connetto-client = { path = "../../crates/connetto-client", default-features = false, optional = true }
+# FileId for the photo staging and the refused and lost lists.
+connetto-file-core = { path = "../../crates/connetto-file-core", optional = true }
+# The Leptos 0.8 csr build, as the Tauri UI uses.
+leptos = { version = "0.8", features = ["csr"] }
+# Client-authored primary keys, one strongly typed `rosetta_uuid::Uuid` that
+# maps to SQLite BLOB and Postgres uuid from a single schema, minted with the
+# browser CSPRNG through getrandom's wasm_js backend.
+rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite"], optional = true }
+# Local thumbnails travel as `data:` URLs, so the resolved bytes are encoded
+# here.
+base64 = { version = "0.22", optional = true }
+# The actions and the view cross invoke as plain JS objects.
+serde = { version = "1", features = ["derive"], optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+# Structured logging (R12). This demo emits through `tracing` and installs
+# the developer-console destination in `main`.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# `Blob`, `File` and `FileList` back the photo pick and the import pick,
+# `BroadcastChannel` the worker-to-page channels, `SaveFilePickerOptions`
+# and `FileSystemFileHandle` the save-as export, `Window` and `History` the
+# login popup and the code delivery.
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "BlobPropertyBag",
+    "BroadcastChannel",
+    "DedicatedWorkerGlobalScope",
+    "Document",
+    "Element",
+    "File",
+    "FileList",
+    "FileSystemFileHandle",
+    "FileSystemWritableFileStream",
+    "History",
+    "HtmlAnchorElement",
+    "HtmlInputElement",
+    "Location",
+    "MessageEvent",
+    "SaveFilePickerOptions",
+    "Storage",
+    "Url",
+    "Window",
+] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+futures-channel = "0.3"
+serde_json = "1"
+# The photo staging rows the browser tests load through their own tables.
+diesel = { version = "2", features = ["sqlite"] }
+serde = { version = "1", features = ["derive"] }
+
+[workspace]
+
+# Verbatim mirror of the root workspace patch blocks. Cargo patches do not
+# cross workspaces, so the demo needs the same routing or the diesel backed
+# graph will not resolve. The sources and revisions must match the root ones
+# exactly. The demo lockfile pins the rest of the graph.
+[patch.crates-io]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "master" }
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+
+[patch."https://github.com/diesel-rs/diesel"]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "master" }
+
+# Headless tests retain function names without loading DWARF into each browser worker.
+[profile.test]
+strip = "debuginfo"
+
+# Fast test iteration, release-grade optimization without the fat link.
+# Mirrors the root workspace profile of the same name.
+[profile.testfast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

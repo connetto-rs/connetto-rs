@@ -134,11 +134,11 @@ mod inner {
 
 pub use inner::{Client, ContentError, DemoContent, Transport};
 
-use crate::mime_from_extension;
-use crate::{Photo, photo_file_id, stage_photo_row};
+use connetto_demo_support as support;
 use connetto_file_core::FileId;
 use dioxus::prelude::*;
 use rosetta_uuid::Uuid;
+use support::Photo;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
@@ -164,7 +164,7 @@ impl DemoContent {
             let mut srcs: std::collections::HashMap<Uuid, PhotoSrc> =
                 std::collections::HashMap::new();
             for photo in photos {
-                let Some(fid) = photo_file_id(&photo.content_id) else {
+                let Some(fid) = support::photo_file_id(&photo.content_id) else {
                     continue;
                 };
                 let available = photo.content_state.as_deref() == Some("available");
@@ -205,7 +205,7 @@ impl DemoContent {
             let mut srcs: std::collections::HashMap<Uuid, PhotoSrc> =
                 std::collections::HashMap::new();
             for photo in photos {
-                let Some(fid) = photo_file_id(&photo.content_id) else {
+                let Some(fid) = support::photo_file_id(&photo.content_id) else {
                     continue;
                 };
                 let available = photo.content_state.as_deref() == Some("available");
@@ -254,28 +254,23 @@ impl DemoContent {
     /// Keeps the photos' files on this device under `photos`.
     pub async fn pin(&self) -> String {
         self.0
-            .pin_content("photos", "SELECT content_id FROM photos", "content_id")
+            .pin_content("photos", support::PIN_PHOTOS_QUERY, "content_id")
             .await
-            .map_or_else(
-                |err| format!("pin failed: {err}"),
-                |_| "pinned photos".to_owned(),
-            )
+            .map_or_else(support::pin_failed, |_| support::PIN_OK.to_owned())
     }
 
-    /// Ends the photos' pin.
     pub async fn unpin(&self) -> String {
-        self.0.unpin_content("photos").await.map_or_else(
-            |err| format!("unpin failed: {err}"),
-            |_| "unpinned photos".to_owned(),
-        )
+        self.0
+            .unpin_content("photos")
+            .await
+            .map_or_else(support::unpin_failed, |_| support::UNPIN_OK.to_owned())
     }
 
-    /// Fetches every pinned file the local store is missing.
     pub async fn fetch_pinned(&self) -> String {
-        self.0.fetch_pinned().await.map_or_else(
-            |err| format!("fetch failed: {err}"),
-            |ids| format!("fetched {} pinned file(s)", ids.len()),
-        )
+        self.0
+            .fetch_pinned()
+            .await
+            .map_or_else(support::fetch_failed, |ids| support::fetch_ok(ids.len()))
     }
 
     /// Evicts the unpinned, unreferenced content files.
@@ -284,10 +279,7 @@ impl DemoContent {
         let evicted = self.0.tidy().await;
         #[cfg(not(target_arch = "wasm32"))]
         let evicted = self.0.tidy_content().await;
-        evicted.map_or_else(
-            |err| format!("content tidy failed: {err}"),
-            |n| format!("content tidy: {n} file(s) evicted"),
-        )
+        evicted.map_or_else(support::tidy_failed, support::tidy_ok)
     }
 }
 
@@ -302,13 +294,13 @@ pub async fn stage_picked(
     name: &str,
     identity: String,
 ) -> String {
-    let Some(mime) = mime_from_extension(std::path::Path::new(name)) else {
+    let Some(mime) = support::mime_from_extension(std::path::Path::new(name)) else {
         return "not an image: only .jpg .jpeg .png are accepted".to_owned();
     };
     match content
         .0
         .stage(blob, mime, client, move |conn, file_id| {
-            stage_photo_row(conn, file_id, &identity)
+            support::stage_photo_row(conn, file_id, &identity)
         })
         .await
     {
@@ -328,7 +320,7 @@ pub async fn stage_picked(
     bytes: Result<Vec<u8>, String>,
     identity: String,
 ) -> String {
-    let Some(mime) = mime_from_extension(std::path::Path::new(name)) else {
+    let Some(mime) = support::mime_from_extension(std::path::Path::new(name)) else {
         return "not an image: only .jpg .jpeg .png are accepted".to_owned();
     };
     let Ok(bytes) = bytes else {
@@ -337,7 +329,7 @@ pub async fn stage_picked(
     match content
         .0
         .stage(bytes.as_slice(), mime, move |conn, file_id| {
-            stage_photo_row(conn, file_id, &identity)
+            support::stage_photo_row(conn, file_id, &identity)
         })
         .await
     {
@@ -371,7 +363,7 @@ pub fn watch_content_events(
     spawn(async move {
         let mut rx = cc.client().events();
         while let Ok(event) = rx.recv().await {
-            feed_status.set(Some(native::content_label(&event)));
+            feed_status.set(Some(support::native::content_label(&event)));
             match event {
                 connetto_file_client::ContentEvent::UploadRefused { file_id, detail } => {
                     if !refused.read().iter().any(|(id, _)| *id == file_id) {

@@ -559,6 +559,34 @@ async fn a_crossed_threshold_bans_the_person_and_refuses_the_next_handshake() {
     );
 }
 
+/// The guard tells its ban hook which identity it banned, once the ban is
+/// written, which is how the server ends every session of that identity
+/// (R105 decision 8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ban_tells_its_hook_the_banned_identity() {
+    let fixture = Fixture::acquire().await;
+    reset_tables(&fixture).await;
+    let guard = guard(&fixture, limits(2, 1), None);
+    let told = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&told);
+    guard.set_ban_hook(Arc::new(move |user: String| sink.lock().push(user)));
+    let manager = manager(&fixture, silent_policy(), &guard);
+
+    let mut live = connect(&manager, "prober", &["user:alice#one"]).await;
+    probe(&mut live.client, "ghost-0").await;
+    probe(&mut live.client, "ghost-1").await;
+    await_ban(fixture.admin(), "alice").await;
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    while told.lock().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the hook was never told"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(*told.lock(), vec!["alice".to_owned()]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_application_decides_the_outcome_and_silence_takes_the_proposal() {
     let fixture = Fixture::acquire().await;

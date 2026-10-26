@@ -219,7 +219,7 @@
       <text x="142" y="13" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Re-execution read tier</text>
       <text x="142" y="25" text-anchor="middle" font-size="8" fill="#555">MIN, MAX, joins, row shapes via the server's connector</text>
       <text x="142" y="37" text-anchor="middle" font-size="8" fill="#4CAF50">per-viewer runs on RLS tables: each viewer's own answer</text>
-      <text x="142" y="49" text-anchor="middle" font-size="8" fill="#C62828">a failing read ends its subscription, not live delivery: R89</text>
+      <text x="142" y="49" text-anchor="middle" font-size="8" fill="#4CAF50">built: a failing read ends its subscription, not live delivery (R89)</text>
     </g>
 
     <g transform="translate(558, 724)">
@@ -474,7 +474,7 @@
     <g transform="translate(1008, 764)">
       <rect width="296" height="44" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="44" rx="1" fill="#4CAF50" />
-      <text x="148" y="17" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Dioxus / Yew app (WASM)</text>
+      <text x="148" y="17" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Dioxus / Yew / Leptos app (WASM)</text>
       <text x="148" y="33" text-anchor="middle" font-size="9" fill="#888">UI rendering, reactive signals</text>
     </g>
     <g transform="translate(1320, 764)">
@@ -651,5 +651,5 @@
   </g>
 
   <!-- Title -->
-  <text x="20" y="1704" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-10-18 to the plan's current state.</text>
+  <text x="20" y="1704" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-10-26 to the plan's current state.</text>
 </svg>

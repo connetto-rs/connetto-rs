@@ -1,20 +1,12 @@
-//! Tauri's build step, the deployment schema translated for the replica,
-//! and the deployment root a `device-identity` build ships.
+//! Tauri's build step and the deployment root a `device-identity` build ships.
+//! The schema comes from `connetto-demo-support`, which translates it with the
+//! demos' local tier.
 
 /// The path of the deployment root's `root.der`, which `connetto-demo-stack`
 /// mints and names to the program it runs.
 const DEVICE_ROOT: &str = "CONNETTO_DEMO_BUILD_DEVICE_ROOT";
 
 fn main() {
-    // The deployment schema the demos share, so one demo stack serves both.
-    connetto_schema::emit::<String, connetto_schema::TextIds>(
-        std::path::Path::new("../../deployment/schema.sql"),
-        std::path::Path::new("../../deployment/policies.sql"),
-        None,
-        &[],
-    )
-    .expect("translate the demo's schema");
-
     if std::env::var_os("CARGO_FEATURE_DEVICE_IDENTITY").is_some() {
         println!("cargo:rerun-if-env-changed={DEVICE_ROOT}");
         // The Tauri CLI hands Xcode's build only CARGO_, RUST_ and TAURI

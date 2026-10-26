@@ -267,3 +267,10 @@ impl Activity {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/it/http.rs"]
+mod test_http;
+
+#[cfg(test)]
+mod tests;

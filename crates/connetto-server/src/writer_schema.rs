@@ -7,7 +7,7 @@
 //! [`connetto_writers_table!`](crate::connetto_writers_table), and names it as
 //! the `Writers` member of its [`ConnettoSchema`](crate::schema::ConnettoSchema).
 //!
-//! Two tables carry the domain. `_connetto_writers` holds one row per writer
+//! Three tables carry the domain. `_connetto_writers` holds one row per writer
 //! with its applied frontier: `writer` (a number the server issues; a number
 //! writer's number is its own `writer` value), `user_id` (the account, absent
 //! for an anonymous caller), `device_key` (the device key's id, absent for a
@@ -17,6 +17,10 @@
 //! entry's chain hash, its outcome as JSON text, the path that settled it and
 //! the settle time. The frontier counts every final answer, applied, refused
 //! or conflicted, and every path takes only the frontier plus one.
+//! `_connetto_session_writers` holds one row per identified session and writer
+//! it bound, with the first sequence still to settle at that session's first
+//! bind, which is how a session's writes are told from another's on the same
+//! writer (R105 decision 6).
 //!
 //! Every associated statement is laundered as a boxed future because the
 //! diesel `future` trait solver cannot name the `INSERT ... ON CONFLICT ...
@@ -38,6 +42,14 @@ use std::io::Write as _;
 
 /// The Postgres enum type backing the settle `path` column.
 pub const SETTLE_PATH_TYPE: &str = "connetto_settle_path";
+
+/// The setting a write binds its writer's number to unless the deployment's
+/// [`ConnettoWriterSchema`] names another.
+pub const DEFAULT_WRITER_SETTING: &str = "app.writer";
+
+/// The setting a write binds its sequence to unless the deployment's
+/// [`ConnettoWriterSchema`] names another.
+pub const DEFAULT_SEQ_SETTING: &str = "app.writer_seq";
 
 /// The Postgres enum type marker for [`SettlePath`].
 #[derive(diesel::SqlType, diesel::query_builder::QueryId)]
@@ -196,6 +208,19 @@ pub struct SettledRow {
     pub path: SettlePath,
 }
 
+/// One session's bind of one writer, as the schema reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBind<Id> {
+    /// The auth-store session that bound the writer.
+    pub session_id: uuid::Uuid,
+    /// The writer's frontier plus one at the session's first bind.
+    pub first_seq: i64,
+    /// When the session first bound it.
+    pub bound_at: SystemTime,
+    /// The writer's row.
+    pub writer: WriterRow<Id>,
+}
+
 /// The writer tables, laundered one statement per member.
 ///
 /// Every `fn` member builds the statement it names; the impl runs it on the
@@ -208,6 +233,15 @@ pub trait ConnettoWriterSchema: Send + Sync + 'static {
     /// The tables this member reads and writes, by name, which startup
     /// requires to exist (R98 decision 5).
     const TABLES: &'static [&'static str];
+
+    /// The setting a write transaction binds its writer's number to, beside
+    /// the caller's identity, so a deployment stamps its rows with a column
+    /// default or trigger reading it.
+    const WRITER_SETTING: &'static str = DEFAULT_WRITER_SETTING;
+
+    /// The setting a write transaction binds its sequence to, beside
+    /// [`WRITER_SETTING`](Self::WRITER_SETTING).
+    const SEQ_SETTING: &'static str = DEFAULT_SEQ_SETTING;
 
     /// `INSERT _connetto_writers (user_id, session_id) RETURNING writer,
     /// frontier`, the issue of a fresh number writer at frontier 0. The
@@ -300,6 +334,23 @@ pub trait ConnettoWriterSchema: Send + Sync + 'static {
     fn prune_all(conn: &mut AsyncPgConnection, writer: i64) -> Statement<'_, i64>;
     /// `SELECT writer, device_key` of every device writer, the sweep's input.
     fn device_writers(conn: &mut AsyncPgConnection) -> Statement<'_, Vec<(i64, Option<Vec<u8>>)>>;
+    /// `INSERT ... (session_id, writer, first_seq) ON CONFLICT (session_id,
+    /// writer) DO NOTHING`, the identified session `session_id` binding
+    /// `writer` when `first_seq` was the next sequence to settle. A session's
+    /// later binds of the same writer keep its first.
+    fn bind_session<'c>(
+        conn: &'c mut AsyncPgConnection,
+        session_id: &'c uuid::Uuid,
+        writer: i64,
+        first_seq: i64,
+    ) -> Statement<'c, ()>;
+    /// Every bind of every writer `session_id` bound, other sessions' binds
+    /// of those writers included, each with its writer's row, in bind order.
+    /// Empty when the session bound none.
+    fn binds_of<'c>(
+        conn: &'c mut AsyncPgConnection,
+        session_id: &'c uuid::Uuid,
+    ) -> Statement<'c, Vec<SessionBind<Self::Id>>>;
 }
 
 /// Generate the default connetto writer tables and their
@@ -312,10 +363,10 @@ pub trait ConnettoWriterSchema: Send + Sync + 'static {
 /// `connetto_settle_path` enum this depends on, is in
 /// `docs/architecture/11-authentication.md`.
 ///
-/// Invoked at module scope, it emits the `_connetto_writers` and
-/// `_connetto_settled` `diesel::table!` modules and a unit struct
-/// `ConnettoWriters` implementing the trait. The caller needs `diesel` and
-/// `diesel_async` in scope.
+/// Invoked at module scope, it emits the `_connetto_writers`,
+/// `_connetto_settled` and `_connetto_session_writers` `diesel::table!`
+/// modules and a unit struct `ConnettoWriters` implementing the trait. The
+/// caller needs `diesel` and `diesel_async` in scope.
 ///
 /// ```ignore
 /// connetto_server::connetto_writers_table!(String, diesel::sql_types::Text);
@@ -374,7 +425,27 @@ macro_rules! connetto_writers_table {
             }
         }
 
-        diesel::allow_tables_to_appear_in_same_query!(_connetto_writers, _connetto_settled,);
+        diesel::table! {
+            /// One session's bind of one writer (R105 decision 6): the first
+            /// sequence still to settle when the session first bound it.
+            _connetto_session_writers (session_id, writer) {
+                /// The auth-store session that bound the writer.
+                session_id -> diesel::sql_types::Uuid,
+                /// The writer it bound.
+                writer -> diesel::sql_types::BigInt,
+                /// The writer's frontier plus one at the session's first bind.
+                first_seq -> diesel::sql_types::BigInt,
+                /// When the session first bound it, defaulted by the column.
+                bound_at -> diesel::sql_types::Timestamptz,
+            }
+        }
+
+        diesel::joinable!(_connetto_session_writers -> _connetto_writers (writer));
+        diesel::allow_tables_to_appear_in_same_query!(
+            _connetto_writers,
+            _connetto_settled,
+            _connetto_session_writers,
+        );
 
         /// The default connetto writer schema over the deployment's `Id` type.
         #[derive(Debug, Clone, Copy, Default)]
@@ -382,7 +453,11 @@ macro_rules! connetto_writers_table {
 
         impl $crate::writer_schema::ConnettoWriterSchema for ConnettoWriters {
             type Id = $id;
-            const TABLES: &'static [&'static str] = &["_connetto_writers", "_connetto_settled"];
+            const TABLES: &'static [&'static str] = &[
+                "_connetto_writers",
+                "_connetto_settled",
+                "_connetto_session_writers",
+            ];
 
             fn issue(
                 conn: &mut diesel_async::AsyncPgConnection,
@@ -757,6 +832,120 @@ macro_rules! connetto_writers_table {
                         (_connetto_writers::writer, _connetto_writers::device_key),
                     );
                     RunQueryDsl::load(query, &mut *conn).await
+                })
+            }
+
+            fn bind_session<'c>(
+                conn: &'c mut diesel_async::AsyncPgConnection,
+                session_id: &'c uuid::Uuid,
+                writer: i64,
+                first_seq: i64,
+            ) -> $crate::writer_schema::Statement<'c, ()> {
+                Box::pin(async move {
+                    use diesel::ExpressionMethods as _;
+                    use diesel_async::RunQueryDsl as _;
+                    diesel::insert_into(_connetto_session_writers::table)
+                        .values((
+                            _connetto_session_writers::session_id.eq(*session_id),
+                            _connetto_session_writers::writer.eq(writer),
+                            _connetto_session_writers::first_seq.eq(first_seq),
+                        ))
+                        .on_conflict((
+                            _connetto_session_writers::session_id,
+                            _connetto_session_writers::writer,
+                        ))
+                        .do_nothing()
+                        .execute(&mut *conn)
+                        .await
+                        .map(drop)
+                })
+            }
+
+            fn binds_of<'c>(
+                conn: &'c mut diesel_async::AsyncPgConnection,
+                session_id: &'c uuid::Uuid,
+            ) -> $crate::writer_schema::Statement<
+                'c,
+                Vec<$crate::writer_schema::SessionBind<Self::Id>>,
+            > {
+                Box::pin(async move {
+                    use diesel::{ExpressionMethods as _, QueryDsl};
+                    use diesel_async::RunQueryDsl;
+                    let writers: Vec<i64> = RunQueryDsl::load(
+                        QueryDsl::select(
+                            QueryDsl::filter(
+                                _connetto_session_writers::table,
+                                _connetto_session_writers::session_id.eq(*session_id),
+                            ),
+                            _connetto_session_writers::writer,
+                        ),
+                        &mut *conn,
+                    )
+                    .await?;
+                    let query = QueryDsl::order(
+                        QueryDsl::select(
+                            QueryDsl::filter(
+                                QueryDsl::inner_join(
+                                    _connetto_session_writers::table,
+                                    _connetto_writers::table,
+                                ),
+                                _connetto_session_writers::writer.eq_any(writers),
+                            ),
+                            (
+                                _connetto_session_writers::session_id,
+                                _connetto_session_writers::first_seq,
+                                _connetto_session_writers::bound_at,
+                                _connetto_writers::writer,
+                                _connetto_writers::user_id,
+                                _connetto_writers::device_key,
+                                _connetto_writers::frontier,
+                                _connetto_writers::head,
+                                _connetto_writers::retired_at,
+                            ),
+                        ),
+                        _connetto_session_writers::bound_at,
+                    );
+                    let rows: Vec<(
+                        uuid::Uuid,
+                        i64,
+                        $crate::authn::schema::Instant,
+                        i64,
+                        Option<$id>,
+                        Option<Vec<u8>>,
+                        i64,
+                        Option<Vec<u8>>,
+                        Option<$crate::authn::schema::Instant>,
+                    )> = RunQueryDsl::load(query, &mut *conn).await?;
+                    Ok(rows
+                        .into_iter()
+                        .map(
+                            |(
+                                session_id,
+                                first_seq,
+                                bound_at,
+                                writer,
+                                user_id,
+                                device_key,
+                                frontier,
+                                head,
+                                retired_at,
+                            )| {
+                                $crate::writer_schema::SessionBind {
+                                    session_id,
+                                    first_seq,
+                                    bound_at: bound_at.into(),
+                                    writer: $crate::writer_schema::WriterRow {
+                                        writer,
+                                        user_id,
+                                        device_key,
+                                        frontier,
+                                        head,
+                                        retired_at: retired_at.map(From::from),
+                                    },
+                                }
+                            },
+                        )
+                        .collect())
                 })
             }
         }

@@ -1,9 +1,11 @@
-//! Build-time schema pipeline for this demo.
+//! Build-time schema pipeline for the shared demo support crate.
 //!
-//! The demo shares the deployment's synced schema and policies and adds its
-//! own local tier, so it runs the shared schema step over those three.
+//! The crate shares the deployment's synced schema and policies and the
+//! demos' local tier, so its `client` feature runs the schema step over those
+//! three. A build without that feature holds no schema.
 
 fn main() {
+    #[cfg(feature = "client")]
     connetto_schema::emit::<String, connetto_schema::TextIds>(
         std::path::Path::new("../deployment/schema.sql"),
         std::path::Path::new("../deployment/policies.sql"),

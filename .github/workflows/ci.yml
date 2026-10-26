@@ -28,7 +28,7 @@ jobs:
     name: Check ${{ matrix.name }}
     # Only pushes and same-repository pull requests may reach the self-hosted
     # runners on emi. LINUX_LIGHT names their scale set, and unset it means GitHub's.
-    runs-on: &light-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT || 'ubuntu-latest' }}
+    runs-on: &light-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT || 'ubuntu-26.04' }}
     timeout-minutes: 40
     # --all-features turns on the demo's device-identity feature, whose build
     # embeds a deployment root. These jobs never run the demo, so any file serves.
@@ -57,10 +57,22 @@ jobs:
             cwd: examples/dioxus-demo
             target: --target wasm32-unknown-unknown
             flags: --no-default-features --features web
+          - name: leptos-demo wasm
+            cwd: examples/leptos-demo
+            target: --target wasm32-unknown-unknown
+            flags: ""
+          - name: leptos-demo tauri wasm
+            cwd: examples/leptos-demo
+            target: --target wasm32-unknown-unknown
+            flags: --no-default-features --features tauri
           - name: yew-web-demo wasm
             cwd: examples/yew-web-demo
             target: --target wasm32-unknown-unknown
             flags: --all-features
+          - name: demo-support wasm
+            cwd: examples/demo-support
+            target: --target wasm32-unknown-unknown
+            flags: --features web
           - name: webauthn-unlock wasm
             cwd: examples/webauthn-unlock
             target: --target wasm32-unknown-unknown
@@ -72,10 +84,6 @@ jobs:
           - name: tauri-leptos-demo native
             cwd: examples/tauri-leptos-demo
             target: ""
-            flags: --all-features
-          - name: tauri-leptos-demo ui wasm
-            cwd: examples/tauri-leptos-demo/ui
-            target: --target wasm32-unknown-unknown
             flags: --all-features
     steps:
       - uses: actions/checkout@v7
@@ -104,11 +112,11 @@ jobs:
         if: matrix.cwd == 'examples/dioxus-demo' || matrix.cwd == 'examples/tauri-leptos-demo' || matrix.cwd == '.'
         uses: $/.github/actions/install-desktop-deps
 
-      # Tauri's context macro needs the UI's output directory, which only the
-      # Tauri CLI fills, and a check never serves the UI.
+      # Tauri's context macro needs the frontend's output directory, which
+      # only the Tauri CLI fills, and a check never builds the UI.
       - name: Stand in for the Tauri demo's UI build
         if: matrix.cwd == 'examples/tauri-leptos-demo'
-        run: mkdir -p examples/tauri-leptos-demo/ui/dist
+        run: mkdir -p examples/leptos-demo/dist-tauri
 
       - name: Check formatting
         working-directory: ${{ matrix.cwd }}
@@ -181,10 +189,10 @@ jobs:
       - name: Install desktop dependencies
         uses: $/.github/actions/install-desktop-deps
 
-      # Tauri's context macro needs the UI's output directory, which only the
-      # Tauri CLI fills, and a lint never serves the UI.
+      # Tauri's context macro needs the frontend's output directory, which
+      # only the Tauri CLI fills, and a lint never builds the UI.
       - name: Stand in for the Tauri demo's UI build
-        run: mkdir -p examples/tauri-leptos-demo/ui/dist
+        run: mkdir -p examples/leptos-demo/dist-tauri
 
       # Every workspace runs even after one fails, so one report lists them all.
       - name: Run nightly clippy
@@ -202,10 +210,12 @@ jobs:
           examples/wasm-smoke --all-features --target=wasm32-unknown-unknown
           examples/dioxus-demo --no-default-features --features=web --target=wasm32-unknown-unknown
           examples/yew-web-demo --all-features --target=wasm32-unknown-unknown
+          examples/leptos-demo --target=wasm32-unknown-unknown
+          examples/leptos-demo --no-default-features --features=tauri --target=wasm32-unknown-unknown
+          examples/demo-support --features=web --target=wasm32-unknown-unknown
           examples/webauthn-unlock --all-features --target=wasm32-unknown-unknown
           examples/dioxus-demo --all-features
           examples/tauri-leptos-demo --all-features
-          examples/tauri-leptos-demo/ui --all-features --target=wasm32-unknown-unknown
           EOF
           if [ "${#failed[@]}" -gt 0 ]; then
             echo "::error::nightly clippy failed in ${failed[*]}"
@@ -326,7 +336,7 @@ jobs:
     # not check.
     name: iOS simulator proof
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
@@ -493,7 +503,7 @@ jobs:
     name: Rust tests ${{ matrix.name }}
     # Only pushes and same-repository pull requests may reach the self-hosted
     # runners on emi. LINUX_HEAVY names their scale set, and unset it means GitHub's.
-    runs-on: &heavy-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_HEAVY || 'ubuntu-latest' }}
+    runs-on: &heavy-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_HEAVY || 'ubuntu-26.04' }}
     # A same-repository pull request runs these suites once, instrumented, in
     # coverage.yml. Forks and Dependabot get no Codecov token, and main runs
     # them here in release.
@@ -544,6 +554,7 @@ jobs:
               -p connetto-dioxus
               -p connetto-yew
               -p connetto-peer
+              -p connetto-demo-support
             bins: ''
     steps:
       - uses: actions/checkout@v7
@@ -576,7 +587,7 @@ jobs:
       - name: Install keyring helpers
         run: |
           sudo apt-get update
-          sudo apt-get install -y keyutils dbus gnome-keyring
+          sudo apt-get install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
 
       # --all-features turns on connetto-dioxus's desktop feature.
       - name: Install desktop dependencies
@@ -663,7 +674,7 @@ jobs:
       - name: Install keyring helpers
         run: |
           sudo apt-get update
-          sudo apt-get install -y keyutils dbus gnome-keyring
+          sudo apt-get install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
 
       - uses: taiki-e/install-action@nextest
 
@@ -725,7 +736,7 @@ jobs:
     # This job hands its binaries to the shards and the Android proof, so all
     # of them run on emi only while both scale-set variables name emi pools,
     # since put-files and get-files must pick the same store.
-    runs-on: &paired-heavy-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_LIGHT && vars.LINUX_HEAVY || 'ubuntu-latest' }}
+    runs-on: &paired-heavy-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(vars.LINUX_LIGHT, 'ubuntu-') && !startsWith(vars.LINUX_HEAVY, 'ubuntu-') && vars.LINUX_LIGHT && vars.LINUX_HEAVY || 'ubuntu-26.04' }}
     # The server and the topology test binary, built once here instead of in
     # every shard, where they were most of the budget. Pull requests build
     # them in testfast like the Rust test jobs, and the harness reads the same
@@ -760,6 +771,11 @@ jobs:
 
       - name: Install stable browser toolchain
         uses: $/.github/actions/install-rust
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Build the browser stack
         run: |
@@ -823,7 +839,7 @@ jobs:
     name: Browser tests ${{ matrix.shard }}/4
     needs: browser-build
     # Light VMs sit idle once the checks finish, while the heavy ones still run the suites.
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_HEAVY && vars.LINUX_LIGHT || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(vars.LINUX_LIGHT, 'ubuntu-') && !startsWith(vars.LINUX_HEAVY, 'ubuntu-') && vars.LINUX_HEAVY && vars.LINUX_LIGHT || 'ubuntu-26.04' }}
     # A shard runs a quarter of the suites against its own machine-local
     # stack from the prebuilt binaries, so the serial rule inside one process
     # holds while the wall clock divides by four.

@@ -1358,6 +1358,32 @@ name = "connetto-demo-deployment"
 version = "0.0.0"
 
 [[package]]
+name = "connetto-demo-support"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "connetto-auth-session",
+ "connetto-client",
+ "connetto-core",
+ "connetto-demo-deployment",
+ "connetto-file-client",
+ "connetto-file-core",
+ "connetto-schema",
+ "connetto-web",
+ "diesel",
+ "js-sys",
+ "manganis",
+ "rosetta-uuid",
+ "serde",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "connetto-dioxus"
 version = "0.0.0"
 dependencies = [
@@ -1375,21 +1401,18 @@ dependencies = [
 name = "connetto-dioxus-demo"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "axum",
  "base64 0.22.1",
- "chrono",
- "connetto-auth-session",
  "connetto-client",
  "connetto-core",
  "connetto-demo-deployment",
+ "connetto-demo-support",
  "connetto-dioxus",
  "connetto-file-client",
  "connetto-file-core",
  "connetto-file-server",
  "connetto-peer-android",
  "connetto-peer-apple",
- "connetto-schema",
  "connetto-server",
  "connetto-test-harness",
  "connetto-web",

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["src-tauri", "ui"]
+members = ["src-tauri"]
 
 # Verbatim mirror of the root workspace patch blocks. Cargo patches do not
 # cross workspaces, so the demo needs the same routing or the diesel backed

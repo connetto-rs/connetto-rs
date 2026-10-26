@@ -485,7 +485,8 @@ async fn authorization_facts_across_a_restore() {
             "CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'",
             "GRANT USAGE ON SCHEMA public TO app_reader",
             "GRANT SELECT ON docs, project_members TO app_reader",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reader",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+             _connetto_session_writers TO app_reader",
             "INSERT INTO project_members VALUES (1, 'alice')",
         ])
         .await;

@@ -37,6 +37,11 @@ use crate::throttle::{AuthThrottle, ByteThrottle, Counters, HandleThrottle, Thro
 /// registry holds.
 pub type PersonCloseHook = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Told the identity a ban was just written for, so the server ends every
+/// session of it (R105 decision 8). Fired synchronously on the ban's task,
+/// so async work belongs on a spawned task inside the hook.
+pub type BanHook<Id> = Arc<dyn Fn(Id) + Send + Sync>;
+
 /// Who a session belongs to, as this process saw it succeed.
 ///
 /// Both forms are kept: the rendering because an `Id` guarantees no `Eq + Hash`,
@@ -127,6 +132,7 @@ pub struct RequestGuard<Id> {
     enforcement: Option<Arc<dyn EnforcementPolicy<Id>>>,
     audit: OnceLock<AuditHook<Id>>,
     close: OnceLock<PersonCloseHook>,
+    ban: OnceLock<BanHook<Id>>,
     reader: Option<ReaderGate>,
 }
 
@@ -176,6 +182,7 @@ where
             enforcement: None,
             audit: OnceLock::new(),
             close: OnceLock::new(),
+            ban: OnceLock::new(),
             reader: None,
         }
     }
@@ -257,6 +264,12 @@ where
     /// after the session manager exists.
     pub fn set_close_hook(&self, hook: PersonCloseHook) {
         let _ = self.close.set(hook);
+    }
+
+    /// Attach the observer told each banned identity, once, after the auth
+    /// service exists, so a ban ends every session of the identity.
+    pub fn set_ban_hook(&self, hook: BanHook<Id>) {
+        let _ = self.ban.set(hook);
     }
 
     /// Whether a ban list is attached, which is whether banning is possible.
@@ -516,6 +529,7 @@ where
         let policy = self.enforcement.clone();
         let audit = self.audit.get().cloned();
         let close = self.close.get().cloned();
+        let ended = self.ban.get().cloned();
         tokio::spawn(async move {
             let verdict = match policy {
                 Some(policy) => policy.on_threshold(&crossing).await,
@@ -563,6 +577,9 @@ where
                     Some(crossing.user_id.clone()),
                     AuthOp::Banned,
                 ));
+            }
+            if let Some(ended) = ended {
+                ended(crossing.user_id.clone());
             }
             // Without the hook the ban is durable but the caller keeps whatever
             // connections it holds until they end on their own, which defeats

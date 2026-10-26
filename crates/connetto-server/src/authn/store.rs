@@ -163,13 +163,34 @@ pub trait AuthStore: Send + Sync {
     /// none, `None` when a describe callback must supply one.
     fn undescribed() -> Option<Self::Descriptor>;
 
-    /// Resolve `identity` to a `user_id`, create a session recording where
-    /// it came from, and return it with its first refresh token.
+    /// Resolve `identity` to the deployment's `user_id`, which sign-in reads
+    /// the ban list for before any session exists (R105 decision 8).
+    fn resolve(
+        &self,
+        identity: &ResolvedIdentity,
+    ) -> impl Future<Output = Result<Self::Id, AuthStoreError>> + Send;
+
+    /// Create a session for `user_id`, the person `identity` resolved to,
+    /// recording where it came from, and return it with its first refresh
+    /// token.
+    fn create_session_for(
+        &self,
+        user_id: Self::Id,
+        identity: &ResolvedIdentity,
+        origin: SessionOrigin<Self::Descriptor>,
+    ) -> impl Future<Output = Result<IssuedSession<Self::Id>, AuthStoreError>> + Send;
+
+    /// Resolve `identity` and create a session for it.
     fn create_session(
         &self,
         identity: &ResolvedIdentity,
         origin: SessionOrigin<Self::Descriptor>,
-    ) -> impl Future<Output = Result<IssuedSession<Self::Id>, AuthStoreError>> + Send;
+    ) -> impl Future<Output = Result<IssuedSession<Self::Id>, AuthStoreError>> + Send {
+        async move {
+            let user_id = self.resolve(identity).await?;
+            self.create_session_for(user_id, identity, origin).await
+        }
+    }
 
     /// How the session began and when it last refreshed, `None` when the id
     /// names no session.
@@ -422,13 +443,21 @@ impl<
         Some(())
     }
 
-    async fn create_session(
+    async fn resolve(&self, identity: &ResolvedIdentity) -> Result<Id, AuthStoreError> {
+        Ok(self.resolver.resolve(&identity.verified_claims()).await?)
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn create_session_for(
         &self,
+        user_id: Id,
         identity: &ResolvedIdentity,
         origin: SessionOrigin<()>,
     ) -> Result<IssuedSession<Id>, AuthStoreError> {
         let now = (self.clock)();
-        let user_id = self.resolver.resolve(&identity.verified_claims()).await?;
         let context = AuthContext { user_id };
         let session_id = new_session_id();
         let secret = new_refresh_secret();
@@ -759,12 +788,16 @@ mod db {
             <D::Auth as ConnettoStoreSchema>::undescribed()
         }
 
-        async fn create_session(
+        async fn resolve(&self, identity: &ResolvedIdentity) -> Result<Self::Id, AuthStoreError> {
+            Ok(self.resolver.resolve(&identity.verified_claims()).await?)
+        }
+
+        async fn create_session_for(
             &self,
+            user_id: Self::Id,
             identity: &ResolvedIdentity,
             origin: SessionOrigin<Self::Descriptor>,
         ) -> Result<IssuedSession<Self::Id>, AuthStoreError> {
-            let user_id = self.resolver.resolve(&identity.verified_claims()).await?;
             let secret = new_refresh_secret();
             let session_id = new_session_id();
             let mut conn = self.pool.get().await.map_err(backend)?;

@@ -7,6 +7,7 @@
 
 mod abuse;
 mod anonymous_writer;
+mod ban_doors;
 mod bot_cap;
 mod bot_proof;
 mod bot_registration;
@@ -135,6 +136,8 @@ mod subscription_translate;
 mod throttle;
 
 mod write_path;
+
+mod write_attribution;
 
 mod writer_frontier;
 

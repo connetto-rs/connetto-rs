@@ -247,7 +247,8 @@ pub(crate) async fn setup_reader_admitting(
             "GRANT EXECUTE ON FUNCTION connetto_visible_files(bytea[]) TO app_reader",
             // The writer tables are provisioned by the fixture; the write
             // target runs as this role and needs DML on them.
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reader",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+             _connetto_session_writers TO app_reader",
         ])
         .await;
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(with_user(
@@ -292,7 +293,8 @@ pub(crate) async fn setup_slow_reader(fixture: &Fixture) -> Pool<AsyncPgConnecti
              END; $$",
             "GRANT USAGE ON SCHEMA public TO app_reader",
             "GRANT EXECUTE ON FUNCTION connetto_visible_files(bytea[]) TO app_reader",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reader",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+             _connetto_session_writers TO app_reader",
         ])
         .await;
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(with_user(

@@ -310,6 +310,31 @@ impl PageSession {
         }
     }
 
+    /// Wait until the button labelled `label` is present and enabled, then
+    /// click it.
+    ///
+    /// # Errors
+    ///
+    /// When the button is never enabled within `limit`, naming what the page
+    /// shows, or as [`Self::call`].
+    pub async fn click_when_enabled(&mut self, label: &str, limit: Duration) -> Result<()> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let script = format!(
+                "(() => {{ const b = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === {}); if (!b || b.disabled) return false; b.click(); return true; }})()",
+                serde_json::Value::String(label.to_owned())
+            );
+            if self.evaluate(&script).await? == true {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let page = self.page_text().await.unwrap_or_default();
+                bail!("the button {label:?} was never enabled, the page shows:\n{page}");
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     /// Focus the input named `name` and put `text` into it, typed as trusted
     /// input over `DevTools` and set by the page with an `input` event over
     /// `WebKit`.
@@ -421,6 +446,56 @@ mod tests {
             }
         });
         format!("ws://{address}")
+    }
+
+    /// A `DevTools` endpoint answering each `Runtime.evaluate` with the next
+    /// boolean of `replies`.
+    async fn bool_endpoint(replies: Vec<bool>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for reply in replies {
+                let Some(Ok(Message::Text(text))) = socket.next().await else {
+                    return;
+                };
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let answer = serde_json::json!({
+                    "id": request["id"],
+                    "result": { "result": { "type": "boolean", "value": reply } },
+                });
+                socket
+                    .send(Message::Text(answer.to_string()))
+                    .await
+                    .unwrap();
+            }
+        });
+        format!("ws://{address}")
+    }
+
+    /// A click waits for the button to stand enabled, and clicks it the
+    /// moment it does.
+    #[tokio::test]
+    async fn a_click_waits_for_the_button_to_stand_enabled() {
+        let url = bool_endpoint(vec![false, false, true]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.click_when_enabled("Sign in", Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    /// A click on a button that never stands enabled fails within its bound
+    /// and names what the page shows.
+    #[tokio::test]
+    async fn a_click_fails_when_the_button_never_stands_enabled() {
+        let url = bool_endpoint(vec![false, false]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        let error = page
+            .click_when_enabled("Sign in", Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("never enabled"), "{error:#}");
     }
 
     /// A `WebKit` target endpoint, which has no `Input` domain, answering

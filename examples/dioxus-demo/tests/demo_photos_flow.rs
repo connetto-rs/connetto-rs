@@ -32,7 +32,7 @@ use connetto_client::{
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_core::transport::LoopbackTransport;
 use connetto_demo_deployment::{CONTENT_SQL, POLICIES_SQL, ROLES_SQL, SCHEMA_SQL};
-use connetto_dioxus_demo::{demo_schema, notes, photos, stage_photo_row};
+use connetto_demo_support::{demo_schema, notes, photos, stage_photo_row};
 use connetto_file_client::{ContentClient, FsStore, MimeClass, ReqwestHttp, Resolved};
 use connetto_file_server::{
     AppPools, Config, DefaultFileSchema, FsStore as ServerStore, TicketSigner, TicketVerifier,
@@ -303,7 +303,8 @@ async fn provision(fixture: &Fixture) {
             "GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO app_writer",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON order_lines TO app_writer",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON photos TO app_writer",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_writer",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+             _connetto_session_writers TO app_writer",
             "GRANT SELECT ON _cfs_manifests TO app_writer",
             "GRANT SELECT ON _cfs_manifest_chunks TO app_writer",
         ])
