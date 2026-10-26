@@ -64,6 +64,9 @@ The drawing below is the whole system coloured by build status. It is too dense 
 | `connetto-web` | Browser platform on wasm32, the DB worker, the relay, storage and custody |
 | `connetto-dioxus`, `connetto-yew` | Framework adapters exposing live queries as hooks |
 | `connetto-file-core`, `connetto-file-server`, `connetto-file-client` | The file stack, which depends on connetto and never the reverse |
+| `connetto-ca`, `connetto-app-attest` | The device certificate authority's offline ceremonies, and Apple App Attest behind device enrolment |
+| `connetto-peer` | The mutual TLS link between certified devices |
+| `connetto-peer-android`, `connetto-peer-apple` | The peer link's Android and Apple glue for permissions, hotspots, Bluetooth and discovery |
 | `connetto-test-harness` | The in-process CDC loop and the browser stack runner behind the tests |
 
-`examples/` holds a Dioxus demo for desktop, Android and iOS, the same demo on Tauri with a Leptos UI, Dioxus and Yew web demos sharing one deployment, the browser smoke suite, and the passkey unlock proof.
+`examples/` holds one demo built on the shared `demo-support` crate and one deployment, in Dioxus for the web, desktop, Android and iOS, in Leptos for the browser and as the Tauri app's UI, and in Yew for the browser. It also holds the browser smoke suite and the passkey unlock proof.
