@@ -244,7 +244,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R54 every demo carries every feature | **DONE** (2026-08-22) | nothing. The yew and desktop demo hand-drives fold into R57's human pass | no |
 | R55 containerised test services and CI | **DONE** (2026-08-20) | nothing. `plans/containerised-test-services-and-ci.md` records all decisions and proofs, and the section here records the four coverage gaps closed 2026-08-22 | no |
 | R56 local data import | **DONE** (2026-08-21) | nothing. Twelve decisions recorded, two findings folded into `R19` and `R26`, and `R26`'s compression and plaintext-statement items landed with it | no |
-| R57 the demo feature gaps the export audit found | IN PROGRESS, step 8 merged as #205 (2026-10-20) and step 6 found already fixed (2026-09-12) | nothing. Steps 1 to 5 and 7 remain | no |
+| R57 the demo feature gaps the export audit found | IN PROGRESS, step 8 merged as #205 (2026-10-20), step 6 found already fixed (2026-09-12), and steps 1 to 5 and 7 found built in the demos on `examples/demo-support` (2026-10-26) | nothing. The Proof's human pass remains | no |
 | R58 a subscription's cost and a large read's ceiling | **DONE** (2026-08-21) | nothing. Fifteen decisions recorded, `R59` absorbed by decision 6, `R60` split out, and the build's own findings written into the section | no. Question 4 established the work is connetto's, with `pg2sqlite` and `subql` untouched |
 | ~~R59 a subscription has no ceiling and no way to page~~ | **ABSORBED** into R58 (2026-08-21) | n/a | no |
 | R43 the browser opens the local tier twice | **DONE** (2026-08-07) | nothing | no, discharged |
@@ -3012,6 +3012,8 @@ A person whose device died can restore the export onto its replacement and find 
 ## R57: the demo feature gaps the export audit found
 
 **Status.** IN PROGRESS. Step 8 merged as #205 (2026-10-20), and step 6 was found already fixed on 2026-09-12. Every item below was verified against source on 2026-08-21 while wiring `R26` into the demos, and each names its evidence.
+
+**Steps 1 to 5 and 7 found built, 2026-10-26.** The demos the steps name were replaced by one demo over `examples/demo-support` (#265, #264, #273 and #293), in Dioxus for the web, desktop and phones (`examples/dioxus-demo`), in Yew (`examples/yew-web-demo`), and in Leptos for the browser and as the Tauri app's UI (`examples/leptos-demo`, `examples/tauri-leptos-demo`). Each step holds in that source. Step 1, `demo-support`'s `orders_count` drives the server's `COUNT(*)` in all four UIs, and no demo carries the false relay comment. Step 2, the Yew demo offers the passkey gate through `Membership::enrol_gate`. Steps 3 to 5, `demo-support`'s `status_label` names `SyncStatus`, `NonFatal` and `FullResync` with its reason, and every UI's status line goes through it. Step 7, the native builder attaches the schema's device-private tier, `examples/demo-support/frontend.sql` declares `notes` in it, and `examples/dioxus-demo/tests/demo_photos_flow.rs` carries it through an archive into a second device. What remains is the Proof's human pass, of which only an aggregate tracking a write has been watched by hand, on the Tauri app (2026-10-26).
 
 **Blocked on nothing.** `R54` claimed every demo carries every application-visible feature. It was true for what it audited and these are what it missed, so this is `R54`'s follow-through rather than a new idea.
 
