@@ -1,15 +1,13 @@
 name: Install the desktop dependencies
 description: >-
-  Installs the system libraries the Dioxus desktop renderer and Tauri link,
-  the webview stack connetto-dioxus's desktop feature and both desktop demos
-  pull.
+  Installs the desktop webview libraries for Dioxus and Tauri, waiting up to five minutes for package installation locks.
 runs:
   using: composite
   steps:
     - shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
+        sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
           libwebkit2gtk-4.1-dev \
           build-essential \
           curl \
