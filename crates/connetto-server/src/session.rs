@@ -88,7 +88,7 @@ use crate::guard::RequestGuard;
 use crate::materializer::{
     ComputedCapture, ComputedChange, Dispatched, MatchedPatch, Materializer, MaterializerError,
     PlannedWrite, ReadConnector, Registration, RuntimeWritableCatalog, SeedPlan, TermMove,
-    TermSeed, UnbuiltPatch, compress, narrowed_sql, typed_subscriber,
+    TermSeed, compress, narrowed_sql, typed_subscriber,
 };
 use crate::openfga::{GrantHolder, GrantMove};
 use crate::oplog::{CatchupDecision, ChangeRecord, InMemoryOplog, Oplog, catchup_decision};
@@ -829,8 +829,6 @@ struct Applied {
     logged: bool,
     /// Row patches not yet sent.
     patches: Vec<MatchedPatch>,
-    /// Matched consumers whose patch is still to be encoded.
-    unbuilt: Vec<UnbuiltPatch>,
     /// Membership moves, absent once fanned out.
     narrowings: Option<Vec<TermMove>>,
     /// Computed changes not yet delivered, in delivery order.
@@ -849,7 +847,6 @@ impl Applied {
             logged: dispatched.record.is_none(),
             record: dispatched.record,
             patches: dispatched.patches,
-            unbuilt: dispatched.unbuilt,
             narrowings: Some(dispatched.narrowings),
             computed: dispatched.computed.into(),
             failure: dispatched.failure,
@@ -2814,14 +2811,6 @@ where
                 self.oplog.append(record).await.map_err(oplog_err)?;
             }
             applied.logged = true;
-        }
-
-        if !applied.unbuilt.is_empty() {
-            let built = counters::timed_lock(&self.materializer)
-                .await
-                .build_patches(event, &applied.unbuilt)?;
-            applied.unbuilt.clear();
-            applied.patches.extend(built);
         }
         // Every patch still owed, paired with the route it goes to now.
         // Collected before the visibility question because that question names

@@ -311,3 +311,56 @@ async fn a_seed_past_the_group_budget_demotes_to_a_whole_read() {
         "no per-group values are delivered for a demoted seed",
     );
 }
+
+/// An insert into `orders` carrying `columns`, as the stream would deliver it.
+fn orders_insert(columns: &[(&str, &str)], ordinal: u64) -> subql::PgChangeEvent {
+    let mut data = pg_walstream::RowData::with_capacity(columns.len());
+    for (name, value) in columns {
+        data.push(
+            std::sync::Arc::from(*name),
+            pg_walstream::ColumnValue::text(value),
+        );
+    }
+    let change =
+        pg_walstream::ChangeEvent::insert("public", "orders", 0, data, pg_walstream::Lsn::new(1));
+    subql::PgChangeEvent::new(
+        change,
+        subql::PgCommitPosition::new(subql::PgLsn(1), subql::PgXid(1), ordinal),
+    )
+}
+
+/// An event the wire cannot encode fails its dispatch before the engine applies
+/// it, so retrying or skipping it never folds it into an answer.
+#[tokio::test]
+async fn an_event_that_cannot_be_encoded_is_not_applied() {
+    let mut mat = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let Registration::Computed(cap) = mat
+        .register(1, "SELECT COUNT(*) FROM orders")
+        .expect("register")
+    else {
+        panic!("expected a computed subscription");
+    };
+    mat.install_fold_seed(cap.subscription_id, vec![vec![PgValue::Int(0)]], None)
+        .expect("seed fold");
+
+    // A column the catalog does not know, as a schema change ahead of the deployment delivers.
+    let drifted = orders_insert(&[("id", "1"), ("quantity", "10"), ("note", "x")], 1);
+    assert!(
+        mat.dispatch(&drifted).await.is_err(),
+        "the patch cannot be encoded, so the dispatch fails"
+    );
+
+    let valid = orders_insert(&[("id", "2"), ("quantity", "20")], 2);
+    let computed = mat.dispatch(&valid).await.expect("dispatch").computed;
+    let values: Vec<Option<&str>> = computed
+        .iter()
+        .map(|change| change.result_json.as_deref())
+        .collect();
+    assert_eq!(
+        values,
+        [Some("1")],
+        "only the encodable insert reached the count"
+    );
+}
