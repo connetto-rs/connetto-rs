@@ -21,7 +21,7 @@ use connetto_server::{
     AbuseConfig, ChangeRecord, Commits, InMemoryOplog, ManagerBuilder, Materializer, Oplog,
     PgReadConnector, PgSnapshotSource, ReconnectPolicy, RequestGuard, ResumePoint,
     RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, Unseen, UnseenIds,
-    loopback, pg_write_target,
+    pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, committed_at};
 use diesel::prelude::*;
@@ -33,7 +33,6 @@ use subql::{
     SourceItem,
 };
 
-use tracing::Instrument;
 const DDL: &str = "CREATE TABLE counts (id INT PRIMARY KEY, n INT)";
 const SQLITE_DDL: &str = "CREATE TABLE counts (id INTEGER PRIMARY KEY, n INTEGER);";
 
@@ -46,15 +45,7 @@ type Manager =
     SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults, PgReadConnector, FlakyAppend>;
 
 fn connect_to(manager: &Arc<Manager>) -> Client {
-    let (server_end, client_end) = loopback();
-    let session = Arc::clone(manager);
-    tokio::spawn(
-        async move {
-            let _ = session.serve(server_end).await;
-        }
-        .instrument(tracing::Span::current()),
-    );
-    Client::new(client_end)
+    super::loopback_session::connect(|end| Arc::clone(manager).serve(end))
 }
 
 fn guard(seed: Duration, triggered: Duration) -> Arc<RequestGuard<String>> {

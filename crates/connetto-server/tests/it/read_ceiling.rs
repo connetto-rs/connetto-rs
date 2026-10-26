@@ -19,13 +19,12 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::IncomingFrame;
 use connetto_server::{
     AbuseConfig, ManagerBuilder, Materializer, NoConnector, PgSnapshotSource, RequestGuard,
-    SessionManager, ThrottleConfig, TierLimits, loopback, pg_write_target,
+    SessionManager, ThrottleConfig, TierLimits, pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth};
 use pg_walstream::{ChangeEvent, Lsn};
 use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
 use subql::{PgChangeEvent, PgCommitPosition, PgLsn, PgXid};
-use tracing::Instrument;
 
 const PG_DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, body TEXT); \
                       CREATE TABLE narrow (id INT PRIMARY KEY, n INT); \
@@ -70,19 +69,8 @@ fn manager(fixture: &Fixture, guard: Arc<RequestGuard<String>>) -> Arc<Manager> 
 }
 
 /// One in-process client on its own session.
-///
-/// The session task runs under the span the caller was in, so a record it
-/// emits carries whatever opened the connection.
 fn connect(manager: &Arc<Manager>) -> Client {
-    let (server_end, client_end) = loopback();
-    let session = Arc::clone(manager);
-    tokio::spawn(
-        async move {
-            let _ = session.serve(server_end).await;
-        }
-        .instrument(tracing::Span::current()),
-    );
-    Client::new(client_end)
+    super::loopback_session::connect(|end| Arc::clone(manager).serve(end))
 }
 
 /// Drain one subscription's initial read the way a real client does: apply each
@@ -456,31 +444,17 @@ mod aggregates {
     use connetto_core::test_support::TestGrantChecker;
     use connetto_server::{
         AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
-        RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, loopback,
-        pg_write_target,
+        RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, pg_write_target,
     };
     use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, committed_at};
     use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
-    use tracing::Instrument;
 
     /// A manager whose aggregates read through connetto's own connector.
     type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults, PgReadConnector>;
 
-    /// One in-process client on its own session, as the row tests do it, over
-    /// the manager type that carries a connector.
-    ///
-    /// The session task runs under the span the caller was in, so a record it
-    /// emits carries whatever opened the connection.
+    /// One in-process client on its own session, over the manager type that carries a connector.
     fn connect_to(manager: &Arc<Manager>) -> Client {
-        let (server_end, client_end) = loopback();
-        let session = Arc::clone(manager);
-        tokio::spawn(
-            async move {
-                let _ = session.serve(server_end).await;
-            }
-            .instrument(tracing::Span::current()),
-        );
-        Client::new(client_end)
+        crate::loopback_session::connect(|end| Arc::clone(manager).serve(end))
     }
     /// A guard whose tier reads may take `seed` and whose triggered
     /// re-executions may take `triggered`.
