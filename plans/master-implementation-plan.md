@@ -159,7 +159,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R74 | Device identity and certificates, first of the peer phases. Needs nothing since R94, whose builders take the device key's store, the certificate lifetime setting and the enrolment step |
 | any | R75 | The per-device applied frontier. Needs R74 |
 | any | R76 | The peer link. Needs R74 |
-| any | R77 | The exchange and the provisional tier. Needs R75, R76 and R57 step 8 |
+| any | R77 | The exchange and the provisional tier. Needs R75, R76 and R57 step 8, and R31 for its slices 1, 4 and 5 |
 | any | R78 | Courier recovery. Needs R75 and R77 |
 | any | R79 | Media over the peer link. Needs R77 and R67 |
 | any | R80 | Peer sync in every demo. Needs R77, R78 and R79 |
@@ -276,7 +276,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R74 device identity and certificates | IN PROGRESS, merged (2026-10-06, #130) with the follow-ups #139 (2026-10-12), #138 (2026-10-14), #146 (2026-10-15), #161 (2026-10-16) and #132 (2026-10-18), and step 7's peer half with proofs 3, 4 and 6's peer half built by R76's slices 1 and 2 (2026-10-07, merged 2026-10-14 as #134 and #135) | proof 5's Windows `unproven` record, which R76's slice 9d run produces once 9d is taken up again | no |
 | R75 the per-device applied frontier | IN PROGRESS, every step built, slices 1 to 5 merged as #196, #197, #199, #200 and #206 (2026-10-20) | R74. Touches the R2 watermark contract and the R56 import. The Done when's three proofs stand in the `writer_frontier` and `courier_frontier` suites with their audit records, for a device writer and a number writer, the courier replay the one a device author alone signs, and the section's closing record is what remains | no |
 | R76 the peer link | IN PROGRESS, sliced into pull requests 2026-10-06 (its section's **Slices**), the Android slices first. Slices 1 to 4 merged 2026-10-14 as #134, #135, #136 and #137, slices 5 to 8 merged 2026-10-15 as #140, #141, #142 and #143, slice 9a, iPhone hosting and iPad joining, merged 2026-10-16 as #148, slice 9b, Linux, and slice 9c, macOS, merged 2026-10-18 as #162 and #163, slice 9f, three handhelds over one hotspot with the Bonjour discovery on iOS, merged 2026-10-20 as #204, with the duplicate close's keep across a reset as #158 (2026-10-15) | nothing. Slice 9d (Windows, designed with decisions 36 to 41) and 9e's home run are parked while the work goes mobile first (decided with the maintainer 2026-10-20) | no |
-| R77 the peer exchange and provisional tier | NOT STARTED | R75, R76 and R31, whose capture major an exchanged entry carries on the wire once it exists. The retraction's reason rides on R57 step 8, merged as #205 | no |
+| R77 the peer exchange and provisional tier | NOT STARTED, designed 2026-10-26 with eight slices | R75 and R76, and R31 for slices 1, 4 and 5, whose capture major an exchanged entry carries. Slices 2 and 3 can start on `main`. The retraction's reason rides on R57 step 8, merged as #205 | no |
 | R78 courier recovery | NOT STARTED | R75, R77 and R31, whose capture major a couriered entry carries on the wire once it exists | no |
 | R79 media over the peer link | NOT STARTED | R77, and R64 to R67 for the chunk machinery | no |
 | R80 peer sync in every demo | NOT STARTED | R77, R78 and R79 | no |
@@ -5618,28 +5618,136 @@ Two native processes with valid certificates discover each other on one network 
 
 ## R77: the exchange and the provisional tier
 
-**Status.** NOT STARTED. The next peer phase once R75 lands, aimed first at offline data between the iPhone, the iPad and an Android phone over R76 slice 9f's star (decided with the maintainer 2026-10-18).
+**Status.** NOT STARTED, designed 2026-10-26 against `main` `ab408112` and the R31 series tip `2d75a9f1`. Aimed first at offline data between the iPhone, the iPad and an Android phone over R76 slice 9f's star (decided with the maintainer 2026-10-18). Decisions 1 to 10 were settled on evidence while grounding the design, and decisions 11 and 12 with the maintainer the same day.
 
-**Blocked on** R75, R76 and R31, whose capture major an exchanged entry carries on the wire once it exists. The retraction's reason rides on R57 step 8, merged as #205 (2026-10-20), which surfaces the `MutationRejectReason` the client used to drop.
+**Blocked on** R75 and R76, both merged for everything this phase uses, and R31 for slices 1, 4 and 5, which carry the capture major. Slices 2 and 3 need nothing from R31 and can start on `main`. The retraction's reason rides on R57 step 8, merged as #205 (2026-10-20), which surfaces the `MutationRejectReason` the client used to drop.
 
-**Changes state.** Client tables: none, the exchange answering from the per-writer record R75 keeps. Server tables: none. Wire messages: the exchange entry with its capture major, and the retraction's typed reason. Archive format: none.
+**Changes state.** Client tables: `_connetto_peer_cursor`, `_connetto_peer_entry`, `_connetto_provisional` and `_connetto_retraction` in `main`, and `settled_seq` and `settled_head` on `_connetto_writers` (decisions 2 and 9). Server tables: none. Wire messages: the chain hash at version 2 covering each entry's capture major and provenance (decision 1), the exchange frames at peer protocol version 2, `ProvisionalStatus` and `ProvisionalVerdicts` on the server wire (decision 11), and the certificate's bot-list extension (decision 12). Archive format: the four peer tables, which chapter 19 already puts in the archive.
 
 ### Purpose
 
 The peer exchange itself, with every rule the review fixed: per-author-device cursors, the acked frontier against the uncovered-row leak, signed retractions, and the provisional tier with its explicit conflict rule and its own eviction spare clause.
 
+### Decisions, settled on evidence on 2026-10-26
+
+1. **The chain hash covers the capture major and the provenance.** `entry_hash` becomes `connetto-chain-v2` over `previous || seq || major || provenance || SHA-256(changeset)`, and one `range_message` serves the peer and the courier, so `courier_range_message` and its per-entry provenance list go. A signature over a head then vouches for every entry's major and original writer below it, as a [Scuttlebutt message](https://ssbc.github.io/scuttlebutt-protocol-guide/#message-format) signs its `previous`, `author`, `sequence` and content together. The server hashes the major its connection declared, which is the entry's capture major on the main wire and on R31's drain wire alike, and the provenance from `MutationHeader.provenance`. Today's chain covers neither, so no signature binds an entry's major. A per-entry list in a separate peer range message was rejected, since it binds the same facts in a second format beside the chain, and so was an unsigned major, which a relay could relabel.
+2. **Every R77 table lives in `main`, beside `_connetto_pending`.** The provenance, the applied rows and the per-author cursor commit in one transaction, and [SQLite documents](https://www.sqlite.org/lang_attach.html) that under `journal_mode` WAL a transaction spanning attached database files is atomic only within each file. The replica runs WAL. `main` also exists on every build, while the tier exists only when the application declares one. The `_connetto*` capture filter keeps these tables device-private as it keeps `_connetto_pending`. This corrects chapter 19, which put the provenance in the device-private tier. The attached tier was rejected for the atomicity reason.
+3. **The author's write is judged by replaying it through the policy views as the author.** [`sqlite3changeset_apply`](https://www.sqlite.org/session/sqlite3changeset_apply.html) modifies a row whose old values match without consulting any handler, and it applies to the backing tables, so neither can enforce a policy. The peer apply runs each op as SQL against the logical view, as `replay` already does for the shared tier, with capture off, write exemption off and the author bound. The `INSTEAD OF` guard refuses a `WITH CHECK` violation, and an update or delete that the view's `USING` hides touches no row, which counts as a refusal. `SuspendedCapture` splits into its two effects, capture suspension and write exemption, since a peer apply needs the first without the second.
+4. **Identity is rebound on the same connection under a guard.** An `AuthorBinding` guard re-registers `current_app_user()` with the author's certificate `account`, `current_app_subjects()` with `NULL` and `current_bot_list()` with the certificate's bot list (decision 12), and restores the receiver's own values on drop, the `adopt_relay_identity` mechanism with RAII restore. `NULL` subjects make every share-key arm deny, chapter 19's fail-closed rule for rights the receiver cannot answer. A second connection was rejected, since its writes would miss the update hooks that drive live queries, and a SQL-function argument needs an upstream `pg2sqlite` change.
+5. **An author's write is applied whole or not at all.** A changeset is one transaction of the author's, so one refused op refuses the entry and none of its rows land. The cursor still advances past it, and the receiver raises `PeerWriteRefused`.
+6. **Keys the receiver's own unsent writes hold are filtered before the apply.** The key set is what `pending_spare` already computes. An op on such a key is dropped, the provenance records the author as displaced by the receiver's own write, and the rest of the entry applies. A conflict handler cannot do this, since a matching row applies without invoking it. Any other collision applies, last writer locally in arrival order, with the displaced provisional author recorded. `server_wins` stays with server patches.
+7. **One signature per hand-off covers the whole offer.** The device key signs one `offer_message(key_id, settled, newest, builds, retractions)`, so the acked frontier, the retraction log and the queue head cost one chip operation per link, within R74 decision 12's reason for signing per hand-off.
+8. **An entry another build captured crosses as a digest.** The offer names the author's builds, its own `(major, version)` and each held major's row from R31's `_connetto_held_batch`. An entry whose `(major, version)` differs from the receiver's build crosses as its manifest row only, so the receiver verifies the chain and advances its cursor and never applies or holds it. A same-major entry under another version is refused the same way, the case R31 refuses at the server.
+9. **The settled head is kept.** An acked entry is deleted from `_connetto_pending` today and the hash at the frontier with it. `_connetto_writers` gains `settled_seq` and `settled_head`, written as each acked entry is deleted, so the author can name the hash its offered range chains from. Settlement runs in sequence order, since the server answers a writer's mutations in order.
+10. **Every request carries an id and every wait has a bound.** Each exchange request carries a `request_id` every reply quotes, a receiver waits at most 30 s for the next frame of a range on a monotonic clock, and a lapse ends the exchange, never the link, and retries at the next offer.
+
+### Decisions, taken with the maintainer on 2026-10-26
+
+11. **The server settles the provisional rows of an author the receiver never meets again, with the author's signature as the right to ask.** The frontier and the retraction log reach a receiver only over a link with the author, so without a server path a row the server applied but the receiver's subscriptions do not cover stays spared for ever, and a refused write stays visible as provisional. On every server connection the receiver sends `ProvisionalStatus { request_id, author, offer, seqs }` per author it holds provisional rows from, `offer` being the author's last verified signed offer. The server verifies the signature against the author's key in its writer row, refuses any sequence above the offer's signed `newest`, and answers `ProvisionalVerdicts` per sequence from R75's settled records: `Applied` and `Settled` (at or below the frontier, record pruned) adjudicate, `Refused(cause)` retracts with the cause, `Abandoned` (above the frontier of a retired writer or a revoked enrolment) retracts with cause `Abandoned`, and `Pending` waits for the next connection. A receiver can ask only about entries the author handed it. [Bayou](https://www.cs.cornell.edu/courses/cs6464/2009sp/papers/bayou.pdf) has every replica learn from the primary which tentative writes committed in the same way. Rejected: expiring provisional rows 30 days past the author's certificate, which drops applied writes the subscriptions do not cover and leaves refused ones visible until then, and waiting for the author, whose retention has no bound.
+12. **A bot session may enrol a device key, and every certificate carries its bot list.** The maintainer judged that refusing bots hardware could be shortsighted, since small language models may run as bots on field devices. Every certificate carries a non-critical extension under `1.3.6.1.4.1.67105.2`, beside the attestation extension's `.1`, holding the bot list text `bot_list_for` renders for the enrolling session, the wildcard `*` for a person and the list for a bot, the same value the server binds as `app.bot_list`. `AuthorBinding` binds that text, and `NULL` when the extension is absent, so a certificate that does not say fails closed. A changed list reaches peers when the certificate renews, a bounded false allow of the class chapter 19 already accepts for an offline-stale replica. Rejected: refusing bot enrolment, which shuts field bots out, and binding `NULL` for every author, which refuses people's writes on every table with a bot arm.
+
+### Design
+
+**The wire.** `PROTOCOL_VERSION` becomes 2, which the hello, the TXT record and the beacon carry together, so a version 1 and a version 2 device refuse each other at hello. The writer is never sent, since each device offers only its own device writer's chain and the link has proven its key. A device with no device writer offers nothing and still receives.
+
+```rust
+// PeerFrame variants
+ExchangeOffer { builds: Vec<(Major, SchemaVersion)>, settled: Option<Frontier>, newest: Option<Frontier>, retractions: Vec<Retraction>, signature: Vec<u8> }
+ExchangeRequest { request_id: u64, from: u64 }
+ExchangeManifest { request_id: u64, previous: [u8; 32], rows: Vec<ManifestRow>, last: bool }
+ExchangeBody { request_id: u64, seq: u64, changeset: Vec<u8> }
+ExchangeEnd { request_id: u64, outcome: EndOutcome }
+
+struct Frontier { seq: u64, head: [u8; 32] }
+struct ManifestRow { seq: u64, major: Major, provenance: Option<Provenance>, digest: [u8; 32] }
+struct Retraction { seq: u64, cause: RetractCause }
+enum RetractCause { Rejected(MutationRejectReason), Conflict, Abandoned }
+
+// ControlMessage variants
+ProvisionalStatus { request_id: String, author: [u8; 32], offer: Vec<u8>, seqs: Vec<u64> }
+ProvisionalVerdicts { request_id: String, verdicts: Vec<(u64, Verdict)> }
+enum Verdict { Applied, Settled, Refused(RetractCause), Abandoned, Pending }
+```
+
+The manifest always runs to the signed `newest`, at most 8192 rows per frame, so the receiver verifies the chain from `previous` to the signed head before any body arrives. Bodies follow in sequence order for the entries the receiver's build can apply, each checked against its digest. `RetractCause::Conflict` exists because R75's `SettledOutcome::Conflict` applied nothing and carries no `MutationRejectReason`.
+
+**One exchange, as the receiver sees it.** The link comes up and each side sends its offer, whose signature the receiver checks against the key the link proved. The receiver applies the offer's frontier and retractions, then requests from `max(cursor, settled.seq) + 1` when `newest.seq` is above it. It recomputes the chain over the manifest and compares the last hash with `newest.head`, and a mismatch, or a `settled` head contradicting one already verified at that sequence, raises `PeerChainInvalid` and ends the exchange. Each row then commits in its own transaction. A row at another build advances the cursor alone. Otherwise the body is checked against its digest, keys held by the receiver's own unsent writes are filtered, the remaining ops run through the views under `AuthorBinding`, and the provenance, the stored entry and the cursor are written, or on refusal the cursor alone.
+
+**Client tables, in `main`.**
+
+```sql
+CREATE TABLE _connetto_peer_cursor (author BLOB PRIMARY KEY, account TEXT NOT NULL, seq INTEGER NOT NULL, head BLOB NOT NULL, offer BLOB NOT NULL);
+CREATE TABLE _connetto_peer_entry (author BLOB, seq INTEGER, major INTEGER NOT NULL, changeset BLOB NOT NULL, PRIMARY KEY (author, seq));
+CREATE TABLE _connetto_provisional (tbl TEXT, pk BLOB, author BLOB NOT NULL, seq INTEGER NOT NULL, account TEXT NOT NULL, received_at INTEGER NOT NULL, state INTEGER NOT NULL, displaced_author BLOB, displaced_seq INTEGER, PRIMARY KEY (tbl, pk));
+CREATE TABLE _connetto_retraction (writer TEXT, seq INTEGER, cause BLOB NOT NULL, PRIMARY KEY (writer, seq));
+-- _connetto_writers gains settled_seq INTEGER and settled_head BLOB
+```
+
+`_connetto_peer_entry` keeps an applied entry until it is adjudicated, because a retraction restores the rows by inverting the author's changeset, as R57's rollback inverts the device's own. A provisional delete keeps its provenance row, so a retraction can restore the row from the changeset's old values. `received_at` is the wall clock and serves display only. `offer` is the author's last verified signed offer, which decision 11 presents to the server. `_connetto_retraction` is the author's own log, written when the server rejects or conflicts one of its device writer's entries and kept until the writer retires. R31's rebuild drops `_connetto_provisional` and `_connetto_peer_entry` with the synced tables and keeps the other two.
+
+**The client surface.** Events `ProvisionalApplied`, `ProvisionalConfirmed`, `ProvisionalRetracted { cause }`, `PeerWriteRefused` and `PeerChainInvalid`, each naming the author and the affected rows. Reads `NativeClient::provenance(table, key)` and `provisional_rows()`, from the table, since the broadcast event stream can drop events. There is no builder setting, and a build with the `peer` feature and a device identity exchanges with every linked peer.
+
+**Adjudication.** A server write on a provisional key deletes its provenance in the same transaction and raises `ProvisionalConfirmed`, whether or not it is the author's write. Rows at or below the author's `settled.seq` and absent from the retraction log become adjudicated, their stored entries are deleted, and the spare clause stops covering them. A retraction inverts the stored entry for the rows whose provenance still names it, restores a displaced author's provenance, deletes the entry and raises `ProvisionalRetracted`. Decision 11 settles the rest online.
+
+**Limits stated in chapter 19.** A receiver applies an author's update or delete only to rows it holds, since an `UPDATE` change carries the changed columns and the primary key alone. A peer's change to a row the receiver never held is refused.
+
+### Every event in every situation
+
+Both roles run on every link at once. For one author as the receiver sees it: **R0** not linked, **R1** linked with no offer verified, **R2** offer verified and nothing to request, **R3** a request outstanding. For the sender: **S0** not linked, **S1** linked and serving no request, **S2** serving a request.
+
+| Event | R0 | R1 | R2 | R3 | S0 | S1 | S2 |
+|---|---|---|---|---|---|---|---|
+| Link up | send own offer, enter R1 | n/a | n/a | n/a | enter S1 | n/a | n/a |
+| Link lost | nothing | enter R0 | enter R0 | abort request, the current row's transaction rolls back, enter R0 | nothing | enter S0 | stop streaming, enter S0 |
+| Offer received, signature valid | n/a | apply frontier and retractions, request if behind (R3) or enter R2 | same as R1 | keep it, act on it at `ExchangeEnd` | n/a | n/a | n/a |
+| Offer received, signature invalid | n/a | `PeerChainInvalid`, stay R1 | same | abort request, same | n/a | n/a | n/a |
+| Manifest chain mismatch or fork | n/a | n/a | n/a | `PeerChainInvalid`, abort, enter R1 until a new offer | n/a | n/a | n/a |
+| Body digest mismatch | n/a | n/a | n/a | same as a chain mismatch | n/a | n/a | n/a |
+| Row at another build | n/a | n/a | n/a | advance the cursor alone | n/a | n/a | n/a |
+| Row refused by policy | n/a | n/a | n/a | advance the cursor, `PeerWriteRefused` | n/a | n/a | n/a |
+| Row applied | n/a | n/a | n/a | provenance, entry and cursor in one transaction, `ProvisionalApplied` | n/a | n/a | n/a |
+| `ExchangeEnd` | n/a | n/a | n/a | act on a kept offer or enter R2 | n/a | n/a | n/a |
+| 30 s without the next frame | n/a | n/a | n/a | abort request, enter R1, retry at the next offer | n/a | n/a | n/a |
+| Request received | n/a | n/a | n/a | n/a | n/a | stream manifest and bodies, enter S2 | refuse with `ExchangeEnd { Busy }` |
+| Own new local write | nothing | nothing | nothing | nothing | nothing | sign and send a fresh offer | send it after the stream ends |
+| Own entry settled, applied | nothing | nothing | nothing | nothing | nothing | update `settled_*`, fresh offer | after the stream |
+| Own entry rejected or conflicted | nothing | nothing | nothing | nothing | write `_connetto_retraction` | same, fresh offer | after the stream |
+| Peer certificate renewed | n/a | nothing | nothing | nothing | n/a | nothing | nothing |
+| Peer revoked or expired, link closes | as link lost | as link lost | as link lost | as link lost | as link lost | as link lost | as link lost |
+| Server patch on a provisional key | delete provenance, `ProvisionalConfirmed` | same | same | same, after the current row's transaction | n/a | n/a | n/a |
+| Eviction pass | spares state provisional | same | same | same | n/a | n/a | n/a |
+| R31 rebuild at a newer major | provisional rows and entries dropped, cursors kept | links close first, as R0 | same | same | n/a | n/a | n/a |
+| Archive import | peer tables restored, as R0 | n/a, import runs closed | n/a | n/a | own writer retired, its retraction log kept | n/a | n/a |
+| Own device writer retired | nothing | nothing | nothing | nothing | offers stop until the fresh key enrols | end the exchange, as S0 | stop streaming |
+| Server session established | send `ProvisionalStatus` per author with provisional rows | same | same | same | n/a | n/a | n/a |
+| `ProvisionalVerdicts` received | adjudicate, retract or keep per verdict | same | same | same, after the current row's transaction | n/a | n/a | n/a |
+| 30 s without `ProvisionalVerdicts` | drop the wait, ask at the next server session | same | same | same | n/a | n/a | n/a |
+
 ### Steps
 
-1. The exchange: mTLS session, mutual offer of queue bounds plus acked frontier plus retraction log, request from cursor plus one, signed changesets streamed in order, cursor advanced in the same transaction as the apply.
-2. Peer applies suspend capture exactly as `apply_patch` does, or a peer's write re-uploads as the receiver's own.
-3. The conflict rule: the receiver's own unsent write is never displaced (own authorship wins locally), any other collision applies last-writer-locally with the displaced author recorded, `server_wins` stays reserved for server patches.
-4. Offline authorization: the translated-RLS evaluation with the author's identity bound through a rebindable evaluator (its own connection or hook, since `register_caller` binds one identity per connection), failing closed on OpenFGA-derived and locally unanswerable rights, with the partial-replica false-deny and bounded false-allow limits stated in the docs.
-5. `_connetto_provisional` in the device tier: provenance per (table, pk), a spare clause feeding `delete_uncovered` beside `pending_spare`, server-sourced writes clearing provenance, typed provenance reads and applied/confirmed/retracted-with-cause events.
-6. The acked frontier marks at-or-below provisional rows adjudicated, handing them to ordinary coverage, and a signed retraction removes the copy and surfaces its `MutationRejectReason`.
+1. The exchange: mTLS session, mutual signed offer of queue bounds plus acked frontier plus retraction log (decision 7), request from cursor plus one, a verified manifest then bodies streamed in order, cursor advanced in the same transaction as the apply.
+2. A peer apply suspends capture as `apply_patch` does, or a peer's write re-uploads as the receiver's own, and keeps the policy guards on (decision 3).
+3. The conflict rule: the receiver's own unsent write is never displaced (decision 6), any other collision applies last-writer-locally with the displaced author recorded, `server_wins` stays reserved for server patches.
+4. Offline authorization: the translated policy evaluated as the author through `AuthorBinding` (decisions 3, 4 and 12), failing closed on share-key and locally unanswerable rights, with the partial-replica false-deny and bounded false-allow limits stated in chapter 19.
+5. `_connetto_provisional` in `main` (decision 2): provenance per (table, pk), a spare clause feeding `delete_uncovered` beside `pending_spare`, server-sourced writes clearing provenance, typed provenance reads and applied, confirmed and retracted-with-cause events.
+6. The acked frontier marks at-or-below provisional rows adjudicated, handing them to ordinary coverage, a signed retraction removes the copy and surfaces its cause, and the server settles the rest online (decision 11).
+
+### Slices
+
+One pull request each, in this order, each green and useful on its own (2026-10-26).
+
+1. **The chain at version 2 and the signed offer** (decisions 1 and 7). `connetto-core` with the server's chain recomputation and `courier_deliver` moved to version 2, and a public `verify_range` a peer and the server call. Needs R31's per-entry major.
+2. **The provisional bookkeeping** (decision 2, step 5). `connetto-client` with no wire: `_connetto_provisional`, `provisional_spare`, the server-write clearing with `ProvisionalConfirmed`, and the reads, proven by tests that write provenance directly and then evict and patch. The other three tables arrive with the slices that write them. Needs nothing from R31.
+3. **The bot list in the certificate** (decision 12). `connetto-core`'s certificate profile, the server's enrolment and renewal filling the extension from `bot_list_for`, and its reading on the client and on a linked peer. Needs nothing from R31.
+4. **The peer link frames** (the wire above). `connetto-peer` at protocol version 2, the frames, a bounded request path through `LinkCommand` and a `PeerEvent` for exchange traffic, proven between two nodes on loopback. Needs R31's `Major`.
+5. **The peer apply** (decisions 3 to 6 and 8). `connetto-client`, from a verified manifest and bodies to applied rows, refusal and retraction, with `SuspendedCapture` split into capture suspension and write exemption, `_connetto_peer_entry` and `AuthorBinding`, proven in process with two replicas and no link. Needs R31.
+6. **The exchange driver** (decisions 9 and 10, the table above). Offers signed on the device key's thread, `_connetto_peer_cursor`, the author's `_connetto_retraction` and settled head, the four peer tables in the archive and in R31's rebuild, proven by two clients on loopback against the real server in the harness.
+7. **Online adjudication** (decision 11). Both server messages, proven Docker-gated by a receiver that never meets the author again and still confirms an applied write, retracts a refused one with its reason, and retracts an abandoned one after the author's enrolment is revoked.
+8. **The handheld proof.** The demo controls the runner drives and a run on R76 slice 9f's star (iPhone, iPad, Android) per R76 decision 4, which runs before each peer phase closes, and chapter 19's R77 statements marked **Built (R77)**.
 
 ### Done when
 
-Two devices of different accounts exchange offline and reconcile online with nothing lost and nothing double-applied: an offline exchange applies policy-passing writes provisionally, a reconnect confirms covered rows, adjudicates uncovered ones by the frontier, rolls back a refused write on both devices with its reason surfaced, and eviction spares provisional rows throughout, proven end to end in the harness.
+Two devices of different accounts exchange offline and reconcile online with nothing lost and nothing double-applied: an offline exchange applies policy-passing writes provisionally, a reconnect confirms covered rows, adjudicates uncovered ones by the frontier, rolls back a refused write on both devices with its reason surfaced, also when the two devices never meet again, and eviction spares provisional rows throughout, proven end to end in the harness and on the handheld star.
 
 ---
 
