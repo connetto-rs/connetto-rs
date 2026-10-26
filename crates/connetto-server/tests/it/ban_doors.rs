@@ -257,3 +257,54 @@ async fn a_ban_in_the_store_alone_refuses_refresh_sign_in_and_liveness() {
         reqwest::StatusCode::UNAUTHORIZED
     );
 }
+
+/// A ban list that cannot be read refuses every door, so an outage never lifts
+/// a ban, and a refresh it refused leaves the caller's token standing, so the
+/// retry after the outage is not taken for a stolen token.
+#[tokio::test]
+async fn a_ban_list_that_cannot_be_read_shuts_the_doors_and_burns_no_token() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let served = served(&fixture).await;
+
+    let (token, _, refresh) = mint_tokens(&served.base, "berlin").await;
+    exec(
+        &served.pool,
+        "ALTER TABLE connetto_bans RENAME TO connetto_bans_away",
+    )
+    .await;
+
+    assert!(
+        matches!(
+            served.handle.verify_live(&token).await,
+            Err(LivenessError::BanList(_))
+        ),
+        "the liveness check fails closed"
+    );
+    assert_eq!(
+        refresh_status(&served.base, &refresh).await,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "a refresh fails closed"
+    );
+    assert_eq!(
+        sign_in_status(&served.base, "berlin").await,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "a sign-in fails closed"
+    );
+
+    exec(
+        &served.pool,
+        "ALTER TABLE connetto_bans_away RENAME TO connetto_bans",
+    )
+    .await;
+    assert_eq!(
+        refresh_status(&served.base, &refresh).await,
+        reqwest::StatusCode::OK,
+        "the refused refresh rotated nothing, so its token still refreshes"
+    );
+    assert!(
+        served.handle.verify_live(&token).await.is_ok(),
+        "the session survived the outage"
+    );
+}

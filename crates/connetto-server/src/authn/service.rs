@@ -448,6 +448,29 @@ impl<S: AuthStore> AuthService<S> {
         {
             return Err(AuthError::RateLimited(wait));
         }
+        // The ban is read before the token rotates. A ban list that cannot
+        // answer then leaves the token standing, where rotating first would
+        // burn it and the caller's retry after the outage would read as a
+        // stolen token. A ban landing after this read ends the session
+        // through the hook, and the rotation below refuses an ended session.
+        if let Some(session_id) = named_session
+            && let Some(record) = self.store.session_record(session_id).await?
+        {
+            match self.refuse_banned(&record.user_id).await {
+                Ok(()) => {}
+                Err(AuthError::Banned) => {
+                    if self.store.end_owned(&record.user_id, session_id).await? {
+                        self.ended(
+                            &record.user_id,
+                            session_id,
+                            crate::audit::AuthOp::EndedByBan,
+                        );
+                    }
+                    return Err(AuthError::Banned);
+                }
+                Err(err) => return Err(err),
+            }
+        }
         let outcome = match self.store.rotate_refresh(refresh_token).await {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -485,19 +508,6 @@ impl<S: AuthStore> AuthService<S> {
                 return Err(err.into());
             }
         };
-        // A ban the store holds shuts the refresh too, whether or not its
-        // sessions were already ended, and ends the session it reached.
-        match self.refuse_banned(&outcome.context.user_id).await {
-            Ok(()) => {}
-            Err(AuthError::Banned) => {
-                let user = &outcome.context.user_id;
-                if self.store.end_owned(user, outcome.session_id).await? {
-                    self.ended(user, outcome.session_id, crate::audit::AuthOp::EndedByBan);
-                }
-                return Err(AuthError::Banned);
-            }
-            Err(err) => return Err(err),
-        }
         let now = SystemTime::now();
         let access_token = self
             .authority
