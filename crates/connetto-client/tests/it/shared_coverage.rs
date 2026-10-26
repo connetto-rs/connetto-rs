@@ -1,5 +1,5 @@
-//! One identity's passes over a shared table keep what another identity on
-//! the device still covers or has unsent.
+//! One identity's passes and server frames over a shared table keep what
+//! another identity on the device still covers, has unsent, or has not pushed.
 
 use std::time::Duration;
 
@@ -46,11 +46,13 @@ fn rows(ids: &[i64]) -> Vec<u8> {
     zstd::encode_all(patchset.build().as_slice(), 3).unwrap()
 }
 
-/// The compressed patchset of a departure: indirect deletes of each id.
-fn departures(ids: &[i64]) -> Vec<u8> {
+/// The compressed patchset deleting each id, as a departure when `departure`
+/// is set (an indirect delete) and as a removal upstream otherwise.
+fn deletes(ids: &[i64], departure: bool) -> Vec<u8> {
     let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
     for id in ids {
-        patchset = patchset.delete(PatchDelete::new(table(), vec![(*id).into()]).indirect(true));
+        patchset =
+            patchset.delete(PatchDelete::new(table(), vec![(*id).into()]).indirect(departure));
     }
     zstd::encode_all(patchset.build().as_slice(), 3).unwrap()
 }
@@ -247,7 +249,7 @@ async fn a_departure_another_identity_still_covers_is_withheld() {
             IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
                 "b".to_owned(),
                 Cursor::new(vec![1]),
-                departures(&[1, 2]),
+                deletes(&[1, 2], true),
             ))),
         ],
     )
@@ -300,7 +302,7 @@ async fn a_departure_from_a_table_another_identity_wants_whole_is_withheld() {
             IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
                 "b".to_owned(),
                 Cursor::new(vec![1]),
-                departures(&[1]),
+                deletes(&[1], true),
             ))),
         ],
     )
@@ -308,4 +310,61 @@ async fn a_departure_from_a_table_another_identity_wants_whole_is_withheld() {
     subscribe(&mut bob, "b", "SELECT * FROM tags WHERE id = 1").await;
     drain(&mut bob).await;
     assert_eq!(ids(&mut bob), [1], "alice still wants the row");
+}
+
+#[tokio::test]
+async fn a_tidy_spares_a_shared_write_another_identity_has_not_pushed() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = super::support::SharedKeys::default();
+    let mut alice = connect(directory.path(), keys.clone(), "alice", Vec::new()).await;
+    let mut bob = connect(directory.path(), keys, "bob", vec![snapshot("b", &[2])]).await;
+    subscribe(&mut bob, "b", "SELECT * FROM tags WHERE id = 2").await;
+    alice
+        .conn()
+        .batch_execute("INSERT INTO tags VALUES (3, 'unpushed')")
+        .unwrap();
+    bob.tidy().unwrap();
+    assert_eq!(ids(&mut bob), [2, 3], "alice's unpushed row survives");
+    assert!(
+        alice.push().await.unwrap().is_some(),
+        "alice's write still uploads"
+    );
+}
+
+#[tokio::test]
+async fn a_server_delete_waits_for_another_identitys_unpushed_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = super::support::SharedKeys::default();
+    let mut alice = connect(directory.path(), keys.clone(), "alice", Vec::new()).await;
+    let mut bob = connect(
+        directory.path(),
+        keys,
+        "bob",
+        vec![
+            snapshot("b", &[]),
+            IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+                "b".to_owned(),
+                Cursor::new(vec![1]),
+                deletes(&[1], false),
+            ))),
+        ],
+    )
+    .await;
+    subscribe(&mut bob, "b", "SELECT * FROM tags").await;
+    alice
+        .conn()
+        .batch_execute("INSERT INTO tags VALUES (1, 'unpushed')")
+        .unwrap();
+    let (applied, pushed) = tokio::join!(bob.pump_one(), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        alice.push().await
+    });
+    assert!(
+        matches!(applied.unwrap(), ClientEvent::LivePatch { .. }),
+        "the delete applies once alice has pushed"
+    );
+    assert!(
+        pushed.unwrap().is_some(),
+        "alice's write uploads instead of vanishing under the delete"
+    );
 }

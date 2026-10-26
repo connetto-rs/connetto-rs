@@ -250,7 +250,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R43 the browser opens the local tier twice | **DONE** (2026-08-07) | nothing | no, discharged |
 | R18 SQLite hardening surface | **DONE** (2026-08-18) | nothing | no |
 | R60 a limited request syncs the whole table and blocks its cleanup | **DONE** (2026-09-02) | nothing. The defect dissolved at the `3d75cca` pin, steps 4 to 6 landed 2026-09-02 and are proven by `crates/connetto-client/tests/it/residual.rs`. The plan carried this row as IN PROGRESS until 2026-09-12 | no longer: the upstream request superseded itself, never sent |
-| R11 shared public store | IN PROGRESS, designed (2026-10-17), sliced into seven pull requests, slices 1 to 4 merged, slice 5 built (2026-10-25) | nothing. Seven decisions in the section | no |
+| R11 shared public store | IN PROGRESS, designed (2026-10-17), sliced into seven pull requests and the shared store's lock, slices 1 to 4 merged, slice 5 in #270, the lock built (2026-10-26) | nothing. Seven decisions in the section | no |
 | R61 the portability download | NOT STARTED, fully designed (2026-08-22), revised (2026-10-25) | wanting it: the deadline is the first real deployment. Ten decisions in the section | no |
 | R105 answering a stolen account | IN PROGRESS, designed and sliced (2026-10-25), slice 1 built (2026-10-25) | nothing. Ten decisions and six slices in the section | no |
 | R62 refuse a table with no declared primary key | **DONE** (2026-08-22) | nothing. Four decisions: three before any code, the fourth (the tier is re-checked before a write too) taken in execution | no |
@@ -4052,11 +4052,11 @@ Every knob has a recorded value and a reason, both open paths set them, and the 
 
 ## R11: the shared public store
 
-**Status.** IN PROGRESS. Designed 2026-10-17 with the maintainer, seven decisions below and seven slices. Slices 1 to 4 merged as #179, #238, #239 and #259, slice 5 built 2026-10-25.
+**Status.** IN PROGRESS. Designed 2026-10-17 with the maintainer, seven decisions below and seven slices. Slices 1 to 4 merged as #179, #238, #239 and #259, slice 5 open as #270, and the shared store's lock, decided 2026-10-25, built 2026-10-26 on top of slice 5.
 
 **Blocked on nothing.** Off the critical path and independent of every other phase, so it lands whenever it is wanted.
 
-**Changes state.** Client tables: the `connetto_shared` store attached to every identity's replica connection, its `_connetto_interest` and `_connetto_spare` records keyed by identity (decision 6), the declared tables and their policy views (step 3) and the device key record under its reserved name (decision 4). Server tables: none. Wire messages: none. Archive format: none.
+**Changes state.** Client tables: the `connetto_shared` store attached to every identity's replica connection, its `_connetto_interest` and `_connetto_spare` records keyed by identity (decision 6), the declared tables and their policy views (step 3) and the device key record under its reserved name (decision 4). Client files: natively a lock file beside the store, never deleted. Server tables: none. Wire messages: none. Archive format: none.
 
 Because the replica is named from the identity (`replica_db_name` in `crates/connetto-client/src/replica.rs`), data visible to everybody is stored once per identity on the same device. This phase adds a store holding the public tables a deployment declares, attached to every identity's replica connection and shared by the identities on one device. Chapter 12 records the design under "Public tables may be shared across identities".
 
@@ -4094,6 +4094,7 @@ One pull request each, in this order, each green and useful on its own (2026-10-
 3. **Reads and server rows** (step 3). Proven by two identities subscribing to one public table and its rows stored once, by a query joining a public and a private table with sharing on, and by a policy view filtering per caller in the shared schema.
 4. **Writes** (step 4). Proven by a rejected write to a public table undone in the shared store, and a rejected write spanning a public and a private table undone in both.
 5. **Union coverage** (step 5). Proven by identity B's pass sparing a row only A covers, and evicting it once A unsubscribes, by B's pass and a departure B receives both keeping every row of a table A wants whole, by a resync that empties B's table keeping A's rows, by B's pass sparing a row A wrote and has not uploaded, by a departure B receives withheld while A covers the row, and by a watch A released no longer covering once its grace runs out.
+   - **The shared store's lock**, its own pull request after slice 5 (decided 2026-10-25 while slicing teardown). A shared write an identity has not pushed lives only in its capture, so natively a lock file beside the store is held shared from that write to the push and taken exclusive by whatever changes another identity's shared rows. An eviction it holds back skips. A resync clear or a server frame touching a shared table waits up to 30 seconds, as PowerSync defers server data while local writes wait to upload, and then drops the connection with nothing applied so the reattach receives it again. Proven by B's tidy sparing a shared row A wrote and has not pushed, after which A's push still uploads it, and by a server delete of such a row waiting until A has pushed.
 6. **Teardown** (step 6). Proven on both platforms by forgetting one of two identities, after which the other opens the store and rows only the forgotten one covered are gone, and by forgetting the last, after which the file and its key record are gone.
 7. **The demos.** Two accounts in one demo share a public table, and chapter 12 records the built state.
 

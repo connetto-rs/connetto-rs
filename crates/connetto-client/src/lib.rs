@@ -33,7 +33,7 @@ use core::time::Duration;
 use diesel::connection::SimpleConnection;
 use diesel::connection::{
     AnsiTransactionManager, CacheSize, ConnectionSealed, DefaultLoadingMode, Instrumentation,
-    LoadConnection,
+    LoadConnection, TransactionManager,
 };
 use diesel::expression::QueryMetadata;
 use diesel::query_builder::{Query, QueryFragment, QueryId};
@@ -90,6 +90,7 @@ pub mod reconnect;
 mod replay;
 pub mod replica;
 pub mod share_keys;
+mod shared_lock;
 mod subscriptions;
 
 #[cfg(feature = "peer")]
@@ -308,6 +309,12 @@ pub enum ClientError {
     /// open waits, so the file and the key are untouched and a later open succeeds.
     #[error("another connection holds the local database locked: {0}")]
     ReplicaBusy(String),
+    /// A server frame or a resync waited 30 seconds for another identity on
+    /// the device to push the shared writes it holds, so the connection
+    /// dropped without applying it and the reconnect receives it again from
+    /// the stored cursor. A reconnect driver treats it as a lost transport.
+    #[error("another identity holds unpushed writes to the shared store")]
+    SharedStoreBusy,
     /// Applying the replica cipher failed before any page was read: this build
     /// links a SQLite with no page codec, or a cipher pragma was rejected.
     #[error("replica cipher: {0}")]
@@ -3283,13 +3290,16 @@ async fn timer_wait(remaining: Duration) {
 /// One atomic load and one map bump per row, the O(1) the decision asked for.
 ///
 /// With `order` given, it also appends each table capture writes, skipping
-/// suspended writes, to the first-write list [`Capture::changeset`] sorts by.
+/// suspended writes, to the first-write list [`Capture::changeset`] sorts by,
+/// and with `lock` given it holds the shared store's lock shared from the
+/// first captured write to a shared table until the push.
 fn install_change_tracker(
     conn: &mut SqliteConnection,
     changed: &Arc<Mutex<HashSet<String>>>,
     staging: &Arc<Mutex<HashMap<String, u64>>>,
     counting: &Arc<AtomicBool>,
     order: Option<(WriteOrder, Arc<AtomicBool>)>,
+    lock: Option<shared_lock::LockHandle>,
 ) {
     let sink = Arc::clone(changed);
     let rows = Arc::clone(staging);
@@ -3308,10 +3318,18 @@ fn install_change_tracker(
             if let Some((order, exempt)) = &order
                 && !exempt.load(Ordering::Relaxed)
                 && !is_internal_table(event.table_name)
-                && let Ok(mut order) = order.lock()
-                && !order.iter().any(|name| name == event.table_name)
             {
-                order.push(event.table_name.to_owned());
+                if let Some(lock) = &lock
+                    && event.db_name == SHARED_SCHEMA
+                    && let Ok(mut lock) = lock.lock()
+                {
+                    lock.wrote();
+                }
+                if let Ok(mut order) = order.lock()
+                    && !order.iter().any(|name| name == event.table_name)
+                {
+                    order.push(event.table_name.to_owned());
+                }
             }
         }),
     );
@@ -3342,6 +3360,13 @@ struct Run {
 
 /// The bound a share-key swap or a declaration fence waits on its answer for.
 const SHARE_KEY_REQUEST_WAIT: Duration = Duration::from_secs(30);
+
+/// The bound a server frame or a resync waits for another identity's
+/// unpushed shared writes, which its next pump step pushes.
+const SHARED_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// How often a waiting frame asks for the shared store's lock again.
+const SHARED_LOCK_RETRY: Duration = Duration::from_millis(20);
 
 static NEXT_SHARE_KEY_REQUEST: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(1);
@@ -3645,6 +3670,27 @@ pub struct ConnettoConnection<T: Transport> {
     /// Where pushed revocation lists go, the enrolment task's inbox.
     #[cfg(feature = "device-identity")]
     list_sink: Option<tokio::sync::mpsc::UnboundedSender<Vec<connetto_core::messages::SignedList>>>,
+    /// The lock beside a durable shared store, held shared from the first
+    /// shared write to the push and exclusive around whatever changes another
+    /// identity's rows. Absent without a durable shared store or in the
+    /// browser, where one worker holds one identity at a time (R42).
+    shared_lock: Option<shared_lock::LockHandle>,
+}
+
+/// The lock beside the durable shared store the replica attaches, if any. The
+/// browser takes none, since one worker holds one identity at a time (R42) and
+/// its store is an OPFS name rather than a path.
+fn open_shared_lock<S: ReplicaStorage>(
+    replica: &Replica<'_, S>,
+    config: &ClientConfig,
+) -> Result<Option<shared_lock::LockHandle>, ClientError> {
+    if cfg!(all(target_family = "wasm", target_os = "unknown")) || config.shared_layout.is_none() {
+        return Ok(None);
+    }
+    replica
+        .shared_store()
+        .map(|(path, _)| shared_lock::SharedLock::open(path))
+        .transpose()
 }
 
 /// Attach the shared store when the build shares tables, then run the program
@@ -3891,6 +3937,7 @@ where
             .shared_layout
             .is_some()
             .then(|| Arc::new(Mutex::new(Vec::new())));
+        let shared_lock = open_shared_lock(replica, config)?;
         install_change_tracker(
             &mut db,
             &changed,
@@ -3899,6 +3946,7 @@ where
             write_order
                 .as_ref()
                 .map(|order| (Arc::clone(order), Arc::clone(&write_exempt))),
+            shared_lock.clone(),
         );
         {
             let dirty = Arc::clone(&dirty);
@@ -3988,6 +4036,7 @@ where
             enrol_waiters: HashMap::new(),
             #[cfg(feature = "device-identity")]
             list_sink: None,
+            shared_lock,
         };
         conn.attach_tier(replica.tier())?;
         conn.refresh_share_key_expiry();
@@ -6609,9 +6658,11 @@ where
                 // rows are evicted here, the first connected moment that can
                 // honour the transport-down guard, before the record goes (R15
                 // D3). The server never saw it on this connection, so there is
-                // nothing to unsubscribe.
-                self.evict_subscription_rows(&record.sub_id)?;
-                self.change_subscriptions(|db| subscriptions::forget(db, &record.sub_id))?;
+                // nothing to unsubscribe. A pass another identity's unpushed
+                // shared writes held back leaves the record for the next attach.
+                if self.evict_subscription_rows(&record.sub_id)? {
+                    self.change_subscriptions(|db| subscriptions::forget(db, &record.sub_id))?;
+                }
             }
         }
         Ok(())
@@ -6626,15 +6677,20 @@ where
     /// rows for ever. Offline, eviction is barred (a row discarded offline
     /// cannot be re-fetched, R15 D3), so the record is ended rather than
     /// forgotten: the next connected attach evicts and then forgets it, and an
-    /// ended record is never replayed as a subscription.
+    /// ended record is never replayed as a subscription. An eviction another
+    /// identity's unpushed shared writes held back ends the record the same
+    /// way.
     ///
     /// # Errors
     ///
     /// [`ClientError::Transport`] when the unsubscribe frame cannot be sent.
     pub async fn unsubscribe(&mut self, sub_id: &str) -> Result<(), ClientError> {
         if self.is_connected() {
-            self.evict_subscription_rows(sub_id)?;
-            self.change_subscriptions(|db| subscriptions::forget(db, sub_id))?;
+            if self.evict_subscription_rows(sub_id)? {
+                self.change_subscriptions(|db| subscriptions::forget(db, sub_id))?;
+            } else {
+                self.change_subscriptions(|db| subscriptions::end(db, sub_id))?;
+            }
             self.wire()?
                 .transport
                 .send_control(ControlMessage::Unsubscribe(Unsubscribe {
@@ -6744,18 +6800,24 @@ where
                 ClientEvent::Closed
             }
             Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch))) => {
-                self.apply_patch(&patch.patchset_zstd, None, Some(&patch.sub_id))?;
+                self.waiting_for_shared(|this| {
+                    this.apply_patch(&patch.patchset_zstd, None, Some(&patch.sub_id))
+                })
+                .await?;
                 self.ack_one().await?;
                 ClientEvent::SnapshotApplied {
                     sub_id: patch.sub_id,
                 }
             }
             Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => {
-                self.apply_patch(
-                    &patch.patchset_zstd,
-                    Some(&patch.cursor),
-                    Some(&patch.sub_id),
-                )?;
+                self.waiting_for_shared(|this| {
+                    this.apply_patch(
+                        &patch.patchset_zstd,
+                        Some(&patch.cursor),
+                        Some(&patch.sub_id),
+                    )
+                })
+                .await?;
                 self.last_cursor = Some(patch.cursor.clone());
                 self.ack_one().await?;
                 ClientEvent::LivePatch {
@@ -6935,12 +6997,16 @@ where
         self.recheck_changed_schemas()?;
         let changeset = self.session.changeset()?;
         if changeset.is_empty() {
+            self.release_shared_hold();
             return Ok(None);
         }
         let writer = self.choose_writer();
         let seq = self.append_entry(&writer, &changeset, None)?;
         // Reset capture: fresh sessions record only writes after this push.
         self.session.reset(&mut self.db)?;
+        // The writes are queued and their spare rows written, so the other
+        // identities' passes now see them.
+        self.release_shared_hold();
         // With no server the write stays queued, which is the designed offline
         // state rather than a failure: it is already durable in
         // `_connetto_pending` above, and `attach` replays it. Returning an
@@ -7271,7 +7337,11 @@ where
                     // is unknown again before the clear runs.
                     self.invalidate_coverage()?;
                 }
-                let aggregate = self.clear_subscription_rows(&resync.sub_id, &resync.reason)?;
+                let aggregate = self
+                    .waiting_for_shared(|this| {
+                        this.clear_subscription_rows(&resync.sub_id, &resync.reason)
+                    })
+                    .await?;
                 // The replacement snapshot lands after this, so the pending writes
                 // this clear took off the replica go back on its `SnapshotEnd`, not
                 // now: a snapshot row under `server_wins` would take a local edit off
@@ -7507,7 +7577,21 @@ where
     /// named aggregate, its whole resting answer (R95). Returns whether the
     /// notice named an aggregate, so the caller keeps its label out of
     /// `resyncing`.
+    ///
+    /// One step under the shared store's lock, so a clear another identity's
+    /// unpushed shared writes hold back returns
+    /// [`ClientError::SharedStoreBusy`] having changed nothing, and the same
+    /// call runs again.
     fn clear_subscription_rows(
+        &mut self,
+        sub_id: &str,
+        reason: &FullResyncReason,
+    ) -> Result<bool, ClientError> {
+        self.exclusive(|this| this.clear_subscription_rows_now(sub_id, reason))
+    }
+
+    /// The body of [`clear_subscription_rows`](Self::clear_subscription_rows).
+    fn clear_subscription_rows_now(
         &mut self,
         sub_id: &str,
         reason: &FullResyncReason,
@@ -7521,7 +7605,6 @@ where
             .map(str::to_lowercase);
         // Every row subscription resyncs, so the first notice empties all their tables and later ones spare fresh replacements.
         if beyond_history && !self.history_cleared {
-            self.history_cleared = true;
             let mut scope: HashSet<String> = membership.into_iter().collect();
             for record in &declared {
                 if let Some(coverage) = crate::live::coverage_of(&record.spec)? {
@@ -7529,6 +7612,7 @@ where
                 }
             }
             self.delete_uncovered(&scope, None, &Stale::Everything, &HashMap::new())?;
+            self.history_cleared = true;
             return Ok(false);
         }
         if let Some(table) = membership {
@@ -7609,9 +7693,33 @@ where
     /// stale or not, since only that identity's own resync may judge its rows
     /// (R11 decision 6). Returns the rows removed.
     ///
+    /// A scope reaching a shared table runs under the shared store's lock, so
+    /// it returns [`ClientError::SharedStoreBusy`] with nothing deleted while
+    /// another identity holds shared writes it has not pushed.
+    ///
     /// Capture is suspended so the deletes are never re-uploaded as a local
     /// mutation.
     fn delete_uncovered(
+        &mut self,
+        scope: &HashSet<String>,
+        exclude: Option<&str>,
+        stale: &Stale,
+        spare: &HashMap<String, Vec<String>>,
+    ) -> Result<usize, ClientError> {
+        let reaches_shared = scope.iter().any(|table| {
+            let physical = self.config.policy_tables.physical(table).unwrap_or(table);
+            is_shared(&self.config.shared_tables, physical)
+        });
+        if reaches_shared {
+            self.exclusive(|this| this.delete_uncovered_now(scope, exclude, stale, spare))
+        } else {
+            self.delete_uncovered_now(scope, exclude, stale, spare)
+        }
+    }
+
+    /// The body of [`delete_uncovered`](Self::delete_uncovered), run under
+    /// whatever lock the scope needs.
+    fn delete_uncovered_now(
         &mut self,
         scope: &HashSet<String>,
         exclude: Option<&str>,
@@ -7762,6 +7870,96 @@ where
         interest::record_spare(&mut self.db, &self.config, &spare)
     }
 
+    /// End this connection's shared hold on the shared store's lock, its
+    /// captured shared writes being queued with their spare rows written.
+    fn release_shared_hold(&self) {
+        if let Some(lock) = &self.shared_lock
+            && let Ok(mut lock) = lock.lock()
+        {
+            lock.pushed();
+        }
+    }
+
+    /// Run `step` in one immediate transaction holding the shared store's
+    /// lock exclusive, so no other identity holds an unpushed shared write
+    /// while it changes shared rows. Without a lock, or inside a step that
+    /// already holds it, `step` runs as it is.
+    ///
+    /// The lock goes before the commit, while SQLite's write lock still keeps
+    /// every other identity from writing, so none can write in between.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::SharedStoreBusy`] with nothing changed when another
+    /// identity holds unpushed shared writes, or whatever `step` returns.
+    fn exclusive<R>(
+        &mut self,
+        step: impl FnOnce(&mut Self) -> Result<R, ClientError>,
+    ) -> Result<R, ClientError> {
+        let Some(lock) = self.shared_lock.clone() else {
+            return step(self);
+        };
+        let poisoned = || ClientError::Session("the shared store's lock is poisoned".to_owned());
+        if lock.lock().map_err(|_| poisoned())?.is_exclusive() {
+            return step(self);
+        }
+        AnsiTransactionManager::begin_transaction_sql(&mut self.db, "BEGIN IMMEDIATE")?;
+        let taken = lock.lock().map_err(|_| poisoned())?.try_exclusive();
+        let outcome = match taken {
+            Ok(true) => {
+                let outcome = step(self);
+                if let Ok(mut lock) = lock.lock() {
+                    lock.end_exclusive();
+                }
+                outcome
+            }
+            Ok(false) => Err(ClientError::SharedStoreBusy),
+            Err(err) => Err(err),
+        };
+        match outcome {
+            Ok(value) => {
+                <AnsiTransactionManager as TransactionManager<SqliteConnection>>::commit_transaction(
+                    &mut self.db,
+                )?;
+                Ok(value)
+            }
+            Err(err) => {
+                <AnsiTransactionManager as TransactionManager<SqliteConnection>>::rollback_transaction(
+                    &mut self.db,
+                )?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Run `step` until no other identity's unpushed shared writes hold it
+    /// back, for at most [`SHARED_LOCK_WAIT`]. Past the bound the connection
+    /// drops with nothing applied, so the reattach receives the frame again
+    /// from the stored cursor.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::SharedStoreBusy`] past the bound, or whatever `step`
+    /// returns.
+    async fn waiting_for_shared<R>(
+        &mut self,
+        mut step: impl FnMut(&mut Self) -> Result<R, ClientError>,
+    ) -> Result<R, ClientError> {
+        let bound = Moment::now(&SystemClock).after(SHARED_LOCK_WAIT);
+        loop {
+            match step(self) {
+                Err(ClientError::SharedStoreBusy) => {}
+                outcome => return outcome,
+            }
+            let remaining = Moment::now(&SystemClock).until(bound);
+            if remaining.is_zero() {
+                self.disconnected();
+                return Err(ClientError::SharedStoreBusy);
+            }
+            timer_wait(remaining.min(SHARED_LOCK_RETRY)).await;
+        }
+    }
+
     /// Return freelist pages to the filesystem: reclaim in
     /// bounded `incremental_vacuum` steps once the freelist is a large enough
     /// fraction of the file (D1), then truncate the write-ahead log so the pages
@@ -7812,10 +8010,12 @@ where
     ///
     /// The transport-down guard lives here: a row discarded offline could not be
     /// re-fetched, so the pass is a no-op until connectivity returns, and the
-    /// ended record is left in place for the next connected pass (D3).
-    pub(crate) fn evict_subscription_rows(&mut self, sub_id: &str) -> Result<(), ClientError> {
+    /// ended record is left in place for the next connected pass (D3). Returns
+    /// `false` when another identity's unpushed shared writes held the pass
+    /// back, so the caller keeps the record ended for a later pass the same way.
+    pub(crate) fn evict_subscription_rows(&mut self, sub_id: &str) -> Result<bool, ClientError> {
         if !self.is_connected() {
-            return Ok(());
+            return Ok(true);
         }
         let declared = subscriptions::declared(&mut self.db)?;
         let Some(coverage) = declared
@@ -7824,15 +8024,18 @@ where
             .and_then(|record| crate::live::coverage_of(&record.spec).transpose())
             .transpose()?
         else {
-            return Ok(());
+            return Ok(true);
         };
         let spare = self.pending_spare()?;
         let removed =
-            self.delete_uncovered(&coverage.tables, Some(sub_id), &Stale::Nothing, &spare)?;
+            match self.delete_uncovered(&coverage.tables, Some(sub_id), &Stale::Nothing, &spare) {
+                Err(ClientError::SharedStoreBusy) => return Ok(false),
+                removed => removed?,
+            };
         if removed > 0 {
             self.trim_replica()?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// The callable free-up-space pass: evict every uncovered row across every
@@ -7846,12 +8049,15 @@ where
     /// Only the eviction waits on the transport, because a row discarded offline
     /// cannot be re-fetched. Trimming discards nothing and reclaims local pages,
     /// so it runs whether or not a server is reachable. Every pending write is
-    /// spared.
+    /// spared. The eviction also waits on another identity's unpushed shared
+    /// writes, and then the measure is left as it was and the crossing event
+    /// re-armed, so the pass comes due again at the next apply.
     ///
     /// # Errors
     ///
     /// [`ClientError`] on a replica read or write failure.
     pub fn tidy(&mut self) -> Result<(), ClientError> {
+        let mut evicted = true;
         if self.is_connected() {
             let declared = subscriptions::declared(&mut self.db)?;
             let mut scope: HashSet<String> = HashSet::new();
@@ -7861,9 +8067,18 @@ where
                 }
             }
             let spare = self.pending_spare()?;
-            self.delete_uncovered(&scope, None, &Stale::Nothing, &spare)?;
+            match self.delete_uncovered(&scope, None, &Stale::Nothing, &spare) {
+                Err(ClientError::SharedStoreBusy) => evicted = false,
+                removed => {
+                    removed?;
+                }
+            }
         }
         self.trim_replica()?;
+        if !evicted {
+            self.residual_warned = false;
+            return Ok(());
+        }
         // The pass is the residual measure's reset point (R60 decision 4):
         // counters cleared, crossing event re-armed.
         if let Ok(mut counts) = self.applied_rows.lock() {
@@ -7968,6 +8183,10 @@ where
     /// checks, and then fails every row as a per-row `Constraint` conflict,
     /// which `server_wins` maps to Omit. Server data is authoritative, so it
     /// lands underneath the policy triggers rather than through them.
+    ///
+    /// A patch reaching a shared table applies under the shared store's lock,
+    /// so it returns [`ClientError::SharedStoreBusy`] having changed nothing
+    /// while another identity holds shared writes it has not pushed.
     fn apply_patch(
         &mut self,
         payload_zstd: &[u8],
@@ -7975,10 +8194,44 @@ where
         addressed_to: Option<&str>,
     ) -> Result<(), ClientError> {
         let bytes = zstd::decode_all(payload_zstd)?;
+        if self.reaches_shared(&bytes) {
+            self.exclusive(|this| this.apply_decoded(&bytes, cursor, addressed_to))?;
+        } else {
+            self.apply_decoded(&bytes, cursor, addressed_to)?;
+        }
+        self.residual_check()
+    }
+
+    /// Whether a server payload touches a table in the shared store, judged
+    /// only when a lock guards it. A payload that does not parse is taken to
+    /// touch one, so the apply that then fails on it does so under the lock.
+    fn reaches_shared(&self, bytes: &[u8]) -> bool {
+        if self.shared_lock.is_none() {
+            return false;
+        }
+        let shared = |name: &str| {
+            let physical = self.config.policy_tables.physical(name).unwrap_or(name);
+            is_shared(&self.config.shared_tables, physical)
+        };
+        match ParsedDiffSet::parse(bytes) {
+            Ok(ParsedDiffSet::Patchset(set)) => set.iter().any(|op| shared(op.table().name())),
+            Ok(ParsedDiffSet::Changeset(set)) => set.iter().any(|op| shared(op.table().name())),
+            Err(_) => true,
+        }
+    }
+
+    /// The body of [`apply_patch`](Self::apply_patch) over the decompressed
+    /// payload.
+    fn apply_decoded(
+        &mut self,
+        bytes: &[u8],
+        cursor: Option<&Cursor>,
+        addressed_to: Option<&str>,
+    ) -> Result<(), ClientError> {
         // Departure filtering weighs the wire's logical names against what the
         // subscriptions cover, which is also logical, so the rename follows it.
         let apply = self
-            .honour_departures(&bytes, addressed_to)?
+            .honour_departures(bytes, addressed_to)?
             .map(|bytes| self.to_physical(bytes))
             .transpose()?;
         let suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
@@ -8027,8 +8280,7 @@ where
         } else if let Ok(mut stage) = self.apply_staging.lock() {
             stage.clear();
         }
-        applied?;
-        self.residual_check()
+        applied
     }
 
     /// After a server patch lands: run the pass under

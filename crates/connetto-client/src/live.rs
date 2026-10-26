@@ -2747,8 +2747,13 @@ struct ReconnectDriver<F, S> {
 fn is_disconnect(err: &ClientError) -> bool {
     // A send attempted with no socket is the same situation as one whose socket
     // died: there is a transport to go and find, and the run continues either
-    // way. Anything else is a genuine fault and ends the pump.
-    matches!(err, ClientError::Transport(_) | ClientError::NotConnected)
+    // way. A frame held back by another identity's unpushed shared writes
+    // dropped the socket on purpose, so the reattach receives it again.
+    // Anything else is a genuine fault and ends the pump.
+    matches!(
+        err,
+        ClientError::Transport(_) | ClientError::NotConnected | ClientError::SharedStoreBusy
+    )
 }
 
 /// Decrement one reference on the wire subscription `wire_id`. When the last
