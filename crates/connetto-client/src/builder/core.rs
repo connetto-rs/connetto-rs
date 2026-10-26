@@ -1012,10 +1012,13 @@ where
             let located = self
                 .place
                 .locate(&crate::shared_store_name(REPLICA_PREFIX))?;
-            let key = match self.key_store.load(&located.record).await? {
-                Some(key) => key,
-                None if located.exists => return Err(ClientError::ReplicaKeyMissing),
-                None => mint_key(&self.key_store, &located.record).await?,
+            let key = if let Some(key) = self.key_store.load(&located.record).await? {
+                key
+            } else {
+                if located.exists {
+                    wipe_keyless_shared(&located)?;
+                }
+                mint_key(&self.key_store, &located.record).await?
             };
             Some((located, key))
         } else {
@@ -1060,6 +1063,26 @@ fn wipe_lost(located: &Located) -> Result<(), ClientError> {
     );
     crate::teardown::purge_replica(std::path::Path::new(&located.url), &[], true)
         .map_err(|err| ClientError::Session(format!("wiping a replica whose key was lost: {err}")))
+}
+
+/// Delete a shared store whose key record is gone, which is what a last
+/// identity's removal leaves when the key went and the file did not, and what
+/// a platform that lost the key leaves. Nothing can open it again either way.
+#[cfg(feature = "native-transport")]
+fn wipe_keyless_shared(located: &Located) -> Result<(), ClientError> {
+    tracing::warn!(
+        store = %located.url,
+        "the shared store has no key, starting a fresh one"
+    );
+    crate::teardown::purge_replica(std::path::Path::new(&located.url), &[], true)
+        .map_err(|err| ClientError::Session(format!("wiping a shared store with no key: {err}")))
+}
+
+/// The browser removes its shared store at boot, key and database together,
+/// so a store without its key is refused there.
+#[cfg(not(feature = "native-transport"))]
+fn wipe_keyless_shared(_located: &Located) -> Result<(), ClientError> {
+    Err(ClientError::ReplicaKeyMissing)
 }
 
 /// The browser keeps its keys in its own storage, which never reports a lost

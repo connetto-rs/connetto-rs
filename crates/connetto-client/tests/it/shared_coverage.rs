@@ -18,7 +18,7 @@ use sqlite_diff_rs::{DiffOps, Indirect, Insert, PatchDelete, PatchSet, SimpleTab
 const SCHEMA: &str = "-- connetto:major 1
 CREATE TABLE tags (id INT PRIMARY KEY, label TEXT NOT NULL);";
 
-fn schema() -> SyncSchema {
+pub(super) fn schema() -> SyncSchema {
     SyncSchema::new(
         connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(
             SCHEMA,
@@ -56,7 +56,7 @@ fn departures(ids: &[i64]) -> Vec<u8> {
     zstd::encode_all(patchset.build().as_slice(), 3).unwrap()
 }
 
-fn snapshot(sub: &str, ids: &[i64]) -> IncomingFrame {
+pub(super) fn snapshot(sub: &str, ids: &[i64]) -> IncomingFrame {
     IncomingFrame::Bulk(BulkMessage::SnapshotPatch(SnapshotPatch::new(
         sub.to_owned(),
         rows(ids),
@@ -65,7 +65,7 @@ fn snapshot(sub: &str, ids: &[i64]) -> IncomingFrame {
 
 /// `owner`'s connection over the shared device directory, delivering
 /// `frames` once connected.
-async fn connect(
+pub(super) async fn connect(
     directory: &std::path::Path,
     keys: super::support::SharedKeys,
     owner: &str,
@@ -87,7 +87,11 @@ async fn connect(
 }
 
 /// Subscribe `sub` to `query` and pump until its snapshot lands.
-async fn subscribe(client: &mut ConnettoConnection<FakeTransport>, sub: &str, query: &str) {
+pub(super) async fn subscribe(
+    client: &mut ConnettoConnection<FakeTransport>,
+    sub: &str,
+    query: &str,
+) {
     client
         .subscribe_spec(sub, SubscriptionSpec::new(query))
         .await
@@ -114,7 +118,7 @@ struct Id {
     id: i64,
 }
 
-fn ids(client: &mut ConnettoConnection<FakeTransport>) -> Vec<i64> {
+pub(super) fn ids(client: &mut ConnettoConnection<FakeTransport>) -> Vec<i64> {
     diesel::sql_query("SELECT id FROM tags ORDER BY id")
         .load::<Id>(client.conn())
         .unwrap()

@@ -905,6 +905,10 @@ where
             let (session, authenticator) = resolved.provider.unzip();
             let share_key_store = core.share_key_store.clone();
             let share_record = share_key_record(&name);
+            let shared = core.base.schema.shared_layout().map(|_| {
+                let record = crate::shared_store_name(crate::REPLICA_PREFIX);
+                (core.place.0.join(&record), record)
+            });
             let teardown: Arc<dyn Forget> = Arc::new(ReplicaTeardown {
                 authenticator,
                 dir: core.place.0.clone(),
@@ -914,6 +918,7 @@ where
                 share_key_store,
                 share_record,
                 hook,
+                shared,
             });
             (session, Some(teardown))
         };
@@ -1870,6 +1875,11 @@ where
     /// afterwards. Once the client is closed every part of the teardown runs
     /// even when an earlier one failed, so as much as possible is removed.
     ///
+    /// A build that shares tables first takes this identity out of the shared
+    /// store, undoing the shared writes a forced forget discards and evicting
+    /// the shared rows no remaining identity covers. When no identity is left
+    /// in the store, its file and key record go after the replica's wipe.
+    ///
     /// # Errors
     ///
     /// [`ForgetError::Refused`] when nothing was destroyed and the client
@@ -1888,12 +1898,26 @@ where
         if !unsynced.is_empty() && !force {
             return Err(ForgetRefusal::Unsynced(unsynced).into());
         }
+        // Out of the shared store while the connection is still open, undoing
+        // the shared writes this forget discards, and before anything is
+        // destroyed (R11 decision 7). A failure is reported and the rest of
+        // the forget still runs.
+        let (last_out, shared) = match self
+            .core
+            .client()
+            .leave_shared_store(!unsynced.is_empty())
+            .await
+        {
+            Ok(departure) => (departure == crate::SharedDeparture::LastOut, None),
+            Err(err) => (false, Some(err)),
+        };
         self.core.close().await;
         let mut report = ForgetIncomplete {
             release: self.core.client().release_replica().await.err(),
+            shared,
             ..ForgetIncomplete::default()
         };
-        teardown.forget(&unsynced, &mut report).await;
+        teardown.forget(&unsynced, &mut report, last_out).await;
         // The certificate went with the replica, and the key goes once the
         // wipe stands, whether or not the server heard (lifecycle row
         // "`forget_device`").
@@ -1953,11 +1977,13 @@ impl NativeSession {
 /// The wipe a durable build knows how to run, erased over its key store.
 #[cfg(feature = "native-auth")]
 trait Forget: Send + Sync {
-    /// The application's forget: revoke the session at the server, then wipe.
+    /// The application's forget: revoke the session at the server, then wipe,
+    /// and remove the shared store too when `last_out`.
     fn forget<'a>(
         &'a self,
         unsynced: &'a [crate::UnsyncedWrite],
         report: &'a mut ForgetIncomplete,
+        last_out: bool,
     ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
     /// A revoked device's wipe, the session already ended at the server and
     /// every unsynced write lost (R105 decision 10).
@@ -1982,6 +2008,8 @@ struct ReplicaTeardown<KS> {
     share_key_store: ErasedShareKeyStore,
     share_record: String,
     hook: Option<DeviceWipeHook>,
+    /// The shared store's file and key record, when the build shares tables.
+    shared: Option<(PathBuf, String)>,
 }
 
 #[cfg(feature = "native-auth")]
@@ -1994,6 +2022,7 @@ where
         sign_out: bool,
         unsynced: &[crate::UnsyncedWrite],
         report: &mut ForgetIncomplete,
+        last_out: bool,
     ) {
         forget_device(
             self.authenticator.as_deref(),
@@ -2008,6 +2037,17 @@ where
         // Local secret cleanup is required even when revocation cannot be confirmed.
         if report.wipe.is_none() {
             report.share_keys = self.share_key_store.clear(&self.share_record).await.err();
+        }
+        // The store goes only once this replica's own wipe stands, and
+        // after the swap closed the connection holding it attached.
+        if last_out
+            && report.wipe.is_none()
+            && let Some((path, record)) = &self.shared
+        {
+            report.shared =
+                crate::teardown::remove_shared_store(path, self.key_store.as_ref(), record)
+                    .await
+                    .err();
         }
         if let Some(hook) = &self.hook {
             report.application = hook(self.name.clone())
@@ -2027,15 +2067,16 @@ where
         &'a self,
         unsynced: &'a [crate::UnsyncedWrite],
         report: &'a mut ForgetIncomplete,
+        last_out: bool,
     ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(self.wipe(true, unsynced, report))
+        Box::pin(self.wipe(true, unsynced, report, last_out))
     }
 
     fn wipe_revoked<'a>(
         &'a self,
         report: &'a mut ForgetIncomplete,
     ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(self.wipe(false, &[], report))
+        Box::pin(self.wipe(false, &[], report, false))
     }
 
     fn pending(&self) -> PendingWipe {

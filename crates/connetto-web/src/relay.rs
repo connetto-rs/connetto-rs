@@ -218,6 +218,17 @@ pub enum RefusedContentRefused {
     Failed(String),
 }
 
+/// Why taking the worker's identity out of the shared store did not finish.
+#[derive(Debug, thiserror::Error)]
+pub enum LeaveSharedRefused {
+    /// Nobody answered: the hub core has ended.
+    #[error(transparent)]
+    Gone(#[from] HubGone),
+    /// The core answered and the shared store could not be read or written.
+    #[error(transparent)]
+    Store(#[from] connetto_client::ClientError),
+}
+
 /// Why clearing a content refusal did not take effect.
 #[derive(Debug, thiserror::Error)]
 pub enum RetryRefusalRefused {
@@ -255,6 +266,15 @@ enum HubEvent {
     Kill(TabId),
     /// Report local work that has not reached the server.
     Unsynced(futures_channel::oneshot::Sender<PendingWork>),
+    /// Take the worker's identity out of the shared store before its replica
+    /// is wiped, undoing its unsent shared writes when the flag is set (R11
+    /// decision 7). Only the core can reach the connection.
+    LeaveShared(
+        bool,
+        futures_channel::oneshot::Sender<
+            Result<connetto_client::SharedDeparture, connetto_client::ClientError>,
+        >,
+    ),
     /// Export the worker's local tiers as an archive. Same reason as
     /// [`Unsynced`](Self::Unsynced): only the core can reach the connection.
     Export(
@@ -937,6 +957,24 @@ impl RelayHub {
     /// [`HubGone`] when the core has ended, so no answer will come.
     pub async fn unsynced(&self) -> Result<PendingWork, HubGone> {
         self.ask(HubEvent::Unsynced).await
+    }
+
+    /// Take the worker's identity out of the shared store, as
+    /// [`ConnettoConnection::leave_shared_store`](connetto_client::ConnettoConnection::leave_shared_store)
+    /// does, undoing its unsent shared writes when `discard_unsent`.
+    ///
+    /// # Errors
+    ///
+    /// [`LeaveSharedRefused::Gone`] when the core has ended, and
+    /// [`LeaveSharedRefused::Store`] when the shared store could not be read
+    /// or written.
+    pub async fn leave_shared_store(
+        &self,
+        discard_unsent: bool,
+    ) -> Result<connetto_client::SharedDeparture, LeaveSharedRefused> {
+        Ok(self
+            .ask(|reply| HubEvent::LeaveShared(discard_unsent, reply))
+            .await??)
     }
 
     /// A zip archive of the worker's local data, scoped as requested.
@@ -2313,6 +2351,9 @@ where
             };
             let _ = reply.send(pending);
         }
+        HubEvent::LeaveShared(discard_unsent, reply) => {
+            let _ = reply.send(worker.leave_shared_store(discard_unsent));
+        }
         HubEvent::ForgetRetired(files, reply) => {
             let answer = match content {
                 Some(content) => content
@@ -2996,6 +3037,7 @@ fn recovery_serves_idle(event: &HubEvent) -> bool {
             | HubEvent::Gone(_)
             | HubEvent::Kill(_)
             | HubEvent::Unsynced(_)
+            | HubEvent::LeaveShared(_, _)
             | HubEvent::Export(_, _)
             | HubEvent::Import(_, _)
             | HubEvent::ForgetRetired(_, _)
@@ -3015,6 +3057,7 @@ fn recovery_interrupts_attach(event: &HubEvent) -> bool {
     matches!(
         event,
         HubEvent::Unsynced(_)
+            | HubEvent::LeaveShared(_, _)
             | HubEvent::Frame(
                 _,
                 IncomingFrame::Control(ControlMessage::TabShareKeyChange(_))

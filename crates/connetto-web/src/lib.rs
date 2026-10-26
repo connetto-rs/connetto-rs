@@ -65,11 +65,12 @@ use futures_util::StreamExt;
 use js_sys::{ArrayBuffer, Uint8Array};
 pub use leader::{LeaderError, Membership, join};
 pub use relay::{
-    ExportRefused, ForgetRefused, HubGone, HubNotice, HubReconnect, ImportRefused, RelayError,
-    RelayHub, TabId,
+    ExportRefused, ForgetRefused, HubGone, HubNotice, HubReconnect, ImportRefused,
+    LeaveSharedRefused, RelayError, RelayHub, TabId,
 };
 pub use storage::{
-    PendingWipe, ReplicaStorage, WipeError, mark_wipe_pending, take_pending_wipes, wipe_replica,
+    PendingWipe, ReplicaStorage, SharedWipe, WipeError, mark_wipe_pending, take_pending_wipes,
+    wipe_replica,
 };
 pub use unlock::UnlockError;
 use wasm_bindgen::JsCast;

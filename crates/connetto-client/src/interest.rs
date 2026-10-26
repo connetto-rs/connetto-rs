@@ -7,7 +7,22 @@ use std::collections::{HashMap, HashSet};
 use diesel::SqliteConnection;
 use diesel::prelude::*;
 
-use crate::{ClientConfig, ClientError, clock, is_shared, subscriptions};
+use connetto_core::sql::quote_ident;
+
+use crate::{ClientConfig, ClientError, SHARED_SCHEMA, clock, is_shared, subscriptions};
+
+/// What an identity leaving the shared store found, which decides whether the
+/// store itself goes (R11 decision 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedDeparture {
+    /// The build shares no tables, so there is no store to leave.
+    NotShared,
+    /// Another identity still has interest or unsent writes in the store, so
+    /// the store stays.
+    Kept,
+    /// No identity is left in the store, so its file and key record go.
+    LastOut,
+}
 
 /// The interest and spare records, created in the shared store at open.
 pub(crate) const INTEREST_DDL: &str = "\
@@ -145,13 +160,23 @@ pub(crate) fn others(
     db: &mut SqliteConnection,
     config: &ClientConfig,
 ) -> Result<Others, ClientError> {
+    everyone_but(db, config, &config.client_id)
+}
+
+/// What every identity but `identity` keeps: its live coverage and its
+/// unacknowledged writes.
+fn everyone_but(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+    identity: &str,
+) -> Result<Others, ClientError> {
     let mut others = Others::default();
     if config.shared_tables.is_empty() {
         return Ok(others);
     }
     let now = clock::now_secs(db)?;
     let interest: Vec<(String, Option<String>)> = _connetto_interest::table
-        .filter(_connetto_interest::identity.ne(&config.client_id))
+        .filter(_connetto_interest::identity.ne(identity))
         .filter(
             _connetto_interest::covers_until
                 .is_null()
@@ -172,11 +197,58 @@ pub(crate) fn others(
         }
     }
     let spared: Vec<(String, String)> = _connetto_spare::table
-        .filter(_connetto_spare::identity.ne(&config.client_id))
+        .filter(_connetto_spare::identity.ne(identity))
         .select((_connetto_spare::tbl, _connetto_spare::clause))
         .load(db)?;
     for (table, clause) in spared {
         others.clauses.entry(table).or_default().push(clause);
     }
     Ok(others)
+}
+
+/// Take `identity` out of the shared store: delete its interest and spare
+/// rows and, when `evict`, every shared row no remaining identity covers or
+/// has unsent (R11 decision 7). Returns whether any identity still has a row
+/// in either record, which is what keeps the store alive.
+///
+/// # Errors
+///
+/// [`ClientError`] when the store cannot be read or written.
+pub(crate) fn depart(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+    identity: &str,
+    evict: bool,
+) -> Result<bool, ClientError> {
+    db.transaction(|conn| {
+        diesel::delete(_connetto_interest::table.filter(_connetto_interest::identity.eq(identity)))
+            .execute(conn)?;
+        diesel::delete(_connetto_spare::table.filter(_connetto_spare::identity.eq(identity)))
+            .execute(conn)?;
+        if evict {
+            let kept = everyone_but(conn, config, identity)?;
+            for table in &config.shared_tables {
+                if kept.whole.contains(table) {
+                    continue;
+                }
+                let target = format!("{SHARED_SCHEMA}.{}", quote_ident(table));
+                let statement = match kept.clauses.get(table) {
+                    Some(clauses) if !clauses.is_empty() => {
+                        format!("DELETE FROM {target} WHERE NOT ({})", clauses.join(" OR "))
+                    }
+                    _ => format!("DELETE FROM {target}"),
+                };
+                diesel::sql_query(statement).execute(conn)?;
+            }
+        }
+        let interest = diesel::select(diesel::dsl::exists(
+            _connetto_interest::table.select(_connetto_interest::identity),
+        ))
+        .get_result::<bool>(conn)?;
+        let spare = diesel::select(diesel::dsl::exists(
+            _connetto_spare::table.select(_connetto_spare::identity),
+        ))
+        .get_result::<bool>(conn)?;
+        Ok(interest || spare)
+    })
 }
