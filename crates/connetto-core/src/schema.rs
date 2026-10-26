@@ -860,4 +860,32 @@ mod tests {
         assert!(base.shared_layout().is_none());
         assert_eq!(base.connection_ddl(), "");
     }
+
+    /// Debug names the number, so a logged bundle shows its major.
+    #[test]
+    fn a_major_debugs_named_and_so_does_the_bundle() {
+        let major = Major::new(3).expect("three is a major");
+        assert_eq!(format!("{major:?}"), "Major(3)");
+        assert!(
+            format!("{:?}", reference()).contains("Major(1)"),
+            "the bundle debug names its major"
+        );
+    }
+
+    /// The bundle reads the major first, so a source without the directive is
+    /// refused before any policy is read.
+    #[test]
+    fn a_bundle_source_without_the_directive_is_refused() {
+        assert!(matches!(
+            SchemaBundle::new(
+                "CREATE TABLE orders (id INT);",
+                "",
+                "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+                None::<&str>,
+            ),
+            Err(MajorError::Missing)
+        ));
+    }
 }

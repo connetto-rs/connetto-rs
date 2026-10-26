@@ -4118,4 +4118,19 @@ mod tests {
             "the term predicate is kept so still_covered can re-test it"
         );
     }
+
+    /// A rate-limited refusal states the wait floor the driver waits out
+    /// instead of probing, and no other fault states one.
+    #[test]
+    fn a_rate_limited_refusal_states_the_wait_floor_and_no_other_fault_does() {
+        assert_eq!(
+            retry_after(&ClientError::Refused {
+                reason: FatalErrorReason::RateLimited {
+                    retry_after_ms: 5000,
+                },
+            }),
+            Some(Duration::from_millis(5000))
+        );
+        assert_eq!(retry_after(&ClientError::Locked), None);
+    }
 }

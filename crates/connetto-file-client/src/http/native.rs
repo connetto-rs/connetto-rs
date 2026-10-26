@@ -454,4 +454,21 @@ mod tests {
             }
         }
     }
+
+    /// The counter refuses a body that stops mid-chunk, so a truncated
+    /// upload is never counted as complete.
+    #[test]
+    fn chunked_payload_counts_only_a_complete_chunked_body() {
+        assert_eq!(
+            chunked_payload(b"4\r\nabcd\r\n7\r\nabcdefg\r\n0\r\n\r\n"),
+            Some(11)
+        );
+        assert_eq!(chunked_payload(b"0\r\n\r\n"), Some(0));
+        assert_eq!(chunked_payload(b"0\r\nx"), None);
+        assert_eq!(chunked_payload(b"4\r"), None);
+        assert_eq!(chunked_payload(b"z\r\n0\r\n\r\n"), None);
+        assert_eq!(chunked_payload(b"\xff\r\n0\r\n\r\n"), None);
+        assert_eq!(chunked_payload(b"4\r\nab"), None);
+        assert_eq!(chunked_payload(b"4\r\nabcd\r0\r\n\r\n"), None);
+    }
 }

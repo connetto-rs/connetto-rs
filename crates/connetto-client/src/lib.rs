@@ -8555,4 +8555,60 @@ mod tests {
             .finish()
             .expect("finish archive")
     }
+
+    /// The faults that name a build the peer can never attach under are
+    /// terminal; the rest are not.
+    #[test]
+    fn a_build_mismatch_fault_is_terminal_and_the_rest_is_not() {
+        let terminal = [
+            ClientError::UpdateRequired {
+                client: None,
+                server: Major::new(2).expect("two is a major"),
+            },
+            ClientError::ServerBehind {
+                client: Major::new(3).expect("three is a major"),
+                server: Major::new(2).expect("two is a major"),
+            },
+            ClientError::SchemaOutdated {
+                client: None,
+                server: SchemaVersion::from_hash(vec![0xAA; 24]),
+            },
+            ClientError::Refused {
+                reason: FatalErrorReason::MajorMismatch {
+                    server: Major::new(2).expect("two is a major"),
+                    client: None,
+                },
+            },
+        ];
+        for fault in &terminal {
+            assert!(fault.is_build_mismatch(), "{fault:?}");
+        }
+        let non_terminal = [
+            ClientError::Refused {
+                reason: FatalErrorReason::RateLimited { retry_after_ms: 10 },
+            },
+            ClientError::Locked,
+        ];
+        for fault in &non_terminal {
+            assert!(!fault.is_build_mismatch(), "{fault:?}");
+        }
+    }
+
+    /// The major the build declares is read back, so a relay hub can hold its
+    /// tabs to it.
+    #[test]
+    fn the_connection_reports_the_major_its_config_declares() {
+        let major = Major::new(3).expect("three is a major");
+        let config = ClientConfig::new("major-test").with_schema_major(Some(major));
+        let conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("open in-memory replica");
+        assert_eq!(conn.schema_major(), Some(major));
+
+        let config = ClientConfig::new("major-test");
+        let conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("open in-memory replica");
+        assert_eq!(conn.schema_major(), None);
+    }
 }

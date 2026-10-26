@@ -1581,4 +1581,17 @@ mod tests {
             "sharing a table changes nothing the server sees"
         );
     }
+
+    /// A source without the directive is refused once the translation
+    /// reaches the bundle, so the build fails on the missing major.
+    #[test]
+    fn a_source_without_the_directive_is_refused_by_the_translation() {
+        assert!(matches!(
+            translate::<String, connetto_core::bots::TextIds>(
+                "CREATE TABLE orders (id INT PRIMARY KEY, label TEXT);",
+                ""
+            ),
+            Err(SchemaError::Major(connetto_core::MajorError::Missing))
+        ));
+    }
 }

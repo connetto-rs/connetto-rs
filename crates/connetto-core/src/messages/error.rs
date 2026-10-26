@@ -176,3 +176,28 @@ impl FatalError {
         Self { reason }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_reasons_that_name_another_build_are_build_mismatches() {
+        let other = Major::new(2).expect("two is a major");
+        assert!(
+            FatalErrorReason::MajorMismatch {
+                server: other,
+                client: None,
+            }
+            .is_build_mismatch()
+        );
+        assert!(
+            FatalErrorReason::ProtocolVersionMismatch {
+                expected: 2,
+                got: 1,
+            }
+            .is_build_mismatch()
+        );
+        assert!(!FatalErrorReason::RateLimited { retry_after_ms: 10 }.is_build_mismatch());
+    }
+}
