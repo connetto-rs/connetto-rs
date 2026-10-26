@@ -61,6 +61,10 @@ jobs:
             cwd: examples/yew-web-demo
             target: --target wasm32-unknown-unknown
             flags: --all-features
+          - name: demo-support wasm
+            cwd: examples/demo-support
+            target: --target wasm32-unknown-unknown
+            flags: --all-features
           - name: webauthn-unlock wasm
             cwd: examples/webauthn-unlock
             target: --target wasm32-unknown-unknown
@@ -202,6 +206,7 @@ jobs:
           examples/wasm-smoke --all-features --target=wasm32-unknown-unknown
           examples/dioxus-demo --no-default-features --features=web --target=wasm32-unknown-unknown
           examples/yew-web-demo --all-features --target=wasm32-unknown-unknown
+          examples/demo-support --all-features --target=wasm32-unknown-unknown
           examples/webauthn-unlock --all-features --target=wasm32-unknown-unknown
           examples/dioxus-demo --all-features
           examples/tauri-leptos-demo --all-features
@@ -544,6 +549,7 @@ jobs:
               -p connetto-dioxus
               -p connetto-yew
               -p connetto-peer
+              -p connetto-demo-support
             bins: ''
     steps:
       - uses: actions/checkout@v7
