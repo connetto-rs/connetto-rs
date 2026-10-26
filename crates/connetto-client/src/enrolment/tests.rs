@@ -810,6 +810,59 @@ async fn a_refused_attestation_is_raised_once_and_asks_again_only_on_the_next_co
     run.await.expect("the run ends");
 }
 
+/// A task that ends without finding the device's own key revoked never asks
+/// the client to wipe, so closing a client wipes nothing (R105 decision 10).
+#[tokio::test]
+async fn a_task_that_ends_unrevoked_never_asks_for_a_wipe() {
+    let (_, der) = attesting_key();
+    let authority = authority(SystemTime::now()).await;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events_rx) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Grant,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        None,
+        Vec::new(),
+        inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+    poll_until(|| !state.lock().stored.is_empty()).await;
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), handle.revoked())
+            .await
+            .is_err(),
+        "an ended task holds no revocation, so the wipe never runs"
+    );
+}
+
 /// A grant the local clock puts before its window leaves the device off the
 /// clock, and the device asks again on its next connection, never on a
 /// notice of the connection it already asked on.

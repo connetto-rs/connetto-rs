@@ -556,4 +556,47 @@ mod tests {
         // A clean replica purges with no force, idempotent when already gone.
         purge_replica(&db, &[], false).expect("idempotent purge of a missing file");
     }
+
+    /// A first start has no data directory yet, which holds no pending wipe
+    /// rather than refusing the start.
+    #[cfg(feature = "native-auth")]
+    #[test]
+    fn a_missing_data_directory_holds_no_pending_wipe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            super::PendingWipe::every(&dir.path().join("never-created")).expect("read"),
+            Vec::new()
+        );
+    }
+
+    /// A marked wipe reads back with its account, or with none for a held
+    /// credential, beside files that are not markers, and clearing it twice
+    /// is fine, so a completion that crashed after clearing runs again.
+    #[cfg(feature = "native-auth")]
+    #[test]
+    fn a_marked_wipe_reads_back_until_cleared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("replica-a"), b"a replica").expect("a replica file");
+        let signed_in = super::PendingWipe {
+            name: "replica-a".to_owned(),
+            account: Some("alice".to_owned()),
+        };
+        let held = super::PendingWipe {
+            name: "replica-b".to_owned(),
+            account: None,
+        };
+        signed_in.mark(dir.path()).expect("mark");
+        held.mark(dir.path()).expect("mark");
+
+        let mut pending = super::PendingWipe::every(dir.path()).expect("read");
+        pending.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(pending, vec![signed_in.clone(), held.clone()]);
+
+        signed_in.clear(dir.path()).expect("clear");
+        signed_in.clear(dir.path()).expect("clearing again is fine");
+        assert_eq!(
+            super::PendingWipe::every(dir.path()).expect("read"),
+            vec![held]
+        );
+    }
 }

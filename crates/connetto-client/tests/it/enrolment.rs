@@ -78,6 +78,7 @@ const APP_REISSUE: &str = "r74-reissue";
 const APP_CAP: &str = "r74-cap";
 const APP_REVOKE: &str = "r74-revoke";
 const APP_REVOKE_RETRY: &str = "r105-revoke-retry";
+const APP_REVOKE_CRASHED: &str = "r105-revoke-crashed";
 const APP_NONE: &str = "r74-no-issuer";
 const APP_RESTART: &str = "r74-restart";
 const APP_OFFLINE: &str = "r74-offline";
@@ -155,6 +156,7 @@ async fn enrolment_phase() {
         "cap" => Box::pin(cap()).await,
         "revoke" => Box::pin(revoke()).await,
         "revoke-retry" => Box::pin(revoke_retry()).await,
+        "revoke-crashed" => Box::pin(revoke_crashed()).await,
         "spectator" => Box::pin(spectator()).await,
         "restart" => Box::pin(restart()).await,
         "offline" => Box::pin(offline()).await,
@@ -1216,6 +1218,81 @@ async fn revoke() {
         .expect("the fresh enrolment records");
     assert_eq!(records[1].key, second_cert.identity().key());
     assert_eq!(&records[1].serial[..], second_cert.serial());
+    second.close().await;
+}
+
+/// A start after a crash mid-wipe finishes the wipe the marker records, with no
+/// application wipe registered: the credential, the replica with its key and
+/// the device key go before anything opens, so only a fresh sign-in comes back,
+/// under a fresh key (R105 decision 10).
+#[test]
+fn a_start_after_a_crash_mid_wipe_finishes_it() {
+    run_phase("revoke-crashed");
+}
+
+async fn revoke_crashed() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, _server) = sync_server(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let dir = tempdir().expect("a data directory");
+
+    let client = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_REVOKE_CRASHED, "crashed-user"),
+            dir.path(),
+        )
+        .connect(),
+    )
+    .await
+    .expect("the signed-in build connects");
+    let first = wait_for_certificate(&client, BOUND)
+        .await
+        .expect("the enrolment grants");
+    let session = client.session().expect("a provider build");
+    let replica = replica_db_name(REPLICA_PREFIX, session.user_id()).expect("a user id serializes");
+    let account = session.account().to_owned();
+    client.close().await;
+    drop(client);
+    // What the wipe records before its first part runs, left by a crash.
+    std::fs::write(dir.path().join(format!("{replica}.wipe-pending")), &account)
+        .expect("the marker a wipe leaves");
+
+    assert!(
+        asks_for_login(addr, &base, APP_REVOKE_CRASHED, dir.path()).await,
+        "the start finished the wipe, so the stored credential is gone"
+    );
+    assert_wiped(dir.path(), &replica, APP_REVOKE_CRASHED).await;
+    assert!(
+        !dir.path().join(format!("{replica}.wipe-pending")).exists(),
+        "a finished wipe leaves no marker"
+    );
+
+    let second = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_REVOKE_CRASHED, "crashed-user"),
+            dir.path(),
+        )
+        .connect(),
+    )
+    .await
+    .expect("a fresh sign-in connects");
+    let second_cert = wait_for_certificate(&second, BOUND)
+        .await
+        .expect("the fresh key enrols");
+    assert_ne!(
+        second_cert.identity().key(),
+        first.identity().key(),
+        "the wiped device key is not reused"
+    );
     second.close().await;
 }
 
