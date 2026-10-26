@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-pub use connetto_demo_support::LogoutState;
+pub use crate::LogoutState;
 use serde::{Deserialize, Serialize};
 
 /// The standing of this page's session, which part of the screen owns it.
@@ -48,10 +48,33 @@ pub struct PhotoRow {
 /// One notes row as the pane shows it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoteRow {
-    /// The row's key.
-    pub id: i64,
+    /// The row's key in decimal. Note keys exceed the 2^53 a JavaScript
+    /// number holds exactly, so they cross invoke as text.
+    pub id: String,
     /// The note's text.
     pub body: String,
+}
+
+/// One stored account, its credential-store key and the label the account
+/// bar shows for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountEntry {
+    /// The credential-store key.
+    pub key: String,
+    /// The decoded identity, or the raw key when the key does not decode.
+    pub label: String,
+}
+
+#[cfg(feature = "client")]
+impl AccountEntry {
+    /// The entry for `key`, labelled with its decoded identity.
+    #[must_use]
+    pub fn new(key: String) -> Self {
+        Self {
+            label: crate::account_label(&key),
+            key,
+        }
+    }
 }
 
 /// Every line the screen shows.
@@ -64,20 +87,25 @@ pub struct View {
     pub gate_line: Option<String>,
     /// The custody line, shown once the worker reports the custody level.
     pub custody_line: Option<String>,
+    /// The device line, the identity and certificate standing on a native
+    /// build and the no-device-identity statement in a browser.
+    pub device_line: String,
+    /// Whether the header offers the unlock, a native gate that is locked.
+    pub offers_unlock: bool,
 
     // The account bar.
     /// The page's session standing.
     pub session: Session,
     /// The signed-in identity, absent while none is live.
     pub identity: Option<String>,
-    /// The decoded label of the live account key.
-    pub account: Option<String>,
-    /// Every account key the worker has offered.
-    pub known_accounts: Vec<String>,
+    /// The live account.
+    pub account: Option<AccountEntry>,
+    /// Every account the worker has offered.
+    pub known_accounts: Vec<AccountEntry>,
     /// The picker's list, parked while the worker awaits a choice.
-    pub picking: Option<Vec<String>>,
+    pub picking: Option<Vec<AccountEntry>>,
     /// The account the last successful sign-in used, for the restore line.
-    pub stored_account: Option<String>,
+    pub stored_account: Option<AccountEntry>,
     /// The session expiry warning line.
     pub expiry_warning: Option<String>,
     /// Whether the passkey gate can be offered from this window.
@@ -94,6 +122,9 @@ pub struct View {
     pub server_count: Option<i64>,
     /// The server's grouped `COUNT(*)` line.
     pub grouped: String,
+    /// Whether the pane offers the insert through the backend writer, the
+    /// phone proofs' Postgres path on the native build.
+    pub backend_writer: bool,
 
     // The photos pane.
     /// The photos rows, oldest first.
@@ -140,7 +171,8 @@ impl View {
     pub fn initial() -> Self {
         Self {
             status: "connecting to the connetto stack".to_owned(),
-            grouped: connetto_demo_support::grouped_label(&HashMap::new()),
+            device_line: "no device identity in this build".to_owned(),
+            grouped: crate::grouped_label(&HashMap::new()),
             ..Self::default()
         }
     }
@@ -151,6 +183,8 @@ impl View {
 pub enum Action {
     /// Open the login popup at the parked URL.
     SignIn,
+    /// Run the native gate's unlock prompt.
+    Unlock,
     /// Answer the parked account picker, `None` picking the new-account entry.
     ChooseAccount {
         /// The stored account key, or `None` for the new-account entry.
@@ -158,6 +192,8 @@ pub enum Action {
     },
     /// Add a new account to the worker's credential store.
     AddAccount,
+    /// Insert one order through the backend writer, straight into Postgres.
+    InsertBackend,
     /// Reboot the worker into another stored account.
     SwitchAccount {
         /// The stored account key.

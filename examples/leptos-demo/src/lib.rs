@@ -1,4 +1,6 @@
-//! The demo's shared items and the browser test worker entry points.
+//! The demo's shared items and the browser test worker entry points, which
+//! exist on the browser layer only.
+#![cfg(feature = "web")]
 
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::wasm_bindgen;

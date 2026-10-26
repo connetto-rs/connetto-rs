@@ -10,33 +10,47 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["web"]
+# The browser layer, which drives connetto-web in the page and boots the DB
+# worker in a dedicated worker.
+web = [
+    "connetto-demo-support/web",
+    "dep:base64",
+    "dep:connetto-client",
+    "dep:connetto-file-core",
+    "dep:connetto-web",
+    "dep:rosetta-uuid",
+]
+# The Tauri layer, which sends every action over invoke to the native core in
+# `examples/tauri-leptos-demo/src-tauri` and renders the view it emits.
+tauri = ["dep:serde", "dep:serde-wasm-bindgen"]
+
 [dependencies]
-# The shared demo core, holding the schema rows and queries, the pane
-# wording, and the browser pieces every browser demo carries.
-connetto-demo-support = { path = "../demo-support" }
+# The shared demo core, holding the view and the actions, the schema rows and
+# queries, the pane wording, and the browser pieces every browser demo carries.
+connetto-demo-support = { path = "../demo-support", default-features = false }
 # The browser platform with its transports, leader election, locks, the
 # relay hub and the DB worker orchestration, booted and attached through its
 # WebClientBuilder.
-connetto-web = { path = "../../crates/connetto-web" }
+connetto-web = { path = "../../crates/connetto-web", optional = true }
 # The client types the window drives (builder pieces, client, events), with
 # default features off for a wasm build with a browser transport.
-connetto-client = { path = "../../crates/connetto-client", default-features = false }
+connetto-client = { path = "../../crates/connetto-client", default-features = false, optional = true }
 # FileId for the photo staging and the refused and lost lists.
-connetto-file-core = { path = "../../crates/connetto-file-core" }
+connetto-file-core = { path = "../../crates/connetto-file-core", optional = true }
 # The Leptos 0.8 csr build, as the Tauri UI uses.
 leptos = { version = "0.8", features = ["csr"] }
-# The view and the actions derive serde so the Tauri layer sends the same
-# two types over invoke.
-serde = { version = "1", features = ["derive"] }
 # Client-authored primary keys, one strongly typed `rosetta_uuid::Uuid` that
 # maps to SQLite BLOB and Postgres uuid from a single schema, minted with the
 # browser CSPRNG through getrandom's wasm_js backend.
-rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite"] }
-# The photo staging rows the browser tests load through their own tables.
-diesel = { version = "2", features = ["sqlite"] }
+rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite"], optional = true }
 # Local thumbnails travel as `data:` URLs, so the resolved bytes are encoded
 # here.
-base64 = "0.22"
+base64 = { version = "0.22", optional = true }
+# The actions and the view cross invoke as plain JS objects.
+serde = { version = "1", features = ["derive"], optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
@@ -73,6 +87,9 @@ web-sys = { version = "0.3", features = [
 wasm-bindgen-test = "0.3"
 futures-channel = "0.3"
 serde_json = "1"
+# The photo staging rows the browser tests load through their own tables.
+diesel = { version = "2", features = ["sqlite"] }
+serde = { version = "1", features = ["derive"] }
 
 [workspace]
 

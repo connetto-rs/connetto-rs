@@ -9,7 +9,7 @@
 //! Each DB worker instantiates the test's compiled Wasm module with its own boot identity.
 //! Distinct database names separate records within the origin-wide `sahpool`.
 
-#![cfg(target_arch = "wasm32")]
+#![cfg(all(target_arch = "wasm32", feature = "web"))]
 
 use connetto_client::dsl::Watchable;
 use connetto_client::{

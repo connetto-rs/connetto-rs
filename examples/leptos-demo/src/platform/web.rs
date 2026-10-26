@@ -27,7 +27,9 @@ use web_sys::{
     BlobPropertyBag, FileSystemFileHandle, FileSystemWritableFileStream, SaveFilePickerOptions,
 };
 
-use crate::view::{Action, LogoutState, NoteRow, OrderRow, PhotoRow, Session, View};
+use connetto_demo_support::view::{
+    AccountEntry, Action, LogoutState, NoteRow, OrderRow, PhotoRow, Session, View,
+};
 
 /// The tab-to-worker transport the window's client rides.
 pub type Transport = MessageTransport<web_sys::BroadcastChannel>;
@@ -44,7 +46,7 @@ type PhotoSrcKey = (Vec<(Uuid, String)>, u64);
 ///
 /// A JS string describing the VFS, acquisition, upstream connect, or
 /// subscribe failure.
-pub async fn run_db_worker() -> Result<(), JsValue> {
+async fn run_db_worker() -> Result<(), JsValue> {
     let origin = glue::worker_origin();
     let session = glue::demo_builder()
         .signed_in(
@@ -168,14 +170,67 @@ fn logging_out(v: &View) -> bool {
         || v.refused_pending.is_some()
 }
 
+/// Start this wasm module in its browser context. The dedicated DB worker
+/// runs this same module and boots the connetto DB tier, because a worker has
+/// no Window. A login popup delivers its code and closes. Every other window
+/// answers with the one view signal the components read.
+pub fn run_page() -> Option<RwSignal<View>> {
+    connetto_web::logging::init_console();
+    let Some(win) = web_sys::window() else {
+        spawn_local(async {
+            if let Err(err) = run_db_worker().await {
+                tracing::error!(error = ?err, "db worker failed");
+            }
+        });
+        return None;
+    };
+
+    // The OAuth popup lands here with ?code=&state= after the user
+    // authenticates. Deliver the code to the waiting worker, then close the
+    // popup so the original window continues uninterrupted.
+    //
+    // A same-window redirect (no opener) delivers the code the same way,
+    // clears the query string, and falls through to render the app. In
+    // practice the popup path is used so the original worker keeps its PKCE
+    // state and can verify the returned state parameter.
+    let search = win.location().search().unwrap_or_default();
+    if let (Some(code), Some(state)) = (query_param(&search, "code"), query_param(&search, "state"))
+    {
+        let _ = connetto_web::deliver_login_code(&code, &state);
+        let has_opener = js_sys::Reflect::get(win.as_ref(), &JsValue::from_str("opener"))
+            .map(|value| !value.is_null() && !value.is_undefined())
+            .unwrap_or(false);
+        if has_opener {
+            let _ = win.close();
+            return None;
+        }
+        // Outside a popup, clear the query string so a reload does not
+        // re-deliver an already-spent code.
+        let pathname = win.location().pathname().unwrap_or_else(|_| "/".to_owned());
+        if let Ok(history) = win.history() {
+            let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&pathname));
+        }
+    }
+    Some(boot_page())
+}
+
+/// One `key=value` pair from a URL query string, `None` when the key is
+/// absent.
+fn query_param(search: &str, key: &str) -> Option<String> {
+    search.trim_start_matches('?').split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| v.to_owned())
+    })
+}
+
 /// Wire the page's channels, register the account chooser, and start the
 /// boot, answering with the one view signal the components read.
-pub fn run_page() -> RwSignal<View> {
+fn boot_page() -> RwSignal<View> {
     let view = RwSignal::new(View::initial());
     if let Some(stored) = glue::read_stored_account() {
         view.update(|v| {
             v.session = Session::Restoring;
-            v.stored_account = Some(stored);
+            v.stored_account = Some(AccountEntry::new(stored));
         });
     }
 
@@ -207,8 +262,9 @@ pub fn run_page() -> RwSignal<View> {
                 match account {
                     Some(account) => {
                         glue::save_stored_account(&account);
-                        v.account = Some(account.clone());
-                        v.stored_account = Some(account);
+                        let entry = AccountEntry::new(account);
+                        v.account = Some(entry.clone());
+                        v.stored_account = Some(entry);
                     }
                     None => v.account = None,
                 }
@@ -234,7 +290,9 @@ pub fn run_page() -> RwSignal<View> {
         serve_account_choice(move |accounts| {
             let answer_cell = Rc::clone(&answer_cell);
             async move {
-                view.update(|v| v.known_accounts = accounts.clone());
+                view.update(|v| {
+                    v.known_accounts = accounts.iter().cloned().map(AccountEntry::new).collect();
+                });
                 // A signed-in page ignores the question, but the worker still
                 // needs an answer to proceed with its boot.
                 if accounts.len() <= 1
@@ -246,7 +304,8 @@ pub fn run_page() -> RwSignal<View> {
                     &accounts,
                     || {
                         view.update(|v| {
-                            v.picking = Some(accounts.clone());
+                            v.picking =
+                                Some(accounts.iter().cloned().map(AccountEntry::new).collect());
                             v.session = Session::PickingAccount;
                         });
                     },
@@ -471,7 +530,7 @@ fn spawn_notes(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: Client) {
                 v.notes = rows
                     .iter()
                     .map(|row| NoteRow {
-                        id: row.id,
+                        id: row.id.to_string(),
                         body: row.body.clone(),
                     })
                     .collect();
@@ -598,17 +657,6 @@ fn mime_type(mime: MimeClass) -> &'static str {
     }
 }
 
-/// A file's bytes and name, read through the browser's Blob API.
-async fn file_bytes(file: web_sys::File) -> Option<(String, Vec<u8>)> {
-    let Ok(buf) = JsFuture::from(file.array_buffer()).await else {
-        return None;
-    };
-    let Ok(buf) = buf.dyn_into::<js_sys::ArrayBuffer>() else {
-        return None;
-    };
-    Some((file.name(), Uint8Array::new(&buf).to_vec()))
-}
-
 /// The hex encoding of a file id, the pane's display and the action's input.
 fn hex_of(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -661,6 +709,9 @@ impl Platform {
     fn act(self, action: Action) {
         match action {
             Action::SignIn => self.sign_in(),
+            // The browser has no native gate to unlock and no backend writer,
+            // and the view never offers either.
+            Action::Unlock | Action::InsertBackend => {}
             Action::ChooseAccount { account } => self.choose_account(account),
             Action::AddAccount => self.add_or_switch(None),
             Action::SwitchAccount { account } => self.add_or_switch(Some(account)),
@@ -1198,9 +1249,4 @@ async fn write_file(handle: &FileSystemFileHandle, blob: &web_sys::Blob) -> Resu
     JsFuture::from(stream.write_with_blob(blob)?).await?;
     JsFuture::from(stream.close()).await?;
     Ok(())
-}
-
-/// Re-export of the file reader for the components.
-pub async fn read_picked_file(file: web_sys::File) -> Option<(String, Vec<u8>)> {
-    file_bytes(file).await
 }

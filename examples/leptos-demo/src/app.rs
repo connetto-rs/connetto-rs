@@ -3,12 +3,13 @@
 
 use connetto_demo_support as support;
 use leptos::prelude::*;
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::HtmlInputElement;
 
 use crate::icons::{Fa, Icon};
-use crate::platform::{act, read_picked_file};
-use crate::view::{Action, LogoutState, Session, View};
+use crate::platform::act;
+use connetto_demo_support::view::{Action, LogoutState, Session, View};
 
 /// The whole page with the stylesheet, the header, the account bar, and the
 /// panes or their skeleton.
@@ -43,7 +44,13 @@ fn Header(view: RwSignal<View>) -> impl IntoView {
             <h1>"connetto web demo (Leptos)"</h1>
             <p class="status">"status: " {move || view.with(|v| v.status.clone())}</p>
             {move || status_line(view.with(|v| v.gate_line.clone()))}
-            <p class="status">"device: no device identity in this build"</p>
+            <p class="status">"device: " {move || view.with(|v| v.device_line.clone())}</p>
+            <Show when=move || view.with(|v| v.offers_unlock)>
+                <button on:click=move |_| act(Action::Unlock)>
+                    <Fa icon=Icon::Fingerprint />
+                    "Unlock"
+                </button>
+            </Show>
             {move || status_line(view.with(|v| v.custody_line.clone()))}
             {move || {
                 view.with(|v| v.expiry_warning.clone())
@@ -95,7 +102,7 @@ fn SignIn(view: RwSignal<View>) -> impl IntoView {
 #[component]
 fn Restoring(view: RwSignal<View>) -> impl IntoView {
     let label = move || {
-        view.with(|v| v.stored_account.as_deref().map(support::account_label))
+        view.with(|v| v.stored_account.as_ref().map(|entry| entry.label.clone()))
             .unwrap_or_default()
     };
     view! {
@@ -114,8 +121,8 @@ fn Picker(view: RwSignal<View>) -> impl IntoView {
                 {move || {
                     accounts()
                         .into_iter()
-                        .map(|key| {
-                            let label = support::account_label(&key);
+                        .map(|entry| {
+                            let (key, label) = (entry.key, entry.label);
                             view! {
                                 <button on:click=move |_| {
                                     act(Action::ChooseAccount {
@@ -146,8 +153,8 @@ fn SignedIn(view: RwSignal<View>) -> impl IntoView {
     let account_tag = move || {
         view.with(|v| {
             v.account
-                .as_deref()
-                .map(support::account_label)
+                .as_ref()
+                .map(|entry| entry.label.clone())
                 .filter(|label| Some(label) != v.identity.as_ref())
         })
     };
@@ -155,8 +162,8 @@ fn SignedIn(view: RwSignal<View>) -> impl IntoView {
         view.with(|v| {
             v.known_accounts
                 .iter()
-                .filter(|key| v.account.as_deref() != Some(key.as_str()))
-                .map(|key| (key.clone(), support::account_label(key)))
+                .filter(|entry| v.account.as_ref().map(|live| &live.key) != Some(&entry.key))
+                .map(|entry| (entry.key.clone(), entry.label.clone()))
                 .collect::<Vec<_>>()
         })
     };
@@ -391,6 +398,12 @@ fn OrdersPane(view: RwSignal<View>) -> impl IntoView {
                         "Remove newest"
                     </button>
                 </Show>
+                <Show when=move || view.with(|v| v.backend_writer)>
+                    <button on:click=move |_| act(Action::InsertBackend)>
+                        <Fa icon=Icon::Database />
+                        "Insert via Postgres (backend writer)"
+                    </button>
+                </Show>
             </div>
             <table>
                 <thead><tr><th>"id"</th><th>"quantity"</th></tr></thead>
@@ -430,6 +443,13 @@ fn on_pick(input: HtmlInputElement, send: fn(String, Vec<u8>) -> Action) {
             act(send(name, bytes));
         }
     });
+}
+
+/// A picked file's name and bytes, read through the browser's Blob API.
+async fn read_picked_file(file: web_sys::File) -> Option<(String, Vec<u8>)> {
+    let buf = JsFuture::from(file.array_buffer()).await.ok()?;
+    let buf = buf.dyn_into::<js_sys::ArrayBuffer>().ok()?;
+    Some((file.name(), js_sys::Uint8Array::new(&buf).to_vec()))
 }
 
 /// The photos pane with the rows and their display sources, the file pick
@@ -611,7 +631,7 @@ fn NotesPane(view: RwSignal<View>) -> impl IntoView {
                                 .map(|row| {
                                     view! {
                                         <tr>
-                                            <td>{row.id.to_string()}</td>
+                                            <td>{row.id.clone()}</td>
                                             <td>{row.body.clone()}</td>
                                         </tr>
                                     }

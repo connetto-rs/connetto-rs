@@ -60,7 +60,11 @@ jobs:
           - name: leptos-demo wasm
             cwd: examples/leptos-demo
             target: --target wasm32-unknown-unknown
-            flags: --all-features
+            flags: ""
+          - name: leptos-demo tauri wasm
+            cwd: examples/leptos-demo
+            target: --target wasm32-unknown-unknown
+            flags: --no-default-features --features tauri
           - name: yew-web-demo wasm
             cwd: examples/yew-web-demo
             target: --target wasm32-unknown-unknown
@@ -80,10 +84,6 @@ jobs:
           - name: tauri-leptos-demo native
             cwd: examples/tauri-leptos-demo
             target: ""
-            flags: --all-features
-          - name: tauri-leptos-demo ui wasm
-            cwd: examples/tauri-leptos-demo/ui
-            target: --target wasm32-unknown-unknown
             flags: --all-features
     steps:
       - uses: actions/checkout@v7
@@ -112,11 +112,11 @@ jobs:
         if: matrix.cwd == 'examples/dioxus-demo' || matrix.cwd == 'examples/tauri-leptos-demo' || matrix.cwd == '.'
         uses: $/.github/actions/install-desktop-deps
 
-      # Tauri's context macro needs the UI's output directory, which only the
-      # Tauri CLI fills, and a check never serves the UI.
+      # Tauri's context macro needs the frontend's output directory, which
+      # only the Tauri CLI fills, and a check never builds the UI.
       - name: Stand in for the Tauri demo's UI build
         if: matrix.cwd == 'examples/tauri-leptos-demo'
-        run: mkdir -p examples/tauri-leptos-demo/ui/dist
+        run: mkdir -p examples/leptos-demo/dist-tauri
 
       - name: Check formatting
         working-directory: ${{ matrix.cwd }}
@@ -189,10 +189,10 @@ jobs:
       - name: Install desktop dependencies
         uses: $/.github/actions/install-desktop-deps
 
-      # Tauri's context macro needs the UI's output directory, which only the
-      # Tauri CLI fills, and a lint never serves the UI.
+      # Tauri's context macro needs the frontend's output directory, which
+      # only the Tauri CLI fills, and a lint never builds the UI.
       - name: Stand in for the Tauri demo's UI build
-        run: mkdir -p examples/tauri-leptos-demo/ui/dist
+        run: mkdir -p examples/leptos-demo/dist-tauri
 
       # Every workspace runs even after one fails, so one report lists them all.
       - name: Run nightly clippy
@@ -210,12 +210,12 @@ jobs:
           examples/wasm-smoke --all-features --target=wasm32-unknown-unknown
           examples/dioxus-demo --no-default-features --features=web --target=wasm32-unknown-unknown
           examples/yew-web-demo --all-features --target=wasm32-unknown-unknown
-          examples/leptos-demo --all-features --target=wasm32-unknown-unknown
+          examples/leptos-demo --target=wasm32-unknown-unknown
+          examples/leptos-demo --no-default-features --features=tauri --target=wasm32-unknown-unknown
           examples/demo-support --all-features --target=wasm32-unknown-unknown
           examples/webauthn-unlock --all-features --target=wasm32-unknown-unknown
           examples/dioxus-demo --all-features
           examples/tauri-leptos-demo --all-features
-          examples/tauri-leptos-demo/ui --all-features --target=wasm32-unknown-unknown
           EOF
           if [ "${#failed[@]}" -gt 0 ]; then
             echo "::error::nightly clippy failed in ${failed[*]}"
