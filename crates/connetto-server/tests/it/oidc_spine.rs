@@ -563,13 +563,21 @@ impl AuthStore for OutageStore {
         Some(())
     }
 
-    fn create_session(
+    fn resolve(
         &self,
+        identity: &connetto_server::ResolvedIdentity,
+    ) -> impl Future<Output = Result<String, AuthStoreError>> + Send {
+        self.0.resolve(identity)
+    }
+
+    fn create_session_for(
+        &self,
+        user_id: String,
         identity: &connetto_server::ResolvedIdentity,
         origin: connetto_server::SessionOrigin<()>,
     ) -> impl Future<Output = Result<connetto_server::IssuedSession<Self::Id>, AuthStoreError>> + Send
     {
-        self.0.create_session(identity, origin)
+        self.0.create_session_for(user_id, identity, origin)
     }
 
     fn session_record(

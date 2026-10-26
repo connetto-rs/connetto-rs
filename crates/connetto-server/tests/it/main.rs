@@ -7,6 +7,7 @@
 
 mod abuse;
 mod anonymous_writer;
+mod ban_doors;
 mod bot_cap;
 mod bot_proof;
 mod bot_registration;

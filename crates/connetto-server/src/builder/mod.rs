@@ -789,15 +789,17 @@ where
     }
 
     /// The person and session a login access token names, once its
-    /// signature verifies and its session is live, the check the sync
-    /// handshake makes, so a handler refuses an ended session at once
-    /// (R105 decision 7).
+    /// signature verifies, its session is live and its identity is not
+    /// banned, the check the sync handshake makes, so a handler refuses an
+    /// ended session at once (R105 decisions 7 and 8).
     ///
     /// # Errors
     ///
     /// [`LivenessError::Refused`] for anything but a valid login access
-    /// token, [`LivenessError::Revoked`] when its session ended, and
-    /// [`LivenessError::Store`] when the store cannot answer.
+    /// token, [`LivenessError::Revoked`] when its session ended,
+    /// [`LivenessError::Banned`] when its identity is banned, and
+    /// [`LivenessError::Store`] or [`LivenessError::BanList`] when the store
+    /// or the ban list cannot answer.
     pub async fn verify_live(
         &self,
         access_token: &str,
@@ -1913,6 +1915,25 @@ async fn build_auth<D: ConnettoSchema>(
     let audit = pg_audit_hook::<D>(pool.clone());
     service.guard().set_audit_hook(Arc::clone(&audit));
     service.set_audit_hook(audit);
+    // A ban ends every session of the banned identity (R105 decision 8). The
+    // guard holds the hook and the service holds the guard, so the hook
+    // reaches the service through a weak handle rather than a cycle.
+    let banned = Arc::downgrade(&service);
+    service.guard().set_ban_hook(Arc::new(move |user: D::Id| {
+        let Some(service) = banned.upgrade() else {
+            return;
+        };
+        tokio::spawn(async move {
+            match service.end_banned(&user).await {
+                Ok(ended) => {
+                    tracing::warn!(user = %user, ended = ended.len(), "the ban ended every session");
+                }
+                Err(error) => {
+                    tracing::error!(%error, user = %user, "the ban's sessions could not be ended");
+                }
+            }
+        });
+    }));
     Ok((service, registry))
 }
 

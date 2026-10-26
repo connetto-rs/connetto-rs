@@ -11,89 +11,21 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
-use std::marker::PhantomData;
 use std::sync::Arc;
 
+use super::photo_fixture::{
+    PHOTO, attach_content, device, photos, provision, spawn_sync_server, stage_photo,
+    start_file_server, wait_for_pg_state, wait_for_upload,
+};
 use connetto_client::live::ConnettoClient;
-use connetto_client::reconnect::{ReconnectPolicy, TokioSleeper};
-use connetto_client::{ClientBuilder, Gate, Grant, HeldCredential, MemoryRefreshStore, SyncSchema};
-use connetto_core::schema::SchemaBundle;
+use connetto_client::reconnect::TokioSleeper;
 use connetto_core::transport::LoopbackTransport;
 use connetto_file_client::{ContentClient, FsStore, ReqwestHttp, Resolved};
-use connetto_file_core::{FileId, MimeClass};
-use connetto_file_server::{
-    AppPools, Config, DefaultFileSchema, FsStore as ServerStore, TicketSigner, TicketVerifier,
-};
-use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog};
-use connetto_test_harness::{
-    Fixture, HarnessAuth, Server, ServerConfig, pool_for, spawn_server, with_user,
-};
+use connetto_file_core::FileId;
+use connetto_file_server::{DefaultFileSchema, FsStore as ServerStore};
+use connetto_test_harness::{Fixture, Server};
 use diesel::prelude::*;
 use tempfile::tempdir;
-
-/// The application's own table, as Postgres holds it.
-const PG_DDL: &str = "CREATE TABLE photos (id INT PRIMARY KEY, owner TEXT, \
-                      content_id BYTEA, content_state TEXT, edited_at TEXT);";
-
-/// The same table as the replica holds it.
-const SQLITE_DDL: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, owner TEXT, \
-                          content_id BLOB, content_state TEXT, edited_at TEXT)";
-
-/// The photograph this case carries the whole way.
-const PHOTO: &[u8] = b"JPEG-ish bytes standing in for a photograph taken in the field, \
-                       long enough that a ranged request over it means something";
-
-diesel::table! {
-    /// The application's photo entries, on the replica.
-    photos (id) {
-        /// Entry identifier.
-        id -> diesel::sql_types::Integer,
-        /// Identity that owns the entry.
-        owner -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
-        /// BLAKE3 identity of the photo's bytes.
-        content_id -> diesel::sql_types::Nullable<diesel::sql_types::Binary>,
-        /// Availability of the bytes, as the server last said.
-        content_state -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
-        /// Optimistic concurrency column.
-        edited_at -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
-    }
-}
-
-/// The deployment statements this case needs beside the file server's own DDL.
-///
-/// `connetto_visible_files` and `connetto_set_content_state` are the two
-/// contracts the file server requires, here answered from the application's
-/// own `photos` table. The setter writes `content_state`, which is what makes
-/// the availability signal an ordinary row change the sync path already
-/// carries.
-const DEPLOYMENT: &[&str] = &[
-    "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
-     THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
-    "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'file_reader') \
-     THEN CREATE ROLE file_reader LOGIN PASSWORD 'file_reader' NOINHERIT; END IF; END $$",
-    "CREATE TABLE photos (id INT PRIMARY KEY, owner TEXT, content_id BYTEA, \
-     content_state TEXT, edited_at TEXT)",
-    "ALTER TABLE photos REPLICA IDENTITY FULL",
-    "GRANT USAGE ON SCHEMA public TO app_writer",
-    "GRANT USAGE ON SCHEMA public TO file_reader",
-    "GRANT SELECT, INSERT, UPDATE, DELETE ON photos TO app_writer",
-    "GRANT SELECT, UPDATE ON photos TO file_reader",
-    "GRANT SELECT ON _cfs_manifests TO file_reader",
-    "GRANT SELECT ON _cfs_manifest_chunks TO file_reader",
-    "CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[]) \
-     RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ \
-       SELECT ARRAY(SELECT f FROM UNNEST(p_file_ids) AS f \
-         WHERE EXISTS (SELECT 1 FROM public.photos p WHERE p.content_id = f)) \
-     $$",
-    "GRANT EXECUTE ON FUNCTION connetto_visible_files TO file_reader",
-    "GRANT EXECUTE ON FUNCTION connetto_visible_files TO app_writer",
-    "CREATE OR REPLACE FUNCTION connetto_set_content_state(p_file_id BYTEA, \
-     p_new_state TEXT, p_caller TEXT) RETURNS BYTEA LANGUAGE plpgsql \
-     SECURITY DEFINER SET search_path TO '' AS $$ BEGIN \
-       UPDATE public.photos SET content_state = p_new_state WHERE content_id = p_file_id; \
-       RETURN p_file_id; END; $$",
-    "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO file_reader",
-];
 
 /// The whole case, in one test because each half is the other's premise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -111,7 +43,7 @@ async fn a_photo_written_offline_arrives_and_a_second_device_fetches_it() {
     // are written while the gate is closed.
     let replica_dir = tempdir().expect("temp dir");
     let (a, gate) = offline_device_a(replica_dir.path(), &server).await;
-    let a_content = attach_device_a_content(a, chunk_dir.path()).await;
+    let a_content = attach_content(a, chunk_dir.path()).await;
     let file_id = stage_offline_photo(&a_content).await;
 
     // Reconnect: the row goes up as an ordinary mutation, the bytes go up
@@ -160,7 +92,7 @@ async fn a_device_holding_a_lost_photo_uploads_it_again() {
     let server = Arc::new(spawn_sync_server(&fixture, signer).await);
     let replica_dir = tempdir().expect("temp dir");
     let (a, gate) = offline_device_a(replica_dir.path(), &server).await;
-    let a_content = attach_device_a_content(a.clone(), chunk_dir.path())
+    let a_content = attach_content(a.clone(), chunk_dir.path())
         .await
         .heal_lost(
             "SELECT content_id FROM photos WHERE content_state = 'lost'",
@@ -209,65 +141,12 @@ async fn a_device_holding_a_lost_photo_uploads_it_again() {
     files.abort();
 }
 
-/// Reads `content_state` out of Postgres until it equals `wanted`.
-async fn wait_for_pg_state(fixture: &Fixture, file_id: &[u8; 32], wanted: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let mut conn = fixture.admin().get().await.expect("admin connection");
-        let rows: Vec<StateRow> = diesel_async::RunQueryDsl::load(
-            diesel::sql_query("SELECT content_state FROM photos WHERE content_id = $1")
-                .bind::<diesel::sql_types::Bytea, _>(file_id.to_vec()),
-            &mut *conn,
-        )
-        .await
-        .expect("read the state");
-        if rows.first().and_then(|row| row.content_state.as_deref()) == Some(wanted) {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "content_state never became {wanted}"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-/// Attaches a content client to device A's dedicated chunk directory.
-async fn attach_device_a_content(
-    a: ConnettoClient<LoopbackTransport>,
-    chunk_dir: &std::path::Path,
-) -> ContentClient<LoopbackTransport, FsStore, ReqwestHttp> {
-    ContentClient::attach(
-        a,
-        FsStore::new(chunk_dir.join("device-a")),
-        [3; 32],
-        ReqwestHttp::new(),
-    )
-    .await
-    .expect("attach content handling to device A")
-}
-
-/// Stages the test photograph on device A as photo row 1 and asserts the
-/// bytes resolve from the local chunk store.
-///
-/// Returns the file identity so the reconnect path can reference it.
+/// Stages the test photograph on device A and asserts the bytes resolve
+/// from the local chunk store.
 async fn stage_offline_photo(
     a_content: &ContentClient<LoopbackTransport, FsStore, ReqwestHttp>,
 ) -> FileId {
-    let (file_id, ()) = a_content
-        .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
-            diesel::insert_into(photos::table)
-                .values((
-                    photos::id.eq(1),
-                    photos::owner.eq("alice"),
-                    photos::content_id.eq(file_id.as_bytes().to_vec()),
-                    photos::edited_at.eq("t0"),
-                ))
-                .execute(conn)
-                .map(|_| ())
-        })
-        .await
-        .expect("stage the photo offline");
+    let file_id = stage_photo(a_content).await;
     assert!(
         matches!(
             a_content.resolve(file_id).await.expect("resolve offline"),
@@ -404,158 +283,6 @@ async fn connect_device_b(
     .await
 }
 
-/// One device of alice's at `path`, presenting `grant` and dialing through
-/// `dial`, redialing under the default policy while the dial fails.
-///
-/// The grant differs per device on purpose, because a session handle is durable and a
-/// second connection presenting the same grant supersedes the first, so two
-/// devices of one user are two grants.
-async fn device<F, Fut>(
-    path: &std::path::Path,
-    grant: &str,
-    dial: F,
-) -> ConnettoClient<LoopbackTransport>
-where
-    F: FnMut() -> Fut + Send + 'static,
-    Fut: Future<Output = Result<LoopbackTransport, &'static str>> + Send + 'static,
-{
-    let credential =
-        HeldCredential::new(Grant::new(grant), "alice").expect("a string identity serializes");
-    let (running, pump) = ClientBuilder::new(
-        SyncSchema::new(SchemaBundle::new(
-            PG_DDL,
-            "",
-            SQLITE_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
-            None::<&str>,
-        )),
-        dial,
-    )
-    .with_reconnect(ReconnectPolicy::default())
-    .signed_in(credential)
-    .durable(
-        super::support::At(path.to_path_buf()),
-        super::support::FixedKey,
-        MemoryRefreshStore::default(),
-    )
-    .with_gate(Gate::off())
-    .connect_with_pump()
-    .await
-    .expect("open the device");
-    tokio::spawn(pump);
-    running.client().clone()
-}
-
-/// Installs the file server's own schema, the application's table, the two
-/// deployment contracts, and the roles each side connects as.
-async fn provision(fixture: &Fixture) {
-    fixture
-        .setup(&[
-            "DROP TABLE IF EXISTS photos CASCADE",
-            "DROP TABLE IF EXISTS _connetto_writers, _connetto_settled CASCADE",
-        ])
-        .await;
-    for statement in split_statements(connetto_file_server::DEPLOYMENT_DDL) {
-        fixture.exec(&statement).await;
-    }
-    for statement in DEPLOYMENT {
-        fixture.exec(statement).await;
-    }
-    connetto_test_harness::provision_writers(fixture.admin()).await;
-    fixture
-        .exec(
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
-             _connetto_session_writers TO app_writer",
-        )
-        .await;
-}
-
-/// Starts the file server on its own socket, so the ticket's base URL is real
-/// and the ranged `GET` at the end goes over a real one.
-///
-/// Returns that base URL, the signer the sync server mints with, and the task
-/// serving it.
-async fn start_file_server(
-    fixture: &Fixture,
-    chunk_root: &std::path::Path,
-) -> (String, TicketSigner, tokio::task::JoinHandle<()>) {
-    let reader_pool = pool_for(&with_user(
-        fixture.admin_url(),
-        "file_reader",
-        "file_reader",
-    ))
-    .await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind the file server");
-    let base_url = format!("http://{}", listener.local_addr().expect("address"));
-    let (signer, public_key) = TicketSigner::generate(&base_url, Duration::from_secs(600), 1 << 20)
-        .expect("generate a ticket key");
-    let router = connetto_file_server::serve(Config::<DefaultFileSchema> {
-        pools: AppPools {
-            admin: fixture.admin().clone(),
-            reader: reader_pool,
-        },
-        store: connetto_file_server::AnyStore::Fs(
-            ServerStore::new(chunk_root.join("server")).expect("server chunk store"),
-        ),
-        verifier: TicketVerifier::new(public_key),
-        grace: Duration::from_secs(600),
-        caller_settings: connetto_file_server::CallerSettings::default(),
-        quotas: connetto_file_server::QuotaSettings::default(),
-        ceilings: connetto_file_server::CeilingCache::default(),
-        _schema: PhantomData,
-    })
-    .await
-    .expect("the deployment contracts are in place");
-    let serving = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    (base_url, signer, serving)
-}
-
-/// A harness server with the file server's signer wired into its session loop.
-async fn spawn_sync_server(fixture: &Fixture, signer: TicketSigner) -> Server {
-    let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
-    let snapshot =
-        PgSnapshotSource::from_ddl(writer_pool.clone(), PG_DDL).expect("snapshot source");
-    let auth = HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth"));
-    spawn_server(
-        ServerConfig::new(PG_DDL, fixture.admin_url())
-            .with_writable(
-                RuntimeWritableCatalog::builder()
-                    .versioned("photos", "edited_at")
-                    .build(),
-            )
-            .with_replication(["photos"])
-            .with_content_signer(signer),
-        snapshot,
-        auth,
-        writer_pool,
-        fixture.admin().clone(),
-    )
-    .await
-}
-
-/// Walks the outbox until it sends, or gives up loudly.
-async fn wait_for_upload(
-    content: &ContentClient<LoopbackTransport, FsStore, ReqwestHttp>,
-) -> usize {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let sent = content.flush_outbox().await.expect("walk the outbox");
-        if sent > 0 {
-            return sent;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the outbox never drained"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
 /// Reads `content_state` out of Postgres until the commit has flipped it.
 async fn wait_for_state(fixture: &Fixture, file_id: &[u8; 32]) -> Option<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -620,13 +347,4 @@ async fn wait_for_replica_state(
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-}
-
-/// Splits DDL with no dollar-quoted bodies on semicolons.
-fn split_statements(ddl: &str) -> Vec<String> {
-    ddl.split(';')
-        .map(str::trim)
-        .filter(|statement| !statement.is_empty())
-        .map(str::to_owned)
-        .collect()
 }

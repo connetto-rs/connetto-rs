@@ -905,13 +905,9 @@ async fn the_throttle_setter_subscriptions_limit_is_met_on_the_wire() {
 }
 
 /// The `abuse` thresholds and the ban wiring are what the identity meets: the
-/// crossing bans the user, closes its live connection without a word, and a
-/// fresh login for the same identity is refused at the handshake.
+/// crossing bans the user, closes its live connection without a word, refuses
+/// a fresh sign-in, and ends the identity's other session.
 #[tokio::test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the test walks the ban from handshake to refused relogin in order and a split would hide the sequence"
-)]
 async fn the_abuse_setter_bans_the_identity_that_crosses() {
     let _keyring = isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
@@ -949,6 +945,8 @@ async fn the_abuse_setter_bans_the_identity_that_crosses() {
     wait_ready(&base).await;
 
     let (token, user_id) = mint_token(&base).await;
+    // A second place the same identity is signed in, which the ban ends too.
+    let (again_token, _) = mint_token(&base).await;
     let mut client = live_session(&format!("127.0.0.1:{port}"), &token).await;
 
     // The first ghost is refused and tallied, the second crosses and is applied.
@@ -1003,34 +1001,26 @@ async fn the_abuse_setter_bans_the_identity_that_crosses() {
         }
     }
 
-    // A fresh login for the same identity is refused at the handshake: no
-    // ack, only a closed connection.
-    let (again_token, _) = mint_token(&base).await;
-    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .expect("connect the sync route again");
-    let mut again = WebSocketTransport::connect(&format!("ws://127.0.0.1:{port}/sync"), tcp)
-        .await
-        .expect("the axum adapter answers the WebSocket handshake");
-    again
-        .send_control(ControlMessage::Handshake(
-            Handshake::new(PROTOCOL_VERSION, "banned").with_grant(Grant::new(&again_token)),
-        ))
-        .await
-        .expect("send the banned handshake");
-    // The gate still led the connection with a challenge before the refusal.
-    let led = tokio::time::timeout(BOUND, again.recv()).await;
-    assert!(
-        matches!(
-            led,
-            Ok(Ok(Some(IncomingFrame::Control(ControlMessage::Challenge(
-                _
-            )))))
-        ),
-        "a banned identity is led by the challenge, got {led:?}"
+    // A fresh sign-in for the same identity is refused at the callback with
+    // the plain 401 every refused credential gets (R105 decision 8).
+    assert_eq!(
+        super::ban_doors::sign_in_status(&base, "e2e-user").await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a banned identity cannot sign in again"
     );
-    if let Ok(Ok(Some(frame))) = tokio::time::timeout(BOUND, again.recv()).await {
-        panic!("a banned identity got a frame after the challenge: {frame:?}");
+
+    // The other place it was signed in is ended by the same ban, so its token
+    // no longer names a live session.
+    let deadline = Instant::now() + BOUND;
+    loop {
+        match parts.handle.verify_live(&again_token).await {
+            Err(connetto_server::LivenessError::Revoked) => break,
+            other => assert!(
+                Instant::now() < deadline,
+                "the ban never ended the other session, got {other:?}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     stream.abort();
     http.abort();

@@ -82,6 +82,14 @@ pub enum AuthError {
     /// callback supplies one.
     #[error("no describe callback supplies the session description")]
     Undescribed,
+    /// The identity is banned, answered at the token endpoints with the plain
+    /// `401` every refused credential gets (R36 decision 4).
+    #[error("refused")]
+    Banned,
+    /// The ban list could not be read, so the identity is refused rather
+    /// than let through (R36 fails closed).
+    #[error("the ban list could not be read: {0}")]
+    BanList(String),
 }
 
 /// Mints and rotates connetto tokens over an [`AuthStore`].
@@ -130,9 +138,15 @@ pub enum LivenessError {
     /// The token's session was revoked or lapsed.
     #[error("the session is no longer live")]
     Revoked,
+    /// The token's identity is banned.
+    #[error("the identity is banned")]
+    Banned,
     /// The auth store could not answer.
     #[error(transparent)]
     Store(#[from] AuthStoreError),
+    /// The ban list could not be read.
+    #[error("the ban list could not be read: {0}")]
+    BanList(String),
 }
 
 /// What a login row and a sign-in notice say about how a session began,
@@ -263,7 +277,12 @@ impl<S: AuthStore> AuthService<S> {
     ) -> Result<TokenPair<S::Id>, AuthError> {
         let now = SystemTime::now();
         let started = Started::of(identity, &origin);
-        let issued = self.store.create_session(identity, origin).await?;
+        let user_id = self.store.resolve(identity).await?;
+        self.refuse_banned(&user_id).await?;
+        let issued = self
+            .store
+            .create_session_for(user_id, identity, origin)
+            .await?;
         self.finish_login(issued, now, started, |issued| {
             tracing::info!(
                 session = %issued.session_id,
@@ -288,7 +307,12 @@ impl<S: AuthStore> AuthService<S> {
     ) -> Result<TokenPair<S::Id>, AuthError> {
         let now = SystemTime::now();
         let started = Started::of(&login.identity, &origin);
-        let issued = self.store.create_session(&login.identity, origin).await?;
+        let user_id = self.store.resolve(&login.identity).await?;
+        self.refuse_banned(&user_id).await?;
+        let issued = self
+            .store
+            .create_session_for(user_id, &login.identity, origin)
+            .await?;
         self.store
             .set_retained_provider_token(issued.session_id, &login.retained)
             .await?;
@@ -424,6 +448,29 @@ impl<S: AuthStore> AuthService<S> {
         {
             return Err(AuthError::RateLimited(wait));
         }
+        // The ban is read before the token rotates. A ban list that cannot
+        // answer then leaves the token standing, where rotating first would
+        // burn it and the caller's retry after the outage would read as a
+        // stolen token. A ban landing after this read ends the session
+        // through the hook, and the rotation below refuses an ended session.
+        if let Some(session_id) = named_session
+            && let Some(record) = self.store.session_record(session_id).await?
+        {
+            match self.refuse_banned(&record.user_id).await {
+                Ok(()) => {}
+                Err(AuthError::Banned) => {
+                    if self.store.end_owned(&record.user_id, session_id).await? {
+                        self.ended(
+                            &record.user_id,
+                            session_id,
+                            crate::audit::AuthOp::EndedByBan,
+                        );
+                    }
+                    return Err(AuthError::Banned);
+                }
+                Err(err) => return Err(err),
+            }
+        }
         let outcome = match self.store.rotate_refresh(refresh_token).await {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -546,6 +593,26 @@ impl<S: AuthStore> AuthService<S> {
         Ok(ended)
     }
 
+    /// End every session of the banned identity `user`, recording
+    /// `ended_by_ban` for each (R105 decision 8).
+    pub(crate) async fn end_banned(&self, user: &S::Id) -> Result<Vec<SessionId>, AuthError> {
+        let ended = self.store.end_all_of(user, None).await?;
+        for session in &ended {
+            self.ended(user, *session, crate::audit::AuthOp::EndedByBan);
+        }
+        Ok(ended)
+    }
+
+    /// Refuse `user` when the ban list holds a ban on it, and when the list
+    /// cannot be read.
+    async fn refuse_banned(&self, user: &S::Id) -> Result<(), AuthError> {
+        match self.guard.banned(user).await {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(AuthError::Banned),
+            Err(err) => Err(AuthError::BanList(err.detail().to_owned())),
+        }
+    }
+
     /// Close an ended session's live connection and record why it ended.
     fn ended(&self, user: &S::Id, session: SessionId, op: crate::audit::AuthOp) {
         tracing::info!(session = %session, cause = op.label(), "session ended");
@@ -564,8 +631,10 @@ impl<S: AuthStore> AuthService<S> {
     /// # Errors
     ///
     /// [`LivenessError::Refused`] for anything but a valid login access
-    /// token, [`LivenessError::Revoked`] when its session ended, and
-    /// [`LivenessError::Store`] when the store cannot answer.
+    /// token, [`LivenessError::Revoked`] when its session ended,
+    /// [`LivenessError::Banned`] when its identity is banned, and
+    /// [`LivenessError::Store`] or [`LivenessError::BanList`] when the store
+    /// or the ban list cannot answer.
     pub(crate) async fn verify_live(
         &self,
         access_token: &str,
@@ -577,10 +646,13 @@ impl<S: AuthStore> AuthService<S> {
         let Subject::Identity(session) = checked.subject else {
             return Err(LivenessError::Refused);
         };
-        if self.store.session_is_live(session.session_id).await? {
-            Ok(session)
-        } else {
-            Err(LivenessError::Revoked)
+        if !self.store.session_is_live(session.session_id).await? {
+            return Err(LivenessError::Revoked);
+        }
+        match self.guard.banned(&session.context.user_id).await {
+            Ok(None) => Ok(session),
+            Ok(Some(_)) => Err(LivenessError::Banned),
+            Err(err) => Err(LivenessError::BanList(err.detail().to_owned())),
         }
     }
 
