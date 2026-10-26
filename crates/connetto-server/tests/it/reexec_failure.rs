@@ -10,7 +10,7 @@ use connetto_core::messages::{ControlMessage, PauseCause, SUBSCRIPTION_REFUSED};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
     AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, ReconnectEvent,
-    RequestGuard, RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, loopback,
+    RequestGuard, RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits,
     pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, committed_at};
@@ -18,7 +18,6 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
-use tracing::Instrument;
 
 use crate::one_event::OneEvent;
 
@@ -27,15 +26,7 @@ const DDL: &str = "CREATE TABLE counts (id INT PRIMARY KEY, n INT)";
 type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults, PgReadConnector>;
 
 fn connect_to(manager: &Arc<Manager>) -> Client {
-    let (server_end, client_end) = loopback();
-    let session = Arc::clone(manager);
-    tokio::spawn(
-        async move {
-            let _ = session.serve(server_end).await;
-        }
-        .instrument(tracing::Span::current()),
-    );
-    Client::new(client_end)
+    super::loopback_session::connect(|end| Arc::clone(manager).serve(end))
 }
 
 fn guard(seed: Duration, triggered: Duration) -> Arc<RequestGuard<String>> {

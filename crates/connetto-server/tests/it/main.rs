@@ -74,6 +74,7 @@ mod idle_limit;
 mod inprocess_loop;
 mod lifecycle;
 mod logging;
+mod loopback_session;
 
 mod one_event;
 
