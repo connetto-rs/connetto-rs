@@ -2,9 +2,11 @@
 //! function a translated column default may call, so a device without a
 //! server still mints the id.
 
-use connetto_client::{ClientBuilder, SyncSchema};
+use connetto_client::{ClientBuilder, SyncSchema, TierStepRefused};
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
+use connetto_core::{Major, TierBoundary, TierHistory};
+use diesel::SqliteConnection;
 use diesel::prelude::*;
 
 /// The replica DDL the bundle carries, whose BLOB key takes a `uuidv4()`
@@ -71,4 +73,72 @@ fn builder_schema_installs_uuidv4_for_a_default_key() {
         );
     }
     assert_ne!(keys[0], keys[1], "two inserts mint distinct keys");
+}
+
+fn major(value: u32) -> Major {
+    Major::new(value).expect("a test major is from 1 up")
+}
+
+/// A data step registered for a boundary this build carries no generated
+/// step for is refused at registration, before a device ever opens it.
+#[test]
+fn a_tier_step_outside_the_boundaries_is_refused() {
+    fn schema() -> SyncSchema {
+        let bundle = SchemaBundle::new(
+            "-- connetto:major 3",
+            "",
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)",
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some("CREATE TABLE notes (id INTEGER PRIMARY KEY)"),
+        )
+        .expect("the source declares major 3");
+        SyncSchema::new(
+            bundle
+                .with_tier_history(TierHistory::new(
+                    major(2),
+                    Some(major(2)),
+                    vec![TierBoundary::new(
+                        major(2),
+                        "ALTER TABLE notes ADD COLUMN pinned INTEGER",
+                    )],
+                ))
+                .expect("the history reaches the build"),
+        )
+    }
+    let step = |_tier: &mut SqliteConnection| -> Result<(), connetto_client::TierStepError> {
+        Err("unreachable".into())
+    };
+
+    match schema().with_tier_step(major(3), step) {
+        Err(TierStepRefused::Outside {
+            from,
+            oldest,
+            build,
+        }) => {
+            assert_eq!(
+                (from, oldest, build),
+                (major(3), major(2), major(3)),
+                "a step at the build's own major could never run"
+            );
+        }
+        Ok(_) => panic!("a step outside the boundaries registered"),
+    }
+    let step = |_tier: &mut SqliteConnection| -> Result<(), connetto_client::TierStepError> {
+        Err("unreachable".into())
+    };
+    match schema().with_tier_step(major(1), step) {
+        Err(TierStepRefused::Outside {
+            from,
+            oldest,
+            build,
+        }) => {
+            assert_eq!(
+                (from, oldest, build),
+                (major(1), major(2), major(3)),
+                "a step before the oldest export could never run"
+            );
+        }
+        Ok(_) => panic!("a step outside the boundaries registered"),
+    }
 }

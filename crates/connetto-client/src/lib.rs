@@ -9056,4 +9056,95 @@ mod tests {
                 .expect("open in-memory replica");
         assert_eq!(conn.schema_major(), None);
     }
+
+    /// One tier `user_version` reading, which no `table!` can name.
+    #[derive(diesel::QueryableByName)]
+    struct TierMajor {
+        /// The major the tier records.
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        user_version: i32,
+    }
+
+    /// A replica that never recorded a major still attaches the tier file beside it, and a build
+    /// carrying no tier plan leaves the tier as it found it.
+    #[test]
+    fn an_unrecorded_replica_attaches_a_surviving_tier_without_a_plan() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let replica_path = dir.path().join("replica.db");
+        let key_bytes = [0x11; ReplicaKey::LEN];
+        {
+            let replica = Replica::encrypted_file(
+                replica_path.to_str().expect("path is utf-8"),
+                Some(ReplicaKey::from_bytes(key_bytes)),
+            )
+            .expect("replica")
+            .with_tier("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)");
+            let mut first = ConnettoConnection::<FakeTransport>::open(
+                &replica,
+                DDL,
+                &ClientConfig::new("unrecorded-tier"),
+                None,
+            )
+            .expect("first boot");
+            first
+                .db
+                .batch_execute("INSERT INTO notes (id, body) VALUES (7, 'kept')")
+                .expect("tier row");
+        }
+        let replica = Replica::encrypted_file(
+            replica_path.to_str().expect("path is utf-8"),
+            Some(ReplicaKey::from_bytes(key_bytes)),
+        )
+        .expect("replica")
+        .with_existing_tier();
+        let mut conn = ConnettoConnection::<FakeTransport>::open_existing(
+            &replica,
+            DDL,
+            &ClientConfig::new("unrecorded-tier"),
+            None,
+        )
+        .expect("open the unrecorded replica");
+        assert!(
+            conn.local_tables.contains("notes"),
+            "the surviving tier is attached, not truncated"
+        );
+        // A vendor pragma, which the typed DSL cannot express.
+        let version = diesel::sql_query("PRAGMA connetto_local.user_version")
+            .get_result::<TierMajor>(&mut conn.db)
+            .expect("read the tier's major");
+        assert_eq!(
+            version.user_version, 0,
+            "a build without a tier plan stamps nothing"
+        );
+    }
+
+    /// A tier created with no DDL and no plan rests empty and unstamped beside the replica.
+    #[test]
+    fn a_create_tier_without_ddl_and_without_a_plan_rests_empty() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let replica_path = dir.path().join("replica.db");
+        let replica = Replica::encrypted_file(
+            replica_path.to_str().expect("path is utf-8"),
+            Some(ReplicaKey::from_bytes([0x11; ReplicaKey::LEN])),
+        )
+        .expect("replica");
+        let mut conn = ConnettoConnection::<FakeTransport>::open(
+            &replica,
+            DDL,
+            &ClientConfig::new("empty-tier"),
+            None,
+        )
+        .expect("open the replica");
+        conn.create_tier(
+            dir.path().join("replica.db-tier").to_str().expect("utf-8"),
+            None,
+            replica.key(),
+        )
+        .expect("create the tier");
+        // A vendor pragma, which the typed DSL cannot express.
+        let version = diesel::sql_query("PRAGMA connetto_local.user_version")
+            .get_result::<TierMajor>(&mut conn.db)
+            .expect("read the tier's major");
+        assert_eq!(version.user_version, 0, "a planless create stamps nothing");
+    }
 }

@@ -25,6 +25,10 @@ const TIER_V2: &str =
     "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, pinned INTEGER NOT NULL DEFAULT 0)";
 const ADD_PINNED: &str = "ALTER TABLE notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0";
 
+/// A major 1 tier with a pin table that references the notes.
+const TIER_V1_FK: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT); \
+     CREATE TABLE pins (note_id INTEGER PRIMARY KEY REFERENCES notes(id))";
+
 diesel::table! {
     /// The device-private table at major 1, named bare as an application names it.
     notes (id) {
@@ -43,6 +47,14 @@ struct Pinned {
     id: i32,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     pinned: i32,
+}
+
+diesel::table! {
+    /// A pin pointing at a note, present at major 1.
+    pins (note_id) {
+        /// The note the pin points at.
+        note_id -> Integer,
+    }
 }
 
 /// One `user_version` reading, which no `table!` can name.
@@ -353,4 +365,241 @@ async fn a_lost_tier_still_fails_loudly() {
         open(&dir, build(1, Some(TIER_V1), None)).await.is_err(),
         "a tier this install already had is lost, never silently recreated"
     );
+}
+
+#[tokio::test]
+async fn a_generated_step_that_is_not_sql_is_refused() {
+    let dir = tempdir().expect("temp dir");
+    first_boot(&dir).await;
+
+    match open(&dir, build_two("THIS IS NOT SQL")).await {
+        Err(ClientError::TierMigration {
+            from,
+            to,
+            cause: TierFailure::Sql(_),
+        }) => {
+            assert_eq!((from, to), (major(1), major(2)));
+        }
+        Err(other) => panic!("expected the step's failure, got {other:?}"),
+        Ok(_) => panic!("an unrunnable step opened the tier"),
+    }
+    let mut conn = open(&dir, build_two(ADD_PINNED))
+        .await
+        .expect("nothing of the step committed");
+    assert_eq!(tier_major(&mut conn), 2);
+}
+
+#[tokio::test]
+async fn a_boundary_that_orphans_a_row_is_refused() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir, build(1, Some(TIER_V1_FK), None))
+        .await
+        .expect("first boot");
+    diesel::insert_into(notes::table)
+        .values((notes::id.eq(7), notes::body.eq("kept")))
+        .execute(conn.conn())
+        .expect("write the note");
+    diesel::insert_into(pins::table)
+        .values(pins::note_id.eq(7))
+        .execute(conn.conn())
+        .expect("write the pin");
+    drop(conn);
+
+    let two = build(
+        2,
+        Some(TIER_V1_FK),
+        Some(TierHistory::new(
+            major(1),
+            Some(major(1)),
+            vec![TierBoundary::new(
+                major(1),
+                "DELETE FROM notes WHERE id = 7",
+            )],
+        )),
+    );
+    match open(&dir, two).await {
+        Err(ClientError::TierMigration {
+            cause: TierFailure::ForeignKeys(rows),
+            ..
+        }) => {
+            assert_eq!(rows, 1, "the one pin outlives its note");
+        }
+        Err(other) => panic!("expected the foreign key refusal, got {other:?}"),
+        Ok(_) => panic!("a boundary that orphans a row opened"),
+    }
+    let retry = build(
+        2,
+        Some(TIER_V1_FK),
+        Some(TierHistory::new(
+            major(1),
+            Some(major(1)),
+            vec![TierBoundary::new(major(1), "")],
+        )),
+    );
+    let mut conn = open(&dir, retry)
+        .await
+        .expect("the orphaning boundary rolled back");
+    assert_eq!(tier_major(&mut conn), 2);
+    let kept: Vec<i32> = notes::table
+        .select(notes::id)
+        .load(conn.conn())
+        .expect("read the note");
+    assert_eq!(kept, vec![7], "the rolled-back delete left the note");
+}
+
+#[tokio::test]
+async fn a_tier_that_records_no_major_takes_the_builds() {
+    let dir = tempdir().expect("temp dir");
+    first_boot(&dir).await;
+    {
+        let mut conn = open(&dir, build(1, Some(TIER_V1), None))
+            .await
+            .expect("reopen");
+        conn.conn()
+            .batch_execute("PRAGMA connetto_local.user_version = 0")
+            .expect("erase the tier's major");
+    }
+
+    let mut conn = open(&dir, build(1, Some(TIER_V1), None))
+        .await
+        .expect("the pre-major tier opens");
+    assert_eq!(
+        tier_major(&mut conn),
+        1,
+        "the pre-major tier takes the build's major"
+    );
+    let body: Vec<Option<String>> = notes::table
+        .select(notes::body)
+        .load(conn.conn())
+        .expect("read the kept row");
+    assert_eq!(body, vec![Some("kept".to_owned())]);
+}
+
+#[tokio::test]
+async fn a_build_whose_tier_ddl_cannot_run_is_refused() {
+    let dir = tempdir().expect("temp dir");
+    first_boot(&dir).await;
+    let broken = build(
+        2,
+        Some("DROP TABLE notes"),
+        Some(TierHistory::new(
+            major(1),
+            Some(major(1)),
+            vec![TierBoundary::new(major(1), ADD_PINNED)],
+        )),
+    );
+
+    match open(&dir, broken).await {
+        Err(ClientError::TierMigration {
+            cause: TierFailure::Sql(_),
+            ..
+        }) => {}
+        Err(other) => panic!("expected the shape check's failure, got {other:?}"),
+        Ok(_) => panic!("a build whose tier DDL cannot run opened"),
+    }
+    let mut conn = open(&dir, build_two(ADD_PINNED))
+        .await
+        .expect("the tier is still at major 1");
+    assert_eq!(tier_major(&mut conn), 2);
+}
+
+/// The shape refusal's message joins the differences so a log names them.
+#[test]
+fn the_shape_refusal_lists_its_differences() {
+    let failure = TierFailure::Shape(vec![
+        ShapeDifference::TableOnlyHere {
+            table: "notes".to_owned(),
+        },
+        ShapeDifference::ColumnsDiffer {
+            table: "pins".to_owned(),
+            detail: "pinned is on this side only".to_owned(),
+        },
+    ]);
+    assert_eq!(
+        failure.to_string(),
+        "the migrated tier differs from the build's tier DDL: \
+         table notes is on this side only, \
+         table pins columns differ, pinned is on this side only"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_replica_refuses_its_now_undecryptable_tier() {
+    let dir = tempdir().expect("temp dir");
+    first_boot(&dir).await;
+    let credential = super::support::held("tester");
+    let replica = dir.path().join(credential.replica_name());
+    std::fs::remove_file(&replica).expect("lose the replica");
+
+    let outcome = open(&dir, build(1, Some(TIER_V1), None)).await;
+    assert!(
+        outcome.is_err(),
+        "a tier the rebuilt replica cannot decrypt is refused, never silently recreated"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_replica_with_a_corrupted_tier_is_refused() {
+    let dir = tempdir().expect("temp dir");
+    first_boot(&dir).await;
+    let credential = super::support::held("tester");
+    let replica = dir.path().join(credential.replica_name());
+    std::fs::remove_file(&replica).expect("lose the replica");
+    let tier = dir
+        .path()
+        .join(format!("{}-tier", credential.replica_name()));
+    std::fs::write(&tier, b"this is not a database").expect("corrupt the tier");
+
+    let outcome = open(&dir, build(1, Some(TIER_V1), None)).await;
+    assert!(
+        outcome.is_err(),
+        "a tier that cannot be read is refused, never silently recreated"
+    );
+}
+
+#[tokio::test]
+async fn an_introduced_tier_whose_ddl_is_not_runnable_is_refused() {
+    let dir = tempdir().expect("temp dir");
+    drop(
+        open(&dir, build(1, None, None))
+            .await
+            .expect("first boot without a tier"),
+    );
+    let broken = build(
+        2,
+        Some("DROP TABLE notes"),
+        Some(TierHistory::new(major(2), Some(major(2)), Vec::new())),
+    );
+
+    match open(&dir, broken).await {
+        Err(ClientError::Session(message)) => {
+            assert!(message.contains("CREATE TABLE"), "{message}");
+        }
+        Err(other) => panic!("expected the DDL refusal, got {other:?}"),
+        Ok(_) => panic!("a build whose tier DDL is not runnable opened"),
+    }
+}
+
+#[tokio::test]
+async fn an_introduced_tier_whose_second_statement_fails_is_refused() {
+    let dir = tempdir().expect("temp dir");
+    drop(
+        open(&dir, build(1, None, None))
+            .await
+            .expect("first boot without a tier"),
+    );
+    let doubled = build(
+        2,
+        Some(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT); \
+             CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+        ),
+        Some(TierHistory::new(major(2), Some(major(2)), Vec::new())),
+    );
+
+    match open(&dir, doubled).await {
+        Err(ClientError::Db(_)) => {}
+        Err(other) => panic!("expected the second statement's failure, got {other:?}"),
+        Ok(_) => panic!("a build whose tier DDL half-applies opened"),
+    }
 }

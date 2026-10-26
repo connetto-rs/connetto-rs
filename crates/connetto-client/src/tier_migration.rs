@@ -285,3 +285,221 @@ fn cross(
     tier.batch_execute(&format!("PRAGMA user_version = {}", to.get()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ClientConfig, ConnettoConnection, Replica};
+    use connetto_core::{TierBoundary, test_support::FakeTransport};
+
+    const TIER_V1: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
+    const TIER_V2: &str =
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, pinned INTEGER NOT NULL DEFAULT 0)";
+    const ADD_PINNED: &str = "ALTER TABLE notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0";
+
+    fn major(value: u32) -> Major {
+        Major::new(value).expect("a test major is from 1 up")
+    }
+
+    /// A plan migrating `from` to `to` with one generated step and no data steps.
+    fn plan(from: Major, to: Major, ddl: &str, generated: &str) -> TierPlan {
+        TierPlan {
+            build: to,
+            ddl: ddl.to_owned(),
+            history: TierHistory::new(from, Some(from), vec![TierBoundary::new(from, generated)]),
+            steps: Arc::new(BTreeMap::new()),
+        }
+    }
+
+    /// An unencrypted tier at `path`, stamped `stamped`, with one row.
+    fn plain_tier(path: &std::path::Path, stamped: u32) {
+        let mut tier =
+            SqliteConnection::establish(path.to_str().expect("utf-8")).expect("open the tier");
+        tier.batch_execute(TIER_V1).expect("tier schema");
+        tier.batch_execute("INSERT INTO notes (id, body) VALUES (7, 'kept')")
+            .expect("tier row");
+        tier.batch_execute(&format!("PRAGMA user_version = {stamped}"))
+            .expect("stamp");
+    }
+
+    /// One `user_version` reading, which no `table!` can name.
+    #[derive(QueryableByName)]
+    struct UserVersion {
+        /// The major the tier records.
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        user_version: i32,
+    }
+
+    fn tier_major(path: &std::path::Path) -> i32 {
+        let mut tier =
+            SqliteConnection::establish(path.to_str().expect("utf-8")).expect("open the tier");
+        // A vendor pragma, which the typed DSL cannot express.
+        diesel::sql_query("PRAGMA user_version")
+            .get_result::<UserVersion>(&mut tier)
+            .expect("read the tier's major")
+            .user_version
+    }
+
+    /// A plan's `Debug` names its build, history and steps, so a log shows what a migration carried.
+    #[test]
+    fn a_plan_debug_names_its_build_history_and_steps() {
+        let mut steps: BTreeMap<Major, Arc<dyn TierStep>> = BTreeMap::new();
+        steps.insert(
+            major(1),
+            Arc::new(|_tier: &mut SqliteConnection| -> Result<(), TierStepError> { Ok(()) }),
+        );
+        let plan = TierPlan {
+            build: major(2),
+            ddl: TIER_V2.to_owned(),
+            history: TierHistory::new(major(1), Some(major(1)), Vec::new()),
+            steps: Arc::new(steps),
+        };
+        let text = format!("{plan:?}");
+        assert!(text.starts_with("TierPlan {"), "{text}");
+        assert!(text.contains("build"), "{text}");
+        assert!(text.contains("history"), "{text}");
+        assert!(text.contains("steps"), "{text}");
+    }
+
+    /// A tier written without a key migrates on its own connection and records the build's major.
+    #[test]
+    fn a_tier_without_a_key_migrates_on_its_own() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("tier.db");
+        plain_tier(&path, 1);
+
+        migrate_alone(
+            path.to_str().expect("the path is utf-8"),
+            None,
+            &SqlFunctions::new(),
+            &plan(major(1), major(2), TIER_V2, ADD_PINNED),
+            major(1),
+        )
+        .expect("an unkeyed tier migrates");
+        assert_eq!(tier_major(&path), 2);
+    }
+
+    /// A migration whose tier file is missing refuses to open it rather than starting an empty one.
+    #[test]
+    fn a_missing_tier_file_refuses_the_alone_migration() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("absent").join("tier.db");
+        match migrate_alone(
+            missing.to_str().expect("the path is utf-8"),
+            None,
+            &SqlFunctions::new(),
+            &plan(major(1), major(2), TIER_V2, ADD_PINNED),
+            major(1),
+        ) {
+            Err(ClientError::Connect(_)) => {}
+            other => panic!("expected the open refusal, got {other:?}"),
+        }
+    }
+
+    /// A tier this key did not write refuses the migration before a step runs.
+    #[test]
+    fn a_wrong_key_refuses_the_alone_migration() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let replica_path = dir.path().join("replica.db");
+        {
+            let replica = Replica::encrypted_file(
+                replica_path.to_str().expect("the path is utf-8"),
+                Some(ReplicaKey::from_bytes([0x11; ReplicaKey::LEN])),
+            )
+            .expect("replica")
+            .with_tier(TIER_V1);
+            ConnettoConnection::<FakeTransport>::open(
+                &replica,
+                "CREATE TABLE items (id INTEGER PRIMARY KEY)",
+                &ClientConfig::new("wrong-key-test"),
+                None,
+            )
+            .expect("first boot");
+        }
+
+        let tier_path = dir.path().join("replica.db-tier");
+        match migrate_alone(
+            tier_path.to_str().expect("the path is utf-8"),
+            Some(&ReplicaKey::from_bytes([0x22; ReplicaKey::LEN])),
+            &SqlFunctions::new(),
+            &plan(major(1), major(2), TIER_V2, ADD_PINNED),
+            major(1),
+        ) {
+            Err(ClientError::ReplicaUndecryptable(_)) => {}
+            other => panic!("expected the wrong key refusal, got {other:?}"),
+        }
+    }
+
+    /// A function installer that fails refuses the migration before a step runs.
+    #[test]
+    fn a_failing_function_installer_refuses_the_alone_migration() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("tier.db");
+        plain_tier(&path, 1);
+        let functions = SqlFunctions::new().with(Arc::new(|tier: &mut SqliteConnection| {
+            tier.batch_execute("THIS IS NOT SQL")
+        }));
+        match migrate_alone(
+            path.to_str().expect("the path is utf-8"),
+            None,
+            &functions,
+            &plan(major(1), major(2), TIER_V2, ADD_PINNED),
+            major(1),
+        ) {
+            Err(ClientError::Session(message)) => {
+                assert!(message.contains("syntax"), "{message}");
+            }
+            other => panic!("expected the installer's refusal, got {other:?}"),
+        }
+    }
+
+    /// A boundary past the last major the build can reach is refused by name.
+    #[test]
+    fn a_boundary_without_a_successor_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("tier.db");
+        plain_tier(&path, 1);
+        let plan = TierPlan {
+            build: major(2),
+            ddl: TIER_V2.to_owned(),
+            history: TierHistory::new(
+                major(u32::MAX),
+                Some(major(u32::MAX)),
+                vec![TierBoundary::new(major(u32::MAX), "")],
+            ),
+            steps: Arc::new(BTreeMap::new()),
+        };
+        match migrate_alone(
+            path.to_str().expect("the path is utf-8"),
+            None,
+            &SqlFunctions::new(),
+            &plan,
+            major(1),
+        ) {
+            Err(ClientError::Session(message)) => {
+                assert!(message.contains("no successor"), "{message}");
+            }
+            other => panic!("expected the successor refusal, got {other:?}"),
+        }
+    }
+
+    /// Reading a major from a schema the connection does not carry is refused.
+    #[test]
+    fn a_recorded_read_on_an_absent_schema_is_refused() {
+        let mut db = SqliteConnection::establish(":memory:").expect("scratch");
+        assert!(
+            recorded(&mut db, "absent").is_err(),
+            "a missing schema cannot record a major"
+        );
+    }
+
+    /// Stamping a major on a schema the connection does not carry is refused.
+    #[test]
+    fn a_stamp_on_an_absent_schema_is_refused() {
+        let mut db = SqliteConnection::establish(":memory:").expect("scratch");
+        assert!(
+            stamp(&mut db, "absent", major(1)).is_err(),
+            "a missing schema cannot take a major"
+        );
+    }
+}
