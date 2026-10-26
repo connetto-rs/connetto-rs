@@ -415,8 +415,6 @@ pub enum SeedPlan {
 pub struct Dispatched {
     /// Row patches to fan out to matched consumers.
     pub patches: Vec<MatchedPatch>,
-    /// Matched consumers whose patch could not be encoded after the engine applied the event.
-    pub unbuilt: Vec<UnbuiltPatch>,
     /// Server-computed results that moved: fold deltas per group, replaced
     /// scalar extremes, re-read row answers, and keyed row changes, each
     /// already shaped for the wire.
@@ -432,13 +430,19 @@ pub struct Dispatched {
     pub failure: Option<MaterializerError>,
 }
 
-/// A matched consumer still owed its patch, built again by [`Materializer::build_patches`].
+/// A matched consumer and whether the row left its window rather than changing in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UnbuiltPatch {
-    /// Consumer the event notified.
-    pub consumer_id: u64,
-    /// Whether the row left this consumer's window rather than changing in it.
-    pub departure: bool,
+struct PatchTarget {
+    consumer_id: u64,
+    departure: bool,
+}
+
+/// An event's wire encodings, built before the engine applies it so a failure applies nothing.
+struct Encoded {
+    /// The compressed patchset every matched consumer shares and the oplog keeps.
+    payload: Vec<u8>,
+    /// The compressed departure notice, for an update only, since only an update moves a row out of a window.
+    departure: Option<Vec<u8>>,
 }
 
 /// What one drain of the queued reads delivered, and the failure that
@@ -1261,25 +1265,28 @@ where
     ///
     /// The event folds once into a compressed patchset, shared across the
     /// matched consumers and kept in the record, so a catchup sends the same
-    /// bytes later instead of folding it again. It is built whenever the event
-    /// is logged, matched or not, since the consumer that needs it may be away.
-    /// The engine applies the event exactly once per call, and what fails after
-    /// that rides in the result, so recovering it never applies the event again.
+    /// bytes later instead of folding it again. It is built for every event of
+    /// a catalog table, matched or not, since the consumer that needs it may be
+    /// away. The engine applies the event exactly once per call, and what fails
+    /// after that rides in the result, so recovering it never applies the event
+    /// again.
     ///
     /// # Errors
     ///
     /// [`MaterializerError::Dispatch`] when the engine cannot apply the event,
     /// and [`MaterializerError::Emit`] or [`MaterializerError::Compression`]
-    /// when a logged event cannot be folded, each before anything is applied.
+    /// when the event cannot be encoded, each before anything is applied.
     pub async fn dispatch(
         &mut self,
         event: &PgChangeEvent,
     ) -> Result<Dispatched, MaterializerError> {
-        // A logged event folds before the engine applies it, so a fold failure leaves nothing applied.
-        let logged = match self.event_identity(event) {
-            Some(identity) => Some((identity, self.fold(event)?)),
+        // Encoded before the engine applies the event, so an encoding failure leaves nothing applied.
+        // An event of a table outside the catalog matches no subscription and is not logged.
+        let encoded = match self.event_table(event) {
+            Some(_) => Some(self.encode(event)?),
             None => None,
         };
+        let identity = self.event_identity(event);
         // The drain is the only way to the in-process half, which is what
         // keeps one delivery path for every computed movement (R82). Whole-row
         // captures, scalar extremes and keyed rows arrive as the read half,
@@ -1324,37 +1331,28 @@ where
         consumers.extend_from_slice(engine.deleted());
         consumers.sort_unstable();
         consumers.dedup();
-        let matched: Vec<UnbuiltPatch> = consumers
+        let matched: Vec<PatchTarget> = consumers
             .into_iter()
-            .map(|consumer_id| UnbuiltPatch {
+            .map(|consumer_id| PatchTarget {
                 consumer_id,
                 departure: departing.contains(&consumer_id),
             })
             .collect();
-        let (built, record) = match logged {
-            Some(((table, pk), (folded, payload))) => {
-                let built = Self::patches_for(event, &matched, &folded, &payload);
-                (
-                    built,
-                    Some(ChangeRecord::new(table, pk, event.clone(), payload)),
-                )
+        let (patches, record) = match encoded {
+            Some(encoded) => {
+                let patches = Self::patches_for(event, &matched, &encoded);
+                let record = identity.map(|(table, pk)| {
+                    ChangeRecord::new(table, pk, event.clone(), encoded.payload)
+                });
+                (patches, record)
             }
-            None if matched.is_empty() => (Ok(Vec::new()), None),
-            None => (self.build_patches(event, &matched), None),
-        };
-        let (patches, unbuilt) = match built {
-            Ok(patches) => (patches, Vec::new()),
-            Err(error) => {
-                tracing::warn!(%error, "an applied event's patches could not be encoded yet");
-                (Vec::new(), matched)
-            }
+            None => (Vec::new(), None),
         };
 
         let narrowings = term_moves(&self.catalog, notifications.engine.narrowings());
 
         Ok(Dispatched {
             patches,
-            unbuilt,
             computed,
             narrowings,
             record,
@@ -1386,21 +1384,6 @@ where
         }
     }
 
-    /// Encode the patches an applied event still owes the consumers in `unbuilt`.
-    ///
-    /// # Errors
-    ///
-    /// [`MaterializerError::Emit`] when the event cannot be folded, and
-    /// [`MaterializerError::Compression`] on a compression failure.
-    pub fn build_patches(
-        &self,
-        event: &PgChangeEvent,
-        unbuilt: &[UnbuiltPatch],
-    ) -> Result<Vec<MatchedPatch>, MaterializerError> {
-        let (folded, payload) = self.fold(event)?;
-        Self::patches_for(event, unbuilt, &folded, &payload)
-    }
-
     /// One event's patchset and its compressed bytes.
     fn fold(&self, event: &PgChangeEvent) -> Result<(WirePatchSet, Vec<u8>), MaterializerError> {
         let folded = pgoutput_patchset_builder(&self.catalog, std::slice::from_ref(event.change()))
@@ -1409,45 +1392,49 @@ where
         Ok((folded, payload))
     }
 
-    /// The patch each matched consumer receives, sharing one payload.
-    fn patches_for(
-        event: &PgChangeEvent,
-        matched: &[UnbuiltPatch],
-        folded: &WirePatchSet,
-        payload: &[u8],
-    ) -> Result<Vec<MatchedPatch>, MaterializerError> {
-        // One extra encode on an event that has departures, not one per
-        // departing consumer: the notice carries a table and a primary key
-        // and nothing consumer-specific, so every consumer that lost this
-        // row receives the same bytes.
-        let departure = if matched.iter().any(|target| target.departure) {
-            Self::departure_patchset(folded)
+    /// Every encoding the event's matched consumers can need.
+    ///
+    /// The departure notice carries a table and a primary key and nothing
+    /// consumer-specific, so one notice serves every consumer that lost the row.
+    fn encode(&self, event: &PgChangeEvent) -> Result<Encoded, MaterializerError> {
+        let (folded, payload) = self.fold(event)?;
+        let departure = if matches!(event.kind(), EventKind::Update) {
+            Self::departure_patchset(&folded)
                 .map(|bytes| compress(&bytes))
                 .transpose()?
         } else {
             None
         };
+        Ok(Encoded { payload, departure })
+    }
+
+    /// The patch each matched consumer receives, sharing one payload.
+    fn patches_for(
+        event: &PgChangeEvent,
+        matched: &[PatchTarget],
+        encoded: &Encoded,
+    ) -> Vec<MatchedPatch> {
         let cursor = event.position().to_opaque().0;
         // Fallible only in theory: usize to u64 cannot lose on any
         // supported pointer width, and a counter saturates rather than
         // panics regardless.
-        let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-        Ok(matched
+        let payload_len = u64::try_from(encoded.payload.len()).unwrap_or(u64::MAX);
+        matched
             .iter()
             .map(|target| {
-                let bytes = match (target.departure, departure.as_ref()) {
+                let bytes = match (target.departure, encoded.departure.as_ref()) {
                     (true, Some(notice)) => notice.clone(),
-                    _ => payload.to_vec(),
+                    _ => encoded.payload.clone(),
                 };
                 crate::counters::add(&crate::counters::FANOUT_PAYLOAD_BYTES, payload_len);
                 MatchedPatch {
                     consumer_id: target.consumer_id,
                     payload_zstd: bytes,
                     cursor: cursor.clone(),
-                    departure: target.departure && departure.is_some(),
+                    departure: target.departure && encoded.departure.is_some(),
                 }
             })
-            .collect())
+            .collect()
     }
 
     /// Build the computed-result changes from a dispatch's immediate results
@@ -1752,15 +1739,19 @@ where
         Ok(Some(compress(&bytes)?))
     }
 
+    /// The catalog name of the event's table, `None` for a table outside the catalog.
+    fn event_table(&self, event: &PgChangeEvent) -> Option<&str> {
+        let index = usize::try_from(event.table_id(&self.catalog)).ok()?;
+        Some(self.catalog.table_by_id(index)?.table_name())
+    }
+
     /// The `(table, primary-key bytes)` identity of a CDC event, for the auth
     /// read filter. Primary-key columns are read from the event's PK image and
     /// encoded by [`crate::pk`] into a stable, self-describing byte string the
     /// auth policy treats as opaque and decodes back into typed values.
     fn event_identity(&self, event: &PgChangeEvent) -> Option<(String, Vec<u8>)> {
+        let table = self.event_table(event)?.to_owned();
         let db = &self.catalog;
-        let table_id = event.table_id(db);
-        let index = usize::try_from(table_id).ok()?;
-        let table = db.table_by_id(index)?.table_name().to_owned();
         let mut values = Vec::new();
         for col in event.pk_columns(db) {
             values.push(event.value_at(db, RowKind::Pk, col).ok()?);
