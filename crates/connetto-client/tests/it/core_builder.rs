@@ -18,7 +18,6 @@ use connetto_core::messages::{
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaBundle, loopback};
 use diesel::prelude::*;
-use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT);";
 
@@ -57,35 +56,6 @@ fn bundle() -> SyncSchema {
 #[derive(Debug, thiserror::Error)]
 #[error("the one-shot dialer has no second transport")]
 struct DialRefused;
-
-/// A dialer that hands out exactly one transport, the one the test attached.
-struct OneShot {
-    transport: Option<LoopbackTransport>,
-}
-
-impl TransportFactory for OneShot {
-    type Transport = LoopbackTransport;
-    type Error = DialRefused;
-
-    fn connect(&mut self) -> impl Future<Output = Result<LoopbackTransport, DialRefused>> + Send {
-        std::future::ready(self.transport.take().ok_or(DialRefused))
-    }
-}
-
-/// Compressed one-row patchset bytes for the wire table shape.
-fn payload(id: i64) -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
-        "orders",
-        &[("id", ""), ("label", "")],
-        &[0],
-    ))
-    .set(0, Value::Integer(id))
-    .expect("set id")
-    .set(1, Value::Text("seed".to_owned()))
-    .expect("set label");
-    let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new().insert(insert);
-    zstd::encode_all(patchset.build().as_slice(), 3).expect("compress payload")
-}
 
 /// The ack every scripted server here answers the handshake with.
 fn ack() -> ControlMessage {
@@ -126,7 +96,7 @@ fn snapshot_server() -> LoopbackTransport {
                     server
                         .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
                             sub_id: sub.sub_id.clone(),
-                            patchset_zstd: payload(1),
+                            patchset_zstd: super::support::labelled_order_payload(1),
                         }))
                         .await
                         .expect("snapshot patch");
@@ -155,12 +125,7 @@ fn snapshot_server() -> LoopbackTransport {
 /// handshake and a snapshot, and the snapshot's row lands in the replica.
 #[tokio::test]
 async fn connect_driven_returns_a_connection_the_test_can_pump() {
-    let builder = ClientBuilder::new(
-        bundle(),
-        OneShot {
-            transport: Some(snapshot_server()),
-        },
-    );
+    let builder = ClientBuilder::new(bundle(), super::support::Once::new(snapshot_server()));
     let mut conn = builder.connect_driven().await.expect("connect driven");
     conn.subscribe("sub", "SELECT * FROM orders")
         .await
@@ -187,15 +152,10 @@ async fn connect_driven_returns_a_connection_the_test_can_pump() {
 /// same row the scripted server's snapshot carries.
 #[tokio::test]
 async fn connect_with_pump_delivers_the_same_row_through_a_live_query() {
-    let builder = ClientBuilder::new(
-        bundle(),
-        OneShot {
-            transport: Some(snapshot_server()),
-        },
-    )
-    .with_tuning(SyncTuning::default())
-    .with_reconnect(ReconnectPolicy::default())
-    .with_sleeper(|d| tokio::time::sleep(d));
+    let builder = ClientBuilder::new(bundle(), super::support::Once::new(snapshot_server()))
+        .with_tuning(SyncTuning::default())
+        .with_reconnect(ReconnectPolicy::default())
+        .with_sleeper(|d| tokio::time::sleep(d));
     let (client, pump) = builder
         .connect_with_pump()
         .await
@@ -235,12 +195,7 @@ async fn signed_in_stage_presents_the_held_credentials_grant() {
         server.send_control(ack()).await.expect("ack the handshake");
         grant
     });
-    let builder = ClientBuilder::new(
-        bundle(),
-        OneShot {
-            transport: Some(client_end),
-        },
-    );
+    let builder = ClientBuilder::new(bundle(), super::support::Once::new(client_end));
     let conn = builder
         .signed_in(
             connetto_client::HeldCredential::new(Grant::new("user:core"), "alice")
@@ -267,12 +222,7 @@ diesel::define_sql_function! {
 /// form the id serializes to.
 #[tokio::test]
 async fn signed_in_build_answers_the_caller_function_with_the_display_identity() {
-    let builder = ClientBuilder::new(
-        bundle(),
-        OneShot {
-            transport: Some(snapshot_server()),
-        },
-    );
+    let builder = ClientBuilder::new(bundle(), super::support::Once::new(snapshot_server()));
     let mut conn = builder
         .signed_in(
             connetto_client::HeldCredential::new(Grant::new("user:identity"), &"alice".to_owned())
@@ -373,12 +323,7 @@ async fn signed_in_build_names_the_key_record_from_the_identity_itself() {
         connetto_client::HeldCredential::new(Grant::new("user:durable"), &"alice".to_owned())
             .expect("a held credential");
     let expected = credential.replica_name().to_owned();
-    let builder = ClientBuilder::new(
-        bundle(),
-        OneShot {
-            transport: Some(snapshot_server()),
-        },
-    );
+    let builder = ClientBuilder::new(bundle(), super::support::Once::new(snapshot_server()));
     let (client, pump) = builder
         .signed_in(credential)
         .durable(
@@ -483,7 +428,10 @@ async fn offline_first_connect_succeeds_when_the_first_dial_is_refused() {
 /// and local reads answer, and a transport attached by hand brings it up.
 #[tokio::test]
 async fn open_driven_returns_an_offline_connection_a_test_attaches_by_hand() {
-    let builder = ClientBuilder::new(bundle(), OneShot { transport: None });
+    let builder = ClientBuilder::new(
+        bundle(),
+        super::support::NeverDial::<LoopbackTransport>::default(),
+    );
     let mut conn = builder.open_driven().expect("open driven, no dial");
     assert!(
         !conn.is_connected(),
@@ -534,15 +482,10 @@ fn closing_server() -> LoopbackTransport {
 /// the transport goes away, rather than dialing again.
 #[tokio::test]
 async fn zero_attempt_policy_ends_the_pump_with_closed() {
-    let builder = ClientBuilder::new(
-        bundle(),
-        OneShot {
-            transport: Some(closing_server()),
-        },
-    )
-    .with_tuning(SyncTuning::default())
-    .with_reconnect(ReconnectPolicy::default().with_max_attempts(Some(0)))
-    .with_sleeper(|d| tokio::time::sleep(d));
+    let builder = ClientBuilder::new(bundle(), super::support::Once::new(closing_server()))
+        .with_tuning(SyncTuning::default())
+        .with_reconnect(ReconnectPolicy::default().with_max_attempts(Some(0)))
+        .with_sleeper(|d| tokio::time::sleep(d));
     let (client, pump) = builder
         .connect_with_pump()
         .await
@@ -577,14 +520,17 @@ async fn a_durable_build_takes_freshness_from_the_file_and_never_rekeys() {
             .expect("a held credential");
     let name = credential.replica_name().to_owned();
     let open = |store: RecordingKeyStore| {
-        ClientBuilder::new(bundle(), OneShot { transport: None })
-            .signed_in(credential.clone())
-            .durable(
-                connetto_client::DataDir::new(dir.path()),
-                store,
-                MemoryRefreshStore::default(),
-            )
-            .open_driven()
+        ClientBuilder::new(
+            bundle(),
+            super::support::NeverDial::<LoopbackTransport>::default(),
+        )
+        .signed_in(credential.clone())
+        .durable(
+            connetto_client::DataDir::new(dir.path()),
+            store,
+            MemoryRefreshStore::default(),
+        )
+        .open_driven()
     };
 
     drop(
@@ -670,14 +616,17 @@ async fn a_replica_whose_key_the_platform_lost_is_wiped_and_started_fresh() {
             .expect("a held credential");
     let name = credential.replica_name().to_owned();
     let open = |keys: LostKeys| {
-        ClientBuilder::new(bundle(), OneShot { transport: None })
-            .signed_in(credential.clone())
-            .durable(
-                connetto_client::DataDir::new(dir.path()),
-                keys,
-                MemoryRefreshStore::default(),
-            )
-            .open_driven()
+        ClientBuilder::new(
+            bundle(),
+            super::support::NeverDial::<LoopbackTransport>::default(),
+        )
+        .signed_in(credential.clone())
+        .durable(
+            connetto_client::DataDir::new(dir.path()),
+            keys,
+            MemoryRefreshStore::default(),
+        )
+        .open_driven()
     };
     let intact = LostKeys {
         lost: std::sync::Arc::default(),
@@ -723,9 +672,12 @@ fn an_anonymous_build_answers_the_caller_and_subjects_functions_as_nobody() {
         vec!["visible".to_owned()],
         None::<&str>,
     ));
-    let mut conn = ClientBuilder::new(schema, OneShot { transport: None })
-        .open_driven()
-        .expect("a schema whose views call both functions opens anonymous");
+    let mut conn = ClientBuilder::new(
+        schema,
+        super::support::NeverDial::<LoopbackTransport>::default(),
+    )
+    .open_driven()
+    .expect("a schema whose views call both functions opens anonymous");
     let subjects: Option<String> = diesel::select(diesel::dsl::sql::<
         diesel::sql_types::Nullable<diesel::sql_types::Text>,
     >("current_app_subjects()"))
@@ -757,28 +709,21 @@ fn identity_server(identity: TabIdentity) -> LoopbackTransport {
 /// answers the worker's signed-in user instead of nobody.
 #[tokio::test]
 async fn a_tab_adopts_the_identity_its_worker_states() {
-    let mut worker = ClientBuilder::new(
-        bundle(),
-        OneShot {
-            transport: Some(snapshot_server()),
-        },
-    )
-    .signed_in(
-        connetto_client::HeldCredential::new(Grant::new("user:alice"), &"alice".to_owned())
-            .expect("a held credential"),
-    )
-    .connect_driven()
-    .await
-    .expect("the worker connects");
+    let mut worker = ClientBuilder::new(bundle(), super::support::Once::new(snapshot_server()))
+        .signed_in(
+            connetto_client::HeldCredential::new(Grant::new("user:alice"), &"alice".to_owned())
+                .expect("a held credential"),
+        )
+        .connect_driven()
+        .await
+        .expect("the worker connects");
     let identity = worker
         .relay_identity()
         .expect("the worker states its identity");
 
     let mut tab = ClientBuilder::new(
         bundle(),
-        OneShot {
-            transport: Some(identity_server(identity)),
-        },
+        super::support::Once::new(identity_server(identity)),
     )
     .connect_driven()
     .await
@@ -896,15 +841,10 @@ where
 /// deferred write arms one that waits exactly as long as the server asked.
 #[tokio::test]
 async fn a_deferred_write_waits_as_long_as_the_server_asked() {
-    let mut conn = ClientBuilder::new(
-        bundle(),
-        OneShot {
-            transport: Some(deferring_server()),
-        },
-    )
-    .connect_driven()
-    .await
-    .expect("connect driven");
+    let mut conn = ClientBuilder::new(bundle(), super::support::Once::new(deferring_server()))
+        .connect_driven()
+        .await
+        .expect("connect driven");
 
     let (related_to, _) = next_rate_limit(&mut conn).await;
     assert_eq!(related_to.as_deref(), Some("some-subscription"));

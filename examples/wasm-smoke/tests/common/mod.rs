@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 use connetto_web::auth::{AccountStore, Acquired, BrowserAuthenticator, LoginMessage};
+use sqlite_diff_rs::SimpleTable;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
@@ -25,6 +26,10 @@ pub const ACCOUNT_DB: &str = "e42-accounts.sqlite";
 /// because the replica's default leaves the changeset value NULL.
 pub fn now_rfc3339() -> String {
     js_sys::Date::new_0().to_json().into()
+}
+/// The `orders (id, quantity)` wire table shape the conflict, credits, and resync suites seed.
+pub fn orders_table() -> SimpleTable {
+    SimpleTable::new("orders", &[("id", ""), ("quantity", "")], &[0])
 }
 /// The stack's provider sign-in, which serves the navigation and the fetch
 /// calls on one origin.

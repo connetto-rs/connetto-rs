@@ -24,7 +24,7 @@ use connetto_server::{
     RuntimeWritableCatalog, SnapshotEstimate, SnapshotPage, SnapshotSource, UnseenIds, loopback,
     pg_write_target, split_snapshot_cursor,
 };
-use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID, wire_tables};
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
 use diesel::{Connection, SqliteConnection, sql_query};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -81,11 +81,7 @@ diesel::table! {
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
 
 fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
-    let table = SimpleTable::new(
-        "notes",
-        &[("id", ""), ("body", ""), ("edited_at", "")],
-        &[0],
-    );
+    let table = wire_tables::notes_table();
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(id))
         .expect("set id")

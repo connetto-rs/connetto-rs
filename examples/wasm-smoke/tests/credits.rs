@@ -23,7 +23,9 @@
 //! `wasm-pack test --headless --chrome examples/wasm-smoke --test credits`
 
 #![cfg(target_arch = "wasm32")]
+mod common;
 
+use common::orders_table;
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::messages::{
@@ -65,7 +67,7 @@ fn unique_base() -> i64 {
 
 /// Build the compressed insert-patchset the wire carries for one row.
 fn insert_payload(id: rosetta_uuid::Uuid, quantity: i64) -> Vec<u8> {
-    let table = SimpleTable::new("orders", &[("id", ""), ("quantity", "")], &[0]);
+    let table = orders_table();
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Blob(<[u8; 16]>::from(id).to_vec()))
         .expect("set id")

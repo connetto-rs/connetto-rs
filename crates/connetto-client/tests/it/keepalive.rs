@@ -23,7 +23,6 @@ use connetto_core::messages::{
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
 use parking_lot::Mutex;
-use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use tempfile::tempdir;
 use tokio::sync::oneshot;
 
@@ -60,21 +59,6 @@ fn ack() -> ControlMessage {
             frontier: 0,
         }),
     })
-}
-
-/// Compressed one-row patchset bytes for the wire table shape.
-fn payload() -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
-        "orders",
-        &[("id", ""), ("label", "")],
-        &[0],
-    ))
-    .set(0, Value::Integer(1))
-    .expect("set id")
-    .set(1, Value::Text("seed".to_owned()))
-    .expect("set label");
-    let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new().insert(insert);
-    zstd::encode_all(patchset.build().as_slice(), 3).expect("compress payload")
 }
 
 /// The test tuning: a probe shortly after the silence, a short answer bound.
@@ -140,7 +124,7 @@ impl TransportFactory for Scripted {
                             server
                                 .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
                                     sub_id: sub.sub_id.clone(),
-                                    patchset_zstd: payload(),
+                                    patchset_zstd: super::support::labelled_order_payload(1),
                                 }))
                                 .await
                                 .expect("snapshot patch");
@@ -659,7 +643,7 @@ async fn a_busy_link_is_never_probed() {
                             server
                                 .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
                                     sub_id: sub.sub_id.clone(),
-                                    patchset_zstd: payload(),
+                                    patchset_zstd: super::support::labelled_order_payload(1),
                                 }))
                                 .await
                                 .expect("snapshot patch");
