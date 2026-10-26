@@ -125,7 +125,10 @@ struct Core {
     /// The parked login URL, `None` while no login stands parked.
     parked: watch::Sender<Option<String>>,
     /// The phone's tab login waits on the parked URL clearing.
-    #[expect(dead_code, reason = "the phone's tab login waits on it")]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "ios")),
+        expect(dead_code, reason = "only the phone's tab login waits on it")
+    )]
     parked_rx: watch::Receiver<Option<String>>,
     /// The parked account picker's answer channel, `None` while none stands.
     picker: Mutex<Option<mpsc::UnboundedSender<Option<String>>>>,
@@ -815,7 +818,7 @@ mod mobile {
                 // parked URL, which is what the web's popup opening is.
                 let _ = parked.send(Some(url.clone()));
                 core.update(&app, |v| v.session = super::Session::SignInOffered);
-                let _ = waiting.wait_for(|parked| parked.is_none());
+                let _ = waiting.wait_for(|parked| parked.is_none()).await;
                 connetto_auth_session::authorize(&url, LOGIN_WINDOW)
                     .await
                     .map_err(|err| ClientError::Auth(err.to_string()))
