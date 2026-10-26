@@ -4399,11 +4399,17 @@ fn wait_ms(deadline: Duration, now: Duration) -> i32 {
     i32::try_from(millis).unwrap_or(i32::MAX)
 }
 
-/// Milliseconds until the worker's share-key work falls due, `None` when
-/// nothing is armed or the armed deadline already woke the hub without moving.
+/// Milliseconds until the worker's share-key work falls due, rounded up, or
+/// `None` when nothing is armed or the armed deadline passed and already woke
+/// the hub without moving. A wake before the deadline keeps waiting on it.
 fn fresh_key_wait_ms(armed: Option<ShareKeyTimer>, fired: Option<ShareKeyTimer>) -> Option<i32> {
-    let timer = armed.filter(|timer| Some(*timer) != fired)?;
-    Some(i32::try_from(timer.wait().as_millis()).unwrap_or(i32::MAX))
+    let timer = armed?;
+    let wait = timer.wait();
+    if Some(timer) == fired && wait.is_zero() {
+        return None;
+    }
+    let millis = wait.as_micros().div_ceil(1_000).max(1);
+    Some(i32::try_from(millis).unwrap_or(i32::MAX))
 }
 
 /// Sleep `ms` milliseconds, or park forever when there is nothing to wait for.
