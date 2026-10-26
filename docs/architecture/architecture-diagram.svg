@@ -142,8 +142,8 @@
       <rect width="300" height="56" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="56" rx="1" fill="#4CAF50" />
       <text x="150" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">Identity and session</text>
-      <text x="150" y="31" text-anchor="middle" font-size="8.5" fill="#555">grants resolve to a Principal, session registry</text>
-      <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#555">resume tokens, revocation closes live connections</text>
+      <text x="150" y="31" text-anchor="middle" font-size="8.5" fill="#555">grants resolve to a Principal, session registry, resume tokens</text>
+      <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#555">a person's sessions listed and ended live, writes attributed (R105)</text>
     </g>
 
     <!-- Cluster: capabilities -->
@@ -160,7 +160,7 @@
       <rect width="300" height="56" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="56" rx="1" fill="#4CAF50" />
       <text x="150" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">Admission control</text>
-      <text x="150" y="31" text-anchor="middle" font-size="8.5" fill="#555">per-handle throttling, abuse detection, bans</text>
+      <text x="150" y="31" text-anchor="middle" font-size="8.5" fill="#555">throttling, abuse detection, bans ending every session (R105)</text>
       <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#555">reserved pool share, snapshot page cap, per-tier read time bound</text>
     </g>
 
@@ -169,7 +169,7 @@
       <rect width="300" height="56" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="56" rx="1" fill="#4CAF50" />
       <text x="150" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">Audit</text>
-      <text x="150" y="31" text-anchor="middle" font-size="8.5" fill="#555">auth_events contract, every producer emits its op</text>
+      <text x="150" y="31" text-anchor="middle" font-size="8.5" fill="#555">auth_events required (R105), every producer emits its op</text>
       <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#555">high-volume stream goes to the structured log</text>
     </g>
 
@@ -408,7 +408,7 @@
       <rect width="300" height="56" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="4" height="56" rx="1" fill="#4CAF50" />
       <text x="150" y="22" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">OAuth login (native)</text>
-      <text x="150" y="42" text-anchor="middle" font-size="9" fill="#4CAF50">auth code + PKCE, token store, refresh</text>
+      <text x="150" y="42" text-anchor="middle" font-size="9" fill="#4CAF50">PKCE, token store, refresh, a revoked device wipes (R105)</text>
     </g>
     <g transform="translate(1325, 516)">
       <rect width="300" height="56" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />

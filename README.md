@@ -18,7 +18,7 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 |---|---|
 | Sync loop | Optimistic writes applied under RLS, CDC through `subql`, live row subscriptions, reconnect with catch-up or resync |
 | Aggregates | `COUNT`, `SUM`, `AVG`, variance and grouped folds per change, `MIN`, `MAX`, joins and rows re-executed per viewer |
-| Identity | OAuth 2.0 and OIDC login, durable sessions, grants, shareable capabilities, audit table, throttling and bans, bots registered by one-time code and held to their declared tables |
+| Identity | OAuth 2.0 and OIDC login, durable sessions a person lists and ends, grants, shareable capabilities, audit table, throttling and bans, revoked devices that wipe themselves, bots registered by one-time code and held to their declared tables |
 | Authorization | RLS on snapshots and writes, the same policies as an OpenFGA model on the change path |
 | Clients | One builder per platform, a native Diesel connection on desktop, Android and iOS, a browser client on a worker over OPFS, Dioxus and Yew hooks |
 | At rest | SQLCipher and `sqlite3mc` with keyring or IndexedDB custody, passkey unlock in the browser and biometric or PIN unlock on Apple, Android and Windows, a device-private tier whose references SQLite enforces, retention, several accounts |
@@ -30,7 +30,7 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 100 phases, 84 done and 16 open. The core is built and proven, and the app system's registry and registration are built with it. What remains is the last mile around it, plus the app system's bot template and demo apps, the extension where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
+The plan in `plans/master-implementation-plan.md` tracks 100 phases, 85 done and 15 open. The core is built and proven, and the app system's registry and registration are built with it. What remains is the last mile around it, plus the app system's bot template and demo apps, the extension where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
 
 | Remaining | Phases |
 |---|---|
@@ -40,7 +40,6 @@ The plan in `plans/master-implementation-plan.md` tracks 100 phases, 84 done and
 | Demo gaps | R57 |
 | Apps, installations and the bot template, the file replica for bots | R91, R93 |
 | Device-to-device sync without a server | R74 to R80 |
-| Answering a stolen account | R105 |
 
 A per-check consistency token, Zanzibar's zookie, is not supported and owned by no phase, since OpenFGA lists it as future work. A withdrawn permission therefore takes effect on the change path within the read cache lifetime, while writes and teardowns are refused at once (chapter 08).
 
