@@ -3271,3 +3271,68 @@ mod membership_term_tests {
         assert_eq!(consumers, [2], "the row admits user-1 alone");
     }
 }
+
+#[cfg(test)]
+mod rows_update_merge_tests {
+    //! How a re-read's pages merge into one full answer, and what a higher
+    //! generation does to a lower one still pending.
+
+    use std::collections::HashSet;
+
+    use super::{Materializer, ParserDB, PgValue, Postgres, RowsUpd, SubscriptionId};
+
+    /// One page of one subscription's re-read.
+    fn page(
+        subscription: SubscriptionId,
+        generation: u64,
+        column: &str,
+        rows: Vec<PgValue<Postgres>>,
+        more: bool,
+    ) -> RowsUpd {
+        RowsUpd {
+            subscription_id: subscription,
+            consumer_id: 1,
+            generation,
+            columns: vec![column.to_owned()],
+            rows: rows.into_iter().map(|value| vec![value]).collect(),
+            more,
+            checkpoint: None,
+        }
+    }
+
+    /// A higher generation starts a new answer, so the lower generation's
+    /// pages never mix into the frame that goes out.
+    #[test]
+    fn a_newer_generation_replaces_the_pending_older_one() {
+        let older = page(7, 5, "old", vec![PgValue::Int(1)], true);
+        let newer = page(7, 9, "new", vec![PgValue::Int(2), PgValue::Int(3)], false);
+        let changes = Materializer::<ParserDB>::rows_changes(vec![older, newer], &HashSet::new());
+        assert_eq!(
+            changes.len(),
+            1,
+            "one full answer per subscription, the newest generation's"
+        );
+        assert!(
+            changes[0].is_full_result,
+            "a re-read replacement is atomic, not a page"
+        );
+        assert_eq!(
+            changes[0].result_json.as_deref(),
+            Some("[{\"new\":2},{\"new\":3}]"),
+            "the frame carries the newer generation's columns and rows, never the older's"
+        );
+    }
+
+    /// A generation that ends without its final page is dropped whole, even
+    /// though the generation below it finished.
+    #[test]
+    fn a_newer_generation_with_no_final_page_delivers_nothing() {
+        let older = page(7, 5, "old", vec![PgValue::Int(1)], false);
+        let newer = page(7, 9, "new", vec![PgValue::Int(2)], true);
+        let changes = Materializer::<ParserDB>::rows_changes(vec![older, newer], &HashSet::new());
+        assert!(
+            changes.is_empty(),
+            "the retry delivers the higher generation that supersedes it"
+        );
+    }
+}

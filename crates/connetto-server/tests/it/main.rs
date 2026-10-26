@@ -82,6 +82,7 @@ mod oidc_spine;
 mod openfga_live;
 
 mod oplog_previous_image;
+mod oplog_retry;
 
 mod pg_async;
 
