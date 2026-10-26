@@ -4,6 +4,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use connetto_demo_support as support;
+
 use dioxus::prelude::*;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::{
@@ -11,10 +13,8 @@ use dioxus_free_icons::icons::fa_solid_icons::{
 };
 use rosetta_uuid::Uuid;
 
-use crate::photos;
 use connetto_dioxus::use_live;
 use connetto_file_core::FileId;
-use diesel::prelude::*;
 
 use super::{ClientSlot, ContentSlot, UserId};
 /// The identity the display sources were fetched for, every row's id and
@@ -34,9 +34,8 @@ pub fn PhotosPane() -> Element {
     let UserId(user_id) = use_context::<UserId>();
     let uid = user_id.read().clone().unwrap_or_default();
 
-    let photos_live =
-        use_live::<_, _, crate::Photo>(&client, photos::table.order(photos::id.asc()));
-    let rows: Vec<crate::Photo> = photos_live.value().read().iter().cloned().collect();
+    let photos_live = use_live::<_, _, support::Photo>(&client, support::photos_rows());
+    let rows: Vec<support::Photo> = photos_live.value().read().iter().cloned().collect();
     let photos_error = photos_live.error().read().clone();
 
     // The display source of each photo's bytes, refetched on a row's id or content state
@@ -51,7 +50,7 @@ pub fn PhotosPane() -> Element {
         let cc = content.clone();
         let last_key: Rc<RefCell<Option<PhotoSrcKey>>> = use_hook(|| Rc::new(RefCell::new(None)));
         use_effect(move || {
-            let rows: Vec<crate::Photo> = live_rows.read().iter().cloned().collect();
+            let rows: Vec<support::Photo> = live_rows.read().iter().cloned().collect();
             let key: PhotoSrcKey = (
                 rows.iter()
                     .map(|row| (row.id, row.content_state.clone().unwrap_or_default()))
@@ -107,10 +106,10 @@ pub fn PhotosPane() -> Element {
         div { class: "pane",
             h2 {
                 Icon { icon: FaImages, width: 14, height: 14 }
-                "photos "
-                span { class: "badge synced", "synced" }
+                {support::PHOTOS_PANE_TITLE} " "
+                span { class: "badge synced", {support::PHOTOS_BADGE} }
             }
-            p { "count {rows.len()}. Pick an image file to stage and upload through the content route." }
+            p { {support::photos_readout(rows.len())} }
             div { class: "row",
                 input {
                     id: "photo-file-input",
@@ -142,14 +141,14 @@ pub fn PhotosPane() -> Element {
                         .map(|row| {
                             (
                                 row.id.to_string(),
-                                row.content_state.as_deref().unwrap_or("pending").to_owned(),
+                                support::photo_state(row.content_state.as_deref()).to_owned(),
                                 row.id,
                             )
                         })
                         .collect::<Vec<_>>()
                     {
                         tr { key: "{id}",
-                            td { code { class: "id", title: id.clone(), {crate::short_id(&id)} } }
+                            td { code { class: "id", title: id.clone(), {support::short_id(&id)} } }
                             td { {state} }
                             td {
                                 if let Some(src) = srcs.get(&row_id) {
@@ -253,8 +252,8 @@ fn RefusedUploads(refused: Signal<Vec<(FileId, String)>>) -> Element {
         div { class: "confirm",
             p { "Refused uploads" }
             for (fid, detail) in entries {
-                div { key: "{crate::short_hex(fid.as_bytes())}",
-                    p { class: "status", "{crate::short_hex(fid.as_bytes())}: {detail}" }
+                div { key: "{support::short_hex(fid.as_bytes())}",
+                    p { class: "status", "{support::short_hex(fid.as_bytes())}: {detail}" }
                     button {
                         onclick: {
                             let cc = content.clone();
@@ -294,7 +293,7 @@ fn LostBytes(retired: Signal<Vec<FileId>>) -> Element {
         div { class: "confirm",
             p { "Bytes lost. These files' chunks are unreadable and their rows still exist. Acknowledge to clear the record." }
             for id in ids.clone() {
-                p { class: "status", {crate::short_hex(id.as_bytes())} }
+                p { class: "status", {support::short_hex(id.as_bytes())} }
             }
             button {
                 onclick: move |_| {

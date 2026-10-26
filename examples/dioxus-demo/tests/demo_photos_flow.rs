@@ -32,7 +32,7 @@ use connetto_client::{
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_core::transport::LoopbackTransport;
 use connetto_demo_deployment::{CONTENT_SQL, POLICIES_SQL, ROLES_SQL, SCHEMA_SQL};
-use connetto_dioxus_demo::{demo_schema, notes, photos, stage_photo_row};
+use connetto_demo_support::{demo_schema, notes, photos, stage_photo_row};
 use connetto_file_client::{ContentClient, FsStore, MimeClass, ReqwestHttp, Resolved};
 use connetto_file_server::{
     AppPools, Config, DefaultFileSchema, FsStore as ServerStore, TicketSigner, TicketVerifier,

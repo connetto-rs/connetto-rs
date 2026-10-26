@@ -463,6 +463,27 @@ name = "connetto-demo-deployment"
 version = "0.0.0"
 
 [[package]]
+name = "connetto-demo-support"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "connetto-client",
+ "connetto-core",
+ "connetto-demo-deployment",
+ "connetto-file-core",
+ "connetto-schema",
+ "connetto-web",
+ "diesel",
+ "js-sys",
+ "rosetta-uuid",
+ "serde",
+ "thiserror 2.0.20",
+ "tracing",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "connetto-file-client"
 version = "0.0.0"
 dependencies = [
@@ -560,10 +581,9 @@ version = "0.0.0"
 dependencies = [
  "connetto-client",
  "connetto-core",
- "connetto-demo-deployment",
+ "connetto-demo-support",
  "connetto-file-client",
  "connetto-file-core",
- "connetto-schema",
  "connetto-web",
  "connetto-yew",
  "diesel",

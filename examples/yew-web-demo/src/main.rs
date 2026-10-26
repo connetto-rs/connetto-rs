@@ -32,201 +32,32 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 
-use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::teardown::expiry_warning;
-use connetto_client::{
-    AccountChoice, Auth, ClientEvent, ConnettoClient, ExportScope, NoGate, SyncSchema, SyncTuning,
-    decode_identity,
-};
+use connetto_client::{AccountChoice, Auth, ClientEvent, ConnettoClient, NoGate};
 use connetto_core::custody::Custody;
-use connetto_file_core::{FileId, MimeClass};
+use connetto_demo_support as support;
+use connetto_demo_support::web as glue;
 use connetto_web::auth::PendingWork;
-use connetto_web::builder::{AttachedTab, TabTopology, WebClientBuilder};
+use connetto_web::builder::{AttachedTab, TabTopology};
 use connetto_web::unlock::serve_account_choice;
 use connetto_web::{
     MessageTransport, ObjectUrl, TabContent, TabResolved, deliver_login_code, workers,
 };
 use connetto_yew::use_live;
-use connetto_yew_web_demo::{short_id, status_label};
-use diesel::prelude::*;
-use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{BroadcastChannel, Event, HtmlInputElement, MessageEvent};
-
-include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
+use web_sys::{BroadcastChannel, Event, HtmlInputElement};
 use yew::prelude::*;
 use yew_icons::{Icon, IconData};
 
 /// The tab-to-worker transport this window's client rides.
 type Tab = MessageTransport<BroadcastChannel>;
 
-/// The demo server the DB worker connects upstream to, `CONNETTO_DEMO_WS` at
-/// build time when set.
-const DEMO_WS_URL: &str = match option_env!("CONNETTO_DEMO_WS") {
-    Some(url) => url,
-    None => "ws://127.0.0.1:7777/sync",
-};
-/// The origin serving `connetto-server`'s auth router, which the worker's login
-/// navigation and `fetch` calls go to. `CONNETTO_DEMO_AUTH_ORIGIN` at build time
-/// moves it.
-const AUTH_ORIGIN: &str = match option_env!("CONNETTO_DEMO_AUTH_ORIGIN") {
-    Some(origin) => origin,
-    None => "http://127.0.0.1:7777",
-};
-/// The upstream subscription the worker registers.
-const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
-/// The extra upstream subscription for photos.
-const PHOTO_QUERY: &str = "SELECT * FROM photos";
-/// The OPFS file holding the worker's durable synced replica.
-const DB_NAME: &str = "connetto-relay.sqlite";
-/// The shared leader lock every window of this app races.
-const LEADER_LOCK: &str = "connetto-demo-leader";
-/// The `BroadcastChannel` the worker uses to report the boot session to all page
-/// tabs after authentication, so they can show the account, custody level, and
-/// expiry information.
-const DEMO_IDENTITY_CHANNEL: &str = "connetto-demo-identity";
-/// OIDC provider registered in the dev IdP.
-const AUTH_PROVIDER: &str = "dev-idp";
-/// Channel the page uses to respond to the worker's provider query at each boot.
-const DEMO_PROVIDER_CHANNEL: &str = "connetto-demo-provider";
-/// File name the export download is offered under.
-const EXPORT_FILE_NAME: &str = "connetto-local-data.zip";
-/// The `localStorage` key holding the account the last successful sign-in used.
-const STORED_ACCOUNT_KEY: &str = "connetto-demo-last-account";
-
-diesel::table! {
-    orders (id) {
-        id -> rosetta_uuid::sql_types::Uuid,
-        owner_id -> diesel::sql_types::Text,
-        quantity -> diesel::sql_types::BigInt,
-        created_at -> diesel::sql_types::Timestamp,
-    }
-}
-
-diesel::table! {
-    notes (id) {
-        id -> diesel::sql_types::BigInt,
-        body -> diesel::sql_types::Text,
-    }
-}
-
-diesel::table! {
-    photos (id) {
-        id -> rosetta_uuid::sql_types::Uuid,
-        order_id -> rosetta_uuid::sql_types::Uuid,
-        owner_id -> diesel::sql_types::Text,
-        content_id -> diesel::sql_types::Binary,
-        content_state -> Nullable<diesel::sql_types::Text>,
-    }
-}
-
-#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
-#[diesel(table_name = orders)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-struct Order {
-    id: rosetta_uuid::Uuid,
-    owner_id: String,
-    quantity: i64,
-    created_at: String,
-}
-
-#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
-#[diesel(table_name = notes)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-struct Note {
-    id: i64,
-    body: String,
-}
-
-#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
-#[diesel(table_name = photos)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-struct Photo {
-    id: rosetta_uuid::Uuid,
-    order_id: rosetta_uuid::Uuid,
-    owner_id: String,
-    content_id: Vec<u8>,
-    content_state: Option<String>,
-}
-
-/// A device-unique integer id for a local-only `notes` row. `notes` stays on
-/// integer keys (device-private, never synced), so the client authors the id.
-/// The id is the millisecond clock above 21 random bits, so notes list in the
-/// order they were written and two windows of one device saving in the same
-/// millisecond collide about once in two million.
-fn fresh_note_id() -> i64 {
-    let span = f64::from(1u32 << 21);
-    let now = js_sys::Date::now();
-    debug_assert!(now.is_finite() && (0.0..span * span).contains(&now));
-    // Deliberate truncation: whole milliseconds, below 2^42 until 2109.
-    let millis = now as i64;
-    let r = js_sys::Math::random() * span;
-    debug_assert!(r.is_finite() && (0.0..span).contains(&r));
-    // Deliberate quantization: [0.0, 2^21) -> [0, 2^21 - 1].
-    (millis << 21) | r as i64
-}
-
-/// A visible order quantity inside the subscription's `quantity > 0` window.
-///
-/// The id is minted by the DEFAULT now, so quantity cannot key off it. A random
-/// `1..=9` times five gives spread while staying strictly positive.
-fn fresh_quantity() -> i64 {
-    let scaled = js_sys::Math::random() * 9.0;
-    // Math::random is [0, 1); scale to 0..=8. Deliberate truncation.
-    debug_assert!(scaled.is_finite() && (0.0..9.0).contains(&scaled));
-    (scaled as i64 + 1) * 5
-}
-
-/// The header's gate line for the custody standing and the worker's reported
-/// unlock state, the lock standing where a gate guards the data, the no-gate
-/// statement where there is none.
-fn gate_text(custody: Custody, state: &'static str) -> &'static str {
-    match custody {
-        Custody::Verified => state,
-        Custody::Unverified(_) | Custody::Ephemeral => {
-            "none, local data opens without user verification"
-        }
-    }
-}
-
-/// The header's custody line for the standing, naming the at-rest policy and
-/// the reason it stands as it does in this browser.
-fn custody_text(custody: Custody) -> &'static str {
-    match custody {
-        Custody::Verified => "released only after user verification",
-        Custody::Unverified(NoGate::Offerable) => {
-            "stored without user verification, a passkey can be set up"
-        }
-        Custody::Unverified(NoGate::Declined) => {
-            "stored without user verification, the passkey was declined"
-        }
-        Custody::Unverified(NoGate::Unsupported) => {
-            "stored without user verification, the browser refused a passkey for this address"
-        }
-        Custody::Ephemeral => "no durable key, nothing is kept",
-    }
-}
-
-/// The tab mirror's physical footprint: total pages and free pages a trim can reclaim.
-async fn replica_footprint(client: &ConnettoClient<Tab>) -> (i64, i64) {
-    client
-        .with_conn(|conn| {
-            let db = conn.conn();
-            let pages = db.page_count(None).unwrap_or(0);
-            let free = db.freelist_count(None).unwrap_or(0);
-            (pages, free)
-        })
-        .await
-        .unwrap_or((0, 0))
-}
-
 fn main() {
     connetto_web::logging::init_console();
-    // The dedicated DB worker runs this same wasm module. A worker has no
-    // Window, so boot the DB tier there instead of rendering the UI.
+    // A worker context has no Window, so boot the DB tier there instead of rendering the UI.
     if web_sys::window().is_none() {
         spawn_local(async {
             if let Err(err) = run_db_worker().await {
@@ -238,21 +69,14 @@ fn main() {
 
     let win = web_sys::window().expect("window context");
 
-    // OAuth popup callback: the auth popup lands here with ?code=&state= after
-    // the user authenticates. Deliver the code to the waiting worker, then
-    // close the popup so the original window continues uninterrupted.
-    //
-    // A same-window redirect (no opener) is handled the same way: deliver the
-    // code, clear the query string, and fall through to render the app. In
-    // practice the popup path is used so the original worker keeps its PKCE
-    // state and can verify the returned state parameter.
+    // The auth popup, or a same-window redirect, lands with ?code=&state=: deliver the code,
+    // then close the popup or clear the query string so a reload cannot re-deliver it.
     let search = win.location().search().unwrap_or_default();
     if let (Some(code), Some(state)) = (query_param(&search, "code"), query_param(&search, "state"))
     {
         let _ = deliver_login_code(&code, &state);
 
-        // If this window was opened by window.open() for the auth popup, close
-        // it now that the code has been delivered to the original window's worker.
+        // The popup closes once the code reached the original window's worker.
         let has_opener = js_sys::Reflect::get(win.as_ref(), &"opener".into())
             .map(|v| !v.is_null() && !v.is_undefined())
             .unwrap_or(false);
@@ -261,8 +85,7 @@ fn main() {
             return;
         }
 
-        // Not a popup: clear the query string so a reload does not re-deliver
-        // an already-spent code.
+        // Outside a popup, clear the query string so a reload does not re-deliver an already-spent code.
         let pathname = win.location().pathname().unwrap_or_else(|_| "/".to_owned());
         if let Ok(history) = win.history() {
             let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&pathname));
@@ -272,116 +95,29 @@ fn main() {
     yew::Renderer::<App>::new().render();
 }
 
-/// Worker context: ask the page which OIDC provider to use for this boot.
-///
-/// The page responds with the user's last choice within a few milliseconds.
-/// Falls back to [`AUTH_PROVIDER`] after 200 ms so a page that never answers
-/// does not stall the boot indefinitely.
-async fn worker_provider() -> String {
-    let Ok(ch) = BroadcastChannel::new(DEMO_PROVIDER_CHANNEL) else {
-        return AUTH_PROVIDER.to_owned();
-    };
-    let received: std::rc::Rc<std::cell::RefCell<Option<String>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
-    let received_clone = std::rc::Rc::clone(&received);
-    let on_msg = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-        if let Some(text) = e.data().as_string()
-            && text != "provider?"
-        {
-            *received_clone.borrow_mut() = Some(text);
-        }
-    });
-    ch.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
-    let _ = ch.post_message(&JsValue::from_str("provider?"));
-    for _ in 0..8 {
-        workers::sleep(core::time::Duration::from_millis(25)).await;
-        if received.borrow().is_some() {
-            break;
-        }
-    }
-    ch.set_onmessage(None);
-    ch.close();
-    drop(on_msg);
-    received
-        .borrow()
-        .clone()
-        .unwrap_or_else(|| AUTH_PROVIDER.to_owned())
-}
-
-/// The one build the worker boots from and every window attaches through.
-fn demo_builder() -> WebClientBuilder {
-    WebClientBuilder::new(
-        DEMO_WS_URL,
-        SyncSchema::new(connetto_schema_bundle::bundle()),
-    )
-    // A low threshold so the free-up-space affordance reclaims after a modest deletion.
-    .with_tuning(SyncTuning::default().with_trim_threshold(5))
-    .with_reconnect(
-        ReconnectPolicy::new()
-            .with_initial_backoff(core::time::Duration::from_millis(100))
-            .with_max_backoff(core::time::Duration::from_secs(2)),
-    )
-    .with_upstream("db-upstream", DEMO_QUERY)
-    .with_upstream("db-photos-upstream", PHOTO_QUERY)
-    .with_content_namespace("connetto-photo-content")
-    .with_content_heal_lost(
-        "SELECT content_id FROM photos WHERE content_state = 'lost'",
-        "content_id",
-    )
-}
-
 /// Boot the connetto DB tier in the worker context with the demo config.
 ///
 /// # Errors
 ///
 /// A JS string describing the VFS, upstream connect, or subscribe failure.
 async fn run_db_worker() -> Result<(), JsValue> {
-    let origin = worker_origin();
-    let session = demo_builder()
-        .signed_in(Auth::new(AUTH_ORIGIN, worker_provider().await).with_account(AccountChoice::Ask))
+    let origin = glue::worker_origin();
+    let session = glue::demo_builder()
+        .signed_in(
+            Auth::new(support::AUTH_BASE, glue::ask_provider().await)
+                .with_account(AccountChoice::Ask),
+        )
         .with_redirect_uri(format!("{origin}/"))
-        .with_auth_db_name("connetto-auth.sqlite")
-        .durable(DB_NAME)
+        .with_auth_db_name(glue::AUTH_DB)
+        .durable(glue::DB_NAME)
         .boot::<String>()
         .await?;
-    // Broadcast so every tab can show the account, expiry info, and custody level.
-    broadcast_boot_session(
+    glue::broadcast_boot_session(
         session.identity.as_deref(),
-        session.session_expires_at,
         session.account.as_deref(),
+        session.session_expires_at,
     );
     Ok(())
-}
-
-/// Worker context: broadcast the authenticated identity and session metadata to
-/// every page tab over the shared identity channel.
-///
-/// The message is a JSON object with optional `identity`, `expiresAt` (string
-/// encoding of unix seconds, avoiding float precision loss), and `account` fields.
-fn broadcast_boot_session(
-    identity: Option<&str>,
-    session_expires_at: Option<u64>,
-    account: Option<&str>,
-) {
-    if let Ok(ch) = BroadcastChannel::new(DEMO_IDENTITY_CHANNEL) {
-        let obj = js_sys::Object::new();
-        if let Some(id) = identity {
-            js_sys::Reflect::set(&obj, &"identity".into(), &id.into()).ok();
-        }
-        if let Some(exp) = session_expires_at {
-            // Send as a string to avoid u64 -> f64 precision loss for far-future timestamps.
-            js_sys::Reflect::set(&obj, &"expiresAt".into(), &exp.to_string().into()).ok();
-        }
-        if let Some(acc) = account {
-            js_sys::Reflect::set(&obj, &"account".into(), &acc.into()).ok();
-        }
-        if let Ok(json) = js_sys::JSON::stringify(&obj.into())
-            && let Some(s) = json.as_string()
-        {
-            let _ = ch.post_message(&JsValue::from_str(&s));
-        }
-        ch.close();
-    }
 }
 
 /// Parse one query-string parameter from a `?key=value&...` search string.
@@ -392,80 +128,11 @@ fn query_param(search: &str, key: &str) -> Option<String> {
     })
 }
 
-/// Reload the page after logout, dropping the remembered account first.
-fn reload_page() {
-    clear_stored_account();
-    if let Some(win) = web_sys::window() {
-        let _ = win.location().reload();
-    }
-}
-
-/// The origin of the worker's own URL, e.g. `http://127.0.0.1:9911`.
-///
-/// Same as the page origin because the worker script is served from the same
-/// host. The login redirect returns here.
-fn worker_origin() -> String {
-    js_sys::eval("self.location.origin")
-        .ok()
-        .and_then(|v| v.as_string())
-        .unwrap_or_default()
-}
-
-/// Offer `blob` to the user as a file download named `name`.
-///
-/// The worker hands over the archive as a `Blob` already, so the page puts it
-/// at an object URL and clicks a synthetic anchor without reading one byte of
-/// it. The URL is revoked immediately, since the click has already taken its
-/// own reference.
-fn download_blob(name: &str, blob: &web_sys::Blob) -> Result<(), JsValue> {
-    let url = web_sys::Url::create_object_url_with_blob(blob)?;
-    let document = web_sys::window()
-        .and_then(|window| window.document())
-        .ok_or_else(|| JsValue::from_str("no document"))?;
-    let anchor: web_sys::HtmlAnchorElement = document.create_element("a")?.dyn_into()?;
-    anchor.set_href(&url);
-    anchor.set_download(name);
-    anchor.click();
-    web_sys::Url::revoke_object_url(&url)
-}
-
-/// The account the last successful sign-in on this origin used, or `None`.
-///
-/// Read at first paint, before the worker re-acquires the session.
-fn read_stored_account() -> Option<String> {
-    let storage = web_sys::window()?.local_storage().ok().flatten()?;
-    storage.get_item(STORED_ACCOUNT_KEY).ok().flatten()
-}
-
-/// Remember the account a successful sign-in used, so a reload knows a restore is under way.
-fn save_stored_account(account: &str) {
-    if let Some(window) = web_sys::window()
-        && let Some(storage) = window.local_storage().ok().flatten()
-    {
-        let _ = storage.set_item(STORED_ACCOUNT_KEY, account);
-    }
-}
-
-/// Drop the remembered account on logout, so the next load shows the sign-in screen.
-fn clear_stored_account() {
-    if let Some(window) = web_sys::window()
-        && let Some(storage) = window.local_storage().ok().flatten()
-    {
-        let _ = storage.remove_item(STORED_ACCOUNT_KEY);
-    }
-}
-
-/// The display identity behind an account key; the key itself when it does not decode.
-fn stored_identity(account: &str) -> String {
-    decode_identity::<String>(account).unwrap_or_else(|_| account.to_owned())
-}
-
-/// The served URL of this app's wasm-bindgen glue module, recovered from the
-/// wasm fetch the page already performed. Under trunk the glue is
-/// `/<name>-<hash>.js` beside `/<name>-<hash>_bg.wasm`, so the wasm resource
-/// entry names the glue by suffix swap. Only the main thread can see these
-/// entries, which is why the worker receives the glue URL as a spawn parameter.
+/// The served URL of this app's wasm-bindgen glue module.
 fn glue_url() -> String {
+    // Only the main thread sees the performance resource entries, so the worker takes the
+    // URL as a spawn parameter and the page recovers the glue by suffix swap from the
+    // wasm fetch it already performed.
     let found = js_sys::eval(
         r#"performance.getEntriesByType("resource").map((e) => e.name).find((n) => n.endsWith("_bg.wasm"))"#,
     )
@@ -477,7 +144,7 @@ fn glue_url() -> String {
 }
 
 /// The window's live connection to the DB worker, plus the topology tokens it
-/// must keep alive: leadership (this window may own the worker) and the tab
+/// must keep alive, leadership (this window may own the worker) and the tab
 /// liveness lock (dropped on unmount, so the worker reaps this tab).
 struct Boot {
     client: ConnettoClient<Tab>,
@@ -490,15 +157,13 @@ struct Boot {
 }
 
 /// Join the topology and attach this window's tab client.
-///
-/// Trunk's glue does not self-initialize, so the winner of the leader
-/// election spawns the worker from a generated bootstrap that imports the
-/// glue and runs init.
 async fn boot_window() -> Result<Boot, JsValue> {
     let glue = glue_url();
-    let tab = demo_builder()
+    // Trunk's glue does not self-initialize, so the winner spawns the worker from a generated
+    // bootstrap that imports the glue and runs init.
+    let tab = glue::demo_builder()
         .attach(TabTopology {
-            leader_lock: LEADER_LOCK,
+            leader_lock: glue::LEADER_LOCK,
             glue_url: &glue,
             bootstrap: workers::WorkerBootstrap::Generated,
         })
@@ -519,55 +184,10 @@ async fn boot_window() -> Result<Boot, JsValue> {
     })
 }
 
-/// The one stylesheet the demo renders, identical to the dioxus demo's.
-const CSS: &str = r#"
-:root { --accent: #2f6feb; --accent-hover: #2559c7; --danger: #b42318; --border: #d0d7de; --muted: #57606a; --surface: #f6f8fa; }
-body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; color: #1f2328; background: #fff; }
-.wrap { padding: 16px; max-width: 960px; margin: 0 auto; }
-h1 { font-size: 1.4em; margin: 0 0 8px; }
-h1, h2 { display: flex; align-items: center; gap: 8px; }
-.panes { display: flex; gap: 16px; flex-wrap: wrap; }
-.pane { flex: 1 1 300px; border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: #fff; }
-.pane h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 1.05em; }
-.badge { font-size: 0.7em; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
-.synced { background: #ddf4ff; color: #0a3069; }
-.local { background: #ffebe9; color: #82071e; }
-.trim { background: #dafbe1; color: #116329; }
-.status { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
-.id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; background: var(--surface); border-radius: 4px; padding: 0 4px; }
-table { border-collapse: collapse; width: 100%; margin-top: 8px; }
-th, td { border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left; }
-th { font-size: 0.85em; color: var(--muted); font-weight: 600; }
-input { font: inherit; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; }
-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
-button { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 0.9em; font-weight: 500; padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: #1f2328; cursor: pointer; transition: background-color .12s, border-color .12s; }
-button svg { flex: none; fill: currentColor; }
-button:hover:not(:disabled) { background: #eaeef2; border-color: #afb8c1; }
-button:active:not(:disabled) { background: #dde3e9; }
-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-button:disabled { opacity: .5; cursor: not-allowed; }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
-button.danger { background: #fff; color: var(--danger); border-color: #f5c2bd; }
-button.danger:hover:not(:disabled) { background: #fff1f0; border-color: var(--danger); }
-input[type=file]::file-selector-button { font: inherit; font-size: 0.9em; padding: 6px 12px; margin-right: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
-input[type=file] { border: none; padding: 0; }
-.row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
-.auth-banner { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; background: var(--surface); }
-.auth-banner p { margin: 0; }
-.confirm { background: #fff8c5; border: 1px solid #d4a72c; border-radius: 8px; padding: 8px 12px; }
-.confirm p { margin: 0 0 6px; }
-.warn { color: #7d4e00; background: #fff8c5; border: 1px solid #d4a72c; border-radius: 6px; padding: 4px 8px; margin: 4px 0; }
-.error { color: var(--danger); }
-.peer { border: 1px solid var(--border); border-radius: 10px; padding: 8px 14px; margin-bottom: 12px; }
-img.thumb { max-height: 60px; border-radius: 4px; }
-"#;
-
 /// A cheaply clonable, identity-compared client handle for props.
 ///
-/// One window creates exactly one client and never replaces it, so pointer
-/// identity is the right equality: [`Dashboard`] mounts once with it and
-/// re-renders from its own live state, not from a prop change.
+/// One window creates exactly one client and never replaces it, so pointer identity is the
+/// right equality.
 #[derive(Clone)]
 struct ClientHandle(Rc<ConnettoClient<Tab>>);
 
@@ -587,49 +207,12 @@ impl PartialEq for ContentHandle {
     }
 }
 
-/// Async helper: queries unsynced work and updates the expiry warning.
-/// Exits early if `exp_secs` is no longer the latest session.
-async fn compute_expiry_for_session(
-    exp_secs: u64,
-    latest: Rc<Cell<u64>>,
-    warned: Rc<Cell<Option<u64>>>,
-    expiry_warn: UseStateHandle<Option<connetto_client::teardown::ExpiryWarning>>,
-) {
-    let expires = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(exp_secs);
-    let pending = connetto_web::auth::request_unsynced().await;
-    if latest.get() != exp_secs {
-        return;
-    }
-    let Ok(pending) = pending else {
-        // expiry_warn.as_ref() returns the value from the render that installed this hook,
-        // not the live value. Use warned to detect a stale warning from a different session.
-        if warned.get().is_some_and(|s| s != exp_secs) {
-            warned.set(None);
-            expiry_warn.set(None);
-        }
-        return;
-    };
-    let now_ms = js_sys::Date::now();
-    // Date.now() is always finite and non-negative (ms since epoch).
-    debug_assert!(now_ms.is_finite() && now_ms >= 0.0);
-    // Deliberate truncation to whole seconds for SystemTime arithmetic.
-    let now_secs = (now_ms / 1000.0) as u64;
-    let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now_secs);
-    let lead = std::time::Duration::from_secs(7 * 24 * 60 * 60);
-    let warning = expiry_warning(now, expires, lead, pending.unsynced, pending.content_files);
-    warned.set(warning.as_ref().map(|_| exp_secs));
-    expiry_warn.set(warning);
-}
-
-/// Registers the account chooser callback that the worker calls when it needs
-/// the user to pick an account. Called on every render so the closure captures
-/// the current render's state handles. A single stored account needs no
-/// choice, so a reload signs it back in without a click, and only several
-/// accounts park the picker for a button click.
+/// Registers the account chooser callback the worker calls when it needs the user to pick an
+/// account. Called on every render so the closure captures the current render's state handles.
 fn register_account_chooser(
     account_picker: UseStateHandle<Option<Vec<String>>>,
     known_accounts: UseStateHandle<Vec<String>>,
-    pending_choice: Rc<RefCell<Option<AccountChoice>>>,
+    pending_choice: Rc<RefCell<Option<glue::AccountAnswer>>>,
 ) {
     serve_account_choice(move |accounts| {
         let account_picker = account_picker.clone();
@@ -638,159 +221,87 @@ fn register_account_chooser(
         async move {
             *pending_choice.borrow_mut() = None;
             known_accounts.set(accounts.clone());
-            if accounts.len() <= 1 {
-                return AccountChoice::LastUsed;
-            }
-            account_picker.set(Some(accounts));
-            loop {
-                workers::sleep(core::time::Duration::from_millis(30)).await;
-                if let Some(choice) = pending_choice.borrow().clone() {
-                    account_picker.set(None);
-                    return choice;
-                }
-            }
+            let choice = glue::choose_account(
+                &accounts,
+                || account_picker.set(Some(accounts.clone())),
+                || pending_choice.borrow().clone(),
+            )
+            .await;
+            account_picker.set(None);
+            choice
         }
     });
 }
 
-/// Decodes the JSON broadcast payload from the identity channel.
-/// Returns `None` when the event carries no parseable JSON object.
-fn decode_boot_message(
-    event: &MessageEvent,
-) -> Option<(Option<String>, Option<u64>, Option<String>)> {
-    let data = event.data().as_string()?;
-    let obj = js_sys::JSON::parse(&data).ok()?;
-    let identity = js_sys::Reflect::get(&obj, &"identity".into())
-        .ok()
-        .and_then(|v| v.as_string());
-    let expires_at = js_sys::Reflect::get(&obj, &"expiresAt".into())
-        .ok()
-        .and_then(|v| v.as_string())
-        .and_then(|s| s.parse::<u64>().ok());
-    let account = js_sys::Reflect::get(&obj, &"account".into())
-        .ok()
-        .and_then(|v| v.as_string());
-    Some((identity, expires_at, account))
-}
-
-/// Custom hook: listens on the identity broadcast channel and updates the
-/// session state, recording the account a reload will restore.
+/// Listens on the boot-session channel and updates the session
+/// state, recording the account a reload will restore.
 #[hook]
 fn use_boot_session_listener(
     identity: UseStateHandle<Option<String>>,
     booted_account: UseStateHandle<Option<String>>,
     session_expires_at: UseStateHandle<Option<u64>>,
-    expiry_warn: UseStateHandle<Option<connetto_client::teardown::ExpiryWarning>>,
+    expiry_warn: UseStateHandle<Option<String>>,
     stored: UseStateHandle<Option<String>>,
 ) {
     use_effect_with((), move |()| {
-        let channel = BroadcastChannel::new(DEMO_IDENTITY_CHANNEL).expect("identity channel");
-        let latest_session = Rc::new(Cell::new(0u64));
-        // Tracks which session expiry the current warning was computed for.
-        let warned_session: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
-        let on_msg = {
+        // The latest session deadline, so a warning computed for a superseded session clears.
+        let latest_session = Rc::new(Cell::new(None::<u64>));
+        let listener = glue::BootSessionListener::new({
             let identity = identity.clone();
             let booted_account = booted_account.clone();
             let session_expires_at = session_expires_at.clone();
             let expiry_warn = expiry_warn.clone();
             let stored = stored.clone();
-            Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-                let Some((id, expires_at, account)) = decode_boot_message(&event) else {
-                    return;
-                };
-                if let Some(id) = id {
-                    identity.set(Some(id));
+            move |uid, account, expires_at| {
+                if let Some(uid) = uid {
+                    identity.set(Some(uid));
                 }
                 if let Some(acc) = account {
-                    save_stored_account(&acc);
+                    glue::save_stored_account(&acc);
                     stored.set(Some(acc.clone()));
                     booted_account.set(Some(acc));
                 }
                 if let Some(exp) = expires_at {
                     session_expires_at.set(Some(exp));
-                }
-                if let Some(exp_secs) = expires_at {
-                    latest_session.set(exp_secs);
+                    latest_session.set(Some(exp));
                     let ls = Rc::clone(&latest_session);
-                    let ws = Rc::clone(&warned_session);
-                    spawn_local(compute_expiry_for_session(
-                        exp_secs,
-                        ls,
-                        ws,
-                        expiry_warn.clone(),
-                    ));
+                    let ew = expiry_warn.clone();
+                    spawn_local(async move {
+                        let line = glue::expiry_warn_for_session(exp).await;
+                        if ls.get() == Some(exp) {
+                            ew.set(line);
+                        }
+                    });
                 }
-            })
-        };
-        channel.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
-        move || {
-            channel.set_onmessage(None);
-            channel.close();
-            drop(on_msg);
-        }
+            }
+        });
+        move || listener.close()
     });
 }
 
-/// Custom hook: listens on the login channel and records the URL the worker
+/// Listens on the login channel and records the URL the worker
 /// wants opened for interactive authentication.
 #[hook]
 fn use_login_url_listener(login_url: UseStateHandle<Option<String>>) {
     use_effect_with((), move |()| {
-        let channel = BroadcastChannel::new(connetto_web::LOGIN_CHANNEL).expect("login channel");
-        let on_msg = {
-            let login_url = login_url.clone();
-            Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-                let Some(text) = event.data().as_string() else {
-                    return;
-                };
-                let Ok(obj) = js_sys::JSON::parse(&text) else {
-                    return;
-                };
-                let kind = js_sys::Reflect::get(&obj, &"kind".into())
-                    .ok()
-                    .and_then(|v| v.as_string());
-                if kind.as_deref() != Some("request") {
-                    return;
-                }
-                if let Some(url) = js_sys::Reflect::get(&obj, &"url".into())
-                    .ok()
-                    .and_then(|v| v.as_string())
-                {
-                    login_url.set(Some(url));
-                }
-            })
-        };
-        channel.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
-        move || {
-            channel.set_onmessage(None);
-            channel.close();
-            drop(on_msg);
-        }
+        let login_url = login_url.clone();
+        let listener = glue::LoginUrlListener::new(move |url| {
+            login_url.set(Some(url));
+        });
+        move || listener.close()
     });
 }
 
-/// Custom hook: listens for the worker's provider query and replies with the
-/// configured provider name so the worker knows which OIDC flow to start.
+/// Answers the worker's provider query with the dev provider.
 #[hook]
 fn use_provider_listener() {
     use_effect_with((), move |()| {
-        let ch_recv = BroadcastChannel::new(DEMO_PROVIDER_CHANNEL).expect("provider channel");
-        let ch_send = ch_recv.clone();
-        let on_msg = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-            if e.data().as_string().as_deref() == Some("provider?") {
-                let _ = ch_send.post_message(&JsValue::from_str(AUTH_PROVIDER));
-            }
-        });
-        ch_recv.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
-        move || {
-            ch_recv.set_onmessage(None);
-            ch_recv.close();
-            drop(on_msg);
-        }
+        let listener = glue::ProviderListener::new();
+        move || listener.close()
     });
 }
 
-/// Custom hook: boots the DB worker connection and forwards status events.
+/// Boots the DB worker connection and forwards status events.
 #[hook]
 fn use_boot_window_effect(
     client: UseStateHandle<Option<ClientHandle>>,
@@ -819,11 +330,10 @@ fn use_boot_window_effect(
                             ClientEvent::Unlocked => gate.set("open"),
                             _ => {}
                         }
-                        if let Some(label) = status_label(&event) {
+                        if let Some(label) = support::status_label(&event) {
                             status.set(label);
                         }
-                        // The stop names its cause, and the `Closed` that
-                        // follows it would only replace that.
+                        // The stop names its cause, and the `Closed` that follows it would only replace that.
                         if matches!(event, ClientEvent::Stopped { .. }) {
                             break;
                         }
@@ -842,8 +352,8 @@ fn app() -> Html {
     // The content lane split off the transport at boot; held here so Dashboard can use it.
     let content = use_state(|| None::<ContentHandle>);
     let status = use_state(|| "connecting to the connetto stack".to_owned());
-    // The boot tokens live as long as the app: dropping them on page close
-    // resigns leadership and frees the tab lock, which reaps this tab.
+    // The boot tokens live as long as the app, since dropping them resigns leadership and frees
+    // the tab lock, which reaps this tab.
     let boot_hold = use_mut_ref(|| None::<Boot>);
 
     // Identity and session metadata received from the worker after authentication.
@@ -852,18 +362,17 @@ fn app() -> Html {
     let session_expires_at = use_state(|| None::<u64>);
 
     // The account a reload restores; the session broadcast refreshes it.
-    let stored_account = use_state(read_stored_account);
+    let stored_account = use_state(glue::read_stored_account);
 
-    // The passkey custody level, unknown until boot_window returns, so the
-    // header shows no gate or custody line before the worker has said which it is.
+    // The passkey custody level, unknown until boot_window returns, so the header shows no gate
+    // or custody line before the worker has said which it is.
     let custody = use_state(|| None::<Custody>);
-    // The gate line's lock standing, open until the worker reports the data
-    // waiting on user verification.
+    // The gate line's lock standing, open until the worker reports the data waiting on user
+    // verification.
     let gate = use_state(|| "open");
 
-    // Session expiry warning: Some when the session is near its end and there
-    // are unsynced writes that would be lost if it lapses.
-    let expiry_warn = use_state(|| None::<connetto_client::teardown::ExpiryWarning>);
+    // The expiry warning line, present while the session is near its end with unsynced work.
+    let expiry_warn = use_state(|| None::<String>);
 
     // Login URL the worker broadcasts when interactive auth is needed.
     let login_url = use_state(|| None::<String>);
@@ -872,17 +381,15 @@ fn app() -> Html {
     let confirm_seqs = use_state(|| None::<PendingWork>);
     let refused_seqs = use_state(|| None::<PendingWork>);
 
-    // Account chooser: the list of accounts the worker offered during the
-    // last account question, shown as a picker while the chooser awaits.
+    // The accounts the worker offered during the last account question,
+    // shown as a picker while the chooser awaits.
     let account_picker = use_state(|| None::<Vec<String>>);
     // Accounts seen so far, kept for the switch-account controls in the auth bar.
     let known_accounts = use_state(Vec::<String>::new);
-    // Shared cell between the chooser future and the picker UI: the UI writes
-    // the user's choice here, the chooser loop reads and returns it.
-    let pending_choice = use_mut_ref(|| None::<AccountChoice>);
+    // Shared cell between the chooser future and the picker UI, where the UI writes the user's
+    // choice and the chooser loop reads and returns it.
+    let pending_choice = use_mut_ref(|| None::<glue::AccountAnswer>);
 
-    // Register the account chooser. Called on every render (just updates a
-    // thread-local), so the captures always point at the current render's state.
     register_account_chooser(
         account_picker.clone(),
         known_accounts.clone(),
@@ -928,9 +435,8 @@ fn app() -> Html {
         Callback::from(move |_| {
             let status = status.clone();
             spawn_local(async move {
-                match connetto_web::auth::request_logout(false, false).await {
-                    Ok(_) => reload_page(),
-                    Err(err) => status.set(format!("logout failed: {err}")),
+                if let Err(err) = glue::logout_keep().await {
+                    status.set(format!("logout failed: {err}"));
                 }
             });
         })
@@ -945,18 +451,11 @@ fn app() -> Html {
             let confirm_seqs = confirm_seqs.clone();
             let refused_seqs = refused_seqs.clone();
             spawn_local(async move {
-                match connetto_web::auth::request_unsynced().await {
-                    Ok(pending) if pending.is_empty() => {
-                        match connetto_web::auth::request_logout(true, false).await {
-                            Ok(connetto_web::auth::LogoutOutcome::Refused { pending }) => {
-                                refused_seqs.set(Some(pending));
-                            }
-                            Ok(_) => reload_page(),
-                            Err(err) => status.set(format!("logout failed: {err}")),
-                        }
-                    }
-                    Ok(pending) => confirm_seqs.set(Some(pending)),
-                    Err(err) => status.set(format!("checking unsynced failed: {err}")),
+                match glue::logout_delete().await {
+                    Ok(glue::DeleteOutcome::Confirm(pending)) => confirm_seqs.set(Some(pending)),
+                    Ok(glue::DeleteOutcome::Refused(pending)) => refused_seqs.set(Some(pending)),
+                    Ok(glue::DeleteOutcome::Reloaded) => {}
+                    Err(err) => status.set(format!("logout failed: {err}")),
                 }
             });
         })
@@ -970,9 +469,8 @@ fn app() -> Html {
             let confirm_seqs = confirm_seqs.clone();
             spawn_local(async move {
                 confirm_seqs.set(None);
-                match connetto_web::auth::request_logout(true, true).await {
-                    Ok(_) => reload_page(),
-                    Err(err) => status.set(format!("forced delete failed: {err}")),
+                if let Err(err) = glue::logout_delete_confirmed().await {
+                    status.set(format!("forced delete failed: {err}"));
                 }
             });
         })
@@ -986,9 +484,8 @@ fn app() -> Html {
             let refused_seqs = refused_seqs.clone();
             spawn_local(async move {
                 refused_seqs.set(None);
-                match connetto_web::auth::request_logout(true, true).await {
-                    Ok(_) => reload_page(),
-                    Err(err) => status.set(format!("forced delete failed: {err}")),
+                if let Err(err) = glue::logout_delete_confirmed().await {
+                    status.set(format!("forced delete failed: {err}"));
                 }
             });
         })
@@ -1008,7 +505,7 @@ fn app() -> Html {
         let add_new = {
             let pending_choice = pending_choice.clone();
             Callback::from(move |_| {
-                *pending_choice.borrow_mut() = Some(AccountChoice::New);
+                *pending_choice.borrow_mut() = Some(glue::AccountAnswer::New);
             })
         };
         let switch_buttons: Html = accounts
@@ -1016,27 +513,27 @@ fn app() -> Html {
             .cloned()
             .map(|account| {
                 let pending_choice = pending_choice.clone();
-                let label = stored_identity(&account);
+                let label = support::account_label(&account);
                 html! {
                     <button onclick={Callback::from(move |_| {
                         *pending_choice.borrow_mut() =
-                            Some(AccountChoice::Account(account.clone()));
+                            Some(glue::AccountAnswer::Stored(account.clone()));
                     })}>
                         <Icon data={IconData::FONT_AWESOME_SOLID_ARROW_RIGHT_ARROW_LEFT} width={"14"} height={"14"} />
                         { "Sign in as " }
-                        <code class="id" title={label.clone()}>{ short_id(&label) }</code>
+                        <code class="id" title={label.clone()}>{ support::short_id(&label) }</code>
                     </button>
                 }
             })
             .collect();
         html! {
             <div class="confirm">
-                <strong>{ "Choose account:" }</strong>
+                <strong>{ "Choose an account to sign in as:" }</strong>
                 <div class="row">
                     { switch_buttons }
                     <button onclick={add_new}>
                         <Icon data={IconData::FONT_AWESOME_SOLID_USER_PLUS} width={"14"} height={"14"} />
-                        { "Add new account" }
+                        { "Sign in as a new account" }
                     </button>
                 </div>
             </div>
@@ -1046,14 +543,10 @@ fn app() -> Html {
     };
 
     // Expiry warning banner.
-    let expiry_html = if let Some(warn) = (*expiry_warn).clone() {
-        let count = warn.pending_count();
+    let expiry_html = if let Some(line) = (*expiry_warn).clone() {
         html! {
             <div class="warn">
-                { format!(
-                    "Session nearing expiry with {count} pending local item(s). \
-                     Reconnect before the session lapses to avoid data loss."
-                ) }
+                { line }
             </div>
         }
     } else {
@@ -1067,21 +560,23 @@ fn app() -> Html {
         if signed_in {
             let account_line = {
                 let uid = (*identity).clone().unwrap_or_default();
-                let decoded = (*booted_account).clone().map(|acc| stored_identity(&acc));
+                let decoded = (*booted_account)
+                    .clone()
+                    .map(|acc| support::account_label(&acc));
                 match decoded {
                     Some(acc) if acc != uid => html! {
                         <span>
                             { "Signed in as " }
-                            <code class="id" title={uid.clone()}>{ short_id(&uid) }</code>
+                            <code class="id" title={uid.clone()}>{ support::short_id(&uid) }</code>
                             { " (account: " }
-                            <code class="id" title={acc.clone()}>{ short_id(&acc) }</code>
+                            <code class="id" title={acc.clone()}>{ support::short_id(&acc) }</code>
                             { ")." }
                         </span>
                     },
                     _ => html! {
                         <span>
                             { "Signed in as " }
-                            <code class="id" title={uid.clone()}>{ short_id(&uid) }</code>
+                            <code class="id" title={uid.clone()}>{ support::short_id(&uid) }</code>
                             { "." }
                         </span>
                     },
@@ -1098,14 +593,11 @@ fn app() -> Html {
                     let status = status.clone();
                     let identity = identity.clone();
                     let booted_account = booted_account.clone();
-                    let label = stored_identity(&account);
+                    let label = support::account_label(&account);
                     html! {
                         <button onclick={Callback::from(move |_| {
-                            // Cleared before the reboot, not after it. The banner
-                            // hides the login prompt while an identity is held, and
-                            // the replacement worker may need one, so a stale
-                            // identity would hide the very control it is waiting
-                            // for. The worker rebroadcasts both once it is up.
+                            // Clear the identity before the reboot, since the replacement worker may need the login
+                            // prompt the banner hides while an identity is held.
                             identity.set(None);
                             booted_account.set(None);
                             let result = {
@@ -1119,7 +611,7 @@ fn app() -> Html {
                         })}>
                             <Icon data={IconData::FONT_AWESOME_SOLID_ARROW_RIGHT_ARROW_LEFT} width={"14"} height={"14"} />
                             { "Switch to " }
-                            <code class="id" title={label.clone()}>{ short_id(&label) }</code>
+                            <code class="id" title={label.clone()}>{ support::short_id(&label) }</code>
                         </button>
                     }
                 })
@@ -1130,11 +622,8 @@ fn app() -> Html {
                 let identity = identity.clone();
                 let booted_account = booted_account.clone();
                 Callback::from(move |_| {
-                    // Same reason as the switch above, and it matters more here:
-                    // adding an account always needs an interactive login, so the
-                    // prompt must be reachable. Nothing is reloaded either way,
-                    // because the pending choice lives in this page and a reload
-                    // would discard it.
+                    // Adding an account always needs the login prompt, so clear the identity first, since the banner
+                    // hides the prompt while an identity is held.
                     identity.set(None);
                     booted_account.set(None);
                     let result = {
@@ -1151,10 +640,10 @@ fn app() -> Html {
                 let count = pending.len();
                 html! {
                     <span>
-                        { format!("{count} local item(s) will be lost. ") }
+                        { format!("{} ", support::logout_confirm_line(count)) }
                         <button class="danger" onclick={confirm_delete}>
                             <Icon data={IconData::FONT_AWESOME_SOLID_CHECK} width={"14"} height={"14"} />
-                            { "Delete anyway" }
+                            { "Confirm: delete and log out" }
                         </button>
                         { " " }
                         <button onclick={cancel_confirm.clone()}>
@@ -1171,7 +660,7 @@ fn app() -> Html {
                 let count = pending.len();
                 html! {
                     <span>
-                        { format!("Refused: {count} local item(s) still pending. ") }
+                        { format!("{} ", support::logout_refused_line(count)) }
                         <button class="danger" onclick={force_delete}>
                             <Icon data={IconData::FONT_AWESOME_SOLID_TRASH_CAN} width={"14"} height={"14"} />
                             { "Force delete" }
@@ -1187,18 +676,16 @@ fn app() -> Html {
                 html! {}
             };
 
-            // The passkey gate can only be offered while a passkey is available and
-            // the session is still unverified; once enrolled, custody flips and the
-            // button goes away.
+            // The passkey gate is only offerable while a passkey is available and the session is still
+            // unverified, once enrolled custody flips and the button goes away.
             let enrol_offerable = matches!(*custody, Some(Custody::Unverified(NoGate::Offerable)));
             let enrol_html = if enrol_offerable {
                 let boot_hold = boot_hold.clone();
                 let custody = custody.clone();
                 let status = status.clone();
                 let enrol_gate = Callback::from(move |_| {
-                    // The ceremony runs for as long as the user takes to present a
-                    // finger, so the membership handle is cloned out and the borrow
-                    // released before the await.
+                    // The ceremony runs as long as the user takes to present a finger, so clone the membership
+                    // handle out and release the borrow before the await.
                     let membership = {
                         let borrow = boot_hold.borrow();
                         match borrow.as_ref() {
@@ -1206,8 +693,7 @@ fn app() -> Html {
                             None => return,
                         }
                     };
-                    // Clone the state handles so the async block owns its copies and
-                    // the callback itself only borrows per call, keeping it `Fn`.
+                    // Clone the state handles so the async block owns its copies and the callback stays `Fn`.
                     let custody = custody.clone();
                     let status = status.clone();
                     spawn_local(async move {
@@ -1217,14 +703,8 @@ fn app() -> Html {
                                     custody.set(Some(level));
                                 }
                             }
-                            Ok(false) => {
-                                status.set(
-                                    "the passkey gate can only be set up in the window that \
-                                     owns the database"
-                                        .to_owned(),
-                                );
-                            }
-                            Err(e) => status.set(format!("enrolment failed: {e:?}")),
+                            Ok(false) => status.set(glue::ENROL_WRONG_WINDOW.to_owned()),
+                            Err(e) => status.set(glue::enrolment_failed(e)),
                         }
                     });
                 });
@@ -1286,7 +766,7 @@ fn app() -> Html {
             }
         } else {
             let account = stored.unwrap_or_default();
-            let identity = stored_identity(&account);
+            let identity = support::account_label(&account);
             html! {
                 <div class="auth-banner">
                     <h2>
@@ -1295,7 +775,7 @@ fn app() -> Html {
                     </h2>
                     <span>
                         { "Signed in as " }
-                        <code class="id" title={identity.clone()}>{ short_id(&identity) }</code>
+                        <code class="id" title={identity.clone()}>{ support::short_id(&identity) }</code>
                         { "." }
                     </span>
                 </div>
@@ -1313,24 +793,24 @@ fn app() -> Html {
         html! { <p>{ "Connecting to the DB worker and the connetto stack..." }</p> }
     };
 
-    // The header's gate and custody lines, shown once the worker has said
-    // which custody level the page runs under.
+    // The header's gate and custody lines, shown once the worker has said which custody level
+    // the page runs under.
     let gate_line_html = match *custody {
         Some(custody) => html! {
-            <p class="status">{ format!("gate: {}", gate_text(custody, *gate)) }</p>
+            <p class="status">{ format!("gate: {}", glue::gate_text(custody, *gate)) }</p>
         },
         None => html! {},
     };
     let custody_line_html = match *custody {
         Some(custody) => html! {
-            <p class="status">{ format!("custody: {}", custody_text(custody)) }</p>
+            <p class="status">{ format!("custody: {}", glue::custody_text(custody)) }</p>
         },
         None => html! {},
     };
 
     html! {
         <>
-            <style>{ CSS }</style>
+            <style>{ support::CSS }</style>
             <div class="wrap">
                 <h1>{ "connetto web demo (Yew)" }</h1>
                 <p class="status">{ format!("status: {}", &*status) }</p>
@@ -1353,40 +833,38 @@ fn panes_skeleton() -> Html {
     html! {
         <div class="panes">
             <div class="pane">
-                <h2><Icon data={IconData::FONT_AWESOME_SOLID_CART_SHOPPING} width={"14"} height={"14"} />{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
-                <p>{ "count 0, total quantity 0. Newest first. Converges across every window through Postgres." }</p>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_CART_SHOPPING} width={"14"} height={"14"} />{ support::ORDERS_PANE_TITLE }<span class="badge synced">{ support::ORDERS_BADGE }</span></h2>
+                <p>{ support::orders_readout(0, 0) }</p>
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "quantity" }</th></tr></thead>
                     <tbody></tbody>
                 </table>
             </div>
             <div class="pane">
-                <h2><Icon data={IconData::FONT_AWESOME_SOLID_IMAGES} width={"14"} height={"14"} />{ "photos " }<span class="badge synced">{ "synced" }</span></h2>
-                <p>{ "count 0. Pick an image file to stage and upload through the content route." }</p>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_IMAGES} width={"14"} height={"14"} />{ support::PHOTOS_PANE_TITLE }<span class="badge synced">{ support::PHOTOS_BADGE }</span></h2>
+                <p>{ support::photos_readout(0) }</p>
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "state" }</th><th>{ "image" }</th></tr></thead>
                     <tbody></tbody>
                 </table>
             </div>
             <div class="pane">
-                <h2><Icon data={IconData::FONT_AWESOME_SOLID_NOTE_STICKY} width={"14"} height={"14"} />{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
-                <p>{ "count 0. Converges across this device's windows through the DB worker, never the server." }</p>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_NOTE_STICKY} width={"14"} height={"14"} />{ support::NOTES_PANE_TITLE }<span class="badge local">{ support::NOTES_BADGE }</span></h2>
+                <p>{ support::notes_readout(0) }</p>
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "body" }</th></tr></thead>
                     <tbody></tbody>
                 </table>
             </div>
             <div class="pane">
-                <h2><Icon data={IconData::FONT_AWESOME_SOLID_BROOM} width={"14"} height={"14"} />{ "retention " }<span class="badge trim">{ "R15" }</span></h2>
-                <p>{ "Replica mirror: 0 pages (~0 KB), 0 free to reclaim. Covered rows: 0." }</p>
-                <p>{ "Ending a subscription evicts the rows no live subscription still covers, and the trimming pass hands the freed pages back to storage." }</p>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_BROOM} width={"14"} height={"14"} />{ support::RETENTION_PANE_TITLE }<span class="badge trim">{ support::RETENTION_BADGE }</span></h2>
+                <p>{ support::retention_readout(0, 0, 0) }</p>
+                <p>{ support::RETENTION_EXPLAINER }</p>
             </div>
             <div class="pane">
-                <h2><Icon data={IconData::FONT_AWESOME_SOLID_DATABASE} width={"14"} height={"14"} />{ "your data " }<span class="badge local">{ "R26" }</span></h2>
-                <p>{ "Save a zip archive of this device's local data. The archive is not \
-                      encrypted and holds every row the device can read: whoever holds \
-                      the file holds the data." }</p>
-                <p>{ "The DB worker exports, not this window: the worker holds the durable replica and the device-private tier, while a tab mirror is in memory and holds only what its subscriptions cover." }</p>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_DATABASE} width={"14"} height={"14"} />{ support::YOUR_DATA_PANE_TITLE }<span class="badge local">{ support::YOUR_DATA_BADGE }</span></h2>
+                <p>{ support::YOUR_DATA_INTRO }</p>
+                <p>{ support::YOUR_DATA_IMPORT_INTRO }</p>
             </div>
         </div>
     }
@@ -1409,12 +887,9 @@ fn photo_storage_controls(props: &PhotoStorageControlsProps) -> Html {
             let message = message.clone();
             spawn_local(async move {
                 let result = content
-                    .pin_content("photos", "SELECT content_id FROM photos", "content_id")
+                    .pin_content("photos", support::PIN_PHOTOS_QUERY, "content_id")
                     .await
-                    .map_or_else(
-                        |err| format!("pin failed: {err}"),
-                        |_| "pinned photos".to_owned(),
-                    );
+                    .map_or_else(support::pin_failed, |_| support::PIN_OK.to_owned());
                 message.set(Some(result));
             });
         })
@@ -1426,10 +901,10 @@ fn photo_storage_controls(props: &PhotoStorageControlsProps) -> Html {
             let content = Rc::clone(&content);
             let message = message.clone();
             spawn_local(async move {
-                let result = content.unpin_content("photos").await.map_or_else(
-                    |err| format!("unpin failed: {err}"),
-                    |_| "unpinned photos".to_owned(),
-                );
+                let result = content
+                    .unpin_content("photos")
+                    .await
+                    .map_or_else(support::unpin_failed, |_| support::UNPIN_OK.to_owned());
                 message.set(Some(result));
             });
         })
@@ -1443,10 +918,10 @@ fn photo_storage_controls(props: &PhotoStorageControlsProps) -> Html {
             let message = message.clone();
             let refresh = refresh.clone();
             spawn_local(async move {
-                let result = content.fetch_pinned().await.map_or_else(
-                    |err| format!("fetch failed: {err}"),
-                    |ids| format!("fetched {} pinned file(s)", ids.len()),
-                );
+                let result = content
+                    .fetch_pinned()
+                    .await
+                    .map_or_else(support::fetch_failed, |ids| support::fetch_ok(ids.len()));
                 refresh.set(*refresh + 1);
                 message.set(Some(result));
             });
@@ -1459,10 +934,10 @@ fn photo_storage_controls(props: &PhotoStorageControlsProps) -> Html {
             let content = Rc::clone(&content);
             let message = message.clone();
             spawn_local(async move {
-                let result = content.tidy().await.map_or_else(
-                    |err| format!("content tidy failed: {err}"),
-                    |n| format!("content tidy: {n} file(s) evicted"),
-                );
+                let result = content
+                    .tidy()
+                    .await
+                    .map_or_else(support::tidy_failed, support::tidy_ok);
                 message.set(Some(result));
             });
         })
@@ -1516,19 +991,11 @@ fn dashboard(props: &DashboardProps) -> Html {
     let client = (*props.client.0).clone();
     let identity = props.identity.clone();
 
-    let orders = use_live::<_, _, Order>(
-        &client,
-        orders::table.order((orders::created_at.desc(), orders::id.desc())),
-    );
-    let notes = use_live::<_, _, Note>(&client, notes::table.order(notes::id));
-    let photos = use_live::<_, _, Photo>(&client, photos::table.order(photos::id));
-    let count = use_live(&client, orders::table.count());
-    let counts_by_quantity = use_live(
-        &client,
-        orders::table
-            .group_by(orders::quantity)
-            .select((orders::quantity, diesel::dsl::count_star())),
-    );
+    let orders = use_live::<_, _, support::Order>(&client, support::orders_newest_first());
+    let notes = use_live::<_, _, support::Note>(&client, support::notes_rows());
+    let photos = use_live::<_, _, support::Photo>(&client, support::photos_rows());
+    let count = use_live(&client, support::orders_count());
+    let counts_by_quantity = use_live(&client, support::orders_counts_by_quantity());
 
     let order_rows = orders.value();
     let note_rows = notes.value();
@@ -1537,14 +1004,11 @@ fn dashboard(props: &DashboardProps) -> Html {
     let order_sum: i64 = order_rows.iter().map(|row| row.quantity).sum();
     let note_count = note_rows.len();
     let photo_count = photo_rows.len();
-    let count_text = count
-        .value()
-        .map_or_else(|| "pending".to_owned(), |value| value.to_string());
-    let grouped_text = grouped_label(&counts_by_quantity.value());
+    let count_text = support::orders_count_value(count.value());
+    let grouped_text = support::grouped_label(&counts_by_quantity.value());
 
-    // The display source of each photo's bytes, refetched on a row's id or content
-    // state change and when the fetch button restores bytes, so a stale ticket
-    // never wedges the panel.
+    // The display source of each photo's bytes, refetched on a row's id or content state change
+    // and when the fetch button restores bytes, so a stale ticket never wedges the panel.
     let photo_urls = use_state(HashMap::<rosetta_uuid::Uuid, PhotoUrl>::new);
     let src_refresh = use_state(|| 0_u64);
     {
@@ -1570,10 +1034,9 @@ fn dashboard(props: &DashboardProps) -> Html {
             spawn_local(async move {
                 let mut new_urls = HashMap::new();
                 for (id, content_id, available) in rows {
-                    let Ok(bytes) = <[u8; 32]>::try_from(content_id.as_slice()) else {
+                    let Some(file_id) = support::photo_file_id(&content_id) else {
                         continue;
                     };
-                    let file_id = FileId::from_bytes(bytes);
                     let resolved = content.resolve(file_id).await;
                     match resolved {
                         TabResolved::Remote { url } if available => {
@@ -1596,8 +1059,7 @@ fn dashboard(props: &DashboardProps) -> Html {
 
     let note_text = use_state(String::new);
 
-    // R15 retention readout: tab mirror page footprint, refreshed whenever the
-    // covered rows move.
+    // Tab mirror page footprint, refreshed whenever the covered rows move.
     let footprint = use_state(|| (0_i64, 0_i64));
     {
         let client = client.clone();
@@ -1607,13 +1069,12 @@ fn dashboard(props: &DashboardProps) -> Html {
             let client = client.clone();
             let footprint = footprint.clone();
             spawn_local(async move {
-                footprint.set(replica_footprint(&client).await);
+                footprint.set(support::replica_footprint(&client).await);
             });
             || ()
         });
     }
     let (pages, free) = *footprint;
-    let kb = pages * 4;
 
     let newest_order = order_rows.first().map(|o| o.id);
 
@@ -1624,21 +1085,8 @@ fn dashboard(props: &DashboardProps) -> Html {
             let client = client.clone();
             let identity = identity.clone();
             spawn_local(async move {
-                let quantity = fresh_quantity();
-                let result = client
-                    .with_conn(move |conn| {
-                        diesel::insert_into(orders::table)
-                            .values((
-                                orders::owner_id.eq(identity.as_str()),
-                                orders::quantity.eq(quantity),
-                            ))
-                            .execute(conn.conn())
-                    })
-                    .await
-                    .and_then(|insert| insert.map_err(Into::into));
-                if let Err(err) = result {
-                    tracing::error!(error = %err, "order insert failed");
-                }
+                let quantity = support::fresh_quantity();
+                let _ = support::add_order(&client, &identity, quantity).await;
             });
         })
     };
@@ -1649,16 +1097,7 @@ fn dashboard(props: &DashboardProps) -> Html {
             if let Some(id) = newest_order {
                 let client = client.clone();
                 spawn_local(async move {
-                    let result = client
-                        .with_conn(move |conn| {
-                            diesel::delete(orders::table.filter(orders::id.eq(id)))
-                                .execute(conn.conn())
-                        })
-                        .await
-                        .and_then(|insert| insert.map_err(Into::into));
-                    if let Err(err) = result {
-                        tracing::error!(error = %err, "order remove failed");
-                    }
+                    let _ = support::remove_newest_order(&client, id).await;
                 });
             }
         })
@@ -1683,97 +1122,52 @@ fn dashboard(props: &DashboardProps) -> Html {
             let client = client.clone();
             let note_text = note_text.clone();
             spawn_local(async move {
-                let id = fresh_note_id();
-                let result = client
-                    .with_conn(move |conn| {
-                        diesel::insert_into(notes::table)
-                            .values((notes::id.eq(id), notes::body.eq(body)))
-                            .execute(conn.conn())
-                    })
-                    .await
-                    .and_then(|insert| insert.map_err(Into::into));
-                match result {
-                    Ok(_) => note_text.set(String::new()),
-                    Err(err) => {
-                        tracing::error!(error = %err, "note save failed");
-                    }
+                if support::save_note(&client, &body).await.is_ok() {
+                    note_text.set(String::new());
                 }
             });
         })
     };
 
-    // Pick a photo file, stage its bytes through the content lane, and insert the rows.
-    // A new order is created for each photo so the foreign key is always satisfied.
+    // Pick a photo file, stage its bytes through the content lane, and insert the rows, one new
+    // order per photo so the foreign key is always satisfied.
+    let stage_status = use_state(|| None::<String>);
     let pick_photo = if identity.is_empty() {
         Callback::noop()
     } else {
         let client = client.clone();
         let content = Rc::clone(&props.content.0);
         let identity = identity.clone();
+        let stage_status = stage_status.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             if let Some(files) = input.files()
                 && let Some(file) = files.get(0)
             {
+                let name = file.name();
                 let client = client.clone();
                 let content = Rc::clone(&content);
                 let identity = identity.clone();
+                let stage_status = stage_status.clone();
                 spawn_local(async move {
+                    let Some(mime) = support::mime_from_extension(Path::new(&name)) else {
+                        stage_status.set(Some(
+                            "not an image: only .jpg .jpeg .png are accepted".to_owned(),
+                        ));
+                        return;
+                    };
                     let blob: web_sys::Blob = file.into();
-                    let stage_identity = identity.clone();
                     let result = content
-                        .stage(&blob, MimeClass::Jpeg, &client, move |conn, file_id| {
-                            conn.transaction(|conn| {
-                                let before_orders: std::collections::HashSet<rosetta_uuid::Uuid> =
-                                    orders::table
-                                        .select(orders::id)
-                                        .load::<rosetta_uuid::Uuid>(conn)?
-                                        .into_iter()
-                                        .collect();
-                                diesel::insert_into(orders::table)
-                                    .values((
-                                        orders::owner_id.eq(stage_identity.as_str()),
-                                        orders::quantity.eq(1_i64),
-                                    ))
-                                    .execute(conn)?;
-                                let order_id = orders::table
-                                    .select(orders::id)
-                                    .load::<rosetta_uuid::Uuid>(conn)?
-                                    .into_iter()
-                                    .find(|id| !before_orders.contains(id))
-                                    .expect("order minted");
-                                let before_photos: std::collections::HashSet<rosetta_uuid::Uuid> =
-                                    photos::table
-                                        .select(photos::id)
-                                        .load::<rosetta_uuid::Uuid>(conn)?
-                                        .into_iter()
-                                        .collect();
-                                diesel::insert_into(photos::table)
-                                    .values((
-                                        photos::order_id.eq(order_id),
-                                        photos::owner_id.eq(stage_identity.as_str()),
-                                        photos::content_id.eq(file_id.as_bytes().to_vec()),
-                                        photos::content_state.eq::<Option<String>>(None),
-                                    ))
-                                    .execute(conn)?;
-                                Ok::<_, diesel::result::Error>(
-                                    photos::table
-                                        .select(photos::id)
-                                        .load::<rosetta_uuid::Uuid>(conn)?
-                                        .into_iter()
-                                        .find(|id| !before_photos.contains(id))
-                                        .expect("photo minted"),
-                                )
-                            })
+                        .stage(&blob, mime, &client, move |conn, file_id| {
+                            support::stage_photo_row(conn, file_id, &identity)
                         })
                         .await;
                     match result {
                         Ok(_) => {
                             client.replay_pending().await.ok();
+                            stage_status.set(Some("photo staged".to_owned()));
                         }
-                        Err(err) => {
-                            tracing::error!(error = %err, "photo stage failed");
-                        }
+                        Err(err) => stage_status.set(Some(format!("stage failed: {err}"))),
                     }
                 });
             }
@@ -1790,15 +1184,15 @@ fn dashboard(props: &DashboardProps) -> Html {
                 if let Err(err) = client.tidy().await {
                     tracing::error!(error = %err, "free up space failed");
                 }
-                footprint.set(replica_footprint(&client).await);
+                footprint.set(support::replica_footprint(&client).await);
             });
         })
     };
 
-    // R26: the export runs in the DB worker, which holds the durable replica
-    // and the device-private tier. A tab mirror is in memory and partial.
-    let export_status = use_state(|| Option::<String>::None);
-    let import_status = use_state(|| Option::<String>::None);
+    // The export runs in the DB worker, which holds the durable replica and the device-private
+    // tier, while a tab mirror is in memory and partial.
+    let export_status = use_state(|| None::<String>);
+    let import_status = use_state(|| None::<String>);
     let import_cb = {
         let import_status = import_status.clone();
         Callback::from(move |event: Event| {
@@ -1808,19 +1202,7 @@ fn dashboard(props: &DashboardProps) -> Html {
             {
                 let import_status = import_status.clone();
                 spawn_local(async move {
-                    let message = match workers::request_import(file.into()).await {
-                        Ok((outcome, clashes)) => {
-                            let mut msg = format!(
-                                "{} row(s) restored, {} kept, {} write(s) restored",
-                                outcome.rows_restored, outcome.rows_kept, outcome.writes_restored
-                            );
-                            if clashes > 0 {
-                                msg.push_str(&format!(" ({clashes} clash(es) resolved to file)"));
-                            }
-                            msg
-                        }
-                        Err(err) => format!("refused: {err}"),
-                    };
+                    let message = glue::import_data(&file.into()).await;
                     import_status.set(Some(message));
                 });
             }
@@ -1831,16 +1213,7 @@ fn dashboard(props: &DashboardProps) -> Html {
         Callback::from(move |_| {
             let export_status = export_status.clone();
             spawn_local(async move {
-                let message = match workers::request_export(ExportScope::Everything).await {
-                    Ok(blob) => {
-                        let size = blob.size();
-                        match download_blob(EXPORT_FILE_NAME, &blob) {
-                            Ok(()) => format!("{size} bytes offered as {EXPORT_FILE_NAME}"),
-                            Err(err) => format!("download refused: {err:?}"),
-                        }
-                    }
-                    Err(err) => format!("export failed: {err}"),
-                };
+                let message = glue::export_data().await;
                 export_status.set(Some(message));
             });
         })
@@ -1866,10 +1239,10 @@ fn dashboard(props: &DashboardProps) -> Html {
     html! {
         <div class="panes">
             <div class="pane">
-                <h2><Icon data={IconData::FONT_AWESOME_SOLID_CART_SHOPPING} width={"14"} height={"14"} />{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
-                <p>{ format!("count {order_count}, total quantity {order_sum}. Newest first. Converges across every window through Postgres.") }</p>
-                <p>{ "COUNT(*) pushed by the server: " }<strong>{ count_text.to_string() }</strong></p>
-                <p>{ "COUNT(*) grouped by quantity: " }<strong>{ grouped_text }</strong></p>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_CART_SHOPPING} width={"14"} height={"14"} />{ support::ORDERS_PANE_TITLE }<span class="badge synced">{ support::ORDERS_BADGE }</span></h2>
+                <p>{ support::orders_readout(order_count, order_sum) }</p>
+                <p>{ support::ORDERS_COUNT_PREFIX }<strong>{ count_text.to_string() }</strong></p>
+                <p>{ support::ORDERS_GROUPED_PREFIX }<strong>{ grouped_text }</strong></p>
                 <div class="row">
                     <button class="primary" onclick={add_order} disabled={identity.is_empty()}>
                         <Icon data={IconData::FONT_AWESOME_SOLID_PLUS} width={"14"} height={"14"} />
@@ -1892,7 +1265,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                             let id = row.id.to_string();
                             html! {
                                 <tr key={id.clone()}>
-                                    <td><code class="id" title={id.clone()}>{ short_id(&id) }</code></td>
+                                    <td><code class="id" title={id.clone()}>{ support::short_id(&id) }</code></td>
                                     <td>{ row.quantity.to_string() }</td>
                                 </tr>
                             }
@@ -1901,18 +1274,21 @@ fn dashboard(props: &DashboardProps) -> Html {
                 </table>
             </div>
             <div class="pane">
-                <h2><Icon data={IconData::FONT_AWESOME_SOLID_IMAGES} width={"14"} height={"14"} />{ "photos " }<span class="badge synced">{ "synced" }</span></h2>
-                <p>{ format!("count {photo_count}. Pick an image file to stage and upload through the content route.") }</p>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_IMAGES} width={"14"} height={"14"} />{ support::PHOTOS_PANE_TITLE }<span class="badge synced">{ support::PHOTOS_BADGE }</span></h2>
+                <p>{ support::photos_readout(photo_count) }</p>
                 <div class="row">
                     <input type="file" accept="image/*" onchange={pick_photo} disabled={identity.is_empty()} />
                 </div>
+                if let Some(message) = (*stage_status).clone() {
+                    <p class="status">{ message }</p>
+                }
                 { photos_error.unwrap_or_default() }
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "state" }</th><th>{ "image" }</th></tr></thead>
                     <tbody>
                         { for photo_rows.iter().map(|row| {
                             let id = row.id.to_string();
-                            let state = row.content_state.as_deref().unwrap_or("pending");
+                            let state = support::photo_state(row.content_state.as_deref());
                             let img = urls.get(&row.id).map(|src| match src {
                                 PhotoUrl::Remote(url) => {
                                     html! { <img class="thumb" src={url.clone()} /> }
@@ -1923,7 +1299,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                             });
                             html! {
                                 <tr key={id.clone()}>
-                                    <td><code class="id" title={id.clone()}>{ short_id(&id) }</code></td>
+                                    <td><code class="id" title={id.clone()}>{ support::short_id(&id) }</code></td>
                                     <td>{ state }</td>
                                     <td>{ img.unwrap_or_default() }</td>
                                 </tr>
@@ -1934,10 +1310,10 @@ fn dashboard(props: &DashboardProps) -> Html {
                 <PhotoStorageControls content={props.content.clone()} refresh={src_refresh.clone()} />
             </div>
             <div class="pane">
-                <h2><Icon data={IconData::FONT_AWESOME_SOLID_NOTE_STICKY} width={"14"} height={"14"} />{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
-                <p>{ format!("count {note_count}. Converges across this device's windows through the DB worker, never the server.") }</p>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_NOTE_STICKY} width={"14"} height={"14"} />{ support::NOTES_PANE_TITLE }<span class="badge local">{ support::NOTES_BADGE }</span></h2>
+                <p>{ support::notes_readout(note_count) }</p>
                 <div class="row">
-                    <input type="text" placeholder="note body" value={(*note_text).clone()} oninput={on_note_input} />
+                    <input type="text" placeholder={support::NOTES_PLACEHOLDER} value={(*note_text).clone()} oninput={on_note_input} />
                     <button class="primary" onclick={save_note}>
                         <Icon data={IconData::FONT_AWESOME_SOLID_FLOPPY_DISK} width={"14"} height={"14"} />
                         { "Save note" }
@@ -1960,9 +1336,9 @@ fn dashboard(props: &DashboardProps) -> Html {
                 </table>
             </div>
             <div class="pane">
-                <h2><Icon data={IconData::FONT_AWESOME_SOLID_BROOM} width={"14"} height={"14"} />{ "retention " }<span class="badge trim">{ "R15" }</span></h2>
-                <p>{ format!("Replica mirror: {pages} pages (~{kb} KB), {free} free to reclaim. Covered rows: {}.", order_count + note_count + photo_count) }</p>
-                <p>{ "Ending a subscription evicts the rows no live subscription still covers, and the trimming pass hands the freed pages back to storage." }</p>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_BROOM} width={"14"} height={"14"} />{ support::RETENTION_PANE_TITLE }<span class="badge trim">{ support::RETENTION_BADGE }</span></h2>
+                <p>{ support::retention_readout(pages, free, order_count + note_count + photo_count) }</p>
+                <p>{ support::RETENTION_EXPLAINER }</p>
                 <div class="row">
                     <button onclick={tidy}>
                         <Icon data={IconData::FONT_AWESOME_SOLID_BROOM} width={"14"} height={"14"} />
@@ -1971,11 +1347,9 @@ fn dashboard(props: &DashboardProps) -> Html {
                 </div>
             </div>
             <div class="pane">
-                <h2><Icon data={IconData::FONT_AWESOME_SOLID_DATABASE} width={"14"} height={"14"} />{ "your data " }<span class="badge local">{ "R26" }</span></h2>
-                <p>{ "Save a zip archive of this device's local data. The archive is not \
-                      encrypted and holds every row the device can read: whoever holds \
-                      the file holds the data." }</p>
-                <p>{ "The DB worker exports, not this window: the worker holds the durable replica and the device-private tier, while a tab mirror is in memory and holds only what its subscriptions cover." }</p>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_DATABASE} width={"14"} height={"14"} />{ support::YOUR_DATA_PANE_TITLE }<span class="badge local">{ support::YOUR_DATA_BADGE }</span></h2>
+                <p>{ support::YOUR_DATA_INTRO }</p>
+                <p>{ support::YOUR_DATA_IMPORT_INTRO }</p>
                 <div class="row">
                     <button onclick={export}>
                         <Icon data={IconData::FONT_AWESOME_SOLID_FILE_EXPORT} width={"14"} height={"14"} />
@@ -1994,18 +1368,4 @@ fn dashboard(props: &DashboardProps) -> Html {
             </div>
         </div>
     }
-}
-
-/// `quantity: count` pairs in quantity order, or `none` for an empty snapshot.
-fn grouped_label(counts: &HashMap<i64, i64>) -> String {
-    let mut sorted: Vec<(i64, i64)> = counts.iter().map(|(q, c)| (*q, *c)).collect();
-    sorted.sort_unstable();
-    if sorted.is_empty() {
-        return "none".to_owned();
-    }
-    sorted
-        .iter()
-        .map(|(quantity, count)| format!("{quantity}: {count}"))
-        .collect::<Vec<_>>()
-        .join(", ")
 }

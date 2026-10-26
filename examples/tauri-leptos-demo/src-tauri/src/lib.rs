@@ -16,15 +16,13 @@ use std::time::Duration;
 use connetto_client::teardown::{ForgetError, ForgetRefusal};
 use connetto_client::{
     AccountChoice, AccountChooser, Auth, ClientError, ClientEvent, ConnettoClient, ExportScope,
-    Gate, ImportChoices, KeyringAuth, KeyringStore, LiveHandle as _, Moment, NativeAuthenticator,
-    NativeClient, NativeClientBuilder, NativeTransport, SyncTuning, SystemClock,
-    dsl::Watchable as _,
+    KeyringAuth, LiveHandle as _, Moment, NativeAuthenticator, NativeClient, NativeTransport,
+    SystemClock, dsl::Watchable as _,
 };
 use connetto_demo_support as support;
 use connetto_file_client::FileId;
 use connetto_file_client::{
-    Content as ContentPiece, ContentClient, ContentEvent, ContentHandle, FsStore, ReqwestHttp,
-    Resolved,
+    ContentClient, ContentEvent, ContentHandle, FsStore, ReqwestHttp, Resolved,
 };
 use diesel::prelude::*;
 use parking_lot::Mutex;
@@ -51,8 +49,6 @@ const KEYRING_SERVICE: &str = "connetto-tauri-demo";
 /// iOS bundle identifier.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 const APP_REDIRECT: &str = "dev.connetto.tauridemo:/oauth2redirect";
-/// The demo's re-check grace, matching the dioxus demo's.
-const RECHECK_AFTER: Duration = Duration::from_secs(30);
 const LOG_FILTER: &str = "info,connetto_client::away=debug,connetto_tauri_demo::away=debug";
 
 type Ws = NativeTransport;
@@ -272,18 +268,18 @@ async fn sign_in(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> 
     match parked {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         Some(_) => {
-            core.update(app, |v| v.status = "the browser page is open".to_owned());
+            core.update(app, |v| v.status = support::native::SIGN_IN_OPEN.to_owned());
             // Clearing the parked URL is what the parked login waits for, so
             // the platform's auth session opens on this click.
             let _ = core.parked.send(None);
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         Some(url) => {
-            core.update(app, |v| v.status = "the browser page is open".to_owned());
+            core.update(app, |v| v.status = support::native::SIGN_IN_OPEN.to_owned());
             let opener = connetto_client::system_browser_opener();
             if let Err(err) = opener(&url) {
                 core.update(app, |v| {
-                    v.logout = LogoutState::Error(format!("opening the browser: {err}"));
+                    v.logout = LogoutState::Error(support::native::sign_in_open_error(err));
                 });
             }
         }
@@ -342,32 +338,16 @@ async fn switch_account(
 ) -> Result<(), CommandError> {
     let session = core.begin_sign_out().ok_or(CommandError::NotReady)?;
     let client = session.native.client().clone();
-    match client.unsynced().await {
-        Ok(unsynced) if unsynced.is_empty() => {
-            client.close().await;
-            *core.slot.lock() = Slot::Empty;
-            drop(session);
-            start(app.clone(), core, AccountChoice::Account(key));
-            Ok(())
-        }
-        Ok(unsynced) => {
-            *core.slot.lock() = Slot::Ready(session);
-            core.update(app, |v| {
-                v.logout = LogoutState::Error(format!(
-                    "Cannot change account: {} write(s) not yet synced.",
-                    unsynced.len()
-                ));
-            });
-            Ok(())
-        }
-        Err(err) => {
-            *core.slot.lock() = Slot::Ready(session);
-            core.update(app, |v| {
-                v.logout = LogoutState::Error(format!("Cannot change account: {err}"));
-            });
-            Ok(())
-        }
+    if let Some(line) = support::native::switch_account_guard(&client).await {
+        *core.slot.lock() = Slot::Ready(session);
+        core.update(app, |v| v.logout = LogoutState::Error(line));
+        return Ok(());
     }
+    client.close().await;
+    *core.slot.lock() = Slot::Empty;
+    drop(session);
+    start(app.clone(), core, AccountChoice::Account(key));
+    Ok(())
 }
 
 /// Log out, keeping the local data. The session is revoked and the stored
@@ -660,36 +640,7 @@ async fn export_to(app: &AppHandle, content: Content, path: FilePath) -> String 
 /// with the line the pane shows.
 async fn import(app: &AppHandle, core: &Arc<Core>, bytes: Vec<u8>) -> Result<(), CommandError> {
     let session = core.session().ok_or(CommandError::NotReady)?;
-    let content = Arc::clone(&session.content);
-    let source = std::io::Cursor::new(bytes);
-    let mut plan = match content.prepare_local_data_import(source).await {
-        Ok(plan) => plan,
-        Err(err) => {
-            core.update(app, |v| v.import_line = Some(format!("refused: {err}")));
-            return Ok(());
-        }
-    };
-    let clash_count = plan.replica_plan().collisions().len();
-    let choices = ImportChoices::keeping_the_file();
-    let outcome = match content.apply_local_data_import(&mut plan, &choices).await {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            core.update(app, |v| {
-                v.import_line = Some(format!("apply failed: {err}"))
-            });
-            return Ok(());
-        }
-    };
-    let mut line = format!(
-        "{} row(s) restored, {} kept, {} write(s) restored, {} content file(s)",
-        outcome.rows_restored,
-        outcome.rows_kept,
-        outcome.writes_restored,
-        plan.content_files(),
-    );
-    if clash_count > 0 {
-        line.push_str(&format!(" ({clash_count} clash(es) resolved to the file)"));
-    }
+    let line = support::native::import_bytes(&session.content, bytes).await;
     core.update(app, |v| v.import_line = Some(line));
     Ok(())
 }
@@ -714,52 +665,6 @@ fn file_id_from_hex(hex: &str) -> Option<FileId> {
     Some(FileId::from_bytes(bytes))
 }
 
-/// The status line for one content event.
-fn content_label(event: &ContentEvent) -> String {
-    match event {
-        ContentEvent::Uploaded { file_id } => {
-            format!("uploaded {}", support::short_hex(file_id.as_bytes()))
-        }
-        ContentEvent::UploadDeferred { file_id, detail } => {
-            format!(
-                "deferred {}: {detail}",
-                support::short_hex(file_id.as_bytes())
-            )
-        }
-        ContentEvent::UploadRefused { file_id, detail } => {
-            format!(
-                "refused {}: {detail}",
-                support::short_hex(file_id.as_bytes())
-            )
-        }
-        ContentEvent::BytesLost {
-            file_id,
-            unreadable,
-        } => format!(
-            "bytes lost {} ({unreadable} unreadable chunks)",
-            support::short_hex(file_id.as_bytes())
-        ),
-        ContentEvent::Fetched { file_id } => {
-            format!("fetched {}", support::short_hex(file_id.as_bytes()))
-        }
-        ContentEvent::LostRequeued { file_id } => {
-            format!(
-                "re-uploading lost {}",
-                support::short_hex(file_id.as_bytes())
-            )
-        }
-        ContentEvent::IntegrityPassFailed { detail } => format!("integrity check failed: {detail}"),
-    }
-}
-
-/// An endpoint as the running environment sets it, else as the build
-/// environment did, else `default`.
-fn endpoint(runtime: Option<String>, built: Option<&'static str>, default: &str) -> String {
-    runtime
-        .or_else(|| built.map(str::to_owned))
-        .unwrap_or_else(|| default.to_owned())
-}
-
 #[cfg(target_os = "android")]
 fn platform_sign_in(app: AppHandle, core: &Arc<Core>, auth: KeyringAuth) -> KeyringAuth {
     auth.with_claimed_redirect(
@@ -767,11 +672,10 @@ fn platform_sign_in(app: AppHandle, core: &Arc<Core>, auth: KeyringAuth) -> Keyr
         Arc::new(mobile::TabSession {
             app,
             core: Arc::clone(core),
-            parked: core.parked.clone(),
-            parked_rx: core.parked_rx.clone(),
+            inner: support::native::TabSession::new(core.parked.clone(), core.parked_rx.clone()),
         }),
     )
-    .with_keystore_prompt(Arc::new(android::KeystoreUnlock))
+    .with_keystore_prompt(Arc::new(support::native::KeystoreUnlock))
 }
 
 #[cfg(target_os = "ios")]
@@ -781,8 +685,7 @@ fn platform_sign_in(app: AppHandle, core: &Arc<Core>, auth: KeyringAuth) -> Keyr
         Arc::new(mobile::TabSession {
             app,
             core: Arc::clone(core),
-            parked: core.parked.clone(),
-            parked_rx: core.parked_rx.clone(),
+            inner: support::native::TabSession::new(core.parked.clone(), core.parked_rx.clone()),
         }),
     )
 }
@@ -794,74 +697,34 @@ fn platform_sign_in(_app: AppHandle, _core: &Arc<Core>, auth: KeyringAuth) -> Ke
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
 mod mobile {
-    use connetto_client::ClientError;
-
-    /// How long a login in the browser tab may take.
-    const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
-
-    /// The Custom Tab on Android or the authentication session on iOS, and
-    /// the app's redirect, through `connetto-auth-session`. The session opens
-    /// when the Sign in click clears the parked URL, so a boot starts no
-    /// in-app browser.
+    /// The app's sign-in session. It parks the login through the support
+    /// session and marks the view offered before the platform's browser
+    /// opens.
     pub(crate) struct TabSession {
         pub(crate) app: tauri::AppHandle,
         pub(crate) core: std::sync::Arc<super::Core>,
-        pub(crate) parked: tokio::sync::watch::Sender<Option<String>>,
-        pub(crate) parked_rx: tokio::sync::watch::Receiver<Option<String>>,
+        pub(crate) inner: connetto_demo_support::native::TabSession,
     }
 
     impl connetto_client::AuthorizationSession for TabSession {
         fn authorize(&self, url: String) -> connetto_client::SessionFuture {
-            let mut waiting = self.parked_rx.clone();
-            let parked = self.parked.clone();
+            let inner = self.inner.authorize(url);
             let app = self.app.clone();
             let core = std::sync::Arc::clone(&self.core);
             Box::pin(async move {
-                // The login stands parked until the Sign in click clears the
-                // parked URL, which is what the web's popup opening is.
-                let _ = parked.send(Some(url.clone()));
                 core.update(&app, |v| v.session = super::Session::SignInOffered);
-                let _ = waiting.wait_for(|parked| parked.is_none()).await;
-                connetto_auth_session::authorize(&url, LOGIN_WINDOW)
-                    .await
-                    .map_err(|err| ClientError::Auth(err.to_string()))
+                inner.await
             })
         }
 
         fn delivered(&self) -> Option<String> {
-            connetto_auth_session::delivered().unwrap_or_else(|err| {
-                tracing::warn!(error = %err, "reading a delivered login redirect");
-                None
-            })
+            connetto_demo_support::native::delivered()
         }
     }
 }
 
 #[cfg(target_os = "android")]
 mod android {
-    use connetto_client::ClientError;
-
-    /// How long the unlock prompt may stay up.
-    const UNLOCK_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
-
-    /// The Keystore unlock prompt, through `connetto-auth-session`.
-    pub(crate) struct KeystoreUnlock;
-
-    impl connetto_client::KeystorePrompt for KeystoreUnlock {
-        fn device_secure(&self) -> Result<bool, ClientError> {
-            connetto_auth_session::device_secure().map_err(|err| ClientError::Auth(err.to_string()))
-        }
-
-        fn approve(&self, cipher: &manganis::jni::objects::GlobalRef) -> Result<bool, ClientError> {
-            connetto_auth_session::approve_unlock(
-                cipher.as_obj(),
-                "Unlock your synced data",
-                UNLOCK_WINDOW,
-            )
-            .map_err(|err| ClientError::Auth(err.to_string()))
-        }
-    }
-
     /// Writes each formatted log line to logcat, since an Android app's
     /// stdout goes nowhere.
     pub(crate) struct Logcat;
@@ -894,38 +757,6 @@ mod android {
             Ok(())
         }
     }
-}
-
-/// The device line, the identity and certificate standing a build with a
-/// device identity reports.
-#[cfg(feature = "device-identity")]
-fn device_label(native: &NativeClient<Ws, ContentHandle<Ws>>) -> String {
-    use connetto_core::device_cert::KeyHome;
-
-    let home = match native.device_key_home() {
-        None => return "opening the device key".to_owned(),
-        Some(KeyHome::SecureEnclave) => "the Secure Enclave",
-        Some(KeyHome::AndroidKeystore { strongbox: true }) => "StrongBox",
-        Some(KeyHome::AndroidKeystore { strongbox: false }) => "the Android Keystore",
-        Some(KeyHome::Tpm) => "the TPM",
-        Some(KeyHome::Software) => "software in the keyring",
-    };
-    match native.device_certificate() {
-        Some(certificate) => {
-            let until = chrono::DateTime::<chrono::Utc>::from(certificate.not_after());
-            format!(
-                "certified until {}, key in {home}, {}",
-                until.format("%Y-%m-%d %H:%M UTC"),
-                certificate.attestation()
-            )
-        }
-        None => format!("enrolling, key in {home}"),
-    }
-}
-
-#[cfg(not(feature = "device-identity"))]
-fn device_label(_native: &NativeClient<Ws, ContentHandle<Ws>>) -> String {
-    "no device identity in this build".to_owned()
 }
 
 /// The account chooser, parked in the view while it waits for the choice.
@@ -961,21 +792,17 @@ async fn setup(
     data_dir: PathBuf,
     choice: AccountChoice,
 ) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    #[cfg(target_os = "android")]
-    connetto_auth_session::initialize_tls()?;
-
-    let server = endpoint(
+    let server = support::native::endpoint(
         std::env::var("CONNETTO_DEMO_WS").ok(),
         option_env!("CONNETTO_DEMO_BUILD_WS"),
         DEFAULT_WS,
     );
-    let pg_url = endpoint(
+    let pg_url = support::native::endpoint(
         std::env::var("CONNETTO_DEMO_PG").ok(),
         option_env!("CONNETTO_DEMO_BUILD_PG"),
         DEFAULT_PG,
     );
-    let auth_origin = endpoint(
+    let auth_origin = support::native::endpoint(
         std::env::var("CONNETTO_DEMO_AUTH_ORIGIN").ok(),
         option_env!("CONNETTO_DEMO_BUILD_AUTH_ORIGIN"),
         DEFAULT_AUTH_ORIGIN,
@@ -1009,47 +836,24 @@ async fn setup(
             .with_account_chooser(account_chooser(&app, &core)),
     );
 
-    tokio::fs::create_dir_all(&data_dir)
-        .await
-        .context("creating the application data directory")?;
-
-    let builder = NativeClientBuilder::new(server, support::demo_schema())
-        .with_tuning(SyncTuning::default().with_trim_threshold(5))
-        .with_content(ContentPiece::new().with_heal_lost(
-            "SELECT content_id FROM photos WHERE content_state = 'lost'",
-            "content_id",
-        ))
-        .signed_in(sign_in)
-        .durable(&data_dir)
-        .with_gate(Gate::default().with_recheck(Some(RECHECK_AFTER)));
     #[cfg(feature = "device-identity")]
-    let builder = builder.with_deployment_roots([DEVICE_ROOT.to_vec()]);
-    #[cfg(all(feature = "device-identity", target_os = "android"))]
-    let builder = builder.with_java_access(connetto_auth_session::java_access());
-    let (native, pump) = builder.connect_with_pump().await.map_err(|err| match err {
-        ClientError::Auth(_) => {
-            anyhow::anyhow!(
-                "the server refused the credential; check CONNETTO_AUTH and OIDC settings"
-            )
-        }
-        other => anyhow::anyhow!("opening the encrypted replica: {other}"),
-    })?;
-    let client = native.client().clone();
-    let content = match native.content() {
-        Some(ContentHandle::Durable(content)) => Arc::clone(content),
-        _ => anyhow::bail!("a durable build keeps its files beside the replica"),
-    };
+    let deployment_roots = [DEVICE_ROOT.to_vec()];
+    #[cfg(not(feature = "device-identity"))]
+    let deployment_roots: [Vec<u8>; 0] = [];
 
-    // The authenticator the logout controls use to revoke the session without
-    // touching the replica, which the wipe path destroys instead.
-    let authenticator = native.session().map(|session| {
-        NativeAuthenticator::new(
-            auth_origin,
-            AUTH_PROVIDER,
-            Arc::new(KeyringStore::new(KEYRING_SERVICE)),
-            Some(session.account().to_owned()),
-        )
-    });
+    let (connected, pump) = support::native::connect(
+        server,
+        auth_origin,
+        KEYRING_SERVICE,
+        &data_dir,
+        &deployment_roots,
+        sign_in,
+    )
+    .await?;
+    let native = connected.native;
+    let client = native.client().clone();
+    let content = connected.content;
+    let authenticator = connected.authenticator;
 
     // Reset before the tasks start, since the count is pushed only on change.
     let session = native.session();
@@ -1077,7 +881,7 @@ async fn setup(
         v.status = "connected".to_owned();
         v.gate_line = Some(format!("gate: {gate}"));
         v.custody_line = Some(format!("custody: {custody}"));
-        v.device_line = device_label(&native);
+        v.device_line = support::native::device_label(&native);
         // Only a lock the gate reports later offers the unlock, and a build
         // with no gate never locks.
         v.offers_unlock = false;
@@ -1365,7 +1169,7 @@ async fn feed_device(app: AppHandle, core: Arc<Core>, session: Weak<Parts>) {
         let Some(session) = session.upgrade() else {
             return;
         };
-        let label = device_label(&session.native);
+        let label = support::native::device_label(&session.native);
         core.update(&app, |v| v.device_line = label);
         drop(session);
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1377,7 +1181,7 @@ async fn feed_device(app: AppHandle, core: Arc<Core>, session: Weak<Parts>) {
 async fn feed_content(app: AppHandle, core: Arc<Core>, content: Content) {
     let mut events = content.events();
     while let Ok(event) = events.recv().await {
-        let line = content_label(&event);
+        let line = support::native::content_label(&event);
         core.update(&app, |v| {
             v.content_line = Some(line);
             match &event {

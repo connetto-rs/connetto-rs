@@ -1367,18 +1367,23 @@ version = "0.0.0"
 name = "connetto-demo-support"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "chrono",
+ "connetto-auth-session",
  "connetto-client",
  "connetto-core",
  "connetto-demo-deployment",
+ "connetto-file-client",
  "connetto-file-core",
  "connetto-schema",
  "connetto-web",
  "diesel",
  "js-sys",
+ "manganis",
  "rosetta-uuid",
  "serde",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
  "wasm-bindgen",
  "web-sys",
