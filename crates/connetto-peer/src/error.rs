@@ -4,6 +4,8 @@ use connetto_core::device_cert::AttestationLevel;
 use rustls::AlertDescription;
 use serde::{Deserialize, Serialize};
 
+use crate::frame::ExchangeFrame;
+
 /// Why a trust cannot build a node.
 #[derive(Debug, thiserror::Error)]
 pub enum TrustError {
@@ -70,6 +72,29 @@ pub enum Refusal {
     /// The peer presents this node's own key.
     #[error("the peer presents this node's own key")]
     OwnKey,
+}
+
+/// Why an exchange frame could not be queued on a link.
+#[derive(Debug, thiserror::Error)]
+pub enum PeerSendError {
+    /// The frame breaks the wire's bounds, so it was refused before queueing.
+    #[error("the frame breaks the wire's bounds")]
+    FrameAboveBounds {
+        /// The frame handed back to its sender.
+        frame: ExchangeFrame,
+    },
+    /// The peer holds no live link.
+    #[error("the peer holds no live link")]
+    Unlinked {
+        /// The frame handed back to its sender.
+        frame: ExchangeFrame,
+    },
+    /// The link closed while the send waited on its full queue.
+    #[error("the link closed while the send waited")]
+    LinkClosed {
+        /// The frame handed back to its sender.
+        frame: ExchangeFrame,
+    },
 }
 
 /// Why a dial failed.

@@ -42,9 +42,9 @@ mod exchange_proofs;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use error::{CloseReason, LinkError, Refusal, TrustError};
+pub use error::{CloseReason, LinkError, PeerSendError, Refusal, TrustError};
 pub use event::PeerEvent;
-pub use frame::PeerFrame;
+pub use frame::{ExchangeFrame, MAX_MANIFEST_ROWS, PeerFrame};
 pub use identity::{Clock, Identity, SystemClock, Trust};
 pub use node::{Liveness, Node, PeerLink, SocketPrep};
 

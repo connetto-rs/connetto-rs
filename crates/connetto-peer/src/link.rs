@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::error::{CloseReason, Refusal};
 use crate::event::PeerEvent;
-use crate::frame::{FrameError, FrameReader, PeerFrame, write_frame};
+use crate::frame::{ExchangeFrame, FrameError, FrameReader, PeerFrame, write_frame};
 use crate::node::{HELLO_TIMEOUT, LinkCommand, NodeState, WRITE_BOUND};
 
 /// How long a link whose write failed reads on for a close the peer queued.
@@ -27,6 +27,7 @@ pub(crate) async fn run<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     state: Arc<NodeState>,
     mut io: S,
     mut commands: mpsc::UnboundedReceiver<LinkCommand>,
+    mut exchange: mpsc::Receiver<ExchangeFrame>,
     key: KeyId,
     seq: u64,
 ) {
@@ -74,6 +75,10 @@ pub(crate) async fn run<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 on_frame(&state, &mut io, key, seq, frame, &mut last_seen, &mut deadline).await
             }
             command = commands.recv() => on_command(&state, &mut io, key, seq, command).await,
+            frame = exchange.recv() => match frame {
+                Some(frame) => on_exchange(&mut io, frame).await,
+                None => None,
+            },
         };
         if let Some(stop) = stop {
             let reason = match stop {
@@ -144,7 +149,9 @@ async fn on_frame<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Option<Stop> {
     match frame {
         Err(err) => Some(Stop::Close(match err {
-            FrameError::TooLong | FrameError::Malformed => CloseReason::Protocol,
+            FrameError::TooLong | FrameError::TooManyRows | FrameError::Malformed => {
+                CloseReason::Protocol
+            }
             FrameError::Io(_) => CloseReason::Closed,
         })),
         Ok(None) => Some(Stop::Close(CloseReason::Closed)),
@@ -186,6 +193,28 @@ async fn on_frame<S: AsyncRead + AsyncWrite + Unpin>(
             } else {
                 CloseReason::Closed
             }))
+        }
+        // An exchange frame reaches the device's owner on its event channel,
+        // naming the peer it crossed from (R77).
+        Ok(Some(PeerFrame::Exchange(frame))) => {
+            *last_seen = tokio::time::Instant::now();
+            let peer = {
+                let links = state.links.lock();
+                match links.get(&key) {
+                    Some(crate::node::SlotState::Live(slot)) if slot.seq == seq => {
+                        slot.peer.clone()
+                    }
+                    _ => return None,
+                }
+            };
+            state
+                .events
+                .send(PeerEvent::Exchange {
+                    peer,
+                    frame: frame.clone(),
+                })
+                .ok();
+            None
         }
         // A hello or an offer past the exchange is a protocol break.
         Ok(Some(PeerFrame::Hello { .. } | PeerFrame::Offer { .. })) => {
@@ -245,6 +274,19 @@ async fn on_command<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         None => Some(Stop::Close(CloseReason::Closed)),
+    }
+}
+
+/// What an exchange frame queued by the node does to the link, `Some` when
+/// it stops it. The frame was checked against the wire's bounds before it
+/// was queued, so the write only fails on the link itself.
+async fn on_exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    io: &mut S,
+    frame: ExchangeFrame,
+) -> Option<Stop> {
+    match bounded_write(io, &PeerFrame::Exchange(frame)).await {
+        Ok(()) => None,
+        Err(_) => Some(Stop::WriteFailed),
     }
 }
 
@@ -317,6 +359,9 @@ fn finish(state: &Arc<NodeState>, key: KeyId, seq: u64, reason: CloseReason) {
             Some(SlotState::Live(slot)) if slot.seq == seq => {
                 let peer = slot.peer.clone();
                 links.remove(&key);
+                // The map and the slot move under the same lock, so the
+                // entry is this link's.
+                state.exchange_senders.write().remove(&key);
                 if reason == CloseReason::Duplicate {
                     links.insert(key, SlotState::AwaitingKeeper(peer.clone()));
                 }

@@ -13,6 +13,7 @@ pub mod device_cert;
 #[cfg(feature = "env")]
 pub mod env;
 pub mod error;
+pub mod exchange;
 #[cfg(feature = "logging")]
 pub mod logging;
 pub mod messages;

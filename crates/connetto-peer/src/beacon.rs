@@ -107,7 +107,7 @@ mod tests {
     fn the_service_data_round_trips_and_names_the_prefix() {
         let fingerprint = Fingerprint::of(b"the presented leaf");
         let beacon = Beacon::of(&fingerprint);
-        assert_eq!(beacon.version, 1);
+        assert_eq!(beacon.version, VERSION);
         assert_eq!(beacon.prefix, fingerprint.prefix());
 
         let data = beacon.to_service_data();

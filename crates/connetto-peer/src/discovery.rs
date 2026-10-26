@@ -348,7 +348,7 @@ impl Discovery {
                 peer: peer.clone(),
                 reason: Some(*reason),
             },
-            PeerEvent::ListReceived { .. } => return,
+            PeerEvent::ListReceived { .. } | PeerEvent::Exchange { .. } => return,
         };
         let _ = self.tx.send(command);
     }
