@@ -21,7 +21,7 @@ use diesel_async::pooled_connection::bb8::Pool;
 use tokio::net::{TcpListener, TcpStream};
 
 use super::e2e::{PG_SERIAL, exec, mint_tokens, reset_fixture};
-use super::lifecycle::{admin_pool, builder_over, next_control, wait_ready};
+use super::lifecycle::{admin_pool, builder_over, next_control, served_major, wait_ready};
 
 /// A deployment stamping every inserted order with the writer and sequence
 /// the write bound, the way decision 6 leaves finding rows to the deployment.
@@ -102,6 +102,7 @@ async fn connect(
     client
         .send_control(ControlMessage::Handshake(
             Handshake::new(PROTOCOL_VERSION, "attribution")
+                .with_major(served_major())
                 .with_grant(Grant::new(token))
                 .with_writer(writer),
         ))
