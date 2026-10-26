@@ -131,10 +131,9 @@ async fn a_silent_upstream_is_dropped_and_the_hub_redials() {
 
     let (mut tab, relay_end) = loopback();
     hub.attach(relay_end);
-    tab.send_control(ControlMessage::Handshake(Handshake::new(
-        PROTOCOL_VERSION,
-        "keepalive-tab",
-    )))
+    tab.send_control(ControlMessage::Handshake(
+        Handshake::new(PROTOCOL_VERSION, "keepalive-tab").with_major(raw_schema(DDL).major()),
+    ))
     .await
     .expect("tab handshake");
 

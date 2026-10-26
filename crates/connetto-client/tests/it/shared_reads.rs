@@ -41,7 +41,7 @@ diesel::allow_tables_to_appear_in_same_query!(vocabulary, notes);
 fn schema() -> SyncSchema {
     SyncSchema::new(
         connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(
-            SCHEMA,
+            &format!("{} 1\n{SCHEMA}", connetto_core::MAJOR_DIRECTIVE),
             POLICIES,
             &["vocabulary"],
         )

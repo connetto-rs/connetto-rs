@@ -101,11 +101,11 @@ impl BoxedDialer<NativeTransport> {
 /// # use connetto_client::{NativeClientBuilder, SyncSchema};
 /// # use connetto_core::schema::SchemaBundle;
 /// # let bundle = SchemaBundle::new(
-/// #     "SCHEMA", "POLICIES", "DDL",
+/// #     "-- connetto:major 1", "POLICIES", "DDL",
 /// #     Vec::<(String, String)>::new(),
 /// #     Vec::<String>::new(),
 /// #     None::<&str>,
-/// # );
+/// # ).expect("the source declares major 1");
 /// // `connect` runs the build and returns a future; await it in your runtime.
 /// let _pending =
 ///     NativeClientBuilder::new("wss://sync.example.com", SyncSchema::new(bundle)).connect();
@@ -119,11 +119,11 @@ impl BoxedDialer<NativeTransport> {
 /// # use connetto_client::{NativeClientBuilder, SyncSchema};
 /// # use connetto_core::schema::SchemaBundle;
 /// # let bundle = SchemaBundle::new(
-/// #     "SCHEMA", "POLICIES", "DDL",
+/// #     "-- connetto:major 1", "POLICIES", "DDL",
 /// #     Vec::<(String, String)>::new(),
 /// #     Vec::<String>::new(),
 /// #     None::<&str>,
-/// # );
+/// # ).expect("the source declares major 1");
 /// let builder = NativeClientBuilder::new(
 ///     "wss://sync.example.com",
 ///     SyncSchema::new(bundle),
@@ -135,11 +135,11 @@ impl BoxedDialer<NativeTransport> {
 /// # use connetto_client::{AccountChoice, NativeClientBuilder, SyncSchema};
 /// # use connetto_core::schema::SchemaBundle;
 /// # let bundle = SchemaBundle::new(
-/// #     "SCHEMA", "POLICIES", "DDL",
+/// #     "-- connetto:major 1", "POLICIES", "DDL",
 /// #     Vec::<(String, String)>::new(),
 /// #     Vec::<String>::new(),
 /// #     None::<&str>,
-/// # );
+/// # ).expect("the source declares major 1");
 /// let builder = NativeClientBuilder::new(
 ///     "wss://sync.example.com",
 ///     SyncSchema::new(bundle),
@@ -205,11 +205,11 @@ where
     /// # use connetto_client::{Auth, NativeClientBuilder, SyncSchema};
     /// # use connetto_core::schema::SchemaBundle;
     /// # let bundle = SchemaBundle::new(
-    /// #     "SCHEMA", "POLICIES", "DDL",
+    /// #     "-- connetto:major 1", "POLICIES", "DDL",
     /// #     Vec::<(String, String)>::new(),
     /// #     Vec::<String>::new(),
     /// #     None::<&str>,
-    /// # );
+    /// # ).expect("the source declares major 1");
     /// let builder = NativeClientBuilder::new(
     ///     "wss://sync.example.com",
     ///     SyncSchema::new(bundle),
@@ -357,11 +357,11 @@ where
     /// # use connetto_client::{Auth, MemoryKeyStore, NativeClientBuilder, SyncSchema};
     /// # use connetto_core::schema::SchemaBundle;
     /// # let bundle = SchemaBundle::new(
-    /// #     "SCHEMA", "POLICIES", "DDL",
+    /// #     "-- connetto:major 1", "POLICIES", "DDL",
     /// #     Vec::<(String, String)>::new(),
     /// #     Vec::<String>::new(),
     /// #     None::<&str>,
-    /// # );
+    /// # ).expect("the source declares major 1");
     /// let builder = NativeClientBuilder::new(
     ///     "wss://sync.example.com",
     ///     SyncSchema::new(bundle),
@@ -410,11 +410,11 @@ where
     /// # use connetto_client::{Auth, MemoryRefreshStore, NativeClientBuilder, SyncSchema};
     /// # use connetto_core::schema::SchemaBundle;
     /// # let bundle = SchemaBundle::new(
-    /// #     "SCHEMA", "POLICIES", "DDL",
+    /// #     "-- connetto:major 1", "POLICIES", "DDL",
     /// #     Vec::<(String, String)>::new(),
     /// #     Vec::<String>::new(),
     /// #     None::<&str>,
-    /// # );
+    /// # ).expect("the source declares major 1");
     /// let builder = NativeClientBuilder::new(
     ///     "wss://sync.example.com",
     ///     SyncSchema::new(bundle),
@@ -2229,16 +2229,22 @@ mod tests {
     use crate::enrolment::{DeviceKeys, Enroller};
     use crate::{ClientBuilder, Grant, HeldCredential, TransportFactory};
 
+    /// The major line the schema source declares.
+    const SOURCE: &str = "-- connetto:major 1";
+
     /// A schema a test's bundle holds.
     fn bundle() -> crate::SyncSchema {
-        crate::SyncSchema::new(SchemaBundle::new(
-            "",
-            "",
-            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
-            None::<&str>,
-        ))
+        crate::SyncSchema::new(
+            SchemaBundle::new(
+                SOURCE,
+                "",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+                None::<&str>,
+            )
+            .expect("the source declares major 1"),
+        )
     }
 
     /// The refusal a dialer that never reaches a server hands back.

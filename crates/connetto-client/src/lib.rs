@@ -27,7 +27,9 @@ use connetto_core::messages::{
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Backoff, Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, quote_ident};
+use connetto_core::{
+    Backoff, Cursor, Major, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, quote_ident,
+};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use diesel::connection::SimpleConnection;
@@ -231,6 +233,27 @@ pub enum ClientError {
         /// The version the server advertised in the handshake ack.
         server: SchemaVersion,
     },
+    /// The server runs a newer application schema major than this build, or
+    /// this build declared none, so the app must update (R31).
+    #[error(
+        "update required: this build speaks major {}, the server major {server}",
+        .client.map_or_else(|| "none".to_owned(), |major| major.to_string())
+    )]
+    UpdateRequired {
+        /// The major this build declared, if any.
+        client: Option<Major>,
+        /// The server's major.
+        server: Major,
+    },
+    /// The server runs an older application schema major than this build, so
+    /// the deployment has not yet put this major up (R31).
+    #[error("server behind: this build speaks major {client}, the server major {server}")]
+    ServerBehind {
+        /// The major this build declared.
+        client: Major,
+        /// The server's major.
+        server: Major,
+    },
     /// The operation needs a server and this connection has none.
     ///
     /// Raised by everything that speaks to the server on a connection that was
@@ -391,6 +414,25 @@ pub enum ClientError {
     /// next approved re-check.
     #[error("locked: the gate is locked and application access is refused")]
     Locked,
+}
+
+impl ClientError {
+    /// Whether this fault names a build the peer can never attach under.
+    ///
+    /// The peer's major, its schema version or its wire version moved out
+    /// from under this build, and no retry against the same peer changes
+    /// the answer. The recovery driver ends the pump here with the reason
+    /// named, the way it ends on a rejected credential.
+    #[must_use]
+    pub fn is_build_mismatch(&self) -> bool {
+        match self {
+            ClientError::UpdateRequired { .. }
+            | ClientError::ServerBehind { .. }
+            | ClientError::SchemaOutdated { .. } => true,
+            ClientError::Refused { reason } => reason.is_build_mismatch(),
+            _ => false,
+        }
+    }
 }
 
 /// Why a peer link could not be opened (R76).
@@ -820,6 +862,9 @@ pub(crate) struct ClientConfig {
     /// with [`ClientError::SchemaOutdated`] so the app can reload. Either side
     /// being `None` skips the check.
     schema_version: Option<SchemaVersion>,
+    /// The application schema major this build declares at handshake, or
+    /// `None` to declare none, which every server with a major refuses.
+    schema_major: Option<Major>,
     /// Custom SQLite functions connetto registers on the replica connection it
     /// opens for this client, before any DDL or insert. Empty by default. A
     /// schema whose column `DEFAULT` calls a function (a `uuidv7` key
@@ -882,6 +927,7 @@ impl ClientConfig {
             client_id: client_id.into(),
             login: None,
             schema_version: None,
+            schema_major: None,
             sql_functions: SqlFunctions::default(),
             policy_tables: PolicyTables::default(),
             unrecorded_tables: HashSet::new(),
@@ -980,6 +1026,12 @@ impl ClientConfig {
     #[must_use]
     pub fn with_schema_version(mut self, schema_version: Option<SchemaVersion>) -> Self {
         self.schema_version = schema_version;
+        self
+    }
+    /// The application schema major this build declares at handshake.
+    #[must_use]
+    pub const fn with_schema_major(mut self, schema_major: Option<Major>) -> Self {
+        self.schema_major = schema_major;
         self
     }
 
@@ -1210,8 +1262,11 @@ pub enum ClientEvent {
     ///
     /// Distinct from [`Closed`](Self::Closed), which is the transport simply
     /// ending. The reconnect driver treats this as a lost connection and backs
-    /// off, so a server going away is not hammered with immediate retries. The
-    /// reason is what lets an app tell a restart from a sign-out.
+    /// off, so a server going away is not hammered with immediate retries,
+    /// except that a reason the build can never attach under, a moved major
+    /// or a wire version, skips the first redial and ends the pump as
+    /// [`Stopped`](Self::Stopped) naming the reason. The reason is what lets
+    /// an app tell a restart from a sign-out.
     ServerClosed {
         /// Why the server closed the session.
         reason: FatalErrorReason,
@@ -3082,26 +3137,12 @@ struct HandshakeInput<'a> {
     cursor_subjects: Option<&'a [String]>,
 }
 
-/// Run the opening handshake and read the ack, shared by the first connect
-/// and every resume.
-async fn exchange_handshake<T>(
-    transport: &mut T,
-    input: HandshakeInput<'_>,
-) -> Result<HandshakeOk, ClientError>
-where
-    T: Transport,
-    T::Error: core::fmt::Display,
-{
-    let HandshakeInput {
-        config,
-        token_source,
-        resume,
-        resume_token,
-        writer,
-        settled_through,
-        now,
-        cursor_subjects,
-    } = input;
+/// Collect the login and unexpired share grants for a handshake.
+async fn presented_grants(
+    config: &ClientConfig,
+    token_source: Option<&AccessTokenSource>,
+    now: i64,
+) -> Result<Vec<Grant>, ClientError> {
     let mut grants = Vec::with_capacity(
         1 + config
             .subjects
@@ -3124,11 +3165,58 @@ where
             .filter(|grant| !grant_expiry::has_expired(grant, now))
             .cloned(),
     );
+    Ok(grants)
+}
+
+/// The typed client error a peer's refusal names, shared by the first
+/// handshake and the recovery driver, so a refusal that ends the pump ends
+/// it with the same words a fresh open would have used.
+fn refusal_error(reason: &FatalErrorReason) -> ClientError {
+    match reason {
+        FatalErrorReason::MajorMismatch { server, client } => match client {
+            Some(client) if client > server => ClientError::ServerBehind {
+                client: *client,
+                server: *server,
+            },
+            client => ClientError::UpdateRequired {
+                client: *client,
+                server: *server,
+            },
+        },
+        reason => ClientError::Refused {
+            reason: reason.clone(),
+        },
+    }
+}
+
+/// Run the opening handshake and read the ack, shared by the first connect
+/// and every resume.
+async fn exchange_handshake<T>(
+    transport: &mut T,
+    input: HandshakeInput<'_>,
+) -> Result<HandshakeOk, ClientError>
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    let HandshakeInput {
+        config,
+        token_source,
+        resume,
+        resume_token,
+        writer,
+        settled_through,
+        now,
+        cursor_subjects,
+    } = input;
     let mut handshake = Handshake::new(PROTOCOL_VERSION, config.client_id.clone())
-        .with_grants(grants)
+        .with_grants(presented_grants(config, token_source, now).await?)
         .with_writer(writer);
     if let Some(seq) = settled_through {
         handshake = handshake.with_settled_through(seq);
+    }
+    if let Some(major) = config.schema_major {
+        handshake = handshake.with_major(major);
     }
     if let Some(cursor) = resume {
         handshake = handshake.with_cursor(cursor.clone());
@@ -3196,9 +3284,7 @@ where
             })
         }
         Some(IncomingFrame::Control(ControlMessage::FatalError(fatal))) => {
-            Err(ClientError::Refused {
-                reason: fatal.reason,
-            })
+            Err(refusal_error(&fatal.reason))
         }
         Some(_) => Err(ClientError::Protocol("expected handshake ack".into())),
         None => Err(ClientError::Protocol("connection closed before ack".into())),
@@ -5180,11 +5266,11 @@ where
         self.disconnected();
     }
 
-    /// Run due share-key work, deferring secret writes while `persist` is `false`.
+    /// Prepare expiry, protocol work and live-wire coverage before a driver selects its wait, deferring secret writes while `persist` is `false`.
     ///
     /// # Errors
     ///
-    /// [`ClientError`] when checkpoint or secret persistence fails.
+    /// [`ClientError`] when checkpoint or secret persistence fails, or a replacement or fence cannot be sent.
     pub async fn process_share_keys(&mut self, persist: bool) -> Result<bool, ClientError> {
         self.check_share_key_deadlines();
         let due = self
@@ -5203,6 +5289,8 @@ where
             store.save(set).await?;
             self.share_key_save_pending = false;
         }
+        self.send_share_key_protocol().await?;
+        self.publish_coverage()?;
         Ok(changed)
     }
 
@@ -5346,10 +5434,10 @@ where
         Ok(())
     }
 
-    /// Publish the durable coverage now that every frame before the cursor is
-    /// owed by the server, so the cursor may be claimed on a resume.
+    /// Publish durable coverage only after a live wire has fenced every preceding delivery.
     fn publish_coverage(&mut self) -> Result<(), ClientError> {
-        if self.cursor_subjects.is_some()
+        if self.wire.is_none()
+            || self.cursor_subjects.is_some()
             || self.share_key_request.is_some()
             || self.declaration_fence.is_some()
             || self.unfenced_count != 0
@@ -5679,6 +5767,19 @@ where
 
     /// Drive replacements, declaration fences, expiry and checkpoint publication.
     async fn step_share_keys(&mut self) -> Result<(), ClientError> {
+        self.send_share_key_protocol().await?;
+        if self
+            .share_key_deadline
+            .is_some_and(|at| crate::away::SystemClock.monotonic() >= at)
+        {
+            self.expire_share_keys(false).await?;
+        }
+        self.publish_coverage()?;
+        Ok(())
+    }
+
+    /// Send ready replacements or declaration fences without expiring the held set.
+    async fn send_share_key_protocol(&mut self) -> Result<(), ClientError> {
         if self.wire.is_some() && matches!(self.attach_replay, AttachReplay::Idle) {
             if self.share_key_request.is_none()
                 && self.share_key_generation > self.share_key_settled
@@ -5695,13 +5796,6 @@ where
                 self.declare_fence().await?;
             }
         }
-        if self
-            .share_key_deadline
-            .is_some_and(|at| crate::away::SystemClock.monotonic() >= at)
-        {
-            self.expire_share_keys(false).await?;
-        }
-        self.publish_coverage()?;
         Ok(())
     }
 
@@ -5847,6 +5941,12 @@ where
         self.run
             .as_ref()
             .and_then(|run| run.schema_version.as_ref())
+    }
+    /// The application schema major this build declares, which a relay hub
+    /// holds its tabs to (R31).
+    #[must_use]
+    pub const fn schema_major(&self) -> Option<Major> {
+        self.config.schema_major
     }
 
     /// The logical-to-physical table map this connection renames with.
@@ -8540,5 +8640,61 @@ mod tests {
             .expect("start archive")
             .finish()
             .expect("finish archive")
+    }
+
+    /// The faults that name a build the peer can never attach under are
+    /// terminal; the rest are not.
+    #[test]
+    fn a_build_mismatch_fault_is_terminal_and_the_rest_is_not() {
+        let terminal = [
+            ClientError::UpdateRequired {
+                client: None,
+                server: Major::new(2).expect("two is a major"),
+            },
+            ClientError::ServerBehind {
+                client: Major::new(3).expect("three is a major"),
+                server: Major::new(2).expect("two is a major"),
+            },
+            ClientError::SchemaOutdated {
+                client: None,
+                server: SchemaVersion::from_hash(vec![0xAA; 24]),
+            },
+            ClientError::Refused {
+                reason: FatalErrorReason::MajorMismatch {
+                    server: Major::new(2).expect("two is a major"),
+                    client: None,
+                },
+            },
+        ];
+        for fault in &terminal {
+            assert!(fault.is_build_mismatch(), "{fault:?}");
+        }
+        let non_terminal = [
+            ClientError::Refused {
+                reason: FatalErrorReason::RateLimited { retry_after_ms: 10 },
+            },
+            ClientError::Locked,
+        ];
+        for fault in &non_terminal {
+            assert!(!fault.is_build_mismatch(), "{fault:?}");
+        }
+    }
+
+    /// The major the build declares is read back, so a relay hub can hold its
+    /// tabs to it.
+    #[test]
+    fn the_connection_reports_the_major_its_config_declares() {
+        let major = Major::new(3).expect("three is a major");
+        let config = ClientConfig::new("major-test").with_schema_major(Some(major));
+        let conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("open in-memory replica");
+        assert_eq!(conn.schema_major(), Some(major));
+
+        let config = ClientConfig::new("major-test");
+        let conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("open in-memory replica");
+        assert_eq!(conn.schema_major(), None);
     }
 }

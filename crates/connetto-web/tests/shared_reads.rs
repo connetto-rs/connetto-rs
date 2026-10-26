@@ -105,13 +105,14 @@ fn shared_record() -> String {
 /// The fixture bundle, shared by the worker, the tab and the control.
 fn bundle() -> SchemaBundle {
     SchemaBundle::new(
-        "",
+        "-- connetto:major 1",
         "",
         MIRROR_DDL,
         [("public", "public_rls")],
         ["public"],
         None::<&str>,
     )
+    .expect("the fixture declares its major")
     .with_shared_tables(["entries", "public"])
     .with_shared_layout(SharedLayout::new(
         format!("{ORDERS_DDL}; {TEMP_READER}; {SHARED_DDL}"),

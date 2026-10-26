@@ -23,17 +23,20 @@ use web_sys::MessagePort;
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 fn schema() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
-         CREATE VIEW visible AS SELECT * FROM notes \
-         WHERE owner = current_app_user() \
-            OR instr(',' || current_app_subjects() || ',', ',' || owner || ',') > 0;",
-        Vec::<(String, String)>::new(),
-        vec!["visible".to_owned()],
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            "-- connetto:major 1",
+            "",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
+             CREATE VIEW visible AS SELECT * FROM notes \
+             WHERE owner = current_app_user() \
+                OR instr(',' || current_app_subjects() || ',', ',' || owner || ',') > 0;",
+            Vec::<(String, String)>::new(),
+            vec!["visible".to_owned()],
+            None::<&str>,
+        )
+        .expect("the fixture declares its major"),
+    )
 }
 
 /// A dialer handing out `transport` once and nothing after.

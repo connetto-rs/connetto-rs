@@ -119,10 +119,9 @@ async fn a_boot_time_upstream_refusal_reaches_a_later_tab() {
 
     let (mut tab, relay_end) = loopback();
     hub.attach(relay_end);
-    tab.send_control(ControlMessage::Handshake(Handshake::new(
-        PROTOCOL_VERSION,
-        "refusal-tab",
-    )))
+    tab.send_control(ControlMessage::Handshake(
+        Handshake::new(PROTOCOL_VERSION, "refusal-tab").with_major(raw_schema(DDL).major()),
+    ))
     .await
     .expect("tab handshake");
     // The ack arrives with the state frames that follow it, and the tab then

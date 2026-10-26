@@ -24,6 +24,9 @@ use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 type Conn = ConnettoConnection<FakeTransport>;
 
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
+
 /// A synced table as its translation reaches the replica, without the
 /// reference to a parent the replica may never hold.
 const SYNCED_DDL: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY); \
@@ -133,14 +136,17 @@ impl TransportFactory for Offline {
 
 /// An in-memory replica over `synced`, with `tier` as its device-local tier.
 fn open_with(synced: &str, tier: Option<&str>) -> Conn {
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        synced,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        tier,
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            synced,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            tier,
+        )
+        .expect("the source declares major 1"),
+    );
     ClientBuilder::new(schema, Offline)
         .open_driven()
         .expect("the replica opens")

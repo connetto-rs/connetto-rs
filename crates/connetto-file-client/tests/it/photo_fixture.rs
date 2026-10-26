@@ -21,7 +21,7 @@ use connetto_test_harness::{
 use diesel::prelude::*;
 
 /// The application's own table, as Postgres holds it.
-pub const PG_DDL: &str = "CREATE TABLE photos (id INT PRIMARY KEY, owner TEXT, \
+pub const PG_DDL: &str = "-- connetto:major 1\nCREATE TABLE photos (id INT PRIMARY KEY, owner TEXT, \
                       content_id BYTEA, content_state TEXT, edited_at TEXT);";
 
 /// The same table as the replica holds it.
@@ -92,14 +92,17 @@ where
     let credential =
         HeldCredential::new(Grant::new(grant), "alice").expect("a string identity serializes");
     let (running, pump) = ClientBuilder::new(
-        SyncSchema::new(SchemaBundle::new(
-            PG_DDL,
-            "",
-            SQLITE_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
-            None::<&str>,
-        )),
+        SyncSchema::new(
+            SchemaBundle::new(
+                PG_DDL,
+                "",
+                SQLITE_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+                None::<&str>,
+            )
+            .expect("the source declares major 1"),
+        ),
         dial,
     )
     .with_reconnect(ReconnectPolicy::default())

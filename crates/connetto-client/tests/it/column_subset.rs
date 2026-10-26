@@ -18,7 +18,8 @@ use diesel::prelude::*;
 
 /// `body` is nullable in `notes` and required in `pages`, the two ways a
 /// column a subscription leaves out can be declared.
-const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL, body TEXT);
+const PG_DDL: &str = "-- connetto:major 1
+CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL, body TEXT);
 CREATE TABLE pages (id INT PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL);";
 
 const POLICIES: &str = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY;

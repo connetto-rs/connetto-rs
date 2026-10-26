@@ -14,7 +14,8 @@ use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use sqlite_diff_rs::ParsedDiffSet;
 
-const SCHEMA: &str = "CREATE TABLE tags (id INT PRIMARY KEY, label TEXT NOT NULL);
+const SCHEMA: &str = "-- connetto:major 1
+CREATE TABLE tags (id INT PRIMARY KEY, label TEXT NOT NULL);
 CREATE TABLE colours (id INT PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE notes (id INT PRIMARY KEY, body TEXT NOT NULL);";
 
