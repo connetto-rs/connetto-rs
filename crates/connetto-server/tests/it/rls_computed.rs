@@ -22,7 +22,7 @@ use connetto_core::messages::{
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
     AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits, loopback,
+    RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits,
     pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, pool_for, with_user};
@@ -95,12 +95,7 @@ async fn manager_under(fixture: &Fixture, policy: &str, session: SessionConfig) 
 
 /// One in-process client on its own session.
 fn connect(manager: &Arc<Manager>) -> Client {
-    let (server_end, client_end) = loopback();
-    let session = Arc::clone(manager);
-    tokio::spawn(async move {
-        let _ = session.serve(server_end).await;
-    });
-    Client::new(client_end)
+    super::loopback_session::connect(|end| Arc::clone(manager).serve(end))
 }
 
 /// The next aggregate frame for `sub_id`.
