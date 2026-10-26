@@ -239,7 +239,10 @@ pub(crate) fn migrate_alone(
         .filter(|boundary| boundary.from() >= from)
     {
         let start = boundary.from();
-        let to = Major::new(start.get() + 1)
+        let to = start
+            .get()
+            .checked_add(1)
+            .and_then(Major::new)
             .ok_or_else(|| ClientError::Session(format!("major {start} has no successor")))?;
         let last = to == plan.build;
         tier.immediate_transaction(|tier| cross(tier, plan, boundary.sql(), start, to, last))
