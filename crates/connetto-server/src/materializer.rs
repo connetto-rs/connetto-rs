@@ -1247,11 +1247,10 @@ where
     ///
     /// The event folds once into a compressed patchset, shared across the
     /// matched consumers and kept in the record, so a catchup sends the same
-    /// bytes later instead of folding it again. It is built for every event of
-    /// a catalog table, matched or not, since the consumer that needs it may be
-    /// away. The engine applies the event exactly once per call, and what fails
-    /// after that rides in the result, so recovering it never applies the event
-    /// again.
+    /// bytes later instead of folding it again. It is built for every event,
+    /// matched or not, since the consumer that needs it may be away. The engine
+    /// applies the event exactly once per call, and what fails after that rides
+    /// in the result, so recovering it never applies the event again.
     ///
     /// # Errors
     ///
@@ -1263,11 +1262,7 @@ where
         event: &PgChangeEvent,
     ) -> Result<Dispatched, MaterializerError> {
         // Encoded before the engine applies the event, so an encoding failure leaves nothing applied.
-        // An event of a table outside the catalog matches no subscription and is not logged.
-        let encoded = match self.event_table(event) {
-            Some(_) => Some(self.encode(event)?),
-            None => None,
-        };
+        let encoded = self.encode(event)?;
         let identity = self.event_identity(event);
         // The drain is the only way to the in-process half, which is what
         // keeps one delivery path for every computed movement (R82). Whole-row
@@ -1320,16 +1315,9 @@ where
                 departure: departing.contains(&consumer_id),
             })
             .collect();
-        let (patches, record) = match encoded {
-            Some(encoded) => {
-                let patches = Self::patches_for(event, &matched, &encoded);
-                let record = identity.map(|(table, pk)| {
-                    ChangeRecord::new(table, pk, event.clone(), encoded.payload)
-                });
-                (patches, record)
-            }
-            None => (Vec::new(), None),
-        };
+        let patches = Self::patches_for(event, &matched, &encoded);
+        let record = identity
+            .map(|(table, pk)| ChangeRecord::new(table, pk, event.clone(), encoded.payload));
 
         let narrowings = term_moves(&self.catalog, notifications.engine.narrowings());
 
@@ -1721,19 +1709,15 @@ where
         Ok(Some(compress(&bytes)?))
     }
 
-    /// The catalog name of the event's table, `None` for a table outside the catalog.
-    fn event_table(&self, event: &PgChangeEvent) -> Option<&str> {
-        let index = usize::try_from(event.table_id(&self.catalog)).ok()?;
-        Some(self.catalog.table_by_id(index)?.table_name())
-    }
-
     /// The `(table, primary-key bytes)` identity of a CDC event, for the auth
     /// read filter. Primary-key columns are read from the event's PK image and
     /// encoded by [`crate::pk`] into a stable, self-describing byte string the
     /// auth policy treats as opaque and decodes back into typed values.
     fn event_identity(&self, event: &PgChangeEvent) -> Option<(String, Vec<u8>)> {
-        let table = self.event_table(event)?.to_owned();
         let db = &self.catalog;
+        let table_id = event.table_id(db);
+        let index = usize::try_from(table_id).ok()?;
+        let table = db.table_by_id(index)?.table_name().to_owned();
         let mut values = Vec::new();
         for col in event.pk_columns(db) {
             values.push(event.value_at(db, RowKind::Pk, col).ok()?);
