@@ -24,9 +24,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use connetto_core::messages::{
     ContentTicketRequest, ContentVerb, ControlMessage, FatalErrorReason, HeldWork, HeldWrite,
-    MutationRejectReason, Provenance, ReplaceShareKeys, WriterAnswer, WriterOutcome, WriterRef,
-    WriterRequest,
+    MutationRejectReason, Provenance, ReplaceShareKeys, WriterRef, WriterRequest,
 };
+#[cfg(feature = "device-identity")]
+use connetto_core::messages::{WriterAnswer, WriterOutcome};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Backoff, Major, RetryPolicy, SchemaVersion};
 use core::time::Duration;
@@ -976,6 +977,8 @@ where
                         }));
                 }
             }
+            // Only a device-identity build binds a device writer on the drain wire.
+            #[cfg(feature = "device-identity")]
             Some(IncomingFrame::Control(ControlMessage::WriterAnswer(answer))) => {
                 return self.drain_writer_answer(major, answer).await;
             }
@@ -1065,36 +1068,29 @@ where
     }
 
     /// The old major's answer to the drain's device bind.
+    #[cfg(feature = "device-identity")]
     async fn drain_writer_answer(
         &mut self,
         major: Major,
         answer: WriterAnswer,
     ) -> Result<(), ClientError> {
-        #[cfg(feature = "device-identity")]
-        {
-            let Some(bind) = self
-                .drain
-                .bind
-                .take_if(|bind| bind.request_id == answer.request_id)
-            else {
-                return Ok(());
-            };
-            let writer = WriterRef::Device(bind.key_id);
-            if let WriterOutcome::Bound { frontier } = answer.outcome {
-                self.drain.writer = Some(writer);
-                return self.drain_reconcile(major, frontier).await;
-            }
-            // Retired, unknown or not enrolled there, so its entries move.
-            self.drain.dead.insert(writer);
-            self.drop_drain_wire().await;
-            self.drain.arm(Duration::ZERO);
-            Ok(())
+        let Some(bind) = self
+            .drain
+            .bind
+            .take_if(|bind| bind.request_id == answer.request_id)
+        else {
+            return Ok(());
+        };
+        let writer = WriterRef::Device(bind.key_id);
+        if let WriterOutcome::Bound { frontier } = answer.outcome {
+            self.drain.writer = Some(writer);
+            return self.drain_reconcile(major, frontier).await;
         }
-        #[cfg(not(feature = "device-identity"))]
-        {
-            let _ = (major, answer, WriterOutcome::Unknown);
-            Ok(())
-        }
+        // Retired, unknown or not enrolled there, so its entries move.
+        self.drain.dead.insert(writer);
+        self.drop_drain_wire().await;
+        self.drain.arm(Duration::ZERO);
+        Ok(())
     }
 
     /// A fatal frame on the drain wire.
