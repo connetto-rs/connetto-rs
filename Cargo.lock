@@ -6526,9 +6526,10 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#eaa8095257cf701a24f2fbaf06cb1b047b91836b"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#64f66ffd685a982337139cb9ec090f4c420f4b0c"
 dependencies = [
  "git2",
+ "recursive",
  "sql-traits",
  "sqlparser",
  "sqlparser-plpgsql",
@@ -7825,7 +7826,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#829374dfd6469b189f1e1b79906e8092ad67634a"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#7489969cc8dadd900b4ecdbc8e0532101616108c"
 dependencies = [
  "openfga-client",
  "prost",
@@ -7840,7 +7841,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#829374dfd6469b189f1e1b79906e8092ad67634a"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#7489969cc8dadd900b4ecdbc8e0532101616108c"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -8741,7 +8742,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#a24b6b9b2dfd969141405f6c48e5ae0c1ea6e08b"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#bf8d23df209fbfc6e28e113a8b0773baddb52381"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -8941,7 +8942,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#c408fb8a78725b3cf843ce3df20a99351b0ba0c2"
+source = "git+https://github.com/connetto-rs/subql?branch=main#e60e72c9a2747e5a8c330ef8defe9c162638b478"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -9147,7 +9148,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.59.0",
