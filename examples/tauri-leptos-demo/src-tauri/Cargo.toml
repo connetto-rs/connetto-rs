@@ -20,7 +20,7 @@ connetto-client = { path = "../../../crates/connetto-client", features = ["nativ
 connetto-core = { path = "../../../crates/connetto-core", features = ["logging"] }
 # The shared demo core, holding the schema rows and queries, the pane wording
 # and the one view and action set the core serves.
-connetto-demo-support = { path = "../../demo-support", default-features = false }
+connetto-demo-support = { path = "../../demo-support", default-features = false, features = ["client"] }
 # The content lane the photos stage through and the export and import name.
 connetto-file-client = { path = "../../../crates/connetto-file-client" }
 diesel = { version = "2", features = ["sqlite", "chrono"] }

@@ -28,7 +28,7 @@ use web_sys::{
 };
 
 use connetto_demo_support::view::{
-    Action, LogoutState, NoteRow, OrderRow, PhotoRow, Session, View,
+    AccountEntry, Action, LogoutState, NoteRow, OrderRow, PhotoRow, Session, View,
 };
 
 /// The tab-to-worker transport the window's client rides.
@@ -230,7 +230,7 @@ fn boot_page() -> RwSignal<View> {
     if let Some(stored) = glue::read_stored_account() {
         view.update(|v| {
             v.session = Session::Restoring;
-            v.stored_account = Some(stored);
+            v.stored_account = Some(AccountEntry::new(stored));
         });
     }
 
@@ -262,8 +262,9 @@ fn boot_page() -> RwSignal<View> {
                 match account {
                     Some(account) => {
                         glue::save_stored_account(&account);
-                        v.account = Some(account.clone());
-                        v.stored_account = Some(account);
+                        let entry = AccountEntry::new(account);
+                        v.account = Some(entry.clone());
+                        v.stored_account = Some(entry);
                     }
                     None => v.account = None,
                 }
@@ -289,7 +290,9 @@ fn boot_page() -> RwSignal<View> {
         serve_account_choice(move |accounts| {
             let answer_cell = Rc::clone(&answer_cell);
             async move {
-                view.update(|v| v.known_accounts = accounts.clone());
+                view.update(|v| {
+                    v.known_accounts = accounts.iter().cloned().map(AccountEntry::new).collect();
+                });
                 // A signed-in page ignores the question, but the worker still
                 // needs an answer to proceed with its boot.
                 if accounts.len() <= 1
@@ -301,7 +304,8 @@ fn boot_page() -> RwSignal<View> {
                     &accounts,
                     || {
                         view.update(|v| {
-                            v.picking = Some(accounts.clone());
+                            v.picking =
+                                Some(accounts.iter().cloned().map(AccountEntry::new).collect());
                             v.session = Session::PickingAccount;
                         });
                     },

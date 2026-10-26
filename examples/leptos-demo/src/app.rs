@@ -102,7 +102,7 @@ fn SignIn(view: RwSignal<View>) -> impl IntoView {
 #[component]
 fn Restoring(view: RwSignal<View>) -> impl IntoView {
     let label = move || {
-        view.with(|v| v.stored_account.as_deref().map(support::account_label))
+        view.with(|v| v.stored_account.as_ref().map(|entry| entry.label.clone()))
             .unwrap_or_default()
     };
     view! {
@@ -121,8 +121,8 @@ fn Picker(view: RwSignal<View>) -> impl IntoView {
                 {move || {
                     accounts()
                         .into_iter()
-                        .map(|key| {
-                            let label = support::account_label(&key);
+                        .map(|entry| {
+                            let (key, label) = (entry.key, entry.label);
                             view! {
                                 <button on:click=move |_| {
                                     act(Action::ChooseAccount {
@@ -153,8 +153,8 @@ fn SignedIn(view: RwSignal<View>) -> impl IntoView {
     let account_tag = move || {
         view.with(|v| {
             v.account
-                .as_deref()
-                .map(support::account_label)
+                .as_ref()
+                .map(|entry| entry.label.clone())
                 .filter(|label| Some(label) != v.identity.as_ref())
         })
     };
@@ -162,8 +162,8 @@ fn SignedIn(view: RwSignal<View>) -> impl IntoView {
         view.with(|v| {
             v.known_accounts
                 .iter()
-                .filter(|key| v.account.as_deref() != Some(key.as_str()))
-                .map(|key| (key.clone(), support::account_label(key)))
+                .filter(|entry| v.account.as_ref().map(|live| &live.key) != Some(&entry.key))
+                .map(|entry| (entry.key.clone(), entry.label.clone()))
                 .collect::<Vec<_>>()
         })
     };

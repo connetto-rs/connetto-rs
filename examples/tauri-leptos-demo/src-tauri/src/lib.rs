@@ -30,7 +30,7 @@ use diesel::prelude::*;
 use parking_lot::Mutex;
 use rosetta_uuid::Uuid;
 use serde::Serialize;
-use support::view::{Action, LogoutState, Session, View};
+use support::view::{AccountEntry, Action, LogoutState, Session, View};
 use tauri::{AppHandle, Emitter as _, Manager as _, RunEvent, WindowEvent};
 use tauri_plugin_dialog::DialogExt as _;
 use tauri_plugin_fs::{FilePath, FsExt as _, OpenOptions};
@@ -937,7 +937,7 @@ fn account_chooser(app: &AppHandle, core: &Arc<Core>) -> AccountChooser {
             *core.picker.lock() = Some(answer);
             core.update(&app, |v| {
                 v.session = Session::PickingAccount;
-                v.picking = Some(accounts);
+                v.picking = Some(accounts.into_iter().map(AccountEntry::new).collect());
             });
             match waiting.recv().await {
                 Some(Some(key)) => AccountChoice::Account(key),
@@ -1066,8 +1066,8 @@ async fn setup(
         v.session = Session::SignedIn;
         v.attached = true;
         v.identity = Some(user.clone());
-        v.account = Some(account);
-        v.known_accounts = accounts;
+        v.account = Some(AccountEntry::new(account));
+        v.known_accounts = accounts.into_iter().map(AccountEntry::new).collect();
         v.status = "connected".to_owned();
         v.gate_line = Some(format!("gate: {gate}"));
         v.custody_line = Some(format!("custody: {custody}"));

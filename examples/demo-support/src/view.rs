@@ -55,6 +55,28 @@ pub struct NoteRow {
     pub body: String,
 }
 
+/// One stored account, its credential-store key and the label the account
+/// bar shows for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountEntry {
+    /// The credential-store key.
+    pub key: String,
+    /// The decoded identity, or the raw key when the key does not decode.
+    pub label: String,
+}
+
+#[cfg(feature = "client")]
+impl AccountEntry {
+    /// The entry for `key`, labelled with its decoded identity.
+    #[must_use]
+    pub fn new(key: String) -> Self {
+        Self {
+            label: crate::account_label(&key),
+            key,
+        }
+    }
+}
+
 /// Every line the screen shows.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct View {
@@ -76,14 +98,14 @@ pub struct View {
     pub session: Session,
     /// The signed-in identity, absent while none is live.
     pub identity: Option<String>,
-    /// The decoded label of the live account key.
-    pub account: Option<String>,
-    /// Every account key the worker has offered.
-    pub known_accounts: Vec<String>,
+    /// The live account.
+    pub account: Option<AccountEntry>,
+    /// Every account the worker has offered.
+    pub known_accounts: Vec<AccountEntry>,
     /// The picker's list, parked while the worker awaits a choice.
-    pub picking: Option<Vec<String>>,
+    pub picking: Option<Vec<AccountEntry>>,
     /// The account the last successful sign-in used, for the restore line.
-    pub stored_account: Option<String>,
+    pub stored_account: Option<AccountEntry>,
     /// The session expiry warning line.
     pub expiry_warning: Option<String>,
     /// Whether the passkey gate can be offered from this window.
