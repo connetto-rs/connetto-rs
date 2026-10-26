@@ -3543,16 +3543,22 @@ async fn timer_wait(remaining: Duration) {
 ///
 /// With `order` given, it also appends each table capture writes, skipping
 /// suspended writes, to the first-write list [`Capture::changeset`] sorts by.
+///
+/// Debug builds also collect into `exempt_written` each table a write under
+/// the exemption changed, for the outbox check to leave alone.
 fn install_change_tracker(
     conn: &mut SqliteConnection,
     changed: &Arc<Mutex<HashSet<String>>>,
     staging: &Arc<Mutex<HashMap<String, u64>>>,
     counting: &Arc<AtomicBool>,
     order: Option<(WriteOrder, Arc<AtomicBool>)>,
+    #[cfg(debug_assertions)] exempt_written: (&Arc<Mutex<HashSet<String>>>, &Arc<AtomicBool>),
 ) {
     let sink = Arc::clone(changed);
     let rows = Arc::clone(staging);
     let gate = Arc::clone(counting);
+    #[cfg(debug_assertions)]
+    let (exempt_written, exempt) = (Arc::clone(exempt_written.0), Arc::clone(exempt_written.1));
     conn.on_update(
         SqliteUpdateRouter::new().on_any(SqliteChangeOps::ALL, move |event| {
             if let Ok(mut tables) = sink.lock() {
@@ -3571,6 +3577,13 @@ fn install_change_tracker(
                 && !order.iter().any(|name| name == event.table_name)
             {
                 order.push(event.table_name.to_owned());
+            }
+            #[cfg(debug_assertions)]
+            if exempt.load(Ordering::Relaxed)
+                && !is_internal_table(event.table_name)
+                && let Ok(mut tables) = exempt_written.lock()
+            {
+                tables.insert(event.table_name.to_owned());
             }
         }),
     );
@@ -3795,6 +3808,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// Raised while [`change_schema`](Self::change_schema) runs, the only time
     /// the authorizer admits DDL on an application table in `main`.
     schema_open: Arc<AtomicBool>,
+    /// The tables a write under the exemption changed since the last push,
+    /// which the debug outbox check leaves alone.
+    #[cfg(debug_assertions)]
+    exempt_written: Arc<Mutex<HashSet<String>>>,
     /// Names of tables whose rows changed since the last drain, from the
     /// connection's update hook (local writes and server patches alike).
     changed: Arc<Mutex<HashSet<String>>>,
@@ -4251,6 +4268,8 @@ where
             .shared_layout
             .is_some()
             .then(|| Arc::new(Mutex::new(Vec::new())));
+        #[cfg(debug_assertions)]
+        let exempt_written: Arc<Mutex<HashSet<String>>> = Arc::default();
         install_change_tracker(
             &mut db,
             &changed,
@@ -4259,6 +4278,8 @@ where
             write_order
                 .as_ref()
                 .map(|order| (Arc::clone(order), Arc::clone(&write_exempt))),
+            #[cfg(debug_assertions)]
+            (&exempt_written, &write_exempt),
         );
         {
             let dirty = Arc::clone(&dirty);
@@ -4301,6 +4322,8 @@ where
             dirty,
             write_exempt,
             schema_open,
+            #[cfg(debug_assertions)]
+            exempt_written,
             changed,
             applied_rows,
             apply_counting,
@@ -7429,7 +7452,14 @@ where
         self.recheck_changed_schemas()?;
         let changeset = self.session.changeset()?;
         #[cfg(debug_assertions)]
-        outbox::assert_matches(&mut self.db, &changeset)?;
+        {
+            let exempt_written = self
+                .exempt_written
+                .lock()
+                .map(|mut tables| std::mem::take(&mut *tables))
+                .unwrap_or_default();
+            outbox::assert_matches(&mut self.db, &changeset, &exempt_written)?;
+        }
         let recorded_through = outbox::last_seq(&mut self.db)?;
         if changeset.is_empty() {
             if let Some(last) = recorded_through {

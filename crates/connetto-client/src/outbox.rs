@@ -259,13 +259,15 @@ pub(crate) use check::assert_matches;
 /// The debug check that the outbox records what the session captures.
 #[cfg(debug_assertions)]
 mod check {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     use diesel::SqliteConnection;
     use diesel::prelude::*;
     use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, Value};
 
-    use super::{Column, cell, columns, recorded_tables};
+    use connetto_core::sql::quote_ident;
+
+    use super::{Column, cell, columns, encoded, recorded_tables};
     use crate::ClientError;
 
     /// One recorded write.
@@ -307,10 +309,19 @@ mod check {
         Update(Vec<(Option<Cell>, Option<Cell>)>),
     }
 
-    type Changes = BTreeMap<(String, Vec<Cell>), Net>;
+    /// A row of one table, by its table and key.
+    type RowKey = (String, Vec<Cell>);
+
+    type Changes = BTreeMap<RowKey, Net>;
 
     /// Panic unless the outbox's writes amount to the changes the session
     /// captured in `changeset` for the tables the outbox records.
+    ///
+    /// In a table in `exempt_written`, which a write under the exemption
+    /// changed since the last push, a key whose row no longer holds the
+    /// outbox's last recorded values is left out, since the session uploads
+    /// the row as it is now and the outbox the values the application wrote,
+    /// which is the difference the outbox exists to make.
     ///
     /// # Errors
     ///
@@ -318,21 +329,81 @@ mod check {
     pub(crate) fn assert_matches(
         db: &mut SqliteConnection,
         changeset: &[u8],
+        exempt_written: &HashSet<String>,
     ) -> Result<(), ClientError> {
         let recorded: Vec<Recorded> =
             diesel::sql_query("SELECT tbl, old, new FROM main._connetto_outbox ORDER BY seq")
                 .load(db)?;
-        let from_outbox = from_recorded(db, &recorded)?;
+        let (from_outbox, overwritten) = from_recorded(db, &recorded, exempt_written)?;
         let tables: Vec<String> = recorded_tables(db)?
             .into_iter()
             .map(|(table, _)| table)
             .collect();
-        let from_session = from_changeset(changeset, &tables)?;
+        let mut from_session = from_changeset(changeset, &tables)?;
+        from_session.retain(|key, _| !overwritten.contains(key));
         assert_eq!(
             from_outbox, from_session,
             "the outbox and the session disagree on the writes to upload"
         );
         Ok(())
+    }
+
+    /// `cell` as an SQL literal.
+    fn literal(cell: &Cell) -> String {
+        match cell {
+            Cell::Null => "NULL".to_owned(),
+            Cell::Integer(integer) => integer.to_string(),
+            Cell::Real(bits) => {
+                let real = f64::from_bits(*bits);
+                if real.is_finite() {
+                    format!("{real:?}")
+                } else if real > 0.0 {
+                    "9e999".to_owned()
+                } else {
+                    "-9e999".to_owned()
+                }
+            }
+            Cell::Text(text) => format!("'{}'", text.replace('\'', "''")),
+            Cell::Blob(blob) => {
+                const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+                let hex: String = blob
+                    .iter()
+                    .flat_map(|byte| {
+                        [
+                            char::from(DIGITS[usize::from(byte >> 4)]),
+                            char::from(DIGITS[usize::from(byte & 0x0f)]),
+                        ]
+                    })
+                    .collect();
+                format!("X'{hex}'")
+            }
+        }
+    }
+
+    /// The row of `table` under `key` as it is now, absent when none is.
+    fn current_row(
+        db: &mut SqliteConnection,
+        table: &str,
+        columns: &[Column],
+        key: &[Cell],
+    ) -> Result<Option<Vec<Cell>>, ClientError> {
+        let mut keyed: Vec<&Column> = columns.iter().filter(|column| column.pk > 0).collect();
+        keyed.sort_by_key(|column| column.pk);
+        let wheres: Vec<String> = keyed
+            .iter()
+            .zip(key)
+            .map(|(column, cell)| format!("{} IS {}", quote_ident(&column.name), literal(cell)))
+            .collect();
+        let target = format!("main.{}", quote_ident(table));
+        let rows: Vec<Encoded> = diesel::sql_query(format!(
+            "SELECT {} AS value FROM {target} WHERE {}",
+            encoded(&target, columns),
+            wheres.join(" AND ")
+        ))
+        .load(db)?;
+        rows.first()
+            .map(|row| decode(db, &row.value, columns))
+            .transpose()
     }
 
     fn from_value(value: &Value<String, Vec<u8>>) -> Cell {
@@ -464,10 +535,14 @@ mod check {
         keyed.into_iter().map(|(_, cell)| cell).collect()
     }
 
+    /// The net change the outbox records per key, and the keys of tables in
+    /// `exempt_written` whose row no longer holds the outbox's last recorded
+    /// values, which the net change leaves out.
     fn from_recorded(
         db: &mut SqliteConnection,
         recorded: &[Recorded],
-    ) -> Result<Changes, ClientError> {
+        exempt_written: &HashSet<String>,
+    ) -> Result<(Changes, BTreeSet<RowKey>), ClientError> {
         let mut schemas: HashMap<String, Vec<Column>> = HashMap::new();
         let mut spans: BTreeMap<(String, Vec<Cell>), Span> = BTreeMap::new();
         let mut write =
@@ -509,7 +584,14 @@ mod check {
             }
         }
         let mut changes = Changes::new();
+        let mut overwritten = BTreeSet::new();
         for ((table, key), span) in spans {
+            if exempt_written.contains(&table)
+                && current_row(db, &table, &schemas[&table], &key)? != span.after
+            {
+                overwritten.insert((table, key));
+                continue;
+            }
             let net = match (span.before, span.after) {
                 (None, None) => continue,
                 (None, Some(after)) => Net::Insert(after),
@@ -537,6 +619,6 @@ mod check {
             };
             changes.insert((table, key), net);
         }
-        Ok(changes)
+        Ok((changes, overwritten))
     }
 }

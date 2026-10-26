@@ -262,3 +262,20 @@ async fn a_refused_schema_change_changes_nothing() {
         )]
     );
 }
+
+/// A row connetto rewrites after a local write and before the push, as a
+/// server frame does, leaves the outbox holding the written values and the
+/// capture session the rewritten ones, and the push still goes out.
+#[tokio::test]
+async fn a_row_rewritten_by_connetto_before_the_push_still_pushes() {
+    let mut conn = open(DDL);
+    conn.batch_execute("INSERT INTO items (id, label) VALUES (1, 'local'), (2, 'kept')")
+        .expect("local writes");
+    conn.transact_with_bookkeeping(
+        |db| db.batch_execute("UPDATE items SET label = 'server' WHERE id = 1"),
+        |_| Ok::<_, diesel::result::Error>(()),
+    )
+    .expect("an exempt rewrite, as a frame applies one");
+
+    assert_eq!(conn.push().await.expect("push"), Some(1));
+}
