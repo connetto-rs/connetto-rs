@@ -20,7 +20,7 @@ use connetto_client::dsl::Watchable;
 use connetto_client::{
     Auth, ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, FirstThen, LiveQuery,
 };
-use connetto_dioxus_demo::{AUTH_BASE, auth_landing, demo_schema};
+use connetto_demo_support::{AUTH_BASE, auth_landing, demo_schema};
 use connetto_file_core::{FileId, MimeClass};
 use connetto_web::auth::{
     AccountStore, Acquired, BrowserAuthenticator, LOGIN_CHANNEL, LoginMessage, deliver_login_code,
@@ -512,7 +512,7 @@ async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
     let demo = connetto_dioxus_demo::platform::DemoContent::new(Rc::clone(&lane));
     assert_eq!(demo.pin().await, "pinned photos");
     assert_eq!(demo.fetch_pinned().await, "fetched 1 pinned file(s)");
-    let held = connetto_dioxus_demo::Photo {
+    let held = connetto_demo_support::Photo {
         id: available.id,
         order_id: available.order_id,
         owner_id: available.owner_id.clone(),

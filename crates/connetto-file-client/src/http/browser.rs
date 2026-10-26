@@ -220,7 +220,7 @@ fn observe(request: &XmlHttpRequest, watch: &IdleWatch) -> Result<Observed, Fail
         .upload()
         .map_err(|value| refused("observe upload progress", &value))?;
     let moved = watch.resetter();
-    let progress = Closure::<dyn FnMut()>::new(move || moved());
+    let progress = Closure::<dyn FnMut()>::new(moved);
     upload.set_onprogress(Some(progress.as_ref().unchecked_ref()));
     request.set_onprogress(Some(progress.as_ref().unchecked_ref()));
     let mut handlers = None;

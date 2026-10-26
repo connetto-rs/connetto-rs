@@ -5,10 +5,10 @@
   "identifier": "dev.connetto.tauridemo",
   "build": {
     "beforeBuildCommand": {
-      "script": "env -u NO_COLOR trunk build",
-      "cwd": "../ui"
+      "script": "env -u NO_COLOR trunk build --no-default-features --features tauri --dist dist-tauri",
+      "cwd": "../../leptos-demo"
     },
-    "frontendDist": "../ui/dist"
+    "frontendDist": "../../leptos-demo/dist-tauri"
   },
   "app": {
     "withGlobalTauri": true,

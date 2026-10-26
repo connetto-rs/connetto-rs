@@ -718,6 +718,22 @@ async fn run_default_browser_suites(services: &Services, shard: Option<Shard>) -
     for test in test_files(&["examples", "yew-web-demo", "tests"])? {
         suite_args.push(per_test_args("examples/yew-web-demo", test));
     }
+    for test in test_files(&["examples", "leptos-demo", "tests"])? {
+        suite_args.push(per_test_args("examples/leptos-demo", test));
+    }
+    // The Dioxus demo builds for the browser under its `web` feature alone,
+    // and its other test file is a native proof with nothing to run in wasm.
+    suite_args.push(strings(&[
+        "test",
+        "--headless",
+        "--chrome",
+        "examples/dioxus-demo",
+        "--no-default-features",
+        "--features",
+        "web",
+        "--test",
+        "photo_flow",
+    ]));
 
     let total = suite_args.len();
     if let Some(shard) = shard {

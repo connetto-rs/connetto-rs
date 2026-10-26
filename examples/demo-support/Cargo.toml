@@ -1,0 +1,116 @@
+[package]
+name = "connetto-demo-support"
+description = "The demos' shared core: the view and the actions, the pane wording and helpers, the demo schema rows, and the browser pieces every browser demo carries."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+
+[dependencies]
+# The view and the actions cross a process boundary in the Tauri build.
+serde = { version = "1", features = ["derive"] }
+# The deployment every demo here runs against, documents and all.
+connetto-demo-deployment = { path = "../deployment", optional = true }
+connetto-core = { path = "../../crates/connetto-core", optional = true }
+# FileId and MimeClass for the staging row and the mime guess, on every target.
+connetto-file-core = { path = "../../crates/connetto-file-core", optional = true }
+chrono = { version = "0.4.45", default-features = false, features = ["std"], optional = true }
+diesel = { version = "2", features = ["sqlite", "chrono"], optional = true }
+# One strongly typed `rosetta_uuid::Uuid` that maps to SQLite BLOB and Postgres
+# uuid from a single schema, minted with the browser CSPRNG through getrandom's
+# wasm_js backend on wasm.
+rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite"], optional = true }
+thiserror = { version = "2", optional = true }
+tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
+
+[features]
+default = ["web"]
+# The schema, its rows, queries and writes, and the lines client events
+# produce, all of which reach the connetto client and the replica. A UI that
+# renders a view another process computes leaves it off and compiles no
+# database engine.
+client = [
+  "dep:chrono",
+  "dep:connetto-client",
+  "dep:connetto-core",
+  "dep:connetto-demo-deployment",
+  "dep:connetto-file-core",
+  "dep:connetto-schema",
+  "dep:diesel",
+  "dep:js-sys",
+  "dep:rosetta-uuid",
+  "dep:thiserror",
+  "dep:tracing",
+]
+# The native pieces the desktop and phone demo builds share. They exist on
+# non-wasm targets only, and a wasm build ignores the feature.
+native = [
+  "client",
+  "connetto-client/native-auth",
+  "dep:anyhow",
+  "dep:connetto-auth-session",
+  "dep:connetto-file-client",
+  "dep:manganis",
+  "dep:tokio",
+]
+# Device certificates for the native builds. A wasm build never turns it on,
+# since the certificate stack does not build for wasm.
+device-identity = [
+  "native",
+  "connetto-client/device-identity",
+  "connetto-auth-session?/device-identity",
+]
+# The browser platform, meaning the transport, the leader election, the relay
+# hub and the DB worker, reached through its WebClientBuilder.
+web = ["client", "dep:connetto-web", "dep:wasm-bindgen", "dep:web-sys"]
+
+# The browser clock and random source the wasm client reads, and the browser
+# platform behind the `web` feature.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+connetto-client = { path = "../../crates/connetto-client", default-features = false, optional = true }
+connetto-web = { path = "../../crates/connetto-web", optional = true }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+# `Blob` and `Url` back the export download, `BroadcastChannel` the
+# worker-to-page channels, `Storage` the last signed-in account across
+# reloads, a non-secret identifier.
+web-sys = { version = "0.3", optional = true, features = [
+  "Blob",
+  "BroadcastChannel",
+  "Document",
+  "Element",
+  "HtmlAnchorElement",
+  "MessageEvent",
+  "Storage",
+  "Url",
+  "Window",
+] }
+
+# The native builds take the client with its native transport and its native
+# sign-in, the browser one leaves both off, since a wasm target has no native
+# WebSocket and no platform keyring.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+connetto-client = { path = "../../crates/connetto-client", optional = true }
+# The builder chain the `native` feature serves, its error lines and the
+# content event lines it feeds.
+anyhow = { version = "1", optional = true }
+connetto-file-client = { path = "../../crates/connetto-file-client", optional = true }
+tokio = { version = "1", features = ["fs", "sync"], optional = true }
+
+# The phone sign-in the `native` feature reaches, on the targets that carry it.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+connetto-auth-session = { path = "../../crates/connetto-auth-session", optional = true }
+
+# The Keystore unlock prompt's JNI types, on the target that carries it.
+[target.'cfg(target_os = "android")'.dependencies]
+manganis = { version = "0.7.10", optional = true }
+
+# The schema step. It translates the deployment's shared schema and policies
+# plus the demos' local tier into the bundle the client builds include and the
+# version they present at handshake.
+[build-dependencies]
+connetto-schema = { path = "../../crates/connetto-schema", optional = true }
+
+[lints.rust]
+missing_docs = "deny"
