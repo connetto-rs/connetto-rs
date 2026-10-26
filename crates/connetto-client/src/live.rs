@@ -2713,8 +2713,9 @@ where
         self.shared.events.subscribe()
     }
 
-    /// The client's event stream the background tasks publish into (R76).
-    #[cfg(feature = "peer")]
+    /// The client's event stream the background tasks publish into (R76),
+    /// and the device wipe once the client closed (R105).
+    #[cfg(feature = "device-identity")]
     pub(crate) fn event_sender(&self) -> broadcast::Sender<ClientEvent> {
         self.shared.events.clone()
     }

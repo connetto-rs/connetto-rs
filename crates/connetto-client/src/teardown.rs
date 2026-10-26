@@ -274,20 +274,78 @@ pub struct ForgetIncomplete {
     pub share_keys: Option<crate::ClientError>,
     /// The device key could not be deleted.
     pub device_key: Option<crate::ClientError>,
+    /// The application's own wipe failed.
+    pub application: Option<ApplicationWipeError>,
 }
 
 #[cfg(feature = "native-auth")]
 impl ForgetIncomplete {
     /// Whether every part succeeded.
     pub(crate) fn is_complete(&self) -> bool {
-        self.release.is_none()
-            && self.credential.is_none()
-            && self.revoke.is_none()
-            && self.wipe.is_none()
-            && self.share_keys.is_none()
-            && self.device_key.is_none()
+        self.failed().is_empty()
+    }
+
+    /// The parts that failed, in the order they run.
+    #[must_use]
+    pub fn failed(&self) -> Vec<WipePart> {
+        [
+            (WipePart::Release, self.release.is_some()),
+            (WipePart::Credential, self.credential.is_some()),
+            (WipePart::Revoke, self.revoke.is_some()),
+            (WipePart::Replica, self.wipe.is_some()),
+            (WipePart::ShareKeys, self.share_keys.is_some()),
+            (WipePart::DeviceKey, self.device_key.is_some()),
+            (WipePart::Application, self.application.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(part, failed)| failed.then_some(part))
+        .collect()
     }
 }
+
+/// One part of a device's teardown, as
+/// [`ClientEvent::DeviceRevoked`](crate::ClientEvent::DeviceRevoked) names the
+/// parts that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WipePart {
+    /// Releasing the replica's file handles.
+    Release,
+    /// Clearing the stored credential.
+    Credential,
+    /// Revoking the session at the server.
+    Revoke,
+    /// Destroying the replica's key and deleting its files.
+    Replica,
+    /// Clearing the share keys.
+    ShareKeys,
+    /// Deleting the device key.
+    DeviceKey,
+    /// The application's own wipe, its
+    /// [`with_device_wipe`](crate::NativeDurable::with_device_wipe) callback.
+    Application,
+}
+
+/// The application's own wipe failed, its error the source.
+#[cfg(feature = "native-auth")]
+#[derive(Debug, thiserror::Error)]
+#[error("the application's own wipe failed")]
+pub struct ApplicationWipeError(#[source] pub Box<dyn std::error::Error + Send + Sync>);
+
+/// What the application wipes of its own when connetto wipes this device's
+/// data, given the replica's name.
+#[cfg(feature = "native-auth")]
+pub type DeviceWipeHook = std::sync::Arc<
+    dyn Fn(
+            String,
+        ) -> core::pin::Pin<
+            Box<
+                dyn core::future::Future<
+                        Output = Result<(), Box<dyn std::error::Error + Send + Sync>>,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
 
 /// The failed parts of a forget, joined for the one-line report.
 #[cfg(feature = "native-auth")]
@@ -296,7 +354,7 @@ struct FailedParts<'a>(&'a ForgetIncomplete);
 #[cfg(feature = "native-auth")]
 impl core::fmt::Display for FailedParts<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let parts: [(&str, Option<&dyn core::fmt::Display>); 6] = [
+        let parts: [(&str, Option<&dyn core::fmt::Display>); 7] = [
             (
                 "releasing the replica",
                 self.0.release.as_ref().map(|err| err as _),
@@ -321,6 +379,10 @@ impl core::fmt::Display for FailedParts<'_> {
                 "deleting the device key",
                 self.0.device_key.as_ref().map(|err| err as _),
             ),
+            (
+                "the application's own wipe",
+                self.0.application.as_ref().map(|err| err as _),
+            ),
         ];
         let mut first = true;
         for (part, err) in parts {
@@ -334,8 +396,10 @@ impl core::fmt::Display for FailedParts<'_> {
     }
 }
 
-/// Revoke and clear the credential, then destroy the key and delete the
-/// replica, filling in the parts of `report` that fail. Both run even when the
+/// Clear the credential, then destroy the key and delete the replica, filling
+/// in the parts of `report` that fail. With `sign_out` the session is revoked
+/// at the server too, and without it only the stored credential is cleared,
+/// for a session the server already ended. Both halves run even when the
 /// other fails: a revoke that never reached the server does not keep the data,
 /// and data that could not be wiped does not keep the session.
 ///
@@ -344,6 +408,7 @@ impl core::fmt::Display for FailedParts<'_> {
 #[cfg(feature = "native-auth")]
 pub(crate) async fn forget_device<S>(
     authenticator: Option<&crate::auth::NativeAuthenticator>,
+    sign_out: bool,
     db_path: &std::path::Path,
     key_store: &S,
     key_name: &str,
@@ -353,13 +418,85 @@ pub(crate) async fn forget_device<S>(
     S: connetto_core::traits::ReplicaKeyStore,
 {
     if let Some(authenticator) = authenticator {
-        let signed_out = authenticator.sign_out().await;
-        report.credential = signed_out.credential.err();
-        report.revoke = signed_out.revoke.err();
+        if sign_out {
+            let signed_out = authenticator.sign_out().await;
+            report.credential = signed_out.credential.err();
+            report.revoke = signed_out.revoke.err();
+        } else {
+            report.credential = authenticator.forget_credential().await.err();
+        }
     }
     report.wipe = wipe_replica(db_path, key_store, key_name, unsynced, true)
         .await
         .err();
+}
+
+/// The marker a device wipe leaves beside the replica `name` under `dir` until
+/// every part of it stood.
+#[cfg(feature = "native-auth")]
+fn pending_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    dir.join(format!("{name}{PENDING_SUFFIX}"))
+}
+
+/// The suffix a pending wipe's marker carries after the replica's name.
+#[cfg(feature = "native-auth")]
+const PENDING_SUFFIX: &str = ".wipe-pending";
+
+/// A device wipe a failed part left for the next start (R105 decision 10).
+#[cfg(feature = "native-auth")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingWipe {
+    /// The replica's name, from which every other record is derived.
+    pub(crate) name: String,
+    /// The account whose stored credential the wipe clears, absent for a
+    /// held credential.
+    pub(crate) account: Option<String>,
+}
+
+#[cfg(feature = "native-auth")]
+impl PendingWipe {
+    /// Record the wipe beside its replica under `dir`, before any part runs,
+    /// so a start after a crash mid-wipe finishes it.
+    pub(crate) fn mark(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(
+            pending_path(dir, &self.name),
+            self.account.as_deref().unwrap_or_default(),
+        )
+    }
+
+    /// Drop the record once every part stood.
+    pub(crate) fn clear(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        match std::fs::remove_file(pending_path(dir, &self.name)) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+            _ => Ok(()),
+        }
+    }
+
+    /// Every wipe recorded under `dir`, none when the directory is absent.
+    pub(crate) fn every(dir: &std::path::Path) -> std::io::Result<Vec<Self>> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        let mut pending = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let file = entry.file_name();
+            let Some(name) = file
+                .to_str()
+                .and_then(|file| file.strip_suffix(PENDING_SUFFIX))
+            else {
+                continue;
+            };
+            let account = std::fs::read_to_string(entry.path())?;
+            pending.push(Self {
+                name: name.to_owned(),
+                account: (!account.is_empty()).then_some(account),
+            });
+        }
+        Ok(pending)
+    }
 }
 
 #[cfg(all(test, feature = "native-transport"))]

@@ -1080,7 +1080,9 @@ async fn a_grant_listing_its_own_certificate_revokes_the_device_unpublished() {
         "the grant stays unpublished while its list is being kept"
     );
     gate.notify_one();
-    poll_until(|| state.lock().emitted.contains(&ClientEvent::DeviceRevoked)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle.revoked())
+        .await
+        .expect("the task hands the device's wipe to the client");
     assert!(
         handle.certificate().is_none(),
         "the device holds no certificate"
@@ -1142,17 +1144,13 @@ async fn a_reissue_refused_as_revoked_deletes_the_key_and_reports_revoked() {
         matches!(outcome, Err(CertificateError::Revoked)),
         "the caller gets the revocation"
     );
-    {
-        let state = state.lock();
-        assert!(
-            state
-                .emitted
-                .iter()
-                .any(|event| matches!(event, ClientEvent::DeviceRevoked)),
-            "the device says its key went"
-        );
-        assert!(state.stored.is_empty(), "a revoked device stores nothing");
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle.revoked())
+        .await
+        .expect("the task hands the device's wipe to the client");
+    assert!(
+        state.lock().stored.is_empty(),
+        "a revoked device stores nothing"
+    );
 
     end_tx.send(()).expect("the run ends");
     run.await.expect("the run ends");
@@ -2311,7 +2309,9 @@ async fn a_peer_list_revoking_the_own_serial_revokes_the_device() {
     // The list-keeping peer keeps the list revoking the device's own serial.
     keeper.keep_list(list, signer);
 
-    poll_until(|| state.lock().emitted.contains(&ClientEvent::DeviceRevoked)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle.revoked())
+        .await
+        .expect("the task hands the device's wipe to the client");
     poll_until(|| {
         state
             .lock()

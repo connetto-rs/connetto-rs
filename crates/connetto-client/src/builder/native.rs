@@ -49,7 +49,10 @@ use crate::share_keys::share_key_record;
 use crate::share_keys::{ErasedShareKeyStore, RefreshStoreShareKeys, ShareKeyStore};
 use crate::teardown::content_dir;
 #[cfg(feature = "native-auth")]
-use crate::teardown::{ForgetError, ForgetIncomplete, ForgetRefusal, forget_device};
+use crate::teardown::{
+    ApplicationWipeError, DeviceWipeHook, ForgetError, ForgetIncomplete, ForgetRefusal,
+    PendingWipe, forget_device, wipe_replica,
+};
 use crate::{ClientError, ConnettoClient, Custody};
 #[cfg(feature = "peer")]
 use crate::{ClientEvent, HotspotError, HotspotOffer, JoinError};
@@ -381,6 +384,8 @@ where
             mechanism: None,
             #[cfg(feature = "device-identity")]
             device: DeviceSetup::default(),
+            #[cfg(feature = "native-auth")]
+            wipe_hook: None,
         }
     }
 }
@@ -436,6 +441,8 @@ where
             mechanism: None,
             #[cfg(feature = "device-identity")]
             device: DeviceSetup::default(),
+            #[cfg(feature = "native-auth")]
+            wipe_hook: None,
         }
     }
 }
@@ -475,6 +482,8 @@ where
             mechanism: None,
             #[cfg(feature = "device-identity")]
             device: DeviceSetup::default(),
+            #[cfg(feature = "native-auth")]
+            wipe_hook: None,
         }
     }
 }
@@ -498,6 +507,10 @@ pub struct NativeDurable<T: Transport, C, K: StorageMarker, KS> {
     mechanism: Option<Arc<dyn GateMechanism>>,
     #[cfg(feature = "device-identity")]
     device: DeviceSetup,
+    /// What the application wipes of its own when the device's data is wiped
+    /// (R105 decision 10).
+    #[cfg(feature = "native-auth")]
+    wipe_hook: Option<DeviceWipeHook>,
 }
 
 /// What a keyring build enrols its device key with (R74).
@@ -761,6 +774,75 @@ where
     K: StorageMarker,
     KS: ReplicaKeyStore<Error = ClientError> + Send + Sync + 'static,
 {
+    /// What the application wipes of its own whenever connetto wipes this
+    /// device's data: when this device's own key is revoked (R105 decision
+    /// 10) and in [`NativeClient::forget_device`]. `hook` receives the
+    /// replica's name and runs after connetto's own parts. It must be safe to
+    /// run again, since a wipe whose parts did not all stand is completed by
+    /// the next start, the hook included.
+    #[cfg(feature = "native-auth")]
+    #[must_use]
+    pub fn with_device_wipe<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'static,
+    {
+        self.wipe_hook = Some(Arc::new(move |replica| Box::pin(hook(replica))));
+        self
+    }
+
+    /// Finish every device wipe a revoked key left pending under the data
+    /// directory, before anything is signed into or opened (R105 decision
+    /// 10). Each part is idempotent, so running one that already stood again
+    /// is harmless.
+    #[cfg(feature = "native-auth")]
+    async fn complete_pending_wipes(&self) -> Result<(), ClientError> {
+        let pending = PendingWipe::every(&self.data_dir).map_err(|err| {
+            ClientError::Session(format!("reading the pending device wipes: {err}"))
+        })?;
+        for wipe in pending {
+            let mut report = ForgetIncomplete::default();
+            if let (Some(account), Some(store)) = (&wipe.account, self.storage.refresh_store()) {
+                report.credential = store.clear(account).await.err();
+            }
+            report.wipe = wipe_replica(
+                &self.data_dir.join(&wipe.name),
+                &self.key_store,
+                &wipe.name,
+                &[],
+                true,
+            )
+            .await
+            .err();
+            if report.wipe.is_none() {
+                report.share_keys = match share_keys(self.share_key_store.as_ref(), &self.storage) {
+                    Ok(store) => store.clear(&share_key_record(&wipe.name)).await.err(),
+                    Err(err) => Some(err),
+                };
+                #[cfg(feature = "device-identity")]
+                if let Some(service) = self.storage.device_service() {
+                    report.device_key = match self.device.keys(service, &wipe.name) {
+                        Ok(keys) => keys.delete().await.err(),
+                        Err(err) => Some(err),
+                    };
+                }
+            }
+            if let Some(hook) = &self.wipe_hook {
+                report.application = hook(wipe.name.clone())
+                    .await
+                    .err()
+                    .map(ApplicationWipeError);
+            }
+            if !report.is_complete() {
+                return Err(ClientError::WipePending(Box::new(report)));
+            }
+            wipe.clear(&self.data_dir).map_err(|err| {
+                ClientError::Session(format!("removing a completed device wipe's marker: {err}"))
+            })?;
+        }
+        Ok(())
+    }
+
     /// The away-and-return gate, on by default.
     #[must_use]
     pub fn with_gate(mut self, gate: Gate) -> Self {
@@ -810,10 +892,16 @@ where
     pub async fn connect_with_pump(
         self,
     ) -> Result<(NativeClient<T, C::Handle>, CorePump), ClientError> {
-        #[cfg(feature = "device-identity")]
+        #[cfg(feature = "native-auth")]
         let mut this = self;
-        #[cfg(not(feature = "device-identity"))]
+        #[cfg(not(feature = "native-auth"))]
         let this = self;
+        // A wipe a revoked key left pending is finished before anything is
+        // signed into or opened (R105 decision 10).
+        #[cfg(feature = "native-auth")]
+        this.complete_pending_wipes().await?;
+        #[cfg(feature = "native-auth")]
+        let hook = this.wipe_hook.take();
         #[cfg(feature = "device-identity")]
         let (device, service) = (
             core::mem::take(&mut this.device),
@@ -830,13 +918,15 @@ where
             let (session, authenticator) = resolved.provider.unzip();
             let share_key_store = core.share_key_store.clone();
             let share_record = share_key_record(&name);
-            let teardown: Box<dyn Forget> = Box::new(ReplicaTeardown {
+            let teardown: Arc<dyn Forget> = Arc::new(ReplicaTeardown {
                 authenticator,
+                dir: core.place.0.clone(),
                 path: core.place.0.join(&name),
                 name,
                 key_store,
                 share_key_store,
                 share_record,
+                hook,
             });
             (session, Some(teardown))
         };
@@ -1100,12 +1190,31 @@ where
                     )
                 })
                 .await;
+                // The wipe waits for the task to find the device's own key
+                // revoked, closes the client while the pump still runs, and
+                // wipes once it ended (R105 decision 10).
+                let revoked = {
+                    let handle = handle.clone();
+                    async move { handle.revoked().await }
+                };
+                let close = {
+                    let client = core.client().clone();
+                    async move { client.close().await }
+                };
+                let wipe = wipe_revoked(core.client().clone(), teardown.clone(), handle.clone());
                 #[cfg(feature = "peer")]
-                let pump: CorePump = Box::pin(with_device_tasks(pump, async move {
-                    tokio::join!(enrolment, runner);
-                }));
+                let pump: CorePump = Box::pin(with_device_tasks(
+                    pump,
+                    async move {
+                        tokio::join!(enrolment, runner);
+                    },
+                    revoked,
+                    close,
+                    wipe,
+                ));
                 #[cfg(not(feature = "peer"))]
-                let pump: CorePump = Box::pin(with_device_tasks(pump, enrolment));
+                let pump: CorePump =
+                    Box::pin(with_device_tasks(pump, enrolment, revoked, close, wipe));
                 #[cfg(feature = "peer")]
                 {
                     beacon = Some(beacon_rx);
@@ -1162,20 +1271,7 @@ where
             .into_iter()
             .collect();
         let key_store = Arc::new(self.key_store);
-        let share_key_store = self
-            .share_key_store
-            .clone()
-            .or_else(|| {
-                let store: ErasedShareKeyStore = self
-                    .storage
-                    .refresh_store()
-                    .map(RefreshStoreShareKeys)
-                    .map(Arc::new)?;
-                Some(store)
-            })
-            .ok_or_else(|| {
-                ClientError::Auth("the durable build named no store for its share keys".to_owned())
-            })?;
+        let share_key_store = share_keys(self.share_key_store.as_ref(), &self.storage)?;
         let core = CoreDurable {
             base: self.base,
             credential: resolved.credential.clone(),
@@ -1191,12 +1287,86 @@ where
 }
 
 #[cfg(feature = "device-identity")]
-async fn with_device_tasks(mut pump: CorePump, tasks: impl Future<Output = ()>) {
+async fn with_device_tasks(
+    mut pump: CorePump,
+    tasks: impl Future<Output = ()>,
+    revoked: impl Future<Output = ()>,
+    close: impl Future<Output = ()>,
+    wipe: impl Future<Output = ()>,
+) {
     // Auxiliary tasks retain client handles, so the core pump owns their lifetime.
     tokio::select! {
-        () = &mut pump => {}
-        () = tasks => pump.await,
+        () = &mut pump => return,
+        () = tasks => {
+            pump.await;
+            return;
+        }
+        () = revoked => {}
     }
+    // The device's own key is revoked. Closing needs the pump polled to end,
+    // and the wipe runs after it, inside this future, so it finishes even
+    // though the pump already has.
+    tokio::join!(close, &mut pump);
+    wipe.await;
+}
+
+/// Finish a revoked device's wipe once its client closed, and say so (R105
+/// decision 10). The device key and certificate went with the task. A part
+/// that fails leaves the wipe marked for the next start.
+#[cfg(feature = "device-identity")]
+async fn wipe_revoked<T>(
+    client: ConnettoClient<T>,
+    teardown: Option<Arc<dyn Forget>>,
+    device: EnrolHandle,
+) where
+    T: Transport + MaybeSend + 'static,
+    T::Error: Display,
+{
+    if let Some(teardown) = &teardown
+        && let Err(err) = teardown.pending().mark(teardown.dir())
+    {
+        tracing::warn!(error = %err, "the device wipe could not be marked pending");
+    }
+    let mut report = ForgetIncomplete {
+        release: client.release_replica().await.err(),
+        ..ForgetIncomplete::default()
+    };
+    if let Some(teardown) = &teardown {
+        teardown.wipe_revoked(&mut report).await;
+    }
+    report.device_key = device.delete_key().await.err();
+    if report.is_complete() {
+        if let Some(teardown) = &teardown
+            && let Err(err) = teardown.pending().clear(teardown.dir())
+        {
+            tracing::warn!(error = %err, "the completed device wipe's marker could not be removed");
+        }
+    } else {
+        tracing::warn!(error = %report, "the revoked device's wipe is incomplete, the next start completes it");
+    }
+    let _ = client.event_sender().send(ClientEvent::DeviceRevoked {
+        failed: report.failed(),
+    });
+}
+
+/// The share-key store a durable build names, the refresh store standing in
+/// for it otherwise.
+fn share_keys<K: StorageMarker>(
+    named: Option<&ErasedShareKeyStore>,
+    storage: &K,
+) -> Result<ErasedShareKeyStore, ClientError> {
+    named
+        .cloned()
+        .or_else(|| {
+            let store: ErasedShareKeyStore = storage
+                .refresh_store()
+                .map(RefreshStoreShareKeys)
+                .map(Arc::new)?;
+            Some(store)
+        })
+        .ok_or_else(|| {
+            ClientError::Auth("the durable build named no store for its share keys".to_owned())
+        })
 }
 
 /// Discovery through the system Bonjour service on iOS, which grants an app no raw multicast, and through `mdns-sd` elsewhere (R76).
@@ -1223,7 +1393,7 @@ pub struct NativeClient<T: Transport, C = ()> {
     #[cfg(feature = "native-auth")]
     session: Option<NativeSession>,
     #[cfg(feature = "native-auth")]
-    teardown: Option<Box<dyn Forget>>,
+    teardown: Option<Arc<dyn Forget>>,
     #[cfg(feature = "device-identity")]
     device: Option<EnrolHandle>,
     #[cfg(feature = "peer")]
@@ -1731,22 +1901,69 @@ impl NativeSession {
 /// The wipe a durable build knows how to run, erased over its key store.
 #[cfg(feature = "native-auth")]
 trait Forget: Send + Sync {
+    /// The application's forget: revoke the session at the server, then wipe.
     fn forget<'a>(
         &'a self,
         unsynced: &'a [crate::UnsyncedWrite],
         report: &'a mut ForgetIncomplete,
     ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    /// A revoked device's wipe, the session already ended at the server and
+    /// every unsynced write lost (R105 decision 10).
+    fn wipe_revoked<'a>(
+        &'a self,
+        report: &'a mut ForgetIncomplete,
+    ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    /// The record a wipe leaves until it stood.
+    fn pending(&self) -> PendingWipe;
+    /// The directory the replica and that record live in.
+    fn dir(&self) -> &std::path::Path;
 }
 
 /// The replica a durable build wrote, and what revokes its session.
 #[cfg(feature = "native-auth")]
 struct ReplicaTeardown<KS> {
     authenticator: Option<Arc<NativeAuthenticator>>,
+    dir: PathBuf,
     path: PathBuf,
     name: String,
     key_store: Arc<KS>,
     share_key_store: ErasedShareKeyStore,
     share_record: String,
+    hook: Option<DeviceWipeHook>,
+}
+
+#[cfg(feature = "native-auth")]
+impl<KS> ReplicaTeardown<KS>
+where
+    KS: ReplicaKeyStore<Error = ClientError> + Send + Sync + 'static,
+{
+    async fn wipe(
+        &self,
+        sign_out: bool,
+        unsynced: &[crate::UnsyncedWrite],
+        report: &mut ForgetIncomplete,
+    ) {
+        forget_device(
+            self.authenticator.as_deref(),
+            sign_out,
+            &self.path,
+            self.key_store.as_ref(),
+            &self.name,
+            unsynced,
+            report,
+        )
+        .await;
+        // Local secret cleanup is required even when revocation cannot be confirmed.
+        if report.wipe.is_none() {
+            report.share_keys = self.share_key_store.clear(&self.share_record).await.err();
+        }
+        if let Some(hook) = &self.hook {
+            report.application = hook(self.name.clone())
+                .await
+                .err()
+                .map(ApplicationWipeError);
+        }
+    }
 }
 
 #[cfg(feature = "native-auth")]
@@ -1759,21 +1976,28 @@ where
         unsynced: &'a [crate::UnsyncedWrite],
         report: &'a mut ForgetIncomplete,
     ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
-            forget_device(
-                self.authenticator.as_deref(),
-                &self.path,
-                self.key_store.as_ref(),
-                &self.name,
-                unsynced,
-                report,
-            )
-            .await;
-            // Local secret cleanup is required even when revocation cannot be confirmed.
-            if report.wipe.is_none() {
-                report.share_keys = self.share_key_store.clear(&self.share_record).await.err();
-            }
-        })
+        Box::pin(self.wipe(true, unsynced, report))
+    }
+
+    fn wipe_revoked<'a>(
+        &'a self,
+        report: &'a mut ForgetIncomplete,
+    ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.wipe(false, &[], report))
+    }
+
+    fn pending(&self) -> PendingWipe {
+        PendingWipe {
+            name: self.name.clone(),
+            account: self
+                .authenticator
+                .as_ref()
+                .and_then(|authenticator| authenticator.account()),
+        }
+    }
+
+    fn dir(&self) -> &std::path::Path {
+        &self.dir
     }
 }
 
@@ -2500,7 +2724,13 @@ mod tests {
                 .expect("the observer remains");
             tokio::time::sleep(Duration::from_secs(60)).await;
         };
-        let pump = tokio::spawn(super::with_device_tasks(pump, tasks));
+        let pump = tokio::spawn(super::with_device_tasks(
+            pump,
+            tasks,
+            core::future::pending(),
+            async {},
+            async {},
+        ));
         let client = NativeClient::bare(core);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), running)

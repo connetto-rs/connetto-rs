@@ -278,6 +278,9 @@ pub(crate) struct Enroller {
     commands: mpsc::UnboundedReceiver<Command>,
     published: watch::Sender<Option<DeviceCertificate>>,
     home: watch::Sender<Option<KeyHome>>,
+    /// Raised once this device's own key is revoked, so the client wipes
+    /// (R105 decision 10).
+    revoked: watch::Sender<bool>,
     /// Whether the local clock puts the held certificate outside its window
     /// (decision 29), shared with the handle so a dial reads the standing the
     /// task does (R76).
@@ -297,6 +300,8 @@ pub(crate) struct EnrolHandle {
     commands: mpsc::UnboundedSender<Command>,
     published: watch::Receiver<Option<DeviceCertificate>>,
     home: watch::Receiver<Option<KeyHome>>,
+    /// Set once the task found this device's own key revoked (R105).
+    revoked: watch::Receiver<bool>,
     #[cfg(feature = "peer")]
     /// The task's clock-off latch, its dials refusing by the window while it
     /// is set (R76).
@@ -342,6 +347,7 @@ impl Enroller {
         let (sender, commands) = mpsc::unbounded_channel();
         let (published, observed) = watch::channel(held.as_ref().map(|held| held.leaf.clone()));
         let (home, homed) = watch::channel(None);
+        let (revoked, revoked_rx) = watch::channel(false);
         let clock_off = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "peer")]
         let peer_node = peer.node.clone();
@@ -359,6 +365,7 @@ impl Enroller {
                 commands,
                 published,
                 home,
+                revoked,
                 clock_off: Arc::clone(&clock_off),
                 #[cfg(feature = "peer")]
                 peer_serving,
@@ -370,6 +377,7 @@ impl Enroller {
                 commands: sender,
                 published: observed,
                 home: homed,
+                revoked: revoked_rx,
                 #[cfg(feature = "peer")]
                 clock_off,
                 #[cfg(feature = "peer")]
@@ -435,6 +443,15 @@ impl EnrolHandle {
     /// Delete the device key wherever it is held.
     pub(crate) async fn delete_key(&self) -> Result<(), ClientError> {
         self.keys.delete().await
+    }
+
+    /// Resolves once the task found this device's own key revoked, and never
+    /// when the task ended without it.
+    pub(crate) async fn revoked(&self) {
+        let mut revoked = self.revoked.clone();
+        if revoked.wait_for(|revoked| *revoked).await.is_err() {
+            core::future::pending::<()>().await;
+        }
     }
 
     /// Where the device's peer listener binds, once the task serves (R76).
@@ -996,8 +1013,9 @@ impl<L: Link> Run<L> {
         self.peer_stop(CloseReason::Withdrawn);
     }
 
-    /// Delete the key and certificate of a revoked device and say so
-    /// (lifecycle row "Refused as revoked").
+    /// Delete the key and certificate of a revoked device and hand the rest
+    /// of the wipe to the client, which closes, wipes and says so (lifecycle
+    /// row "Refused as revoked", R105 decision 10).
     async fn revoked(&mut self) {
         if let Err(err) = self.enroller.keys.delete().await {
             tracing::warn!(error = %err, "the revoked device key could not be deleted");
@@ -1009,9 +1027,9 @@ impl<L: Link> Run<L> {
         self.enroller.home.send_replace(None);
         self.held = None;
         self.publish();
-        self.link.emit(ClientEvent::DeviceRevoked);
         #[cfg(feature = "peer")]
         self.peer_stop(CloseReason::Revoked);
+        self.enroller.revoked.send_replace(true);
     }
 
     /// Delete the key and certificate of a retired writer, keeping the

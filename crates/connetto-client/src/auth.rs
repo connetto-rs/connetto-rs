@@ -655,11 +655,20 @@ impl NativeAuthenticator {
     }
 
     /// The account whose stored credential this authenticator addresses.
-    fn account(&self) -> Option<String> {
+    pub(crate) fn account(&self) -> Option<String> {
         self.account
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Clear the stored credential without asking the server, for a session
+    /// the server already ended (R105 decision 10). Idempotent.
+    pub(crate) async fn forget_credential(&self) -> Result<(), ClientError> {
+        match self.account() {
+            Some(account) => self.store.clear(&account).await,
+            None => Ok(()),
+        }
     }
 
     /// A silent-refresh [`AccessTokenSource`] for

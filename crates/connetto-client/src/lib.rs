@@ -156,6 +156,7 @@ pub use replica::{
     Encrypted, IDENTITY_RECORD, InMemory, Replica, ReplicaStorage, Tier, decode_identity,
     device_key_record, encode_identity, is_reserved_record, replica_db_name, shared_store_name,
 };
+pub use teardown::WipePart;
 
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.
 const ZSTD_LEVEL: i32 = 3;
@@ -265,6 +266,12 @@ pub enum ClientError {
     #[cfg(feature = "device-identity")]
     #[error("the device descriptor cannot be sent: {0}")]
     DeviceDescriptor(String),
+    /// A device wipe a revoked key left pending could not complete at this
+    /// start, so nothing was opened (R105 decision 10). The start completes
+    /// it once every part can run.
+    #[cfg(feature = "native-auth")]
+    #[error("a pending device wipe could not complete: {0}")]
+    WipePending(Box<teardown::ForgetIncomplete>),
     /// An Android build with a device identity connected without the JNI
     /// access its key needs, which `NativeDurable::with_java_access` hands in
     /// (R74 decision 20).
@@ -1269,9 +1276,18 @@ pub enum ClientEvent {
         /// The ceiling granted instead, which later renewals ask for.
         ceiling: Duration,
     },
-    /// The server refused this device's key as revoked, so the key and its
-    /// certificate are deleted and the device holds no identity (R74).
-    DeviceRevoked,
+    /// This device's own key was revoked, so the device wiped itself (R74,
+    /// R105 decision 10): the device key and its certificate, the stored
+    /// credential, the replica with its key and share keys, and the
+    /// application's own content through its
+    /// [`with_device_wipe`](crate::NativeDurable::with_device_wipe) callback.
+    /// Writes the server had not acknowledged are lost. The client is closed
+    /// and holds no identity. `failed` names the parts that did not stand,
+    /// which the next start completes before it opens anything.
+    DeviceRevoked {
+        /// The parts of the wipe that failed, empty when it all stood.
+        failed: Vec<WipePart>,
+    },
     /// The root revoked the issuer of this device's certificate, so peers
     /// refuse it. The certificate is deleted, the key kept, and the device
     /// enrols the key again on its next connection (R74 decision 24).

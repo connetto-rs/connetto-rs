@@ -652,8 +652,10 @@ fn pump_event(event: ClientEvent, fatal: &tokio::sync::mpsc::UnboundedSender<Str
         ClientEvent::CertificateExpired => {
             fatal_line("the device certificate is expired".to_owned());
         }
-        ClientEvent::DeviceRevoked => {
-            fatal_line("the device was revoked".to_owned());
+        ClientEvent::DeviceRevoked { failed } => {
+            fatal_line(format!(
+                "the device was revoked and wiped, failed parts {failed:?}"
+            ));
         }
         ClientEvent::CertificateWithdrawn => {
             fatal_line("the device certificate was withdrawn".to_owned());
