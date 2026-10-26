@@ -3925,6 +3925,17 @@ where
             }
             WriterRequest::Device => {}
         }
+        // An identified session records every writer it binds, so its writes
+        // are told from another login's on the same writer (R105 decision 6).
+        // An anonymous number already carries its run.
+        if principal.identity().is_some()
+            && let Some(row) = &writer_row
+        {
+            self.target
+                .record_bind(session_id.as_uuid(), row.writer, row.frontier)
+                .await
+                .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        }
         if let (Some(settled_through), Some(row)) = (handshake.settled_through, &writer_row) {
             self.target
                 .prune_settled(row.writer, settled_through)
@@ -5461,6 +5472,10 @@ where
         if row.retired_at.is_some() {
             return Ok(BindVerdict::Writer(WriterOutcome::Retired));
         }
+        self.target
+            .record_bind(state.session_id.as_uuid(), row.writer, row.frontier)
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
         // A bind after a number switches the connection to the device writer.
         state.writer_row = Some(row.clone());
         state.indeterminate = None;

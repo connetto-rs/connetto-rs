@@ -87,7 +87,10 @@ async fn write_lands_under_rls_and_fans_out_over_cdc() {
         .await;
     connetto_test_harness::provision_writers(fixture.admin()).await;
     fixture
-        .exec("GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_writer")
+        .exec(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+         _connetto_session_writers TO app_writer",
+        )
         .await;
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
     let snapshot =

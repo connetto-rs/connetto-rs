@@ -174,7 +174,8 @@ async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, user_id: &str) {
         OWNED_PG_DDL,
         "GRANT USAGE ON SCHEMA public TO app_reader",
         "GRANT SELECT ON owned TO app_reader",
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+         _connetto_session_writers TO app_reader",
     ] {
         exec(pool, stmt).await;
     }
@@ -1415,7 +1416,8 @@ async fn seed_no_rls_orders(pool: &Pool<AsyncPgConnection>) {
         PG_DDL,
         "GRANT USAGE ON SCHEMA public TO app_reader",
         "GRANT SELECT ON orders TO app_reader",
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+         _connetto_session_writers TO app_reader",
     ] {
         exec(pool, stmt).await;
     }

@@ -58,6 +58,23 @@ diesel::define_sql_function! {
     fn set_config(name: Text, value: Text, is_local: Bool) -> Text;
 }
 
+/// Bind a write's writer and sequence under `W`'s settings for the rest of
+/// the transaction, so the deployment stamps the rows it writes (R105
+/// decision 6).
+pub(crate) async fn bind_writer<W: crate::writer_schema::ConnettoWriterSchema>(
+    conn: &mut AsyncPgConnection,
+    writer: i64,
+    seq: i64,
+) -> diesel::QueryResult<()> {
+    diesel::select((
+        set_config(W::WRITER_SETTING, writer.to_string(), true),
+        set_config(W::SEQ_SETTING, seq.to_string(), true),
+    ))
+    .execute(conn)
+    .await
+    .map(drop)
+}
+
 /// Render the caller for a transaction or a ticket: the identity, the share
 /// keys packed by the deployment's [`CapabilityKey`], and the bot list the
 /// caller's connection binds.

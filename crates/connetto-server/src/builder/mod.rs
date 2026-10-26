@@ -16,6 +16,7 @@ mod ws;
 use std::fmt;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::ops::RangeInclusive;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -48,6 +49,7 @@ use crate::session::{
 use crate::throttle::ThrottleConfig;
 use crate::writer_schema::ConnettoWriterSchema;
 use connetto_core::auth::{CapabilityKey, DEFAULT_USER_SETTING};
+use connetto_core::device_cert::KeyId;
 use connetto_core::messages::{ContentVerb, FatalErrorReason};
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority};
 use connetto_core::{CALLER_FUNCTION, SUBJECTS_FUNCTION, SchemaVersion};
@@ -723,6 +725,20 @@ impl<Id, RowKey> Ended<Id, RowKey> {
     }
 }
 
+/// One writer a session wrote as (R105 decision 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionWrites {
+    /// The writer's server-issued number.
+    pub writer: u64,
+    /// The device key the writer is, absent for a number writer.
+    pub device: Option<KeyId>,
+    /// Whether the writer has retired.
+    pub retired: bool,
+    /// The sequences the session settled under the writer, absent when it
+    /// settled none.
+    pub seqs: Option<RangeInclusive<u64>>,
+}
+
 /// Why a session surface could not answer.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionsError {
@@ -738,6 +754,9 @@ pub enum SessionsError {
     /// What the ended sessions left behind could not be read.
     #[error("reading what the ended sessions left behind: {0}")]
     LeftBehind(String),
+    /// The writer tables could not be read.
+    #[error("reading the writers a session wrote as: {0}")]
+    Writers(String),
 }
 
 impl<D> ServerHandle<D>
@@ -881,6 +900,57 @@ where
     ) -> Result<Ended<D::Id, RowKey<D>>, SessionsError> {
         let ended = self.service.end_sessions(user, Some(current)).await?;
         self.left_behind(user, ended).await
+    }
+
+    /// Every writer `session` wrote as, each with the sequences it settled
+    /// under that writer, so the application finds the rows one login wrote
+    /// among another's on the same writer and decides what undoing means
+    /// (R105 decision 6). A session's sequences on a writer run from its
+    /// first bind to just before the next session's bind of that writer, or
+    /// to the writer's frontier. A deployment stamping its rows with the
+    /// writer and sequence a write binds finds them by that range. Empty
+    /// when the session bound no writer.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionsError::Writers`] when the writer tables cannot be read.
+    pub async fn writes_of(&self, session: SessionId) -> Result<Vec<SessionWrites>, SessionsError> {
+        let failed = |err: &dyn fmt::Display| SessionsError::Writers(err.to_string());
+        let mut conn = self.pool.get().await.map_err(|err| failed(&err))?;
+        let binds = <D::Writers as ConnettoWriterSchema>::binds_of(&mut conn, session.as_uuid())
+            .await
+            .map_err(|err| failed(&err))?;
+        Ok(binds
+            .iter()
+            .filter(|bind| bind.session_id == *session.as_uuid())
+            .map(|own| {
+                let next = binds
+                    .iter()
+                    .filter(|other| {
+                        other.writer.writer == own.writer.writer
+                            && other.session_id != own.session_id
+                            && other.bound_at > own.bound_at
+                    })
+                    .map(|other| other.first_seq)
+                    .min();
+                let last = next.map_or(own.writer.frontier, |first| first - 1);
+                SessionWrites {
+                    writer: u64::try_from(own.writer.writer).unwrap_or(0),
+                    device: own
+                        .writer
+                        .device_key
+                        .as_deref()
+                        .and_then(|key| <[u8; 32]>::try_from(key).ok())
+                        .map(KeyId::from_bytes),
+                    retired: own.writer.retired_at.is_some(),
+                    seqs: (last >= own.first_seq)
+                        .then(|| {
+                            Some(u64::try_from(own.first_seq).ok()?..=u64::try_from(last).ok()?)
+                        })
+                        .flatten(),
+                }
+            })
+            .collect())
     }
 
     /// The share keys `sessions` minted and every installation `user` owns,
