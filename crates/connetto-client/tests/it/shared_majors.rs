@@ -3,6 +3,7 @@
 use connetto_client::{
     ClientBuilder, ClientError, ConnettoConnection, DataDir, MemoryRefreshStore, SyncSchema,
 };
+use connetto_core::Major;
 use connetto_core::schema::{SchemaBundle, SharedLayout};
 use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::ReplicaKeyStore;
@@ -677,5 +678,627 @@ async fn a_pre_major_queue_is_adopted_without_losing_its_bytes_or_writer_frontie
             .map(|entry| entry.major)
             .collect::<Vec<_>>(),
         [None, Some(1)],
+    );
+}
+
+/// The `main` DDL and queue, for a refusal the standard snapshot cannot
+/// take, because the queue no longer holds a column it projects.
+fn main_dump(db: &mut SqliteConnection) -> Vec<String> {
+    let mut rows = texts(
+        db,
+        "SELECT type || ' ' || name || ' ' || COALESCE(sql, '') AS text FROM main.sqlite_master ORDER BY type, name",
+    );
+    rows.extend(texts(
+        db,
+        "SELECT writer || ' ' || seq AS text FROM _connetto_pending ORDER BY position",
+    ));
+    rows.extend(texts(db, "SELECT label AS text FROM notes"));
+    rows
+}
+
+/// A replica that records the previous build and holds one write queued
+/// under it, so an open at the current one rebuilds it in place.
+async fn behind(directory: &std::path::Path, keys: &SharedKeys) -> SqliteConnection {
+    let mut db = seed(directory, keys, "account", schema(2), true).await;
+    set_state(&mut db, "main", State::Behind, schema(1).version().hash());
+    db
+}
+
+/// A stamped replica with its record erased, so a reopen restamps it.
+async fn unrecorded(directory: &std::path::Path, keys: &SharedKeys) -> SqliteConnection {
+    let mut db = seed(directory, keys, "account", schema(2), true).await;
+    db.batch_execute("PRAGMA main.user_version = 0").unwrap();
+    db
+}
+
+/// A rebuild that cannot read the queue's capture major is refused, and the
+/// file stands as it was.
+#[tokio::test]
+async fn a_rebuild_that_cannot_read_the_queue_capture_major_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = behind(directory.path(), &keys).await;
+    db.batch_execute("ALTER TABLE _connetto_pending DROP COLUMN major")
+        .unwrap();
+    let before = main_dump(&mut db);
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose queue lost its capture major");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        main_dump(&mut db),
+        before,
+        "the refusal left the file untouched"
+    );
+}
+
+/// A queued write that no longer parses is refused by the rebuild, and both
+/// files stand as they were.
+#[tokio::test]
+async fn a_rebuild_that_cannot_parse_a_queued_write_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = behind(directory.path(), &keys).await;
+    db.batch_execute("UPDATE _connetto_pending SET changeset = X'FF00FF'")
+        .unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose queued write no longer parses");
+    };
+    assert!(
+        matches!(error, ClientError::Apply(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A rename record of the wrong shape is refused by the rebuild.
+#[tokio::test]
+async fn a_rebuild_that_cannot_read_the_rename_record_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = behind(directory.path(), &keys).await;
+    db.batch_execute(
+        "DROP TABLE _connetto_build_renames; CREATE TABLE _connetto_build_renames (a INTEGER); INSERT INTO _connetto_build_renames VALUES (1)",
+    ).unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose rename record lost its columns");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A queue that lost its changesets is refused by the rebuild.
+#[tokio::test]
+async fn a_rebuild_that_cannot_read_the_queued_changesets_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = behind(directory.path(), &keys).await;
+    db.batch_execute("ALTER TABLE _connetto_pending DROP COLUMN changeset")
+        .unwrap();
+    let before = main_dump(&mut db);
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose queue lost its changesets");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        main_dump(&mut db),
+        before,
+        "the refusal left the file untouched"
+    );
+}
+
+/// A held write the rebuild cannot rewrite is refused, and the write stands
+/// as it was captured.
+#[tokio::test]
+async fn a_rebuild_that_cannot_rewrite_a_held_write_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = behind(directory.path(), &keys).await;
+    db.batch_execute(
+        "CREATE TRIGGER block_rebuild_update BEFORE UPDATE ON _connetto_pending BEGIN SELECT RAISE(ABORT, 'the held write stays as captured'); END;",
+    ).unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose held write cannot be rewritten");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the held write stands as captured"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A rebuild that cannot record its held batch is refused.
+#[tokio::test]
+async fn a_rebuild_that_cannot_record_its_held_batch_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = behind(directory.path(), &keys).await;
+    db.batch_execute(
+        "CREATE TABLE _connetto_held_batch (major INTEGER PRIMARY KEY, version BLOB NOT NULL); CREATE TRIGGER block_held_batch BEFORE INSERT ON _connetto_held_batch BEGIN SELECT RAISE(ABORT, 'the held batch cannot be recorded'); END;",
+    ).unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose held batch cannot be recorded");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A rebuild that cannot create its held batch is refused.
+#[tokio::test]
+async fn a_rebuild_that_cannot_create_its_held_batch_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = behind(directory.path(), &keys).await;
+    db.batch_execute(
+        "CREATE TABLE _main_hold (a INTEGER PRIMARY KEY); CREATE INDEX _connetto_held_batch ON _main_hold(a)",
+    ).unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose held batch cannot be created");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A replica that cannot create its build record is refused by the restamp.
+#[tokio::test]
+async fn a_replica_that_cannot_create_its_build_record_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = unrecorded(directory.path(), &keys).await;
+    db.batch_execute(
+        "DROP TABLE _connetto_build; CREATE TABLE _main_hold (a INTEGER PRIMARY KEY); CREATE INDEX _connetto_build ON _main_hold(a)",
+    ).unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose build record cannot be created");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A replica whose build record cannot be stamped is refused by the restamp.
+#[tokio::test]
+async fn a_replica_that_cannot_stamp_its_build_record_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = unrecorded(directory.path(), &keys).await;
+    db.batch_execute(
+        "DELETE FROM _connetto_build WHERE id = 1; CREATE TRIGGER block_build_stamp BEFORE INSERT ON _connetto_build BEGIN SELECT RAISE(ABORT, 'the build record cannot be stamped'); END;",
+    ).unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose build record cannot be stamped");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A replica whose rename record cannot be cleared is refused by the
+/// restamp.
+#[tokio::test]
+async fn a_replica_that_cannot_clear_its_rename_record_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = unrecorded(directory.path(), &keys).await;
+    db.batch_execute(
+        "CREATE TRIGGER block_rename_clear BEFORE DELETE ON _connetto_build_renames BEGIN SELECT RAISE(ABORT, 'the rename record cannot be cleared'); END;",
+    ).unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose rename record cannot be cleared");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A replica whose rename record cannot be written is refused by the
+/// restamp.
+#[tokio::test]
+async fn a_replica_that_cannot_write_its_rename_record_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = unrecorded(directory.path(), &keys).await;
+    db.batch_execute(
+        "CREATE TRIGGER block_rename_stamp BEFORE INSERT ON _connetto_build_renames BEGIN SELECT RAISE(ABORT, 'the rename record cannot be written'); END;",
+    ).unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose rename record cannot be written");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A shared cache that records a major and no build row beside it is
+/// refused by name.
+#[tokio::test]
+async fn a_shared_record_missing_its_build_row_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = seed(directory.path(), &keys, "account", schema(2), true).await;
+    db.batch_execute(
+        "DELETE FROM connetto_shared._connetto_build WHERE id = 1; PRAGMA connetto_shared.user_version = 2",
+    ).unwrap();
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a shared cache recording a major without its build row");
+    };
+    let ClientError::ReplicaRecordMissing { recorded } = error else {
+        panic!("wrong refusal: {error:?}");
+    };
+    assert_eq!(recorded, Major::new(2).unwrap());
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A shared cache whose build record carries no hash or generation is
+/// refused by name.
+#[tokio::test]
+async fn a_shared_record_with_null_build_fields_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = seed(directory.path(), &keys, "account", schema(2), true).await;
+    db.batch_execute(
+        "DROP TABLE connetto_shared._connetto_build; CREATE TABLE connetto_shared._connetto_build (id INTEGER PRIMARY KEY CHECK (id = 1), version BLOB, generation BLOB); INSERT INTO connetto_shared._connetto_build VALUES (1, NULL, NULL); PRAGMA connetto_shared.user_version = 2",
+    ).unwrap();
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a shared cache whose build record carries no fields");
+    };
+    let ClientError::ReplicaRecordMissing { recorded } = error else {
+        panic!("wrong refusal: {error:?}");
+    };
+    assert_eq!(recorded, Major::new(2).unwrap());
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A shared cache that cannot create its build record is refused by the
+/// restamp.
+#[tokio::test]
+async fn a_shared_cache_that_cannot_create_its_build_record_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = seed(directory.path(), &keys, "account", schema(2), true).await;
+    db.batch_execute(
+        "CREATE TABLE connetto_shared._shared_hold (a INTEGER PRIMARY KEY); DROP TABLE connetto_shared._connetto_build; CREATE INDEX connetto_shared._connetto_build ON _shared_hold(a); PRAGMA connetto_shared.user_version = 0",
+    ).unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a shared cache whose build record cannot be created");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A shared cache whose build record cannot be stamped is refused by the
+/// restamp.
+#[tokio::test]
+async fn a_shared_cache_that_cannot_stamp_its_build_record_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = seed(directory.path(), &keys, "account", schema(2), true).await;
+    db.batch_execute(
+        "DELETE FROM connetto_shared._connetto_build WHERE id = 1; DROP TABLE connetto_shared._connetto_build; CREATE TABLE connetto_shared._connetto_build (id INTEGER PRIMARY KEY CHECK (id = 2), version BLOB NOT NULL, generation BLOB NOT NULL); PRAGMA connetto_shared.user_version = 0",
+    ).unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a shared cache whose build record cannot be stamped");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the shared build record stands as it was"
+    );
+}
+
+/// A replica that cannot create its generation record is refused by the
+/// reopen.
+#[tokio::test]
+async fn a_replica_that_cannot_create_its_generation_record_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = seed(directory.path(), &keys, "account", schema(2), true).await;
+    db.batch_execute(
+        "DROP TABLE _connetto_shared_generation; CREATE TABLE _main_hold (a INTEGER PRIMARY KEY); CREATE INDEX _connetto_shared_generation ON _main_hold(a); PRAGMA connetto_shared.user_version = 0",
+    ).unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose generation record cannot be created");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A generation record of the wrong shape is refused by the reopen.
+#[tokio::test]
+async fn a_replica_that_cannot_read_its_generation_record_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = seed(directory.path(), &keys, "account", schema(2), true).await;
+    db.batch_execute(
+        "DROP TABLE _connetto_shared_generation; CREATE TABLE _connetto_shared_generation (id INTEGER PRIMARY KEY CHECK (id = 1), other BLOB); INSERT INTO _connetto_shared_generation VALUES (1, X'00')",
+    ).unwrap();
+    let before_main = main_dump(&mut db);
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose generation record lost its column");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        main_dump(&mut db),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A replica whose resume state cannot be cleared is refused by the reopen.
+#[tokio::test]
+async fn a_replica_that_cannot_clear_its_resume_state_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = seed(directory.path(), &keys, "account", schema(2), true).await;
+    db.batch_execute(
+        "CREATE TRIGGER block_resume_clear BEFORE DELETE ON _connetto_meta BEGIN SELECT RAISE(ABORT, 'the resume state cannot be cleared'); END; DELETE FROM _connetto_shared_generation WHERE id = 1",
+    ).unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose resume state cannot be cleared");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
+    );
+}
+
+/// A replica whose generation record cannot be written is refused by the
+/// reopen.
+#[tokio::test]
+async fn a_replica_that_cannot_write_its_generation_record_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut db = seed(directory.path(), &keys, "account", schema(2), true).await;
+    db.batch_execute(
+        "DELETE FROM _connetto_shared_generation WHERE id = 1; CREATE TRIGGER block_generation_stamp BEFORE INSERT ON _connetto_shared_generation BEGIN SELECT RAISE(ABORT, 'the generation record cannot be written'); END;",
+    ).unwrap();
+    let before_main = snapshot(&mut db, "main");
+    let before_shared = snapshot(&mut db, "connetto_shared");
+    drop(db);
+    let Err(error) = open(directory.path(), &keys, "account", schema(2)).await else {
+        panic!("opened a replica whose generation record cannot be written");
+    };
+    assert!(
+        matches!(error, ClientError::Db(_)),
+        "wrong refusal: {error:?}"
+    );
+    let mut db = raw(directory.path(), &keys, "account", true).await;
+    assert_eq!(
+        snapshot(&mut db, "main"),
+        before_main,
+        "the refusal left main untouched"
+    );
+    assert_eq!(
+        snapshot(&mut db, "connetto_shared"),
+        before_shared,
+        "the refusal left the shared cache untouched"
     );
 }
