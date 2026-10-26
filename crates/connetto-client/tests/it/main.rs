@@ -73,6 +73,8 @@ mod never_synced;
 
 mod offline_start;
 
+mod outbox;
+
 #[cfg(feature = "native-auth")]
 mod pump_fault;
 

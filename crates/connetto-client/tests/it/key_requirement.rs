@@ -112,23 +112,20 @@ fn a_unique_constraint_without_a_primary_key_is_refused() {
     );
 }
 
-/// The capture session covers tables created after it exists, so a table
-/// created mid-run is caught at the next write rather than at the next
-/// restart, which is where the loss would otherwise be unbounded.
+/// A synced table the application creates mid-run goes through
+/// `change_schema`, which refuses an unkeyed one as it is created rather than
+/// at the next write or the next restart, where the loss would otherwise be
+/// unbounded.
 #[tokio::test]
-async fn a_table_created_after_open_is_caught_at_the_next_write() {
+async fn a_table_created_after_open_is_refused_as_it_is_created() {
     let mut conn = ClientBuilder::new(
         super::support::bundle(KEYED_DDL),
         super::support::NeverDial::<FakeTransport>::default(),
     )
     .open_driven()
     .expect("open the replica");
-    conn.batch_execute("CREATE TABLE later (body TEXT)")
-        .expect("the application creates its own table");
-    conn.batch_execute("INSERT INTO later (body) VALUES ('lost')")
-        .expect("and writes to it");
 
-    let tables = refused(conn.push().await);
+    let tables = refused(conn.change_schema("CREATE TABLE later (body TEXT)"));
     assert!(
         tables.iter().any(|refusal| refusal.contains("later")),
         "names the table created mid-run: {tables:?}"

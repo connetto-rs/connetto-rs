@@ -3,11 +3,12 @@
 
 use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, ConnettoClient, DataDir, MemoryRefreshStore,
-    SyncStatus,
+    SyncSchema, SyncStatus,
 };
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, LivePatch,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -21,7 +22,10 @@ use tempfile::tempdir;
 
 use super::support::handshake_ack as ack;
 
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
+const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
 const BOUND: Duration = Duration::from_secs(5);
 
 diesel::table! {
@@ -129,7 +133,17 @@ async fn client() -> (
     let credential = super::support::held("tester");
     let key_store = super::support::key_store(&credential).await;
     let (running, pump) = ClientBuilder::new(
-        super::support::bundle(DDL),
+        SyncSchema::new(
+            SchemaBundle::new(
+                SOURCE,
+                "",
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+                Some(TIER_DDL),
+            )
+            .expect("the source declares major 1"),
+        ),
         super::support::Once::new(script.clone()),
     )
     .signed_in(credential)
@@ -261,10 +275,10 @@ async fn a_fault_that_stops_the_pump_is_announced_and_releases_waiting_handles()
         .expect("close returns at once after the stop");
 }
 
-/// A table without a primary key is created mid-run, so the next auto-submit
-/// refuses to upload anything. The fault is caught on the drain side, before
-/// the pump step, and still announces the stop, closes the transport, and
-/// releases the live handle.
+/// A table without a primary key is created mid-run in the device-private
+/// tier, so the next auto-submit refuses to upload anything. The fault is
+/// caught on the drain side, before the pump step, and still announces the
+/// stop, closes the transport, and releases the live handle.
 #[tokio::test]
 async fn a_local_fault_on_the_drain_side_stops_the_pump_the_same_way() {
     let (client, script, _dir, _pump) = client().await;
@@ -285,8 +299,11 @@ async fn a_local_fault_on_the_drain_side_stops_the_pump_the_same_way() {
         .expect("the write lands locally");
     client
         .with_conn(|conn| {
-            SimpleConnection::batch_execute(conn.conn(), "CREATE TABLE loose (label TEXT)")
-                .expect("the application creates its own table");
+            SimpleConnection::batch_execute(
+                conn.conn(),
+                "CREATE TABLE connetto_local.loose (label TEXT)",
+            )
+            .expect("the application creates its own table");
         })
         .await
         .expect("the table lands locally");

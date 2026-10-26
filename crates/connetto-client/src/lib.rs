@@ -88,6 +88,7 @@ mod majors;
 mod memory_stores;
 #[cfg(all(feature = "peer", target_os = "android"))]
 mod multicast;
+mod outbox;
 pub mod reconnect;
 mod replay;
 pub mod replica;
@@ -3791,6 +3792,9 @@ pub struct ConnettoConnection<T: Transport> {
     /// [`connetto_core::WRITE_EXEMPTION_FUNCTION`], so the translated schema's fail-closed
     /// write guards admit connetto's own writes and nobody else's.
     write_exempt: Arc<AtomicBool>,
+    /// Raised while [`change_schema`](Self::change_schema) runs, the only time
+    /// the authorizer admits DDL on an application table in `main`.
+    schema_open: Arc<AtomicBool>,
     /// Names of tables whose rows changed since the last drain, from the
     /// connection's update hook (local writes and server patches alike).
     changed: Arc<Mutex<HashSet<String>>>,
@@ -3967,6 +3971,7 @@ fn install_replica_metadata(
     // A rowid-only table records nothing, so a write to one uploads nothing and reports success (R62).
     check_recorded_tables(db, "main", &config.unrecorded_tables)?;
     db.batch_execute(META_DDL)?;
+    db.batch_execute(outbox::OUTBOX_DDL)?;
     for ddl in [
         "ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB",
         "ALTER TABLE _connetto_pending ADD COLUMN major INTEGER",
@@ -4235,6 +4240,12 @@ where
         let apply_staging: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let apply_counting = Arc::new(AtomicBool::new(false));
         let dirty = Arc::new(AtomicBool::new(false));
+        // The sessions still build the upload, so writes a previous run left
+        // in the outbox were lost with that run's sessions and go with them.
+        outbox::install(&mut db)?;
+        outbox::clear(&mut db)?;
+        let schema_open = Arc::new(AtomicBool::new(false));
+        outbox::guard_schema(&mut db, &schema_open);
         // The store is attached exactly when the build shares tables.
         let write_order = config
             .shared_layout
@@ -4289,6 +4300,7 @@ where
             retired_keys,
             dirty,
             write_exempt,
+            schema_open,
             changed,
             applied_rows,
             apply_counting,
@@ -5265,13 +5277,15 @@ where
     }
 
     /// Atomically appends an entry captured under `major`, its position and
-    /// its writer frontier.
+    /// its writer frontier, deleting the outbox's records through
+    /// `recorded_through`, the writes the entry carries.
     fn append_entry(
         &mut self,
         writer: &WriterRef,
         changeset: &[u8],
         provenance: Option<Provenance>,
         major: Option<Major>,
+        recorded_through: Option<i64>,
     ) -> Result<u64, ClientError> {
         let position = self.next_position;
         let (seq, head) = match self.writers.get(writer) {
@@ -5290,6 +5304,9 @@ where
         self.db.transaction::<(), ClientError, _>(|db| {
             persist_writer_state(db, writer, seq + 1, &hash)?;
             persist_pending(db, writer, seq, &entry.record())?;
+            if let Some(last) = recorded_through {
+                outbox::clear_through(db, last)?;
+            }
             Ok(())
         })?;
         let queue = self
@@ -6340,8 +6357,30 @@ where
 
     /// The application's local connection, for ordinary diesel reads and writes.
     /// Writes here are captured for upload on the next [`push`](Self::push).
+    /// `CREATE`, `ALTER` and `DROP` of a synced table are refused here and go
+    /// through [`change_schema`](Self::change_schema).
     pub const fn conn(&mut self) -> &mut SqliteConnection {
         &mut self.db
+    }
+
+    /// Run `sql`, DDL that creates, alters or drops synced tables, and
+    /// recreate the outbox triggers in the same transaction, so every write
+    /// to the changed tables is recorded from the first.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the DDL fails or the catalog cannot be read, and
+    /// [`ClientError::WritesNotRecorded`] when it leaves a synced table
+    /// connetto cannot record changes to. Nothing changes on any error.
+    pub fn change_schema(&mut self, sql: &str) -> Result<(), ClientError> {
+        let unrecorded = &self.config.unrecorded_tables;
+        let _open = outbox::SchemaWindow::new(&self.schema_open);
+        self.db.transaction(|db| {
+            outbox::drop_triggers(db)?;
+            db.batch_execute(sql)?;
+            check_recorded_tables(db, "main", unrecorded)?;
+            outbox::install(db)
+        })
     }
 
     /// The highest resume cursor applied so far, if any.
@@ -6744,7 +6783,7 @@ where
                     seq: entry.seq,
                 })
             });
-            self.append_entry(&target, &entry.changeset, provenance, entry.major)?;
+            self.append_entry(&target, &entry.changeset, provenance, entry.major, None)?;
             restored += 1;
         }
         Ok(restored)
@@ -7389,11 +7428,23 @@ where
     pub async fn push(&mut self) -> Result<Option<u64>, ClientError> {
         self.recheck_changed_schemas()?;
         let changeset = self.session.changeset()?;
+        #[cfg(debug_assertions)]
+        outbox::assert_matches(&mut self.db, &changeset)?;
+        let recorded_through = outbox::last_seq(&mut self.db)?;
         if changeset.is_empty() {
+            if let Some(last) = recorded_through {
+                outbox::clear_through(&mut self.db, last)?;
+            }
             return Ok(None);
         }
         let writer = self.choose_writer();
-        let seq = self.append_entry(&writer, &changeset, None, self.config.schema_major)?;
+        let seq = self.append_entry(
+            &writer,
+            &changeset,
+            None,
+            self.config.schema_major,
+            recorded_through,
+        )?;
         // Reset capture: fresh sessions record only writes after this push.
         self.session.reset(&mut self.db)?;
         // With no server the write stays queued, which is the designed offline
@@ -8827,14 +8878,14 @@ mod tests {
             .expect("local write");
         let changeset = conn.session.changeset().expect("capture the write");
         let first = conn
-            .append_entry(&writer, &changeset, None, None)
+            .append_entry(&writer, &changeset, None, None, None)
             .expect("queue the write");
         conn.db
             .batch_execute("INSERT INTO t (id) VALUES (2)")
             .expect("second local write");
         let changeset = conn.session.changeset().expect("capture the second write");
         let second = conn
-            .append_entry(&writer, &changeset, None, None)
+            .append_entry(&writer, &changeset, None, None, None)
             .expect("queue the second write");
         // A deferral whose writes went out again after its schedule had grown.
         let mut episode = RESEND_POLICY.start();
