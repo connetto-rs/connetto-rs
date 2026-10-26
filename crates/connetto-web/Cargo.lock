@@ -2257,7 +2257,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#4f74d3c29e223e39782b2abc18e7fcea25ddfae9"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#829374dfd6469b189f1e1b79906e8092ad67634a"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -2270,7 +2270,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#4f74d3c29e223e39782b2abc18e7fcea25ddfae9"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#829374dfd6469b189f1e1b79906e8092ad67634a"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -2725,7 +2725,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#a1691749fc2072bc47223514dde731fa0d3165ba"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#a24b6b9b2dfd969141405f6c48e5ae0c1ea6e08b"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -2780,7 +2780,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#594bb046b03ccf9463b00a5906b4ed8e2f2978a6"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#72ce6a8c34f8e2fd9c467be4c6f71093de4d7458"
 dependencies = [
  "log",
  "recursive",
@@ -2791,7 +2791,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.2.1"
-source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#4e8ea6b2214f3d2471453af47281e93b8d16bd20"
+source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#d335d07f39faed13da5838c80dd807a881118171"
 dependencies = [
  "seahash",
  "sqlparser",
@@ -2801,7 +2801,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#594bb046b03ccf9463b00a5906b4ed8e2f2978a6"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#72ce6a8c34f8e2fd9c467be4c6f71093de4d7458"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2842,7 +2842,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#6e58f9cefc8fd61009f28ece9e806bd0f23dfb7b"
+source = "git+https://github.com/connetto-rs/subql?branch=main#c408fb8a78725b3cf843ce3df20a99351b0ba0c2"
 dependencies = [
  "arc-swap",
  "async-lock",

@@ -1669,9 +1669,11 @@ impl Capture {
         let session_err =
             |e: diesel_sqlite_session::SessionError| ClientError::Session(e.to_string());
         let mut main = db.create_session().map_err(session_err)?;
+        main.set_table_filter(|name| !name.starts_with("_connetto"));
         main.attach_all().map_err(session_err)?;
         let shared = if order.is_some() {
             let mut shared = db.create_session_on(SHARED_SCHEMA).map_err(session_err)?;
+            shared.set_table_filter(|name| !name.starts_with("_connetto"));
             shared.attach_all().map_err(session_err)?;
             Some(shared)
         } else {
@@ -8484,6 +8486,74 @@ mod tests {
             wait <= RESEND_POLICY.initial_backoff(),
             "the new deferral starts from the first wait"
         );
+    }
+
+    /// A write to a connetto table never becomes an upload, and the application writes beside it still do.
+    #[tokio::test]
+    async fn connetto_tables_are_never_captured() {
+        let mut config = ClientConfig::new("capture-test");
+        config.shared_layout = Some(Arc::new(connetto_core::schema::SharedLayout::new(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY); \
+                 CREATE TABLE connetto_shared.albums (id INTEGER PRIMARY KEY)",
+            "",
+            "",
+            "",
+        )));
+        config.shared_tables = HashSet::from(["albums".to_owned()]);
+        let mut conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("open in-memory replica");
+        conn.db
+            .batch_execute(
+                "CREATE TABLE _connetto_content_outbox (file_id BLOB PRIMARY KEY); \
+                 CREATE TABLE connetto_shared._connetto_content_outbox (file_id BLOB PRIMARY KEY)",
+            )
+            .expect("bookkeeping tables");
+        for (main_id, shared_id) in [(1, 2), (3, 4)] {
+            conn.db
+                .batch_execute(&format!(
+                    "INSERT INTO _connetto_content_outbox (file_id) VALUES (x'0{main_id}'); \
+                     INSERT INTO connetto_shared._connetto_content_outbox (file_id) VALUES (x'0{shared_id}')"
+                ))
+                .expect("bookkeeping writes");
+            assert_eq!(
+                conn.push().await.expect("push"),
+                None,
+                "bookkeeping uploads nothing before or after a capture reset"
+            );
+            conn.db
+                .batch_execute(&format!(
+                    "INSERT INTO t (id) VALUES ({main_id}); \
+                     INSERT INTO connetto_shared.albums (id) VALUES ({shared_id})"
+                ))
+                .expect("application writes");
+            let rows = affected_rows(
+                &conn
+                    .session
+                    .changeset()
+                    .expect("capture the application writes"),
+                conn.policy_tables(),
+            )
+            .expect("decode the capture");
+            assert_eq!(
+                rows,
+                vec![
+                    AffectedRow {
+                        table: "t".to_owned(),
+                        key: vec![KeyValue::Int(main_id)],
+                    },
+                    AffectedRow {
+                        table: "albums".to_owned(),
+                        key: vec![KeyValue::Int(shared_id)],
+                    },
+                ],
+                "both stores capture exactly their application rows"
+            );
+            assert!(
+                conn.push().await.expect("push").is_some(),
+                "the application writes upload and reset capture"
+            );
+        }
     }
 
     /// A device with a device-private tier, for the two refusals an honest

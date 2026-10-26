@@ -55,6 +55,10 @@ mod revocation;
 
 mod session_record;
 
+mod session_contract;
+
+mod session_surfaces;
+
 mod epoch;
 
 mod grants;

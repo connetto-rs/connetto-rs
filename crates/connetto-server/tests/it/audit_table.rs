@@ -30,27 +30,10 @@ async fn reset_audit_table(pool: &Pool<AsyncPgConnection>) {
     for stmt in [
         "DROP TABLE IF EXISTS auth_events".to_owned(),
         format!("DROP TYPE IF EXISTS {AUTH_OP_TYPE}"),
-        format!(
-            "CREATE TYPE {AUTH_OP_TYPE} AS ENUM (\
-                'logged_in', 'logged_out', 'session_revoked', 'token_replayed', \
-                'capability_minted', 'permission_change', 'model_change', \
-                'banned', 'ban_lifted', 'write_forked', 'write_redelivered')"
-        ),
-        format!(
-            "CREATE TABLE auth_events (\
-                at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-                session UUID NOT NULL, \
-                user_id TEXT, \
-                op {AUTH_OP_TYPE} NOT NULL, \
-                table_name TEXT, \
-                pk UUID, \
-                writer BIGINT, seq BIGINT, \
-                path connetto_settle_path, other_path connetto_settle_path, \
-                provider TEXT, issuer TEXT)"
-        ),
     ] {
         sql_query(stmt).execute(&mut conn).await.expect("ddl");
     }
+    connetto_test_harness::provision_audit(pool).await;
 }
 
 /// Every value the contract declares must survive Postgres.
@@ -71,6 +54,9 @@ async fn every_auth_op_round_trips_through_postgres() {
         AuthOp::LoggedIn,
         AuthOp::LoggedOut,
         AuthOp::SessionRevoked,
+        AuthOp::EndedByOwner,
+        AuthOp::EndedAll,
+        AuthOp::EndedOthers,
         AuthOp::TokenReplayed,
         AuthOp::CapabilityMinted,
         AuthOp::PermissionChange,
@@ -141,7 +127,8 @@ async fn a_mint_names_its_row_and_a_logout_does_not() {
                 Some("alice".to_owned()),
                 AuthOp::CapabilityMinted,
             )
-            .about_row("orders", vec![Value::Uuid(shared_row)]),
+            .about_row("orders", vec![Value::Uuid(shared_row)])
+            .about_key("key:abc"),
         ),
         &mut conn,
     )
@@ -170,6 +157,19 @@ async fn a_mint_names_its_row_and_a_logout_does_not() {
         .await
         .expect("read mint");
     assert_eq!(table_name.as_deref(), Some("orders"));
+    let subject: Option<String> = diesel_async::RunQueryDsl::get_result(
+        auth_events::table
+            .filter(auth_events::session.eq(mint_session))
+            .select(auth_events::subject),
+        &mut conn,
+    )
+    .await
+    .expect("read the minted key");
+    assert_eq!(
+        subject.as_deref(),
+        Some("key:abc"),
+        "the mint names the key it minted"
+    );
     assert_eq!(
         pk,
         Some(shared_row),

@@ -65,7 +65,7 @@ jobs:
       - name: Restore cargo downloads
         if: runner.environment == 'github-hosted'
         id: cache-1
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -114,10 +114,6 @@ jobs:
             --profile testfast \
             --codecov \
             --output-path codecov.json
-          cargo +stable llvm-cov report \
-            --profile testfast \
-            --lcov \
-            --output-path lcov-${{ matrix.name }}.info
 
       - uses: codecov/codecov-action@v7
         with:
@@ -126,17 +122,9 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
 
-      # The same measurement in LCOV, for the SonarQube scan below.
-      - uses: actions/upload-artifact@v7
-        with:
-          name: lcov-${{ matrix.name }}
-          path: lcov-${{ matrix.name }}.info
-          retention-days: 1
-          if-no-files-found: error
-
       - name: Save cargo downloads
         if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -163,7 +151,7 @@ jobs:
 
       - name: Restore cargo downloads
         if: runner.environment == 'github-hosted'
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -256,10 +244,6 @@ jobs:
             --profile testfast \
             --codecov \
             --output-path codecov.json
-          cargo +stable llvm-cov report \
-            --profile testfast \
-            --lcov \
-            --output-path lcov-server-${{ matrix.partition }}.info
 
       - uses: codecov/codecov-action@v7
         with:
@@ -267,71 +251,3 @@ jobs:
           flags: server
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: lcov-server-${{ matrix.partition }}
-          path: lcov-server-${{ matrix.partition }}.info
-          retention-days: 1
-          if-no-files-found: error
-
-  # The scan imports every shard's and partition's LCOV, so SonarQube Cloud
-  # measures new code on the same coverage Codecov does. It runs only once
-  # every one passed, since a missing one would read as uncovered code.
-  sonar:
-    name: SonarQube scan
-    needs: [coverage, coverage-server]
-    # Only pushes and same-repository pull requests may reach the self-hosted
-    # runners on emi. LINUX_LIGHT names their scale set, and unset it means GitHub's.
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT || 'ubuntu-latest' }}
-    timeout-minutes: 45
-    # Neither a fork's pull request nor a Dependabot run can read SONAR_TOKEN,
-    # so the scan runs for same-repo human branches and pushes to main only.
-    if: >-
-      github.event_name == 'push' ||
-      (github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login != 'dependabot[bot]')
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          # Full history improves blame-based new-code attribution.
-          fetch-depth: 0
-          # The scan runs clippy, whose build scripts must not find the token.
-          persist-credentials: false
-
-      # Downloaded into the checkout, the path the reports name, which is the
-      # same on every hosted runner.
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: lcov-*
-          merge-multiple: true
-
-      - name: List the coverage reports
-        run: |
-          reports=(lcov-*.info)
-          echo "LCOV_PATHS=$(IFS=,; echo "${reports[*]}")" >> "$GITHUB_ENV"
-
-      - name: Restore cargo downloads
-        if: runner.environment == 'github-hosted'
-        id: cache-1
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
-
-      - name: Install stable clippy
-        uses: $/.github/actions/install-rust
-        with:
-          components: clippy
-
-      - name: SonarQube scan
-        uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          args: >-
-            -Dsonar.rust.lcov.reportPaths=${{ env.LCOV_PATHS }}

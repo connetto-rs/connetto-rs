@@ -704,6 +704,37 @@ pub async fn provision_writers(pool: &Pool<AsyncPgConnection>) {
     exec(pool, WRITERS_DDL).await;
 }
 
+/// Reference DDL for the audit table every server records access changes in
+/// (R105 decision 5), matching `docs/architecture/08-authorization.md` and the
+/// default schema's audit member, created only where missing. It names the
+/// settle-path enum, so [`WRITERS_DDL`] runs first.
+pub const AUDIT_DDL: &str = "DO $$ BEGIN \
+    CREATE TYPE connetto_auth_op AS ENUM (\
+    'logged_in', 'logged_out', 'session_revoked', 'token_replayed', \
+    'ended_by_owner', 'ended_all', 'ended_others', \
+    'capability_minted', 'permission_change', 'model_change', \
+    'banned', 'ban_lifted', 'write_forked', 'write_redelivered'); \
+    EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
+    CREATE TABLE IF NOT EXISTS auth_events \
+    (at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+     session UUID NOT NULL, \
+     user_id TEXT, \
+     op connetto_auth_op NOT NULL, \
+     table_name TEXT, \
+     pk UUID, \
+     subject TEXT, \
+     writer BIGINT, \
+     seq BIGINT, \
+     path connetto_settle_path, \
+     other_path connetto_settle_path, \
+     provider TEXT, \
+     issuer TEXT)";
+
+/// Create the reference audit enum and table if missing, as admin.
+pub async fn provision_audit(pool: &Pool<AsyncPgConnection>) {
+    exec(pool, AUDIT_DDL).await;
+}
+
 /// The bot registry tables' DDL over the default schema's `TEXT` ids (R91),
 /// which every server requires, so the fixture creates them with the writer
 /// and epoch tables.
@@ -1042,6 +1073,7 @@ impl Fixture {
     ) -> Self {
         let admin = pool_when_ready(&admin_url).await;
         provision_writers(&admin).await;
+        provision_audit(&admin).await;
         provision_bot_tables(&admin).await;
         exec(&admin, connetto_server::epoch::EPOCH_DDL).await;
         Self {

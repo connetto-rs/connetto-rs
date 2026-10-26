@@ -184,6 +184,34 @@ pub trait AuthStore: Send + Sync {
         Output = Result<Option<SessionRecord<Self::Id, Self::Descriptor>>, AuthStoreError>,
     > + Send;
 
+    /// Every live session of `user`, oldest first: not revoked, and neither
+    /// deadline passed.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the trait spells its future's output in full, as every method beside it does"
+    )]
+    fn sessions_of(
+        &self,
+        user: &Self::Id,
+    ) -> impl Future<Output = Result<Vec<SessionRecord<Self::Id, Self::Descriptor>>, AuthStoreError>>
+    + Send;
+
+    /// Revoke `session` when it is `user`'s and not yet revoked, answering
+    /// whether it was.
+    fn end_owned(
+        &self,
+        user: &Self::Id,
+        session: SessionId,
+    ) -> impl Future<Output = Result<bool, AuthStoreError>> + Send;
+
+    /// Revoke every live session of `user` but `keep`, answering the ones it
+    /// revoked.
+    fn end_all_of(
+        &self,
+        user: &Self::Id,
+        keep: Option<SessionId>,
+    ) -> impl Future<Output = Result<Vec<SessionId>, AuthStoreError>> + Send;
+
     /// Whether the session still exists, is not revoked, and is within its
     /// absolute ceiling. This is the handshake liveness check that makes
     /// revocation authoritative.
@@ -315,6 +343,26 @@ struct StoredSession<Id> {
     refreshed_at: Option<SystemTime>,
 }
 
+impl<Id: Clone> StoredSession<Id> {
+    /// The session as its record shows it.
+    fn record(&self, session_id: SessionId) -> SessionRecord<Id, ()> {
+        SessionRecord {
+            session_id,
+            user_id: self.context.user_id.clone(),
+            provider: self.provider.clone(),
+            issuer: self.issuer.clone(),
+            description: (),
+            created_at: self.created_at,
+            refreshed_at: self.refreshed_at,
+        }
+    }
+
+    /// Whether the session is still a place someone is signed in at `now`.
+    fn live_at(&self, now: SystemTime) -> bool {
+        !self.revoked && now <= self.idle_deadline && now <= self.absolute_deadline
+    }
+}
+
 /// The store's own copy of a session's retained provider tokens, stamped with
 /// the expiry the process clock projects.
 struct RetainedRecord {
@@ -360,6 +408,7 @@ impl<
     Id: serde::Serialize
         + serde::de::DeserializeOwned
         + Clone
+        + PartialEq
         + core::fmt::Display
         + Send
         + Sync
@@ -419,15 +468,63 @@ impl<
         session_id: SessionId,
     ) -> Result<Option<SessionRecord<Id, ()>>, AuthStoreError> {
         let sessions = self.sessions.lock().expect("auth store lock");
-        Ok(sessions.get(&session_id).map(|stored| SessionRecord {
-            session_id,
-            user_id: stored.context.user_id.clone(),
-            provider: stored.provider.clone(),
-            issuer: stored.issuer.clone(),
-            description: (),
-            created_at: stored.created_at,
-            refreshed_at: stored.refreshed_at,
-        }))
+        Ok(sessions
+            .get(&session_id)
+            .map(|stored| stored.record(session_id)))
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn sessions_of(&self, user: &Id) -> Result<Vec<SessionRecord<Id, ()>>, AuthStoreError> {
+        let now = (self.clock)();
+        let sessions = self.sessions.lock().expect("auth store lock");
+        let mut records: Vec<_> = sessions
+            .iter()
+            .filter(|(_, stored)| stored.context.user_id == *user && stored.live_at(now))
+            .map(|(session_id, stored)| stored.record(*session_id))
+            .collect();
+        records.sort_by_key(|record| record.created_at);
+        Ok(records)
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn end_owned(&self, user: &Id, session: SessionId) -> Result<bool, AuthStoreError> {
+        let mut sessions = self.sessions.lock().expect("auth store lock");
+        Ok(match sessions.get_mut(&session) {
+            Some(stored) if stored.context.user_id == *user && !stored.revoked => {
+                stored.revoked = true;
+                stored.retained = None;
+                true
+            }
+            _ => false,
+        })
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn end_all_of(
+        &self,
+        user: &Id,
+        keep: Option<SessionId>,
+    ) -> Result<Vec<SessionId>, AuthStoreError> {
+        let now = (self.clock)();
+        let mut sessions = self.sessions.lock().expect("auth store lock");
+        let mut ended = Vec::new();
+        for (session_id, stored) in sessions.iter_mut() {
+            if stored.context.user_id == *user && stored.live_at(now) && keep != Some(*session_id) {
+                stored.revoked = true;
+                stored.retained = None;
+                ended.push(*session_id);
+            }
+        }
+        Ok(ended)
     }
 
     #[expect(
@@ -465,6 +562,7 @@ impl<
         if !hashes_match(&hash_secret(secret), &record.current_refresh_hash) {
             // A rotated-out token for a live session: treat as theft.
             record.revoked = true;
+            record.retained = None;
             return Err(AuthStoreError::Reuse { session_id });
         }
         let new_secret = new_refresh_secret();
@@ -491,6 +589,7 @@ impl<
             .get_mut(&session_id)
         {
             record.revoked = true;
+            record.retained = None;
         }
         Ok(())
     }
@@ -509,6 +608,7 @@ impl<
             .filter(|record| !record.revoked)
         {
             record.revoked = true;
+            record.retained = None;
             revoked += 1;
         }
         Ok(revoked)
@@ -634,6 +734,17 @@ mod db {
                 resolver,
             }
         }
+
+        /// Delete the retained provider tokens of `sessions`, which were just
+        /// revoked in the same transaction (R105 decision 5).
+        async fn forget(
+            conn: &mut AsyncPgConnection,
+            sessions: Vec<SessionId>,
+        ) -> Result<(), AuthStoreError> {
+            <D::Auth as ConnettoStoreSchema>::forget_provider_tokens(conn, sessions)
+                .await
+                .map_err(backend)
+        }
     }
 
     fn backend<E: core::fmt::Display>(err: E) -> AuthStoreError {
@@ -695,6 +806,52 @@ mod db {
             <D::Auth as ConnettoStoreSchema>::session_record(&mut conn, session_id)
                 .await
                 .map_err(backend)
+        }
+
+        async fn sessions_of(
+            &self,
+            user: &Self::Id,
+        ) -> Result<Vec<SessionRecord<Self::Id, Self::Descriptor>>, AuthStoreError> {
+            let mut conn = self.pool.get().await.map_err(backend)?;
+            <D::Auth as ConnettoStoreSchema>::sessions_of(&mut conn, user.clone())
+                .await
+                .map_err(backend)
+        }
+
+        async fn end_owned(
+            &self,
+            user: &Self::Id,
+            session: SessionId,
+        ) -> Result<bool, AuthStoreError> {
+            let mut conn = self.pool.get().await.map_err(backend)?;
+            let user = user.clone();
+            conn.transaction::<_, AuthStoreError, _>(async move |conn| {
+                let ended = <D::Auth as ConnettoStoreSchema>::end_owned(conn, user, session)
+                    .await
+                    .map_err(backend)?;
+                if ended {
+                    Self::forget(conn, vec![session]).await?;
+                }
+                Ok(ended)
+            })
+            .await
+        }
+
+        async fn end_all_of(
+            &self,
+            user: &Self::Id,
+            keep: Option<SessionId>,
+        ) -> Result<Vec<SessionId>, AuthStoreError> {
+            let mut conn = self.pool.get().await.map_err(backend)?;
+            let user = user.clone();
+            conn.transaction::<_, AuthStoreError, _>(async move |conn| {
+                let ended = <D::Auth as ConnettoStoreSchema>::end_all_of(conn, user, keep)
+                    .await
+                    .map_err(backend)?;
+                Self::forget(conn, ended.clone()).await?;
+                Ok(ended)
+            })
+            .await
         }
 
         async fn session_is_live(&self, session_id: SessionId) -> Result<bool, AuthStoreError> {
@@ -762,26 +919,41 @@ mod db {
                 .await
             };
             if matches!(outcome, Err(AuthStoreError::Reuse { .. })) {
-                <D::Auth as ConnettoStoreSchema>::revoke_update(&mut conn, session_id)
-                    .await
-                    .map_err(backend)?;
+                conn.transaction::<_, AuthStoreError, _>(async move |conn| {
+                    <D::Auth as ConnettoStoreSchema>::revoke_update(conn, session_id)
+                        .await
+                        .map_err(backend)?;
+                    Self::forget(conn, vec![session_id]).await
+                })
+                .await?;
             }
             outcome
         }
 
         async fn revoke_session(&self, session_id: SessionId) -> Result<(), AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            <D::Auth as ConnettoStoreSchema>::revoke_update(&mut conn, session_id)
-                .await
-                .map_err(backend)?;
-            Ok(())
+            conn.transaction::<_, AuthStoreError, _>(async move |conn| {
+                <D::Auth as ConnettoStoreSchema>::revoke_update(conn, session_id)
+                    .await
+                    .map_err(backend)?;
+                Self::forget(conn, vec![session_id]).await
+            })
+            .await
         }
 
         async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let revoked = <D::Auth as ConnettoStoreSchema>::revoke_every_update(&mut conn)
-                .await
-                .map_err(backend)?;
+            let revoked = conn
+                .transaction::<_, AuthStoreError, _>(async move |conn| {
+                    let revoked = <D::Auth as ConnettoStoreSchema>::revoke_every_update(conn)
+                        .await
+                        .map_err(backend)?;
+                    <D::Auth as ConnettoStoreSchema>::forget_every_provider_token(conn)
+                        .await
+                        .map_err(backend)?;
+                    Ok(revoked)
+                })
+                .await?;
             Ok(u64::try_from(revoked).unwrap_or(u64::MAX))
         }
 

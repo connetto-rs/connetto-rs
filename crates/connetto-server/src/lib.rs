@@ -93,6 +93,7 @@ pub use subql::visibility::WriteOp;
 // Re-exported so `connetto_schema!` can name it as
 // `$crate::SessionId` in a consumer's crate, which need not depend on
 // connetto-core directly.
+pub use audit::MintedKey;
 pub use authn::http::{
     BROWSER_CLIENT, CLIENT_KIND_HEADER, CookieSameSite, RedirectPolicy, auth_router,
     is_loopback_host,
@@ -100,18 +101,20 @@ pub use authn::http::{
 pub use authn::{
     AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
     ConnettoHandshakeAuthority, DefaultUuidResolver, GenericOidcProvider, IdentityProvider,
-    IdentityResolver, InMemoryAuthStore, IssuedAuthCode, IssuedSession, LoginRedirect,
-    LoginRequest, OidcProviderConfig, PendingLogin, PendingLogins, ProviderError, ProviderRegistry,
-    RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture, ResolvedIdentity,
-    RetainedProviderToken, SessionDescriber, SessionOrigin, SessionRecord, SessionRow, SignInHook,
-    SignInNotice, StoredProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedClaims,
-    VerifiedLogin, VerifiedSession,
+    IdentityResolver, InMemoryAuthStore, IssuedAuthCode, IssuedSession, LivenessError,
+    LoginRedirect, LoginRequest, OidcProviderConfig, PendingLogin, PendingLogins, ProviderError,
+    ProviderRegistry, RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture,
+    ResolvedIdentity, RetainedProviderToken, SessionDescriber, SessionOrigin, SessionRecord,
+    SessionRow, SignInHook, SignInNotice, StoredProviderToken, TokenAuthority, TokenError,
+    TokenPair, VerifiedClaims, VerifiedLogin, VerifiedSession,
 };
 pub use authn::{ConnettoStoreSchema, DbAuthStore};
+pub use bots::InstalledApp;
+pub use builder::Ended;
 pub use builder::{
     BuildError, ChangeStream, ContentBuildError, ContentSettings, ContentSigner,
     ContentSignerError, PoolError, SHUTDOWN_GRACE, SYNC_PATH, ServeError, ServerBuilder,
-    ServerHandle, ServerParts,
+    ServerHandle, ServerParts, SessionsError, SignedInPlace,
 };
 pub use connetto_core::SessionId;
 pub use connetto_core::transport::{

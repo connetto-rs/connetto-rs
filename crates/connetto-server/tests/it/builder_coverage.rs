@@ -1457,7 +1457,6 @@ async fn a_logout_revokes_the_live_session_and_the_audit_records_it() {
     let port = listener.local_addr().expect("local address").port();
     let (builder, _idp, _keys) = builder_over(&fixture, port).await;
     let base = format!("http://127.0.0.1:{port}");
-    let builder = builder.audit(true);
 
     let parts = builder.build().await.expect("the deployment assembles");
     let stream = tokio::spawn(parts.change_stream);
@@ -2030,8 +2029,8 @@ async fn missing(
 }
 
 /// A table one of the schema's members names and the deployment never
-/// created refuses the build naming it, the ban, audit and enrolment tables
-/// only when those are turned on.
+/// created refuses the build naming it, the audit table always and the ban
+/// and enrolment tables only when those are turned on.
 #[tokio::test]
 async fn a_missing_schema_table_refuses_naming_it() {
     let _keyring = isolated_session_keyring();
@@ -2042,15 +2041,16 @@ async fn a_missing_schema_table_refuses_naming_it() {
     fixture.provision_auth_tables().await;
     exec(&pool, "DROP TABLE auth_events").await;
 
+    let audit = missing(&fixture, |builder| builder).await;
+    assert!(
+        audit.starts_with("table auth_events does not exist"),
+        "{audit}"
+    );
+    connetto_test_harness::provision_audit(&pool).await;
     let bans = missing(&fixture, |builder| builder.bans(true)).await;
     assert!(
         bans.starts_with("table connetto_bans does not exist"),
         "{bans}"
-    );
-    let audit = missing(&fixture, |builder| builder.audit(true)).await;
-    assert!(
-        audit.starts_with("table auth_events does not exist"),
-        "{audit}"
     );
     let (_, _, issuer) = super::enrolment::rooted_issuer();
     let devices = missing(&fixture, move |builder| {

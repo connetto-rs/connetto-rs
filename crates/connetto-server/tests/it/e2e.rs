@@ -597,28 +597,11 @@ pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixt
     exec(pool, "DROP TABLE IF EXISTS _connetto_settled").await;
     exec(pool, "DROP TABLE IF EXISTS _connetto_writers").await;
     connetto_test_harness::provision_writers(pool).await;
-    // The audit table the server appends access changes to when
-    // `CONNETTO_AUDIT=database`, dropped and recreated per run.
+    // The audit table every server appends access changes to, dropped and
+    // recreated per run.
     exec(pool, "DROP TABLE IF EXISTS auth_events").await;
     exec(pool, "DROP TYPE IF EXISTS connetto_auth_op").await;
-    exec(
-        pool,
-        "CREATE TYPE connetto_auth_op AS ENUM (\
-         'logged_in', 'logged_out', 'session_revoked', 'token_replayed', 'capability_minted', \
-         'permission_change', 'model_change', 'banned', 'ban_lifted', \
-         'write_forked', 'write_redelivered')",
-    )
-    .await;
-    exec(
-        pool,
-        "CREATE TABLE auth_events (\
-         at TIMESTAMPTZ NOT NULL DEFAULT now(), session UUID NOT NULL, user_id TEXT, \
-         op connetto_auth_op NOT NULL, table_name TEXT, pk UUID, \
-         writer BIGINT, seq BIGINT, \
-         path connetto_settle_path, other_path connetto_settle_path, \
-         provider TEXT, issuer TEXT)",
-    )
-    .await;
+    connetto_test_harness::provision_audit(pool).await;
     exec(pool, PG_DDL).await;
     provision_cap_policies(pool, PG_DDL, NO_POLICIES).await;
     exec(
@@ -1466,66 +1449,6 @@ async fn e2e_startup_refuses_unparsable_pool_size_and_cookie_mode() {
     }
 }
 
-/// Asking for records without asking for logins refuses startup.
-///
-/// Every access change recorded comes from the login machinery, so with logins
-/// off there is nothing to record. The first version of this wiring sat behind
-/// the early return for no logins, so the setting was accepted and silently
-/// did nothing, which is the failure this pins.
-#[tokio::test]
-async fn e2e_startup_refuses_audit_without_auth() {
-    let _keyring = connetto_test_harness::isolated_session_keyring();
-    let _serial = PG_SERIAL.lock().await;
-    let fixture = Fixture::acquire().await;
-    let url = fixture.admin_url().to_owned();
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
-    let pool = Pool::builder().build(manager).await.expect("build pool");
-    reset_fixture(&pool, &fixture).await;
-
-    let reader_url = with_user_url(&url, "app_reader", "app_reader");
-    let output =
-        run_server_exit_output(&url, Some(&reader_url), &[("CONNETTO_AUDIT", "database")]).await;
-    assert!(
-        !output.status.success(),
-        "expected nonzero exit for records without logins"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("CONNETTO_AUTH"),
-        "the refusal must name the missing setting, got: {stderr}"
-    );
-}
-
-/// An unrecognised recording mode refuses startup, matching every other mode
-/// setting the binary reads.
-#[tokio::test]
-async fn e2e_startup_refuses_an_unrecognised_audit_mode() {
-    let _keyring = connetto_test_harness::isolated_session_keyring();
-    let _serial = PG_SERIAL.lock().await;
-    let fixture = Fixture::acquire().await;
-    let url = fixture.admin_url().to_owned();
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
-    let pool = Pool::builder().build(manager).await.expect("build pool");
-    reset_fixture(&pool, &fixture).await;
-
-    let reader_url = with_user_url(&url, "app_reader", "app_reader");
-    let output = run_server_exit_output(
-        &url,
-        Some(&reader_url),
-        &[("CONNETTO_AUTH", "database"), ("CONNETTO_AUDIT", "sqlite")],
-    )
-    .await;
-    assert!(
-        !output.status.success(),
-        "expected nonzero exit for an unrecognised audit mode"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("\"sqlite\""),
-        "expected the Debug-quoted mode in stderr, got: {stderr}"
-    );
-}
-
 #[tokio::test]
 async fn e2e_startup_refuses_a_miscapitalised_provider_name() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
@@ -1691,11 +1614,9 @@ async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
 /// A real logout against a real server leaves exactly one row saying so.
 ///
 /// The two audit suites beside this one each attach their own collector, so
-/// they prove the parts and never the whole. That is how the reference server
-/// shipped without ever switching recording on: every test supplied its own
-/// sink, so a green run said nothing about the wiring. This is the only test
-/// that exercises the switch, the startup shape check, the ready-made writer,
-/// and the table together, through a process nobody handed a collector to.
+/// they prove the parts and never the whole. This is the only test that
+/// exercises the startup shape check, the ready-made writer and the table
+/// together, through a process nobody handed a collector to.
 #[tokio::test]
 async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
@@ -1711,8 +1632,8 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
     let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
     let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
-    // With CONNETTO_AUDIT=database the server refuses to start unless the
-    // audit table matches, which start_server reports as an exit.
+    // The server refuses to start without the audit table, which
+    // start_server reports as an exit.
     let (_server, ports) =
         start_server(&auth_stack, Duration::from_secs(20), |ports, auth_pairs| {
             let mut command = Command::new(server_bin());
@@ -1724,9 +1645,6 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
                 .env("CONNETTO_SLOT", SLOT)
                 .env("CONNETTO_PUBLICATION", PUBLICATION)
                 .env("CONNETTO_READER_URL", &reader_url)
-                // The switch under test. Without it the server records nothing, which
-                // is the default and is what shipped by accident.
-                .env("CONNETTO_AUDIT", "database")
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
             command.envs(auth_pairs.iter().copied());

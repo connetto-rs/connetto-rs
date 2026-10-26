@@ -159,3 +159,31 @@ async fn in_memory_store_records_how_a_session_began() {
         .expect("the refresh is stamped");
     assert!(refreshed >= began.created_at);
 }
+
+/// The in-memory store keeps the list-and-end contract the database store
+/// keeps.
+#[tokio::test]
+async fn in_memory_store_lists_and_ends_one_persons_sessions() {
+    let store = store();
+    let mut hana = Vec::new();
+    for _ in 0..3 {
+        hana.push(
+            store
+                .create_session(&identity("hana"), origin())
+                .await
+                .expect("create")
+                .session_id,
+        );
+    }
+    let ivan = store
+        .create_session(&identity("ivan"), origin())
+        .await
+        .expect("create");
+    super::session_contract::ends_only_the_persons_sessions(
+        &store,
+        &expected_id("hana"),
+        [hana[0], hana[1], hana[2]],
+        ivan.session_id,
+    )
+    .await;
+}

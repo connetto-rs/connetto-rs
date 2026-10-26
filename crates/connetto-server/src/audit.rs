@@ -15,9 +15,10 @@
 //! imposed. The split is normative in `08-authorization.md` and
 //! `denials_never_reach_the_audit_table` pins it.
 //!
-//! Only the insert is laundered as an associated type. The writer's contract
-//! carries many because it reads, settles and prunes; an audit row is written
-//! once and never read back by connetto, so one suffices.
+//! The insert is laundered as an associated type, and one read is a
+//! statement function: the keys a set of sessions minted, which ending those
+//! sessions hands back so the application can withdraw them (R105 decision
+//! 5). Every other row is written once and never read back by connetto.
 
 use crate::writer_schema::SettlePath;
 use connetto_core::SessionId;
@@ -58,6 +59,13 @@ pub enum AuthOp {
     LoggedOut,
     /// The embedding application revoked the login itself.
     SessionRevoked,
+    /// The person ended one of their sessions from their list of signed-in
+    /// places.
+    EndedByOwner,
+    /// The person ended every one of their sessions.
+    EndedAll,
+    /// The person ended every one of their sessions but the current one.
+    EndedOthers,
     /// The theft defence saw a rotated-out refresh token presented and killed
     /// the login.
     TokenReplayed,
@@ -92,6 +100,9 @@ impl AuthOp {
             Self::LoggedIn => "logged_in",
             Self::LoggedOut => "logged_out",
             Self::SessionRevoked => "session_revoked",
+            Self::EndedByOwner => "ended_by_owner",
+            Self::EndedAll => "ended_all",
+            Self::EndedOthers => "ended_others",
             Self::TokenReplayed => "token_replayed",
             Self::CapabilityMinted => "capability_minted",
             Self::PermissionChange => "permission_change",
@@ -117,6 +128,9 @@ impl FromSql<AuthOpSql, Pg> for AuthOp {
             b"logged_in" => Ok(Self::LoggedIn),
             b"logged_out" => Ok(Self::LoggedOut),
             b"session_revoked" => Ok(Self::SessionRevoked),
+            b"ended_by_owner" => Ok(Self::EndedByOwner),
+            b"ended_all" => Ok(Self::EndedAll),
+            b"ended_others" => Ok(Self::EndedOthers),
             b"token_replayed" => Ok(Self::TokenReplayed),
             b"capability_minted" => Ok(Self::CapabilityMinted),
             b"permission_change" => Ok(Self::PermissionChange),
@@ -172,6 +186,9 @@ pub struct AuthEvent<Id> {
     /// The issuer a sign-in's identity was verified from, absent for
     /// everything else.
     pub issuer: Option<String>,
+    /// The key a share mint issued, as its grant row names it, absent for
+    /// everything else.
+    pub subject: Option<String>,
 }
 
 impl<Id> AuthEvent<Id> {
@@ -190,6 +207,7 @@ impl<Id> AuthEvent<Id> {
             other_path: None,
             provider: None,
             issuer: None,
+            subject: None,
         }
     }
 
@@ -226,12 +244,36 @@ impl<Id> AuthEvent<Id> {
         self.issuer = Some(issuer.into());
         self
     }
+
+    /// Name the key a share mint issued, as the grant row the application
+    /// writes names it.
+    #[must_use]
+    pub fn about_key(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
+    }
 }
 
-/// The `auth_events` table and the pre-built insert connetto appends through.
+/// One share key a session minted, read back from its `capability_minted`
+/// row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintedKey<RowKey> {
+    /// The session that minted it.
+    pub session: SessionId,
+    /// The key, as the application's grant row names it.
+    pub subject: String,
+    /// The table of the shared row.
+    pub table: String,
+    /// The shared row's key, absent when the table stores no key for its
+    /// shape.
+    pub row: Option<RowKey>,
+}
+
+/// The `auth_events` table, the pre-built insert connetto appends through,
+/// and the one read connetto makes, the keys a set of sessions minted.
 ///
-/// Insert-only by design: connetto writes the history and never reads it, so
-/// the application is free to index and query it however it likes.
+/// connetto reads nothing else back, so the application is free to index
+/// and query it however it likes.
 pub trait ConnettoAuditSchema: Send + Sync + 'static {
     /// The deployment's typed distributed user id, the same one
     /// [`ConnettoStoreSchema`](crate::authn::schema::ConnettoStoreSchema)
@@ -250,7 +292,7 @@ pub trait ConnettoAuditSchema: Send + Sync + 'static {
     /// `MessagePack` encoding of the values, which no policy could join against
     /// and no person could read, in a table whose neighbouring column is text
     /// precisely so a person can read it.
-    type RowKey;
+    type RowKey: core::fmt::Debug + Clone + Send + Sync + 'static;
 
     /// The whole `INSERT INTO auth_events ...` statement, laundered as one
     /// executable value, because the diesel trait solver cannot name an insert
@@ -267,6 +309,12 @@ pub trait ConnettoAuditSchema: Send + Sync + 'static {
 
     /// Build the insert for one event.
     fn audit_insert(event: AuthEvent<Self::Id>) -> Self::Insert;
+
+    /// The keys `sessions` minted, from their `capability_minted` rows.
+    fn minted_by(
+        conn: &mut AsyncPgConnection,
+        sessions: Vec<SessionId>,
+    ) -> crate::authn::schema::Statement<'_, Vec<MintedKey<Self::RowKey>>>;
 }
 
 /// Records one change to who can reach what.
@@ -359,6 +407,8 @@ macro_rules! connetto_audit_table {
                 table_name -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
                 /// The row a share key names, absent for everything else.
                 pk -> diesel::sql_types::Nullable<$pk_sql>,
+                /// The key a share mint issued.
+                subject -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
                 /// The server-issued writer named by a write-state event.
                 writer -> diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
                 /// The writer sequence named by a write-state event.
@@ -390,6 +440,7 @@ macro_rules! connetto_audit_table {
             other_path: Option<$crate::writer_schema::SettlePath>,
             provider: Option<String>,
             issuer: Option<String>,
+            subject: Option<String>,
         }
 
         /// The default connetto audit schema over the deployment's `Id` type.
@@ -428,6 +479,52 @@ macro_rules! connetto_audit_table {
                     other_path: event.other_path,
                     provider: event.provider,
                     issuer: event.issuer,
+                    subject: event.subject,
+                })
+            }
+
+            fn minted_by(
+                conn: &mut diesel_async::AsyncPgConnection,
+                sessions: Vec<$crate::SessionId>,
+            ) -> $crate::authn::schema::Statement<'_, Vec<$crate::audit::MintedKey<Self::RowKey>>>
+            {
+                Box::pin(async move {
+                    use diesel::BoolExpressionMethods as _;
+                    use diesel::ExpressionMethods as _;
+                    let rows: Vec<(
+                        $crate::SessionId,
+                        Option<String>,
+                        Option<String>,
+                        Option<$pk>,
+                    )> = diesel_async::RunQueryDsl::load(
+                        diesel::QueryDsl::select(
+                            diesel::QueryDsl::filter(
+                                auth_events::table,
+                                auth_events::session.eq_any(sessions).and(
+                                    auth_events::op.eq($crate::audit::AuthOp::CapabilityMinted),
+                                ),
+                            ),
+                            (
+                                auth_events::session,
+                                auth_events::subject,
+                                auth_events::table_name,
+                                auth_events::pk,
+                            ),
+                        ),
+                        conn,
+                    )
+                    .await?;
+                    Ok(rows
+                        .into_iter()
+                        .filter_map(|(session, subject, table, row)| {
+                            Some($crate::audit::MintedKey {
+                                session,
+                                subject: subject?,
+                                table: table?,
+                                row,
+                            })
+                        })
+                        .collect())
                 })
             }
         }

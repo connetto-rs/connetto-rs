@@ -318,7 +318,11 @@ async fn a_caller_cannot_mint_a_capability_over_a_resource_it_cannot_read() {
     // change is most likely to break.
     let recorded: Arc<Mutex<Vec<AuthEvent<String>>>> = Arc::default();
     let sink = Arc::clone(&recorded);
-    let issuer = CapabilityIssuer::new(authority, auth, rows, &AuthConfig::default()).with_audit(
+    let issuer = CapabilityIssuer::new(
+        authority,
+        auth,
+        rows,
+        &AuthConfig::default(),
         Arc::new(move |event| sink.lock().expect("sink").push(event)),
     );
 
@@ -326,7 +330,7 @@ async fn a_caller_cannot_mint_a_capability_over_a_resource_it_cannot_read() {
     let bob_paper = [Value::<PgValues>::Int(3)];
 
     // Alice may share her own paper.
-    issuer
+    let minted = issuer
         .issue(
             &caller(Some("alice"), &[]),
             "papers",
@@ -371,7 +375,7 @@ async fn a_caller_cannot_mint_a_capability_over_a_resource_it_cannot_read() {
     // check is the same read question every other caller asks.
     let bearer = caller(None, &[SHARED_KEY]);
     let shared_paper = [Value::<PgValues>::Int(2)];
-    issuer
+    let reshared = issuer
         .issue(&bearer, "papers", &shared_paper, ShareLevel::read(), None)
         .await
         .expect("a key holder may reshare what the key opens");
@@ -407,6 +411,11 @@ async fn a_caller_cannot_mint_a_capability_over_a_resource_it_cannot_read() {
     assert_eq!(
         recorded[1].user_id, None,
         "a key holder with no identity mints without one"
+    );
+    assert_eq!(
+        [recorded[0].subject.clone(), recorded[1].subject.clone()],
+        [Some(minted.key.to_string()), Some(reshared.key.to_string())],
+        "a mint names the key it minted, which the application's grant names"
     );
 }
 
@@ -588,7 +597,13 @@ impl VisibilityPolicy for ReadOnlyPolicy {
 fn issuer_over(policy: ReadOnlyPolicy) -> CapabilityIssuer<ReadOnlyPolicy, AlwaysFound, String> {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    CapabilityIssuer::new(authority, Arc::new(policy), Arc::new(AlwaysFound), &config)
+    CapabilityIssuer::new(
+        authority,
+        Arc::new(policy),
+        Arc::new(AlwaysFound),
+        &config,
+        Arc::new(|_| {}),
+    )
 }
 
 #[tokio::test]
@@ -715,6 +730,7 @@ async fn a_lifetime_over_the_ceiling_is_refused_rather_than_shortened() {
         Arc::new(RosterAuth::granting("alice").withholding(WITHHELD_ID)),
         Arc::new(AlwaysFound),
         &config,
+        Arc::new(|_| {}),
     );
     let caller = caller(Some("alice"), &[]);
 
@@ -757,6 +773,7 @@ async fn the_withheld_row_cannot_be_minted_into_a_share() {
         Arc::new(policy),
         Arc::new(FixedRow(WITHHELD_ID)),
         &config,
+        Arc::new(|_| {}),
     );
     let refused = issuer
         .issue(

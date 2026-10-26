@@ -149,6 +149,29 @@ pub trait ConnettoStoreSchema: Send + Sync + 'static {
         session_id: SessionId,
     ) -> Statement<'_, Option<SessionRecord<Self::Id, Self::Descriptor>>>;
 
+    /// Every live session of `user`, oldest first: not revoked, and neither
+    /// deadline passed by the database's clock.
+    fn sessions_of(
+        conn: &mut AsyncPgConnection,
+        user: Self::Id,
+    ) -> Statement<'_, Vec<SessionRecord<Self::Id, Self::Descriptor>>>;
+
+    /// Revoke `session` when it is `user`'s and not yet revoked, answering
+    /// whether it was.
+    fn end_owned(
+        conn: &mut AsyncPgConnection,
+        user: Self::Id,
+        session: SessionId,
+    ) -> Statement<'_, bool>;
+
+    /// Revoke every live session of `user` but `keep`, answering the ones it
+    /// revoked.
+    fn end_all_of(
+        conn: &mut AsyncPgConnection,
+        user: Self::Id,
+        keep: Option<SessionId>,
+    ) -> Statement<'_, Vec<SessionId>>;
+
     /// The `revoked` flag of a session whose absolute deadline has not passed
     /// by the database's clock, absent when the id names no such row.
     fn live_session(
@@ -198,6 +221,16 @@ pub trait ConnettoStoreSchema: Send + Sync + 'static {
         conn: &mut AsyncPgConnection,
         session_id: SessionId,
     ) -> Statement<'_, Option<StoredProviderToken>>;
+
+    /// Delete the retained provider tokens of `sessions`, the only copy
+    /// connetto holds, once those sessions are revoked.
+    fn forget_provider_tokens(
+        conn: &mut AsyncPgConnection,
+        sessions: Vec<SessionId>,
+    ) -> Statement<'_, ()>;
+
+    /// Delete every retained provider token, once every session is revoked.
+    fn forget_every_provider_token(conn: &mut AsyncPgConnection) -> Statement<'_, ()>;
 }
 
 /// Generate the default connetto auth tables and their [`ConnettoStoreSchema`]
@@ -419,6 +452,136 @@ macro_rules! connetto_auth_tables {
                 })
             }
 
+            fn sessions_of(
+                conn: &mut diesel_async::AsyncPgConnection,
+                user: Self::Id,
+            ) -> $crate::authn::schema::Statement<
+                '_,
+                Vec<$crate::authn::schema::SessionRecord<Self::Id, Self::Descriptor>>,
+            > {
+                Box::pin(async move {
+                    use diesel::ExpressionMethods as _;
+                    use diesel::BoolExpressionMethods as _;
+                    let rows: Vec<(
+                        $crate::SessionId,
+                        Self::Id,
+                        String,
+                        String,
+                        $crate::authn::schema::Instant,
+                        Option<$crate::authn::schema::Instant>,
+                        $( $crate::__connetto_type_hole!($field), )*
+                    )> = diesel_async::RunQueryDsl::load(
+                        diesel::QueryDsl::select(
+                            diesel::QueryDsl::order(
+                                diesel::QueryDsl::filter(
+                                    connetto_sessions::table,
+                                    connetto_sessions::user_id
+                                        .eq(user)
+                                        .and(connetto_sessions::revoked.eq(false))
+                                        .and(
+                                            connetto_sessions::idle_deadline
+                                                .ge($crate::db_clock::now()),
+                                        )
+                                        .and(
+                                            connetto_sessions::absolute_deadline
+                                                .ge($crate::db_clock::now()),
+                                        ),
+                                ),
+                                connetto_sessions::created_at,
+                            ),
+                            (
+                                connetto_sessions::session_id,
+                                connetto_sessions::user_id,
+                                connetto_sessions::provider,
+                                connetto_sessions::issuer,
+                                connetto_sessions::created_at,
+                                connetto_sessions::refreshed_at,
+                                $( connetto_sessions::$field, )*
+                            ),
+                        ),
+                        conn,
+                    )
+                    .await?;
+                    Ok(rows
+                        .into_iter()
+                        .map(
+                            |(
+                                session_id,
+                                user_id,
+                                provider,
+                                issuer,
+                                created_at,
+                                refreshed_at,
+                                $($field,)*
+                            )| {
+                                $crate::authn::schema::SessionRecord {
+                                    session_id,
+                                    user_id,
+                                    provider,
+                                    issuer,
+                                    description: $($shape)*,
+                                    created_at: created_at.into(),
+                                    refreshed_at: refreshed_at.map(Into::into),
+                                }
+                            },
+                        )
+                        .collect())
+                })
+            }
+
+            fn end_owned(
+                conn: &mut diesel_async::AsyncPgConnection,
+                user: Self::Id,
+                session: $crate::SessionId,
+            ) -> $crate::authn::schema::Statement<'_, bool> {
+                Box::pin(async move {
+                    use diesel::ExpressionMethods as _;
+                    use diesel::BoolExpressionMethods as _;
+                    let ended = diesel_async::RunQueryDsl::execute(
+                        diesel::update(diesel::QueryDsl::filter(
+                            connetto_sessions::table,
+                            connetto_sessions::session_id
+                                .eq(session)
+                                .and(connetto_sessions::user_id.eq(user))
+                                .and(connetto_sessions::revoked.eq(false)),
+                        ))
+                        .set(connetto_sessions::revoked.eq(true)),
+                        conn,
+                    )
+                    .await?;
+                    Ok(ended == 1)
+                })
+            }
+
+            fn end_all_of(
+                conn: &mut diesel_async::AsyncPgConnection,
+                user: Self::Id,
+                keep: Option<$crate::SessionId>,
+            ) -> $crate::authn::schema::Statement<'_, Vec<$crate::SessionId>> {
+                Box::pin(async move {
+                    use diesel::ExpressionMethods as _;
+                    use diesel::BoolExpressionMethods as _;
+                    diesel_async::RunQueryDsl::get_results(
+                        diesel::update(diesel::QueryDsl::filter(
+                            connetto_sessions::table,
+                            connetto_sessions::user_id
+                                .eq(user)
+                                .and(connetto_sessions::revoked.eq(false))
+                                .and(connetto_sessions::idle_deadline.ge($crate::db_clock::now()))
+                                .and(
+                                    connetto_sessions::absolute_deadline
+                                        .ge($crate::db_clock::now()),
+                                )
+                                .and(connetto_sessions::session_id.ne_all(keep.into_iter().collect::<Vec<_>>())),
+                        ))
+                        .set(connetto_sessions::revoked.eq(true))
+                        .returning(connetto_sessions::session_id),
+                        conn,
+                    )
+                    .await
+                })
+            }
+
             fn live_session(
                 conn: &mut diesel_async::AsyncPgConnection,
                 session_id: $crate::SessionId,
@@ -560,6 +723,37 @@ macro_rules! connetto_auth_tables {
                     .set(connetto_sessions::revoked.eq(true))
                     .execute(conn)
                     .await
+                })
+            }
+
+            fn forget_provider_tokens(
+                conn: &mut diesel_async::AsyncPgConnection,
+                sessions: Vec<$crate::SessionId>,
+            ) -> $crate::authn::schema::Statement<'_, ()> {
+                Box::pin(async move {
+                    use diesel::ExpressionMethods as _;
+                    diesel_async::RunQueryDsl::execute(
+                        diesel::delete(diesel::QueryDsl::filter(
+                            connetto_provider_tokens::table,
+                            connetto_provider_tokens::session_id.eq_any(sessions),
+                        )),
+                        conn,
+                    )
+                    .await?;
+                    Ok(())
+                })
+            }
+
+            fn forget_every_provider_token(
+                conn: &mut diesel_async::AsyncPgConnection,
+            ) -> $crate::authn::schema::Statement<'_, ()> {
+                Box::pin(async move {
+                    diesel_async::RunQueryDsl::execute(
+                        diesel::delete(connetto_provider_tokens::table),
+                        conn,
+                    )
+                    .await?;
+                    Ok(())
                 })
             }
 

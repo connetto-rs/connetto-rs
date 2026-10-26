@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use connetto_core::SessionId;
-use connetto_core::auth::Subject;
+use connetto_core::auth::{Subject, VerifiedSession};
 use connetto_core::messages::Grant;
 use connetto_core::traits::{
     CheckedGrant, GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority,
@@ -120,6 +120,20 @@ pub struct AuthService<S: AuthStore> {
 /// Observes a session revocation. Fired synchronously after the store revoke
 /// succeeds, so an async close belongs on a spawned task inside the hook.
 pub type SessionRevocationHook = Arc<dyn Fn(SessionId) + Send + Sync>;
+
+/// Why an access token names no live session.
+#[derive(Debug, thiserror::Error)]
+pub enum LivenessError {
+    /// The token is not a valid login access token.
+    #[error("not a valid login access token")]
+    Refused,
+    /// The token's session was revoked or lapsed.
+    #[error("the session is no longer live")]
+    Revoked,
+    /// The auth store could not answer.
+    #[error(transparent)]
+    Store(#[from] AuthStoreError),
+}
 
 /// What a login row and a sign-in notice say about how a session began,
 /// taken before the store consumes the origin.
@@ -487,6 +501,87 @@ impl<S: AuthStore> AuthService<S> {
     /// [`AuthError`] if the store fails.
     pub async fn revoke_every_session(&self) -> Result<u64, AuthError> {
         Ok(self.store.revoke_every_session().await?)
+    }
+
+    /// Every live session of `user`, oldest first.
+    pub(crate) async fn sessions_of(
+        &self,
+        user: &S::Id,
+    ) -> Result<Vec<SessionRecord<S::Id, S::Descriptor>>, AuthError> {
+        Ok(self.store.sessions_of(user).await?)
+    }
+
+    /// End `user`'s session `session` as the person's own choice, closing its
+    /// live connection and recording `ended_by_owner`. Answers whether the
+    /// session was `user`'s and still live.
+    pub(crate) async fn end_session(
+        &self,
+        user: &S::Id,
+        session: SessionId,
+    ) -> Result<bool, AuthError> {
+        if !self.store.end_owned(user, session).await? {
+            return Ok(false);
+        }
+        self.ended(user, session, crate::audit::AuthOp::EndedByOwner);
+        Ok(true)
+    }
+
+    /// End every live session of `user` but `keep`, closing each live
+    /// connection and recording `ended_others`, or `ended_all` when nothing
+    /// is kept. Answers the sessions it ended.
+    pub(crate) async fn end_sessions(
+        &self,
+        user: &S::Id,
+        keep: Option<SessionId>,
+    ) -> Result<Vec<SessionId>, AuthError> {
+        let op = if keep.is_some() {
+            crate::audit::AuthOp::EndedOthers
+        } else {
+            crate::audit::AuthOp::EndedAll
+        };
+        let ended = self.store.end_all_of(user, keep).await?;
+        for session in &ended {
+            self.ended(user, *session, op);
+        }
+        Ok(ended)
+    }
+
+    /// Close an ended session's live connection and record why it ended.
+    fn ended(&self, user: &S::Id, session: SessionId, op: crate::audit::AuthOp) {
+        tracing::info!(session = %session, cause = op.label(), "session ended");
+        self.notify_revoked(session);
+        self.record(crate::audit::AuthEvent::new(
+            session,
+            Some(user.clone()),
+            op,
+        ));
+    }
+
+    /// The person and session a login access token names, once its signature
+    /// verifies and its session is live in the store, the check the sync
+    /// handshake makes (R105 decision 7).
+    ///
+    /// # Errors
+    ///
+    /// [`LivenessError::Refused`] for anything but a valid login access
+    /// token, [`LivenessError::Revoked`] when its session ended, and
+    /// [`LivenessError::Store`] when the store cannot answer.
+    pub(crate) async fn verify_live(
+        &self,
+        access_token: &str,
+    ) -> Result<VerifiedSession<S::Id>, LivenessError> {
+        let checked = self
+            .authority
+            .check_grant::<S::Id, serde::de::IgnoredAny>(&Grant::new(access_token))
+            .map_err(|_| LivenessError::Refused)?;
+        let Subject::Identity(session) = checked.subject else {
+            return Err(LivenessError::Refused);
+        };
+        if self.store.session_is_live(session.session_id).await? {
+            Ok(session)
+        } else {
+            Err(LivenessError::Revoked)
+        }
     }
 
     /// Revoke, and record the cause. Three causes reach here and they are not

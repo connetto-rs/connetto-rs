@@ -185,6 +185,19 @@ pub struct Installation<Id> {
     pub optional_tables: Vec<String>,
 }
 
+/// One installation a person owns, with the app it runs, as ending their
+/// sessions lists it so they can remove one they did not make (R105
+/// decision 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledApp<Id> {
+    /// The installation's id, the row the person deletes to remove it.
+    pub installation: Id,
+    /// The app it runs.
+    pub app: Uuid,
+    /// The app's name.
+    pub app_name: String,
+}
+
 /// What a registration settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Registered {
@@ -276,6 +289,12 @@ pub trait ConnettoBotSchema: Send + Sync + 'static {
         conn: &'c mut AsyncPgConnection,
         installation: &'c Self::Id,
     ) -> Statement<'c, Option<Installation<Self::Id>>>;
+
+    /// Every installation `owner` owns, with the app each runs.
+    fn installations_of(
+        conn: &mut AsyncPgConnection,
+        owner: Self::Id,
+    ) -> Statement<'_, Vec<InstalledApp<Self::Id>>>;
 }
 
 /// The bot registry over the deployment's registry tables, `D`'s `Bots`
@@ -737,6 +756,51 @@ macro_rules! connetto_bots_tables {
                         accepted_version,
                         optional_tables,
                     }))
+                })
+            }
+
+            fn installations_of(
+                conn: &mut diesel_async::AsyncPgConnection,
+                owner: Self::Id,
+            ) -> $crate::bots::Statement<'_, Vec<$crate::bots::InstalledApp<Self::Id>>> {
+                Box::pin(async move {
+                    use diesel::ExpressionMethods as _;
+                    let installed: Vec<($id, $crate::bots::Uuid)> =
+                        diesel_async::RunQueryDsl::load(
+                            diesel::QueryDsl::select(
+                                diesel::QueryDsl::filter(
+                                    connetto_installations::table,
+                                    connetto_installations::owner.eq(owner),
+                                ),
+                                (connetto_installations::id, connetto_installations::bot),
+                            ),
+                            conn,
+                        )
+                        .await?;
+                    let apps: Vec<($crate::bots::Uuid, String)> = diesel_async::RunQueryDsl::load(
+                        diesel::QueryDsl::select(
+                            diesel::QueryDsl::filter(
+                                connetto_bots::table,
+                                connetto_bots::id.eq_any(
+                                    installed.iter().map(|(_, app)| *app).collect::<Vec<_>>(),
+                                ),
+                            ),
+                            (connetto_bots::id, connetto_bots::name),
+                        ),
+                        conn,
+                    )
+                    .await?;
+                    Ok(installed
+                        .into_iter()
+                        .filter_map(|(installation, app)| {
+                            let (_, app_name) = apps.iter().find(|(id, _)| *id == app)?;
+                            Some($crate::bots::InstalledApp {
+                                installation,
+                                app,
+                                app_name: app_name.clone(),
+                            })
+                        })
+                        .collect())
                 })
             }
         }
