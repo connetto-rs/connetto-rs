@@ -257,7 +257,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R63 rewire the membership term onto subql's own APIs | **DONE** (2026-08-30) | nothing. Steps 1 to 3 landed 2026-08-23, step 4 (caller bind retired onto the self-seeding term) and decision 3's proof landed 2026-08-30 in the pin-move working tree | landed: `TermDescription::Caller` since subql `1e5382f` |
 | R86 adopt the re-run path so the boot refusal asks the real question | **DONE** (2026-08-31) | nothing | landed and adopted: composite-join grading plus the unqualified-table fix, rls2fga `bbe4f57a` |
 | R15 replica retention and trimming | **DONE** (2026-08-19) | **nothing.** The pin carries all nine APIs the phase uses (`wal_checkpoint`, `WalCheckpointMode`, `auto_vacuum` and its setter, `page_count`, `freelist_count`, `incremental_vacuum`, `vacuum`, `vacuum_into`) | merged and pinned |
-| R31 application schema majors and the update path | **DONE** (2026-10-20) | R75, whose per-writer queue the held writes ride. The build found a defect present on `main`, the content outbox captured as an upload, fixed on its own branch | no |
+| R31 application schema majors and the update path | **DONE** (2026-10-27) | nothing. Merged as #190, #191, #193, #194 and #195, the held writes riding R75's per-writer queue. The build found a defect present on `main`, the content outbox captured as an upload, fixed as #189 | no |
 | R32 replication slot lifecycle | **DONE** (2026-08-09) | nothing | no |
 | R40 replica policy enforcement wired into sync | **DONE** (2026-08-19) | nothing. The pk codec is type-directed, the relay hub reads and applies split tables through the worker's map, and all twenty browser binaries pass | landed |
 | R24 file-sync integration | **DONE** (2026-08-21, as a design) | nothing. Ten positions recorded, R64 to R69 derived | no |
@@ -276,8 +276,8 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R74 device identity and certificates | IN PROGRESS, merged (2026-10-06, #130) with the follow-ups #139 (2026-10-12), #138 (2026-10-14), #146 (2026-10-15), #161 (2026-10-16) and #132 (2026-10-18), and step 7's peer half with proofs 3, 4 and 6's peer half built by R76's slices 1 and 2 (2026-10-07, merged 2026-10-14 as #134 and #135) | proof 5's Windows `unproven` record, which R76's slice 9d run produces once 9d is taken up again | no |
 | R75 the per-device applied frontier | IN PROGRESS, every step built, slices 1 to 5 merged as #196, #197, #199, #200 and #206 (2026-10-20) | R74. Touches the R2 watermark contract and the R56 import. The Done when's three proofs stand in the `writer_frontier` and `courier_frontier` suites with their audit records, for a device writer and a number writer, the courier replay the one a device author alone signs, and the section's closing record is what remains | no |
 | R76 the peer link | IN PROGRESS, sliced into pull requests 2026-10-06 (its section's **Slices**), the Android slices first. Slices 1 to 4 merged 2026-10-14 as #134, #135, #136 and #137, slices 5 to 8 merged 2026-10-15 as #140, #141, #142 and #143, slice 9a, iPhone hosting and iPad joining, merged 2026-10-16 as #148, slice 9b, Linux, and slice 9c, macOS, merged 2026-10-18 as #162 and #163, slice 9f, three handhelds over one hotspot with the Bonjour discovery on iOS, merged 2026-10-20 as #204, with the duplicate close's keep across a reset as #158 (2026-10-15) | nothing. Slice 9d (Windows, designed with decisions 36 to 41) and 9e's home run are parked while the work goes mobile first (decided with the maintainer 2026-10-20) | no |
-| R77 the peer exchange and provisional tier | NOT STARTED, designed 2026-10-26 with eight slices | R75 and R76, and R31 for slices 1, 4 and 5, whose capture major an exchanged entry carries. Slices 2 and 3 can start on `main`. The retraction's reason rides on R57 step 8, merged as #205 | no |
-| R78 courier recovery | NOT STARTED | R75, R77 and R31, whose capture major a couriered entry carries on the wire once it exists | no |
+| R77 the peer exchange and provisional tier | NOT STARTED, designed 2026-10-26 with eight slices | R75 and R76, merged for everything this phase uses. R31's capture major, which slices 1, 4 and 5 carry on an exchanged entry, is merged. The retraction's reason rides on R57 step 8, merged as #205 | no |
+| R78 courier recovery | NOT STARTED | R75 and R77. The capture major a couriered entry carries on the wire is R31's, merged | no |
 | R79 media over the peer link | NOT STARTED | R77, and R64 to R67 for the chunk machinery | no |
 | R80 peer sync in every demo | NOT STARTED | R77, R78 and R79 | no |
 | R30 grouped aggregates revisited | **DONE** (2026-08-22, as a design) | nothing. R82 to R85 derived on the maintainer's instruction, the upstream request written | no longer: the GROUP BY/HAVING refusal defect is resolved upstream and adopted (2026-08-25) |
@@ -336,7 +336,7 @@ graph TD
   R41 --> R42[R42 several accounts signed in at once]
   R18[R18 SQLite hardening surface]
   R11[R11 shared public store]
-  R31[R31 application schema majors]
+  R31[R31 application schema majors, DONE]
   R32[R32 replication slot lifecycle]
   R12A -.->|lag line only| R32
   U3[upstream diesel: wal_checkpoint merged,<br/>fork rebased and pinned 2026-08-18] --> R15[R15 replica retention and trimming]
@@ -4177,9 +4177,9 @@ A replica that has held and released a large window returns disk to the filesyst
 
 ## R31: application schema majors and the update path
 
-**Status.** **DONE (2026-10-20).** Every step and every refusal the Proof names is proven. The two-major story runs end to end in `crates/connetto-client/tests/it/two_majors.rs` and `crates/connetto-file-client/tests/it/held_files.rs` through a router in `connetto-test-harness` that routes on the handshake major, and each way a held write's drain can end runs against scripted servers in `held_drain.rs`. The tier refusals run natively in `tier_majors.rs` and in the browser worker in `crates/connetto-web/tests/tier_majors.rs`. The update story is in chapter 13 and in chapter 06's Case 3.
+**Status.** **DONE (2026-10-27)**, merged as #190, #191, #193, #194 and #195. Every step and every refusal the Proof names is proven. The two-major story runs end to end in `crates/connetto-client/tests/it/two_majors.rs` and `crates/connetto-file-client/tests/it/held_files.rs` through a router in `connetto-test-harness` that routes on the handshake major, and each way a held write's drain can end runs against scripted servers in `held_drain.rs` and in the drain's unit tests. The tier refusals run natively in `tier_majors.rs` and in the browser worker in `crates/connetto-web/tests/tier_majors.rs`. The update story is in chapter 13 and in chapter 06's Case 3.
 
-**Found while building, present on `main` at `b38250e3`.** The content client's outbox delete after an upload was captured and pushed as its own mutation, which the server refused. That is fixed on `fix/content-bookkeeping-capture` by a capture filter that never records a `_connetto` table, and this branch's own drain writes suspend capture explicitly.
+**Found while building, present on `main` at `b38250e3`.** The content client's outbox delete after an upload was captured and pushed as its own mutation, which the server refused. #189 fixed it with a capture filter that never records a `_connetto` table, and the drain's own writes suspend capture explicitly.
 
 **Blocked on** R75, whose per-writer queue the held writes ride.
 
@@ -5678,7 +5678,7 @@ Two native processes with valid certificates discover each other on one network 
 
 **Status.** NOT STARTED, designed 2026-10-26 against `main` `ab408112` and the R31 series tip `2d75a9f1`. Aimed first at offline data between the iPhone, the iPad and an Android phone over R76 slice 9f's star (decided with the maintainer 2026-10-18). Decisions 1 to 10 were settled on evidence while grounding the design, and decisions 11 and 12 with the maintainer the same day.
 
-**Blocked on** R75 and R76, both merged for everything this phase uses, and R31 for slices 1, 4 and 5, which carry the capture major. Slices 2 and 3 need nothing from R31 and can start on `main`. The retraction's reason rides on R57 step 8, merged as #205 (2026-10-20), which surfaces the `MutationRejectReason` the client used to drop.
+**Blocked on** R75 and R76, both merged for everything this phase uses. R31 is merged, and slices 1, 4 and 5 carry its capture major. The retraction's reason rides on R57 step 8, merged as #205 (2026-10-20), which surfaces the `MutationRejectReason` the client used to drop.
 
 **Changes state.** Client tables: `_connetto_peer_cursor`, `_connetto_peer_entry`, `_connetto_provisional` and `_connetto_retraction` in `main`, and `settled_seq` and `settled_head` on `_connetto_writers` (decisions 2 and 9). Server tables: none. Wire messages: the chain hash at version 2 covering each entry's capture major and provenance (decision 1), the exchange frames at peer protocol version 2, `ProvisionalStatus` and `ProvisionalVerdicts` on the server wire (decision 11), and the certificate's bot-list extension (decision 12). Archive format: the four peer tables, which chapter 19 already puts in the archive.
 
@@ -5813,7 +5813,7 @@ Two devices of different accounts exchange offline and reconcile online with not
 
 **Status.** NOT STARTED.
 
-**Blocked on** R75, R77 and R31, whose capture major a couriered entry carries on the wire once it exists.
+**Blocked on** R75 and R77. The capture major a couriered entry carries on the wire is R31's, merged.
 
 **Changes state.** Client tables: none, the courier's entry reading the record R75 settles into. Server tables: the settled record the courier replay answers from, with its audit rows. Wire messages: the couriered entry with its capture major. Archive format: none.
 

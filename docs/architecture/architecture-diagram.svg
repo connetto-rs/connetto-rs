@@ -370,14 +370,14 @@
       <rect width="4" height="56" rx="1" fill="#4CAF50" />
       <text x="150" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Sync engine</text>
       <text x="150" y="36" text-anchor="middle" font-size="10" font-family="monospace" fill="#4CAF50">tokio-tungstenite</text>
-      <text x="150" y="50" text-anchor="middle" font-size="9" fill="#888">reconnect loop, backoff, keys changed live (R95)</text>
+      <text x="150" y="50" text-anchor="middle" font-size="9" fill="#888">reconnect, backoff, live keys (R95), old-major drain (R31)</text>
     </g>
     <g transform="translate(1325, 252)">
       <rect width="300" height="56" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="4" height="56" rx="1" fill="#4CAF50" />
       <text x="150" y="17" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Local SQLite</text>
       <text x="150" y="30" text-anchor="middle" font-size="10" font-family="monospace" fill="#4CAF50">diesel</text>
-      <text x="150" y="41" text-anchor="middle" font-size="8.5" fill="#888">app tables, pending mutations, aggregates</text>
+      <text x="150" y="41" text-anchor="middle" font-size="8.5" fill="#888">app tables, pending writes, tier migrated per major (R31)</text>
       <text x="150" y="52" text-anchor="middle" font-size="8.5" fill="#4CAF50">resting table for server results: offline restart shows the last synced value</text>
     </g>
 
@@ -400,7 +400,7 @@
       <text x="315" y="16" text-anchor="middle" font-size="11.5" font-weight="600" fill="#333">Schema pipeline (build time)</text>
       <text x="315" y="30" text-anchor="middle" font-size="9" fill="#555">pg2sqlite translates PG DDL to replica DDL plus translation manifest</text>
       <text x="315" y="43" text-anchor="middle" font-size="8.5" fill="#555">translation emits fail-closed write guards, server applies land exempt (connetto_write_exempt)</text>
-      <text x="315" y="56" text-anchor="middle" font-size="8.5" fill="#888">the client is refused without the manifest</text>
+      <text x="315" y="56" text-anchor="middle" font-size="8.5" fill="#888">a major per schema source and one server per major (R31), the client refused without the manifest</text>
     </g>
 
     <!-- OAuth login and retention -->
@@ -650,5 +650,5 @@
   </g>
 
   <!-- Title -->
-  <text x="20" y="1704" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-10-26 to the plan's current state.</text>
+  <text x="20" y="1704" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-10-27 to the plan's current state.</text>
 </svg>
