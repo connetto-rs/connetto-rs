@@ -204,7 +204,7 @@ fn black_hole() -> LoopbackTransport {
             return;
         };
         let number = match handshake.writer {
-            connetto_core::messages::WriterRequest::Number(number) => number,
+            connetto_core::messages::WriterRequest::Number { number, .. } => number,
             _ => 1,
         };
         let _ = fake_server

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, HeldWork, HeldWrite,
-    MutationApplied, WriterGrant, WriterRef, WriterRequest,
+    MutationApplied, WriterGrant, WriterRef, WriterRequest, WriterSecret,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, Major, SchemaVersion, loopback};
@@ -78,14 +78,41 @@ pub(crate) fn replica() -> Conn {
 }
 
 /// Queue a write of row `id` under `writer`, as the build at `captured`
-/// captured it.
+/// captured it. An issued number holds [`secret_of`] its number, as the grant
+/// that issued it leaves it.
 pub(crate) fn queue(conn: &mut Conn, writer: WriterRef, id: i32, captured: Major) -> u64 {
     conn.db
         .batch_execute(&format!("INSERT INTO items (id) VALUES ({id})"))
         .expect("write locally");
     let changeset = conn.session.changeset().expect("capture the write");
-    conn.append_entry(&writer, &changeset, None, Some(captured), true)
-        .expect("queue the write")
+    let seq = conn
+        .append_entry(&writer, &changeset, None, Some(captured), true)
+        .expect("queue the write");
+    if let WriterRef::Number(number) = writer
+        && crate::is_real_writer(&writer)
+    {
+        let secret = secret_of(number);
+        conn.writers
+            .get_mut(&writer)
+            .expect("the queue stands")
+            .secret = Some(secret);
+        crate::persist_writer_secret(&mut conn.db, &writer, Some(&secret))
+            .expect("store the secret");
+    }
+    seq
+}
+
+/// The secret a test number is issued under, one per number.
+pub(crate) fn secret_of(number: u64) -> WriterSecret {
+    WriterSecret::from_bytes([u8::try_from(number).unwrap_or(u8::MAX); WriterSecret::LEN])
+}
+
+/// The handshake request naming the test number `number` with its secret.
+pub(crate) fn number_request(number: u64) -> WriterRequest {
+    WriterRequest::Number {
+        number,
+        secret: secret_of(number),
+    }
 }
 
 /// Record major 1 as held, as a rebuild leaves it, and owe its drain.
@@ -235,7 +262,7 @@ async fn a_batch_held_under_two_writers_drains_one_writer_per_wire() {
     hold_major_one(&mut conn);
 
     let (asked, mut old, _broken) = dial(&mut conn, vec![granting(7)], Then::Stay).await;
-    assert_eq!(asked, WriterRequest::Number(7), "the oldest write's writer");
+    assert_eq!(asked, number_request(7), "the oldest write's writer");
     assert_eq!(apply_next(&mut old).await, first);
     assert_eq!(
         pump(&mut conn).await,
@@ -258,7 +285,7 @@ async fn a_batch_held_under_two_writers_drains_one_writer_per_wire() {
     );
 
     let (asked, mut old, _broken) = dial(&mut conn, vec![granting(8)], Then::Stay).await;
-    assert_eq!(asked, WriterRequest::Number(8));
+    assert_eq!(asked, number_request(8));
     assert_eq!(apply_next(&mut old).await, second);
     let mut events = Vec::new();
     while !events.contains(&ClientEvent::Held(HeldWork::Drained { major: major(1) })) {
@@ -277,7 +304,7 @@ async fn a_held_write_behind_another_majors_earlier_write_waits() {
     hold_major_one(&mut conn);
 
     let (asked, mut old, _broken) = dial(&mut conn, vec![granting(7)], Then::Stay).await;
-    assert_eq!(asked, WriterRequest::Number(7));
+    assert_eq!(asked, number_request(7));
     assert_eq!(
         sent(&mut old).await,
         None,
@@ -300,9 +327,8 @@ async fn losing_a_major_held_under_two_device_keys_retires_the_device_once() {
     hold_major_one(&mut conn);
 
     let (asked, _old, _broken) = dial(&mut conn, vec![major_one_gone()], Then::Stay).await;
-    assert_eq!(
-        asked,
-        WriterRequest::Issue,
+    assert!(
+        matches!(asked, WriterRequest::Issue { .. }),
         "no certificate binds either key"
     );
     assert_eq!(

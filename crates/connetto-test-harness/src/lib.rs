@@ -11,7 +11,7 @@ use connetto_core::messages::{
     AckCredits, BindDevice, BulkMessage, Challenge, ContentVerb, ControlMessage, FullResyncReason,
     Grant, Handshake, HandshakeAck, LivePatch, MutationHeader, MutationPatch, Ping, Provenance,
     RetireWriter, SnapshotPatch, Subscribe, SubscriptionSpec, Unsubscribe, WriterAnswer, WriterRef,
-    WriterRequest,
+    WriterRequest, WriterSecret,
 };
 use connetto_core::traits::{ContentTicketSigner, IncomingFrame, MaybeSend, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
@@ -87,6 +87,31 @@ pub use connetto_server::defaults::ConnettoDefaults;
 pub const SLOT: &str = "connetto_slot";
 /// The publication the slot follows. Matches the server binary default.
 pub const PUBLICATION: &str = "connetto_pub";
+
+/// The secret the harness client issues every number writer under, so a test
+/// presents its number again with [`number_writer`].
+#[must_use]
+pub const fn writer_secret() -> WriterSecret {
+    WriterSecret::from_bytes([0x5c; WriterSecret::LEN])
+}
+
+/// The handshake request naming `number` with the harness's [`writer_secret`].
+#[must_use]
+pub const fn number_writer(number: u64) -> WriterRequest {
+    WriterRequest::Number {
+        number,
+        secret: writer_secret(),
+    }
+}
+
+/// The handshake request for a fresh number under the harness's
+/// [`writer_secret`], so the test presents it again with [`number_writer`].
+#[must_use]
+pub const fn issue_writer() -> WriterRequest {
+    WriterRequest::Issue {
+        secret: Some(writer_secret()),
+    }
+}
 
 /// The images a fixture starts, pinned rather than floating: a test that cannot
 /// say which server it ran against proves less than it appears to.
@@ -688,7 +713,8 @@ pub const WRITERS_DDL: &str = "DO $$ BEGIN \
      device_key BYTEA UNIQUE, \
      frontier BIGINT NOT NULL DEFAULT 0, \
      head BYTEA, \
-     retired_at TIMESTAMPTZ); \
+     retired_at TIMESTAMPTZ, \
+     secret_hash BYTEA); \
     CREATE TABLE IF NOT EXISTS _connetto_settled \
     (writer BIGINT NOT NULL, \
      seq BIGINT NOT NULL, \
@@ -1945,7 +1971,8 @@ impl Client {
     }
 
     /// Send a handshake presenting `grants`, each checked on its own, plus an
-    /// optional resume credential, asking the server to issue a number writer.
+    /// optional resume credential, asking the server to issue a number writer
+    /// under [`writer_secret`].
     ///
     /// # Panics
     ///
@@ -1956,8 +1983,16 @@ impl Client {
         grants: &[&str],
         resume_token: Option<&str>,
     ) -> HandshakeAck {
-        self.handshake_writing(client_id, grants, resume_token, WriterRequest::Issue, None)
-            .await
+        self.handshake_writing(
+            client_id,
+            grants,
+            resume_token,
+            WriterRequest::Issue {
+                secret: Some(writer_secret()),
+            },
+            None,
+        )
+        .await
     }
 
     /// Resume from `cursor` with optional known completed subject coverage.
@@ -2184,10 +2219,27 @@ impl Client {
     ///
     /// Panics when sending the `RetireWriter` frame fails, when the answer is not a `WriterAnswer` naming `request_id`, or when the connection closes before answering.
     pub async fn retire_writer(&mut self, request_id: &str, writer: WriterRef) -> WriterAnswer {
+        let secret = matches!(writer, WriterRef::Number(_)).then(writer_secret);
+        self.retire_writer_with(request_id, writer, secret).await
+    }
+
+    /// [`Self::retire_writer`] presenting `secret` as the writer's, for a
+    /// test of what a wrong or missing secret meets.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::retire_writer`].
+    pub async fn retire_writer_with(
+        &mut self,
+        request_id: &str,
+        writer: WriterRef,
+        secret: Option<WriterSecret>,
+    ) -> WriterAnswer {
         self.transport
             .send_control(ControlMessage::RetireWriter(RetireWriter {
                 request_id: request_id.to_owned(),
                 writer,
+                secret,
             }))
             .await
             .expect("send retire writer");

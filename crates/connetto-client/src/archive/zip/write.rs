@@ -199,9 +199,9 @@ fn write_entry<W: Write>(
 ///
 /// Its own framing rather than one entry per write, because a queue of a
 /// hundred writes is a hundred zip entries otherwise, and the order is the
-/// only thing about them that matters. Each entry carries the writer, the
-/// sequence, the chain hash, the capture major (0 for none) and the optional
-/// provenance the write rode with.
+/// only thing about them that matters. Each entry carries the writer and its
+/// secret, the sequence, the chain hash, the capture major (0 for none) and
+/// the optional provenance the write rode with.
 pub(super) fn encode_pending(entries: &[super::super::ArchivedEntry]) -> Vec<u8> {
     let total: usize = entries
         .iter()
@@ -213,10 +213,10 @@ pub(super) fn encode_pending(entries: &[super::super::ArchivedEntry]) -> Vec<u8>
                 + 8 // changeset length
                 + entry.changeset.len()
                 + writer_field_len(&entry.writer)
-                + entry
-                    .provenance
-                    .as_ref()
-                    .map_or(0, |prov| writer_field_len(&prov.writer) + 8)
+                + secret_field_len(entry.secret.as_ref())
+                + entry.provenance.as_ref().map_or(0, |prov| {
+                    writer_field_len(&prov.writer) + 8 + secret_field_len(prov.secret.as_ref())
+                })
         })
         .sum();
     let mut out = Vec::with_capacity(total + 8);
@@ -225,6 +225,7 @@ pub(super) fn encode_pending(entries: &[super::super::ArchivedEntry]) -> Vec<u8>
     out.extend_from_slice(&count.to_be_bytes());
     for entry in entries {
         write_writer(&mut out, &entry.writer);
+        write_secret(&mut out, entry.secret.as_ref());
         out.extend_from_slice(&entry.seq.to_be_bytes());
         out.extend_from_slice(&entry.hash);
         out.extend_from_slice(
@@ -238,6 +239,7 @@ pub(super) fn encode_pending(entries: &[super::super::ArchivedEntry]) -> Vec<u8>
                 out.push(1);
                 write_writer(&mut out, &prov.writer);
                 out.extend_from_slice(&prov.seq.to_be_bytes());
+                write_secret(&mut out, prov.secret.as_ref());
             }
             None => out.push(0),
         }
@@ -246,6 +248,21 @@ pub(super) fn encode_pending(entries: &[super::super::ArchivedEntry]) -> Vec<u8>
         out.extend_from_slice(&entry.changeset);
     }
     out
+}
+
+fn secret_field_len(secret: Option<&connetto_core::messages::WriterSecret>) -> usize {
+    1 + secret.map_or(0, |_| connetto_core::messages::WriterSecret::LEN)
+}
+
+/// A writer secret as a presence byte, then its bytes when present.
+fn write_secret(out: &mut Vec<u8>, secret: Option<&connetto_core::messages::WriterSecret>) {
+    match secret {
+        Some(secret) => {
+            out.push(1);
+            out.extend_from_slice(secret.as_bytes());
+        }
+        None => out.push(0),
+    }
 }
 
 fn writer_field_len(writer: &connetto_core::messages::WriterRef) -> usize {

@@ -104,7 +104,7 @@ impl Handshake {
             resume_token: None,
             last_cursor: None,
             cursor_subjects: None,
-            writer: WriterRequest::Issue,
+            writer: WriterRequest::default(),
             settled_through: None,
             schema_major: None,
         }

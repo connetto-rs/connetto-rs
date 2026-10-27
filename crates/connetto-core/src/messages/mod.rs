@@ -54,5 +54,5 @@ pub use subscription::{
 };
 pub use writer::{
     BindDevice, Provenance, RetireWriter, WRITER_BIND_DOMAIN, WriterAnswer, WriterGrant,
-    WriterOutcome, WriterRef, WriterRequest, writer_bind_message,
+    WriterOutcome, WriterRef, WriterRequest, WriterSecret, writer_bind_message,
 };

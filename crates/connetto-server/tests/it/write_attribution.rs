@@ -13,7 +13,9 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::Transport as _;
 use connetto_server::{ServerHandle, ServerParts, SessionWrites, WebSocketTransport};
-use connetto_test_harness::{Fixture, RowValue, insert_changeset, isolated_session_keyring};
+use connetto_test_harness::{
+    Fixture, RowValue, insert_changeset, isolated_session_keyring, issue_writer, number_writer,
+};
 use diesel::QueryableByName;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl as _;
@@ -190,7 +192,7 @@ async fn writes_of_names_the_sequences_each_login_wrote_and_the_rows_carry_them(
     let (idle, _, _) = mint_tokens(&served.base, "milan").await;
 
     // The first login writes two orders under a fresh number.
-    let (mut client, grant) = connect(&served.addr, &first, WriterRequest::Issue).await;
+    let (mut client, grant) = connect(&served.addr, &first, issue_writer()).await;
     let number = grant
         .expect("an identified caller is issued a number")
         .number;
@@ -200,12 +202,12 @@ async fn writes_of_names_the_sequences_each_login_wrote_and_the_rows_carry_them(
 
     // A second login of the same person continues that number, as a browser
     // does after signing in again, and writes one more.
-    let (mut client, _) = connect(&served.addr, &second, WriterRequest::Number(number)).await;
+    let (mut client, _) = connect(&served.addr, &second, number_writer(number)).await;
     write(&mut client, 3, 1003).await;
     drop(client);
 
     // A third binds the number and writes nothing.
-    let (_client, _) = connect(&served.addr, &idle, WriterRequest::Number(number)).await;
+    let (_client, _) = connect(&served.addr, &idle, number_writer(number)).await;
 
     let wrote = |seqs| {
         vec![SessionWrites {

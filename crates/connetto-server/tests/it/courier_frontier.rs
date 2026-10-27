@@ -1108,6 +1108,7 @@ async fn a_courier_restore_answers_a_settled_original_without_reapplying() {
     let original = Provenance {
         writer: WriterRef::Device(k1_id),
         seq: 1,
+        secret: None,
     };
     let restored = vec![CourierEntry {
         seq: 1,
@@ -1176,6 +1177,7 @@ async fn a_courier_restore_settles_the_unsettled_original_with_the_copy() {
     let original = Provenance {
         writer: WriterRef::Device(k1_id),
         seq: 1,
+        secret: None,
     };
     let restored = vec![CourierEntry {
         seq: 1,
@@ -1298,6 +1300,7 @@ async fn a_courier_restore_keeps_a_refused_original_outcome() {
     let original = Provenance {
         writer: WriterRef::Device(k1_id),
         seq: 1,
+        secret: None,
     };
     let restored = vec![CourierEntry {
         seq: 1,
@@ -1374,6 +1377,7 @@ async fn a_courier_range_signature_covers_the_entries_provenance() {
     let original = Provenance {
         writer: WriterRef::Device(k1_id),
         seq: 1,
+        secret: None,
     };
     let signed = vec![CourierEntry {
         seq: 1,
@@ -1403,6 +1407,7 @@ async fn a_courier_range_signature_covers_the_entries_provenance() {
         provenance: Some(Provenance {
             writer: WriterRef::Number(5),
             seq: 1,
+            secret: None,
         }),
     }];
     let delivery = manager
@@ -1504,6 +1509,7 @@ async fn a_courier_restore_of_a_foreign_original_applies_plain() {
     let original = Provenance {
         writer: WriterRef::Device(k3_id),
         seq: 1,
+        secret: None,
     };
     let restored = vec![CourierEntry {
         seq: 1,
@@ -1598,6 +1604,7 @@ async fn a_courier_restore_with_a_provenance_gap_settles_neither() {
     let original = Provenance {
         writer: WriterRef::Device(k1_id),
         seq: 3,
+        secret: None,
     };
     let restored = vec![CourierEntry {
         seq: 1,
@@ -1674,6 +1681,7 @@ async fn a_refused_courier_restore_settles_the_unsettled_original() {
         provenance: Some(Provenance {
             writer: WriterRef::Device(original_key),
             seq: 1,
+            secret: None,
         }),
     }];
     let head = entry_hash(&GENESIS, 1, &entries[0].changeset);
@@ -1772,6 +1780,7 @@ async fn concurrent_courier_restores_reserve_the_original_before_applying() {
         provenance: Some(Provenance {
             writer: WriterRef::Device(original_key),
             seq: 1,
+            secret: None,
         }),
     }]);
     let head = entry_hash(&GENESIS, 1, &entries[0].changeset);

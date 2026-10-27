@@ -3645,7 +3645,7 @@ async fn a_held_device_write_without_a_bindable_key_asks_for_a_number() {
     for holds in [HeldKey::Uncertified, HeldKey::Recertified, HeldKey::Retired] {
         let mut held = held_device_write(holds).await;
         let (asked, _old, _broken) = dial(&mut held.conn, vec![ack(ISSUED_NINE)], Then::Stay).await;
-        assert_eq!(asked, WriterRequest::Issue, "{holds:?}");
+        assert!(matches!(asked, WriterRequest::Issue { .. }), "{holds:?}");
     }
 }
 
@@ -3716,7 +3716,7 @@ async fn a_device_that_reopens_another_key_drains_its_held_write_under_a_number(
         Some(Duration::ZERO)
     );
     let (asked, _old, _broken) = dial(&mut held.conn, vec![ack(ISSUED_NINE)], Then::Stay).await;
-    assert_eq!(asked, WriterRequest::Issue);
+    assert!(matches!(asked, WriterRequest::Issue { .. }));
 }
 
 /// R31 on R75: the old major refusing the device's bind moves the held
@@ -3775,7 +3775,7 @@ async fn a_refused_drain_bind_moves_the_held_write_to_a_number() {
     );
 
     let (asked, mut old, _broken) = dial(&mut held.conn, vec![ack(ISSUED_NINE)], Then::Stay).await;
-    assert_eq!(asked, WriterRequest::Issue);
+    assert!(matches!(asked, WriterRequest::Issue { .. }));
     let Some(ControlMessage::MutationHeader(header)) = sent(&mut old).await else {
         panic!("the issued number sends the held write");
     };
@@ -3784,6 +3784,7 @@ async fn a_refused_drain_bind_moves_the_held_write_to_a_number() {
         Some(Provenance {
             writer: WriterRef::Device(held.key_id),
             seq: held.seq,
+            secret: None,
         }),
         "the write names the device it was captured under"
     );
@@ -3857,5 +3858,5 @@ async fn a_device_revoked_at_the_drain_handshake_drains_its_held_write_under_a_n
         Some(Duration::ZERO)
     );
     let (asked, _old, _broken) = dial(&mut held.conn, vec![ack(ISSUED_NINE)], Then::Stay).await;
-    assert_eq!(asked, WriterRequest::Issue);
+    assert!(matches!(asked, WriterRequest::Issue { .. }));
 }

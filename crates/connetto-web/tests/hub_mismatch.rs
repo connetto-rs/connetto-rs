@@ -129,7 +129,7 @@ impl Transport for FakeUpstream {
         if let ControlMessage::Handshake(handshake) = &message {
             let writer = match &handshake.writer {
                 WriterRequest::Device => None,
-                WriterRequest::Issue | WriterRequest::Number(_) => Some(WriterGrant {
+                WriterRequest::Issue { .. } | WriterRequest::Number { .. } => Some(WriterGrant {
                     number: 1,
                     frontier: 0,
                 }),

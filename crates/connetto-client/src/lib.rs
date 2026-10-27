@@ -2,6 +2,7 @@
 
 pub use connetto_core::messages::{
     FullResyncReason, Grant, PauseCause, SyncStatus, WriterGrant, WriterRef, WriterRequest,
+    WriterSecret,
 };
 pub use connetto_core::{Custody, NoGate};
 /// The peer link's close reasons, dial errors and chain refusals (R76).
@@ -53,7 +54,6 @@ use sqlite_diff_rs::{
     Value,
 };
 use std::borrow::Cow;
-use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(feature = "peer")]
 use std::net::SocketAddr;
@@ -2044,14 +2044,14 @@ fn count_ops(changeset: &[u8]) -> u32 {
 const META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_meta \
     (id INTEGER PRIMARY KEY CHECK (id = 1), cursor BLOB NOT NULL, cursor_subjects BLOB); \
     CREATE TABLE IF NOT EXISTS _connetto_writers \
-    (id TEXT NOT NULL PRIMARY KEY, next_seq INTEGER NOT NULL, head BLOB NOT NULL); \
+    (id TEXT NOT NULL PRIMARY KEY, next_seq INTEGER NOT NULL, head BLOB NOT NULL, secret BLOB); \
     CREATE TABLE IF NOT EXISTS _connetto_pending \
     (writer TEXT NOT NULL, seq INTEGER NOT NULL, changeset BLOB NOT NULL, \
      entry_hash BLOB NOT NULL, position INTEGER NOT NULL, \
-     prov_writer TEXT, prov_seq INTEGER, major INTEGER, \
+     prov_writer TEXT, prov_seq INTEGER, prov_secret BLOB, major INTEGER, \
      PRIMARY KEY (writer, seq)); \
     CREATE TABLE IF NOT EXISTS _connetto_retire \
-    (writer TEXT NOT NULL PRIMARY KEY); \
+    (writer TEXT NOT NULL PRIMARY KEY, secret BLOB); \
     CREATE TABLE IF NOT EXISTS _connetto_retired_keys \
     (key_id BLOB NOT NULL PRIMARY KEY)";
 
@@ -2113,6 +2113,8 @@ diesel::table! {
         next_seq -> diesel::sql_types::BigInt,
         /// The last appended entry hash.
         head -> diesel::sql_types::Binary,
+        /// The secret a number writer was issued under.
+        secret -> diesel::sql_types::Nullable<diesel::sql_types::Binary>,
     }
 }
 
@@ -2134,6 +2136,8 @@ diesel::table! {
         prov_writer -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
         /// The original writer's sequence.
         prov_seq -> diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+        /// The secret the original number writer was issued under.
+        prov_secret -> diesel::sql_types::Nullable<diesel::sql_types::Binary>,
         /// The application schema major the entry was captured under (R31).
         major -> diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
     }
@@ -2144,6 +2148,8 @@ diesel::table! {
     _connetto_retire (writer) {
         /// The writer awaiting retirement.
         writer -> diesel::sql_types::Text,
+        /// The secret the number writer was issued under.
+        secret -> diesel::sql_types::Nullable<diesel::sql_types::Binary>,
     }
 }
 
@@ -3000,6 +3006,8 @@ struct CarriedEntry {
     position: u64,
     seq: u64,
     hash: [u8; 32],
+    /// The provenance the entry carries to its new writer.
+    provenance: Option<Provenance>,
 }
 
 /// One writer's queue, the client half of the (writer, sequence) identity.
@@ -3009,6 +3017,10 @@ struct WriterQueue {
     next_seq: u64,
     /// The chain head, the last queued entry's hash or the genesis.
     head: [u8; 32],
+    /// The secret a number writer was issued under, presented with its
+    /// number (R70 decision 22), absent for a device writer, the unissued
+    /// queue and a number this replica holds no secret for.
+    secret: Option<WriterSecret>,
     /// The queued entries, in sequence order.
     pending: BTreeMap<u64, PendingEntry>,
 }
@@ -3019,12 +3031,14 @@ impl WriterQueue {
         Self {
             next_seq: 1,
             head: GENESIS,
+            secret: None,
             pending: BTreeMap::new(),
         }
     }
 }
 
-/// Record a writer's queue state, its next sequence and chain head.
+/// Record a writer's queue state, its next sequence and chain head, keeping
+/// the secret its row already holds.
 fn persist_writer_state(
     db: &mut SqliteConnection,
     writer: &WriterRef,
@@ -3032,12 +3046,32 @@ fn persist_writer_state(
     head: &[u8; 32],
 ) -> Result<(), ClientError> {
     let id = writer_id(writer);
-    diesel::replace_into(_connetto_writers::table)
+    let next_seq = seq_storage(next_seq)?;
+    diesel::insert_into(_connetto_writers::table)
         .values((
             _connetto_writers::id.eq(&id),
-            _connetto_writers::next_seq.eq(seq_storage(next_seq)?),
+            _connetto_writers::next_seq.eq(next_seq),
             _connetto_writers::head.eq(*head),
         ))
+        .on_conflict(_connetto_writers::id)
+        .do_update()
+        .set((
+            _connetto_writers::next_seq.eq(next_seq),
+            _connetto_writers::head.eq(*head),
+        ))
+        .execute(db)?;
+    Ok(())
+}
+
+/// Record the secret a number writer was issued under, on its existing row.
+fn persist_writer_secret(
+    db: &mut SqliteConnection,
+    writer: &WriterRef,
+    secret: Option<&WriterSecret>,
+) -> Result<(), ClientError> {
+    let id = writer_id(writer);
+    diesel::update(_connetto_writers::table.filter(_connetto_writers::id.eq(&id)))
+        .set(_connetto_writers::secret.eq(secret.map(WriterSecret::as_bytes)))
         .execute(db)?;
     Ok(())
 }
@@ -3050,26 +3084,61 @@ fn drop_writer_state(db: &mut SqliteConnection, writer: &WriterRef) -> Result<()
     Ok(())
 }
 
-/// The queue state of every writer a previous run left behind.
+/// The queue state of every writer a previous run left behind, its next
+/// sequence, chain head and the secret a number was issued under, each queue
+/// empty until its pending entries load.
 fn load_writer_states(
     db: &mut SqliteConnection,
-) -> Result<BTreeMap<WriterRef, (u64, [u8; 32])>, ClientError> {
-    let rows: Vec<(String, i64, Vec<u8>)> = _connetto_writers::table
+) -> Result<BTreeMap<WriterRef, WriterQueue>, ClientError> {
+    #[derive(diesel::Queryable)]
+    struct StateRow {
+        id: String,
+        next_seq: i64,
+        head: Vec<u8>,
+        secret: Option<Vec<u8>>,
+    }
+    let rows: Vec<StateRow> = _connetto_writers::table
         .select((
             _connetto_writers::id,
             _connetto_writers::next_seq,
             _connetto_writers::head,
+            _connetto_writers::secret,
         ))
         .load(db)?;
     Ok(rows
         .into_iter()
-        .filter_map(|(id, next_seq, head)| {
-            Some((
-                writer_from_id(&id)?,
-                (u64::try_from(next_seq).ok()?, head.try_into().ok()?),
-            ))
+        .filter_map(|row| {
+            let queue = WriterQueue {
+                next_seq: u64::try_from(row.next_seq).ok()?,
+                head: row.head.try_into().ok()?,
+                secret: stored_secret(row.secret),
+                pending: BTreeMap::new(),
+            };
+            Some((writer_from_id(&row.id)?, queue))
         })
         .collect())
+}
+
+/// A stored writer secret, absent when the column is empty or the wrong length.
+fn stored_secret(bytes: Option<Vec<u8>>) -> Option<WriterSecret> {
+    let bytes: [u8; WriterSecret::LEN] = bytes?.try_into().ok()?;
+    Some(WriterSecret::from_bytes(bytes))
+}
+
+/// A fresh writer secret from the platform's entropy, drawn when the
+/// replica asks for a number (R70 decision 22).
+fn draw_writer_secret() -> WriterSecret {
+    let mut bytes = [0_u8; WriterSecret::LEN];
+    bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    WriterSecret::from_bytes(bytes)
+}
+
+/// A request for a fresh number under a freshly drawn secret.
+fn issue_request() -> WriterRequest {
+    WriterRequest::Issue {
+        secret: Some(draw_writer_secret()),
+    }
 }
 
 /// Record a queued entry durably, with its chain hash, append position,
@@ -3080,9 +3149,13 @@ fn persist_pending(
     seq: u64,
     entry: &EntryRecord<'_>,
 ) -> Result<(), ClientError> {
-    let (prov_writer, prov_seq) = match &entry.provenance {
-        Some(prov) => (Some(writer_id(&prov.writer)), Some(seq_storage(prov.seq)?)),
-        None => (None, None),
+    let (prov_writer, prov_seq, prov_secret) = match &entry.provenance {
+        Some(prov) => (
+            Some(writer_id(&prov.writer)),
+            Some(seq_storage(prov.seq)?),
+            prov.secret.as_ref().map(WriterSecret::as_bytes),
+        ),
+        None => (None, None, None),
     };
     let id = writer_id(writer);
     diesel::replace_into(_connetto_pending::table)
@@ -3094,6 +3167,7 @@ fn persist_pending(
             _connetto_pending::position.eq(seq_storage(entry.position)?),
             _connetto_pending::prov_writer.eq(&prov_writer),
             _connetto_pending::prov_seq.eq(&prov_seq),
+            _connetto_pending::prov_secret.eq(prov_secret),
             _connetto_pending::major.eq(entry.major.map(|major| i64::from(major.get()))),
         ))
         .execute(db)?;
@@ -3167,6 +3241,7 @@ fn load_pending(
         position: i64,
         prov_writer: Option<String>,
         prov_seq: Option<i64>,
+        prov_secret: Option<Vec<u8>>,
         major: Option<i64>,
     }
     let rows: Vec<PendingRow> = _connetto_pending::table
@@ -3178,6 +3253,7 @@ fn load_pending(
             _connetto_pending::position,
             _connetto_pending::prov_writer,
             _connetto_pending::prov_seq,
+            _connetto_pending::prov_secret,
             _connetto_pending::major,
         ))
         .order((
@@ -3199,12 +3275,17 @@ fn load_pending(
         let Ok(position) = u64::try_from(row.position) else {
             continue;
         };
+        let secret = stored_secret(row.prov_secret);
         let provenance = row
             .prov_writer
             .as_deref()
             .zip(row.prov_seq)
             .and_then(|(writer, seq)| Some((writer_from_id(writer)?, u64::try_from(seq).ok()?)))
-            .map(|(writer, seq)| Provenance { writer, seq });
+            .map(|(writer, seq)| Provenance {
+                writer,
+                seq,
+                secret,
+            });
         let major = row
             .major
             .and_then(|major| u32::try_from(major).ok())
@@ -3224,25 +3305,35 @@ fn load_pending(
     Ok(queues)
 }
 
-/// Remember a writer to retire on the next connection.
-fn persist_retire(db: &mut SqliteConnection, writer: &WriterRef) -> Result<(), ClientError> {
+/// Remember a writer to retire on the next connection, with the secret a
+/// number writer was issued under.
+fn persist_retire(
+    db: &mut SqliteConnection,
+    writer: &WriterRef,
+    secret: Option<&WriterSecret>,
+) -> Result<(), ClientError> {
     let id = writer_id(writer);
     diesel::insert_into(_connetto_retire::table)
-        .values(_connetto_retire::writer.eq(&id))
+        .values((
+            _connetto_retire::writer.eq(&id),
+            _connetto_retire::secret.eq(secret.map(WriterSecret::as_bytes)),
+        ))
         .on_conflict_do_nothing()
         .execute(db)?;
     Ok(())
 }
 
-/// The writers owed a retirement, in writer order.
-fn load_retires(db: &mut SqliteConnection) -> Result<Vec<WriterRef>, ClientError> {
-    let rows: Vec<String> = _connetto_retire::table
-        .select(_connetto_retire::writer)
+/// The writers owed a retirement with their secrets, in writer order.
+fn load_retires(
+    db: &mut SqliteConnection,
+) -> Result<Vec<(WriterRef, Option<WriterSecret>)>, ClientError> {
+    let rows: Vec<(String, Option<Vec<u8>>)> = _connetto_retire::table
+        .select((_connetto_retire::writer, _connetto_retire::secret))
         .order(_connetto_retire::writer.asc())
         .load(db)?;
     Ok(rows
         .into_iter()
-        .filter_map(|writer| writer_from_id(&writer))
+        .filter_map(|(writer, secret)| Some((writer_from_id(&writer)?, stored_secret(secret))))
         .collect())
 }
 
@@ -3283,19 +3374,8 @@ fn load_retired_keys(db: &mut SqliteConnection) -> Result<HashSet<[u8; 32]>, Cli
 fn load_writer_queues(
     db: &mut SqliteConnection,
 ) -> Result<(BTreeMap<WriterRef, WriterQueue>, u64), ClientError> {
-    let states = load_writer_states(db)?;
+    let mut queues = load_writer_states(db)?;
     let pending = load_pending(db)?;
-    let mut queues = BTreeMap::new();
-    for (writer, (next_seq, head)) in states {
-        queues.insert(
-            writer,
-            WriterQueue {
-                next_seq,
-                head,
-                pending: BTreeMap::new(),
-            },
-        );
-    }
     for (writer, entries) in pending {
         let queue = queues.entry(writer).or_insert_with(WriterQueue::fresh);
         let mut last_hash: Option<[u8; 32]> = None;
@@ -3748,8 +3828,8 @@ enum WriterTaskKind {
         key_id: [u8; 32],
         signature: Vec<u8>,
     },
-    /// A writer retirement.
-    Retire(WriterRef),
+    /// A writer retirement, with the secret a number writer was issued under.
+    Retire(WriterRef, Option<WriterSecret>),
 }
 
 /// How long a bind or retirement waits for its `WriterAnswer` before the
@@ -4647,7 +4727,7 @@ where
                     reason: FatalErrorReason::WriterUnknown | FatalErrorReason::WriterRetired,
                 },
             ) => {
-                if let WriterRequest::Number(number) = writer {
+                if let WriterRequest::Number { number, .. } = writer {
                     self.carry_to_live(WriterRef::Number(number));
                 }
                 return Err(error);
@@ -4695,9 +4775,9 @@ where
         self.plan_bind().await?;
         // A retirement owed before the last connection is re-sent here, queued
         // behind any bind so the connection is bound before it retires.
-        for writer in load_retires(&mut self.db)? {
+        for (writer, secret) in load_retires(&mut self.db)? {
             self.writer_tasks.push_back(WriterTask {
-                kind: WriterTaskKind::Retire(writer),
+                kind: WriterTaskKind::Retire(writer, secret),
                 request_id: writer_request_id(),
                 deadline: crate::away::SystemClock.monotonic() + WRITER_ANSWER_WAIT,
             });
@@ -4788,7 +4868,15 @@ where
     /// bind, and an unissued tail takes its fresh number first, so a fresh
     /// number is asked whenever any writer's tail waits.
     fn writer_handshake(&mut self) -> Result<(WriterRequest, Option<u64>), ClientError> {
-        let number = self.number_identity();
+        let mut number = self.number_identity();
+        // A number this replica holds no secret for can never be named
+        // again (R70 decision 22), so its tail travels to a fresh number.
+        if let Some(held) = number
+            && self.number_secret(held).is_none()
+        {
+            self.carry_to_live(WriterRef::Number(held));
+            number = None;
+        }
         let number_tail = number.is_some_and(|number| {
             self.writers
                 .get(&WriterRef::Number(number))
@@ -4796,11 +4884,7 @@ where
         });
         if number_tail {
             let number = number.expect("a tail names its writer");
-            let writer = WriterRef::Number(number);
-            return Ok((
-                WriterRequest::Number(number),
-                Some(self.settled_through(&writer)),
-            ));
+            return Ok(self.present_number(number));
         }
         // An unissued tail settles under its own fresh number first, or a
         // device handshake would queue it behind the device's later entries.
@@ -4809,21 +4893,35 @@ where
             .get(&unissued())
             .is_some_and(|queue| !queue.pending.is_empty());
         if unissued_tail {
-            return Ok((WriterRequest::Issue, None));
+            return Ok((issue_request(), None));
         }
         if self.device_bindable()? {
             return Ok((WriterRequest::Device, None));
         }
         match number {
-            Some(number) => {
-                let writer = WriterRef::Number(number);
-                Ok((
-                    WriterRequest::Number(number),
-                    Some(self.settled_through(&writer)),
-                ))
-            }
-            None => Ok((WriterRequest::Issue, None)),
+            Some(number) => Ok(self.present_number(number)),
+            None => Ok((issue_request(), None)),
         }
+    }
+
+    /// The secret the number writer `number` was issued under, if this
+    /// replica holds one.
+    fn number_secret(&self, number: u64) -> Option<WriterSecret> {
+        self.writers
+            .get(&WriterRef::Number(number))
+            .and_then(|queue| queue.secret)
+    }
+
+    /// The handshake request naming the held number `number` with its
+    /// secret, and how much of it the server has settled.
+    fn present_number(&self, number: u64) -> (WriterRequest, Option<u64>) {
+        let secret = self
+            .number_secret(number)
+            .expect("a presented number holds its secret");
+        (
+            WriterRequest::Number { number, secret },
+            Some(self.settled_through(&WriterRef::Number(number))),
+        )
     }
 
     /// The number writer this replica holds, if any, the unissued one
@@ -4901,7 +4999,7 @@ where
         granted: Option<WriterGrant>,
     ) -> Result<Option<WriterRef>, ClientError> {
         match request {
-            WriterRequest::Issue => {
+            WriterRequest::Issue { secret } => {
                 let grant = granted.ok_or_else(|| {
                     ClientError::Protocol("the server issued no writer to an issue".to_owned())
                 })?;
@@ -4926,17 +5024,19 @@ where
                         } else {
                             (1, &GENESIS)
                         };
-                        persist_writer_state(db, &number, next_seq, head)
+                        persist_writer_state(db, &number, next_seq, head)?;
+                        persist_writer_secret(db, &number, secret.as_ref())
                     })?;
                 }
-                let queue = self
+                let mut queue = self
                     .writers
                     .remove(&unissued())
                     .unwrap_or_else(WriterQueue::fresh);
+                queue.secret = secret;
                 self.writers.insert(number, queue);
                 Ok(Some(number))
             }
-            WriterRequest::Number(number) => {
+            WriterRequest::Number { number, .. } => {
                 let grant = granted.ok_or_else(|| {
                     ClientError::Protocol("the server answered a number without a grant".to_owned())
                 })?;
@@ -4945,16 +5045,9 @@ where
                         "the server confirmed another number than the handshake named".to_owned(),
                     ));
                 }
-                let writer = WriterRef::Number(number);
-                if let Entry::Vacant(entry) = self.writers.entry(writer) {
-                    {
-                        let _suspended =
-                            SuspendedCapture::new(&mut self.session, &self.write_exempt);
-                        persist_writer_state(&mut self.db, &writer, 1, &GENESIS)?;
-                    }
-                    entry.insert(WriterQueue::fresh());
-                }
-                Ok(Some(writer))
+                // The handshake names only a number whose queue this replica
+                // holds, its secret beside it, so the queue already stands.
+                Ok(Some(WriterRef::Number(number)))
             }
             WriterRequest::Device => {
                 if granted.is_some() {
@@ -5080,9 +5173,10 @@ where
                 key_id: *key_id,
                 signature: signature.clone(),
             }),
-            WriterTaskKind::Retire(writer) => ControlMessage::RetireWriter(RetireWriter {
+            WriterTaskKind::Retire(writer, secret) => ControlMessage::RetireWriter(RetireWriter {
                 request_id: task.request_id.clone(),
                 writer: *writer,
+                secret: *secret,
             }),
         };
         wire.transport
@@ -5128,7 +5222,7 @@ where
                 self.answer_bind(key_id, answer.request_id.clone(), answer.outcome)
                     .await
             }
-            WriterTaskKind::Retire(writer) => {
+            WriterTaskKind::Retire(writer, _) => {
                 {
                     let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
                     clear_retire(&mut self.db, &writer)?;
@@ -5205,11 +5299,12 @@ where
     /// Retire the number writer whose tail settled, its entries all answered,
     /// and drop its state, so the next handshake does not present it again.
     fn retire_number(&mut self, number: WriterRef) -> Result<(), ClientError> {
+        let secret = self.writers.get(&number).and_then(|queue| queue.secret);
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        persist_retire(&mut self.db, &number)?;
+        persist_retire(&mut self.db, &number, secret.as_ref())?;
         drop_writer_state(&mut self.db, &number)?;
         self.writer_tasks.push_back(WriterTask {
-            kind: WriterTaskKind::Retire(number),
+            kind: WriterTaskKind::Retire(number, secret),
             request_id: writer_request_id(),
             deadline: crate::away::SystemClock.monotonic() + WRITER_ANSWER_WAIT,
         });
@@ -5265,12 +5360,22 @@ where
             if let Some(queue) = self.writers.get(source) {
                 for (original_seq, entry) in &queue.pending {
                     if carried(entry) {
+                        // A carried entry keeps an earlier carry's provenance,
+                        // and otherwise names the writer it was made under.
+                        let provenance = entry.provenance.or_else(|| {
+                            is_real_writer(source).then_some(Provenance {
+                                writer: *source,
+                                seq: *original_seq,
+                                secret: queue.secret,
+                            })
+                        });
                         plan.push(CarriedEntry {
                             source: *source,
                             original_seq: *original_seq,
                             position: entry.position,
                             seq: 0,
                             hash: GENESIS,
+                            provenance,
                         });
                     }
                 }
@@ -5319,12 +5424,7 @@ where
                 let entry = &self.writers[&placement.source].pending[&placement.original_seq];
                 let record = EntryRecord {
                     hash: placement.hash,
-                    provenance: entry.provenance.or_else(|| {
-                        is_real_writer(&placement.source).then_some(Provenance {
-                            writer: placement.source,
-                            seq: placement.original_seq,
-                        })
-                    }),
+                    provenance: placement.provenance,
                     ..entry.record()
                 };
                 persist_pending(db, target, placement.seq, &record)?;
@@ -5360,12 +5460,7 @@ where
                     .remove(&placement.original_seq)
                     .expect("the planned entry exists");
                 entry.hash = placement.hash;
-                entry.provenance = entry.provenance.or_else(|| {
-                    is_real_writer(&placement.source).then_some(Provenance {
-                        writer: placement.source,
-                        seq: placement.original_seq,
-                    })
-                });
+                entry.provenance = placement.provenance;
                 queue.pending.insert(placement.seq, entry);
             }
             self.writers.insert(*target, queue);
@@ -6652,6 +6747,7 @@ where
                                         hash: entry.hash,
                                         major: entry.major,
                                         changeset: entry.changeset.clone(),
+                                        secret: queue.secret,
                                         provenance: entry.provenance,
                                     },
                                 )
@@ -6876,18 +6972,18 @@ where
             return Ok(0);
         }
         let current = self.choose_writer();
-        let archived: std::collections::BTreeSet<WriterRef> = entries
-            .iter()
-            .map(|entry| entry.writer)
-            .filter(is_real_writer)
-            .collect();
+        let mut archived: BTreeMap<WriterRef, Option<WriterSecret>> = BTreeMap::new();
+        for entry in entries.iter().filter(|entry| is_real_writer(&entry.writer)) {
+            let secret = archived.entry(entry.writer).or_default();
+            *secret = secret.or(entry.secret);
+        }
         {
             let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-            for writer in &archived {
-                persist_retire(&mut self.db, writer)?;
+            for (writer, secret) in &archived {
+                persist_retire(&mut self.db, writer, secret.as_ref())?;
             }
         }
-        let target = if archived.contains(&current) {
+        let target = if archived.contains_key(&current) {
             // The archived writer is this replica's own, so it is retired and
             // its tail, restored entries included, travels to the live writer.
             let live = self.tail_target(&current);
@@ -6908,6 +7004,7 @@ where
                 is_real_writer(&entry.writer).then_some(Provenance {
                     writer: entry.writer,
                     seq: entry.seq,
+                    secret: entry.secret,
                 })
             });
             self.append_entry(&target, &entry.changeset, provenance, entry.major, false)?;

@@ -331,7 +331,7 @@ impl Transport for FakeTransport {
         if let ControlMessage::Handshake(handshake) = &message {
             let writer = match &handshake.writer {
                 WriterRequest::Device => None,
-                WriterRequest::Issue | WriterRequest::Number(_) => Some(WriterGrant {
+                WriterRequest::Issue { .. } | WriterRequest::Number { .. } => Some(WriterGrant {
                     number: self.issued,
                     frontier: self.issued_frontier,
                 }),

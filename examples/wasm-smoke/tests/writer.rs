@@ -24,7 +24,7 @@ use connetto_client::{
 };
 use connetto_core::messages::{
     BulkMessage, Challenge, ControlMessage, Grant, Handshake, MutationApplied, MutationHeader,
-    MutationPatch, MutationReject, MutationRejectReason, WriterGrant, WriterRequest,
+    MutationPatch, MutationReject, MutationRejectReason, WriterGrant, WriterRequest, WriterSecret,
 };
 use connetto_core::{IncomingFrame, PROTOCOL_VERSION, Transport};
 use connetto_wasm_smoke::BrowserSocket;
@@ -124,6 +124,28 @@ async fn settle_one(
         "the settled write leaves the queue"
     );
     (id, number)
+}
+
+diesel::table! {
+    /// The replica's writer states, read for the secret a number was issued under.
+    _connetto_writers (id) {
+        id -> Text,
+        secret -> Nullable<Binary>,
+    }
+}
+
+/// The secret the replica's number writer `number` was issued under.
+fn number_secret(writer: &mut ConnettoConnection<BrowserSocket>, number: u64) -> WriterSecret {
+    let bytes: Option<Vec<u8>> = _connetto_writers::table
+        .filter(_connetto_writers::id.eq(format!("number:{number}")))
+        .select(_connetto_writers::secret)
+        .first(writer.conn())
+        .expect("the replica holds its number");
+    let bytes: [u8; WriterSecret::LEN] = bytes
+        .expect("an issued number holds its secret")
+        .try_into()
+        .expect("a secret is 32 bytes");
+    WriterSecret::from_bytes(bytes)
 }
 
 /// The worker's durable replica reboots under the writer number it was issued,
@@ -316,7 +338,8 @@ async fn a_forged_changeset_at_a_settled_sequence_is_refused_forked() {
     let (token, user_id) = mint_session().await;
     let mut fixture = ParityFixture::setup(base, "writer-fork", token.clone(), &user_id).await;
 
-    // Settle one row under the direct client's number.
+    // Settle one row under the direct client's number, whose secret the
+    // forger presents with it.
     let (_, number) = settle_one(&mut fixture.direct, &user_id, 1).await;
 
     // A valid insert the server never saw, compressed as the bulk frame carries it.
@@ -354,7 +377,10 @@ async fn a_forged_changeset_at_a_settled_sequence_is_refused_forked() {
         .send_control(ControlMessage::Handshake(
             Handshake::new(PROTOCOL_VERSION, rosetta_uuid::Uuid::new_v4().to_string())
                 .with_grant(Grant::new(token))
-                .with_writer(WriterRequest::Number(number))
+                .with_writer(WriterRequest::Number {
+                    number,
+                    secret: number_secret(&mut fixture.direct, number),
+                })
                 .with_major(demo_schema().major()),
         ))
         .await

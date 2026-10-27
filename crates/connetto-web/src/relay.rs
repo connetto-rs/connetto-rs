@@ -3323,8 +3323,8 @@ where
             // The frontier is the tab's own durable watermark. A fresh tab
             // presents no number and the protocol answers a fresh number at 0.
             let (number, frontier) = match handshake.writer {
-                WriterRequest::Issue => (tab_writer_number(client_uuid), 0),
-                WriterRequest::Number(number) => (
+                WriterRequest::Issue { .. } => (tab_writer_number(client_uuid), 0),
+                WriterRequest::Number { number, .. } => (
                     number,
                     match (tab.applied_watermark, tab.local_watermark) {
                         (Some(synced), Some(local)) => synced.max(local),

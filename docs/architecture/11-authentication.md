@@ -122,13 +122,14 @@ CREATE TABLE connetto_provider_tokens (
 CREATE TYPE connetto_settle_path AS ENUM ('direct', 'restore', 'courier');
 
 CREATE TABLE _connetto_writers (
-    writer     BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-    user_id    <IdSqlType>,
-    session_id UUID,
-    device_key BYTEA UNIQUE,
-    frontier   BIGINT NOT NULL DEFAULT 0,
-    head       BYTEA,
-    retired_at TIMESTAMPTZ
+    writer      BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    user_id     <IdSqlType>,
+    session_id  UUID,
+    device_key  BYTEA UNIQUE,
+    frontier    BIGINT NOT NULL DEFAULT 0,
+    head        BYTEA,
+    retired_at  TIMESTAMPTZ,
+    secret_hash BYTEA
 );
 
 CREATE TABLE _connetto_settled (
@@ -195,7 +196,7 @@ CREATE INDEX connetto_oplog_xids_lsn ON connetto_oplog_xids (commit_lsn);
 
 **What stays out of reach (R105).** Data already synced to a device an attacker controls cannot be taken back. Their copy of the replica and its key are on their machine, and an attacker's own client ignores the revocation. A browser enrols no device key, so its replica stays until it logs out with clear, and ending its session only stops it syncing. A device offline and out of reach of every peer wipes when it next learns of the revocation. An access token already minted stays signature-valid until its short lifetime ends for any handler that does not call `verify_live`. Share keys an ended session minted and installations stay until the person withdraws them from the `Ended` answer, and the rows an ended session wrote stay until the application undoes them from what `writes_of` names.
 
-The writer frontier keys on a server-issued writer number. A device writer additionally has a unique `device_key` and survives its enrolment connection. `user_id` is nullable for anonymous writers. `frontier` is the highest settled sequence and `head` its chain hash. `_connetto_settled` stores each `(writer, seq)` with its entry hash, `previous_hash`, outcome and delivery path. A retained entry verifies against its own predecessor evidence after pruning. Missing or malformed retained hashes fail redelivery explicitly.
+The writer frontier keys on a server-issued writer number. A device writer additionally has a unique `device_key` and survives its enrolment connection. `user_id` is nullable for anonymous writers. `frontier` is the highest settled sequence and `head` its chain hash. `secret_hash` is the SHA-256 of the 32-byte secret the client drew when it asked for a number. A handshake, a `RetireWriter` and an owned provenance name a number writer only with that secret, so a number the server issues again after a restore never binds the replica that held it before. A caller that asks for a number without a secret is issued it under one the server draws and keeps for that connection alone, so the number is never named again (R70 decision 22). `_connetto_settled` stores each `(writer, seq)` with its entry hash, `previous_hash`, outcome and delivery path. A retained entry verifies against its own predecessor evidence after pruning. Missing or malformed retained hashes fail redelivery explicitly.
 
 **The reconnect log is on this list as of R32 (2026-08-09), and the server refuses to start without it.** It holds what a returning client missed, and it used to live only in the server's memory, so it was empty on every boot and answered "you have missed nothing" to every client that came back after a restart, which sent them nothing and left them silently stale. Durable, it answers from evidence. `CONNETTO_OPLOG_TABLE` names it, defaulting to `connetto_oplog`, and `PgOplog::ensure_schema` creates this schema for a scratch database, each object only when it is absent. The boot check refuses a log table that predates the compressed patch and a commit table without `xid_horizon`, naming the table and the column it lacks, and refuses a missing transaction index (`06-reconnect.md`).
 
