@@ -48,6 +48,7 @@ use tokio::task::JoinHandle;
 
 pub mod android_phone;
 pub mod demo;
+pub mod events;
 pub mod fanout;
 pub mod inspector;
 pub mod ios_signing;
@@ -57,6 +58,7 @@ pub mod peer_devices;
 pub mod peer_proof;
 pub mod relay;
 pub mod roster;
+pub mod router;
 pub mod stack;
 pub mod standby;
 pub mod star;

@@ -24,6 +24,7 @@ use connetto_server::{
     SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback,
     pg_write_target,
 };
+use connetto_test_harness::events::await_event;
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -588,25 +589,6 @@ async fn a_deferred_write_stays_local_and_lands_after_the_outage() {
     )
     .await;
     assert_eq!(target_rows(&fixture, 60).await.len(), 1);
-}
-
-/// Read events until `wanted` arrives by `deadline`, failing on any event `forbidden` names.
-async fn await_event(
-    events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
-    deadline: tokio::time::Instant,
-    wanted: impl Fn(&ClientEvent) -> bool,
-    forbidden: impl Fn(&ClientEvent) -> bool,
-) {
-    loop {
-        let event = tokio::time::timeout_at(deadline, events.recv())
-            .await
-            .expect("the awaited event arrives within the deadline")
-            .expect("event stream closed");
-        assert!(!forbidden(&event), "unexpected event {event:?}");
-        if wanted(&event) {
-            return;
-        }
-    }
 }
 
 #[expect(

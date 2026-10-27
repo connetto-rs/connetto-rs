@@ -8,9 +8,10 @@ use connetto_client::live::ConnettoClient;
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientBuilder, Gate, Grant, HeldCredential, MemoryRefreshStore, SyncSchema};
 use connetto_core::schema::SchemaBundle;
+use connetto_core::traits::Transport;
 use connetto_core::transport::LoopbackTransport;
 use connetto_file_client::{ContentClient, FsStore, ReqwestHttp};
-use connetto_file_core::{FileId, MimeClass};
+use connetto_file_core::{FileId, MaybeSend, MimeClass};
 use connetto_file_server::{
     AppPools, Config, DefaultFileSchema, FsStore as ServerStore, TicketSigner, TicketVerifier,
 };
@@ -267,9 +268,11 @@ pub async fn attach_content(
 }
 
 /// Stages the test photograph as photo row 1 and returns the file identity.
-pub async fn stage_photo(
-    a_content: &ContentClient<LoopbackTransport, FsStore, ReqwestHttp>,
-) -> FileId {
+pub async fn stage_photo<T>(a_content: &ContentClient<T, FsStore, ReqwestHttp>) -> FileId
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
     let (file_id, ()) = a_content
         .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
             diesel::insert_into(photos::table)

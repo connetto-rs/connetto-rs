@@ -4,6 +4,9 @@
 mod archive;
 mod bookkeeping_write;
 mod builder_content;
+mod held;
+mod held_files;
+mod held_wire;
 mod negotiation;
 mod offline_photo;
 mod photo_fixture;

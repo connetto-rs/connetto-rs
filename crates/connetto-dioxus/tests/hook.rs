@@ -331,6 +331,10 @@ async fn use_live_renders_and_follows_cdc() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
+    #[expect(
+        clippy::large_futures,
+        reason = "The startup future is awaited directly without an extra heap allocation."
+    )]
     let client = NativeClientBuilder::new(format!("ws://{addr}/"), schema())
         .signed_in(
             HeldCredential::new(Grant::new("user:dioxus-test"), "dioxus-test")
@@ -412,6 +416,10 @@ async fn use_live_fn_follows_a_boxed_row_query() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
+    #[expect(
+        clippy::large_futures,
+        reason = "The startup future is awaited directly without an extra heap allocation."
+    )]
     let client = NativeClientBuilder::new(format!("ws://{addr}/"), schema())
         .signed_in(
             HeldCredential::new(Grant::new("user:dioxus-fn-test"), "dioxus-fn-test")

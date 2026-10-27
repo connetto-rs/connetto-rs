@@ -19,9 +19,9 @@ use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::device_cert::DeviceKey;
 use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
-    ControlMessage, FatalErrorReason, GateState, Handshake, MutationHeader, MutationPatch,
-    MutationReject, MutationRejectReason, Ping, Provenance, ReplaceShareKeys, RetireWriter,
-    SUBSCRIPTION_REFUSED, ShareKeyChange, Subscribe, SubscriptionSpec, TabIdentity,
+    ControlMessage, FatalErrorReason, GateState, Handshake, HeldWork, MutationHeader,
+    MutationPatch, MutationReject, MutationRejectReason, Ping, Provenance, ReplaceShareKeys,
+    RetireWriter, SUBSCRIPTION_REFUSED, ShareKeyChange, Subscribe, SubscriptionSpec, TabIdentity,
     TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, Unsubscribe, WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
@@ -74,6 +74,7 @@ pub mod cipher;
 mod clock;
 #[cfg(feature = "device-identity")]
 pub mod device_key;
+mod drain;
 pub mod dsl;
 #[cfg(feature = "device-identity")]
 mod enrolment;
@@ -89,6 +90,7 @@ mod memory_stores;
 #[cfg(all(feature = "peer", target_os = "android"))]
 mod multicast;
 mod outbox;
+mod pending;
 pub mod reconnect;
 mod replay;
 pub mod replica;
@@ -138,6 +140,7 @@ pub use builder::{
     Gate, Located, REPLICA_PREFIX, ReplicaPlace, SyncSchema, SyncTuning, TierStepRefused,
 };
 pub use cipher::{ReplicaKey, UnlockError};
+pub use drain::DrainTimer;
 pub use dsl::Watchable;
 #[cfg(all(feature = "native-auth", target_os = "android"))]
 pub use keyring::KeystorePrompt;
@@ -153,6 +156,7 @@ pub use live::{
 };
 pub use majors::HeldContent;
 pub use memory_stores::{MemoryKeyStore, MemoryRefreshStore};
+pub use pending::PendingWork;
 #[cfg(feature = "native-transport")]
 pub use reconnect::TokioSleeper;
 pub use reconnect::{FirstThen, ReconnectPolicy, Sleeper, TransportFactory};
@@ -345,6 +349,9 @@ pub enum ClientError {
     /// transport is dropped and the dial goes out again.
     #[error("the handshake drew no answer within the answer bound")]
     HandshakeUnanswered,
+    /// The drain awaits acknowledgement of its current share keys.
+    #[error("the drain is waiting for its current share keys")]
+    ShareKeysPending,
     /// The client's pump stopped on a fault no reconnect can cure, named here.
     #[error("the client stopped: {0}")]
     Stopped(String),
@@ -1008,6 +1015,11 @@ pub(crate) struct ClientConfig {
     /// Whether this connection mirrors a relay's worker, which holds the share
     /// keys, so a key change travels to the relay instead of committing here.
     relay_mirror: bool,
+    /// The content layer's hooks for an old major's unsent files across a
+    /// rebuild and its drain (R31): `hold` moves them aside, `count` says how
+    /// many remain, `forget` drops them. A build that attaches no content uses
+    /// [`HeldContent::NONE`].
+    held_content: HeldContent,
     /// What brings an existing device-private tier to this build's major,
     /// `None` for a build declaring no major (R31).
     tier_plan: Option<TierPlan>,
@@ -1034,6 +1046,7 @@ impl ClientConfig {
             shared_tables: HashSet::new(),
             connection_ddl: None,
             relay_mirror: false,
+            held_content: HeldContent::NONE,
             tier_plan: None,
         }
     }
@@ -1124,6 +1137,7 @@ impl ClientConfig {
         self.schema_version = schema_version;
         self
     }
+
     /// The application schema major this build declares at handshake.
     #[must_use]
     pub const fn with_schema_major(mut self, schema_major: Option<Major>) -> Self {
@@ -1194,6 +1208,18 @@ impl ClientConfig {
     #[must_use]
     pub fn with_custody(mut self, custody: Custody) -> Self {
         self.custody = custody;
+        self
+    }
+
+    /// The same, unchanged when nothing is named.
+    #[must_use]
+    pub(crate) const fn with_optional_held_content(
+        mut self,
+        held_content: Option<HeldContent>,
+    ) -> Self {
+        if let Some(held_content) = held_content {
+            self.held_content = held_content;
+        }
         self
     }
 
@@ -1315,6 +1341,10 @@ pub enum ClientEvent {
         /// The applied mutation's sequence number.
         client_seq: u64,
     },
+    /// Work held from an older application schema major settled while it
+    /// drained to that major's server (R31). A browser tab receives it from
+    /// the relay hub, whose worker owns the drain.
+    Held(HeldWork),
     /// The server refused a mutation and the client rolled it back locally.
     MutationRejected {
         /// The rejected mutation's sequence number.
@@ -1634,6 +1664,14 @@ pub const DEFAULT_ANSWER_WITHIN: Duration = Duration::from_secs(10);
 /// the server could not settle is kept like an offline one.
 static RESEND_POLICY: std::sync::LazyLock<RetryPolicy> = std::sync::LazyLock::new(RetryPolicy::new);
 
+/// What one pump wait produced, and on which wire.
+enum Arrived<F> {
+    /// The connection's own wire.
+    Main(F),
+    /// The wire draining an older major's held work (R31).
+    Drain(F),
+}
+
 /// Where sending the deferred writes again stands.
 enum Resend {
     /// Nothing is deferred.
@@ -1748,7 +1786,7 @@ struct RelayShareKeyWait {
 }
 
 /// The next share-key wake for a pump driver.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShareKeyTimer {
     /// How many times the timer was armed, so a pump tells a fresh one from the
     /// one it sleeps on.
@@ -1766,13 +1804,6 @@ impl ShareKeyTimer {
     }
 }
 
-impl PartialEq for ShareKeyTimer {
-    fn eq(&self, other: &Self) -> bool {
-        self.armed == other.armed
-    }
-}
-
-impl Eq for ShareKeyTimer {}
 /// Conflict resolution for a rollback: a row a concurrent server patch already
 /// changed is left as the server left it, so only a cleanly-matching optimistic
 /// write is reverted.
@@ -1921,12 +1952,41 @@ pub fn replica_schema<S: core::hash::BuildHasher>(
     }
 }
 
+/// Send one changeset already in wire form, named as its server reads it, as
+/// its header and patchset frame pair, with the provenance it rides with. The
+/// connection's own writes and the drain's older-major writes both leave
+/// through here.
+pub(crate) async fn send_wire_changeset<T: Transport>(
+    transport: &mut T,
+    seq: u64,
+    changeset: &[u8],
+    provenance: Option<&Provenance>,
+) -> Result<(), ClientError>
+where
+    T::Error: core::fmt::Display,
+{
+    let op_count = count_ops(changeset);
+    let payload = zstd::encode_all(changeset, ZSTD_LEVEL)?;
+    let mut header = MutationHeader::new(seq, op_count);
+    if let Some(provenance) = provenance {
+        header = header.with_provenance(*provenance);
+    }
+    transport
+        .send_control(ControlMessage::MutationHeader(header))
+        .await
+        .map_err(|e| ClientError::Transport(e.to_string()))?;
+    transport
+        .send_bulk(BulkMessage::MutationPatch(MutationPatch::new(seq, payload)))
+        .await
+        .map_err(|e| ClientError::Transport(e.to_string()))
+}
+
 /// Rewrite the table names in a diffset, returning the original bytes when
 /// nothing matched so an unaffected payload costs no re-encode.
 ///
 /// One parse per renamed payload is the price of the split, and callers skip
 /// this entirely when no table was split.
-fn rename_diffset(
+pub(crate) fn rename_diffset(
     bytes: Vec<u8>,
     mut rename: impl FnMut(&str) -> Option<String>,
 ) -> Result<Vec<u8>, ClientError> {
@@ -3293,6 +3353,14 @@ struct HandshakeInput<'a> {
     cursor_subjects: Option<&'a [String]>,
 }
 
+fn live_share_grants(config: &ClientConfig, now: i64) -> impl Iterator<Item = &Grant> {
+    config
+        .subjects
+        .iter()
+        .flat_map(SubjectSource::grants)
+        .filter(move |grant| !grant_expiry::has_expired(grant, now))
+}
+
 /// Collect the login and unexpired share grants for a handshake.
 async fn presented_grants(
     config: &ClientConfig,
@@ -3313,14 +3381,7 @@ async fn presented_grants(
     // honest source of the signal R36 counts, so it is worth not sending. The
     // login grant is not filtered: its refresh is `token_source`'s job, and a
     // client with no fresh token still has to present what it has and be told.
-    grants.extend(
-        config
-            .subjects
-            .iter()
-            .flat_map(SubjectSource::grants)
-            .filter(|grant| !grant_expiry::has_expired(grant, now))
-            .cloned(),
-    );
+    grants.extend(live_share_grants(config, now).cloned());
     Ok(grants)
 }
 
@@ -3750,6 +3811,8 @@ impl Stale {
 pub struct ConnettoConnection<T: Transport> {
     /// The live socket, absent when no server is reachable.
     wire: Option<Wire<T>>,
+    /// The second wire draining an older major's held work, boxed since it is idle nearly always (R31).
+    drain: Box<drain::Drain<T>>,
     /// The run this caller's work belongs to, absent until a first handshake
     /// and kept across every later drop.
     run: Option<Run>,
@@ -4058,7 +4121,7 @@ fn install_replica_schema<S: ReplicaStorage>(
             majors::Record::Current => Some(build),
             majors::Record::Unrecorded => None,
             majors::Record::Behind(from) => {
-                majors::prepare_rebuild(db, from, HeldContent::NONE)?;
+                majors::prepare_rebuild(db, from, config.held_content)?;
                 Some(from.major)
             }
         };
@@ -4124,7 +4187,7 @@ where
 
     /// Open a replica that already carries its schema, with no server.
     ///
-    /// [`open`](Self::open) for a replica a previous run created.
+    /// [`open`](Self::open) for a replica a previous run created. `sqlite_ddl`
     /// is this build's replica DDL, applied only when the replica records an
     /// older application schema major and is rebuilt in place (R31).
     ///
@@ -4372,10 +4435,12 @@ where
             enrol_waiters: HashMap::new(),
             #[cfg(feature = "device-identity")]
             list_sink: None,
+            drain: Box::new(drain::Drain::idle()),
         };
         conn.attach_tier(replica.tier(), replica.key(), prior)?;
         conn.refresh_share_key_expiry();
         conn.recompute_share_key_deadline();
+        conn.load_drain()?;
         Ok(conn)
     }
 
@@ -4715,12 +4780,7 @@ where
     /// captured. This major's wire sends nothing queued at or after it, so no
     /// write lands ahead of an earlier one only its own major can apply (R31).
     fn held_from(&self) -> Option<u64> {
-        self.writers
-            .values()
-            .flat_map(|queue| queue.pending.values())
-            .filter(|entry| self.held_major(entry.major))
-            .map(|entry| entry.position)
-            .min()
+        self.lowest_position_outside(self.config.schema_major)
     }
 
     /// The writer to present at the next handshake, with how much of it the
@@ -5181,25 +5241,38 @@ where
         Ok(())
     }
 
-    /// Atomically carries tails in append order and excludes retired device keys.
+    /// Atomically carries tails in append order and excludes retired device
+    /// keys. Only this build's major's entries travel, so a tail never
+    /// joins a chain ahead of an older major's entry its drain still owes,
+    /// and a writer whose older-major entries stay behind keeps its state
+    /// for the drain (R31).
     fn carry_writers(&mut self, dead: &[WriterRef], target: &WriterRef) -> Result<(), ClientError> {
-        debug_assert!(!dead.contains(target));
-        let capacity = dead
-            .iter()
-            .filter_map(|writer| self.writers.get(writer))
-            .map(|queue| queue.pending.len())
-            .sum();
-        let mut plan = Vec::with_capacity(capacity);
+        let build = self.config.schema_major;
+        self.carry_matching(dead, target, |entry| entry.major == build)
+    }
+
+    /// Where each entry of `dead` that `carried` admits lands under `target`:
+    /// in append order after the target's own entries, each re-chained, with
+    /// the target's next sequence and head once they are all placed.
+    fn carry_plan(
+        &self,
+        dead: &[WriterRef],
+        target: &WriterRef,
+        carried: &impl Fn(&PendingEntry) -> bool,
+    ) -> Result<(Vec<CarriedEntry>, u64, [u8; 32]), ClientError> {
+        let mut plan = Vec::new();
         for source in dead {
             if let Some(queue) = self.writers.get(source) {
                 for (original_seq, entry) in &queue.pending {
-                    plan.push(CarriedEntry {
-                        source: *source,
-                        original_seq: *original_seq,
-                        position: entry.position,
-                        seq: 0,
-                        hash: GENESIS,
-                    });
+                    if carried(entry) {
+                        plan.push(CarriedEntry {
+                            source: *source,
+                            original_seq: *original_seq,
+                            position: entry.position,
+                            seq: 0,
+                            hash: GENESIS,
+                        });
+                    }
                 }
             }
         }
@@ -5215,11 +5288,36 @@ where
             next_seq += 1;
             head = placement.hash;
         }
+        Ok((plan, next_seq, head))
+    }
+
+    /// Atomically carries the entries of `dead` that `carried` admits to
+    /// `target`, in append order, re-chained after the target's own. A dead
+    /// writer's state goes once nothing of it remains, and a dead device's
+    /// key is excluded either way.
+    fn carry_matching(
+        &mut self,
+        dead: &[WriterRef],
+        target: &WriterRef,
+        carried: impl Fn(&PendingEntry) -> bool,
+    ) -> Result<(), ClientError> {
+        debug_assert!(!dead.contains(target));
+        let (plan, next_seq, head) = self.carry_plan(dead, target, &carried)?;
+        // A dead writer whose every entry travels leaves nothing behind.
+        let emptied: Vec<WriterRef> = dead
+            .iter()
+            .filter(|writer| {
+                self.writers
+                    .get(writer)
+                    .is_none_or(|queue| queue.pending.values().all(&carried))
+            })
+            .copied()
+            .collect();
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         self.db.transaction::<(), ClientError, _>(|db| {
             for placement in &plan {
                 let entry = &self.writers[&placement.source].pending[&placement.original_seq];
-                let carried = EntryRecord {
+                let record = EntryRecord {
                     hash: placement.hash,
                     provenance: entry.provenance.or_else(|| {
                         is_real_writer(&placement.source).then_some(Provenance {
@@ -5229,7 +5327,8 @@ where
                     }),
                     ..entry.record()
                 };
-                persist_pending(db, target, placement.seq, &carried)?;
+                persist_pending(db, target, placement.seq, &record)?;
+                delete_pending(db, &placement.source, placement.original_seq)?;
             }
             if !plan.is_empty() {
                 persist_writer_state(db, target, next_seq, &head)?;
@@ -5239,7 +5338,9 @@ where
                 if let WriterRef::Device(key) = writer {
                     persist_retired_key(db, *key)?;
                 }
-                drop_writer_state(db, writer)?;
+                if emptied.contains(writer) {
+                    drop_writer_state(db, writer)?;
+                }
             }
             Ok(())
         })?;
@@ -5270,7 +5371,9 @@ where
             self.writers.insert(*target, queue);
         }
         for writer in dead {
-            self.writers.remove(writer);
+            if emptied.contains(writer) {
+                self.writers.remove(writer);
+            }
             #[cfg(feature = "device-identity")]
             if let WriterRef::Device(key) = writer {
                 self.retired_keys.insert(*key);
@@ -5684,6 +5787,8 @@ where
         }
         self.send_share_key_protocol().await?;
         self.publish_coverage()?;
+        self.check_drain_deadline().await;
+        self.step_drain_share_keys().await?;
         Ok(changed)
     }
 
@@ -5691,10 +5796,14 @@ where
     /// [`process_share_keys`](Self::process_share_keys) when it lands.
     #[must_use]
     pub fn share_key_timer(&self) -> Option<ShareKeyTimer> {
-        self.share_key_deadline.map(|deadline| ShareKeyTimer {
-            armed: self.share_key_armed,
-            deadline,
-        })
+        self.share_key_deadline
+            .into_iter()
+            .chain(self.drain.authorization_deadline())
+            .min()
+            .map(|deadline| ShareKeyTimer {
+                armed: self.share_key_armed,
+                deadline,
+            })
     }
 
     /// Set the secret store before preparing the durable connection.
@@ -6111,13 +6220,7 @@ where
     /// Send the swap carrying every live held key, one in flight at a time.
     async fn send_share_key_replacement(&mut self) -> Result<(), ClientError> {
         let now = clock::now_secs(&mut self.db)?;
-        let keys = self
-            .config
-            .subjects
-            .iter()
-            .flat_map(|subjects| subjects.set.keys.iter().map(|(grant, _)| grant.clone()))
-            .filter(|grant| !grant_expiry::has_expired(grant, now))
-            .collect();
+        let keys = live_share_grants(&self.config, now).cloned().collect();
         let request_id = share_key_request_id();
         let generation = self.share_key_generation;
         self.wire()?
@@ -6335,6 +6438,7 @@ where
             .as_ref()
             .and_then(|run| run.schema_version.as_ref())
     }
+
     /// The application schema major this build declares, which a relay hub
     /// holds its tabs to (R31).
     #[must_use]
@@ -6529,8 +6633,8 @@ where
             sink,
             &archive::Archive {
                 scope,
-                major: self.config.schema_major,
                 fingerprint: self.schema_fingerprint()?,
+                major: self.config.schema_major,
                 account: self.account(),
                 synced_rows,
                 local_rows,
@@ -7177,7 +7281,9 @@ where
     }
 
     /// Read one inbound frame, apply it if it is a patch, and report what
-    /// happened. Applying a bulk patch replenishes one delivery credit.
+    /// happened. Applying a bulk patch replenishes one delivery credit. A
+    /// frame on the drain wire settles held work and reports through the
+    /// notices (R31).
     ///
     /// # Errors
     ///
@@ -7187,22 +7293,27 @@ where
             self.check_share_key_deadlines();
             self.step_share_keys().await?;
             self.check_writer_deadlines();
+            self.check_drain_deadline().await;
+            self.step_drain_share_keys().await?;
             if let Some(notice) = self.notices.pop_front() {
                 return Ok(notice);
             }
-            let frame = self.wire()?.transport.recv().await;
-            let frame = self.judge(frame)?;
-            if let Some(event) = self.handle_frame(frame).await? {
+            let arrived = match (self.wire.as_mut(), self.drain.wire_mut()) {
+                (None, None) => return Err(ClientError::NotConnected),
+                (Some(wire), None) => Arrived::Main(wire.transport.recv().await),
+                (None, Some(drain)) => Arrived::Drain(drain.recv().await),
+                (Some(wire), Some(drain)) => tokio::select! {
+                    frame = wire.transport.recv() => Arrived::Main(frame),
+                    frame = drain.recv() => Arrived::Drain(frame),
+                },
+            };
+            if let Some(event) = self.on_arrival(arrived).await? {
                 return Ok(event);
             }
         }
     }
 
-    /// Like [`pump_one`](Self::pump_one), but abandons the idle wait when
-    /// `cancel` resolves first, returning `None`. The underlying receive is
-    /// cancel-safe, so an abandoned wait loses no frame. This is the pump step
-    /// a shared driver uses so it never parks on the transport while holding
-    /// the connection lock.
+    /// Reads one cancel-safe protocol step, returning `None` on cancellation or a frame without a client event.
     ///
     /// # Errors
     ///
@@ -7216,26 +7327,62 @@ where
         self.check_writer_deadlines();
         self.check_share_key_deadlines();
         self.step_share_keys().await?;
+        self.check_drain_deadline().await;
+        self.step_drain_share_keys().await?;
         // Ahead of the transport, and ahead of the cancel, because a state
         // change already happened and holding it back would leave a caller
         // showing stale data with nothing to tell it otherwise.
         if let Some(notice) = self.notices.pop_front() {
             return Ok(Some(notice));
         }
-        let Some(wire) = self.wire.as_mut() else {
-            // No socket is not a failure here. It is a connection with nothing
-            // to say, exactly like an idle one, and treating it as an error
-            // would end a pump that still has local work to do.
-            cancel.await;
-            return Ok(None);
+        let arrived = match (self.wire.as_mut(), self.drain.wire_mut()) {
+            (None, None) => {
+                // No socket is not a failure here. It is a connection with
+                // nothing to say, exactly like an idle one, and treating it as
+                // an error would end a pump that still has local work to do.
+                cancel.await;
+                return Ok(None);
+            }
+            (Some(wire), None) => tokio::select! {
+                biased;
+                () = cancel => return Ok(None),
+                frame = wire.transport.recv() => Arrived::Main(frame),
+            },
+            (None, Some(drain)) => tokio::select! {
+                biased;
+                () = cancel => return Ok(None),
+                frame = drain.recv() => Arrived::Drain(frame),
+            },
+            (Some(wire), Some(drain)) => tokio::select! {
+                biased;
+                () = cancel => return Ok(None),
+                frame = wire.transport.recv() => Arrived::Main(frame),
+                frame = drain.recv() => Arrived::Drain(frame),
+            },
         };
-        let frame = tokio::select! {
-            biased;
-            () = cancel => return Ok(None),
-            frame = wire.transport.recv() => frame,
-        };
-        let frame = self.judge(frame)?;
-        self.handle_frame(frame).await
+        self.on_arrival(arrived).await
+    }
+
+    /// Act on whatever one wait produced, on either wire.
+    async fn on_arrival(
+        &mut self,
+        arrived: Arrived<Result<Option<IncomingFrame>, T::Error>>,
+    ) -> Result<Option<ClientEvent>, ClientError> {
+        match arrived {
+            Arrived::Main(frame) => {
+                let frame = self.judge(frame)?;
+                self.handle_frame(frame).await
+            }
+            Arrived::Drain(Ok(frame)) => {
+                self.handle_drain_frame(frame).await?;
+                Ok(self.notices.pop_front())
+            }
+            Arrived::Drain(Err(err)) => {
+                tracing::warn!(error = %err, "the drain wire failed");
+                self.drain_wire_failed().await;
+                Ok(self.notices.pop_front())
+            }
+        }
     }
 
     /// Apply one received frame: bulk patches mutate the replica and advance
@@ -7525,23 +7672,7 @@ where
             ));
         }
         let logical = self.to_logical(changeset.to_vec())?;
-        let op_count = count_ops(&logical);
-        let payload = zstd::encode_all(logical.as_slice(), ZSTD_LEVEL)?;
-        let mut header = MutationHeader::new(seq, op_count);
-        if let Some(provenance) = provenance {
-            header = header.with_provenance(*provenance);
-        }
-        self.wire()?
-            .transport
-            .send_control(ControlMessage::MutationHeader(header))
-            .await
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
-        self.wire()?
-            .transport
-            .send_bulk(BulkMessage::MutationPatch(MutationPatch::new(seq, payload)))
-            .await
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
-        Ok(())
+        send_wire_changeset(&mut self.wire()?.transport, seq, &logical, provenance).await
     }
 
     /// Undo `writer`'s rejected `client_seq` in both schemas with capture
@@ -7878,6 +8009,9 @@ where
                 GateState::Unlocked => ClientEvent::Unlocked,
                 GateState::UnlockDismissed => ClientEvent::UnlockDismissed,
             }),
+            // A relay stating how the worker's drain of held work settled
+            // (R31). The application acts on it wherever it runs.
+            ControlMessage::HeldWork(held) => Ok(ClientEvent::Held(held)),
             // A relay stating who its worker is. The tab's mirror runs the
             // worker's translated schema, whose views filter on both values.
             ControlMessage::TabIdentity(identity) => {

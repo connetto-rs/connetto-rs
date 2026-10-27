@@ -9,7 +9,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use connetto_client::live::ConnettoClient;
 use connetto_client::{ClientEvent, ConnettoConnection};
-use connetto_core::messages::{CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR, ContentVerb};
+use connetto_core::messages::{
+    CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR, ContentVerb, HeldWork,
+};
 use connetto_core::traits::Transport;
 use connetto_file_core::{FileId, MaybeSend};
 use tokio::sync::broadcast::error::RecvError;
@@ -19,7 +21,17 @@ use crate::error::ContentError;
 /// Source of request ids unique within this process.
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(0);
 
-/// Asks for one ticket and returns the URL the server granted.
+/// The wire a ticket request rides.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TicketWire {
+    /// The connection's own wire.
+    Main,
+    /// The drain wire of a held major (R31). Its loss abandons the request,
+    /// and its redial reissues it.
+    Drain,
+}
+
+/// Asks for one ticket on `wire` and returns the URL the server granted.
 ///
 /// The subscription is taken before the request goes out, so an answer the
 /// pump delivers immediately cannot be missed.
@@ -27,6 +39,7 @@ pub(crate) async fn request<T>(
     client: &ConnettoClient<T>,
     file_id: FileId,
     verb: ContentVerb,
+    wire: TicketWire,
 ) -> Result<String, ContentError>
 where
     T: Transport + MaybeSend + 'static,
@@ -34,12 +47,21 @@ where
 {
     let request_id = next_request_id();
     let mut events = client.events();
-    client
-        .request_content_ticket(request_id.clone(), *file_id.as_bytes(), verb)
-        .await?;
+    match wire {
+        TicketWire::Main => {
+            client
+                .request_content_ticket(request_id.clone(), *file_id.as_bytes(), verb)
+                .await?;
+        }
+        TicketWire::Drain => {
+            client
+                .request_held_ticket(request_id.clone(), *file_id.as_bytes(), verb)
+                .await?;
+        }
+    }
     loop {
         match events.recv().await {
-            Ok(event) => match classify(event, &request_id, file_id) {
+            Ok(event) => match classify(event, &request_id, file_id, wire) {
                 TicketAnswer::Granted(url) => return Ok(url),
                 TicketAnswer::Failed(error) => return Err(error),
                 TicketAnswer::Unrelated(_) => {}
@@ -56,8 +78,12 @@ where
 pub(crate) struct PendingTicket {
     pub(crate) file_id: FileId,
     request_id: String,
+    /// The drain dial generation the request rode on. `None` is the main
+    /// wire, which reissues on its own.
+    dial: Option<u64>,
 }
 
+/// Asks for one ticket on `wire`, interruptibly.
 pub(crate) async fn request_connection_or<T, C>(
     connection: &mut ConnettoConnection<T>,
     file_id: FileId,
@@ -65,13 +91,14 @@ pub(crate) async fn request_connection_or<T, C>(
     observed: &mut Vec<ClientEvent>,
     cancel: C,
     pending: &mut Option<PendingTicket>,
+    wire: TicketWire,
 ) -> Result<Option<String>, ContentError>
 where
     T: Transport,
     T::Error: Display,
     C: core::future::Future<Output = ()>,
 {
-    ensure_pending_request(connection, file_id, verb, pending).await?;
+    ensure_pending_request(connection, file_id, verb, pending, wire).await?;
     tokio::pin!(cancel);
     loop {
         let event = match connection.pump_one_or(cancel.as_mut()).await {
@@ -82,31 +109,53 @@ where
                 return Err(err.into());
             }
         };
-        if let Some(result) = resolve_connection_event(event, file_id, pending, observed) {
+        if let Some(result) = resolve_connection_event(event, file_id, pending, observed, wire) {
             return result.map(Some);
         }
     }
 }
 
+/// Asks for one ticket on `wire` unless one is already waiting there. A
+/// drain request waits only on the dial generation it rode on, so the
+/// redial reissues it (R31).
 pub(crate) async fn ensure_pending_request<T: Transport>(
     connection: &mut ConnettoConnection<T>,
     file_id: FileId,
     verb: ContentVerb,
     pending: &mut Option<PendingTicket>,
+    wire: TicketWire,
 ) -> Result<(), ContentError>
 where
     T::Error: Display,
 {
-    if pending.is_some() {
+    let dial = match wire {
+        TicketWire::Main => None,
+        TicketWire::Drain => Some(connection.drain_dial_generation()),
+    };
+    let waiting = match wire {
+        TicketWire::Main => pending.is_some(),
+        TicketWire::Drain => pending.as_ref().is_some_and(|ticket| ticket.dial == dial),
+    };
+    if waiting {
         return Ok(());
     }
     let request_id = next_request_id();
-    connection
-        .request_content_ticket(request_id.clone(), *file_id.as_bytes(), verb)
-        .await?;
+    match wire {
+        TicketWire::Main => {
+            connection
+                .request_content_ticket(request_id.clone(), *file_id.as_bytes(), verb)
+                .await?;
+        }
+        TicketWire::Drain => {
+            connection
+                .request_held_ticket(request_id.clone(), *file_id.as_bytes(), verb)
+                .await?;
+        }
+    }
     *pending = Some(PendingTicket {
         file_id,
         request_id,
+        dial,
     });
     Ok(())
 }
@@ -121,7 +170,12 @@ enum TicketAnswer {
     Unrelated(ClientEvent),
 }
 
-fn classify(event: ClientEvent, request_id: &str, file_id: FileId) -> TicketAnswer {
+fn classify(
+    event: ClientEvent,
+    request_id: &str,
+    file_id: FileId,
+    wire: TicketWire,
+) -> TicketAnswer {
     match event {
         ClientEvent::ContentTicket {
             request_id: answered,
@@ -138,6 +192,10 @@ fn classify(event: ClientEvent, request_id: &str, file_id: FileId) -> TicketAnsw
         } if related_to.as_deref() == Some(request_id) => {
             TicketAnswer::Failed(ContentError::TicketRateLimited { retry_after_ms })
         }
+        // The drain wire the request rode on is gone (R31).
+        ClientEvent::Held(HeldWork::WireLost { .. }) if wire == TicketWire::Drain => {
+            TicketAnswer::Failed(ContentError::TicketAbandoned)
+        }
         event => TicketAnswer::Unrelated(event),
     }
 }
@@ -147,12 +205,19 @@ fn resolve_connection_event(
     file_id: FileId,
     pending: &mut Option<PendingTicket>,
     observed: &mut Vec<ClientEvent>,
+    wire: TicketWire,
 ) -> Option<Result<String, ContentError>> {
     let Some(ticket) = pending.as_ref() else {
         observed.push(event);
         return None;
     };
-    let result = match classify(event, &ticket.request_id, file_id) {
+    if wire == TicketWire::Drain && matches!(event, ClientEvent::Held(HeldWork::WireLost { .. })) {
+        // The drain wire the request rode on is gone (R31).
+        observed.push(event);
+        pending.take();
+        return Some(Err(ContentError::TicketAbandoned));
+    }
+    let result = match classify(event, &ticket.request_id, file_id, wire) {
         TicketAnswer::Granted(url) => Ok(url),
         TicketAnswer::Failed(error) => Err(error),
         TicketAnswer::Unrelated(
@@ -180,7 +245,12 @@ pub(crate) enum RouteAnswer {
 }
 
 pub(crate) fn route_connection_event(pending: &PendingTicket, event: &ClientEvent) -> RouteAnswer {
-    match classify(event.clone(), &pending.request_id, pending.file_id) {
+    match classify(
+        event.clone(),
+        &pending.request_id,
+        pending.file_id,
+        TicketWire::Main,
+    ) {
         TicketAnswer::Granted(url) => RouteAnswer::Settled(Ok(url)),
         TicketAnswer::Failed(error) => RouteAnswer::Settled(Err(error)),
         TicketAnswer::Unrelated(ClientEvent::Closed | ClientEvent::ServerClosed { .. }) => {
@@ -214,6 +284,7 @@ mod tests {
         PendingTicket {
             file_id: FileId::from_bytes([1; 32]),
             request_id: "content-7".to_owned(),
+            dial: None,
         }
     }
 
