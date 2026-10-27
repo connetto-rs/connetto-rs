@@ -1,0 +1,4 @@
+# English for running text, and PostgreSQL's documented function names, so a
+# mention of a SQL function such as `uuidv7` never reads as a removed Rust item.
+[vocabularies]
+builtins = ["english", "postgres@18"]
