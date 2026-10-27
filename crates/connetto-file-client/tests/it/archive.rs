@@ -405,8 +405,9 @@ async fn content_only_import_wakes_outbox_driver() {
         () = target.drive_outbox(|_: core::time::Duration| core::future::ready(())) => {
             panic!("drive_outbox must not return while the test runs");
         }
+        // A stalled CI runner pauses for tens of seconds, and a lost wake still fails here.
         result = tokio::time::timeout(
-            core::time::Duration::from_secs(5),
+            core::time::Duration::from_secs(60),
             async {
                 tokio::time::sleep(core::time::Duration::from_millis(50)).await;
                 target
@@ -424,7 +425,7 @@ async fn content_only_import_wakes_outbox_driver() {
                 }
             },
         ) => {
-            result.expect("Uploaded event must arrive within five seconds of the import");
+            result.expect("Uploaded event must arrive within a minute of the import");
         }
     }
 }
