@@ -31,7 +31,10 @@ CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT, body TEXT);\
 CREATE TABLE shares (doc_id INT, viewer TEXT, PRIMARY KEY (doc_id, viewer));\
 CREATE TABLE assets (id UUID PRIMARY KEY, owner TEXT);\
 CREATE TABLE events (occurred_at TIMESTAMP PRIMARY KEY, owner TEXT);\
-CREATE TABLE tagged (tag JSONB PRIMARY KEY, owner TEXT);";
+CREATE TABLE tagged (tag JSONB PRIMARY KEY, owner TEXT);\
+CREATE TABLE instants (at TIMESTAMPTZ PRIMARY KEY, owner TEXT);\
+CREATE TABLE days (day DATE PRIMARY KEY, owner TEXT);\
+CREATE TABLE slots (at TIME PRIMARY KEY, owner TEXT);";
 
 /// Ask the policy about one row, as the change path does.
 ///
@@ -169,6 +172,76 @@ async fn rls_read_filter_enforces_visibility_per_user() {
         matches!(err, RlsAuthError::UnsupportedKeyType { .. }),
         "expected UnsupportedKeyType, got {err:?}"
     );
+}
+
+/// A typed date, time and timestamptz key each bind as their own type and
+/// name only the row whose key they equal.
+#[tokio::test]
+async fn a_date_or_time_key_binds_as_its_own_type() {
+    let fixture = Fixture::acquire().await;
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    // DDL and role setup cannot be expressed in diesel's typed DSL.
+    for stmt in [
+        "DROP TABLE IF EXISTS instants, days, slots CASCADE",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
+         THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
+        "CREATE TABLE instants (at TIMESTAMPTZ PRIMARY KEY, owner TEXT)",
+        "CREATE TABLE days (day DATE PRIMARY KEY, owner TEXT)",
+        "CREATE TABLE slots (at TIME PRIMARY KEY, owner TEXT)",
+        "INSERT INTO instants VALUES ('2024-01-01 12:00:00+00', 'alice')",
+        "INSERT INTO days VALUES ('2024-01-01', 'alice')",
+        "INSERT INTO slots VALUES ('12:00:00', 'alice')",
+        "ALTER TABLE instants ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE days ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE slots ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY instants_p ON instants USING (owner = current_setting('app.user_id', true))",
+        "CREATE POLICY days_p ON days USING (owner = current_setting('app.user_id', true))",
+        "CREATE POLICY slots_p ON slots USING (owner = current_setting('app.user_id', true))",
+        "GRANT USAGE ON SCHEMA public TO app_reader",
+        "GRANT SELECT ON instants, days, slots TO app_reader",
+    ] {
+        sql_query(stmt)
+            .execute(&mut *conn)
+            .await
+            .expect("setup statement");
+    }
+    drop(conn);
+    let reader = pool_for(&with_user(fixture.admin_url(), "app_reader", "app_reader")).await;
+    let auth = RlsAuth::from_ddl(reader, CATALOG_DDL).expect("build RlsAuth");
+
+    let day = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("date");
+    let noon = chrono::NaiveTime::from_hms_opt(12, 0, 0).expect("time");
+    let instant = day.and_time(noon).and_utc();
+    for (table, key, other) in [
+        (
+            "instants",
+            Value::TimestampTz(instant),
+            Value::TimestampTz(instant + chrono::Duration::seconds(1)),
+        ),
+        (
+            "days",
+            Value::Date(day),
+            Value::Date(day.succ_opt().expect("the next day")),
+        ),
+        (
+            "slots",
+            Value::Time(noon),
+            Value::Time(noon + chrono::Duration::seconds(1)),
+        ),
+    ] {
+        assert!(
+            visible(&auth, "alice", table, std::slice::from_ref(&key)).await,
+            "{table}: alice sees her row"
+        );
+        assert!(
+            !visible(&auth, "bob", table, std::slice::from_ref(&key)).await,
+            "{table}: bob does not"
+        );
+        assert!(
+            !visible(&auth, "alice", table, &[other]).await,
+            "{table}: a different key names no row"
+        );
+    }
 }
 
 /// A policy naming its own identity setting is honoured.
