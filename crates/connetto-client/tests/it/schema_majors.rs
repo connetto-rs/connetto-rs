@@ -92,6 +92,13 @@ struct QueuedRow {
     major: Option<i64>,
 }
 
+/// The major a queue row records, or the absent one.
+fn row_major(major: Option<i64>) -> Option<Major> {
+    major
+        .and_then(|value| u32::try_from(value).ok())
+        .and_then(Major::new)
+}
+
 /// One `user_version` reading, which no `table!` can name.
 #[derive(QueryableByName)]
 struct UserVersion {
@@ -425,7 +432,13 @@ async fn a_write_after_the_rebuild_chains_after_the_older_majors_entry() {
     );
     assert_eq!(
         first.entry_hash.as_slice(),
-        entry_hash(&GENESIS, first_seq, &first.changeset),
+        entry_hash(
+            &GENESIS,
+            first_seq,
+            row_major(first.major),
+            None,
+            &first.changeset
+        ),
         "the older entry keeps the hash it was queued with"
     );
     let head: [u8; 32] = first
@@ -435,7 +448,13 @@ async fn a_write_after_the_rebuild_chains_after_the_older_majors_entry() {
         .expect("a 32-byte hash");
     assert_eq!(
         second.entry_hash.as_slice(),
-        entry_hash(&head, second_seq, &second.changeset),
+        entry_hash(
+            &head,
+            second_seq,
+            row_major(second.major),
+            None,
+            &second.changeset
+        ),
         "the newer entry chains after the older one"
     );
 }
@@ -474,7 +493,7 @@ async fn a_rebuild_stores_a_split_tables_older_entry_under_its_wire_name() {
     assert_eq!(names, ["items", "t"]);
     assert_eq!(
         stored.as_slice(),
-        entry_hash(&GENESIS, 1, &changeset),
+        entry_hash(&GENESIS, 1, Major::new(1), None, &changeset),
         "the stored bytes are the bytes the hash was taken over"
     );
 }

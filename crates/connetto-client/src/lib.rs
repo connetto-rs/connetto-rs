@@ -18,6 +18,7 @@ use connetto_core::chain::{GENESIS, entry_hash};
 use connetto_core::device_cert::DeviceIdentity;
 #[cfg(feature = "device-identity")]
 use connetto_core::device_cert::DeviceKey;
+use connetto_core::exchange::Origin;
 use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
     ControlMessage, FatalErrorReason, GateState, Handshake, HeldWork, MutationHeader,
@@ -5518,7 +5519,13 @@ where
         for placement in &mut plan {
             let entry = &self.writers[&placement.source].pending[&placement.original_seq];
             placement.seq = next_seq;
-            placement.hash = entry_hash(&head, next_seq, &self.chain_bytes(entry)?);
+            placement.hash = entry_hash(
+                &head,
+                next_seq,
+                entry.major,
+                placement.provenance.map(Origin::from),
+                &self.chain_bytes(entry)?,
+            );
             next_seq += 1;
             head = placement.hash;
         }
@@ -5667,7 +5674,13 @@ where
             Some(queue) => (queue.next_seq, queue.head),
             None => (1, GENESIS),
         };
-        let hash = entry_hash(&head, seq, &self.chain_bytes_of(changeset, major)?);
+        let hash = entry_hash(
+            &head,
+            seq,
+            major,
+            provenance.map(Origin::from),
+            &self.chain_bytes_of(changeset, major)?,
+        );
         let entry = PendingEntry {
             changeset: changeset.to_vec(),
             hash,

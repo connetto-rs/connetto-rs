@@ -24,16 +24,21 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, HeldCredential, SyncSchema};
+
+use connetto_core::Major;
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::SessionId;
 use connetto_core::auth::Principal;
-use connetto_core::chain::{GENESIS, entry_hash};
+use connetto_core::chain::{GENESIS, chain_walk, entry_hash};
 use connetto_core::device_cert::{AttestationLevel, KeyId};
+use connetto_core::exchange::Origin;
 use connetto_core::messages::{
     BindDevice, ConflictRow, ControlMessage, FatalError, FatalErrorReason, Grant, Handshake,
     MutationRejectReason, Provenance, WriterGrant, WriterOutcome, WriterRef, WriterRequest,
     WriterSecret, writer_bind_message,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport as _};
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
@@ -43,9 +48,9 @@ use connetto_server::device_cert::{
 };
 use connetto_server::writer_schema::SettlePath;
 use connetto_server::{
-    AbuseConfig, ManagerBuilder, Materializer, NoConnector, PageSpec, RequestGuard,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, ThrottleConfig, loopback, pg_write_target,
+    AbuseConfig, LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PageSpec,
+    RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate,
+    SnapshotPage, SnapshotSource, ThrottleConfig, loopback, pg_write_target,
 };
 use connetto_test_harness::{
     Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID, issue_writer, number_writer,
@@ -57,6 +62,7 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use parking_lot::Mutex;
 use rcgen::{KeyPair, PublicKeyData as _, SigningKey as _};
+use sha2::{Digest, Sha256};
 use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, Insert, SimpleTable, Update, Value};
 
 /// The notes table these tests sync.
@@ -122,6 +128,27 @@ diesel::table! {
         body -> diesel::sql_types::Text,
         /// Timestamp of the last edit.
         edited_at -> diesel::sql_types::Text,
+    }
+}
+
+diesel::table! {
+    /// The client's private pending queue, read from its replica by the
+    /// acceptance assertions.
+    _connetto_pending (writer, seq) {
+        /// The writer the entry is queued under, as the replica spells it.
+        writer -> Text,
+        /// The entry's sequence in that writer's queue.
+        seq -> BigInt,
+        /// The changeset the entry applies.
+        changeset -> Binary,
+        /// The hash the client stored for the entry.
+        entry_hash -> Binary,
+        /// The entry's position in the writer's queue.
+        position -> BigInt,
+        /// The writer the entry was first written under.
+        prov_writer -> Nullable<Text>,
+        /// The sequence the entry was first written at.
+        prov_seq -> Nullable<BigInt>,
     }
 }
 
@@ -1040,11 +1067,15 @@ async fn a_good_bind_binds_a_live_enrolment_and_rebinds_at_its_frontier() {
     );
     let hash_3 = entry_hash(
         &entry_hash(
-            &entry_hash(&GENESIS, 1, &insert_changeset(2, "two", "t1")),
+            &entry_hash(&GENESIS, 1, None, None, &insert_changeset(2, "two", "t1")),
             2,
+            None,
+            None,
             &insert_changeset(3, "three", "t2"),
         ),
         3,
+        None,
+        None,
         &insert_changeset(4, "four", "t3"),
     );
     assert_eq!(
@@ -1644,7 +1675,7 @@ async fn a_forged_changeset_at_a_settled_sequence_is_refused_forked_and_audited(
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].entry_hash,
-        entry_hash(&GENESIS, 1, &cs1).to_vec(),
+        entry_hash(&GENESIS, 1, None, None, &cs1).to_vec(),
         "the record stands the original entry"
     );
     assert_eq!(
@@ -1813,9 +1844,14 @@ async fn a_provenance_write_at_the_originals_frontier_plus_one_applies_and_settl
         vec![note(1, "hello", "t0"), note(2, "two", "t1")]
     );
 
-    // Both sequences settled. The original through restore, the copy direct,
-    // both with the same chain hash.
-    let hash = entry_hash(&GENESIS, 1, &cs1);
+    // The copy's hash binds its provenance, the original's does not.
+    let prov = Provenance {
+        writer: WriterRef::Number(a),
+        seq: 1,
+        secret: None,
+    };
+    let hash = entry_hash(&GENESIS, 1, None, None, &cs1);
+    let copy_hash = entry_hash(&GENESIS, 1, None, Some(Origin::from(prov)), &cs1);
     let rows_a = settled_rows(fixture.admin(), i64::try_from(a).expect("number fits")).await;
     assert_eq!(rows_a.len(), 1);
     assert_eq!(rows_a[0].seq, 1);
@@ -1825,7 +1861,7 @@ async fn a_provenance_write_at_the_originals_frontier_plus_one_applies_and_settl
     assert_eq!(rows_b.len(), 1);
     assert_eq!(rows_b[0].seq, 1);
     assert_eq!(rows_b[0].path, SettlePath::Direct);
-    assert_eq!(rows_b[0].entry_hash, hash.to_vec());
+    assert_eq!(rows_b[0].entry_hash, copy_hash.to_vec());
 
     // Both frontiers advanced to the shared entry.
     let facts_a = writer_facts(fixture.admin(), i64::try_from(a).expect("number fits")).await;
@@ -1833,6 +1869,7 @@ async fn a_provenance_write_at_the_originals_frontier_plus_one_applies_and_settl
     assert_eq!(facts_a.head, Some(hash.to_vec()));
     let facts_b = writer_facts(fixture.admin(), i64::try_from(b).expect("number fits")).await;
     assert_eq!(facts_b.frontier, 1);
+    assert_eq!(facts_b.head, Some(copy_hash.to_vec()));
 }
 
 /// A provenance write whose original stands past the original writer's
@@ -1963,7 +2000,10 @@ async fn a_provenance_write_naming_an_enrolled_key_that_never_bound_stands_its_r
     let facts = writer_facts(fixture.admin(), writer).await;
     assert!(!facts.retired, "the provenance stands the key's row live");
     assert_eq!(facts.frontier, 1);
-    assert_eq!(facts.head, Some(entry_hash(&GENESIS, 1, &cs1).to_vec()));
+    assert_eq!(
+        facts.head,
+        Some(entry_hash(&GENESIS, 1, None, None, &cs1).to_vec())
+    );
     let rows = settled_rows(fixture.admin(), writer).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].path, SettlePath::Restore);
@@ -2400,7 +2440,10 @@ async fn a_forged_changeset_at_a_device_sequence_is_refused_forked_and_audited()
     assert_eq!(event.other_path, Some(SettlePath::Direct));
     let rows = settled_rows(fixture.admin(), writer).await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].entry_hash, entry_hash(&GENESIS, 1, &cs1).to_vec());
+    assert_eq!(
+        rows[0].entry_hash,
+        entry_hash(&GENESIS, 1, None, None, &cs1).to_vec()
+    );
     assert_eq!(
         notes(fixture.admin()).await,
         vec![note(1, "hello", "t0"), note(2, "two", "t1")],
@@ -2767,7 +2810,7 @@ async fn two_connections_racing_one_sequence_are_answered_from_the_record() {
     assert_eq!(rows.len(), 1, "the race settled one row");
     assert_eq!(
         rows[0].entry_hash,
-        entry_hash(&GENESIS, 1, &cs1).to_vec(),
+        entry_hash(&GENESIS, 1, None, None, &cs1).to_vec(),
         "the record stands the first entry"
     );
     assert_eq!(
@@ -4102,4 +4145,203 @@ async fn a_refused_provenance_write_settles_its_unbound_original() {
     assert_eq!(writer_facts(fixture.admin(), original).await.frontier, 1);
     assert_eq!(writer_facts(fixture.admin(), copy).await.frontier, 1);
     assert_eq!(notes(fixture.admin()).await, [note(1, "hello", "t0")]);
+}
+
+/// The Postgres source the acceptance manager serves at major 1.
+const ACCEPT_DDL: &str = "-- connetto:major 1\nCREATE TABLE notes (id INT PRIMARY KEY, \
+    body TEXT, edited_at TEXT);";
+
+/// The replica DDL the acceptance client bakes.
+const ACCEPT_SQLITE_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT, edited_at TEXT)";
+
+/// The bundle the acceptance client opens and the manager advertises.
+#[must_use]
+fn accept_bundle() -> SyncSchema {
+    SyncSchema::new(
+        SchemaBundle::new(
+            ACCEPT_DDL,
+            "",
+            ACCEPT_SQLITE_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares its major"),
+    )
+}
+
+/// The manager the acceptance client reaches: the suite's write manager at
+/// major 1, the bundle's version advertised the way the deployment does.
+fn accept_manager(
+    pool: &Pool<AsyncPgConnection>,
+    guard: Arc<RequestGuard<String>>,
+) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>> {
+    let version = accept_bundle().version();
+    ManagerBuilder::new(
+        Materializer::builder(ACCEPT_DDL)
+            .with_write_catalog(writable_catalog())
+            .build()
+            .expect("build materializer"),
+        NoSnapshot,
+        RosterAuth::granting("alice"),
+        test_verifier(),
+        NoConnector,
+        pg_write_target::<ConnettoDefaults>(pool.clone(), ACCEPT_DDL).expect("build write target"),
+    )
+    .with_session(
+        SessionConfig::default()
+            .with_schema_major(Some(Major::new(1).expect("one is a major")))
+            .with_schema_version(Some(version)),
+    )
+    .with_guard(guard)
+    .build()
+}
+
+/// The in-process acceptance client, signed in as alice over one of the
+/// manager's loopback ends, subscribed and snapshot-complete.
+async fn accept_client(
+    manager: &Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>>,
+) -> ConnettoConnection<LoopbackTransport> {
+    let (server_end, client_end) = loopback();
+    let serving = Arc::clone(manager);
+    tokio::spawn(async move {
+        let _ = serving.serve(server_end).await;
+    });
+    let mut held = Some(client_end);
+    let dial = move || {
+        std::future::ready(
+            held.take()
+                .ok_or_else(|| String::from("the dialer handed out its last transport")),
+        )
+    };
+    let credential =
+        HeldCredential::new(Grant::new("user:alice"), "alice").expect("the credential holds");
+    let mut client = ClientBuilder::new(accept_bundle(), dial)
+        .signed_in(credential)
+        .connect_driven()
+        .await
+        .expect("the client connects");
+    client
+        .subscribe("notes", "SELECT * FROM notes")
+        .await
+        .expect("subscribe");
+    pump_until(&mut client, |event| {
+        matches!(event, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    client
+}
+
+/// Drive the client until its pump reports an event matching `pred`,
+/// applying every frame in between, bounded so a wedged pump fails.
+async fn pump_until(
+    client: &mut ConnettoConnection<LoopbackTransport>,
+    pred: impl Fn(&ClientEvent) -> bool,
+) -> ClientEvent {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, client.pump_one())
+            .await
+            .expect("the client pump is bounded")
+            .expect("the client pump answers");
+        assert_ne!(event, ClientEvent::Closed, "the connection closed early");
+        if pred(&event) {
+            return event;
+        }
+    }
+}
+
+/// The client's queued writes, read from its replica in sequence order.
+fn client_pending(
+    client: &mut ConnettoConnection<LoopbackTransport>,
+) -> Vec<(String, i64, Vec<u8>, Vec<u8>)> {
+    diesel::RunQueryDsl::load(
+        _connetto_pending::table
+            .select((
+                _connetto_pending::writer,
+                _connetto_pending::seq,
+                _connetto_pending::changeset,
+                _connetto_pending::entry_hash,
+            ))
+            .order(_connetto_pending::seq.asc()),
+        client.conn(),
+    )
+    .expect("read the client's queue")
+}
+
+/// The real connetto-client writes through the real server: the hash the
+/// client stored for its entry is the `entry_hash` the server settles for
+/// that writer and sequence, and the core's chain walk over the client's
+/// stored row reaches the writer head the server holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_real_client_write_settles_the_hash_the_client_stored() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let manager = accept_manager(fixture.admin(), guard);
+    let mut client = accept_client(&manager).await;
+
+    // One local write, captured and queued by the real client.
+    diesel::RunQueryDsl::execute(
+        diesel::insert_into(notes::table).values((
+            notes::id.eq(2_i32),
+            notes::body.eq("two"),
+            notes::edited_at.eq("t1"),
+        )),
+        client.conn(),
+    )
+    .expect("write the note");
+    let seq = client.push().await.expect("queue").expect("a sequence");
+
+    // What the client stored for the entry, before the answer retires it.
+    let mut rows = client_pending(&mut client);
+    assert_eq!(rows.len(), 1, "the one write stands in the queue");
+    let (writer_name, stored_seq, changeset, stored_hash) = rows.pop().expect("the queued row");
+    assert_eq!(stored_seq, i64::try_from(seq).expect("the sequence fits"));
+    let writer = writer_name
+        .strip_prefix("number:")
+        .and_then(|number| number.parse::<i64>().ok())
+        .expect("the queue names the number writer");
+
+    // The server settles the write.
+    pump_until(&mut client, |event| {
+        matches!(
+            event,
+            ClientEvent::MutationApplied { client_seq } if *client_seq == seq
+        )
+    })
+    .await;
+    let settled = settled_rows(fixture.admin(), writer).await;
+    assert_eq!(settled.len(), 1, "the one entry settled");
+    assert_eq!(
+        settled[0].seq,
+        i64::try_from(seq).expect("the sequence fits")
+    );
+    assert_eq!(
+        settled[0].entry_hash, stored_hash,
+        "the server settles the hash the client stored"
+    );
+
+    // The core's chain walk over the client's stored row reaches the head
+    // the server holds.
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&Sha256::digest(&changeset));
+    let head = chain_walk(
+        &GENESIS,
+        vec![(
+            seq,
+            Some(Major::new(1).expect("one is a major")),
+            None,
+            digest,
+        )],
+    );
+    assert_eq!(
+        writer_facts(fixture.admin(), writer).await.head,
+        Some(head.to_vec()),
+        "the client's chain reaches the writer head the server holds"
+    );
 }

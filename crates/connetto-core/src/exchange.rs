@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::messages::{MutationRejectReason, WriterRef};
+use crate::messages::{MutationRejectReason, Provenance, WriterRef};
 use crate::schema::Major;
 
 /// A chain frontier, the sequence a device has settled and the hash at it.
@@ -18,15 +18,25 @@ pub struct Frontier {
 /// The writer and sequence an entry was first written under, as it crosses
 /// to a peer.
 ///
-/// A [`Provenance`](crate::messages::Provenance) also carries a number
-/// writer's secret, which names that writer to the server. A peer must never
-/// hold it, so the exchange carries this type, which has no place for one.
+/// A [`Provenance`] also carries a number writer's secret, which names that
+/// writer to the server. A peer must never hold it, so the exchange carries
+/// this type, which has no place for one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Origin {
     /// The writer the entry was first written under.
     pub writer: WriterRef,
     /// Its sequence there.
     pub seq: u64,
+}
+
+/// The writer and sequence alone, the secret left behind.
+impl From<Provenance> for Origin {
+    fn from(provenance: Provenance) -> Self {
+        Self {
+            writer: provenance.writer,
+            seq: provenance.seq,
+        }
+    }
 }
 
 /// One row of a manifest, a sequence the answering device carries.

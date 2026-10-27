@@ -1,11 +1,11 @@
 //! The courier core's wire types (R75).
 //!
 //! A range of one author's writer entries arrives signed by the author's
-//! device key over the courier-range attestation
-//! [`courier_range_message`](connetto_core::chain::courier_range_message),
-//! which also covers every entry's provenance original, so a courier cannot
-//! strip or substitute it. The range settles through the write path the
-//! direct upload takes, as
+//! device key over the range attestation
+//! [`range_message`](connetto_core::chain::range_message), whose chain head
+//! binds every entry's capture major and provenance original, so a courier
+//! cannot relabel or substitute either. The range settles through the write
+//! path the direct upload takes, as
 //! [`SettlePath::Courier`](crate::writer_schema::SettlePath::Courier),
 //! under [`SessionManager::courier_deliver`](crate::session::SessionManager::courier_deliver).
 

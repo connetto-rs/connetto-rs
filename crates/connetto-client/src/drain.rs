@@ -22,6 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use connetto_core::exchange::Origin;
 use connetto_core::messages::{
     ContentTicketRequest, ContentVerb, ControlMessage, FatalErrorReason, HeldWork, HeldWrite,
     MutationRejectReason, Provenance, ReplaceShareKeys, WriterRef, WriterRequest,
@@ -863,8 +864,13 @@ where
         let mut placed: BTreeMap<u64, crate::PendingEntry> = BTreeMap::new();
         for (_, mut entry) in queue.pending {
             let seq = rechained.next_seq;
-            entry.hash =
-                connetto_core::chain::entry_hash(&rechained.head, seq, &self.chain_bytes(&entry)?);
+            entry.hash = connetto_core::chain::entry_hash(
+                &rechained.head,
+                seq,
+                entry.major,
+                entry.provenance.map(Origin::from),
+                &self.chain_bytes(&entry)?,
+            );
             rechained.head = entry.hash;
             rechained.next_seq = seq + 1;
             placed.insert(seq, entry);

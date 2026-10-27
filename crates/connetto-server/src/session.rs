@@ -34,6 +34,7 @@ use std::time::{Duration, Instant, SystemTime};
 use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
 use connetto_core::chain::{self, GENESIS};
 use connetto_core::device_cert::{KeyId, spki_point};
+use connetto_core::exchange::Origin;
 use connetto_core::messages::{
     AggregateUpdate, BindDevice, BindValue, BotRegistered, BulkMessage, CONTENT_TICKET_REFUSED,
     CONTENT_TICKET_SIGNER_ERROR, Challenge, ConflictRow, ContentTicketGrant, ContentTicketRequest,
@@ -1419,6 +1420,9 @@ struct HandshakeOutcome<Id, Key> {
     key_expiry: BTreeMap<String, u64>,
     /// Known completed subject coverage for the resume cursor.
     cursor_subjects: Option<BTreeSet<String>>,
+    /// The application schema major the connection declared at the handshake,
+    /// the capture major of every entry the connection settles.
+    schema_major: Option<Major>,
 }
 
 /// One item waiting on the outbound queue.
@@ -1730,6 +1734,9 @@ struct SessionState<Id, Key> {
     resume_read_budget: Duration,
     /// Known completed subject coverage, absent while unknown or unfinished.
     cursor_subjects: Option<BTreeSet<String>>,
+    /// The application schema major the connection declared at the handshake,
+    /// the capture major of every entry the connection settles.
+    schema_major: Option<Major>,
     /// When each held share key dies, in Unix seconds by the key's rendering,
     /// which the run loop sleeps until (R95).
     key_expiry: BTreeMap<String, u64>,
@@ -4086,6 +4093,7 @@ where
             cursor_subjects: handshake
                 .cursor_subjects
                 .map(|subjects| subjects.into_iter().collect()),
+            schema_major: handshake.schema_major,
         }))
     }
 
@@ -4490,6 +4498,7 @@ where
             outbound_rx,
             key_expiry,
             cursor_subjects,
+            schema_major,
         } = outcome;
         let session_id = principal.session_id();
         tracing::info!(?resume, "connection established");
@@ -4523,6 +4532,7 @@ where
             resume,
             resume_read_budget,
             cursor_subjects,
+            schema_major,
             key_expiry,
             closing: refused == Reaction::Close,
             enrol_challenge: None,
@@ -5721,15 +5731,18 @@ where
             .map_err(|err| SessionError::WriteTarget(err.detail()))
     }
 
-    /// Settle a range the courier carried from the author's device (R75).
+    /// Settle a range the courier carried from the author's device (R75),
+    /// with `major` the application schema major the delivering connection
+    /// declared, the capture major of every entry the range settles.
     ///
     /// The author's signature verifies against the author's live enrolment
-    /// over the range's chain and every entry's provenance original, the
-    /// entries continue the author's settled chain from the writer's
-    /// frontier, and each entry settles at the frontier plus one, in order,
-    /// under the author's identity, so an entry another path settled is
-    /// answered from the record and never applied twice. A carried entry
-    /// settles its provenance original the way the direct upload does.
+    /// over the range's chain, whose head binds every entry's major and
+    /// provenance original, the entries continue the author's settled chain
+    /// from the writer's frontier, and each entry settles at the frontier
+    /// plus one, in order, under the author's identity, so an entry another
+    /// path settled is answered from the record and never applied twice. A
+    /// carried entry settles its provenance original the way the direct
+    /// upload does.
     ///
     /// # Errors
     ///
@@ -5748,6 +5761,7 @@ where
     pub async fn courier_deliver(
         &self,
         author: KeyId,
+        major: Option<Major>,
         entries: &[CourierEntry],
         signature: &[u8],
     ) -> Result<CourierDelivery, SessionError> {
@@ -5806,30 +5820,30 @@ where
                     got: entry.seq,
                 }));
             }
-            let hash = chain::entry_hash(&previous, entry.seq, &entry.changeset);
+            let hash = chain::entry_hash(
+                &previous,
+                entry.seq,
+                major,
+                entry.provenance.map(Origin::from),
+                &entry.changeset,
+            );
             previous = hash;
             expected = entry.seq.saturating_add(1);
             hashes.push(hash);
         }
         // The author vouches the range's chain up to its last entry, or its
-        // own head when the range carries none, and every entry's provenance.
+        // own head when the range carries none.
         let (vouch_seq, vouch_head) = match entries.last() {
             Some(last) => (last.seq, previous),
             None => (frontier, head),
         };
-        let message = chain::courier_range_message(
+        if !chain::verify_range(
+            &record.public_key,
             author.as_bytes(),
             vouch_seq,
             &vouch_head,
-            entries.iter().map(|entry| (entry.seq, entry.provenance)),
-        );
-        let Some(point) = spki_point(&record.public_key) else {
-            return Ok(CourierDelivery::Refused(CourierRefusal::NotEnrolled));
-        };
-        if UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &point)
-            .verify(&message, signature)
-            .is_err()
-        {
+            signature,
+        ) {
             return Ok(CourierDelivery::Refused(CourierRefusal::NotEnrolled));
         }
         // The author's identity every entry applies under.
@@ -5851,6 +5865,7 @@ where
                 .courier_entry(
                     &author,
                     session_uuid,
+                    major,
                     writer_row.writer,
                     entry,
                     *hash,
@@ -5876,10 +5891,15 @@ where
     /// tables fail.
     /// [`SessionError::Protocol`] when the changeset will not compress, or
     /// the provenance sequence is past the original's frontier.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the author, its declared major and the entry's hash and predecessor are the range's per-entry identity, and the range hands each over as it settles"
+    )]
     async fn courier_entry(
         &self,
         author: &Arc<Principal<Id, Key>>,
         session_id: uuid::Uuid,
+        major: Option<Major>,
         writer: i64,
         entry: &CourierEntry,
         entry_hash: [u8; 32],
@@ -5895,7 +5915,7 @@ where
             original: None,
         };
         if let Some(outcome) = self
-            .courier_original(author, session_id, entry, &mut settle)
+            .courier_original(author, session_id, major, entry, &mut settle)
             .await?
         {
             return Ok(outcome);
@@ -5974,6 +5994,7 @@ where
         &self,
         author: &Arc<Principal<Id, Key>>,
         session_id: uuid::Uuid,
+        major: Option<Major>,
         entry: &CourierEntry,
         settle: &mut SettleSpec,
     ) -> Result<Option<SettledOutcome>, SessionError> {
@@ -5981,7 +6002,7 @@ where
             return Ok(None);
         };
         match self
-            .provenance_original(&provenance, &entry.changeset, author, session_id)
+            .provenance_original(&provenance, major, &entry.changeset, author, session_id)
             .await?
         {
             Some((writer, frontier, _, _)) if provenance.seq <= frontier => {
@@ -6216,7 +6237,14 @@ where
         };
         if client_seq <= frontier {
             return self
-                .redelivered(transport, writer, client_seq, &bytes, state)
+                .redelivered(
+                    transport,
+                    writer,
+                    client_seq,
+                    &bytes,
+                    header.provenance,
+                    state,
+                )
                 .await;
         }
         if client_seq > frontier + 1 {
@@ -6267,7 +6295,13 @@ where
             let settle = SettleSpec {
                 writer,
                 seq: client_seq,
-                entry_hash: chain::entry_hash(&previous, client_seq, &bytes),
+                entry_hash: chain::entry_hash(
+                    &previous,
+                    client_seq,
+                    state.schema_major,
+                    header.provenance.map(Origin::from),
+                    &bytes,
+                ),
                 previous_hash: previous,
                 path: SettlePath::Direct,
                 original: None,
@@ -6368,6 +6402,7 @@ where
         writer: i64,
         seq: u64,
         bytes: &[u8],
+        provenance: Option<Provenance>,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
         // A pruned record stands settled, so the client retires its copy.
@@ -6382,7 +6417,13 @@ where
         let previous = <[u8; 32]>::try_from(row.previous_hash.as_slice()).map_err(|_| {
             SessionError::WriteTarget("a retained entry's predecessor hash is malformed".to_owned())
         })?;
-        let hash = chain::entry_hash(&previous, seq, bytes);
+        let hash = chain::entry_hash(
+            &previous,
+            seq,
+            state.schema_major,
+            provenance.map(Origin::from),
+            bytes,
+        );
         let stored = <[u8; 32]>::try_from(row.entry_hash.as_slice()).map_err(|_| {
             SessionError::WriteTarget("a settled entry hash is not 32 bytes".to_owned())
         })?;
@@ -6516,7 +6557,13 @@ where
         let previous = writer_row.head.as_deref().map_or(GENESIS, |head| {
             <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
         });
-        let entry_hash = chain::entry_hash(&previous, seq, bytes);
+        let entry_hash = chain::entry_hash(
+            &previous,
+            seq,
+            state.schema_major,
+            header.provenance.map(Origin::from),
+            bytes,
+        );
         let mut settle = SettleSpec {
             writer,
             seq,
@@ -6531,6 +6578,7 @@ where
             match self
                 .provenance_original(
                     &provenance,
+                    state.schema_major,
                     bytes,
                     &state.principal,
                     *state.session_id.as_uuid(),
@@ -6652,6 +6700,7 @@ where
     async fn provenance_original(
         &self,
         provenance: &Provenance,
+        major: Option<Major>,
         bytes: &[u8],
         caller: &Arc<Principal<Id, Key>>,
         session_id: uuid::Uuid,
@@ -6731,7 +6780,9 @@ where
         let previous = row.head.as_deref().map_or(GENESIS, |head| {
             <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
         });
-        let entry_hash = chain::entry_hash(&previous, provenance.seq, bytes);
+        // The original settled as a plain write, so its hash never carries
+        // a provenance of its own.
+        let entry_hash = chain::entry_hash(&previous, provenance.seq, major, None, bytes);
         Ok(Some((row.writer, frontier, entry_hash, previous)))
     }
 

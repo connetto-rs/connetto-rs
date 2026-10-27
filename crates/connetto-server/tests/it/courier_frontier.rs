@@ -2,26 +2,32 @@
 //! sweep (R75).
 //!
 //! A courier range carries one author's queued entries, signed by the
-//! author's device key over its chain and every entry's provenance original,
-//! and settles them through the write path the direct upload takes, as the
-//! `Courier` path. The range continues the author's settled chain and
-//! applies under the author's account identity. A carried entry settles its
-//! provenance original the way the direct upload does, so the logical write
-//! applies once whichever copy arrives first. The sweep prunes the settled
-//! rows of the device writers whose enrolment is revoked or has gone absent,
-//! keeps the writer row and its frontier, and spares the writers whose
-//! enrolment still stands, expired certificates included.
+//! author's device key over the range's chain, which binds every entry's
+//! provenance original. It settles them through the write path the direct
+//! upload takes, as the `Courier` path. The range continues the author's
+//! settled chain and applies under the author's account identity. A carried
+//! entry settles its provenance original the way the direct upload does, so
+//! the logical write applies once whichever copy arrives first. The sweep
+//! prunes the settled rows of the device writers whose enrolment is revoked
+//! or has gone absent, keeps the writer row and its frontier, and spares the
+//! writers whose enrolment still stands, expired certificates included.
 //!
 //! Needs Docker: the fixture starts its own Postgres.
+#![expect(
+    clippy::too_many_lines,
+    reason = "the acceptance tests walk one courier delivery in order and a split would hide the sequence"
+)]
 
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use connetto_core::Major;
 use connetto_core::SessionId;
 use connetto_core::auth::Principal;
-use connetto_core::chain::{GENESIS, courier_range_message, entry_hash};
+use connetto_core::chain::{GENESIS, entry_hash, range_message};
 use connetto_core::device_cert::{AttestationLevel, KeyId};
+use connetto_core::exchange::Origin;
 use connetto_core::messages::{
     ControlMessage, MutationRejectReason, Provenance, WriterOutcome, WriterRef, WriterRequest,
 };
@@ -374,24 +380,10 @@ fn sign(key: &KeyPair, message: &[u8]) -> Vec<u8> {
     key.sign(message).expect("sign the message").clone()
 }
 
-/// The signature the author's key signs over the range, its chain up to the
-/// last entry and every entry's provenance original.
-fn range_signature(
-    key: &KeyPair,
-    key_id: [u8; 32],
-    seq: u64,
-    head: [u8; 32],
-    entries: &[CourierEntry],
-) -> Vec<u8> {
-    sign(
-        key,
-        &courier_range_message(
-            &key_id,
-            seq,
-            &head,
-            entries.iter().map(|entry| (entry.seq, entry.provenance)),
-        ),
-    )
+/// The signature the author's key signs over the range's chain, up to its
+/// last entry, which binds every entry's major and provenance original.
+fn range_signature(key: &KeyPair, key_id: [u8; 32], seq: u64, head: [u8; 32]) -> Vec<u8> {
+    sign(key, &range_message(&key_id, seq, &head))
 }
 
 fn writing_manager(
@@ -465,8 +457,8 @@ async fn a_good_courier_range_settles_the_authors_entries_under_courier() {
     // The range carries the author's first two entries, chained from genesis.
     let cs1 = insert_changeset(2, "two", "t1");
     let cs2 = insert_changeset(3, "three", "t2");
-    let head1 = entry_hash(&GENESIS, 1, &cs1);
-    let head2 = entry_hash(&head1, 2, &cs2);
+    let head1 = entry_hash(&GENESIS, 1, None, None, &cs1);
+    let head2 = entry_hash(&head1, 2, None, None, &cs2);
     let entries = vec![
         CourierEntry {
             seq: 1,
@@ -479,9 +471,9 @@ async fn a_good_courier_range_settles_the_authors_entries_under_courier() {
             provenance: None,
         },
     ];
-    let signature = range_signature(&key, key_id, 2, head2, &entries);
+    let signature = range_signature(&key, key_id, 2, head2);
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(key_id), &entries, &signature)
+        .courier_deliver(KeyId::from_bytes(key_id), None, &entries, &signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Entries(outcomes) = delivery else {
@@ -559,9 +551,9 @@ async fn a_courier_range_missing_the_authors_signature_is_refused() {
         changeset: cs1,
         provenance: None,
     }];
-    let wrong_signature = range_signature(&key, key_id, 1, GENESIS, &entries);
+    let wrong_signature = range_signature(&key, key_id, 1, GENESIS);
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(key_id), &entries, &wrong_signature)
+        .courier_deliver(KeyId::from_bytes(key_id), None, &entries, &wrong_signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Refused(refusal) = delivery else {
@@ -632,11 +624,11 @@ async fn a_courier_range_past_the_authors_frontier_is_refused() {
         changeset: cs3,
         provenance: None,
     }];
-    let head1 = entry_hash(&GENESIS, 1, &insert_changeset(2, "two", "t1"));
-    let head3 = entry_hash(&head1, 3, &entries[0].changeset);
-    let signature = range_signature(&key, key_id, 3, head3, &entries);
+    let head1 = entry_hash(&GENESIS, 1, None, None, &insert_changeset(2, "two", "t1"));
+    let head3 = entry_hash(&head1, 3, None, None, &entries[0].changeset);
+    let signature = range_signature(&key, key_id, 3, head3);
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(key_id), &entries, &signature)
+        .courier_deliver(KeyId::from_bytes(key_id), None, &entries, &signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Refused(refusal) = delivery else {
@@ -714,16 +706,16 @@ async fn a_courier_range_for_a_retired_author_is_refused() {
 
     // The range for the retired author settles nothing.
     let cs2 = insert_changeset(3, "three", "t2");
-    let head1 = entry_hash(&GENESIS, 1, &cs1);
-    let head2 = entry_hash(&head1, 2, &cs2);
+    let head1 = entry_hash(&GENESIS, 1, None, None, &cs1);
+    let head2 = entry_hash(&head1, 2, None, None, &cs2);
     let entries = vec![CourierEntry {
         seq: 2,
         changeset: cs2.clone(),
         provenance: None,
     }];
-    let signature = range_signature(&key, key_id, 2, head2, &entries);
+    let signature = range_signature(&key, key_id, 2, head2);
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(key_id), &entries, &signature)
+        .courier_deliver(KeyId::from_bytes(key_id), None, &entries, &signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Refused(CourierRefusal::WriterRetired) = delivery else {
@@ -767,15 +759,15 @@ async fn a_direct_reupload_of_a_courier_settled_entry_is_answered_from_the_recor
 
     // The courier settles the author's first entry.
     let cs1 = insert_changeset(2, "two", "t1");
-    let head1 = entry_hash(&GENESIS, 1, &cs1);
+    let head1 = entry_hash(&GENESIS, 1, None, None, &cs1);
     let entries = vec![CourierEntry {
         seq: 1,
         changeset: cs1.clone(),
         provenance: None,
     }];
-    let signature = range_signature(&key, key_id, 1, head1, &entries);
+    let signature = range_signature(&key, key_id, 1, head1);
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(key_id), &entries, &signature)
+        .courier_deliver(KeyId::from_bytes(key_id), None, &entries, &signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Entries(outcomes) = delivery else {
@@ -1002,16 +994,16 @@ async fn a_sweep_keeps_an_expired_writers_records_and_a_renewed_key_keeps_delive
 
     // The courier still refuses the expired certificate.
     let cs2 = insert_changeset(3, "three", "t2");
-    let head1 = entry_hash(&GENESIS, 1, &cs1);
-    let head2 = entry_hash(&head1, 2, &cs2);
+    let head1 = entry_hash(&GENESIS, 1, None, None, &cs1);
+    let head2 = entry_hash(&head1, 2, None, None, &cs2);
     let entries = vec![CourierEntry {
         seq: 2,
         changeset: cs2,
         provenance: None,
     }];
-    let signature = range_signature(&key, key_id, 2, head2, &entries);
+    let signature = range_signature(&key, key_id, 2, head2);
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(key_id), &entries, &signature)
+        .courier_deliver(KeyId::from_bytes(key_id), None, &entries, &signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Refused(refusal) = delivery else {
@@ -1079,15 +1071,15 @@ async fn a_courier_restore_answers_a_settled_original_without_reapplying() {
 
     // The author settles the original entry.
     let cs1 = insert_changeset(2, "two", "t1");
-    let head1 = entry_hash(&GENESIS, 1, &cs1);
+    let head1 = entry_hash(&GENESIS, 1, None, None, &cs1);
     let entries = vec![CourierEntry {
         seq: 1,
         changeset: cs1.clone(),
         provenance: None,
     }];
-    let signature = range_signature(&k1, k1_id, 1, head1, &entries);
+    let signature = range_signature(&k1, k1_id, 1, head1);
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k1_id), &entries, &signature)
+        .courier_deliver(KeyId::from_bytes(k1_id), None, &entries, &signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Entries(outcomes) = delivery else {
@@ -1110,14 +1102,15 @@ async fn a_courier_restore_answers_a_settled_original_without_reapplying() {
         seq: 1,
         secret: None,
     };
+    let head_copy = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs1);
     let restored = vec![CourierEntry {
         seq: 1,
         changeset: cs1,
         provenance: Some(original),
     }];
-    let signature = range_signature(&k2, k2_id, 1, head1, &restored);
+    let signature = range_signature(&k2, k2_id, 1, head_copy);
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), &restored, &signature)
+        .courier_deliver(KeyId::from_bytes(k2_id), None, &restored, &signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Entries(outcomes) = delivery else {
@@ -1173,20 +1166,21 @@ async fn a_courier_restore_settles_the_unsettled_original_with_the_copy() {
     let _ = captured;
 
     let cs1 = insert_changeset(2, "two", "t1");
-    let head1 = entry_hash(&GENESIS, 1, &cs1);
     let original = Provenance {
         writer: WriterRef::Device(k1_id),
         seq: 1,
         secret: None,
     };
+    let original_head = entry_hash(&GENESIS, 1, None, None, &cs1);
+    let head1 = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs1);
     let restored = vec![CourierEntry {
         seq: 1,
         changeset: cs1,
         provenance: Some(original),
     }];
-    let signature = range_signature(&k2, k2_id, 1, head1, &restored);
+    let signature = range_signature(&k2, k2_id, 1, head1);
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), &restored, &signature)
+        .courier_deliver(KeyId::from_bytes(k2_id), None, &restored, &signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Entries(outcomes) = delivery else {
@@ -1205,7 +1199,7 @@ async fn a_courier_restore_settles_the_unsettled_original_with_the_copy() {
     assert_eq!(rows_1.len(), 1, "the original settled with the copy");
     assert_eq!(rows_1[0].seq, 1);
     assert_eq!(rows_1[0].path, SettlePath::Restore);
-    assert_eq!(rows_1[0].entry_hash, head1.to_vec());
+    assert_eq!(rows_1[0].entry_hash, original_head.to_vec());
     assert_eq!(writer_facts(fixture.admin(), writer_1).await.frontier, 1);
     // The copy settled under the renewed key as the courier.
     let writer_2 = writer_for_key(fixture.admin(), k2_id).await;
@@ -1293,7 +1287,7 @@ async fn a_courier_restore_keeps_a_refused_original_outcome() {
     // The original's refusal stands settled under it, as a direct denial
     // does.
     let cs1 = insert_changeset(2, "two", "t1");
-    let head1 = entry_hash(&GENESIS, 1, &cs1);
+    let head1 = entry_hash(&GENESIS, 1, None, None, &cs1);
     seed_direct_refusal(fixture.admin(), writer_1, &head1).await;
 
     // The renewed key couriers the restored copy.
@@ -1302,14 +1296,15 @@ async fn a_courier_restore_keeps_a_refused_original_outcome() {
         seq: 1,
         secret: None,
     };
+    let head_copy = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs1);
     let restored = vec![CourierEntry {
         seq: 1,
         changeset: cs1,
         provenance: Some(original),
     }];
-    let signature = range_signature(&k2, k2_id, 1, head1, &restored);
+    let signature = range_signature(&k2, k2_id, 1, head_copy);
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), &restored, &signature)
+        .courier_deliver(KeyId::from_bytes(k2_id), None, &restored, &signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Entries(outcomes) = delivery else {
@@ -1373,18 +1368,19 @@ async fn a_courier_range_signature_covers_the_entries_provenance() {
     let _ = captured;
 
     let cs1 = insert_changeset(2, "two", "t1");
-    let head1 = entry_hash(&GENESIS, 1, &cs1);
+    let head_plain = entry_hash(&GENESIS, 1, None, None, &cs1);
     let original = Provenance {
         writer: WriterRef::Device(k1_id),
         seq: 1,
         secret: None,
     };
+    let head_signed = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs1);
     let signed = vec![CourierEntry {
         seq: 1,
         changeset: cs1.clone(),
         provenance: Some(original),
     }];
-    let signature = range_signature(&k2, k2_id, 1, head1, &signed);
+    let signature = range_signature(&k2, k2_id, 1, head_signed);
 
     // Signed with the provenance, stripped on delivery.
     let stripped = vec![CourierEntry {
@@ -1393,7 +1389,7 @@ async fn a_courier_range_signature_covers_the_entries_provenance() {
         provenance: None,
     }];
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), &stripped, &signature)
+        .courier_deliver(KeyId::from_bytes(k2_id), None, &stripped, &signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Refused(CourierRefusal::NotEnrolled) = delivery else {
@@ -1411,22 +1407,17 @@ async fn a_courier_range_signature_covers_the_entries_provenance() {
         }),
     }];
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), &substituted, &signature)
+        .courier_deliver(KeyId::from_bytes(k2_id), None, &substituted, &signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Refused(CourierRefusal::NotEnrolled) = delivery else {
         panic!("the substituted provenance fails the signature");
     };
 
-    // Signed without the provenance, carried on delivery.
-    let plain = vec![CourierEntry {
-        seq: 1,
-        changeset: cs1,
-        provenance: None,
-    }];
-    let plain_signature = range_signature(&k2, k2_id, 1, head1, &plain);
+    // Signed over a chain that carries no provenance, delivered with one.
+    let plain_signature = range_signature(&k2, k2_id, 1, head_plain);
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), &signed, &plain_signature)
+        .courier_deliver(KeyId::from_bytes(k2_id), None, &signed, &plain_signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Refused(CourierRefusal::NotEnrolled) = delivery else {
@@ -1442,6 +1433,61 @@ async fn a_courier_range_signature_covers_the_entries_provenance() {
         notes(fixture.admin()).await,
         vec![note(1, "hello", "t0")],
         "the refusals settled nothing"
+    );
+}
+
+/// A range delivered under a schema major the author's signature did not
+/// vouch for fails the signature and settles nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_courier_range_relabelled_to_another_major_is_refused() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let store = Enrolments::new();
+    let (key, key_id) = store
+        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .await;
+    let manager = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(store.installable()),
+        SessionConfig::default(),
+    );
+
+    // The signature vouches the chain under one major, and the delivery
+    // declares another.
+    let cs1 = insert_changeset(2, "two", "t1");
+    let entries = vec![CourierEntry {
+        seq: 1,
+        changeset: cs1.clone(),
+        provenance: None,
+    }];
+    let head = entry_hash(&GENESIS, 1, Major::new(1), None, &cs1);
+    let signature = range_signature(&key, key_id, 1, head);
+    let delivery = manager
+        .courier_deliver(
+            KeyId::from_bytes(key_id),
+            Major::new(2),
+            &entries,
+            &signature,
+        )
+        .await
+        .expect("deliver the range");
+    let CourierDelivery::Refused(CourierRefusal::NotEnrolled) = delivery else {
+        panic!("the relabelled major fails the signature");
+    };
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    assert!(
+        settled_rows(fixture.admin(), writer).await.is_empty(),
+        "the refusal settled nothing"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0")],
+        "the refusal settled nothing"
     );
 }
 
@@ -1505,20 +1551,20 @@ async fn a_courier_restore_of_a_foreign_original_applies_plain() {
 
     // alice's renewed key couriers a copy claiming the foreign original.
     let cs2 = insert_changeset(6, "six", "t2");
-    let head1 = entry_hash(&GENESIS, 1, &cs2);
     let original = Provenance {
         writer: WriterRef::Device(k3_id),
         seq: 1,
         secret: None,
     };
+    let head1 = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs2);
     let restored = vec![CourierEntry {
         seq: 1,
         changeset: cs2,
         provenance: Some(original),
     }];
-    let signature = range_signature(&k2, k2_id, 1, head1, &restored);
+    let signature = range_signature(&k2, k2_id, 1, head1);
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), &restored, &signature)
+        .courier_deliver(KeyId::from_bytes(k2_id), None, &restored, &signature)
         .await
         .expect("deliver the range");
     let CourierDelivery::Entries(outcomes) = delivery else {
@@ -1600,20 +1646,20 @@ async fn a_courier_restore_with_a_provenance_gap_settles_neither() {
     // The renewed key couriers a copy whose original sequence skips the
     // original's frontier.
     let cs2 = insert_changeset(3, "three", "t2");
-    let head1 = entry_hash(&GENESIS, 1, &cs2);
     let original = Provenance {
         writer: WriterRef::Device(k1_id),
         seq: 3,
         secret: None,
     };
+    let head1 = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs2);
     let restored = vec![CourierEntry {
         seq: 1,
         changeset: cs2,
         provenance: Some(original),
     }];
-    let signature = range_signature(&k2, k2_id, 1, head1, &restored);
+    let signature = range_signature(&k2, k2_id, 1, head1);
     let error = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), &restored, &signature)
+        .courier_deliver(KeyId::from_bytes(k2_id), None, &restored, &signature)
         .await
         .unwrap_err();
     assert!(
@@ -1684,10 +1730,16 @@ async fn a_refused_courier_restore_settles_the_unsettled_original() {
             secret: None,
         }),
     }];
-    let head = entry_hash(&GENESIS, 1, &entries[0].changeset);
-    let signature = range_signature(&author, author_key, 1, head, &entries);
+    let head = entry_hash(
+        &GENESIS,
+        1,
+        None,
+        entries[0].provenance.map(Origin::from),
+        &entries[0].changeset,
+    );
+    let signature = range_signature(&author, author_key, 1, head);
     let delivery = manager
-        .courier_deliver(KeyId::from_bytes(author_key), &entries, &signature)
+        .courier_deliver(KeyId::from_bytes(author_key), None, &entries, &signature)
         .await
         .expect("deliver malformed logical write");
     let CourierDelivery::Entries(outcomes) = delivery else {
@@ -1774,16 +1826,18 @@ async fn concurrent_courier_restores_reserve_the_original_before_applying() {
         Some(store.installable()),
         SessionConfig::default(),
     );
+    let cs = insert_changeset(2, "two", "t1");
+    let original = Provenance {
+        writer: WriterRef::Device(original_key),
+        seq: 1,
+        secret: None,
+    };
+    let head = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs);
     let entries = Arc::new([CourierEntry {
         seq: 1,
-        changeset: insert_changeset(2, "two", "t1"),
-        provenance: Some(Provenance {
-            writer: WriterRef::Device(original_key),
-            seq: 1,
-            secret: None,
-        }),
+        changeset: cs,
+        provenance: Some(original),
     }]);
-    let head = entry_hash(&GENESIS, 1, &entries[0].changeset);
     let pool = fixture.admin().clone();
     let mut blocker = fixture.admin().get().await.expect("lock connection");
     let jobs = blocker
@@ -1792,13 +1846,18 @@ async fn concurrent_courier_restores_reserve_the_original_before_applying() {
                 .await?;
             let mut jobs = Vec::with_capacity(authors.len());
             for (key, id) in authors {
-                let signature = range_signature(&key, id, 1, head, &entries[..]);
+                let signature = range_signature(&key, id, 1, head);
                 let manager = Arc::clone(&manager);
                 let entries = Arc::clone(&entries);
                 jobs.push(tokio::spawn(async move {
                     let delivery = tokio::time::timeout(
                         Duration::from_secs(30),
-                        manager.courier_deliver(KeyId::from_bytes(id), &entries[..], &signature),
+                        manager.courier_deliver(
+                            KeyId::from_bytes(id),
+                            None,
+                            &entries[..],
+                            &signature,
+                        ),
                     )
                     .await
                     .expect("courier deadline")

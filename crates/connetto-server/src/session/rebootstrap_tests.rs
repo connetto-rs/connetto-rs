@@ -87,6 +87,7 @@ fn state() -> State {
         resume: Resume::Fresh,
         resume_read_budget: Duration::from_secs(10),
         cursor_subjects: None,
+        schema_major: None,
         key_expiry: BTreeMap::new(),
         closing: false,
         enrol_challenge: None,
