@@ -461,22 +461,17 @@ where
                     }
                     self.drain.dead.remove(&writer);
                 }
-                self.drain.writer = Some(issued);
-                self.drain_reconcile(major, grant.frontier).await
+                self.drain_reconcile(major, issued, grant.frontier).await
             }
-            WriterRequest::Number(_) => {
-                self.drain.writer = writer;
+            WriterRequest::Number(number) => {
                 let frontier = ack.writer.map_or(0, |grant| grant.frontier);
-                self.drain_reconcile(major, frontier).await
+                self.drain_reconcile(major, WriterRef::Number(number), frontier)
+                    .await
             }
             WriterRequest::Device => match writer {
-                // Files alone, so nothing binds and the content layer asks for its tickets.
-                None => self.after_drain_settle(major).await,
                 Some(WriterRef::Device(key_id)) => self.drain_bind(key_id, &ack).await,
-                Some(_) => {
-                    self.drop_drain_wire().await;
-                    Ok(())
-                }
+                // Files alone, so nothing binds and the content layer asks for its tickets.
+                _ => self.after_drain_settle(major).await,
             },
         }
     }
@@ -613,12 +608,16 @@ where
         Ok(())
     }
 
-    /// Settle what the old major reports at or below `frontier` for the bound
-    /// writer, then send the rest of the major's writes in sequence order.
-    async fn drain_reconcile(&mut self, major: Major, frontier: u64) -> Result<(), ClientError> {
-        let Some(writer) = self.drain.writer else {
-            return self.after_drain_settle(major).await;
-        };
+    /// Bind the drain wire to `writer`, settle what the old major reports at
+    /// or below `frontier` for it, then send the rest of the major's writes
+    /// in sequence order.
+    async fn drain_reconcile(
+        &mut self,
+        major: Major,
+        writer: WriterRef,
+        frontier: u64,
+    ) -> Result<(), ClientError> {
+        self.drain.writer = Some(writer);
         let settled: Vec<(u64, Option<Major>)> = self
             .writers
             .get(&writer)
@@ -1083,8 +1082,7 @@ where
         };
         let writer = WriterRef::Device(bind.key_id);
         if let WriterOutcome::Bound { frontier } = answer.outcome {
-            self.drain.writer = Some(writer);
-            return self.drain_reconcile(major, frontier).await;
+            return self.drain_reconcile(major, writer, frontier).await;
         }
         // Retired, unknown or not enrolled there, so its entries move.
         self.drain.dead.insert(writer);
@@ -1227,3 +1225,6 @@ where
         self.drop_drain_wire().await;
     }
 }
+
+#[cfg(test)]
+mod tests;
