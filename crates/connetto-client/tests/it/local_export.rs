@@ -1,6 +1,8 @@
 //! Local data export contract tests.
 
-use connetto_client::{ClientBuilder, DataDir, ExportScope, MemoryRefreshStore, SyncSchema};
+use connetto_client::{
+    ClientBuilder, DataDir, ExportScope, MemoryRefreshStore, ReplicaKey, SyncSchema, cipher,
+};
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use diesel::prelude::*;
@@ -299,21 +301,39 @@ fn everything_scope_carries_both_tiers_unsynced_omits_synced_replica() {
 
 /// The export's own refusal, which R62 left in place as the backstop.
 ///
-/// Its only route is now a table created after open, since a schema carrying
-/// an unkeyed table no longer opens at all.
-#[test]
-fn table_without_primary_key_is_refused_by_name() {
+/// A schema carrying an unkeyed table never opens, and the connection refuses
+/// table DDL outside `change_schema`, which refuses one too. What remains is
+/// another connection to the same replica file creating one.
+#[tokio::test]
+async fn table_without_primary_key_is_refused_by_name() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let credential = super::support::held("test");
+    let key = ReplicaKey::from_bytes([0x45; ReplicaKey::LEN]);
+    let path = dir.path().join(credential.replica_name());
+    let store = super::support::key_store_with(&credential, key.clone()).await;
     let mut conn = ClientBuilder::new(
         super::support::bundle("CREATE TABLE keyed (id INTEGER PRIMARY KEY);"),
         super::support::NeverDial::<FakeTransport>::default(),
     )
-    .open_driven()
-    .expect("open replica");
-    diesel::connection::SimpleConnection::batch_execute(
-        &mut conn,
-        "CREATE TABLE nokey (name TEXT NOT NULL)",
+    .signed_in(credential)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
     )
-    .expect("create it mid-run");
+    .open_driven()
+    .await
+    .expect("open replica");
+    {
+        let mut other = SqliteConnection::establish(path.to_str().expect("utf-8 path"))
+            .expect("a second connection to the replica");
+        cipher::unlock(&mut other, &key).expect("key it");
+        diesel::connection::SimpleConnection::batch_execute(
+            &mut other,
+            "CREATE TABLE nokey (name TEXT NOT NULL)",
+        )
+        .expect("create it from outside");
+    }
     let err = conn
         .export_local_data(ExportScope::Everything, Vec::new())
         .expect_err("must refuse a table without a primary key");
