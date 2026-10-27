@@ -488,7 +488,7 @@ where
             .await??;
         let mut sent = 0;
         for file_id in waiting {
-            match self.upload_one(file_id).await {
+            match self.upload_one(file_id, None).await {
                 Ok(()) => {
                     self.client
                         .with_conn(|conn| db::dequeue(conn.conn(), file_id))
@@ -544,16 +544,32 @@ where
         Ok(sent)
     }
 
-    /// One file: a write ticket, then the whole negotiation under it.
-    async fn upload_one(&self, file_id: FileId) -> Result<(), ContentError> {
-        let manifest = self
-            .client
-            .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
-            .await??
-            .ok_or(ContentError::NoManifest { file_id })?;
+    /// One file: a write ticket, then the whole negotiation under it. A file
+    /// held from an older major (R31) asks on that major's drain wire.
+    async fn upload_one(&self, file_id: FileId, held: Option<Major>) -> Result<(), ContentError> {
+        let (manifest, wire) = match held {
+            None => (
+                self.client
+                    .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
+                    .await??,
+                ticket::TicketWire::Main,
+            ),
+            Some(major) => (
+                self.client
+                    .with_conn(move |conn| db::load_held_manifest(conn.conn(), major, file_id))
+                    .await??,
+                ticket::TicketWire::Drain,
+            ),
+        };
+        let manifest = manifest.ok_or(ContentError::NoManifest { file_id })?;
         let declared_len: u64 = manifest.chunks().iter().map(|chunk| chunk.len).sum();
-        let url =
-            ticket::request(&self.client, file_id, ContentVerb::Write { declared_len }).await?;
+        let url = ticket::request(
+            &self.client,
+            file_id,
+            ContentVerb::Write { declared_len },
+            wire,
+        )
+        .await?;
         let store = self.store_for(FETCHED_CLASS);
         upload::upload(&self.http, &url, &manifest, &store).await
     }
@@ -577,7 +593,7 @@ where
             if self.client.held_files_ready().await? != Some(major) {
                 break;
             }
-            match self.upload_held_one(major, file_id).await {
+            match self.upload_one(file_id, Some(major)).await {
                 Ok(()) => {
                     self.forget_held(major, file_id).await?;
                     self.client.held_file_settled().await?;
@@ -602,21 +618,6 @@ where
             }
         }
         Ok(sent)
-    }
-
-    /// One held file: a write ticket on the drain wire, then the whole
-    /// negotiation under it.
-    async fn upload_held_one(&self, major: Major, file_id: FileId) -> Result<(), ContentError> {
-        let manifest = self
-            .client
-            .with_conn(move |conn| db::load_held_manifest(conn.conn(), major, file_id))
-            .await??
-            .ok_or(ContentError::NoManifest { file_id })?;
-        let declared_len: u64 = manifest.chunks().iter().map(|chunk| chunk.len).sum();
-        let url = ticket::request_held(&self.client, file_id, ContentVerb::Write { declared_len })
-            .await?;
-        let store = self.store_for(FETCHED_CLASS);
-        upload::upload(&self.http, &url, &manifest, &store).await
     }
 
     /// Deletes one settled or abandoned held file's rows, under suspended capture (R31).
@@ -652,7 +653,13 @@ where
         if !self.client.with_conn(|conn| conn.is_connected()).await? {
             return Ok(Resolved::Unavailable);
         }
-        let url = ticket::request(&self.client, file_id, ContentVerb::Read).await?;
+        let url = ticket::request(
+            &self.client,
+            file_id,
+            ContentVerb::Read,
+            ticket::TicketWire::Main,
+        )
+        .await?;
         Ok(Resolved::Remote { url })
     }
 
@@ -846,7 +853,13 @@ where
     /// Downloads one file whole, proves it is the file that was asked for, and
     /// re-chunks it into the store under its own manifest.
     async fn fetch_one(&self, file_id: FileId) -> Result<(), ContentError> {
-        let url = ticket::request(&self.client, file_id, ContentVerb::Read).await?;
+        let url = ticket::request(
+            &self.client,
+            file_id,
+            ContentVerb::Read,
+            ticket::TicketWire::Main,
+        )
+        .await?;
         let bytes = upload::download(&self.http, &url).await?;
         let _writing = self.content_writes.lock().await;
         let store = self.store_for(FETCHED_CLASS);

@@ -544,8 +544,14 @@ where
             return Ok(ResolveStart::Answered(Resolved::Unavailable));
         }
         let mut pending = None;
-        ticket::ensure_pending_request(connection, file_id, ContentVerb::Read, &mut pending)
-            .await?;
+        ticket::ensure_pending_request(
+            connection,
+            file_id,
+            ContentVerb::Read,
+            &mut pending,
+            ticket::TicketWire::Main,
+        )
+        .await?;
         let ticket = pending.expect("a sent request leaves its handle behind");
         Ok(ResolveStart::Waiting(PendingConnectionResolve { ticket }))
     }
@@ -576,6 +582,7 @@ where
             observed,
             cancel,
             &mut pending,
+            ticket::TicketWire::Main,
         )
         .await?;
         Ok(match url {
@@ -978,6 +985,7 @@ where
             observed,
             cancel,
             &mut cursor.state.pending_ticket,
+            ticket::TicketWire::Main,
         )
         .await
         {
@@ -1188,13 +1196,14 @@ where
             .map(ContentFlushStart::Complete);
         };
         let declared_len = manifest.chunks().iter().map(|chunk| chunk.len).sum();
-        let upload_url = match ticket::request_held_connection_or(
+        let upload_url = match ticket::request_connection_or(
             cursor.connection,
             file_id,
             ContentVerb::Write { declared_len },
             observed,
             cancel,
             &mut cursor.state.pending_ticket,
+            ticket::TicketWire::Drain,
         )
         .await
         {
