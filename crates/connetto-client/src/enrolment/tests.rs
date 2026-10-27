@@ -3476,9 +3476,16 @@ async fn a_peer_listener_that_will_not_bind_reports_the_failure() {
 
 const DRAIN_NONCE: [u8; 32] = [5; 32];
 
-fn major_one() -> connetto_core::Major {
-    connetto_core::Major::new(1).expect("one is a major")
+/// The old major's challenge, which a device bind on the drain wire signs.
+fn drain_challenge() -> ControlMessage {
+    ControlMessage::Challenge(connetto_core::messages::Challenge { nonce: DRAIN_NONCE })
 }
+
+const ISSUED_NINE: Option<connetto_core::messages::WriterGrant> =
+    Some(connetto_core::messages::WriterGrant {
+        number: 9,
+        frontier: 0,
+    });
 
 /// How the device stands toward the key a held write was captured under.
 #[derive(Debug, Clone, Copy)]
@@ -3500,32 +3507,17 @@ enum HeldKey {
 /// A major 2 replica holding one write the major 1 build captured under the
 /// device's key, as a rebuild leaves it, with its drain owed.
 struct HeldDevice {
-    conn: crate::ConnettoConnection<connetto_core::LoopbackTransport>,
+    conn: crate::drain::tests::Conn,
     key_id: [u8; 32],
     point: [u8; 65],
     seq: u64,
-    old_version: connetto_core::SchemaVersion,
 }
 
 async fn held_device_write(holds: HeldKey) -> HeldDevice {
+    use crate::drain::tests::{hold_major_one, major, queue, replica};
     use connetto_core::messages::WriterRef;
-    use connetto_core::{Major, SchemaVersion};
-    use diesel::prelude::*;
 
-    let old_version = SchemaVersion::from_hash(b"the major 1 bundle".to_vec());
-    let config = crate::ClientConfig::new("device-drain")
-        .with_schema_major(Some(Major::new(2).expect("two is a major")))
-        .with_schema_version(Some(SchemaVersion::from_hash(
-            b"the major 2 bundle".to_vec(),
-        )));
-    let mut conn = crate::ConnettoConnection::open(
-        &crate::Replica::in_memory(),
-        "CREATE TABLE items (id INTEGER PRIMARY KEY)",
-        &config,
-        None,
-    )
-    .expect("open the major 2 replica");
-
+    let mut conn = replica();
     let (key, der) = attesting_key();
     let point = key.public_point();
     let key_id = *connetto_core::device_cert::key_id(&key).as_bytes();
@@ -3561,123 +3553,24 @@ async fn held_device_write(holds: HeldKey) -> HeldDevice {
     if matches!(holds, HeldKey::Retired) {
         conn.retired_keys.insert(key_id);
     }
-
-    conn.db
-        .batch_execute("INSERT INTO items (id) VALUES (1)")
-        .expect("write locally");
-    let changeset = conn.session.changeset().expect("capture the write");
-    let seq = conn
-        .append_entry(
-            &WriterRef::Device(key_id),
-            &changeset,
-            None,
-            Some(major_one()),
-        )
-        .expect("queue the write under major 1");
-    conn.db
-        .batch_execute(crate::majors::HELD_DDL)
-        .expect("the held batch table");
-    diesel::insert_into(crate::majors::held_batch::table)
-        .values((
-            crate::majors::held_batch::major.eq(1_i64),
-            crate::majors::held_batch::version.eq(old_version.hash()),
-        ))
-        .execute(&mut conn.db)
-        .expect("record the major 1 batch");
-    conn.load_drain().expect("load the drain");
-    assert_eq!(
-        conn.pump_one_or(core::future::ready(()))
-            .await
-            .expect("a pump step"),
-        Some(ClientEvent::SyncStatus(crate::SyncStatus::Offline)),
-        "the offline open states itself first"
-    );
+    let seq = queue(&mut conn, WriterRef::Device(key_id), 1, major(1));
+    hold_major_one(&mut conn);
     HeldDevice {
         conn,
         key_id,
         point,
         seq,
-        old_version,
     }
 }
-
-/// Dial the owed drain over a loopback pair whose far end answers the
-/// handshake, after a challenge when `challenge` says so, granting `grant`.
-/// Returns the writer the drain asked for and the far end.
-async fn answer_drain(
-    conn: &mut crate::ConnettoConnection<connetto_core::LoopbackTransport>,
-    version: connetto_core::SchemaVersion,
-    challenge: bool,
-    grant: Option<connetto_core::messages::WriterGrant>,
-) -> (
-    connetto_core::messages::WriterRequest,
-    connetto_core::LoopbackTransport,
-) {
-    use connetto_core::messages::{Challenge, HandshakeAck};
-    use connetto_core::traits::{IncomingFrame, Transport as _};
-
-    let (client_end, mut old) = connetto_core::loopback();
-    let timer = conn.drain_timer().expect("the held batch owes a dial");
-    let answer = async {
-        let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(handshake)))) =
-            old.recv().await
-        else {
-            panic!("the drain opens with a handshake");
-        };
-        assert_eq!(handshake.schema_major, Some(major_one()));
-        if challenge {
-            old.send_control(ControlMessage::Challenge(Challenge { nonce: DRAIN_NONCE }))
-                .await
-                .expect("send the challenge");
-        }
-        old.send_control(ControlMessage::HandshakeAck(HandshakeAck {
-            connection_id: "old".to_owned(),
-            session_token: "old".to_owned(),
-            resume_token: "old".to_owned(),
-            current_cursor: connetto_core::Cursor::new(Vec::new()),
-            schema_version: Some(version),
-            initial_credits: 64,
-            writer: grant,
-        }))
-        .await
-        .expect("send the ack");
-        handshake.writer
-    };
-    let (attached, asked) = tokio::join!(conn.attach_drain(timer, client_end), answer);
-    attached.expect("attach the drain");
-    (asked, old)
-}
-
-/// The next control frame the far end of the drain receives, bounded.
-async fn drain_sent(old: &mut connetto_core::LoopbackTransport) -> Option<ControlMessage> {
-    use connetto_core::traits::{IncomingFrame, Transport as _};
-    loop {
-        match tokio::time::timeout(Duration::from_secs(5), old.recv())
-            .await
-            .expect("a frame within the bound")
-            .expect("receive")
-        {
-            Some(IncomingFrame::Control(message)) => return Some(message),
-            Some(IncomingFrame::Bulk(_)) => {}
-            None => return None,
-        }
-    }
-}
-
-const ISSUED_NINE: Option<connetto_core::messages::WriterGrant> =
-    Some(connetto_core::messages::WriterGrant {
-        number: 9,
-        frontier: 0,
-    });
 
 /// R31 on R75: a write an older major captured under the device's own
 /// writer drains under that device. The drain binds the key by signing the
 /// old major's challenge on its own wire, and only then sends the write.
 #[tokio::test]
 async fn an_older_majors_device_write_drains_under_the_bound_device() {
+    use crate::drain::tests::{Then, ack, apply_next, dial, major, pump, sent};
     use connetto_core::messages::{
-        BindDevice, HeldWork, HeldWrite, MutationApplied, WriterAnswer, WriterOutcome, WriterRef,
-        WriterRequest,
+        BindDevice, HeldWork, HeldWrite, WriterAnswer, WriterOutcome, WriterRef, WriterRequest,
     };
     use connetto_core::traits::Transport as _;
     use ring::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
@@ -3687,9 +3580,9 @@ async fn an_older_majors_device_write_drains_under_the_bound_device() {
         key_id,
         point,
         seq,
-        old_version,
     } = held_device_write(HeldKey::Standing).await;
-    let (asked, mut old) = answer_drain(&mut conn, old_version, true, None).await;
+    let (asked, mut old, _broken) =
+        dial(&mut conn, vec![drain_challenge(), ack(None)], Then::Stay).await;
     assert_eq!(
         asked,
         WriterRequest::Device,
@@ -3699,7 +3592,7 @@ async fn an_older_majors_device_write_drains_under_the_bound_device() {
         request_id,
         key_id: bound,
         signature,
-    })) = drain_sent(&mut old).await
+    })) = sent(&mut old).await
     else {
         panic!("the drain binds before it sends anything");
     };
@@ -3717,29 +3610,14 @@ async fn an_older_majors_device_write_drains_under_the_bound_device() {
     .await
     .expect("answer the bind");
     let old_major = tokio::spawn(async move {
-        let Some(ControlMessage::MutationHeader(header)) = drain_sent(&mut old).await else {
-            panic!("the bound drain sends the write");
-        };
-        old.send_control(ControlMessage::MutationApplied(MutationApplied {
-            client_seq: header.client_seq,
-        }))
-        .await
-        .expect("apply the write");
-        while drain_sent(&mut old).await.is_some() {}
-        header.client_seq
+        let applied = apply_next(&mut old).await;
+        while sent(&mut old).await.is_some() {}
+        applied
     });
 
     let mut events = Vec::new();
-    loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), conn.pump_one())
-            .await
-            .expect("the drain answers within the bound")
-            .expect("a pump step");
-        let drained = matches!(event, ClientEvent::Held(HeldWork::Drained { .. }));
-        events.push(event);
-        if drained {
-            break;
-        }
+    while !events.contains(&ClientEvent::Held(HeldWork::Drained { major: major(1) })) {
+        events.push(pump(&mut conn).await);
     }
     assert_eq!(
         old_major.await.expect("the old major ran"),
@@ -3749,27 +3627,24 @@ async fn an_older_majors_device_write_drains_under_the_bound_device() {
     let writer = WriterRef::Device(key_id);
     assert!(
         events.contains(&ClientEvent::Held(HeldWork::Applied {
-            major: major_one(),
+            major: major(1),
             write: HeldWrite { writer, seq },
         })),
         "the write is reported applied under the device, saw {events:?}"
     );
-    assert!(
-        conn.unsynced().is_empty(),
-        "nothing of major 1 is left queued"
-    );
+    assert_eq!(conn.unsynced(), [] as [crate::UnsyncedWrite; 0]);
 }
 
 /// R31 on R75: a held device write whose key this device cannot bind asks
 /// the old major for a number instead.
 #[tokio::test]
 async fn a_held_device_write_without_a_bindable_key_asks_for_a_number() {
+    use crate::drain::tests::{Then, ack, dial};
     use connetto_core::messages::WriterRequest;
 
     for holds in [HeldKey::Uncertified, HeldKey::Recertified, HeldKey::Retired] {
         let mut held = held_device_write(holds).await;
-        let (asked, _old) =
-            answer_drain(&mut held.conn, held.old_version.clone(), false, ISSUED_NINE).await;
+        let (asked, _old, _broken) = dial(&mut held.conn, vec![ack(ISSUED_NINE)], Then::Stay).await;
         assert_eq!(asked, WriterRequest::Issue, "{holds:?}");
     }
 }
@@ -3778,15 +3653,17 @@ async fn a_held_device_write_without_a_bindable_key_asks_for_a_number() {
 /// drain's dial rather than present a bind it cannot sign.
 #[tokio::test]
 async fn an_expired_device_holds_its_drain_dial() {
+    use crate::drain::tests::{sent, wire};
+
     let mut held = held_device_write(HeldKey::Expired).await;
-    let (client_end, mut old) = connetto_core::loopback();
+    let (wire, mut old, _broken) = wire();
     let timer = held.conn.drain_timer().expect("a dial is owed");
     held.conn
-        .attach_drain(timer, client_end)
+        .attach_drain(timer, wire)
         .await
         .expect("attach the drain");
     assert!(
-        drain_sent(&mut old).await.is_none(),
+        sent(&mut old).await.is_none(),
         "the dial closes without a handshake"
     );
     assert!(
@@ -3802,13 +3679,11 @@ async fn an_expired_device_holds_its_drain_dial() {
 /// so the drain wire closes and the drain backs off.
 #[tokio::test]
 async fn a_drain_ack_without_a_challenge_closes_the_drain_wire() {
+    use crate::drain::tests::{Then, ack, dial, sent};
+
     let mut held = held_device_write(HeldKey::Standing).await;
-    let (_asked, mut old) =
-        answer_drain(&mut held.conn, held.old_version.clone(), false, None).await;
-    assert!(
-        drain_sent(&mut old).await.is_none(),
-        "nothing binds on the wire"
-    );
+    let (_asked, mut old, _broken) = dial(&mut held.conn, vec![ack(None)], Then::Stay).await;
+    assert!(sent(&mut old).await.is_none(), "nothing binds on the wire");
     assert!(
         held.conn
             .drain_timer()
@@ -3821,21 +3696,26 @@ async fn a_drain_ack_without_a_challenge_closes_the_drain_wire() {
 /// held write to a number, which the next dial asks for at once.
 #[tokio::test]
 async fn a_device_that_reopens_another_key_drains_its_held_write_under_a_number() {
+    use crate::drain::tests::{Then, ack, dial, sent};
     use connetto_core::messages::WriterRequest;
 
     let mut held = held_device_write(HeldKey::Reopened).await;
-    let (asked, mut old) = answer_drain(&mut held.conn, held.old_version.clone(), true, None).await;
+    let (asked, mut old, _broken) = dial(
+        &mut held.conn,
+        vec![drain_challenge(), ack(None)],
+        Then::Stay,
+    )
+    .await;
     assert_eq!(asked, WriterRequest::Device);
     assert!(
-        drain_sent(&mut old).await.is_none(),
+        sent(&mut old).await.is_none(),
         "nothing binds under the old key"
     );
     assert_eq!(
         held.conn.drain_timer().map(|timer| timer.wait()),
         Some(Duration::ZERO)
     );
-    let (asked, _old) =
-        answer_drain(&mut held.conn, held.old_version.clone(), false, ISSUED_NINE).await;
+    let (asked, _old, _broken) = dial(&mut held.conn, vec![ack(ISSUED_NINE)], Then::Stay).await;
     assert_eq!(asked, WriterRequest::Issue);
 }
 
@@ -3843,6 +3723,7 @@ async fn a_device_that_reopens_another_key_drains_its_held_write_under_a_number(
 /// write to a number, and an answer to another request changes nothing.
 #[tokio::test]
 async fn a_refused_drain_bind_moves_the_held_write_to_a_number() {
+    use crate::drain::tests::{Then, ack, dial, major, pump, sent};
     use connetto_core::messages::{
         HeldWork, HeldWrite, MutationApplied, Provenance, WriterAnswer, WriterOutcome, WriterRef,
         WriterRequest,
@@ -3850,9 +3731,13 @@ async fn a_refused_drain_bind_moves_the_held_write_to_a_number() {
     use connetto_core::traits::Transport as _;
 
     let mut held = held_device_write(HeldKey::Standing).await;
-    let (_asked, mut old) =
-        answer_drain(&mut held.conn, held.old_version.clone(), true, None).await;
-    let Some(ControlMessage::BindDevice(bind)) = drain_sent(&mut old).await else {
+    let (_asked, mut old, _broken) = dial(
+        &mut held.conn,
+        vec![drain_challenge(), ack(None)],
+        Then::Stay,
+    )
+    .await;
+    let Some(ControlMessage::BindDevice(bind)) = sent(&mut old).await else {
         panic!("the drain binds the device");
     };
     old.send_control(ControlMessage::WriterAnswer(WriterAnswer {
@@ -3868,7 +3753,7 @@ async fn a_refused_drain_bind_moves_the_held_write_to_a_number() {
         .expect("a pump step");
     assert_eq!(stepped, None);
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), drain_sent(&mut old))
+        tokio::time::timeout(Duration::from_millis(200), sent(&mut old))
             .await
             .is_err(),
         "a foreign answer binds nothing, so no write goes up"
@@ -3880,23 +3765,18 @@ async fn a_refused_drain_bind_moves_the_held_write_to_a_number() {
     }))
     .await
     .expect("refuse the bind");
-    let event = tokio::time::timeout(Duration::from_secs(5), held.conn.pump_one())
-        .await
-        .expect("a pump step within the bound")
-        .expect("a pump step");
     assert_eq!(
-        event,
-        ClientEvent::Held(HeldWork::WireLost { major: major_one() })
+        pump(&mut held.conn).await,
+        ClientEvent::Held(HeldWork::WireLost { major: major(1) })
     );
     assert_eq!(
         held.conn.drain_timer().map(|timer| timer.wait()),
         Some(Duration::ZERO)
     );
 
-    let (asked, mut old) =
-        answer_drain(&mut held.conn, held.old_version.clone(), false, ISSUED_NINE).await;
+    let (asked, mut old, _broken) = dial(&mut held.conn, vec![ack(ISSUED_NINE)], Then::Stay).await;
     assert_eq!(asked, WriterRequest::Issue);
-    let Some(ControlMessage::MutationHeader(header)) = drain_sent(&mut old).await else {
+    let Some(ControlMessage::MutationHeader(header)) = sent(&mut old).await else {
         panic!("the issued number sends the held write");
     };
     assert_eq!(
@@ -3913,16 +3793,11 @@ async fn a_refused_drain_bind_moves_the_held_write_to_a_number() {
     .await
     .expect("apply the write");
     let mut events = Vec::new();
-    while !events.contains(&ClientEvent::Held(HeldWork::Drained { major: major_one() })) {
-        events.push(
-            tokio::time::timeout(Duration::from_secs(5), held.conn.pump_one())
-                .await
-                .expect("a pump step within the bound")
-                .expect("a pump step"),
-        );
+    while !events.contains(&ClientEvent::Held(HeldWork::Drained { major: major(1) })) {
+        events.push(pump(&mut held.conn).await);
     }
     assert!(events.contains(&ClientEvent::Held(HeldWork::Applied {
-        major: major_one(),
+        major: major(1),
         write: HeldWrite {
             writer: WriterRef::Number(9),
             seq: header.client_seq,
@@ -3933,33 +3808,15 @@ async fn a_refused_drain_bind_moves_the_held_write_to_a_number() {
 /// R31 on R75: a drain wire that fails while sending the bind closes.
 #[tokio::test]
 async fn a_drain_bind_the_wire_cannot_send_closes_the_drain_wire() {
-    use connetto_core::messages::{Challenge, HandshakeAck};
-    use connetto_core::traits::Transport as _;
+    use crate::drain::tests::{Then, ack, dial};
 
     let mut held = held_device_write(HeldKey::Standing).await;
-    let (client_end, mut old) = connetto_core::loopback();
-    let timer = held.conn.drain_timer().expect("a dial is owed");
-    let version = held.old_version.clone();
-    let answer = async move {
-        let _ = drain_sent(&mut old).await;
-        old.send_control(ControlMessage::Challenge(Challenge { nonce: DRAIN_NONCE }))
-            .await
-            .expect("send the challenge");
-        old.send_control(ControlMessage::HandshakeAck(HandshakeAck {
-            connection_id: "old".to_owned(),
-            session_token: "old".to_owned(),
-            resume_token: "old".to_owned(),
-            current_cursor: connetto_core::Cursor::new(Vec::new()),
-            schema_version: Some(version),
-            initial_credits: 64,
-            writer: None,
-        }))
-        .await
-        .expect("send the ack");
-        // The old major goes away before the bind arrives.
-    };
-    let (attached, ()) = tokio::join!(held.conn.attach_drain(timer, client_end), answer);
-    attached.expect("attach the drain");
+    dial(
+        &mut held.conn,
+        vec![drain_challenge(), ack(None)],
+        Then::HangUp,
+    )
+    .await;
     assert!(
         held.conn
             .drain_timer()
@@ -3974,88 +3831,31 @@ async fn a_drain_bind_the_wire_cannot_send_closes_the_drain_wire() {
 /// major for a number to drain it under.
 #[tokio::test]
 async fn a_device_revoked_at_the_drain_handshake_drains_its_held_write_under_a_number() {
+    use crate::drain::tests::{Then, ack, dial, major};
     use connetto_core::messages::{FatalError, FatalErrorReason, WriterRef, WriterRequest};
-    use connetto_core::traits::Transport as _;
 
     let mut held = held_device_write(HeldKey::Standing).await;
-    let (client_end, mut old) = connetto_core::loopback();
-    let timer = held.conn.drain_timer().expect("a dial is owed");
-    let answer = async {
-        let _ = drain_sent(&mut old).await;
-        old.send_control(ControlMessage::FatalError(FatalError::new(
+    dial(
+        &mut held.conn,
+        vec![ControlMessage::FatalError(FatalError::new(
             FatalErrorReason::DeviceRevoked,
-        )))
-        .await
-        .expect("refuse the device");
-    };
-    let (attached, ()) = tokio::join!(held.conn.attach_drain(timer, client_end), answer);
-    attached.expect("attach the drain");
+        ))],
+        Then::Stay,
+    )
+    .await;
     assert_eq!(
         held.conn
             .unsynced()
             .iter()
             .map(|write| (write.writer, write.major))
             .collect::<Vec<_>>(),
-        [(WriterRef::Device(held.key_id), Some(major_one()))],
+        [(WriterRef::Device(held.key_id), Some(major(1)))],
         "the held write stays in its writer's chain"
     );
     assert_eq!(
         held.conn.drain_timer().map(|timer| timer.wait()),
         Some(Duration::ZERO)
     );
-    let (asked, _old) =
-        answer_drain(&mut held.conn, held.old_version.clone(), false, ISSUED_NINE).await;
+    let (asked, _old, _broken) = dial(&mut held.conn, vec![ack(ISSUED_NINE)], Then::Stay).await;
     assert_eq!(asked, WriterRequest::Issue);
-}
-
-/// R31 on R75: losing a major whose held writes the device captured
-/// retires the device's writer, so a fresh key enrolls.
-#[tokio::test]
-async fn a_decommissioned_major_retires_the_device_writer_of_its_lost_writes() {
-    use connetto_core::messages::{FatalError, FatalErrorReason, HeldWork, HeldWrite, WriterRef};
-    use connetto_core::traits::Transport as _;
-
-    let mut held = held_device_write(HeldKey::Standing).await;
-    let (client_end, mut old) = connetto_core::loopback();
-    let timer = held.conn.drain_timer().expect("a dial is owed");
-    let answer = async {
-        let _ = drain_sent(&mut old).await;
-        old.send_control(ControlMessage::FatalError(FatalError::new(
-            FatalErrorReason::MajorMismatch {
-                server: connetto_core::Major::new(2).expect("two is a major"),
-                client: Some(major_one()),
-            },
-        )))
-        .await
-        .expect("refuse the major");
-    };
-    let (attached, ()) = tokio::join!(held.conn.attach_drain(timer, client_end), answer);
-    attached.expect("attach the drain");
-    let mut events = Vec::new();
-    for _ in 0..2 {
-        events.push(
-            tokio::time::timeout(Duration::from_secs(5), held.conn.pump_one())
-                .await
-                .expect("a pump step within the bound")
-                .expect("a pump step"),
-        );
-    }
-    assert_eq!(
-        events,
-        [
-            ClientEvent::NonFatal {
-                related_to: None,
-                detail: "the device's writer retired, a fresh key enrolls".to_owned(),
-            },
-            ClientEvent::Held(HeldWork::Lost {
-                major: major_one(),
-                writes: vec![HeldWrite {
-                    writer: WriterRef::Device(held.key_id),
-                    seq: held.seq,
-                }],
-                files: 0,
-            }),
-        ]
-    );
-    assert_eq!(held.conn.unsynced(), [] as [crate::UnsyncedWrite; 0]);
 }

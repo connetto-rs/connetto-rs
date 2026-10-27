@@ -15,7 +15,7 @@ use crate::{ClientConfig, ClientEvent, ConnettoConnection, Replica, SyncStatus};
 
 /// A loopback end whose receive fails once the test breaks it, the way an
 /// erroring socket's does.
-struct Wire {
+pub(crate) struct Wire {
     end: LoopbackTransport,
     broken: Arc<AtomicBool>,
 }
@@ -43,18 +43,20 @@ impl Transport for Wire {
     }
 }
 
-type Conn = ConnettoConnection<Wire>;
+/// A connection whose drain wire a test can break.
+pub(crate) type Conn = ConnettoConnection<Wire>;
 
-fn major(number: u32) -> Major {
+pub(crate) fn major(number: u32) -> Major {
     Major::new(number).expect("a major")
 }
 
-fn old_version() -> SchemaVersion {
+/// The bundle hash the held major 1 was built from.
+pub(crate) fn old_version() -> SchemaVersion {
     SchemaVersion::from_hash(b"the major 1 bundle".to_vec())
 }
 
 /// A major 2 replica with no wire and nothing queued.
-fn replica() -> Conn {
+pub(crate) fn replica() -> Conn {
     let config = ClientConfig::new("drain")
         .with_schema_major(Some(major(2)))
         .with_schema_version(Some(SchemaVersion::from_hash(
@@ -77,17 +79,17 @@ fn replica() -> Conn {
 
 /// Queue a write of row `id` under `writer`, as the build at `captured`
 /// captured it.
-fn queue(conn: &mut Conn, writer: WriterRef, id: i32, captured: Major) -> u64 {
+pub(crate) fn queue(conn: &mut Conn, writer: WriterRef, id: i32, captured: Major) -> u64 {
     conn.db
         .batch_execute(&format!("INSERT INTO items (id) VALUES ({id})"))
         .expect("write locally");
     let changeset = conn.session.changeset().expect("capture the write");
-    conn.append_entry(&writer, &changeset, None, Some(captured))
+    conn.append_entry(&writer, &changeset, None, Some(captured), true)
         .expect("queue the write")
 }
 
 /// Record major 1 as held, as a rebuild leaves it, and owe its drain.
-fn hold_major_one(conn: &mut Conn) {
+pub(crate) fn hold_major_one(conn: &mut Conn) {
     conn.db
         .batch_execute(crate::majors::HELD_DDL)
         .expect("the held batch table");
@@ -101,27 +103,54 @@ fn hold_major_one(conn: &mut Conn) {
     conn.load_drain().expect("load the drain");
 }
 
-/// Dial the owed drain over a loopback pair whose far end answers the
-/// handshake with `answer`. Returns the writer the drain asked for, the far
-/// end, and the switch that breaks the drain's receive.
-async fn dial(
-    conn: &mut Conn,
-    answer: ControlMessage,
-) -> (WriterRequest, LoopbackTransport, Arc<AtomicBool>) {
-    let (end, mut old) = loopback();
+/// What the far end of a drain dial does once it has sent its answers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Then {
+    /// It keeps the wire for the test to script.
+    Stay,
+    /// It hangs up at once, so the drain's next send fails.
+    HangUp,
+}
+
+/// A drain wire, its far end, and the switch that breaks its receive.
+pub(crate) fn wire() -> (Wire, LoopbackTransport, Arc<AtomicBool>) {
+    let (end, old) = loopback();
     let broken = Arc::new(AtomicBool::new(false));
     let wire = Wire {
         end,
         broken: Arc::clone(&broken),
     };
+    (wire, old, broken)
+}
+
+/// Dial the owed drain over a loopback pair whose far end answers the
+/// handshake, which presents major 1, with `answers` and then does `then`.
+/// Returns the writer the drain asked for, the far end, and the switch that
+/// breaks the drain's receive.
+pub(crate) async fn dial(
+    conn: &mut Conn,
+    answers: Vec<ControlMessage>,
+    then: Then,
+) -> (WriterRequest, LoopbackTransport, Arc<AtomicBool>) {
+    let (wire, mut old, broken) = wire();
     let timer = conn.drain_timer().expect("the held batch owes a dial");
     let reply = async {
         let Some(ControlMessage::Handshake(handshake)) = sent(&mut old).await else {
             panic!("the drain opens with a handshake");
         };
-        old.send_control(answer)
-            .await
-            .expect("answer the handshake");
+        assert_eq!(
+            handshake.schema_major,
+            Some(major(1)),
+            "the drain presents major 1"
+        );
+        for answer in answers {
+            old.send_control(answer)
+                .await
+                .expect("answer the handshake");
+        }
+        if then == Then::HangUp {
+            old.close().await.expect("hang up");
+        }
         handshake.writer
     };
     let (attached, asked) = tokio::join!(conn.attach_drain(timer, wire), reply);
@@ -129,7 +158,8 @@ async fn dial(
     (asked, old, broken)
 }
 
-fn ack(grant: Option<WriterGrant>) -> ControlMessage {
+/// The old major's acknowledgement of the drain handshake, granting `grant`.
+pub(crate) fn ack(grant: Option<WriterGrant>) -> ControlMessage {
     ControlMessage::HandshakeAck(HandshakeAck {
         connection_id: "old".to_owned(),
         session_token: "old".to_owned(),
@@ -143,16 +173,24 @@ fn ack(grant: Option<WriterGrant>) -> ControlMessage {
 
 /// The old major's acknowledgement, granting writer `number` with nothing
 /// settled yet.
-fn granting(number: u64) -> ControlMessage {
+pub(crate) fn granting(number: u64) -> ControlMessage {
     ack(Some(WriterGrant {
         number,
         frontier: 0,
     }))
 }
 
+/// The refusal of a deployment that no longer hosts major 1.
+pub(crate) fn major_one_gone() -> ControlMessage {
+    ControlMessage::FatalError(FatalError::new(FatalErrorReason::MajorMismatch {
+        server: major(2),
+        client: Some(major(1)),
+    }))
+}
+
 /// The next control frame the far end receives, `None` once the wire
 /// closed, bounded.
-async fn sent(old: &mut LoopbackTransport) -> Option<ControlMessage> {
+pub(crate) async fn sent(old: &mut LoopbackTransport) -> Option<ControlMessage> {
     loop {
         match tokio::time::timeout(Duration::from_secs(5), old.recv())
             .await
@@ -167,7 +205,7 @@ async fn sent(old: &mut LoopbackTransport) -> Option<ControlMessage> {
 }
 
 /// Apply the next write the far end receives, returning its sequence.
-async fn apply_next(old: &mut LoopbackTransport) -> u64 {
+pub(crate) async fn apply_next(old: &mut LoopbackTransport) -> u64 {
     let Some(ControlMessage::MutationHeader(header)) = sent(old).await else {
         panic!("a held write goes up");
     };
@@ -179,7 +217,8 @@ async fn apply_next(old: &mut LoopbackTransport) -> u64 {
     header.client_seq
 }
 
-async fn pump(conn: &mut Conn) -> ClientEvent {
+/// One pump step, bounded.
+pub(crate) async fn pump(conn: &mut Conn) -> ClientEvent {
     tokio::time::timeout(Duration::from_secs(5), conn.pump_one())
         .await
         .expect("a pump step within the bound")
@@ -195,7 +234,7 @@ async fn a_batch_held_under_two_writers_drains_one_writer_per_wire() {
     let second = queue(&mut conn, WriterRef::Number(8), 2, major(1));
     hold_major_one(&mut conn);
 
-    let (asked, mut old, _broken) = dial(&mut conn, granting(7)).await;
+    let (asked, mut old, _broken) = dial(&mut conn, vec![granting(7)], Then::Stay).await;
     assert_eq!(asked, WriterRequest::Number(7), "the oldest write's writer");
     assert_eq!(apply_next(&mut old).await, first);
     assert_eq!(
@@ -218,7 +257,7 @@ async fn a_batch_held_under_two_writers_drains_one_writer_per_wire() {
         Some(Duration::ZERO)
     );
 
-    let (asked, mut old, _broken) = dial(&mut conn, granting(8)).await;
+    let (asked, mut old, _broken) = dial(&mut conn, vec![granting(8)], Then::Stay).await;
     assert_eq!(asked, WriterRequest::Number(8));
     assert_eq!(apply_next(&mut old).await, second);
     let mut events = Vec::new();
@@ -237,7 +276,7 @@ async fn a_held_write_behind_another_majors_earlier_write_waits() {
     queue(&mut conn, WriterRef::Number(7), 2, major(1));
     hold_major_one(&mut conn);
 
-    let (asked, mut old, _broken) = dial(&mut conn, granting(7)).await;
+    let (asked, mut old, _broken) = dial(&mut conn, vec![granting(7)], Then::Stay).await;
     assert_eq!(asked, WriterRequest::Number(7));
     assert_eq!(
         sent(&mut old).await,
@@ -260,14 +299,7 @@ async fn losing_a_major_held_under_two_device_keys_retires_the_device_once() {
     let second = queue(&mut conn, WriterRef::Device([2; 32]), 2, major(1));
     hold_major_one(&mut conn);
 
-    let (asked, _old, _broken) = dial(
-        &mut conn,
-        ControlMessage::FatalError(FatalError::new(FatalErrorReason::MajorMismatch {
-            server: major(2),
-            client: Some(major(1)),
-        })),
-    )
-    .await;
+    let (asked, _old, _broken) = dial(&mut conn, vec![major_one_gone()], Then::Stay).await;
     assert_eq!(
         asked,
         WriterRequest::Issue,
@@ -307,7 +339,7 @@ async fn a_drain_wire_whose_receive_fails_redials_after_a_backoff() {
     queue(&mut conn, WriterRef::Number(7), 1, major(1));
     hold_major_one(&mut conn);
 
-    let (_asked, mut old, broken) = dial(&mut conn, granting(7)).await;
+    let (_asked, mut old, broken) = dial(&mut conn, vec![granting(7)], Then::Stay).await;
     assert!(matches!(
         sent(&mut old).await,
         Some(ControlMessage::MutationHeader(_))

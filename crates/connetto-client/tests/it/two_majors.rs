@@ -46,7 +46,7 @@ use std::time::Duration;
 use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, ConnettoClient, ConnettoConnection, CoreClient,
     CorePump, DataDir, Grant, HeldCredential, LiveQuery, MemoryRefreshStore, PendingWork,
-    ReconnectPolicy, SyncSchema, TierStepError, TransportFactory,
+    ReconnectPolicy, SyncSchema, TierStepError,
 };
 use connetto_core::messages::HeldWork;
 use connetto_core::schema::SchemaBundle;
@@ -56,6 +56,7 @@ use connetto_server::{
     ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, RuntimeWritableCatalog,
     SessionConfig, SessionManager, WebSocketTransport, pg_write_target,
 };
+use connetto_test_harness::events::await_event;
 use connetto_test_harness::router::{HostedEntry, Relay, Router};
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth};
 use diesel::connection::SimpleConnection;
@@ -148,12 +149,6 @@ struct UserVersion {
     user_version: i32,
 }
 
-/// A dial through the router that failed, at the socket or the handshake
-/// step.
-#[derive(Debug, thiserror::Error)]
-#[error("the dial to the router failed: {0}")]
-struct DialFailed(String);
-
 /// A manager whose computed subscriptions read through connetto's connector.
 type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults, PgReadConnector>;
 
@@ -166,21 +161,6 @@ fn entry(manager: Arc<Manager>) -> HostedEntry {
             let _ = manager.serve(relay).await;
         })
     })
-}
-
-/// The one dialer a build names, the socket connect and the upgrade.
-/// Routing by major stays the router's business.
-fn dial(
-    addr: std::net::SocketAddr,
-) -> impl TransportFactory<Transport = WebSocketTransport<TcpStream>, Error = DialFailed> {
-    move || async move {
-        let stream = TcpStream::connect(addr)
-            .await
-            .map_err(|err| DialFailed(err.to_string()))?;
-        WebSocketTransport::connect("ws://127.0.0.1/", stream)
-            .await
-            .map_err(|err| DialFailed(err.to_string()))
-    }
 }
 
 /// A manager for one hosted major over the fixture's Postgres, serving `ddl`
@@ -320,7 +300,7 @@ async fn connect_pumped(
 ) -> Result<(CoreClient<WebSocketTransport<TcpStream>, ()>, CorePump), ClientError> {
     let held = credential(device);
     let store = super::support::key_store(&held).await;
-    ClientBuilder::new(schema, dial(router.addr()))
+    ClientBuilder::new(schema, router.dialer())
         .with_reconnect(test_policy())
         .with_sleeper(|d| tokio::time::sleep(d))
         .signed_in(held)
@@ -393,26 +373,6 @@ async fn wait_rows(fixture: &Fixture, count: usize) {
             tokio::time::Instant::now() < until,
             "the server rows settle within the bound"
         );
-    }
-}
-
-/// Read events until `wanted` arrives by `deadline`, failing on any event
-/// `forbidden` names.
-async fn await_event(
-    events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
-    deadline: tokio::time::Instant,
-    wanted: impl Fn(&ClientEvent) -> bool,
-    forbidden: impl Fn(&ClientEvent) -> bool,
-) {
-    loop {
-        let event = tokio::time::timeout_at(deadline, events.recv())
-            .await
-            .expect("the awaited event arrives within the deadline")
-            .expect("event stream closed");
-        assert!(!forbidden(&event), "unexpected event {event:?}");
-        if wanted(&event) {
-            return;
-        }
     }
 }
 

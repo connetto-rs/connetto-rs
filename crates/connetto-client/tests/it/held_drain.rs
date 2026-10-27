@@ -319,10 +319,7 @@ async fn held_under_number(
         let mut conn = open(dir, first.clone()).await;
         let (transport, _seen) = server(Answer::Ack {
             version: first.version(),
-            grant: Some(WriterGrant {
-                number: NUMBER,
-                frontier: 0,
-            }),
+            grant: HELD_NUMBER,
             settle: Settle::Silent,
         });
         conn.attach(transport).await.expect("attach to major 1");
@@ -332,20 +329,39 @@ async fn held_under_number(
     (open(dir, schema(2, V2_DDL)).await, first.version())
 }
 
-#[tokio::test]
-async fn an_unissued_write_drains_under_a_number_the_old_major_issues() {
-    let dir = tempdir().expect("temp dir");
+/// A major 1 replica whose one write sits queued under no number, captured
+/// while no server was reachable, then opened by the major 2 build. Returns
+/// the connection and the major 1 bundle hash.
+async fn held_unissued(dir: &TempDir) -> (ConnettoConnection<LoopbackTransport>, SchemaVersion) {
     let first = schema(1, V1_DDL);
     {
-        let mut conn = open(&dir, first.clone()).await;
+        let mut conn = open(dir, first.clone()).await;
         write(&mut conn, 1, "offline");
         conn.push().await.expect("queue").expect("a seq");
     }
-    let mut conn = open(&dir, schema(2, V2_DDL)).await;
+    (open(dir, schema(2, V2_DDL)).await, first.version())
+}
+
+/// An old major that acks the held number's handshake under `version` and
+/// then hangs up before settling anything.
+fn hanging_up(version: SchemaVersion) -> LoopbackTransport {
+    let (client_end, mut server_end) = loopback();
+    tokio::spawn(async move {
+        let _ = server_end.recv().await;
+        let _ = server_end.send_control(ack(version, HELD_NUMBER)).await;
+        let _ = server_end.close().await;
+    });
+    client_end
+}
+
+#[tokio::test]
+async fn an_unissued_write_drains_under_a_number_the_old_major_issues() {
+    let dir = tempdir().expect("temp dir");
+    let (mut conn, old_version) = held_unissued(&dir).await;
     assert_eq!(conn.draining_major(), Some(one()));
 
     let (transport, mut rx) = server(Answer::Ack {
-        version: first.version(),
+        version: old_version,
         grant: Some(WriterGrant {
             number: 9,
             frontier: 0,
@@ -625,22 +641,7 @@ async fn a_failed_dial_backs_off_and_a_dropped_drain_redials() {
     let backed_off = conn.drain_timer().expect("the drain still owes a dial");
     assert!(backed_off.wait() > std::time::Duration::ZERO);
 
-    // An old server that acks and then hangs up before settling anything.
-    let (client_end, mut server_end) = loopback();
-    tokio::spawn(async move {
-        let _ = server_end.recv().await;
-        let _ = server_end
-            .send_control(ack(
-                old_version,
-                Some(WriterGrant {
-                    number: NUMBER,
-                    frontier: 0,
-                }),
-            ))
-            .await;
-        let _ = server_end.close().await;
-    });
-    conn.attach_drain(backed_off, client_end)
+    conn.attach_drain(backed_off, hanging_up(old_version))
         .await
         .expect("attach the drain");
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.pump_one()).await;
@@ -727,23 +728,8 @@ async fn a_dropped_drain_wire_reports_its_held_work_as_wire_lost() {
     let dir = tempdir().expect("temp dir");
     let (mut conn, old_version) = held_under_number(&dir).await;
 
-    // An old server that acks and then hangs up before settling anything.
-    let (client_end, mut server_end) = loopback();
-    tokio::spawn(async move {
-        let _ = server_end.recv().await;
-        let _ = server_end
-            .send_control(ack(
-                old_version,
-                Some(WriterGrant {
-                    number: NUMBER,
-                    frontier: 0,
-                }),
-            ))
-            .await;
-        let _ = server_end.close().await;
-    });
     let timer = conn.drain_timer().expect("a dial is owed");
-    conn.attach_drain(timer, client_end)
+    conn.attach_drain(timer, hanging_up(old_version))
         .await
         .expect("attach the drain");
     let events = pump_until(&mut conn, wire_lost).await;
@@ -958,15 +944,9 @@ async fn an_unanswered_drain_handshake_backs_off() {
 #[tokio::test]
 async fn an_issue_answer_granting_no_number_drops_the_drain_wire() {
     let dir = tempdir().expect("temp dir");
-    let first = schema(1, V1_DDL);
-    {
-        let mut conn = open(&dir, first.clone()).await;
-        write(&mut conn, 1, "offline");
-        conn.push().await.expect("queue").expect("a seq");
-    }
-    let mut conn = open(&dir, schema(2, V2_DDL)).await;
+    let (mut conn, old_version) = held_unissued(&dir).await;
     let (transport, _rx) = server(Answer::Ack {
-        version: first.version(),
+        version: old_version,
         grant: None,
         settle: Settle::Apply,
     });
@@ -1276,12 +1256,7 @@ async fn the_drain_wires_other_frames_reach_the_application_and_the_write_still_
 #[tokio::test]
 async fn a_lost_unissued_write_rechains_the_newer_writes_from_one() {
     let dir = tempdir().expect("temp dir");
-    {
-        let mut conn = open(&dir, schema(1, V1_DDL)).await;
-        write(&mut conn, 1, "offline");
-        conn.push().await.expect("queue").expect("a seq");
-    }
-    let mut conn = open(&dir, schema(2, V2_DDL)).await;
+    let (mut conn, _old_version) = held_unissued(&dir).await;
     write(&mut conn, 2, "newer");
     conn.push().await.expect("queue").expect("a seq");
     assert_eq!(

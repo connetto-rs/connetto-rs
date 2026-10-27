@@ -20,6 +20,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use connetto_client::TransportFactory;
 use connetto_core::messages::{BulkMessage, ControlMessage};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Major, WebSocketError, WebSocketTransport};
@@ -114,10 +115,22 @@ impl Router {
         self.hosted.lock().retain(|(at, _)| *at != major);
     }
 
-    /// The address the dialer names.
+    /// The one dialer a build names, the socket connect and the upgrade.
+    /// Routing by major stays the router's business.
     #[must_use]
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
+    pub fn dialer(
+        &self,
+    ) -> impl TransportFactory<Transport = WebSocketTransport<TcpStream>, Error = DialFailed> + use<>
+    {
+        let addr = self.addr;
+        move || async move {
+            let stream = TcpStream::connect(addr)
+                .await
+                .map_err(|err| DialFailed(err.to_string()))?;
+            WebSocketTransport::connect("ws://127.0.0.1/", stream)
+                .await
+                .map_err(|err| DialFailed(err.to_string()))
+        }
     }
 
     /// Stop accepting. In-flight connections finish on their own.
@@ -125,6 +138,11 @@ impl Router {
         self.accept.abort();
     }
 }
+
+/// A dial through the router that failed, at the socket or the upgrade.
+#[derive(Debug, thiserror::Error)]
+#[error("the dial to the router failed: {0}")]
+pub struct DialFailed(String);
 
 /// Serve one accepted connection. Read the first control frame, the
 /// handshake, route it on the field, and hand the chosen entry the
