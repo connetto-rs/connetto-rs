@@ -719,11 +719,12 @@ pub const AUDIT_DDL: &str = "DO $$ BEGIN \
     'logged_in', 'logged_out', 'session_revoked', 'token_replayed', \
     'ended_by_owner', 'ended_all', 'ended_others', 'ended_by_ban', \
     'capability_minted', 'permission_change', 'model_change', \
-    'banned', 'ban_lifted', 'write_forked', 'write_redelivered'); \
+    'banned', 'ban_lifted', 'write_forked', 'write_redelivered', \
+    'data_downloaded', 'data_erased'); \
     EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
     CREATE TABLE IF NOT EXISTS auth_events \
     (at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-     session UUID NOT NULL, \
+     session UUID, \
      user_id TEXT, \
      op connetto_auth_op NOT NULL, \
      table_name TEXT, \
@@ -734,7 +735,10 @@ pub const AUDIT_DDL: &str = "DO $$ BEGIN \
      path connetto_settle_path, \
      other_path connetto_settle_path, \
      provider TEXT, \
-     issuer TEXT)";
+     issuer TEXT, \
+     query_list_hash TEXT, \
+     archive_bytes BIGINT, \
+     acted_by TEXT)";
 
 /// Create the reference audit enum and table if missing, as admin.
 pub async fn provision_audit(pool: &Pool<AsyncPgConnection>) {

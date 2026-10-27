@@ -377,29 +377,34 @@ CREATE TYPE connetto_auth_op AS ENUM (
     -- abuse response
     'banned', 'ban_lifted',
     -- the writer frontier
-    'write_forked', 'write_redelivered'
+    'write_forked', 'write_redelivered',
+    -- a person's data requests (R61)
+    'data_downloaded', 'data_erased'
 );
 
 CREATE TABLE auth_events (
-    at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    session    UUID NOT NULL,
-    user_id    <IdSqlType>,
-    op         connetto_auth_op NOT NULL,
-    table_name TEXT,
-    pk         <RowKeySqlType>,
-    subject    TEXT,
-    writer     BIGINT,
-    seq        BIGINT,
-    path       connetto_settle_path,
-    other_path connetto_settle_path,
-    provider   TEXT,
-    issuer     TEXT
+    at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    session         UUID,
+    user_id         <IdSqlType>,
+    op              connetto_auth_op NOT NULL,
+    table_name      TEXT,
+    pk              <RowKeySqlType>,
+    subject         TEXT,
+    writer          BIGINT,
+    seq             BIGINT,
+    path            connetto_settle_path,
+    other_path      connetto_settle_path,
+    provider        TEXT,
+    issuer          TEXT,
+    query_list_hash TEXT,
+    archive_bytes   BIGINT,
+    acted_by        TEXT
 );
 ```
 
 **Every column type here is a correction, and the reasons are worth keeping.** An earlier version of this block gave eight columns of which five were `TEXT`, including the two that hold closed sets. That was a sketch written before there was code to check it against, and it disagreed with the two contracts it says to sit beside.
 
-`session` is `UUID`, because the durable session handle is a `SessionId` and both tables that already store one declare it `UUID`. As `TEXT` it would need a cast to join against either of them.
+`session` is `UUID`, because the durable session handle is a `SessionId` and both tables that already store one declare it `UUID`. As `TEXT` it would need a cast to join against either of them. It is empty on one kind of row only, a data request staff made with no session behind it (R61), where `acted_by` names who acted instead.
 
 `user_id` is the deployment's own `<IdSqlType>`, the same placeholder `connetto_sessions` uses, because the identity type has been the deployment's choice since R8 and a second opinion about it here would be a second contract. Nullable, because a caller may have no identity.
 
@@ -443,7 +448,9 @@ CREATE TABLE auth_events (
 
 **Recording is always on. Decided (R105, 2026-10-25).** Ending a person's sessions answers the share keys those sessions minted, read back from their `capability_minted` rows, so a deployment without the table could miss an intruder's keys without anyone noticing. The server refuses to start without `auth_events`, the reference binary has no switch for it, and `CapabilityIssuer::new` takes its audit hook, so no mint goes unrecorded. A mint's row names the key it issued in `subject`, the string the application's grant row names, so the application withdraws exactly that grant. connetto reads the table back for nothing else.
 
-Audit writing is off the synchronous hot path: the sink is fired synchronously and the supplied Postgres implementation spawns the write, so a slow or failing sink never delays the caller and never fails the logout, revocation or mint that produced it.
+**`data_downloaded` and `data_erased` record a person's data requests (R61).** A download row names the person, the session that asked, the hash of the registered query list it ran as `query_list_hash` (hex BLAKE3) and the archive's size in bytes as `archive_bytes`. An erasure row is written by `ServerHandle::record_erasure` once the application's erasure recipe has run, since connetto deletes nothing itself. Staff answering a request with no session behind them, such as a regulator's, leave the session empty and name themselves in `acted_by` as the application names them, for example `staff:marco` or a ticket id. Both rows are written and awaited rather than spawned, and a request whose row cannot be written fails, because the row exists for disputes.
+
+Audit writing is off the synchronous hot path: the sink is fired synchronously and the supplied Postgres implementation spawns the write, so a slow or failing sink never delays the caller and never fails the logout, revocation or mint that produced it. The two data-request rows above are the exception, awaited by design.
 
 ---
 

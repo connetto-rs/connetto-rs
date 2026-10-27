@@ -26,7 +26,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowCredentials, AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
-use crate::audit::{ConnettoAuditSchema, MintedKey, pg_audit_hook};
+use crate::audit::{AuthOp, ConnettoAuditSchema, MintedKey, pg_audit_hook, record_awaited};
 use crate::authn::schema::ConnettoStoreSchema;
 use crate::ban::ConnettoBanSchema;
 use crate::bots::{ConnettoBotSchema, InstalledApp, pg_bot_registry};
@@ -39,6 +39,7 @@ use crate::manager_builder::ManagerBuilder;
 use crate::materializer::Materializer;
 use crate::openfga::{Counted, FgaAuth, ModelState, ModelSubject, SetupError, Translated};
 use crate::oplog::{OplogConfig, PgOplog};
+use crate::portability::{DataRequestError, DataRequester};
 use crate::reach::GrantReach;
 use crate::reserve::{ReaderGate, ReaderReserve};
 use crate::schema::ConnettoSchema;
@@ -984,6 +985,23 @@ where
         let mut devices = self.manager.devices_of(user).await?;
         devices.retain(|device| device.revoked_at.is_none());
         Ok(devices)
+    }
+
+    /// Record that the application erased `person`'s data, once its erasure
+    /// recipe (chapter 20) has run. connetto deletes nothing itself, so the
+    /// record is the application's act, named by `requester`, and the call
+    /// returns once the row is written.
+    ///
+    /// # Errors
+    ///
+    /// [`DataRequestError::Audit`] when the row cannot be written.
+    pub async fn record_erasure(
+        &self,
+        person: D::Id,
+        requester: &DataRequester,
+    ) -> Result<(), DataRequestError> {
+        record_awaited::<D>(&self.pool, requester.event(person, AuthOp::DataErased)).await?;
+        Ok(())
     }
 }
 
