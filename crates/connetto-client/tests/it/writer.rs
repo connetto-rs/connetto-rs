@@ -627,8 +627,9 @@ async fn an_archive_import_requeues_with_provenance_and_retires_the_archived_wri
         "the applied answer retired the entry"
     );
 
-    // The answer cleared the obligation, so a second connection owes nothing.
-    let second = Wire::default().grant(2, 0);
+    // The answer cleared the obligation, so a second connection, granted the
+    // frontier the first one settled, owes nothing.
+    let second = Wire::default().grant(2, 1);
     fresh.attach(second.clone()).await.expect("attach");
     drain(&mut fresh).await;
     assert!(
@@ -848,6 +849,12 @@ async fn a_writer_unknown_fatal_carries_the_tail_to_the_unissued_number() {
             },
         ],
         "both writes survive the carry"
+    );
+    assert!(
+        pending(&mut conn)
+            .iter()
+            .all(|row| row.prov_writer.is_none()),
+        "an unknown number can only be a restore, so the tail names nothing past it"
     );
 
     // The fresh run asks for a new number and resends the carried tail.
@@ -1187,6 +1194,10 @@ async fn a_handshake_refusal_carries_the_unknown_or_retired_numbers_tail() {
             ],
             "both writes survive the carry"
         );
+        let carried_provenance: Vec<Option<String>> = pending(&mut conn)
+            .into_iter()
+            .map(|row| row.prov_writer)
+            .collect();
 
         // The next run asks for a fresh number and resends the carried tail.
         let wire = Wire::default();
@@ -1208,6 +1219,17 @@ async fn a_handshake_refusal_carries_the_unknown_or_retired_numbers_tail() {
         assert!(
             conn.unsynced().is_empty(),
             "the applied answers retired the carried entries"
+        );
+        let named = || match reason {
+            // A number the server no longer holds can only be a restore, so
+            // nothing names it (R70 decision 21).
+            FatalErrorReason::WriterUnknown => None,
+            _ => Some("number:1".to_owned()),
+        };
+        assert_eq!(
+            carried_provenance,
+            vec![named(), named()],
+            "a retired number is named by its tail, an unknown one is not"
         );
     }
 }
@@ -1251,6 +1273,153 @@ async fn a_number_held_without_a_secret_asks_for_a_fresh_one() {
         "the fresh number settled the tail"
     );
     assert_eq!(writers(&mut conn), vec!["number:2".to_owned()]);
+}
+
+/// Write `ids` offline, then settle them on a first connection, so the number
+/// stands with `ids.len()` sequences acknowledged, and queue one more write
+/// the next connection never answers.
+async fn settle_then_queue(conn: &mut ConnettoConnection<Wire>, ids: &[i32], queued: i32) {
+    for (seq, id) in (1..).zip(ids) {
+        write(conn, *id);
+        assert_eq!(conn.push().await.expect("queue"), Some(seq));
+    }
+    conn.attach(Wire::default()).await.expect("attach");
+    drain(conn).await;
+    assert!(conn.unsynced().is_empty(), "the first writes settled");
+    let settled = u64::try_from(ids.len()).expect("a short list");
+    conn.attach(Wire::default().silent().grant(1, settled))
+        .await
+        .expect("a frontier at the settled prefix keeps the number");
+    write(conn, queued);
+    assert_eq!(conn.push().await.expect("queue"), Some(settled + 1));
+    drain(conn).await;
+    assert_eq!(
+        conn.unsynced(),
+        vec![UnsyncedWrite {
+            writer: WriterRef::Number(1),
+            seq: settled + 1,
+            major: Major::new(1),
+        }],
+        "the queued write waits under the number"
+    );
+}
+
+/// Decision 21's restored-number row: a grant whose frontier stands below
+/// what this replica saw settled can only come from a restore, so the queue
+/// moves to the unissued writer without naming the abandoned number, the
+/// attach fails, and the redial asks for a fresh number.
+#[tokio::test]
+async fn a_grant_below_the_settled_prefix_moves_the_queue_to_a_fresh_number() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    settle_then_queue(&mut conn, &[1, 2], 3).await;
+
+    let error = conn
+        .attach(Wire::default().silent().grant(1, 1))
+        .await
+        .expect_err("a rewound frontier fails the attach");
+    assert!(
+        matches!(
+            error,
+            ClientError::WriterRewound {
+                writer: WriterRef::Number(1)
+            }
+        ),
+        "the rewound writer is named, saw {error:?}"
+    );
+    assert_eq!(
+        writers(&mut conn),
+        vec!["number:0".to_owned()],
+        "the rewound number is abandoned"
+    );
+    assert_eq!(
+        pending(&mut conn),
+        vec![PendingRow {
+            writer: "number:0".to_owned(),
+            seq: 1,
+            prov_writer: None,
+            prov_seq: None,
+        }],
+        "the queue waits for a fresh number, naming nothing past the restored frontier"
+    );
+
+    let wire = Wire::default().grant(2, 0);
+    conn.attach(wire.clone()).await.expect("re-attach");
+    drain(&mut conn).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(asked(&log.handshakes), vec![Asked::Issue]);
+        assert_eq!(
+            log.mutations,
+            vec![1],
+            "the queue resends under the fresh number"
+        );
+    }
+    assert!(
+        conn.unsynced().is_empty(),
+        "the fresh number settled the write"
+    );
+    assert_eq!(writers(&mut conn), vec!["number:2".to_owned()]);
+}
+
+/// Decision 21's live gap rows: a `SequenceGap` whose server frontier stands
+/// below what this replica saw settled moves the queue as a rewound grant
+/// does, while one at the settled prefix is a gap the client cannot have made
+/// and leaves the queue to the redial.
+#[tokio::test]
+async fn a_live_sequence_gap_below_the_settled_prefix_moves_the_queue() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    settle_then_queue(&mut conn, &[1, 2], 3).await;
+
+    let at_prefix = Wire::default()
+        .silent()
+        .grant(1, 2)
+        .closing(FatalErrorReason::SequenceGap {
+            expected: 3,
+            got: 4,
+        });
+    conn.attach(at_prefix).await.expect("attach");
+    drain(&mut conn).await;
+    assert_eq!(
+        conn.unsynced(),
+        vec![UnsyncedWrite {
+            writer: WriterRef::Number(1),
+            seq: 3,
+            major: Major::new(1),
+        }],
+        "a gap at the settled prefix leaves the number's queue"
+    );
+
+    let below = Wire::default()
+        .silent()
+        .grant(1, 2)
+        .closing(FatalErrorReason::SequenceGap {
+            expected: 2,
+            got: 3,
+        });
+    conn.attach(below).await.expect("attach");
+    let seen = drain(&mut conn).await;
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            ClientEvent::ServerClosed {
+                reason: FatalErrorReason::SequenceGap { .. }
+            }
+        )),
+        "the gap surfaced, saw {seen:?}"
+    );
+    assert_eq!(writers(&mut conn), vec!["number:0".to_owned()]);
+    assert_eq!(
+        pending(&mut conn),
+        vec![PendingRow {
+            writer: "number:0".to_owned(),
+            seq: 1,
+            prov_writer: None,
+            prov_seq: None,
+        }],
+        "a gap below the settled prefix abandons the number"
+    );
 }
 
 /// The split table's local replica writes the physical table under the view,

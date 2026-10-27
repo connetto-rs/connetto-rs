@@ -552,7 +552,6 @@ async fn a_decommissioned_major_loses_its_writes_and_retires_their_writer() {
 async fn a_writer_the_old_major_refuses_hands_its_writes_to_an_issued_number() {
     let dir = tempdir().expect("temp dir");
     let (mut conn, old_version) = held_under_number(&dir).await;
-    let secret = held_secret(&mut conn);
 
     let (transport, _rx) = server(Answer::Refuse(FatalErrorReason::WriterUnknown));
     dial(&mut conn, transport).await;
@@ -577,14 +576,11 @@ async fn a_writer_the_old_major_refuses_hands_its_writes_to_an_issued_number() {
             },
             Seen::Mutation {
                 seq: 1,
-                provenance: Some(Provenance {
-                    writer: WriterRef::Number(NUMBER),
-                    seq: 1,
-                    secret: Some(secret),
-                }),
+                provenance: None,
             },
         ],
-        "the refused writer's write goes up under the issued number, naming where it came from"
+        "the refused writer's write goes up under the issued number, naming nothing past a \
+         number the server no longer holds (R70 decision 21)"
     );
     assert!(events.contains(&ClientEvent::Held(HeldWork::Applied {
         major: one(),
