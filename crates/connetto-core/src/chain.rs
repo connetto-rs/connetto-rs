@@ -55,6 +55,7 @@ pub fn range_message(key_id: &[u8; 32], seq: u64, head: &[u8; 32]) -> Vec<u8> {
 }
 
 /// Encodes the author, terminal chain head and every courier entry's original.
+/// An original number's secret is not signed, so a courier never needs it.
 ///
 /// # Panics
 ///
@@ -134,6 +135,7 @@ mod tests {
         let original = Provenance {
             writer: WriterRef::Device([1; 32]),
             seq: 7,
+            secret: None,
         };
         let entries = &[(1u64, None), (2, Some(original))];
         let base = courier_range_message(&[3; 32], 2, &GENESIS, entries.iter().copied());
@@ -168,64 +170,32 @@ mod tests {
             courier_range_message(&[3; 32], 2, &GENESIS, [(1, None), (2, None)].into_iter()),
             "a stripped provenance is not the signed one"
         );
-        assert_ne!(
-            base,
+        let substituted = |writer, seq| {
+            let provenance = Provenance {
+                writer,
+                seq,
+                secret: None,
+            };
             courier_range_message(
                 &[3; 32],
                 2,
                 &GENESIS,
-                [
-                    (1, None),
-                    (
-                        2,
-                        Some(Provenance {
-                            writer: WriterRef::Number(9),
-                            seq: 7
-                        })
-                    )
-                ]
-                .into_iter()
-            ),
+                [(1, None), (2, Some(provenance))].into_iter(),
+            )
+        };
+        assert_ne!(
+            base,
+            substituted(WriterRef::Number(9), 7),
             "a substituted writer kind is not the signed one"
         );
         assert_ne!(
             base,
-            courier_range_message(
-                &[3; 32],
-                2,
-                &GENESIS,
-                [
-                    (1, None),
-                    (
-                        2,
-                        Some(Provenance {
-                            writer: WriterRef::Device([2; 32]),
-                            seq: 7
-                        })
-                    )
-                ]
-                .into_iter()
-            ),
+            substituted(WriterRef::Device([2; 32]), 7),
             "a substituted writer identity is not the signed one"
         );
         assert_ne!(
             base,
-            courier_range_message(
-                &[3; 32],
-                2,
-                &GENESIS,
-                [
-                    (1, None),
-                    (
-                        2,
-                        Some(Provenance {
-                            writer: WriterRef::Device([1; 32]),
-                            seq: 8
-                        })
-                    )
-                ]
-                .into_iter()
-            ),
+            substituted(WriterRef::Device([1; 32]), 8),
             "a changed original sequence is not the signed one"
         );
     }
@@ -235,10 +205,12 @@ mod tests {
         let device = Provenance {
             writer: WriterRef::Device([7; 32]),
             seq: 1,
+            secret: None,
         };
         let number = Provenance {
             writer: WriterRef::Number(7),
             seq: 1,
+            secret: None,
         };
         assert_ne!(
             courier_range_message(&[3; 32], 1, &GENESIS, [(1, Some(device))].into_iter()),

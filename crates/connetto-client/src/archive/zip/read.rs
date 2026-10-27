@@ -311,9 +311,9 @@ pub(super) fn decode_pending(
             .try_into()
             .map_err(|_| malformed())?,
     );
-    // Every entry costs at least its fixed 55 bytes, so a count above what the
+    // Every entry costs at least its fixed 56 bytes, so a count above what the
     // entry can hold is refused before one vector per entry is allocated.
-    let capacity = u64::try_from(bytes.len().saturating_sub(8) / 55).unwrap_or(u64::MAX);
+    let capacity = u64::try_from(bytes.len().saturating_sub(8) / 56).unwrap_or(u64::MAX);
     if count > capacity {
         return Err(malformed());
     }
@@ -321,6 +321,7 @@ pub(super) fn decode_pending(
     let mut entries = Vec::new();
     for _ in 0..count {
         let writer = read_writer(bytes, &mut at, &malformed)?;
+        let secret = read_secret(bytes, &mut at, &malformed)?;
         let seq = u64::from_be_bytes(
             bytes
                 .get(at..at.checked_add(8).ok_or_else(malformed)?)
@@ -358,9 +359,11 @@ pub(super) fn decode_pending(
                     .map_err(|_| malformed())?,
             );
             at = at.checked_add(8).ok_or_else(malformed)?;
+            let prov_secret = read_secret(bytes, &mut at, &malformed)?;
             Some(Provenance {
                 writer: prov_writer,
                 seq: prov_seq,
+                secret: prov_secret,
             })
         } else if prov_present == 0 {
             None
@@ -387,10 +390,37 @@ pub(super) fn decode_pending(
             hash,
             major,
             changeset,
+            secret,
             provenance,
         });
     }
     Ok(entries)
+}
+
+/// A writer secret behind its presence byte, absent when the byte is zero.
+fn read_secret(
+    bytes: &[u8],
+    at: &mut usize,
+    malformed: &impl Fn() -> ClientError,
+) -> Result<Option<connetto_core::messages::WriterSecret>, ClientError> {
+    use connetto_core::messages::WriterSecret;
+
+    let present = *bytes.get(*at).ok_or_else(malformed)?;
+    *at = at.checked_add(1).ok_or_else(malformed)?;
+    match present {
+        0 => Ok(None),
+        1 => {
+            let end = at.checked_add(WriterSecret::LEN).ok_or_else(malformed)?;
+            let secret: [u8; WriterSecret::LEN] = bytes
+                .get(*at..end)
+                .ok_or_else(malformed)?
+                .try_into()
+                .map_err(|_| malformed())?;
+            *at = end;
+            Ok(Some(WriterSecret::from_bytes(secret)))
+        }
+        _ => Err(malformed()),
+    }
 }
 
 fn read_writer(
@@ -442,24 +472,46 @@ mod tests {
     /// write keeping the major it was captured under or none.
     #[test]
     fn an_archive_round_trips() {
+        let number = connetto_core::messages::WriterRef::Number(4);
+        let secret = |byte| {
+            Some(connetto_core::messages::WriterSecret::from_bytes(
+                [byte; 32],
+            ))
+        };
         let pending = vec![
             crate::archive::ArchivedEntry {
-                writer: connetto_core::messages::WriterRef::Number(0),
+                writer: number,
                 seq: 1,
                 hash: [9u8; 32],
                 major: Major::new(1),
                 changeset: vec![9u8; 16],
-                provenance: None,
+                secret: secret(5),
+                provenance: Some(connetto_core::messages::Provenance {
+                    writer: connetto_core::messages::WriterRef::Number(2),
+                    seq: 3,
+                    secret: secret(6),
+                }),
             },
             crate::archive::ArchivedEntry {
-                writer: connetto_core::messages::WriterRef::Number(0),
+                writer: number,
                 seq: 2,
                 hash: [8u8; 32],
                 major: None,
                 changeset: vec![8u8; 4],
+                secret: secret(5),
+                provenance: None,
+            },
+            crate::archive::ArchivedEntry {
+                writer: connetto_core::messages::WriterRef::Number(0),
+                seq: 1,
+                hash: [7u8; 32],
+                major: None,
+                changeset: vec![7u8; 16],
+                secret: None,
                 provenance: Some(connetto_core::messages::Provenance {
                     writer: connetto_core::messages::WriterRef::Number(3),
                     seq: 5,
+                    secret: None,
                 }),
             },
         ];
@@ -516,7 +568,7 @@ mod tests {
     fn compressed_attachments_are_refused_before_their_body_is_read() {
         let manifest = json!({
             "format": "connetto-local-data",
-            "version": 5,
+            "version": super::VERSION,
             "scope": "unsynced",
             "schema_fingerprint": "abc123",
             "major": 1,
@@ -605,7 +657,7 @@ mod tests {
     fn zip_with_entry(entry: &[u8]) -> Vec<u8> {
         let manifest = json!({
             "format": "connetto-local-data",
-            "version": 5,
+            "version": super::VERSION,
             "scope": "unsynced",
             "schema_fingerprint": "abc123",
             "major": 1,
@@ -647,6 +699,7 @@ mod tests {
             hash: [7; 32],
             major: Major::new(1),
             changeset: vec![8],
+            secret: None,
             provenance: None,
         };
         let mut bytes = super::super::write::encode_pending(std::slice::from_ref(&entry));
@@ -656,11 +709,51 @@ mod tests {
                 .as_slice(),
             std::slice::from_ref(&entry)
         );
-        let major_at = 8 + 8 + crate::writer_id(&entry.writer).len() + 8 + 32;
+        // Count, writer length and id, the secret's presence byte, sequence
+        // and hash precede the major.
+        let major_at = 8 + 8 + crate::writer_id(&entry.writer).len() + 1 + 8 + 32;
         for kept in (0..4).rev() {
             bytes.truncate(major_at + kept);
             assert!(matches!(
                 decode_pending(&bytes),
+                Err(crate::ClientError::Import(_))
+            ));
+        }
+    }
+
+    /// A writer secret behind a presence byte other than 0 or 1, or cut
+    /// short, is refused rather than read as the fields after it.
+    #[test]
+    fn a_malformed_writer_secret_is_refused() {
+        use connetto_core::messages::WriterSecret;
+
+        // The longest writer id, so a cut inside the secret still passes the
+        // entry count check and reaches the secret's read.
+        let entry = crate::archive::ArchivedEntry {
+            writer: connetto_core::messages::WriterRef::Number(u64::MAX),
+            seq: 1,
+            hash: [7; 32],
+            major: Major::new(1),
+            changeset: vec![8],
+            secret: Some(WriterSecret::from_bytes([5; WriterSecret::LEN])),
+            provenance: None,
+        };
+        let bytes = super::super::write::encode_pending(std::slice::from_ref(&entry));
+        assert_eq!(
+            decode_pending(&bytes)
+                .expect("a valid writer secret")
+                .as_slice(),
+            std::slice::from_ref(&entry)
+        );
+        // Count, then the writer's length and id, precede the presence byte.
+        let presence_at = 8 + 8 + crate::writer_id(&entry.writer).len();
+        let mut unknown = bytes.clone();
+        unknown[presence_at] = 2;
+        let mut cut = bytes;
+        cut.truncate(presence_at + WriterSecret::LEN);
+        for malformed in [unknown, cut] {
+            assert!(matches!(
+                decode_pending(&malformed),
                 Err(crate::ClientError::Import(_))
             ));
         }
@@ -716,7 +809,7 @@ mod tests {
     ) {
         let manifest = json!({
             "format": "connetto-local-data",
-            "version": 5,
+            "version": super::VERSION,
             "scope": "unsynced",
             "schema_fingerprint": "abc123",
             "major": 1,

@@ -26,7 +26,7 @@ mod visibility {
 }
 
 use connetto_core::auth::Principal;
-use connetto_core::messages::ConflictRow;
+use connetto_core::messages::{ConflictRow, WriterSecret};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use sqlparser::dialect::PostgreSqlDialect;
@@ -36,7 +36,7 @@ use subql::patchset::{PgAdapter, apply_diffset_bytes_async_with_catalog};
 use crate::capability::CallerBinding;
 use crate::schema::ConnettoSchema;
 use crate::writer_schema::{
-    ConnettoWriterSchema, SettlePath, SettledOutcome, SettledRow, WriterRow,
+    ConnettoWriterSchema, SettlePath, SettledOutcome, SettledRow, WriterRow, writer_secret_hash,
 };
 use connetto_core::auth::CapabilityKey;
 
@@ -238,30 +238,36 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
     }
 
     /// A fresh number writer issued for the account `user_id` at frontier 0,
-    /// bound to `session_id` when the caller has no identity.
+    /// bound to `session_id` when the caller has no identity, under `secret`'s
+    /// hash.
     pub(crate) async fn issue_writer(
         &self,
         user_id: Option<D::Id>,
         session_id: Option<uuid::Uuid>,
+        secret: &WriterSecret,
     ) -> Result<(i64, i64), WriteError> {
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
-        D::Writers::issue(&mut conn, user_id, session_id)
+        D::Writers::issue(&mut conn, user_id, session_id, writer_secret_hash(secret))
             .await
             .map_err(WriteError::from)
     }
 
-    /// The number writer `writer` of the caller, absent when no such writer
-    /// exists. An identified caller is admitted to a writer of its account and
-    /// nothing else; an anonymous caller is admitted to the writer its run
-    /// handle `session_id` holds and nothing else.
+    /// The number writer `writer` of the caller issued under `secret`, absent
+    /// when no such writer exists. An identified caller is admitted to a
+    /// writer of its account and nothing else; an anonymous caller is
+    /// admitted to the writer its run handle `session_id` holds and nothing
+    /// else, and either only with the secret it was issued under (R70
+    /// decision 22).
     pub(crate) async fn writer_by_number(
         &self,
         writer: i64,
         user_id: Option<&D::Id>,
         session_id: Option<&uuid::Uuid>,
+        secret: &WriterSecret,
     ) -> Result<Option<WriterRow<D::Id>>, WriteError> {
+        let hash = writer_secret_hash(secret);
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
-        D::Writers::by_number(&mut conn, writer, user_id, session_id)
+        D::Writers::by_number(&mut conn, writer, user_id, session_id, &hash)
             .await
             .map_err(WriteError::from)
     }

@@ -1072,7 +1072,7 @@ async fn a_last_used_build_signs_back_in_without_a_browser() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     let (base, _idp) = spawn_auth_server().await;
     let store = SharedRefreshStore::default();
-    let account = builder_login(&base, &store, "returning-user").await;
+    let account = Box::pin(builder_login(&base, &store, "returning-user")).await;
 
     let client = offline_builder()
         .signed_in(
@@ -1098,7 +1098,7 @@ async fn an_ask_build_signs_in_as_the_account_the_chooser_picks() {
     let (base, _service, _idp) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store = SharedRefreshStore::default();
-    let first = builder_login(&base, &store, "first-user").await;
+    let first = Box::pin(builder_login(&base, &store, "first-user")).await;
 
     let client = offline_builder()
         .signed_in(

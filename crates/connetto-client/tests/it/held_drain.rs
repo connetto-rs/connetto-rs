@@ -16,6 +16,7 @@ use connetto_core::messages::{
     ControlMessage, FatalError, FatalErrorReason, HandshakeAck, HeldWork, HeldWrite,
     MutationApplied, MutationConflict, MutationReject, MutationRejectReason, NonFatalError, Pong,
     Provenance, RateLimited, ShareKeysReplaced, WriterGrant, WriterRef, WriterRequest,
+    WriterSecret,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -108,12 +109,20 @@ enum Settle {
     Silent,
 }
 
+/// What a handshake asked for, an issue's freshly drawn secret left out.
+#[derive(Debug, PartialEq, Eq)]
+enum Asked {
+    Issue,
+    Number(u64, WriterSecret),
+    Device,
+}
+
 /// What one scripted server was sent.
 #[derive(Debug, PartialEq, Eq)]
 enum Seen {
     Handshake {
         major: Option<Major>,
-        writer: WriterRequest,
+        writer: Asked,
         settled_through: Option<u64>,
     },
     Mutation {
@@ -148,7 +157,11 @@ fn server(answer: Answer) -> (LoopbackTransport, mpsc::UnboundedReceiver<Seen>) 
         };
         let _ = seen_tx.send(Seen::Handshake {
             major: handshake.schema_major,
-            writer: handshake.writer,
+            writer: match handshake.writer {
+                WriterRequest::Issue { .. } => Asked::Issue,
+                WriterRequest::Number { number, secret } => Asked::Number(number, secret),
+                WriterRequest::Device => Asked::Device,
+            },
             settled_through: handshake.settled_through,
         });
         let (version, grant, settle) = match answer {
@@ -308,6 +321,21 @@ fn two() -> Major {
 
 const NUMBER: u64 = 7;
 
+/// The secret the replica holds for `NUMBER`, the one its issue drew.
+fn held_secret(conn: &mut ConnettoConnection<LoopbackTransport>) -> WriterSecret {
+    #[derive(diesel::QueryableByName)]
+    struct Held {
+        #[diesel(sql_type = diesel::sql_types::Binary)]
+        secret: Vec<u8>,
+    }
+    let held: Held = diesel::sql_query(format!(
+        "SELECT secret FROM _connetto_writers WHERE id = 'number:{NUMBER}'"
+    ))
+    .get_result(conn.conn())
+    .expect("the number holds the secret its issue drew");
+    WriterSecret::from_bytes(held.secret.try_into().expect("a 32-byte secret"))
+}
+
 /// A major 1 replica whose one write sits unsent under number 7, issued by a
 /// major 1 server that never answered the write, then opened by the major 2
 /// build. Returns the connection and the major 1 bundle hash.
@@ -376,7 +404,7 @@ async fn an_unissued_write_drains_under_a_number_the_old_major_issues() {
         vec![
             Seen::Handshake {
                 major: Some(one()),
-                writer: WriterRequest::Issue,
+                writer: Asked::Issue,
                 settled_through: None,
             },
             Seen::Mutation {
@@ -404,6 +432,7 @@ async fn an_unissued_write_drains_under_a_number_the_old_major_issues() {
 async fn a_numbered_write_drains_under_its_number_and_settles_by_the_frontier() {
     let dir = tempdir().expect("temp dir");
     let (mut conn, old_version) = held_under_number(&dir).await;
+    let secret = held_secret(&mut conn);
 
     // The old major already settled it, so it answers the frontier and refuses anything sent.
     let (transport, mut rx) = server(Answer::Ack {
@@ -421,7 +450,7 @@ async fn a_numbered_write_drains_under_its_number_and_settles_by_the_frontier() 
         seen(&mut rx),
         vec![Seen::Handshake {
             major: Some(one()),
-            writer: WriterRequest::Number(NUMBER),
+            writer: Asked::Number(NUMBER, secret),
             settled_through: Some(0),
         }],
         "the drain presents the write's own number and sends nothing the frontier covers"
@@ -523,6 +552,7 @@ async fn a_decommissioned_major_loses_its_writes_and_retires_their_writer() {
 async fn a_writer_the_old_major_refuses_hands_its_writes_to_an_issued_number() {
     let dir = tempdir().expect("temp dir");
     let (mut conn, old_version) = held_under_number(&dir).await;
+    let secret = held_secret(&mut conn);
 
     let (transport, _rx) = server(Answer::Refuse(FatalErrorReason::WriterUnknown));
     dial(&mut conn, transport).await;
@@ -542,7 +572,7 @@ async fn a_writer_the_old_major_refuses_hands_its_writes_to_an_issued_number() {
         vec![
             Seen::Handshake {
                 major: Some(one()),
-                writer: WriterRequest::Issue,
+                writer: Asked::Issue,
                 settled_through: None,
             },
             Seen::Mutation {
@@ -550,6 +580,7 @@ async fn a_writer_the_old_major_refuses_hands_its_writes_to_an_issued_number() {
                 provenance: Some(Provenance {
                     writer: WriterRef::Number(NUMBER),
                     seq: 1,
+                    secret: Some(secret),
                 }),
             },
         ],
@@ -1140,6 +1171,7 @@ async fn a_device_revoked_on_the_drain_wire_redials_at_once() {
 async fn a_writer_retired_on_the_drain_wire_moves_its_write_to_an_issued_number() {
     let dir = tempdir().expect("temp dir");
     let (mut conn, old_version) = fatal_on_the_drain(&dir, FatalErrorReason::WriterRetired).await;
+    let secret = held_secret(&mut conn);
     pump_until(&mut conn, wire_lost).await;
     assert_eq!(
         conn.drain_timer().map(|timer| timer.wait()),
@@ -1160,7 +1192,7 @@ async fn a_writer_retired_on_the_drain_wire_moves_its_write_to_an_issued_number(
         vec![
             Seen::Handshake {
                 major: Some(one()),
-                writer: WriterRequest::Issue,
+                writer: Asked::Issue,
                 settled_through: None,
             },
             Seen::Mutation {
@@ -1168,6 +1200,7 @@ async fn a_writer_retired_on_the_drain_wire_moves_its_write_to_an_issued_number(
                 provenance: Some(Provenance {
                     writer: WriterRef::Number(NUMBER),
                     seq: 1,
+                    secret: Some(secret),
                 }),
             },
         ]

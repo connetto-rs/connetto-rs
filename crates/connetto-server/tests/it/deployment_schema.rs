@@ -44,6 +44,7 @@ mod app {
             frontier -> BigInt,
             head -> Nullable<Bytea>,
             retired_at -> Nullable<Timestamptz>,
+            secret_hash -> Nullable<Bytea>,
         }
     }
 
@@ -88,7 +89,8 @@ mod app {
         "CREATE TABLE app_writers (\
          writer BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY, \
          user_id UUID, session_id UUID, device_key BYTEA UNIQUE, \
-         frontier BIGINT NOT NULL DEFAULT 0, head BYTEA, retired_at TIMESTAMPTZ)",
+         frontier BIGINT NOT NULL DEFAULT 0, head BYTEA, retired_at TIMESTAMPTZ, \
+         secret_hash BYTEA)",
         "CREATE TABLE app_settled (\
          writer BIGINT NOT NULL, seq BIGINT NOT NULL, entry_hash BYTEA NOT NULL, \
          previous_hash BYTEA NOT NULL, \
@@ -114,6 +116,7 @@ mod app {
             conn: &mut AsyncPgConnection,
             user_id: Option<Self::Id>,
             session_id: Option<uuid::Uuid>,
+            secret_hash: [u8; 32],
         ) -> Statement<'_, (i64, i64)> {
             Box::pin(async move {
                 use diesel::ExpressionMethods as _;
@@ -122,6 +125,7 @@ mod app {
                     .values((
                         app_writers::user_id.eq(user_id),
                         app_writers::session_id.eq(session_id),
+                        app_writers::secret_hash.eq(secret_hash.to_vec()),
                         app_writers::frontier.eq(0),
                     ))
                     .returning((app_writers::writer, app_writers::frontier))
@@ -135,6 +139,7 @@ mod app {
             writer: i64,
             user_id: Option<&'c Self::Id>,
             session_id: Option<&'c uuid::Uuid>,
+            secret_hash: &'c [u8; 32],
         ) -> Statement<'c, Option<WriterRow<Self::Id>>> {
             Box::pin(async move {
                 use diesel::{
@@ -154,6 +159,7 @@ mod app {
                             .nullable()
                             .is_not_distinct_from(session_id.copied()),
                     )
+                    .filter(app_writers::secret_hash.eq(secret_hash.to_vec()))
                     .select((
                         app_writers::writer,
                         app_writers::user_id,

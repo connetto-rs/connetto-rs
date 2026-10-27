@@ -93,6 +93,7 @@ mod tests {
             hash: [0u8; 32],
             major: connetto_core::Major::new(1),
             changeset: changeset.to_vec(),
+            secret: None,
             provenance: None,
         }
     }

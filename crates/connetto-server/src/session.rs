@@ -44,7 +44,8 @@ use connetto_core::messages::{
     Pong, Provenance, RateLimited, RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate,
     RevokeDeviceRequest, SUBSCRIPTION_REFUSED, ShareKeysReplaced, SignedList, SnapshotBegin,
     SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec, WriterAnswer, WriterGrant,
-    WriterOutcome, WriterRef, WriterRequest, bot_registration_message, writer_bind_message,
+    WriterOutcome, WriterRef, WriterRequest, WriterSecret, bot_registration_message,
+    writer_bind_message,
 };
 use connetto_core::traits::{
     CheckedGrant, ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport,
@@ -1400,7 +1401,7 @@ struct HandshakeOutcome<Id, Key> {
     /// The writer this connection writes as, resolved at the handshake for a
     /// number request and set by the `BindDevice` for a device one, absent
     /// before that bind.
-    writer_row: Option<WriterRow<Id>>,
+    writer: Option<BoundWriter<Id>>,
     /// The challenge nonce of the round the handshake settled, the message a
     /// device key signs to bind its writer (R75).
     bind_nonce: [u8; 32],
@@ -1666,6 +1667,20 @@ struct MissedReplay {
     cursor: Cursor,
 }
 
+/// The writer a connection writes as, with the key its row is read again by.
+struct BoundWriter<Id> {
+    row: WriterRow<Id>,
+    key: WriterKey,
+}
+
+/// How a bound writer's row is named when it is read again.
+enum WriterKey {
+    /// A device writer, by its key.
+    Device(Vec<u8>),
+    /// A number writer, by the secret it was issued under (R70 decision 22).
+    Number(WriterSecret),
+}
+
 struct SessionState<Id, Key> {
     credits: u32,
     pending: VecDeque<Deliverable>,
@@ -1693,9 +1708,9 @@ struct SessionState<Id, Key> {
     pending_header: Option<MutationHeader>,
     /// The writer this connection writes as (R75), resolved at the handshake
     /// for a number request and set by the `BindDevice` for a device one,
-    /// absent before that bind. Its `frontier` is the per-connection cache of
-    /// the writer's durable frontier.
-    writer_row: Option<WriterRow<Id>>,
+    /// absent before that bind. Its row's `frontier` is the per-connection
+    /// cache of the writer's durable frontier.
+    writer: Option<BoundWriter<Id>>,
     /// The connetto-minted session id from the verified token.
     session_id: SessionId,
     /// The challenge nonce of the round the handshake settled, the message a
@@ -3906,12 +3921,23 @@ where
             return Ok(None);
         };
         let mut writer_row: Option<WriterRow<Id>> = None;
+        let mut writer_secret: Option<WriterSecret> = None;
         let mut writer_grant = None;
         match handshake.writer {
-            WriterRequest::Issue => {
+            WriterRequest::Issue { secret } => {
+                // A caller that drew no secret is issued under one only this
+                // connection holds, so its own row still re-reads and no
+                // later handshake names the number (R70 decision 22).
+                let secret = secret.unwrap_or_else(|| {
+                    let mut bytes = [0_u8; WriterSecret::LEN];
+                    bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                    bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                    WriterSecret::from_bytes(bytes)
+                });
+                writer_secret = Some(secret);
                 let (writer, frontier) = self
                     .target
-                    .issue_writer(user_id.clone(), bind_session)
+                    .issue_writer(user_id.clone(), bind_session, &secret)
                     .await
                     .map_err(|err| SessionError::WriteTarget(err.detail()))?;
                 writer_grant = Some(WriterGrant {
@@ -3927,11 +3953,12 @@ where
                     retired_at: None,
                 });
             }
-            WriterRequest::Number(number) => {
+            WriterRequest::Number { number, secret } => {
+                writer_secret = Some(secret);
                 let writer = i64::try_from(number).unwrap_or(i64::MAX);
                 match self
                     .target
-                    .writer_by_number(writer, user_id.as_ref(), bind_session.as_ref())
+                    .writer_by_number(writer, user_id.as_ref(), bind_session.as_ref(), &secret)
                     .await
                     .map_err(|err| SessionError::WriteTarget(err.detail()))?
                 {
@@ -4044,7 +4071,12 @@ where
             principal: Arc::new(principal),
             resume,
             resume_read_budget,
-            writer_row,
+            writer: writer_row
+                .zip(writer_secret)
+                .map(|(row, secret)| BoundWriter {
+                    row,
+                    key: WriterKey::Number(secret),
+                }),
             bind_nonce: nonce,
             refused_grants,
             span,
@@ -4450,7 +4482,7 @@ where
             principal,
             resume,
             resume_read_budget,
-            writer_row,
+            writer,
             bind_nonce,
             refused_grants,
             span: _,
@@ -4483,7 +4515,7 @@ where
             outbound: outbound_tx,
             principal,
             pending_header: None,
-            writer_row,
+            writer,
             session_id,
             bind_nonce,
             indeterminate: None,
@@ -4587,10 +4619,10 @@ where
     }
 
     async fn unregister_writer_session(&self, state: &SessionState<Id, Key>) {
-        if let Some(row) = state
-            .writer_row
-            .as_ref()
-            .filter(|row| row.device_key.is_some())
+        if let Some(BoundWriter {
+            row,
+            key: WriterKey::Device(_),
+        }) = &state.writer
         {
             let mut live = self.writer_sessions.lock().await;
             if let Some(set) = live.get_mut(&row.writer) {
@@ -5521,7 +5553,10 @@ where
             .await
             .map_err(|err| SessionError::WriteTarget(err.detail()))?;
         // A bind after a number switches the connection to the device writer.
-        state.writer_row = Some(row.clone());
+        state.writer = Some(BoundWriter {
+            row: row.clone(),
+            key: WriterKey::Device(key),
+        });
         state.indeterminate = None;
         self.writer_sessions
             .lock()
@@ -5548,14 +5583,20 @@ where
                     Some(identity.user_id.clone()),
                     state.session_id,
                     &retire.writer,
+                    retire.secret.as_ref(),
                 )
                 .await?
             }
             // An anonymous run retires only the number writer its own handle
             // holds, looked up by that handle.
             None => {
-                self.retire_writer(None, state.session_id, &retire.writer)
-                    .await?
+                self.retire_writer(
+                    None,
+                    state.session_id,
+                    &retire.writer,
+                    retire.secret.as_ref(),
+                )
+                .await?
             }
         };
         transport
@@ -5567,20 +5608,27 @@ where
             .map_err(transport_err)
     }
 
-    /// Mark the named writer retired and close the sessions bound to it.
+    /// Mark the named writer retired and close the sessions bound to it. A
+    /// number writer is named only with the `secret` it was issued under.
     async fn retire_writer(
         &self,
         user_id: Option<Id>,
         session: SessionId,
         writer: &WriterRef,
+        secret: Option<&WriterSecret>,
     ) -> Result<WriterOutcome, SessionError> {
         let bind_session = user_id.is_none().then(|| *session.as_uuid());
         let row = match writer {
             WriterRef::Number(number) => {
+                // A number names its writer only with the secret it was
+                // issued under (R70 decision 22).
+                let Some(secret) = secret else {
+                    return Ok(WriterOutcome::Unknown);
+                };
                 let writer = i64::try_from(*number).unwrap_or(i64::MAX);
                 match self
                     .target
-                    .writer_by_number(writer, user_id.as_ref(), bind_session.as_ref())
+                    .writer_by_number(writer, user_id.as_ref(), bind_session.as_ref(), secret)
                     .await
                     .map_err(|err| SessionError::WriteTarget(err.detail()))?
                 {
@@ -6117,7 +6165,7 @@ where
         }
         // A write before a device writer binds arrives first, and no sequence
         // can stand under a writer that does not exist yet.
-        if state.writer_row.is_none() {
+        if state.writer.is_none() {
             let _ = transport
                 .send_control(ControlMessage::FatalError(FatalError::new(
                     FatalErrorReason::ProtocolViolation {
@@ -6138,7 +6186,10 @@ where
             Err(err) => return Err(SessionError::WriteTarget(err.detail())),
             Ok(()) => {}
         }
-        let Some(writer_row) = &state.writer_row else {
+        let Some(BoundWriter {
+            row: writer_row, ..
+        }) = &state.writer
+        else {
             return Err(SessionError::Protocol(
                 "the writer row did not stand".into(),
             ));
@@ -6281,20 +6332,29 @@ where
         &self,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), WriteError> {
-        let Some(row) = state.writer_row.clone() else {
+        let Some(bound) = state.writer.as_mut() else {
             return Ok(());
         };
-        let bind_session = row.user_id.is_none().then(|| *state.session_id.as_uuid());
-        let fresh = match row.device_key.as_deref() {
-            Some(key) => self.target.writer_by_key(key).await,
-            None => {
+        let fresh = match &bound.key {
+            WriterKey::Device(key) => self.target.writer_by_key(key).await,
+            WriterKey::Number(secret) => {
+                let bind_session = bound
+                    .row
+                    .user_id
+                    .is_none()
+                    .then(|| *state.session_id.as_uuid());
                 self.target
-                    .writer_by_number(row.writer, row.user_id.as_ref(), bind_session.as_ref())
+                    .writer_by_number(
+                        bound.row.writer,
+                        bound.row.user_id.as_ref(),
+                        bind_session.as_ref(),
+                        secret,
+                    )
                     .await
             }
         }?;
         if let Some(fresh) = fresh {
-            state.writer_row = Some(fresh);
+            bound.row = fresh;
         }
         Ok(())
     }
@@ -6447,10 +6507,11 @@ where
         bytes: &[u8],
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
-        let writer_row = state
-            .writer_row
+        let writer_row = &state
+            .writer
             .as_ref()
-            .expect("a new write stands on the bound writer");
+            .expect("a new write stands on the bound writer")
+            .row;
         let writer = writer_row.writer;
         let previous = writer_row.head.as_deref().map_or(GENESIS, |head| {
             <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
@@ -6599,10 +6660,15 @@ where
         let bind_session = user_id.is_none().then_some(session_id);
         let row = match provenance.writer {
             WriterRef::Number(number) => {
+                // A number names its writer only with the secret it was
+                // issued under (R70 decision 22).
+                let Some(secret) = provenance.secret else {
+                    return Ok(None);
+                };
                 let writer = i64::try_from(number).unwrap_or(i64::MAX);
                 match self
                     .target
-                    .writer_by_number(writer, user_id.as_ref(), bind_session.as_ref())
+                    .writer_by_number(writer, user_id.as_ref(), bind_session.as_ref(), &secret)
                     .await
                     .map_err(|err| SessionError::WriteTarget(err.detail()))?
                 {

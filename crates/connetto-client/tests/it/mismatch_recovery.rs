@@ -113,10 +113,12 @@ impl Transport for StaleTransport {
                         initial_credits: 64,
                         writer: match &handshake.writer {
                             WriterRequest::Device => None,
-                            WriterRequest::Issue | WriterRequest::Number(_) => Some(WriterGrant {
-                                number: 1,
-                                frontier: 0,
-                            }),
+                            WriterRequest::Issue { .. } | WriterRequest::Number { .. } => {
+                                Some(WriterGrant {
+                                    number: 1,
+                                    frontier: 0,
+                                })
+                            }
                         },
                     },
                 )));

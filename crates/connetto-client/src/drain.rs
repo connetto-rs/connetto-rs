@@ -287,10 +287,15 @@ where
             return Ok(Some(WriterRequest::Device));
         };
         if self.drain.dead.contains(&writer) || !is_real_writer(&writer) {
-            return Ok(Some(WriterRequest::Issue));
+            return Ok(Some(crate::issue_request()));
         }
         match writer {
-            WriterRef::Number(number) => Ok(Some(WriterRequest::Number(number))),
+            // A number this replica holds no secret for is never named again
+            // (R70 decision 22), so it takes a fresh number.
+            WriterRef::Number(number) => Ok(Some(self.number_secret(number).map_or_else(
+                crate::issue_request,
+                |secret| WriterRequest::Number { number, secret },
+            ))),
             WriterRef::Device(key_id) => self.drain_device_request(key_id),
         }
     }
@@ -304,13 +309,13 @@ where
         key_id: [u8; 32],
     ) -> Result<Option<WriterRequest>, ClientError> {
         if self.retired_keys.contains(&key_id) {
-            return Ok(Some(WriterRequest::Issue));
+            return Ok(Some(crate::issue_request()));
         }
         let Some(held) = self.device_certificate()? else {
-            return Ok(Some(WriterRequest::Issue));
+            return Ok(Some(crate::issue_request()));
         };
         if *held.leaf.identity().key().as_bytes() != key_id {
-            return Ok(Some(WriterRequest::Issue));
+            return Ok(Some(crate::issue_request()));
         }
         let standing = crate::enrolment::Standing::of(Some(&held), std::time::SystemTime::now());
         let bindable = self.writer_keys.is_some()
@@ -333,7 +338,7 @@ where
         &mut self,
         _key_id: [u8; 32],
     ) -> Result<Option<WriterRequest>, ClientError> {
-        Ok(Some(WriterRequest::Issue))
+        Ok(Some(crate::issue_request()))
     }
 
     /// Present the held major over `transport`, bound to the writer of its
@@ -375,8 +380,10 @@ where
             return Ok(());
         };
         let settled_through = match request {
-            WriterRequest::Number(number) => Some(self.settled_through(&WriterRef::Number(number))),
-            WriterRequest::Issue | WriterRequest::Device => None,
+            WriterRequest::Number { number, .. } => {
+                Some(self.settled_through(&WriterRef::Number(number)))
+            }
+            WriterRequest::Issue { .. } | WriterRequest::Device => None,
         };
         let now = clock::now_secs(&mut self.db)?;
         let presented = self
@@ -446,7 +453,7 @@ where
         ack: HandshakeOk,
     ) -> Result<(), ClientError> {
         match request {
-            WriterRequest::Issue => {
+            WriterRequest::Issue { secret } => {
                 let Some(grant) = ack.writer else {
                     self.drop_drain_wire().await;
                     return Ok(());
@@ -461,9 +468,16 @@ where
                     }
                     self.drain.dead.remove(&writer);
                 }
+                // The issued number keeps the secret it was asked under, so a
+                // later handshake names it (R70 decision 22).
+                if let Some(queue) = self.writers.get_mut(&issued) {
+                    queue.secret = secret;
+                    let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                    crate::persist_writer_secret(&mut self.db, &issued, secret.as_ref())?;
+                }
                 self.drain_reconcile(major, issued, grant.frontier).await
             }
-            WriterRequest::Number(number) => {
+            WriterRequest::Number { number, .. } => {
                 let frontier = ack.writer.map_or(0, |grant| grant.frontier);
                 self.drain_reconcile(major, WriterRef::Number(number), frontier)
                     .await
@@ -808,13 +822,14 @@ where
     /// Record that `writer` is owed a retirement and send it now when the
     /// connection's own wire is up.
     async fn owe_retire(&mut self, writer: WriterRef) -> Result<(), ClientError> {
+        let secret = self.writers.get(&writer).and_then(|queue| queue.secret);
         {
             let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-            persist_retire(&mut self.db, &writer)?;
+            persist_retire(&mut self.db, &writer, secret.as_ref())?;
         }
         if self.is_connected() {
             self.writer_tasks.push_back(crate::WriterTask {
-                kind: crate::WriterTaskKind::Retire(writer),
+                kind: crate::WriterTaskKind::Retire(writer, secret),
                 request_id: crate::writer_request_id(),
                 deadline: crate::away::SystemClock.monotonic() + crate::WRITER_ANSWER_WAIT,
             });

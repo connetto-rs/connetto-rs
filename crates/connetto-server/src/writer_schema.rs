@@ -51,6 +51,14 @@ pub const DEFAULT_WRITER_SETTING: &str = "app.writer";
 /// [`ConnettoWriterSchema`] names another.
 pub const DEFAULT_SEQ_SETTING: &str = "app.writer_seq";
 
+/// The hash a writers table stores for a number writer's secret, SHA-256 of
+/// its bytes, so the table never holds the secret itself (R70 decision 22).
+#[must_use]
+pub fn writer_secret_hash(secret: &connetto_core::messages::WriterSecret) -> [u8; 32] {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(secret.as_bytes()).into()
+}
+
 /// The Postgres enum type marker for [`SettlePath`].
 #[derive(diesel::SqlType, diesel::query_builder::QueryId)]
 #[diesel(postgres_type(name = "connetto_settle_path"))]
@@ -243,25 +251,31 @@ pub trait ConnettoWriterSchema: Send + Sync + 'static {
     /// [`WRITER_SETTING`](Self::WRITER_SETTING).
     const SEQ_SETTING: &'static str = DEFAULT_SEQ_SETTING;
 
-    /// `INSERT _connetto_writers (user_id, session_id) RETURNING writer,
-    /// frontier`, the issue of a fresh number writer at frontier 0. The
-    /// `session_id` is the run's durable handle and is set only for a number
-    /// writer issued to a caller with no identity.
+    /// `INSERT _connetto_writers (user_id, session_id, secret_hash) RETURNING
+    /// writer, frontier`, the issue of a fresh number writer at frontier 0.
+    /// The `session_id` is the run's durable handle and is set only for a
+    /// number writer issued to a caller with no identity. `secret_hash` is
+    /// [`writer_secret_hash`] of the secret the number is issued under.
     fn issue(
         conn: &mut AsyncPgConnection,
         user_id: Option<Self::Id>,
         session_id: Option<uuid::Uuid>,
+        secret_hash: [u8; 32],
     ) -> Statement<'_, (i64, i64)>;
-    /// `SELECT` the number writer `writer` of the caller, `None` when no such
-    /// writer exists. An identified caller meets a writer of its account and
-    /// nothing else; an anonymous caller meets the writer its run handle
-    /// `session_id` holds and nothing else, so a guessed number of another
-    /// run is never admitted.
+    /// `SELECT` the number writer `writer` of the caller issued under the
+    /// secret whose hash is `secret_hash`, `None` when no such writer exists.
+    /// An identified caller meets a writer of its account and nothing else;
+    /// an anonymous caller meets the writer its run handle `session_id`
+    /// holds and nothing else, so a guessed number of another run is never
+    /// admitted. The hash keeps a number issued again after a restore from
+    /// binding the replica that held it before (R70 decision 22), and a
+    /// writer stored without one never matches.
     fn by_number<'c>(
         conn: &'c mut AsyncPgConnection,
         writer: i64,
         user_id: Option<&'c Self::Id>,
         session_id: Option<&'c uuid::Uuid>,
+        secret_hash: &'c [u8; 32],
     ) -> Statement<'c, Option<WriterRow<Self::Id>>>;
     /// `SELECT` the device writer `device_key`, `None` when none exists.
     fn by_key<'c>(
@@ -398,6 +412,9 @@ macro_rules! connetto_writers_table {
                 head -> diesel::sql_types::Nullable<diesel::sql_types::Bytea>,
                 /// When the writer retired.
                 retired_at -> diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+                /// The SHA-256 of the secret a number writer was issued
+                /// under, absent for a device writer (R70 decision 22).
+                secret_hash -> diesel::sql_types::Nullable<diesel::sql_types::Bytea>,
             }
         }
 
@@ -463,6 +480,7 @@ macro_rules! connetto_writers_table {
                 conn: &mut diesel_async::AsyncPgConnection,
                 user_id: Option<Self::Id>,
                 session_id: Option<uuid::Uuid>,
+                secret_hash: [u8; 32],
             ) -> $crate::writer_schema::Statement<'_, (i64, i64)> {
                 Box::pin(async move {
                     use diesel::ExpressionMethods as _;
@@ -471,6 +489,7 @@ macro_rules! connetto_writers_table {
                         .values((
                             _connetto_writers::user_id.eq(user_id),
                             _connetto_writers::session_id.eq(session_id),
+                            _connetto_writers::secret_hash.eq(secret_hash.to_vec()),
                             _connetto_writers::frontier.eq(0),
                         ))
                         .returning((_connetto_writers::writer, _connetto_writers::frontier))
@@ -484,6 +503,7 @@ macro_rules! connetto_writers_table {
                 writer: i64,
                 user_id: Option<&'c Self::Id>,
                 session_id: Option<&'c uuid::Uuid>,
+                secret_hash: &'c [u8; 32],
             ) -> $crate::writer_schema::Statement<
                 'c,
                 Option<$crate::writer_schema::WriterRow<Self::Id>>,
@@ -498,16 +518,19 @@ macro_rules! connetto_writers_table {
                         QueryDsl::filter(
                             QueryDsl::filter(
                                 QueryDsl::filter(
-                                    _connetto_writers::table,
-                                    _connetto_writers::writer.eq(writer),
+                                    QueryDsl::filter(
+                                        _connetto_writers::table,
+                                        _connetto_writers::writer.eq(writer),
+                                    ),
+                                    _connetto_writers::user_id
+                                        .nullable()
+                                        .is_not_distinct_from(user_id.cloned()),
                                 ),
-                                _connetto_writers::user_id
+                                _connetto_writers::session_id
                                     .nullable()
-                                    .is_not_distinct_from(user_id.cloned()),
+                                    .is_not_distinct_from(session_id.cloned()),
                             ),
-                            _connetto_writers::session_id
-                                .nullable()
-                                .is_not_distinct_from(session_id.cloned()),
+                            _connetto_writers::secret_hash.eq(secret_hash.to_vec()),
                         ),
                         (
                             _connetto_writers::writer,

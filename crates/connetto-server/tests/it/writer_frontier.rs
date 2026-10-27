@@ -32,7 +32,7 @@ use connetto_core::device_cert::{AttestationLevel, KeyId};
 use connetto_core::messages::{
     BindDevice, ConflictRow, ControlMessage, FatalError, FatalErrorReason, Grant, Handshake,
     MutationRejectReason, Provenance, WriterGrant, WriterOutcome, WriterRef, WriterRequest,
-    writer_bind_message,
+    WriterSecret, writer_bind_message,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport as _};
@@ -47,7 +47,10 @@ use connetto_server::{
     RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
     SnapshotSource, ThrottleConfig, loopback, pg_write_target,
 };
-use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{
+    Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID, issue_writer, number_writer,
+    writer_secret,
+};
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
@@ -512,7 +515,7 @@ async fn an_unknown_number_at_the_handshake_closes_writer_unknown() {
         &manager,
         "probe",
         "user:alice",
-        WriterRequest::Number(987_654_321),
+        number_writer(987_654_321),
         None,
     )
     .await;
@@ -581,7 +584,7 @@ async fn a_retired_number_at_the_handshake_closes_writer_retired() {
         &manager,
         "retired-3",
         "user:alice",
-        WriterRequest::Number(number),
+        number_writer(number),
         None,
     )
     .await;
@@ -624,7 +627,7 @@ async fn a_foreign_accounts_number_at_the_handshake_closes_writer_unknown() {
         &manager,
         "foreign-2",
         "user:bob",
-        WriterRequest::Number(alice_number),
+        number_writer(alice_number),
         None,
     )
     .await;
@@ -640,6 +643,299 @@ async fn a_foreign_accounts_number_at_the_handshake_closes_writer_unknown() {
     .await;
     assert_eq!(facts.frontier, 1, "the owner's record stands");
     assert!(!facts.retired, "the foreign handshake retired nothing");
+}
+
+/// A writing manager with no audit capture, for the writer-secret tests.
+fn secret_manager(
+    fixture: &Fixture,
+) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>> {
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    writing_manager(fixture.admin(), guard, None, SessionConfig::default())
+}
+
+/// Another replica of the same account naming a number with any secret but
+/// the one it was issued under is refused as unknown, exactly as a number the
+/// account never held, and the owner's record stands (R70 decision 22).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_number_named_without_its_secret_closes_writer_unknown() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let manager = secret_manager(&fixture);
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("owner-1", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    expect_applied(&mut client, 1).await;
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    let fatal = refused_handshake(
+        &manager,
+        "other-replica",
+        "user:alice",
+        WriterRequest::Number {
+            number,
+            secret: WriterSecret::from_bytes([0x11; WriterSecret::LEN]),
+        },
+        None,
+    )
+    .await;
+    assert!(
+        matches!(fatal.reason, FatalErrorReason::WriterUnknown),
+        "a wrong secret closes as an unknown number does, got {:?}",
+        fatal.reason
+    );
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client
+        .handshake_writing(
+            "owner-2",
+            &["user:alice"],
+            None,
+            number_writer(number),
+            None,
+        )
+        .await;
+    assert_eq!(
+        ack.writer,
+        Some(WriterGrant {
+            number,
+            frontier: 1
+        }),
+        "the owner's own secret still binds its writer"
+    );
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
+}
+
+/// A restore rewinds the writer number sequence with the rows, so a number
+/// can be issued again to another replica of the same account. The replica
+/// that held it before is refused as unknown, and the new holder writes on
+/// (R70 decision 22).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_number_issued_again_never_binds_the_replica_that_held_it_before() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let manager = secret_manager(&fixture);
+    let before = WriterSecret::from_bytes([0x21; WriterSecret::LEN]);
+    let after = WriterSecret::from_bytes([0x22; WriterSecret::LEN]);
+    let issue = |secret| WriterRequest::Issue {
+        secret: Some(secret),
+    };
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client
+        .handshake_writing("held-before", &["user:alice"], None, issue(before), None)
+        .await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    // What the restore did: the row is gone and the sequence issues it again.
+    let number_sql = i64::try_from(number).expect("number fits");
+    fixture
+        .exec(&format!(
+            "DELETE FROM _connetto_writers WHERE writer = {number_sql}"
+        ))
+        .await;
+    fixture
+        .exec(&format!(
+            "ALTER TABLE _connetto_writers ALTER COLUMN writer RESTART WITH {number_sql}"
+        ))
+        .await;
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client
+        .handshake_writing("issued-after", &["user:alice"], None, issue(after), None)
+        .await;
+    assert_eq!(
+        ack.writer.map(|grant| grant.number),
+        Some(number),
+        "the sequence issued the same number again"
+    );
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
+
+    let fatal = refused_handshake(
+        &manager,
+        "held-before-returns",
+        "user:alice",
+        WriterRequest::Number {
+            number,
+            secret: before,
+        },
+        None,
+    )
+    .await;
+    assert!(
+        matches!(fatal.reason, FatalErrorReason::WriterUnknown),
+        "the replica that held the number before is refused, got {:?}",
+        fatal.reason
+    );
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client
+        .handshake_writing(
+            "issued-after-returns",
+            &["user:alice"],
+            None,
+            WriterRequest::Number {
+                number,
+                secret: after,
+            },
+            None,
+        )
+        .await;
+    assert_eq!(
+        ack.writer.map(|grant| grant.number),
+        Some(number),
+        "the new holder binds its number"
+    );
+    client.close().await;
+    server.await.expect("join 3").expect("session ok");
+}
+
+/// A retirement naming a number with the wrong secret retires nothing and
+/// answers `Unknown`, so one replica cannot close another's writer (R70
+/// decision 22).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retirement_without_the_numbers_secret_retires_nothing() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let manager = secret_manager(&fixture);
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("owner", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake_with("other-replica", "user:alice").await;
+    for (request_id, secret) in [
+        (
+            "wrong",
+            Some(WriterSecret::from_bytes([0x31; WriterSecret::LEN])),
+        ),
+        ("missing", None),
+    ] {
+        let answer = client
+            .retire_writer_with(request_id, WriterRef::Number(number), secret)
+            .await;
+        assert_eq!(
+            answer.outcome,
+            WriterOutcome::Unknown,
+            "a {request_id} secret retires nothing"
+        );
+    }
+    let facts = writer_facts(fixture.admin(), i64::try_from(number).expect("number fits")).await;
+    assert!(!facts.retired, "the owner's writer stands");
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
+}
+
+/// A carried entry's provenance naming a number with the wrong secret names
+/// no writer, so the entry applies as an ordinary write and the number's own
+/// chain gains nothing. The right secret reserves the original's next link
+/// (R70 decision 22).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_provenance_without_the_numbers_secret_names_no_writer() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let manager = secret_manager(&fixture);
+
+    // The original number settles one entry.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("original", "user:alice").await;
+    let original = ack.writer.expect("the handshake issues a number").number;
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    expect_applied(&mut client, 1).await;
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    // A carrier writes three entries naming the original's second sequence,
+    // the first with a wrong secret, the second with none and the third with
+    // the right one.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake_with("carrier", "user:alice").await;
+    let original_sql = i64::try_from(original).expect("number fits");
+    for (seq, id, edited_at, secret) in [
+        (
+            1,
+            3,
+            "t2",
+            Some(WriterSecret::from_bytes([0x41; WriterSecret::LEN])),
+        ),
+        (2, 4, "t3", None),
+    ] {
+        client
+            .upload_with_provenance(
+                seq,
+                insert_changeset(id, "unnamed", edited_at),
+                Some(Provenance {
+                    writer: WriterRef::Number(original),
+                    seq: 2,
+                    secret,
+                }),
+            )
+            .await;
+        expect_applied(&mut client, seq).await;
+        assert_eq!(
+            writer_facts(fixture.admin(), original_sql).await.frontier,
+            1,
+            "a wrong or missing secret reserves no link in the original's chain"
+        );
+    }
+    client
+        .upload_with_provenance(
+            3,
+            insert_changeset(5, "named", "t4"),
+            Some(Provenance {
+                writer: WriterRef::Number(original),
+                seq: 2,
+                secret: Some(writer_secret()),
+            }),
+        )
+        .await;
+    expect_applied(&mut client, 3).await;
+    assert_eq!(
+        writer_facts(fixture.admin(), original_sql).await.frontier,
+        2,
+        "the right secret reserves the original's next link"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "two", "t1"),
+            note(3, "unnamed", "t2"),
+            note(4, "unnamed", "t3"),
+            note(5, "named", "t4"),
+        ],
+    );
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
 }
 
 /// The good bind stands the device's writer at frontier 0 and writes take
@@ -848,7 +1144,7 @@ async fn a_device_bind_records_its_session_once_and_an_anonymous_run_records_non
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     let ack = client
-        .handshake_writing("anon", &[], None, WriterRequest::Issue, None)
+        .handshake_writing("anon", &[], None, issue_writer(), None)
         .await;
     let anonymous = ack.writer.expect("an anonymous caller is issued a number");
     client.close().await;
@@ -1187,7 +1483,7 @@ async fn settled_through_prunes_the_rows_and_the_pruned_record_answers_by_sequen
             "prune-2",
             &["user:alice"],
             None,
-            WriterRequest::Number(number),
+            number_writer(number),
             Some(3),
         )
         .await;
@@ -1319,13 +1615,7 @@ async fn a_forged_changeset_at_a_settled_sequence_is_refused_forked_and_audited(
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     client
-        .handshake_writing(
-            "fork-2",
-            &["user:alice"],
-            None,
-            WriterRequest::Number(number),
-            None,
-        )
+        .handshake_writing("fork-2", &["user:alice"], None, number_writer(number), None)
         .await;
     client.upload(1, insert_changeset(5, "forged", "t9")).await;
     let ControlMessage::MutationReject(reject) = client.next_control().await else {
@@ -1415,6 +1705,7 @@ async fn a_provenance_write_of_a_settled_original_settles_the_new_sequence_with_
             Some(Provenance {
                 writer: WriterRef::Number(a),
                 seq: 1,
+                secret: Some(writer_secret()),
             }),
         )
         .await;
@@ -1426,6 +1717,7 @@ async fn a_provenance_write_of_a_settled_original_settles_the_new_sequence_with_
             Some(Provenance {
                 writer: WriterRef::Number(a),
                 seq: 2,
+                secret: Some(writer_secret()),
             }),
         )
         .await;
@@ -1507,6 +1799,7 @@ async fn a_provenance_write_at_the_originals_frontier_plus_one_applies_and_settl
             Some(Provenance {
                 writer: WriterRef::Number(a),
                 seq: 1,
+                secret: Some(writer_secret()),
             }),
         )
         .await;
@@ -1582,6 +1875,7 @@ async fn a_provenance_write_past_the_originals_frontier_closes_with_sequence_gap
             Some(Provenance {
                 writer: WriterRef::Number(a),
                 seq: 3,
+                secret: Some(writer_secret()),
             }),
         )
         .await;
@@ -1656,6 +1950,7 @@ async fn a_provenance_write_naming_an_enrolled_key_that_never_bound_stands_its_r
             Some(Provenance {
                 writer: WriterRef::Device(key.1),
                 seq: 1,
+                secret: None,
             }),
         )
         .await;
@@ -1755,6 +2050,7 @@ async fn a_provenance_write_naming_a_foreign_writer_applies_plainly() {
             Some(Provenance {
                 writer: WriterRef::Number(bob_number),
                 seq: 1,
+                secret: Some(writer_secret()),
             }),
         )
         .await;
@@ -1766,6 +2062,7 @@ async fn a_provenance_write_naming_a_foreign_writer_applies_plainly() {
             Some(Provenance {
                 writer: WriterRef::Device(bob_key.1),
                 seq: 1,
+                secret: None,
             }),
         )
         .await;
@@ -2151,6 +2448,7 @@ async fn a_restore_then_reupload_is_answered_from_the_record_and_audited() {
             Some(Provenance {
                 writer: WriterRef::Number(a),
                 seq: 1,
+                secret: Some(writer_secret()),
             }),
         )
         .await;
@@ -2177,6 +2475,7 @@ async fn a_restore_then_reupload_is_answered_from_the_record_and_audited() {
             Some(Provenance {
                 writer: WriterRef::Number(a),
                 seq: 1,
+                secret: Some(writer_secret()),
             }),
         )
         .await;
@@ -2260,6 +2559,7 @@ async fn a_device_restore_then_reupload_is_answered_from_the_record_and_audited(
             Some(Provenance {
                 writer: WriterRef::Device(k.1),
                 seq: 1,
+                secret: None,
             }),
         )
         .await;
@@ -2289,6 +2589,7 @@ async fn a_device_restore_then_reupload_is_answered_from_the_record_and_audited(
             Some(Provenance {
                 writer: WriterRef::Device(k.1),
                 seq: 1,
+                secret: None,
             }),
         )
         .await;
@@ -2434,7 +2735,7 @@ async fn two_connections_racing_one_sequence_are_answered_from_the_record() {
         "race-b",
         &["user:alice#race-b"],
         None,
-        WriterRequest::Number(number),
+        number_writer(number),
         None,
     )
     .await;
@@ -2649,13 +2950,7 @@ async fn a_patch_that_does_not_decompress_closes_the_session_and_resends_applied
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     client
-        .handshake_writing(
-            "mal-2",
-            &["user:alice"],
-            None,
-            WriterRequest::Number(number),
-            None,
-        )
+        .handshake_writing("mal-2", &["user:alice"], None, number_writer(number), None)
         .await;
     client.upload(1, insert_changeset(2, "two", "t1")).await;
     expect_applied(&mut client, 1).await;
@@ -2816,7 +3111,7 @@ async fn a_redelivery_behind_a_pruned_chain_reanswers_the_retained_record() {
             "chain-2",
             &["user:alice"],
             None,
-            WriterRequest::Number(number),
+            number_writer(number),
             Some(1),
         )
         .await;
@@ -2888,7 +3183,7 @@ async fn a_redelivery_behind_a_pruned_chain_reanswers_the_stored_refusal() {
             "win-3",
             &["user:alice"],
             None,
-            WriterRequest::Number(number),
+            number_writer(number),
             Some(1),
         )
         .await;
@@ -2949,7 +3244,7 @@ async fn a_redelivery_with_forged_bytes_behind_a_pruned_chain_is_refused_forked(
             "fork-2",
             &["user:alice"],
             None,
-            WriterRequest::Number(number),
+            number_writer(number),
             Some(1),
         )
         .await;
@@ -3023,13 +3318,7 @@ async fn a_settled_entry_hash_of_the_wrong_length_closes_the_session() {
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     client
-        .handshake_writing(
-            "hash-2",
-            &["user:alice"],
-            None,
-            WriterRequest::Number(number),
-            None,
-        )
+        .handshake_writing("hash-2", &["user:alice"], None, number_writer(number), None)
         .await;
     client.upload(1, cs1).await;
     assert!(
@@ -3084,13 +3373,7 @@ async fn a_retained_predecessor_hash_of_the_wrong_length_closes_the_session() {
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     client
-        .handshake_writing(
-            "prev-2",
-            &["user:alice"],
-            None,
-            WriterRequest::Number(number),
-            None,
-        )
+        .handshake_writing("prev-2", &["user:alice"], None, number_writer(number), None)
         .await;
     client.upload(1, cs1).await;
     assert!(
@@ -3198,6 +3481,7 @@ async fn a_restore_path_entry_reuploaded_at_its_sequence_audits_redelivered() {
             Some(Provenance {
                 writer: WriterRef::Number(a),
                 seq: 1,
+                secret: Some(writer_secret()),
             }),
         )
         .await;
@@ -3215,13 +3499,7 @@ async fn a_restore_path_entry_reuploaded_at_its_sequence_audits_redelivered() {
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     let ack = client
-        .handshake_writing(
-            "rp-3",
-            &["user:alice"],
-            None,
-            WriterRequest::Number(a),
-            None,
-        )
+        .handshake_writing("rp-3", &["user:alice"], None, number_writer(a), None)
         .await;
     assert_eq!(
         ack.writer.expect("the number confirms").frontier,
@@ -3293,14 +3571,7 @@ async fn a_retired_number_with_settled_through_prunes_and_a_provenance_of_it_app
     client.close().await;
     server.await.expect("join 2").expect("session ok");
 
-    let fatal = refused_handshake(
-        &manager,
-        "pt-3",
-        "user:alice",
-        WriterRequest::Number(a),
-        Some(1),
-    )
-    .await;
+    let fatal = refused_handshake(&manager, "pt-3", "user:alice", number_writer(a), Some(1)).await;
     assert!(
         matches!(fatal.reason, FatalErrorReason::WriterRetired),
         "the retired number must close as WriterRetired, got {:?}",
@@ -3323,6 +3594,7 @@ async fn a_retired_number_with_settled_through_prunes_and_a_provenance_of_it_app
             Some(Provenance {
                 writer: WriterRef::Number(a),
                 seq: 1,
+                secret: Some(writer_secret()),
             }),
         )
         .await;
@@ -3365,7 +3637,7 @@ async fn an_anonymous_bind_is_not_enrolled() {
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     let (_, _) = client
-        .handshake_challenge_writing("anon-bind", &[], None, WriterRequest::Issue, None)
+        .handshake_challenge_writing("anon-bind", &[], None, issue_writer(), None)
         .await;
     let answer = client.bind_device("b1", key_id, Vec::new()).await;
     assert_eq!(
@@ -3411,7 +3683,7 @@ async fn a_bind_of_a_key_with_an_unreadable_public_key_is_not_enrolled() {
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     let (challenge, _) = client
-        .handshake_challenge_writing("unr-1", &["user:alice"], None, WriterRequest::Issue, None)
+        .handshake_challenge_writing("unr-1", &["user:alice"], None, issue_writer(), None)
         .await;
     let key = device_key();
     let signature = key
@@ -3455,7 +3727,7 @@ async fn retiring_a_device_key_another_account_holds_is_unknown() {
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     let (challenge, _) = client
-        .handshake_challenge_writing("fk-1", &["user:alice"], None, WriterRequest::Issue, None)
+        .handshake_challenge_writing("fk-1", &["user:alice"], None, issue_writer(), None)
         .await;
     let answer = client
         .bind_device("b1", key_id, signer.signature(&challenge.nonce))
@@ -3509,7 +3781,7 @@ async fn an_anonymous_retire_of_a_device_key_is_unknown() {
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     let (challenge, _) = client
-        .handshake_challenge_writing("anr-1", &["user:alice"], None, WriterRequest::Issue, None)
+        .handshake_challenge_writing("anr-1", &["user:alice"], None, issue_writer(), None)
         .await;
     let answer = client
         .bind_device("b1", key_id, signer.signature(&challenge.nonce))
@@ -3576,6 +3848,7 @@ async fn a_server_without_enrolment_refuses_device_retire_and_applies_provenance
             Some(Provenance {
                 writer: WriterRef::Device([7; 32]),
                 seq: 1,
+                secret: None,
             }),
         )
         .await;
@@ -3670,6 +3943,7 @@ async fn a_provenance_write_of_a_device_key_that_cannot_stand_applies_plain() {
                 Some(Provenance {
                     writer: WriterRef::Device(key_id),
                     seq: 1,
+                    secret: None,
                 }),
             )
             .await;
@@ -3737,7 +4011,7 @@ async fn an_anonymous_provenance_copy_of_a_device_key_settles_nothing() {
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     let _ = client
-        .handshake_writing("ap-2", &[], None, WriterRequest::Issue, None)
+        .handshake_writing("ap-2", &[], None, issue_writer(), None)
         .await;
     client
         .upload_with_provenance(
@@ -3746,6 +4020,7 @@ async fn an_anonymous_provenance_copy_of_a_device_key_settles_nothing() {
             Some(Provenance {
                 writer: WriterRef::Device(held),
                 seq: 1,
+                secret: None,
             }),
         )
         .await;
@@ -3762,6 +4037,7 @@ async fn an_anonymous_provenance_copy_of_a_device_key_settles_nothing() {
             Some(Provenance {
                 writer: WriterRef::Device(unbound),
                 seq: 1,
+                secret: None,
             }),
         )
         .await;
@@ -3803,6 +4079,7 @@ async fn a_refused_provenance_write_settles_its_unbound_original() {
             Some(Provenance {
                 writer: WriterRef::Device(key),
                 seq: 1,
+                secret: None,
             }),
         )
         .await;

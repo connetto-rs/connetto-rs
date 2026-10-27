@@ -415,7 +415,7 @@ async fn a_withdrawn_share_reaches_its_bearer_alone() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     let fixture = Fixture::acquire().await;
     let server = keyed_share_fixture(&fixture).await;
-    let (mut bearer_a, mut bearer_b, mut owner) = three_bearers(&server).await;
+    let (mut bearer_a, mut bearer_b, mut owner) = Box::pin(three_bearers(&server)).await;
 
     fixture
         .exec(&format!(
@@ -472,7 +472,7 @@ async fn a_granted_share_reaches_its_new_bearer_alone() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     let fixture = Fixture::acquire().await;
     let server = keyed_share_fixture(&fixture).await;
-    let (mut bearer_a, mut bearer_b, mut owner) = three_bearers(&server).await;
+    let (mut bearer_a, mut bearer_b, mut owner) = Box::pin(three_bearers(&server)).await;
 
     fixture
         .exec(&format!(

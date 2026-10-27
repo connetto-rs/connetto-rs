@@ -99,6 +99,26 @@ enum Lie {
     Grant(WriterGrant),
 }
 
+/// What a handshake asked for, its secret left out, since an issue draws a
+/// random one.
+#[derive(Debug, PartialEq, Eq)]
+enum Asked {
+    Issue,
+    Number(u64),
+    Device,
+}
+
+fn asked(requests: &[WriterRequest]) -> Vec<Asked> {
+    requests
+        .iter()
+        .map(|request| match request {
+            WriterRequest::Issue { .. } => Asked::Issue,
+            WriterRequest::Number { number, .. } => Asked::Number(*number),
+            WriterRequest::Device => Asked::Device,
+        })
+        .collect()
+}
+
 /// What the connection has been sent, plus the frames it is due to hand back.
 #[derive(Default)]
 struct Log {
@@ -201,10 +221,12 @@ impl Transport for Wire {
                     Some(Lie::Grant(grant)) => Some(grant),
                     None => match handshake.writer {
                         WriterRequest::Device => None,
-                        WriterRequest::Issue | WriterRequest::Number(_) => Some(WriterGrant {
-                            number: self.writer_number,
-                            frontier: self.writer_frontier,
-                        }),
+                        WriterRequest::Issue { .. } | WriterRequest::Number { .. } => {
+                            Some(WriterGrant {
+                                number: self.writer_number,
+                                frontier: self.writer_frontier,
+                            })
+                        }
                     },
                 };
                 let mut log = self.log.lock();
@@ -388,8 +410,8 @@ async fn a_handshake_ack_keeps_the_issued_number_and_rekeys_the_queue() {
     {
         let log = wire.log.lock();
         assert_eq!(
-            log.handshakes,
-            vec![WriterRequest::Issue],
+            asked(&log.handshakes),
+            vec![Asked::Issue],
             "nothing settled yet, so a fresh number is asked"
         );
         assert_eq!(
@@ -432,7 +454,8 @@ async fn a_handshake_ack_reconciles_the_number_against_the_frontier() {
     }
 
     // A first connection that never answers, so the queue still waits.
-    conn.attach(Wire::default().silent()).await.expect("attach");
+    let first = Wire::default().silent();
+    conn.attach(first.clone()).await.expect("attach");
     drain(&mut conn).await;
 
     // A second connection that reports a frontier ahead of the queue, as a
@@ -442,9 +465,20 @@ async fn a_handshake_ack_reconciles_the_number_against_the_frontier() {
     {
         let log = wire.log.lock();
         assert_eq!(
-            log.handshakes,
-            vec![WriterRequest::Number(1)],
+            asked(&log.handshakes),
+            vec![Asked::Number(1)],
             "the unsent tail outlives the connection, so the number is presented"
+        );
+        let WriterRequest::Issue { secret: drawn } = first.log.lock().handshakes[0] else {
+            panic!("the first connection asks for a number");
+        };
+        let WriterRequest::Number { secret, .. } = log.handshakes[0] else {
+            panic!("the second connection presents the number");
+        };
+        assert_eq!(
+            Some(secret),
+            drawn,
+            "the number is presented with the secret its issue drew"
         );
     }
     drain(&mut conn).await;
@@ -514,8 +548,8 @@ async fn a_writer_retired_fatal_requeues_the_tail_with_provenance() {
     {
         let log = wire.log.lock();
         assert_eq!(
-            log.handshakes,
-            vec![WriterRequest::Issue],
+            asked(&log.handshakes),
+            vec![Asked::Issue],
             "the retired number is no longer presented"
         );
     }
@@ -575,7 +609,7 @@ async fn an_archive_import_requeues_with_provenance_and_retires_the_archived_wri
     fresh.attach(wire.clone()).await.expect("attach");
     {
         let log = wire.log.lock();
-        assert_eq!(log.handshakes, vec![WriterRequest::Issue]);
+        assert_eq!(asked(&log.handshakes), vec![Asked::Issue]);
     }
     drain(&mut fresh).await;
     {
@@ -823,8 +857,8 @@ async fn a_writer_unknown_fatal_carries_the_tail_to_the_unissued_number() {
     {
         let log = wire.log.lock();
         assert_eq!(
-            log.handshakes,
-            vec![WriterRequest::Issue],
+            asked(&log.handshakes),
+            vec![Asked::Issue],
             "the carried tail presents no number, so a fresh one is asked"
         );
         assert_eq!(
@@ -1161,8 +1195,8 @@ async fn a_handshake_refusal_carries_the_unknown_or_retired_numbers_tail() {
         {
             let log = wire.log.lock();
             assert_eq!(
-                log.handshakes,
-                vec![WriterRequest::Issue],
+                asked(&log.handshakes),
+                vec![Asked::Issue],
                 "the carried tail presents no number, so a fresh one is asked"
             );
             assert_eq!(
@@ -1176,6 +1210,47 @@ async fn a_handshake_refusal_carries_the_unknown_or_retired_numbers_tail() {
             "the applied answers retired the carried entries"
         );
     }
+}
+
+/// A number stored without a secret, as a replica from before decision 22
+/// holds it, can never be named again, so its tail asks for a fresh number
+/// and settles under it (R70 decision 22).
+#[tokio::test]
+async fn a_number_held_without_a_secret_asks_for_a_fresh_one() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    write(&mut conn, 1);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    conn.attach(Wire::default().silent()).await.expect("attach");
+    drain(&mut conn).await;
+    assert_eq!(writers(&mut conn), vec!["number:1".to_owned()]);
+    conn.conn()
+        .batch_execute("UPDATE _connetto_writers SET secret = NULL")
+        .expect("forget the secret");
+    drop(conn);
+
+    let mut conn = open(&dir).await;
+    let wire = Wire::default().grant(2, 0);
+    conn.attach(wire.clone()).await.expect("attach");
+    drain(&mut conn).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(
+            asked(&log.handshakes),
+            vec![Asked::Issue],
+            "the secretless number is never presented"
+        );
+        assert_eq!(
+            log.mutations,
+            vec![1],
+            "its tail resends under the fresh number"
+        );
+    }
+    assert!(
+        conn.unsynced().is_empty(),
+        "the fresh number settled the tail"
+    );
+    assert_eq!(writers(&mut conn), vec!["number:2".to_owned()]);
 }
 
 /// The split table's local replica writes the physical table under the view,

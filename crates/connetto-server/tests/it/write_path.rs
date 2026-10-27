@@ -24,14 +24,16 @@ use core::fmt::Write as _;
 use connetto_core::auth::Principal;
 use connetto_core::chain::{GENESIS, entry_hash};
 use connetto_core::messages::{
-    ControlMessage, FatalErrorReason, MutationRejectReason, WriterGrant, WriterRequest,
+    ControlMessage, FatalErrorReason, MutationRejectReason, WriterGrant,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog, SessionConfig,
     SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{
+    Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID, number_writer,
+};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -488,7 +490,7 @@ async fn the_writer_frontier_survives_a_reconnect_reusing_the_session() {
             "worker-boot-2",
             &["user:alice"],
             None,
-            WriterRequest::Number(writer.number),
+            number_writer(writer.number),
             None,
         )
         .await;

@@ -31,7 +31,9 @@ use connetto_server::{
     RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
     SnapshotSource, ThrottleConfig, loopback, pg_write_target,
 };
-use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth};
+use connetto_test_harness::{
+    Client, ConnettoDefaults, Fixture, RosterAuth, number_writer, writer_secret,
+};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -308,8 +310,7 @@ async fn an_anonymous_run_cannot_reach_another_run_number() {
 
     // Run B: a second anonymous run names the first run's number. It is told
     // unknown, and the owner's record stands untouched.
-    let fatal =
-        refused_anonymous_handshake(&manager, "anon-b", WriterRequest::Number(number)).await;
+    let fatal = refused_anonymous_handshake(&manager, "anon-b", number_writer(number)).await;
     assert!(
         matches!(fatal.reason, FatalErrorReason::WriterUnknown),
         "another run's number must close as unknown, got {:?}",
@@ -326,8 +327,7 @@ async fn an_anonymous_run_cannot_reach_another_run_number() {
 
     // Run B cannot prune the owner's records, its settle report never reaching
     // a number it does not hold.
-    let fatal =
-        refused_anonymous_handshake(&manager, "anon-b-prune", WriterRequest::Number(number)).await;
+    let fatal = refused_anonymous_handshake(&manager, "anon-b-prune", number_writer(number)).await;
     assert!(
         matches!(fatal.reason, FatalErrorReason::WriterUnknown),
         "a foreign settle report is refused as unknown"
@@ -372,6 +372,7 @@ async fn an_anonymous_run_cannot_reach_another_run_number() {
             Some(Provenance {
                 writer: WriterRef::Number(number),
                 seq: 1,
+                secret: Some(writer_secret()),
             }),
         )
         .await;
@@ -406,7 +407,7 @@ async fn an_anonymous_run_cannot_reach_another_run_number() {
             "anon-a-resume",
             &[],
             Some(&ack.resume_token),
-            WriterRequest::Number(number),
+            number_writer(number),
             None,
         )
         .await;

@@ -36,10 +36,11 @@ impl ExportScope {
 
 /// The archive format name.
 const FORMAT: &str = "connetto-local-data";
-/// Version 5 carries each queued write's writer, sequence, chain hash and the
-/// application schema major it was captured under, beside the major the
-/// archive was made under (R31).
-const VERSION: u32 = 5;
+/// Version 6 carries each queued write's writer, the secret a number writer
+/// was issued under (R70), sequence, chain hash and the application schema
+/// major it was captured under, beside the major the archive was made under
+/// (R31).
+const VERSION: u32 = 6;
 const MANIFEST: &str = "manifest.json";
 const SYNCED_ROWS: &str = "synced.patchset";
 const LOCAL_ROWS: &str = "device-private.patchset";
@@ -136,6 +137,9 @@ pub(crate) struct ArchivedEntry {
     pub(crate) major: Option<Major>,
     /// The captured changeset.
     pub(crate) changeset: Vec<u8>,
+    /// The secret the queue's number writer was issued under, so an import
+    /// names that number to the server (R70 decision 22).
+    pub(crate) secret: Option<connetto_core::messages::WriterSecret>,
     /// The writer and sequence the write was first made under, present when
     /// the write was carried to a fresh writer or restored by an earlier
     /// import.

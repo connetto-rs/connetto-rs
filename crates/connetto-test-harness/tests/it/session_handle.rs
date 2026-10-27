@@ -10,13 +10,11 @@ use std::str::FromStr as _;
 use std::time::Duration;
 
 use connetto_core::SessionId;
-use connetto_core::messages::{
-    ControlMessage, FatalErrorReason, MutationRejectReason, WriterRequest,
-};
+use connetto_core::messages::{ControlMessage, FatalErrorReason, MutationRejectReason};
 use connetto_server::{PgSnapshotSource, RuntimeWritableCatalog};
 use connetto_test_harness::{
     Fixture, HarnessAuth, RosterAuth, Server, ServerConfig, WITHHELD_ID, insert_changeset,
-    spawn_server,
+    number_writer, spawn_server,
 };
 use sqlite_diff_rs::Value;
 
@@ -313,7 +311,7 @@ async fn the_frontier_resumes_on_the_writer_across_a_reconnect() {
             "socket-two",
             &["user:alice"],
             None,
-            WriterRequest::Number(first_writer.number),
+            number_writer(first_writer.number),
             None,
         )
         .await;

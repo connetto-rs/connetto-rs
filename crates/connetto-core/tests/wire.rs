@@ -23,7 +23,7 @@ use connetto_core::{
         RetireWriter, RevocationUpdate, RevokeDeviceRequest, ShareKeysReplaced, SignedList,
         SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority,
         SubscriptionSpec, Unsubscribe, WriterAnswer, WriterGrant, WriterOutcome, WriterRef,
-        WriterRequest,
+        WriterRequest, WriterSecret,
     },
     version::PROTOCOL_VERSION,
 };
@@ -106,8 +106,14 @@ fn handshake_and_ack_round_trip() {
         "client-a",
     )));
     for writer in [
-        WriterRequest::Issue,
-        WriterRequest::Number(12),
+        WriterRequest::Issue { secret: None },
+        WriterRequest::Issue {
+            secret: Some(WriterSecret::from_bytes([6; 32])),
+        },
+        WriterRequest::Number {
+            number: 12,
+            secret: WriterSecret::from_bytes([6; 32]),
+        },
         WriterRequest::Device,
     ] {
         round_trip_control(&ControlMessage::Handshake(
@@ -175,10 +181,17 @@ fn writer_frames_round_trip() {
         key_id: [3; 32],
         signature: vec![0x30, 0x45, 0x02],
     }));
-    for writer in [WriterRef::Device([4; 32]), WriterRef::Number(7)] {
+    for (writer, secret) in [
+        (WriterRef::Device([4; 32]), None),
+        (
+            WriterRef::Number(7),
+            Some(WriterSecret::from_bytes([8; 32])),
+        ),
+    ] {
         round_trip_control(&ControlMessage::RetireWriter(RetireWriter {
             request_id: "retire-1".into(),
             writer,
+            secret,
         }));
     }
     for outcome in [
@@ -242,6 +255,14 @@ fn mutation_control_frames_round_trip() {
         MutationHeader::new(18, 1).with_provenance(Provenance {
             writer: WriterRef::Device([5; 32]),
             seq: 3,
+            secret: None,
+        }),
+    ));
+    round_trip_control(&ControlMessage::MutationHeader(
+        MutationHeader::new(19, 1).with_provenance(Provenance {
+            writer: WriterRef::Number(4),
+            seq: 2,
+            secret: Some(WriterSecret::from_bytes([9; 32])),
         }),
     ));
     round_trip_control(&ControlMessage::MutationReject(MutationReject {
