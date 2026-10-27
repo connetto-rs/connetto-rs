@@ -24,13 +24,13 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 | At rest | SQLCipher and `sqlite3mc` with keyring or IndexedDB custody, passkey unlock in the browser and biometric or PIN unlock on Apple, Android and Windows, a device-private tier whose references SQLite enforces, retention, several accounts |
 | Portability | Streamed device archives that restore the tier, unsent writes and unsent content |
 | Files | Chunked, encrypted content with a file server and a client for both platforms, per-identity storage quotas and deployment storage and bandwidth ceilings answered with `Retry-After` |
-| Schema | Postgres DDL translated to the replica at build time by `pg2sqlite`, with write guards |
+| Schema | Postgres DDL translated to the replica at build time by `pg2sqlite`, with write guards, and a major per schema source, so one server runs per major and an updated app drains the writes and files the old build left to the major that captured them and migrates the device-private tier |
 | Peers | Device certificates with hardware attestation, and a mutual TLS link between certified devices found over mDNS or a hotspot handed over by Bluetooth beacon or QR code, hosted on Android, iPhone and Linux and joined from those, the iPad and the Mac |
 | Operations | `tracing` logs everywhere, Docker and headless Chrome suites, CI over eight workspaces with proofs on an Android emulator and an iOS simulator, both walking the Tauri demo |
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 100 phases, 85 done and 15 open. The core is built and proven, and the app system's registry and registration are built with it. What remains is the last mile around it, plus the app system's bot template and demo apps, the extension where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
+The plan in `plans/master-implementation-plan.md` tracks 100 phases, 86 done and 14 open. The core is built and proven, and the app system's registry and registration are built with it. What remains is the last mile around it, plus the app system's bot template and demo apps, the extension where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
 
 | Remaining | Phases |
 |---|---|
