@@ -69,7 +69,7 @@ impl SyncSchema {
         self
     }
 
-    /// Enable the device-wide public store.
+    /// Enable the device-wide public cache, whose major upgrades preserve account queues and whose newer major refuses older builds.
     #[must_use]
     pub fn with_shared_store(mut self, enabled: bool) -> Self {
         self.shared_store = enabled;

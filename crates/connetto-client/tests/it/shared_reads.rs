@@ -39,9 +39,13 @@ diesel::table! {
 diesel::allow_tables_to_appear_in_same_query!(vocabulary, notes);
 
 fn schema() -> SyncSchema {
+    schema_at(1)
+}
+
+fn schema_at(major: u32) -> SyncSchema {
     SyncSchema::new(
         connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(
-            &format!("{} 1\n{SCHEMA}", connetto_core::MAJOR_DIRECTIVE),
+            &format!("{} {major}\n{SCHEMA}", connetto_core::MAJOR_DIRECTIVE),
             POLICIES,
             &["vocabulary"],
         )
@@ -179,4 +183,43 @@ async fn disabling_sharing_keeps_each_accounts_public_rows_in_its_own_replica() 
     .await;
     assert_eq!(words(&mut alice), [(1, "word-1".to_owned())]);
     assert_eq!(words(&mut bob), [(2, "word-2".to_owned())]);
+}
+
+async fn open_offline(
+    directory: &std::path::Path,
+    keys: super::support::SharedKeys,
+    owner: &str,
+    schema: SyncSchema,
+) -> Result<ConnettoConnection<FakeTransport>, connetto_client::ClientError> {
+    ClientBuilder::new(
+        schema,
+        super::support::NeverDial::<FakeTransport>::default(),
+    )
+    .signed_in(super::support::held(owner))
+    .durable(
+        DataDir::new(directory.to_path_buf()),
+        keys,
+        connetto_client::MemoryRefreshStore::default(),
+    )
+    .open_driven()
+    .await
+}
+
+#[tokio::test]
+async fn an_older_build_refuses_a_newer_shared_cache_for_a_fresh_account() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = super::support::SharedKeys::default();
+    drop(
+        open_offline(directory.path(), keys.clone(), "alice", schema_at(2))
+            .await
+            .unwrap(),
+    );
+    match open_offline(directory.path(), keys, "bob", schema_at(1)).await {
+        Err(connetto_client::ClientError::ReplicaNewer { recorded, build }) => {
+            assert_eq!(recorded.get(), 2);
+            assert_eq!(build.get(), 1);
+        }
+        Err(error) => panic!("expected a newer shared-cache refusal, got {error:?}"),
+        Ok(_) => panic!("an older build opened a newer shared cache"),
+    }
 }
