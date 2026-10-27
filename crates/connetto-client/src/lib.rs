@@ -7318,7 +7318,7 @@ where
             ControlMessage::SnapshotEnd(end) => {
                 // This records a resume position for rows delivered on the
                 // other plane, so it depends on the server having sent them
-                // first: see the invariant on `persist_cursor`.
+                // first: see the invariant on `persist_cursor_and_subjects`.
                 //
                 // An empty cursor carries no resume information: never let
                 // it regress a real one, in memory or in the replica.

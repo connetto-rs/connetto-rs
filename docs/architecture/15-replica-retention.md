@@ -145,7 +145,7 @@ This constraint has no urgency today. The workspace is at `version = "0.0.0"`, u
 
 ## The create path
 
-**Decided (R15).** The deleted upstream proposals stated that "the replica templates bake `auto_vacuum = INCREMENTAL` at build time." That claim was stale. There is no replica template. `Replica::PlaintextFile` and `connect_with_plaintext_template` were deleted in phase E5 (recorded in `docs/roadmap.md` under "Replica encryption at rest"). Neither symbol exists in `crates/connetto-client/src/replica.rs` or `crates/connetto-client/src/lib.rs`. Baked templates survive only for the local tier's first boot, which is a different SQLite file. connetto creates the replica through `connect_inner` in `crates/connetto-client/src/lib.rs`.
+**Decided (R15).** The deleted upstream proposals stated that "the replica templates bake `auto_vacuum = INCREMENTAL` at build time." That claim was stale. There is no replica template. `Replica::PlaintextFile` and `connect_with_plaintext_template` were deleted in phase E5 (recorded in `docs/roadmap.md` under "Replica encryption at rest"). Neither symbol exists in `crates/connetto-client/src/replica.rs` or `crates/connetto-client/src/lib.rs`. Baked templates survive only for the local tier's first boot, which is a different SQLite file. connetto creates the replica through `ConnettoConnection::open_inner` in `crates/connetto-client/src/lib.rs`.
 
 **Built.** The existing pragma sequence in `open_inner`, documented in `docs/architecture/14-at-rest-encryption.md`, is:
 
@@ -156,7 +156,7 @@ This constraint has no urgency today. The workspace is at `version = "0.0.0"`, u
 5. Application DDL (`sqlite_ddl`), run without its synced references (R92)
 6. `META_DDL` (connetto's `_connetto_meta` and `_connetto_pending` tables)
 
-**Decided (R15).** `PRAGMA auto_vacuum = INCREMENTAL` joins this sequence after step 2 and before step 5. After step 2 because the key pragma in step 1 must precede any statement that reads the database header, and WAL is established immediately after it. Before step 5 because both the application DDL and `META_DDL` create tables, and the mode must precede the first `CREATE TABLE`. On the `connect_existing` path the database already has its schema and the mode is already stored in the file from the original create, so the pragma applies only on the `connect` path.
+**Decided (R15).** `PRAGMA auto_vacuum = INCREMENTAL` joins this sequence after step 2 and before step 5. After step 2 because the key pragma in step 1 must precede any statement that reads the database header, and WAL is established immediately after it. Before step 5 because both the application DDL and `META_DDL` create tables, and the mode must precede the first `CREATE TABLE`. On the `open_existing` path the database already has its schema and the mode is already stored in the file from the original create, so the pragma applies only on the `open` path.
 
 Chapter 14 is the authoritative source for the unlock ordering constraint. This chapter records only that `auto_vacuum` joins that sequence and where it lands relative to the DDL steps.
 

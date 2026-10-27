@@ -193,7 +193,7 @@ pub enum FakeTransportError {
 /// A transport that answers the handshake with a canned reply and drops
 /// everything else on the floor.
 ///
-/// Enough to drive `connect`, `connect_existing`, and `resume` with no server.
+/// Enough to drive `attach` with no server.
 /// Because it acknowledges nothing after the handshake, an uploaded mutation is
 /// never retired, which is how a test arranges a replica that still has unsynced
 /// work in it.

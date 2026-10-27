@@ -399,7 +399,7 @@ async fn content_only_import_wakes_outbox_driver() {
         .await
         .expect("prepare");
     let mut events = target.events();
-    // The driver parks after the boot pass. The import signals import_notify,
+    // The driver parks after the boot pass. The import signals outbox_wake,
     // waking the driver, which uploads the file and emits Uploaded.
     tokio::select! {
         () = target.drive_outbox(|_: core::time::Duration| core::future::ready(())) => {

@@ -1243,7 +1243,7 @@ fn store_error(err: &AuthError) -> ClientError {
 /// none cached.
 ///
 /// Provision-once, and the browser mirror of
-/// `connetto_client::auth::provision_replica_key`: a key already cached on this
+/// `connetto_client::replica::provision_replica_key`: a key already cached on this
 /// device always wins and is never overwritten, so a second login cannot
 /// silently re-key a replica and strand its contents. Only when nothing is
 /// cached is a fresh key minted, and it is written through first.

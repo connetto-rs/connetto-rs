@@ -3,8 +3,8 @@
 //! Every authorization question goes through subql's [`VisibilityPolicy`], so
 //! what answers it is an implementation detail rather than a structural
 //! commitment. The shipped answer is `FgaAuth` (R5b) and [`RlsAuth`] is the
-//! row-level-security one, kept as the second opinion `ParityAuth` compares
-//! against.
+//! row-level-security one, kept as the
+//! [`SecondOpinion`](crate::parity::SecondOpinion) a run can ask beside it.
 //!
 //! [`VisibilityPolicy`]: subql::visibility::VisibilityPolicy
 
