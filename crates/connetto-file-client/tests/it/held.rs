@@ -167,3 +167,15 @@ async fn hold_is_a_no_op_without_content() {
         .expect("hold finds no content tables");
     assert!(!did_hold, "no content, nothing held");
 }
+
+/// A replica no rebuild ever held from counts its unsent file as content
+/// work and no held file.
+#[tokio::test]
+async fn pending_work_before_any_rebuild_counts_no_held_files() {
+    let dir = tempdir().expect("a scratch directory");
+    let (_client, content) = offline_content(dir.path()).await;
+    stage_photo(&content, 1, b"a photo never held", MimeClass::Jpeg).await;
+    let work = content.pending_work().await.expect("the gate answers");
+    assert_eq!(work.content_files, 1, "the unsent file is content work");
+    assert_eq!(work.held_files, 0, "nothing was ever held");
+}

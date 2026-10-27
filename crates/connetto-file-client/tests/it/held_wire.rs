@@ -20,7 +20,7 @@ use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, MAJOR_DIRECTIVE, Major, SchemaVersion, loopback};
 use connetto_file_client::{
-    ContentArchive, ContentClient, ContentError, ContentFlush, ContentFlushStart,
+    ContentArchive, ContentClient, ContentError, ContentEvent, ContentFlush, ContentFlushStart,
     ContentFlushState, ContentUpload, FsStore, held_content,
 };
 use connetto_file_core::{FileId, MimeClass};
@@ -507,44 +507,216 @@ async fn accept_keys(
         .expect("process the replacement answer");
 }
 
+/// Grants the held file's ticket on `server` while one walk asks for it, and
+/// returns the upload the walk starts.
+async fn granted_upload(
+    archive: &ContentArchive<FsStore>,
+    conn: &mut ConnettoConnection<LoopbackTransport>,
+    server: &mut LoopbackTransport,
+) -> ContentUpload<FsStore> {
+    let mut state = ContentFlushState::default();
+    let ((start, _), ()) = tokio::join!(
+        begin(
+            archive,
+            conn,
+            &mut state,
+            tokio::time::sleep(Duration::from_secs(5))
+        ),
+        grant_ticket(server),
+    );
+    let ContentFlushStart::Upload(upload) = start.expect("the authorized file gets a ticket")
+    else {
+        panic!("the authorized file must upload");
+    };
+    upload
+}
+
+/// Grants the next held ticket request `server` receives.
+async fn grant_ticket(server: &mut LoopbackTransport) {
+    let ControlMessage::ContentTicketRequest(request) = control(server).await else {
+        panic!("expected the held file's ticket request");
+    };
+    server
+        .send_control(ControlMessage::ContentTicketGrant(ContentTicketGrant {
+            request_id: request.request_id,
+            url: GRANT_URL.to_owned(),
+        }))
+        .await
+        .expect("grant the correlated file ticket");
+}
+
 async fn upload_authorized_file(
     dir: &TempDir,
     conn: &mut ConnettoConnection<LoopbackTransport>,
     server: &mut LoopbackTransport,
 ) {
     let archive = ContentArchive::new(FsStore::new(dir.path().join("chunks")), ROOT_KEY);
-    let mut state = ContentFlushState::default();
-    let answer = async {
-        let ControlMessage::ContentTicketRequest(request) = control(server).await else {
-            panic!("expected the held file's ticket request");
-        };
-        server
-            .send_control(ControlMessage::ContentTicketGrant(ContentTicketGrant {
-                request_id: request.request_id,
-                url: GRANT_URL.to_owned(),
-            }))
-            .await
-            .expect("grant the correlated file ticket");
-    };
-    let ((start, _), ()) = tokio::join!(
-        begin(
-            &archive,
-            conn,
-            &mut state,
-            tokio::time::sleep(Duration::from_secs(5))
-        ),
-        answer,
-    );
-    let ContentFlushStart::Upload(upload) = start.expect("the authorized file gets a ticket")
-    else {
-        panic!("the authorized file must upload");
-    };
+    let upload = granted_upload(&archive, conn, server).await;
     assert_eq!(
         finish_upload(&archive, conn, &upload).await,
         ContentFlush::Progressed
     );
     assert!(!conn.held_files_pending().expect("read the held files"));
     assert_eq!(conn.draining_major(), None);
+}
+
+/// A held upload the file server refuses for good loses the file. Its rows
+/// go, the loss is reported, and the batch closes with nothing left to walk.
+#[tokio::test]
+async fn a_held_upload_the_file_server_refuses_loses_the_file() {
+    let (dir, _file_id) = held_file_offline().await;
+    let mut conn = reopen_held(&dir).await;
+    let archive = ContentArchive::new(FsStore::new(dir.path().join("chunks")), ROOT_KEY);
+    let mut server = attach_held(&mut conn).await;
+    let upload = granted_upload(&archive, &mut conn, &mut server).await;
+    let refused = upload
+        .transfer(&RecordingHttp::new([(422, Vec::new())]))
+        .await
+        .expect_err("the file server refuses the upload");
+    assert_eq!(
+        archive
+            .finish_held_upload(&mut conn, &upload, one(), Err(refused))
+            .await
+            .expect("the bookkeeping"),
+        ContentFlush::Progressed,
+        "the refused file settles the walk"
+    );
+    assert!(!conn.held_files_pending().expect("read the held files"));
+    let mut events = Vec::new();
+    while let Some(event) = conn
+        .pump_one_or(core::future::ready(()))
+        .await
+        .expect("a pump step")
+    {
+        if !matches!(event, ClientEvent::SyncStatus(_)) {
+            events.push(event);
+        }
+    }
+    assert_eq!(
+        events,
+        [
+            ClientEvent::Held(HeldWork::Lost {
+                major: one(),
+                writes: Vec::new(),
+                files: 1,
+            }),
+            ClientEvent::Held(HeldWork::Drained { major: one() }),
+        ]
+    );
+    assert_eq!(conn.draining_major(), None);
+    let mut state = ContentFlushState::default();
+    let (start, _observed) = begin(&archive, &mut conn, &mut state, Never).await;
+    assert!(
+        matches!(start, Ok(ContentFlushStart::Complete(ContentFlush::Empty))),
+        "nothing is left to walk"
+    );
+}
+
+/// A protocol failure on the drain wire while a held ticket waits defers the
+/// file and frees the waiting slot, so the next walk asks again.
+#[tokio::test]
+async fn a_protocol_failure_under_a_held_ticket_defers_the_file() {
+    let (dir, _file_id) = held_file_offline().await;
+    let mut conn = reopen_held(&dir).await;
+    let archive = ContentArchive::new(FsStore::new(dir.path().join("chunks")), ROOT_KEY);
+    let mut server = attach_held(&mut conn).await;
+    let mut state = ContentFlushState::default();
+    let violate = async {
+        let ControlMessage::ContentTicketRequest(_) = control(&mut server).await else {
+            panic!("expected the held file's ticket request");
+        };
+        server
+            .send_control(ControlMessage::ShareKeysReplaced(ShareKeysReplaced {
+                request_id: "never-asked".to_owned(),
+            }))
+            .await
+            .expect("answer a replacement nobody asked for");
+    };
+    let ((start, _observed), ()) = tokio::join!(
+        begin(
+            &archive,
+            &mut conn,
+            &mut state,
+            tokio::time::sleep(Duration::from_secs(5))
+        ),
+        violate,
+    );
+    assert!(
+        matches!(
+            start,
+            Ok(ContentFlushStart::Complete(ContentFlush::Deferred))
+        ),
+        "the failed wait keeps the file for a later walk"
+    );
+    assert!(!state.is_waiting(), "the failed wait frees the slot");
+    assert!(conn.held_files_pending().expect("read the held files"));
+}
+
+/// A held file whose chunk list is gone cannot upload, so it is lost rather
+/// than holding its batch open for ever.
+#[tokio::test]
+async fn a_held_file_without_its_manifest_is_lost() {
+    use diesel::connection::SimpleConnection as _;
+
+    let (dir, _file_id) = held_file_offline().await;
+    let mut conn = reopen_held(&dir).await;
+    let archive = ContentArchive::new(FsStore::new(dir.path().join("chunks")), ROOT_KEY);
+    let _server = attach_held(&mut conn).await;
+    conn.conn()
+        .batch_execute("DELETE FROM _connetto_held_content_chunks")
+        .expect("drop the held chunk list");
+    let mut state = ContentFlushState::default();
+    let (start, _observed) = begin(&archive, &mut conn, &mut state, Never).await;
+    assert!(
+        matches!(
+            start,
+            Ok(ContentFlushStart::Complete(ContentFlush::Progressed))
+        ),
+        "the file settles as lost"
+    );
+    assert!(!conn.held_files_pending().expect("read the held files"));
+    assert_eq!(conn.draining_major(), None, "the batch closes");
+}
+
+/// The native content driver forgets a held file the file server refuses
+/// for good, and says so.
+#[tokio::test]
+async fn the_content_driver_reports_a_refused_held_file() {
+    let (dir, file_id) = held_file_offline().await;
+    let mut conn = reopen_held(&dir).await;
+    let mut server = attach_held(&mut conn).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
+    let content = ContentClient::attach(
+        client.clone(),
+        FsStore::new(dir.path().join("chunks")),
+        ROOT_KEY,
+        RecordingHttp::new([(422, Vec::new())]),
+    )
+    .await
+    .expect("attach content");
+    let mut events = content.events();
+    let refused = async {
+        grant_ticket(&mut server).await;
+        loop {
+            if let Ok(ContentEvent::UploadRefused { file_id, .. }) = events.recv().await {
+                break file_id;
+            }
+        }
+    };
+    let refused_file = tokio::select! {
+        () = content.drive_outbox(|_| core::future::ready(())) => panic!("the driver ended"),
+        refused_file = refused => refused_file,
+        () = tokio::time::sleep(Duration::from_secs(10)) => panic!("the refusal never surfaced"),
+    };
+    assert_eq!(refused_file, file_id);
+    assert!(
+        !client
+            .held_files_pending()
+            .await
+            .expect("read the held files"),
+        "the refused file leaves the held rows"
+    );
 }
 
 #[tokio::test]

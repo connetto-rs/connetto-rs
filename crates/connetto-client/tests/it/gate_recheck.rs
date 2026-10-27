@@ -401,6 +401,18 @@ async fn a_return_beyond_the_grace_locks_and_refuses() {
         matches!(client.unsynced().await, Err(ClientError::Locked)),
         "the unsynced list is refused while locked"
     );
+    assert!(
+        matches!(client.pending_work().await, Err(ClientError::Locked)),
+        "the pending work is refused while locked"
+    );
+    assert!(
+        matches!(client.held_files_ready().await, Err(ClientError::Locked)),
+        "the held files' readiness is refused while locked"
+    );
+    assert!(
+        matches!(client.held_files_pending().await, Err(ClientError::Locked)),
+        "the held files' count is refused while locked"
+    );
 }
 
 /// A zero grace re-checks on every return, however brief.
