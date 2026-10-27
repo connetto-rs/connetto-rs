@@ -2276,7 +2276,7 @@ async fn second_intent_with_different_chunks_refused() {
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "second intent with different chunks returns 200 (AlreadyPresent collapses ManifestConflict)"
+        "second intent with different chunks returns 200 (AlreadyPresent whether or not the chunks match)"
     );
 }
 

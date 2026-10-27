@@ -953,9 +953,9 @@ mod tests {
     /// backend, so a wrong answer here is a picker offering accounts that are not
     /// there or hiding ones that are.
     ///
-    /// The integration twin against the real keyring is
-    /// `the_keyring_refresh_store_lists_every_account_it_holds`, which a headless
-    /// or locked session cannot run. This half needs no secure storage.
+    /// Its twin against a durable store is the read phase in
+    /// `tests/it/linux_custody.rs`, which asserts the accounts a fresh process
+    /// lists after another one wrote them. This half needs no secure storage.
     #[test]
     fn the_account_index_records_each_account_once() {
         assert_eq!(

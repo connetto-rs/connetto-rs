@@ -218,7 +218,7 @@ fn one_kind(terms: &[TermDescription], side: TermCaller) -> Result<ScalarFamily,
 /// admits here exactly as it does in the database.
 ///
 /// Each key has to render here exactly as `CallerBinding` packs it into
-/// `app.subjects` through [`CapabilityKey::pack`], because that packed list
+/// `app.subjects` through [`CapabilityKey::subjects`], because that packed list
 /// is what the membership subquery compares against in SQL. A change to
 /// either rendering that the other does not follow leaves the seed matching
 /// no membership row while the database still matches one, which admits

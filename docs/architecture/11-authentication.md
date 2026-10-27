@@ -315,7 +315,7 @@ Each identity keeps its own replica, encrypted at rest per `14-at-rest-encryptio
 
 ## Protocol impact
 
-**Decided (R2, R3).** Three breaking wire changes (`PROTOCOL_VERSION` stays frozen until the first release with one deliberate bump then, see the version-bump decision in `02-protocol.md`). First, the single credential field is replaced by `Handshake.grants`, a list of zero or more opaque grants. Second, the handle becomes real: the reply carries it in the clear beside a signed credential the client persists and presents on reconnect, replacing the connection-scoped placeholder that was there before. Third, `FullResyncReason` gains a variant for an authorization change, sent when the change log delivers a grant change for a live subscription. `FatalErrorReason::AuthenticationFailed` from the earlier seam work remains and covers the case where the connection is refused entirely.
+**Decided (R2, R3).** Three breaking wire changes (`PROTOCOL_VERSION` stays frozen until the first release with one deliberate bump then, see the version-bump decision in `02-protocol.md`). First, the single credential field is replaced by `Handshake.grants`, a list of zero or more opaque grants. Second, the handle becomes real: the reply carries it in the clear beside a signed credential the client persists and presents on reconnect, replacing the connection-scoped placeholder that was there before. Third, `FullResyncReason` gains a variant for an authorization change, sent when the change log delivers a grant change for a live subscription. No fatal reason refuses a connection over its grants, because a grant that fails to resolve leaves the connection open and says nothing.
 
 ---
 
