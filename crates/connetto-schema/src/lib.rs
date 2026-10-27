@@ -11,6 +11,29 @@
 //! The server runs the same step at boot over its own sources, so a client
 //! and its server agree on the version iff the pg2sqlite that built each of
 //! them emitted the same replica DDL for the same sources.
+//!
+//! A build that carries a local tier passes [`TierSource`] to [`emit`],
+//! which pairs the tier's source document with the directory its history
+//! lives in. That directory holds one export per exported major, the file
+//! `<N>.sql`, the local tier of major `N` translated the way the build
+//! translates it, beside the optional `<N>.boundary.toml` that declares
+//! the drops and renames the boundary into major `N` allows. The
+//! declaration file holds `dropped_tables`, a top-level array of table
+//! names, `dropped_columns`, a map from a table to the columns it drops,
+//! `renamed_tables`, a map from an old table name to its new one, and
+//! `renamed_columns`, a map from a table name at major `N - 1` to a map
+//! from each old column to its new name. [`emit`] only reads that
+//! directory and fails the build when the directory is missing, when its
+//! current major holds no export, when that export is stale, or when its
+//! majors hold a gap.
+//!
+//! The `connetto-schema export-tier` command, the crate's binary
+//! `connetto-schema`, writes that current export instead. It translates the
+//! tier over the major the schema source declares and writes that major's
+//! `<N>.sql` alone, so it never rewrites the exports of the majors below
+//! the current one. With `--check` it writes nothing and fails instead when
+//! the current export is missing or stale, the gate a CI run adds to keep a
+//! history fresh.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
@@ -42,6 +65,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Location, Token};
 use thiserror::Error;
+mod boundary;
 
 diesel::table! {
     /// SQLite's own catalogue, read to list the views a translation built.
@@ -75,6 +99,120 @@ pub enum SchemaError {
     /// The step ran outside a cargo build script.
     #[error("OUT_DIR is unset, so the bundle cannot be written from here")]
     MissingOutDir,
+    /// The build has a tier but its history directory is not there.
+    #[error("the tier history directory {dir} is missing, the build needs its exports", dir = .dir.display())]
+    MissingHistoryDir {
+        /// The directory the exports live in.
+        dir: std::path::PathBuf,
+    },
+    /// The tier history holds no export for the build's own major.
+    #[error("the tier history holds no export for major {major}, run `connetto-schema export-tier --schema <schema> --tier <tier> --dir {dir}`", dir = .dir.display())]
+    MissingExport {
+        /// The major the export is missing for.
+        major: u32,
+        /// The export file the command writes.
+        path: std::path::PathBuf,
+        /// The history directory the file would live in.
+        dir: std::path::PathBuf,
+    },
+    /// The tier history's export for the build's major differs from the
+    /// translation the build just computed.
+    #[error("the export {path} for major {major} is stale against the current sources, run `connetto-schema export-tier` over them", path = .path.display())]
+    StaleExport {
+        /// The major the export is stale for.
+        major: u32,
+        /// The export file the command rewrites.
+        path: std::path::PathBuf,
+        /// The history directory the file lives in.
+        dir: std::path::PathBuf,
+    },
+    /// The history's exported majors skip one the build's tier crossed.
+    #[error(
+        "the tier history jumps from major {lowest} to major {build} without exporting major {missing}"
+    )]
+    HistoryGap {
+        /// The directory the exports live in.
+        dir: std::path::PathBuf,
+        /// The major the history skipped.
+        missing: u32,
+        /// The oldest major the history holds.
+        lowest: u32,
+        /// The build's own major.
+        build: u32,
+    },
+    /// The diff between two exports drops a table the boundary file does
+    /// not declare.
+    #[error(
+        "the boundary for major {boundary} drops table {table}, which its declaration file does not declare"
+    )]
+    UndeclaredTableDrop {
+        /// The table the diff drops.
+        table: String,
+        /// The boundary the drop sits in.
+        boundary: u32,
+    },
+    /// The diff between two exports drops a column the boundary file does
+    /// not declare.
+    #[error(
+        "the boundary for major {boundary} drops column {column} of table {table}, which its declaration file does not declare"
+    )]
+    UndeclaredColumnDrop {
+        /// The table the column sits in.
+        table: String,
+        /// The column the diff drops.
+        column: String,
+        /// The boundary the drop sits in.
+        boundary: u32,
+    },
+    /// The diff adds a not null column without a default, which an add
+    /// column cannot apply and a rebuild would fill with nulls.
+    #[error(
+        "the boundary for major {boundary} adds not null column {column} of table {table} without a default"
+    )]
+    NewNotNullColumnWithoutDefault {
+        /// The table the column is added to.
+        table: String,
+        /// The column the diff adds.
+        column: String,
+        /// The boundary the add sits in.
+        boundary: u32,
+    },
+    /// The boundary file declares a change the diff between the two
+    /// exports does not hold.
+    #[error("the boundary file {path} declares a change the diff does not hold, {detail}", path = .path.display())]
+    DeclarationMismatch {
+        /// The declaration file that holds the entry.
+        path: std::path::PathBuf,
+        /// The entry that does not match.
+        detail: String,
+    },
+    /// A boundary declaration file does not parse.
+    #[error("the boundary file {path} does not parse, {detail}", path = .path.display())]
+    BoundaryFile {
+        /// The file that does not parse.
+        path: std::path::PathBuf,
+        /// What the parser reported.
+        detail: String,
+    },
+    /// The export for one major holds a view or a trigger that names a
+    /// table or view the export does not hold, which a fresh install of the
+    /// export would carry dangling.
+    #[error(
+        "the export for major {major} holds {kind} {name} that names a table or view the export does not hold: {detail}"
+    )]
+    DanglingExportObject {
+        /// The major the export was written for.
+        major: u32,
+        /// The kind of the object, `view` or `trigger`.
+        kind: String,
+        /// The name of the object that names what is absent.
+        name: String,
+        /// What SQLite reported on the probe's rename.
+        detail: String,
+    },
+    /// The tier history does not fit the bundle the build just translated.
+    #[error(transparent)]
+    TierHistory(#[from] connetto_core::TierHistoryError),
     /// The shared table list names a table the synced schema does not declare.
     #[error("the shared table list names `{table}`, which the synced schema does not declare")]
     SharedTableUndeclared {
@@ -538,15 +676,152 @@ fn offset(text: &str, lines: &[usize], at: Location) -> usize {
         .nth(column)
         .map_or(text.len(), |(at, _)| start + at)
 }
+/// The local tier a build translates beside its synced schema, and the
+/// directory of its exports the build reads its tier history from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierSource {
+    /// The Postgres source document the tier translates from.
+    source: std::path::PathBuf,
+    /// The directory the tier exports and boundary files live in.
+    history: std::path::PathBuf,
+}
+
+impl TierSource {
+    /// The tier source document and the directory its exports live in.
+    #[must_use]
+    pub fn new(
+        source: impl Into<std::path::PathBuf>,
+        history: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            history: history.into(),
+        }
+    }
+
+    /// The Postgres source document the tier translates from.
+    #[must_use]
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
+
+    /// The directory the tier exports and boundary files live in.
+    #[must_use]
+    pub fn history(&self) -> &Path {
+        &self.history
+    }
+}
+
+/// The export one run of [`export_tier`] wrote or checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportOutcome {
+    /// The export file the run wrote or checked.
+    pub path: std::path::PathBuf,
+}
+
+/// Translate one local tier source exactly the way the build translates it
+/// and write, or with `check` check only, the export for the schema source's
+/// major into the history directory.
+///
+/// A run never rewrites an export for a major it was not given, so a history
+/// directory keeps its older exports intact while its current one is
+/// refreshed. `check` writes nothing and fails when the current export is
+/// missing or differs from the translation the same sources would compute
+/// now, which is the CI gate that keeps a history fresh.
+///
+/// # Errors
+///
+/// As [`translate`], plus [`SchemaError::MissingExport`] and
+/// [`SchemaError::StaleExport`] in `check` mode for the current export.
+pub fn export_tier<K: CapabilityKey, Id: BotRegistryIdSql>(
+    schema: &Path,
+    tier: &Path,
+    dir: &Path,
+    check: bool,
+) -> Result<ExportOutcome, SchemaError> {
+    let schema_sql = std::fs::read_to_string(schema)?;
+    let tier_sql = std::fs::read_to_string(tier)?;
+    let major = connetto_core::Major::declared_in(&schema_sql)?;
+    let tier_ddl = translate_tier::<K>(&tier_sql)?;
+    let path = dir.join(format!("{major}.sql"));
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(existing) => Some(existing),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
+    let fresh = existing.as_deref() != Some(tier_ddl.as_str());
+    if check && fresh {
+        return Err(match existing {
+            Some(_) => SchemaError::StaleExport {
+                major: major.get(),
+                path,
+                dir: dir.to_path_buf(),
+            },
+            None => SchemaError::MissingExport {
+                major: major.get(),
+                path,
+                dir: dir.to_path_buf(),
+            },
+        });
+    }
+    if fresh {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(&path, tier_ddl)?;
+    }
+    Ok(ExportOutcome { path })
+}
+
+/// The translated local tier one source document holds, validated against a
+/// throwaway SQLite database the same way the build validates it.
+///
+/// # Errors
+///
+/// As [`translate`], with [`SchemaError::Sqlite`] for the local tier.
+fn translate_tier<K: CapabilityKey>(tier_sql: &str) -> Result<String, SchemaError> {
+    let options = options::<K>();
+    let tier = parsed_documents(tier_sql, "")?;
+    let report = tier
+        .translate_with_report(&options)
+        .map_err(|err| SchemaError::Translate(err.to_string()))?;
+    let ddl = statements_to_ddl(report.script.iter());
+    validate(&ddl, "local tier")?;
+    Ok(ddl)
+}
+
+/// Print a rerun trigger for the history directory and every file in it,
+/// failing the build when the directory is not there.
+///
+/// # Errors
+///
+/// [`SchemaError::MissingHistoryDir`] when the directory is absent,
+/// [`SchemaError::Io`] when a file cannot be read.
+fn rerun_history(dir: &Path) -> Result<(), SchemaError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SchemaError::MissingHistoryDir {
+                dir: dir.to_path_buf(),
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
+    println!("cargo::rerun-if-changed={}", dir.display());
+    for entry in entries {
+        let path = entry.map_err(SchemaError::from)?.path();
+        println!("cargo::rerun-if-changed={}", path.display());
+    }
+    Ok(())
+}
 
 /// The build-script entry point.
 ///
 /// Reads the two Postgres source documents, translates the synced tier and,
-/// when `local_tier` is given, the demo's own local tier as a separate
-/// reference universe, validates both DDLs against a throwaway SQLite
-/// database, checks `shared` under [`shared_tables`], and writes
-/// `connetto-schema.rs` under `OUT_DIR`. It prints `cargo::rerun-if-changed`
-/// for every file it reads.
+/// when a [`TierSource`] is given, the deployment's own local tier as a
+/// separate reference universe and the tier history its exports hold,
+/// validates both DDLs against a throwaway SQLite database, checks `shared`
+/// under [`shared_tables`], and writes `connetto-schema.rs` under `OUT_DIR`.
+/// It prints `cargo::rerun-if-changed` for every file it reads, the history
+/// directory's files included.
 ///
 /// The application that ships the schema includes the file and reads the
 /// bundle through the module it defines:
@@ -563,41 +838,57 @@ fn offset(text: &str, lines: &[usize], at: Location) -> usize {
 /// such as `concat!` can use them without re-deriving the bundle. `emit` also
 /// writes the cap document to `connetto-cap-policies.sql` in `OUT_DIR`, the
 /// SQL the deployment applies beside its schema and policies.
+///
 /// # Errors
 ///
 /// As [`translate`] and [`shared_tables`], plus [`SchemaError::MissingOutDir`]
-/// outside a build script and [`SchemaError::Sqlite`] for a refused local
-/// tier.
+/// outside a build script, [`SchemaError::Sqlite`] for a refused local tier,
+/// the tier history errors for a build with a tier, and
+/// [`SchemaError::TierHistory`] when the history does not reach the bundle's
+/// major.
 pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
     schema: &Path,
     policies: &Path,
-    local_tier: Option<&Path>,
+    tier: Option<&TierSource>,
     shared: &[&str],
+) -> Result<(), SchemaError> {
+    let out_dir = std::env::var("OUT_DIR").map_err(|_| SchemaError::MissingOutDir)?;
+    emit_to::<K, Id>(schema, policies, tier, shared, Path::new(&out_dir))
+}
+
+/// The body of [`emit`], its output directory supplied, so a test can run
+/// the step without a build script.
+///
+/// # Errors
+///
+/// As [`emit`], minus [`SchemaError::MissingOutDir`].
+pub(crate) fn emit_to<K: CapabilityKey, Id: BotRegistryIdSql>(
+    schema: &Path,
+    policies: &Path,
+    tier: Option<&TierSource>,
+    shared: &[&str],
+    out_dir: &Path,
 ) -> Result<(), SchemaError> {
     println!("cargo::rerun-if-changed={}", schema.display());
     println!("cargo::rerun-if-changed={}", policies.display());
+    if let Some(tier) = tier {
+        println!("cargo::rerun-if-changed={}", tier.source().display());
+        rerun_history(tier.history())?;
+    }
     let schema_sql = std::fs::read_to_string(schema)?;
     let policies_sql = std::fs::read_to_string(policies)?;
     let cap = cap_policies::<Id>(&schema_sql, &policies_sql)?;
     let mut bundle = translate_shared::<K, Id>(&schema_sql, &policies_sql, shared)?;
-    if let Some(local_tier) = local_tier {
-        println!("cargo::rerun-if-changed={}", local_tier.display());
-        let tier_sql = std::fs::read_to_string(local_tier)?;
-        let options = options::<K>();
-        let tier = parsed_documents(&tier_sql, "")?;
-        let report = tier
-            .translate_with_report(&options)
-            .map_err(|err| SchemaError::Translate(err.to_string()))?;
-        let ddl = statements_to_ddl(report.script.iter());
-        validate(&ddl, "local tier")?;
-        bundle = bundle.with_local_tier(ddl);
+    if let Some(tier) = tier {
+        let tier_sql = std::fs::read_to_string(tier.source())?;
+        let tier_ddl = translate_tier::<K>(&tier_sql)?;
+        let history = boundary::tier_history(tier.history(), bundle.major(), &tier_ddl)?;
+        bundle = bundle
+            .with_local_tier(tier_ddl)
+            .with_tier_history(history)?;
     }
-    let out_dir = std::env::var("OUT_DIR").map_err(|_| SchemaError::MissingOutDir)?;
-    std::fs::write(Path::new(&out_dir).join("connetto-cap-policies.sql"), &cap)?;
-    std::fs::write(
-        Path::new(&out_dir).join("connetto-schema.rs"),
-        render(&bundle, &cap),
-    )?;
+    std::fs::write(out_dir.join("connetto-cap-policies.sql"), &cap)?;
+    std::fs::write(out_dir.join("connetto-schema.rs"), render(&bundle, &cap))?;
     Ok(())
 }
 
@@ -816,7 +1107,10 @@ fn validate_shared(program: &str) -> Result<(), SchemaError> {
 /// The translated documents are named as literals so the included module is
 /// all the demo's runtime needs, a `bundle()` that builds the
 /// [`connetto_core::SchemaBundle`], plus the `pub const` documents for the
-/// `const` contexts that cannot re-derive the bundle.
+/// `const` contexts that cannot re-derive the bundle. When the build has a
+/// local tier, `bundle()` also attaches the tier history the build read from
+/// its exports, so the device holds every generated step from the oldest
+/// exported major to the build's own major.
 fn render(bundle: &SchemaBundle, cap: &str) -> String {
     let tier = match bundle.local_tier_ddl() {
         Some(tier) => {
@@ -828,6 +1122,11 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
             )
         }
         None => "pub const LOCAL_TIER_DDL: Option<&str> = None;".to_string(),
+    };
+    let history = if bundle.local_tier_ddl().is_some() {
+        history_call(bundle.tier_history())
+    } else {
+        String::new()
     };
     let tables = bundle
         .policy_tables()
@@ -895,7 +1194,8 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
          )\n\
          .expect(\"the build step translated this bundle\")\n\
          .with_shared_tables(SHARED_TABLES.iter().copied())\n\
-         .with_connection_ddl(CONNECTION_DDL);\n\
+         .with_connection_ddl(CONNECTION_DDL)\n\
+         {history};\n\
          if let Some((both_fresh, main_fresh, shared_fresh, reopen)) = SHARED_LAYOUT {{\n\
              bundle = bundle.with_shared_layout(\n\
                  connetto_core::SharedLayout::new(both_fresh, main_fresh, shared_fresh, reopen),\n\
@@ -920,6 +1220,49 @@ fn borrowed_slice(names: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("&[{names}]")
+}
+
+/// The `bundle()` code that attaches the tier history a build with a tier
+/// read from its exports.
+fn history_call(history: &connetto_core::schema::TierHistory) -> String {
+    let first = match history.first_with_tier() {
+        Some(first) => format!("Some({})", major_literal(first)),
+        None => "None".to_string(),
+    };
+    let boundaries = history
+        .boundaries()
+        .iter()
+        .map(|boundary| {
+            format!(
+                "connetto_core::TierBoundary::new(\n    {},\n    {},\n)",
+                major_literal(boundary.from()),
+                raw_literal(boundary.sql())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n        ");
+    format!(
+        ".with_tier_history(\n\
+         connetto_core::TierHistory::new(\n\
+         {},\n\
+         {},\n\
+         vec![\n\
+         {}\n\
+         ],\n\
+         ),\n\
+         )\n\
+         .expect(\"the build step generated this history\")",
+        major_literal(history.oldest()),
+        first,
+        boundaries
+    )
+}
+
+/// The one-line code a build's `bundle()` holds for one checked major.
+fn major_literal(major: connetto_core::Major) -> String {
+    format!(
+        "connetto_core::Major::new({major})\n    .expect(\"the build step checked the history majors\")"
+    )
 }
 
 /// Wrap `text` in a Rust raw string literal, adding `#`s until the closing
@@ -1321,6 +1664,488 @@ mod tests {
         assert!(bundle.schema_source().contains("REFERENCES notes(id)"));
     }
 
+    /// The source documents a build step reads, the schema source declaring
+    /// `major`, written under `dir`. The last result is the DDL the same
+    /// tier source translates to now.
+    fn emit_inputs(
+        dir: &std::path::Path,
+        major: u32,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        String,
+    ) {
+        let schema = dir.join("schema.sql");
+        let policies = dir.join("policies.sql");
+        let tier = dir.join("tier.sql");
+        let schema_sql = format!(
+            "{} {major}\nCREATE TABLE orders (id INT PRIMARY KEY, label TEXT);",
+            connetto_core::MAJOR_DIRECTIVE
+        );
+        let policies_sql = "ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
+                            CREATE POLICY orders_p ON orders FOR ALL USING (true);";
+        let tier_sql = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);";
+        std::fs::write(&schema, schema_sql).expect("the schema source writes");
+        std::fs::write(&policies, policies_sql).expect("the policies source writes");
+        std::fs::write(&tier, tier_sql).expect("the tier source writes");
+        (
+            schema,
+            policies,
+            tier,
+            translate_tier::<String>(tier_sql).expect("the tier translates"),
+        )
+    }
+
+    /// A build without a tier writes the bundle file and attaches no
+    /// history to it.
+    #[test]
+    fn emit_without_a_tier_attaches_no_history() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, _, _) = emit_inputs(dir.path(), 1);
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        emit_to::<String, TextIds>(&schema, &policies, None, &[], &out).expect("emits");
+        let rendered =
+            std::fs::read_to_string(out.join("connetto-schema.rs")).expect("the bundle file");
+        assert!(
+            rendered.contains("LOCAL_TIER_DDL: Option<&str> = None"),
+            "a build without a tier has no tier const: {rendered}"
+        );
+        assert!(
+            !rendered.contains("with_tier_history"),
+            "a build without a tier attaches no history: {rendered}"
+        );
+        assert!(
+            out.join("connetto-cap-policies.sql").exists(),
+            "the cap document lands beside the bundle file"
+        );
+    }
+
+    /// A build whose history holds a fresh export for its major attaches
+    /// the history to the bundle it renders.
+    #[test]
+    fn emit_with_a_fresh_history_attaches_it() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, tier, tier_ddl) = emit_inputs(dir.path(), 1);
+        let history = dir.path().join("tier_history");
+        std::fs::create_dir_all(&history).expect("the history directory writes");
+        std::fs::write(history.join("1.sql"), tier_ddl).expect("the current export writes");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        let source = TierSource::new(&tier, &history);
+        emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+            .expect("emits with the history");
+        let rendered =
+            std::fs::read_to_string(out.join("connetto-schema.rs")).expect("the bundle file");
+        assert!(
+            rendered.contains("LOCAL_TIER_DDL: Option<&str> = Some("),
+            "a build with a tier carries its tier: {rendered}"
+        );
+        assert!(
+            rendered.contains(".with_tier_history("),
+            "the bundle attaches the history: {rendered}"
+        );
+        assert!(rendered.contains("connetto_core::TierHistory::new("));
+        assert!(rendered.contains("connetto_core::Major::new(1)"));
+        assert!(rendered.contains("the build step generated this history"));
+    }
+
+    /// A tier whose history directory is absent refuses the build.
+    #[test]
+    fn emit_refuses_a_missing_history_directory() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, tier, _) = emit_inputs(dir.path(), 1);
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        let source = TierSource::new(&tier, dir.path().join("absent"));
+        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+            .expect_err("an absent history directory refuses");
+        match err {
+            SchemaError::MissingHistoryDir { dir: reported } => {
+                assert_eq!(reported, dir.path().join("absent"));
+            }
+            other => panic!("the absent directory must refuse, got {other}"),
+        }
+    }
+
+    /// A current export the translation no longer computes refuses the
+    /// build as stale.
+    #[test]
+    fn emit_refuses_a_stale_current_export() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, tier, _) = emit_inputs(dir.path(), 1);
+        let history = dir.path().join("tier_history");
+        std::fs::create_dir_all(&history).expect("the history directory writes");
+        std::fs::write(
+            history.join("1.sql"),
+            "an export the sources no longer compute",
+        )
+        .expect("the stale export writes");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        let source = TierSource::new(&tier, &history);
+        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+            .expect_err("a stale export refuses");
+        match err {
+            SchemaError::StaleExport { major, path, .. } => {
+                assert_eq!(major, 1);
+                assert_eq!(path, history.join("1.sql"));
+            }
+            other => panic!("a stale export must refuse, got {other}"),
+        }
+    }
+
+    /// A history without the build's own major refuses the build.
+    #[test]
+    fn emit_refuses_a_missing_current_export() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, tier, _) = emit_inputs(dir.path(), 1);
+        let history = dir.path().join("tier_history");
+        std::fs::create_dir_all(&history).expect("the history directory writes");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        let source = TierSource::new(&tier, &history);
+        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+            .expect_err("a missing export refuses");
+        match err {
+            SchemaError::MissingExport { major, path, .. } => {
+                assert_eq!(major, 1);
+                assert_eq!(path, history.join("1.sql"));
+            }
+            other => panic!("a missing export must refuse, got {other}"),
+        }
+    }
+
+    /// A history that skips a major between its lowest export and the
+    /// build's major refuses the build.
+    #[test]
+    fn emit_refuses_a_gap_between_exports() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, tier, tier_ddl) = emit_inputs(dir.path(), 3);
+        let history = dir.path().join("tier_history");
+        std::fs::create_dir_all(&history).expect("the history directory writes");
+        std::fs::write(history.join("1.sql"), tier_ddl.clone()).expect("the first export writes");
+        std::fs::write(history.join("3.sql"), tier_ddl).expect("the current export writes");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        let source = TierSource::new(&tier, &history);
+        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+            .expect_err("a gap refuses");
+        match err {
+            SchemaError::HistoryGap { dir, missing, .. } => {
+                assert_eq!(dir, history);
+                assert_eq!(missing, 2);
+            }
+            other => panic!("a gap must refuse, got {other}"),
+        }
+    }
+
+    /// The export command writes the current major's export and leaves
+    /// the history's older exports untouched.
+    #[test]
+    fn export_tier_writes_the_current_major_and_keeps_the_older_ones() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, _policies, tier, tier_ddl) = emit_inputs(dir.path(), 2);
+        let history = dir.path().join("tier_history");
+        std::fs::create_dir_all(&history).expect("the history directory writes");
+        std::fs::write(
+            history.join("1.sql"),
+            "an export the command never rewrites",
+        )
+        .expect("the older export writes");
+        let outcome = export_tier::<String, TextIds>(&schema, &tier, &history, false)
+            .expect("writes the current export");
+        assert_eq!(outcome.path, history.join("2.sql"));
+        assert_eq!(
+            std::fs::read_to_string(&outcome.path).expect("the export"),
+            tier_ddl
+        );
+        assert_eq!(
+            std::fs::read_to_string(history.join("1.sql")).expect("the older export"),
+            "an export the command never rewrites"
+        );
+    }
+
+    /// The check mode writes nothing and reports the export it would
+    /// write or refresh.
+    #[test]
+    fn export_tier_check_mode_reports_a_missing_or_stale_export() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, _policies, tier, tier_ddl) = emit_inputs(dir.path(), 1);
+        let history = dir.path().join("tier_history");
+        std::fs::create_dir_all(&history).expect("the history directory writes");
+        std::fs::write(history.join("1.sql"), tier_ddl).expect("the export writes");
+        let fresh = export_tier::<String, TextIds>(&schema, &tier, &history, true)
+            .expect("a fresh export checks clean");
+        assert_eq!(fresh.path, history.join("1.sql"));
+        std::fs::write(history.join("1.sql"), "a drifted export").expect("the drift writes");
+        let err = export_tier::<String, TextIds>(&schema, &tier, &history, true)
+            .expect_err("a drifted export fails the check");
+        match err {
+            SchemaError::StaleExport { major, .. } => assert_eq!(major, 1),
+            other => panic!("a drifted export must fail the check, got {other}"),
+        }
+        std::fs::remove_file(history.join("1.sql")).expect("the export deletes");
+        let err = export_tier::<String, TextIds>(&schema, &tier, &history, true)
+            .expect_err("a missing export fails the check");
+        match err {
+            SchemaError::MissingExport { major, .. } => assert_eq!(major, 1),
+            other => panic!("a missing export must fail the check, got {other}"),
+        }
+        assert!(
+            !history.join("1.sql").exists(),
+            "the check mode never writes"
+        );
+    }
+
+    /// An export whose schema source carries no major directive refuses with
+    /// the major error.
+    #[test]
+    fn export_tier_refuses_a_schema_without_the_major_directive() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let schema = dir.path().join("schema.sql");
+        let tier = dir.path().join("tier.sql");
+        std::fs::write(&schema, "CREATE TABLE orders (id INT);").expect("the source writes");
+        std::fs::write(&tier, "CREATE TABLE notes (id INT);").expect("the source writes");
+        let err =
+            export_tier::<String, TextIds>(&schema, &tier, &dir.path().join("tier_history"), false)
+                .expect_err("a source without the directive refuses");
+        assert!(matches!(
+            err,
+            SchemaError::Major(connetto_core::MajorError::Missing)
+        ));
+    }
+
+    /// An export whose tier source is missing, unparseable or refused by the
+    /// translation refuses with the matching error.
+    #[test]
+    fn export_tier_refuses_a_missing_or_untranslatable_tier_source() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let schema = dir.path().join("schema.sql");
+        let tier = dir.path().join("tier.sql");
+        std::fs::write(&schema, majored("CREATE TABLE orders (id INT);"))
+            .expect("the schema source writes");
+        let history = dir.path().join("tier_history");
+        let err = export_tier::<String, TextIds>(&schema, &tier, &history, false)
+            .expect_err("a missing source refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+        std::fs::write(&tier, "not a Postgres document").expect("the source writes");
+        let err = export_tier::<String, TextIds>(&schema, &tier, &history, false)
+            .expect_err("an unparseable source refuses");
+        assert!(matches!(err, SchemaError::Translate(_)));
+        std::fs::write(
+            &tier,
+            "CREATE TABLE notes (id INT PRIMARY KEY); \
+             ALTER TABLE notes ENABLE ROW LEVEL SECURITY; \
+             ALTER TABLE notes RENAME TO notes_v2;",
+        )
+        .expect("the source writes");
+        let err = export_tier::<String, TextIds>(&schema, &tier, &history, false)
+            .expect_err("a refused translation refuses the export");
+        assert!(matches!(err, SchemaError::Translate(_)));
+    }
+    /// An export whose tier declares a column twice refuses with the
+    /// translation error, before it writes anything.
+    #[test]
+    fn export_tier_refuses_a_tier_that_declares_a_column_twice() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let schema = dir.path().join("schema.sql");
+        let tier = dir.path().join("tier.sql");
+        std::fs::write(&schema, majored("CREATE TABLE orders (id INT);"))
+            .expect("the schema source writes");
+        std::fs::write(&tier, "CREATE TABLE notes (id INT PRIMARY KEY, id INT);")
+            .expect("the tier source writes");
+        let err =
+            export_tier::<String, TextIds>(&schema, &tier, &dir.path().join("tier_history"), false)
+                .expect_err("the duplicated column refuses the export");
+        assert!(matches!(
+            err,
+            SchemaError::Translate(detail) if detail.contains("`id` already exists")
+        ));
+        assert!(
+            !dir.path().join("tier_history").exists(),
+            "the refusal writes nothing"
+        );
+    }
+
+    /// An export whose history holds a directory where the export should be
+    /// reports the read error, not a missing or stale export.
+    #[test]
+    fn export_tier_reports_a_read_error_when_the_export_is_a_directory() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let schema = dir.path().join("schema.sql");
+        let tier = dir.path().join("tier.sql");
+        std::fs::write(&schema, majored("CREATE TABLE orders (id INT);"))
+            .expect("the schema source writes");
+        std::fs::write(&tier, "CREATE TABLE notes (id INT);").expect("the tier source writes");
+        let history = dir.path().join("tier_history");
+        std::fs::create_dir_all(history.join("1.sql")).expect("the directory writes");
+        let err = export_tier::<String, TextIds>(&schema, &tier, &history, false)
+            .expect_err("a directory where the export should be refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+    }
+
+    /// An export whose history directory cannot be created reports the
+    /// error.
+    #[test]
+    fn export_tier_reports_a_write_error_when_the_history_cannot_be_created() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let schema = dir.path().join("schema.sql");
+        let tier = dir.path().join("tier.sql");
+        std::fs::write(&schema, majored("CREATE TABLE orders (id INT);"))
+            .expect("the schema source writes");
+        std::fs::write(&tier, "CREATE TABLE notes (id INT);").expect("the tier source writes");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "a file in the way").expect("the blocker writes");
+        let err = export_tier::<String, TextIds>(&schema, &tier, &blocker.join("history"), false)
+            .expect_err("a history that cannot be created refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+    }
+
+    /// A build whose tier source is missing or does not translate refuses
+    /// before it writes its bundle.
+    #[test]
+    fn emit_refuses_a_tier_source_that_is_missing_or_untranslatable() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, tier, _) = emit_inputs(dir.path(), 1);
+        let history = dir.path().join("tier_history");
+        std::fs::create_dir_all(&history).expect("the history directory writes");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        let source = TierSource::new(&tier, &history);
+        std::fs::remove_file(&tier).expect("the source deletes");
+        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+            .expect_err("a missing tier source refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+        std::fs::write(&tier, "not a Postgres document").expect("the source writes");
+        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+            .expect_err("an untranslatable tier source refuses");
+        assert!(matches!(err, SchemaError::Translate(_)));
+    }
+
+    /// A build whose history directory it cannot read refuses with the
+    /// error, not a missing directory.
+    #[test]
+    #[cfg(unix)]
+    fn emit_refuses_a_history_directory_it_cannot_read() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, tier, _) = emit_inputs(dir.path(), 1);
+        let history = dir.path().join("tier_history");
+        std::fs::create_dir_all(&history).expect("the history directory writes");
+        std::fs::set_permissions(
+            &history,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .expect("the permissions apply");
+        let source = TierSource::new(&tier, &history);
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        let result = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out);
+        std::fs::set_permissions(
+            &history,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("the permissions apply");
+        let err = result.expect_err("a history it cannot read refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+    }
+
+    /// The entry point refuses outside a build script, where `OUT_DIR` is
+    /// unset.
+    #[test]
+    fn emit_refuses_outside_a_build_script() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, _, _) = emit_inputs(dir.path(), 1);
+        assert!(
+            std::env::var("OUT_DIR").is_err(),
+            "cargo leaves OUT_DIR unset for tests"
+        );
+        let err = emit::<String, TextIds>(&schema, &policies, None, &[])
+            .expect_err("without OUT_DIR the entry point refuses");
+        assert!(matches!(err, SchemaError::MissingOutDir));
+    }
+
+    /// An output path a directory already occupies refuses the write.
+    #[test]
+    fn emit_to_refuses_an_output_file_that_is_a_directory() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (schema, policies, _, _) = emit_inputs(dir.path(), 1);
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(out.join("connetto-cap-policies.sql"))
+            .expect("the blocking directory writes");
+        let err = emit_to::<String, TextIds>(&schema, &policies, None, &[], &out)
+            .expect_err("a directory where the cap file should be refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+        let out = dir.path().join("out2");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        std::fs::create_dir_all(out.join("connetto-schema.rs"))
+            .expect("the blocking directory writes");
+        let err = emit_to::<String, TextIds>(&schema, &policies, None, &[], &out)
+            .expect_err("a directory where the bundle file should be refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+    }
+
+    /// The rendered bundle attaches the tier history the build read, its
+    /// boundaries included.
+    #[test]
+    fn render_attaches_the_tier_history_with_its_boundaries() {
+        let bundle = SchemaBundle::new(
+            format!(
+                "{} 2\nCREATE TABLE orders (id INT);",
+                connetto_core::MAJOR_DIRECTIVE
+            ),
+            "",
+            "CREATE TABLE orders_rls (id INTEGER);",
+            [] as [(&str, &str); 0],
+            [] as [&str; 0],
+            None::<&str>,
+        )
+        .expect("the source declares major 2")
+        .with_local_tier("CREATE TABLE notes (id INTEGER);")
+        .with_tier_history(connetto_core::TierHistory::new(
+            connetto_core::Major::new(1).expect("major 1"),
+            Some(connetto_core::Major::new(2).expect("major 2")),
+            vec![connetto_core::TierBoundary::new(
+                connetto_core::Major::new(1).expect("major 1"),
+                "ALTER TABLE notes ADD COLUMN body TEXT;",
+            )],
+        ))
+        .expect("the history reaches the build's major");
+        let source = render(&bundle, "");
+        assert!(source.contains("connetto_core::TierHistory::new("));
+        assert!(source.contains("connetto_core::TierBoundary::new("));
+        assert!(source.contains("connetto_core::Major::new(1)"));
+        assert!(source.contains("connetto_core::Major::new(2)"));
+        assert!(source.contains(r#"r"ALTER TABLE notes ADD COLUMN body TEXT;""#));
+    }
+
+    /// A history whose builds carry no tier before the build's own renders
+    /// the first tier as `None`, the same gap the history it names carries.
+    #[test]
+    fn render_marks_a_history_without_a_earlier_tier() {
+        let bundle = SchemaBundle::new(
+            majored("CREATE TABLE orders (id INT);"),
+            "",
+            "CREATE TABLE orders_rls (id INTEGER);",
+            [] as [(&str, &str); 0],
+            [] as [&str; 0],
+            None::<&str>,
+        )
+        .expect("the source declares major 1")
+        .with_local_tier("CREATE TABLE notes (id INTEGER);")
+        .with_tier_history(connetto_core::TierHistory::new(
+            connetto_core::Major::new(1).expect("major 1"),
+            None,
+            Vec::new(),
+        ))
+        .expect("the history reaches the build's major");
+        let source = render(&bundle, "");
+        assert!(
+            source.contains(",\nNone,\nvec!["),
+            "no earlier tier renders as None: {source}"
+        );
+    }
     // The consumer behavior of the shared store layout, read through the
     // replica's logical names the way an application does.
 
