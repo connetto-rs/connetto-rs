@@ -3566,23 +3566,24 @@ async fn a_sender_blocked_on_a_full_exchange_queue_is_released_when_the_link_clo
             .await
             .expect("the queue takes it");
     }
-    let node = host_node.clone();
-    let peer = raw_dev.identity.clone();
-    let send = tokio::spawn(async move {
-        node.send_exchange(
-            &peer,
-            ExchangeFrame::Request {
-                request_id: 99,
-                from: 1,
-            },
-        )
-        .await
-    });
+    let mut blocked = Box::pin(host_node.send_exchange(
+        &raw_dev.identity,
+        ExchangeFrame::Request {
+            request_id: 99,
+            from: 1,
+        },
+    ));
+    let waiting = core::future::poll_fn(|cx| {
+        core::task::Poll::Ready(core::future::Future::poll(blocked.as_mut(), cx).is_pending())
+    })
+    .await;
+    assert!(waiting, "the send waits on the full queue");
+    // The close is queued before the link resumes, so it ends the link before any frame drains.
+    command
+        .send(crate::node::LinkCommand::Close(CloseReason::Closed))
+        .expect("the command takes");
     drop(links);
-    let err = send
-        .await
-        .expect("the send resolves")
-        .expect_err("the link closed while it waited");
+    let err = blocked.await.expect_err("the link closed while it waited");
     assert!(
         matches!(
             err,

@@ -56,7 +56,9 @@ pub(crate) async fn run<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let deadline_sleep =
             tokio::time::sleep(deadline.duration_since(clock.now()).unwrap_or_default());
         let silence = tokio::time::sleep_until(last_seen + silence_limit);
+        // Ordered so a close, a list or a certificate never waits behind queued exchange bodies.
         let stop = tokio::select! {
+            biased;
             () = deadline_sleep => {
                 // A back-jumped wall clock re-arms the sleep, and a real expiry
                 // closes the link.
@@ -71,10 +73,10 @@ pub(crate) async fn run<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 Ok(()) => None,
                 Err(_) => Some(Stop::WriteFailed),
             },
+            command = commands.recv() => on_command(&state, &mut io, key, seq, command).await,
             frame = reader.next(&mut io) => {
                 on_frame(&state, &mut io, key, seq, frame, &mut last_seen, &mut deadline).await
             }
-            command = commands.recv() => on_command(&state, &mut io, key, seq, command).await,
             frame = exchange.recv() => match frame {
                 Some(frame) => on_exchange(&mut io, frame).await,
                 None => None,
