@@ -15,7 +15,8 @@ use crate::{ClientConfig, ClientError, SHARED_SCHEMA, clock, is_shared, subscrip
 /// store itself goes (R11 decision 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedDeparture {
-    /// The build shares no tables, so there is no store to leave.
+    /// The build shares no tables, or the device holds no store this identity
+    /// can read, so there is nothing to leave.
     NotShared,
     /// Another identity still has interest or unsent writes in the store, so
     /// the store stays.
@@ -251,4 +252,82 @@ pub(crate) fn depart(
         .get_result::<bool>(conn)?;
         Ok(interest || spare)
     })
+}
+
+/// Take `config`'s identity out of the shared store at `store` with no client
+/// open, as a wipe that runs after its client closed must (R11 slice 6, Q6
+/// and Q7). The shared writes still queued in the replica at `replica` are
+/// undone first, newest first, under the rollback's rule of leaving a row a
+/// later change touched, then [`depart`] runs, all in one transaction that
+/// waits for any other identity's writer.
+///
+/// A store without its key is inert and the next open replaces it, and a
+/// replica without its file or key holds nothing to undo.
+///
+/// # Errors
+///
+/// [`ClientError`] when the replica or the store cannot be opened, read or
+/// written.
+#[cfg(feature = "native-auth")]
+pub(crate) fn depart_alone(
+    store: &std::path::Path,
+    store_key: Option<&crate::ReplicaKey>,
+    replica: Option<(&std::path::Path, &crate::ReplicaKey)>,
+    config: &ClientConfig,
+) -> Result<SharedDeparture, ClientError> {
+    let Some(store_key) = store_key.filter(|_| !config.shared_tables.is_empty() && store.exists())
+    else {
+        return Ok(SharedDeparture::NotShared);
+    };
+    let replica = replica.filter(|(path, _)| path.exists());
+    let opened = replica.map_or(Ok(":memory:"), |(path, _)| {
+        path.to_str().ok_or_else(|| {
+            ClientError::Connect(format!("a non-UTF-8 replica path {}", path.display()))
+        })
+    })?;
+    let mut db =
+        SqliteConnection::establish(opened).map_err(|err| ClientError::Connect(err.to_string()))?;
+    if let Some((_, key)) = replica {
+        crate::cipher::unlock(&mut db, key)?;
+    }
+    crate::harden::harden_replica_connection(&mut db)?;
+    // A coverage predicate may call an application function.
+    config
+        .sql_functions
+        .install(&mut db)
+        .map_err(|err| ClientError::Session(err.to_string()))?;
+    let store = store.to_str().ok_or_else(|| {
+        ClientError::Connect(format!("a non-UTF-8 store path {}", store.display()))
+    })?;
+    crate::harden::attach_keyed_in_window(
+        &mut db,
+        store,
+        SHARED_SCHEMA,
+        crate::harden::AttachPermits::Write,
+        store_key,
+    )?;
+    let identity = config.client_id.clone();
+    let remain = db.immediate_transaction::<_, ClientError, _>(|db| {
+        if replica.is_some() {
+            undo_queued_shared(db, config)?;
+        }
+        depart(db, config, &identity, true)
+    })?;
+    Ok(if remain {
+        SharedDeparture::Kept
+    } else {
+        SharedDeparture::LastOut
+    })
+}
+
+/// Undo the shared writes of every entry queued in `main`'s pending table,
+/// newest first, as [`crate::undo_shared`] does.
+#[cfg(feature = "native-auth")]
+fn undo_queued_shared(db: &mut SqliteConnection, config: &ClientConfig) -> Result<(), ClientError> {
+    use crate::_connetto_pending;
+    let queued: Vec<Vec<u8>> = _connetto_pending::table
+        .select(_connetto_pending::changeset)
+        .order(_connetto_pending::position.desc())
+        .load(db)?;
+    crate::undo_shared(db, &config.shared_tables, queued.iter().map(Vec::as_slice))
 }

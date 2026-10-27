@@ -816,6 +816,7 @@ where
                     .storage
                     .device_service()
                     .map(|service| self.device.keys(service, &wipe.name)),
+                shared: SharedStore::of(&self.base.schema, &self.data_dir, &wipe.name),
                 wipe,
             })
             .collect())
@@ -905,10 +906,7 @@ where
             let (session, authenticator) = resolved.provider.unzip();
             let share_key_store = core.share_key_store.clone();
             let share_record = share_key_record(&name);
-            let shared = core.base.schema.shared_layout().map(|_| {
-                let record = crate::shared_store_name(crate::REPLICA_PREFIX);
-                (core.place.0.join(&record), record)
-            });
+            let shared = SharedStore::of(&core.base.schema, &core.place.0, &name);
             let teardown: Arc<dyn Forget> = Arc::new(ReplicaTeardown {
                 authenticator,
                 dir: core.place.0.clone(),
@@ -1350,6 +1348,9 @@ struct PreparedWipe {
     share_keys: Result<ErasedShareKeyStore, ClientError>,
     #[cfg(feature = "device-identity")]
     device_keys: Option<Result<Arc<dyn DeviceKeys>, ClientError>>,
+    /// The shared store the wiped identity leaves, when the build shares
+    /// tables.
+    shared: Option<SharedStore>,
 }
 
 /// Finish every pending device wipe under `dir` before anything is signed
@@ -1373,8 +1374,19 @@ where
             share_keys,
             #[cfg(feature = "device-identity")]
             device_keys,
+            shared,
         } = prepared;
         let mut report = ForgetIncomplete::default();
+        // Out of the shared store before anything of the replica goes, its
+        // queued shared writes undone while it still exists (R11 slice 6, Q6
+        // and Q7).
+        let last_out = SharedStore::leave(
+            shared.as_ref(),
+            &dir.join(&wipe.name),
+            key_store,
+            &mut report,
+        )
+        .await;
         if let (Some(account), Some(store)) = (&wipe.account, refresh) {
             report.credential = store.clear(account).await.err();
         }
@@ -1386,6 +1398,9 @@ where
                 Ok(store) => store.clear(&share_key_record(&wipe.name)).await.err(),
                 Err(err) => Some(err),
             };
+            if last_out && let Some(shared) = &shared {
+                shared.remove(key_store, &mut report).await;
+            }
             #[cfg(feature = "device-identity")]
             if let Some(keys) = device_keys {
                 report.device_key = match keys {
@@ -1986,7 +2001,9 @@ trait Forget: Send + Sync {
         last_out: bool,
     ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
     /// A revoked device's wipe, the session already ended at the server and
-    /// every unsynced write lost (R105 decision 10).
+    /// every unsynced write lost (R105 decision 10). A build that shares
+    /// tables first takes the identity out of the shared store on a
+    /// connection of its own, since the client has closed.
     fn wipe_revoked<'a>(
         &'a self,
         report: &'a mut ForgetIncomplete,
@@ -2008,8 +2025,82 @@ struct ReplicaTeardown<KS> {
     share_key_store: ErasedShareKeyStore,
     share_record: String,
     hook: Option<DeviceWipeHook>,
-    /// The shared store's file and key record, when the build shares tables.
-    shared: Option<(PathBuf, String)>,
+    /// The shared store, when the build shares tables.
+    shared: Option<SharedStore>,
+}
+
+/// The shared store a durable build's identity leaves when it is wiped, and
+/// what leaving it with no client open needs.
+#[cfg(feature = "native-auth")]
+struct SharedStore {
+    path: PathBuf,
+    record: String,
+    /// The departing identity's client id, the shared tables and the
+    /// application's SQL functions.
+    config: crate::ClientConfig,
+}
+
+#[cfg(feature = "native-auth")]
+impl SharedStore {
+    /// The store under `dir` the identity `name` leaves, when `schema` shares
+    /// tables.
+    fn of(schema: &SyncSchema, dir: &std::path::Path, name: &str) -> Option<Self> {
+        schema.shared_layout()?;
+        let record = crate::shared_store_name(crate::REPLICA_PREFIX);
+        Some(Self {
+            path: dir.join(&record),
+            record,
+            config: crate::ClientConfig::new(name.to_owned())
+                .with_storage_schema(schema)
+                .with_sql_functions(schema.sql_functions().clone()),
+        })
+    }
+
+    /// Take the identity out of `shared`, when the build shares tables, with
+    /// no client open, undoing the shared writes still queued in its replica
+    /// at `replica`, and say whether it was the last identity in the store. A
+    /// failure lands in `report`.
+    async fn leave<KS>(
+        shared: Option<&Self>,
+        replica: &std::path::Path,
+        key_store: &KS,
+        report: &mut ForgetIncomplete,
+    ) -> bool
+    where
+        KS: ReplicaKeyStore<Error = ClientError>,
+    {
+        let Some(shared) = shared else {
+            return false;
+        };
+        let left = async {
+            let store_key = key_store.load(&shared.record).await?;
+            let replica_key = key_store.load(&shared.config.client_id).await?;
+            crate::interest::depart_alone(
+                &shared.path,
+                store_key.as_ref(),
+                replica_key.as_ref().map(|key| (replica, key)),
+                &shared.config,
+            )
+        }
+        .await;
+        match left {
+            Ok(departure) => departure == crate::SharedDeparture::LastOut,
+            Err(err) => {
+                report.shared = Some(err);
+                false
+            }
+        }
+    }
+
+    /// Remove the store and its key record as the last identity out.
+    async fn remove<KS>(&self, key_store: &KS, report: &mut ForgetIncomplete)
+    where
+        KS: ReplicaKeyStore,
+    {
+        report.shared = crate::teardown::remove_shared_store(&self.path, key_store, &self.record)
+            .await
+            .err();
+    }
 }
 
 #[cfg(feature = "native-auth")]
@@ -2042,12 +2133,9 @@ where
         // after the swap closed the connection holding it attached.
         if last_out
             && report.wipe.is_none()
-            && let Some((path, record)) = &self.shared
+            && let Some(shared) = &self.shared
         {
-            report.shared =
-                crate::teardown::remove_shared_store(path, self.key_store.as_ref(), record)
-                    .await
-                    .err();
+            shared.remove(self.key_store.as_ref(), report).await;
         }
         if let Some(hook) = &self.hook {
             report.application = hook(self.name.clone())
@@ -2076,7 +2164,19 @@ where
         &'a self,
         report: &'a mut ForgetIncomplete,
     ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(self.wipe(false, &[], report, false))
+        Box::pin(async move {
+            // Out of the shared store before the replica goes, its queued
+            // shared writes undone, with the client already closed (R11
+            // slice 6, Q6 and Q7).
+            let last_out = SharedStore::leave(
+                self.shared.as_ref(),
+                &self.path,
+                self.key_store.as_ref(),
+                report,
+            )
+            .await;
+            self.wipe(false, &[], report, last_out).await;
+        })
     }
 
     fn pending(&self) -> PendingWipe {
