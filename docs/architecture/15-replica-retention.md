@@ -145,7 +145,7 @@ This constraint has no urgency today. The workspace is at `version = "0.0.0"`, u
 
 ## The create path
 
-**Decided (R15).** The deleted upstream proposals stated that "the replica templates bake `auto_vacuum = INCREMENTAL` at build time." That claim was stale. There is no replica template. `Replica::PlaintextFile` and `connect_with_plaintext_template` were deleted in phase E5 (recorded in `docs/roadmap.md` under "Replica encryption at rest"). Neither symbol exists in `crates/connetto-client/src/replica.rs` or `crates/connetto-client/src/lib.rs`. Baked templates survive only for the local tier's first boot, which is a different SQLite file. connetto creates the replica through `ConnettoConnection::open_inner` in `crates/connetto-client/src/lib.rs`.
+**Decided (R15).** The deleted upstream proposals stated that "the replica templates bake `auto_vacuum = INCREMENTAL` at build time." That claim was stale. There is no replica template. `Replica::PlaintextFile` and `connect_with_plaintext_template` were deleted in phase E5 (recorded in `docs/architecture/14-at-rest-encryption.md` under "Where the handoff contradicted the source"). Neither symbol exists in `crates/connetto-client/src/replica.rs` or `crates/connetto-client/src/lib.rs`. Baked templates survive only for the local tier's first boot, which is a different SQLite file. connetto creates the replica through `ConnettoConnection::open_inner` in `crates/connetto-client/src/lib.rs`.
 
 **Built.** The existing pragma sequence in `open_inner`, documented in `docs/architecture/14-at-rest-encryption.md`, is:
 
