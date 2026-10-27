@@ -6,16 +6,20 @@
 //! so the visibility check and the row the minting path reads cannot drift
 //! apart. Identifiers come from the parsed catalog and every value binds
 //! positionally with the scalar type the catalog gave it, so the row's own
-//! primary-key index answers the read.
+//! primary-key index answers the read. A date or time key reaches the filter
+//! as text, the form the replica carries it in, so its placeholder casts to
+//! the column's declared type and Postgres compares it as that type.
 
 use core::fmt::Write as _;
 
 use connetto_core::quote_ident;
 use diesel::pg::Pg;
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
-use diesel::sql_types::{BigInt, Binary, Bool, Double, Text};
-use subql::backend::{Postgres, Value};
-use subql::{ColumnId, DatabaseLike, TableId, ValueError, catalog_helpers};
+use diesel::sql_types::{BigInt, Binary, Bool, Date, Double, Text, Time, Timestamp, Timestamptz};
+use subql::backend::{Postgres, ScalarFamily, Value};
+use subql::{
+    ColumnId, ColumnLike as _, DatabaseLike, TableId, TableLike as _, ValueError, catalog_helpers,
+};
 
 /// A key column could not be read, or carried a type the filter cannot bind.
 #[derive(Debug, thiserror::Error)]
@@ -44,10 +48,31 @@ enum KeyBind {
     Text(String),
     Bytes(Vec<u8>),
     Uuid(uuid::Uuid),
+    Date(chrono::NaiveDate),
+    Time(chrono::NaiveTime),
+    Timestamp(chrono::NaiveDateTime),
+    TimestampTz(chrono::DateTime<chrono::Utc>),
+}
+
+/// One key column: its name, and the declared type its placeholder casts to
+/// when the column is a date or time.
+struct KeyColumn {
+    name: String,
+    cast: Option<String>,
+}
+
+impl KeyColumn {
+    /// The placeholder `$place`, cast to the column's type where it has one.
+    fn placeholder(&self, place: usize) -> String {
+        match &self.cast {
+            Some(cast) => format!("${place}::{cast}"),
+            None => format!("${place}"),
+        }
+    }
 }
 
 /// One row's key columns, in key order, with the value each binds.
-type CollectedKey = (Vec<String>, Vec<KeyBind>);
+type CollectedKey = (Vec<KeyColumn>, Vec<KeyBind>);
 
 /// A predicate over a table's primary key, plus the values it binds.
 ///
@@ -81,11 +106,16 @@ impl KeyFilter {
             return Ok(None);
         };
         let mut predicate = String::new();
-        for (position, name) in columns.iter().enumerate() {
+        for (position, column) in columns.iter().enumerate() {
             if position > 0 {
                 predicate.push_str(" AND ");
             }
-            let _ = write!(predicate, "{} = ${}", quote_ident(name), position + 1);
+            let _ = write!(
+                predicate,
+                "{} = {}",
+                quote_ident(&column.name),
+                column.placeholder(position + 1)
+            );
         }
         Ok(Some(Self { predicate, binds }))
     }
@@ -116,11 +146,13 @@ impl KeyFilter {
         };
         let names = columns
             .iter()
-            .map(|name| quote_ident(name))
+            .map(|column| quote_ident(&column.name))
             .collect::<Vec<_>>()
             .join(", ");
-        let places = (first..first + columns.len())
-            .map(|place| format!("${place}"))
+        let places = columns
+            .iter()
+            .enumerate()
+            .map(|(offset, column)| column.placeholder(first + offset))
             .collect::<Vec<_>>()
             .join(", ");
         Ok(Some(Self {
@@ -149,7 +181,7 @@ impl KeyFilter {
             return Ok(None);
         }
         let mut binds = Vec::with_capacity(columns.len());
-        let mut names = Vec::with_capacity(columns.len());
+        let mut keys = Vec::with_capacity(columns.len());
         for (position, column) in columns.into_iter().enumerate() {
             let bind = match value_at(position, column)? {
                 Value::Bool(value) => KeyBind::Bool(value),
@@ -158,6 +190,10 @@ impl KeyFilter {
                 Value::String(value) => KeyBind::Text(value),
                 Value::Bytes(value) => KeyBind::Bytes(value),
                 Value::Uuid(value) => KeyBind::Uuid(value),
+                Value::Date(value) => KeyBind::Date(value),
+                Value::Time(value) => KeyBind::Time(value),
+                Value::Timestamp(value) => KeyBind::Timestamp(value),
+                Value::TimestampTz(value) => KeyBind::TimestampTz(value),
                 Value::Null | Value::Missing => return Ok(None),
                 other => {
                     return Err(KeyError::Unsupported {
@@ -169,10 +205,13 @@ impl KeyFilter {
             let Some(name) = catalog_helpers::column_name(catalog, table_id, column) else {
                 return Ok(None);
             };
-            names.push(name);
+            keys.push(KeyColumn {
+                name,
+                cast: temporal_type(catalog, table_id, column),
+            });
             binds.push(bind);
         }
-        Ok(Some((names, binds)))
+        Ok(Some((keys, binds)))
     }
 
     /// The rendered `WHERE` body, with `$n` placeholders in bind order.
@@ -192,6 +231,31 @@ impl KeyFilter {
             KeyBind::Text(value) => query.bind::<Text, _>(value.clone()),
             KeyBind::Bytes(value) => query.bind::<Binary, _>(value.clone()),
             KeyBind::Uuid(value) => query.bind::<diesel::sql_types::Uuid, _>(*value),
+            KeyBind::Date(value) => query.bind::<Date, _>(*value),
+            KeyBind::Time(value) => query.bind::<Time, _>(*value),
+            KeyBind::Timestamp(value) => query.bind::<Timestamp, _>(*value),
+            KeyBind::TimestampTz(value) => query.bind::<Timestamptz, _>(*value),
         })
+    }
+}
+
+/// The declared type of `column` when it is a date or time, which the
+/// placeholder casts to, and [`None`] for every other type, whose bind
+/// already carries it.
+fn temporal_type<DB: DatabaseLike>(
+    catalog: &DB,
+    table_id: TableId,
+    column: ColumnId,
+) -> Option<String> {
+    match catalog_helpers::column_scalar_family(catalog, table_id, column)? {
+        ScalarFamily::Date
+        | ScalarFamily::Time
+        | ScalarFamily::Timestamp
+        | ScalarFamily::TimestampTz => {
+            let table = catalog.table_by_id(usize::try_from(table_id).ok()?)?;
+            let declared = table.column_by_id(usize::from(column), catalog).ok()??;
+            Some(declared.data_type(catalog).into_owned())
+        }
+        _ => None,
     }
 }
