@@ -2,8 +2,9 @@
 //!
 //! The pass runs in the browser with no platform gate, so its documented
 //! effect is measured here rather than assumed. The suite grows an encrypted
-//! replica by several hundred pages, deletes the rows, and runs the pass
-//! under a threshold and a budget that must fire.
+//! replica by several hundred pages, deletes the rows, pushes so the outbox
+//! lets go of their records, and runs the pass under a threshold and a
+//! budget that must fire.
 #![cfg(target_arch = "wasm32")]
 
 mod common;
@@ -166,22 +167,33 @@ async fn the_trim_pass_shrinks_the_opfs_replica() {
         "OPFS reports the growth, {bytes_before} to {bytes_grown}"
     );
 
-    // A delete lands the pages on the freelist and leaves the file alone.
+    // The deletes record their rows in the outbox, which reuses the pages they
+    // free and may extend the file. The push that follows queues nothing,
+    // since each row was written and deleted before it, and deletes those
+    // records, which lands every page they held on the freelist and leaves
+    // the file alone.
     diesel::delete(photos::table.filter(photos::owner_id.eq(user_id.as_str())))
         .execute(conn.conn())
         .expect("grow row delete");
     diesel::delete(orders::table.filter(orders::id.eq(order_id)))
         .execute(conn.conn())
         .expect("seed row delete");
-    let (pages_after_delete, freed) = page_stats(&mut conn);
+    let (pages_deleted, freelist_deleted) = page_stats(&mut conn);
+    let bytes_deleted = opfs_bytes(DB_NAME).await;
+    assert_eq!(
+        conn.push().await.expect("push"),
+        None,
+        "rows written and deleted before a push upload nothing"
+    );
+    let (pages_freed, freed) = page_stats(&mut conn);
     let bytes_freed = opfs_bytes(DB_NAME).await;
     assert!(
-        pages_after_delete == grown_pages && freed > grown_freelist,
-        "the delete frees {freed} of {pages_after_delete} pages onto the freelist"
+        pages_freed == pages_deleted && freed > freelist_deleted && freed > grown_freelist,
+        "the push frees {freed} of {pages_freed} pages onto the freelist"
     );
     assert_eq!(
-        bytes_freed, bytes_grown,
-        "the delete alone leaves the file at {bytes_freed} bytes"
+        bytes_freed, bytes_deleted,
+        "freeing alone leaves the file at {bytes_freed} bytes"
     );
 
     // The pass. `tidy` evicts the rows no subscription covers, of which there
@@ -195,12 +207,12 @@ async fn the_trim_pass_shrinks_the_opfs_replica() {
         "the pass drains the freelist, {freed} to {trimmed_freelist} of {trimmed_pages} pages"
     );
     assert!(
-        trimmed_pages < grown_pages,
-        "the pass returns pages to the file, {grown_pages} to {trimmed_pages}"
+        trimmed_pages < pages_freed,
+        "the pass returns pages to the file, {pages_freed} to {trimmed_pages}"
     );
     assert!(
-        bytes_trimmed < bytes_grown,
-        "OPFS reports the shrink, {bytes_grown} to {bytes_trimmed} bytes"
+        bytes_trimmed < bytes_freed,
+        "OPFS reports the shrink, {bytes_freed} to {bytes_trimmed} bytes"
     );
 
     conn.close().await.expect("close");
