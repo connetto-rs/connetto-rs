@@ -1347,8 +1347,9 @@ pub(crate) enum FirstDial {
 
 /// The shared connect opens the replica so local reads answer at once, then
 /// tries one dial and attaches it on success. A refusal no retry can cure
-/// fails the build either way, an unanswered handshake starts offline when a
-/// reconnect loop will redial, and any other failure follows `first_dial`.
+/// fails the build either way, an unanswered handshake or an attach that moved
+/// a writer to a fresh one starts offline when a reconnect loop will redial,
+/// and any other failure follows `first_dial`.
 /// The replica is opened by the caller, which knows its storage.
 #[expect(
     clippy::too_many_arguments,
@@ -1386,14 +1387,14 @@ where
     }
     match dialer.connect().await {
         Ok(transport) => match conn.attach(transport).await {
+            // A handshake that drew no answer, or a writer the attach moved
+            // to a fresh one (R70 decision 21), starts a running client
+            // offline, its reconnect loop redialing.
             Err(err)
-                if matches!(err, ClientError::HandshakeUnanswered)
+                if (matches!(err, ClientError::HandshakeUnanswered) || err.is_writer_rebase())
                     && first_dial == FirstDial::MayFail =>
             {
-                tracing::warn!(
-                    error = %err,
-                    "the handshake drew no answer, starting offline"
-                );
+                tracing::warn!(error = %err, "the first attach failed, starting offline");
             }
             Err(err) => return Err(err),
             Ok(()) => {}

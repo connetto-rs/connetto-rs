@@ -17,8 +17,8 @@ use connetto_client::{
     SystemClock, TransportFactory,
 };
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, HandshakeAck, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch,
-    SubscriptionPriority,
+    BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, Pong, SnapshotBegin,
+    SnapshotEnd, SnapshotPatch, SubscriptionPriority,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
@@ -766,6 +766,75 @@ async fn a_handshake_without_an_ack_is_abandoned_and_redialed() {
     assert!(
         dials.load(Ordering::Acquire) >= 2,
         "the dialer drew a fresh transport for the redial"
+    );
+}
+
+/// A dialer whose first server refuses the handshake with `WriterUnknown`,
+/// as a restored server does for a number it no longer holds, and whose
+/// later servers answer it.
+struct RefusedFirst {
+    dials: Arc<AtomicU32>,
+}
+
+impl TransportFactory for RefusedFirst {
+    type Transport = LoopbackTransport;
+    type Error = std::convert::Infallible;
+
+    fn connect(
+        &mut self,
+    ) -> impl Future<Output = Result<LoopbackTransport, std::convert::Infallible>> + Send {
+        let first = self.dials.fetch_add(1, Ordering::Relaxed) == 0;
+        async move {
+            let (mut server, client_end) = loopback();
+            tokio::spawn(async move {
+                let Ok(Some(_)) = server.recv().await else {
+                    return;
+                };
+                let answer = if first {
+                    ControlMessage::FatalError(FatalError::new(FatalErrorReason::WriterUnknown))
+                } else {
+                    ack()
+                };
+                let _ = server.send_control(answer).await;
+                let _held = server;
+                core::future::pending::<()>().await;
+            });
+            Ok(client_end)
+        }
+    }
+}
+
+/// A first attach refused because a restore re-based the writer starts the
+/// running client offline rather than failing the build, and the pump
+/// redials under the fresh writer (R70 decision 21).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_attach_refused_for_a_rebased_writer_starts_offline_and_redials() {
+    let dials = Arc::new(AtomicU32::new(0));
+    let (running, pump) = ClientBuilder::new(
+        super::support::bundle(DDL),
+        RefusedFirst {
+            dials: Arc::clone(&dials),
+        },
+    )
+    .with_tuning(tuning())
+    .with_reconnect(ReconnectPolicy::default())
+    .with_sleeper(|d| tokio::time::sleep(d))
+    .connect_with_pump()
+    .await
+    .expect("a re-based writer starts the client offline");
+    let client = running.client().clone();
+    let mut events = client.events();
+    tokio::spawn(pump);
+    next_event(
+        &mut events,
+        std::time::Instant::now() + BOUND,
+        "the redial never connected",
+        |e| matches!(e, ClientEvent::SyncStatus(SyncStatus::Connected)),
+    )
+    .await;
+    assert!(
+        dials.load(Ordering::Acquire) >= 2,
+        "the pump redialed after the refused first attach"
     );
 }
 

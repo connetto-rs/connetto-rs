@@ -318,6 +318,32 @@ async fn a_held_write_behind_another_majors_earlier_write_waits() {
     assert_eq!(conn.unsynced().len(), 2);
 }
 
+/// R70 decision 22 on R31: a held number with no secret is never named again,
+/// so the drain asks for a fresh number and the held write names nothing.
+#[tokio::test]
+async fn a_held_number_without_a_secret_drains_under_a_fresh_number_naming_nothing() {
+    let mut conn = replica();
+    queue(&mut conn, WriterRef::Number(7), 1, major(1));
+    conn.writers
+        .get_mut(&WriterRef::Number(7))
+        .expect("the queue stands")
+        .secret = None;
+    hold_major_one(&mut conn);
+
+    let (asked, mut old, _broken) = dial(&mut conn, vec![granting(9)], Then::Stay).await;
+    assert!(
+        matches!(asked, WriterRequest::Issue { .. }),
+        "the secretless number is never presented"
+    );
+    let Some(ControlMessage::MutationHeader(header)) = sent(&mut old).await else {
+        panic!("the issued number sends the held write");
+    };
+    assert_eq!(
+        header.provenance, None,
+        "the write names nothing past a number it cannot name"
+    );
+}
+
 /// R31: losing a major held under two device keys retires the device once.
 #[tokio::test]
 async fn losing_a_major_held_under_two_device_keys_retires_the_device_once() {

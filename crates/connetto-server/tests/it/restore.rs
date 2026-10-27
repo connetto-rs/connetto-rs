@@ -420,6 +420,235 @@ async fn a_dump_into_the_same_cluster_resyncs_clients_and_revokes_sessions() {
     assert_recovered(&observed);
 }
 
+/// The application launching on its replica and pushing `write`.
+fn launch_writing(ws: &str, db: &Path, token: &str, write: &str) -> ChildGuard {
+    spawn_client_env(
+        ws,
+        db,
+        "restore-client",
+        PG_DDL,
+        NO_POLICIES,
+        "orders",
+        QUERY,
+        token,
+        Some(write),
+    )
+}
+
+/// An order the client inserts locally and pushes.
+fn local_order(id: i32) -> String {
+    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 1.0, 1, 'mine')")
+}
+
+/// The client's writer rows as `(id, next_seq)` and its pending entries as
+/// `(writer, seq)`, or why the replica could not be read.
+#[expect(
+    clippy::type_complexity,
+    reason = "two plain row lists read back for the demonstration's report"
+)]
+fn client_writer_state(db_path: &Path) -> Result<(Vec<(String, i64)>, Vec<(String, i64)>), String> {
+    #[derive(diesel::QueryableByName)]
+    struct Seq {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        writer: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        seq: i64,
+    }
+    let path = db_path.to_string_lossy();
+    let key = keyring_entry(&path)
+        .map_err(|err| format!("keyring entry: {err}"))?
+        .get_password()
+        .map_err(|err| format!("replica key: {err}"))?
+        .parse::<ReplicaKey>()
+        .map_err(|err| format!("replica key: {err}"))?;
+    let mut conn = SqliteConnection::establish(&path).map_err(|err| format!("open: {err}"))?;
+    cipher::unlock(&mut conn, &key).map_err(|err| format!("unlock: {err}"))?;
+    let mut read = |sql: &str| -> Result<Vec<(String, i64)>, String> {
+        Ok(
+            diesel::RunQueryDsl::load::<Seq>(diesel::sql_query(sql), &mut conn)
+                .map_err(|err| format!("{sql}: {err}"))?
+                .into_iter()
+                .map(|row| (row.writer, row.seq))
+                .collect(),
+        )
+    };
+    Ok((
+        read("SELECT id AS writer, next_seq AS seq FROM _connetto_writers ORDER BY id")?,
+        read("SELECT writer, seq FROM _connetto_pending ORDER BY writer, seq")?,
+    ))
+}
+
+/// Poll the server until it holds every order in `ids`.
+async fn wait_for_server(pool: &Pool<AsyncPgConnection>, ids: &[i32]) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let held = server_ids(pool).await;
+        if ids.iter().all(|id| held.contains(id)) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server never held {ids:?}, it holds {held:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll `holds` until it is true, for at most 30 seconds.
+async fn eventually(what: &str, mut holds: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !holds() {
+        assert!(std::time::Instant::now() < deadline, "never true: {what}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Whether the replica at `db` holds no pending entry.
+fn settled(db: &Path) -> bool {
+    client_writer_state(db).is_ok_and(|(_, pending)| pending.is_empty())
+}
+
+/// The issued number writer the replica at `db` holds.
+fn number_of(db: &Path) -> u64 {
+    let (writers, _) = client_writer_state(db).expect("read the replica's writers");
+    writers
+        .iter()
+        .find_map(|(id, _)| {
+            id.strip_prefix("number:")?
+                .parse::<u64>()
+                .ok()
+                .filter(|number| *number != 0)
+        })
+        .expect("the replica holds an issued number")
+}
+
+/// R70 step 2's frontier leg (decisions 21 and 22): a server restored to an
+/// earlier point holds one client's number below what that client saw
+/// settled, and issues another client's number again to a third. Both
+/// returning clients move their queues to fresh numbers and their new writes
+/// settle, while the writes acknowledged after the backup are lost, R78's
+/// courier being their recovery (decision 20).
+#[tokio::test]
+#[ignore = "needs Docker and the release connetto-server and connetto-client binaries"]
+async fn a_restore_moves_rewound_writers_to_fresh_numbers() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    assert!(client_bin().exists(), "build the client binary first");
+    let _serial = PG_SERIAL.lock().await;
+
+    let fixture = Fixture::acquire_restorable().await;
+    let primary_url = fixture.admin_url().to_owned();
+    let primary = seeded_primary(&fixture, &primary_url).await;
+    let auth_stack = build_auth_stack().await;
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
+    let secs = Duration::from_secs(30);
+    let reader = with_user_url(&primary_url, "app_reader", "app_reader");
+    let spawn_on = |database_url: &str, reader: &str, ports: Ports, auth_pairs: &[(&str, &str)]| {
+        spawn_server_cfg(
+            database_url,
+            &ports.bind(),
+            PG_DDL,
+            "orders",
+            Some(reader),
+            &authorization,
+            auth_pairs,
+        )
+    };
+    let (server, ports) = start_server(&auth_stack, secs, |ports, auth_pairs| {
+        spawn_on(&primary_url, &reader, ports, auth_pairs)
+    })
+    .await;
+    let (ws, auth_base) = (ports.ws(), ports.auth_base());
+    // One login per client, since a second connection presenting the same
+    // grant supersedes the first.
+    let (token, _) = mint_token(&auth_base).await;
+    let (token_b, _) = mint_token(&auth_base).await;
+
+    let mut dir = ReplicaDir::new();
+    let early = dir.replica("issued-before.db");
+    let late = dir.replica("issued-after.db");
+
+    // Client A is issued its number and settles order 10 before the backup.
+    let a = launch_writing(&ws, &early, &token, &local_order(10));
+    wait_for_server(&primary, &[10]).await;
+    drop(a);
+    fixture.shell(DUMP).await;
+
+    // After the backup A settles order 11, and client B is issued its number
+    // and settles order 20.
+    let a = launch_writing(&ws, &early, &token, &local_order(11));
+    let b = launch_writing(&ws, &late, &token_b, &local_order(20));
+    wait_for_server(&primary, &[11, 20]).await;
+    eventually("A and B settle", || settled(&early) && settled(&late)).await;
+    drop((a, b));
+    let a_before = number_of(&early);
+    let b_before = number_of(&late);
+    drop(server);
+
+    let (target_url, _, _, _) = restore(&fixture, Method::SameCluster, primary_url).await;
+    let restored = pool_for(&target_url).await;
+    let reader = with_user_url(&target_url, "app_reader", "app_reader");
+    let _server = restart_server(&auth_stack, ports, secs, |ports, auth_pairs| {
+        spawn_on(&target_url, &reader, ports, auth_pairs)
+    })
+    .await;
+
+    // A brand-new client of the same account arrives first, and the restored
+    // server issues it B's number again, the sequence having rewound with the
+    // rows.
+    let fresh = dir.replica("fresh-after-restore.db");
+    let (token_c, _) = mint_token(&auth_base).await;
+    let c = launch_writing(&ws, &fresh, &token_c, &local_order(30));
+    wait_for_server(&restored, &[30]).await;
+    eventually("C settles", || settled(&fresh)).await;
+    drop(c);
+    let c_number = number_of(&fresh);
+    assert_eq!(
+        c_number, b_before,
+        "the restored server issued B's number again"
+    );
+
+    // Both log in again, as a restore revoked every session. A finds its
+    // number held below what it saw settled and B finds its number unknown
+    // under its own secret, so each moves its queue to a fresh writer and its
+    // first attach fails, a driven client having no redial of its own.
+    let (token_a, _) = mint_token(&auth_base).await;
+    let (token_b, _) = mint_token(&auth_base).await;
+    let mut a = launch_writing(&ws, &early, &token_a, &local_order(12));
+    let mut b = launch_writing(&ws, &late, &token_b, &local_order(21));
+    eventually("A and B end on their first attach", || {
+        a.exited().is_some() && b.exited().is_some()
+    })
+    .await;
+
+    // The relaunch is the redial, each asking for a fresh number and writing.
+    let mut a = launch_writing(&ws, &early, &token_a, &local_order(12));
+    let mut b = launch_writing(&ws, &late, &token_b, &local_order(21));
+    wait_for_server(&restored, &[12, 21]).await;
+    eventually("A and B settle under fresh numbers", || {
+        settled(&early) && settled(&late)
+    })
+    .await;
+    assert!(a.exited().is_none(), "A keeps running");
+    assert!(b.exited().is_none(), "B keeps running");
+    let (a_after, b_after) = (number_of(&early), number_of(&late));
+    assert_ne!(a_after, a_before, "A moved off its rewound number");
+    assert_ne!(b_after, b_before, "B moved off its reissued number");
+    assert!(
+        a_after != b_after && a_after != c_number && b_after != c_number,
+        "every replica writes under its own number, A {a_after}, B {b_after}, C {c_number}"
+    );
+
+    let held = server_ids(&restored).await;
+    assert!(
+        !held.contains(&11) && !held.contains(&20),
+        "the writes acknowledged after the backup are lost, the server holds {held:?}"
+    );
+    eventually("A resyncs to the restored server", || {
+        !client_ids(&early).contains(&11)
+    })
+    .await;
+}
+
 /// A membership-guarded schema, so the change path asks the authorization
 /// store about `docs` rows from facts derived from `project_members`.
 const MEMBERSHIP_DDL: &str = "CREATE TABLE docs (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL);\n\

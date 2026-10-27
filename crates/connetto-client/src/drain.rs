@@ -97,8 +97,8 @@ pub(crate) struct Drain<T> {
     #[cfg(feature = "device-identity")]
     bind: Option<DrainBind>,
     /// Writers the old major refused, whose entries a number the drain is
-    /// issued takes over.
-    dead: BTreeSet<WriterRef>,
+    /// issued takes over, each with whether those entries still name it.
+    dead: BTreeMap<WriterRef, crate::Carry>,
     /// The arm count the attached wire's dial carried, so a held content
     /// ticket told on one wire recognizes the wire it rode on.
     dial: u64,
@@ -118,7 +118,7 @@ impl<T> Drain<T> {
             in_flight: BTreeSet::new(),
             #[cfg(feature = "device-identity")]
             bind: None,
-            dead: BTreeSet::new(),
+            dead: BTreeMap::new(),
             dial: 0,
             timer: None,
             episode: DRAIN_POLICY.start(),
@@ -286,16 +286,20 @@ where
             // request does until a bind follows it, and none does.
             return Ok(Some(WriterRequest::Device));
         };
-        if self.drain.dead.contains(&writer) || !is_real_writer(&writer) {
+        if self.drain.dead.contains_key(&writer) || !is_real_writer(&writer) {
             return Ok(Some(crate::issue_request()));
         }
         match writer {
-            // A number this replica holds no secret for is never named again
-            // (R70 decision 22), so it takes a fresh number.
-            WriterRef::Number(number) => Ok(Some(self.number_secret(number).map_or_else(
-                crate::issue_request,
-                |secret| WriterRequest::Number { number, secret },
-            ))),
+            WriterRef::Number(number) => {
+                if let Some(secret) = self.number_secret(number) {
+                    return Ok(Some(WriterRequest::Number { number, secret }));
+                }
+                // A number this replica holds no secret for is never named
+                // again (R70 decision 22), so it takes a fresh number and its
+                // entries name nothing.
+                self.drain.dead.insert(writer, crate::Carry::Abandoned);
+                Ok(Some(crate::issue_request()))
+            }
             WriterRef::Device(key_id) => self.drain_device_request(key_id),
         }
     }
@@ -419,10 +423,10 @@ where
                 | ClientError::SchemaOutdated { .. },
             ) => self.lose_major(major).await,
             Err(ClientError::Refused {
-                reason: FatalErrorReason::WriterUnknown | FatalErrorReason::WriterRetired,
+                reason: reason @ (FatalErrorReason::WriterUnknown | FatalErrorReason::WriterRetired),
             }) => {
                 if let Some(writer) = writer {
-                    self.drain.dead.insert(writer);
+                    self.drain.dead.insert(writer, crate::carry_after(&reason));
                 }
                 self.drain.arm(Duration::ZERO);
                 Ok(())
@@ -433,7 +437,7 @@ where
             Err(ClientError::Refused {
                 reason: FatalErrorReason::DeviceRevoked,
             }) => {
-                self.exclude_device_writers()?;
+                self.exclude_device_writers(crate::Carry::Named)?;
                 self.drain.arm(Duration::ZERO);
                 Ok(())
             }
@@ -461,12 +465,19 @@ where
                 let issued = WriterRef::Number(grant.number);
                 if let Some(writer) = writer {
                     // This major's entries move to the issued number, and the
-                    // rest of the tail goes to the live writer.
-                    self.carry_matching(&[writer], &issued, |entry| entry.major == Some(major))?;
+                    // rest of the tail goes to the live writer, each naming
+                    // the writer only while its record stands.
+                    let carry = self
+                        .drain
+                        .dead
+                        .remove(&writer)
+                        .unwrap_or(crate::Carry::Named);
+                    self.carry_matching(&[writer], &issued, carry, |entry| {
+                        entry.major == Some(major)
+                    })?;
                     if self.writers.contains_key(&writer) {
-                        self.carry_to_live(writer);
+                        self.carry_to_live(writer, carry);
                     }
-                    self.drain.dead.remove(&writer);
                 }
                 // The issued number keeps the secret it was asked under, so a
                 // later handshake names it (R70 decision 22).
@@ -502,7 +513,9 @@ where
         let opened = keys.open().await?;
         if *connetto_core::device_cert::key_id(&*opened.key).as_bytes() != key_id {
             // The device holds another key now, so the old one's entries move.
-            self.drain.dead.insert(WriterRef::Device(key_id));
+            self.drain
+                .dead
+                .insert(WriterRef::Device(key_id), crate::Carry::Named);
             self.drop_drain_wire().await;
             self.drain.arm(Duration::ZERO);
             return Ok(());
@@ -795,7 +808,7 @@ where
             match writer {
                 WriterRef::Device(_) if !device_retired => {
                     device_retired = true;
-                    let event = self.retire_device()?;
+                    let event = self.retire_device(crate::Carry::Named)?;
                     self.notices.push_back(event);
                 }
                 WriterRef::Device(_) => {}
@@ -804,8 +817,8 @@ where
                 }
                 number @ WriterRef::Number(_) => {
                     self.owe_retire(number).await?;
-                    self.carry_to_live(number);
-                    self.drain.dead.insert(number);
+                    self.carry_to_live(number, crate::Carry::Named);
+                    self.drain.dead.insert(number, crate::Carry::Named);
                 }
             }
         }
@@ -1100,7 +1113,7 @@ where
             return self.drain_reconcile(major, writer, frontier).await;
         }
         // Retired, unknown or not enrolled there, so its entries move.
-        self.drain.dead.insert(writer);
+        self.drain.dead.insert(writer, crate::Carry::Named);
         self.drop_drain_wire().await;
         self.drain.arm(Duration::ZERO);
         Ok(())
@@ -1121,14 +1134,14 @@ where
                 Ok(())
             }
             FatalErrorReason::DeviceRevoked => {
-                self.exclude_device_writers()?;
+                self.exclude_device_writers(crate::Carry::Named)?;
                 self.drop_drain_wire().await;
                 self.drain.arm(Duration::ZERO);
                 Ok(())
             }
-            FatalErrorReason::WriterUnknown | FatalErrorReason::WriterRetired => {
+            reason @ (FatalErrorReason::WriterUnknown | FatalErrorReason::WriterRetired) => {
                 if let Some(writer) = self.drain.writer {
-                    self.drain.dead.insert(writer);
+                    self.drain.dead.insert(writer, crate::carry_after(&reason));
                 }
                 self.drop_drain_wire().await;
                 self.drain.arm(Duration::ZERO);

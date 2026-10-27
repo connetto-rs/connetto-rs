@@ -190,6 +190,14 @@ pub enum ClientError {
         /// The refusal the peer sent.
         reason: FatalErrorReason,
     },
+    /// The handshake granted the writer at a frontier below what this
+    /// replica saw settled, which only a restore can do, so its queue moved
+    /// to a fresh writer and the next attach asks for one (R70 decision 21).
+    #[error("a restore rewound writer {writer:?} below what this replica saw settled")]
+    WriterRewound {
+        /// The writer the restore rewound.
+        writer: WriterRef,
+    },
     /// The bot's registration was refused (R91). The refusal is the wire's
     /// `RegistrationRefused` frame, after which the connection carries on with
     /// a fresh challenge, so there is no close reason to carry.
@@ -518,6 +526,18 @@ impl ClientError {
             ClientError::Refused { reason } => reason.is_build_mismatch(),
             _ => false,
         }
+    }
+
+    /// Whether this attach failure moved a writer's queue to a fresh writer,
+    /// so the next attach succeeds where this one failed (R70 decision 21).
+    fn is_writer_rebase(&self) -> bool {
+        matches!(
+            self,
+            ClientError::WriterRewound { .. }
+                | ClientError::Refused {
+                    reason: FatalErrorReason::WriterUnknown | FatalErrorReason::WriterRetired,
+                }
+        )
     }
 }
 
@@ -3000,6 +3020,29 @@ struct EntryRecord<'a> {
     major: Option<Major>,
 }
 
+/// Whether a carried tail names the writer it leaves (R70 decision 21).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Carry {
+    /// The writer's settled record stands on the server, so each entry names
+    /// it and is answered from it.
+    Named,
+    /// A restore rewound the writer, so nothing past the restored frontier
+    /// exists to name and the entries travel as fresh writes.
+    Abandoned,
+}
+
+/// How a writer's tail travels once the server refuses the writer. A retired
+/// writer's record stands, so its entries name it, and a number the server no
+/// longer holds can only be a restore, so its entries name nothing past it
+/// (R70 decision 21).
+fn carry_after(reason: &FatalErrorReason) -> Carry {
+    if matches!(reason, FatalErrorReason::WriterUnknown) {
+        Carry::Abandoned
+    } else {
+        Carry::Named
+    }
+}
+
 struct CarriedEntry {
     source: WriterRef,
     original_seq: u64,
@@ -4727,8 +4770,10 @@ where
                     reason: FatalErrorReason::WriterUnknown | FatalErrorReason::WriterRetired,
                 },
             ) => {
-                if let WriterRequest::Number { number, .. } = writer {
-                    self.carry_to_live(WriterRef::Number(number));
+                if let WriterRequest::Number { number, .. } = writer
+                    && let ClientError::Refused { reason } = &error
+                {
+                    self.carry_to_live(WriterRef::Number(number), carry_after(reason));
                 }
                 return Err(error);
             }
@@ -4740,6 +4785,12 @@ where
             Some(WriterRef::Number(_)) => ack.writer.map(|grant| grant.frontier),
             _ => None,
         };
+        if let (Some(rewound), Some(frontier)) = (bound, frontier)
+            && self.rewound(&rewound, frontier)
+        {
+            self.abandon_rewound(rewound)?;
+            return Err(ClientError::WriterRewound { writer: rewound });
+        }
         self.run = Some(Run {
             session_handle: ack.session_handle,
             resume_token: ack.resume_token,
@@ -4874,7 +4925,7 @@ where
         if let Some(held) = number
             && self.number_secret(held).is_none()
         {
-            self.carry_to_live(WriterRef::Number(held));
+            self.carry_to_live(WriterRef::Number(held), Carry::Abandoned);
             number = None;
         }
         let number_tail = number.is_some_and(|number| {
@@ -5061,7 +5112,7 @@ where
                 #[cfg(feature = "device-identity")]
                 if let Ok(Some(held)) = self.device_certificate() {
                     let key_id = *held.leaf.identity().key().as_bytes();
-                    self.carry_writers(&[unissued()], &WriterRef::Device(key_id))?;
+                    self.carry_writers(&[unissued()], &WriterRef::Device(key_id), Carry::Named)?;
                 }
                 Ok(None)
             }
@@ -5257,6 +5308,12 @@ where
                         detail: "a stale bind answer for a retired key dropped".to_owned(),
                     });
                 }
+                // A frontier below what this replica saw settled can only be
+                // a restore, so the key retires and its queue travels on
+                // naming nothing past the restored frontier (R70 decision 21).
+                if self.rewound(&writer, frontier) {
+                    return self.retire_device(Carry::Abandoned);
+                }
                 let queue = self
                     .writers
                     .entry(writer)
@@ -5279,7 +5336,7 @@ where
                     .filter(|w| !matches!(w, WriterRef::Device(_)))
                     .copied()
                     .collect();
-                self.carry_writers(&stale, &writer)?;
+                self.carry_writers(&stale, &writer, Carry::Named)?;
                 self.flush_writer_tasks().await?;
                 self.replay_pending().await?;
                 Ok(ClientEvent::NonFatal {
@@ -5290,7 +5347,7 @@ where
             WriterOutcome::Retired | WriterOutcome::NotEnrolled | WriterOutcome::Unknown => {
                 // The key is retired or not a live enrolment, so the tail
                 // travels under a fresh number and the device enrols fresh.
-                self.retire_device()
+                self.retire_device(Carry::Named)
             }
         }
     }
@@ -5341,9 +5398,14 @@ where
     /// joins a chain ahead of an older major's entry its drain still owes,
     /// and a writer whose older-major entries stay behind keeps its state
     /// for the drain (R31).
-    fn carry_writers(&mut self, dead: &[WriterRef], target: &WriterRef) -> Result<(), ClientError> {
+    fn carry_writers(
+        &mut self,
+        dead: &[WriterRef],
+        target: &WriterRef,
+        carry: Carry,
+    ) -> Result<(), ClientError> {
         let build = self.config.schema_major;
-        self.carry_matching(dead, target, |entry| entry.major == build)
+        self.carry_matching(dead, target, carry, |entry| entry.major == build)
     }
 
     /// Where each entry of `dead` that `carried` admits lands under `target`:
@@ -5353,6 +5415,7 @@ where
         &self,
         dead: &[WriterRef],
         target: &WriterRef,
+        carry: Carry,
         carried: &impl Fn(&PendingEntry) -> bool,
     ) -> Result<(Vec<CarriedEntry>, u64, [u8; 32]), ClientError> {
         let mut plan = Vec::new();
@@ -5361,13 +5424,16 @@ where
                 for (original_seq, entry) in &queue.pending {
                     if carried(entry) {
                         // A carried entry keeps an earlier carry's provenance,
-                        // and otherwise names the writer it was made under.
+                        // and otherwise names the writer it was made under
+                        // unless a restore rewound that writer.
                         let provenance = entry.provenance.or_else(|| {
-                            is_real_writer(source).then_some(Provenance {
-                                writer: *source,
-                                seq: *original_seq,
-                                secret: queue.secret,
-                            })
+                            (carry == Carry::Named && is_real_writer(source)).then_some(
+                                Provenance {
+                                    writer: *source,
+                                    seq: *original_seq,
+                                    secret: queue.secret,
+                                },
+                            )
                         });
                         plan.push(CarriedEntry {
                             source: *source,
@@ -5404,10 +5470,11 @@ where
         &mut self,
         dead: &[WriterRef],
         target: &WriterRef,
+        carry: Carry,
         carried: impl Fn(&PendingEntry) -> bool,
     ) -> Result<(), ClientError> {
         debug_assert!(!dead.contains(target));
-        let (plan, next_seq, head) = self.carry_plan(dead, target, &carried)?;
+        let (plan, next_seq, head) = self.carry_plan(dead, target, carry, &carried)?;
         // A dead writer whose every entry travels leaves nothing behind.
         let emptied: Vec<WriterRef> = dead
             .iter()
@@ -5490,11 +5557,30 @@ where
 
     /// Carry a dead writer's tail to the live writer, tolerating the database
     /// the same way the fatal that drove the carry does.
-    fn carry_to_live(&mut self, dead: WriterRef) {
+    fn carry_to_live(&mut self, dead: WriterRef, carry: Carry) {
         let target = self.tail_target(&dead);
-        if let Err(err) = self.carry_writers(&[dead], &target) {
+        if let Err(err) = self.carry_writers(&[dead], &target, carry) {
             tracing::warn!(error = %err, "the tail could not be re-queued");
         }
+    }
+
+    /// Whether `frontier`, the server's for `writer`, stands below what this
+    /// replica saw settled, which only a restore can do (R70 decision 21).
+    fn rewound(&self, writer: &WriterRef, frontier: u64) -> bool {
+        frontier < self.settled_through(writer)
+    }
+
+    /// Abandon a writer a restore rewound (R70 decision 21). A number's queue
+    /// moves to the unissued writer, and a device's key retires with its
+    /// queue moving to a number, neither naming the writer it leaves.
+    fn abandon_rewound(&mut self, writer: WriterRef) -> Result<(), ClientError> {
+        if matches!(writer, WriterRef::Device(_)) {
+            self.retire_device(Carry::Abandoned)?;
+        } else {
+            let target = self.tail_target(&writer);
+            self.carry_writers(&[writer], &target, Carry::Abandoned)?;
+        }
+        Ok(())
     }
 
     /// Atomically appends an entry captured under `major`, its position and
@@ -5582,8 +5668,8 @@ where
     /// # Errors
     ///
     /// [`ClientError`] if the carry and key exclusion cannot commit together.
-    fn retire_device(&mut self) -> Result<ClientEvent, ClientError> {
-        self.exclude_device_writers()?;
+    fn retire_device(&mut self, carry: Carry) -> Result<ClientEvent, ClientError> {
+        self.exclude_device_writers(carry)?;
         #[cfg(feature = "device-identity")]
         if let Some(sender) = &self.writer_retired {
             let _ = sender.send(crate::enrolment::Command::WriterRetired);
@@ -5599,7 +5685,7 @@ where
     /// # Errors
     ///
     /// [`ClientError`] if the carry and key exclusion cannot commit together.
-    fn exclude_device_writers(&mut self) -> Result<(), ClientError> {
+    fn exclude_device_writers(&mut self, carry: Carry) -> Result<(), ClientError> {
         let writers = self.device_writers();
         #[cfg(feature = "device-identity")]
         let writers = {
@@ -5614,7 +5700,7 @@ where
         let target = self
             .number_identity()
             .map_or_else(unissued, WriterRef::Number);
-        self.carry_writers(&writers, &target)?;
+        self.carry_writers(&writers, &target, carry)?;
         #[cfg(feature = "device-identity")]
         {
             self.pending_bind = None;
@@ -6987,7 +7073,7 @@ where
             // The archived writer is this replica's own, so it is retired and
             // its tail, restored entries included, travels to the live writer.
             let live = self.tail_target(&current);
-            self.carry_writers(&[current], &live)?;
+            self.carry_writers(&[current], &live, Carry::Named)?;
             #[cfg(feature = "device-identity")]
             if matches!(current, WriterRef::Device(_))
                 && let Some(sender) = &self.writer_retired
@@ -8154,25 +8240,35 @@ where
     /// [`ClientError`] when a device retirement cannot be made durable; the
     /// queues then stand as they did before the transition.
     fn server_closed(&mut self, reason: FatalErrorReason) -> Result<ClientEvent, ClientError> {
-        match reason {
+        match &reason {
             FatalErrorReason::WriterRetired | FatalErrorReason::WriterUnknown => {
                 match self.bound_writer {
                     Some(WriterRef::Device(_)) => {
                         // The device's writer is gone, so its tails travel
                         // under a number, the key is excluded before the
                         // cleanup runs, and a fresh key enrols.
-                        self.retire_device()?;
+                        self.retire_device(Carry::Named)?;
                     }
                     Some(writer) => {
                         // A number died, so its tail travels to the live
                         // writer, the key untouched.
-                        self.carry_to_live(writer);
+                        self.carry_to_live(writer, carry_after(&reason));
                     }
                     None => {}
                 }
             }
+            FatalErrorReason::SequenceGap { expected, .. } => {
+                // A server frontier below what this replica saw settled can
+                // only be a restore, so the writer is abandoned before the
+                // redial. A gap at the settled prefix is left to the redial.
+                if let Some(writer) = self.bound_writer
+                    && self.rewound(&writer, expected.saturating_sub(1))
+                {
+                    self.abandon_rewound(writer)?;
+                }
+            }
             FatalErrorReason::DeviceRevoked => {
-                self.exclude_device_writers()?;
+                self.exclude_device_writers(Carry::Named)?;
             }
             _ => {}
         }
@@ -9458,5 +9554,78 @@ mod tests {
             .get_result::<TierMajor>(&mut conn.db)
             .expect("read the tier's major");
         assert_eq!(version.user_version, 0, "a planless create stamps nothing");
+    }
+
+    /// Decision 21's device rows: a `Bound` whose frontier stands at what the
+    /// replica saw settled keeps the device, and one below it can only come
+    /// from a restore, so the key is retired and its queue moves to a number
+    /// without naming the key.
+    #[cfg(feature = "device-identity")]
+    #[tokio::test]
+    async fn a_bind_below_the_settled_prefix_retires_the_key_and_names_nothing() {
+        let config = ClientConfig::new("rebase-test");
+        let mut conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("open in-memory replica");
+        let key = [7; 32];
+        let device = WriterRef::Device(key);
+        for id in 1..=3 {
+            conn.db
+                .batch_execute(&format!("INSERT INTO t (id) VALUES ({id})"))
+                .expect("local write");
+            let changeset = conn.session.changeset().expect("capture the write");
+            conn.append_entry(&device, &changeset, None, None, true)
+                .expect("queue the write");
+        }
+        conn.bound_writer = Some(device);
+        for client_seq in [1, 2] {
+            conn.handle_control(ControlMessage::MutationApplied(
+                connetto_core::messages::MutationApplied { client_seq },
+            ))
+            .await
+            .expect("the write settles");
+        }
+        conn.bound_writer = None;
+
+        conn.answer_bind(
+            key,
+            "at-prefix".to_owned(),
+            WriterOutcome::Bound { frontier: 2 },
+        )
+        .await
+        .expect("the bind is answered");
+        assert_eq!(
+            conn.bound_writer,
+            Some(device),
+            "a frontier at the settled prefix binds the key"
+        );
+        conn.bound_writer = None;
+
+        conn.answer_bind(
+            key,
+            "below".to_owned(),
+            WriterOutcome::Bound { frontier: 1 },
+        )
+        .await
+        .expect("the bind is answered");
+        assert!(
+            conn.retired_keys.contains(&key),
+            "the rewound key is retired"
+        );
+        assert_eq!(conn.bound_writer, None, "the rewound key never binds");
+        assert_eq!(
+            conn.unsynced(),
+            vec![UnsyncedWrite {
+                writer: unissued(),
+                seq: 1,
+                major: None,
+            }],
+            "the key's queue waits for a fresh number"
+        );
+        assert_eq!(
+            conn.writers[&unissued()].pending[&1].provenance,
+            None,
+            "nothing past the restored frontier is named"
+        );
     }
 }

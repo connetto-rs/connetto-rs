@@ -130,7 +130,7 @@ impl ChildGuard {
     }
 
     /// The child's exit status, if it has exited.
-    fn exited(&mut self) -> Option<std::process::ExitStatus> {
+    pub(super) fn exited(&mut self) -> Option<std::process::ExitStatus> {
         self.child.as_mut()?.try_wait().ok().flatten()
     }
 

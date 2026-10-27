@@ -65,6 +65,8 @@
 
 **Built (R70) for the cluster.** A cursor also carries the cluster's system identifier, read from the `IDENTIFY_SYSTEM` the timeline read already sends, and one from another cluster takes a full resync with `CursorBeyondHistory`, because a database restored into another cluster starts again at timeline 1 and the timeline check does not see it.
 
+**Built (R70, 2026-10-27) for writers.** A restore holds each writer at the frontier of the backup and rewinds the writer number sequence with the rows. The server's frontier never decreases and no code deletes a writer row, so a client that meets a frontier below what it saw settled, at the handshake, at a device bind or in a live `SequenceGap`, or meets `WriterUnknown` for a number it holds, reads it as a restore. It moves that writer's pending entries to a fresh writer without provenance naming the abandoned one, a number taking a new number at the next handshake and a device retiring its key and enrolling a new one. Each number carries a secret only its replica holds (`11-authentication.md`), so a number the restored server issues again to another replica never binds the one that held it before. Writes the server acknowledged after the backup are lost on both sides, and R78's courier is their recovery. `a_restore_moves_rewound_writers_to_fresh_numbers` in `restore.rs` proves it with a same-cluster dump restore.
+
 ---
 
 ## Running the server
