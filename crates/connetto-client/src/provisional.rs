@@ -7,7 +7,7 @@
 //! the row's record and confirms it, and the application stands the records
 //! back from the table, since the broadcast event stream can drop events.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use diesel::prelude::*;
 use sqlite_diff_rs::Value;
@@ -128,13 +128,9 @@ const TAG_BLOB: u8 = 4;
 
 /// The table's `pk` encoding of a key: one tag byte per column, the integer
 /// and real values as eight little-endian bytes, the text and blob values as
-/// a four-byte little-endian length then their bytes.
-///
-/// # Errors
-///
-/// [`ClientError::Session`] when a text or blob column is longer than four
-/// bytes can count, which no SQLite value can be.
-pub fn encode_key(key: &[KeyValue]) -> Result<Vec<u8>, ClientError> {
+/// an eight-byte little-endian length then their bytes.
+#[must_use]
+pub fn encode_key(key: &[KeyValue]) -> Vec<u8> {
     let mut out = Vec::new();
     for value in key {
         match value {
@@ -149,24 +145,20 @@ pub fn encode_key(key: &[KeyValue]) -> Result<Vec<u8>, ClientError> {
             }
             KeyValue::Text(text) => {
                 out.push(TAG_TEXT);
-                push_sized(&mut out, text.as_bytes())?;
+                push_sized(&mut out, text.as_bytes());
             }
             KeyValue::Blob(blob) => {
                 out.push(TAG_BLOB);
-                push_sized(&mut out, blob)?;
+                push_sized(&mut out, blob);
             }
         }
     }
-    Ok(out)
+    out
 }
 
-fn push_sized(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ClientError> {
-    let len = u32::try_from(bytes.len()).map_err(|_| {
-        ClientError::Session("a provisional key column is too long to encode".to_owned())
-    })?;
-    out.extend_from_slice(&len.to_le_bytes());
+fn push_sized(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
     out.extend_from_slice(bytes);
-    Ok(())
 }
 
 /// Decode the table's `pk` bytes back into their typed columns.
@@ -193,10 +185,12 @@ pub fn decode_key(bytes: &[u8]) -> Result<Vec<KeyValue>, ClientError> {
                 }
             }
             TAG_TEXT | TAG_BLOB => {
-                let Some((head, tail)) = rest.split_first_chunk::<4>() else {
+                let Some((head, tail)) = rest.split_first_chunk::<8>() else {
                     return Err(short());
                 };
-                let len = usize::try_from(u32::from_le_bytes(*head)).map_err(|_| short())?;
+                // A length no slice can hold on this target is as short as any
+                // other length the bytes cannot cover.
+                let len = usize::try_from(u64::from_le_bytes(*head)).unwrap_or(usize::MAX);
                 let Some((body, tail)) = tail.split_at_checked(len) else {
                     return Err(short());
                 };
@@ -257,17 +251,16 @@ fn pk_column_names(db: &mut SqliteConnection, table: &str) -> Result<Vec<String>
 }
 
 /// One keep clause for a stored key, the same `(col IS literal AND ...)`
-/// shape the pending spare builds.
+/// shape the pending spare builds, or `None` when the table's key layout
+/// cannot express the key, whose row is then provably gone.
 fn key_clause(
     db: &mut SqliteConnection,
     table: &str,
     key: &[KeyValue],
-) -> Result<String, ClientError> {
+) -> Result<Option<String>, ClientError> {
     let names = pk_column_names(db, table)?;
     if key.is_empty() || names.len() != key.len() {
-        return Err(ClientError::Session(
-            "a provisional record's key does not match its table's key layout".to_owned(),
-        ));
+        return Ok(None);
     }
     let wheres: Vec<String> = names
         .iter()
@@ -280,7 +273,7 @@ fn key_clause(
             ))
         })
         .collect::<Result<_, ClientError>>()?;
-    Ok(format!("({})", wheres.join(" AND ")))
+    Ok(Some(format!("({})", wheres.join(" AND "))))
 }
 
 /// The eviction passes' keep clauses over the rows still awaiting a
@@ -301,7 +294,7 @@ pub(crate) fn spare(
         let Ok(key) = decode_key(&pk) else {
             continue;
         };
-        let Ok(clause) = key_clause(db, &tbl, &key) else {
+        let Some(clause) = key_clause(db, &tbl, &key)? else {
             continue;
         };
         spare.entry(tbl).or_default().push(clause);
@@ -341,7 +334,7 @@ pub(crate) fn row_of_key(
     table: &str,
     key: &[KeyValue],
 ) -> Result<Option<ProvisionalRow>, ClientError> {
-    let blob = encode_key(key)?;
+    let blob = encode_key(key);
     let record: Option<Stored> = dsl::_connetto_provisional
         .filter(dsl::tbl.eq(table))
         .filter(dsl::pk.eq(&blob))
@@ -351,14 +344,15 @@ pub(crate) fn row_of_key(
 }
 
 /// The records of the keys a server write just wrote, deleted in the
-/// caller's transaction and returned as the application stands them.
+/// caller's transaction and returned as the application stands them. A key
+/// named twice is cleared once, its record gone at the second lookup.
 pub(crate) fn clear_written(
     db: &mut SqliteConnection,
     keys: &[(String, Vec<KeyValue>)],
 ) -> Result<Vec<ProvisionalRow>, ClientError> {
     let mut out = Vec::new();
     for (table, key) in keys {
-        let blob = encode_key(key)?;
+        let blob = encode_key(key);
         let record: Option<Stored> = dsl::_connetto_provisional
             .filter(dsl::tbl.eq(table))
             .filter(dsl::pk.eq(&blob))
@@ -375,25 +369,16 @@ pub(crate) fn clear_written(
     Ok(out)
 }
 
-/// The (table, key) pairs a payload writes, each once, the tables lowercased
-/// as the payload names them.
+/// The (table, key) pairs a payload writes, payload order, the tables
+/// lowercased as the payload names them.
 pub(crate) fn written_keys(bytes: &[u8]) -> Result<Vec<(String, Vec<KeyValue>)>, ClientError> {
     let ops = crate::op_keys(bytes).map_err(|err| {
         ClientError::Apply(format!("parsing a payload to confirm its keys: {err:?}"))
     })?;
-    let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
-    let mut out: Vec<(String, Vec<KeyValue>)> = Vec::new();
-    for (table, key) in ops {
-        if key.is_empty() {
-            continue;
-        }
-        let table = table.to_lowercase();
-        let blob = encode_key(&key)?;
-        if seen.insert((table.clone(), blob)) {
-            out.push((table, key));
-        }
-    }
-    Ok(out)
+    Ok(ops
+        .into_iter()
+        .map(|(table, key)| (table.to_lowercase(), key))
+        .collect())
 }
 
 /// Drop the records of `table`'s keys whose rows are gone, whatever took
@@ -422,38 +407,16 @@ fn key_alive(
     table: &str,
     key: &[KeyValue],
 ) -> Result<bool, ClientError> {
-    #[derive(diesel::QueryableByName)]
-    struct Present {
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        present: i32,
-    }
-
-    let names = pk_column_names(db, table)?;
-    if key.is_empty() || names.len() != key.len() {
-        // A key the table's layout cannot express is provably gone: the row
-        // it described was taken, or the table itself.
+    let Some(clause) = key_clause(db, table, key)? else {
         return Ok(false);
-    }
-    let wheres: Vec<String> = names
-        .iter()
-        .zip(key)
-        .map(|(name, value)| {
-            Ok(format!(
-                "{} IS {}",
-                quote_ident(name),
-                bind_literal_of(&value_of(value))?
-            ))
-        })
-        .collect::<Result<_, ClientError>>()?;
+    };
     // The table and the clause come from the provenance record, so the DSL
-    // cannot name them: the probe stays a raw statement.
+    // cannot name them and the probe stays raw SQL.
     let probe = format!(
-        "SELECT 1 AS present FROM {} WHERE {} LIMIT 1",
-        quote_ident(table),
-        wheres.join(" AND ")
+        "EXISTS (SELECT 1 FROM {} WHERE {clause})",
+        quote_ident(table)
     );
-    let present: Option<Present> = diesel::sql_query(&probe).get_result(db).optional()?;
-    Ok(present.is_some_and(|row| row.present > 0))
+    Ok(diesel::select(diesel::dsl::sql::<diesel::sql_types::Bool>(&probe)).get_result(db)?)
 }
 
 /// Drop every record of `table`, whose rows all went.
@@ -481,10 +444,10 @@ mod tests {
         ];
         for column in &columns {
             let key = vec![column.clone()];
-            let bytes = encode_key(&key).expect("encode");
+            let bytes = encode_key(&key);
             assert_eq!(decode_key(&bytes).expect("decode"), key);
         }
-        let bytes = encode_key(&columns).expect("encode");
+        let bytes = encode_key(&columns);
         assert_eq!(decode_key(&bytes).expect("decode"), columns);
     }
 
@@ -502,10 +465,7 @@ mod tests {
                 KeyValue::Text("b".to_owned()),
             ],
         ];
-        let encoded: Vec<Vec<u8>> = keys
-            .iter()
-            .map(|key| encode_key(key).expect("encode"))
-            .collect();
+        let encoded: Vec<Vec<u8>> = keys.iter().map(|key| encode_key(key)).collect();
         for (index, bytes) in encoded.iter().enumerate() {
             assert!(
                 !encoded[index + 1..].contains(bytes),
@@ -519,11 +479,12 @@ mod tests {
     #[test]
     fn malformed_key_bytes_are_refused() {
         for bytes in [
-            vec![1, 0, 0, 0],                // an integer cut short
-            vec![3, 5, 0],                   // a text length cut short
-            vec![4, 5, 0, 0, 0, 1, 2],       // a blob shorter than its length
-            vec![3, 2, 0, 0, 0, 0xff, 0xfe], // text that is not UTF-8
-            vec![9],                         // an undefined tag
+            vec![1, 0, 0, 0],                                // an integer cut short
+            vec![3, 5, 0, 0, 0],                             // a text length cut short
+            vec![4, 5, 0, 0, 0, 0, 0, 0, 0, 1, 2],           // a blob shorter than its length
+            vec![4, 255, 255, 255, 255, 255, 255, 255, 255], // a length no slice holds
+            vec![3, 2, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe],     // text that is not UTF-8
+            vec![9],                                         // an undefined tag
         ] {
             assert!(decode_key(&bytes).is_err(), "{bytes:?} decoded");
         }

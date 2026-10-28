@@ -12,9 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use connetto_client::{
-    ClientBuilder, ClientEvent, ConnettoClient, DataDir, Gate, GateAskFuture, GateAskOutcome,
-    GateMechanism, MemoryRefreshStore, Moment, ReconnectPolicy, SyncStatus, SyncTuning,
-    SystemClock, TransportFactory,
+    ClientBuilder, ClientEvent, ConnettoClient, DataDir, Gate, GateAskOutcome, MemoryRefreshStore,
+    Moment, ReconnectPolicy, SyncStatus, SyncTuning, SystemClock, TransportFactory,
 };
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, Pong, SnapshotBegin,
@@ -22,10 +21,8 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
-use parking_lot::Mutex;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use tempfile::tempdir;
-use tokio::sync::oneshot;
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT);";
 
@@ -843,7 +840,7 @@ async fn a_first_attach_refused_for_a_rebased_writer_starts_offline_and_redials(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_probe_runs_while_the_gate_is_locked() {
     let pings = Arc::new(AtomicU32::new(0));
-    let mechanism = LockedMechanism::new();
+    let mechanism = super::support::LockedMechanism::new();
     let connecting = tokio::spawn({
         let pings = Arc::clone(&pings);
         let mechanism = mechanism.clone();
@@ -904,58 +901,4 @@ async fn the_probe_runs_while_the_gate_is_locked() {
         "the probe went out while the gate was locked and asking"
     );
     mechanism.resolve(GateAskOutcome::Approved);
-}
-
-/// A gate mechanism that stays locked and asks a prompt the test holds.
-#[derive(Clone)]
-struct LockedMechanism {
-    open: Arc<AtomicBool>,
-    asks: Arc<AtomicU32>,
-    senders: Arc<Mutex<Vec<oneshot::Sender<GateAskOutcome>>>>,
-}
-
-impl LockedMechanism {
-    fn new() -> Self {
-        Self {
-            open: Arc::new(AtomicBool::new(false)),
-            asks: Arc::new(AtomicU32::new(0)),
-            senders: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    /// Wait until the mechanism was asked `count` times.
-    async fn until_asked(&self, count: u32) {
-        tokio::time::timeout(BOUND, async {
-            while self.asks.load(Ordering::Acquire) < count {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the mechanism is asked in time");
-    }
-
-    /// Resolve the pending prompt with the given outcome.
-    fn resolve(&self, outcome: GateAskOutcome) {
-        let mut senders = self.senders.lock();
-        if let Some(sender) = senders.pop() {
-            sender.send(outcome).expect("the pump holds the prompt");
-        }
-    }
-}
-
-impl GateMechanism for LockedMechanism {
-    fn lock(&self) {
-        self.open.store(false, Ordering::Release);
-    }
-
-    fn is_open(&self) -> bool {
-        self.open.load(Ordering::Acquire)
-    }
-
-    fn ask(&self) -> GateAskFuture {
-        self.asks.fetch_add(1, Ordering::AcqRel);
-        let (tx, rx) = oneshot::channel();
-        self.senders.lock().push(tx);
-        Box::pin(async move { rx.await.unwrap_or(GateAskOutcome::Dismissed) })
-    }
 }
