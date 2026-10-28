@@ -10067,4 +10067,16 @@ mod tests {
             "the next check lies after now: {timer:?}"
         );
     }
+
+    /// A payload that is no changeset and no patchset is refused, so an event
+    /// naming its affected rows is never built on garbage.
+    #[test]
+    fn affected_rows_refuses_a_payload_it_cannot_parse() {
+        let err = affected_rows(b"not a changeset", &PolicyTables::default())
+            .expect_err("the payload parses as neither");
+        assert!(
+            err.to_string().contains("parsing pushed changeset"),
+            "the refusal names the parse: {err}"
+        );
+    }
 }

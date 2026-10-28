@@ -8,10 +8,19 @@
 //! describes.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use connetto_client::provisional::{ProvisionalRow, ProvisionalState, encode_key};
-use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, KeyValue, SyncSchema};
+use connetto_client::provisional::{ProvisionalRow, ProvisionalState, decode_key, encode_key};
+use connetto_client::{
+    ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, Gate, GateAskFuture,
+    GateAskOutcome, GateMechanism, KeyValue, MemoryRefreshStore, Moment, NativeClientBuilder,
+    ReconnectPolicy, SyncSchema, SystemClock,
+};
+use parking_lot::Mutex;
+use tokio::sync::oneshot;
+
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, LivePatch, SnapshotBegin,
@@ -26,7 +35,8 @@ use super::support::{self, Script};
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT); \
                    CREATE TABLE parts (name TEXT, size BLOB, label TEXT, \
-                   PRIMARY KEY (name, size));";
+                   PRIMARY KEY (name, size)); \
+                   CREATE TABLE reals (id REAL PRIMARY KEY, label TEXT);";
 
 const AUTHOR: &str = "r77-peer-author";
 const ACCOUNT: &str = "peer@account";
@@ -50,6 +60,16 @@ diesel::table! {
         name -> Text,
         /// Second key column.
         size -> Binary,
+        /// Free-text payload.
+        label -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    /// The synced reals table, a real primary key.
+    reals (id) {
+        /// Primary key.
+        id -> Double,
         /// Free-text payload.
         label -> Nullable<Text>,
     }
@@ -139,6 +159,25 @@ fn hex(bytes: &[u8]) -> String {
         })
 }
 
+/// Write one provenance row straight into the replica with the raw stored
+/// `state` value and `pk` bytes, so a test can name a state or a key the
+/// table does not define.
+fn raw_record<T>(conn: &mut ConnettoConnection<T>, table: &str, pk: &str, state: i64)
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    let author: Vec<u8> = AUTHOR.bytes().collect();
+    conn.conn()
+        .batch_execute(&format!(
+            "INSERT INTO _connetto_provisional \
+             (tbl, pk, author, seq, account, received_at, state) \
+             VALUES ('{table}', X'{pk}', X'{author}', {SEQ}, '{ACCOUNT}', {RECEIVED_AT}, {state})",
+            author = hex(&author),
+        ))
+        .expect("insert the provenance row");
+}
+
 /// A compressed insert patchset over `orders`.
 fn orders_payload(rows: &[(i64, &str)]) -> Vec<u8> {
     let mut patch = PatchSet::<SimpleTable, String, Vec<u8>>::new();
@@ -175,6 +214,37 @@ fn parts_payload(rows: &[(&str, &[u8], &str)]) -> Vec<u8> {
         patch = patch.insert(insert);
     }
     zstd::encode_all(patch.build().as_slice(), 3).expect("compress the patch")
+}
+
+/// A compressed insert patchset over `reals`.
+fn reals_payload(rows: &[(f64, &str)]) -> Vec<u8> {
+    let mut patch = PatchSet::<SimpleTable, String, Vec<u8>>::new();
+    for (id, label) in rows {
+        let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
+            "reals",
+            &[("id", ""), ("label", "")],
+            &[0],
+        ))
+        .set(0, Value::<String, Vec<u8>>::Real(*id))
+        .expect("set the key")
+        .set(1, Value::<String, Vec<u8>>::Text(label.to_string()))
+        .expect("set the label");
+        patch = patch.insert(insert);
+    }
+    zstd::encode_all(patch.build().as_slice(), 3).expect("compress the patch")
+}
+
+/// The `reals` table's ids, key order.
+fn real_ids<T>(conn: &mut ConnettoConnection<T>) -> Vec<f64>
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    reals::table
+        .select(reals::id)
+        .order(reals::id.asc())
+        .load(conn.conn())
+        .expect("read the reals table")
 }
 
 /// A compressed one-row update patchset over `table`, the row's new column
@@ -812,6 +882,522 @@ async fn a_shared_table_provisional_row_survives_tidy_and_confirms() {
     })
     .await;
     assert_eq!(stored_provenance(&mut conn), Vec::new());
+}
+
+/// The bound every prompt and event in a gated test has to arrive within.
+const BOUND: Duration = Duration::from_secs(5);
+
+/// The live client stands the provenance back from the table, naming the
+/// table as the application writes it, and answers nothing for an absent key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_client_answers_provenance_from_the_table() {
+    let script = Script::default();
+    script.say(support::handshake_ack());
+    let (running, pump) = ClientBuilder::new(support::bundle(DDL), support::Once::new(script))
+        .signed_in(support::held("r77"))
+        .connect_with_pump()
+        .await
+        .expect("the build connects");
+    tokio::spawn(pump);
+    let client = running.client().clone();
+    client
+        .with_conn(|conn| {
+            record_provenance(
+                conn,
+                "orders",
+                &[KeyValue::Int(2)],
+                ProvisionalState::Provisional,
+                Some(("r77-local-author", 3)),
+            );
+        })
+        .await
+        .expect("seed the provenance");
+    let author: Vec<u8> = AUTHOR.bytes().collect();
+    let row = ProvisionalRow {
+        table: "orders".to_owned(),
+        key: vec![KeyValue::Int(2)],
+        author: author.clone(),
+        seq: SEQ,
+        account: ACCOUNT.to_owned(),
+        received_at: RECEIVED_AT,
+        state: ProvisionalState::Provisional,
+        displaced_author: Some("r77-local-author".bytes().collect()),
+        displaced_seq: Some(3),
+    };
+    for table in ["orders", "ORDERS"] {
+        assert_eq!(
+            client
+                .provenance(table, &[KeyValue::Int(2)])
+                .await
+                .expect("read the provenance"),
+            Some(row.clone()),
+            "the table is named as the application writes it"
+        );
+    }
+    assert_eq!(
+        client
+            .provenance("orders", &[KeyValue::Int(99)])
+            .await
+            .expect("read an absent key"),
+        None,
+        "an absent key holds no provenance"
+    );
+    assert_eq!(
+        client
+            .provisional_rows()
+            .await
+            .expect("list the provenance"),
+        vec![row],
+        "the listing stands the stored row back"
+    );
+}
+
+/// A locked gate refuses the provenance reads rather than answer them stale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_locked_gate_refuses_provenance_reads() {
+    let script = Script::default();
+    script.say(support::handshake_ack());
+    let mechanism = LockedGate::new();
+    let connecting = tokio::spawn({
+        let mechanism = mechanism.clone();
+        async move {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let credential = support::held("r77");
+            let key_store = support::key_store(&credential).await;
+            ClientBuilder::new(support::bundle(DDL), support::Once::new(script))
+                .with_reconnect(ReconnectPolicy::default())
+                .signed_in(credential)
+                .durable(
+                    DataDir::new(dir.path().to_path_buf()),
+                    key_store,
+                    MemoryRefreshStore::default(),
+                )
+                .with_gate(Gate::default().with_recheck(Some(Duration::ZERO)))
+                .with_gate_mechanism(mechanism)
+                .connect_with_pump()
+                .await
+        }
+    });
+    mechanism.until_asked(1).await;
+    mechanism.resolve(GateAskOutcome::Approved);
+    let (running, pump) = tokio::time::timeout(BOUND, connecting)
+        .await
+        .expect("the build returns once the launch prompt resolves")
+        .expect("the connect task")
+        .expect("the approved build connects");
+    tokio::spawn(pump);
+    let client = running.client().clone();
+    let mut events = client.events();
+    client.away(Moment::now(&SystemClock)).await;
+    client.back(Moment::now(&SystemClock)).await;
+    let mut locked = false;
+    let until = tokio::time::Instant::now() + BOUND;
+    while !locked {
+        match tokio::time::timeout_at(until, events.recv()).await {
+            Ok(Ok(ClientEvent::Locked)) => locked = true,
+            Ok(Ok(_) | Err(_)) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(
+        locked,
+        "the zero grace re-checks on the return, so the gate locks"
+    );
+    assert!(
+        client
+            .provenance("orders", &[KeyValue::Int(2)])
+            .await
+            .is_err_and(|err| matches!(err, ClientError::Locked)),
+        "a locked gate refuses the provenance read"
+    );
+    assert!(
+        client
+            .provisional_rows()
+            .await
+            .is_err_and(|err| matches!(err, ClientError::Locked)),
+        "a locked gate refuses the provenance listing"
+    );
+}
+
+/// A gate mechanism that stays locked and asks a prompt the test holds.
+#[derive(Clone)]
+struct LockedGate {
+    asks: Arc<AtomicU32>,
+    senders: Arc<Mutex<Vec<oneshot::Sender<GateAskOutcome>>>>,
+}
+
+impl LockedGate {
+    fn new() -> Self {
+        Self {
+            asks: Arc::new(AtomicU32::new(0)),
+            senders: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Wait until the mechanism was asked `count` times.
+    async fn until_asked(&self, count: u32) {
+        tokio::time::timeout(BOUND, async {
+            while self.asks.load(Ordering::Acquire) < count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the mechanism is asked in time");
+    }
+
+    /// Resolve the pending prompt with the given outcome.
+    fn resolve(&self, outcome: GateAskOutcome) {
+        let mut senders = self.senders.lock();
+        if let Some(sender) = senders.pop() {
+            sender.send(outcome).expect("the pump holds the prompt");
+        }
+    }
+}
+
+impl GateMechanism for LockedGate {
+    fn lock(&self) {
+        // The gate never opens again in this test.
+    }
+
+    fn ask(&self) -> GateAskFuture {
+        self.asks.fetch_add(1, Ordering::AcqRel);
+        let (tx, rx) = oneshot::channel();
+        self.senders.lock().push(tx);
+        Box::pin(async move { rx.await.unwrap_or(GateAskOutcome::Dismissed) })
+    }
+}
+
+/// The native client stands the provenance back from the table, the same
+/// rows the live client would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_native_client_answers_provenance_from_the_table() {
+    let script = Script::default();
+    script.say(support::handshake_ack());
+    let client = NativeClientBuilder::new("ws://127.0.0.1:1", support::bundle(DDL))
+        .with_dialer(support::Once::new(script))
+        .connect()
+        .await
+        .expect("the build connects");
+    client
+        .client()
+        .with_conn(|conn| {
+            record_provenance(
+                conn,
+                "orders",
+                &[KeyValue::Int(2)],
+                ProvisionalState::Provisional,
+                None,
+            );
+        })
+        .await
+        .expect("seed the provenance");
+    let author: Vec<u8> = AUTHOR.bytes().collect();
+    let row = ProvisionalRow {
+        table: "orders".to_owned(),
+        key: vec![KeyValue::Int(2)],
+        author,
+        seq: SEQ,
+        account: ACCOUNT.to_owned(),
+        received_at: RECEIVED_AT,
+        state: ProvisionalState::Provisional,
+        displaced_author: None,
+        displaced_seq: None,
+    };
+    assert_eq!(
+        client
+            .provenance("orders", &[KeyValue::Int(2)])
+            .await
+            .expect("read the provenance"),
+        Some(row.clone()),
+        "the table is named as the application writes it"
+    );
+    assert_eq!(
+        client
+            .provisional_rows()
+            .await
+            .expect("list the provenance"),
+        vec![row],
+        "the listing stands the stored row back"
+    );
+}
+
+/// A stored state the table no longer defines refuses the reads rather than
+/// stand a row back from nothing.
+#[tokio::test]
+async fn a_record_with_no_defined_state_fails_the_reads() {
+    let (mut conn, _server) = connected().await;
+    raw_record(
+        &mut conn,
+        "orders",
+        &hex(&encode_key(&[KeyValue::Int(2)]).expect("encode")),
+        2,
+    );
+    let err = conn
+        .provenance("orders", &[KeyValue::Int(2)])
+        .expect_err("the stored state is undefined");
+    assert!(
+        err.to_string()
+            .contains("holds no state the table defines: 2"),
+        "the refusal names the state: {err}"
+    );
+    let err = conn
+        .provisional_rows()
+        .expect_err("the listing reads the same row");
+    assert!(
+        err.to_string()
+            .contains("holds no state the table defines: 2"),
+        "the listing refuses too: {err}"
+    );
+}
+
+/// A record whose key the table's layout cannot express is neither spared
+/// from eviction nor kept, and it is swept with the rows it cannot name.
+#[tokio::test]
+async fn a_key_the_table_cannot_express_is_neither_spared_nor_kept() {
+    let (mut conn, _server) = orders_fixture().await;
+    record_provenance(
+        &mut conn,
+        "orders",
+        &[KeyValue::Int(2)],
+        ProvisionalState::Provisional,
+        None,
+    );
+    raw_record(
+        &mut conn,
+        "orders",
+        &hex(&encode_key(&[KeyValue::Int(9), KeyValue::Int(9)]).expect("encode")),
+        1,
+    );
+    conn.tidy().expect("tidy");
+    assert_eq!(order_ids(&mut conn), vec![1, 2]);
+    let stored = stored_provenance(&mut conn);
+    assert_eq!(
+        stored.len(),
+        1,
+        "the mismatched record is swept, the matching one is spared"
+    );
+    assert_eq!(
+        decode_key(&stored[0].pk).expect("decode the kept record's key"),
+        vec![KeyValue::Int(2)]
+    );
+}
+
+/// A record whose key the encoding cannot decode cannot spare its row, so the
+/// row is evicted and the record is left alone by the passes.
+#[tokio::test]
+async fn an_undecodable_key_is_left_alone_by_the_passes() {
+    let (mut conn, _server) = orders_fixture().await;
+    raw_record(&mut conn, "orders", "09", 1);
+    conn.tidy().expect("tidy");
+    assert_eq!(order_ids(&mut conn), vec![1]);
+    assert_eq!(
+        stored_provenance(&mut conn).len(),
+        1,
+        "the undecodable record is not touched by the passes"
+    );
+}
+
+/// A key column with no SQL literal fails the pass, and the failed pass
+/// leaves the rows and the record as it found them.
+#[tokio::test]
+async fn a_key_column_with_no_sql_literal_fails_the_pass() {
+    let (mut conn, server) = connected().await;
+    conn.subscribe("a", "SELECT * FROM reals WHERE id = 1.0")
+        .await
+        .expect("subscribe");
+    send_snapshot(
+        &server,
+        "a",
+        reals_payload(&[(1.0, "x"), (f64::INFINITY, "y")]),
+        1,
+    );
+    pump_to(
+        &mut conn,
+        |event| matches!(event, ClientEvent::SnapshotEnd { sub_id, .. } if sub_id == "a"),
+    )
+    .await;
+    raw_record(
+        &mut conn,
+        "reals",
+        &hex(&encode_key(&[KeyValue::Real(f64::INFINITY)]).expect("encode")),
+        1,
+    );
+    let err = conn
+        .tidy()
+        .expect_err("the non-finite key has no SQL literal");
+    assert!(
+        err.to_string().contains("non-finite float bind"),
+        "the failure names the bind: {err}"
+    );
+    assert_eq!(
+        real_ids(&mut conn),
+        vec![1.0, f64::INFINITY],
+        "the failed pass rolled back, so the rows are as they were"
+    );
+    assert_eq!(stored_provenance(&mut conn).len(), 1);
+}
+
+/// A record whose key column is null spares no row, since no row has a null
+/// key column, so the uncovered row goes and the probe sweeps the record.
+#[tokio::test]
+async fn a_null_key_column_is_spared_and_swept() {
+    let (mut conn, _server) = orders_fixture().await;
+    raw_record(&mut conn, "orders", "00", 1);
+    conn.tidy().expect("tidy");
+    assert_eq!(order_ids(&mut conn), vec![1]);
+    assert_eq!(
+        stored_provenance(&mut conn),
+        Vec::new(),
+        "the probe finds no row under a null key, so the record goes"
+    );
+}
+
+/// A payload the replica cannot apply is refused before the cursor advances,
+/// and the refusal leaves the rows and the provenance as they were.
+#[tokio::test]
+async fn a_payload_the_replica_cannot_apply_rolls_back() {
+    let (mut conn, server) = orders_fixture().await;
+    record_provenance(
+        &mut conn,
+        "orders",
+        &[KeyValue::Int(2)],
+        ProvisionalState::Provisional,
+        None,
+    );
+    server.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+        "a".to_owned(),
+        cursor_byte(2),
+        zstd::encode_all(b"not a patchset".as_slice(), 3).expect("compress"),
+    ))));
+    let err = conn
+        .pump_one()
+        .await
+        .expect_err("the payload is not a patchset");
+    assert!(
+        err.to_string().contains("Failed to apply changeset"),
+        "the refusal is the applier's: {err}"
+    );
+    assert_eq!(order_ids(&mut conn), vec![1, 2]);
+    assert_eq!(stored_provenance(&mut conn).len(), 1);
+}
+
+/// A clear the provenance table refuses rolls the server write back with it,
+/// so the write and the confirmation stand or fall together.
+#[tokio::test]
+async fn a_refused_clear_rolls_back_the_server_write() {
+    let (mut conn, server) = orders_fixture().await;
+    record_provenance(
+        &mut conn,
+        "orders",
+        &[KeyValue::Int(2)],
+        ProvisionalState::Provisional,
+        None,
+    );
+    conn.conn()
+        .batch_execute(
+            "CREATE TEMP TRIGGER refuse_clear BEFORE DELETE ON _connetto_provisional \
+             BEGIN SELECT RAISE(ABORT, 'the clear is refused'); END",
+        )
+        .expect("arm the refusal");
+    server.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+        "a".to_owned(),
+        cursor_byte(2),
+        update_payload(
+            "orders",
+            &["id", "status"],
+            vec![Value::Integer(2), Value::Text("s".to_owned())],
+        ),
+    ))));
+    let err = conn.pump_one().await.expect_err("the clear is refused");
+    assert!(
+        err.to_string().contains("the clear is refused"),
+        "the refusal names the trigger: {err}"
+    );
+    let status: Option<String> = orders::table
+        .find(2)
+        .select(orders::status)
+        .first(conn.conn())
+        .expect("read the row");
+    assert_eq!(
+        status.as_deref(),
+        Some("y"),
+        "the server write rolled back with the clear"
+    );
+    assert_eq!(stored_provenance(&mut conn).len(), 1);
+}
+
+/// A confirm over a record whose state the table no longer defines rolls the
+/// server write back, so a stale record cannot stand a confirmed row.
+#[tokio::test]
+async fn a_record_with_no_defined_state_fails_the_confirm() {
+    let (mut conn, server) = orders_fixture().await;
+    raw_record(
+        &mut conn,
+        "orders",
+        &hex(&encode_key(&[KeyValue::Int(2)]).expect("encode")),
+        2,
+    );
+    server.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+        "a".to_owned(),
+        cursor_byte(2),
+        update_payload(
+            "orders",
+            &["id", "status"],
+            vec![Value::Integer(2), Value::Text("s".to_owned())],
+        ),
+    ))));
+    let err = conn
+        .pump_one()
+        .await
+        .expect_err("the stored state is undefined");
+    assert!(
+        err.to_string()
+            .contains("holds no state the table defines: 2"),
+        "the refusal names the state: {err}"
+    );
+    let status: Option<String> = orders::table
+        .find(2)
+        .select(orders::status)
+        .first(conn.conn())
+        .expect("read the row");
+    let status = status.expect("the row is still there");
+    assert_eq!(status.as_str(), "y");
+    assert_eq!(stored_provenance(&mut conn).len(), 1);
+}
+
+/// A drop the provenance table refuses rolls the truncate back with it, so
+/// the rows and their records are gone together or not at all.
+#[tokio::test]
+async fn a_refused_drop_rolls_back_the_truncate() {
+    let (mut conn, server) = orders_fixture().await;
+    record_provenance(
+        &mut conn,
+        "orders",
+        &[KeyValue::Int(2)],
+        ProvisionalState::Provisional,
+        None,
+    );
+    conn.conn()
+        .batch_execute(
+            "CREATE TEMP TRIGGER refuse_drop BEFORE DELETE ON _connetto_provisional \
+             BEGIN SELECT RAISE(ABORT, 'the drop is refused'); END",
+        )
+        .expect("arm the refusal");
+    server.say(IncomingFrame::Control(ControlMessage::FullResyncRequired(
+        FullResyncRequired {
+            sub_id: "a".to_owned(),
+            reason: FullResyncReason::TableTruncated {
+                table: "orders".to_owned(),
+            },
+        },
+    )));
+    let err = conn.pump_one().await.expect_err("the drop is refused");
+    assert!(
+        err.to_string().contains("the drop is refused"),
+        "the refusal names the trigger: {err}"
+    );
+    assert_eq!(order_ids(&mut conn), vec![1, 2]);
+    assert_eq!(stored_provenance(&mut conn).len(), 1);
 }
 
 diesel::table! {

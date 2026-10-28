@@ -358,9 +358,6 @@ pub(crate) fn clear_written(
 ) -> Result<Vec<ProvisionalRow>, ClientError> {
     let mut out = Vec::new();
     for (table, key) in keys {
-        if key.is_empty() {
-            continue;
-        }
         let blob = encode_key(key)?;
         let record: Option<Stored> = dsl::_connetto_provisional
             .filter(dsl::tbl.eq(table))
@@ -430,6 +427,7 @@ fn key_alive(
         #[diesel(sql_type = diesel::sql_types::Integer)]
         present: i32,
     }
+
     let names = pk_column_names(db, table)?;
     if key.is_empty() || names.len() != key.len() {
         // A key the table's layout cannot express is provably gone: the row
@@ -454,10 +452,8 @@ fn key_alive(
         quote_ident(table),
         wheres.join(" AND ")
     );
-    let present = diesel::sql_query(probe)
-        .get_result::<Present>(db)
-        .optional()?;
-    Ok(present.is_some_and(|Present { present }| present > 0))
+    let present: Option<Present> = diesel::sql_query(&probe).get_result(db).optional()?;
+    Ok(present.is_some_and(|row| row.present > 0))
 }
 
 /// Drop every record of `table`, whose rows all went.
