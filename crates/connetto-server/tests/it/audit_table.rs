@@ -272,6 +272,40 @@ async fn the_database_clock_stamps_the_row() {
     );
 }
 
+/// One login event for `session`, as `user` signs in.
+fn login(session: SessionId, user: &str) -> AuthEvent<String> {
+    AuthEvent::new(session, Some(user.to_owned()), AuthOp::LoggedIn)
+}
+
+/// The sessions of the rows landed so far, read by time, once `count` of
+/// them have landed. The hook writes in the background, so this waits for
+/// them, at most thirty seconds.
+async fn landed_sessions(pool: &Pool<AsyncPgConnection>, count: usize) -> Vec<Option<SessionId>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let landed: Vec<Option<SessionId>> = {
+            let mut conn = pool.get().await.expect("connection");
+            diesel_async::RunQueryDsl::load(
+                auth_events::table
+                    .order(auth_events::at)
+                    .select(auth_events::session),
+                &mut conn,
+            )
+            .await
+            .expect("read rows")
+        };
+        if landed.len() >= count {
+            return landed;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} of {count} rows landed in time",
+            landed.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// The ready-made hook lands its rows in the order the server emitted them,
 /// so a trail read by time never shows a logout ahead of its login, however
 /// many writes are in flight at once.
@@ -286,40 +320,74 @@ async fn the_hook_lands_rows_in_the_order_they_were_emitted() {
         .map(|_| SessionId::from_uuid(uuid::Uuid::new_v4()))
         .collect();
     for session in &emitted {
-        hook(AuthEvent::new(
-            *session,
-            Some("anna".to_owned()),
-            AuthOp::LoggedIn,
-        ));
+        hook(login(*session, "anna"));
     }
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let landed = loop {
-        let mut conn = fixture.admin().get().await.expect("connection");
-        let landed: Vec<Option<SessionId>> = diesel_async::RunQueryDsl::load(
-            auth_events::table
-                .order(auth_events::at)
-                .select(auth_events::session),
-            &mut conn,
-        )
-        .await
-        .expect("read rows");
-        if landed.len() == emitted.len() {
-            break landed;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{} of {} rows landed in time",
-            landed.len(),
-            emitted.len()
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    };
     assert_eq!(
-        landed,
+        landed_sessions(fixture.admin(), emitted.len()).await,
         emitted.into_iter().map(Some).collect::<Vec<_>>(),
         "the rows land in emission order"
     );
+}
+
+/// A row the pool cannot hand a connection for waits until it can, rather
+/// than being dropped while the rows behind it land.
+#[tokio::test]
+async fn a_row_waits_for_a_connection_rather_than_being_dropped() {
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    reset_audit_table(fixture.admin()).await;
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            fixture.admin_url(),
+        );
+    let pool = Pool::builder()
+        .max_size(1)
+        .connection_timeout(std::time::Duration::from_millis(200))
+        .build(manager)
+        .await
+        .expect("build the one-connection pool");
+    let held = pool.get().await.expect("hold the only connection");
+    let hook = pg_audit_hook::<ConnettoDefaults>(pool.clone());
+
+    let session = SessionId::from_uuid(uuid::Uuid::new_v4());
+    hook(login(session, "anna"));
+    // Long enough for the writer's ask to time out and be asked again.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    drop(held);
+    assert_eq!(
+        landed_sessions(fixture.admin(), 1).await,
+        vec![Some(session)]
+    );
+}
+
+/// A row whose insert fails is dropped, and the rows behind it still land.
+#[tokio::test]
+async fn a_row_that_cannot_be_inserted_is_dropped_and_the_next_lands() {
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    reset_audit_table(fixture.admin()).await;
+    {
+        let mut conn = fixture.admin().get().await.expect("connection");
+        for statement in [
+            "CREATE OR REPLACE FUNCTION refuse_mallory() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN IF NEW.user_id = 'mallory' THEN RAISE EXCEPTION 'refused'; END IF; \
+             RETURN NEW; END $$",
+            "CREATE TRIGGER refuse_mallory BEFORE INSERT ON auth_events \
+             FOR EACH ROW EXECUTE FUNCTION refuse_mallory()",
+        ] {
+            sql_query(statement)
+                .execute(&mut conn)
+                .await
+                .expect("arm the refusal");
+        }
+    }
+    let hook = pg_audit_hook::<ConnettoDefaults>(fixture.admin().clone());
+
+    let refused = SessionId::from_uuid(uuid::Uuid::new_v4());
+    let kept = SessionId::from_uuid(uuid::Uuid::new_v4());
+    hook(login(refused, "mallory"));
+    hook(login(kept, "anna"));
+    assert_eq!(landed_sessions(fixture.admin(), 1).await, vec![Some(kept)]);
 }
 
 /// A download names the query list it ran and the archive's size, and a
