@@ -656,6 +656,16 @@ impl<S: AuthStore> AuthService<S> {
         }
     }
 
+    /// Whether the store still holds `session_id` live, the handshake's own
+    /// liveness check, exposed so a data download refuses a dead session.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError`] if the store fails.
+    pub async fn session_is_live(&self, session_id: SessionId) -> Result<bool, AuthError> {
+        Ok(self.store.session_is_live(session_id).await?)
+    }
+
     /// Revoke, and record the cause. Three causes reach here and they are not
     /// interchangeable: an audit row saying only that a login ended cannot tell
     /// an ordinary logout from a stolen credential, which is the most valuable

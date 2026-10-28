@@ -589,6 +589,14 @@ pub(super) async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
         .unwrap_or_else(|err| panic!("statement failed ({sql}): {err}"));
 }
 
+/// Drop and recreate the audit table every server appends access changes to,
+/// so each run reads its own rows.
+pub(super) async fn reset_audit_table(pool: &Pool<AsyncPgConnection>) {
+    exec(pool, "DROP TABLE IF EXISTS auth_events").await;
+    exec(pool, "DROP TYPE IF EXISTS connetto_auth_op").await;
+    connetto_test_harness::provision_audit(pool).await;
+}
+
 /// Reset the orders fixture, auth tables and reader role for one server run.
 pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixture) {
     exec(pool, "DROP TABLE IF EXISTS orders CASCADE").await;
@@ -598,11 +606,7 @@ pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixt
     exec(pool, "DROP TABLE IF EXISTS _connetto_writers").await;
     exec(pool, "DROP TABLE IF EXISTS _connetto_session_writers").await;
     connetto_test_harness::provision_writers(pool).await;
-    // The audit table every server appends access changes to, dropped and
-    // recreated per run.
-    exec(pool, "DROP TABLE IF EXISTS auth_events").await;
-    exec(pool, "DROP TYPE IF EXISTS connetto_auth_op").await;
-    connetto_test_harness::provision_audit(pool).await;
+    reset_audit_table(pool).await;
     exec(pool, PG_DDL).await;
     provision_cap_policies(pool, PG_DDL, NO_POLICIES).await;
     exec(

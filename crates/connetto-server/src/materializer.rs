@@ -619,25 +619,7 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
         &self,
         sqlite_sql: &str,
     ) -> Result<String, MaterializerError> {
-        let mut statements = Parser::parse_sql(&SQLiteDialect {}, sqlite_sql)
-            .map_err(|err| MaterializerError::Translate(format!("{err}")))?;
-        if statements.len() != 1 {
-            return Err(MaterializerError::Translate(
-                "expected exactly one SQL statement".to_owned(),
-            ));
-        }
-        let statement = statements.remove(0);
-        let mut options = Pg2SqliteOptions::default();
-        if let Some(caller) = &self.caller {
-            options = options.with_session_variable(caller.identity.clone());
-            if let Some(subjects) = &caller.subjects {
-                options = options.with_session_variable(subjects.clone());
-            }
-        }
-        let context = TranslationContext::new(&options);
-        let mut pg = statement
-            .reverse_translate(&self.catalog, &context)
-            .map_err(|err| MaterializerError::Translate(format!("{err}")))?;
+        let mut pg = translate_select(&self.catalog, self.caller.as_ref(), sqlite_sql)?;
         widen_column_subset(&mut pg);
         Ok(pg.to_string())
     }
@@ -752,7 +734,7 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
 /// [`SubscriptionRequest`] carries. Total by construction: every wire variant
 /// has a subql counterpart, blobs included, so a bind can only be refused by
 /// the engine's own placeholder pairing.
-fn wire_binds(binds: &[BindValue]) -> Vec<PgValue<Postgres>> {
+pub(crate) fn wire_binds(binds: &[BindValue]) -> Vec<PgValue<Postgres>> {
     binds
         .iter()
         .map(|bind| match bind {
@@ -2154,6 +2136,40 @@ fn answers_one_value(pg_sql: &str) -> bool {
     select.projection.len() == 1
         && matches!(&select.group_by, GroupByExpr::Expressions(exprs, mods)
             if exprs.is_empty() && mods.is_empty())
+}
+
+/// Reverse translate one SQLite-dialect statement into Postgres against
+/// `catalog`, the caller's SQLite functions mapped to the settings the server
+/// binds. Placeholders translate as syntax, values never enter the SQL.
+///
+/// # Errors
+///
+/// [`MaterializerError::Translate`] when the text is not one SQLite statement
+/// or does not reverse translate.
+pub(crate) fn translate_select(
+    catalog: &ParserDB,
+    caller: Option<&CallerMappings>,
+    sqlite_sql: &str,
+) -> Result<Statement, MaterializerError> {
+    let mut statements = Parser::parse_sql(&SQLiteDialect {}, sqlite_sql)
+        .map_err(|err| MaterializerError::Translate(format!("{err}")))?;
+    if statements.len() != 1 {
+        return Err(MaterializerError::Translate(
+            "expected exactly one SQL statement".to_owned(),
+        ));
+    }
+    let statement = statements.remove(0);
+    let mut options = Pg2SqliteOptions::default();
+    if let Some(caller) = caller {
+        options = options.with_session_variable(caller.identity.clone());
+        if let Some(subjects) = &caller.subjects {
+            options = options.with_session_variable(subjects.clone());
+        }
+    }
+    let context = TranslationContext::new(&options);
+    statement
+        .reverse_translate(catalog, &context)
+        .map_err(|err| MaterializerError::Translate(format!("{err}")))
 }
 
 /// Rewrite a select list naming only plain columns to `*`.

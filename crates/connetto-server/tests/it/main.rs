@@ -83,6 +83,8 @@ mod oplog_previous_image;
 
 mod pg_async;
 
+mod portability;
+
 mod preflight_previous_image;
 
 mod preflight_oplog_payload;

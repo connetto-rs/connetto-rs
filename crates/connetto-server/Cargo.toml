@@ -68,6 +68,11 @@ serde_json = "1"
 # (`timeline.rs`, R73). Already in the graph through sqlite-diff-rs, at the same
 # version and default features.
 pg_walstream = "0.9"
+# The data download (R61) stages its SQLite file in a temp file, packs it into
+# a streamed zip, and names the query list by a blake3 hash.
+blake3 = "1"
+tempfile = "3"
+zip = { version = "4.6.1", default-features = false }
 
 # Synchronous lock guarding the SQLite write target (never held across .await).
 parking_lot = "0.12"
@@ -174,8 +179,6 @@ connetto-file-server = { path = "../connetto-file-server" }
 # The raw-frame WebSocket client the sync adapter tests drive over `/sync`.
 tokio-tungstenite = "0.24"
 http-body-util = "0.1"
-# Isolated per-client SQLite database directories in the multi-process e2e test.
-tempfile = "3"
 # The demo distributed id type, driving the generic in-memory auth store over a
 # typed user id (not a string) in authn_generic_id.rs.
 rosetta-uuid = { version = "0.2.0", features = ["serde"] }
