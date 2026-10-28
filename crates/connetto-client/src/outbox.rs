@@ -800,17 +800,16 @@ struct Shape {
 }
 
 impl Shape {
+    /// The table's current shape. The key check refuses a table whose key
+    /// has more columns than a changeset's one byte per column can number,
+    /// so every key position fits.
     fn read(db: &mut SqliteConnection, schema: &str, table: &str) -> Result<Self, ClientError> {
         let columns = columns(db, schema, table)?;
         let flags = columns
             .iter()
             .map(|column| u8::try_from(column.pk))
             .collect::<Result<Vec<u8>, _>>()
-            .map_err(|_| {
-                ClientError::Apply(format!(
-                    "{table} has more key columns than a changeset holds"
-                ))
-            })?;
+            .map_err(|_| ClientError::Apply(format!("{table} has over 255 key columns")))?;
         let defaults = columns.iter().map(|_| None).collect();
         Ok(Self {
             schema: TableSchema::new(table.to_owned(), columns.len(), flags),
@@ -850,6 +849,19 @@ impl Shape {
             .map(|column| row.get(&column.name).cloned())
             .collect()
     }
+
+    /// Whether an update from `old` to `new` moves the row's key, a key cell
+    /// either record lacks counting as moved.
+    fn moves_key(&self, old: &HashMap<String, Cell>, new: &HashMap<String, Cell>) -> bool {
+        self.key_of(old)
+            .iter()
+            .zip(&self.key_of(new))
+            .any(|(left, right)| {
+                left.as_ref()
+                    .zip(right.as_ref())
+                    .is_none_or(|(l, r)| !l.same(r))
+            })
+    }
 }
 
 /// A changeset built from the outbox, and the last write it covers.
@@ -884,13 +896,12 @@ pub(crate) fn build(
     let mut shapes: HashMap<String, Shape> = HashMap::new();
     let mut builder = ChangeSet::<TableSchema<String>, String, Vec<u8>>::new();
     for write in writes {
-        if !shapes.contains_key(&write.tbl) {
-            let shape = Shape::read(db, schema_of(shared, &write.tbl), &write.tbl)?;
-            shapes.insert(write.tbl.clone(), shape);
-        }
-        let shape = shapes
-            .get_mut(&write.tbl)
-            .ok_or_else(|| ClientError::Apply(format!("no columns read for {}", write.tbl)))?;
+        let shape = match shapes.entry(write.tbl.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Shape::read(db, schema_of(shared, &write.tbl), &write.tbl)?)
+            }
+        };
         let known = |column: &str| shape.columns.iter().any(|known| known.name == column);
         let old = write
             .old
@@ -905,23 +916,14 @@ pub(crate) fn build(
         let (delete, insert, update) = match (old, new) {
             (None, Some(new)) => (None, Some(new), None),
             (Some(old), None) => (Some(old), None, None),
-            (Some(old), Some(new)) => {
-                let (from, to) = (shape.key_of(&old), shape.key_of(&new));
-                let moved = from.len() != to.len()
-                    || from
-                        .iter()
-                        .zip(&to)
-                        .any(|(left, right)| match (left, right) {
-                            (Some(left), Some(right)) => !left.same(right),
-                            _ => true,
-                        });
-                if moved {
-                    (Some(old), Some(new), None)
-                } else {
-                    (None, None, Some((old, new)))
-                }
+            (Some(old), Some(new)) if shape.moves_key(&old, &new) => (Some(old), Some(new), None),
+            (Some(old), Some(new)) => (None, None, Some((old, new))),
+            (None, None) => {
+                return Err(ClientError::Apply(format!(
+                    "outbox write {} records neither an old nor a new row",
+                    write.seq
+                )));
             }
-            (None, None) => (None, None, None),
         };
         if let Some(old) = delete {
             let mut op = ChangeDelete::from(shape.schema.clone());

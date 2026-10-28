@@ -132,6 +132,51 @@ async fn a_table_created_after_open_is_refused_as_it_is_created() {
     );
 }
 
+/// A table whose key has `columns` columns, `c0` to `c{columns - 1}`.
+fn keyed_by(table: &str, columns: usize) -> String {
+    let names: Vec<String> = (0..columns).map(|index| format!("c{index}")).collect();
+    format!(
+        "CREATE TABLE {table} ({}, PRIMARY KEY ({}))",
+        names
+            .iter()
+            .map(|name| format!("{name} INTEGER NOT NULL"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        names.join(", ")
+    )
+}
+
+/// A change record numbers each key column in one byte, so a key of 255
+/// columns records and uploads, and one of 256 is refused as it is created,
+/// naming the limit, rather than failing at every push after its first write.
+#[tokio::test]
+async fn a_key_wider_than_a_change_record_numbers_is_refused() {
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(KEYED_DDL),
+        super::support::NeverDial::<FakeTransport>::default(),
+    )
+    .open_driven()
+    .expect("open the replica");
+
+    let tables = refused(conn.change_schema(&keyed_by("too_wide", 256)));
+    assert!(
+        tables
+            .iter()
+            .any(|refusal| refusal.contains("too_wide") && refusal.contains("255")),
+        "names the table and the limit: {tables:?}"
+    );
+
+    conn.change_schema(&keyed_by("widest", 255))
+        .expect("a key of 255 columns is recorded");
+    let values: Vec<String> = (0..255).map(|value| value.to_string()).collect();
+    conn.batch_execute(&format!(
+        "INSERT INTO widest VALUES ({})",
+        values.join(", ")
+    ))
+    .expect("write a row");
+    assert_eq!(conn.push().await.expect("the widest key uploads"), Some(1));
+}
+
 /// `ANALYZE` creates `sqlite_stat1`, which declares no primary key and moves
 /// the schema cookie, so the write path meets it. It is SQLite's own table
 /// rather than the application's, and skipping it is what keeps a replica

@@ -558,3 +558,137 @@ async fn a_schema_change_that_cannot_create_its_triggers_changes_nothing() {
         )]
     );
 }
+
+/// How many objects named `names` the main and temp schemas hold.
+fn schema_objects(conn: &mut ConnettoConnection<FakeTransport>, names: &str) -> i64 {
+    diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(&format!(
+        "(SELECT count(*) FROM (SELECT name FROM sqlite_master \
+          UNION ALL SELECT name FROM sqlite_temp_master) WHERE name IN ({names}))"
+    )))
+    .get_result(conn.conn())
+    .expect("read the catalog")
+}
+
+/// A drop asks SQLite's authorizer to delete the object it drops, and gives
+/// up without an error when refused, so a view, a temporary table, a
+/// temporary view and a virtual table the application drops on the
+/// connection are really gone.
+#[tokio::test]
+async fn the_objects_the_connection_may_drop_really_go() {
+    let mut conn = open(DDL);
+    conn.batch_execute(
+        "CREATE VIEW labels AS SELECT label FROM items; \
+         CREATE TEMP TABLE scratch (x); \
+         CREATE TEMP VIEW recent AS SELECT id FROM items; \
+         CREATE VIRTUAL TABLE temp.search USING fts5(body)",
+    )
+    .expect("create one object of each kind");
+    let names = "'labels', 'scratch', 'recent', 'search'";
+    assert_eq!(schema_objects(&mut conn, names), 4);
+
+    conn.batch_execute("DROP VIEW labels; DROP TABLE scratch; DROP VIEW recent; DROP TABLE search")
+        .expect("drop each");
+    assert_eq!(
+        schema_objects(&mut conn, names),
+        0,
+        "every drop took effect"
+    );
+}
+
+/// An update to a row keyed by a real number is an update of that row, not
+/// a delete and an insert, since the key compares by its stored bits.
+#[tokio::test]
+async fn a_row_keyed_by_a_real_number_uploads_as_an_update() {
+    let mut conn = open("CREATE TABLE readings (at REAL PRIMARY KEY, label TEXT)");
+    conn.transact_with_bookkeeping(
+        |db| db.batch_execute("INSERT INTO readings VALUES (1.5, 'cold')"),
+        |_| Ok::<_, diesel::result::Error>(()),
+    )
+    .expect("a row the server sent");
+    conn.batch_execute("UPDATE readings SET label = 'warm' WHERE at = 1.5")
+        .expect("edit the label");
+
+    assert_eq!(conn.push().await.expect("push"), Some(1));
+    assert_eq!(
+        sorted_ops(&mut conn, 1),
+        vec![
+            r#"update readings [(Some(Real(1.5)), None), (Some(Text("cold")), Some(Text("warm")))]"#
+        ]
+    );
+}
+
+/// A delete uploads the whole old row, a blob cell included, since the
+/// server reads it for the delete's conflict and policy checks.
+#[tokio::test]
+async fn a_deleted_rows_blob_reaches_the_upload() {
+    let mut conn = open(DDL);
+    conn.transact_with_bookkeeping(
+        |db| db.batch_execute("INSERT INTO items VALUES (1, 'cat', 0.5, x'00ff')"),
+        |_| Ok::<_, diesel::result::Error>(()),
+    )
+    .expect("a row the server sent");
+    conn.batch_execute("DELETE FROM items WHERE id = 1")
+        .expect("delete it");
+
+    assert_eq!(conn.push().await.expect("push"), Some(1));
+    assert_eq!(
+        sorted_ops(&mut conn, 1),
+        vec![r#"delete items [Integer(1), Text("cat"), Real(0.5), Blob([0, 255])]"#]
+    );
+}
+
+/// Rows recorded before columns were added upload each new column at its
+/// default, of every storage class, `NULL` for a column with none.
+#[tokio::test]
+async fn rows_recorded_before_new_columns_upload_their_defaults() {
+    let mut conn = open(DDL);
+    conn.batch_execute("INSERT INTO items (id) VALUES (1), (2)")
+        .expect("write before the change");
+    conn.change_schema(
+        "ALTER TABLE items ADD COLUMN plain TEXT; \
+         ALTER TABLE items ADD COLUMN thumb BLOB DEFAULT x'01'; \
+         ALTER TABLE items ADD COLUMN gone DEFAULT NULL; \
+         ALTER TABLE items ADD COLUMN tally INTEGER DEFAULT 7; \
+         ALTER TABLE items ADD COLUMN ratio REAL DEFAULT 2.5",
+    )
+    .expect("add a column of each kind");
+
+    assert_eq!(conn.push().await.expect("push"), Some(1));
+    let added = "Null, Blob([1]), Null, Integer(7), Real(2.5)";
+    assert_eq!(
+        sorted_ops(&mut conn, 1),
+        vec![
+            format!("insert items [Integer(1), Null, Null, Null, {added}]"),
+            format!("insert items [Integer(2), Null, Null, Null, {added}]"),
+        ]
+    );
+}
+
+/// An outbox row that does not decode stops the push, which queues nothing
+/// rather than uploading values nobody wrote.
+#[tokio::test]
+async fn a_malformed_outbox_row_stops_the_push() {
+    let mut conn = open(DDL);
+    let planted: [(Option<&str>, Option<&str>); 3] = [
+        (None, Some(r#"{"id":true}"#)),
+        (None, Some(r#"{"id":{"q":1}}"#)),
+        (None, None),
+    ];
+    for (old, new) in planted {
+        diesel::sql_query(
+            "INSERT INTO _connetto_outbox (tbl, op, old, new) VALUES ('items', 'I', ?, ?)",
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(old)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(new)
+        .execute(conn.conn())
+        .expect("plant a malformed row");
+        let refused = conn.push().await.expect_err("the row does not decode");
+        assert!(
+            refused.to_string().contains("outbox"),
+            "names the outbox: {refused}"
+        );
+        assert!(conn.unsynced().is_empty(), "nothing was queued");
+        conn.batch_execute("DELETE FROM _connetto_outbox")
+            .expect("clear the planted row");
+    }
+}

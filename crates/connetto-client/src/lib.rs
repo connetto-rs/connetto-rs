@@ -478,7 +478,9 @@ pub enum ClientError {
     /// the session diff the browser relay serves a tab from, so a table of
     /// either database is never read by a sibling tab. `CREATE TABLE prefs (name
     /// TEXT, value TEXT)` is a keyed table by SQL's standards, so this
-    /// requirement is connetto's own and the refusal names the fix.
+    /// requirement is connetto's own and the refusal names the fix. A key of
+    /// more than 255 columns is refused too, since a change record numbers
+    /// each key column in one byte.
     ///
     /// A table listed in
     /// [`SyncSchema::with_unrecorded_tables`](crate::SyncSchema::with_unrecorded_tables) that does
@@ -2473,13 +2475,18 @@ fn schema_label(schema: &str) -> &'static str {
     }
 }
 
+/// The most key columns a SQLite change record can number, one byte each.
+const MAX_KEY_COLUMNS: i64 = 255;
+
 /// Refuse the tables of `schema` whose changes connetto cannot record.
 ///
 /// SQLite records nothing for a table whose only key is the implicit `rowid`,
 /// so a write to one is never uploaded and never reaches a sibling browser
-/// tab, and nothing else notices. `accepted` names the tables whose missing
-/// key the application declared intentional, and a name in it that does
-/// declare a key is refused for the opposite reason (R62).
+/// tab, and nothing else notices. A change record numbers each key column in
+/// one byte, so a key of more than 255 columns cannot be recorded either.
+/// `accepted` names the tables whose missing key the application declared
+/// intentional, and a name in it that does declare a key is refused for the
+/// opposite reason (R62).
 fn check_recorded_tables(
     db: &mut SqliteConnection,
     schema: &str,
@@ -2491,19 +2498,25 @@ fn check_recorded_tables(
         if is_internal_table(&row.name) {
             continue;
         }
-        let keyed = key_columns(db, schema, &row.name)? > 0;
-        match (keyed, accepted.contains(&row.name.to_lowercase())) {
-            (false, false) => tables.push(format!(
+        let key = key_columns(db, schema, &row.name)?;
+        match (key, accepted.contains(&row.name.to_lowercase())) {
+            (0, false) => tables.push(format!(
                 "{} in the {where_it_is} database declares no primary key, so SQLite records \
                  nothing for it and writes to it are lost: declare one (a single-row table wants \
                  id INTEGER PRIMARY KEY CHECK (id = 1)), or accept the loss with \
                  SyncSchema::with_unrecorded_tables",
                 row.name
             )),
-            (true, true) => tables.push(format!(
+            (1.., true) => tables.push(format!(
                 "{} in the {where_it_is} database declares a primary key and is named in \
                  SyncSchema::with_unrecorded_tables, so the two disagree: drop the name to sync \
                  it, or drop the key to keep it local",
+                row.name
+            )),
+            (wide, false) if wide > MAX_KEY_COLUMNS => tables.push(format!(
+                "{} in the {where_it_is} database declares {key} primary key columns, more than \
+                 the {MAX_KEY_COLUMNS} a SQLite change record can number, so writes to it cannot \
+                 be recorded: declare a key of at most {MAX_KEY_COLUMNS} columns",
                 row.name
             )),
             _ => {}
@@ -9508,6 +9521,51 @@ mod tests {
                 .is_some(),
             "recording is back once the switch drops"
         );
+    }
+
+    /// The clause an unpushed write's key is spared under selects exactly
+    /// the row written, whatever storage class the key holds, a `NULL` key
+    /// SQLite admits outside an `INTEGER PRIMARY KEY` included.
+    #[test]
+    fn a_spare_clause_selects_the_row_its_key_names() {
+        let ddl = "CREATE TABLE notes (k PRIMARY KEY, body TEXT)";
+        let config = ClientConfig::new("spare-test");
+        let mut conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), ddl, &config, None)
+                .expect("open in-memory replica");
+        conn.db
+            .batch_execute(
+                "INSERT INTO notes VALUES (NULL, 'null'), (7, 'integer'), (0.1, 'real'), \
+                 ('it''s', 'text'), (x'00ff', 'blob')",
+            )
+            .expect("one row per storage class");
+        let clauses = outbox::spare_clauses(&mut conn.db, &conn.config.shared_tables)
+            .expect("read the outbox")
+            .remove("notes")
+            .expect("the writes are spared");
+        let mut bodies = Vec::new();
+        for clause in &clauses {
+            let matched: Vec<String> = notes_matching(&mut conn.db, clause);
+            assert_eq!(matched.len(), 1, "{clause} selects one row: {matched:?}");
+            bodies.extend(matched);
+        }
+        bodies.sort();
+        assert_eq!(bodies, ["blob", "integer", "null", "real", "text"]);
+    }
+
+    /// The bodies of the `notes` rows `clause` selects.
+    fn notes_matching(db: &mut SqliteConnection, clause: &str) -> Vec<String> {
+        #[derive(diesel::QueryableByName)]
+        struct Body {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            body: String,
+        }
+        diesel::sql_query(format!("SELECT body FROM notes WHERE {clause}"))
+            .load::<Body>(db)
+            .expect("run the clause")
+            .into_iter()
+            .map(|row| row.body)
+            .collect()
     }
 
     /// A write to a connetto table never becomes an upload, and the application writes beside it still do.
