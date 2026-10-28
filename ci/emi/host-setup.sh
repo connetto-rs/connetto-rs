@@ -37,10 +37,13 @@ ZABBLY_FINGERPRINT=4EFC590696CB15B87C73A3AD82CC8797C838DCFD
 # commons is shared with other people, who keep about 50 GiB of its 251 GiB.
 EMI_MEMORY_GIB=440
 EMI_VMS=28
+EMI_CPUS=64
 COMMONS_MEMORY_GIB=200
 COMMONS_VMS=16
+COMMONS_CPUS=64
 # The largest flavor, which a VM still being created is counted as.
 LARGEST_GIB=22
+LARGEST_CPUS=8
 
 case "$MEMBER" in
   emi)
@@ -347,6 +350,7 @@ if [ "$MEMBER" = emi ]; then
     restricted.networks.access="$BRIDGE" \
     restricted.storage-pools.access="$POOL" \
     limits.memory="$((EMI_MEMORY_GIB + COMMONS_MEMORY_GIB))GiB" \
+    limits.cpu="$((EMI_CPUS + COMMONS_CPUS))" \
     limits.virtual-machines="$((EMI_VMS + COMMONS_VMS))" \
     limits.containers=0
   # Incus 7.0.1 refuses to launch the project's own published images while this option is set (upstream/incus-restricted-image-servers-blocks-local-images.md).
@@ -376,7 +380,7 @@ if [ "$MEMBER" = emi ]; then
   }
   # The largest measured peaks are 9.3 GiB light and 19.1 GiB heavy.
   make_profile ci-light 4 12GiB
-  make_profile ci-heavy 8 "${LARGEST_GIB}GiB"
+  make_profile ci-heavy "$LARGEST_CPUS" "${LARGEST_GIB}GiB"
 
   log "Account $RUNNER_USER, which runs GARM and holds the GitHub App key"
   id "$RUNNER_USER" >/dev/null 2>&1 \
@@ -416,6 +420,7 @@ if [ "$MEMBER" = emi ]; then
   log "Placement: each new CI VM goes to the member with the most CI memory left, within the share ci-share.sh set"
   incus config set instances.placement.scriptlet="$(cat <<EOF
 LARGEST = $LARGEST_GIB
+LARGEST_CPUS = $LARGEST_CPUS
 GIB = 1024 * 1024 * 1024
 
 def share(member, key):
@@ -430,17 +435,26 @@ def memory_gib(instance):
         return LARGEST
     return int(value[:-3])
 
+def cpus(instance):
+    value = instance.expanded_config.get("limits.cpu", "")
+    if not value.isdigit():
+        return LARGEST_CPUS
+    return int(value)
+
 def instance_placement(request, candidate_members):
     if request.project != "$PROJECT" or request.reason != "new":
         return
-    wanted = get_instance_resources().memory_size // GIB
+    resources = get_instance_resources()
+    wanted = resources.memory_size // GIB
+    wanted_cpus = resources.cpu_cores
     best = None
     best_room = -1
     for member in candidate_members:
         name = member.server_name
         share_memory = share(member, "memory_gib")
         share_vms = share(member, "vms")
-        if share_memory == 0 or share_vms == 0:
+        share_cpus = share(member, "cpus")
+        if share_memory == 0 or share_vms == 0 or share_cpus == 0:
             continue
         instances = get_instances(project="$PROJECT", location=name)
         # Each creation in flight is an operation, and gets its stopped record soon after, so only the excess has no record yet.
@@ -449,10 +463,13 @@ def instance_placement(request, candidate_members):
         unrecorded = max(0, operations - stopped)
         count = len(instances) + unrecorded
         used = LARGEST * unrecorded
+        used_cpus = LARGEST_CPUS * unrecorded
         for instance in instances:
             used += memory_gib(instance)
+            used_cpus += cpus(instance)
         room = share_memory - used
-        if count < share_vms and room >= wanted and room > best_room:
+        fits = count < share_vms and room >= wanted and share_cpus - used_cpus >= wanted_cpus
+        if fits and room > best_room:
             best = name
             best_room = room
     if best == None:
@@ -495,11 +512,12 @@ EOF
 fi
 
 log "CI ceilings of the members, the most ci-share.sh may give CI on each"
-for entry in "emi $EMI_MEMORY_GIB $EMI_VMS" "commons $COMMONS_MEMORY_GIB $COMMONS_VMS"; do
-  read -r name memory vms <<<"$entry"
+for entry in "emi $EMI_MEMORY_GIB $EMI_VMS $EMI_CPUS" "commons $COMMONS_MEMORY_GIB $COMMONS_VMS $COMMONS_CPUS"; do
+  read -r name memory vms cpus <<<"$entry"
   incus cluster list --format csv --columns n | grep -qx "$name" || continue
   incus cluster set "$name" user.ci.ceiling_memory_gib="$memory"
   incus cluster set "$name" user.ci.ceiling_vms="$vms"
+  incus cluster set "$name" user.ci.ceiling_cpus="$cpus"
 done
 
 log "Docker Hub pull-through mirror on $BRIDGE_IP:$MIRROR_PORT"
