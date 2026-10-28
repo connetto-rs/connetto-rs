@@ -1165,13 +1165,21 @@ async fn thumbs(rows: Vec<support::Photo>, content: Content) -> HashMap<String, 
 /// The device line, read again every second since enrolment runs beside the
 /// pump. It holds the session weakly, since the session owns this task.
 async fn feed_device(app: AppHandle, core: Arc<Core>, session: Weak<Parts>) {
-    loop {
-        let Some(session) = session.upgrade() else {
-            return;
-        };
+    each_second(session, |session| {
         let label = support::native::device_label(&session.native);
         core.update(&app, |v| v.device_line = label);
-        drop(session);
+    })
+    .await;
+}
+
+/// Run `each` on the session once a second, holding it only for that call.
+/// A session still inside `Arc::new_cyclic` does not upgrade yet, so a miss
+/// waits for the next tick, and the session's own task set ends the loop.
+async fn each_second<T>(session: Weak<T>, mut each: impl FnMut(&T)) {
+    loop {
+        if let Some(session) = session.upgrade() {
+            each(&session);
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -1388,4 +1396,36 @@ pub fn run() {
                 feed_away(&lifecycle, event);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::sync::{Arc, Weak};
+    use std::time::Duration;
+
+    use super::each_second;
+
+    /// A feed spawned while `Arc::new_cyclic` builds its session still reads it.
+    #[test]
+    fn each_second_reads_a_session_still_being_built() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let _entered = runtime.enter();
+        let (seen, read) = mpsc::channel();
+        let mut task = None;
+        let _session = Arc::new_cyclic(|session: &Weak<u32>| {
+            task = Some(tokio::spawn(each_second(session.clone(), move |value| {
+                let _ = seen.send(*value);
+            })));
+            // An idle worker polls the feed while the session is still unbuilt.
+            std::thread::sleep(Duration::from_millis(200));
+            7
+        });
+        assert_eq!(read.recv_timeout(Duration::from_secs(5)), Ok(7));
+        task.expect("spawned").abort();
+    }
 }
