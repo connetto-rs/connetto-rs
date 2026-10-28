@@ -1842,25 +1842,63 @@ fn rollback_omit(_conflict: ConflictType) -> ConflictAction {
     ConflictAction::Omit
 }
 
+/// The two switches over connetto's own writes, read by the SQL functions
+/// the translated schema's write guards and the outbox triggers call.
+#[derive(Default)]
+struct WriteFlags {
+    /// Raised by [`ExemptWrites`], read through
+    /// [`connetto_core::WRITE_EXEMPTION_FUNCTION`] by the write guards and
+    /// the outbox triggers alike.
+    exempt: AtomicBool,
+    /// Raised by [`UnrecordedWrites`], read through
+    /// [`outbox::UNRECORDED_FUNCTION`] by the outbox triggers alone.
+    unrecorded: AtomicBool,
+}
+
 /// Holds the write exemption for a write connetto makes itself, so the
 /// outbox triggers record nothing and the translated schema's write guards
 /// admit it, lowering it on drop.
 struct ExemptWrites {
-    exempt: Arc<AtomicBool>,
+    flags: Arc<WriteFlags>,
 }
 
 impl ExemptWrites {
-    fn raise(exempt: &Arc<AtomicBool>) -> Self {
-        exempt.store(true, Ordering::Relaxed);
+    fn raise(flags: &Arc<WriteFlags>) -> Self {
+        flags.exempt.store(true, Ordering::Relaxed);
         Self {
-            exempt: Arc::clone(exempt),
+            flags: Arc::clone(flags),
         }
     }
 }
 
 impl Drop for ExemptWrites {
     fn drop(&mut self) {
-        self.exempt.store(false, Ordering::Relaxed);
+        self.flags.exempt.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Keeps the outbox triggers from recording while the write exemption stays
+/// down, for a write the translated schema's write guards judge and this
+/// device does not upload, as a peer's entry applied as its author is
+/// (R77). Lowered on drop.
+#[cfg_attr(not(test), expect(dead_code, reason = "R77's peer apply raises it"))]
+struct UnrecordedWrites {
+    flags: Arc<WriteFlags>,
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "R77's peer apply raises it"))]
+impl UnrecordedWrites {
+    fn raise(flags: &Arc<WriteFlags>) -> Self {
+        flags.unrecorded.store(true, Ordering::Relaxed);
+        Self {
+            flags: Arc::clone(flags),
+        }
+    }
+}
+
+impl Drop for UnrecordedWrites {
+    fn drop(&mut self) {
+        self.flags.unrecorded.store(false, Ordering::Relaxed);
     }
 }
 
@@ -2219,28 +2257,36 @@ fn register_bot_list(db: &mut SqliteConnection, list: String) -> Result<(), Clie
 /// connetto authors itself: applying server-authoritative patches, rolling a
 /// refused mutation back, evicting uncovered rows, and its own bookkeeping.
 /// The application's writes always see it false, so the policy judges them.
-/// Register [`connetto_core::WRITE_EXEMPTION_FUNCTION`] backed by `flag`.
+/// Register [`connetto_core::WRITE_EXEMPTION_FUNCTION`] and
+/// [`outbox::UNRECORDED_FUNCTION`] backed by `flags`.
 ///
 /// A build that translates its schema with policies passes the same name to
 /// `Pg2SqliteOptions::with_write_exemption_function`. connetto registers the
 /// function on every replica connection it opens, whether or not the schema
 /// names it.
 ///
-/// Nondeterministic on purpose: its value changes between statements (the
-/// suspension guard flips it), so SQLite must not hoist or cache it the way
-/// the caller function invites. Innocuous because the generated triggers are
-/// exactly the schema objects it has to be callable from.
-fn register_write_exemption(
+/// Nondeterministic on purpose: their values change between statements (the
+/// guards flip them), so SQLite must not hoist or cache them the way the
+/// caller function invites. Innocuous because the generated triggers are
+/// exactly the schema objects they have to be callable from.
+fn register_write_flags(
     db: &mut SqliteConnection,
-    flag: &Arc<AtomicBool>,
+    flags: &Arc<WriteFlags>,
 ) -> Result<(), ClientError> {
-    let flag = Arc::clone(flag);
+    let exempt = Arc::clone(flags);
     db.register_noarg_sql_function::<diesel::sql_types::Bool, _, _>(
         connetto_core::WRITE_EXEMPTION_FUNCTION,
         SqliteFunctionBehavior::INNOCUOUS,
-        move || flag.load(Ordering::Relaxed),
+        move || exempt.exempt.load(Ordering::Relaxed),
     )
-    .map_err(|e| ClientError::Session(format!("registering the write exemption function: {e}")))
+    .map_err(|e| ClientError::Session(format!("registering the write exemption function: {e}")))?;
+    let unrecorded = Arc::clone(flags);
+    db.register_noarg_sql_function::<diesel::sql_types::Bool, _, _>(
+        outbox::UNRECORDED_FUNCTION,
+        SqliteFunctionBehavior::INNOCUOUS,
+        move || unrecorded.unrecorded.load(Ordering::Relaxed),
+    )
+    .map_err(|e| ClientError::Session(format!("registering the unrecorded function: {e}")))
 }
 
 /// Whether `name` is SQLite's or connetto's own, rather than the application's.
@@ -3974,11 +4020,12 @@ pub struct ConnettoConnection<T: Transport> {
     /// to look for a recorded write to flush. Server patch applies trip it
     /// too, harmlessly: an empty outbox never uploads.
     dirty: Arc<AtomicBool>,
-    /// True while [`ExemptWrites`] holds it, read by the registered
-    /// [`connetto_core::WRITE_EXEMPTION_FUNCTION`], so the outbox records
-    /// nothing connetto writes and the translated schema's fail-closed write
-    /// guards admit connetto's own writes and nobody else's.
-    write_exempt: Arc<AtomicBool>,
+    /// The write exemption and the outbox's own switch, read by the
+    /// registered [`connetto_core::WRITE_EXEMPTION_FUNCTION`] and
+    /// [`outbox::UNRECORDED_FUNCTION`], so the outbox records nothing
+    /// connetto writes and the translated schema's fail-closed write guards
+    /// admit connetto's own writes and nobody else's.
+    write_flags: Arc<WriteFlags>,
     /// Raised while [`change_schema`](Self::change_schema) runs, the only time
     /// the authorizer admits DDL on an application table in `main`.
     schema_open: Arc<AtomicBool>,
@@ -4398,10 +4445,11 @@ where
             register_subjects(&mut db, &subjects.function, subjects.rendered(now))?;
         }
         // Beside the caller function and for the same reach: the generated
-        // write guards call it, so it exists before any trigger can run. A
-        // schema that never names it pays nothing.
-        let write_exempt = Arc::new(AtomicBool::new(false));
-        register_write_exemption(&mut db, &write_exempt)?;
+        // write guards and the outbox triggers call them, so they exist
+        // before any trigger can run. A schema that never names them pays
+        // nothing.
+        let write_flags = Arc::new(WriteFlags::default());
+        register_write_flags(&mut db, &write_flags)?;
         // A person carries the wildcard, and a bot login reads its list here (R99).
         register_bot_list(&mut db, connetto_core::BOT_LIST_WILDCARD.to_owned())?;
         let (prior, reset_resume) = install_replica_schema(&mut db, replica, boot, config)?;
@@ -4474,7 +4522,7 @@ where
             #[cfg(feature = "device-identity")]
             retired_keys,
             dirty,
-            write_exempt,
+            write_flags,
             schema_open,
             changed,
             applied_rows,
@@ -5057,7 +5105,7 @@ where
                 }
                 let number = WriterRef::Number(grant.number);
                 {
-                    let _suspended = ExemptWrites::raise(&self.write_exempt);
+                    let _suspended = ExemptWrites::raise(&self.write_flags);
                     let queue = self.writers.get(&unissued());
                     self.db.transaction::<(), ClientError, _>(|db| {
                         let (next_seq, head) = if let Some(queue) = queue {
@@ -5178,7 +5226,7 @@ where
             .entry(WriterRef::Device(key_id))
             .or_insert_with(WriterQueue::fresh);
         {
-            let _suspended = ExemptWrites::raise(&self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             persist_writer_state(
                 &mut self.db,
                 &WriterRef::Device(key_id),
@@ -5266,7 +5314,7 @@ where
             }
             WriterTaskKind::Retire(writer, _) => {
                 {
-                    let _suspended = ExemptWrites::raise(&self.write_exempt);
+                    let _suspended = ExemptWrites::raise(&self.write_flags);
                     clear_retire(&mut self.db, &writer)?;
                 }
                 self.flush_writer_tasks().await?;
@@ -5314,7 +5362,7 @@ where
                     queue.next_seq = raised;
                 }
                 {
-                    let _suspended = ExemptWrites::raise(&self.write_exempt);
+                    let _suspended = ExemptWrites::raise(&self.write_flags);
                     persist_writer_state(&mut self.db, &writer, queue.next_seq, &queue.head)?;
                 }
                 self.bound_writer = Some(writer);
@@ -5348,7 +5396,7 @@ where
     /// and drop its state, so the next handshake does not present it again.
     fn retire_number(&mut self, number: WriterRef) -> Result<(), ClientError> {
         let secret = self.writers.get(&number).and_then(|queue| queue.secret);
-        let _suspended = ExemptWrites::raise(&self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         persist_retire(&mut self.db, &number, secret.as_ref())?;
         drop_writer_state(&mut self.db, &number)?;
         self.writer_tasks.push_back(WriterTask {
@@ -5476,7 +5524,7 @@ where
             })
             .copied()
             .collect();
-        let _suspended = ExemptWrites::raise(&self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         self.db.transaction::<(), ClientError, _>(|db| {
             for placement in &plan {
                 let entry = &self.writers[&placement.source].pending[&placement.original_seq];
@@ -5622,7 +5670,7 @@ where
         };
         {
             let config = &self.config;
-            let _suspended = ExemptWrites::raise(&self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             self.db.transaction::<(), ClientError, _>(|db| {
                 persist_writer_state(db, writer, seq + 1, &hash)?;
                 persist_pending(db, writer, seq, &entry.record())?;
@@ -6141,7 +6189,7 @@ where
     fn invalidate_coverage(&mut self) -> Result<(), ClientError> {
         if self.cursor_subjects.is_some() {
             if let Some(cursor) = &self.last_cursor {
-                let _suspended = ExemptWrites::raise(&self.write_exempt);
+                let _suspended = ExemptWrites::raise(&self.write_flags);
                 persist_cursor_and_subjects(&mut self.db, cursor, None)?;
             }
             self.cursor_subjects = None;
@@ -6175,7 +6223,7 @@ where
         } else {
             Vec::new()
         };
-        let _suspended = ExemptWrites::raise(&self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         persist_cursor_and_subjects(&mut self.db, cursor, Some(&subjects))?;
         self.cursor_subjects = Some(subjects);
         self.authorization_cleared = None;
@@ -7037,7 +7085,7 @@ where
         {
             // Suspended for the whole apply, so restoring a write does not
             // capture a second write of the same rows.
-            let _suspended = ExemptWrites::raise(&self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             let shared = &self.config.shared_tables;
             self.db.transaction::<(), ClientError, _>(|db| {
                 // Checked at the commit, so neither table order nor row order
@@ -7111,7 +7159,7 @@ where
             *secret = secret.or(entry.secret);
         }
         {
-            let _suspended = ExemptWrites::raise(&self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             for (writer, secret) in &archived {
                 persist_retire(&mut self.db, writer, secret.as_ref())?;
             }
@@ -7330,7 +7378,7 @@ where
     /// replica clock. The pump asks on every step, so the interest is
     /// rewritten only when a record moved.
     fn reanchor_subscriptions(&mut self) -> Result<(), ClientError> {
-        let _suspended = ExemptWrites::raise(&self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
         self.db.transaction(|db| {
             if subscriptions::reanchor_ahead(db)? {
@@ -7347,7 +7395,7 @@ where
         &mut self,
         change: impl FnOnce(&mut SqliteConnection) -> Result<R, ClientError>,
     ) -> Result<R, ClientError> {
-        let _suspended = ExemptWrites::raise(&self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
         self.db.transaction(|db| {
             let changed = change(db)?;
@@ -7393,7 +7441,7 @@ where
         // The statistics still on record are the ones a handle still watches,
         // so the cap never evicts a value in use.
         let protected = subscriptions::live_identities(&mut self.db)?;
-        let _suspended = ExemptWrites::raise(&self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         aggregates::apply_frame(&mut self.db, query_id, &binds, frame, now)?;
         // A removal cannot add a statistic, so only a write needs the cap.
         if frame.result_json.is_some() {
@@ -7786,7 +7834,7 @@ where
     {
         // Prepared here so the closure below captures this field rather than
         // all of `self`, which `db` is borrowed out of for the duration.
-        let exempt = &self.write_exempt;
+        let exempt = &self.write_flags;
         self.db.transaction(|conn| {
             let private = {
                 let _suspended = ExemptWrites::raise(exempt);
@@ -7946,7 +7994,7 @@ where
             .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?;
         let shared = &self.config.shared_tables;
         {
-            let _suspended = ExemptWrites::raise(&self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             self.db.transaction::<_, ClientError, _>(|db| {
                 delete_pending(db, &writer, client_seq)?;
                 db.apply_changeset(&inverse, rollback_omit)
@@ -8141,7 +8189,7 @@ where
                 // An empty cursor carries no resume information: never let
                 // it regress a real one, in memory or in the replica.
                 if !end.cursor.is_empty() {
-                    let _suspended = ExemptWrites::raise(&self.write_exempt);
+                    let _suspended = ExemptWrites::raise(&self.write_flags);
                     let coverage = self.cursor_subjects.as_deref();
                     persist_cursor_and_subjects(&mut self.db, &end.cursor, coverage)?;
                     self.last_cursor = Some(end.cursor);
@@ -8366,7 +8414,7 @@ where
                 .is_some();
             if removed {
                 {
-                    let _suspended = ExemptWrites::raise(&self.write_exempt);
+                    let _suspended = ExemptWrites::raise(&self.write_flags);
                     delete_pending(&mut self.db, &writer, client_seq)?;
                 }
                 self.record_spare()?;
@@ -8516,7 +8564,7 @@ where
         let Some((query_id, binds)) = subscriptions::identity_of(&mut self.db, sub_id)? else {
             return Ok(());
         };
-        let _suspended = ExemptWrites::raise(&self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         aggregates::clear(&mut self.db, query_id, &binds)?;
         Ok(())
     }
@@ -8569,7 +8617,7 @@ where
                 }
             }
         }
-        let _suspended = ExemptWrites::raise(&self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         let tables = self.config.policy_tables.clone();
         let config = &self.config;
         deleting_transaction(&mut self.db, config, |conn| {
@@ -8654,7 +8702,7 @@ where
             return Ok(());
         }
         let spare = self.pending_spare()?;
-        let _suspended = ExemptWrites::raise(&self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         interest::record_spare(&mut self.db, &self.config, &spare)
     }
 
@@ -8696,7 +8744,7 @@ where
             .into_iter()
             .chain(queued.into_iter().map(|entry| entry.changeset.as_slice()));
         let config = &self.config;
-        let _suspended = ExemptWrites::raise(&self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         let remain = self.db.immediate_transaction(|db| {
             undo_shared(db, &config.shared_tables, newest_first)?;
             interest::depart(db, config, &config.client_id, true)
@@ -8721,7 +8769,7 @@ where
         if self.config.shared_tables.is_empty() || identity == self.config.client_id {
             return Ok(());
         }
-        let _suspended = ExemptWrites::raise(&self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
         self.db
             .immediate_transaction(|db| interest::depart(db, config, identity, true))
@@ -8910,7 +8958,7 @@ where
             return Ok(());
         }
         let shared = &self.config.shared_tables;
-        let _suspended = ExemptWrites::raise(&self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         self.db.transaction::<_, ClientError, _>(|conn| {
             for changeset in &queued {
                 conn.apply_changeset(changeset, server_wins)
@@ -8949,7 +8997,7 @@ where
         addressed_to: Option<&str>,
     ) -> Result<(), ClientError> {
         let bytes = zstd::decode_all(payload_zstd)?;
-        let suspended = ExemptWrites::raise(&self.write_exempt);
+        let suspended = ExemptWrites::raise(&self.write_flags);
         // The counting gate makes the update hook tally each row into
         // `apply_staging` (R60 decision 4). Cleared before any error propagates
         // so a failed apply never leaves the gate up. The staging map merges
@@ -9421,6 +9469,44 @@ mod tests {
         assert!(
             wait <= RESEND_POLICY.initial_backoff(),
             "the new deferral starts from the first wait"
+        );
+    }
+
+    /// A write under the unrecorded switch stays out of the outbox while the
+    /// write exemption stays down, so the policy guards still judge it, and
+    /// the next write after the switch drops is recorded again.
+    #[test]
+    fn an_unrecorded_write_is_judged_and_kept_out_of_the_outbox() {
+        let config = ClientConfig::new("unrecorded-test");
+        let mut conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("open in-memory replica");
+        {
+            let _unrecorded = UnrecordedWrites::raise(&conn.write_flags);
+            let exempt: bool = diesel::select(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                &format!("{}()", connetto_core::WRITE_EXEMPTION_FUNCTION),
+            ))
+            .get_result(&mut conn.db)
+            .expect("read the exemption");
+            assert!(!exempt, "the policy guards still judge the write");
+            conn.db
+                .batch_execute("INSERT INTO t (id) VALUES (1)")
+                .expect("a peer's row");
+        }
+        assert!(
+            outbox::build(&mut conn.db, &conn.config.shared_tables)
+                .expect("read the outbox")
+                .is_none(),
+            "nothing was recorded"
+        );
+        conn.db
+            .batch_execute("INSERT INTO t (id) VALUES (2)")
+            .expect("an application write");
+        assert!(
+            outbox::build(&mut conn.db, &conn.config.shared_tables)
+                .expect("read the outbox")
+                .is_some(),
+            "recording is back once the switch drops"
         );
     }
 

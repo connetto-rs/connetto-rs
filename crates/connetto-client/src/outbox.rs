@@ -6,7 +6,9 @@
 //! The triggers are generated from the replica's own catalog at every open
 //! and by every [`change_schema`](crate::ConnettoConnection::change_schema),
 //! and they record nothing while connetto's write exemption is raised, so
-//! server frames, rollbacks, replays and bookkeeping never enter the outbox.
+//! server frames, rollbacks, replays and bookkeeping never enter the outbox,
+//! nor while [`UNRECORDED_FUNCTION`] answers true, which keeps out a write
+//! the policy guards still judge, as a peer's entry applied as its author is.
 //! A table in the shared store gets the same triggers on each identity's own
 //! connection, which write that identity's outbox in `main` and spare the
 //! written key in the store's `_connetto_spare` in the same transaction, so
@@ -54,6 +56,12 @@ const TRIGGER_PREFIX: &str = "_connetto_outbox_";
 
 /// The JSON a blob cell holds in place of its bytes.
 const BLOB_MARKER: &str = r#"{"b":0}"#;
+
+/// The SQL function the outbox triggers call beside
+/// [`WRITE_EXEMPTION_FUNCTION`], true while a write the policy guards judge
+/// must still stay out of the outbox, as a peer's entry applied as its author
+/// does.
+pub(crate) const UNRECORDED_FUNCTION: &str = "connetto_unrecorded";
 
 /// One column of a captured table, in column order.
 #[derive(diesel::QueryableByName)]
@@ -298,7 +306,7 @@ fn triggers(schema: &str, table: &str, columns: &[Column], spare: Option<&str>) 
         );
         format!(
             "CREATE TEMP TRIGGER {name} AFTER {event} ON {target} \
-             WHEN NOT {WRITE_EXEMPTION_FUNCTION}() BEGIN \
+             WHEN NOT {WRITE_EXEMPTION_FUNCTION}() AND NOT {UNRECORDED_FUNCTION}() BEGIN \
              INSERT INTO _connetto_outbox (tbl, op, old, new) \
              VALUES ('{literal}', '{op}', {old}, {new}); {blobs}{spares}END; "
         )
