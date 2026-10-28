@@ -17,6 +17,8 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use subql::backend::Value;
 
+use super::logging::{LogCapture, with_capture};
+
 /// Serializes these tests. Each drops and recreates the one `auth_events`
 /// table and its enum type, so concurrent runs race on the DDL. Same treatment
 /// `e2e.rs` gives the fixtures it shares.
@@ -329,8 +331,16 @@ async fn the_hook_lands_rows_in_the_order_they_were_emitted() {
     );
 }
 
+/// Whether the capture holds a warning carrying `message` about a login row.
+fn told_about_a_login(capture: &LogCapture, message: &str) -> bool {
+    capture
+        .lines()
+        .iter()
+        .any(|line| line["message"] == message && line["op"] == "logged_in")
+}
+
 /// A row the pool cannot hand a connection for waits until it can, rather
-/// than being dropped while the rows behind it land.
+/// than being dropped while the rows behind it land, and the wait is logged.
 #[tokio::test]
 async fn a_row_waits_for_a_connection_rather_than_being_dropped() {
     let _serial = PG_SERIAL.lock().await;
@@ -346,21 +356,32 @@ async fn a_row_waits_for_a_connection_rather_than_being_dropped() {
         .build(manager)
         .await
         .expect("build the one-connection pool");
-    let held = pool.get().await.expect("hold the only connection");
-    let hook = pg_audit_hook::<ConnettoDefaults>(pool.clone());
-
     let session = SessionId::from_uuid(uuid::Uuid::new_v4());
-    hook(login(session, "anna"));
-    // Long enough for the writer's ask to time out and be asked again.
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-    drop(held);
+    let capture = with_capture(
+        "a_row_waits_for_a_connection_rather_than_being_dropped",
+        |capture| async move {
+            let held = pool.get().await.expect("hold the only connection");
+            let hook = pg_audit_hook::<ConnettoDefaults>(pool.clone());
+            hook(login(session, "anna"));
+            // Long enough for the writer's ask to time out and be asked again.
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            drop(held);
+            capture
+        },
+    )
+    .await;
     assert_eq!(
         landed_sessions(fixture.admin(), 1).await,
         vec![Some(session)]
     );
+    assert!(told_about_a_login(
+        &capture,
+        "audit row waiting for a connection"
+    ));
 }
 
-/// A row whose insert fails is dropped, and the rows behind it still land.
+/// A row whose insert fails is dropped and logged, and the rows behind it
+/// still land.
 #[tokio::test]
 async fn a_row_that_cannot_be_inserted_is_dropped_and_the_next_lands() {
     let _serial = PG_SERIAL.lock().await;
@@ -381,13 +402,56 @@ async fn a_row_that_cannot_be_inserted_is_dropped_and_the_next_lands() {
                 .expect("arm the refusal");
         }
     }
-    let hook = pg_audit_hook::<ConnettoDefaults>(fixture.admin().clone());
-
     let refused = SessionId::from_uuid(uuid::Uuid::new_v4());
     let kept = SessionId::from_uuid(uuid::Uuid::new_v4());
-    hook(login(refused, "mallory"));
-    hook(login(kept, "anna"));
-    assert_eq!(landed_sessions(fixture.admin(), 1).await, vec![Some(kept)]);
+    let admin = fixture.admin().clone();
+    let (landed, capture) = with_capture(
+        "a_row_that_cannot_be_inserted_is_dropped_and_the_next_lands",
+        |capture| async move {
+            let hook = pg_audit_hook::<ConnettoDefaults>(admin.clone());
+            hook(login(refused, "mallory"));
+            hook(login(kept, "anna"));
+            (landed_sessions(&admin, 1).await, capture)
+        },
+    )
+    .await;
+    assert_eq!(landed, vec![Some(kept)]);
+    assert!(told_about_a_login(
+        &capture,
+        "audit row dropped, insert failed"
+    ));
+}
+
+/// A row handed to a hook whose writer has stopped, as when the runtime it
+/// ran on shut down, is logged as dropped and never fails its producer.
+#[test]
+fn a_row_for_a_stopped_writer_is_logged_as_dropped() {
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    };
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            "postgres://nobody@127.0.0.1:1/none",
+        );
+    // The writer's runtime shuts down once the hook is made, taking the
+    // writer with it.
+    let hook = runtime().block_on(async {
+        pg_audit_hook::<ConnettoDefaults>(Pool::builder().build_unchecked(manager))
+    });
+    let capture = runtime().block_on(with_capture(
+        "a_row_for_a_stopped_writer_is_logged_as_dropped",
+        |capture| async move {
+            hook(login(SessionId::from_uuid(uuid::Uuid::new_v4()), "anna"));
+            capture
+        },
+    ));
+    assert!(told_about_a_login(
+        &capture,
+        "audit row dropped, the writer has stopped"
+    ));
 }
 
 /// A download names the query list it ran and the archive's size, and a

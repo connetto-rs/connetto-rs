@@ -415,7 +415,12 @@ where
     D: crate::schema::ConnettoSchema,
 {
     let (queue, events) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(write_in_order::<D>(pool, events));
+    // The writer's warnings carry the span the hook was made under, as every
+    // task the server spawns for a caller does.
+    tokio::spawn(tracing::Instrument::instrument(
+        write_in_order::<D>(pool, events),
+        tracing::Span::current(),
+    ));
     std::sync::Arc::new(move |event: AuthEvent<D::Id>| {
         let op = event.op;
         if queue.send(event).is_err() {
