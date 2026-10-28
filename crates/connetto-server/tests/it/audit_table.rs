@@ -7,7 +7,7 @@
 
 use connetto_core::SessionId;
 use connetto_server::audit::{
-    AUTH_OP_TYPE, AuthEvent, AuthOp, ConnettoAuditSchema, record_awaited,
+    AUTH_OP_TYPE, AuthEvent, AuthOp, ConnettoAuditSchema, pg_audit_hook, record_awaited,
 };
 use connetto_server::defaults::ConnettoDefaults;
 use connetto_test_harness::Fixture;
@@ -269,6 +269,56 @@ async fn the_database_clock_stamps_the_row() {
         skew.secs.abs() < 5,
         "the row is stamped by the database clock, skew {}s",
         skew.secs
+    );
+}
+
+/// The ready-made hook lands its rows in the order the server emitted them,
+/// so a trail read by time never shows a logout ahead of its login, however
+/// many writes are in flight at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hook_lands_rows_in_the_order_they_were_emitted() {
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    reset_audit_table(fixture.admin()).await;
+    let hook = pg_audit_hook::<ConnettoDefaults>(fixture.admin().clone());
+
+    let emitted: Vec<SessionId> = (0..64)
+        .map(|_| SessionId::from_uuid(uuid::Uuid::new_v4()))
+        .collect();
+    for session in &emitted {
+        hook(AuthEvent::new(
+            *session,
+            Some("anna".to_owned()),
+            AuthOp::LoggedIn,
+        ));
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let landed = loop {
+        let mut conn = fixture.admin().get().await.expect("connection");
+        let landed: Vec<Option<SessionId>> = diesel_async::RunQueryDsl::load(
+            auth_events::table
+                .order(auth_events::at)
+                .select(auth_events::session),
+            &mut conn,
+        )
+        .await
+        .expect("read rows");
+        if landed.len() == emitted.len() {
+            break landed;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} of {} rows landed in time",
+            landed.len(),
+            emitted.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        landed,
+        emitted.into_iter().map(Some).collect::<Vec<_>>(),
+        "the rows land in emission order"
     );
 }
 
