@@ -77,7 +77,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};
 pub use workers::BootError;
-pub use workers::{ChannelError, IntakeError};
+pub use workers::{BootProgress, ChannelError, IntakeError};
 
 /// Failure surfaced by [`BrowserSocket`].
 #[derive(Debug, thiserror::Error)]

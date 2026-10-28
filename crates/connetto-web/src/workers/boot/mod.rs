@@ -325,13 +325,15 @@ pub(super) fn generated_bootstrap_source(
 {{
   const hello = new BroadcastChannel("connetto-hello");
   const progress = "progress:{id}";
-  hello.postMessage(progress);
+  hello.postMessage(progress + ":bootstrap-started");
   const beat = setInterval(() => hello.postMessage(progress), {beat_ms});
   try {{
     const mod = await import({glue});
+    hello.postMessage(progress + ":module-imported");
     await mod.default({{ module_or_path: {wasm} }});
-{entry}    hello.postMessage(progress);
-  }} catch (err) {{
+    clearInterval(beat);
+    hello.postMessage(progress + ":module-initialized");
+{entry}  }} catch (err) {{
     new BroadcastChannel("connetto-debug").postMessage("db worker bootstrap FAILED: " + err);
     hello.postMessage("failed:{id}:" + err);
     throw err;
@@ -450,13 +452,13 @@ fn report_boot_failure(detail: &str) {
     }
 }
 
-/// Tells the waiting page this boot is still working, naming the boot it was spawned as.
-fn report_boot_progress() {
+/// Tells the waiting page this boot has completed `stage`, naming the boot it was spawned as.
+fn report_boot_progress(stage: &str) {
     let Some(identity) = boot_identity_from_location() else {
         return;
     };
     if let Ok(hello) = web_sys::BroadcastChannel::new(super::HELLO_CHANNEL) {
-        let _ = hello.post_message(&JsValue::from_str(&format!("progress:{identity}")));
+        let _ = hello.post_message(&JsValue::from_str(&format!("progress:{identity}:{stage}")));
         hello.close();
     }
 }
@@ -484,20 +486,25 @@ where
 {
     let crate::builder::WebBuild { core, web: config } = build;
     let (storage, key_store, was_enrolled) = services::prepare_boot_storage(&config).await?;
-    report_boot_progress();
+    report_boot_progress("storage-prepared");
     let resolved =
         replica::resolve_boot_sign_in::<Id>(&config, &storage, &key_store, was_enrolled).await?;
-    report_boot_progress();
+    report_boot_progress("signed-in");
     let (spec, mut worker, content_root_key) =
         replica::open_worker(core, &config, resolved, &storage, &key_store).await?;
+    report_boot_progress("replica-opened");
     services::retry_shared_departures(&mut worker).await;
-    report_boot_progress();
+    report_boot_progress("departures-retried");
     if config.connect_gate.is_none() {
         replica::try_connect_upstream(&mut worker, config.ws_url).await?;
+        report_boot_progress("upstream-dialed");
+    } else {
+        report_boot_progress("upstream-deferred");
     }
-    report_boot_progress();
     replica::subscribe_and_boot(&mut worker, &config).await?;
+    report_boot_progress("subscribed");
     services::hold_alive_lock().await;
+    report_boot_progress("alive-lock-held");
     let (hub, content_persistent) =
         services::start_boot_services(&config, &spec, worker, content_root_key).await?;
     // The re-check guards what the gate protects, so it runs once the key
