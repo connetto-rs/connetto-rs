@@ -1605,6 +1605,7 @@ where
         }
 
         // A refused download query stops the build before anything connects.
+        let serves_content = cfg!(feature = "content") && content.is_some();
         let portability = portability
             .map(|list| {
                 let replica =
@@ -1614,6 +1615,7 @@ where
                     &schema.engine_ddl::<RegistryIds<D>>(),
                     &replica,
                     &caller_mapping(),
+                    serves_content,
                 )
             })
             .transpose()?;
@@ -1634,7 +1636,7 @@ where
         let reader_pool = build_pool(&database.reader_url, reader_pool_size).await?;
         if portability
             .as_ref()
-            .is_some_and(ValidatedList::reads_as_owner)
+            .is_some_and(ValidatedList::needs_owner_snapshot)
             && reader_in_recovery(&reader_pool)
                 .await
                 .map_err(BuildError::ReaderRecovery)?
@@ -1651,13 +1653,7 @@ where
         let engine_connector = PgReadConnector::with_session_setup(reexec_pool.clone());
         let guard = build_guard::<D>(&pool, reader_reserve.gate(), &throttle, abuse, bans);
         let sign_in = sign_in.map(|OnSignIn(hook)| hook);
-        let portability = portability.map(|list| {
-            Arc::new(list.serve(
-                reader_pool.clone(),
-                pool.clone(),
-                guard.read_limits(Tier::Identified),
-            ))
-        });
+        let download_reader = reader_pool.clone();
         let (service, registry) = build_auth::<D>(
             &pool,
             resolver.0,
@@ -1672,7 +1668,7 @@ where
         )
         .await?;
         let authority: Arc<dyn HandshakeAuthority<D::Id>> = Arc::new(service.handshake_authority());
-        let reader = build_reader_side::<D>(
+        let mut reader = build_reader_side::<D>(
             &database,
             reader_pool,
             reader_pool_size,
@@ -1681,6 +1677,17 @@ where
             content,
         )
         .await?;
+        let portability = portability
+            .map(|list| {
+                list.serve(
+                    download_reader,
+                    pool.clone(),
+                    guard.read_limits(Tier::Identified),
+                    reader.files.take(),
+                )
+                .map(Arc::new)
+            })
+            .transpose()?;
         let write_side = build_write_side::<D>(
             Pools {
                 owner: pool.clone(),
@@ -2103,7 +2110,12 @@ async fn build_reader_side<D: ConnettoSchema>(
     publication: &str,
     content: Option<ContentSettings>,
 ) -> Result<ReaderSide, BuildError> {
-    let (signer, file_router, sweep) = content::build::<D>(
+    let content::FileHalf {
+        signer,
+        router: file_router,
+        sweep,
+        files,
+    } = content::build::<D>(
         content,
         &database.owner_url,
         &database.reader_url,
@@ -2119,6 +2131,7 @@ async fn build_reader_side<D: ConnettoSchema>(
         file_router,
         sweep,
         snapshot,
+        files,
     })
 }
 
@@ -2450,14 +2463,15 @@ struct Pools {
     reader: PgPool,
 }
 
-/// The reader pool's three consumers, the pool, the file half, its sweep's
-/// stop handle and the snapshot source.
+/// The reader pool's consumers, the pool, the file half, its sweep's stop
+/// handle, the snapshot source, and the content store a download reads.
 struct ReaderSide {
     pool: PgPool,
     signer: ContentSigner,
     file_router: Option<Router>,
     sweep: Option<BackgroundTask>,
     snapshot: PgSnapshotSource,
+    files: Option<crate::portability::FileSource>,
 }
 
 /// The login and file routes' settings.

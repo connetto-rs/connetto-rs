@@ -18,6 +18,7 @@ mod upload;
 
 pub use caller::CallerSettings;
 pub use connetto_core::auth::ContentCaller;
+pub use db::load_any_committed_manifest;
 pub use error::ServerError;
 pub use preflight::{PreflightError, preflight, preflight_reader};
 pub use quotas::{CeilingCache, CeilingTotals, Crossing, QuotaSettings};

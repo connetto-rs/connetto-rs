@@ -195,8 +195,15 @@ pub(crate) async fn file_visible_to_caller(
 ///
 /// The alphabetically first `uploaded_by` among committed rows for this `file_id` is chosen. This choice is safe because every committed manifest for one `file_id` carries identical chunk content, BLAKE3 identity being verified at commit, so any row yields the correct bytes.
 ///
-/// Callers must have verified visibility through `file_visible_to_caller` first, since the admin connection used here bypasses RLS.
-pub(crate) async fn load_any_committed_manifest<S: ConnettoFileSchema>(
+/// Callers must have established that the caller may receive the file first,
+/// through `file_visible_to_caller` or, as a person's data download does,
+/// through rows naming it that the person may see, since the admin
+/// connection used here bypasses RLS.
+///
+/// # Errors
+///
+/// The read's [`diesel::result::Error`].
+pub async fn load_any_committed_manifest<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     file_id: &FileId,
 ) -> Result<Option<Manifest>, diesel::result::Error> {

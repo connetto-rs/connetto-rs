@@ -6,6 +6,10 @@
 //! they exist for disputes, so a request whose record cannot be written fails.
 
 mod archive;
+mod files;
+
+pub use files::ChunkReadError;
+pub(crate) use files::FileSource;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -32,7 +36,11 @@ use subql::{ColumnId, ParserDB, QueryProjection, TableId, catalog_helpers};
 use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 
-use archive::{Batch, Manifest, ManifestQuery, TableShape};
+use archive::{Batch, Manifest, ManifestQuery, TableShape, ZipPart};
+use bytes::Bytes;
+use files::{
+    ChunkRef, EntryNames, FileRef, FileRefs, MissingFile, MissingReason, PlacedFile, hex, verifies,
+};
 
 /// Rows one page of a download reads, the last one telling whether another
 /// page follows.
@@ -77,6 +85,7 @@ pub struct PortabilityQuery {
     description: String,
     binds: Vec<PortabilityBind>,
     read_as_owner: bool,
+    file: Option<PortabilityFile>,
 }
 
 impl PortabilityQuery {
@@ -88,6 +97,7 @@ impl PortabilityQuery {
             description: description.into(),
             binds: Vec::new(),
             read_as_owner: false,
+            file: None,
         }
     }
 
@@ -105,6 +115,40 @@ impl PortabilityQuery {
     #[must_use]
     pub fn read_as_owner(mut self) -> Self {
         self.read_as_owner = true;
+        self
+    }
+
+    /// The rows name files, whose bytes the archive carries under `files/`.
+    #[must_use]
+    pub fn file(mut self, file: PortabilityFile) -> Self {
+        self.file = Some(file);
+        self
+    }
+}
+
+/// The query column holding a file's id, the 32-byte BLAKE3 identity the
+/// content store keys the file by, and the column naming the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortabilityFile {
+    column: String,
+    name: Option<String>,
+}
+
+impl PortabilityFile {
+    /// Files identified by `column`, each named by its id.
+    #[must_use]
+    pub fn new(column: impl Into<String>) -> Self {
+        Self {
+            column: column.into(),
+            name: None,
+        }
+    }
+
+    /// Name each file by the text in `column`, such as a photo's title, and
+    /// by its id where the row holds none.
+    #[must_use]
+    pub fn named_by(mut self, column: impl Into<String>) -> Self {
+        self.name = Some(column.into());
         self
     }
 }
@@ -190,6 +234,25 @@ pub enum PortabilityError {
     /// The scratch database the replica schema is read in did not open.
     #[error("the scratch database for the replica schema did not open")]
     ReplicaOpen(#[source] diesel::ConnectionError),
+    /// A file or name column is not among the columns the query reads.
+    #[error("the file column {column} is not among the query's columns")]
+    FileColumn {
+        /// The column named.
+        column: String,
+    },
+    /// A file column is not a blob, or a name column is not text.
+    #[error("column {column} is declared {declared}, which cannot hold {holds}")]
+    FileColumnType {
+        /// The column named.
+        column: String,
+        /// Its type in the replica schema.
+        declared: String,
+        /// What it was named to hold.
+        holds: &'static str,
+    },
+    /// The query names files on a deployment that serves no content.
+    #[error("the query names files, and the deployment serves no content store")]
+    NoContentStore,
 }
 
 /// A data request was refused or could not be answered.
@@ -270,6 +333,21 @@ pub enum DataRequestError {
     /// A blocking archive task panicked or was cancelled.
     #[error("an archive task did not finish")]
     Task(#[source] tokio::task::JoinError),
+    /// A file's chunk could not be read once its entry had begun.
+    #[error("file {file} could not be read past its first chunk")]
+    FileBytes {
+        /// The file's hex id.
+        file: String,
+        /// The store's failure.
+        #[source]
+        source: ChunkReadError,
+    },
+    /// A file's bytes did not match its id once its entry had begun.
+    #[error("file {file} does not match its id")]
+    FileCorrupt {
+        /// The file's hex id.
+        file: String,
+    },
     /// The record could not be written.
     #[error(transparent)]
     Audit(#[from] AuditWriteError),
@@ -313,6 +391,15 @@ struct ValidQuery {
     ordinals: Vec<usize>,
     key: Vec<ColumnId>,
     key_names: Vec<String>,
+    file: Option<FileColumns>,
+}
+
+/// Where a query's rows hold a file id and its name, as archive column
+/// positions.
+struct FileColumns {
+    registered: PortabilityFile,
+    id: usize,
+    name: Option<usize>,
 }
 
 /// `binds` with the person put in.
@@ -336,30 +423,51 @@ pub(crate) struct ValidatedList {
 }
 
 impl ValidatedList {
-    /// Whether any query reads as the owner role, which needs the reader on
-    /// the primary (decision 12).
-    pub(crate) fn reads_as_owner(&self) -> bool {
-        self.queries.iter().any(|query| query.read_as_owner)
+    /// Whether the download opens an owner transaction under the reader's
+    /// snapshot, for an owner query or for the file manifests, which needs
+    /// the reader on the primary (decisions 12 and 16).
+    pub(crate) fn needs_owner_snapshot(&self) -> bool {
+        self.queries
+            .iter()
+            .any(|query| query.read_as_owner || query.file.is_some())
     }
 
-    /// The download served from `reader` and `owner` under `limits`.
+    /// The download served from `reader` and `owner` under `limits`, reading
+    /// file bytes from `files`.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::Portability`] naming the first query that names files
+    /// when `files` is absent.
     pub(crate) fn serve(
         self,
         reader: Pool<AsyncPgConnection>,
         owner: Pool<AsyncPgConnection>,
         limits: ReadLimits,
-    ) -> PortabilityState {
-        PortabilityState {
+        files: Option<FileSource>,
+    ) -> Result<PortabilityState, BuildError> {
+        if files.is_none()
+            && let Some(query) = self.queries.iter().find(|query| query.file.is_some())
+        {
+            return Err(BuildError::Portability {
+                name: query.description.clone(),
+                source: PortabilityError::NoContentStore,
+            });
+        }
+        Ok(PortabilityState {
             list: self,
             reader,
             owner,
             limits,
-        }
+            files,
+        })
     }
 }
 
 /// Validate `list` against the deployment's catalog, `engine_ddl`, and its
-/// client replica schema, `replica`, before anything connects.
+/// client replica schema, `replica`, before anything connects, with
+/// `serves_content` saying whether a content store will be there to read
+/// files from.
 ///
 /// # Errors
 ///
@@ -371,6 +479,7 @@ pub(crate) fn validate(
     engine_ddl: &str,
     replica: &connetto_core::schema::SchemaBundle,
     caller: &CallerMappings,
+    serves_content: bool,
 ) -> Result<ValidatedList, BuildError> {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(engine_ddl)
         .map_err(|err| MaterializerError::Catalog(format!("{err:?}")))?;
@@ -384,17 +493,23 @@ pub(crate) fn validate(
             name: query.description.clone(),
             source,
         };
-        let valid = validate_query(&catalog, caller, &query).map_err(refused)?;
+        let mut valid = validate_query(&catalog, caller, &query).map_err(refused)?;
         if !tables.insert(valid.table.clone()) {
             return Err(refused(PortabilityError::DuplicateTable {
                 table: valid.table,
             }));
         }
-        shapes.push(
-            replica
-                .shape(&valid.table, &valid.columns)
-                .map_err(refused)?,
-        );
+        let shape = replica
+            .shape(&valid.table, &valid.columns)
+            .map_err(refused)?;
+        if let Some(file) = &query.file {
+            if !serves_content {
+                return Err(refused(PortabilityError::NoContentStore));
+            }
+            valid.file =
+                Some(file_columns(file, &valid.columns, &shape.declared).map_err(refused)?);
+        }
+        shapes.push(shape);
         queries.push(valid);
     }
     Ok(ValidatedList {
@@ -403,6 +518,55 @@ pub(crate) fn validate(
         shapes: shapes.into(),
         query_list_hash,
         catalog,
+    })
+}
+
+/// Place `file`'s columns among the query's `columns`, refusing a file
+/// column whose replica type is not a blob and a name column not text, by
+/// SQLite's affinity rules over `declared`.
+fn file_columns(
+    file: &PortabilityFile,
+    columns: &[String],
+    declared: &[String],
+) -> Result<FileColumns, PortabilityError> {
+    let place = |column: &str, holds: &'static str, fits: fn(&str) -> bool| {
+        let index = columns
+            .iter()
+            .position(|name| name == column)
+            .ok_or_else(|| PortabilityError::FileColumn {
+                column: column.to_owned(),
+            })?;
+        if fits(&declared[index].to_uppercase()) {
+            Ok(index)
+        } else {
+            Err(PortabilityError::FileColumnType {
+                column: column.to_owned(),
+                declared: declared[index].clone(),
+                holds,
+            })
+        }
+    };
+    let blob = |declared: &str| {
+        declared.is_empty()
+            || (declared.contains("BLOB")
+                && !["INT", "CHAR", "CLOB", "TEXT"]
+                    .iter()
+                    .any(|mark| declared.contains(mark)))
+    };
+    let text = |declared: &str| {
+        !declared.contains("INT")
+            && ["CHAR", "CLOB", "TEXT"]
+                .iter()
+                .any(|mark| declared.contains(mark))
+    };
+    Ok(FileColumns {
+        id: place(&file.column, "a file id", blob)?,
+        name: file
+            .name
+            .as_deref()
+            .map(|column| place(column, "a file name", text))
+            .transpose()?,
+        registered: file.clone(),
     })
 }
 
@@ -469,11 +633,12 @@ fn validate_query(
         read_as_owner: query.read_as_owner,
         table,
         table_id,
+        file: None,
     })
 }
 
 /// The hex BLAKE3 hash of the registered list, in order: each query's SQL,
-/// binds, description and owner flag.
+/// binds, description, owner flag and file columns.
 fn query_list_hash(queries: &[PortabilityQuery]) -> String {
     #[derive(serde::Serialize)]
     struct Canonical<'a> {
@@ -481,6 +646,8 @@ fn query_list_hash(queries: &[PortabilityQuery]) -> String {
         binds: Vec<Option<&'a BindValue>>,
         description: &'a str,
         read_as_owner: bool,
+        file_column: Option<&'a str>,
+        name_column: Option<&'a str>,
     }
     let canonical: Vec<Canonical<'_>> = queries
         .iter()
@@ -497,14 +664,16 @@ fn query_list_hash(queries: &[PortabilityQuery]) -> String {
                 .collect(),
             description: &query.description,
             read_as_owner: query.read_as_owner,
+            file_column: query.file.as_ref().map(|file| file.column.as_str()),
+            name_column: query.file.as_ref().and_then(|file| file.name.as_deref()),
         })
         .collect();
     let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
     blake3::hash(&bytes).to_hex().to_string()
 }
 
-/// Refuse an owner query when the reader is a hot standby, whose snapshot the
-/// primary cannot import (decision 12).
+/// Whether the reader is a hot standby, whose snapshot the owner role on the
+/// primary cannot import (decisions 12 and 16).
 ///
 /// # Errors
 ///
@@ -531,6 +700,7 @@ pub(crate) struct PortabilityState {
     reader: Pool<AsyncPgConnection>,
     owner: Pool<AsyncPgConnection>,
     limits: ReadLimits,
+    files: Option<FileSource>,
 }
 
 /// The moment the download's snapshot was taken (decision 7).
@@ -579,49 +749,153 @@ impl PortabilityState {
         let read = self.read_all(person, session, rows).await;
         // The writer's own failure explains a read that found it gone.
         let file = writer.await.map_err(DataRequestError::Task)??;
-        let moment = read?;
-        let manifest = Manifest {
-            person,
-            deployment: &self.list.deployment,
-            postgres_system_identifier: system.as_deref(),
-            generated_at: moment.generated_at.to_rfc3339(),
-            snapshot: &moment.snapshot,
-            queries: self
-                .list
-                .queries
-                .iter()
-                .map(|query| ManifestQuery {
-                    sql: &query.sql,
-                    table: &query.table,
-                    columns: &query.columns,
-                    description: &query.description,
-                    read_as_owner: query.read_as_owner,
-                })
-                .collect(),
-            query_list_hash: &self.list.query_list_hash,
-        };
-        let manifest = serde_json::to_vec_pretty(&manifest).map_err(DataRequestError::Manifest)?;
+        let read = read?;
+        let (parts, parted) = mpsc::channel(4);
         let (chunks, mut zipped) = mpsc::channel::<Vec<u8>>(8);
-        let packing = tokio::task::spawn_blocking(move || archive::zip(&file, &manifest, chunks));
-        let mut bytes = 0_u64;
-        while let Some(chunk) = zipped.recv().await {
-            sink.write_all(&chunk).await.map_err(DataRequestError::Io)?;
-            bytes += chunk.len() as u64;
+        let packing = tokio::task::spawn_blocking(move || archive::zip(&file, parted, chunks));
+        let pump = async move {
+            let mut bytes = 0_u64;
+            while let Some(chunk) = zipped.recv().await {
+                sink.write_all(&chunk).await.map_err(DataRequestError::Io)?;
+                bytes += chunk.len() as u64;
+            }
+            sink.flush().await.map_err(DataRequestError::Io)?;
+            Ok::<u64, DataRequestError>(bytes)
+        };
+        let feed = async move {
+            let (placed, missing) = self.write_files(read.files, read.malformed, &parts).await?;
+            let manifest = Manifest {
+                person,
+                deployment: &self.list.deployment,
+                postgres_system_identifier: system.as_deref(),
+                generated_at: read.moment.generated_at.to_rfc3339(),
+                snapshot: &read.moment.snapshot,
+                queries: self
+                    .list
+                    .queries
+                    .iter()
+                    .map(|query| ManifestQuery {
+                        sql: &query.sql,
+                        table: &query.table,
+                        columns: &query.columns,
+                        description: &query.description,
+                        read_as_owner: query.read_as_owner,
+                        file_column: query
+                            .file
+                            .as_ref()
+                            .map(|file| file.registered.column.as_str()),
+                        name_column: query
+                            .file
+                            .as_ref()
+                            .and_then(|file| file.registered.name.as_deref()),
+                    })
+                    .collect(),
+                query_list_hash: &self.list.query_list_hash,
+                files: &placed,
+                missing_files: &missing,
+            };
+            let manifest =
+                serde_json::to_vec_pretty(&manifest).map_err(DataRequestError::Manifest)?;
+            parts
+                .send(ZipPart::Manifest(manifest))
+                .await
+                .map_err(|_| DataRequestError::WriterStopped)
+        };
+        let (delivered, archived) = tokio::join!(pump, feed);
+        let packed = packing.await.map_err(DataRequestError::Task)?;
+        // The sink's failure stops everything after it, the reads' failure
+        // stops the zip, and only a zip failing on its own is the zip's.
+        let bytes = delivered?;
+        match (archived, packed) {
+            (Err(DataRequestError::WriterStopped), Err(zip)) => Err(zip),
+            (Err(read), _) | (Ok(()), Err(read)) => Err(read),
+            (Ok(()), Ok(())) => Ok(bytes),
         }
-        packing.await.map_err(DataRequestError::Task)??;
-        sink.flush().await.map_err(DataRequestError::Io)?;
-        Ok(bytes)
+    }
+
+    /// Hand each file's entry to the zip chunk by chunk, verifying every
+    /// chunk and the whole file as they pass, and list the files that cannot
+    /// be produced (decisions 14 and 15).
+    async fn write_files(
+        &self,
+        located: Vec<Located>,
+        mut missing: Vec<MissingFile>,
+        parts: &mpsc::Sender<ZipPart>,
+    ) -> Result<(Vec<PlacedFile>, Vec<MissingFile>), DataRequestError> {
+        let mut placed = Vec::with_capacity(located.len());
+        let Some(source) = &self.files else {
+            // `serve` refuses a list naming files without a store, so no row named one.
+            debug_assert!(located.is_empty(), "files named without a store");
+            return Ok((placed, missing));
+        };
+        let send = async |part| {
+            parts
+                .send(part)
+                .await
+                .map_err(|_| DataRequestError::WriterStopped)
+        };
+        let mut names = EntryNames::default();
+        for Located { file, chunks } in located {
+            let file_id = hex(&file.id);
+            let not_produced = |reason| MissingFile {
+                file_id: file_id.clone(),
+                reason,
+            };
+            let Some(chunks) = chunks else {
+                missing.push(not_produced(MissingReason::NotUploaded));
+                continue;
+            };
+            let mut rest = chunks.iter();
+            let first = match rest.next() {
+                None => Bytes::new(),
+                Some(chunk) => match source.chunk(chunk.hash).await {
+                    Ok(bytes) if verifies(&bytes, chunk) => bytes,
+                    Ok(_) => {
+                        missing.push(not_produced(MissingReason::Corrupt));
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, file = %file_id, "a downloaded file's first chunk is unreadable");
+                        missing.push(not_produced(MissingReason::Unreadable));
+                        continue;
+                    }
+                },
+            };
+            let path = names.place(&file.id, file.name.as_deref());
+            send(ZipPart::File(path.clone())).await?;
+            let mut whole = blake3::Hasher::new();
+            whole.update(&first);
+            send(ZipPart::Bytes(first)).await?;
+            for chunk in rest {
+                let bytes = source.chunk(chunk.hash).await.map_err(|source| {
+                    DataRequestError::FileBytes {
+                        file: file_id.clone(),
+                        source,
+                    }
+                })?;
+                if !verifies(&bytes, chunk) {
+                    return Err(DataRequestError::FileCorrupt { file: file_id });
+                }
+                whole.update(&bytes);
+                send(ZipPart::Bytes(bytes)).await?;
+            }
+            if *whole.finalize().as_bytes() != file.id {
+                return Err(DataRequestError::FileCorrupt { file: file_id });
+            }
+            placed.push(PlacedFile { file_id, path });
+        }
+        Ok((placed, missing))
     }
 
     /// Read every query under one moment, the person's queries on the reader
-    /// as the person and the owner queries on the owner pool under the
-    /// snapshot the reader exported.
+    /// as the person, and the owner queries and the file manifests on the
+    /// owner pool under the snapshot the reader exported.
     async fn read_all(
         &self,
         person: &str,
         session: Option<SessionId>,
         rows: mpsc::Sender<Batch>,
-    ) -> Result<MomentRow, DataRequestError> {
+    ) -> Result<Read, DataRequestError> {
         let session_id = session.unwrap_or_else(|| SessionId::from_uuid(uuid::Uuid::nil()));
         let mut caller = Principal::<String, String>::unidentified(session_id);
         let accepted = caller.accept(Subject::Identity(VerifiedSession {
@@ -635,14 +909,14 @@ impl PortabilityState {
         );
         let binding = CallerBinding::of(&caller, Arc::from(DEFAULT_USER_SETTING));
         let timeout_ms = crate::reexec::statement_timeout_ms(self.limits.timeout);
-        let owner_reads = self.list.reads_as_owner();
+        let owner_snapshot = self.list.needs_owner_snapshot();
         let rows = &rows;
         let mut conn = self
             .reader
             .get()
             .await
             .map_err(DataRequestError::Connection)?;
-        conn.transaction::<MomentRow, DataRequestError, _>(async move |c| {
+        conn.transaction::<Read, DataRequestError, _>(async move |c| {
             diesel::sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
                 .execute(c)
                 .await?;
@@ -656,33 +930,42 @@ impl PortabilityState {
                 .execute(c)
                 .await?;
             binding.apply(c).await?;
+            let mut refs = FileRefs::default();
             for (index, query) in self.list.queries.iter().enumerate() {
                 if !query.read_as_owner {
-                    self.read_query(c, index, person, rows).await?;
+                    self.read_query(c, index, person, rows, &mut refs).await?;
                 }
             }
-            if owner_reads {
+            let files = if owner_snapshot {
                 let exported: ExportedRow =
                     diesel::sql_query("SELECT pg_export_snapshot() AS snapshot_id")
                         .get_result(c)
                         .await?;
-                self.read_as_owner(&exported.snapshot_id, timeout_ms, person, rows)
-                    .await?;
-            }
-            Ok(moment)
+                self.read_as_owner(&exported.snapshot_id, timeout_ms, person, rows, &mut refs)
+                    .await?
+            } else {
+                Vec::new()
+            };
+            Ok(Read {
+                moment,
+                files,
+                malformed: refs.malformed,
+            })
         })
         .await
     }
 
-    /// The owner queries, on an owner connection importing the reader's
-    /// snapshot, with no caller bound.
+    /// The owner queries and then the manifests of every file the rows
+    /// named, on an owner connection importing the reader's snapshot, with
+    /// no caller bound.
     async fn read_as_owner(
         &self,
         snapshot_id: &str,
         timeout_ms: u32,
         person: &str,
         rows: &mpsc::Sender<Batch>,
-    ) -> Result<(), DataRequestError> {
+        refs: &mut FileRefs,
+    ) -> Result<Vec<Located>, DataRequestError> {
         let mut conn = self
             .owner
             .get()
@@ -693,7 +976,7 @@ impl PortabilityState {
             "SET TRANSACTION SNAPSHOT '{}'",
             snapshot_id.replace('\'', "''")
         );
-        conn.transaction::<(), DataRequestError, _>(async move |c| {
+        conn.transaction::<Vec<Located>, DataRequestError, _>(async move |c| {
             diesel::sql_query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .execute(c)
                 .await?;
@@ -703,22 +986,30 @@ impl PortabilityState {
                 .await?;
             for (index, query) in self.list.queries.iter().enumerate() {
                 if query.read_as_owner {
-                    self.read_query(c, index, person, rows).await?;
+                    self.read_query(c, index, person, rows, refs).await?;
                 }
             }
-            Ok(())
+            let mut located = Vec::with_capacity(refs.files.len());
+            if let Some(source) = &self.files {
+                for file in std::mem::take(&mut refs.files) {
+                    let chunks = source.manifest(c, file.id).await?;
+                    located.push(Located { file, chunks });
+                }
+            }
+            Ok(located)
         })
         .await
     }
 
-    /// Page through query `index` on the primary key and hand each page's
-    /// rows to the archive writer.
+    /// Page through query `index` on the primary key, hand each page's rows
+    /// to the archive writer, and note the files they name in `refs`.
     async fn read_query(
         &self,
         conn: &mut AsyncPgConnection,
         index: usize,
         person: &str,
         rows: &mpsc::Sender<Batch>,
+        refs: &mut FileRefs,
     ) -> Result<(), DataRequestError> {
         let query = &self.list.queries[index];
         let catalog = &self.list.catalog;
@@ -775,7 +1066,7 @@ impl PortabilityState {
                 query: query.description.clone(),
                 source,
             })?;
-            let mut batch = Vec::with_capacity(cells.len());
+            let mut batch: Vec<Vec<archive::Cell>> = Vec::with_capacity(cells.len());
             let mut last = None;
             for op in built.iter() {
                 if let PatchsetOp::Insert { values, .. } = op {
@@ -789,21 +1080,13 @@ impl PortabilityState {
                     last = Some(values);
                 }
             }
-            after = match last {
-                Some(values) if filled => {
-                    let row = crate::pk::row_from_wire(catalog, query.table_id, values);
-                    Some(
-                        query
-                            .key
-                            .iter()
-                            .map(|column| {
-                                row.get(usize::from(*column))
-                                    .cloned()
-                                    .unwrap_or(Value::Missing)
-                            })
-                            .collect(),
-                    )
+            if let Some(file) = &query.file {
+                for row in &batch {
+                    refs.note(&row[file.id], file.name.map(|name| &row[name]));
                 }
+            }
+            after = match last {
+                Some(values) if filled => Some(query.key_of(catalog, values)),
                 _ => None,
             };
             rows.send(Batch {
@@ -817,6 +1100,38 @@ impl PortabilityState {
             }
         }
     }
+}
+
+impl ValidQuery {
+    /// The primary-key values of the wire row `values`, in key order, where
+    /// the next page resumes.
+    fn key_of(&self, catalog: &ParserDB, values: &[archive::Cell]) -> Vec<Value<Postgres>> {
+        let row = crate::pk::row_from_wire(catalog, self.table_id, values);
+        self.key
+            .iter()
+            .map(|column| {
+                row.get(usize::from(*column))
+                    .cloned()
+                    .unwrap_or(Value::Missing)
+            })
+            .collect()
+    }
+}
+
+/// What the reads under the one snapshot found.
+struct Read {
+    moment: MomentRow,
+    /// The files the rows named, each with its committed manifest's chunks.
+    files: Vec<Located>,
+    /// File cells holding no file id.
+    malformed: Vec<MissingFile>,
+}
+
+/// A file the rows named, with its committed manifest's chunks, `None` when
+/// the file server holds no committed manifest for it.
+struct Located {
+    file: FileRef,
+    chunks: Option<Vec<ChunkRef>>,
 }
 
 #[cfg(test)]

@@ -2910,7 +2910,7 @@ async fn a_sweep_tick_reclaims_a_chunk_marked_deleting() {
 
 /// The photo table and the two contract functions a configured deployment
 /// applies, from a clean slate.
-async fn apply_content_deployment(pool: &Pool<AsyncPgConnection>) {
+pub(super) async fn apply_content_deployment(pool: &Pool<AsyncPgConnection>) {
     const DEPLOYMENT_SQL: &[&str] = &[
         "CREATE TABLE photos (content_id BYTEA PRIMARY KEY, content_state TEXT NOT NULL \
          DEFAULT 'staged')",

@@ -224,6 +224,28 @@ fn spawn_sweep<D: crate::schema::ConnettoSchema>(
     })))
 }
 
+/// The file-serving half: the ticket signer, the file routes, the sweep's
+/// stop handle, and the content store a person's data download reads files
+/// from (R61).
+pub(crate) struct FileHalf {
+    pub(crate) signer: super::ContentSigner,
+    pub(crate) router: Option<Router>,
+    pub(crate) sweep: Option<super::BackgroundTask>,
+    pub(crate) files: Option<crate::portability::FileSource>,
+}
+
+impl FileHalf {
+    /// The no-files deployment.
+    fn none() -> Self {
+        Self {
+            signer: super::ContentSigner::None,
+            router: None,
+            sweep: None,
+            files: None,
+        }
+    }
+}
+
 /// The file-serving half of the deployment.
 ///
 /// `settings` absent answers no signer and no router, which is the
@@ -242,16 +264,9 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     owner_url: &str,
     reader_url: &str,
     reader_pool_size: u32,
-) -> Result<
-    (
-        super::ContentSigner,
-        Option<Router>,
-        Option<super::BackgroundTask>,
-    ),
-    ContentBuildError,
-> {
+) -> Result<FileHalf, ContentBuildError> {
     let Some(settings) = settings else {
-        return Ok((super::ContentSigner::None, None, None));
+        return Ok(FileHalf::none());
     };
     settings.validate()?;
     let (signer, public) = ticket_keypair(&settings)?;
@@ -311,11 +326,14 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
         bandwidth_window_days = settings.bandwidth_window_days,
         "file routes mounted beside the login endpoints",
     );
-    Ok((
-        super::ContentSigner::Files(Box::new(signer)),
-        Some(router),
+    Ok(FileHalf {
+        signer: super::ContentSigner::Files(Box::new(signer)),
+        router: Some(router),
         sweep,
-    ))
+        files: Some(crate::portability::FileSource::new::<D::Files>(open_store(
+            &settings.store,
+        )?)),
+    })
 }
 
 /// The no-op shape of [`build`] for a server built without the `content`
@@ -330,21 +348,14 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     _owner_url: &str,
     _reader_url: &str,
     _reader_pool_size: u32,
-) -> Result<
-    (
-        super::ContentSigner,
-        Option<Router>,
-        Option<super::BackgroundTask>,
-    ),
-    ContentBuildError,
-> {
+) -> Result<FileHalf, ContentBuildError> {
     if settings.is_some() {
         tracing::warn!(
             "file settings were handed over but this server was built without \
              the content feature, so no file routes are mounted"
         );
     }
-    Ok((super::ContentSigner::None, None, None))
+    Ok(FileHalf::none())
 }
 
 #[cfg(all(test, feature = "content"))]
@@ -456,7 +467,7 @@ mod tests {
     #[tokio::test]
     async fn a_deployment_without_settings_mounts_nothing() {
         use crate::builder::ContentSigner;
-        let (signer, router, _) = build::<crate::defaults::ConnettoDefaults>(
+        let half = build::<crate::defaults::ConnettoDefaults>(
             None,
             "postgres://unused",
             "postgres://unused",
@@ -464,8 +475,8 @@ mod tests {
         )
         .await
         .expect("no settings is a valid deployment");
-        assert!(matches!(signer, ContentSigner::None));
-        assert!(router.is_none());
+        assert!(matches!(half.signer, ContentSigner::None));
+        assert!(half.router.is_none());
     }
 
     /// A configured deployment builds the whole file half in process:
@@ -547,12 +558,12 @@ mod tests {
             key: doc.as_ref().to_vec(),
         };
         // The sweep's guard stays alive until the tick below, then stops it.
-        let (signer, router, _sweep) =
+        let half =
             build::<crate::defaults::ConnettoDefaults>(Some(settings), &admin_url, &reader_url, 2)
                 .await
                 .expect("a configured deployment builds");
         let url = ContentTicketSigner::mint(
-            &signer,
+            &half.signer,
             &identified("caller-9"),
             [3u8; 32],
             ContentVerb::Read,
@@ -560,7 +571,7 @@ mod tests {
         .await
         .expect("the deployment signer mints");
         assert!(url.starts_with("http://127.0.0.1:8099/files/"));
-        assert!(router.is_some(), "the file router rides the listener");
+        assert!(half.router.is_some(), "the file router rides the listener");
         // One sweep tick at the cadence, so the reclaim arm runs.
         tokio::time::sleep(Duration::from_millis(1_300)).await;
     }
