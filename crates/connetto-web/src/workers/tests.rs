@@ -334,8 +334,8 @@ async fn await_db_worker_ready_ignores_a_failure_with_foreign_identity() {
     .await
     .expect_err("deadline must expire");
     assert!(
-        matches!(&error, IntakeError::Timeout { .. }),
-        "expected Timeout, not a foreign failure: {error:?}"
+        matches!(&error, IntakeError::NotReady { .. }),
+        "expected NotReady, not a foreign failure: {error:?}"
     );
     channel.close();
 }
@@ -490,7 +490,7 @@ async fn a_wait_scoped_to_one_boot_ignores_a_later_spawn() {
     .await
     .expect_err("no worker reports readiness here");
     assert!(
-        matches!(&error, IntakeError::Timeout { .. }),
+        matches!(&error, IntakeError::NotReady { .. }),
         "the newer boot {newer}'s failure must not resolve this wait, got {error:?}"
     );
     drop(announcer);
@@ -524,7 +524,7 @@ async fn an_implicit_wait_refuses_another_boot_while_its_own_is_in_flight() {
     .await
     .expect_err("no worker reports readiness here");
     assert!(
-        matches!(&error, IntakeError::Timeout { .. }),
+        matches!(&error, IntakeError::NotReady { .. }),
         "another boot's failure must not resolve a wait for this context's boot, got {error:?}"
     );
 }
@@ -620,7 +620,7 @@ async fn an_error_after_ready_is_not_replayed_as_a_boot_failure() {
     .await
     .expect_err("no worker answers this wait");
     assert!(
-        matches!(&error, IntakeError::Timeout { .. }),
+        matches!(&error, IntakeError::NotReady { .. }),
         "a completed boot must not be replayed as failed, got {error:?}"
     );
     drop(announcer);
@@ -665,7 +665,7 @@ async fn a_ready_boot_stops_reporting_worker_errors() {
     .await
     .expect_err("nothing answers this wait");
     assert!(
-        matches!(&error, IntakeError::Timeout { .. }),
+        matches!(&error, IntakeError::NotReady { .. }),
         "a booted worker's later error must not read as a boot failure, got {error:?}"
     );
     worker.terminate();
@@ -701,7 +701,7 @@ async fn a_replacement_announcement_drops_the_boot_it_replaced() {
     .await
     .expect_err("nothing reports readiness here");
     assert!(
-        matches!(&error, IntakeError::Timeout { .. }),
+        matches!(&error, IntakeError::NotReady { .. }),
         "a superseded boot's failure must not resolve this wait, got {error:?}"
     );
 }
@@ -832,7 +832,7 @@ async fn a_waiter_with_its_own_boot_ignores_another_announced_boot() {
     .await
     .expect_err("no worker reports readiness here");
     assert!(
-        matches!(&error, IntakeError::Timeout { .. }),
+        matches!(&error, IntakeError::NotReady { .. }),
         "another boot's failure must not be adopted, got {error:?}"
     );
 }
@@ -895,13 +895,80 @@ async fn silence_after_the_last_progress_fails_at_silence() {
     .expect_err("silence must fail the wait");
     let elapsed = SystemClock.monotonic().saturating_sub(started);
     assert!(
-        matches!(&error, IntakeError::Timeout { .. }),
-        "expected Timeout, got {error:?}"
+        matches!(&error, IntakeError::NotReady { .. }),
+        "expected NotReady, got {error:?}"
     );
     // The beat at about 200 ms pushes the deadline to about 800 ms, past the 400 ms base.
     assert!(
         (Duration::from_millis(700)..=Duration::from_millis(1_200)).contains(&elapsed),
         "the deadline must count from the last progress, expired after {elapsed:?}"
+    );
+}
+
+/// Progress named for a boot stage keeps a boot alive the way a plain beat does.
+#[wasm_bindgen_test]
+async fn progress_named_for_a_stage_keeps_the_boot_alive() {
+    let identity = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-stage-keeps-alive";
+    post_later(
+        hello,
+        200,
+        vec![
+            format!("progress:{identity}:storage-prepared"),
+            format!("progress:{identity}:signed-in"),
+            format!("progress:{identity}:replica-opened"),
+            format!("ready:{identity}"),
+        ],
+    );
+    crate::workers::intake::await_db_worker_ready_bounded(
+        hello,
+        &[identity],
+        Duration::from_millis(400),
+        Duration::from_millis(500),
+    )
+    .await
+    .expect("stage progress must keep the boot alive past the base");
+}
+
+/// A readiness timeout names the last stage the boot reported and when it last heard any
+/// progress, and a plain beat counts as progress without replacing the stage.
+#[wasm_bindgen_test]
+async fn a_readiness_timeout_names_the_last_stage_and_the_last_progress() {
+    let identity = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-names-the-stage";
+    post_later(
+        hello,
+        200,
+        vec![
+            format!("progress:{identity}:replica-opened"),
+            format!("progress:{identity}"),
+        ],
+    );
+    let error = crate::workers::intake::await_db_worker_ready_bounded(
+        hello,
+        &[identity],
+        Duration::from_millis(400),
+        Duration::from_millis(500),
+    )
+    .await
+    .expect_err("silence after the beat must fail the wait");
+    let IntakeError::NotReady { progress, .. } = &error else {
+        panic!("expected NotReady, got {error:?}");
+    };
+    let (stage, stage_ms) = progress.stage.clone().expect("the stage must be recorded");
+    assert_eq!(stage, "replica-opened", "{progress:?}");
+    assert!(
+        (150.0..=550.0).contains(&stage_ms),
+        "the stage arrives at about 200 ms: {progress:?}"
+    );
+    let last_ms = progress.last_ms.expect("the beat must be recorded");
+    assert!(
+        last_ms > stage_ms,
+        "the beat at about 400 ms is later progress than the stage: {progress:?}"
+    );
+    assert!(
+        error.to_string().contains("replica-opened"),
+        "the message must name the stage: {error}"
     );
 }
 
@@ -921,8 +988,8 @@ async fn no_progress_fails_at_the_base_deadline() {
     .expect_err("no progress and no readiness must time out");
     let elapsed = SystemClock.monotonic().saturating_sub(started);
     assert!(
-        matches!(&error, IntakeError::Timeout { .. }),
-        "expected Timeout, got {error:?}"
+        matches!(&error, IntakeError::NotReady { .. }),
+        "expected NotReady, got {error:?}"
     );
     assert!(
         (Duration::from_millis(350)..=Duration::from_millis(800)).contains(&elapsed),
@@ -956,8 +1023,8 @@ async fn progress_while_at_user_does_not_move_the_deadline() {
     .expect_err("silence after the resume must fail the wait");
     let elapsed = SystemClock.monotonic().saturating_sub(started);
     assert!(
-        matches!(&error, IntakeError::Timeout { .. }),
-        "expected Timeout, got {error:?}"
+        matches!(&error, IntakeError::NotReady { .. }),
+        "expected NotReady, got {error:?}"
     );
     // The resume at about 300 ms restarts the deadline at 300 + 400 = 700 ms; a progress that
     // wrongly aimed at the 3000 ms silence would push it far later.
@@ -989,8 +1056,8 @@ async fn progress_for_an_unknown_identity_does_not_extend() {
     .expect_err("foreign progress must not hold the wait");
     let elapsed = SystemClock.monotonic().saturating_sub(started);
     assert!(
-        matches!(&error, IntakeError::Timeout { .. }),
-        "expected Timeout, got {error:?}"
+        matches!(&error, IntakeError::NotReady { .. }),
+        "expected NotReady, got {error:?}"
     );
     // The base is 400 ms; a foreign progress that wrongly aimed at the 3000 ms silence would
     // push it far later.
@@ -1052,8 +1119,8 @@ async fn a_resumed_boot_gets_a_fresh_deadline_and_no_more() {
     .expect_err("nothing reports readiness after the resume");
     let elapsed = SystemClock.monotonic().saturating_sub(started);
     assert!(
-        matches!(&error, IntakeError::Timeout { .. }),
-        "expected Timeout, got {error:?}"
+        matches!(&error, IntakeError::NotReady { .. }),
+        "expected NotReady, got {error:?}"
     );
     assert!(
         elapsed >= Duration::from_millis(550),
@@ -1077,8 +1144,8 @@ async fn another_boot_waiting_on_its_user_pauses_nothing() {
     .await
     .expect_err("a foreign pause must not hold this wait");
     assert!(
-        matches!(&error, IntakeError::Timeout { .. }),
-        "expected Timeout, got {error:?}"
+        matches!(&error, IntakeError::NotReady { .. }),
+        "expected NotReady, got {error:?}"
     );
 }
 
@@ -1219,7 +1286,7 @@ async fn a_replayed_user_step_arriving_after_its_resume_pauses_nothing() {
         }
     };
     assert!(
-        matches!(&outcome, Err(IntakeError::Timeout { .. })),
+        matches!(&outcome, Err(IntakeError::NotReady { .. })),
         "a silent worker after the resume must time out, got {outcome:?}"
     );
 }

@@ -1,36 +1,40 @@
-// DB worker bootstrap: import the wasm module named by the glue query
-// parameter and boot the DB tier (OPFS replica, server connection, relay
-// hub, hello channel intake). The parameter is read from import.meta.url,
-// not self.location: a harness may load this script through a wrapper
-// blob, and only the module URL keeps the query. Progress and failures go
-// to connetto-debug for captured logs and to connetto-hello for the page
-// readiness wait.
+// A harness may load this script through a wrapper blob, so the query is read from import.meta.url.
 const debug = new BroadcastChannel("connetto-debug");
 const hello = new BroadcastChannel("connetto-hello");
 
 const params = new URL(import.meta.url).searchParams;
-// The page spawns this worker with the identity of the boot it is waiting for, and a
-// failure before the Rust side starts has to name it too.
+// A failure before the Rust side starts has to name the boot the page is waiting for.
 const boot = params.get("boot");
 if (boot) {
   self.connettoBoot = boot;
 }
+const report = (stage) => {
+  if (boot) {
+    hello.postMessage("progress:" + boot + (stage ? ":" + stage : ""));
+  }
+};
 
+report("bootstrap-started");
+const beat = setInterval(() => report(), 5000);
 try {
   const glue = params.get("glue");
   debug.postMessage("db worker: importing " + glue);
   const mod = await import(glue);
-  // The harness glue omits its default module path, so name the wasm
-  // binary explicitly, derived from the glue URL.
+  report("module-imported");
+  // The harness glue omits its default module path.
   await mod.default({ module_or_path: glue.replace(/\.js$/, "_bg.wasm") });
+  clearInterval(beat);
+  report("module-initialized");
   debug.postMessage("db worker: module ready, booting the db tier");
   await mod.db_worker_boot();
   debug.postMessage("db worker: serving");
 } catch (err) {
   debug.postMessage("db worker FAILED: " + err);
-  // A worker that cannot name its boot stays silent, because a page cannot attribute it.
+  // A page cannot attribute a failure that names no boot.
   if (boot) {
     hello.postMessage("failed:" + boot + ":" + err);
   }
   throw err;
+} finally {
+  clearInterval(beat);
 }

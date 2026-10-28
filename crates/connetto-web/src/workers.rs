@@ -17,8 +17,8 @@ pub use blob_io::{BlobError, BlobSink, BlobSource};
 pub(crate) use boot::boot_db_worker;
 pub use boot::{BootError, BootIdentity, BootedSession, WorkerBootstrap, spawn_db_worker};
 pub use intake::{
-    IntakeError, TabWire, announce_tab, await_db_worker_ready, request_custody, sleep,
-    tab_wire_factory,
+    BootProgress, IntakeError, TabWire, announce_tab, await_db_worker_ready, request_custody,
+    sleep, tab_wire_factory,
 };
 pub use logout::{LogoutConfig, serve_logout_requests};
 

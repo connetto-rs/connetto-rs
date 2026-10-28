@@ -357,7 +357,7 @@ pub(super) async fn subscribe_and_boot(
                 last_activity = performance.now();
                 if last_activity - last_progress >= PROGRESS_THROTTLE_MS {
                     last_progress = last_activity;
-                    super::report_boot_progress();
+                    super::report_boot_progress("server-frame");
                 }
             }
             None => {}

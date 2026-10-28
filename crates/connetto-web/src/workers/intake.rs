@@ -61,6 +61,40 @@ pub enum IntakeError {
         /// how long the wait ran before expiring, in milliseconds
         elapsed_ms: f64,
     },
+    /// the readiness wait ran out without the db worker reporting ready
+    #[error("db worker did not report ready within {elapsed_ms:.0} ms, {progress}")]
+    NotReady {
+        /// how long the wait ran before expiring, in milliseconds
+        elapsed_ms: f64,
+        /// what the boot reported before the wait expired
+        progress: BootProgress,
+    },
+}
+
+/// What a boot reported on the hello channel before its readiness wait expired, in
+/// milliseconds since the wait began.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BootProgress {
+    /// The last boot stage the worker named, and when it arrived.
+    pub stage: Option<(String, f64)>,
+    /// When the worker last reported any progress, a plain beat included.
+    pub last_ms: Option<f64>,
+}
+
+impl core::fmt::Display for BootProgress {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match (&self.stage, self.last_ms) {
+            (None, None) => f.write_str("no progress heard"),
+            (None, Some(last)) => write!(f, "no stage named, last progress at {last:.0} ms"),
+            (Some((stage, at)), last) => {
+                write!(f, "last stage {stage} at {at:.0} ms")?;
+                match last {
+                    Some(last) => write!(f, ", last progress at {last:.0} ms"),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
 }
 
 impl From<IntakeError> for JsValue {
@@ -70,7 +104,8 @@ impl From<IntakeError> for JsValue {
 }
 
 /// Time since `started` on the monotonic clock every deadline here is set and checked
-/// against (chapter 21, class D), in the milliseconds [`IntakeError::Timeout`] reports.
+/// against (chapter 21, class D), in the milliseconds [`IntakeError::Timeout`] and
+/// [`IntakeError::NotReady`] report.
 fn elapsed_ms(started: Duration) -> f64 {
     SystemClock
         .monotonic()
@@ -82,6 +117,7 @@ fn elapsed_ms(started: Duration) -> f64 {
 async fn poll_hello_channel(
     channel: &BroadcastChannel,
     state: &Rc<RefCell<HelloReady>>,
+    progress: &Rc<RefCell<BootProgress>>,
     started: Duration,
 ) -> Result<(), IntakeError> {
     const POLL_MS: i32 = 50;
@@ -94,8 +130,9 @@ async fn poll_hello_channel(
             }
             HelloReady::Counting { deadline } => {
                 if SystemClock.monotonic() >= *deadline {
-                    return Err(IntakeError::Timeout {
+                    return Err(IntakeError::NotReady {
                         elapsed_ms: elapsed_ms(started),
+                        progress: progress.borrow().clone(),
                     });
                 }
             }
@@ -175,6 +212,16 @@ impl UserSteps {
 fn user_step<'a>(message: &'a str, prefix: &str) -> Option<(&'a str, u64)> {
     let (id, step) = message.strip_prefix(prefix)?.split_once(':')?;
     Some((id, step.parse().ok()?))
+}
+
+/// The boot identity and named stage of a `progress:` message, `None` when it names no boot.
+fn progress_message(message: &str) -> Option<(&str, Option<&str>)> {
+    let rest = message.strip_prefix("progress:")?;
+    let (id, stage) = match rest.split_once(':') {
+        Some((id, stage)) => (id, Some(stage).filter(|stage| !stage.is_empty())),
+        None => (rest, None),
+    };
+    (!id.is_empty()).then_some((id, stage))
 }
 
 /// Keeps a boot's identity and its outcome obtainable for as long as they explain anything.
@@ -313,7 +360,7 @@ pub(super) fn announce_boot_on(
 ///
 /// [`IntakeError::ChannelOpen`] when the hello channel cannot be opened,
 /// [`IntakeError::BootFailed`] when the worker reported a failure for a known identity, or
-/// [`IntakeError::Timeout`] when the deadline expires.
+/// [`IntakeError::NotReady`] when the deadline expires, naming the last stage the boot reported.
 pub async fn await_db_worker_ready(known: &[super::boot::BootIdentity]) -> Result<(), IntakeError> {
     await_db_worker_ready_bounded(super::HELLO_CHANNEL, known, BASE, SILENCE).await
 }
@@ -341,9 +388,11 @@ pub(super) async fn await_db_worker_ready_bounded(
     let known_ids = Rc::new(RefCell::new(initial));
     // A waiter that knows which boot it waits for has no business adopting another one.
     let trusts_announcements = known_ids.borrow().is_empty();
+    let progress = Rc::new(RefCell::new(BootProgress::default()));
     let on_message = {
         let state = Rc::clone(&state);
         let known_ids = Rc::clone(&known_ids);
+        let progress = Rc::clone(&progress);
         let mut steps = UserSteps::default();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             let Some(message) = event.data().as_string() else {
@@ -360,18 +409,24 @@ pub(super) async fn await_db_worker_ready_bounded(
             } else if let Some(id) = message.strip_prefix("booting:") {
                 if trusts_announcements && !is_known(id) {
                     *known_ids.borrow_mut() = vec![super::boot::BootIdentity::from_wire(id)];
-                    // A new boot numbers its user steps from 1 again.
+                    // A new boot numbers its user steps from 1 again and reports its own stages.
                     steps = UserSteps::default();
+                    *progress.borrow_mut() = BootProgress::default();
                     if matches!(*state, HelloReady::AtUser) {
                         *state = HelloReady::Counting {
                             deadline: SystemClock.monotonic() + base,
                         };
                     }
                 }
-            } else if let Some(id) = message.strip_prefix("progress:")
-                && !id.is_empty()
+            } else if let Some((id, stage)) = progress_message(&message)
                 && is_known(id)
             {
+                let at = elapsed_ms(started);
+                let mut heard = progress.borrow_mut();
+                heard.last_ms = Some(at);
+                if let Some(stage) = stage {
+                    heard.stage = Some((stage.to_owned(), at));
+                }
                 // An AtUser boot waits on the user, so progress extends only a running deadline.
                 if let HelloReady::Counting { deadline } = &mut *state {
                     let candidate = SystemClock.monotonic() + silence;
@@ -402,7 +457,7 @@ pub(super) async fn await_db_worker_ready_bounded(
         })
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let result = poll_hello_channel(&channel, &state, started).await;
+    let result = poll_hello_channel(&channel, &state, &progress, started).await;
     channel.set_onmessage(None);
     channel.close();
     result
