@@ -613,6 +613,18 @@ impl<S: AuthStore> AuthService<S> {
         }
     }
 
+    /// Revoke every live session of `user` for the application's own
+    /// reasons, closing each live connection and recording
+    /// `session_revoked`, the sign-out an erasure runs first. Answers the
+    /// sessions it revoked.
+    pub(crate) async fn revoke_person(&self, user: &S::Id) -> Result<Vec<SessionId>, AuthError> {
+        let revoked = self.store.end_all_of(user, None).await?;
+        for session in &revoked {
+            self.ended(user, *session, crate::audit::AuthOp::SessionRevoked);
+        }
+        Ok(revoked)
+    }
+
     /// Close an ended session's live connection and record why it ended.
     fn ended(&self, user: &S::Id, session: SessionId, op: crate::audit::AuthOp) {
         tracing::info!(session = %session, cause = op.label(), "session ended");

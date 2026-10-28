@@ -8,35 +8,42 @@ use std::path::Path;
 use std::pin::Pin;
 use std::time::Duration;
 
-use connetto_core::messages::BindValue;
+use connetto_core::device_cert::KeyId;
+use connetto_core::messages::{BindValue, ControlMessage, FatalError, FatalErrorReason};
 use connetto_server::builder::{
     BuildError, ContentSettings, Database, OidcProvider, OpenFga, ServerBuilder, ServerSchema,
     StoreSpec, TokenKeys,
 };
+use connetto_server::device_cert::DeviceCertConfig;
 use connetto_server::portability::{
-    DataRequestError, DataRequester, PortabilityBind, PortabilityError, PortabilityFile,
-    PortabilityList, PortabilityQuery,
+    DataRequestError, DataRequester, PersonEnded, PortabilityBind, PortabilityError,
+    PortabilityFile, PortabilityList, PortabilityQuery,
 };
 use connetto_server::{
-    OidcProviderConfig, RuntimeWritableCatalog, SessionId, ThrottleConfig, TierLimits,
+    OidcProviderConfig, RuntimeWritableCatalog, SessionId, SessionsError, ThrottleConfig,
+    TierLimits,
 };
 use connetto_test_harness::{
     Fixture, MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET, MOCK_OAUTH_PROVIDER, MockOauth,
     OPLOG_TABLE, PUBLICATION, SLOT, isolated_session_keyring, provision_cap_policies,
 };
 use diesel::sqlite::SqliteConnection;
-use diesel::{Connection as _, ExpressionMethods, QueryableByName};
+use diesel::{Connection as _, ExpressionMethods, QueryDsl as _, QueryableByName};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl as _, SimpleAsyncConnection as _};
 use futures_util::FutureExt as _;
+use rcgen::PublicKeyData as _;
 use serde_json::json;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::io::AsyncWrite;
+use tokio::net::TcpListener;
 use uuid::Uuid;
 
 use super::builder_coverage::apply_content_deployment;
-use super::e2e::{PG_SERIAL, exec, reset_audit_table, signing_keys, with_user_url};
-use super::lifecycle::admin_pool;
+use super::device_identity::{challenge_nonce, enrol_request};
+use super::e2e::{PG_SERIAL, exec, mint_tokens, reset_audit_table, signing_keys, with_user_url};
+use super::enrolment::{device_key, rooted_issuer};
+use super::lifecycle::{admin_pool, next_control, wait_ready};
 
 /// The schema document declares no RLS, the policies document carries it.
 const PG_DDL: &str = "-- connetto:major 1\n\
@@ -126,6 +133,19 @@ diesel::table! {
         created_at -> Timestamptz,
         provider -> Text,
         issuer -> Text,
+    }
+}
+
+diesel::table! {
+    connetto_device_enrolments (key_id) {
+        key_id -> Binary,
+        user_id -> Text,
+        session_id -> Uuid,
+        enrolled_at -> Timestamptz,
+        last_seen -> Timestamptz,
+        revoked_at -> Nullable<Timestamptz>,
+        public_key -> Binary,
+        attestation -> Text,
     }
 }
 
@@ -242,6 +262,18 @@ async fn portability_builder(
     fixture: &Fixture,
     list: PortabilityList,
 ) -> (ServerBuilder, MockOauth, TempDir) {
+    // The tests on this path never drive the OAuth dance over HTTP, so the
+    // callback's port is a placeholder the server never reaches.
+    portability_builder_base(fixture, list, "http://127.0.0.1:0").await
+}
+
+/// [`portability_builder`] under a real auth base, for the tests that serve
+/// HTTP and drive the login dance through the callback.
+async fn portability_builder_base(
+    fixture: &Fixture,
+    list: PortabilityList,
+    base: &str,
+) -> (ServerBuilder, MockOauth, TempDir) {
     let url = fixture.admin_url().to_owned();
     let reader = with_user_url(&url, "app_reader", "app_reader");
     let idp = MockOauth::start().await;
@@ -257,7 +289,7 @@ async fn portability_builder(
             MOCK_OAUTH_PROVIDER,
             MOCK_OAUTH_CLIENT_ID,
             idp.issuer().to_owned(),
-            "http://127.0.0.1:0/auth/callback",
+            format!("{base}/auth/callback"),
         )
         .with_client_secret(Some(MOCK_OAUTH_CLIENT_SECRET.to_owned())),
     );
@@ -535,6 +567,62 @@ async fn audit_rows(pool: &Pool<AsyncPgConnection>) -> Vec<AuditRow> {
     .load(&mut conn)
     .await
     .expect("read auth_events")
+}
+
+/// The sessions a `session_revoked` audit row names, ordered.
+async fn revoked_sessions(pool: &Pool<AsyncPgConnection>) -> Vec<uuid::Uuid> {
+    let mut rows = audit_rows(pool).await;
+    rows.retain(|row| row.op == "session_revoked");
+    let mut sessions: Vec<uuid::Uuid> = rows
+        .into_iter()
+        .map(|row| row.session.expect("a session revocation names its session"))
+        .collect();
+    sessions.sort();
+    sessions
+}
+
+/// Whether the named session is revoked.
+async fn session_revoked(pool: &Pool<AsyncPgConnection>, session: SessionId) -> bool {
+    let mut conn = pool.get().await.expect("a connection");
+    diesel::select(diesel::dsl::exists(
+        connetto_sessions::table
+            .filter(connetto_sessions::session_id.eq(session))
+            .filter(connetto_sessions::revoked.eq(true)),
+    ))
+    .get_result(&mut conn)
+    .await
+    .expect("read the session")
+}
+
+/// Whether the named key's enrolment is revoked.
+async fn device_revoked(pool: &Pool<AsyncPgConnection>, key: KeyId) -> bool {
+    let mut conn = pool.get().await.expect("a connection");
+    diesel::select(diesel::dsl::exists(
+        connetto_device_enrolments::table
+            .filter(connetto_device_enrolments::key_id.eq(key.as_bytes().to_vec()))
+            .filter(connetto_device_enrolments::revoked_at.is_not_null()),
+    ))
+    .get_result(&mut conn)
+    .await
+    .expect("read the enrolment")
+}
+
+/// Enrol a fresh device key under `subject`'s login, answering the login's
+/// user id and the enrolled key.
+async fn enrol_device(port: u16, subject: &str) -> (String, KeyId) {
+    let base = format!("http://127.0.0.1:{port}");
+    let (access, user_id, _refresh) = mint_tokens(&base, subject).await;
+    let mut client = super::lifecycle::live_session(&format!("127.0.0.1:{port}"), &access).await;
+    let nonce = challenge_nonce(&mut client).await;
+    let key = device_key();
+    match enrol_request(&mut client, &key, nonce, None).await {
+        ControlMessage::EnrolGrant(_) => {}
+        other => panic!("the enrolment answered {other:?}"),
+    }
+    (
+        user_id,
+        KeyId::of_public_key(&key.subject_public_key_info()),
+    )
 }
 
 #[tokio::test]
@@ -1717,5 +1805,243 @@ async fn a_chunk_lost_inside_a_file_fails_the_download() {
         audit_rows(&pool).await,
         Vec::new(),
         "a failed download leaves no audit row"
+    );
+}
+
+/// The sign-out an erasure runs first revokes the person's live sessions,
+/// leaves the other people's live, records one row per revocation, and a
+/// second call revokes nothing.
+#[tokio::test]
+async fn end_person_revokes_the_persons_sessions_and_not_the_others() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_portability_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    let alice_one = live_session(&pool, "alice").await;
+    let alice_two = live_session(&pool, "alice").await;
+    let bob = live_session(&pool, "bob").await;
+
+    let (builder, _idp, _keys) = portability_builder(&fixture, record_list()).await;
+    let parts = builder.build().await.expect("the deployment assembles");
+    let ended = parts
+        .handle
+        .end_person(&"alice".to_owned())
+        .await
+        .expect("the sign-out finishes");
+    assert_eq!(
+        ended,
+        PersonEnded {
+            sessions: 2,
+            devices: 0
+        },
+        "both of alice's live sessions are revoked and nothing else is touched"
+    );
+    assert!(
+        session_revoked(&pool, alice_one).await,
+        "alice's first session is revoked"
+    );
+    assert!(
+        session_revoked(&pool, alice_two).await,
+        "alice's second session is revoked"
+    );
+    assert!(
+        !session_revoked(&pool, bob).await,
+        "bob's session stays live"
+    );
+
+    // The audit writes are spawned, so they land shortly after the call.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut rows = revoked_sessions(&pool).await;
+    while rows.len() < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        rows = revoked_sessions(&pool).await;
+    }
+    // Spawned writes land in no fixed order, so the rows compare as a set.
+    rows.sort_unstable();
+    let mut expected = [*alice_one.as_uuid(), *alice_two.as_uuid()];
+    expected.sort_unstable();
+    assert_eq!(
+        rows, expected,
+        "one session_revoked row per revoked session, no other"
+    );
+
+    let again = parts
+        .handle
+        .end_person(&"alice".to_owned())
+        .await
+        .expect("the second sign-out finishes");
+    assert_eq!(
+        again,
+        PersonEnded {
+            sessions: 0,
+            devices: 0
+        },
+        "the second sign-out revokes nothing"
+    );
+}
+
+/// The sign-out closes the person's live connection with `SessionRevoked`, the
+/// revocation hook's close, before the next handshake would refuse it.
+#[tokio::test]
+async fn end_person_closes_the_persons_live_connection() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_portability_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a listener");
+    let port = listener.local_addr().expect("local address").port();
+    let base = format!("http://127.0.0.1:{port}");
+    let (builder, _idp, _keys) = portability_builder_base(&fixture, record_list(), &base).await;
+    let parts = builder.build().await.expect("the deployment assembles");
+    let stream = tokio::spawn(parts.change_stream);
+    let http = tokio::spawn(async move { axum::serve(listener, parts.router).await });
+    wait_ready(&base).await;
+
+    let (access, user_id, _refresh) = mint_tokens(&base, "alice").await;
+    let mut client = super::lifecycle::live_session(&format!("127.0.0.1:{port}"), &access).await;
+    let ended = parts
+        .handle
+        .end_person(&user_id)
+        .await
+        .expect("the sign-out finishes");
+    assert_eq!(ended.sessions, 1, "the login's session is the one revoked");
+
+    let last = loop {
+        if let fatal @ ControlMessage::FatalError(_) = next_control(&mut client).await {
+            break fatal;
+        }
+    };
+    match last {
+        ControlMessage::FatalError(FatalError {
+            reason: FatalErrorReason::SessionRevoked,
+        }) => {}
+        other => panic!("the session's last frame says {other:?}"),
+    }
+    stream.abort();
+    http.abort();
+}
+
+/// The sign-out revokes the person's enrolled device keys, leaves the other
+/// people's, and counts what it revoked.
+#[tokio::test]
+async fn end_person_revokes_the_persons_device_keys() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_portability_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    connetto_test_harness::stack::provision_enrolment_tables(&fixture).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a listener");
+    let port = listener.local_addr().expect("local address").port();
+    let base = format!("http://127.0.0.1:{port}");
+    let (builder, _idp, _keys) = portability_builder_base(&fixture, record_list(), &base).await;
+    let (_, _, issuer) = rooted_issuer();
+    let parts = builder
+        .device_identity(Some(DeviceCertConfig::new(issuer)))
+        .build()
+        .await
+        .expect("the deployment with device identity assembles");
+    let stream = tokio::spawn(parts.change_stream);
+    let http = tokio::spawn(async move { axum::serve(listener, parts.router).await });
+    wait_ready(&base).await;
+
+    let (alice_id, alice_key) = enrol_device(port, "alice").await;
+    let (_bob_id, bob_key) = enrol_device(port, "bob").await;
+
+    let ended = parts
+        .handle
+        .end_person(&alice_id)
+        .await
+        .expect("the sign-out finishes");
+    assert_eq!(
+        ended,
+        PersonEnded {
+            sessions: 1,
+            devices: 1
+        },
+        "alice's session and key are revoked, bob's are not"
+    );
+    assert!(
+        device_revoked(&pool, alice_key).await,
+        "alice's enrolment ends revoked"
+    );
+    assert!(
+        !device_revoked(&pool, bob_key).await,
+        "bob's enrolment stays"
+    );
+    stream.abort();
+    http.abort();
+}
+
+/// A sign-out whose session store cannot answer fails rather than report
+/// that the person had no session.
+#[tokio::test]
+async fn end_person_fails_when_the_session_store_cannot_answer() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_portability_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    live_session(&pool, "alice").await;
+
+    let (builder, _idp, _keys) = portability_builder(&fixture, record_list()).await;
+    let parts = builder.build().await.expect("the deployment assembles");
+    exec(&pool, "DROP TABLE connetto_sessions CASCADE").await;
+    let err = parts
+        .handle
+        .end_person(&"alice".to_owned())
+        .await
+        .expect_err("without the session store nothing can be revoked");
+    assert!(
+        matches!(err, SessionsError::Auth(_)),
+        "the failure is the store's: {err}"
+    );
+}
+
+/// A sign-out whose enrolment table cannot be read fails rather than report
+/// that the person enrolled no device.
+#[tokio::test]
+async fn end_person_fails_when_the_enrolments_cannot_be_read() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_portability_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    connetto_test_harness::stack::provision_enrolment_tables(&fixture).await;
+    let session = live_session(&pool, "alice").await;
+
+    let (builder, _idp, _keys) = portability_builder(&fixture, record_list()).await;
+    let (_, _, issuer) = rooted_issuer();
+    let parts = builder
+        .device_identity(Some(DeviceCertConfig::new(issuer)))
+        .build()
+        .await
+        .expect("the deployment with device identity assembles");
+    exec(&pool, "DROP TABLE connetto_device_enrolments CASCADE").await;
+    let err = parts
+        .handle
+        .end_person(&"alice".to_owned())
+        .await
+        .expect_err("without the enrolments the devices cannot be listed");
+    assert!(
+        matches!(err, SessionsError::Devices(_)),
+        "the failure is the enrolment table's: {err}"
+    );
+    assert!(
+        session_revoked(&pool, session).await,
+        "the sessions, revoked first, stay revoked"
     );
 }

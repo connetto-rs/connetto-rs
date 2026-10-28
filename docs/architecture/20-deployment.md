@@ -69,6 +69,36 @@
 
 ---
 
+## Erasing a person
+
+**Decided (R61 question 2, step 6 and decisions 18 to 22).** connetto has no erase function. A function erasing over a list of queries could not know the list is complete, and an incomplete erasure fails silently while its name claims success. The deployment erases a person with this recipe instead, walking the inventory above, and records that it did. The recipe reaches further than the download, which carries the registered queries only.
+
+**1. Sign the person out.** **Built (R61, 2026-10-25).** `ServerHandle::end_person(person)` revokes every live session of the person, closing each live connection with `SessionRevoked`, and revokes every device key the person enrolled, which publishes the revocation and closes that device's connection. Deleting the rows alone ends nothing already connected, since a live connection streams until its next handshake is refused and a device key stays valid until its certificate expires.
+
+**2. Delete the application's rows** with ordinary SQL, every table the application holds about the person. Each delete reaches every device holding the row. A device offline at the time receives it from the reconnect log when it returns inside the log's window, and resyncs when it returns after, so no device keeps a copy. This covers server-mediated sync, and the peer copies of `R77` and `R78` follow the same rule once those phases land. The person's own devices are wiped by the teardown calls, `purge_replica`, `wipe_replica` and `forget_device`. Rows a bot wrote under the person's grant are the application's to classify as the person's or the bot owner's.
+
+**3. Delete connetto's rows about the person**, children before the rows they reference.
+
+| Table | What goes |
+|---|---|
+| `connetto_provider_tokens`, then `connetto_sessions` | The provider tokens of the person's sessions, then every session whose `user_id` is the person. Revoking the grant at the identity provider itself is the application's step, since connetto holds only its copies |
+| `connetto_device_certificates`, then `connetto_device_enrolments` | The certificates of the person's enrolments, then every enrolment whose `user_id` is the person, with the application-defined descriptor columns it carries |
+| `connetto_bans` | The person's ban. Once the identity is gone it stops nothing (decision 19) |
+| The bot registry | For each bot the person owns (`connetto_bots.owner`), its installations' `connetto_installation_optional_tables` rows, its `connetto_installations`, `connetto_bot_lists` and `connetto_registration_codes` rows, then the bot. Then the codes the person created (`creator`) and the installations serving the person (`connetto_installations.owner`, optional tables first). Another person's bot the person installed stays (decision 21) |
+| `_cfs_manifests` | The manifests whose `uploaded_by` is the person's id, or a share key the application's own tables bind to the person's account. `_cfs_manifest_chunks` follows by cascade. connetto binds no share key to an account, so an upload under a key bound to no account belongs to the space that key opens and goes when that space's rows go (decision 22) |
+
+**The file bytes go at the next sweep pass.** The sweep reclaims a chunk once no manifest names it and the grace window has passed (`CONNETTO_CONTENT_SWEEP_SECS`, default an hour, and `CONNETTO_CONTENT_SWEEP_GRACE_SECS`, default the upload ticket lifetime, `18-file-handling.md`). A chunk another uploader's manifest also names stays, because it is that uploader's file too.
+
+**Three stores keep something of the person, and the recipe says so rather than promising them away.** `_connetto_writers` and `_connetto_settled` are never deleted with SQL, because they hold the exactly-once frontier and a writer whose row is gone reads as new, so its replayed uploads would apply twice. A device writer's settled rows go through the writer sweep once its enrolment is revoked or gone, and a writer row stays, naming the person when it was the person's number writer. The reconnect log holds row images, the person's deletes among them, until they leave its retention window, at most 72 hours or a million entries by default (`06-reconnect.md`). The audit table keeps the rows naming the person, sign-ins ended and downloads among them, because they are the evidence a dispute about the person's requests turns on, which GDPR Art. 17(3)(e) allows. The deployment sets its own retention for them (decision 18).
+
+**4. Record the erasure.** `ServerHandle::record_erasure(person, requester)` writes the `data_erased` row once the deletes are done, naming the session that asked or the staff member who acted (`08-authorization.md`). It waits for the row and fails when it cannot be written.
+
+**5. Outside the database.** A backup taken before the erasure holds the person's rows and manifests until its own retention ends, so a restore is followed by this recipe again for every person erased since that backup, and the chunk store's backup the same. The application tells every recipient it disclosed the person's data to, as GDPR Art. 17(2) and Art. 19 require.
+
+**The download's queries can be narrowed in time the same way.** A registered query's predicate can express a window such as CCPA's twelve months, so a deployment answering a request bounded in time registers the bound in the query.
+
+---
+
 ## Running the server
 
 **Built (R96, 2026-10-04).** The binary is a translation from its environment into one `ServerBuilder`, and the builder is the one assembly path. The binary reads every setting, binds the one listener and serves through the builder's own lifecycle, and owns what a process owns and a library must not own, the logging, the shutdown signal and the exit code. `CONNETTO_BIND` (default `127.0.0.1:8080`) names the one listener that serves the `/sync` WebSocket route, the login endpoints and the file routes. `CONNETTO_AUTH` accepts only `database`, the persisted JWT key files are required so a token survives a restart, and `CONNETTO_CONTENT_KEY` is required when `CONNETTO_CONTENT_URL` is set. The process exits `1` when the change stream cannot answer what a row looked like before it changed, or gives up reconnecting.
