@@ -28,7 +28,7 @@ use connetto_core::SessionId;
 use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
 use connetto_server::counters;
 use connetto_server::openfga::{
-    Counted, FgaAuth, ModelState, ModelSubject, SetupError, Translated, UpkeepError,
+    Counted, FactSource, FgaAuth, ModelState, ModelSubject, SetupError, Translated, UpkeepError,
 };
 use connetto_server::row_view::ValuesRow;
 use connetto_test_harness::Fixture;
@@ -130,7 +130,7 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     let n = translated
-        .load_into(&pool, &loader)
+        .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
         .expect("the generated queries ran and their rows spell facts");
     assert!(
@@ -262,7 +262,10 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
     )
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
-    translated.load_into(&pool, &loader).await.expect("loaded");
+    translated
+        .load_into(&FactSource::owner(pool.clone()), &loader)
+        .await
+        .expect("loaded");
     let before = store_tuples(channel.clone(), &store).await;
     assert!(
         before.iter().any(|tuple| tuple.contains("bob")),
@@ -290,7 +293,7 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
             .expect("adopted");
     assert_eq!(adopted, ModelState::Adopted(model.id().to_owned()));
     let (added, removed) = translated
-        .reconcile_store(&pool, &loader)
+        .reconcile_store(&FactSource::owner(pool.clone()), &loader)
         .await
         .expect("reconciled");
     assert!(added > 0 && removed > 0, "added {added}, removed {removed}");
@@ -306,7 +309,7 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
 
     assert_eq!(
         translated
-            .reconcile_store(&pool, &loader)
+            .reconcile_store(&FactSource::owner(pool.clone()), &loader)
             .await
             .expect("reconciled again"),
         (0, 0),
@@ -342,7 +345,10 @@ async fn an_adopted_boot_that_cannot_reconcile_refuses() {
     };
 
     let unknown = translated
-        .reconcile_store(&pool, &policy("01JAAAAAAAAAAAAAAAAAAAAAAA"))
+        .reconcile_store(
+            &FactSource::owner(pool.clone()),
+            &policy("01JAAAAAAAAAAAAAAAAAAAAAAA"),
+        )
         .await;
     assert!(
         matches!(unknown, Err(SetupError::Store(_))),
@@ -355,7 +361,9 @@ async fn an_adopted_boot_that_cannot_reconcile_refuses() {
         .await
         .expect("drop the table");
     drop(conn);
-    let unreadable = translated.reconcile_store(&pool, &policy(&store)).await;
+    let unreadable = translated
+        .reconcile_store(&FactSource::owner(pool.clone()), &policy(&store))
+        .await;
     assert!(
         matches!(unreadable, Err(SetupError::Store(_))),
         "facts whose query fails cannot be reconciled: {unreadable:?}"
@@ -467,7 +475,7 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     translated
-        .load_into(&pool, &loader)
+        .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
         .expect("the facts load");
 
@@ -482,7 +490,7 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
-    let upkeep = auth.upkeep(reach, translator, pool.clone());
+    let upkeep = auth.upkeep(reach, translator, FactSource::owner(pool.clone()));
 
     // Row 1 moves from alice to carol. This is the event the change stream
     // would carry, with both images, which is what `REPLICA IDENTITY FULL`
@@ -600,7 +608,7 @@ async fn cross_executor(
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     translated
-        .load_into(pool, &loader)
+        .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
         .expect("the facts load");
 
@@ -615,7 +623,7 @@ async fn cross_executor(
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
-    let upkeep = auth.upkeep(reach, translator, pool.clone());
+    let upkeep = auth.upkeep(reach, translator, FactSource::owner(pool.clone()));
     (auth, upkeep, shapes)
 }
 
@@ -800,7 +808,7 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     translated
-        .load_into(&pool, &loader)
+        .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
         .expect("the generated queries ran and the facts loaded");
 
@@ -922,7 +930,7 @@ async fn replay_executor(
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     translated
-        .load_into(pool, &loader)
+        .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
         .expect("the facts load");
 
@@ -937,7 +945,7 @@ async fn replay_executor(
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     let auth: FgaAuth<String, String, _> = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
-    let upkeep = auth.upkeep(reach, translator, pool.clone());
+    let upkeep = auth.upkeep(reach, translator, FactSource::owner(pool.clone()));
     (auth, upkeep, shapes)
 }
 
@@ -1359,7 +1367,7 @@ async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     translated
-        .load_into(&pool, &loader)
+        .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
         .expect("the facts load");
 
@@ -1374,7 +1382,7 @@ async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     let auth: FgaAuth<String, String, _> = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
-    let upkeep = auth.upkeep(reach, translator, pool.clone());
+    let upkeep = auth.upkeep(reach, translator, FactSource::owner(pool.clone()));
 
     // (d) Two tenants sharing id=1 each grant their own viewer. The compound
     // key (tenant_id, paper_id) binds both join columns, so the grants are
@@ -1543,7 +1551,7 @@ async fn keyed_replay_executor(
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     translated
-        .load_into(pool, &loader)
+        .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
         .expect("the facts load");
 
@@ -1557,7 +1565,7 @@ async fn keyed_replay_executor(
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     let auth: FgaAuth<String, String, _> = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
-    auth.upkeep(reach, translator, pool.clone())
+    auth.upkeep(reach, translator, FactSource::owner(pool.clone()))
 }
 
 /// **The replay path's half of the narrowing.** A keyed grant whose facts

@@ -16,7 +16,7 @@ They also fail differently, which is why they are separate mechanisms rather tha
 
 **Built, sizes explicit since R39 (2026-08-08).** The server builds three Postgres pools through one helper, `build_pool` in `crates/connetto-server/src/builder/mod.rs`. `CONNETTO_OWNER_POOL_SIZE` and `CONNETTO_READER_POOL_SIZE` set two of them, each defaulting to bb8's ten connections, now stated rather than implied, and the re-execution pool takes the owner pool's size. `CONNETTO_READER_RESERVE` (default 3) is expressed against the reader pool's configured total.
 
-The **owner pool** connects as the deployment's owning role and carries the authentication store (`DbAuthStore`) and audit writes (`pg_audit_hook`). Row-level security does not apply to it, which is the entire reason the reader-role pools exist.
+The **owner pool** connects as the deployment's owning role and carries the authentication store (`DbAuthStore`), audit writes (`pg_audit_hook`) and every read of the facts behind the authorization store, which must see every row (`08-authorization.md`). Row-level security does not apply to it, which is the entire reason the reader-role pools exist.
 
 The **re-execution pool** connects as the reader role and carries the computed reads that run under a caller's binding, the session's scalar and seed first answers and the engine-driven re-reads, all through `PgAsyncDieselConnector`. It is a pool of their own, sized at the owner pool's, so a re-execution hold never reaches the gated reader pool the reserve splits (R39). It is the reader role so the caller's policies scope the rows a read answers.
 

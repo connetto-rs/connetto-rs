@@ -12,19 +12,17 @@
 use std::path::Path;
 use std::time::Duration;
 
-use diesel::sqlite::SqliteConnection;
-use diesel::{Connection, ExpressionMethods, QueryDsl};
+use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
-use connetto_client::{ReplicaKey, cipher};
-use connetto_test_harness::{Fixture, PUBLICATION, SLOT};
+use connetto_test_harness::{Fixture, PUBLICATION, SLOT, provision_cap_policies};
 use openidconnect::reqwest;
 
 use super::e2e::{
     Authorization, ChildGuard, NO_POLICIES, PG_DDL, PG_SERIAL, Ports, QUERY, ReplicaDir,
-    build_auth_stack, client_bin, keyring_entry, mint_refresh_token, mint_token, orders,
+    build_auth_stack, client_bin, mint_refresh_token, mint_token, open_replica, orders,
     reset_fixture, restart_server, spawn_client_env, spawn_server_cfg, start_server, wait_for_rows,
     with_user_url,
 };
@@ -113,20 +111,9 @@ struct Observation {
 
 /// Order ids in the client's replica, empty while it cannot be opened.
 fn client_ids(db_path: &Path) -> Vec<i32> {
-    let path = db_path.to_string_lossy();
-    let Some(key) = keyring_entry(&path)
-        .ok()
-        .and_then(|entry| entry.get_password().ok())
-        .and_then(|hex| hex.parse::<ReplicaKey>().ok())
-    else {
+    let Some(mut conn) = open_replica(db_path) else {
         return Vec::new();
     };
-    let Ok(mut conn) = SqliteConnection::establish(&path) else {
-        return Vec::new();
-    };
-    if cipher::unlock(&mut conn, &key).is_err() {
-        return Vec::new();
-    }
     diesel::RunQueryDsl::load(
         orders::table.select(orders::id).order(orders::id),
         &mut conn,
@@ -440,13 +427,12 @@ fn local_order(id: i32) -> String {
     format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 1.0, 1, 'mine')")
 }
 
+/// A replica's `(writer, sequence)` rows.
+type WriterRows = Vec<(String, i64)>;
+
 /// The client's writer rows as `(id, next_seq)` and its pending entries as
-/// `(writer, seq)`, or why the replica could not be read.
-#[expect(
-    clippy::type_complexity,
-    reason = "two plain row lists read back for the demonstration's report"
-)]
-fn client_writer_state(db_path: &Path) -> Result<(Vec<(String, i64)>, Vec<(String, i64)>), String> {
+/// `(writer, seq)`, absent while the replica cannot be read.
+fn client_writer_state(db_path: &Path) -> Option<(WriterRows, WriterRows)> {
     #[derive(diesel::QueryableByName)]
     struct Seq {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -454,25 +440,17 @@ fn client_writer_state(db_path: &Path) -> Result<(Vec<(String, i64)>, Vec<(Strin
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         seq: i64,
     }
-    let path = db_path.to_string_lossy();
-    let key = keyring_entry(&path)
-        .map_err(|err| format!("keyring entry: {err}"))?
-        .get_password()
-        .map_err(|err| format!("replica key: {err}"))?
-        .parse::<ReplicaKey>()
-        .map_err(|err| format!("replica key: {err}"))?;
-    let mut conn = SqliteConnection::establish(&path).map_err(|err| format!("open: {err}"))?;
-    cipher::unlock(&mut conn, &key).map_err(|err| format!("unlock: {err}"))?;
-    let mut read = |sql: &str| -> Result<Vec<(String, i64)>, String> {
-        Ok(
+    let mut conn = open_replica(db_path)?;
+    let mut read = |sql: &str| -> Option<WriterRows> {
+        Some(
             diesel::RunQueryDsl::load::<Seq>(diesel::sql_query(sql), &mut conn)
-                .map_err(|err| format!("{sql}: {err}"))?
+                .ok()?
                 .into_iter()
                 .map(|row| (row.writer, row.seq))
                 .collect(),
         )
     };
-    Ok((
+    Some((
         read("SELECT id AS writer, next_seq AS seq FROM _connetto_writers ORDER BY id")?,
         read("SELECT writer, seq FROM _connetto_pending ORDER BY writer, seq")?,
     ))
@@ -505,7 +483,7 @@ async fn eventually(what: &str, mut holds: impl FnMut() -> bool) {
 
 /// Whether the replica at `db` holds no pending entry.
 fn settled(db: &Path) -> bool {
-    client_writer_state(db).is_ok_and(|(_, pending)| pending.is_empty())
+    client_writer_state(db).is_some_and(|(_, pending)| pending.is_empty())
 }
 
 /// The issued number writer the replica at `db` holds.
@@ -651,56 +629,12 @@ async fn a_restore_moves_rewound_writers_to_fresh_numbers() {
 
 /// A membership-guarded schema, so the change path asks the authorization
 /// store about `docs` rows from facts derived from `project_members`.
-const MEMBERSHIP_DDL: &str = "CREATE TABLE docs (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL);\n\
+const MEMBERSHIP_DDL: &str = "-- connetto:major 1\nCREATE TABLE docs (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL);\n\
      CREATE TABLE project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, \
      PRIMARY KEY (project_id, user_id));";
 const MEMBERSHIP_POLICIES: &str = "ALTER TABLE docs ENABLE ROW LEVEL SECURITY;\n\
      CREATE POLICY docs_members ON docs FOR ALL USING (project_id IN \
      (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true)));";
-
-/// Every tuple in the store whose user names `who`.
-async fn tuples_naming(authorization: &Authorization, who: &str) -> Vec<String> {
-    use openfga_client::client::{OpenFgaServiceClient, ReadRequest};
-    let mut client = OpenFgaServiceClient::connect(authorization.endpoint.clone())
-        .await
-        .expect("connect to the authorization service");
-    let mut found = Vec::new();
-    let mut continuation_token = String::new();
-    loop {
-        let page = client
-            .read(ReadRequest {
-                store_id: authorization.store.clone(),
-                continuation_token,
-                ..ReadRequest::default()
-            })
-            .await
-            .expect("read the store")
-            .into_inner();
-        found.extend(
-            page.tuples
-                .into_iter()
-                .filter_map(|tuple| tuple.key)
-                .filter(|key| key.user.contains(who))
-                .map(|key| format!("{} {} {}", key.user, key.relation, key.object)),
-        );
-        if page.continuation_token.is_empty() {
-            return found;
-        }
-        continuation_token = page.continuation_token;
-    }
-}
-
-/// Poll the store until a tuple names `who`, or the timeout passes.
-async fn await_tuples(authorization: &Authorization, who: &str) -> Vec<String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let found = tuples_naming(authorization, who).await;
-        if !found.is_empty() || std::time::Instant::now() >= deadline {
-            return found;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
 
 #[tokio::test]
 #[ignore = "R70 step 2 demonstration, prints what a restore does and asserts nothing"]
@@ -711,6 +645,7 @@ async fn authorization_facts_across_a_restore() {
     fixture
         .setup(&[
             MEMBERSHIP_DDL,
+            MEMBERSHIP_POLICIES,
             "CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'",
             "GRANT USAGE ON SCHEMA public TO app_reader",
             "GRANT SELECT ON docs, project_members TO app_reader",
@@ -719,6 +654,10 @@ async fn authorization_facts_across_a_restore() {
             "INSERT INTO project_members VALUES (1, 'alice')",
         ])
         .await;
+    // The server refuses a synced table not held to the bot cap, so the
+    // generated cap rules go in beside the schema and its policies, as a
+    // deployment applies them.
+    provision_cap_policies(fixture.admin(), MEMBERSHIP_DDL, MEMBERSHIP_POLICIES).await;
     fixture
         .start_replication(&["docs", "project_members"])
         .await;
@@ -739,13 +678,13 @@ async fn authorization_facts_across_a_restore() {
         )
     };
     let (server, ports) = start_server(&auth_stack, secs, spawn).await;
-    let alice_at_boot = await_tuples(&authorization, "alice").await;
+    let alice_at_boot = authorization.await_tuples("alice").await;
 
     fixture.shell(DUMP).await;
     fixture
         .exec("INSERT INTO project_members VALUES (1, 'mallory')")
         .await;
-    let mallory_granted = await_tuples(&authorization, "mallory").await;
+    let mallory_granted = authorization.await_tuples("mallory").await;
 
     drop(server);
     fixture
@@ -769,6 +708,6 @@ async fn authorization_facts_across_a_restore() {
             .shell("psql -d postgres -At -c \"SELECT count(*) FROM project_members WHERE user_id = 'mallory'\"")
             .await
             .trim(),
-        tuples_naming(&authorization, "mallory").await,
+        authorization.tuples_naming("mallory").await,
     );
 }
