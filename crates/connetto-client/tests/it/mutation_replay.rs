@@ -1,8 +1,10 @@
 //! Exactly-once mutation uploads, end to end against the real session
 //! machinery: a mutation that was sent but never processed replays after a
 //! resume, a mutation that was applied but never acknowledged is retired by
-//! the handshake watermark WITHOUT a second apply, and pending records
-//! persisted in the replica replay across a full process restart.
+//! the handshake watermark WITHOUT a second apply, pending records
+//! persisted in the replica replay across a full process restart, and a
+//! write restored from an archive and uploaded again by its original device
+//! applies once and is audited.
 //!
 //! The deterministic stand-ins: a black hole completes the handshake and
 //! swallows every frame (a connection that died with frames in flight), and
@@ -17,18 +19,23 @@
 use std::sync::Arc;
 
 use connetto_client::{
-    ClientBuilder, ClientEvent, ConnettoConnection, DataDir, MemoryRefreshStore,
+    ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, ExportScope,
+    ImportChoices, MemoryRefreshStore,
 };
-use connetto_core::messages::{ControlMessage, HandshakeAck};
+use connetto_core::messages::{ControlMessage, FatalErrorReason, HandshakeAck};
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, ReplicaKeyStore, Transport};
 use connetto_core::{Cursor, test_support::TestGrantChecker};
+use connetto_server::audit::{AuthEvent, AuthOp};
+use connetto_server::writer_schema::SettlePath;
 use connetto_server::{
-    LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PageSpec, RequestGuard,
+    RuntimeWritableCatalog, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
+    loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
+use parking_lot::Mutex;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 const PG_DDL: &str =
@@ -164,8 +171,8 @@ async fn reset_orders(fixture: &Fixture) {
 }
 
 /// A manager whose `orders` table accepts client writes into the real Postgres
-/// target the test reads back through the admin pool.
-fn writable_manager(fixture: &Fixture) -> Arc<Manager> {
+/// target the test reads back through the admin pool, guarded by `guard`.
+fn writable_manager(fixture: &Fixture, guard: Arc<RequestGuard<String>>) -> Arc<Manager> {
     let materializer = Materializer::builder(PG_DDL)
         .with_write_catalog(RuntimeWritableCatalog::builder().writable("orders").build())
         .build()
@@ -179,6 +186,7 @@ fn writable_manager(fixture: &Fixture) -> Arc<Manager> {
         pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
+    .with_guard(guard)
     .build()
 }
 
@@ -296,7 +304,7 @@ where
 async fn sent_but_unprocessed_mutation_replays_after_resume() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
-    let manager = writable_manager(&fixture);
+    let manager = writable_manager(&fixture, Arc::default());
     let dir = tempfile::tempdir().expect("replica directory");
     let credential = super::support::held("token");
     let record = credential.replica_name().to_owned();
@@ -389,7 +397,7 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
 async fn applied_but_unacked_mutation_dedupes_on_resume() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
-    let manager = writable_manager(&fixture);
+    let manager = writable_manager(&fixture, Arc::default());
 
     // A man in the middle forwards the handshake and the mutation into a
     // real session, reads the acknowledgement (the durable apply happened),
@@ -484,7 +492,7 @@ async fn restart_replays_persisted_pending() {
     keys.store(&record, &connetto_core::test_support::replica_key())
         .await
         .expect("the shared store never fails");
-    let manager = writable_manager(&fixture);
+    let manager = writable_manager(&fixture, Arc::default());
 
     // First process: prime the server with this account's writer number, push
     // into the black hole, then die outright.
@@ -573,4 +581,134 @@ async fn restart_replays_persisted_pending() {
         0,
         "withheld row must not appear in Postgres"
     );
+}
+
+/// Pump until the server answers `client_seq` as applied.
+async fn until_applied<T>(conn: &mut ConnettoConnection<T>, client_seq: u64)
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    loop {
+        match conn.pump_one().await.expect("pump") {
+            ClientEvent::MutationApplied { client_seq: seq } if seq == client_seq => return,
+            ClientEvent::Closed | ClientEvent::ServerClosed { .. } => {
+                panic!("closed before sequence {client_seq} was answered")
+            }
+            _ => {}
+        }
+    }
+}
+
+/// R75's restore-then-reupload through the real archive and the real
+/// frontier: a second replica restores device A's unsent write and lands it,
+/// and A, back online under the writer the restore retired, uploads it again
+/// under a fresh number and is answered from the record, audited, with the
+/// row applied once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_write_its_device_uploads_again_applies_once_and_is_audited() {
+    let fixture = Fixture::acquire().await;
+    reset_orders(&fixture).await;
+    let events: Arc<Mutex<Vec<AuthEvent<String>>>> = Arc::default();
+    let guard = Arc::new(RequestGuard::default());
+    guard.set_audit_hook({
+        let events = Arc::clone(&events);
+        Arc::new(move |event| events.lock().push(event))
+    });
+    let manager = writable_manager(&fixture, guard);
+    let write_events = || -> Vec<AuthEvent<String>> {
+        events
+            .lock()
+            .iter()
+            .filter(|event| matches!(event.op, AuthOp::WriteForked | AuthOp::WriteRedelivered))
+            .cloned()
+            .collect()
+    };
+    let credential = super::support::held("token");
+    let keys = super::support::SharedKeys::default();
+    keys.store(
+        credential.replica_name(),
+        &connetto_core::test_support::replica_key(),
+    )
+    .await
+    .expect("the shared store never fails");
+    let open = async |dir: &std::path::Path| {
+        ClientBuilder::new(
+            super::support::bundle(SQLITE_DDL),
+            super::support::Once::new(open_session(&manager)),
+        )
+        .signed_in(credential.clone())
+        .durable(
+            DataDir::new(dir.to_path_buf()),
+            keys.clone(),
+            MemoryRefreshStore::default(),
+        )
+        .connect_driven()
+        .await
+        .expect("connect")
+    };
+
+    // A takes its number from the server, then writes into a connection that
+    // dies with the write in flight, and exports the unsent write.
+    let dir_a = tempfile::tempdir().expect("replica directory");
+    let mut a = open(dir_a.path()).await;
+    a.attach(black_hole()).await.expect("attach the black hole");
+    insert_local(&mut a, 71);
+    assert_eq!(a.push().await.expect("push"), Some(1));
+    let archive = a
+        .export_local_data(ExportScope::Everything, Vec::new())
+        .expect("export");
+
+    // B restores the archive and lands the write, retiring A's number.
+    let dir_b = tempfile::tempdir().expect("replica directory");
+    let mut b = open(dir_b.path()).await;
+    let plan = b
+        .import_local_data(std::io::Cursor::new(archive))
+        .expect("plan the import");
+    assert_eq!(plan.queued_writes(), 1, "the unsent write travelled");
+    b.apply_import(&plan, &ImportChoices::keeping_the_file())
+        .expect("apply the import");
+    b.attach(open_session(&manager)).await.expect("attach B");
+    until_applied(&mut b, 1).await;
+    assert_eq!(
+        target_rows(&fixture, 71).await.len(),
+        1,
+        "the restore landed"
+    );
+    assert!(
+        write_events().is_empty(),
+        "the first copy to arrive settles the original unaudited"
+    );
+
+    // A comes back under the retired number, is refused at the handshake, and
+    // carries its tail to a fresh number that uploads the same write again.
+    let refused = a.attach(open_session(&manager)).await;
+    assert!(
+        matches!(
+            refused,
+            Err(ClientError::Refused {
+                reason: FatalErrorReason::WriterRetired
+            })
+        ),
+        "the retired number is refused, got {refused:?}"
+    );
+    a.attach(open_session(&manager))
+        .await
+        .expect("attach A again");
+    until_applied(&mut a, 1).await;
+
+    assert_eq!(
+        target_rows(&fixture, 71).await.len(),
+        1,
+        "the write applied once across both paths"
+    );
+    assert!(a.unsynced().is_empty(), "the answer retired A's entry");
+    let audited = write_events();
+    assert_eq!(audited.len(), 1, "the cross-path re-upload audits once");
+    let event = &audited[0];
+    assert_eq!(event.op, AuthOp::WriteRedelivered);
+    assert_eq!(event.user_id.as_deref(), Some("token"));
+    assert_eq!(event.seq, Some(1));
+    assert_eq!(event.path, Some(SettlePath::Restore));
+    assert_eq!(event.other_path, Some(SettlePath::Direct));
 }
