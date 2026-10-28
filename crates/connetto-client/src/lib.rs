@@ -2924,6 +2924,34 @@ fn spare_clauses<'c>(
     Ok(spare)
 }
 
+/// Add `from`'s clauses to `into`'s, table by table, each clause once.
+fn merge_clauses(into: &mut HashMap<String, Vec<String>>, from: HashMap<String, Vec<String>>) {
+    for (table, clauses) in from {
+        let kept = into.entry(table).or_default();
+        for clause in clauses {
+            if !kept.contains(&clause) {
+                kept.push(clause);
+            }
+        }
+    }
+}
+
+/// Run `f` as a pass that deletes rows, in a transaction opened
+/// `BEGIN IMMEDIATE` when `config` shares tables, so the other identities'
+/// interest and spare rows it reads stay as read until it commits: a write
+/// another identity commits first is spared, and one after waits (R11).
+fn deleting_transaction<T>(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+    f: impl FnOnce(&mut SqliteConnection) -> Result<T, ClientError>,
+) -> Result<T, ClientError> {
+    if config.shared_tables.is_empty() {
+        db.transaction(f)
+    } else {
+        db.immediate_transaction(f)
+    }
+}
+
 mod cursor_metadata {
     diesel::table! {
         _connetto_meta (id) {
@@ -4509,6 +4537,9 @@ where
         // The sessions still build the upload, so writes a previous run left
         // in the outbox were lost with that run's sessions and go with them.
         outbox::install(&mut db)?;
+        if !config.shared_tables.is_empty() {
+            outbox::install_shared(&mut db, &config.client_id, &config.shared_tables)?;
+        }
         outbox::clear(&mut db)?;
         let schema_open = Arc::new(AtomicBool::new(false));
         outbox::guard_schema(&mut db, &schema_open);
@@ -5653,10 +5684,10 @@ where
     /// Atomically appends an entry captured under `major`, its position and
     /// its writer frontier, and, with `clears_outbox`, deletes the outbox's
     /// records, which are then the writes the entry carries. The keys of the
-    /// shared rows every queued entry touches, this one included, are written
-    /// in the same transaction, so another identity's pass spares the write
-    /// from the moment it is queued, and a store that refuses them queues
-    /// nothing.
+    /// shared rows every queued entry touches, this one included, and every
+    /// write the outbox still holds are written in the same transaction, so
+    /// another identity's pass spares the write from the moment it is queued,
+    /// and a store that refuses them queues nothing.
     fn append_entry(
         &mut self,
         writer: &WriterRef,
@@ -5704,8 +5735,12 @@ where
                 if clears_outbox {
                     outbox::clear(db)?;
                 }
-                if let Some(spare) = &spare {
-                    interest::record_spare(db, config, spare)?;
+                if let Some(mut spare) = spare {
+                    merge_clauses(
+                        &mut spare,
+                        outbox::spare_clauses(db, &config.shared_tables)?,
+                    );
+                    interest::record_spare(db, config, &spare)?;
                 }
                 Ok(())
             })?;
@@ -7893,7 +7928,12 @@ where
                 .lock()
                 .map(|mut tables| std::mem::take(&mut *tables))
                 .unwrap_or_default();
-            outbox::assert_matches(&mut self.db, &changeset, &exempt_written)?;
+            outbox::assert_matches(
+                &mut self.db,
+                &changeset,
+                &exempt_written,
+                &self.config.shared_tables,
+            )?;
         }
         // Nothing writes between the capture above and the queueing below,
         // so every record the outbox holds now is a write this push carries.
@@ -8605,11 +8645,11 @@ where
                 }
             }
         }
-        let others = interest::others(&mut self.db, &self.config)?;
-
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         let tables = self.config.policy_tables.clone();
-        self.db.transaction::<_, ClientError, _>(|conn| {
+        let config = &self.config;
+        deleting_transaction(&mut self.db, config, |conn| {
+            let others = interest::others(conn, config)?;
             let mut removed = 0usize;
             for table in scope {
                 let truncated = stale.covers(table);
@@ -8661,26 +8701,27 @@ where
     ///
     /// Keyed by the lowercased physical table the delete runs against, each
     /// value a list of `(col IS literal AND ...)` clauses. Decoded from every
-    /// writer queue's pending entries and from the capture sessions the same
-    /// way [`affected_rows`] reads a changeset's touched keys, so the
-    /// protection is bounded by the queue's cap and clears itself when an ack
-    /// retires the mutation. A write not yet pushed lives only in the capture,
-    /// whose changeset reads each row's current state, so a row deleted before
-    /// the push would leave nothing to upload. A captured mutation is a
+    /// writer queue's pending entries the same way [`affected_rows`] reads a
+    /// changeset's touched keys, so the protection is bounded by the queue's
+    /// cap and clears itself when an ack retires the mutation, and from every
+    /// write the outbox holds, its old key and its new one, since the capture
+    /// builds the upload from each row's current state and an eviction before
+    /// the push would leave it nothing to upload. A captured mutation is a
     /// changeset, whose op carries the backing table's own schema, so the
     /// primary-key columns and ordinals come straight from it.
     fn pending_spare(&mut self) -> Result<HashMap<String, Vec<String>>, ClientError> {
-        let mut changesets: Vec<Vec<u8>> = self
+        let changesets: Vec<Vec<u8>> = self
             .writers
             .values()
             .flat_map(|queue| queue.pending.values())
             .map(|entry| entry.changeset.clone())
             .collect();
-        let captured = self.session.changeset()?;
-        if !captured.is_empty() {
-            changesets.push(captured);
-        }
-        spare_clauses(&mut self.db, changesets.iter().map(Vec::as_slice))
+        let mut spare = spare_clauses(&mut self.db, changesets.iter().map(Vec::as_slice))?;
+        merge_clauses(
+            &mut spare,
+            outbox::spare_clauses(&mut self.db, &self.config.shared_tables)?,
+        );
+        Ok(spare)
     }
 
     /// Rewrite the shared rows this identity's unacknowledged writes touched,
@@ -8731,7 +8772,7 @@ where
             .chain(queued.into_iter().map(|entry| entry.changeset.as_slice()));
         let config = &self.config;
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        let remain = self.db.transaction(|db| {
+        let remain = self.db.immediate_transaction(|db| {
             undo_shared(db, &config.shared_tables, newest_first)?;
             interest::depart(db, config, &config.client_id, true)
         })?;
@@ -8756,7 +8797,10 @@ where
             return Ok(());
         }
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        interest::depart(&mut self.db, &self.config, identity, true).map(drop)
+        let config = &self.config;
+        self.db
+            .immediate_transaction(|db| interest::depart(db, config, identity, true))
+            .map(drop)
     }
 
     /// Return freelist pages to the filesystem: reclaim in
@@ -8972,12 +9016,6 @@ where
         addressed_to: Option<&str>,
     ) -> Result<(), ClientError> {
         let bytes = zstd::decode_all(payload_zstd)?;
-        // Departure filtering weighs the wire's logical names against what the
-        // subscriptions cover, which is also logical, so the rename follows it.
-        let apply = self
-            .honour_departures(&bytes, addressed_to)?
-            .map(|bytes| self.to_physical(bytes))
-            .transpose()?;
         let suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         // The counting gate makes the update hook tally each row into
         // `apply_staging` (R60 decision 4). Cleared before any error propagates
@@ -8988,8 +9026,16 @@ where
         // The coverage the cursor carries, materialized before the closure so
         // the pair writes in the same statement as the cursor.
         let coverage = self.cursor_subjects.as_deref();
-        let shared = &self.config.shared_tables;
-        let applied = self.db.transaction::<_, ClientError, _>(|conn| {
+        let config = &self.config;
+        let shared = &config.shared_tables;
+        let applied = deleting_transaction(&mut self.db, config, |conn| {
+            // Departure filtering weighs the wire's logical names against what
+            // the subscriptions cover, which is also logical, so the rename
+            // follows it. It reads the other identities' rows in this
+            // transaction, so what it spares is what the apply sees.
+            let apply = Self::honour_departures(conn, config, &bytes, addressed_to)?
+                .map(|bytes| Self::to_physical(config, bytes))
+                .transpose()?;
             // The cursor advances even when every op was withheld. A departure
             // this replica declined to act on is still an event it has seen,
             // and not recording it would replay the same decision for ever.
@@ -9061,8 +9107,8 @@ where
 
     /// Rewrite a payload from the wire's logical names onto the replica's
     /// physical ones. A schema with no split table skips the parse entirely.
-    fn to_physical(&self, bytes: Vec<u8>) -> Result<Vec<u8>, ClientError> {
-        let tables = &self.config.policy_tables;
+    fn to_physical(config: &ClientConfig, bytes: Vec<u8>) -> Result<Vec<u8>, ClientError> {
+        let tables = &config.policy_tables;
         if tables.is_empty() {
             return Ok(bytes);
         }
@@ -9109,7 +9155,8 @@ where
     /// Returns `None` when the payload should be applied unchanged, which is
     /// every ordinary patch and costs one parse.
     fn honour_departures(
-        &mut self,
+        db: &mut SqliteConnection,
+        config: &ClientConfig,
         bytes: &[u8],
         addressed_to: Option<&str>,
     ) -> Result<Option<Vec<u8>>, ClientError> {
@@ -9135,7 +9182,7 @@ where
         let mut kept = PatchSet::<TableSchema<String>, String, Vec<u8>>::new();
         let mut any = false;
         for (table, pk) in departures {
-            if self.still_covered(&table, &pk, addressed_to)? {
+            if Self::still_covered(db, config, &table, &pk, addressed_to)? {
                 continue;
             }
             any = true;
@@ -9154,14 +9201,15 @@ where
     /// subscriptions, and the view would answer only for the rows the local
     /// policy admits.
     fn still_covered(
-        &mut self,
+        db: &mut SqliteConnection,
+        config: &ClientConfig,
         table: &TableSchema<String>,
         pk: &[sqlite_diff_rs::Value<String, Vec<u8>>],
         addressed_to: Option<&str>,
     ) -> Result<bool, ClientError> {
         let name = table.name().to_lowercase();
         let mut clauses = Vec::new();
-        for record in subscriptions::declared(&mut self.db)? {
+        for record in subscriptions::declared(db)? {
             if !record.live || addressed_to.is_some_and(|id| id == record.sub_id) {
                 continue;
             }
@@ -9178,13 +9226,12 @@ where
                 Some(predicate) => clauses.push(format!("({predicate})")),
             }
         }
-        let physical = self
-            .config
+        let physical = config
             .policy_tables
             .physical(&name)
             .unwrap_or(table.name())
             .to_owned();
-        let others = interest::others(&mut self.db, &self.config)?;
+        let others = interest::others(db, config)?;
         let key = physical.to_lowercase();
         if others.whole.contains(&key) {
             return Ok(true);
@@ -9199,7 +9246,7 @@ where
         // The key is matched by ordinal, because the wire format carries a
         // primary key's positions and never its column names. The replica's own
         // catalog supplies the names for those positions.
-        let columns = replica_columns(&mut self.db, &physical)?;
+        let columns = replica_columns(db, &physical)?;
         let mut wheres = Vec::with_capacity(pk.len());
         for (position, value) in pk_ordinals(table).into_iter().zip(pk) {
             let column = columns.get(position).ok_or_else(|| {
@@ -9219,7 +9266,7 @@ where
             wheres.join(" AND "),
             clauses.join(" OR ")
         );
-        let rows: Vec<Present> = diesel::sql_query(sql).load(&mut self.db)?;
+        let rows: Vec<Present> = diesel::sql_query(sql).load(db)?;
         Ok(!rows.is_empty())
     }
 

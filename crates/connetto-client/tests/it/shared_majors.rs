@@ -564,8 +564,10 @@ async fn replacing_a_current_major_cache_invalidates_resume_but_keeps_private_wo
         ),
         original_generation
     );
-    set_state(client.conn(), "connetto_shared", State::Fresh, &[]);
     drop(client);
+    let mut db = raw(directory.path(), &keys, "alice", true).await;
+    set_state(&mut db, "connetto_shared", State::Fresh, &[]);
+    drop(db);
     let mut client = open(directory.path(), &keys, "alice", schema(2))
         .await
         .unwrap();

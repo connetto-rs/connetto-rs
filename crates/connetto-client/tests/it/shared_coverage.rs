@@ -16,16 +16,17 @@ use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Indirect, Insert, PatchDelete, PatchSet, SimpleTable, Value};
 
 const SCHEMA: &str = "-- connetto:major 1
-CREATE TABLE tags (id INT PRIMARY KEY, label TEXT NOT NULL);";
+CREATE TABLE tags (id INT PRIMARY KEY, label TEXT NOT NULL);
+CREATE TABLE marks (name TEXT, code BYTEA, weight DOUBLE PRECISION, PRIMARY KEY (name, code, weight));";
 
 pub(super) fn schema() -> SyncSchema {
     SyncSchema::new(
         connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(
             SCHEMA,
             "",
-            &["tags"],
+            &["tags", "marks"],
         )
-        .expect("translate the shared table"),
+        .expect("translate the shared tables"),
     )
 }
 
@@ -442,7 +443,7 @@ async fn an_aggregate_subscription_covers_no_shared_row() {
 }
 
 /// `owner`'s replica over the shared device directory, opened with no server.
-async fn open(
+pub(super) async fn open(
     directory: &std::path::Path,
     keys: super::support::SharedKeys,
     owner: &str,
@@ -587,7 +588,7 @@ async fn a_departure_that_cannot_read_the_other_identities_removes_nothing() {
 
 /// Attach a server sending `frames` and pump until it hangs up or a step
 /// fails, saying whether one failed.
-async fn serve(
+pub(super) async fn serve(
     client: &mut ConnettoConnection<FakeTransport>,
     frames: Vec<ControlMessage>,
 ) -> bool {

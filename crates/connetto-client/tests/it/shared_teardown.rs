@@ -312,9 +312,7 @@ async fn a_pending_wipe_whose_departure_fails_refuses_the_start() {
                 .unwrap();
             assert!(bob.push().await.unwrap().is_some(), "the write is queued");
             if broken.starts_with('_') || broken == "tags_rls" {
-                bob.conn()
-                    .batch_execute(&format!("DROP TABLE connetto_shared.{broken}"))
-                    .unwrap();
+                refuse_deletes(bob.conn(), broken);
             }
         }
         if broken == "file" {
@@ -441,12 +439,22 @@ fn count(client: &mut ConnettoConnection<FakeTransport>, table: &str) -> i64 {
     .unwrap()
 }
 
+/// Make the shared store refuse every delete from `table`, for every
+/// connection, since the store's own tables change only with a release.
+fn refuse_deletes(db: &mut diesel::SqliteConnection, table: &str) {
+    db.batch_execute(&format!(
+        "CREATE TRIGGER connetto_shared.refuse_{table} BEFORE DELETE ON {table} \
+         BEGIN SELECT RAISE(ABORT, 'the store refuses'); END"
+    ))
+    .unwrap();
+}
+
 /// A departure the store refuses in any part leaves the store as it was,
 /// the unsent write it would have undone included.
 #[tokio::test]
 async fn a_departure_the_store_refuses_leaves_the_store_as_it_was() {
     let tables = ["tags_rls", "_connetto_interest", "_connetto_spare"];
-    for dropped in tables {
+    for refused in tables {
         let directory = tempfile::tempdir().unwrap();
         let keys = super::support::SharedKeys::default();
         let mut alice = connect(
@@ -463,20 +471,19 @@ async fn a_departure_the_store_refuses_leaves_the_store_as_it_was() {
             .batch_execute("INSERT INTO tags VALUES (5, 'never sent')")
             .unwrap();
         assert!(bob.push().await.unwrap().is_some(), "the write is queued");
-        let kept: Vec<&str> = tables.into_iter().filter(|t| *t != dropped).collect();
-        let before: Vec<i64> = kept.iter().map(|t| count(&mut alice, t)).collect();
-        alice
-            .conn()
-            .batch_execute(&format!("DROP TABLE connetto_shared.{dropped}"))
-            .unwrap();
+        let before: Vec<i64> = tables.iter().map(|t| count(&mut alice, t)).collect();
+        refuse_deletes(alice.conn(), refused);
 
         assert!(
             bob.leave_shared_store(true).is_err(),
-            "without {dropped} the departure fails"
+            "refusing deletes from {refused} fails the departure"
         );
 
-        let after: Vec<i64> = kept.iter().map(|t| count(&mut alice, t)).collect();
-        assert_eq!(after, before, "without {dropped} {kept:?} are untouched");
+        let after: Vec<i64> = tables.iter().map(|t| count(&mut alice, t)).collect();
+        assert_eq!(
+            after, before,
+            "refusing deletes from {refused} leaves {tables:?} untouched"
+        );
     }
 }
 
