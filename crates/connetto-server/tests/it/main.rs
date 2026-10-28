@@ -87,6 +87,8 @@ mod pg_async;
 
 mod portability;
 
+mod preflight_owner_rls;
+
 mod preflight_previous_image;
 
 mod preflight_oplog_payload;

@@ -84,6 +84,16 @@ pub enum Artifact<'a> {
         /// The column connetto reads from it.
         column: &'a str,
     },
+    /// A table the connecting role must read in full, by name, resolved
+    /// through the connection's own `search_path`.
+    ///
+    /// The owner pool reads the facts behind the authorization store and the
+    /// rows withdrawn from callers for everyone at once, binding none of the
+    /// settings a policy reads. Postgres applies a table's policies to its
+    /// owner under `FORCE ROW LEVEL SECURITY` and to any other role that is
+    /// neither a superuser nor `BYPASSRLS`, so such a read would come back
+    /// short and the rows it missed would be lost without an error.
+    ReadInFull(&'a str),
 }
 
 /// What a probe found.
@@ -100,6 +110,9 @@ enum Found {
     /// The table is there but lacks a column connetto reads from it, naming
     /// both.
     MissingColumn { table: String, column: String },
+    /// The table is there, and row-level security filters it for the
+    /// connecting role.
+    Filtered,
 }
 
 impl Artifact<'_> {
@@ -108,7 +121,7 @@ impl Artifact<'_> {
         match self {
             Self::ReplicationSlot(_) => "replication slot",
             Self::Publication(_) | Self::PreviousImages { .. } => "publication",
-            Self::Table(_) => "table",
+            Self::Table(_) | Self::ReadInFull(_) => "table",
             Self::PublishedTable { .. } => "replicated table",
             Self::CappedTable(_) => "synced table",
             Self::TableColumn { .. } => "column",
@@ -121,6 +134,7 @@ impl Artifact<'_> {
             Self::ReplicationSlot(name) | Self::Publication(name) | Self::Table(name) => name,
             Self::PublishedTable { table, .. }
             | Self::CappedTable(table)
+            | Self::ReadInFull(table)
             | Self::TableColumn { table, .. } => table,
             Self::PreviousImages { publication } => publication,
         }
@@ -248,6 +262,25 @@ impl Artifact<'_> {
                     Found::Absent
                 });
             }
+            Self::ReadInFull(table) => {
+                // `row_security_active` is Postgres's own answer for the
+                // current role, so ownership through membership, `FORCE ROW
+                // LEVEL SECURITY`, superusers and `BYPASSRLS` are all weighed
+                // as a read would weigh them. A catalog function the DSL does
+                // not model, so a statement of its own.
+                let filtered: Vec<Filtered> = sql_query(
+                    "SELECT to_regclass($1) IS NOT NULL AS present, \
+                     COALESCE(row_security_active(to_regclass($1)), false) AS filtered",
+                )
+                .bind::<Text, _>(table)
+                .load(conn)
+                .await?;
+                return Ok(match filtered.into_iter().next() {
+                    Some(Filtered { present: false, .. }) | None => Found::Absent,
+                    Some(Filtered { filtered: true, .. }) => Found::Filtered,
+                    Some(_) => Found::Fit,
+                });
+            }
             Self::ReplicationSlot(_) => {
                 "SELECT EXISTS (SELECT 1 FROM pg_replication_slots \
                  WHERE slot_name = $1 AND database = current_database()) AS present"
@@ -359,6 +392,22 @@ pub enum PreflightError {
         /// The column connetto reads from it.
         column: String,
     },
+    /// Row-level security filters the connecting role on a table that role
+    /// must read in full.
+    ///
+    /// Its own variant because the fix is the role the pool connects as or
+    /// the table's setting, not anything missing.
+    #[error(
+        "row-level security filters the owner pool's role on table {table}, so the \
+         authorization facts and the rows withdrawn from callers would be read short \
+         and lost without an error. Connect the owner pool as the table's owner on a \
+         table without FORCE ROW LEVEL SECURITY, or as a superuser or a role with \
+         BYPASSRLS, before the server will start"
+    )]
+    OwnerFiltered {
+        /// The table the role cannot read in full.
+        table: String,
+    },
 }
 
 #[derive(QueryableByName)]
@@ -402,6 +451,16 @@ struct Named {
     name: String,
 }
 
+/// Whether a table is present and row-level security filters it for the
+/// connecting role.
+#[derive(QueryableByName)]
+struct Filtered {
+    #[diesel(sql_type = Bool)]
+    present: bool,
+    #[diesel(sql_type = Bool)]
+    filtered: bool,
+}
+
 /// Refuse unless every artifact is there and fit to serve, naming the first
 /// that is not.
 ///
@@ -416,6 +475,8 @@ struct Named {
 /// connetto reads, [`PreflightError::Uncapped`] naming the synced table the
 /// cap rules leave out, [`PreflightError::PreviousImage`] naming the
 /// replicated tables that cannot report an old row,
+/// [`PreflightError::OwnerFiltered`] naming a table row-level security filters
+/// for the connecting role,
 /// [`PreflightError::Probe`] when the check could not be answered, and
 /// [`PreflightError::Pool`] when no connection was available.
 pub async fn require(
@@ -457,6 +518,11 @@ pub async fn require(
             }
             Found::MissingColumn { table, column } => {
                 return Err(PreflightError::MissingColumn { table, column });
+            }
+            Found::Filtered => {
+                return Err(PreflightError::OwnerFiltered {
+                    table: artifact.name().to_owned(),
+                });
             }
         }
     }
