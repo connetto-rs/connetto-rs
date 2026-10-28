@@ -553,7 +553,7 @@ async fn the_changed_table_is_reported_under_its_logical_name() {
 /// A local write goes up under the logical name Postgres knows.
 ///
 /// The write travels through the view's `INSTEAD OF` insert trigger, so the
-/// capture session records the backing table. Uploading that name would make
+/// outbox records the backing table. Uploading that name would make
 /// the server's write target apply to a Postgres table that does not exist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_local_write_travels_up_under_its_logical_name() {

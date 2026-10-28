@@ -212,7 +212,7 @@ async fn the_tier_is_attached_to_the_replica_and_frees_with_it() {
         assert_eq!(
             conn.push().await.expect("push"),
             None,
-            "a device-private write is outside the capture session and can never upload"
+            "a device-private write is outside the outbox and can never upload"
         );
     }
 

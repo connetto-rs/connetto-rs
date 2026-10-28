@@ -2,8 +2,8 @@
 //! `rowid`, so it refuses one unless the application accepted the loss.
 //!
 //! The first test here is the finding rather than the fix: it writes a row to
-//! an unkeyed table the application accepted and shows the capture session
-//! hands back nothing, which is why the refusals below exist. Before the fix
+//! an unkeyed table the application accepted and shows the outbox records
+//! nothing, which is why the refusals below exist. Before the fix
 //! the same test ran without the acceptance and passed, because
 //! `CREATE TABLE prefs (name TEXT, value TEXT)` is a keyed table by SQLite's
 //! rules, so nothing warned the developer and the write was never uploaded.
@@ -66,7 +66,7 @@ async fn a_write_to_an_accepted_table_is_captured_by_nothing() {
     assert_eq!(
         conn.push().await.expect("push"),
         None,
-        "the session recorded nothing, so there is no mutation to send"
+        "the outbox recorded nothing, so there is no mutation to send"
     );
 
     conn.batch_execute("INSERT INTO items (id, label) VALUES (1, 'kept')")

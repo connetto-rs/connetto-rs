@@ -136,7 +136,7 @@ fn queued(conn: &mut ConnettoConnection<FakeTransport>) -> Vec<PendingRow> {
 #[tokio::test]
 async fn a_restored_replica_holds_the_device_only_rows_and_the_unsent_writes() {
     let mut source = device(SYNCED_DDL, TIER_DDL, "alice").await;
-    // The device-only tier is outside the capture session, so seeding it
+    // The device-only tier is outside the outbox, so seeding it
     // queues nothing: those rows travel as rows.
     source
         .conn

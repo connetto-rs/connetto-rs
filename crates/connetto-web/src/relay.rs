@@ -530,7 +530,7 @@ struct HubState {
     /// Lowercased names of the device-private tables the worker connection has
     /// attached, empty when this run serves no tier. Writes to them commit on
     /// the worker connection and can never reach the server, because the
-    /// capture session is bound to `main` and these tables are not in it.
+    /// outbox records no table of the tier.
     local_tables: HashSet<String>,
     /// Whether the hub can currently reach the server, so a tab arriving later
     /// is told the current answer rather than having to wait for the next
@@ -3557,8 +3557,7 @@ where
 /// with the tab's durable watermark, in one transaction on the worker
 /// connection. The hub is the terminal authority for this tier (there is no
 /// upstream leg), so its own durable apply is the acknowledgement. Nothing
-/// here can ride an upload: the capture session is bound to `main` and these
-/// tables are not in it.
+/// here can ride an upload: the outbox records no table of the tier.
 ///
 /// The worker is the tier's one enforcer of references, since a tab mirror
 /// holds only what its subscriptions cover and carries none (R92). They are
@@ -3689,8 +3688,8 @@ where
 
 /// Apply one synced tier mutation to the worker replica.
 ///
-/// The changeset is applied with capture ACTIVE (so the worker's own
-/// session records it and the following push re-uploads it), and the
+/// The changeset is applied outside the write exemption (so the worker's
+/// outbox records it and the following push uploads it), and the
 /// tab's durable watermark advances in the same transaction. A replayed
 /// sequence at or below the watermark is re-acknowledged, never
 /// re-applied. The end-to-end acknowledgement the tab retires its pending
@@ -5428,7 +5427,7 @@ fn synced_snapshot(
 /// under the same table name, so the blank database is attached once and each
 /// requested table's stored DDL is replayed into it with a schema qualifier
 /// spliced in. The throwaway session never sees a write, it only loads the
-/// diff, so any capture session on the connection is unaffected.
+/// diff, so nothing it does reaches the outbox.
 ///
 /// `schema` is what lets one connection serve both tiers. A session binds to
 /// one database for its whole life, so the device-private tables need a

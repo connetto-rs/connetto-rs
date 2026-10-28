@@ -77,6 +77,8 @@ mod offline_start;
 
 mod outbox;
 
+mod outbox_push;
+
 #[cfg(feature = "native-auth")]
 mod pump_fault;
 

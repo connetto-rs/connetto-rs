@@ -339,6 +339,36 @@ async fn an_unacknowledged_local_write_survives_the_clear() {
     );
 }
 
+/// A write committed and not yet pushed is cleared with the server's rows and
+/// put back when the replacement snapshot ends, like a queued one, and stays
+/// in the outbox for the push that uploads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpushed_local_write_survives_the_clear() {
+    let mut conn = seeded(FullResyncReason::TableTruncated {
+        table: "orders".to_owned(),
+    })
+    .await;
+
+    diesel::insert_into(orders::table)
+        .values((orders::id.eq(99), orders::quantity.eq(7)))
+        .execute(conn.conn())
+        .expect("local insert");
+
+    pump_to_snapshot_end(&mut conn).await;
+    pump_to_snapshot_end(&mut conn).await;
+    assert_eq!(
+        replica_ids(&mut conn),
+        vec![99],
+        "the unpushed insert is back on screen after the resync"
+    );
+    let recorded: i64 = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+        "(SELECT count(*) FROM _connetto_outbox WHERE tbl = 'orders')",
+    ))
+    .get_result(conn.conn())
+    .expect("count the outbox");
+    assert_eq!(recorded, 1, "the outbox still holds the write for its push");
+}
+
 diesel::table! {
     /// A membership table the server serves through a hidden subscription.
     members (id) {

@@ -11,7 +11,7 @@ use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{ClientError, ConnettoConnection, SuspendedCapture};
+use crate::{ClientError, ConnettoConnection, ExemptWrites};
 
 mod task;
 
@@ -318,7 +318,7 @@ where
         held: &Held,
     ) -> Result<(), ClientError> {
         {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_exempt);
             store(&mut self.db, held)?;
         }
         let key_id = *held.leaf.identity().key().as_bytes();
@@ -326,7 +326,7 @@ where
         if !self.writers.contains_key(&writer) {
             let queue = crate::WriterQueue::fresh();
             {
-                let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                let _suspended = ExemptWrites::raise(&self.write_exempt);
                 crate::persist_writer_state(&mut self.db, &writer, queue.next_seq, &queue.head)?;
             }
             self.writers.insert(writer, queue);
@@ -358,7 +358,7 @@ where
 
     /// Forget the certificate the replica holds.
     pub(crate) fn delete_device_certificate(&mut self) -> Result<(), ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_exempt);
         delete(&mut self.db)
     }
 
@@ -369,7 +369,7 @@ where
 
     /// Keep `kept` as its signer's list, replacing the one before.
     pub(crate) fn store_revocation_list(&mut self, kept: &KeptList) -> Result<(), ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_exempt);
         store_list(&mut self.db, kept)
     }
 

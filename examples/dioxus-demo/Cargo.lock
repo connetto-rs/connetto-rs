@@ -1571,6 +1571,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "base64 0.22.1",
+ "blake3",
  "chrono",
  "ciborium",
  "connetto-core",
@@ -1598,6 +1599,7 @@ dependencies = [
  "sqlparser",
  "subql",
  "subtle",
+ "tempfile",
  "thiserror 2.0.20",
  "time",
  "tokio",
@@ -1607,6 +1609,7 @@ dependencies = [
  "uuid",
  "x509-parser",
  "zeroize",
+ "zip",
  "zstd",
 ]
 
@@ -6214,7 +6217,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -7346,7 +7349,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -7365,7 +7368,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -9090,9 +9093,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.16.1"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4a8b5a943c0d72e94795ef8d10977f9ad611eb6efd0a65ce2ffa9cc59416b0d"
+checksum = "aa74d24e848c12eefcacb7d4d25f19890210017882f7da90ae948cbad9d7c771"
 dependencies = [
  "diesel",
  "diesel-async",

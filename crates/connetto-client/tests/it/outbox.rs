@@ -1,7 +1,6 @@
 //! The outbox records every application write to a synced table inside the
-//! transaction that makes it, and nothing connetto writes itself. Debug
-//! builds check at each `push` that the outbox amounts to the same upload as
-//! the capture session, so every push here also runs that check.
+//! transaction that makes it, and nothing connetto writes itself, and `push`
+//! builds the upload from what it recorded.
 
 use connetto_client::{ClientBuilder, ClientError, ConnettoConnection};
 use connetto_core::test_support::FakeTransport;
@@ -29,6 +28,44 @@ fn recorded(conn: &mut ConnettoConnection<FakeTransport>) -> Vec<Recorded> {
         .expect("read the outbox")
 }
 
+/// One blob cell stored beside its outbox row.
+#[derive(Debug, PartialEq, Eq, diesel::QueryableByName)]
+struct Blob {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    seq: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    col: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    side: String,
+    #[diesel(sql_type = diesel::sql_types::Binary)]
+    value: Vec<u8>,
+}
+
+fn blobs(conn: &mut ConnettoConnection<FakeTransport>) -> Vec<Blob> {
+    diesel::sql_query(
+        "SELECT seq, col, side, value FROM _connetto_outbox_blob ORDER BY seq, col, side",
+    )
+    .load(conn.conn())
+    .expect("read the outbox's blobs")
+}
+
+fn blob(seq: i64, col: &str, side: &str, value: &[u8]) -> Blob {
+    Blob {
+        seq,
+        col: col.to_owned(),
+        side: side.to_owned(),
+        value: value.to_vec(),
+    }
+}
+
+/// The operations of queued entry `seq`, sorted, since a changeset orders a
+/// table's rows by hash.
+fn sorted_ops(conn: &mut ConnettoConnection<FakeTransport>, seq: u64) -> Vec<String> {
+    let mut ops = super::support::queued_ops(conn.conn(), seq);
+    ops.sort();
+    ops
+}
+
 fn open(ddl: &str) -> ConnettoConnection<FakeTransport> {
     ClientBuilder::new(
         super::support::bundle(ddl),
@@ -48,7 +85,9 @@ fn row(tbl: &str, op: &str, old: Option<&str>, new: Option<&str>) -> Recorded {
 }
 
 /// Each value keeps its storage class: a real round trips through its 17
-/// digits, a blob travels as hex, and text with a quote stays text.
+/// digits, text with a quote stays text, and a blob is stored raw beside its
+/// row with a marker in the JSON. An update records the key and the cells it
+/// changed, an insert the whole new row and a delete the whole old one.
 #[tokio::test]
 async fn each_write_is_recorded_with_its_values() {
     let mut conn = open(DDL);
@@ -59,14 +98,117 @@ async fn each_write_is_recorded_with_its_values() {
     )
     .expect("write a row three times");
 
-    let inserted = r#"{"id":1,"label":"it's \"here\"","weight":{"r":"0.10000000000000001"},"data":{"b":"00FF"}}"#;
-    let updated = r#"{"id":1,"label":null,"weight":{"r":"2.0"},"data":{"b":"00FF"}}"#;
+    let inserted =
+        r#"{"id":1,"label":"it's \"here\"","weight":{"r":"0.10000000000000001"},"data":{"b":0}}"#;
+    let before = r#"{"id":1,"label":"it's \"here\"","weight":{"r":"0.10000000000000001"}}"#;
+    let after = r#"{"id":1,"label":null,"weight":{"r":"2.0"}}"#;
+    let deleted = r#"{"id":1,"label":null,"weight":{"r":"2.0"},"data":{"b":0}}"#;
     assert_eq!(
         recorded(&mut conn),
         vec![
             row("items", "I", None, Some(inserted)),
-            row("items", "U", Some(inserted), Some(updated)),
-            row("items", "D", Some(updated), None),
+            row("items", "U", Some(before), Some(after)),
+            row("items", "D", Some(deleted), None),
+        ]
+    );
+    assert_eq!(
+        blobs(&mut conn),
+        vec![
+            blob(1, "data", "n", &[0x00, 0xff]),
+            blob(3, "data", "o", &[0x00, 0xff]),
+        ]
+    );
+}
+
+/// A photo is stored once at its own size, and editing the row's caption
+/// afterwards records no photo bytes and uploads the caption alone.
+#[tokio::test]
+async fn a_blob_is_stored_once_and_a_caption_edit_carries_none_of_it() {
+    let mut conn = open(DDL);
+    conn.batch_execute("INSERT INTO items (id, label, data) VALUES (1, 'cat', zeroblob(12000))")
+        .expect("insert a photo");
+    let stored: Vec<Blob> = blobs(&mut conn);
+    assert_eq!(stored.len(), 1, "one stored copy of the photo");
+    assert_eq!(stored[0].value.len(), 12000, "stored raw at its own size");
+    assert_eq!(conn.push().await.expect("push"), Some(1));
+    assert_eq!(
+        blobs(&mut conn),
+        Vec::new(),
+        "the push took the photo's copy"
+    );
+
+    conn.batch_execute("UPDATE items SET label = 'cat on a mat' WHERE id = 1")
+        .expect("edit the caption");
+    assert_eq!(
+        recorded(&mut conn),
+        vec![row(
+            "items",
+            "U",
+            Some(r#"{"id":1,"label":"cat"}"#),
+            Some(r#"{"id":1,"label":"cat on a mat"}"#)
+        )]
+    );
+    assert_eq!(blobs(&mut conn), Vec::new(), "no photo bytes recorded");
+    assert_eq!(conn.push().await.expect("push"), Some(2));
+    assert_eq!(
+        sorted_ops(&mut conn, 2),
+        vec![
+            r#"update items [(Some(Integer(1)), None), (Some(Text("cat")), Some(Text("cat on a mat"))), (None, None), (None, None)]"#
+        ]
+    );
+}
+
+/// An update that moves a row's key records both whole rows, since the
+/// upload carries it as a delete and an insert.
+#[tokio::test]
+async fn a_key_change_records_both_whole_rows() {
+    let mut conn = open(DDL);
+    conn.transact_with_bookkeeping(
+        |db| db.batch_execute("INSERT INTO items VALUES (1, 'kept', 1.5, NULL)"),
+        |_| Ok::<_, diesel::result::Error>(()),
+    )
+    .expect("a row the server sent");
+    conn.batch_execute("UPDATE items SET id = 2 WHERE id = 1")
+        .expect("move the key");
+
+    assert_eq!(
+        recorded(&mut conn),
+        vec![row(
+            "items",
+            "U",
+            Some(r#"{"id":1,"label":"kept","weight":{"r":"1.5"},"data":null}"#),
+            Some(r#"{"id":2,"label":"kept","weight":{"r":"1.5"},"data":null}"#)
+        )]
+    );
+    assert_eq!(conn.push().await.expect("push"), Some(1));
+    assert_eq!(
+        sorted_ops(&mut conn, 1),
+        vec![
+            r#"delete items [Integer(1), Text("kept"), Real(1.5), Null]"#,
+            r#"insert items [Integer(2), Text("kept"), Real(1.5), Null]"#,
+        ]
+    );
+}
+
+/// A change a column's collation calls equal, or one only of storage class,
+/// is still a change the server has to receive.
+#[tokio::test]
+async fn a_change_only_case_or_storage_class_tells_apart_is_recorded() {
+    let mut conn =
+        open("CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT COLLATE NOCASE, any)");
+    conn.transact_with_bookkeeping(
+        |db| db.batch_execute("INSERT INTO items VALUES (1, 'cat', 1)"),
+        |_| Ok::<_, diesel::result::Error>(()),
+    )
+    .expect("a row the server sent");
+    conn.batch_execute("UPDATE items SET label = 'CAT', any = 1.0 WHERE id = 1")
+        .expect("change case and storage class");
+
+    assert_eq!(conn.push().await.expect("push"), Some(1));
+    assert_eq!(
+        sorted_ops(&mut conn, 1),
+        vec![
+            r#"update items [(Some(Integer(1)), None), (Some(Text("cat")), Some(Text("CAT"))), (Some(Integer(1)), Some(Real(1.0)))]"#
         ]
     );
 }
@@ -124,8 +266,10 @@ async fn push_clears_what_it_covered() {
     );
 }
 
-/// A key change, a row inserted and deleted again, and two updates of one
-/// row all reach the upload the way the capture session merges them.
+/// A key change, a row inserted and deleted again, two updates of one row,
+/// a delete and insert of one key, updates of two columns one after the
+/// other, and an update then a delete all reach the upload merged per row as
+/// SQLite's session merges them.
 #[tokio::test]
 async fn merged_writes_upload_as_the_session_merges_them() {
     let mut conn = open(DDL);
@@ -137,6 +281,13 @@ async fn merged_writes_upload_as_the_session_merges_them() {
     )
     .expect("first round of writes");
     assert_eq!(conn.push().await.expect("push"), Some(1));
+    assert_eq!(
+        sorted_ops(&mut conn, 1),
+        vec![
+            r#"insert items [Integer(2), Text("c"), Null, Null]"#,
+            r#"insert items [Integer(5), Text("e"), Null, Null]"#,
+        ]
+    );
 
     conn.batch_execute(
         "UPDATE items SET id = 6 WHERE id = 5; \
@@ -145,6 +296,28 @@ async fn merged_writes_upload_as_the_session_merges_them() {
     )
     .expect("second round over pushed rows");
     assert_eq!(conn.push().await.expect("push"), Some(2));
+    assert_eq!(
+        sorted_ops(&mut conn, 2),
+        vec![
+            r#"delete items [Integer(5), Text("e"), Null, Null]"#,
+            r#"insert items [Integer(6), Text("e"), Null, Null]"#,
+            r#"update items [(Some(Integer(2)), None), (Some(Text("c")), Some(Text("again"))), (None, None), (None, None)]"#,
+        ]
+    );
+
+    conn.batch_execute(
+        "UPDATE items SET label = 'x' WHERE id = 6; UPDATE items SET weight = 3.5 WHERE id = 6; \
+         UPDATE items SET label = 'y' WHERE id = 2; DELETE FROM items WHERE id = 2",
+    )
+    .expect("third round over pushed rows");
+    assert_eq!(conn.push().await.expect("push"), Some(3));
+    assert_eq!(
+        sorted_ops(&mut conn, 3),
+        vec![
+            r#"delete items [Integer(2), Text("again"), Null, Null]"#,
+            r#"update items [(Some(Integer(6)), None), (Some(Text("e")), Some(Text("x"))), (Some(Null), Some(Real(3.5))), (None, None)]"#,
+        ]
+    );
 }
 
 /// A table created with `change_schema` is recorded from its first write.
@@ -264,10 +437,9 @@ async fn a_refused_schema_change_changes_nothing() {
 }
 
 /// A row connetto rewrites after a local write and before the push, as a
-/// server frame does, leaves the outbox holding the written values and the
-/// capture session the rewritten ones, and the push still goes out.
+/// server frame does, uploads the values the application wrote.
 #[tokio::test]
-async fn a_row_rewritten_by_connetto_before_the_push_still_pushes() {
+async fn a_row_rewritten_by_connetto_before_the_push_uploads_the_written_values() {
     let mut conn = open(DDL);
     conn.batch_execute("INSERT INTO items (id, label) VALUES (1, 'local'), (2, 'kept')")
         .expect("local writes");
@@ -278,6 +450,13 @@ async fn a_row_rewritten_by_connetto_before_the_push_still_pushes() {
     .expect("an exempt rewrite, as a frame applies one");
 
     assert_eq!(conn.push().await.expect("push"), Some(1));
+    assert_eq!(
+        sorted_ops(&mut conn, 1),
+        vec![
+            r#"insert items [Integer(1), Text("local"), Null, Null]"#,
+            r#"insert items [Integer(2), Text("kept"), Null, Null]"#,
+        ]
+    );
 }
 
 /// The queue entry and the deletion of the records it covers commit
