@@ -68,6 +68,26 @@ test-group = 'docker'
 threads-required = 2
 slow-timeout = { period = "120s", terminate-after = 5 }
 
+# These server tests start a container too and run outside the group, so
+# they keep the default concurrency. Container startup under load stretches
+# them like the group's, so the wedge kill waits as long.
+[[profile.default.overrides]]
+filter = '''
+package(connetto-server) & (
+  test(anonymous_writer::) | test(ban_doors::) | test(bot_cap::) | test(bot_proof::)
+  | test(bot_registration::) | test(bots::) | test(bots_client::) | test(builder_coverage::)
+  | test(courier_frontier::) | test(deployment_schema::) | test(device_identity::)
+  | test(enrolment::) | test(enrolment_store::) | test(epoch::) | test(idle_limit::)
+  | test(lifecycle::) | test(mutation_budget::) | test(portability::)
+  | test(preflight_oplog_payload::) | test(read_rule_fold::) | test(reexec_failure::)
+  | test(restore::) | test(resume_point::) | test(session_record::) | test(session_surfaces::)
+  | test(share_key_admission::) | test(share_key_checkpoint::) | test(share_key_reach::)
+  | test(share_keys::) | test(share_key_terms::) | test(ticket_budget::) | test(ticket_mint::)
+  | test(upkeep_consulted::) | test(write_attribution::) | test(writer_frontier::)
+)
+'''
+slow-timeout = { period = "120s", terminate-after = 5 }
+
 [[profile.default.overrides]]
 filter = '''
 test(two_nodes_discover_each_other_and_autolink)
