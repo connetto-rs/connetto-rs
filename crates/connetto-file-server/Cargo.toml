@@ -20,7 +20,7 @@ path = "tests/it/mod.rs"
 [dependencies]
 connetto-file-core = { path = "../connetto-file-core" }
 connetto-core = { workspace = true }
-axum = "0.8"
+axum = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
 thiserror.workspace = true
 # Typed diesel queries for manifest and refcount state.
@@ -55,6 +55,6 @@ serde_json = "1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-axum = { version = "0.8", features = [] }
+axum = { workspace = true }
 diesel-async = { version = "0.9", default-features = false, features = ["postgres", "bb8"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

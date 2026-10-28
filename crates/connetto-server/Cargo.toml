@@ -101,7 +101,7 @@ tracing = { version = "0.1", default-features = false, features = ["std", "attri
 # refresh secret, serde derives the claim and request bodies.
 jsonwebtoken = "9"
 ring = "0.17"
-axum = { version = "0.8", features = ["ws"] }
+axum = { workspace = true, features = ["ws"] }
 uuid = { version = "1", features = ["v4", "v5"] }
 # The device issuer key read at boot is wiped once loaded.
 zeroize = "1"
@@ -177,7 +177,7 @@ openidconnect = { version = "4.0.1", default-features = false, features = ["reqw
 # Driving the axum auth router without a socket in the Docker-free auth test.
 tower = { version = "0.5", features = ["util"] }
 # Serving the built parts on a real listener in the lifecycle test.
-axum = { version = "0.8", features = ["ws"] }
+axum = { workspace = true, features = ["ws"] }
 # The content deployment's DDL, applied by the sweep and reconcile tests.
 connetto-file-server = { path = "../connetto-file-server" }
 # The raw-frame WebSocket client the sync adapter tests drive over `/sync`.
