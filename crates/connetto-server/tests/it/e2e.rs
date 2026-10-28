@@ -216,34 +216,23 @@ pub(super) fn keyring_entry(name: &str) -> keyring_core::Result<Entry> {
     Entry::new(CLIENT_KEYRING_SERVICE, name)
 }
 
-/// Row count of the `orders` table in a client's local SQLite, or 0 while the
-/// database is absent, still locked, or not yet holding the table.
+/// A client's local SQLite opened as the client sees it, absent while the
+/// database is absent, still locked or its key not yet stored.
 ///
 /// The client keeps its replica encrypted at rest with the key in the OS
 /// keyring, under the binary's service and keyed by the database path, so the
-/// count unlocks with that same key. The path is probed before opening,
+/// open unlocks with that same key. The path is probed before opening,
 /// because an open would create an empty file and the client refuses an
 /// existing file that has no cached key.
-fn count_orders(db_path: &Path) -> i64 {
+pub(super) fn open_replica(db_path: &Path) -> Option<SqliteConnection> {
     if !db_path.exists() {
-        return 0;
+        return None;
     }
     let path = db_path.to_string_lossy();
-    let Ok(entry) = keyring_entry(&path) else {
-        return 0;
-    };
-    let Ok(hex) = entry.get_password() else {
-        return 0;
-    };
-    let Ok(key) = hex.parse::<ReplicaKey>() else {
-        return 0;
-    };
-    let Ok(mut conn) = SqliteConnection::establish(&path) else {
-        return 0;
-    };
-    if cipher::unlock(&mut conn, &key).is_err() {
-        return 0;
-    }
+    let hex = keyring_entry(&path).ok()?.get_password().ok()?;
+    let key = hex.parse::<ReplicaKey>().ok()?;
+    let mut conn = SqliteConnection::establish(&path).ok()?;
+    cipher::unlock(&mut conn, &key).ok()?;
     // A person's replica holds the wildcard. The harness opens its own
     // connection, which the client never set up, so register the function
     // here or the translated view (which calls it per row) hides every row.
@@ -254,6 +243,15 @@ fn count_orders(db_path: &Path) -> i64 {
         || connetto_core::BOT_LIST_WILDCARD.to_owned(),
     )
     .ok();
+    Some(conn)
+}
+
+/// Row count of the `orders` table in a client's local SQLite, or 0 while the
+/// replica cannot be opened or does not yet hold the table.
+fn count_orders(db_path: &Path) -> i64 {
+    let Some(mut conn) = open_replica(db_path) else {
+        return 0;
+    };
     diesel::RunQueryDsl::get_result::<i64>(
         diesel::QueryDsl::select(orders::table, diesel::dsl::count_star()),
         &mut conn,
@@ -482,6 +480,50 @@ impl Authorization {
             ("CONNETTO_FGA_URL", self.endpoint.as_str()),
             ("CONNETTO_FGA_STORE", self.store.as_str()),
         ]
+    }
+
+    /// Every tuple in the store whose user names `who`.
+    pub(super) async fn tuples_naming(&self, who: &str) -> Vec<String> {
+        use openfga_client::client::{OpenFgaServiceClient, ReadRequest};
+        let mut client = OpenFgaServiceClient::connect(self.endpoint.clone())
+            .await
+            .expect("connect to the authorization service");
+        let mut found = Vec::new();
+        let mut continuation_token = String::new();
+        loop {
+            let page = client
+                .read(ReadRequest {
+                    store_id: self.store.clone(),
+                    continuation_token,
+                    ..ReadRequest::default()
+                })
+                .await
+                .expect("read the store")
+                .into_inner();
+            found.extend(
+                page.tuples
+                    .into_iter()
+                    .filter_map(|tuple| tuple.key)
+                    .filter(|key| key.user.contains(who))
+                    .map(|key| format!("{} {} {}", key.user, key.relation, key.object)),
+            );
+            if page.continuation_token.is_empty() {
+                return found;
+            }
+            continuation_token = page.continuation_token;
+        }
+    }
+
+    /// Poll the store until a tuple names `who`, or 30 seconds pass.
+    pub(super) async fn await_tuples(&self, who: &str) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let found = self.tuples_naming(who).await;
+            if !found.is_empty() || std::time::Instant::now() >= deadline {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 }
 
