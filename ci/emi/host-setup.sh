@@ -12,6 +12,7 @@
 # A first commons run makes its WireGuard key and stops, the emi run then
 # invites commons into the cluster, and a second commons run joins it. Keys
 # and the invitation travel through ~/ci-cluster of lucac on emi and cappelle on commons.
+# Each member gives CI nothing until ci-share.sh on emi sets its share.
 set -euo pipefail
 
 MEMBER=${1:-}
@@ -32,7 +33,7 @@ WG_PORT=51820
 # The runner account inside the golden image, which owns what it writes to the caches.
 GUEST_UID=1001
 ZABBLY_FINGERPRINT=4EFC590696CB15B87C73A3AD82CC8797C838DCFD
-# CI's share of each host. emi fits 18 light and 10 heavy VMs and keeps about 60 GiB of its 503 GiB.
+# The most of each host CI may take, the bound for ci-share.sh. emi keeps about 60 GiB of its 503 GiB.
 # commons is shared with other people, who keep about 50 GiB of its 251 GiB.
 EMI_MEMORY_GIB=440
 EMI_VMS=28
@@ -412,14 +413,16 @@ if [ "$MEMBER" = emi ]; then
   remote_cert=$RUNNER_HOME/.config/incus/servercerts/emi.crt
   [ -f "$remote_cert" ] && install -m 0644 -o "$RUNNER_USER" -g "$RUNNER_USER" "$cert" "$remote_cert"
 
-  log "Placement: each new CI VM goes to the member with the most CI memory left, within its share"
+  log "Placement: each new CI VM goes to the member with the most CI memory left, within the share ci-share.sh set"
   incus config set instances.placement.scriptlet="$(cat <<EOF
-SHARES = {
-    "emi": {"memory": $EMI_MEMORY_GIB, "vms": $EMI_VMS},
-    "commons": {"memory": $COMMONS_MEMORY_GIB, "vms": $COMMONS_VMS},
-}
 LARGEST = $LARGEST_GIB
 GIB = 1024 * 1024 * 1024
+
+def share(member, key):
+    value = member.config.get("user.ci." + key, "")
+    if not value.isdigit():
+        return 0
+    return int(value)
 
 def memory_gib(instance):
     value = instance.expanded_config.get("limits.memory", "")
@@ -435,7 +438,9 @@ def instance_placement(request, candidate_members):
     best_room = -1
     for member in candidate_members:
         name = member.server_name
-        if name not in SHARES:
+        share_memory = share(member, "memory_gib")
+        share_vms = share(member, "vms")
+        if share_memory == 0 or share_vms == 0:
             continue
         instances = get_instances(project="$PROJECT", location=name)
         # Each creation in flight is an operation, and gets its stopped record soon after, so only the excess has no record yet.
@@ -446,8 +451,8 @@ def instance_placement(request, candidate_members):
         used = LARGEST * unrecorded
         for instance in instances:
             used += memory_gib(instance)
-        room = SHARES[name]["memory"] - used
-        if count < SHARES[name]["vms"] and room >= wanted and room > best_room:
+        room = share_memory - used
+        if count < share_vms and room >= wanted and room > best_room:
             best = name
             best_room = room
     if best == None:
@@ -488,6 +493,14 @@ EOF
     rm "$EXCHANGE/join-token"
   fi
 fi
+
+log "CI ceilings of the members, the most ci-share.sh may give CI on each"
+for entry in "emi $EMI_MEMORY_GIB $EMI_VMS" "commons $COMMONS_MEMORY_GIB $COMMONS_VMS"; do
+  read -r name memory vms <<<"$entry"
+  incus cluster list --format csv --columns n | grep -qx "$name" || continue
+  incus cluster set "$name" user.ci.ceiling_memory_gib="$memory"
+  incus cluster set "$name" user.ci.ceiling_vms="$vms"
+done
 
 log "Docker Hub pull-through mirror on $BRIDGE_IP:$MIRROR_PORT"
 # Host networking, because a published port DNATs to Docker's 172.17/16, which the CI egress ACL drops.
