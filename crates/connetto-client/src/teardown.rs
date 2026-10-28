@@ -274,6 +274,10 @@ pub struct ForgetIncomplete {
     pub share_keys: Option<crate::ClientError>,
     /// The device key could not be deleted.
     pub device_key: Option<crate::ClientError>,
+    /// Leaving the shared store failed, so its rows this identity alone
+    /// covered may stay, or as the last identity out its file and key record
+    /// could not be removed.
+    pub shared: Option<crate::ClientError>,
     /// The application's own wipe failed.
     pub application: Option<ApplicationWipeError>,
 }
@@ -294,6 +298,7 @@ impl ForgetIncomplete {
             (WipePart::Revoke, self.revoke.is_some()),
             (WipePart::Replica, self.wipe.is_some()),
             (WipePart::ShareKeys, self.share_keys.is_some()),
+            (WipePart::Shared, self.shared.is_some()),
             (WipePart::DeviceKey, self.device_key.is_some()),
             (WipePart::Application, self.application.is_some()),
         ]
@@ -318,6 +323,8 @@ pub enum WipePart {
     Replica,
     /// Clearing the share keys.
     ShareKeys,
+    /// Leaving the shared store, and removing it as the last identity out.
+    Shared,
     /// Deleting the device key.
     DeviceKey,
     /// The application's own wipe, its
@@ -354,7 +361,7 @@ struct FailedParts<'a>(&'a ForgetIncomplete);
 #[cfg(feature = "native-auth")]
 impl core::fmt::Display for FailedParts<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let parts: [(&str, Option<&dyn core::fmt::Display>); 7] = [
+        let parts: [(&str, Option<&dyn core::fmt::Display>); 8] = [
             (
                 "releasing the replica",
                 self.0.release.as_ref().map(|err| err as _),
@@ -374,6 +381,10 @@ impl core::fmt::Display for FailedParts<'_> {
             (
                 "clearing the share keys",
                 self.0.share_keys.as_ref().map(|err| err as _),
+            ),
+            (
+                "leaving the shared store",
+                self.0.shared.as_ref().map(|err| err as _),
             ),
             (
                 "deleting the device key",
@@ -499,6 +510,34 @@ impl PendingWipe {
     }
 }
 
+/// Remove the shared store at `path` once no identity is left in it: its key
+/// record first, so a failed delete leaves inert ciphertext, then the file
+/// with its `-wal` and `-shm`.
+///
+/// # Errors
+///
+/// [`crate::ClientError`] when the record cannot be cleared or a file cannot
+/// be deleted for any reason but absence.
+#[cfg(feature = "native-auth")]
+pub(crate) async fn remove_shared_store<S>(
+    path: &std::path::Path,
+    key_store: &S,
+    record: &str,
+) -> Result<(), crate::ClientError>
+where
+    S: connetto_core::traits::ReplicaKeyStore,
+{
+    key_store.clear(record).await.map_err(|err| {
+        crate::ClientError::Session(format!("clearing the shared store's key: {err}"))
+    })?;
+    for suffix in ["", "-wal", "-shm"] {
+        remove_absent_ok(&with_suffix(path, suffix)).map_err(|err| {
+            crate::ClientError::Session(format!("removing the shared store: {err}"))
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(all(test, feature = "native-transport"))]
 mod tests {
     use super::{PurgeError, expiry_warning, purge_replica};
@@ -599,5 +638,33 @@ mod tests {
             super::PendingWipe::every(dir.path()).expect("read"),
             vec![held]
         );
+    }
+
+    /// A last-out removal that cannot delete a file reports it, with the key
+    /// record already gone, so what stays behind is inert ciphertext.
+    #[cfg(feature = "native-auth")]
+    #[tokio::test]
+    async fn a_shared_store_file_that_cannot_be_deleted_has_lost_its_key() {
+        use connetto_core::traits::ReplicaKeyStore as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shared");
+        std::fs::write(&path, b"ciphertext").expect("the store");
+        let wal = super::with_suffix(&path, "-wal");
+        std::fs::create_dir(&wal).expect("a directory where the log goes");
+        std::fs::write(wal.join("held"), b"").expect("which is not empty");
+        let keys = crate::MemoryKeyStore::default();
+        keys.store("shared", &connetto_core::test_support::replica_key())
+            .await
+            .expect("the store's key");
+
+        super::remove_shared_store(&path, &keys, "shared")
+            .await
+            .expect_err("the log cannot be deleted");
+
+        assert!(
+            keys.load("shared").await.expect("load").is_none(),
+            "the key went first"
+        );
+        assert!(!path.exists(), "and the file before its log");
     }
 }

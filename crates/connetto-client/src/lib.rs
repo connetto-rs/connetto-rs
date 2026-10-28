@@ -108,6 +108,7 @@ pub use bluetooth::{
 pub use enrolment::{CertificateError, DeviceEntry};
 #[cfg(feature = "peer")]
 pub use hotspot::{HotspotError, HotspotOffer, HotspotSecurity, JoinError, WifiPayloadError};
+pub use interest::SharedDeparture;
 pub use replay::replay_aborting;
 pub use subscriptions::{DEFAULT_GRACE, MAX_GRACE};
 pub mod teardown;
@@ -1957,6 +1958,23 @@ fn is_shared<S: core::hash::BuildHasher>(shared_tables: &HashSet<String, S>, tab
 /// native apply.
 fn shared_route(shared: &HashSet<String>) -> impl Fn(&str) -> Option<&'static str> + '_ {
     move |table| is_shared(shared, table).then_some(SHARED_SCHEMA)
+}
+
+/// Undo the shared part of each changeset in `newest_first`, in that order,
+/// under the rollback's rule of leaving a row a later change touched, so
+/// values the server never received leave the rows other identities read.
+fn undo_shared<'c>(
+    db: &mut SqliteConnection,
+    shared: &HashSet<String>,
+    newest_first: impl IntoIterator<Item = &'c [u8]>,
+) -> Result<(), ClientError> {
+    let route = shared_route(shared);
+    for changeset in newest_first {
+        let inverse = invert_changeset(changeset)
+            .map_err(|err| ClientError::Apply(format!("inverting an unsent write: {err}")))?;
+        replay::apply(db, &inverse, replay::Policy::Omit, &route)?;
+    }
+    Ok(())
 }
 
 /// The schema a replica table lives in, the routing a replica write gives
@@ -8674,6 +8692,71 @@ where
         let spare = self.pending_spare()?;
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         interest::record_spare(&mut self.db, &self.config, &spare)
+    }
+
+    /// Take this identity out of the shared store before its replica is
+    /// wiped (R11 decision 7). Its captured and queued shared writes are
+    /// undone first, newest first, when `discard_unsent`, leaving a row a
+    /// later change touched as a rollback does, then its interest and spare
+    /// rows go and every shared row no remaining identity covers or has
+    /// unsent is evicted, online or not, since no subscription covers what
+    /// goes. All of it is one transaction, so a store that refuses any part
+    /// keeps the identity as it was.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the store cannot be read or written.
+    pub fn leave_shared_store(
+        &mut self,
+        discard_unsent: bool,
+    ) -> Result<SharedDeparture, ClientError> {
+        if self.config.shared_tables.is_empty() {
+            return Ok(SharedDeparture::NotShared);
+        }
+        let (captured, mut queued): (Vec<u8>, Vec<&PendingEntry>) = if discard_unsent {
+            (
+                self.session.changeset()?,
+                self.writers
+                    .values()
+                    .flat_map(|queue| queue.pending.values())
+                    .collect(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        queued.sort_by_key(|entry| core::cmp::Reverse(entry.position));
+        let newest_first = (!captured.is_empty())
+            .then_some(captured.as_slice())
+            .into_iter()
+            .chain(queued.into_iter().map(|entry| entry.changeset.as_slice()));
+        let config = &self.config;
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let remain = self.db.transaction(|db| {
+            undo_shared(db, &config.shared_tables, newest_first)?;
+            interest::depart(db, config, &config.client_id, true)
+        })?;
+        Ok(if remain {
+            SharedDeparture::Kept
+        } else {
+            SharedDeparture::LastOut
+        })
+    }
+
+    /// Take `identity` out of the shared store as its own
+    /// [`leave_shared_store`](Self::leave_shared_store) would have, for an
+    /// identity whose departure failed before its replica was wiped. An
+    /// identity naming this connection is left alone, since this open
+    /// rewrote its rows already.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the store cannot be read or written.
+    pub fn retire_shared_identity(&mut self, identity: &str) -> Result<(), ClientError> {
+        if self.config.shared_tables.is_empty() || identity == self.config.client_id {
+            return Ok(());
+        }
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        interest::depart(&mut self.db, &self.config, identity, true).map(drop)
     }
 
     /// Return freelist pages to the filesystem: reclaim in

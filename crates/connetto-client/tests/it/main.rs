@@ -113,6 +113,7 @@ mod shared_coverage;
 mod shared_majors;
 mod shared_reads;
 mod shared_store;
+mod shared_teardown;
 mod shared_writes;
 
 mod sql_functions;

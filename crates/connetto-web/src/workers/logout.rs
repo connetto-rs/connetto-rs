@@ -170,8 +170,27 @@ async fn guard_replica_deletion(
     let Some(pending) = ask_unsynced(hub).await else {
         return Err(None);
     };
+    // Refused before anything changes, so a kept replica keeps its share of
+    // the shared store too.
+    if !pending.is_empty() && !force {
+        return Err(Some(crate::auth::LogoutMessage::Refused { pending }));
+    }
+    // Out of the shared store while the worker still holds it attached,
+    // undoing the shared writes this delete discards (R11 decision 7). A
+    // failure leaves the departure owed to the next boot's worker.
+    let shared = match hub.leave_shared_store(!pending.unsynced.is_empty()).await {
+        Ok(connetto_client::SharedDeparture::LastOut) => crate::storage::SharedWipe::LastOut,
+        Ok(
+            connetto_client::SharedDeparture::Kept | connetto_client::SharedDeparture::NotShared,
+        ) => crate::storage::SharedWipe::Kept,
+        Err(err) => {
+            tracing::warn!(error = %err, "db worker: leaving the shared store failed, the next boot retries");
+            crate::storage::SharedWipe::Depart
+        }
+    };
     let wipe =
-        crate::storage::PendingWipe::new(replica_db_name, content_namespace.map(ToOwned::to_owned));
+        crate::storage::PendingWipe::new(replica_db_name, content_namespace.map(ToOwned::to_owned))
+            .with_shared(shared);
     crate::storage::mark_wipe_pending(&wipe, &pending, force)
         .await
         .map_err(|err| match err {

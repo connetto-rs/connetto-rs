@@ -1399,6 +1399,20 @@ where
         }
     }
 
+    /// Take this identity out of the shared store before a forget wipes its
+    /// replica, as [`ConnettoConnection::leave_shared_store`] does.
+    #[cfg(feature = "native-auth")]
+    pub(crate) async fn leave_shared_store(
+        &self,
+        discard_unsent: bool,
+    ) -> Result<crate::SharedDeparture, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
+        state.conn.leave_shared_store(discard_unsent)
+    }
+
     /// Swap the replica for an empty in-memory one after [`close`](Self::close),
     /// so no handle keeps the file open while it is deleted. Windows refuses to
     /// delete an open file. Clones that stay alive read the empty replica.

@@ -384,6 +384,21 @@ async fn open_pending_wipes() -> Result<IdbDatabase, AuthError> {
         .map_err(|err| AuthError::Store(format!("open the pending-wipe store: {err}")))
 }
 
+/// What a pending wipe does to the device's shared store (R11 decision 7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SharedWipe {
+    /// The identity left the store and another identity still uses it, or
+    /// the build shares no tables.
+    #[default]
+    Kept,
+    /// The identity was the last one in the store, so the next boot removes
+    /// its key record and its database before anything opens.
+    LastOut,
+    /// The identity's departure failed, so the next boot's worker takes it
+    /// out of the store once its own connection is open.
+    Depart,
+}
+
 /// One deferred local-data wipe.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PendingWipe {
@@ -394,6 +409,9 @@ pub struct PendingWipe {
     /// Whether the replica is already gone and only content cleanup remains.
     #[serde(default)]
     replica_deleted: bool,
+    /// What happens to the shared store.
+    #[serde(default)]
+    shared: SharedWipe,
 }
 
 impl PendingWipe {
@@ -404,11 +422,23 @@ impl PendingWipe {
             replica: replica.into(),
             content_namespace,
             replica_deleted: false,
+            shared: SharedWipe::Kept,
         }
+    }
+
+    /// The same wipe, doing `shared` to the device's shared store.
+    #[must_use]
+    pub const fn with_shared(mut self, shared: SharedWipe) -> Self {
+        self.shared = shared;
+        self
     }
 
     pub(crate) const fn replica_deleted(&self) -> bool {
         self.replica_deleted
+    }
+
+    pub(crate) const fn shared(&self) -> SharedWipe {
+        self.shared
     }
 
     fn after_replica_deleted(&self) -> Self {
@@ -563,6 +593,41 @@ pub(crate) async fn acknowledge_pending_wipe(wipe: &PendingWipe) -> Result<(), A
 
 pub(crate) async fn defer_pending_content_wipe(wipe: &PendingWipe) -> Result<(), AuthError> {
     update_pending_wipe(wipe, Some(&wipe.after_replica_deleted())).await
+}
+
+/// Clear a wipe's pending departure once the identity is out of the shared
+/// store, keeping whatever content cleanup it still carries.
+pub(crate) async fn settle_shared_departure(wipe: &PendingWipe) -> Result<(), AuthError> {
+    update_pending_wipe(wipe, Some(&wipe.clone().with_shared(SharedWipe::Kept))).await
+}
+
+/// Remove the device's shared store once no identity is left in it: its key
+/// record first, so a failed delete leaves inert ciphertext, then its
+/// database. Both are named by [`replica_entry`] under `prefix`.
+///
+/// # Errors
+///
+/// [`WipeError::KeyStore`] when the record cannot be cleared, or
+/// [`WipeError::Storage`] when the database cannot be deleted.
+pub(crate) async fn remove_shared_store<S>(
+    storage: &ReplicaStorage,
+    key_store: &S,
+    prefix: &str,
+) -> Result<(), WipeError>
+where
+    S: ReplicaKeyStore<Error = AuthError>,
+{
+    let name = replica_entry(
+        prefix,
+        &connetto_client::shared_store_name(connetto_client::REPLICA_PREFIX),
+    );
+    key_store
+        .clear(&name)
+        .await
+        .map_err(|err| WipeError::KeyStore(err.to_string()))?;
+    storage
+        .delete_db(&name)
+        .map_err(|err| WipeError::Storage(err.to_string()))
 }
 
 /// Takes every outstanding wipe record.

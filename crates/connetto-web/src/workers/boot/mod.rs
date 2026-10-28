@@ -490,6 +490,7 @@ where
     report_boot_progress();
     let (spec, mut worker, content_root_key) =
         replica::open_worker(core, &config, resolved, &storage, &key_store).await?;
+    services::retry_shared_departures(&mut worker).await;
     report_boot_progress();
     if config.connect_gate.is_none() {
         replica::try_connect_upstream(&mut worker, config.ws_url).await?;
