@@ -37,7 +37,9 @@ use crate::device_cert::{
 };
 use crate::manager_builder::ManagerBuilder;
 use crate::materializer::Materializer;
-use crate::openfga::{Counted, FgaAuth, ModelState, ModelSubject, SetupError, Translated};
+use crate::openfga::{
+    Counted, FactSource, FgaAuth, ModelState, ModelSubject, SetupError, Translated,
+};
 use crate::oplog::{OplogConfig, PgOplog};
 use crate::portability::{DataRequestError, DataRequester};
 use crate::reach::GrantReach;
@@ -2064,7 +2066,7 @@ fn require_one_numbering(model: &ParserDB, engine_ddl: &str) -> Result<(), Build
 /// where the counter lives and the setup calls outside it.
 async fn build_authorization<D: ConnettoSchema>(
     owner_pool: &PgPool,
-    reader_pool: &PgPool,
+    facts: &FactSource,
     schema: &ServerSchema,
     publication: &str,
     openfga: &OpenFga,
@@ -2108,7 +2110,7 @@ async fn build_authorization<D: ConnettoSchema>(
     .authorization_model_id(model.id().to_owned());
     match &model {
         ModelState::Written(_) => {
-            let n = translated.load_into(reader_pool, &loader).await?;
+            let n = translated.load_into(facts, &loader).await?;
             tracing::info!(
                 model = model.id(),
                 facts = n,
@@ -2116,7 +2118,7 @@ async fn build_authorization<D: ConnettoSchema>(
             );
         }
         ModelState::Adopted(_) => {
-            let (added, removed) = translated.reconcile_store(reader_pool, &loader).await?;
+            let (added, removed) = translated.reconcile_store(facts, &loader).await?;
             tracing::info!(
                 model = model.id(),
                 added,
@@ -2150,8 +2152,9 @@ async fn build_write_side<D: ConnettoSchema>(
     writable: RuntimeWritableCatalog,
     engine_connector: PgReadConnector,
 ) -> Result<WriteSide<D>, BuildError> {
+    let facts = FactSource::owner(pools.owner.clone());
     let (auth, translator, reach) =
-        build_authorization::<D>(&pools.owner, &pools.reader, schema, publication, openfga).await?;
+        build_authorization::<D>(&pools.owner, &facts, schema, publication, openfga).await?;
     // The engine and the upkeep each classify membership against the deployment's policies, so each takes a translator.
     let upkeep_translator = translator.clone();
     let catalog = schema.catalog::<RegistryIds<D>>()?;
@@ -2173,7 +2176,7 @@ async fn build_write_side<D: ConnettoSchema>(
     } else {
         None
     };
-    let upkeep = auth.upkeep(reach, upkeep_translator, pools.reader.clone());
+    let upkeep = auth.upkeep(reach, upkeep_translator, facts);
     let write = pg_write_target::<D>(pools.reader, &schema.engine_ddl::<RegistryIds<D>>())?;
     // A changed policy makes an existing replica stale, so a client holding one is told through the advertised version.
     let bundle = connetto_schema::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(

@@ -18,7 +18,9 @@ use std::time::Duration;
 use connetto_core::messages::{
     CONTENT_TICKET_REFUSED, ContentVerb, ControlMessage, MutationRejectReason,
 };
-use connetto_server::openfga::{Counted, FgaAuth, ModelSubject, StoreUpkeep, Translated};
+use connetto_server::openfga::{
+    Counted, FactSource, FgaAuth, ModelSubject, StoreUpkeep, Translated,
+};
 use connetto_server::{PgSnapshotSource, RuntimeWritableCatalog};
 use connetto_test_harness::{
     Fixture, HarnessAuth, PUBLICATION, RowValue, Server, ServerConfig, drop_slot, insert_changeset,
@@ -100,7 +102,6 @@ async fn row_exists(pool: &Pool<AsyncPgConnection>, id: i32) -> bool {
 /// service, and compose the executor the shipped binary composes.
 async fn shipped_executor(
     fixture: &Fixture,
-    pool: Pool<AsyncPgConnection>,
 ) -> (
     connetto_test_harness::HarnessFga,
     Arc<dyn StoreUpkeep>,
@@ -126,7 +127,7 @@ async fn shipped_executor(
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     translated
-        .load_into(fixture.admin(), &loader)
+        .load_into(&FactSource::owner(fixture.admin().clone()), &loader)
         .await
         .expect("the generated queries ran and the facts loaded");
     let naming = translated.naming();
@@ -139,7 +140,11 @@ async fn shipped_executor(
     .expect("the index carries what the questions need")
     .authorization_model_id(model.id().to_owned());
     let fga = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
-    let upkeep = fga.upkeep(reach, translator.clone(), pool);
+    let upkeep = fga.upkeep(
+        reach,
+        translator.clone(),
+        FactSource::owner(fixture.admin().clone()),
+    );
     (fga, upkeep, translator)
 }
 
@@ -177,7 +182,7 @@ async fn stack(fixture: &Fixture) -> (Server, Pool<AsyncPgConnection>) {
     provision_cap_policies(fixture.admin(), PG_DDL, NO_POLICIES).await;
     let reader = pool_for(&with_user(fixture.admin_url(), READER, READER)).await;
     let engine_ddl = connetto_schema::with_registry::<connetto_core::bots::TextIds>(PG_DDL);
-    let (fga, upkeep, translator) = shipped_executor(fixture, reader.clone()).await;
+    let (fga, upkeep, translator) = shipped_executor(fixture).await;
     let auth = HarnessAuth::fga(fga, upkeep);
     let snapshot = PgSnapshotSource::from_ddl(reader.clone(), &engine_ddl)
         .expect("snapshot source")

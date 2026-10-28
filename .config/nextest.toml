@@ -39,6 +39,7 @@ threads-required = 4
 filter = '''
 package(connetto-test-harness)
 | test(abuse::) | test(audit_table::) | test(auth_retry::) | test(authentication::)
+| test(authorization_facts::)
 | test(authn_db::) | test(authn_flow::) | test(capabilities::) | test(cdc_reconnect::)
 | test(failover::)
 | test(grants::) | test(grouped_live::) | test(grouped_wire::) | test(inprocess_loop::)

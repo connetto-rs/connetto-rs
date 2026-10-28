@@ -398,7 +398,7 @@ impl<Id, Key, T> FgaAuth<Id, Key, T> {
         &self,
         reach: GrantReach,
         translator: Translator,
-        pool: Pool<AsyncPgConnection>,
+        facts: FactSource,
     ) -> Arc<dyn StoreUpkeep>
     where
         Id: Display + Send + Sync + 'static,
@@ -424,7 +424,7 @@ impl<Id, Key, T> FgaAuth<Id, Key, T> {
             reach,
             naming: Arc::clone(&self.naming),
             translator,
-            pool,
+            facts,
             key_tables,
         })
     }
@@ -558,6 +558,25 @@ pub enum SetupError {
          will narrow this refusal: {0}"
     )]
     Unwithdrawable(String),
+}
+
+/// The pool the authorization store's facts are read from, whose role sees
+/// every row of the tables the policies read.
+///
+/// The facts state what the database holds for everyone, so they are read as
+/// the deployment and never through the reader role that row-level security
+/// binds, which a deployment's own policies or the bot cap leave seeing too
+/// little. The store would then lose every fact that role cannot see.
+#[derive(Clone)]
+pub struct FactSource(Pool<AsyncPgConnection>);
+
+impl FactSource {
+    /// Facts read on the tables' owner, which row-level security does not bind
+    /// unless a table forces it.
+    #[must_use]
+    pub fn owner(pool: Pool<AsyncPgConnection>) -> Self {
+        Self(pool)
+    }
 }
 
 /// One translation, read once, so nothing downstream reads a second.
@@ -914,7 +933,7 @@ impl Translated {
     /// the translation cannot be re-derived, which startup already refused.
     pub async fn load_into<T>(
         &self,
-        pool: &Pool<AsyncPgConnection>,
+        facts: &FactSource,
         policy: &OpenFgaPolicy<ParserDB, T, ModelSubject<String, String>, Postgres>,
     ) -> Result<usize, SetupError>
     where
@@ -924,6 +943,7 @@ impl Translated {
         <T::ResponseBody as ResponseBody>::Error: Into<StdError> + Send,
         T::Future: Send,
     {
+        let pool = &facts.0;
         let records = self.keyed_records(pool).await?;
         policy
             .write_records(&records)
@@ -952,7 +972,7 @@ impl Translated {
     /// is known, and a retry is safe.
     pub async fn reconcile_store<T>(
         &self,
-        pool: &Pool<AsyncPgConnection>,
+        facts: &FactSource,
         policy: &OpenFgaPolicy<ParserDB, T, ModelSubject<String, String>, Postgres>,
     ) -> Result<(usize, usize), SetupError>
     where
@@ -962,6 +982,7 @@ impl Translated {
         <T::ResponseBody as ResponseBody>::Error: Into<StdError> + Send,
         T::Future: Send,
     {
+        let pool = &facts.0;
         let records = self.keyed_records(pool).await?;
         let outputs = self
             .translator
@@ -1378,9 +1399,9 @@ struct FgaUpkeep<Id, Key, T> {
     /// Re-derives the outputs a replayed query's rows are read through, which
     /// is the same translation the boot used.
     translator: Translator,
-    /// Runs a replayed query as the deployment, not as a caller: it asks what
-    /// the database now states, not what one viewer may see.
-    pool: Pool<AsyncPgConnection>,
+    /// Runs a replayed query as the deployment and never as a caller, since it
+    /// asks what the database now states for everyone.
+    facts: FactSource,
     delegate: OpenFgaPolicy<ParserDB, T, ModelSubject<Id, Key>, Postgres>,
     /// What each kind of fact reaches, walked once at startup.
     reach: GrantReach,
@@ -1685,13 +1706,13 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
             .translate(self.shapes.catalog())
             .map_err(|err| UpkeepError::Replay(err.to_string()))?
             .outputs_accepting_gaps();
-        let mut conn = self
-            .pool
+        let pool = &self.facts.0;
+        let mut conn = pool
             .get()
             .await
             .map_err(|err| UpkeepError::Replay(err.to_string()))?;
         let replayer = ConnettoReplayer {
-            pool: &self.pool,
+            pool,
             outputs: &outputs,
         };
         let mut outcome = Replayed::default();
@@ -1882,9 +1903,9 @@ mod tests {
     use subql::visibility::RowView;
 
     use super::{
-        BTreeMap, Body, FgaAuth, GrantHolder, GrantMove, GrpcService, ModelSubject, OpenFgaError,
-        OpenFgaPolicy, OpenFgaServiceClient, ParserDB, Principal, Reconciled, SubjectNaming,
-        Translated, UpkeepError, VisibilityPolicy, WithdrawnFact,
+        BTreeMap, Body, FactSource, FgaAuth, GrantHolder, GrantMove, GrpcService, ModelSubject,
+        OpenFgaError, OpenFgaPolicy, OpenFgaServiceClient, ParserDB, Principal, Reconciled,
+        SubjectNaming, Translated, UpkeepError, VisibilityPolicy, WithdrawnFact,
     };
     use connetto_core::auth::DEFAULT_USER_SETTING;
 
@@ -2692,7 +2713,7 @@ mod tests {
             .build(manager)
             .await
             .expect("the pool builds even though it connects nowhere");
-        let upkeep = auth.upkeep(reach, translator, pool);
+        let upkeep = auth.upkeep(reach, translator, FactSource::owner(pool));
         assert_eq!(
             upkeep.key_tables(),
             ["papers".to_owned()],

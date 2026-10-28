@@ -28,6 +28,8 @@ mod audit_table;
 
 mod auth_retry;
 
+mod authorization_facts;
+
 mod authentication;
 
 mod authn_db;
