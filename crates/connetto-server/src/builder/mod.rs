@@ -2221,18 +2221,24 @@ async fn build_authorization<D: ConnettoSchema>(
         &schema.pg_policies,
         DEFAULT_USER_SETTING,
     )?;
-    require_one_numbering(
-        translated.shapes_arc().catalog(),
-        &schema.engine_ddl::<RegistryIds<D>>(),
-    )?;
+    let engine_ddl = schema.engine_ddl::<RegistryIds<D>>();
+    require_one_numbering(translated.shapes_arc().catalog(), &engine_ddl)?;
     // A policy reading a table the change stream does not carry never hears
     // of a grant given or taken, so the store goes stale and then answers
     // confidently and wrongly, and this set difference names the table.
-    let required: Vec<Artifact<'_>> = translated
+    let mut required: Vec<Artifact<'_>> = translated
         .policy_tables()
         .iter()
         .map(|table| Artifact::PublishedTable { publication, table })
         .collect();
+    // The owner pool reads the facts off the tables the policies read, and
+    // the withdrawals and the bot registry off the synced tables, each for
+    // every caller at once, so row-level security must filter none of them.
+    let mut read_in_full = connetto_schema::schema_tables(&engine_ddl)?;
+    read_in_full.extend(translated.policy_tables().iter().cloned());
+    read_in_full.sort_unstable();
+    read_in_full.dedup();
+    required.extend(read_in_full.iter().map(|table| Artifact::ReadInFull(table)));
     preflight::require(owner_pool, &required).await?;
 
     let channel = openfga.endpoint()?.connect().await.map_err(|err| {
