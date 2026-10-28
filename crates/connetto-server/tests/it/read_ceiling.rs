@@ -29,7 +29,11 @@ use tracing::Instrument;
 
 const PG_DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, body TEXT); \
                       CREATE TABLE narrow (id INT PRIMARY KEY, n INT); \
-                      CREATE TABLE counts (id INT PRIMARY KEY, n INT);";
+                      CREATE TABLE counts (id INT PRIMARY KEY, n INT); \
+                      CREATE TABLE at_tz (k TIMESTAMPTZ PRIMARY KEY, n INT); \
+                      CREATE TABLE at_local (k TIMESTAMP PRIMARY KEY, n INT); \
+                      CREATE TABLE on_day (k DATE PRIMARY KEY, n INT); \
+                      CREATE TABLE at_time (k TIME PRIMARY KEY, n INT);";
 
 /// The manager these tests serve: the real Postgres read, a policy the initial
 /// read never consults, and no re-execution connector.
@@ -92,6 +96,11 @@ fn connect(manager: &Arc<Manager>) -> Client {
 /// The acknowledgement is what makes a paged read progress, so a drain that
 /// forgets it hangs rather than failing.
 async fn drain_pages(client: &mut Client, sub_id: &str) -> Vec<Vec<i64>> {
+    drain_pages_at(client, sub_id, 0).await
+}
+
+/// [`drain_pages`], returning the integer at `column` of each row.
+async fn drain_pages_at(client: &mut Client, sub_id: &str, column: usize) -> Vec<Vec<i64>> {
     let ControlMessage::SnapshotBegin(begin) = client.next_control().await else {
         panic!("expected a snapshot begin");
     };
@@ -101,7 +110,7 @@ async fn drain_pages(client: &mut Client, sub_id: &str) -> Vec<Vec<i64>> {
         match client.recv().await {
             Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch))) => {
                 assert_eq!(patch.sub_id, sub_id);
-                pages.push(ids_in(&patch.patchset_zstd));
+                pages.push(ints_in(&patch.patchset_zstd, column));
                 client.ack_credits(1).await;
             }
             Some(IncomingFrame::Control(ControlMessage::SnapshotEnd(end))) => {
@@ -113,17 +122,18 @@ async fn drain_pages(client: &mut Client, sub_id: &str) -> Vec<Vec<i64>> {
     }
 }
 
-/// The primary keys one delivered page carries, in delivery order.
-fn ids_in(payload: &[u8]) -> Vec<i64> {
+/// The integer at `column` of each row one delivered page carries, in
+/// delivery order.
+fn ints_in(payload: &[u8], column: usize) -> Vec<i64> {
     let raw = zstd::decode_all(payload).expect("decompress the page");
     let ParsedDiffSet::Patchset(set) = ParsedDiffSet::parse(&raw).expect("parse the page") else {
         panic!("a snapshot page is a patchset");
     };
     set.iter()
         .map(|op| match op {
-            PatchsetOp::Insert { values, .. } => match values.first() {
+            PatchsetOp::Insert { values, .. } => match values.get(column) {
                 Some(Value::Integer(id)) => *id,
-                other => panic!("the first column is the integer key, got {other:?}"),
+                other => panic!("column {column} is an integer, got {other:?}"),
             },
             other => panic!("a snapshot page carries inserts only, got {other:?}"),
         })
@@ -174,6 +184,66 @@ async fn a_read_over_the_budget_arrives_completely_in_pages() {
         (1..=200).collect::<Vec<i64>>(),
         "every row arrives exactly once across the pages"
     );
+}
+
+/// A read keyed by a date or time pages like an integer-keyed one: each page
+/// resumes past the last key it delivered, compared as the key's own type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_keyed_by_a_date_or_time_arrives_completely_in_pages() {
+    let fixture = Fixture::acquire().await;
+    let tables = [
+        (
+            "at_tz",
+            "TIMESTAMPTZ",
+            "timestamptz '2026-01-01 00:00:00+00' + g * interval '1 minute'",
+        ),
+        (
+            "at_local",
+            "TIMESTAMP",
+            "timestamp '2026-01-01 00:00:00' + g * interval '1 minute'",
+        ),
+        ("on_day", "DATE", "date '2026-01-01' + g"),
+        (
+            "at_time",
+            "TIME",
+            "time '00:00:00' + g * interval '1 second'",
+        ),
+    ];
+    for (table, kind, key) in tables {
+        fixture
+            .exec(&format!(
+                "CREATE TABLE {table} (k {kind} PRIMARY KEY, n INT)"
+            ))
+            .await;
+        fixture
+            .exec(&format!(
+                "INSERT INTO {table} (k, n) SELECT {key}, g FROM generate_series(1, 200) AS g"
+            ))
+            .await;
+        fixture.exec(&format!("ANALYZE {table}")).await;
+    }
+    let manager = manager(&fixture, limits(512, 32 * 1024, Duration::from_secs(30)));
+
+    for (table, _, _) in tables {
+        let mut client = connect(&manager);
+        client.handshake_with("pager", "user:pager").await;
+        client
+            .subscribe(table, &format!("SELECT * FROM {table}"))
+            .await;
+        let pages = drain_pages_at(&mut client, table, 1).await;
+        assert!(
+            pages.len() > 1,
+            "{table}: a 200 row read under a 512 byte budget must take several pages, took {}",
+            pages.len()
+        );
+        let mut delivered: Vec<i64> = pages.iter().flatten().copied().collect();
+        delivered.sort_unstable();
+        assert_eq!(
+            delivered,
+            (1..=200).collect::<Vec<i64>>(),
+            "{table}: every row arrives exactly once across the pages"
+        );
+    }
 }
 
 /// The same byte budget over wider rows produces smaller pages, because the page
