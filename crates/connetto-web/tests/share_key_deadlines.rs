@@ -727,9 +727,10 @@ async fn an_expired_grant_is_swapped_during_reconnect_backoff() {
     let saves = Rc::new(Cell::new(0u32));
     let dials = Rc::new(Cell::new(0u32));
     let now = seconds_now();
+    let grant_deadline = now + 8;
     let worker = ClientBuilder::new(skd_schema(), || ready(Err::<Upstream, &str>("offline")))
         .with_share_keys(vec![(
-            mint(now + 2),
+            mint(grant_deadline),
             CapabilitySubject::<String>::new(SKD_SUBJECT),
         )])
         .signed_in(
@@ -800,7 +801,12 @@ async fn an_expired_grant_is_swapped_during_reconnect_backoff() {
         err = hub_err.try_recv().unwrap_or_default(),
         m = log.mutations()
     );
-    timeout_ms(3_000).await;
+    assert!(
+        seconds_now() < grant_deadline,
+        "the grant is still live once the hub waits out its backoff"
+    );
+    let wait_ms = i64::max(0, (grant_deadline - seconds_now()) * 1000);
+    timeout_ms(i32::try_from(wait_ms).expect("expiry wait fits milliseconds")).await;
     let persisted = wait_until(async || saves.get() >= 2, 300, 10).await;
     assert!(
         persisted,
