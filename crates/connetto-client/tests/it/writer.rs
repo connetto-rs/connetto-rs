@@ -1595,7 +1595,10 @@ async fn a_refused_writer_carries_held_bytes_without_the_active_builds_renames()
         .first(conn.conn())
         .expect("read the carried entry");
     assert_eq!(carried, held);
-    assert_eq!(hash.as_slice(), entry_hash(&GENESIS, 1, &carried));
+    assert_eq!(
+        hash.as_slice(),
+        entry_hash(&GENESIS, 1, Major::new(1), None, &carried,)
+    );
     let expected = vec![UnsyncedWrite {
         writer: WriterRef::Number(9),
         seq: 1,
@@ -1632,7 +1635,7 @@ async fn a_split_table_entry_hashes_the_logical_bytes() {
     // ...and the hash and the queue head stand the logical upload bytes.
     assert_eq!(
         stored,
-        entry_hash(&GENESIS, 1, &logical).to_vec(),
+        entry_hash(&GENESIS, 1, Major::new(1), None, &logical).to_vec(),
         "the stored hash stands the logical upload bytes"
     );
     let head: Vec<u8> = _connetto_writers::table
@@ -2029,7 +2032,7 @@ fn split_pending_writers(source: &mut ConnettoConnection<Wire>) {
         .first(source.conn())
         .expect("later delete");
     let device = format!("device:{}", "01".repeat(32));
-    let device_head = entry_hash(&GENESIS, 1, &second);
+    let device_head = entry_hash(&GENESIS, 1, Major::new(1), None, &second);
     diesel::update(_connetto_pending::table.filter(_connetto_pending::seq.eq(2_i64)))
         .set((
             _connetto_pending::writer.eq(&device),

@@ -48,10 +48,12 @@ use connetto_client::{
     CorePump, DataDir, Grant, HeldCredential, LiveQuery, MemoryRefreshStore, PendingWork,
     ReconnectPolicy, SyncSchema, TierStepError,
 };
+use connetto_core::chain::{GENESIS, chain_walk};
 use connetto_core::messages::HeldWork;
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::{MAJOR_DIRECTIVE, Major, SchemaVersion, TierBoundary, TierHistory};
+use connetto_server::defaults::{_connetto_settled, _connetto_writers};
 use connetto_server::{
     ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, RuntimeWritableCatalog,
     SessionConfig, SessionManager, WebSocketTransport, pg_write_target,
@@ -62,6 +64,7 @@ use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_query;
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use tokio::net::TcpStream;
 
@@ -699,5 +702,186 @@ async fn a_decommissioned_major_is_update_required_and_its_drain_loses_its_work(
     );
 
     client.close().await;
+    router.close();
+}
+
+diesel::table! {
+    /// The client's private pending queue, read from its replica by the
+    /// acceptance assertions.
+    _connetto_pending (writer, seq) {
+        /// The writer the entry is queued under, as the replica spells it.
+        writer -> Text,
+        /// The entry's sequence in that writer's queue.
+        seq -> BigInt,
+        /// The changeset the entry applies.
+        changeset -> Binary,
+        /// The hash the client stored for the entry.
+        entry_hash -> Binary,
+        /// The entry's position in the writer's queue.
+        position -> BigInt,
+        /// The writer the entry was first written under.
+        prov_writer -> Nullable<Text>,
+        /// The sequence the entry was first written at.
+        prov_seq -> Nullable<BigInt>,
+    }
+}
+
+/// The client's queued writes, read from its replica in sequence order.
+fn client_pending(
+    conn: &mut ConnettoConnection<WebSocketTransport<TcpStream>>,
+) -> Vec<(String, i64, Vec<u8>, Vec<u8>)> {
+    _connetto_pending::table
+        .select((
+            _connetto_pending::writer,
+            _connetto_pending::seq,
+            _connetto_pending::changeset,
+            _connetto_pending::entry_hash,
+        ))
+        .order(_connetto_pending::seq.asc())
+        .load(conn.conn())
+        .expect("read the client's queue")
+}
+
+/// The server's settled entries, read as admin in sequence order.
+async fn settled_entries(fixture: &Fixture) -> Vec<(i64, i64, Vec<u8>)> {
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    diesel_async::RunQueryDsl::load(
+        _connetto_settled::table
+            .select((
+                _connetto_settled::writer,
+                _connetto_settled::seq,
+                _connetto_settled::entry_hash,
+            ))
+            .order(_connetto_settled::seq.asc()),
+        &mut *conn,
+    )
+    .await
+    .expect("read the settled entries")
+}
+
+/// The drain settles with the hash the client stored: the major 1 server's
+/// settled record holds the hash the client's replica held for the entry,
+/// and the core's chain walk over the client's stored row reaches the
+/// writer head the server holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drained_write_settles_with_the_hash_the_client_stored() {
+    let fixture = Fixture::acquire().await;
+    fixture
+        .exec("CREATE TABLE items (id INT PRIMARY KEY, label TEXT)")
+        .await;
+    let manager1 = manager(&fixture, PG_DDL_V1, one(), advertised(1, SQLITE_DDL_V1));
+    let router = Router::start(vec![(one(), entry(manager1))]).await;
+    let dir = tempdir().expect("device C's replica dir");
+
+    // Device C writes one row under major 1 while offline, and the client
+    // stores its hash in the pending queue before any server answers.
+    let (stored, unsent) = {
+        let mut offline = open_offline(
+            dir.path(),
+            build(1, SQLITE_DDL_V1, Some(TIER_V1)),
+            "device-c",
+        )
+        .await;
+        diesel::insert_into(items_v1::table)
+            .values((items_v1::id.eq(1), items_v1::label.eq("one")))
+            .execute(offline.conn())
+            .expect("write the row offline");
+        let seq = offline.push().await.expect("queue").expect("a sequence");
+        assert_eq!(seq, 1, "the offline write takes the first sequence");
+        (client_pending(&mut offline), offline.unsynced())
+    };
+    assert_eq!(stored.len(), 1, "the offline write stands in the queue");
+    let (writer_name, stored_seq, changeset, stored_hash) =
+        stored.into_iter().next().expect("the queued row");
+    assert_eq!(stored_seq, 1, "the queued row names the first sequence");
+    assert_eq!(unsent.len(), 1, "the gate names the one pending write");
+    assert_eq!(
+        unsent[0].major,
+        Some(one()),
+        "the write carries its capture major"
+    );
+
+    // The deployment migrates Postgres and hosts the major 2 manager.
+    fixture.exec("ALTER TABLE items ADD COLUMN note TEXT").await;
+    let manager2 = manager(&fixture, PG_DDL_V2, two(), advertised(2, SQLITE_DDL_V2));
+    router.host(two(), entry(manager2));
+
+    // The app updates and the held major 1 write drains to the major 1 manager.
+    let (core, pump) = connect_pumped(
+        &router,
+        build_two(&Arc::new(AtomicUsize::new(0))),
+        "device-c",
+        dir.path(),
+    )
+    .await
+    .expect("the update opens");
+    let client = core.client();
+    let pump = tokio::spawn(pump);
+    let mut events = client.events();
+    await_event(
+        &mut events,
+        deadline(),
+        |event| {
+            matches!(
+                event,
+                ClientEvent::Held(HeldWork::Applied { major, write })
+                    if *major == one() && write.seq == 1
+            )
+        },
+        rejected,
+    )
+    .await;
+    await_event(
+        &mut events,
+        deadline(),
+        |event| matches!(event, ClientEvent::Held(HeldWork::Drained { major }) if *major == one()),
+        rejected,
+    )
+    .await;
+    wait_rows(&fixture, 1).await;
+
+    // The major 1 server settled the entry with the hash the client stored.
+    let entries = settled_entries(&fixture).await;
+    assert_eq!(entries.len(), 1, "the drain settled exactly one entry");
+    let (writer, seq, server_hash) = entries.into_iter().next().expect("the settled entry");
+    assert_eq!(seq, 1, "the settled entry names the first sequence");
+    assert_eq!(
+        server_hash, stored_hash,
+        "the server settles the hash the client stored"
+    );
+    assert!(
+        writer_name.starts_with("number:"),
+        "the queue names a number writer: {writer_name}"
+    );
+
+    // The core's chain walk over the client's stored row reaches the head
+    // the server holds.
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&Sha256::digest(&changeset));
+    let head = chain_walk(
+        &GENESIS,
+        vec![(
+            u64::try_from(seq).expect("the sequence fits"),
+            unsent[0].major,
+            None,
+            digest,
+        )],
+    );
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    let held_head = diesel_async::RunQueryDsl::get_result::<Option<Vec<u8>>>(
+        _connetto_writers::table
+            .filter(_connetto_writers::writer.eq(writer))
+            .select(_connetto_writers::head),
+        &mut *conn,
+    )
+    .await
+    .expect("read the writer head");
+    assert_eq!(
+        held_head,
+        Some(head.to_vec()),
+        "the client's chain reaches the writer head the server holds"
+    );
+    client.close().await;
+    pump.await.expect("the pump ends on close");
     router.close();
 }

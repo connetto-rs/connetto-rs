@@ -60,7 +60,7 @@ env = []
 # Device certificates (R74): the identity a native device proves to its peers,
 # issued by the server and checked by every native side. Native only, since
 # browsers never enrol, so the browser build never links `ring` through it.
-device-cert = ["dep:rcgen", "dep:x509-parser", "dep:time"]
+device-cert = ["dep:rcgen", "dep:x509-parser", "dep:time", "dep:ring"]
 
 [dependencies]
 serde.workspace = true
@@ -91,6 +91,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "x509-parser"], optional = true }
 x509-parser = { version = "0.18", features = ["verify"], optional = true }
 time = { version = "0.3", default-features = false, optional = true }
+# The range and offer verifiers check ECDSA P-256 signatures the way the
+# server verifies. Native only, so the browser build never links it.
+ring = { version = "0.17", optional = true }
 
 [dev-dependencies]
 serde_json = "1"

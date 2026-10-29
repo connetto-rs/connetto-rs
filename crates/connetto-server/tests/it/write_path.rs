@@ -783,8 +783,8 @@ async fn a_write_the_settled_record_covers_is_acknowledged_unapplied() {
     expect_applied(&mut client, 1).await;
 
     // Stands in for a commit of 2 whose reply never reached the connection.
-    let h1 = entry_hash(&GENESIS, 1, &cs1);
-    let h2 = entry_hash(&h1, 2, &cs2);
+    let h1 = entry_hash(&GENESIS, 1, None, None, &cs1);
+    let h2 = entry_hash(&h1, 2, None, None, &cs2);
     fixture
         .setup(&[
             &format!(
