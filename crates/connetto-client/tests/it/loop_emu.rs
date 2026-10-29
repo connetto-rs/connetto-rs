@@ -680,7 +680,7 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         "live insert reached the local replica",
     );
 
-    // Write locally through the managed connection; the session captures it.
+    // Write locally through the managed connection; the outbox records it.
     sql_query("INSERT INTO orders (id, price, quantity, status) VALUES (9, 2.0, 1, 'local')")
         .execute(client.conn())
         .expect("local insert");

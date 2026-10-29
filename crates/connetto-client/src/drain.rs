@@ -37,8 +37,8 @@ use diesel::sqlite::SqliteConnection;
 use crate::away::Clock as _;
 use crate::majors::held_batch;
 use crate::{
-    ClientError, ClientEvent, ConnettoConnection, EntryRecord, HandshakeInput, HandshakeOk,
-    SHARE_KEY_REQUEST_WAIT, ShareKeyRequest, SuspendedCapture, WriterQueue, clock, delete_pending,
+    ClientError, ClientEvent, ConnettoConnection, EntryRecord, ExemptWrites, HandshakeInput,
+    HandshakeOk, SHARE_KEY_REQUEST_WAIT, ShareKeyRequest, WriterQueue, clock, delete_pending,
     delete_writer_pending, exchange_handshake, is_real_writer, live_share_grants, persist_pending,
     persist_retire, persist_writer_state, share_key_request_id, unissued,
 };
@@ -483,7 +483,7 @@ where
                 // later handshake names it (R70 decision 22).
                 if let Some(queue) = self.writers.get_mut(&issued) {
                     queue.secret = secret;
-                    let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                    let _suspended = ExemptWrites::raise(&self.write_flags);
                     crate::persist_writer_secret(&mut self.db, &issued, secret.as_ref())?;
                 }
                 self.drain_reconcile(major, issued, grant.frontier).await
@@ -670,7 +670,7 @@ where
             if raised != queue.next_seq {
                 queue.next_seq = raised;
                 let (next_seq, head) = (queue.next_seq, queue.head);
-                let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                let _suspended = ExemptWrites::raise(&self.write_flags);
                 persist_writer_state(&mut self.db, &writer, next_seq, &head)?;
             }
         }
@@ -732,7 +732,7 @@ where
             .and_then(|queue| queue.pending.remove(&seq))
             .is_some();
         if removed {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             delete_pending(&mut self.db, &writer, seq)?;
         }
         self.drain.in_flight.remove(&seq);
@@ -800,7 +800,7 @@ where
             self.settle_entry(write.writer, write.seq)?;
         }
         let files = {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             crate::majors::forget_batch(&mut self.db, major, self.config.held_content)?
         };
         let mut device_retired = false;
@@ -837,7 +837,7 @@ where
     async fn owe_retire(&mut self, writer: WriterRef) -> Result<(), ClientError> {
         let secret = self.writers.get(&writer).and_then(|queue| queue.secret);
         {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             persist_retire(&mut self.db, &writer, secret.as_ref())?;
         }
         if self.is_connected() {
@@ -870,7 +870,7 @@ where
             placed.insert(seq, entry);
         }
         {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             self.db.transaction::<(), ClientError, _>(|db| {
                 delete_writer_pending(db, &writer)?;
                 for (seq, entry) in &placed {
@@ -896,7 +896,7 @@ where
             return Ok(());
         }
         {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             crate::majors::forget_batch(&mut self.db, major, self.config.held_content)?;
         }
         self.drop_drain_wire().await;

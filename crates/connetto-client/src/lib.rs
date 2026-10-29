@@ -46,9 +46,7 @@ use diesel::sqlite::{
     SqliteUpdateRouter, WalCheckpointMode,
 };
 use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
-use diesel_sqlite_session::{
-    ConflictAction, ConflictType, Session, SqliteSessionExt, invert_changeset,
-};
+use diesel_sqlite_session::{ConflictAction, ConflictType, SqliteSessionExt, invert_changeset};
 use sqlite_diff_rs::{
     DiffOps, DynTable, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK, TableSchema,
     Value,
@@ -215,7 +213,7 @@ pub enum ClientError {
     /// a display reads what the wire said.
     #[error("subscription refused")]
     SubscriptionRefused,
-    /// The SQLite capture session failed.
+    /// A local operation on the replica or its bookkeeping failed.
     #[error("session error: {0}")]
     Session(String),
     /// Applying a server patch to the local replica failed.
@@ -475,12 +473,14 @@ pub enum ClientError {
     /// lost without a word.
     ///
     /// SQLite records nothing for a table whose only key is the implicit
-    /// `rowid`, and two mechanisms depend on that record: the capture session
-    /// bound to `main`, so a synced table is never uploaded, and the session
-    /// diff the browser relay serves a tab from, so a table of either
-    /// database is never read by a sibling tab. `CREATE TABLE prefs (name
+    /// `rowid`, and two mechanisms depend on a key: the outbox, which records
+    /// only keyed tables in `main`, so a synced table is never uploaded, and
+    /// the session diff the browser relay serves a tab from, so a table of
+    /// either database is never read by a sibling tab. `CREATE TABLE prefs (name
     /// TEXT, value TEXT)` is a keyed table by SQL's standards, so this
-    /// requirement is connetto's own and the refusal names the fix.
+    /// requirement is connetto's own and the refusal names the fix. A key of
+    /// more than 255 columns is refused too, since a change record numbers
+    /// each key column in one byte.
     ///
     /// A table listed in
     /// [`SyncSchema::with_unrecorded_tables`](crate::SyncSchema::with_unrecorded_tables) that does
@@ -491,6 +491,17 @@ pub enum ClientError {
     WritesNotRecorded {
         /// One sentence per table, naming which database holds it and what to
         /// change.
+        tables: Vec<String>,
+    },
+    /// A schema change would drop or rename tables that hold writes not yet
+    /// pushed, which the upload could then no longer name. Nothing changed,
+    /// and the change goes through after a [`push`](ConnettoConnection::push).
+    #[error(
+        "the schema change drops or renames {}, which hold writes not yet pushed, so push them first",
+        .tables.join(", ")
+    )]
+    UnpushedWrites {
+        /// The tables the change would take away, as the outbox names them.
         tables: Vec<String>,
     },
     /// A plain `ws` URL named a host that is not loopback, refused before
@@ -1833,119 +1844,63 @@ fn rollback_omit(_conflict: ConflictType) -> ConflictAction {
     ConflictAction::Omit
 }
 
-/// Tables written since the last push, in first-write order.
-type WriteOrder = Arc<Mutex<Vec<String>>>;
-
-/// The capture sessions of one connection, the shared store's apart because
-/// a session records one schema.
-struct Capture {
-    main: Session,
-    shared: Option<Session>,
-    order: Option<WriteOrder>,
+/// The two switches over connetto's own writes, read by the SQL functions
+/// the translated schema's write guards and the outbox triggers call.
+#[derive(Default)]
+struct WriteFlags {
+    /// Raised by [`ExemptWrites`], read through
+    /// [`connetto_core::WRITE_EXEMPTION_FUNCTION`] by the write guards and
+    /// the outbox triggers alike.
+    exempt: AtomicBool,
+    /// Raised by [`UnrecordedWrites`], read through
+    /// [`outbox::UNRECORDED_FUNCTION`] by the outbox triggers alone.
+    unrecorded: AtomicBool,
 }
 
-impl Capture {
-    /// Open the sessions, the shared store's only when `order` is given.
-    fn open(db: &mut SqliteConnection, order: Option<WriteOrder>) -> Result<Self, ClientError> {
-        let session_err =
-            |e: diesel_sqlite_session::SessionError| ClientError::Session(e.to_string());
-        let mut main = db.create_session().map_err(session_err)?;
-        main.set_table_filter(|name| !name.starts_with("_connetto"));
-        main.attach_all().map_err(session_err)?;
-        let shared = if order.is_some() {
-            let mut shared = db.create_session_on(SHARED_SCHEMA).map_err(session_err)?;
-            shared.set_table_filter(|name| !name.starts_with("_connetto"));
-            shared.attach_all().map_err(session_err)?;
-            Some(shared)
-        } else {
-            None
-        };
-        Ok(Self {
-            main,
-            shared,
-            order,
-        })
-    }
-
-    fn set_enabled(&mut self, enabled: bool) {
-        self.main.set_enabled(enabled);
-        if let Some(shared) = &mut self.shared {
-            shared.set_enabled(enabled);
-        }
-    }
-
-    /// Everything captured since the last reset, its table sections in
-    /// first-write order, the order one session gives when every table lives
-    /// in `main`.
-    ///
-    /// The server applies a mutation in section order and checks references
-    /// per statement, so a row may reference one written before it.
-    fn changeset(&mut self) -> Result<Vec<u8>, ClientError> {
-        let session_err =
-            |e: diesel_sqlite_session::SessionError| ClientError::Session(e.to_string());
-        let main = self.main.changeset().map_err(session_err)?;
-        let Some(shared) = &mut self.shared else {
-            return Ok(main);
-        };
-        let shared = shared.changeset().map_err(session_err)?;
-        if shared.is_empty() {
-            return Ok(main);
-        }
-        if main.is_empty() {
-            return Ok(shared);
-        }
-        let order = self
-            .order
-            .as_ref()
-            .and_then(|order| order.lock().ok().map(|order| order.clone()))
-            .unwrap_or_default();
-        let mut bytes = main;
-        bytes.extend_from_slice(&shared);
-        let mut parsed = ParsedDiffSet::parse(&bytes)
-            .map_err(|err| ClientError::Session(format!("merging the captures: {err:?}")))?;
-        parsed.sort_tables_by_key(|table| {
-            order
-                .iter()
-                .position(|name| name.eq_ignore_ascii_case(table.name()))
-                .unwrap_or(usize::MAX)
-        });
-        Ok(parsed.into())
-    }
-
-    /// Replace the sessions, so the next changeset holds only later writes.
-    fn reset(&mut self, db: &mut SqliteConnection) -> Result<(), ClientError> {
-        if let Some(order) = &self.order
-            && let Ok(mut order) = order.lock()
-        {
-            order.clear();
-        }
-        *self = Self::open(db, self.order.clone())?;
-        Ok(())
-    }
+/// Holds the write exemption for a write connetto makes itself, so the
+/// outbox triggers record nothing and the translated schema's write guards
+/// admit it, lowering it on drop.
+struct ExemptWrites {
+    flags: Arc<WriteFlags>,
 }
 
-/// Suspends capture and holds the write exemption for a server-originated
-/// apply, restoring both on drop.
-struct SuspendedCapture<'s> {
-    session: &'s mut Capture,
-    exempt: Arc<AtomicBool>,
-}
-
-impl<'s> SuspendedCapture<'s> {
-    fn new(session: &'s mut Capture, exempt: &Arc<AtomicBool>) -> Self {
-        session.set_enabled(false);
-        exempt.store(true, Ordering::Relaxed);
+impl ExemptWrites {
+    fn raise(flags: &Arc<WriteFlags>) -> Self {
+        flags.exempt.store(true, Ordering::Relaxed);
         Self {
-            session,
-            exempt: Arc::clone(exempt),
+            flags: Arc::clone(flags),
         }
     }
 }
 
-impl Drop for SuspendedCapture<'_> {
+impl Drop for ExemptWrites {
     fn drop(&mut self) {
-        self.exempt.store(false, Ordering::Relaxed);
-        self.session.set_enabled(true);
+        self.flags.exempt.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Keeps the outbox triggers from recording while the write exemption stays
+/// down, for a write the translated schema's write guards judge and this
+/// device does not upload, as a peer's entry applied as its author is
+/// (R77). Lowered on drop.
+#[cfg_attr(not(test), expect(dead_code, reason = "R77's peer apply raises it"))]
+struct UnrecordedWrites {
+    flags: Arc<WriteFlags>,
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "R77's peer apply raises it"))]
+impl UnrecordedWrites {
+    fn raise(flags: &Arc<WriteFlags>) -> Self {
+        flags.unrecorded.store(true, Ordering::Relaxed);
+        Self {
+            flags: Arc::clone(flags),
+        }
+    }
+}
+
+impl Drop for UnrecordedWrites {
+    fn drop(&mut self) {
+        self.flags.unrecorded.store(false, Ordering::Relaxed);
     }
 }
 
@@ -2300,32 +2255,40 @@ fn register_bot_list(db: &mut SqliteConnection, list: String) -> Result<(), Clie
 /// pg2sqlite's write guards are fail-closed: a translation built with
 /// `with_write_exemption_function` names one function, and a backing-table
 /// write is admitted only while that function returns true. connetto holds it
-/// true exactly while its capture session is suspended, which is every write
+/// true exactly while it holds the write exemption, which is every write
 /// connetto authors itself: applying server-authoritative patches, rolling a
 /// refused mutation back, evicting uncovered rows, and its own bookkeeping.
 /// The application's writes always see it false, so the policy judges them.
-/// Register [`connetto_core::WRITE_EXEMPTION_FUNCTION`] backed by `flag`.
+/// Register [`connetto_core::WRITE_EXEMPTION_FUNCTION`] and
+/// [`outbox::UNRECORDED_FUNCTION`] backed by `flags`.
 ///
 /// A build that translates its schema with policies passes the same name to
 /// `Pg2SqliteOptions::with_write_exemption_function`. connetto registers the
 /// function on every replica connection it opens, whether or not the schema
 /// names it.
 ///
-/// Nondeterministic on purpose: its value changes between statements (the
-/// suspension guard flips it), so SQLite must not hoist or cache it the way
-/// the caller function invites. Innocuous because the generated triggers are
-/// exactly the schema objects it has to be callable from.
-fn register_write_exemption(
+/// Nondeterministic on purpose: their values change between statements (the
+/// guards flip them), so SQLite must not hoist or cache them the way the
+/// caller function invites. Innocuous because the generated triggers are
+/// exactly the schema objects they have to be callable from.
+fn register_write_flags(
     db: &mut SqliteConnection,
-    flag: &Arc<AtomicBool>,
+    flags: &Arc<WriteFlags>,
 ) -> Result<(), ClientError> {
-    let flag = Arc::clone(flag);
+    let exempt = Arc::clone(flags);
     db.register_noarg_sql_function::<diesel::sql_types::Bool, _, _>(
         connetto_core::WRITE_EXEMPTION_FUNCTION,
         SqliteFunctionBehavior::INNOCUOUS,
-        move || flag.load(Ordering::Relaxed),
+        move || exempt.exempt.load(Ordering::Relaxed),
     )
-    .map_err(|e| ClientError::Session(format!("registering the write exemption function: {e}")))
+    .map_err(|e| ClientError::Session(format!("registering the write exemption function: {e}")))?;
+    let unrecorded = Arc::clone(flags);
+    db.register_noarg_sql_function::<diesel::sql_types::Bool, _, _>(
+        outbox::UNRECORDED_FUNCTION,
+        SqliteFunctionBehavior::INNOCUOUS,
+        move || unrecorded.unrecorded.load(Ordering::Relaxed),
+    )
+    .map_err(|e| ClientError::Session(format!("registering the unrecorded function: {e}")))
 }
 
 /// Whether `name` is SQLite's or connetto's own, rather than the application's.
@@ -2512,13 +2475,18 @@ fn schema_label(schema: &str) -> &'static str {
     }
 }
 
+/// The most key columns a SQLite change record can number, one byte each.
+const MAX_KEY_COLUMNS: i64 = 255;
+
 /// Refuse the tables of `schema` whose changes connetto cannot record.
 ///
 /// SQLite records nothing for a table whose only key is the implicit `rowid`,
 /// so a write to one is never uploaded and never reaches a sibling browser
-/// tab, and nothing else notices. `accepted` names the tables whose missing
-/// key the application declared intentional, and a name in it that does
-/// declare a key is refused for the opposite reason (R62).
+/// tab, and nothing else notices. A change record numbers each key column in
+/// one byte, so a key of more than 255 columns cannot be recorded either.
+/// `accepted` names the tables whose missing key the application declared
+/// intentional, and a name in it that does declare a key is refused for the
+/// opposite reason (R62).
 fn check_recorded_tables(
     db: &mut SqliteConnection,
     schema: &str,
@@ -2530,19 +2498,25 @@ fn check_recorded_tables(
         if is_internal_table(&row.name) {
             continue;
         }
-        let keyed = key_columns(db, schema, &row.name)? > 0;
-        match (keyed, accepted.contains(&row.name.to_lowercase())) {
-            (false, false) => tables.push(format!(
+        let key = key_columns(db, schema, &row.name)?;
+        match (key, accepted.contains(&row.name.to_lowercase())) {
+            (0, false) => tables.push(format!(
                 "{} in the {where_it_is} database declares no primary key, so SQLite records \
                  nothing for it and writes to it are lost: declare one (a single-row table wants \
                  id INTEGER PRIMARY KEY CHECK (id = 1)), or accept the loss with \
                  SyncSchema::with_unrecorded_tables",
                 row.name
             )),
-            (true, true) => tables.push(format!(
+            (1.., true) => tables.push(format!(
                 "{} in the {where_it_is} database declares a primary key and is named in \
                  SyncSchema::with_unrecorded_tables, so the two disagree: drop the name to sync \
                  it, or drop the key to keep it local",
+                row.name
+            )),
+            (wide, false) if wide > MAX_KEY_COLUMNS => tables.push(format!(
+                "{} in the {where_it_is} database declares {key} primary key columns, more than \
+                 the {MAX_KEY_COLUMNS} a SQLite change record can number, so writes to it cannot \
+                 be recorded: declare a key of at most {MAX_KEY_COLUMNS} columns",
                 row.name
             )),
             _ => {}
@@ -3143,6 +3117,10 @@ struct CarriedEntry {
     provenance: Option<Provenance>,
 }
 
+/// A queued entry on its way out: its sequence, its changeset and its
+/// provenance.
+type QueuedSend = (u64, Vec<u8>, Option<Provenance>);
+
 /// One writer's queue, the client half of the (writer, sequence) identity.
 #[derive(Debug, Clone)]
 struct WriterQueue {
@@ -3156,6 +3134,11 @@ struct WriterQueue {
     secret: Option<WriterSecret>,
     /// The queued entries, in sequence order.
     pending: BTreeMap<u64, PendingEntry>,
+    /// The highest sequence of this writer sent on the current transport, 0
+    /// for none, so a push sends every queued entry above it and never
+    /// leaves the server a gap. Held in memory only, since a new transport
+    /// starts from nothing sent.
+    sent_through: u64,
 }
 
 impl WriterQueue {
@@ -3166,6 +3149,7 @@ impl WriterQueue {
             head: GENESIS,
             secret: None,
             pending: BTreeMap::new(),
+            sent_through: 0,
         }
     }
 }
@@ -3246,6 +3230,7 @@ fn load_writer_states(
                 head: row.head.try_into().ok()?,
                 secret: stored_secret(row.secret),
                 pending: BTreeMap::new(),
+                sent_through: 0,
             };
             Some((writer_from_id(&row.id)?, queue))
         })
@@ -3814,25 +3799,15 @@ async fn timer_wait(remaining: Duration) {
 /// `staging`. `apply_patch` merges staging into `applied_rows` only after the
 /// transaction commits, so a rolled-back apply leaves no phantom counts.
 /// One atomic load and one map bump per row, the O(1) the decision asked for.
-///
-/// With `order` given, it also appends each table capture writes, skipping
-/// suspended writes, to the first-write list [`Capture::changeset`] sorts by.
-///
-/// Debug builds also collect into `exempt_written` each table a write under
-/// the exemption changed, for the outbox check to leave alone.
 fn install_change_tracker(
     conn: &mut SqliteConnection,
     changed: &Arc<Mutex<HashSet<String>>>,
     staging: &Arc<Mutex<HashMap<String, u64>>>,
     counting: &Arc<AtomicBool>,
-    order: Option<(WriteOrder, Arc<AtomicBool>)>,
-    #[cfg(debug_assertions)] exempt_written: (&Arc<Mutex<HashSet<String>>>, &Arc<AtomicBool>),
 ) {
     let sink = Arc::clone(changed);
     let rows = Arc::clone(staging);
     let gate = Arc::clone(counting);
-    #[cfg(debug_assertions)]
-    let (exempt_written, exempt) = (Arc::clone(exempt_written.0), Arc::clone(exempt_written.1));
     conn.on_update(
         SqliteUpdateRouter::new().on_any(SqliteChangeOps::ALL, move |event| {
             if let Ok(mut tables) = sink.lock() {
@@ -3843,21 +3818,6 @@ fn install_change_tracker(
                 && let Ok(mut counts) = rows.lock()
             {
                 *counts.entry(event.table_name.to_owned()).or_insert(0) += 1;
-            }
-            if let Some((order, exempt)) = &order
-                && !exempt.load(Ordering::Relaxed)
-                && !is_internal_table(event.table_name)
-                && let Ok(mut order) = order.lock()
-                && !order.iter().any(|name| name == event.table_name)
-            {
-                order.push(event.table_name.to_owned());
-            }
-            #[cfg(debug_assertions)]
-            if exempt.load(Ordering::Relaxed)
-                && !is_internal_table(event.table_name)
-                && let Ok(mut tables) = exempt_written.lock()
-            {
-                tables.insert(event.table_name.to_owned());
             }
         }),
     );
@@ -4046,10 +4006,6 @@ pub struct ConnettoConnection<T: Transport> {
     /// How many handshakes this connection has completed.
     #[cfg(feature = "device-identity")]
     handshakes: u64,
-    // `session` is declared before `db` so it drops first: its sessions hold
-    // a raw pointer into the connection's SQLite handle and must not outlive
-    // it.
-    session: Capture,
     db: SqliteConnection,
     last_cursor: Option<Cursor>,
     /// The queues of the writers this replica has queued writes under.
@@ -4083,20 +4039,18 @@ pub struct ConnettoConnection<T: Transport> {
     #[cfg(feature = "device-identity")]
     retired_keys: HashSet<[u8; 32]>,
     /// Set by the commit hook whenever a write commits, so the driver knows
-    /// to look for a captured mutation to flush. Server patch applies trip it
-    /// too, harmlessly: an empty capture session never uploads.
+    /// to look for a recorded write to flush. Server patch applies trip it
+    /// too, harmlessly: an empty outbox never uploads.
     dirty: Arc<AtomicBool>,
-    /// True while [`SuspendedCapture`] holds it, read by the registered
-    /// [`connetto_core::WRITE_EXEMPTION_FUNCTION`], so the translated schema's fail-closed
-    /// write guards admit connetto's own writes and nobody else's.
-    write_exempt: Arc<AtomicBool>,
+    /// The write exemption and the outbox's own switch, read by the
+    /// registered [`connetto_core::WRITE_EXEMPTION_FUNCTION`] and
+    /// [`outbox::UNRECORDED_FUNCTION`], so the outbox records nothing
+    /// connetto writes and the translated schema's fail-closed write guards
+    /// admit connetto's own writes and nobody else's.
+    write_flags: Arc<WriteFlags>,
     /// Raised while [`change_schema`](Self::change_schema) runs, the only time
     /// the authorizer admits DDL on an application table in `main`.
     schema_open: Arc<AtomicBool>,
-    /// The tables a write under the exemption changed since the last push,
-    /// which the debug outbox check leaves alone.
-    #[cfg(debug_assertions)]
-    exempt_written: Arc<Mutex<HashSet<String>>>,
     /// Names of tables whose rows changed since the last drain, from the
     /// connection's update hook (local writes and server patches alike).
     changed: Arc<Mutex<HashSet<String>>>,
@@ -4454,7 +4408,7 @@ where
     }
 
     /// Shared open body: open the database, unlock the page codec, apply the
-    /// schema when it arrives as DDL, and hook the capture session. No
+    /// schema when it arrives as DDL, and install the outbox triggers. No
     /// handshake happens here, which is the whole point.
     #[expect(
         clippy::too_many_lines,
@@ -4513,10 +4467,11 @@ where
             register_subjects(&mut db, &subjects.function, subjects.rendered(now))?;
         }
         // Beside the caller function and for the same reach: the generated
-        // write guards call it, so it exists before any trigger can run. A
-        // schema that never names it pays nothing.
-        let write_exempt = Arc::new(AtomicBool::new(false));
-        register_write_exemption(&mut db, &write_exempt)?;
+        // write guards and the outbox triggers call them, so they exist
+        // before any trigger can run. A schema that never names them pays
+        // nothing.
+        let write_flags = Arc::new(WriteFlags::default());
+        register_write_flags(&mut db, &write_flags)?;
         // A person carries the wildcard, and a bot login reads its list here (R99).
         register_bot_list(&mut db, connetto_core::BOT_LIST_WILDCARD.to_owned())?;
         let (prior, reset_resume) = install_replica_schema(&mut db, replica, boot, config)?;
@@ -4542,34 +4497,16 @@ where
         let applied_rows: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let apply_staging: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let apply_counting = Arc::new(AtomicBool::new(false));
-        let dirty = Arc::new(AtomicBool::new(false));
-        // The sessions still build the upload, so writes a previous run left
-        // in the outbox were lost with that run's sessions and go with them.
+        // A write a previous run committed and never pushed is still in the
+        // outbox, and the next flush uploads it.
+        let dirty = Arc::new(AtomicBool::new(outbox::holds_writes(&mut db)?));
         outbox::install(&mut db)?;
         if !config.shared_tables.is_empty() {
             outbox::install_shared(&mut db, &config.client_id, &config.shared_tables)?;
         }
-        outbox::clear(&mut db)?;
         let schema_open = Arc::new(AtomicBool::new(false));
         outbox::guard_schema(&mut db, &schema_open);
-        // The store is attached exactly when the build shares tables.
-        let write_order = config
-            .shared_layout
-            .is_some()
-            .then(|| Arc::new(Mutex::new(Vec::new())));
-        #[cfg(debug_assertions)]
-        let exempt_written: Arc<Mutex<HashSet<String>>> = Arc::default();
-        install_change_tracker(
-            &mut db,
-            &changed,
-            &apply_staging,
-            &apply_counting,
-            write_order
-                .as_ref()
-                .map(|order| (Arc::clone(order), Arc::clone(&write_exempt))),
-            #[cfg(debug_assertions)]
-            (&exempt_written, &write_exempt),
-        );
+        install_change_tracker(&mut db, &changed, &apply_staging, &apply_counting);
         {
             let dirty = Arc::clone(&dirty);
             db.on_commit(move || {
@@ -4577,7 +4514,6 @@ where
                 CommitDecision::Proceed
             });
         }
-        let session = Capture::open(&mut db, write_order)?;
 
         // Read after every statement this open applies, so the first write
         // re-checks only what the application changed since.
@@ -4590,7 +4526,6 @@ where
             notices: VecDeque::new(),
             #[cfg(feature = "device-identity")]
             handshakes: 0,
-            session,
             db,
             last_cursor: resume,
             writers,
@@ -4609,10 +4544,8 @@ where
             #[cfg(feature = "device-identity")]
             retired_keys,
             dirty,
-            write_exempt,
+            write_flags,
             schema_open,
-            #[cfg(debug_assertions)]
-            exempt_written,
             changed,
             applied_rows,
             apply_counting,
@@ -4678,7 +4611,7 @@ where
     ///
     /// Driven from `open` rather than exposed, because which one is legal
     /// depends on what the replica keeps at rest and only the replica knows
-    /// that. The capture session is bound to `main`, so writes to these tables
+    /// that. The outbox records no table of the tier, so writes to these tables
     /// are physically incapable of being uploaded, rejected, or rolled back,
     /// and live queries over them are served locally with no subscription.
     ///
@@ -4831,7 +4764,7 @@ where
 
     /// Give this connection a transport: greet the server with the highest
     /// applied cursor and the writer this run writes as, and keep every piece
-    /// of local state (replica, capture session, the writer queues, the
+    /// of local state (replica, outbox, the writer queues, the
     /// sequence counters).
     ///
     /// One method for both arrivals, because they are one operation. A
@@ -4922,6 +4855,7 @@ where
         self.keepalive_armed += 1;
         self.history_cleared = false;
         self.bound_writer = bound;
+        self.forget_sent();
         self.share_key_settled = self.share_key_generation;
         self.authorization_cleared = Some(HashSet::new());
         self.attach_replay = AttachReplay::Pending { frontier };
@@ -4988,30 +4922,50 @@ where
     ///
     /// [`ClientError`] when encoding or sending a queued entry fails.
     pub async fn replay_pending(&mut self) -> Result<(), ClientError> {
-        if !self.is_connected() {
-            return Ok(());
-        }
-        let Some((writer, queue)) = self
-            .bound_writer
-            .and_then(|writer| self.writers.get(&writer).map(|queue| (writer, queue)))
-        else {
+        let Some((writer, sends)) = self.queued_sends(0) else {
             return Ok(());
         };
+        for (seq, changeset, provenance) in sends {
+            self.send_mutation(writer, seq, &changeset, provenance.as_ref())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Send the bound writer's entries this transport has not carried yet,
+    /// as [`replay_pending`](Self::replay_pending) sends them.
+    async fn send_unsent(&mut self) -> Result<(), ClientError> {
+        let after = self
+            .bound_writer
+            .and_then(|writer| self.writers.get(&writer))
+            .map_or(0, |queue| queue.sent_through);
+        let Some((writer, sends)) = self.queued_sends(after) else {
+            return Ok(());
+        };
+        for (seq, changeset, provenance) in sends {
+            self.send_mutation(writer, seq, &changeset, provenance.as_ref())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The bound writer and its queued entries above sequence `after`, in
+    /// sequence order, up to the first entry another major's entry holds
+    /// back (R31). None while offline or unbound.
+    fn queued_sends(&self, after: u64) -> Option<(WriterRef, Vec<QueuedSend>)> {
+        let writer = self.bound_writer.filter(|_| self.is_connected())?;
+        let queue = self.writers.get(&writer)?;
         let held_from = self.held_from();
-        let replays: Vec<(u64, Vec<u8>, Option<Provenance>)> = queue
+        let sends = queue
             .pending
-            .iter()
+            .range(after.saturating_add(1)..)
             .take_while(|(_, entry)| {
                 !self.held_major(entry.major)
                     && held_from.is_none_or(|position| entry.position < position)
             })
             .map(|(seq, entry)| (*seq, entry.changeset.clone(), entry.provenance))
             .collect();
-        for (seq, changeset, provenance) in replays {
-            self.send_mutation(writer, seq, &changeset, provenance.as_ref())
-                .await?;
-        }
-        Ok(())
+        Some((writer, sends))
     }
 
     /// The lowest append position among the queued entries another major
@@ -5173,7 +5127,7 @@ where
                 }
                 let number = WriterRef::Number(grant.number);
                 {
-                    let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                    let _suspended = ExemptWrites::raise(&self.write_flags);
                     let queue = self.writers.get(&unissued());
                     self.db.transaction::<(), ClientError, _>(|db| {
                         let (next_seq, head) = if let Some(queue) = queue {
@@ -5294,7 +5248,7 @@ where
             .entry(WriterRef::Device(key_id))
             .or_insert_with(WriterQueue::fresh);
         {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             persist_writer_state(
                 &mut self.db,
                 &WriterRef::Device(key_id),
@@ -5382,7 +5336,7 @@ where
             }
             WriterTaskKind::Retire(writer, _) => {
                 {
-                    let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                    let _suspended = ExemptWrites::raise(&self.write_flags);
                     clear_retire(&mut self.db, &writer)?;
                 }
                 self.flush_writer_tasks().await?;
@@ -5430,7 +5384,7 @@ where
                     queue.next_seq = raised;
                 }
                 {
-                    let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                    let _suspended = ExemptWrites::raise(&self.write_flags);
                     persist_writer_state(&mut self.db, &writer, queue.next_seq, &queue.head)?;
                 }
                 self.bound_writer = Some(writer);
@@ -5464,7 +5418,7 @@ where
     /// and drop its state, so the next handshake does not present it again.
     fn retire_number(&mut self, number: WriterRef) -> Result<(), ClientError> {
         let secret = self.writers.get(&number).and_then(|queue| queue.secret);
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         persist_retire(&mut self.db, &number, secret.as_ref())?;
         drop_writer_state(&mut self.db, &number)?;
         self.writer_tasks.push_back(WriterTask {
@@ -5592,7 +5546,7 @@ where
             })
             .copied()
             .collect();
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         self.db.transaction::<(), ClientError, _>(|db| {
             for placement in &plan {
                 let entry = &self.writers[&placement.source].pending[&placement.original_seq];
@@ -5691,8 +5645,9 @@ where
     }
 
     /// Atomically appends an entry captured under `major`, its position and
-    /// its writer frontier, and, with `clears_outbox`, deletes the outbox's
-    /// records, which are then the writes the entry carries. The keys of the
+    /// its writer frontier, and, with `outbox_through`, deletes the outbox's
+    /// records up to that sequence, which are then the writes the entry
+    /// carries. The keys of the
     /// shared rows every queued entry touches, this one included, and every
     /// write the outbox still holds are written in the same transaction, so
     /// another identity's pass spares the write from the moment it is queued,
@@ -5703,7 +5658,7 @@ where
         changeset: &[u8],
         provenance: Option<Provenance>,
         major: Option<Major>,
-        clears_outbox: bool,
+        outbox_through: Option<i64>,
     ) -> Result<u64, ClientError> {
         let position = self.next_position;
         let (seq, head) = match self.writers.get(writer) {
@@ -5737,12 +5692,12 @@ where
         };
         {
             let config = &self.config;
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             self.db.transaction::<(), ClientError, _>(|db| {
                 persist_writer_state(db, writer, seq + 1, &hash)?;
                 persist_pending(db, writer, seq, &entry.record())?;
-                if clears_outbox {
-                    outbox::clear(db)?;
+                if let Some(through) = outbox_through {
+                    outbox::clear_through(db, through)?;
                 }
                 if let Some(mut spare) = spare {
                     merge_clauses(
@@ -6038,6 +5993,14 @@ where
         })
     }
 
+    /// Forget what any writer sent, at a transport's end and at a new
+    /// handshake, since the next transport starts with nothing sent.
+    fn forget_sent(&mut self) {
+        for queue in self.writers.values_mut() {
+            queue.sent_through = 0;
+        }
+    }
+
     /// Drop the live socket and announce it, once.
     fn disconnected(&mut self) {
         self.attach_replay = AttachReplay::Idle;
@@ -6051,6 +6014,7 @@ where
         // The writer identity a connection bound to is per-connection; a fresh
         // handshake rebinds, and a held bind re-signs against the fresh nonce.
         self.bound_writer = None;
+        self.forget_sent();
         self.writer_tasks.clear();
         self.writer_in_flight = None;
         #[cfg(feature = "device-identity")]
@@ -6253,7 +6217,7 @@ where
     fn invalidate_coverage(&mut self) -> Result<(), ClientError> {
         if self.cursor_subjects.is_some() {
             if let Some(cursor) = &self.last_cursor {
-                let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                let _suspended = ExemptWrites::raise(&self.write_flags);
                 persist_cursor_and_subjects(&mut self.db, cursor, None)?;
             }
             self.cursor_subjects = None;
@@ -6287,7 +6251,7 @@ where
         } else {
             Vec::new()
         };
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         persist_cursor_and_subjects(&mut self.db, cursor, Some(&subjects))?;
         self.cursor_subjects = Some(subjects);
         self.authorization_cleared = None;
@@ -6821,15 +6785,22 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError`] when the DDL fails or the catalog cannot be read, and
+    /// [`ClientError`] when the DDL fails or the catalog cannot be read,
     /// [`ClientError::WritesNotRecorded`] when it leaves a synced table
-    /// connetto cannot record changes to. Nothing changes on any error.
+    /// connetto cannot record changes to, and
+    /// [`ClientError::UnpushedWrites`] when it drops or renames a table the
+    /// outbox holds writes to. Nothing changes on any error.
     pub fn change_schema(&mut self, sql: &str) -> Result<(), ClientError> {
         let unrecorded = &self.config.unrecorded_tables;
+        let shared = &self.config.shared_tables;
         let _open = outbox::SchemaWindow::new(&self.schema_open);
         self.db.transaction(|db| {
             outbox::drop_triggers(db)?;
             db.batch_execute(sql)?;
+            let tables = outbox::stranded_tables(db, shared)?;
+            if !tables.is_empty() {
+                return Err(ClientError::UnpushedWrites { tables });
+            }
             check_recorded_tables(db, "main", unrecorded)?;
             outbox::install(db)
         })
@@ -6889,6 +6860,9 @@ where
     /// [`ExportScope::Unsynced`] carries only what an import restores, which is
     /// the device-private tier and the writes that never reached the server.
     /// Authentication state and sync cursors are never exported.
+    /// Writes committed and not yet pushed are queued first, as a push
+    /// queues them, so the archive carries them too and the next push sends
+    /// them.
     ///
     /// Rows use connetto's SQLite change-record format, while optional client layers may add declared attachments.
     ///
@@ -6904,7 +6878,8 @@ where
     /// [`SyncSchema::with_unrecorded_tables`](crate::SyncSchema::with_unrecorded_tables), since SQLite
     /// records no changes for one and its rows would be silently absent. A
     /// named one is skipped, which is what the declaration means. Also when
-    /// the sink refuses a write.
+    /// the sink refuses a write, and [`ClientError`] when the writes not yet
+    /// pushed cannot be read or queued.
     pub fn export_local_data<W: std::io::Write>(
         &mut self,
         scope: ExportScope,
@@ -6933,6 +6908,10 @@ where
         attachments: &[ArchiveAttachment],
         sink: W,
     ) -> Result<LocalDataExport<W>, ClientError> {
+        // A write not yet pushed is queued first, which needs no server, so
+        // the archive carries it with its writer and sequence. The next push
+        // sends it.
+        self.queue_outbox()?;
         let synced_rows = match scope {
             ExportScope::Everything => Some(export_rows(
                 &mut self.db,
@@ -7134,7 +7113,7 @@ where
         {
             // Suspended for the whole apply, so restoring a write does not
             // capture a second write of the same rows.
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             let shared = &self.config.shared_tables;
             self.db.transaction::<(), ClientError, _>(|db| {
                 // Checked at the commit, so neither table order nor row order
@@ -7208,7 +7187,7 @@ where
             *secret = secret.or(entry.secret);
         }
         {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             for (writer, secret) in &archived {
                 persist_retire(&mut self.db, writer, secret.as_ref())?;
             }
@@ -7237,7 +7216,7 @@ where
                     secret: entry.secret,
                 })
             });
-            self.append_entry(&target, &entry.changeset, provenance, entry.major, false)?;
+            self.append_entry(&target, &entry.changeset, provenance, entry.major, None)?;
             restored += 1;
         }
         Ok(restored)
@@ -7427,7 +7406,7 @@ where
     /// replica clock. The pump asks on every step, so the interest is
     /// rewritten only when a record moved.
     fn reanchor_subscriptions(&mut self) -> Result<(), ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
         self.db.transaction(|db| {
             if subscriptions::reanchor_ahead(db)? {
@@ -7437,14 +7416,14 @@ where
         })
     }
 
-    /// Change the subscription record with capture suspended, and rewrite
+    /// Change the subscription record under the write exemption, and rewrite
     /// this identity's interest in the shared store in the same transaction
     /// so the other identities' passes see the change.
     fn change_subscriptions<R>(
         &mut self,
         change: impl FnOnce(&mut SqliteConnection) -> Result<R, ClientError>,
     ) -> Result<R, ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
         self.db.transaction(|db| {
             let changed = change(db)?;
@@ -7490,7 +7469,7 @@ where
         // The statistics still on record are the ones a handle still watches,
         // so the cap never evicts a value in use.
         let protected = subscriptions::live_identities(&mut self.db)?;
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         aggregates::apply_frame(&mut self.db, query_id, &binds, frame, now)?;
         // A removal cannot add a statistic, so only a write needs the cap.
         if frame.result_json.is_some() {
@@ -7849,13 +7828,13 @@ where
     /// Commit connetto's own bookkeeping and the application's writes as one
     /// transaction, where only the second is uploaded.
     ///
-    /// `bookkeeping` runs with capture suspended, so its writes to the
-    /// `_connetto_` tables never enter a changeset, and `app` runs with
-    /// capture live, so its writes upload as an ordinary mutation. Both are
-    /// inside one SQLite transaction on one file, which is what makes a
-    /// bookkeeping record and the row that depends on it survive or vanish
-    /// together rather than by convention. Suspension is orthogonal to the
-    /// transaction: switching the session off does not end it.
+    /// `bookkeeping` runs under the write exemption, so the outbox records
+    /// none of its writes, and `app` runs without it, so its writes upload as
+    /// an ordinary mutation. Both are inside one SQLite transaction on one
+    /// file, which is what makes a bookkeeping record and the row that
+    /// depends on it survive or vanish together rather than by convention.
+    /// The exemption is orthogonal to the transaction: lowering it does not
+    /// end it.
     ///
     /// The pair exists because the alternative cannot be enforced. A caller
     /// writing its own record and then the row, or handed a recorder to call
@@ -7881,13 +7860,12 @@ where
         A: FnOnce(&mut SqliteConnection) -> Result<O, E>,
         E: From<diesel::result::Error>,
     {
-        // Prepared here so the closure below captures these two fields rather
-        // than all of `self`, which `db` is borrowed out of for the duration.
-        let session = &mut self.session;
-        let exempt = &self.write_exempt;
+        // Prepared here so the closure below captures this field rather than
+        // all of `self`, which `db` is borrowed out of for the duration.
+        let exempt = &self.write_flags;
         self.db.transaction(|conn| {
             let private = {
-                let _suspended = SuspendedCapture::new(session, exempt);
+                let _suspended = ExemptWrites::raise(exempt);
                 bookkeeping(conn)?
             };
             Ok((private, app(conn)?))
@@ -7896,10 +7874,9 @@ where
 
     /// Re-run the key check for a schema whose DDL moved since the last look.
     ///
-    /// The capture session covers tables created after it exists, so a table
-    /// the application creates mid-run would otherwise lose every write to it
-    /// until the next restart. The gate is one integer read per schema, and
-    /// the tier is read too even though nothing there uploads, because a tier
+    /// A table the outbox cannot record would otherwise lose every write to
+    /// it without a word. The gate is one integer read per schema, and the
+    /// tier is read too even though nothing there uploads, because a tier
     /// table nobody records is invisible to every sibling browser tab (R62
     /// decisions 1 and 4).
     fn recheck_changed_schemas(&mut self) -> Result<(), ClientError> {
@@ -7918,48 +7895,27 @@ where
         Ok(())
     }
 
-    /// Upload local writes captured since the last push as one mutation
-    /// under the writer this run writes as.
+    /// Upload the writes the outbox recorded since the last push as one
+    /// mutation under the writer this run writes as.
     ///
-    /// Returns the assigned `client_seq`, or `None` when there was nothing to
-    /// send. The pending record is persisted and the capture session reset
-    /// BEFORE the frames leave, so from that point the pending table is the
-    /// single owner of this mutation: a send failure replays it on the next
-    /// resume instead of re-capturing it, and a process death replays it on
-    /// the next boot of the same replica.
+    /// Returns the assigned `client_seq`, or `None` when the outbox held
+    /// nothing or its writes cancel out. The entry is queued and the outbox
+    /// rows it covers deleted in one transaction BEFORE any frame leaves, and
+    /// from that point the pending table alone owns this mutation. A send
+    /// failure replays it on the next resume, and a process death replays it
+    /// on the next boot of the same replica. While
+    /// connected, every entry of the bound writer not yet sent on this
+    /// transport goes out in sequence order, so an entry queued without being
+    /// sent, as an export queues one, never leaves the server a gap.
     ///
     /// # Errors
     ///
-    /// [`ClientError`] on a session, compression, or transport failure, and
+    /// [`ClientError`] on an outbox, compression, or transport failure, and
     /// [`ClientError::WritesNotRecorded`] when the application created a table
     /// connetto cannot record changes to since the last write.
     pub async fn push(&mut self) -> Result<Option<u64>, ClientError> {
         self.recheck_changed_schemas()?;
-        let changeset = self.session.changeset()?;
-        #[cfg(debug_assertions)]
-        {
-            let exempt_written = self
-                .exempt_written
-                .lock()
-                .map(|mut tables| std::mem::take(&mut *tables))
-                .unwrap_or_default();
-            outbox::assert_matches(
-                &mut self.db,
-                &changeset,
-                &exempt_written,
-                &self.config.shared_tables,
-            )?;
-        }
-        // Nothing writes between the capture above and the queueing below,
-        // so every record the outbox holds now is a write this push carries.
-        if changeset.is_empty() {
-            outbox::clear(&mut self.db)?;
-            return Ok(None);
-        }
-        let writer = self.choose_writer();
-        let seq = self.append_entry(&writer, &changeset, None, self.config.schema_major, true)?;
-        // Reset capture: fresh sessions record only writes after this push.
-        self.session.reset(&mut self.db)?;
+        let queued = self.queue_outbox()?;
         // With no server the write stays queued, which is the designed offline
         // state rather than a failure: it is already durable in
         // `_connetto_pending` above, and `attach` replays it. Returning an
@@ -7969,10 +7925,34 @@ where
         // not bound to waits for the connection to bind it, and a write behind
         // another major's entry waits for that entry to settle, the replay
         // sending it then.
-        if self.is_connected() && self.bound_writer == Some(writer) && self.held_from().is_none() {
-            self.send_mutation(writer, seq, &changeset, None).await?;
+        if self.is_connected() {
+            self.send_unsent().await?;
         }
-        Ok(Some(seq))
+        Ok(queued)
+    }
+
+    /// Queue the writes the outbox holds as one entry under the writer this
+    /// run writes as, deleting the rows it covers in the same transaction,
+    /// and return its sequence, absent when the outbox held nothing or its
+    /// writes cancel out, whose rows go then too.
+    fn queue_outbox(&mut self) -> Result<Option<u64>, ClientError> {
+        let Some(built) = outbox::build(&mut self.db, &self.config.shared_tables)? else {
+            return Ok(None);
+        };
+        if built.changeset.is_empty() {
+            self.db
+                .transaction(|db| outbox::clear_through(db, built.through))?;
+            return Ok(None);
+        }
+        let writer = self.choose_writer();
+        self.append_entry(
+            &writer,
+            &built.changeset,
+            None,
+            self.config.schema_major,
+            Some(built.through),
+        )
+        .map(Some)
     }
 
     /// The writer a new local write queues under: the enrolled device's key
@@ -7994,7 +7974,8 @@ where
     }
 
     /// Send one mutation as its header and patchset frame pair, as `writer`'s
-    /// sequence `seq`. Shared by [`push`](Self::push) and the replay in
+    /// sequence `seq`, and remember it as sent on this transport. Shared by
+    /// [`push`](Self::push) and the replay in
     /// [`replay_pending`](Self::replay_pending).
     ///
     /// This is the one place a captured changeset leaves for the server, so it
@@ -8015,11 +7996,15 @@ where
             ));
         }
         let logical = self.to_logical(changeset.to_vec())?;
-        send_wire_changeset(&mut self.wire()?.transport, seq, &logical, provenance).await
+        send_wire_changeset(&mut self.wire()?.transport, seq, &logical, provenance).await?;
+        if let Some(queue) = self.writers.get_mut(&writer) {
+            queue.sent_through = queue.sent_through.max(seq);
+        }
+        Ok(())
     }
 
-    /// Undo `writer`'s rejected `client_seq` in both schemas with capture
-    /// suspended, leaving a row a later change touched, and return its rows.
+    /// Undo `writer`'s rejected `client_seq` in both schemas under the write
+    /// exemption, leaving a row a later change touched, and return its rows.
     fn rollback(
         &mut self,
         writer: WriterRef,
@@ -8037,7 +8022,7 @@ where
             .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?;
         let shared = &self.config.shared_tables;
         {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            let _suspended = ExemptWrites::raise(&self.write_flags);
             self.db.transaction::<_, ClientError, _>(|db| {
                 delete_pending(db, &writer, client_seq)?;
                 db.apply_changeset(&inverse, rollback_omit)
@@ -8052,8 +8037,8 @@ where
         Ok(rows)
     }
 
-    /// Flush locally captured writes as one mutation when the capture session
-    /// recorded a committed change since the last flush.
+    /// Flush the outbox's writes as one mutation when a write committed
+    /// since the last flush.
     ///
     /// Returns the assigned `client_seq`, or `None` when nothing was pending.
     /// This is the automatic submit: writes made on [`conn`](Self::conn) are
@@ -8232,7 +8217,7 @@ where
                 // An empty cursor carries no resume information: never let
                 // it regress a real one, in memory or in the replica.
                 if !end.cursor.is_empty() {
-                    let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                    let _suspended = ExemptWrites::raise(&self.write_flags);
                     let coverage = self.cursor_subjects.as_deref();
                     persist_cursor_and_subjects(&mut self.db, &end.cursor, coverage)?;
                     self.last_cursor = Some(end.cursor);
@@ -8457,7 +8442,7 @@ where
                 .is_some();
             if removed {
                 {
-                    let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                    let _suspended = ExemptWrites::raise(&self.write_flags);
                     delete_pending(&mut self.db, &writer, client_seq)?;
                 }
                 self.record_spare()?;
@@ -8607,7 +8592,7 @@ where
         let Some((query_id, binds)) = subscriptions::identity_of(&mut self.db, sub_id)? else {
             return Ok(());
         };
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         aggregates::clear(&mut self.db, query_id, &binds)?;
         Ok(())
     }
@@ -8626,8 +8611,8 @@ where
     /// stale or not, since only that identity's own resync may judge its rows
     /// (R11 decision 6). Returns the rows removed.
     ///
-    /// Capture is suspended so the deletes are never re-uploaded as a local
-    /// mutation.
+    /// The write exemption is raised so the outbox records none of the
+    /// deletes and they are never uploaded as a local mutation.
     fn delete_uncovered(
         &mut self,
         scope: &HashSet<String>,
@@ -8660,7 +8645,7 @@ where
                 }
             }
         }
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         let tables = self.config.policy_tables.clone();
         let config = &self.config;
         deleting_transaction(&mut self.db, config, |conn| {
@@ -8719,9 +8704,8 @@ where
     /// writer queue's pending entries the same way [`affected_rows`] reads a
     /// changeset's touched keys, so the protection is bounded by the queue's
     /// cap and clears itself when an ack retires the mutation, and from every
-    /// write the outbox holds, its old key and its new one, since the capture
-    /// builds the upload from each row's current state and an eviction before
-    /// the push would leave it nothing to upload. A captured mutation is a
+    /// write the outbox holds, its old key and its new one, so a row written
+    /// and not yet pushed stays as the application left it. A queued mutation is a
     /// changeset, whose op carries the backing table's own schema, so the
     /// primary-key columns and ordinals come straight from it.
     fn pending_spare(&mut self) -> Result<HashMap<String, Vec<String>>, ClientError> {
@@ -8746,12 +8730,12 @@ where
             return Ok(());
         }
         let spare = self.pending_spare()?;
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         interest::record_spare(&mut self.db, &self.config, &spare)
     }
 
     /// Take this identity out of the shared store before its replica is
-    /// wiped (R11 decision 7). Its captured and queued shared writes are
+    /// wiped (R11 decision 7). Its unpushed and queued shared writes are
     /// undone first, newest first, when `discard_unsent`, leaving a row a
     /// later change touched as a rollback does, then its interest and spare
     /// rows go and every shared row no remaining identity covers or has
@@ -8769,9 +8753,11 @@ where
         if self.config.shared_tables.is_empty() {
             return Ok(SharedDeparture::NotShared);
         }
-        let (captured, mut queued): (Vec<u8>, Vec<&PendingEntry>) = if discard_unsent {
+        let (unpushed, mut queued): (Vec<u8>, Vec<&PendingEntry>) = if discard_unsent {
             (
-                self.session.changeset()?,
+                outbox::build(&mut self.db, &self.config.shared_tables)?
+                    .map(|built| built.changeset)
+                    .unwrap_or_default(),
                 self.writers
                     .values()
                     .flat_map(|queue| queue.pending.values())
@@ -8781,12 +8767,12 @@ where
             (Vec::new(), Vec::new())
         };
         queued.sort_by_key(|entry| core::cmp::Reverse(entry.position));
-        let newest_first = (!captured.is_empty())
-            .then_some(captured.as_slice())
+        let newest_first = (!unpushed.is_empty())
+            .then_some(unpushed.as_slice())
             .into_iter()
             .chain(queued.into_iter().map(|entry| entry.changeset.as_slice()));
         let config = &self.config;
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         let remain = self.db.immediate_transaction(|db| {
             undo_shared(db, &config.shared_tables, newest_first)?;
             interest::depart(db, config, &config.client_id, true)
@@ -8811,7 +8797,7 @@ where
         if self.config.shared_tables.is_empty() || identity == self.config.client_id {
             return Ok(());
         }
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
         self.db
             .immediate_transaction(|db| interest::depart(db, config, identity, true))
@@ -8957,11 +8943,13 @@ where
     }
 
     /// Put this replica's own unacknowledged writes back after a replacement
-    /// snapshot has landed, in append-position order across every writer.
+    /// snapshot has landed, the queued ones in append-position order across
+    /// every writer and then the ones the outbox holds, not yet pushed.
     ///
     /// **The clear ahead of a resync deletes rows the server has never seen.**
-    /// A local insert that is still queued lives in the replica and in
-    /// `_connetto_pending`, and the replacement snapshot cannot carry it back
+    /// A local insert that is still queued or not yet pushed lives in the
+    /// replica and in `_connetto_pending` or the outbox, and the replacement
+    /// snapshot cannot carry it back
     /// because the server does not have it yet, so without this the user watches
     /// their own unsaved work vanish and it returns only if and when the write is
     /// acknowledged. This is R15's un-acked rule, which until R48 was written
@@ -8977,8 +8965,9 @@ where
     ///
     /// A queued update or delete whose row the resync did not restore applies to
     /// nothing and is omitted, which is correct: there is no row left to change,
-    /// and the server refuses the upload for the same reason. Capture stays
-    /// suspended so re-applying does not queue the writes a second time.
+    /// and the server refuses the upload for the same reason. The write
+    /// exemption is raised, so re-applying records nothing and the outbox
+    /// keeps the unpushed writes for the push that uploads them.
     fn reapply_pending(&mut self) -> Result<(), ClientError> {
         let mut queued: Vec<(u64, Vec<u8>)> = self
             .writers
@@ -8987,12 +8976,17 @@ where
             .map(|entry| (entry.position, entry.changeset.clone()))
             .collect();
         queued.sort_unstable_by_key(|(position, _)| *position);
-        let queued: Vec<Vec<u8>> = queued.into_iter().map(|(_, changeset)| changeset).collect();
+        let mut queued: Vec<Vec<u8>> = queued.into_iter().map(|(_, changeset)| changeset).collect();
+        if let Some(built) = outbox::build(&mut self.db, &self.config.shared_tables)?
+            && !built.changeset.is_empty()
+        {
+            queued.push(built.changeset);
+        }
         if queued.is_empty() {
             return Ok(());
         }
         let shared = &self.config.shared_tables;
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let _suspended = ExemptWrites::raise(&self.write_flags);
         self.db.transaction::<_, ClientError, _>(|conn| {
             for changeset in &queued {
                 conn.apply_changeset(changeset, server_wins)
@@ -9012,9 +9006,9 @@ where
 
     /// Apply one compressed server patchset to the replica, recording
     /// `cursor` in the same transaction when one accompanies it, so a crash
-    /// never separates an applied change from its resume point. Capture is
-    /// suspended throughout: the session never records what the server
-    /// already knows.
+    /// never separates an applied change from its resume point. The write
+    /// exemption is raised throughout, so the outbox never records what the
+    /// server already knows.
     ///
     /// The wire speaks logical Postgres names, so a split table's rows are
     /// rewritten onto its backing table before the apply. Applying them to the
@@ -9031,7 +9025,7 @@ where
         addressed_to: Option<&str>,
     ) -> Result<(), ClientError> {
         let bytes = zstd::decode_all(payload_zstd)?;
-        let suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        let suspended = ExemptWrites::raise(&self.write_flags);
         // The counting gate makes the update hook tally each row into
         // `apply_staging` (R60 decision 4). Cleared before any error propagates
         // so a failed apply never leaves the gate up. The staging map merges
@@ -9465,16 +9459,20 @@ mod tests {
         conn.db
             .batch_execute("INSERT INTO t (id) VALUES (1)")
             .expect("local write");
-        let changeset = conn.session.changeset().expect("capture the write");
+        let built = outbox::build(&mut conn.db, &conn.config.shared_tables)
+            .expect("read the outbox")
+            .expect("the write is recorded");
         let first = conn
-            .append_entry(&writer, &changeset, None, None, false)
+            .append_entry(&writer, &built.changeset, None, None, Some(built.through))
             .expect("queue the write");
         conn.db
             .batch_execute("INSERT INTO t (id) VALUES (2)")
             .expect("second local write");
-        let changeset = conn.session.changeset().expect("capture the second write");
+        let built = outbox::build(&mut conn.db, &conn.config.shared_tables)
+            .expect("read the outbox")
+            .expect("the second write is recorded");
         let second = conn
-            .append_entry(&writer, &changeset, None, None, false)
+            .append_entry(&writer, &built.changeset, None, None, Some(built.through))
             .expect("queue the second write");
         // A deferral whose writes went out again after its schedule had grown.
         let mut episode = RESEND_POLICY.start();
@@ -9500,6 +9498,89 @@ mod tests {
             wait <= RESEND_POLICY.initial_backoff(),
             "the new deferral starts from the first wait"
         );
+    }
+
+    /// A write under the unrecorded switch stays out of the outbox while the
+    /// write exemption stays down, so the policy guards still judge it, and
+    /// the next write after the switch drops is recorded again.
+    #[test]
+    fn an_unrecorded_write_is_judged_and_kept_out_of_the_outbox() {
+        let config = ClientConfig::new("unrecorded-test");
+        let mut conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("open in-memory replica");
+        {
+            let _unrecorded = UnrecordedWrites::raise(&conn.write_flags);
+            let exempt: bool = diesel::select(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                &format!("{}()", connetto_core::WRITE_EXEMPTION_FUNCTION),
+            ))
+            .get_result(&mut conn.db)
+            .expect("read the exemption");
+            assert!(!exempt, "the policy guards still judge the write");
+            conn.db
+                .batch_execute("INSERT INTO t (id) VALUES (1)")
+                .expect("a peer's row");
+        }
+        assert!(
+            outbox::build(&mut conn.db, &conn.config.shared_tables)
+                .expect("read the outbox")
+                .is_none(),
+            "nothing was recorded"
+        );
+        conn.db
+            .batch_execute("INSERT INTO t (id) VALUES (2)")
+            .expect("an application write");
+        assert!(
+            outbox::build(&mut conn.db, &conn.config.shared_tables)
+                .expect("read the outbox")
+                .is_some(),
+            "recording is back once the switch drops"
+        );
+    }
+
+    /// The clause an unpushed write's key is spared under selects exactly
+    /// the row written, whatever storage class the key holds, a `NULL` key
+    /// SQLite admits outside an `INTEGER PRIMARY KEY` included.
+    #[test]
+    fn a_spare_clause_selects_the_row_its_key_names() {
+        let ddl = "CREATE TABLE notes (k PRIMARY KEY, body TEXT)";
+        let config = ClientConfig::new("spare-test");
+        let mut conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), ddl, &config, None)
+                .expect("open in-memory replica");
+        conn.db
+            .batch_execute(
+                "INSERT INTO notes VALUES (NULL, 'null'), (7, 'integer'), (0.1, 'real'), \
+                 ('it''s', 'text'), (x'00ff', 'blob')",
+            )
+            .expect("one row per storage class");
+        let clauses = outbox::spare_clauses(&mut conn.db, &conn.config.shared_tables)
+            .expect("read the outbox")
+            .remove("notes")
+            .expect("the writes are spared");
+        let mut bodies = Vec::new();
+        for clause in &clauses {
+            let matched: Vec<String> = notes_matching(&mut conn.db, clause);
+            assert_eq!(matched.len(), 1, "{clause} selects one row: {matched:?}");
+            bodies.extend(matched);
+        }
+        bodies.sort();
+        assert_eq!(bodies, ["blob", "integer", "null", "real", "text"]);
+    }
+
+    /// The bodies of the `notes` rows `clause` selects.
+    fn notes_matching(db: &mut SqliteConnection, clause: &str) -> Vec<String> {
+        #[derive(diesel::QueryableByName)]
+        struct Body {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            body: String,
+        }
+        diesel::sql_query(format!("SELECT body FROM notes WHERE {clause}"))
+            .load::<Body>(db)
+            .expect("run the clause")
+            .into_iter()
+            .map(|row| row.body)
+            .collect()
     }
 
     /// A write to a connetto table never becomes an upload, and the application writes beside it still do.
@@ -9533,7 +9614,7 @@ mod tests {
             assert_eq!(
                 conn.push().await.expect("push"),
                 None,
-                "bookkeeping uploads nothing before or after a capture reset"
+                "bookkeeping uploads nothing before or after a push"
             );
             conn.db
                 .batch_execute(&format!(
@@ -9542,13 +9623,13 @@ mod tests {
                 ))
                 .expect("application writes");
             let rows = affected_rows(
-                &conn
-                    .session
-                    .changeset()
-                    .expect("capture the application writes"),
+                &outbox::build(&mut conn.db, &conn.config.shared_tables)
+                    .expect("read the outbox")
+                    .expect("the application writes are recorded")
+                    .changeset,
                 conn.policy_tables(),
             )
-            .expect("decode the capture");
+            .expect("decode the upload");
             assert_eq!(
                 rows,
                 vec![
@@ -9561,11 +9642,11 @@ mod tests {
                         key: vec![KeyValue::Int(shared_id)],
                     },
                 ],
-                "both stores capture exactly their application rows"
+                "both stores record exactly their application rows"
             );
             assert!(
                 conn.push().await.expect("push").is_some(),
-                "the application writes upload and reset capture"
+                "the application writes upload"
             );
         }
     }
@@ -9805,8 +9886,10 @@ mod tests {
             conn.db
                 .batch_execute(&format!("INSERT INTO t (id) VALUES ({id})"))
                 .expect("local write");
-            let changeset = conn.session.changeset().expect("capture the write");
-            conn.append_entry(&device, &changeset, None, None, true)
+            let built = outbox::build(&mut conn.db, &conn.config.shared_tables)
+                .expect("read the outbox")
+                .expect("the write is recorded");
+            conn.append_entry(&device, &built.changeset, None, None, Some(built.through))
                 .expect("queue the write");
         }
         conn.bound_writer = Some(device);

@@ -1,22 +1,31 @@
 //! The outbox: every application write to a synced table, recorded by
 //! `TEMP` triggers inside the transaction that makes it, so an unsent write
-//! is a committed row from the moment it is written.
+//! is a committed row from the moment it is written, and the upload
+//! [`push`](crate::ConnettoConnection::push) builds from those rows.
 //!
 //! The triggers are generated from the replica's own catalog at every open
 //! and by every [`change_schema`](crate::ConnettoConnection::change_schema),
 //! and they record nothing while connetto's write exemption is raised, so
-//! server frames, rollbacks, replays and bookkeeping never enter the outbox.
+//! server frames, rollbacks, replays and bookkeeping never enter the outbox,
+//! nor while [`UNRECORDED_FUNCTION`] answers true, which keeps out a write
+//! the policy guards still judge, as a peer's entry applied as its author is.
 //! A table in the shared store gets the same triggers on each identity's own
 //! connection, which write that identity's outbox in `main` and spare the
 //! written key in the store's `_connetto_spare` in the same transaction, so
 //! another identity's pass keeps the row before it is pushed. An authorizer
 //! refuses any other `CREATE`, `ALTER` or `DROP` of an application table in
 //! `main` and every one in the shared store, which is what keeps the
-//! triggers in step with the tables. Each row carries the old and new values
-//! as a JSON object keyed by column name, each value encoded by its storage
-//! class: integers, text and null as plain JSON, a real as
-//! `{"r": "<17 significant digits>"}` so it round trips exactly, and a blob
-//! as `{"b": "<hex>"}`.
+//! triggers in step with the tables.
+//!
+//! Each row carries the old and new values as JSON objects keyed by column
+//! name, holding what a SQLite changeset holds. An insert carries the whole
+//! new row and a delete the whole old row, and an update the key and the
+//! cells it changed, or both whole rows when it moves the key. Each value is
+//! encoded by its storage class, integers, text and null as plain JSON and a
+//! real as `{"r": "<17 significant digits>"}` so it round trips exactly. A
+//! blob is the marker `{"b": 0}`, its bytes stored raw in
+//! `_connetto_outbox_blob` under the row's sequence, the column and the
+//! side, `o` for old and `n` for new, so a blob costs its own size once.
 
 use core::fmt::Write as _;
 use std::collections::{HashMap, HashSet};
@@ -29,16 +38,30 @@ use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sqlite::{AuthorizerContext, AuthorizerDecision};
+use sqlite_diff_rs::{ChangeDelete, ChangeSet, DiffOps, Insert, TableSchema, Update, Value};
 
 use crate::{ClientError, SHARED_SCHEMA, is_internal_table, is_shared, schema_ddl_rows};
 
-/// The outbox table, created beside connetto's other bookkeeping.
+/// The outbox and its blob cells, created beside connetto's other
+/// bookkeeping.
 pub(crate) const OUTBOX_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_outbox \
     (seq INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, op TEXT NOT NULL, \
-     old TEXT, new TEXT)";
+     old TEXT, new TEXT); \
+    CREATE TABLE IF NOT EXISTS _connetto_outbox_blob \
+    (seq INTEGER NOT NULL, col TEXT NOT NULL, side TEXT NOT NULL, value BLOB NOT NULL, \
+     PRIMARY KEY (seq, col, side))";
 
 /// The prefix of every outbox trigger name.
 const TRIGGER_PREFIX: &str = "_connetto_outbox_";
+
+/// The JSON a blob cell holds in place of its bytes.
+const BLOB_MARKER: &str = r#"{"b":0}"#;
+
+/// The SQL function the outbox triggers call beside
+/// [`WRITE_EXEMPTION_FUNCTION`], true while a write the policy guards judge
+/// must still stay out of the outbox, as a peer's entry applied as its author
+/// does.
+pub(crate) const UNRECORDED_FUNCTION: &str = "connetto_unrecorded";
 
 /// One column of a captured table, in column order.
 #[derive(diesel::QueryableByName)]
@@ -50,10 +73,6 @@ pub(crate) struct Column {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     pub(crate) pk: i64,
     /// The SQL text of the column's default, absent without one.
-    #[cfg_attr(
-        not(debug_assertions),
-        expect(dead_code, reason = "read by the debug check")
-    )]
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     pub(crate) dflt_value: Option<String>,
 }
@@ -146,9 +165,8 @@ pub(crate) fn drop_triggers(db: &mut SqliteConnection) -> Result<(), ClientError
     let drops = recorded_tables(db)?
         .iter()
         .flat_map(|(table, _)| {
-            OPS.iter().map(move |(op, ..)| {
-                format!("DROP TRIGGER IF EXISTS temp.{}; ", trigger_name(op, table))
-            })
+            OPS.iter()
+                .map(move |op| format!("DROP TRIGGER IF EXISTS temp.{}; ", trigger_name(op, table)))
         })
         .collect::<Vec<_>>()
         .concat();
@@ -156,13 +174,8 @@ pub(crate) fn drop_triggers(db: &mut SqliteConnection) -> Result<(), ClientError
     Ok(())
 }
 
-/// The writes each table gets a trigger for: the operation's letter, the
-/// event, and which rows the record carries as old and new.
-const OPS: [(&str, &str, Option<&str>, Option<&str>); 3] = [
-    ("I", "INSERT", None, Some("NEW")),
-    ("U", "UPDATE", Some("OLD"), Some("NEW")),
-    ("D", "DELETE", Some("OLD"), None),
-];
+/// The letters of the writes each table gets a trigger for.
+const OPS: [&str; 3] = ["I", "U", "D"];
 
 /// The quoted name of `table`'s trigger for `op`.
 fn trigger_name(op: &str, table: &str) -> String {
@@ -201,40 +214,105 @@ pub(crate) fn install_shared(
     Ok(())
 }
 
+/// The SQL condition under which an update's record carries `column`.
+///
+/// A key column is always carried. Any other is carried when the update
+/// changed it, compared as stored bytes the way SQLite's session compares
+/// them, so a change of case under a `NOCASE` collation or of storage class
+/// alone counts, and every column is carried when the update moves the key.
+fn carried(column: &Column, columns: &[Column]) -> String {
+    if column.pk > 0 {
+        return "1".to_owned();
+    }
+    let differs = |column: &Column| {
+        let name = quote_ident(&column.name);
+        format!(
+            "(OLD.{name} IS NOT NEW.{name} COLLATE BINARY \
+             OR typeof(OLD.{name}) IS NOT typeof(NEW.{name}))"
+        )
+    };
+    let moved: Vec<String> = key_columns(columns).into_iter().map(differs).collect();
+    format!("({} OR {})", differs(column), moved.join(" OR "))
+}
+
 /// The three `TEMP` triggers recording writes to `table` in `schema`, each
 /// also sparing the keys it touched under `spare`'s identity when given. The
-/// unqualified `_connetto_outbox` resolves to `main` and `_connetto_spare` to
-/// the shared store, the only schemas holding them.
+/// unqualified `_connetto_outbox` and `_connetto_outbox_blob` resolve to
+/// `main` and `_connetto_spare` to the shared store, the only schemas holding
+/// them.
 fn triggers(schema: &str, table: &str, columns: &[Column], spare: Option<&str>) -> String {
     let target = format!("{}.{}", quote_ident(schema), quote_ident(table));
     let literal = table.replace('\'', "''");
-    OPS.into_iter()
-        .map(|(op, event, old, new)| {
-            let name = trigger_name(op, table);
-            let mut spares = String::new();
-            if let Some(identity) = spare {
-                let identity = identity.replace('\'', "''");
-                let lowered = table.to_lowercase().replace('\'', "''");
-                for row in old.into_iter().chain(new) {
-                    let _ = write!(
-                        spares,
-                        "INSERT OR IGNORE INTO _connetto_spare (identity, tbl, clause) \
-                         VALUES ('{identity}', '{lowered}', {}); ",
-                        spare_clause(row, columns)
-                    );
-                }
+    let whole = |_: &Column| "1".to_owned();
+    let changed = |column: &Column| carried(column, columns);
+    let (insert, delete) = (whole, whole);
+    [
+        (
+            "I",
+            "INSERT",
+            None,
+            Some(("NEW", &insert as &dyn Fn(&Column) -> String)),
+        ),
+        (
+            "U",
+            "UPDATE",
+            Some(("OLD", &changed as &dyn Fn(&Column) -> String)),
+            Some(("NEW", &changed as &dyn Fn(&Column) -> String)),
+        ),
+        (
+            "D",
+            "DELETE",
+            Some(("OLD", &delete as &dyn Fn(&Column) -> String)),
+            None,
+        ),
+    ]
+    .into_iter()
+    .map(|(op, event, old, new)| {
+        let name = trigger_name(op, table);
+        let mut spares = String::new();
+        if let Some(identity) = spare {
+            let identity = identity.replace('\'', "''");
+            let lowered = table.to_lowercase().replace('\'', "''");
+            for (row, _) in old.into_iter().chain(new) {
+                let _ = write!(
+                    spares,
+                    "INSERT OR IGNORE INTO _connetto_spare (identity, tbl, clause) \
+                     VALUES ('{identity}', '{lowered}', {}); ",
+                    spare_clause(row, columns)
+                );
             }
-            let old = old.map_or_else(|| "NULL".to_owned(), |row| encoded(row, columns));
-            let new = new.map_or_else(|| "NULL".to_owned(), |row| encoded(row, columns));
-            format!(
-                "CREATE TEMP TRIGGER {name} AFTER {event} ON {target} \
-             WHEN NOT {WRITE_EXEMPTION_FUNCTION}() BEGIN \
+        }
+        let mut blobs = String::new();
+        for ((row, carry), side) in old.into_iter().zip(["o"]).chain(new.into_iter().zip(["n"])) {
+            for column in columns {
+                let value = format!("{row}.{}", quote_ident(&column.name));
+                let _ = write!(
+                    blobs,
+                    "INSERT INTO _connetto_outbox_blob (seq, col, side, value) \
+                     SELECT (SELECT max(seq) FROM _connetto_outbox), '{}', '{side}', {value} \
+                     WHERE typeof({value}) = 'blob' AND {}; ",
+                    column.name.replace('\'', "''"),
+                    carry(column)
+                );
+            }
+        }
+        let old = old.map_or_else(
+            || "NULL".to_owned(),
+            |(row, carry)| encoded(row, columns, carry),
+        );
+        let new = new.map_or_else(
+            || "NULL".to_owned(),
+            |(row, carry)| encoded(row, columns, carry),
+        );
+        format!(
+            "CREATE TEMP TRIGGER {name} AFTER {event} ON {target} \
+             WHEN NOT {WRITE_EXEMPTION_FUNCTION}() AND NOT {UNRECORDED_FUNCTION}() BEGIN \
              INSERT INTO _connetto_outbox (tbl, op, old, new) \
-             VALUES ('{literal}', '{op}', {old}, {new}); {spares}END; "
-            )
-        })
-        .collect::<Vec<_>>()
-        .concat()
+             VALUES ('{literal}', '{op}', {old}, {new}); {blobs}{spares}END; "
+        )
+    })
+    .collect::<Vec<_>>()
+    .concat()
 }
 
 /// The key columns of `columns`, in key order.
@@ -261,28 +339,31 @@ fn spare_clause(row: &str, columns: &[Column]) -> String {
 fn cell(value: &str) -> String {
     format!(
         "CASE typeof({value}) \
-         WHEN 'blob' THEN '{{\"b\":\"' || hex({value}) || '\"}}' \
+         WHEN 'blob' THEN '{BLOB_MARKER}' \
          WHEN 'real' THEN '{{\"r\":\"' || printf('%!.17g', {value}) || '\"}}' \
          ELSE json_quote({value}) END"
     )
 }
 
-/// The SQL building one row's JSON object. Concatenation rather than
-/// `json_object`, so a wide table never meets the function argument limit.
-fn encoded(row: &str, columns: &[Column]) -> String {
-    let cells: Vec<String> = columns
+/// The SQL building one row's JSON object from the columns `carry` admits.
+/// Concatenation rather than `json_object`, so a wide table never meets the
+/// function argument limit. Each member starts with a comma, and the first
+/// is cut, since a key column is always carried.
+fn encoded(row: &str, columns: &[Column], carry: &dyn Fn(&Column) -> String) -> String {
+    let members: Vec<String> = columns
         .iter()
         .map(|column| {
             let key = serde_json::Value::from(column.name.as_str())
                 .to_string()
                 .replace('\'', "''");
             format!(
-                "'{key}:' || {}",
+                "CASE WHEN {} THEN ',{key}:' || {} ELSE '' END",
+                carry(column),
                 cell(&format!("{row}.{}", quote_ident(&column.name)))
             )
         })
         .collect();
-    format!("'{{' || {} || '}}'", cells.join(" || ',' || "))
+    format!("'{{' || substr({}, 2) || '}}'", members.join(" || "))
 }
 
 /// Refuse every `CREATE`, `ALTER` and `DROP` of an application table in
@@ -290,13 +371,54 @@ fn encoded(row: &str, columns: &[Column]) -> String {
 /// always, since the outbox triggers would no longer match the table. The
 /// shared store's tables change only with a release, through the layout
 /// programs every identity runs at open.
+///
+/// Every `DELETE` is answered with `SQLITE_IGNORE`, which runs it row by row
+/// rather than through SQLite's truncate optimization, so a `DELETE` without
+/// a `WHERE` on a table no trigger watches, a device-private tier table
+/// above all, still reports each row to the update hook that drives
+/// reactivity. A `DROP` asks for `DELETE` too, on the schema table and on the
+/// object it drops, and gives up silently on any answer but `SQLITE_OK`, so
+/// those two are admitted.
 pub(crate) fn guard_schema(db: &mut SqliteConnection, open: &Arc<AtomicBool>) {
     let open = Arc::clone(open);
+    let mut dropping: Option<String> = None;
     db.on_authorize(move |action| {
+        let dropped = dropping.take();
         let (database, table) = match action {
             AuthorizerContext::CreateTable(create) => (create.database, create.table),
             AuthorizerContext::AlterTable(alter) => (alter.database, alter.table),
-            AuthorizerContext::DropTable(drop) => (drop.database, drop.table),
+            AuthorizerContext::DropTable(drop) => {
+                dropping = drop.table.map(str::to_owned);
+                (drop.database, drop.table)
+            }
+            AuthorizerContext::DropTempTable(drop) => {
+                dropping = drop.table.map(str::to_owned);
+                return AuthorizerDecision::Allow;
+            }
+            AuthorizerContext::DropView(drop) => {
+                dropping = drop.view.map(str::to_owned);
+                return AuthorizerDecision::Allow;
+            }
+            AuthorizerContext::DropTempView(drop) => {
+                dropping = drop.view.map(str::to_owned);
+                return AuthorizerDecision::Allow;
+            }
+            AuthorizerContext::DropVTable(drop) => {
+                dropping = drop.table.map(str::to_owned);
+                return AuthorizerDecision::Allow;
+            }
+            AuthorizerContext::Delete(delete) => {
+                let table = delete.table.unwrap_or_default();
+                let part_of_a_drop = SCHEMA_TABLES
+                    .iter()
+                    .any(|schema| schema.eq_ignore_ascii_case(table))
+                    || dropped.is_some_and(|dropped| dropped.eq_ignore_ascii_case(table));
+                return if part_of_a_drop {
+                    AuthorizerDecision::Allow
+                } else {
+                    AuthorizerDecision::Ignore
+                };
+            }
             _ => return AuthorizerDecision::Allow,
         };
         let guarded = match database {
@@ -311,6 +433,14 @@ pub(crate) fn guard_schema(db: &mut SqliteConnection, open: &Arc<AtomicBool>) {
         }
     });
 }
+
+/// The names SQLite gives the schema table a `DROP` deletes from.
+const SCHEMA_TABLES: [&str; 4] = [
+    "sqlite_master",
+    "sqlite_temp_master",
+    "sqlite_schema",
+    "sqlite_temp_schema",
+];
 
 /// Admits schema changes to application tables in `main` while it lives.
 pub(crate) struct SchemaWindow<'a> {
@@ -331,14 +461,56 @@ impl Drop for SchemaWindow<'_> {
     }
 }
 
-/// Delete every recorded write.
+/// Delete every recorded write up to and including sequence `through`,
+/// with its blob cells.
 ///
 /// # Errors
 ///
 /// [`ClientError`] when the outbox cannot be written.
-pub(crate) fn clear(db: &mut SqliteConnection) -> Result<(), ClientError> {
-    db.batch_execute("DELETE FROM main._connetto_outbox")?;
+pub(crate) fn clear_through(db: &mut SqliteConnection, through: i64) -> Result<(), ClientError> {
+    diesel::sql_query("DELETE FROM main._connetto_outbox_blob WHERE seq <= ?")
+        .bind::<diesel::sql_types::BigInt, _>(through)
+        .execute(db)?;
+    diesel::sql_query("DELETE FROM main._connetto_outbox WHERE seq <= ?")
+        .bind::<diesel::sql_types::BigInt, _>(through)
+        .execute(db)?;
     Ok(())
+}
+
+/// Whether the outbox holds any write.
+///
+/// # Errors
+///
+/// [`ClientError`] when the outbox cannot be read.
+pub(crate) fn holds_writes(db: &mut SqliteConnection) -> Result<bool, ClientError> {
+    Ok(diesel::select(diesel::dsl::exists(
+        _connetto_outbox::table.select(_connetto_outbox::seq),
+    ))
+    .get_result(db)?)
+}
+
+/// The tables the outbox holds writes to that no longer exist in their
+/// schema, sorted, so a schema change that drops or renames one is refused.
+///
+/// # Errors
+///
+/// [`ClientError`] when the outbox or the catalog cannot be read.
+pub(crate) fn stranded_tables(
+    db: &mut SqliteConnection,
+    shared: &HashSet<String>,
+) -> Result<Vec<String>, ClientError> {
+    let named: Vec<String> = _connetto_outbox::table
+        .select(_connetto_outbox::tbl)
+        .distinct()
+        .order(_connetto_outbox::tbl)
+        .load(db)?;
+    let mut stranded = Vec::new();
+    for table in named {
+        if columns(db, schema_of(shared, &table), &table)?.is_empty() {
+            stranded.push(table);
+        }
+    }
+    Ok(stranded)
 }
 
 diesel::table! {
@@ -359,6 +531,8 @@ diesel::table! {
 
 /// One recorded write.
 struct Recorded {
+    /// The write's place in the outbox.
+    seq: i64,
     /// The table written, as the trigger named it.
     tbl: String,
     /// The row before the write, absent for an insert.
@@ -373,8 +547,9 @@ struct Recorded {
 ///
 /// [`ClientError`] when the outbox cannot be read.
 fn recorded(db: &mut SqliteConnection) -> Result<Vec<Recorded>, ClientError> {
-    let rows: Vec<(String, Option<String>, Option<String>)> = _connetto_outbox::table
+    let rows: Vec<(i64, String, Option<String>, Option<String>)> = _connetto_outbox::table
         .select((
+            _connetto_outbox::seq,
             _connetto_outbox::tbl,
             _connetto_outbox::old,
             _connetto_outbox::new,
@@ -383,18 +558,38 @@ fn recorded(db: &mut SqliteConnection) -> Result<Vec<Recorded>, ClientError> {
         .load(db)?;
     Ok(rows
         .into_iter()
-        .map(|(tbl, old, new)| Recorded { tbl, old, new })
+        .map(|(seq, tbl, old, new)| Recorded { seq, tbl, old, new })
         .collect())
 }
 
-/// One cell, comparable and orderable.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// One cell, comparable.
+#[derive(Debug, Clone, PartialEq)]
 enum Cell {
     Null,
     Integer(i64),
-    Real(u64),
+    Real(f64),
     Text(String),
     Blob(Vec<u8>),
+}
+
+impl Cell {
+    fn into_value(self) -> Value<String, Vec<u8>> {
+        match self {
+            Self::Null => Value::Null,
+            Self::Integer(integer) => Value::Integer(integer),
+            Self::Real(real) => Value::Real(real),
+            Self::Text(text) => Value::Text(text),
+            Self::Blob(blob) => Value::Blob(blob),
+        }
+    }
+
+    /// The cell as stored bytes compare, a real by its bits.
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Real(left), Self::Real(right)) => left.to_bits() == right.to_bits(),
+            _ => self == other,
+        }
+    }
 }
 
 /// `cell` as an SQL literal.
@@ -402,11 +597,10 @@ fn literal(cell: &Cell) -> String {
     match cell {
         Cell::Null => "NULL".to_owned(),
         Cell::Integer(integer) => integer.to_string(),
-        Cell::Real(bits) => {
-            let real = f64::from_bits(*bits);
+        Cell::Real(real) => {
             if real.is_finite() {
                 format!("{real:?}")
-            } else if real > 0.0 {
+            } else if *real > 0.0 {
                 "9e999".to_owned()
             } else {
                 "-9e999".to_owned()
@@ -429,9 +623,39 @@ fn literal(cell: &Cell) -> String {
     }
 }
 
-/// One encoded value as a cell.
-fn decode_value(value: serde_json::Value, text: &str) -> Result<Cell, ClientError> {
-    let malformed = || ClientError::Apply(format!("a malformed outbox value: {text}"));
+/// Which row of a write a value belongs to.
+#[derive(Clone, Copy)]
+enum Side {
+    Old,
+    New,
+}
+
+impl Side {
+    const fn letter(self) -> &'static str {
+        match self {
+            Self::Old => "o",
+            Self::New => "n",
+        }
+    }
+}
+
+/// A blob cell stored beside its outbox row.
+#[derive(diesel::QueryableByName)]
+struct StoredBlob {
+    #[diesel(sql_type = diesel::sql_types::Binary)]
+    value: Vec<u8>,
+}
+
+/// One encoded value as a cell, reading a blob from `side` of the write
+/// `seq` under `column`.
+fn decode_value(
+    db: &mut SqliteConnection,
+    seq: i64,
+    side: Side,
+    column: &str,
+    value: serde_json::Value,
+) -> Result<Cell, ClientError> {
+    let malformed = || ClientError::Apply(format!("a malformed outbox value in write {seq}"));
     match value {
         serde_json::Value::Null => Ok(Cell::Null),
         serde_json::Value::Number(number) => {
@@ -439,12 +663,20 @@ fn decode_value(value: serde_json::Value, text: &str) -> Result<Cell, ClientErro
         }
         serde_json::Value::String(text) => Ok(Cell::Text(text)),
         serde_json::Value::Object(object) => {
-            if let Some(serde_json::Value::String(hex)) = object.get("b") {
-                decode_hex(hex).map(Cell::Blob).ok_or_else(malformed)
+            if object.contains_key("b") {
+                let stored: StoredBlob = diesel::sql_query(
+                    "SELECT value FROM main._connetto_outbox_blob \
+                     WHERE seq = ? AND col = ? AND side = ?",
+                )
+                .bind::<diesel::sql_types::BigInt, _>(seq)
+                .bind::<diesel::sql_types::Text, _>(column)
+                .bind::<diesel::sql_types::Text, _>(side.letter())
+                .get_result(db)
+                .optional()?
+                .ok_or_else(malformed)?;
+                Ok(Cell::Blob(stored.value))
             } else if let Some(serde_json::Value::String(real)) = object.get("r") {
-                real.parse::<f64>()
-                    .map(|real| Cell::Real(real.to_bits()))
-                    .map_err(|_| malformed())
+                real.parse::<f64>().map(Cell::Real).map_err(|_| malformed())
             } else {
                 Err(malformed())
             }
@@ -453,17 +685,25 @@ fn decode_value(value: serde_json::Value, text: &str) -> Result<Cell, ClientErro
     }
 }
 
-fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok())
-        .collect()
-}
-
-/// One recorded row as a JSON object.
-fn parsed(text: &str) -> Result<serde_json::Map<String, serde_json::Value>, ClientError> {
-    serde_json::from_str(text)
-        .map_err(|_| ClientError::Apply(format!("a malformed outbox row: {text}")))
+/// The cells of one recorded row whose column `want` admits, by column
+/// name, a column the row does not carry left out.
+fn decode_row(
+    db: &mut SqliteConnection,
+    seq: i64,
+    side: Side,
+    text: &str,
+    want: impl Fn(&str) -> bool,
+) -> Result<HashMap<String, Cell>, ClientError> {
+    let object: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text)
+        .map_err(|_| ClientError::Apply(format!("a malformed outbox row in write {seq}")))?;
+    let mut cells = HashMap::with_capacity(object.len());
+    for (column, value) in object {
+        if want(&column) {
+            let cell = decode_value(db, seq, side, &column, value)?;
+            cells.insert(column, cell);
+        }
+    }
+    Ok(cells)
 }
 
 /// The key clauses of every write the outbox holds, the old key and the new
@@ -486,19 +726,22 @@ pub(crate) fn spare_clauses(
             let found = columns(db, schema_of(shared, &row.tbl), &row.tbl)?;
             schemas.insert(row.tbl.clone(), found);
         }
-        let keyed = key_columns(&schemas[&row.tbl]);
-        for text in [&row.old, &row.new].into_iter().flatten() {
-            let mut values = parsed(text)?;
-            let mut wheres = Vec::with_capacity(keyed.len());
-            for column in &keyed {
-                let value = values.remove(&column.name).unwrap_or_default();
-                let cell = decode_value(value, text)?;
-                wheres.push(format!(
-                    "{} IS {}",
-                    quote_ident(&column.name),
-                    literal(&cell)
-                ));
-            }
+        let keyed: Vec<String> = key_columns(&schemas[&row.tbl])
+            .into_iter()
+            .map(|column| column.name.clone())
+            .collect();
+        for (side, text) in [(Side::Old, &row.old), (Side::New, &row.new)] {
+            let Some(text) = text else { continue };
+            let mut values = decode_row(db, row.seq, side, text, |column| {
+                keyed.iter().any(|key| key == column)
+            })?;
+            let wheres: Vec<String> = keyed
+                .iter()
+                .map(|column| {
+                    let cell = values.remove(column).unwrap_or(Cell::Null);
+                    format!("{} IS {}", quote_ident(column), literal(&cell))
+                })
+                .collect();
             let clause = format!("({})", wheres.join(" AND "));
             let table = clauses.entry(row.tbl.to_lowercase()).or_default();
             if !table.contains(&clause) {
@@ -509,297 +752,217 @@ pub(crate) fn spare_clauses(
     Ok(clauses)
 }
 
-#[cfg(debug_assertions)]
-pub(crate) use check::assert_matches;
+/// One cell's storage class and value, read back from SQL.
+#[derive(diesel::QueryableByName)]
+struct Typed {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    kind: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+    integer: Option<i64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    real: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    text: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
+    blob: Option<Vec<u8>>,
+}
 
-/// The debug check that the outbox records what the session captures.
-#[cfg(debug_assertions)]
-mod check {
-    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-
-    use diesel::SqliteConnection;
-    use diesel::prelude::*;
-    use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, Value};
-
-    use connetto_core::sql::quote_ident;
-
-    use super::{
-        Cell, Column, Recorded, cell, columns, decode_value, encoded, key_columns, literal, parsed,
-        recorded, recorded_tables, schema_of, shared_tables,
+/// The value `column` holds in a row recorded before the column existed,
+/// its default, which is what the row reads as now.
+fn default_cell(db: &mut SqliteConnection, column: &Column) -> Result<Cell, ClientError> {
+    let Some(default) = &column.dflt_value else {
+        return Ok(Cell::Null);
     };
-    use crate::{ClientError, SHARED_SCHEMA};
+    let typed: Typed = diesel::sql_query(format!(
+        "SELECT typeof(v) AS kind, \
+         CASE typeof(v) WHEN 'integer' THEN v END AS integer, \
+         CASE typeof(v) WHEN 'real' THEN v END AS real, \
+         CASE typeof(v) WHEN 'text' THEN v END AS text, \
+         CASE typeof(v) WHEN 'blob' THEN v END AS blob \
+         FROM (SELECT ({default}) AS v)"
+    ))
+    .get_result(db)?;
+    Ok(match typed.kind.as_str() {
+        "integer" => typed.integer.map_or(Cell::Null, Cell::Integer),
+        "real" => typed.real.map_or(Cell::Null, Cell::Real),
+        "text" => typed.text.map_or(Cell::Null, Cell::Text),
+        "blob" => typed.blob.map_or(Cell::Null, Cell::Blob),
+        _ => Cell::Null,
+    })
+}
 
-    /// One encoded value read back from SQL.
-    #[derive(diesel::QueryableByName)]
-    struct Encoded {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        value: String,
-    }
+/// A recorded table as the upload names it, with its columns.
+struct Shape {
+    schema: TableSchema<String>,
+    columns: Vec<Column>,
+    /// Each column's default, read once.
+    defaults: Vec<Option<Cell>>,
+}
 
-    /// A row's net change, in the changeset's own terms.
-    #[derive(Debug, PartialEq, Eq)]
-    enum Net {
-        Insert(Vec<Cell>),
-        Delete(Vec<Cell>),
-        Update(Vec<(Option<Cell>, Option<Cell>)>),
-    }
-
-    /// A row of one table, by its table and key.
-    type RowKey = (String, Vec<Cell>);
-
-    type Changes = BTreeMap<RowKey, Net>;
-
-    /// Panic unless the outbox's writes amount to the changes the session
-    /// captured in `changeset` for the tables the outbox records, those in
-    /// `main` and the tables of `shared` in the shared store.
-    ///
-    /// A key whose row no longer holds the outbox's last recorded values is
-    /// left out, in a table of `exempt_written`, which a write under the
-    /// exemption changed since the last push, and in every shared table,
-    /// which another identity's connection writes unseen. The session uploads
-    /// the row as it is now and the outbox the values the application wrote,
-    /// which is the difference the outbox exists to make.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`] when the catalog or either side cannot be read.
-    pub(crate) fn assert_matches(
-        db: &mut SqliteConnection,
-        changeset: &[u8],
-        exempt_written: &HashSet<String>,
-        shared: &HashSet<String>,
-    ) -> Result<(), ClientError> {
-        let recorded = recorded(db)?;
-        let (from_outbox, overwritten) = from_recorded(db, &recorded, exempt_written, shared)?;
-        let mut tables: Vec<String> = recorded_tables(db)?
-            .into_iter()
-            .map(|(table, _)| table)
-            .collect();
-        if !shared.is_empty() {
-            tables.extend(
-                shared_tables(db, shared)?
-                    .into_iter()
-                    .map(|(table, _)| table),
-            );
-        }
-        let mut from_session = from_changeset(changeset, &tables)?;
-        from_session.retain(|key, _| !overwritten.contains(key));
-        assert_eq!(
-            from_outbox, from_session,
-            "the outbox and the session disagree on the writes to upload"
-        );
-        Ok(())
-    }
-
-    /// The row of `table` in `schema` under `key` as it is now, absent when
-    /// none is.
-    fn current_row(
-        db: &mut SqliteConnection,
-        schema: &str,
-        table: &str,
-        columns: &[Column],
-        key: &[Cell],
-    ) -> Result<Option<Vec<Cell>>, ClientError> {
-        let wheres: Vec<String> = key_columns(columns)
+impl Shape {
+    /// The table's current shape. The key check refuses a table whose key
+    /// has more columns than a changeset's one byte per column can number,
+    /// so every key position fits.
+    fn read(db: &mut SqliteConnection, schema: &str, table: &str) -> Result<Self, ClientError> {
+        let columns = columns(db, schema, table)?;
+        let flags = columns
             .iter()
-            .zip(key)
-            .map(|(column, cell)| format!("{} IS {}", quote_ident(&column.name), literal(cell)))
-            .collect();
-        let target = format!("{}.{}", quote_ident(schema), quote_ident(table));
-        let rows: Vec<Encoded> = diesel::sql_query(format!(
-            "SELECT {} AS value FROM {target} WHERE {}",
-            encoded(&target, columns),
-            wheres.join(" AND ")
-        ))
-        .load(db)?;
-        rows.first()
-            .map(|row| decode(db, &row.value, columns))
-            .transpose()
+            .map(|column| u8::try_from(column.pk))
+            .collect::<Result<Vec<u8>, _>>()
+            .map_err(|_| ClientError::Apply(format!("{table} has over 255 key columns")))?;
+        let defaults = columns.iter().map(|_| None).collect();
+        Ok(Self {
+            schema: TableSchema::new(table.to_owned(), columns.len(), flags),
+            columns,
+            defaults,
+        })
     }
 
-    fn from_value(value: &Value<String, Vec<u8>>) -> Cell {
-        match value {
-            Value::Null => Cell::Null,
-            Value::Integer(integer) => Cell::Integer(*integer),
-            Value::Real(real) => Cell::Real(real.to_bits()),
-            Value::Text(text) => Cell::Text(text.clone()),
-            Value::Blob(blob) => Cell::Blob(blob.clone()),
-        }
-    }
-
-    fn from_changeset(changeset: &[u8], tables: &[String]) -> Result<Changes, ClientError> {
-        let mut changes = Changes::new();
-        if changeset.is_empty() {
-            return Ok(changes);
-        }
-        let ParsedDiffSet::Changeset(diff) = ParsedDiffSet::parse(changeset)
-            .map_err(|err| ClientError::Apply(format!("parsing the capture: {err:?}")))?
-        else {
-            return Ok(changes);
-        };
-        for op in diff.iter() {
-            let table = op.table().name().clone();
-            if !tables.contains(&table) {
-                continue;
-            }
-            let key: Vec<Cell> = op.primary_key().iter().map(from_value).collect();
-            let net = match op {
-                ChangesetOp::Insert { values, .. } => {
-                    Net::Insert(values.iter().map(from_value).collect())
-                }
-                ChangesetOp::Delete { old_values, .. } => {
-                    Net::Delete(old_values.iter().map(from_value).collect())
-                }
-                ChangesetOp::Update { values, .. } => Net::Update(
-                    values
-                        .iter()
-                        .map(|(old, new)| {
-                            (old.as_ref().map(from_value), new.as_ref().map(from_value))
-                        })
-                        .collect(),
-                ),
-            };
-            changes.insert((table, key), net);
-        }
-        Ok(changes)
-    }
-
-    /// The value a column added after a row was recorded holds in that row,
-    /// its default, which is what the session reports for it too.
-    fn default_cell(db: &mut SqliteConnection, column: &Column) -> Result<Cell, ClientError> {
-        let Some(default) = &column.dflt_value else {
-            return Ok(Cell::Null);
-        };
-        let rows: Vec<Encoded> = diesel::sql_query(format!(
-            "SELECT {} AS value FROM (SELECT ({default}) AS v)",
-            cell("v")
-        ))
-        .load(db)?;
-        let text = rows.first().map_or("null", |row| row.value.as_str());
-        let value = serde_json::from_str(text)
-            .map_err(|_| ClientError::Apply(format!("a malformed default: {text}")))?;
-        decode_value(value, text)
-    }
-
-    /// One recorded row as cells in the order of `columns`.
-    fn decode(
+    /// `row` in column order, a column it does not carry at its default.
+    fn whole(
+        &mut self,
         db: &mut SqliteConnection,
-        text: &str,
-        columns: &[Column],
+        mut row: HashMap<String, Cell>,
     ) -> Result<Vec<Cell>, ClientError> {
-        let mut row = parsed(text)?;
-        columns
-            .iter()
-            .map(|column| match row.remove(&column.name) {
-                Some(value) => decode_value(value, text),
-                None => default_cell(db, column),
-            })
+        let mut cells = Vec::with_capacity(self.columns.len());
+        for (index, column) in self.columns.iter().enumerate() {
+            let cell = match row.remove(&column.name) {
+                Some(cell) => cell,
+                None => {
+                    if let Some(cell) = &self.defaults[index] {
+                        cell.clone()
+                    } else {
+                        let cell = default_cell(db, column)?;
+                        self.defaults[index] = Some(cell.clone());
+                        cell
+                    }
+                }
+            };
+            cells.push(cell);
+        }
+        Ok(cells)
+    }
+
+    fn key_of(&self, row: &HashMap<String, Cell>) -> Vec<Option<Cell>> {
+        key_columns(&self.columns)
+            .into_iter()
+            .map(|column| row.get(&column.name).cloned())
             .collect()
     }
 
-    /// The row before the first write and after the last, per key.
-    struct Span {
-        before: Option<Vec<Cell>>,
-        after: Option<Vec<Cell>>,
-    }
-
-    fn key(row: &[Cell], columns: &[Column]) -> Vec<Cell> {
-        let mut keyed: Vec<(i64, Cell)> = columns
+    /// Whether an update from `old` to `new` moves the row's key, a key cell
+    /// either record lacks counting as moved.
+    fn moves_key(&self, old: &HashMap<String, Cell>, new: &HashMap<String, Cell>) -> bool {
+        self.key_of(old)
             .iter()
-            .zip(row)
-            .filter(|(column, _)| column.pk > 0)
-            .map(|(column, cell)| (column.pk, cell.clone()))
-            .collect();
-        keyed.sort_by_key(|(pk, _)| *pk);
-        keyed.into_iter().map(|(_, cell)| cell).collect()
+            .zip(&self.key_of(new))
+            .any(|(left, right)| {
+                left.as_ref()
+                    .zip(right.as_ref())
+                    .is_none_or(|(l, r)| !l.same(r))
+            })
     }
+}
 
-    /// The net change the outbox records per key, and the keys whose row no
-    /// longer holds the outbox's last recorded values, in a table of
-    /// `exempt_written` or of `shared`, which the net change leaves out.
-    fn from_recorded(
-        db: &mut SqliteConnection,
-        recorded: &[Recorded],
-        exempt_written: &HashSet<String>,
-        shared: &HashSet<String>,
-    ) -> Result<(Changes, BTreeSet<RowKey>), ClientError> {
-        let mut schemas: HashMap<String, Vec<Column>> = HashMap::new();
-        let mut spans: BTreeMap<(String, Vec<Cell>), Span> = BTreeMap::new();
-        let mut write =
-            |table: &str, key: Vec<Cell>, before: Option<Vec<Cell>>, after: Option<Vec<Cell>>| {
-                spans
-                    .entry((table.to_owned(), key))
-                    .and_modify(|span| span.after.clone_from(&after))
-                    .or_insert(Span { before, after });
-            };
-        for row in recorded {
-            if !schemas.contains_key(&row.tbl) {
-                let found = columns(db, schema_of(shared, &row.tbl), &row.tbl)?;
-                schemas.insert(row.tbl.clone(), found);
+/// A changeset built from the outbox, and the last write it covers.
+pub(crate) struct Built {
+    /// The upload, empty when the writes cancel out.
+    pub(crate) changeset: Vec<u8>,
+    /// The sequence of the newest write read.
+    pub(crate) through: i64,
+}
+
+/// Build the changeset the outbox's writes amount to, merged per row in the
+/// order they were made as SQLite's session merges them, each table under
+/// its physical name and its current columns. A column a row does not carry
+/// reads as its default in an insert or a delete and as unchanged in an
+/// update, and a column the table no longer has is left out. `None` when the
+/// outbox is empty.
+///
+/// # Errors
+///
+/// [`ClientError`] when the outbox or the catalog cannot be read, or a record
+/// is malformed.
+pub(crate) fn build(
+    db: &mut SqliteConnection,
+    shared: &HashSet<String>,
+) -> Result<Option<Built>, ClientError> {
+    let writes = recorded(db)?;
+    let Some(through) = writes.last().map(|write| write.seq) else {
+        return Ok(None);
+    };
+    let builder_err =
+        |err: sqlite_diff_rs::Error| ClientError::Apply(format!("building the upload: {err}"));
+    let mut shapes: HashMap<String, Shape> = HashMap::new();
+    let mut builder = ChangeSet::<TableSchema<String>, String, Vec<u8>>::new();
+    for write in writes {
+        let shape = match shapes.entry(write.tbl.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Shape::read(db, schema_of(shared, &write.tbl), &write.tbl)?)
             }
-            let columns = &schemas[&row.tbl];
-            let old = row
-                .old
-                .as_deref()
-                .map(|old| decode(db, old, columns))
-                .transpose()?;
-            let new = row
-                .new
-                .as_deref()
-                .map(|new| decode(db, new, columns))
-                .transpose()?;
-            match (old, new) {
-                (None, Some(new)) => write(&row.tbl, key(&new, columns), None, Some(new)),
-                (Some(old), None) => write(&row.tbl, key(&old, columns), Some(old), None),
-                (Some(old), Some(new)) => {
-                    let (from, to) = (key(&old, columns), key(&new, columns));
-                    if from == to {
-                        write(&row.tbl, from, Some(old), Some(new));
-                    } else {
-                        write(&row.tbl, from, Some(old), None);
-                        write(&row.tbl, to, None, Some(new));
-                    }
+        };
+        let known = |column: &str| shape.columns.iter().any(|known| known.name == column);
+        let old = write
+            .old
+            .as_deref()
+            .map(|text| decode_row(db, write.seq, Side::Old, text, known))
+            .transpose()?;
+        let new = write
+            .new
+            .as_deref()
+            .map(|text| decode_row(db, write.seq, Side::New, text, known))
+            .transpose()?;
+        let (delete, insert, update) = match (old, new) {
+            (None, Some(new)) => (None, Some(new), None),
+            (Some(old), None) => (Some(old), None, None),
+            (Some(old), Some(new)) if shape.moves_key(&old, &new) => (Some(old), Some(new), None),
+            (Some(old), Some(new)) => (None, None, Some((old, new))),
+            (None, None) => {
+                return Err(ClientError::Apply(format!(
+                    "outbox write {} records neither an old nor a new row",
+                    write.seq
+                )));
+            }
+        };
+        if let Some(old) = delete {
+            let mut op = ChangeDelete::from(shape.schema.clone());
+            for (index, cell) in shape.whole(db, old)?.into_iter().enumerate() {
+                op = op.set(index, cell.into_value()).map_err(builder_err)?;
+            }
+            builder = builder.delete(op);
+        }
+        if let Some(new) = insert {
+            let mut op = Insert::from(shape.schema.clone());
+            for (index, cell) in shape.whole(db, new)?.into_iter().enumerate() {
+                op = op.set(index, cell.into_value()).map_err(builder_err)?;
+            }
+            builder = builder.insert(op);
+        }
+        if let Some((mut old, mut new)) = update {
+            let mut op = Update::from(shape.schema.clone());
+            let mut changed = false;
+            for (index, column) in shape.columns.iter().enumerate() {
+                if column.pk > 0 {
+                    let key = old.remove(&column.name).unwrap_or(Cell::Null);
+                    op = op.set_old(index, key.into_value()).map_err(builder_err)?;
+                } else if let (Some(before), Some(after)) =
+                    (old.remove(&column.name), new.remove(&column.name))
+                    && !before.same(&after)
+                {
+                    op = op
+                        .set(index, before.into_value(), after.into_value())
+                        .map_err(builder_err)?;
+                    changed = true;
                 }
-                (None, None) => {}
+            }
+            if changed {
+                builder = builder.update(op);
             }
         }
-        let mut changes = Changes::new();
-        let mut overwritten = BTreeSet::new();
-        for ((table, key), span) in spans {
-            let schema = schema_of(shared, &table);
-            if (schema == SHARED_SCHEMA || exempt_written.contains(&table))
-                && current_row(db, schema, &table, &schemas[&table], &key)? != span.after
-            {
-                overwritten.insert((table, key));
-                continue;
-            }
-            let net = match (span.before, span.after) {
-                (None, None) => continue,
-                (None, Some(after)) => Net::Insert(after),
-                (Some(before), None) => Net::Delete(before),
-                (Some(before), Some(after)) => {
-                    if before == after {
-                        continue;
-                    }
-                    Net::Update(
-                        schemas[&table]
-                            .iter()
-                            .zip(before.into_iter().zip(after))
-                            .map(|(column, (old, new))| {
-                                if column.pk > 0 {
-                                    (Some(old), None)
-                                } else if old == new {
-                                    (None, None)
-                                } else {
-                                    (Some(old), Some(new))
-                                }
-                            })
-                            .collect(),
-                    )
-                }
-            };
-            changes.insert((table, key), net);
-        }
-        Ok((changes, overwritten))
     }
+    Ok(Some(Built {
+        changeset: builder.build(),
+        through,
+    }))
 }

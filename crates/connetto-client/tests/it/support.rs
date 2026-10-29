@@ -227,6 +227,43 @@ pub fn captured_tables(replica: &mut diesel::SqliteConnection, seq: u64) -> Vec<
     set.iter().map(|op| op.table().name().to_owned()).collect()
 }
 
+/// The operations of the queued entry `seq`, in the order its changeset
+/// carries them, each as its kind, its table and its values, an update's as
+/// `(old, new)` pairs with an undefined side as `None`.
+///
+/// # Panics
+///
+/// When the record is absent or does not parse as a changeset.
+#[must_use]
+pub fn queued_ops(replica: &mut diesel::SqliteConnection, seq: u64) -> Vec<String> {
+    use diesel::RunQueryDsl as _;
+    use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet};
+
+    let seq: i64 = i64::try_from(seq).expect("a test sequence fits an i64");
+    let row: PendingRow =
+        diesel::sql_query("SELECT changeset FROM _connetto_pending WHERE seq = ?")
+            .bind::<diesel::sql_types::BigInt, _>(seq)
+            .get_result(replica)
+            .expect("the pending record is durable");
+    let ParsedDiffSet::Changeset(set) =
+        ParsedDiffSet::parse(&row.changeset).expect("a queued changeset parses")
+    else {
+        panic!("the queued record is not a changeset");
+    };
+    set.iter()
+        .map(|op| {
+            let table = op.table().name().to_owned();
+            match op {
+                ChangesetOp::Insert { values, .. } => format!("insert {table} {values:?}"),
+                ChangesetOp::Delete { old_values, .. } => {
+                    format!("delete {table} {old_values:?}")
+                }
+                ChangesetOp::Update { values, .. } => format!("update {table} {values:?}"),
+            }
+        })
+        .collect()
+}
+
 /// A scripted server or relay that records every control frame the client
 /// sends and serves the frames a test queues, idling while none are queued.
 #[derive(Clone, Default)]

@@ -2,7 +2,7 @@
 //! live query tier dispatch against a real in-process server.
 //!
 //! The tier contract under test: `notes` lives in an attached local database,
-//! the capture session is bound to `main`, so a note is physically incapable
+//! the outbox records no table of it, so a note is physically incapable
 //! of riding a mutation upload, and live queries dispatch by tier at
 //! registration. Local rows and aggregates are served by local (re-)execution
 //! with no server subscription at all, a mixed row query auto-subscribes each
@@ -266,7 +266,7 @@ async fn local_write_is_outside_the_capture_session() {
     );
 
     // A note lands in the attached database, readable through the bare name,
-    // and the capture session has nothing to upload: push is a no-op.
+    // and the outbox has nothing to upload: push is a no-op.
     diesel::insert_into(notes::table)
         .values((notes::id.eq(1_i64), notes::body.eq("draft")))
         .execute(client.conn())

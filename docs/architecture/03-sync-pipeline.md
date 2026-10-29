@@ -16,7 +16,7 @@ Describe how mutations flow from client to server (write path) and how server-si
 
 The client writes the mutation to its local SQLite immediately, before the server has confirmed it. This keeps the UI responsive.
 
-Nothing tags the row itself. The write is recorded by the change-capture session, and pending state lives in the queue below, keyed by `client_seq`. What makes the write "optimistic" is only that the local apply precedes the server's answer: a rejection or a conflict later inverts the captured changeset (see 6 below).
+Nothing tags the row itself. The write is recorded in the outbox inside its own transaction (`13-client-connection.md`), and pending state lives in the queue below, keyed by `client_seq`. What makes the write "optimistic" is only that the local apply precedes the server's answer: a rejection or a conflict later inverts the queued changeset (see 6 below).
 
 ### 2. Local mutation queue
 
@@ -55,11 +55,11 @@ A conflict occurs when a version-bearing op's recorded `updated_at` does not mat
 
 The server sends `MutationConflict(client_seq, table, server_row)`, with the server's copy absent when the row is gone.
 
-**The client's response is one policy, revert, and the application layers its own merge on top.** An earlier sketch here tabled four per-table strategies (`ServerWins`, `ClientWins`, `LastWriterWins`, `Custom`). None of that configuration exists and none is planned: the connection inverts the retained changeset and applies the inverse with capture suspended, undoing the optimistic write without re-uploading it, and a row a concurrent server patch already changed is left as the server left it. Both `MutationReject` and `MutationConflict` reach the application carrying the affected rows (`AffectedRow { table, key }`) and, for a conflict, the server's current copy, so an application wanting anything other than server-wins re-writes on top of the reverted state with data it was handed.
+**The client's response is one policy, revert, and the application layers its own merge on top.** An earlier sketch here tabled four per-table strategies (`ServerWins`, `ClientWins`, `LastWriterWins`, `Custom`). None of that configuration exists and none is planned: the connection inverts the retained changeset and applies the inverse under the write exemption, undoing the optimistic write without recording it for upload, and a row a concurrent server patch already changed is left as the server left it. Both `MutationReject` and `MutationConflict` reach the application carrying the affected rows (`AffectedRow { table, key }`) and, for a conflict, the server's current copy, so an application wanting anything other than server-wins re-writes on top of the reverted state with data it was handed.
 
 ### 6. Rollback on rejection
 
-On `MutationReject`, the client retires the pending record, inverts the retained changeset with capture suspended (reverting the optimistic local write), and surfaces the rejection with its affected rows to the application. **Built (2026-09-24).** `Indeterminate` is the exception. It means the server could not settle the write, so the record and its rows stay and the write is sent again (`10-subscription-materializer.md`, rows 6 and 8 of the failure inventory).
+On `MutationReject`, the client retires the pending record, inverts the retained changeset under the write exemption (reverting the optimistic local write), and surfaces the rejection with its affected rows to the application. **Built (2026-09-24).** `Indeterminate` is the exception. It means the server could not settle the write, so the record and its rows stay and the write is sent again (`10-subscription-materializer.md`, rows 6 and 8 of the failure inventory).
 
 ---
 
@@ -118,7 +118,7 @@ The message is sent over the WebSocket connection.
 
 On receiving `LivePatch`:
 
-1. Apply the patchset to local SQLite inside one transaction, with capture suspended so server rows are never re-uploaded. Frames arrive in commit order on an ordered transport, so there is no gap detection and no reorder buffer on the live path: a gap can only open across a disconnect, and the resume cursor plus catchup or full resync covers it (`06-reconnect.md`).
+1. Apply the patchset to local SQLite inside one transaction, under the write exemption so the outbox never records server rows. Frames arrive in commit order on an ordered transport, so there is no gap detection and no reorder buffer on the live path: a gap can only open across a disconnect, and the resume cursor plus catchup or full resync covers it (`06-reconnect.md`).
 2. Honour the departure marker: an indirect delete applies only when no surviving subscription's predicate still matches the row (R44).
 3. Persist the frame's cursor as the resume position, atomically with the apply.
 4. Return flow-control credit to the server (`AckCredits`).

@@ -84,9 +84,17 @@ pub(crate) fn queue(conn: &mut Conn, writer: WriterRef, id: i32, captured: Major
     conn.db
         .batch_execute(&format!("INSERT INTO items (id) VALUES ({id})"))
         .expect("write locally");
-    let changeset = conn.session.changeset().expect("capture the write");
+    let built = crate::outbox::build(&mut conn.db, &conn.config.shared_tables)
+        .expect("read the outbox")
+        .expect("the write is recorded");
     let seq = conn
-        .append_entry(&writer, &changeset, None, Some(captured), true)
+        .append_entry(
+            &writer,
+            &built.changeset,
+            None,
+            Some(captured),
+            Some(built.through),
+        )
         .expect("queue the write");
     if let WriterRef::Number(number) = writer
         && crate::is_real_writer(&writer)

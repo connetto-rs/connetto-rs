@@ -424,7 +424,7 @@ async fn offline_write_reflushes_after_resume() {
     let client = client.client();
     let mut events = client.events();
 
-    // Cut the transport, then write locally: the capture session records
+    // Cut the transport, then write locally: the outbox records
     // the change, the send fails, and nothing is lost.
     offline.store(true, Ordering::Relaxed);
     kill_session(&slot).await;

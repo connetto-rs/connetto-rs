@@ -572,7 +572,7 @@ pub(crate) fn pins(db: &mut SqliteConnection) -> Result<Vec<(String, String)>, C
 /// Store the replica's `now` as the stop moment of every record whose stop the
 /// clock has not reached, a wall clock stepped back, so its countdown runs from
 /// `now` and outlives a restart (`docs/architecture/21-clocks.md`). The caller
-/// holds capture suspended, as for every other `_connetto_subscription` write.
+/// holds the write exemption, as for every other `_connetto_subscription` write.
 /// Returns whether any record moved.
 ///
 /// # Errors

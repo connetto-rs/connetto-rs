@@ -191,7 +191,7 @@ async fn a_fresh_process_with_the_cached_key_resumes_with_its_unsynced_work() {
         unsynced
     };
 
-    // A different connection, a different capture session, the same file and the
+    // A different connection, the same file and the
     // same cached key: this is the cold start an offline reboot performs.
     let store = super::support::key_store_with(&credential, key()).await;
     let mut conn = ClientBuilder::new(
