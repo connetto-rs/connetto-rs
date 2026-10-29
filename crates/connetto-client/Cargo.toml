@@ -355,7 +355,7 @@ pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main",
 rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "serde"] }
 # The native-auth test serves connetto-server's auth router on a real port and
 # drives the browser round-trip with a redirect-following-disabled HTTP client.
-axum = "0.8"
+axum = { workspace = true }
 reqwest = { version = "0.12", default-features = false }
 # GenericOidcProvider::discover takes an openidconnect::reqwest::Client.
 openidconnect = { version = "4.0.1", default-features = false, features = [

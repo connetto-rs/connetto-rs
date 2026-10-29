@@ -38,6 +38,21 @@ homepage = "https://github.com/connetto-rs/connetto-rs"
 connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 connetto-schema = { path = "crates/connetto-schema", version = "0.0.0" }
 
+# axum without its default `tower-log`, which turns on `tracing`'s `log`
+# bridge. The server installs its own tracing subscriber, so the bridge is
+# never read, and every log line it compiles in carries a fallback branch that
+# only runs when no subscriber is set. The other defaults stay on.
+axum = { version = "0.8", default-features = false, features = [
+  "form",
+  "http1",
+  "json",
+  "matched-path",
+  "original-uri",
+  "query",
+  "tokio",
+  "tracing",
+] }
+
 # subql: the CDC subscription runtime the materializer drives. Pinned to a rev
 # on main. `8ad31be` carries the whole row-visibility composition R5b consumes:
 # `RowPolicy` answering from the changed row, `OpenFgaPolicy` terminating it
