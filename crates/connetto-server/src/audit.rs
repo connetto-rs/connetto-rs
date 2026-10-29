@@ -396,32 +396,66 @@ pub type AuditHook<Id> = std::sync::Arc<dyn Fn(AuthEvent<Id>) + Send + Sync>;
 /// An [`AuditHook`] that appends through the deployment's audit table, `D`'s
 /// [`Audit`] member, on the given pool.
 ///
-/// The write is spawned, so the producer is never delayed by it, and a failure
-/// is logged rather than propagated: losing an audit row must not fail the
-/// logout, revocation or mint that produced it.
+/// The hook only queues the event, so the producer is never delayed, and one
+/// writer task drains the queue, so the rows land in the order the hook
+/// received them and the database clock stamps them in that order. Every
+/// producer sharing the hook shares that order. The writer waits for a
+/// connection rather than dropping a row it could not get one for, since a
+/// later row would otherwise land ahead of it. An insert that fails is logged
+/// and dropped rather than propagated: losing an audit row must not fail the
+/// logout, revocation or mint that produced it, nor stall the rows behind it.
+///
+/// # Panics
+///
+/// When called outside a Tokio runtime, which the writer task runs on.
 ///
 /// [`Audit`]: crate::schema::ConnettoSchema::Audit
 pub fn pg_audit_hook<D>(pool: Pool<AsyncPgConnection>) -> AuditHook<D::Id>
 where
     D: crate::schema::ConnettoSchema,
 {
+    let (queue, events) = tokio::sync::mpsc::unbounded_channel();
+    // The writer's warnings carry the span the hook was made under, as every
+    // task the server spawns for a caller does.
+    tokio::spawn(tracing::Instrument::instrument(
+        write_in_order::<D>(pool, events),
+        tracing::Span::current(),
+    ));
     std::sync::Arc::new(move |event: AuthEvent<D::Id>| {
-        let pool = pool.clone();
         let op = event.op;
-        tokio::spawn(async move {
-            let mut conn = match pool.get().await {
-                Ok(conn) => conn,
-                Err(error) => {
-                    tracing::warn!(%error, op = op.label(), "audit row dropped, no connection");
-                    return;
-                }
-            };
-            if let Err(error) = ExecuteDsl::execute(D::Audit::audit_insert(event), &mut conn).await
-            {
-                tracing::warn!(%error, op = op.label(), "audit row dropped, insert failed");
-            }
-        });
+        if queue.send(event).is_err() {
+            tracing::warn!(op = op.label(), "audit row dropped, the writer has stopped");
+        }
     })
+}
+
+/// How long the writer waits before asking the pool again after it could not
+/// hand out a connection.
+const CONNECTION_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Drain `events` into the audit table one row at a time, in queue order,
+/// until every hook feeding the queue is gone.
+async fn write_in_order<D>(
+    pool: Pool<AsyncPgConnection>,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<AuthEvent<D::Id>>,
+) where
+    D: crate::schema::ConnettoSchema,
+{
+    while let Some(event) = events.recv().await {
+        let op = event.op;
+        let mut conn = loop {
+            match pool.get().await {
+                Ok(conn) => break conn,
+                Err(error) => {
+                    tracing::warn!(%error, op = op.label(), "audit row waiting for a connection");
+                    tokio::time::sleep(CONNECTION_RETRY).await;
+                }
+            }
+        };
+        if let Err(error) = ExecuteDsl::execute(D::Audit::audit_insert(event), &mut conn).await {
+            tracing::warn!(%error, op = op.label(), "audit row dropped, insert failed");
+        }
+    }
 }
 
 /// Append one event through the deployment's audit table and wait for it.

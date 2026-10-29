@@ -1481,7 +1481,8 @@ async fn a_logout_revokes_the_live_session_and_the_audit_records_it() {
         other => panic!("the session's last frame says {other:?}"),
     }
 
-    // The writes are spawned, so they land shortly after the response.
+    // The writes are queued, so they land shortly after the response and in
+    // the order they were emitted, the login before the logout.
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut ops = audit_ops(&pool).await;
     while !ops.iter().any(|op| op == "logged_out") && Instant::now() < deadline {

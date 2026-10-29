@@ -1720,7 +1720,8 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
         .expect("POST /auth/logout");
     assert!(logout.status().is_success(), "logout: {}", logout.status());
 
-    // The writes are spawned, so they land shortly after the response.
+    // The writes are queued, so they land shortly after the response and in
+    // the order they were emitted, the login before the logout.
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut ops = audit_ops(&pool).await;
     while !ops.iter().any(|op| op == "logged_out") && Instant::now() < deadline {
