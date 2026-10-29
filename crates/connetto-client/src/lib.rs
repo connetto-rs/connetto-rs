@@ -92,6 +92,8 @@ mod memory_stores;
 mod multicast;
 mod outbox;
 mod pending;
+#[cfg(feature = "peer")]
+pub mod provisional;
 pub mod reconnect;
 mod replay;
 pub mod replica;
@@ -1624,6 +1626,14 @@ pub enum ClientEvent {
         /// The host's device.
         host: crate::bluetooth::HostId,
     },
+    /// A server write confirmed a peer-applied row's key, so its provenance
+    /// is cleared and the row falls under ordinary coverage (R77). Raised
+    /// once per apply, naming every row the apply confirmed.
+    #[cfg(feature = "peer")]
+    ProvisionalConfirmed {
+        /// The confirmed provenance rows, as stored.
+        rows: Vec<provisional::ProvisionalRow>,
+    },
     /// The server accepted a share-key replacement and queued its authorization resends.
     ShareKeysReplaced {
         /// The correlation token the swap it answers carried.
@@ -2001,26 +2011,38 @@ pub(crate) fn rename_diffset(
 /// application wrote against, because a capture records what SQLite actually
 /// changed and the `INSTEAD OF` triggers change the backing table.
 fn affected_rows(changeset: &[u8], tables: &PolicyTables) -> Result<Vec<AffectedRow>, ClientError> {
-    let parsed = ParsedDiffSet::parse(changeset)
-        .map_err(|err| ClientError::Apply(format!("parsing pushed changeset: {err:?}")))?;
-    let named = |physical: &str| tables.logical(physical).unwrap_or(physical).to_owned();
-    let rows = match parsed {
+    let rows = op_keys(changeset)
+        .map_err(|err| ClientError::Apply(format!("parsing pushed changeset: {err:?}")))?
+        .into_iter()
+        .map(|(table, key)| AffectedRow {
+            table: tables.logical(&table).map(str::to_owned).unwrap_or(table),
+            key,
+        })
+        .collect();
+    Ok(rows)
+}
+
+/// Every op of a changeset or patchset as its table, named as the payload
+/// names it, and its primary key, in payload order.
+pub(crate) fn op_keys(
+    bytes: &[u8],
+) -> Result<Vec<(String, Vec<KeyValue>)>, sqlite_diff_rs::ParseError> {
+    fn keyed(table: &str, key: Vec<Value<String, Vec<u8>>>) -> (String, Vec<KeyValue>) {
+        (
+            table.to_owned(),
+            key.into_iter().map(KeyValue::from).collect(),
+        )
+    }
+    Ok(match ParsedDiffSet::parse(bytes)? {
         ParsedDiffSet::Changeset(diff) => diff
             .iter()
-            .map(|op| AffectedRow {
-                table: named(op.table().name()),
-                key: op.primary_key().into_iter().map(KeyValue::from).collect(),
-            })
+            .map(|op| keyed(op.table().name(), op.primary_key()))
             .collect(),
         ParsedDiffSet::Patchset(diff) => diff
             .iter()
-            .map(|op| AffectedRow {
-                table: named(op.table().name()),
-                key: op.primary_key().into_iter().map(KeyValue::from).collect(),
-            })
+            .map(|op| keyed(op.table().name(), op.primary_key()))
             .collect(),
-    };
-    Ok(rows)
+    })
 }
 
 /// Count the ops in a captured changeset for the advisory `MutationHeader`.
@@ -4248,6 +4270,8 @@ fn install_replica_metadata(
     db.batch_execute(aggregates::AGGREGATE_DDL)?;
     #[cfg(feature = "device-identity")]
     db.batch_execute(enrolment::CERTIFICATE_DDL)?;
+    #[cfg(feature = "peer")]
+    db.batch_execute(provisional::PROVISIONAL_DDL)?;
     // A watch the previous run died still holding counts down from now.
     subscriptions::anchor_launch(db)?;
     Ok(())
@@ -6856,6 +6880,39 @@ where
             .collect()
     }
 
+    /// The provenance of a peer-applied row, standing it back from the table,
+    /// since the broadcast event stream can drop events (R77). The key is the
+    /// row's primary-key column values, in key order, and the table is named
+    /// as the application writes it.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the replica cannot be read.
+    #[cfg(feature = "peer")]
+    pub fn provenance(
+        &mut self,
+        table: &str,
+        key: &[KeyValue],
+    ) -> Result<Option<provisional::ProvisionalRow>, ClientError> {
+        let table = self
+            .config
+            .policy_tables
+            .physical(table)
+            .unwrap_or(table)
+            .to_lowercase();
+        provisional::row_of_key(&mut self.db, &table, key)
+    }
+
+    /// Every provenance row the replica holds, keyed order (R77).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the replica cannot be read.
+    #[cfg(feature = "peer")]
+    pub fn provisional_rows(&mut self) -> Result<Vec<provisional::ProvisionalRow>, ClientError> {
+        provisional::rows(&mut self.db)
+    }
+
     /// The lowercased names of the tables in the attached local tier, empty
     /// when no tier is attached.
     #[must_use]
@@ -8734,6 +8791,14 @@ where
                     format!("DELETE FROM {quoted} WHERE NOT ({})", kept.join(" OR "))
                 };
                 removed += diesel::sql_query(statement).execute(conn)?;
+                // A provenance record must not outlive the row it describes
+                // (R77), so whatever this delete took, its records go too.
+                #[cfg(feature = "peer")]
+                if truncated {
+                    provisional::drop_table(conn, &target.to_lowercase())?;
+                } else {
+                    provisional::drop_gone(conn, &target.to_lowercase())?;
+                }
             }
             Ok(removed)
         })
@@ -8848,6 +8913,26 @@ where
             .map(drop)
     }
 
+    /// The peer-applied rows still awaiting a verdict, as per-table primary-key
+    /// match clauses, so the eviction passes spare them beside the pending
+    /// writes (R77). The same shape as [`pending_spare`].
+    #[cfg(feature = "peer")]
+    fn provisional_spare(&mut self) -> Result<HashMap<String, Vec<String>>, ClientError> {
+        provisional::spare(&mut self.db)
+    }
+
+    /// The keep list a pass over the replica hands [`delete_uncovered`]: the
+    /// pending writes' keys, and, with a device, the still-provisional rows'
+    /// keys, one clause list per physical table.
+    fn keep_spare(&mut self) -> Result<HashMap<String, Vec<String>>, ClientError> {
+        let spare = self.pending_spare()?;
+        #[cfg(feature = "peer")]
+        let mut spare = spare;
+        #[cfg(feature = "peer")]
+        merge_clauses(&mut spare, self.provisional_spare()?);
+        Ok(spare)
+    }
+
     /// Return freelist pages to the filesystem: reclaim in
     /// bounded `incremental_vacuum` steps once the freelist is a large enough
     /// fraction of the file (D1), then truncate the write-ahead log so the pages
@@ -8912,7 +8997,7 @@ where
         else {
             return Ok(());
         };
-        let spare = self.pending_spare()?;
+        let spare = self.keep_spare()?;
         let removed =
             self.delete_uncovered(&coverage.tables, Some(sub_id), &Stale::Nothing, &spare)?;
         if removed > 0 {
@@ -8946,7 +9031,7 @@ where
                     scope.extend(coverage.tables);
                 }
             }
-            let spare = self.pending_spare()?;
+            let spare = self.keep_spare()?;
             self.delete_uncovered(&scope, None, &Stale::Nothing, &spare)?;
         }
         self.trim_replica()?;
@@ -9091,6 +9176,8 @@ where
         let coverage = self.cursor_subjects.as_deref();
         let config = &self.config;
         let shared = &config.shared_tables;
+        #[cfg(feature = "peer")]
+        let mut confirmed: Option<Vec<provisional::ProvisionalRow>> = None;
         let applied = deleting_transaction(&mut self.db, config, |conn| {
             let held = match set {
                 Some(set) if holdings::is_holder(conn, addressed_to)? => {
@@ -9123,6 +9210,12 @@ where
                         &shared_route(shared),
                     )?;
                 }
+                // A server write confirms the keys it lands on (R77).
+                #[cfg(feature = "peer")]
+                {
+                    let keys = provisional::written_keys(bytes)?;
+                    confirmed = Some(provisional::clear_written(conn, &keys)?);
+                }
             }
             if let Some(held) = &held {
                 held.take(conn, addressed_to)?;
@@ -9146,6 +9239,11 @@ where
             stage.clear();
         }
         applied?;
+        #[cfg(feature = "peer")]
+        if let Some(rows) = confirmed.filter(|rows| !rows.is_empty()) {
+            self.notices
+                .push_back(ClientEvent::ProvisionalConfirmed { rows });
+        }
         self.residual_check()
     }
 
@@ -10034,6 +10132,18 @@ mod tests {
         assert!(
             !timer.wait().is_zero(),
             "the next check lies after now: {timer:?}"
+        );
+    }
+
+    /// A payload that is no changeset and no patchset is refused, so an event
+    /// naming its affected rows is never built on garbage.
+    #[test]
+    fn affected_rows_refuses_a_payload_it_cannot_parse() {
+        let err = affected_rows(b"not a changeset", &PolicyTables::default())
+            .expect_err("the payload parses as neither");
+        assert!(
+            err.to_string().contains("parsing pushed changeset"),
+            "the refusal names the parse: {err}"
         );
     }
 }

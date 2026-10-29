@@ -7,16 +7,77 @@
 //! dialer the builder owns.
 
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 
 use connetto_client::{
-    ClientError, Custody, Grant, HeldCredential, MemoryKeyStore, NoGate, SyncSchema,
-    TransportFactory,
+    ClientError, Custody, GateAskFuture, GateAskOutcome, GateMechanism, Grant, HeldCredential,
+    MemoryKeyStore, NoGate, SyncSchema, TransportFactory,
 };
 use connetto_core::ReplicaKey;
 use connetto_core::messages::ControlMessage;
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, MaybeSend, ReplicaKeyStore, Transport};
 use connetto_server::openfga::{GrantMove, StoreUpkeep, UpkeepError};
+use parking_lot::Mutex;
+use tokio::sync::oneshot;
+
+/// A gate mechanism that stays locked and asks a prompt the test holds.
+#[derive(Clone)]
+pub struct LockedMechanism {
+    open: Arc<AtomicBool>,
+    asks: Arc<AtomicU32>,
+    senders: Arc<Mutex<Vec<oneshot::Sender<GateAskOutcome>>>>,
+}
+
+impl LockedMechanism {
+    /// A mechanism that starts locked and has never been asked.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            open: Arc::new(AtomicBool::new(false)),
+            asks: Arc::new(AtomicU32::new(0)),
+            senders: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Wait until the mechanism was asked `count` times, at most five seconds.
+    pub async fn until_asked(&self, count: u32) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.asks.load(Ordering::Acquire) < count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the mechanism is asked in time");
+    }
+
+    /// Resolve the pending prompt with the given outcome.
+    pub fn resolve(&self, outcome: GateAskOutcome) {
+        let mut senders = self.senders.lock();
+        if let Some(sender) = senders.pop() {
+            sender.send(outcome).expect("the pump holds the prompt");
+        }
+    }
+}
+
+impl GateMechanism for LockedMechanism {
+    fn lock(&self) {
+        self.open.store(false, Ordering::Release);
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
+    fn ask(&self) -> GateAskFuture {
+        self.asks.fetch_add(1, Ordering::AcqRel);
+        let (tx, rx) = oneshot::channel();
+        self.senders.lock().push(tx);
+        Box::pin(async move { rx.await.unwrap_or(GateAskOutcome::Dismissed) })
+    }
+}
 
 /// Authorization metadata for static policies that do not depend on share keys.
 pub struct KeyIndependentUpkeep;

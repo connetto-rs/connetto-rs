@@ -84,6 +84,8 @@ mod outbox_push;
 #[cfg(feature = "native-auth")]
 mod pump_fault;
 
+#[cfg(feature = "peer")]
+mod provisional;
 mod reconnect_live;
 
 mod references;
