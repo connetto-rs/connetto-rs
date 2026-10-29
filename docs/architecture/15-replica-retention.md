@@ -70,6 +70,8 @@ Eviction must run under the write exemption. `ExemptWrites` in `crates/connetto-
 
 This is possible because the client already holds, per subscription, the **SQLite-dialect** query text and its bind values (`ConnettoSession::subscribe_spec`), so a subscription is directly runnable against the replica. Storing the association instead was rejected on two grounds: a record per row per covering subscription is more storage than the data itself on a narrow table, which is self-defeating in a feature meant to shrink the replica, and it would need reference counting, which fails in both directions (a leaked count pins rows forever, a lost count deletes live data).
 
+**Amended (R11 Part B, 2026-10-29): the replica records row holdings.** Every row a server frame writes is held in `_connetto_holding` by the subscription the frame was addressed to, or by a hidden membership subscription's label (R27). A departure releases the addressed subscription's holding, a delete upstream releases every holding of the row, a resync releases what its replacement delivers again, and a subscription's holdings go when its record ends, is forgotten or runs out of grace. A holding is present or absent, never counted, so a frame applied twice changes nothing and no count can leak or be lost. The key is the clause the outbox triggers spare a written row under, computed with `quote()` over the stored row. A table the build shares keeps no holdings in `main`. Eviction still deletes by the recomputed coverage below and does not read the holdings.
+
 **Overlap falls out for free, which is the property that matters.** Every subscription is a predicate over one table, so the surviving predicates `OR` together and eviction deletes the complement:
 
 ```sql

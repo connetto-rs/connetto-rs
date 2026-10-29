@@ -527,6 +527,27 @@ pub(crate) fn coverage_of(spec: &SubscriptionSpec) -> Result<Option<Coverage>, C
     Ok(Some(Coverage { tables, predicate }))
 }
 
+/// The lowercased tables `spec`'s query reads anywhere but its own `FROM`
+/// and `JOIN`s, which is where a membership term's `IN (SELECT ...)` reads
+/// its membership table (R27).
+pub(crate) fn membership_tables(spec: &SubscriptionSpec) -> Result<HashSet<String>, ClientError> {
+    let sql = inline_binds(&spec.query, &spec.binds)?;
+    let mut tables = parse_subscription(&sql)?.tables;
+    let statements = Parser::parse_sql(&SQLiteDialect {}, &sql)
+        .map_err(|err| ClientError::Session(err.to_string()))?;
+    match statements.as_slice() {
+        [Statement::Query(query)] => match query.body.as_ref() {
+            SetExpr::Select(select) => {
+                let outer = outer_tables(select);
+                tables.retain(|table| !outer.contains(table));
+            }
+            _ => tables.clear(),
+        },
+        _ => tables.clear(),
+    }
+    Ok(tables)
+}
+
 /// The base tables named in a query's own `FROM` and `JOIN`s, excluding any
 /// relation that appears only inside a subquery. A membership term's `IN
 /// (SELECT ... FROM member_table ...)` names `member_table`, which belongs to

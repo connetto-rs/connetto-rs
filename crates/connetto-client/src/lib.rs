@@ -78,6 +78,7 @@ pub mod dsl;
 mod enrolment;
 mod grant_expiry;
 pub mod harden;
+mod holdings;
 #[cfg(feature = "peer")]
 mod hotspot;
 mod interest;
@@ -4241,6 +4242,7 @@ fn install_replica_metadata(
         }
     }
     db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
+    db.batch_execute(holdings::HOLDING_DDL)?;
     // After the subscription tables, since it references `_connetto_query`.
     db.batch_execute(aggregates::AGGREGATE_DDL)?;
     #[cfg(feature = "device-identity")]
@@ -7418,7 +7420,8 @@ where
 
     /// Change the subscription record under the write exemption, and rewrite
     /// this identity's interest in the shared store in the same transaction
-    /// so the other identities' passes see the change.
+    /// so the other identities' passes see the change. The holdings no live
+    /// record keeps go in that transaction too.
     fn change_subscriptions<R>(
         &mut self,
         change: impl FnOnce(&mut SqliteConnection) -> Result<R, ClientError>,
@@ -7428,6 +7431,7 @@ where
         self.db.transaction(|db| {
             let changed = change(db)?;
             interest::record(db, config)?;
+            holdings::prune(db)?;
             Ok(changed)
         })
     }
@@ -7725,18 +7729,14 @@ where
                 ClientEvent::Closed
             }
             Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch))) => {
-                self.apply_patch(&patch.patchset_zstd, None, Some(&patch.sub_id))?;
+                self.apply_patch(&patch.patchset_zstd, None, &patch.sub_id)?;
                 self.ack_one().await?;
                 ClientEvent::SnapshotApplied {
                     sub_id: patch.sub_id,
                 }
             }
             Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => {
-                self.apply_patch(
-                    &patch.patchset_zstd,
-                    Some(&patch.cursor),
-                    Some(&patch.sub_id),
-                )?;
+                self.apply_patch(&patch.patchset_zstd, Some(&patch.cursor), &patch.sub_id)?;
                 self.last_cursor = Some(patch.cursor.clone());
                 self.ack_one().await?;
                 ClientEvent::LivePatch {
@@ -8509,6 +8509,11 @@ where
     /// named aggregate, its whole resting answer (R95). Returns whether the
     /// notice named an aggregate, so the caller keeps its label out of
     /// `resyncing`.
+    ///
+    /// The holdings the replacement delivers again go first: the notified
+    /// subscription's own, every holding on a truncated table whoever holds
+    /// it (O5), and every holding at a connection's first beyond-history
+    /// notice, since every subscription resyncs then (R73).
     fn clear_subscription_rows(
         &mut self,
         sub_id: &str,
@@ -8516,13 +8521,39 @@ where
     ) -> Result<bool, ClientError> {
         let declared = subscriptions::declared(&mut self.db)?;
         let beyond_history = *reason == FullResyncReason::CursorBeyondHistory;
+        let every_holding = beyond_history && !self.history_cleared;
+        let truncated = match reason {
+            FullResyncReason::TableTruncated { table } => {
+                let table = table.to_lowercase();
+                Some(
+                    self.config
+                        .policy_tables
+                        .physical(&table)
+                        .map_or(table.clone(), str::to_lowercase),
+                )
+            }
+            _ => None,
+        };
+        {
+            let _suspended = ExemptWrites::raise(&self.write_flags);
+            self.db.transaction(|db| {
+                if every_holding {
+                    return holdings::release_all(db);
+                }
+                holdings::release_holder(db, sub_id)?;
+                match &truncated {
+                    Some(table) => holdings::release_table(db, table),
+                    None => Ok(()),
+                }
+            })?;
+        }
         // A hidden membership subscription has no declared record to take its tables from.
         let membership = sub_id
             .strip_prefix(MEMBERSHIP_LABEL_PREFIX)
             .filter(|_| beyond_history)
             .map(str::to_lowercase);
         // Every row subscription resyncs, so the first notice empties all their tables and later ones spare fresh replacements.
-        if beyond_history && !self.history_cleared {
+        if every_holding {
             self.history_cleared = true;
             let mut scope: HashSet<String> = membership.into_iter().collect();
             for record in &declared {
@@ -9018,13 +9049,23 @@ where
     /// checks, and then fails every row as a per-row `Constraint` conflict,
     /// which `server_wins` maps to Omit. Server data is authoritative, so it
     /// lands underneath the policy triggers rather than through them.
+    ///
+    /// The same transaction moves `addressed_to`'s holdings: a departure
+    /// releases its holding of the row, a delete upstream releases every
+    /// holding of it, and every row the patch writes is held, whether or not
+    /// a departure withheld from the apply left the row in place.
     fn apply_patch(
         &mut self,
         payload_zstd: &[u8],
         cursor: Option<&Cursor>,
-        addressed_to: Option<&str>,
+        addressed_to: &str,
     ) -> Result<(), ClientError> {
         let bytes = zstd::decode_all(payload_zstd)?;
+        let parsed = ParsedDiffSet::parse(&bytes).ok();
+        let set = match &parsed {
+            Some(ParsedDiffSet::Patchset(set)) => Some(set),
+            _ => None,
+        };
         let suspended = ExemptWrites::raise(&self.write_flags);
         // The counting gate makes the update hook tally each row into
         // `apply_staging` (R60 decision 4). Cleared before any error propagates
@@ -9038,11 +9079,20 @@ where
         let config = &self.config;
         let shared = &config.shared_tables;
         let applied = deleting_transaction(&mut self.db, config, |conn| {
+            let held = match set {
+                Some(set) if holdings::is_holder(conn, addressed_to)? => {
+                    Some(holdings::PatchHoldings::read(conn, config, set)?)
+                }
+                _ => None,
+            };
+            if let Some(held) = &held {
+                held.release(conn, addressed_to)?;
+            }
             // Departure filtering weighs the wire's logical names against what
             // the subscriptions cover, which is also logical, so the rename
             // follows it. It reads the other identities' rows in this
             // transaction, so what it spares is what the apply sees.
-            let apply = Self::honour_departures(conn, config, &bytes, addressed_to)?
+            let apply = Self::honour_departures(conn, config, &bytes, set, addressed_to)?
                 .map(|bytes| Self::to_physical(config, bytes))
                 .transpose()?;
             // The cursor advances even when every op was withheld. A departure
@@ -9060,6 +9110,9 @@ where
                         &shared_route(shared),
                     )?;
                 }
+            }
+            if let Some(held) = &held {
+                held.take(conn, addressed_to)?;
             }
             if let Some(cursor) = cursor {
                 persist_cursor_and_subjects(conn, cursor, coverage)?;
@@ -9161,15 +9214,16 @@ where
     /// the server sends one to every covering subscription, and holding each
     /// back on the others would leave the row for ever.
     ///
-    /// Returns `None` when the payload should be applied unchanged, which is
-    /// every ordinary patch and costs one parse.
+    /// Returns the payload to apply, `None` when every op was withheld.
+    /// `set` is `bytes` parsed, absent when it is not a patchset.
     fn honour_departures(
         db: &mut SqliteConnection,
         config: &ClientConfig,
         bytes: &[u8],
-        addressed_to: Option<&str>,
+        set: Option<&holdings::ParsedPatch>,
+        addressed_to: &str,
     ) -> Result<Option<Vec<u8>>, ClientError> {
-        let Ok(ParsedDiffSet::Patchset(set)) = ParsedDiffSet::parse(bytes) else {
+        let Some(set) = set else {
             return Ok(Some(bytes.to_vec()));
         };
         // The server sends a departure as a patchset of indirect deletes and
@@ -9191,7 +9245,7 @@ where
         let mut kept = PatchSet::<TableSchema<String>, String, Vec<u8>>::new();
         let mut any = false;
         for (table, pk) in departures {
-            if Self::still_covered(db, config, &table, &pk, addressed_to)? {
+            if Self::still_covered(db, config, &table, &pk, Some(addressed_to))? {
                 continue;
             }
             any = true;
