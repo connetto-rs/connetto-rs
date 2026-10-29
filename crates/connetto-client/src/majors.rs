@@ -492,6 +492,7 @@ pub(crate) fn remember_shared_generation(
         return Ok(false);
     }
     db.batch_execute("DELETE FROM _connetto_meta; DELETE FROM _connetto_aggregates")?;
+    crate::holdings::release_account(db)?;
     diesel::sql_query(
         "INSERT INTO _connetto_shared_generation (id, generation) VALUES (1, ?) \
          ON CONFLICT(id) DO UPDATE SET generation = excluded.generation",

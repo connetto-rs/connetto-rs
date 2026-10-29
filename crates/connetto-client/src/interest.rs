@@ -207,10 +207,11 @@ fn everyone_but(
     Ok(others)
 }
 
-/// Take `identity` out of the shared store: delete its interest and spare
-/// rows and, when `evict`, every shared row no remaining identity covers or
-/// has unsent (R11 decision 7). Returns whether any identity still has a row
-/// in either record, which is what keeps the store alive.
+/// Take `identity` out of the shared store: delete its interest, spare and
+/// holdings rows and, when `evict`, every shared row no remaining identity
+/// covers or has unsent (R11 decision 7). Returns whether any identity still
+/// has a row in the interest or spare record, which is what keeps the store
+/// alive.
 ///
 /// # Errors
 ///
@@ -226,6 +227,7 @@ pub(crate) fn depart(
             .execute(conn)?;
         diesel::delete(_connetto_spare::table.filter(_connetto_spare::identity.eq(identity)))
             .execute(conn)?;
+        crate::holdings::release_identity(conn, identity)?;
         if evict {
             let kept = everyone_but(conn, config, identity)?;
             for table in &config.shared_tables {

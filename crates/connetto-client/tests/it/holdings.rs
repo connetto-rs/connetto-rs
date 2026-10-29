@@ -39,7 +39,7 @@ diesel::table! {
 }
 
 /// One holding as the replica stores it: holder, table, key.
-type Holding = (String, String, String);
+pub(super) type Holding = (String, String, String);
 
 #[derive(QueryableByName)]
 struct HoldingRow {
@@ -51,7 +51,7 @@ struct HoldingRow {
     key: String,
 }
 
-fn holdings<T>(conn: &mut ConnettoConnection<T>) -> BTreeSet<Holding>
+pub(super) fn holdings<T>(conn: &mut ConnettoConnection<T>) -> BTreeSet<Holding>
 where
     T: Transport,
     T::Error: core::fmt::Display,
@@ -65,7 +65,7 @@ where
 }
 
 /// The holdings `entries` name, each a holder, a table and the ids it holds.
-fn held(entries: &[(&str, &str, &[i64])]) -> BTreeSet<Holding> {
+pub(super) fn held(entries: &[(&str, &str, &[i64])]) -> BTreeSet<Holding> {
     entries
         .iter()
         .flat_map(|(holder, table, ids)| {
@@ -107,20 +107,20 @@ where
 }
 
 fn table(name: &str) -> SimpleTable {
-    let second = if name == "orders" {
-        "quantity"
-    } else {
-        "order_id"
+    let second = match name {
+        "orders" => "quantity",
+        "tags" => "label",
+        _ => "order_id",
     };
     SimpleTable::new(name, &[("id", ""), (second, "")], &[0])
 }
 
 /// One patch's ops, built in order.
 #[derive(Default)]
-struct Patch(PatchSet<SimpleTable, String, Vec<u8>>);
+pub(super) struct Patch(PatchSet<SimpleTable, String, Vec<u8>>);
 
 impl Patch {
-    fn insert(self, name: &str, id: i64) -> Self {
+    pub(super) fn insert(self, name: &str, id: i64) -> Self {
         let insert = Insert::<_, String, Vec<u8>>::from(table(name))
             .set(0, Value::Integer(id))
             .expect("set id")
@@ -141,7 +141,7 @@ impl Patch {
         Self(self.0.insert(insert))
     }
 
-    fn update(self, name: &str, id: i64, second: i64) -> Self {
+    pub(super) fn update(self, name: &str, id: i64, second: i64) -> Self {
         let update = Update::<_, PatchsetFormat, String, Vec<u8>>::from(table(name))
             .set(0, Value::Integer(id))
             .expect("set id")
@@ -151,7 +151,7 @@ impl Patch {
     }
 
     /// A delete of a row gone upstream.
-    fn delete(self, name: &str, id: i64) -> Self {
+    pub(super) fn delete(self, name: &str, id: i64) -> Self {
         Self(
             self.0
                 .delete(PatchDelete::new(table(name), vec![Value::Integer(id)])),
@@ -159,7 +159,7 @@ impl Patch {
     }
 
     /// A departure, the row left the addressed subscription (R44).
-    fn depart(self, name: &str, id: i64) -> Self {
+    pub(super) fn depart(self, name: &str, id: i64) -> Self {
         Self(
             self.0
                 .delete(PatchDelete::new(table(name), vec![Value::Integer(id)]).indirect(true)),
@@ -171,7 +171,7 @@ impl Patch {
     }
 }
 
-fn inserts(name: &str, ids: &[i64]) -> Patch {
+pub(super) fn inserts(name: &str, ids: &[i64]) -> Patch {
     ids.iter()
         .fold(Patch::default(), |patch, id| patch.insert(name, *id))
 }
@@ -199,8 +199,8 @@ async fn ack_handshake(server: &mut LoopbackTransport) {
 
 /// A connected client and the server end of its wire, which the test drives
 /// frame by frame.
-struct Session {
-    conn: ConnettoConnection<LoopbackTransport>,
+pub(super) struct Session {
+    pub(super) conn: ConnettoConnection<LoopbackTransport>,
     server: LoopbackTransport,
     cursor: u8,
 }
@@ -227,6 +227,21 @@ impl Session {
         }
     }
 
+    /// Bring `conn`, opened with no server, online over a fresh wire.
+    pub(super) async fn attach(mut conn: ConnettoConnection<LoopbackTransport>) -> Self {
+        let (mut server, client_end) = loopback();
+        let acked = tokio::spawn(async move {
+            ack_handshake(&mut server).await;
+            server
+        });
+        conn.attach(client_end).await.expect("attach");
+        Self {
+            conn,
+            server: acked.await.expect("the handshake task"),
+            cursor: 0,
+        }
+    }
+
     fn next_cursor(&mut self) -> Cursor {
         self.cursor += 1;
         Cursor::new(vec![0, 0, 0, 0, 0, 0, 0, self.cursor])
@@ -234,7 +249,7 @@ impl Session {
 
     /// Pump until the client reports the event `wanted` picks out, which is
     /// the one the frame just sent produces.
-    async fn until(&mut self, what: &str, wanted: impl Fn(&ClientEvent) -> bool) {
+    pub(super) async fn until(&mut self, what: &str, wanted: impl Fn(&ClientEvent) -> bool) {
         for _ in 0..64 {
             let event = self.conn.pump_one().await.expect("pump");
             assert!(
@@ -248,7 +263,7 @@ impl Session {
         panic!("no {what} within 64 events");
     }
 
-    async fn control(
+    pub(super) async fn control(
         &mut self,
         message: ControlMessage,
         what: &str,
@@ -262,7 +277,7 @@ impl Session {
     }
 
     /// A snapshot of `pages` for `sub_id`, each page its own patch.
-    async fn snapshot(&mut self, sub_id: &str, pages: Vec<Patch>) {
+    pub(super) async fn snapshot(&mut self, sub_id: &str, pages: Vec<Patch>) {
         self.control(
             ControlMessage::SnapshotBegin(SnapshotBegin {
                 sub_id: sub_id.to_owned(),
@@ -297,7 +312,7 @@ impl Session {
         .await;
     }
 
-    async fn live(&mut self, sub_id: &str, patch: Patch) {
+    pub(super) async fn live(&mut self, sub_id: &str, patch: Patch) {
         let cursor = self.next_cursor();
         self.server
             .send_bulk(BulkMessage::LivePatch(LivePatch::new(
@@ -313,7 +328,7 @@ impl Session {
         .await;
     }
 
-    async fn resync(&mut self, sub_id: &str, reason: FullResyncReason) {
+    pub(super) async fn resync(&mut self, sub_id: &str, reason: FullResyncReason) {
         self.control(
             ControlMessage::FullResyncRequired(FullResyncRequired {
                 sub_id: sub_id.to_owned(),
@@ -326,13 +341,13 @@ impl Session {
     }
 
     /// Declare `sub_id` over `query` and deliver its snapshot of `ids`.
-    async fn holding(&mut self, sub_id: &str, query: &str, name: &str, ids: &[i64]) {
+    pub(super) async fn holding(&mut self, sub_id: &str, query: &str, name: &str, ids: &[i64]) {
         self.conn.subscribe(sub_id, query).await.expect("subscribe");
         self.snapshot(sub_id, vec![inserts(name, ids)]).await;
     }
 
     /// Take the wire down, as a server going away does.
-    async fn offline(mut self) -> ConnettoConnection<LoopbackTransport> {
+    pub(super) async fn offline(mut self) -> ConnettoConnection<LoopbackTransport> {
         drop(self.server);
         for _ in 0..64 {
             if !self.conn.is_connected() {
@@ -776,9 +791,9 @@ mod rebuild {
     };
     use connetto_core::MAJOR_DIRECTIVE;
     use connetto_core::schema::SchemaBundle;
-    use connetto_server::{LoopbackTransport, loopback};
+    use connetto_server::LoopbackTransport;
 
-    use super::{DDL, ORDERS, Session, ack_handshake, held, holdings};
+    use super::{DDL, ORDERS, Session, held, holdings};
 
     fn schema_at(major: u32) -> SyncSchema {
         SyncSchema::new(
@@ -815,18 +830,7 @@ mod rebuild {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_major_rebuild_drops_the_holdings_with_the_rows() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut conn = open_at(&dir, 1).await;
-        let (mut server, client_end) = loopback();
-        let acked = tokio::spawn(async move {
-            ack_handshake(&mut server).await;
-            server
-        });
-        conn.attach(client_end).await.expect("attach");
-        let mut s = Session {
-            conn,
-            server: acked.await.expect("the handshake task"),
-            cursor: 0,
-        };
+        let mut s = Session::attach(open_at(&dir, 1).await).await;
         s.holding("a", ORDERS, "orders", &[1]).await;
         assert_eq!(holdings(&mut s.conn), held(&[("a", "orders", &[1])]));
         drop(s.offline().await);
