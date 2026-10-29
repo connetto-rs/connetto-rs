@@ -47,7 +47,7 @@ jobs:
       - uses: LucaCappelletti94/cargo-echoes@9d3e3917cbfde54b75a50204df645e33d8274b59 # v1.11.0
         with:
           cwd: ${{ matrix.cwd }}
-          version: 0.9.1
+          version: 0.10.2
           threshold: 2
           min-tokens: 0
           functions: true
