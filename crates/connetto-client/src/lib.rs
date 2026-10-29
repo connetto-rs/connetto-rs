@@ -3889,6 +3889,15 @@ struct Run {
 /// The bound a share-key swap or a declaration fence waits on its answer for.
 const SHARE_KEY_REQUEST_WAIT: Duration = Duration::from_secs(30);
 
+/// The wait before a held key whose expiry second has just begun is checked
+/// again.
+///
+/// The deadline counts on the wall clock and the check reads the replica's,
+/// which can still be in the second before when the wall clock has reached
+/// the expiry. The check then keeps the key, and a deadline handed out as
+/// already passed would never wake a driver that already woke on it.
+const SHARE_KEY_EXPIRY_RECHECK: Duration = Duration::from_millis(1);
+
 static NEXT_SHARE_KEY_REQUEST: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(1);
 
@@ -6165,8 +6174,14 @@ where
             let remaining = if expiry <= 0 {
                 Duration::ZERO
             } else {
-                Duration::from_secs(u64::try_from(expiry).expect("a positive i64 fits a u64"))
-                    .saturating_sub(crate::away::SystemClock.wall())
+                let at =
+                    Duration::from_secs(u64::try_from(expiry).expect("a positive i64 fits a u64"));
+                let wall = crate::away::SystemClock.wall();
+                match at.checked_sub(wall) {
+                    Some(left) if !left.is_zero() => left,
+                    _ if wall.as_secs() == at.as_secs() => SHARE_KEY_EXPIRY_RECHECK,
+                    _ => Duration::ZERO,
+                }
             };
             deadline = Some(match deadline {
                 Some(armed) => armed.min(now + remaining),
@@ -9843,6 +9858,32 @@ mod tests {
             conn.writers[&unissued()].pending[&1].provenance,
             None,
             "nothing past the restored frontier is named"
+        );
+    }
+
+    /// A held key whose expiry second the wall clock has reached is checked
+    /// again later rather than handed to a driver as a deadline already
+    /// passed. The replica's clock can still read the second before, so the
+    /// key outlives the check, and a driver that already woke on that deadline
+    /// would wait on it for ever.
+    #[test]
+    fn a_held_key_at_its_expiry_second_is_checked_again_later() {
+        use crate::away::Clock as _;
+
+        let mut conn = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            DDL,
+            &ClientConfig::new("expiry-recheck"),
+            None,
+        )
+        .expect("open replica");
+        let reached = crate::away::SystemClock.wall().as_secs();
+        conn.share_key_expiry = Some(i64::try_from(reached).expect("a wall second fits an i64"));
+        conn.recompute_share_key_deadline();
+        let timer = conn.share_key_timer().expect("the held key arms the timer");
+        assert!(
+            !timer.wait().is_zero(),
+            "the next check lies after now: {timer:?}"
         );
     }
 }
