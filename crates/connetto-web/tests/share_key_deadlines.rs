@@ -924,8 +924,10 @@ async fn the_expiry_saves_while_a_recovery_dial_is_pending() {
     let dial_started = dial_at.borrow()[0];
     let wait_ms = i64::max(0, (grant_deadline - seconds_now()) * 1000);
     timeout_ms(i32::try_from(wait_ms).expect("expiry wait fits milliseconds")).await;
+    // The hub saves on its own expiry wake, which can land after this one.
+    let persisted = wait_until(async || saves.get() >= 2, 300, 10).await;
     assert!(
-        saves.get() >= 2,
+        persisted,
         "the expiry persisted while the dial stayed held, dial {dial_started}, hub error {err:?}",
         err = hub_err.try_recv().unwrap_or_default(),
     );
@@ -1119,8 +1121,10 @@ async fn the_key_win_resumes_a_fresh_attach_without_a_redial() {
     );
     let wait_ms = i64::max(0, (grant_deadline - seconds_now()) * 1000);
     timeout_ms(i32::try_from(wait_ms).expect("expiry wait fits milliseconds")).await;
+    // The hub saves on its own expiry wake, which can land after this one.
+    let persisted = wait_until(async || saves.get() >= 2, 300, 10).await;
     assert!(
-        saves.get() >= 2,
+        persisted,
         "the expiry saved during the post-attach restore, dials {d}, hub error {err:?}",
         d = dials.get(),
         err = hub_err.try_recv().unwrap_or_default(),
