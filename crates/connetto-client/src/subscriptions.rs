@@ -282,6 +282,18 @@ pub(crate) fn forget(db: &mut SqliteConnection, sub_id: &str) -> Result<(), Clie
     })
 }
 
+/// Whether a record names `sub_id`, live or ended.
+///
+/// # Errors
+///
+/// [`ClientError::Session`] when the replica cannot be read.
+pub(crate) fn is_declared(db: &mut SqliteConnection, sub_id: &str) -> Result<bool, ClientError> {
+    Ok(diesel::select(diesel::dsl::exists(
+        subscription::table.filter(subscription::id.eq(sub_id)),
+    ))
+    .get_result(db)?)
+}
+
 /// The query identity a subscription id names: the shared `_connetto_query`
 /// row id and the binds in placeholder order, or `None` when no record names
 /// it. The resting table keys server-computed values on this identity rather

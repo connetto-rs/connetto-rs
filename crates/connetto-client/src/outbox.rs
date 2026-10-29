@@ -82,7 +82,7 @@ pub(crate) struct Column {
 /// # Errors
 ///
 /// [`ClientError`] when the catalog cannot be read.
-fn columns(
+pub(crate) fn columns(
     db: &mut SqliteConnection,
     schema: &str,
     table: &str,
@@ -278,7 +278,7 @@ fn triggers(schema: &str, table: &str, columns: &[Column], spare: Option<&str>) 
                     spares,
                     "INSERT OR IGNORE INTO _connetto_spare (identity, tbl, clause) \
                      VALUES ('{identity}', '{lowered}', {}); ",
-                    spare_clause(row, columns)
+                    key_clause(row, columns)
                 );
             }
         }
@@ -316,15 +316,15 @@ fn triggers(schema: &str, table: &str, columns: &[Column], spare: Option<&str>) 
 }
 
 /// The key columns of `columns`, in key order.
-fn key_columns(columns: &[Column]) -> Vec<&Column> {
+pub(crate) fn key_columns(columns: &[Column]) -> Vec<&Column> {
     let mut keyed: Vec<&Column> = columns.iter().filter(|column| column.pk > 0).collect();
     keyed.sort_by_key(|column| column.pk);
     keyed
 }
 
-/// The SQL rendering `row`'s key as the clause `record_spare` writes,
-/// `("a" IS 1 AND "b" IS 'x')`, each value through `quote()`.
-fn spare_clause(row: &str, columns: &[Column]) -> String {
+/// The SQL rendering `row`'s key as the clause `record_spare` writes and a
+/// holding names, `("a" IS 1 AND "b" IS 'x')`, each value through `quote()`.
+pub(crate) fn key_clause(row: &str, columns: &[Column]) -> String {
     let parts: Vec<String> = key_columns(columns)
         .into_iter()
         .map(|column| {
