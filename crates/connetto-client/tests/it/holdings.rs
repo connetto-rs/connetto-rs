@@ -15,6 +15,7 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use sqlite_diff_rs::{
     DiffOps, Indirect, Insert, PatchDelete, PatchSet, PatchsetFormat, SimpleTable, Update, Value,
@@ -77,6 +78,32 @@ fn held(entries: &[(&str, &str, &[i64])]) -> BTreeSet<Holding> {
             })
         })
         .collect()
+}
+
+/// Make the replica refuse `op` on `_connetto_holding`, as a full disk would.
+fn refuse_holdings<T>(conn: &mut ConnettoConnection<T>, op: &str)
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    conn.conn()
+        .batch_execute(&format!(
+            "CREATE TEMP TRIGGER refuse_{op} BEFORE {op} ON main._connetto_holding \
+             BEGIN SELECT RAISE(ABORT, 'the replica refuses'); END"
+        ))
+        .expect("install the refusal");
+}
+
+fn order_ids<T>(conn: &mut ConnettoConnection<T>) -> Vec<i64>
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    orders::table
+        .select(orders::id)
+        .order(orders::id.asc())
+        .load(conn.conn())
+        .expect("read the replica")
 }
 
 fn table(name: &str) -> SimpleTable {
@@ -397,6 +424,52 @@ async fn a_frame_applied_twice_leaves_the_holdings_of_one() {
         .await;
     }
     assert_eq!(holdings(&mut s.conn), held(&[("a", "orders", &[2])]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frame_whose_holdings_cannot_be_written_applies_nothing() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1]).await;
+    refuse_holdings(&mut s.conn, "INSERT");
+    let cursor = s.next_cursor();
+    s.server
+        .send_bulk(BulkMessage::LivePatch(LivePatch::new(
+            "a",
+            cursor,
+            Patch::default().insert("orders", 2).compressed(),
+        )))
+        .await
+        .expect("send a live patch");
+    s.conn
+        .pump_one()
+        .await
+        .expect_err("the replica refuses the holding");
+    assert_eq!(
+        order_ids(&mut s.conn),
+        vec![1],
+        "the row goes in with its holding or not at all"
+    );
+    assert_eq!(holdings(&mut s.conn), held(&[("a", "orders", &[1])]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unsubscribe_whose_holdings_cannot_be_released_keeps_the_subscription() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1]).await;
+    refuse_holdings(&mut s.conn, "DELETE");
+    s.conn
+        .unsubscribe("a")
+        .await
+        .expect_err("the replica refuses the release");
+    assert_eq!(
+        s.conn
+            .declared_subscriptions()
+            .expect("read the records")
+            .len(),
+        1,
+        "the record ends with its holdings or not at all"
+    );
+    assert_eq!(holdings(&mut s.conn), held(&[("a", "orders", &[1])]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
