@@ -11,17 +11,22 @@ use std::time::{Duration, SystemTime};
 
 use parking_lot::Mutex;
 
-use crate::frame::{PeerFrame, read_frame, write_frame};
-use crate::node::client_config_for;
+use crate::frame::{ExchangeFrame, MAX_MANIFEST_ROWS, PeerFrame, read_frame, write_frame};
+use crate::node::{EXCHANGE_QUEUE, SlotState, client_config_for};
 use crate::{
-    CloseReason, Identity, LinkError, Liveness, Node, PeerEvent, Refusal, SocketPrep, SystemClock,
-    Trust,
+    CloseReason, Identity, LinkError, Liveness, Node, PeerEvent, PeerSendError, Refusal,
+    SocketPrep, SystemClock, Trust,
 };
 use connetto_core::device_cert::{
     AttestationLevel, CertificateRequest, CertificateSerial, CertificateSigner, DeploymentId,
     DeviceCertificate, DeviceIdentity, DeviceIssuer, DeviceKey, DeviceKeyError, KeyHome, Revoked,
-    RootCa, key_id, public_key_info,
+    RootCa, certificate_key_id, key_id, public_key_info,
 };
+use connetto_core::exchange::{
+    EndOutcome, Frontier, ManifestRow, Origin, RetractCause, Retraction,
+};
+use connetto_core::messages::{MutationRejectReason, WriterRef};
+use connetto_core::schema::{Major, SchemaVersion};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, SigningKey as RcgenSigningKey};
 use socket2::SockRef;
 use tokio::sync::mpsc;
@@ -1050,6 +1055,10 @@ async fn an_unaccepted_attestation_level_is_refused() {
 
 /// Proof 7.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the scenario walks the pings and the silence in the order they cross the link"
+)]
 async fn a_silent_peer_closes_with_peer_lost_and_pings_keep_a_link() {
     let now = whole_second();
     let deployment = Deployment::new(8, now);
@@ -1088,7 +1097,7 @@ async fn a_silent_peer_closes_with_peer_lost_and_pings_keep_a_link() {
     // sending, holding the socket open.
     let mut raw = raw_peer_connect(deployment.root_der(), &silent, host_addr).await;
     let hello = PeerFrame::Hello {
-        version: 1,
+        version: crate::frame::PROTOCOL_VERSION,
         dial: 1,
         numbers: Vec::new(),
     };
@@ -1100,7 +1109,13 @@ async fn a_silent_peer_closes_with_peer_lost_and_pings_keep_a_link() {
         .expect("the host answers within the bound")
         .expect("a frame arrives")
         .expect("the host sends a hello");
-    assert!(matches!(hello, PeerFrame::Hello { version: 1, .. }));
+    assert!(matches!(
+        hello,
+        PeerFrame::Hello {
+            version: crate::frame::PROTOCOL_VERSION,
+            ..
+        }
+    ));
     time::pause();
 
     // The link is live on the host side, and then the silence bound closes
@@ -1463,7 +1478,7 @@ async fn raw_linked(
 ) -> tokio_rustls::TlsStream<tokio::net::TcpStream> {
     let mut raw = raw_peer_connect(root_der, peer, addr).await;
     let hello = PeerFrame::Hello {
-        version: 1,
+        version: crate::frame::PROTOCOL_VERSION,
         dial: 1,
         numbers: Vec::new(),
     };
@@ -1534,7 +1549,7 @@ async fn an_oversized_or_misplaced_frame_closes_with_protocol() {
     // A second `Hello` on a live link breaks the protocol too.
     let mut raw = raw_linked(deployment.root_der(), &again, host_addr).await;
     let hello = PeerFrame::Hello {
-        version: 1,
+        version: crate::frame::PROTOCOL_VERSION,
         dial: 2,
         numbers: Vec::new(),
     };
@@ -2032,10 +2047,10 @@ async fn a_peer_speaking_another_version_is_refused_both_ways() {
     let host_node = node(deployment.root_der(), h_tx);
     let host_addr = serve(&host_node, &host);
 
-    // A dialler speaking version 2 never links, and the host closes on it.
+    // A dialler speaking version 1 never links, and the host closes on it.
     let mut raw = raw_peer_connect(deployment.root_der(), &future, host_addr).await;
     let hello = PeerFrame::Hello {
-        version: 2,
+        version: 1,
         dial: 1,
         numbers: Vec::new(),
     };
@@ -2059,7 +2074,7 @@ async fn a_peer_speaking_another_version_is_refused_both_ways() {
     assert!(ended, "the host closes on a peer of another version");
     no_events(&mut h_rx, Duration::from_millis(500)).await;
 
-    // A listener speaking version 2 answers the dial with its version.
+    // A listener speaking version 1 answers the dial with its version.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("a loopback port");
@@ -2087,7 +2102,7 @@ async fn a_peer_speaking_another_version_is_refused_both_ways() {
     });
     assert!(matches!(
         host_node.link(future_addr).await,
-        Err(LinkError::UnsupportedVersion { their: 2 })
+        Err(LinkError::UnsupportedVersion { their: 1 })
     ));
     server.await.expect("the listener task ends");
 }
@@ -3096,6 +3111,603 @@ async fn the_hello_bound_drops_a_held_peer_in_the_link_read() {
         host_node.linked().is_empty(),
         "the bound drops the peer the keeper never kept"
     );
+    host_node.stop(CloseReason::Closed);
+}
+
+/// The five exchange frames a test sends across a link, in send order.
+fn exchange_frames(request_id: u64) -> [ExchangeFrame; 5] {
+    let major = Major::new(1).expect("a real major");
+    [
+        ExchangeFrame::Offer {
+            builds: vec![(major, SchemaVersion::from_hash(vec![1, 2, 3]))],
+            settled: Some(Frontier {
+                seq: 2,
+                head: [1; 32],
+            }),
+            newest: Some(Frontier {
+                seq: 5,
+                head: [2; 32],
+            }),
+            retractions: vec![
+                Retraction {
+                    seq: 2,
+                    cause: RetractCause::Rejected(MutationRejectReason::Forked),
+                },
+                Retraction {
+                    seq: 4,
+                    cause: RetractCause::Conflict,
+                },
+                Retraction {
+                    seq: 5,
+                    cause: RetractCause::Abandoned,
+                },
+            ],
+            signature: vec![4; 64],
+        },
+        ExchangeFrame::Request {
+            request_id,
+            from: 3,
+        },
+        ExchangeFrame::Manifest {
+            request_id,
+            previous: [1; 32],
+            rows: vec![
+                ManifestRow {
+                    seq: 3,
+                    major,
+                    origin: None,
+                    digest: [3; 32],
+                },
+                ManifestRow {
+                    seq: 4,
+                    major,
+                    origin: Some(Origin {
+                        writer: WriterRef::Device([7; 32]),
+                        seq: 9,
+                    }),
+                    digest: [4; 32],
+                },
+            ],
+            last: true,
+        },
+        ExchangeFrame::Body {
+            request_id,
+            seq: 3,
+            changeset: vec![5; 1024],
+        },
+        ExchangeFrame::End {
+            request_id,
+            outcome: EndOutcome::Complete,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn every_exchange_frame_round_trips_its_encoding() {
+    let frames = exchange_frames(41);
+    let (mut tx, mut rx) = tokio::io::duplex(64 * 1024);
+    for frame in &frames {
+        write_frame(&mut tx, &PeerFrame::Exchange(frame.clone()))
+            .await
+            .expect("the frame encodes");
+    }
+    for frame in &frames {
+        let read = read_frame(&mut rx)
+            .await
+            .expect("the frame decodes")
+            .expect("the frame stands");
+        assert_eq!(read, PeerFrame::Exchange(frame.clone()));
+    }
+}
+
+#[tokio::test]
+async fn a_manifest_at_the_row_bound_encodes_under_the_ceiling() {
+    let rows = (0..MAX_MANIFEST_ROWS)
+        .map(|i| ManifestRow {
+            seq: u64::try_from(i).expect("the bound fits a sequence"),
+            major: Major::new(1).expect("a real major"),
+            origin: None,
+            digest: [7; 32],
+        })
+        .collect::<Vec<_>>();
+    let frame = PeerFrame::Exchange(ExchangeFrame::Manifest {
+        request_id: 7,
+        previous: [1; 32],
+        rows: rows.clone(),
+        last: true,
+    });
+    let (mut tx, mut rx) = tokio::io::duplex(1024 * 1024);
+    write_frame(&mut tx, &frame)
+        .await
+        .expect("the bound-sized manifest encodes");
+    let read = read_frame(&mut rx)
+        .await
+        .expect("it decodes")
+        .expect("it stands");
+    assert_eq!(read, frame);
+    let PeerFrame::Exchange(ExchangeFrame::Manifest { rows, .. }) = read else {
+        panic!("the round trip keeps the frame")
+    };
+    assert_eq!(rows.len(), MAX_MANIFEST_ROWS);
+}
+
+#[tokio::test]
+async fn a_manifest_over_the_row_bound_is_refused_both_ways() {
+    use tokio::io::AsyncWriteExt;
+
+    let now = whole_second();
+    let deployment = Deployment::new(30, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let over = deployment.device(
+        &issuer,
+        "over",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (h_tx, mut h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    let host_addr = serve(&host_node, &host);
+
+    let rows = (0..=MAX_MANIFEST_ROWS)
+        .map(|i| ManifestRow {
+            seq: u64::try_from(i).expect("the count fits a sequence"),
+            major: Major::new(1).expect("a real major"),
+            origin: None,
+            digest: [7; 32],
+        })
+        .collect::<Vec<_>>();
+    let manifest = ExchangeFrame::Manifest {
+        request_id: 7,
+        previous: [1; 32],
+        rows,
+        last: true,
+    };
+
+    // The send refuses the frame before it queues.
+    let err = host_node
+        .send_exchange(&over.identity, manifest.clone())
+        .await
+        .expect_err("the bound holds");
+    assert!(matches!(err, PeerSendError::FrameAboveBounds { .. }));
+
+    // A decoded frame over the bound closes the link with Protocol.
+    let mut raw = raw_linked(deployment.root_der(), &over, host_addr).await;
+    let frame = PeerFrame::Exchange(manifest);
+    let body = rmp_serde::to_vec_named(&frame).expect("the raw body encodes");
+    let len = u32::try_from(body.len()).expect("the body is under the ceiling");
+    raw.write_all(&len.to_be_bytes())
+        .await
+        .expect("the length writes");
+    raw.write_all(&body).await.expect("the body writes");
+    raw.flush().await.expect("the frame flushes");
+    let event = await_event(&mut h_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::Unlinked { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Unlinked {
+            peer: over.identity.clone(),
+            reason: CloseReason::Protocol
+        }
+    );
+    host_node.stop(CloseReason::Closed);
+}
+
+/// Send `frames` from `sender` to `to` and see each reach `rx` in send
+/// order, naming `from`.
+async fn exchange_reaches_in_order(
+    sender: &Node,
+    from: &DeviceIdentity,
+    to: &DeviceIdentity,
+    rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
+    frames: [ExchangeFrame; 5],
+) {
+    for frame in &frames {
+        sender
+            .send_exchange(to, frame.clone())
+            .await
+            .expect("the queue takes it");
+    }
+    for frame in frames {
+        let event = await_event(rx, Duration::from_secs(10), |event| {
+            matches!(event, PeerEvent::Exchange { .. })
+        })
+        .await;
+        assert_eq!(
+            event,
+            PeerEvent::Exchange {
+                peer: from.clone(),
+                frame
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn linked_nodes_deliver_each_exchange_frame_in_order_naming_the_sender() {
+    let now = whole_second();
+    let deployment = Deployment::new(29, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alice = deployment.device(
+        &issuer,
+        "alice",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let bob = deployment.device(
+        &issuer,
+        "bob",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (a_tx, mut a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+
+    let addr = serve(&b, &bob);
+    let _ = serve(&a, &alice);
+    let peer = a.link(addr).await.expect("the link completes");
+    assert_eq!(peer, bob.identity);
+    assert_eq!(
+        next_events(&mut a_rx, 1).await,
+        vec![PeerEvent::Linked {
+            peer: bob.identity.clone()
+        }]
+    );
+    assert_eq!(
+        next_events(&mut b_rx, 1).await,
+        vec![PeerEvent::Linked {
+            peer: alice.identity.clone()
+        }]
+    );
+
+    exchange_reaches_in_order(
+        &a,
+        &alice.identity,
+        &bob.identity,
+        &mut b_rx,
+        exchange_frames(7),
+    )
+    .await;
+    exchange_reaches_in_order(
+        &b,
+        &bob.identity,
+        &alice.identity,
+        &mut a_rx,
+        exchange_frames(8),
+    )
+    .await;
+
+    a.stop(CloseReason::Closed);
+    b.stop(CloseReason::Closed);
+}
+
+#[tokio::test]
+async fn a_send_to_an_unlinked_peer_is_refused() {
+    let now = whole_second();
+    let deployment = Deployment::new(28, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alice = deployment.device(
+        &issuer,
+        "alice",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let bob = deployment.device(
+        &issuer,
+        "bob",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (a_tx, mut a_rx) = events();
+    let (b_tx, _b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    let frame = exchange_frames(1)[1].clone();
+
+    // No link to bob, so the send is refused with the frame handed back.
+    let err = a
+        .send_exchange(&bob.identity, frame.clone())
+        .await
+        .expect_err("no link stands");
+    assert!(
+        matches!(err, PeerSendError::Unlinked { frame: f } if f == frame),
+        "the frame comes back to its sender"
+    );
+
+    // Once the linked link falls, the send is refused the same way.
+    let addr = serve(&b, &bob);
+    let _ = serve(&a, &alice);
+    let peer = a.link(addr).await.expect("the link completes");
+    assert_eq!(peer, bob.identity);
+    let _ = next_events(&mut a_rx, 1).await;
+    b.stop(CloseReason::Closed);
+    let event = await_event(&mut a_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::Unlinked { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Unlinked {
+            peer: bob.identity.clone(),
+            reason: CloseReason::Closed
+        }
+    );
+    let err = a
+        .send_exchange(&bob.identity, frame)
+        .await
+        .expect_err("the link fell");
+    assert!(matches!(err, PeerSendError::Unlinked { .. }));
+    a.stop(CloseReason::Closed);
+}
+
+/// A send waiting on a full exchange queue ends in a typed refusal with the
+/// frame handed back when the link closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    clippy::await_holding_lock,
+    reason = "the held links lock parks the link task, and the scenario is one straight line"
+)]
+async fn a_sender_blocked_on_a_full_exchange_queue_is_released_when_the_link_closes() {
+    let now = whole_second();
+    let deployment = Deployment::new(31, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let raw_dev = deployment.device(
+        &issuer,
+        "raw",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (h_tx, mut h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    let host_addr = serve(&host_node, &host);
+
+    let mut raw = raw_peer_connect(deployment.root_der(), &raw_dev, host_addr).await;
+    let hello = PeerFrame::Hello {
+        version: crate::frame::PROTOCOL_VERSION,
+        dial: 1,
+        numbers: Vec::new(),
+    };
+    write_frame(&mut raw, &hello)
+        .await
+        .expect("the hello writes");
+    let answer = time::timeout(crate::node::HELLO_TIMEOUT, read_frame(&mut raw))
+        .await
+        .expect("the host answers within the bound")
+        .expect("a frame arrives");
+    assert!(matches!(answer, Some(PeerFrame::Hello { .. })));
+    let event = await_event(&mut h_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::Linked { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Linked {
+            peer: raw_dev.identity.clone()
+        }
+    );
+
+    // The held links lock parks the link task once its List command reaches
+    // its lock, and the raw peer stops reading after the list frame crosses.
+    let links = host_node.state().links.lock();
+    let command = match links.get(&raw_dev.key_id()) {
+        Some(SlotState::Live(slot)) => slot.command.clone(),
+        _ => panic!("the link is live"),
+    };
+    let (list, signer) = deployment.issuer_list(&issuer, 1, &[], now);
+    let issuer_key = certificate_key_id(&signer).expect("the issuer names a key");
+    command
+        .send(crate::node::LinkCommand::List {
+            list,
+            signer,
+            issuer: issuer_key,
+            number: 1,
+        })
+        .expect("the command takes");
+    let (saw, seen) = tokio::sync::oneshot::channel();
+    let raw_task = tokio::spawn(async move {
+        let crossed = loop {
+            match read_frame(&mut raw).await {
+                Ok(Some(PeerFrame::List { .. })) => break true,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break false,
+            }
+        };
+        let _ = saw.send(crossed);
+    });
+    assert!(
+        seen.await.expect("the raw peer read"),
+        "the list frame crossed"
+    );
+
+    // The link task is parked on the held lock, so the queue cannot drain.
+    for i in 0..EXCHANGE_QUEUE {
+        let frame = ExchangeFrame::Request {
+            request_id: u64::try_from(i).expect("the queue fits a request id"),
+            from: 1,
+        };
+        host_node
+            .send_exchange(&raw_dev.identity, frame)
+            .await
+            .expect("the queue takes it");
+    }
+    let mut blocked = Box::pin(host_node.send_exchange(
+        &raw_dev.identity,
+        ExchangeFrame::Request {
+            request_id: 99,
+            from: 1,
+        },
+    ));
+    let waiting = core::future::poll_fn(|cx| {
+        core::task::Poll::Ready(core::future::Future::poll(blocked.as_mut(), cx).is_pending())
+    })
+    .await;
+    assert!(waiting, "the send waits on the full queue");
+    // The close is queued before the link resumes, so it ends the link before any frame drains.
+    command
+        .send(crate::node::LinkCommand::Close(CloseReason::Closed))
+        .expect("the command takes");
+    drop(links);
+    let err = blocked.await.expect_err("the link closed while it waited");
+    assert!(
+        matches!(
+            err,
+            PeerSendError::LinkClosed { frame }
+                if matches!(
+                    frame,
+                    ExchangeFrame::Request {
+                        request_id: 99,
+                        ..
+                    }
+                )
+        ),
+        "the blocked send ends refused, its frame handed back"
+    );
+    let event = await_event(&mut h_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::Unlinked { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Unlinked {
+            peer: raw_dev.identity.clone(),
+            reason: CloseReason::Closed
+        }
+    );
+    raw_task.abort();
+}
+
+#[tokio::test]
+async fn an_exchange_frame_before_the_hello_refuses_the_link() {
+    let now = whole_second();
+    let deployment = Deployment::new(32, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let raw_dev = deployment.device(
+        &issuer,
+        "raw",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let late = deployment.device(
+        &issuer,
+        "late",
+        now,
+        DAY,
+        [3; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (h_tx, mut h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    let host_addr = serve(&host_node, &host);
+
+    // A listener that answers the dial with an exchange frame, so the dial
+    // reads it where its hello comes.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port");
+    let addr = listener.local_addr().expect("its address");
+    let crls = Arc::new(parking_lot::RwLock::new(Arc::from(
+        Vec::<crate::verify::Crl>::new().into_boxed_slice(),
+    )));
+    let config = crate::node::server_config_for(
+        &trust_root(deployment.root_der()),
+        Arc::new(SystemClock),
+        Some(raw_dev.key_id()),
+        crls,
+        &raw_dev.identity(),
+    );
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("the dial arrives");
+        let mut tls = tokio_rustls::TlsAcceptor::from(config)
+            .accept(tcp)
+            .await
+            .expect("the handshake completes");
+        let first = read_frame(&mut tls)
+            .await
+            .expect("the dialer sends its hello")
+            .expect("a frame arrives");
+        assert!(matches!(first, PeerFrame::Hello { .. }));
+        write_frame(
+            &mut tls,
+            &PeerFrame::Exchange(exchange_frames(1)[2].clone()),
+        )
+        .await
+        .expect("the manifest writes");
+        let _ = read_frame(&mut tls).await;
+    });
+    let err = host_node
+        .link(addr)
+        .await
+        .expect_err("the first frame is not a hello");
+    assert!(matches!(err, LinkError::Protocol(_)));
+    server.await.expect("the listener task ends");
+
+    // An exchange frame before the hello on the inbound side closes the
+    // connection, and no link registers.
+    let mut raw = raw_peer_connect(deployment.root_der(), &late, host_addr).await;
+    write_frame(
+        &mut raw,
+        &PeerFrame::Exchange(exchange_frames(1)[2].clone()),
+    )
+    .await
+    .expect("the manifest writes");
+    let first = time::timeout(crate::node::HELLO_TIMEOUT, read_frame(&mut raw))
+        .await
+        .expect("the host answers within the bound")
+        .expect("a frame arrives");
+    assert!(matches!(first, Some(PeerFrame::Hello { .. })));
+    let next = read_frame(&mut raw).await.expect("the close reads");
+    assert!(
+        next.is_none(),
+        "the host drops the connection on the misplaced frame"
+    );
+    no_events(&mut h_rx, Duration::from_millis(500)).await;
     host_node.stop(CloseReason::Closed);
 }
 

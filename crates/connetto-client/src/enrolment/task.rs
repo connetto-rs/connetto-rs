@@ -1461,6 +1461,9 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                                 due = run.link.connection().await.is_some();
                             }
                         }
+                        // No exchange driver runs on this client, so a
+                        // peer's exchange frames are dropped as they arrive.
+                        PeerEvent::Exchange { .. } => {}
                     }
                 }
                 #[cfg(not(feature = "peer"))]

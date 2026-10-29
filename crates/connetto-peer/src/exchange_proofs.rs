@@ -9,6 +9,11 @@ use connetto_core::device_cert::{
     AttestationLevel, CertificateRequest, CertificateSerial, CertificateSigner, DeviceKey,
     DeviceKeyError, KeyHome, key_id,
 };
+use connetto_core::exchange::{
+    EndOutcome, Frontier, ManifestRow, Origin, RetractCause, Retraction,
+};
+use connetto_core::messages::{MutationRejectReason, WriterRef};
+use connetto_core::schema::{Major, SchemaVersion};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, SigningKey as _};
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,7 +22,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::error::{ExchangeError, Refusal};
 use crate::exchange::{ChunkStream, EXCHANGE_BOUND, OfferFrame};
-use crate::frame::{PeerFrame, read_frame, write_frame};
+use crate::frame::{ExchangeFrame, PeerFrame, read_frame, write_frame};
 use crate::node::{client_config_for, server_config_for};
 use crate::signer::{IdentityClientCert, IdentityServerCert};
 use crate::tests::{Deployment, Peer, events, node, serve, whole_second};
@@ -349,7 +354,7 @@ async fn a_version_mismatch_is_refused() {
         AttestationLevel::Unproven,
     );
 
-    // A joiner speaking version 2 gets no offer, and the host refuses it.
+    // A joiner speaking version 1 gets no offer, and the host refuses it.
     let (h_tx, _h_rx) = events();
     let host_node = node(deployment.root_der(), h_tx);
     serve(&host_node, &host);
@@ -358,7 +363,7 @@ async fn a_version_mismatch_is_refused() {
     let (host_res, ()) = tokio::join!(host_node.offer_over(host_io, offer), async {
         let mut raw = raw_client(deployment.root_der(), &joiner, joiner_io).await;
         let hello = PeerFrame::Hello {
-            version: 2,
+            version: 1,
             dial: 1,
             numbers: Vec::new(),
         };
@@ -369,10 +374,10 @@ async fn a_version_mismatch_is_refused() {
     });
     assert!(matches!(
         host_res,
-        Err(ExchangeError::UnsupportedVersion { their: 2 })
+        Err(ExchangeError::UnsupportedVersion { their: 1 })
     ));
 
-    // A host speaking version 2 refuses the joiner the same way.
+    // A host speaking version 1 refuses the joiner the same way.
     let (j_tx, _j_rx) = events();
     let joiner_node = node(deployment.root_der(), j_tx);
     serve(&joiner_node, &joiner);
@@ -380,7 +385,7 @@ async fn a_version_mismatch_is_refused() {
     let raw_host = tokio::spawn(async move {
         let mut raw = raw_server(deployment.root_der(), &host, host_io).await;
         let hello = PeerFrame::Hello {
-            version: 2,
+            version: 1,
             dial: 1,
             numbers: Vec::new(),
         };
@@ -392,7 +397,7 @@ async fn a_version_mismatch_is_refused() {
     let result = joiner_node.fetch_over(joiner_io).await;
     assert!(matches!(
         result,
-        Err(ExchangeError::UnsupportedVersion { their: 2 })
+        Err(ExchangeError::UnsupportedVersion { their: 1 })
     ));
     raw_host.await.expect("the raw host ends");
 }
@@ -430,7 +435,7 @@ async fn a_silent_host_times_out_at_the_bound() {
     let silent = tokio::spawn(async move {
         let mut tls = raw_server(deployment.root_der(), &host, host_io).await;
         let hello = PeerFrame::Hello {
-            version: 1,
+            version: crate::frame::PROTOCOL_VERSION,
             dial: 0,
             numbers: Vec::new(),
         };
@@ -758,7 +763,7 @@ async fn a_joiner_that_breaks_the_frame_protocol_where_its_lists_come() {
     let (host_res, ()) = tokio::join!(host_node.offer_over(host_io, offer), async {
         let mut raw = raw_client(deployment.root_der(), &joiner, joiner_io).await;
         let hello = PeerFrame::Hello {
-            version: 1,
+            version: crate::frame::PROTOCOL_VERSION,
             dial: 1,
             numbers: Vec::new(),
         };
@@ -785,7 +790,7 @@ async fn a_joiner_that_breaks_the_frame_protocol_where_its_lists_come() {
     let (host_res, ()) = tokio::join!(host_node.offer_over(host_io, offer), async {
         let mut raw = raw_client(deployment.root_der(), &joiner, joiner_io).await;
         let hello = PeerFrame::Hello {
-            version: 1,
+            version: crate::frame::PROTOCOL_VERSION,
             dial: 1,
             numbers: Vec::new(),
         };
@@ -837,7 +842,7 @@ async fn a_joiner_offer_where_its_lists_come_keeps_its_payload_out_of_its_name()
     let (host_res, ()) = tokio::join!(host_node.offer_over(host_io, offer), async {
         let mut raw = raw_client(deployment.root_der(), &joiner, joiner_io).await;
         let hello = PeerFrame::Hello {
-            version: 1,
+            version: crate::frame::PROTOCOL_VERSION,
             dial: 1,
             numbers: Vec::new(),
         };
@@ -950,7 +955,7 @@ async fn a_host_that_sends_a_ping_where_the_offer_comes() {
         async {
             let mut raw = raw_server(deployment.root_der(), &host, host_io).await;
             let hello = PeerFrame::Hello {
-                version: 1,
+                version: crate::frame::PROTOCOL_VERSION,
                 dial: 0,
                 numbers: Vec::new(),
             };
@@ -1005,7 +1010,7 @@ async fn a_host_that_closes_before_its_offer_refuses_the_fetch() {
         async {
             let mut raw = raw_server(deployment.root_der(), &host, host_io).await;
             let hello = PeerFrame::Hello {
-                version: 1,
+                version: crate::frame::PROTOCOL_VERSION,
                 dial: 0,
                 numbers: Vec::new(),
             };
@@ -1097,6 +1102,10 @@ fn a_peer_frame_offer_redacts_its_passphrase_in_its_debug_form() {
 /// frame's diagnostic name names its own variant, so a hand-written arm can
 /// neither drop a field nor name another frame.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one case per frame variant, each asserted against its derived form"
+)]
 fn every_frame_names_itself_and_only_the_offer_hides_a_field() {
     use serde_bytes::ByteBuf;
 
@@ -1121,18 +1130,19 @@ fn every_frame_names_itself_and_only_the_offer_hides_a_field() {
         },
         Ping,
         Pong,
+        Exchange(ExchangeFrame),
     }
 
     let bytes = |byte: u8| ByteBuf::from(vec![byte; 3]);
     let cases = [
         (
             PeerFrame::Hello {
-                version: 1,
+                version: 2,
                 dial: 7,
                 numbers: vec![(bytes(1), 9)],
             },
             Derived::Hello {
-                version: 1,
+                version: 2,
                 dial: 7,
                 numbers: vec![(bytes(1), 9)],
             },
@@ -1171,6 +1181,113 @@ fn every_frame_names_itself_and_only_the_offer_hides_a_field() {
         ),
         (PeerFrame::Ping, Derived::Ping, "a Ping"),
         (PeerFrame::Pong, Derived::Pong, "a Pong"),
+        (
+            PeerFrame::Exchange(ExchangeFrame::Offer {
+                builds: vec![(
+                    Major::new(1).expect("a real major"),
+                    SchemaVersion::from_hash(vec![6, 6, 6]),
+                )],
+                settled: Some(Frontier {
+                    seq: 2,
+                    head: [1; 32],
+                }),
+                newest: Some(Frontier {
+                    seq: 5,
+                    head: [2; 32],
+                }),
+                retractions: vec![Retraction {
+                    seq: 4,
+                    cause: RetractCause::Rejected(MutationRejectReason::Forked),
+                }],
+                signature: vec![7, 7, 7],
+            }),
+            Derived::Exchange(ExchangeFrame::Offer {
+                builds: vec![(
+                    Major::new(1).expect("a real major"),
+                    SchemaVersion::from_hash(vec![6, 6, 6]),
+                )],
+                settled: Some(Frontier {
+                    seq: 2,
+                    head: [1; 32],
+                }),
+                newest: Some(Frontier {
+                    seq: 5,
+                    head: [2; 32],
+                }),
+                retractions: vec![Retraction {
+                    seq: 4,
+                    cause: RetractCause::Rejected(MutationRejectReason::Forked),
+                }],
+                signature: vec![7, 7, 7],
+            }),
+            "an Exchange::Offer",
+        ),
+        (
+            PeerFrame::Exchange(ExchangeFrame::Request {
+                request_id: 3,
+                from: 9,
+            }),
+            Derived::Exchange(ExchangeFrame::Request {
+                request_id: 3,
+                from: 9,
+            }),
+            "an Exchange::Request",
+        ),
+        (
+            PeerFrame::Exchange(ExchangeFrame::Manifest {
+                request_id: 3,
+                previous: [8; 32],
+                rows: vec![ManifestRow {
+                    seq: 4,
+                    major: Major::new(1).expect("a real major"),
+                    origin: Some(Origin {
+                        writer: WriterRef::Device([9; 32]),
+                        seq: 5,
+                    }),
+                    digest: [6; 32],
+                }],
+                last: true,
+            }),
+            Derived::Exchange(ExchangeFrame::Manifest {
+                request_id: 3,
+                previous: [8; 32],
+                rows: vec![ManifestRow {
+                    seq: 4,
+                    major: Major::new(1).expect("a real major"),
+                    origin: Some(Origin {
+                        writer: WriterRef::Device([9; 32]),
+                        seq: 5,
+                    }),
+                    digest: [6; 32],
+                }],
+                last: true,
+            }),
+            "an Exchange::Manifest",
+        ),
+        (
+            PeerFrame::Exchange(ExchangeFrame::Body {
+                request_id: 3,
+                seq: 4,
+                changeset: vec![10, 10, 10],
+            }),
+            Derived::Exchange(ExchangeFrame::Body {
+                request_id: 3,
+                seq: 4,
+                changeset: vec![10, 10, 10],
+            }),
+            "an Exchange::Body",
+        ),
+        (
+            PeerFrame::Exchange(ExchangeFrame::End {
+                request_id: 3,
+                outcome: EndOutcome::Complete,
+            }),
+            Derived::Exchange(ExchangeFrame::End {
+                request_id: 3,
+                outcome: EndOutcome::Complete,
+            }),
+            "an Exchange::End",
+        ),
     ];
     for (frame, derived, named) in cases {
         assert_eq!(format!("{frame:?}"), format!("{derived:?}"));

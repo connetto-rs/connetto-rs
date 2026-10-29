@@ -25,11 +25,13 @@ use tracing::{debug, warn};
 
 #[cfg(feature = "bluetooth")]
 use crate::error::ExchangeError;
-use crate::error::{CloseReason, LinkError, Refusal, TrustError};
+use crate::error::{CloseReason, LinkError, PeerSendError, Refusal, TrustError};
 use crate::event::PeerEvent;
 #[cfg(feature = "bluetooth")]
 use crate::exchange::OfferFrame;
-use crate::frame::{FrameError, PROTOCOL_VERSION, PeerFrame, read_frame, write_frame};
+use crate::frame::{
+    ExchangeFrame, FrameError, PROTOCOL_VERSION, PeerFrame, read_frame, write_frame,
+};
 use crate::identity::{Clock, Identity, Trust};
 use crate::signer::{IdentityClientCert, IdentityServerCert};
 use crate::verify::{Crl, KeptList, PeerVerifier};
@@ -52,6 +54,9 @@ pub(crate) const SILENCE_LIMIT: Duration = Duration::from_secs(45);
 /// The inbound handshakes the listener runs at once, the unauthenticated
 /// network's bound on its sockets.
 const MAX_INBOUND_HANDSHAKES: usize = 16;
+/// The exchange frames one link's queue holds, the backpressure a sender
+/// waits on while the link drains.
+pub(crate) const EXCHANGE_QUEUE: usize = 8;
 pub(crate) const DIAL_NAME: &str = "connetto-peer";
 
 /// The links' liveness bounds, the ping pace and the silence that takes a
@@ -97,6 +102,10 @@ pub(crate) struct NodeState {
     /// The live links and the peers awaiting their keeper, under one lock so
     /// a close and a registration never race.
     pub(crate) links: Mutex<HashMap<KeyId, SlotState>>,
+    /// The exchange senders of the live links, by peer key and
+    /// registration order, so a send awaits the link's bounded queue
+    /// without the links lock.
+    pub(crate) exchange_senders: RwLock<HashMap<KeyId, (u64, mpsc::Sender<ExchangeFrame>)>>,
     listener: RwLock<Option<ListenerSlot>>,
     /// Whether the node still serves, checked under the links lock.
     pub(crate) serving: AtomicBool,
@@ -160,7 +169,7 @@ pub(crate) struct LinkSlot {
     pub(crate) seq: u64,
     /// The commands the frame task obeys, unbounded so a revocation is never
     /// dropped.
-    command: mpsc::UnboundedSender<LinkCommand>,
+    pub(crate) command: mpsc::UnboundedSender<LinkCommand>,
     /// The frame task, once spawned.
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -276,6 +285,7 @@ impl Node {
             lists,
             crls,
             links: Mutex::new(HashMap::new()),
+            exchange_senders: RwLock::new(HashMap::new()),
             listener: RwLock::new(None),
             serving: AtomicBool::new(false),
             dial_count: Mutex::new(0),
@@ -405,6 +415,42 @@ impl Node {
             .lock()
             .get(&peer.key())
             .copied()
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "the refusal hands the frame back to its sender by value"
+    )]
+    /// Queue an exchange frame on the link to `peer`, awaiting the link's
+    /// bounded queue so a sender that outruns the link waits rather than
+    /// piling frames up in memory (R77).
+    ///
+    /// # Errors
+    ///
+    /// [`PeerSendError`] with the frame handed back when it breaks the
+    /// wire's bounds, when the peer holds no live link, and when the link
+    /// closes while the send waits on a full queue.
+    pub async fn send_exchange(
+        &self,
+        peer: &DeviceIdentity,
+        frame: ExchangeFrame,
+    ) -> Result<(), PeerSendError> {
+        match frame.within_bounds() {
+            Ok(()) => {}
+            Err(_) => return Err(PeerSendError::FrameAboveBounds { frame }),
+        }
+        let key = peer.key();
+        let sender = {
+            let senders = self.state.exchange_senders.read();
+            match senders.get(&key) {
+                Some((_, sender)) => sender.clone(),
+                None => return Err(PeerSendError::Unlinked { frame }),
+            }
+        };
+        match sender.send(frame).await {
+            Ok(()) => Ok(()),
+            Err(err) => Err(PeerSendError::LinkClosed { frame: err.0 }),
+        }
     }
 
     /// Dial `addr`, answering the peer's identity once the link is live.
@@ -799,7 +845,9 @@ pub(crate) fn classify_io(err: io::Error) -> Failure {
 pub(crate) fn classify_frame(err: FrameError) -> Failure {
     match err {
         FrameError::Io(io_err) => classify_io(io_err),
-        FrameError::TooLong | FrameError::Malformed => Failure::Protocol(err.to_string()),
+        FrameError::TooLong | FrameError::TooManyRows | FrameError::Malformed => {
+            Failure::Protocol(err.to_string())
+        }
     }
 }
 
@@ -1041,6 +1089,10 @@ fn catch_up_renewal(state: &NodeState, slot: &LinkSlot, presented: &[u8]) {
 /// [`LinkError::NotServing`] when the node stopped before the link could
 /// register, and [`LinkError::Refused`] when a list kept since the handshake
 /// revokes the peer's chain.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the keep decision, the serving check and the insert are atomic under the one links lock"
+)]
 fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     state: &Arc<NodeState>,
     handshaken: Handshaken,
@@ -1064,6 +1116,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         *next_seq
     };
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (exchange_tx, exchange_rx) = mpsc::channel(EXCHANGE_QUEUE);
     // The keep decision, the serving check and the insert, atomic under the
     // one links lock so a stop and a duplicate close cannot race a
     // registration.
@@ -1115,6 +1168,10 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             };
             catch_up_renewal(state, &slot, &presented);
             links.insert(peer_key, SlotState::Live(slot));
+            state
+                .exchange_senders
+                .write()
+                .insert(peer_key, (seq, exchange_tx));
             #[cfg(feature = "discovery")]
             state.peer_fingerprints.lock().insert(peer_key, fingerprint);
             if fresh {
@@ -1133,6 +1190,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             Arc::clone(state),
             tls,
             cmd_rx,
+            exchange_rx,
             peer_key,
             seq,
         ));

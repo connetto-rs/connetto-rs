@@ -5752,7 +5752,8 @@ ExchangeBody { request_id: u64, seq: u64, changeset: Vec<u8> }
 ExchangeEnd { request_id: u64, outcome: EndOutcome }
 
 struct Frontier { seq: u64, head: [u8; 32] }
-struct ManifestRow { seq: u64, major: Major, provenance: Option<Provenance>, digest: [u8; 32] }
+struct ManifestRow { seq: u64, major: Major, origin: Option<Origin>, digest: [u8; 32] }
+struct Origin { writer: WriterRef, seq: u64 }
 struct Retraction { seq: u64, cause: RetractCause }
 enum RetractCause { Rejected(MutationRejectReason), Conflict, Abandoned }
 
@@ -5762,7 +5763,7 @@ ProvisionalVerdicts { request_id: String, verdicts: Vec<(u64, Verdict)> }
 enum Verdict { Applied, Settled, Refused(RetractCause), Abandoned, Pending }
 ```
 
-The manifest always runs to the signed `newest`, at most 8192 rows per frame, so the receiver verifies the chain from `previous` to the signed head before any body arrives. Bodies follow in sequence order for the entries the receiver's build can apply, each checked against its digest. `RetractCause::Conflict` exists because R75's `SettledOutcome::Conflict` applied nothing and carries no `MutationRejectReason`.
+The manifest always runs to the signed `newest`, at most 8192 rows per frame, so the receiver verifies the chain from `previous` to the signed head before any body arrives. Bodies follow in sequence order for the entries the receiver's build can apply, each checked against its digest. `RetractCause::Conflict` exists because R75's `SettledOutcome::Conflict` applied nothing and carries no `MutationRejectReason`. A row names an entry's original writer as an `Origin`, the writer and sequence of a `Provenance` without the number writer's secret, which names that writer to the server (R70 decision 22) and so must never reach a peer. The type has no place for it, and the chain hash covers the same two fields.
 
 **One exchange, as the receiver sees it.** The link comes up and each side sends its offer, whose signature the receiver checks against the key the link proved. The receiver applies the offer's frontier and retractions, then requests from `max(cursor, settled.seq) + 1` when `newest.seq` is above it. It recomputes the chain over the manifest and compares the last hash with `newest.head`, and a mismatch, or a `settled` head contradicting one already verified at that sequence, raises `PeerChainInvalid` and ends the exchange. Each row then commits in its own transaction. A row at another build advances the cursor alone. Otherwise the body is checked against its digest, keys held by the receiver's own unsent writes are filtered, the remaining ops run through the views under `AuthorBinding`, and the provenance, the stored entry and the cursor are written, or on refusal the cursor alone.
 
