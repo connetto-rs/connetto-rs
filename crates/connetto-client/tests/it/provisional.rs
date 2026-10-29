@@ -10,7 +10,7 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use connetto_client::provisional::{ProvisionalRow, ProvisionalState, decode_key, encode_key};
+use connetto_client::provisional::{ProvisionalRow, ProvisionalState, encode_key};
 use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, Gate, GateAskOutcome,
     KeyValue, MemoryRefreshStore, Moment, NativeClientBuilder, ReconnectPolicy, SyncSchema,
@@ -430,12 +430,7 @@ async fn a_provisional_row_is_evicted_once_it_is_no_longer_provisional() {
         ProvisionalState::Provisional,
         None,
     );
-    conn.conn()
-        .batch_execute(&format!(
-            "UPDATE _connetto_provisional SET state = {state} WHERE tbl = 'orders'",
-            state = ProvisionalState::Adjudicated.db()
-        ))
-        .expect("mark the provenance adjudicated");
+    adjudicate_all(&mut conn);
     conn.tidy().expect("tidy");
     assert_eq!(
         order_ids(&mut conn),
@@ -1098,10 +1093,25 @@ async fn a_record_with_no_defined_state_fails_the_reads() {
     );
 }
 
-/// A record whose key the table's layout cannot express is neither spared
-/// from eviction nor kept, and it is swept with the rows it cannot name.
+/// Mark every stored record adjudicated, its verdict in.
+fn adjudicate_all<T>(conn: &mut ConnettoConnection<T>)
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    conn.conn()
+        .batch_execute(&format!(
+            "UPDATE _connetto_provisional SET state = {}",
+            ProvisionalState::Adjudicated.db()
+        ))
+        .expect("adjudicate the records");
+}
+
+/// A record whose key the table's layout cannot express spares no row and
+/// stays while it awaits its verdict, as a provisional delete does. Once
+/// adjudicated it is swept with the rows it cannot name.
 #[tokio::test]
-async fn a_key_the_table_cannot_express_is_neither_spared_nor_kept() {
+async fn a_key_the_table_cannot_express_spares_nothing_and_goes_once_adjudicated() {
     let (mut conn, _server) = orders_fixture().await;
     record_provenance(
         &mut conn,
@@ -1117,16 +1127,20 @@ async fn a_key_the_table_cannot_express_is_neither_spared_nor_kept() {
         ProvisionalState::Provisional.db(),
     );
     conn.tidy().expect("tidy");
-    assert_eq!(order_ids(&mut conn), vec![1, 2]);
-    let stored = stored_provenance(&mut conn);
     assert_eq!(
-        stored.len(),
-        1,
-        "the mismatched record is swept, the matching one is spared"
+        order_ids(&mut conn),
+        vec![1, 2],
+        "the matching record spares 2"
     );
+    assert_eq!(stored_provenance(&mut conn).len(), 2);
+
+    adjudicate_all(&mut conn);
+    conn.tidy().expect("tidy after the verdicts");
+    assert_eq!(order_ids(&mut conn), vec![1]);
     assert_eq!(
-        decode_key(&stored[0].pk).expect("decode the kept record's key"),
-        vec![KeyValue::Int(2)]
+        stored_provenance(&mut conn),
+        Vec::new(),
+        "the mismatched record names no row, and the other's row went"
     );
 }
 
@@ -1191,9 +1205,10 @@ async fn a_key_column_with_no_sql_literal_fails_the_pass() {
 }
 
 /// A record whose key column is null spares no row, since no row has a null
-/// key column, so the uncovered row goes and the probe sweeps the record.
+/// key column, so the uncovered row goes. The record stays until its verdict,
+/// and once adjudicated the probe finds no row under it and sweeps it.
 #[tokio::test]
-async fn a_null_key_column_is_spared_and_swept() {
+async fn a_null_key_column_spares_nothing_and_goes_once_adjudicated() {
     let (mut conn, _server) = orders_fixture().await;
     raw_record(
         &mut conn,
@@ -1203,6 +1218,10 @@ async fn a_null_key_column_is_spared_and_swept() {
     );
     conn.tidy().expect("tidy");
     assert_eq!(order_ids(&mut conn), vec![1]);
+    assert_eq!(stored_provenance(&mut conn).len(), 1);
+
+    adjudicate_all(&mut conn);
+    conn.tidy().expect("tidy after the verdict");
     assert_eq!(
         stored_provenance(&mut conn),
         Vec::new(),

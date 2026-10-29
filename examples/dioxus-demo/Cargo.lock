@@ -1300,6 +1300,7 @@ dependencies = [
  "oo7",
  "open",
  "parking_lot",
+ "pg2sqlite",
  "reqwest 0.12.28",
  "ring",
  "rmp-serde",

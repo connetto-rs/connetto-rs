@@ -384,17 +384,22 @@ pub(crate) fn written_keys(bytes: &[u8]) -> Result<Vec<(String, Vec<KeyValue>)>,
 /// Drop the records of `table`'s keys whose rows are gone, whatever took
 /// them, so a record never outlives the row it describes.
 pub(crate) fn drop_gone(db: &mut SqliteConnection, table: &str) -> Result<(), ClientError> {
-    let records: Vec<(String, Vec<u8>)> = dsl::_connetto_provisional
-        .select((dsl::tbl, dsl::pk))
+    let records: Vec<(Vec<u8>, i64)> = dsl::_connetto_provisional
+        .select((dsl::pk, dsl::state))
         .filter(dsl::tbl.eq(table))
         .load(db)?;
-    for (tbl, pk) in records {
+    for (pk, state) in records {
+        if state == ProvisionalState::Provisional.db() {
+            // A provisional delete keeps its record beside the gone row, so
+            // a retraction can restore the row from the entry's old values.
+            continue;
+        }
         let Ok(key) = decode_key(&pk) else {
             continue;
         };
-        if !key_alive(db, &tbl, &key)? {
+        if !key_alive(db, table, &key)? {
             diesel::delete(dsl::_connetto_provisional)
-                .filter(dsl::tbl.eq(&tbl))
+                .filter(dsl::tbl.eq(table))
                 .filter(dsl::pk.eq(&pk))
                 .execute(db)?;
         }
@@ -425,6 +430,81 @@ pub(crate) fn drop_table(db: &mut SqliteConnection, table: &str) -> Result<(), C
         .filter(dsl::tbl.eq(table))
         .execute(db)?;
     Ok(())
+}
+
+/// Store or replace the record of one key, the delete and insert running
+/// in the caller's transaction so the replacement is atomic (R77).
+pub(crate) fn upsert_record(
+    db: &mut SqliteConnection,
+    record: &ProvisionalRow,
+) -> Result<(), ClientError> {
+    let pk = encode_key(&record.key);
+    diesel::delete(dsl::_connetto_provisional)
+        .filter(dsl::tbl.eq(&record.table))
+        .filter(dsl::pk.eq(&pk))
+        .execute(db)?;
+    diesel::insert_into(dsl::_connetto_provisional)
+        .values((
+            dsl::tbl.eq(record.table.clone()),
+            dsl::pk.eq(&pk),
+            dsl::author.eq(&record.author),
+            dsl::seq.eq(record.seq),
+            dsl::account.eq(record.account.clone()),
+            dsl::received_at.eq(record.received_at),
+            dsl::state.eq(record.state.db()),
+            dsl::displaced_author.eq(&record.displaced_author),
+            dsl::displaced_seq.eq(record.displaced_seq),
+        ))
+        .execute(db)?;
+    Ok(())
+}
+
+/// Delete the record of one key, the retraction's key whose provenance the
+/// receiver can no longer stand back.
+pub(crate) fn delete_record(
+    db: &mut SqliteConnection,
+    table: &str,
+    key: &[KeyValue],
+) -> Result<(), ClientError> {
+    let blob = encode_key(key);
+    diesel::delete(dsl::_connetto_provisional)
+        .filter(dsl::tbl.eq(table))
+        .filter(dsl::pk.eq(&blob))
+        .execute(db)?;
+    Ok(())
+}
+
+/// The records naming one author's entry, whatever their verdict state, in
+/// keyed order.
+pub(crate) fn records_of_entry(
+    db: &mut SqliteConnection,
+    author: &[u8],
+    seq: i64,
+) -> Result<Vec<ProvisionalRow>, ClientError> {
+    let stored: Vec<Stored> = dsl::_connetto_provisional
+        .filter(dsl::author.eq(author))
+        .filter(dsl::seq.eq(seq))
+        .order((dsl::tbl.asc(), dsl::pk.asc()))
+        .load(db)?;
+    stored.into_iter().map(row_of).collect()
+}
+
+/// Move the records naming one author's entry from provisional to
+/// adjudicated, the frontier having settled them (R77).
+pub(crate) fn adjudicate_entry(
+    db: &mut SqliteConnection,
+    author: &[u8],
+    seq: i64,
+) -> Result<usize, ClientError> {
+    diesel::update(
+        dsl::_connetto_provisional
+            .filter(dsl::author.eq(author))
+            .filter(dsl::seq.eq(seq))
+            .filter(dsl::state.eq(ProvisionalState::Provisional.db())),
+    )
+    .set(dsl::state.eq(ProvisionalState::Adjudicated.db()))
+    .execute(db)
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
