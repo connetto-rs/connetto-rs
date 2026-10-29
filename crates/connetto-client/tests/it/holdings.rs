@@ -102,6 +102,18 @@ impl Patch {
         Self(self.0.insert(insert))
     }
 
+    /// An insert into `orders` whose patch keys the table on `quantity`,
+    /// which the replica does not key on.
+    fn insert_keyed_on_quantity(self, id: i64) -> Self {
+        let table = SimpleTable::new("orders", &[("id", ""), ("quantity", "")], &[1]);
+        let insert = Insert::<_, String, Vec<u8>>::from(table)
+            .set(0, Value::Integer(id))
+            .expect("set id")
+            .set(1, Value::Integer(5))
+            .expect("set quantity");
+        Self(self.0.insert(insert))
+    }
+
     fn update(self, name: &str, id: i64, second: i64) -> Self {
         let update = Update::<_, PatchsetFormat, String, Vec<u8>>::from(table(name))
             .set(0, Value::Integer(id))
@@ -400,6 +412,19 @@ async fn a_frame_for_a_subscription_no_longer_on_record_holds_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_patch_keyed_unlike_the_replica_holds_nothing_and_fails_nothing() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1]).await;
+    s.live("a", Patch::default().insert_keyed_on_quantity(2))
+        .await;
+    assert_eq!(
+        holdings(&mut s.conn),
+        held(&[("a", "orders", &[1])]),
+        "SQLite skips a table whose key differs, so there is no row to hold"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn membership_rows_are_held_until_no_term_needs_their_table() {
     let mut s = Session::connected().await;
     s.conn.subscribe("t1", TERM).await.expect("subscribe t1");
@@ -430,6 +455,35 @@ async fn membership_rows_are_held_until_no_term_needs_their_table() {
     assert!(
         holdings(&mut s.conn).is_empty(),
         "the last term over the table ended"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compound_query_keeps_every_table_it_reads_as_a_possible_term() {
+    let mut s = Session::connected().await;
+    s.conn
+        .subscribe(
+            "u",
+            &format!("{TERM} UNION SELECT * FROM orders WHERE id = 0"),
+        )
+        .await
+        .expect("subscribe u");
+    s.control(
+        ControlMessage::MembershipOpened(MembershipOpened {
+            sub_id: LABEL.to_owned(),
+            member_table: "team_members".to_owned(),
+        }),
+        "the membership notice",
+        |event| matches!(event, ClientEvent::MembershipOpened { .. }),
+    )
+    .await;
+    s.snapshot(LABEL, vec![inserts("team_members", &[10])])
+        .await;
+    s.conn.subscribe("x", ORDERS).await.expect("subscribe x");
+    assert_eq!(
+        holdings(&mut s.conn),
+        held(&[(LABEL, "team_members", &[10])]),
+        "the compound query's term still reads the membership table"
     );
 }
 

@@ -527,23 +527,21 @@ pub(crate) fn coverage_of(spec: &SubscriptionSpec) -> Result<Option<Coverage>, C
     Ok(Some(Coverage { tables, predicate }))
 }
 
-/// The lowercased tables `spec`'s query reads anywhere but its own `FROM`
-/// and `JOIN`s, which is where a membership term's `IN (SELECT ...)` reads
-/// its membership table (R27).
+/// The lowercased tables `spec`'s query may read a membership term from
+/// (R27). A plain `SELECT` reads a term's table in an `IN (SELECT ...)`, so
+/// its own `FROM` and `JOIN`s are left out. Any other query keeps every table
+/// it reads, since keeping a membership table too long costs a few rows
+/// while dropping one too early empties the term's local answer.
 pub(crate) fn membership_tables(spec: &SubscriptionSpec) -> Result<HashSet<String>, ClientError> {
     let sql = inline_binds(&spec.query, &spec.binds)?;
     let mut tables = parse_subscription(&sql)?.tables;
     let statements = Parser::parse_sql(&SQLiteDialect {}, &sql)
         .map_err(|err| ClientError::Session(err.to_string()))?;
-    match statements.as_slice() {
-        [Statement::Query(query)] => match query.body.as_ref() {
-            SetExpr::Select(select) => {
-                let outer = outer_tables(select);
-                tables.retain(|table| !outer.contains(table));
-            }
-            _ => tables.clear(),
-        },
-        _ => tables.clear(),
+    if let [Statement::Query(query)] = statements.as_slice()
+        && let SetExpr::Select(select) = query.body.as_ref()
+    {
+        let outer = outer_tables(select);
+        tables.retain(|table| !outer.contains(table));
     }
     Ok(tables)
 }

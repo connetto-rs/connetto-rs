@@ -12,9 +12,9 @@ use std::collections::HashSet;
 
 use diesel::prelude::*;
 use diesel::sql_types::Text;
-use sqlite_diff_rs::{DiffSet, PatchsetFormat, PatchsetOp, TableSchema};
+use sqlite_diff_rs::{DiffSet, DynTable, PatchsetFormat, PatchsetOp, TableSchema};
 
-use crate::outbox::{self, Column};
+use crate::outbox;
 use crate::{
     ClientConfig, ClientError, MEMBERSHIP_LABEL_PREFIX, is_shared, pk_ordinals, quote_ident,
 };
@@ -51,8 +51,6 @@ diesel::table! {
 struct TableKeys {
     /// The lowercased physical table, as holdings name it.
     table: String,
-    /// The table's columns, in column order.
-    catalog: Vec<Column>,
     /// The quoted key columns, in key order.
     columns: Vec<String>,
     /// The SQL computing a row's key from the row aliased `r`.
@@ -117,19 +115,20 @@ pub(crate) struct PatchHoldings {
 
 impl PatchHoldings {
     /// Read the keys of `set`, a patch in the wire's logical names. A table
-    /// the build shares, or one the replica does not have, is left out.
+    /// the build shares is left out, and so is one whose columns or key
+    /// differ from the replica's, which SQLite's apply skips too.
     ///
     /// # Errors
     ///
-    /// [`ClientError`] when the catalog cannot be read, a key value has no
-    /// SQL literal, or the patch names a key column the replica lacks.
+    /// [`ClientError`] when the catalog cannot be read or a key value has no
+    /// SQL literal.
     pub(crate) fn read(
         db: &mut SqliteConnection,
         config: &ClientConfig,
         set: &ParsedPatch,
     ) -> Result<Self, ClientError> {
         let mut tables: Vec<TableKeys> = Vec::new();
-        let mut unkeyed: HashSet<String> = HashSet::new();
+        let mut skipped: HashSet<String> = HashSet::new();
         for op in set.iter() {
             let schema = op.table();
             let physical = config
@@ -137,15 +136,15 @@ impl PatchHoldings {
                 .physical(schema.name())
                 .unwrap_or(schema.name())
                 .to_lowercase();
-            if is_shared(&config.shared_tables, &physical) || unkeyed.contains(&physical) {
+            if is_shared(&config.shared_tables, &physical) || skipped.contains(&physical) {
                 continue;
             }
             let index = if let Some(index) = tables.iter().position(|keys| keys.table == physical) {
                 index
             } else {
                 let columns = outbox::columns(db, "main", &physical)?;
-                if !columns.iter().any(|column| column.pk > 0) {
-                    unkeyed.insert(physical);
+                if !keyed_alike(&columns, schema) {
+                    skipped.insert(physical);
                     continue;
                 }
                 tables.push(TableKeys {
@@ -158,12 +157,15 @@ impl PatchHoldings {
                     written: Vec::new(),
                     left: Vec::new(),
                     gone: Vec::new(),
-                    catalog: columns,
                 });
                 tables.len() - 1
             };
             let keys = &mut tables[index];
-            let literals = key_literals(&keys.catalog, schema, &op)?;
+            let literals = op
+                .primary_key()
+                .iter()
+                .map(crate::live::bind_literal_of)
+                .collect::<Result<Vec<_>, _>>()?;
             match op {
                 PatchsetOp::Delete { .. } if op.indirect() => keys.left.push(literals),
                 PatchsetOp::Delete { .. } => keys.gone.push(literals),
@@ -234,27 +236,24 @@ impl PatchHoldings {
     }
 }
 
-/// The SQL literals of `op`'s key, in the replica's key order.
-fn key_literals(
-    catalog: &[Column],
-    schema: &TableSchema<String>,
-    op: &PatchsetOp<'_, TableSchema<String>, String, Vec<u8>>,
-) -> Result<Vec<String>, ClientError> {
-    let mut keyed: Vec<(i64, String)> = Vec::new();
-    for (position, value) in pk_ordinals(schema).into_iter().zip(op.primary_key()) {
-        let column = catalog
-            .get(position)
-            .filter(|column| column.pk > 0)
-            .ok_or_else(|| {
-                ClientError::Session(format!(
-                    "a patch keys {} on column {position}, which the replica does not key on",
-                    schema.name()
-                ))
-            })?;
-        keyed.push((column.pk, crate::live::bind_literal_of(&value)?));
-    }
-    keyed.sort_by_key(|(pk, _)| *pk);
-    Ok(keyed.into_iter().map(|(_, literal)| literal).collect())
+/// Whether the replica's `columns` can take the patch's `schema` as SQLite's
+/// apply decides before it writes a table: at least as many columns, and key
+/// columns at the same positions in the same order. A table the replica
+/// lacks has no columns and fails it.
+fn keyed_alike(columns: &[outbox::Column], schema: &TableSchema<String>) -> bool {
+    let mut keyed: Vec<(i64, usize)> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.pk > 0)
+        .map(|(position, column)| (column.pk, position))
+        .collect();
+    keyed.sort_unstable();
+    columns.len() >= schema.number_of_columns()
+        && !keyed.is_empty()
+        && keyed
+            .into_iter()
+            .map(|(_, position)| position)
+            .eq(pk_ordinals(schema))
 }
 
 /// Whether `holder` may hold rows: a subscription on record, or a hidden
