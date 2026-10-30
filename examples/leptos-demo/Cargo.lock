@@ -949,7 +949,7 @@ dependencies = [
 [[package]]
 name = "diesel-sqlite-session"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/diesel-sqlite-session#4bc74da66fdf7d5fcdda38335030c9d9aacebc74"
+source = "git+https://github.com/connetto-rs/diesel-sqlite-session#dddfd0ef0dd0b097efda1c6ef3f7a0b91ee5f7bd"
 dependencies = [
  "diesel",
  "libsqlite3-sys",
@@ -2481,9 +2481,10 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#6c89348bf8c3097ffd430b4322fb4a5accec865f"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#0110015b43d61f7dc4730dc87b81745a687843b9"
 dependencies = [
  "git2",
+ "recursive",
  "sql-traits",
  "sqlparser",
  "sqlparser-plpgsql",
@@ -3571,7 +3572,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#b95a605d00789e113e8dd40b78317b0430f9662a"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#b3addb3c6d44b262908c3177c4f6c1a2511f08c2"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -3647,7 +3648,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#8ba43e6a9dee5b24bfbd918d93b50d596fa451b5"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#5b149a9de47f531e0875271980d9932a4da95398"
 dependencies = [
  "sqlparser",
  "thiserror 2.0.20",

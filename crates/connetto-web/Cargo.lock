@@ -731,7 +731,7 @@ dependencies = [
 [[package]]
 name = "diesel-sqlite-session"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/diesel-sqlite-session#eb602e20d405fbe30afb89429580ebc92038b44b"
+source = "git+https://github.com/connetto-rs/diesel-sqlite-session#dddfd0ef0dd0b097efda1c6ef3f7a0b91ee5f7bd"
 dependencies = [
  "diesel",
  "libsqlite3-sys",
@@ -2726,7 +2726,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#b95a605d00789e113e8dd40b78317b0430f9662a"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#b3addb3c6d44b262908c3177c4f6c1a2511f08c2"
 dependencies = [
  "geometric-traits",
  "serde",
