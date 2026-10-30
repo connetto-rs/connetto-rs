@@ -480,15 +480,25 @@ fn wire_subscriptions(
         .collect()
 }
 
-/// Whether `spec` is a row subscription, whose rows the replica holds, rather
-/// than an aggregate, whose answer rests in `_connetto_aggregates` (R95).
-pub(crate) fn holds_rows(spec: &SubscriptionSpec) -> Result<bool, ClientError> {
+/// The lowercased tables a row subscription's rows come from, its outer
+/// query's own `FROM` and `JOIN`s, or `None` for an aggregate, whose answer
+/// rests in `_connetto_aggregates` (R95). A membership term's
+/// `IN (SELECT ...)` table is no table of the subscription's rows.
+pub(crate) fn row_tables(spec: &SubscriptionSpec) -> Result<Option<HashSet<String>>, ClientError> {
     let sql = inline_binds(&spec.query, &spec.binds)?;
     let parsed = parse_subscription(&sql)?;
-    Ok(!matches!(
-        parsed.shape,
-        QueryShape::Aggregate | QueryShape::Grouped
-    ))
+    if matches!(parsed.shape, QueryShape::Aggregate | QueryShape::Grouped) {
+        return Ok(None);
+    }
+    let statements = Parser::parse_sql(&SQLiteDialect {}, &sql)
+        .map_err(|err| ClientError::Session(err.to_string()))?;
+    Ok(Some(match statements.as_slice() {
+        [Statement::Query(query)] => match query.body.as_ref() {
+            SetExpr::Select(select) => outer_tables(select),
+            _ => parsed.tables,
+        },
+        _ => parsed.tables,
+    }))
 }
 
 /// The lowercased tables `spec`'s query may read a membership term from

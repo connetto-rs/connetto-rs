@@ -431,6 +431,14 @@ impl Released {
         }
     }
 
+    /// The lowercased physical `tables`.
+    pub(crate) fn of(tables: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            every: false,
+            tables: tables.into_iter().collect(),
+        }
+    }
+
     /// Add `other`'s tables to these.
     pub(crate) fn absorb(&mut self, other: Self) {
         self.every |= other.every;

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use diesel::prelude::*;
 
-use crate::{ClientConfig, ClientError, SHARED_SCHEMA};
+use crate::{ClientConfig, ClientError};
 
 /// What an identity leaving the shared store found, which decides whether the
 /// store itself goes (R11 decision 7).
@@ -99,24 +99,18 @@ pub(crate) fn depart_alone(
         return Ok(SharedDeparture::NotShared);
     };
     let replica = replica.filter(|(path, _)| path.exists());
-    let opened = replica.map_or(Ok(":memory:"), |(path, _)| {
-        path.to_str().ok_or_else(|| {
-            ClientError::Connect(format!("a non-UTF-8 replica path {}", path.display()))
-        })
-    })?;
+    let opened = replica.map_or(Ok(":memory:"), |(path, _)| utf8(path))?;
     let mut db =
         SqliteConnection::establish(opened).map_err(|err| ClientError::Connect(err.to_string()))?;
     if let Some((_, key)) = replica {
         crate::cipher::unlock(&mut db, key)?;
     }
     crate::harden::harden_replica_connection(&mut db)?;
-    let store = store.to_str().ok_or_else(|| {
-        ClientError::Connect(format!("a non-UTF-8 store path {}", store.display()))
-    })?;
+    let store = utf8(store)?;
     crate::harden::attach_keyed_in_window(
         &mut db,
         store,
-        SHARED_SCHEMA,
+        crate::SHARED_SCHEMA,
         crate::harden::AttachPermits::Write,
         store_key,
     )?;
@@ -132,6 +126,13 @@ pub(crate) fn depart_alone(
     } else {
         SharedDeparture::LastOut
     })
+}
+
+/// `path` as the `&str` SQLite opens.
+#[cfg(feature = "native-auth")]
+fn utf8(path: &std::path::Path) -> Result<&str, ClientError> {
+    path.to_str()
+        .ok_or_else(|| ClientError::Connect(format!("a non-UTF-8 path {}", path.display())))
 }
 
 /// Undo the shared writes of every entry queued in `main`'s pending table,

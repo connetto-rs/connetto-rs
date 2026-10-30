@@ -7759,7 +7759,7 @@ where
     ) -> Result<(), ClientError> {
         // A computed declaration carries no coverage to prove it, so it owes
         // its replay until a fence or a swap settles it (R95).
-        let computed = crate::live::holds_rows(&spec).is_ok_and(|rows| !rows);
+        let computed = crate::live::row_tables(&spec).is_ok_and(|tables| tables.is_none());
         self.invalidate_coverage()?;
         if computed {
             if self.unfenced_computed.insert(sub_id.to_owned()) {
@@ -8963,22 +8963,34 @@ where
     /// subscription resyncs then (R73), and every subscription's holding on a
     /// truncated table whoever holds it (O5). The rows wait for the pass the
     /// last outstanding replacement's `SnapshotEnd` runs, except a truncated
-    /// table's, which go at once, sparing this identity's unsent writes.
+    /// table's, which go at once, sparing this identity's unsent writes. That
+    /// pass reads the subscription's own tables besides the released ones,
+    /// since its replacement is the server's whole answer for them, so a row
+    /// there nothing delivered again goes even when nothing ever held it.
     fn clear_subscription_rows(
         &mut self,
         sub_id: &str,
         reason: &FullResyncReason,
     ) -> Result<bool, ClientError> {
-        let aggregate = match subscriptions::declared(&mut self.db)?
+        let read = match subscriptions::declared(&mut self.db)?
             .into_iter()
             .find(|record| record.sub_id == sub_id)
         {
-            Some(record) => !crate::live::holds_rows(&record.spec)?,
-            None => false,
+            Some(record) => crate::live::row_tables(&record.spec)?,
+            None => Some(HashSet::new()),
         };
+        let aggregate = read.is_none();
         if aggregate {
             self.clear_aggregate_resting(sub_id)?;
         }
+        let policy = &self.config.policy_tables;
+        self.released
+            .absorb(holdings::Released::of(read.into_iter().flatten().map(
+                |table| match policy.physical(&table) {
+                    Some(physical) => physical.to_lowercase(),
+                    None => table,
+                },
+            )));
         let every_holding =
             *reason == FullResyncReason::CursorBeyondHistory && !self.history_cleared;
         self.history_cleared |= every_holding;

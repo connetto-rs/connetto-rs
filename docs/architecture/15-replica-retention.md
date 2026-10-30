@@ -59,7 +59,7 @@ The client is the only party that can determine when a row is held by nothing. A
 | `tidy`, and the R60 automatic pass that calls it | every synced table | trims only |
 | An unsubscribe, a grace expiry or an unpin `drain_dropped` retires | the tables whose holdings the record change released | the record is ended and its holdings go, its rows wait |
 | Attach, when a record is no longer live | every synced table, since the release happened offline or before a restart | not reachable |
-| The `SnapshotEnd` that leaves no resync outstanding | the tables the resync notices released | not reachable |
+| The `SnapshotEnd` that leaves no resync outstanding | the tables the resync notices released and each resynced subscription's own tables, whose replacement is the server's whole answer for them | not reachable |
 | `TableTruncated` | that table, at the notice | not reachable |
 | A departure batch (R44) | the departed keys alone, in the frame's transaction | not reachable |
 | An identity leaving the shared store (R11 decision 7) | every shared table | runs online or not |

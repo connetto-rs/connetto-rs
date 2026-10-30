@@ -307,7 +307,10 @@ async fn a_second_identitys_late_tab_reads_the_first_identitys_shared_rows() {
     ] {
         storage.delete_db(name).expect("clear the entry");
     }
-    storage.reserve(4).await.expect("room in the pool");
+    // Bob's open writes his replica and the shared store, where it records
+    // him present, in one transaction, so each database holds a journal slot
+    // beside the three files and the transaction may hold a super-journal.
+    storage.reserve(6).await.expect("room in the pool");
 
     // Alice writes the shared rows to the one shared file, then her run ends.
     seed_alice(&storage).await;
