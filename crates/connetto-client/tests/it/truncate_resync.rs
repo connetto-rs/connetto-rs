@@ -231,18 +231,18 @@ async fn a_truncate_empties_the_replica_even_under_an_overlapping_subscription()
 
 /// The same sequence under the reason that has to keep sparing siblings, which
 /// is what says the emptying above comes from the truncate and not from the
-/// resync itself.
+/// resync itself: once the low subscription's empty replacement ends, the
+/// rows the high one still holds stay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ordinary_resync_still_spares_what_a_sibling_claims() {
     let mut conn = seeded(FullResyncReason::CursorOutsideRetention).await;
 
     pump_to_snapshot_end(&mut conn).await;
-    pump_to_snapshot_end(&mut conn).await;
     assert_eq!(
         replica_ids(&mut conn),
         vec![1, 2],
-        "each subscription's clear spares what the other still claims, which is \
-         the rule a truncate is the one thing entitled to ignore",
+        "a resync releases its own holdings and spares what the other still \
+         holds, which is the rule a truncate is the one thing entitled to ignore",
     );
 }
 

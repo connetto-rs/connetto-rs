@@ -173,9 +173,6 @@ pub(crate) struct Declared {
     /// Whether the subscription still wants its rows: a pin always, a watch
     /// while held and until its grace runs out.
     pub live: bool,
-    /// When a released watch stops wanting its rows, in the replica clock's
-    /// seconds, `None` for a pin or a held watch.
-    pub covers_until: Option<i64>,
 }
 
 /// Record `spec` under `sub_id`, replacing any record already there.
@@ -395,11 +392,10 @@ pub(crate) fn declared(db: &mut SqliteConnection) -> Result<Vec<Declared>, Clien
         // handle drops until the grace runs out. Nothing runs to end it: the
         // comparison is the expiry, which is how ban expiry and provider token
         // refresh already work in this codebase.
-        let covers_until = match (&pin_name, stopped_at) {
-            (Some(_), _) | (None, None) => None,
-            (None, Some(stopped)) => Some(stopped.saturating_add(grace_secs)),
+        let live = match (&pin_name, stopped_at) {
+            (Some(_), _) | (None, None) => true,
+            (None, Some(stopped)) => now < stopped.saturating_add(grace_secs),
         };
-        let live = covers_until.is_none_or(|until| now < until);
         out.push(Declared {
             sub_id,
             spec: SubscriptionSpec {
@@ -408,7 +404,6 @@ pub(crate) fn declared(db: &mut SqliteConnection) -> Result<Vec<Declared>, Clien
                 binds,
             },
             live,
-            covers_until,
         });
     }
     Ok(out)

@@ -7,7 +7,7 @@ use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, DataDir, S
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, LivePatch, MutationApplied,
-    MutationReject, MutationRejectReason, SnapshotPatch, SubscriptionSpec,
+    MutationReject, MutationRejectReason, SnapshotEnd, SnapshotPatch, SubscriptionSpec,
 };
 use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::IncomingFrame;
@@ -204,6 +204,10 @@ async fn a_history_resync_keeps_the_rows_another_identity_covers() {
                 sub_id: "b".to_owned(),
                 reason: FullResyncReason::CursorBeyondHistory,
             })),
+            IncomingFrame::Control(ControlMessage::SnapshotEnd(SnapshotEnd {
+                sub_id: "b".to_owned(),
+                cursor: Cursor::new(vec![2]),
+            })),
         ],
     )
     .await;
@@ -212,7 +216,7 @@ async fn a_history_resync_keeps_the_rows_another_identity_covers() {
     assert_eq!(
         ids(&mut bob),
         [1],
-        "bob's clear empties his rows and keeps alice's"
+        "bob's empty replacement takes his rows and keeps alice's"
     );
 }
 
@@ -349,50 +353,35 @@ fn subscriptions(client: &mut ConnettoConnection<FakeTransport>) -> i64 {
         .n
 }
 
-/// A subscription's coverage is recorded with the subscription, so a store
-/// that refuses the coverage leaves no subscription behind.
+/// Ending a subscription releases its holdings with the record, so a store
+/// that refuses the release keeps the subscription.
 #[tokio::test]
-async fn a_subscription_whose_coverage_cannot_be_recorded_is_not_kept() {
-    let directory = tempfile::tempdir().unwrap();
-    let keys = super::support::SharedKeys::default();
-    let mut alice = connect(directory.path(), keys, "alice", Vec::new()).await;
-    refuse(&mut alice, "INSERT", "_connetto_interest");
-    alice
-        .subscribe_spec("a", SubscriptionSpec::new("SELECT * FROM tags"))
-        .await
-        .expect_err("the store refuses the coverage");
-    assert_eq!(subscriptions(&mut alice), 0, "nothing is subscribed");
-}
-
-/// Ending a subscription rewrites its coverage with the record, so a store
-/// that refuses the rewrite keeps the subscription.
-#[tokio::test]
-async fn an_unsubscribe_whose_coverage_cannot_be_rewritten_keeps_the_subscription() {
+async fn an_unsubscribe_whose_holdings_cannot_be_released_keeps_the_subscription() {
     let directory = tempfile::tempdir().unwrap();
     let keys = super::support::SharedKeys::default();
     let mut alice = connect(directory.path(), keys, "alice", vec![snapshot("a", &[1])]).await;
     subscribe(&mut alice, "a", "SELECT * FROM tags").await;
-    refuse(&mut alice, "DELETE", "_connetto_interest");
+    refuse(&mut alice, "DELETE", "_connetto_shared_holding");
     alice
         .unsubscribe("a")
         .await
-        .expect_err("the store refuses the rewrite");
+        .expect_err("the store refuses the release");
     assert_eq!(subscriptions(&mut alice), 1, "the subscription stays");
 }
 
-/// A push whose spare record the store refuses still uploads the write once,
-/// and the next push queues nothing more of it.
+/// A push whose unsent holdings the store refuses still uploads the write
+/// once, and the next push queues nothing more of it.
 #[tokio::test]
-async fn a_write_whose_spare_cannot_be_recorded_is_queued_once() {
+async fn a_write_whose_unsent_holding_cannot_be_recorded_is_queued_once() {
     let directory = tempfile::tempdir().unwrap();
     let keys = super::support::SharedKeys::default();
     let mut bob = connect(directory.path(), keys, "bob", Vec::new()).await;
     bob.conn()
         .batch_execute("INSERT INTO tags VALUES (5, 'unsent')")
         .unwrap();
-    refuse(&mut bob, "INSERT", "_connetto_spare");
+    refuse(&mut bob, "INSERT", "_connetto_shared_holding");
     let refused = bob.push().await;
-    accept(&mut bob, "INSERT", "_connetto_spare");
+    accept(&mut bob, "INSERT", "_connetto_shared_holding");
     let retried = bob.push().await.expect("the store accepts again");
     assert_eq!(
         bob.unsynced().len(),
@@ -401,7 +390,7 @@ async fn a_write_whose_spare_cannot_be_recorded_is_queued_once() {
     );
 }
 
-/// A pass that cannot learn what the other identities keep evicts nothing.
+/// A pass that cannot read what the other identities hold evicts nothing.
 #[tokio::test]
 async fn a_tidy_that_cannot_read_the_other_identities_evicts_nothing() {
     let directory = tempfile::tempdir().unwrap();
@@ -415,14 +404,12 @@ async fn a_tidy_that_cannot_read_the_other_identities_evicts_nothing() {
     .await;
     subscribe(&mut alice, "a", "SELECT * FROM tags").await;
     let mut bob = connect(directory.path(), keys, "bob", Vec::new()).await;
-    for table in ["_connetto_spare", "_connetto_interest"] {
-        bob.conn()
-            .batch_execute(&format!("DROP TABLE connetto_shared.{table}"))
-            .unwrap();
-        bob.tidy()
-            .expect_err("the pass cannot read what others keep");
-        assert_eq!(ids(&mut bob), [1], "alice's row stays");
-    }
+    bob.conn()
+        .batch_execute("DROP TABLE connetto_shared._connetto_shared_holding")
+        .unwrap();
+    bob.tidy()
+        .expect_err("the pass cannot read what others hold");
+    assert_eq!(ids(&mut bob), [1], "alice's row stays");
 }
 
 /// An aggregate rests apart from the rows it counts, so it keeps none of
@@ -462,20 +449,21 @@ pub(super) async fn open(
     .await
 }
 
-/// An identity whose coverage or unsent writes the store cannot rewrite does
-/// not open, so no identity runs unseen by the others' passes.
+/// An identity the store cannot record, its presence or the holdings of its
+/// unsent writes, does not open, so no identity runs unseen by the others'
+/// passes.
 #[tokio::test]
 async fn an_identity_the_store_cannot_record_does_not_open() {
-    for table in ["_connetto_interest", "_connetto_spare"] {
+    for (table, op) in [
+        ("_connetto_identity", "INSERT"),
+        ("_connetto_shared_holding", "DELETE"),
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let keys = super::support::SharedKeys::default();
         {
             let mut bob = open(directory.path(), keys.clone(), "bob")
                 .await
                 .expect("bob opens");
-            bob.subscribe_spec("b", SubscriptionSpec::new("SELECT * FROM tags"))
-                .await
-                .expect("declaring needs no server");
             bob.conn()
                 .batch_execute("INSERT INTO tags VALUES (5, 'unsent')")
                 .unwrap();
@@ -487,39 +475,36 @@ async fn an_identity_the_store_cannot_record_does_not_open() {
         alice
             .conn()
             .batch_execute(&format!(
-                "CREATE TRIGGER connetto_shared.refuse BEFORE DELETE ON {table} \
+                "CREATE TRIGGER connetto_shared.refuse BEFORE {op} ON {table} \
                  BEGIN SELECT RAISE(ABORT, 'the store refuses'); END"
             ))
             .unwrap();
         let refused = open(directory.path(), keys, "bob")
             .await
             .err()
-            .expect("bob cannot rewrite his rows, so he does not open");
+            .expect("bob cannot record himself, so he does not open");
         assert!(
             refused.to_string().contains("the store refuses"),
-            "the {table} rewrite is what refused, got {refused}"
+            "the {table} write is what refused, got {refused}"
         );
     }
 }
 
-/// Ending a subscription offline rewrites its coverage with the stop moment,
-/// so a store that refuses the rewrite keeps the subscription running.
+/// Ending a subscription offline releases its holdings with the stop
+/// moment, so a store that refuses the release keeps the subscription
+/// running.
 #[tokio::test]
-async fn an_offline_unsubscribe_whose_coverage_cannot_be_rewritten_keeps_the_subscription() {
+async fn an_offline_unsubscribe_whose_holdings_cannot_be_released_keeps_the_subscription() {
     let directory = tempfile::tempdir().unwrap();
     let keys = super::support::SharedKeys::default();
-    let mut alice = open(directory.path(), keys, "alice")
-        .await
-        .expect("alice opens");
-    alice
-        .subscribe_spec("a", SubscriptionSpec::new("SELECT * FROM tags"))
-        .await
-        .expect("declaring needs no server");
-    refuse(&mut alice, "DELETE", "_connetto_interest");
+    let mut alice = connect(directory.path(), keys, "alice", vec![snapshot("a", &[1])]).await;
+    subscribe(&mut alice, "a", "SELECT * FROM tags").await;
+    drain(&mut alice).await;
+    refuse(&mut alice, "DELETE", "_connetto_shared_holding");
     alice
         .unsubscribe("a")
         .await
-        .expect_err("the store refuses the rewrite");
+        .expect_err("the store refuses the release");
     let running = diesel::sql_query(
         "SELECT count(*) AS n FROM _connetto_subscription WHERE stopped_at IS NULL",
     )
@@ -529,34 +514,7 @@ async fn an_offline_unsubscribe_whose_coverage_cannot_be_rewritten_keeps_the_sub
     assert_eq!(running, 1, "the subscription has not stopped");
 }
 
-/// A subscription the replica cannot record leaves no coverage in the store,
-/// since both commit together.
-#[tokio::test]
-async fn a_subscription_the_replica_cannot_record_covers_nothing() {
-    let directory = tempfile::tempdir().unwrap();
-    let keys = super::support::SharedKeys::default();
-    let mut alice = open(directory.path(), keys, "alice")
-        .await
-        .expect("alice opens");
-    alice
-        .conn()
-        .batch_execute(
-            "CREATE TEMP TRIGGER refuse_subscription BEFORE INSERT ON main._connetto_subscription \
-             BEGIN SELECT RAISE(ABORT, 'the replica refuses'); END",
-        )
-        .unwrap();
-    alice
-        .subscribe_spec("a", SubscriptionSpec::new("SELECT * FROM tags"))
-        .await
-        .expect_err("the replica refuses the record");
-    let covered = diesel::sql_query("SELECT count(*) AS n FROM connetto_shared._connetto_interest")
-        .get_result::<Count>(alice.conn())
-        .unwrap()
-        .n;
-    assert_eq!(covered, 0, "nothing is covered");
-}
-
-/// A departure that cannot learn what the other identities keep removes
+/// A departure that cannot read what the other identities hold removes
 /// nothing.
 #[tokio::test]
 async fn a_departure_that_cannot_read_the_other_identities_removes_nothing() {
@@ -578,11 +536,11 @@ async fn a_departure_that_cannot_read_the_other_identities_removes_nothing() {
     .await;
     subscribe(&mut bob, "b", "SELECT * FROM tags").await;
     bob.conn()
-        .batch_execute("DROP TABLE connetto_shared._connetto_interest")
+        .batch_execute("DROP TABLE connetto_shared._connetto_shared_holding")
         .unwrap();
     bob.pump_one()
         .await
-        .expect_err("the departure cannot read what others keep");
+        .expect_err("the departure cannot read what others hold");
     assert_eq!(ids(&mut bob), [1, 2], "both rows stay");
 }
 
@@ -610,9 +568,10 @@ pub(super) async fn serve(
 }
 
 /// The server's answer to a write stands when the store cannot rewrite the
-/// write's spare rows afterwards, which then over-keep until the next rewrite.
+/// write's unsent holdings afterwards, which then over-keep until the next
+/// rewrite.
 #[tokio::test]
-async fn a_settled_write_stays_settled_when_its_spare_cannot_be_rewritten() {
+async fn a_settled_write_stays_settled_when_its_unsent_holding_cannot_be_rewritten() {
     for applied in [true, false] {
         let directory = tempfile::tempdir().unwrap();
         let keys = super::support::SharedKeys::default();
@@ -623,7 +582,7 @@ async fn a_settled_write_stays_settled_when_its_spare_cannot_be_rewritten() {
             .batch_execute("INSERT INTO tags VALUES (5, 'sent')")
             .unwrap();
         let client_seq = bob.push().await.expect("queue the write").expect("a seq");
-        refuse(&mut bob, "DELETE", "_connetto_spare");
+        refuse(&mut bob, "DELETE", "_connetto_shared_holding");
         let answer = if applied {
             ControlMessage::MutationApplied(MutationApplied { client_seq })
         } else {
@@ -634,7 +593,7 @@ async fn a_settled_write_stays_settled_when_its_spare_cannot_be_rewritten() {
         };
         assert!(
             serve(&mut bob, vec![answer]).await,
-            "applied {applied}: the spare rewrite fails"
+            "applied {applied}: the unsent rewrite fails"
         );
         assert!(
             bob.unsynced().is_empty(),
@@ -646,29 +605,4 @@ async fn a_settled_write_stays_settled_when_its_spare_cannot_be_rewritten() {
             "applied {applied}: the row follows the answer"
         );
     }
-}
-
-/// An ended subscription the store cannot forget stays recorded, so the next
-/// connection forgets it.
-#[tokio::test]
-async fn an_ended_subscription_the_store_cannot_forget_stays_recorded() {
-    let directory = tempfile::tempdir().unwrap();
-    let keys = super::support::SharedKeys::default();
-    let mut alice = open(directory.path(), keys, "alice")
-        .await
-        .expect("alice opens");
-    alice
-        .subscribe_spec("a", SubscriptionSpec::new("SELECT * FROM tags"))
-        .await
-        .expect("declaring needs no server");
-    alice.unsubscribe("a").await.expect("end it offline");
-    refuse(&mut alice, "DELETE", "_connetto_interest");
-    assert!(
-        serve(&mut alice, Vec::new()).await,
-        "the replay cannot forget it"
-    );
-    assert_eq!(subscriptions(&mut alice), 1, "the record stays");
-    accept(&mut alice, "DELETE", "_connetto_interest");
-    assert!(!serve(&mut alice, Vec::new()).await, "the next one can");
-    assert_eq!(subscriptions(&mut alice), 0, "and forgets it");
 }

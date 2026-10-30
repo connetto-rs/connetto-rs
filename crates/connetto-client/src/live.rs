@@ -480,51 +480,15 @@ fn wire_subscriptions(
         .collect()
 }
 
-/// What one subscription still wants from the replica.
-pub(crate) struct Coverage {
-    /// Lowercased replica tables the subscription reads.
-    pub tables: HashSet<String>,
-    /// Its `WHERE` clause with every bind already a literal, or `None` when it
-    /// has none and therefore covers the whole table.
-    pub predicate: Option<String>,
-}
-
-/// The coverage a row subscription contributes, or `None` for an aggregate,
-/// which holds no replica rows.
-///
-/// Binds are inlined into the whole statement before parsing, not into the
-/// extracted clause afterwards, because a placeholder anywhere ahead of the
-/// `WHERE` would otherwise shift every value in it by one.
-///
-/// Pagination needs no special handling here and gets none: taking the `WHERE`
-/// clause alone already discards `LIMIT`, `OFFSET` and `FETCH`, so a paginated
-/// subscription contributes the predicate its page was drawn from. That
-/// protects a superset of what it was actually delivered, which can only keep
-/// too much, never too little.
-pub(crate) fn coverage_of(spec: &SubscriptionSpec) -> Result<Option<Coverage>, ClientError> {
+/// Whether `spec` is a row subscription, whose rows the replica holds, rather
+/// than an aggregate, whose answer rests in `_connetto_aggregates` (R95).
+pub(crate) fn holds_rows(spec: &SubscriptionSpec) -> Result<bool, ClientError> {
     let sql = inline_binds(&spec.query, &spec.binds)?;
     let parsed = parse_subscription(&sql)?;
-    if matches!(parsed.shape, QueryShape::Aggregate | QueryShape::Grouped) {
-        return Ok(None);
-    }
-    let statements = Parser::parse_sql(&SQLiteDialect {}, &sql)
-        .map_err(|err| ClientError::Session(err.to_string()))?;
-    // Only the outer query's own tables cover this subscription's rows. A
-    // membership term reads a second table inside an `IN (SELECT ...)`, which
-    // `visit_relations` (and so `parsed.tables`) collects for refresh routing,
-    // but a changed row of that table is never a row of the subscribed table,
-    // so a departure there must not be tested against this predicate.
-    let (tables, predicate) = match statements.as_slice() {
-        [Statement::Query(query)] => match query.body.as_ref() {
-            SetExpr::Select(select) => (
-                outer_tables(select),
-                select.selection.as_ref().map(ToString::to_string),
-            ),
-            _ => (parsed.tables, None),
-        },
-        _ => (parsed.tables, None),
-    };
-    Ok(Some(Coverage { tables, predicate }))
+    Ok(!matches!(
+        parsed.shape,
+        QueryShape::Aggregate | QueryShape::Grouped
+    ))
 }
 
 /// The lowercased tables `spec`'s query may read a membership term from
@@ -4308,12 +4272,12 @@ mod tests {
     }
 
     // A membership term reads a second table inside `IN (SELECT ...)`. Refresh
-    // routing needs both tables, so `parse_subscription` keeps them, but a
-    // subscription answers departures only for its own rows, so `coverage_of`
-    // drops the membership table: a `project_members` change must never be
-    // tested against the `docs` predicate.
+    // routing needs both tables, so `parse_subscription` keeps them, and the
+    // hidden membership subscription's holdings live as long as some live
+    // query reads its table that way (O4), while a table read only in `FROM`
+    // keeps no membership holding alive.
     #[test]
-    fn coverage_of_excludes_the_membership_subquery_table() {
+    fn membership_tables_names_only_the_subquery_table() {
         let query = "SELECT * FROM docs WHERE project_id IN \
                      (SELECT project_id FROM project_members WHERE user_id = current_app_user())";
         let parsed = parse_subscription(query).expect("parse");
@@ -4322,17 +4286,15 @@ mod tests {
             "refresh routing must still watch the membership table, got {:?}",
             parsed.tables
         );
-        let coverage = coverage_of(&SubscriptionSpec::new(query))
-            .expect("coverage")
-            .expect("a row subscription has coverage");
         assert_eq!(
-            coverage.tables,
-            HashSet::from(["docs".to_owned()]),
-            "coverage answers only for the subscribed table"
+            membership_tables(&SubscriptionSpec::new(query)).expect("tables"),
+            HashSet::from(["project_members".to_owned()]),
         );
         assert!(
-            coverage.predicate.is_some(),
-            "the term predicate is kept so still_covered can re-test it"
+            membership_tables(&SubscriptionSpec::new("SELECT * FROM project_members"))
+                .expect("tables")
+                .is_empty(),
+            "a table read in FROM is no membership term"
         );
     }
 

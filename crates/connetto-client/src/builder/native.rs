@@ -2104,7 +2104,7 @@ impl SharedStore {
         let left = async {
             let store_key = key_store.load(&shared.record).await?;
             let replica_key = key_store.load(&shared.config.client_id).await?;
-            crate::interest::depart_alone(
+            crate::presence::depart_alone(
                 &shared.path,
                 store_key.as_ref(),
                 replica_key.as_ref().map(|key| (replica, key)),

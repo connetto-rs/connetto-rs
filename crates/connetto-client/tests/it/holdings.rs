@@ -827,6 +827,98 @@ async fn local_writes_and_their_answers_leave_the_holdings_alone() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_departure_takes_a_row_only_once_no_holding_keeps_it() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1, 2]).await;
+    s.holding("b", ORDERS, "orders", &[1]).await;
+    s.live(
+        "a",
+        Patch::default().depart("orders", 1).depart("orders", 2),
+    )
+    .await;
+    assert_eq!(
+        order_ids(&mut s.conn),
+        vec![1],
+        "b still holds row 1, nothing holds row 2"
+    );
+    s.live("b", Patch::default().depart("orders", 1)).await;
+    assert!(order_ids(&mut s.conn).is_empty(), "the last holding went");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_departure_spares_an_unsent_write() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1]).await;
+    diesel::update(orders::table.find(1))
+        .set(orders::quantity.eq(9))
+        .execute(s.conn.conn())
+        .expect("a local write");
+    s.live("a", Patch::default().depart("orders", 1)).await;
+    assert_eq!(
+        order_ids(&mut s.conn),
+        vec![1],
+        "the row waits for its write's answer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tidy_takes_a_row_no_frame_delivered_to_a_live_subscription() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1]).await;
+    s.live("ended", Patch::default().insert("orders", 2)).await;
+    s.conn.tidy().expect("tidy");
+    assert_eq!(
+        order_ids(&mut s.conn),
+        vec![1],
+        "row 2 matches a's filter, but no frame addressed to a delivered it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tidy_takes_an_acknowledged_write_to_a_table_no_subscription_reads() {
+    let mut s = Session::connected().await;
+    diesel::insert_into(orders::table)
+        .values((orders::id.eq(7), orders::quantity.eq(1)))
+        .execute(s.conn.conn())
+        .expect("a local write");
+    s.conn.tidy().expect("tidy while unsent");
+    assert_eq!(order_ids(&mut s.conn), vec![7], "the outbox keeps it");
+    let seq = s.conn.push().await.expect("push").expect("a write");
+    s.conn.tidy().expect("tidy while queued");
+    assert_eq!(order_ids(&mut s.conn), vec![7], "the queue keeps it");
+    s.control(
+        ControlMessage::MutationApplied(MutationApplied { client_seq: seq }),
+        "the acknowledgement",
+        |event| matches!(event, ClientEvent::MutationApplied { .. }),
+    )
+    .await;
+    s.conn.tidy().expect("tidy once answered");
+    assert!(
+        order_ids(&mut s.conn).is_empty(),
+        "nothing holds an answered write no subscription reads (O8, B3)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resync_keeps_its_rows_until_its_replacement_ends() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1, 2]).await;
+    s.resync("a", FullResyncReason::CursorOutsideRetention)
+        .await;
+    assert_eq!(
+        order_ids(&mut s.conn),
+        vec![1, 2],
+        "the rows stay on screen while the replacement streams"
+    );
+    s.snapshot("a", vec![inserts("orders", &[2])]).await;
+    assert_eq!(
+        order_ids(&mut s.conn),
+        vec![2],
+        "what the replacement did not bring back goes at its end"
+    );
+}
+
 /// A durable replica reopened at a newer major (R31), which needs a key store.
 #[cfg(feature = "native-auth")]
 mod rebuild {

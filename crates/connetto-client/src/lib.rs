@@ -50,12 +50,9 @@ use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnect
 use diesel_sqlite_session::{ConflictAction, ConflictType, SqliteSessionExt, invert_changeset};
 #[cfg(feature = "peer")]
 use sha2::{Digest, Sha256};
-use sqlite_diff_rs::{
-    DiffOps, DynTable, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK, TableSchema,
-    Value,
-};
+use sqlite_diff_rs::{DynTable, ParsedDiffSet, PatchsetOp, SchemaWithPK, TableSchema, Value};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(feature = "peer")]
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -84,7 +81,6 @@ pub mod harden;
 mod holdings;
 #[cfg(feature = "peer")]
 mod hotspot;
-mod interest;
 #[cfg(feature = "native-auth")]
 mod keyring;
 pub mod live;
@@ -96,6 +92,7 @@ mod outbox;
 #[cfg(feature = "peer")]
 pub mod peer;
 mod pending;
+mod presence;
 #[cfg(feature = "peer")]
 pub mod provisional;
 pub mod reconnect;
@@ -114,7 +111,7 @@ pub use bluetooth::{
 pub use enrolment::{CertificateError, DeviceEntry};
 #[cfg(feature = "peer")]
 pub use hotspot::{HotspotError, HotspotOffer, HotspotSecurity, JoinError, WifiPayloadError};
-pub use interest::SharedDeparture;
+pub use presence::SharedDeparture;
 pub use replay::replay_aborting;
 pub use subscriptions::{DEFAULT_GRACE, MAX_GRACE};
 pub mod teardown;
@@ -4060,26 +4057,6 @@ enum AttachReplay {
 /// The label prefix the server gives a hidden membership subscription (R27).
 const MEMBERSHIP_LABEL_PREFIX: &str = "connetto-membership:";
 
-/// Which scoped tables a clear empties whatever a sibling subscription still claims.
-enum Stale {
-    /// None, so each sibling keeps what its filter claims.
-    Nothing,
-    /// The one table a truncate emptied, lowercased (R48).
-    Table(String),
-    /// Every scoped table, because the whole session resyncs past where its timeline ended (R73).
-    Everything,
-}
-
-impl Stale {
-    fn covers(&self, table: &str) -> bool {
-        match self {
-            Self::Nothing => false,
-            Self::Table(emptied) => *emptied == table.to_lowercase(),
-            Self::Everything => true,
-        }
-    }
-}
-
 /// A sync client bound to one local SQLite database, with or without a server.
 ///
 /// It exists before any transport does. Opening the replica, serving reads from
@@ -4210,15 +4187,16 @@ pub struct ConnettoConnection<T: Transport> {
     /// not served or released since. A reader that builds on the connection (a
     /// relay hub, at construction) reads them to refuse what the server would.
     refused: HashSet<String>,
-    /// Whether this connection already emptied every subscribed table for a
-    /// cursor past where its timeline ended (R73).
+    /// Whether this connection already released every holding for a cursor
+    /// past where its timeline ended (R73).
     history_cleared: bool,
     /// Subjects durably covering the cursor, or `None` while coverage is unknown.
     cursor_subjects: Option<Vec<String>>,
     /// Row declarations and deliveries awaiting their ordered completion.
     open_snapshots: HashSet<String>,
-    /// Tables already emptied by the current attach or key-replacement batch.
-    authorization_cleared: Option<HashSet<String>>,
+    /// The tables whose holdings were released since the last pass read
+    /// them, so the next pass reads only those (R11).
+    released: holdings::Released,
     /// Computed declarations awaiting a successful fence or retirement.
     unfenced_computed: HashSet<String>,
     /// Declarations awaiting an ordered server-processing fence.
@@ -4311,8 +4289,9 @@ fn install_storage_layout(
 ) -> Result<(), ClientError> {
     if let Some(layout) = &config.shared_layout {
         db.batch_execute(layout.sql(fresh_main, fresh_shared))?;
-        db.batch_execute(interest::INTEREST_DDL)?;
         db.batch_execute(holdings::SHARED_HOLDING_DDL)?;
+        db.batch_execute(presence::PRESENCE_DDL)?;
+        presence::join(db, config)?;
         check_recorded_tables(db, SHARED_SCHEMA, &config.unrecorded_tables)?;
     } else if fresh_main {
         let (Boot::Fresh(ddl) | Boot::Existing(ddl)) = boot;
@@ -4683,7 +4662,7 @@ where
             history_cleared: false,
             cursor_subjects,
             open_snapshots: HashSet::new(),
-            authorization_cleared: None,
+            released: holdings::Released::default(),
             unfenced_computed: HashSet::new(),
             unfenced_count: 0,
             declaration_fence: None,
@@ -4715,10 +4694,11 @@ where
         conn.refresh_share_key_expiry();
         conn.recompute_share_key_deadline();
         conn.load_drain()?;
-        // A shared file created fresh under an existing replica holds none of
-        // this identity's interest or unsent writes yet.
+        // Holdings of records no longer live go, and a shared file created
+        // fresh under an existing replica holds none of this identity's
+        // unsent writes yet.
         conn.change_subscriptions(|_| Ok(()))?;
-        conn.record_spare()?;
+        conn.record_unsent()?;
         Ok(conn)
     }
 
@@ -4972,7 +4952,6 @@ where
         self.bound_writer = bound;
         self.forget_sent();
         self.share_key_settled = self.share_key_generation;
-        self.authorization_cleared = Some(HashSet::new());
         self.attach_replay = AttachReplay::Pending { frontier };
         self.notices
             .push_back(ClientEvent::SyncStatus(SyncStatus::Connected));
@@ -5800,7 +5779,7 @@ where
             provenance,
             major,
         };
-        let spare = if self.config.shared_tables.is_empty() {
+        let unsent = if self.config.shared_tables.is_empty() {
             None
         } else {
             let queued: Vec<Vec<u8>> = self
@@ -5826,13 +5805,12 @@ where
                 if let Some(through) = outbox_through {
                     outbox::clear_through(db, through)?;
                 }
-                if let Some(mut spare) = spare {
+                if let Some(mut unsent) = unsent {
                     merge_clauses(
-                        &mut spare,
+                        &mut unsent,
                         outbox::spare_clauses(db, &config.shared_tables)?,
                     );
-                    interest::record_spare(db, config, &spare)?;
-                    holdings::rewrite_unsent(db, config, &spare)?;
+                    holdings::rewrite_unsent(db, config, &unsent)?;
                 }
                 Ok(())
             })?;
@@ -6158,7 +6136,6 @@ where
         self.declaration_fence = None;
         self.share_key_retry_at = None;
         self.open_snapshots.clear();
-        self.authorization_cleared = None;
         self.unfenced_computed.clear();
         self.unfenced_count = 0;
         self.recompute_share_key_deadline();
@@ -6382,7 +6359,6 @@ where
         let _suspended = ExemptWrites::raise(&self.write_flags);
         persist_cursor_and_subjects(&mut self.db, cursor, Some(&subjects))?;
         self.cursor_subjects = Some(subjects);
-        self.authorization_cleared = None;
         Ok(())
     }
 
@@ -6648,7 +6624,6 @@ where
             }))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))?;
-        self.authorization_cleared = Some(HashSet::new());
         self.share_key_request = Some(ShareKeyRequest {
             request_id,
             generation,
@@ -7784,7 +7759,7 @@ where
     ) -> Result<(), ClientError> {
         // A computed declaration carries no coverage to prove it, so it owes
         // its replay until a fence or a swap settles it (R95).
-        let computed = crate::live::coverage_of(&spec).is_ok_and(|coverage| coverage.is_none());
+        let computed = crate::live::holds_rows(&spec).is_ok_and(|rows| !rows);
         self.invalidate_coverage()?;
         if computed {
             if self.unfenced_computed.insert(sub_id.to_owned()) {
@@ -7870,35 +7845,27 @@ where
     }
 
     /// Re-anchor every stop moment a stepped-back wall clock left ahead of the
-    /// replica clock. The pump asks on every step, so the interest is
-    /// rewritten only when a record moved.
+    /// replica clock.
     fn reanchor_subscriptions(&mut self) -> Result<(), ClientError> {
         let _suspended = ExemptWrites::raise(&self.write_flags);
-        let config = &self.config;
-        self.db.transaction(|db| {
-            if subscriptions::reanchor_ahead(db)? {
-                interest::record(db, config)?;
-            }
-            Ok(())
-        })
+        subscriptions::reanchor_ahead(&mut self.db).map(drop)
     }
 
-    /// Change the subscription record under the write exemption, and rewrite
-    /// this identity's interest in the shared store in the same transaction
-    /// so the other identities' passes see the change. The holdings no live
-    /// record keeps go in that transaction too.
+    /// Change the subscription record under the write exemption, releasing
+    /// in the same transaction the holdings no live record keeps any longer,
+    /// whose tables the next pass reads.
     fn change_subscriptions<R>(
         &mut self,
         change: impl FnOnce(&mut SqliteConnection) -> Result<R, ClientError>,
     ) -> Result<R, ClientError> {
         let _suspended = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
-        self.db.transaction(|db| {
+        let (changed, released) = self.db.transaction(|db| {
             let changed = change(db)?;
-            interest::record(db, config)?;
-            holdings::prune(db, config)?;
-            Ok(changed)
-        })
+            Ok::<_, ClientError>((changed, holdings::prune(db, config)?))
+        })?;
+        self.released.absorb(released);
+        Ok(changed)
     }
 
     /// The current wall time in seconds since the epoch, from the replica's
@@ -8006,20 +7973,26 @@ where
     /// never dropped. `docs/architecture/15-replica-retention.md` decides that
     /// the second kind is live at launch and re-claimed as screens mount, so
     /// there is no second case to write here.
+    ///
+    /// A record past its grace is forgotten rather than re-declared, and the
+    /// server never saw it on this connection, so there is nothing to
+    /// unsubscribe. Its holdings went while it was offline, perhaps before a
+    /// restart, so this first connected moment passes over every synced
+    /// table (B2).
     async fn replay_subscriptions(&mut self) -> Result<(), ClientError> {
         self.reanchor_subscriptions()?;
+        let mut ended = false;
         for record in subscriptions::declared(&mut self.db)? {
             if record.live {
                 self.send_subscribe(&record.sub_id, record.spec).await?;
             } else {
-                // Past its grace, so it is ended rather than re-declared. Its
-                // rows are evicted here, the first connected moment that can
-                // honour the transport-down guard, before the record goes (R15
-                // D3). The server never saw it on this connection, so there is
-                // nothing to unsubscribe.
-                self.evict_subscription_rows(&record.sub_id)?;
                 self.change_subscriptions(|db| subscriptions::forget(db, &record.sub_id))?;
+                ended = true;
             }
+        }
+        if ended {
+            self.released.absorb(holdings::Released::every());
+            self.pass_released()?;
         }
         Ok(())
     }
@@ -8027,21 +8000,20 @@ where
     /// Cancel a subscription (row or aggregate) by its client-assigned id. The
     /// server tolerates an unknown id silently.
     ///
-    /// Connected, the rows the subscription synced are evicted before the
-    /// record goes, the live teardown's order, because a forgotten record
-    /// takes its table out of every later pass's scope and would strand the
-    /// rows for ever. Offline, eviction is barred (a row discarded offline
-    /// cannot be re-fetched, R15 D3), so the record is ended rather than
-    /// forgotten: the next connected attach evicts and then forgets it, and an
-    /// ended record is never replayed as a subscription.
+    /// Connected, the record goes with its holdings, and the pass that
+    /// follows deletes every row no holding or unsent write keeps any longer.
+    /// Offline, deletion is barred (a row discarded offline cannot be
+    /// re-fetched, B2), so the record is ended rather than forgotten: its
+    /// holdings go now, the next connected attach forgets it and deletes the
+    /// rows, and an ended record is never replayed as a subscription.
     ///
     /// # Errors
     ///
     /// [`ClientError::Transport`] when the unsubscribe frame cannot be sent.
     pub async fn unsubscribe(&mut self, sub_id: &str) -> Result<(), ClientError> {
         if self.is_connected() {
-            self.evict_subscription_rows(sub_id)?;
             self.change_subscriptions(|db| subscriptions::forget(db, sub_id))?;
+            self.pass_released()?;
             self.wire()?
                 .transport
                 .send_control(ControlMessage::Unsubscribe(Unsubscribe {
@@ -8498,7 +8470,7 @@ where
                 Ok(())
             })?;
         }
-        self.record_spare()?;
+        self.record_unsent()?;
         Ok(rows)
     }
 
@@ -8689,6 +8661,12 @@ where
                 }
                 self.open_snapshots.remove(&end.sub_id);
                 if self.resyncing.remove(&end.sub_id) {
+                    // The last outstanding replacement has delivered what
+                    // its subscriptions still hold, so the rows the resync
+                    // notices released and nothing took back go now.
+                    if self.resyncing.is_empty() {
+                        self.pass_released()?;
+                    }
                     // The stored peer entries go back ahead of the receiver's
                     // own unsent writes, in their append-position order (R77
                     // decision 13).
@@ -8915,7 +8893,7 @@ where
                     let _suspended = ExemptWrites::raise(&self.write_flags);
                     delete_pending(&mut self.db, &writer, client_seq)?;
                 }
-                self.record_spare()?;
+                self.record_unsent()?;
             }
         }
         self.settle_resend();
@@ -8975,23 +8953,37 @@ where
         }
     }
 
-    /// Drop the replica rows a full-resync snapshot will replace, or, for a
-    /// named aggregate, its whole resting answer (R95). Returns whether the
-    /// notice named an aggregate, so the caller keeps its label out of
+    /// Release the holdings a full-resync snapshot will deliver again, or, for
+    /// a named aggregate, drop its whole resting answer (R95). Returns whether
+    /// the notice named an aggregate, so the caller keeps its label out of
     /// `resyncing`.
     ///
-    /// The holdings the replacement delivers again go first: the notified
-    /// subscription's own, every holding on a truncated table whoever holds
-    /// it (O5), and every holding at a connection's first beyond-history
-    /// notice, since every subscription resyncs then (R73).
+    /// The notified subscription's holdings go, every holding of this
+    /// identity at a connection's first beyond-history notice, since every
+    /// subscription resyncs then (R73), and every subscription's holding on a
+    /// truncated table whoever holds it (O5). The rows wait for the pass the
+    /// last outstanding replacement's `SnapshotEnd` runs, except a truncated
+    /// table's, which go at once, sparing this identity's unsent writes.
     fn clear_subscription_rows(
         &mut self,
         sub_id: &str,
         reason: &FullResyncReason,
     ) -> Result<bool, ClientError> {
-        let declared = subscriptions::declared(&mut self.db)?;
-        let beyond_history = *reason == FullResyncReason::CursorBeyondHistory;
-        let every_holding = beyond_history && !self.history_cleared;
+        let aggregate = match subscriptions::declared(&mut self.db)?
+            .into_iter()
+            .find(|record| record.sub_id == sub_id)
+        {
+            Some(record) => !crate::live::holds_rows(&record.spec)?,
+            None => false,
+        };
+        if aggregate {
+            self.clear_aggregate_resting(sub_id)?;
+        }
+        let every_holding =
+            *reason == FullResyncReason::CursorBeyondHistory && !self.history_cleared;
+        self.history_cleared |= every_holding;
+        // Compared case-insensitively because the server names it from the
+        // catalog, and a split table's holdings name its backing table.
         let truncated = match reason {
             FullResyncReason::TableTruncated { table } => {
                 let table = table.to_lowercase();
@@ -9004,83 +8996,34 @@ where
             }
             _ => None,
         };
-        {
+        let released = {
             let _suspended = ExemptWrites::raise(&self.write_flags);
             let config = &self.config;
             self.db.transaction(|db| {
                 if every_holding {
                     return holdings::release_all(db, config);
                 }
-                holdings::release_holder(db, config, sub_id)?;
-                match &truncated {
-                    Some(table) => holdings::release_table(db, config, table),
-                    None => Ok(()),
+                let released = holdings::release_holder(db, config, sub_id)?;
+                if let Some(table) = &truncated {
+                    holdings::release_table(db, config, table)?;
                 }
-            })?;
-        }
-        // A hidden membership subscription has no declared record to take its tables from.
-        let membership = sub_id
-            .strip_prefix(MEMBERSHIP_LABEL_PREFIX)
-            .filter(|_| beyond_history)
-            .map(str::to_lowercase);
-        // Every row subscription resyncs, so the first notice empties all their tables and later ones spare fresh replacements.
-        if every_holding {
-            self.history_cleared = true;
-            let mut scope: HashSet<String> = membership.into_iter().collect();
-            for record in &declared {
-                if let Some(coverage) = crate::live::coverage_of(&record.spec)? {
-                    scope.extend(coverage.tables);
-                }
-            }
-            self.delete_uncovered(&scope, None, &Stale::Everything, &HashMap::new())?;
-            return Ok(false);
-        }
-        if let Some(table) = membership {
-            let scope = HashSet::from([table]);
-            self.delete_uncovered(&scope, None, &Stale::Nothing, &HashMap::new())?;
-            return Ok(false);
-        }
-        let Some(record) = declared.iter().find(|record| record.sub_id == sub_id) else {
-            return Ok(false);
+                Ok(released)
+            })?
         };
-        match crate::live::coverage_of(&record.spec)? {
-            // A named aggregate has no replica rows to clear.
-            None => {
-                self.clear_aggregate_resting(sub_id)?;
-                Ok(true)
-            }
-            Some(mut resyncing) => {
-                if *reason == FullResyncReason::AuthorizationChange
-                    && let Some(cleared) = &self.authorization_cleared
-                {
-                    resyncing.tables.retain(|table| !cleared.contains(table));
-                    self.delete_uncovered(
-                        &resyncing.tables,
-                        None,
-                        &Stale::Everything,
-                        &HashMap::new(),
-                    )?;
-                    self.authorization_cleared
-                        .as_mut()
-                        .expect("an authorization batch is active")
-                        .extend(resyncing.tables);
-                    return Ok(false);
-                }
-                let stale = match reason {
-                    // Compared case-insensitively because the server names it from the
-                    // catalog and a subscription names it as its query spelled it.
-                    FullResyncReason::TableTruncated { table } => {
-                        Stale::Table(table.to_lowercase())
-                    }
-                    FullResyncReason::CursorOutsideRetention
-                    | FullResyncReason::AuthorizationChange
-                    | FullResyncReason::SnapshotInterrupted
-                    | FullResyncReason::CursorBeyondHistory => Stale::Nothing,
-                };
-                self.delete_uncovered(&resyncing.tables, Some(sub_id), &stale, &HashMap::new())?;
-                Ok(false)
+        self.released.absorb(released);
+        if let Some(table) = truncated {
+            // Every row of an emptied table is stale, so only an unsent write
+            // keeps one, and the provenance records of the table go with it.
+            let keep = self.pending_spare()?;
+            let tables = BTreeSet::from([table]);
+            self.delete_unheld(&tables, &keep)?;
+            #[cfg(feature = "peer")]
+            for table in &tables {
+                let _suspended = ExemptWrites::raise(&self.write_flags);
+                provisional::drop_table(&mut self.db, table)?;
             }
         }
+        Ok(aggregate)
     }
 
     /// Drop every row of the aggregate `sub_id` names, under the query identity
@@ -9099,110 +9042,48 @@ where
         Ok(())
     }
 
-    /// The complement-of-union delete a resync clear and an eviction run share.
-    ///
-    /// Over the `scope` tables, delete every row no live subscription other than
-    /// `exclude` still covers. A subscription is never named: it stops
-    /// contributing a clause, so a row another subscription still wants matches
-    /// that clause and survives, and a table no survivor claims takes the whole
-    /// delete. `spare` holds extra keep-clauses per physical table (the eviction
-    /// pass passes its pending-write keys, a resync passes none). `stale` names
-    /// the tables that delete whole regardless of a survivor's filter, because
-    /// their every row may be gone upstream (R48, R73). A shared table also
-    /// keeps what every other identity on the device covers or has unsent,
-    /// stale or not, since only that identity's own resync may judge its rows
-    /// (R11 decision 6). Returns the rows removed.
-    ///
-    /// The write exemption is raised so the outbox records none of the
-    /// deletes and they are never uploaded as a local mutation.
-    fn delete_uncovered(
+    /// Delete every row of `tables` no holding names and no clause of `keep`
+    /// matches, under the write exemption so the outbox records none of the
+    /// deletes (R11 Part B). A shared table reads every identity's holdings,
+    /// and the transaction waits for any other identity's writer. A
+    /// provenance record must not outlive the row it describes (R77), so the
+    /// records of the rows a pass took go with them. Returns the rows removed.
+    fn delete_unheld(
         &mut self,
-        scope: &HashSet<String>,
-        exclude: Option<&str>,
-        stale: &Stale,
-        spare: &HashMap<String, Vec<String>>,
+        tables: &BTreeSet<String>,
+        keep: &HashMap<String, Vec<String>>,
     ) -> Result<usize, ClientError> {
-        // Every surviving subscription's claim on the scoped tables, as SQL. A
-        // survivor with no predicate wants the whole table, so nothing there may
-        // go. A subscription past its grace no longer wants anything.
-        let declared = subscriptions::declared(&mut self.db)?;
-        let mut clauses: HashMap<&str, Vec<String>> = HashMap::new();
-        let mut untouchable: HashSet<&str> = HashSet::new();
-        for record in &declared {
-            if exclude == Some(record.sub_id.as_str()) || !record.live {
-                continue;
-            }
-            let Some(coverage) = crate::live::coverage_of(&record.spec)? else {
-                continue;
-            };
-            for table in scope.iter().filter(|t| coverage.tables.contains(*t)) {
-                match &coverage.predicate {
-                    Some(predicate) => clauses
-                        .entry(table.as_str())
-                        .or_default()
-                        .push(predicate.clone()),
-                    None => {
-                        untouchable.insert(table.as_str());
-                    }
-                }
-            }
+        if tables.is_empty() {
+            return Ok(0);
         }
         let _suspended = ExemptWrites::raise(&self.write_flags);
-        let tables = self.config.policy_tables.clone();
         let config = &self.config;
         deleting_transaction(&mut self.db, config, |conn| {
-            let others = interest::others(conn, config)?;
-            let mut removed = 0usize;
-            for table in scope {
-                let truncated = stale.covers(table);
-                // A split table is cleared at its backing table, not through the
-                // policy view: the view yields only rows the local policy admits,
-                // so deleting through it would strand every row the policy hides.
-                // The predicates name plain columns of the logical table and the
-                // backing table carries the same columns in the same order.
-                let target = tables.physical(table).unwrap_or(table);
-                let key = target.to_lowercase();
-                if others.whole.contains(&key)
-                    || (untouchable.contains(table.as_str()) && !truncated)
-                {
-                    continue;
-                }
-                let quoted = quote_ident(target);
-                // Survivor predicates plus any spared pending-write keys: a row
-                // matching any of them stays. A truncate ignores this identity's
-                // own, since every row of an emptied table is stale to it.
-                let mut kept: Vec<String> = Vec::new();
-                if !truncated {
-                    if let Some(surviving) = clauses.get(table.as_str()) {
-                        kept.extend(surviving.iter().map(|clause| format!("({clause})")));
-                    }
-                    if let Some(spared) = spare.get(&key) {
-                        kept.extend(spared.iter().cloned());
-                    }
-                }
-                if let Some(kept_by_others) = others.clauses.get(&key) {
-                    kept.extend(kept_by_others.iter().cloned());
-                }
-                // The table and the predicates are chosen at runtime from the
-                // subscriptions' own parsed queries, so diesel's compile-time
-                // DSL cannot name them: this is the one raw statement here.
-                let statement = if kept.is_empty() {
-                    format!("DELETE FROM {quoted}")
-                } else {
-                    format!("DELETE FROM {quoted} WHERE NOT ({})", kept.join(" OR "))
-                };
-                removed += diesel::sql_query(statement).execute(conn)?;
-                // A provenance record must not outlive the row it describes
-                // (R77), so whatever this delete took, its records go too.
-                #[cfg(feature = "peer")]
-                if truncated {
-                    provisional::drop_table(conn, &target.to_lowercase())?;
-                } else {
-                    provisional::drop_gone(conn, &target.to_lowercase())?;
-                }
+            let removed = holdings::delete_unheld(conn, config, tables, keep)?;
+            #[cfg(feature = "peer")]
+            for table in tables {
+                provisional::drop_gone(conn, table)?;
             }
             Ok(removed)
         })
+    }
+
+    /// The pass the released holdings owe, once connected (B2): every row of
+    /// the released tables no holding names and no unsent write keeps goes,
+    /// and the freed pages are trimmed. Offline the released tables wait for
+    /// the next connected pass.
+    fn pass_released(&mut self) -> Result<(), ClientError> {
+        if !self.is_connected() || self.released.is_empty() {
+            return Ok(());
+        }
+        let tables = holdings::tables_of(&mut self.db, &self.config, &self.released)?;
+        let keep = self.keep_clauses()?;
+        let removed = self.delete_unheld(&tables, &keep)?;
+        self.released = holdings::Released::default();
+        if removed > 0 {
+            self.trim_replica()?;
+        }
+        Ok(())
     }
 
     /// This client's own writes the server has not acknowledged, as per-table
@@ -9233,30 +9114,27 @@ where
         Ok(spare)
     }
 
-    /// Rewrite the shared rows this identity's unacknowledged writes touched,
-    /// so another identity's pass spares them, and the holdings those writes
-    /// keep in the shared store.
-    fn record_spare(&mut self) -> Result<(), ClientError> {
+    /// Rewrite the holdings this identity's unacknowledged shared writes keep
+    /// in the shared store, so another identity's pass spares their rows.
+    fn record_unsent(&mut self) -> Result<(), ClientError> {
         if self.config.shared_tables.is_empty() {
             return Ok(());
         }
-        let spare = self.pending_spare()?;
+        let unsent = self.pending_spare()?;
         let _suspended = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
-        self.db.transaction(|db| {
-            interest::record_spare(db, config, &spare)?;
-            holdings::rewrite_unsent(db, config, &spare)
-        })
+        self.db
+            .transaction(|db| holdings::rewrite_unsent(db, config, &unsent))
     }
 
     /// Take this identity out of the shared store before its replica is
     /// wiped (R11 decision 7). Its unpushed and queued shared writes are
     /// undone first, newest first, when `discard_unsent`, leaving a row a
-    /// later change touched as a rollback does, then its interest and spare
-    /// rows go and every shared row no remaining identity covers or has
-    /// unsent is evicted, online or not, since no subscription covers what
-    /// goes. All of it is one transaction, so a store that refuses any part
-    /// keeps the identity as it was.
+    /// later change touched as a rollback does, then its presence and every
+    /// holding it has in the store go, and every shared row no remaining
+    /// holding names is deleted, online or not. All of it is one
+    /// transaction, so a store that refuses any part keeps the identity as
+    /// it was.
     ///
     /// # Errors
     ///
@@ -9290,7 +9168,7 @@ where
         let _suspended = ExemptWrites::raise(&self.write_flags);
         let remain = self.db.immediate_transaction(|db| {
             undo_shared(db, &config.shared_tables, newest_first)?;
-            interest::depart(db, config, &config.client_id, true)
+            presence::depart(db, config, &config.client_id)
         })?;
         Ok(if remain {
             SharedDeparture::Kept
@@ -9303,7 +9181,7 @@ where
     /// [`leave_shared_store`](Self::leave_shared_store) would have, for an
     /// identity whose departure failed before its replica was wiped. An
     /// identity naming this connection is left alone, since this open
-    /// rewrote its rows already.
+    /// rejoined the store already.
     ///
     /// # Errors
     ///
@@ -9315,28 +9193,28 @@ where
         let _suspended = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
         self.db
-            .immediate_transaction(|db| interest::depart(db, config, identity, true))
+            .immediate_transaction(|db| presence::depart(db, config, identity))
             .map(drop)
     }
 
     /// The peer-applied rows still awaiting a verdict, as per-table primary-key
-    /// match clauses, so the eviction passes spare them beside the pending
-    /// writes (R77). The same shape as [`pending_spare`].
+    /// match clauses, so the passes spare them beside the pending writes
+    /// (R77). The same shape as [`pending_spare`].
     #[cfg(feature = "peer")]
     fn provisional_spare(&mut self) -> Result<HashMap<String, Vec<String>>, ClientError> {
         provisional::spare(&mut self.db)
     }
 
-    /// The keep list a pass over the replica hands [`delete_uncovered`]: the
-    /// pending writes' keys, and, with a device, the still-provisional rows'
-    /// keys, one clause list per physical table.
-    fn keep_spare(&mut self) -> Result<HashMap<String, Vec<String>>, ClientError> {
-        let spare = self.pending_spare()?;
+    /// The keep clauses a pass hands [`holdings::delete_unheld`]: this
+    /// identity's unsent writes' keys, and, with a device, the
+    /// still-provisional rows' keys, one clause list per physical table.
+    fn keep_clauses(&mut self) -> Result<HashMap<String, Vec<String>>, ClientError> {
+        let keep = self.pending_spare()?;
         #[cfg(feature = "peer")]
-        let mut spare = spare;
+        let mut keep = keep;
         #[cfg(feature = "peer")]
-        merge_clauses(&mut spare, self.provisional_spare()?);
-        Ok(spare)
+        merge_clauses(&mut keep, self.provisional_spare()?);
+        Ok(keep)
     }
 
     /// Return freelist pages to the filesystem: reclaim in
@@ -9383,62 +9261,28 @@ where
         Ok(())
     }
 
-    /// Evict the replica rows of a subscription that has ended, sparing every
-    /// row a surviving subscription still covers and every row a pending write
-    /// awaits an ack for, then trim the pages the delete freed.
+    /// The callable free-up-space pass: delete every row of every synced table
+    /// no holding names and no unsent write keeps (O8), then trim the
+    /// freelist.
     ///
-    /// The transport-down guard lives here: a row discarded offline could not be
-    /// re-fetched, so the pass is a no-op until connectivity returns, and the
-    /// ended record is left in place for the next connected pass (D3).
-    pub(crate) fn evict_subscription_rows(&mut self, sub_id: &str) -> Result<(), ClientError> {
-        if !self.is_connected() {
-            return Ok(());
-        }
-        let declared = subscriptions::declared(&mut self.db)?;
-        let Some(coverage) = declared
-            .iter()
-            .find(|record| record.sub_id == sub_id)
-            .and_then(|record| crate::live::coverage_of(&record.spec).transpose())
-            .transpose()?
-        else {
-            return Ok(());
-        };
-        let spare = self.keep_spare()?;
-        let removed =
-            self.delete_uncovered(&coverage.tables, Some(sub_id), &Stale::Nothing, &spare)?;
-        if removed > 0 {
-            self.trim_replica()?;
-        }
-        Ok(())
-    }
-
-    /// The callable free-up-space pass: evict every uncovered row across every
-    /// table any declared subscription names, then trim the freelist.
+    /// The trim runs whether or not the pass removed a row, so pages an
+    /// application freed by deleting rows are returned to the filesystem too.
+    /// The trim keeps its own ratio gate, reclaiming only once the freelist is
+    /// a large enough fraction of the file.
     ///
-    /// The trim runs whether or not the eviction removed a row, so pages an
-    /// application freed by deleting covered rows are returned to the filesystem
-    /// too, not only pages an eviction freed. The trim keeps its own ratio gate,
-    /// reclaiming only once the freelist is a large enough fraction of the file.
-    ///
-    /// Only the eviction waits on the transport, because a row discarded offline
-    /// cannot be re-fetched. Trimming discards nothing and reclaims local pages,
-    /// so it runs whether or not a server is reachable. Every pending write is
-    /// spared.
+    /// Only the deletion waits on the transport, because a row discarded
+    /// offline cannot be re-fetched (B2). Trimming discards nothing and
+    /// reclaims local pages, so it runs whether or not a server is reachable.
     ///
     /// # Errors
     ///
     /// [`ClientError`] on a replica read or write failure.
     pub fn tidy(&mut self) -> Result<(), ClientError> {
         if self.is_connected() {
-            let declared = subscriptions::declared(&mut self.db)?;
-            let mut scope: HashSet<String> = HashSet::new();
-            for record in &declared {
-                if let Some(coverage) = crate::live::coverage_of(&record.spec)? {
-                    scope.extend(coverage.tables);
-                }
-            }
-            let spare = self.keep_spare()?;
-            self.delete_uncovered(&scope, None, &Stale::Nothing, &spare)?;
+            let tables = holdings::synced_tables(&mut self.db, &self.config)?;
+            let keep = self.keep_clauses()?;
+            self.delete_unheld(&tables, &keep)?;
+            self.released = holdings::Released::default();
         }
         self.trim_replica()?;
         // The pass is the residual measure's reset point (R60 decision 4):
@@ -9554,10 +9398,13 @@ where
     /// which `server_wins` maps to Omit. Server data is authoritative, so it
     /// lands underneath the policy triggers rather than through them.
     ///
-    /// The same transaction moves `addressed_to`'s holdings: a departure
-    /// releases its holding of the row, a delete upstream releases every
-    /// holding of it, and every row the patch writes is held, whether or not
-    /// a departure withheld from the apply left the row in place.
+    /// The same transaction moves the holdings: a departure releases
+    /// `addressed_to`'s holding of the row, a delete upstream releases every
+    /// holding of it, and every row the patch writes is held by
+    /// `addressed_to` while a record names it. A departure batch, the server's
+    /// patchset of indirect deletes and nothing else (R44), is not applied
+    /// natively: each departed row goes only once no holding names it and no
+    /// unsent write of this identity keeps it.
     fn apply_patch(
         &mut self,
         payload_zstd: &[u8],
@@ -9569,6 +9416,17 @@ where
         let set = match &parsed {
             Some(ParsedDiffSet::Patchset(set)) => Some(set),
             _ => None,
+        };
+        let departures = set.is_some_and(|set| {
+            !set.is_empty()
+                && set
+                    .iter()
+                    .all(|op| matches!(op, PatchsetOp::Delete { .. }) && op.indirect())
+        });
+        let keep = if departures {
+            self.keep_clauses()?
+        } else {
+            HashMap::new()
         };
         let suspended = ExemptWrites::raise(&self.write_flags);
         // The counting gate makes the update hook tally each row into
@@ -9586,45 +9444,41 @@ where
         let mut confirmed: Option<Vec<provisional::ProvisionalRow>> = None;
         let applied = deleting_transaction(&mut self.db, config, |conn| {
             let held = match set {
-                Some(set) if holdings::is_holder(conn, addressed_to)? => {
-                    Some(holdings::PatchHoldings::read(conn, config, set)?)
-                }
-                _ => None,
+                Some(set) => Some(holdings::PatchHoldings::read(conn, config, set)?),
+                None => None,
             };
             if let Some(held) = &held {
                 held.release(conn, addressed_to)?;
             }
-            // Departure filtering weighs the wire's logical names against what
-            // the subscriptions cover, which is also logical, so the rename
-            // follows it. It reads the other identities' rows in this
-            // transaction, so what it spares is what the apply sees.
-            let apply = Self::honour_departures(conn, config, &bytes, set, addressed_to)?
-                .map(|bytes| Self::to_physical(config, bytes))
-                .transpose()?;
-            // The cursor advances even when every op was withheld. A departure
-            // this replica declined to act on is still an event it has seen,
-            // and not recording it would replay the same decision for ever.
-            if let Some(bytes) = apply.as_deref() {
-                conn.apply_patchset(bytes, server_wins)
-                    .map_err(|e| ClientError::Apply(e.to_string()))?;
-                // The native apply reaches `main` only.
-                if !shared.is_empty() {
-                    replay::apply(
-                        conn,
-                        bytes,
-                        replay::Policy::ServerWins,
-                        &shared_route(shared),
-                    )?;
+            match &held {
+                Some(held) if departures => {
+                    held.delete_departed(conn, &keep)?;
                 }
-                // A server write confirms the keys it lands on (R77).
-                #[cfg(feature = "peer")]
-                {
-                    let keys = provisional::written_keys(bytes)?;
-                    confirmed = Some(provisional::clear_written(conn, &keys)?);
+                _ => {
+                    let bytes = Self::to_physical(config, bytes)?;
+                    conn.apply_patchset(&bytes, server_wins)
+                        .map_err(|e| ClientError::Apply(e.to_string()))?;
+                    // The native apply reaches `main` only.
+                    if !shared.is_empty() {
+                        replay::apply(
+                            conn,
+                            &bytes,
+                            replay::Policy::ServerWins,
+                            &shared_route(shared),
+                        )?;
+                    }
+                    // A server write confirms the keys it lands on (R77).
+                    #[cfg(feature = "peer")]
+                    {
+                        let keys = provisional::written_keys(&bytes)?;
+                        confirmed = Some(provisional::clear_written(conn, &keys)?);
+                    }
+                    if let Some(held) = &held
+                        && holdings::is_holder(conn, addressed_to)?
+                    {
+                        held.take(conn, addressed_to)?;
+                    }
                 }
-            }
-            if let Some(held) = &held {
-                held.take(conn, addressed_to)?;
             }
             if let Some(cursor) = cursor {
                 persist_cursor_and_subjects(conn, cursor, coverage)?;
@@ -9746,135 +9600,6 @@ where
             return Ok(Cow::Borrowed(changeset));
         }
         Ok(Cow::Owned(parsed.into()))
-    }
-
-    /// What of `bytes` should actually be applied, once departure notices are
-    /// weighed against what other subscriptions still want.
-    ///
-    /// A server-synthesized indirect delete means the row left the addressed
-    /// subscription's window rather than being removed, so it applies only
-    /// when no surviving subscription still covers the row. Everything else,
-    /// including a genuine delete, applies unconditionally: on a real removal
-    /// the server sends one to every covering subscription, and holding each
-    /// back on the others would leave the row for ever.
-    ///
-    /// Returns the payload to apply, `None` when every op was withheld.
-    /// `set` is `bytes` parsed, absent when it is not a patchset.
-    fn honour_departures(
-        db: &mut SqliteConnection,
-        config: &ClientConfig,
-        bytes: &[u8],
-        set: Option<&holdings::ParsedPatch>,
-        addressed_to: &str,
-    ) -> Result<Option<Vec<u8>>, ClientError> {
-        let Some(set) = set else {
-            return Ok(Some(bytes.to_vec()));
-        };
-        // The server sends a departure as a patchset of indirect deletes and
-        // nothing else, so a payload carrying anything further is an ordinary
-        // one and is not inspected further.
-        let mut departures = Vec::new();
-        for op in set.iter() {
-            match op {
-                PatchsetOp::Delete { .. } if op.indirect() => {
-                    departures.push((op.table().clone(), op.primary_key()));
-                }
-                _ => return Ok(Some(bytes.to_vec())),
-            }
-        }
-        if departures.is_empty() {
-            return Ok(Some(bytes.to_vec()));
-        }
-
-        let mut kept = PatchSet::<TableSchema<String>, String, Vec<u8>>::new();
-        let mut any = false;
-        for (table, pk) in departures {
-            if Self::still_covered(db, config, &table, &pk, Some(addressed_to))? {
-                continue;
-            }
-            any = true;
-            kept = kept.delete(PatchDelete::new(table, pk));
-        }
-        Ok(any.then(|| kept.build()))
-    }
-
-    /// Whether some subscription other than `addressed_to`, or another
-    /// identity's coverage of a shared table, still wants the row `pk`
-    /// identifies in `table`.
-    ///
-    /// `table` is the wire's logical name, so the subscription match below is
-    /// on that, while the row itself is read from the backing table when the
-    /// table was split: the question is what this replica holds for other
-    /// subscriptions, and the view would answer only for the rows the local
-    /// policy admits.
-    fn still_covered(
-        db: &mut SqliteConnection,
-        config: &ClientConfig,
-        table: &TableSchema<String>,
-        pk: &[sqlite_diff_rs::Value<String, Vec<u8>>],
-        addressed_to: Option<&str>,
-    ) -> Result<bool, ClientError> {
-        let name = table.name().to_lowercase();
-        let mut clauses = Vec::new();
-        for record in subscriptions::declared(db)? {
-            if !record.live || addressed_to.is_some_and(|id| id == record.sub_id) {
-                continue;
-            }
-            let Some(coverage) = crate::live::coverage_of(&record.spec)? else {
-                continue;
-            };
-            if !coverage.tables.contains(&name) {
-                continue;
-            }
-            match coverage.predicate {
-                // A survivor with no predicate wants the whole table, so the
-                // row is covered and no further clause can change that.
-                None => return Ok(true),
-                Some(predicate) => clauses.push(format!("({predicate})")),
-            }
-        }
-        let physical = config
-            .policy_tables
-            .physical(&name)
-            .unwrap_or(table.name())
-            .to_owned();
-        let others = interest::others(db, config)?;
-        let key = physical.to_lowercase();
-        if others.whole.contains(&key) {
-            return Ok(true);
-        }
-        if let Some(kept_by_others) = others.clauses.get(&key) {
-            clauses.extend(kept_by_others.iter().cloned());
-        }
-        if clauses.is_empty() {
-            return Ok(false);
-        }
-
-        // The key is matched by ordinal, because the wire format carries a
-        // primary key's positions and never its column names. The replica's own
-        // catalog supplies the names for those positions.
-        let columns = replica_columns(db, &physical)?;
-        let mut wheres = Vec::with_capacity(pk.len());
-        for (position, value) in pk_ordinals(table).into_iter().zip(pk) {
-            let column = columns.get(position).ok_or_else(|| {
-                ClientError::Session(format!(
-                    "a patch names column {position} of {name}, which the replica does not have"
-                ))
-            })?;
-            wheres.push(format!(
-                "{} IS {}",
-                quote_ident(column),
-                crate::live::bind_literal_of(value)?
-            ));
-        }
-        let sql = format!(
-            "SELECT 1 AS present FROM {} WHERE {} AND ({}) LIMIT 1",
-            quote_ident(&physical),
-            wheres.join(" AND "),
-            clauses.join(" OR ")
-        );
-        let rows: Vec<Present> = diesel::sql_query(sql).load(db)?;
-        Ok(!rows.is_empty())
     }
 
     async fn ack_one(&mut self) -> Result<(), ClientError> {

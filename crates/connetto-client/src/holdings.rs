@@ -3,16 +3,19 @@
 //! A holding names a holder, a table and one row's key. A holder is the
 //! subscription a server frame was addressed to, or a hidden membership
 //! subscription's label (R27). The key is the clause the outbox triggers
-//! spare a written row under, `("a" IS 1 AND "b" IS 'x')`, each value through
-//! `quote()` over the stored row, so one computed text matches a row to its
-//! holdings.
+//! render a written row under, `("a" IS 1 AND "b" IS 'x')`, each value
+//! through `quote()` over the stored row, so one computed text matches a row
+//! to its holdings.
 //!
 //! A table the build does not share keeps its holdings in `main`. A shared
 //! table keeps them in the shared store, under the identity holding the row,
 //! where an identity's unsent writes hold their rows too (O3), so every
-//! identity on the device sees what every other one keeps.
+//! identity on the device sees what every other one keeps. A pass deletes
+//! every row of its tables no holding names and no unsent write of the
+//! passing identity keeps.
 
-use std::collections::{HashMap, HashSet};
+use core::fmt::Write as _;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use diesel::prelude::*;
 use diesel::sql_types::Text;
@@ -94,7 +97,6 @@ fn text_literal(value: &str) -> String {
 /// infinity is `9e999`, which SQLite reads back as the infinity it stores,
 /// and a `NaN` is `NULL`, which is what SQLite stores for one.
 fn key_literal(value: &sqlite_diff_rs::Value<String, Vec<u8>>) -> String {
-    use core::fmt::Write as _;
     use sqlite_diff_rs::Value;
     match value {
         Value::Null => "NULL".to_owned(),
@@ -337,6 +339,44 @@ impl PatchHoldings {
         }
         Ok(())
     }
+
+    /// For a departure batch, after [`release`](Self::release): delete each
+    /// departed row no holding names and no clause of `keep` matches, which
+    /// is what the departure means once no other holder wants the row. The
+    /// batch itself is not applied. Returns the rows removed.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when a row cannot be deleted.
+    pub(crate) fn delete_departed(
+        &self,
+        db: &mut SqliteConnection,
+        keep: &HashMap<String, Vec<String>>,
+    ) -> Result<usize, ClientError> {
+        let mut removed = 0;
+        for keys in &self.tables {
+            let holdings = if keys.shared {
+                SHARED_HOLDINGS
+            } else {
+                "main._connetto_holding"
+            };
+            let condition = unheld(
+                holdings,
+                &keys.key,
+                keep.get(&keys.table).map(Vec::as_slice),
+            );
+            for chunk in keys.left.chunks(CHUNK) {
+                removed += diesel::sql_query(format!(
+                    "DELETE FROM {} AS r WHERE ({}) AND {condition}",
+                    keys.rows(),
+                    keys.matching(chunk)
+                ))
+                .bind::<Text, _>(&keys.table)
+                .execute(db)?;
+            }
+        }
+        Ok(removed)
+    }
 }
 
 /// Whether the replica's `columns` can take the patch's `schema` as SQLite's
@@ -373,27 +413,72 @@ pub(crate) fn is_holder(db: &mut SqliteConnection, holder: &str) -> Result<bool,
     crate::subscriptions::is_declared(db, holder)
 }
 
+/// The tables whose holdings a release took, which the next pass reads.
+#[derive(Debug, Default)]
+pub(crate) struct Released {
+    /// Every synced table, as a session-wide release leaves them.
+    every: bool,
+    /// The lowercased physical tables, when not every one.
+    tables: BTreeSet<String>,
+}
+
+impl Released {
+    /// Every synced table.
+    pub(crate) fn every() -> Self {
+        Self {
+            every: true,
+            tables: BTreeSet::new(),
+        }
+    }
+
+    /// Add `other`'s tables to these.
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.every |= other.every;
+        if !self.every {
+            self.tables.extend(other.tables);
+        }
+    }
+
+    /// Whether no table was released.
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.every && self.tables.is_empty()
+    }
+}
+
 /// Release every holding of `holder`, this identity's in the shared store
-/// included.
+/// included, and name the tables they held rows of.
 ///
 /// # Errors
 ///
-/// [`ClientError`] when the holdings cannot be deleted.
+/// [`ClientError`] when the holdings cannot be read or deleted.
 pub(crate) fn release_holder(
     db: &mut SqliteConnection,
     config: &ClientConfig,
     holder: &str,
-) -> Result<(), ClientError> {
+) -> Result<Released, ClientError> {
+    let mut tables: BTreeSet<String> = holding::table
+        .filter(holding::holder.eq(holder))
+        .select(holding::tbl)
+        .distinct()
+        .load::<String>(db)?
+        .into_iter()
+        .collect();
     diesel::delete(holding::table.filter(holding::holder.eq(holder))).execute(db)?;
     if !config.shared_tables.is_empty() {
-        diesel::delete(
-            shared_holding::table
-                .filter(shared_holding::identity.eq(&config.client_id))
-                .filter(shared_holding::holder.eq(holder)),
-        )
-        .execute(db)?;
+        let mine = shared_holding::table
+            .filter(shared_holding::identity.eq(&config.client_id))
+            .filter(shared_holding::holder.eq(holder));
+        tables.extend(
+            mine.select(shared_holding::tbl)
+                .distinct()
+                .load::<String>(db)?,
+        );
+        diesel::delete(mine).execute(db)?;
     }
-    Ok(())
+    Ok(Released {
+        every: false,
+        tables,
+    })
 }
 
 /// Release every subscription's holding of a row of `table`, a lowercased
@@ -430,7 +515,7 @@ pub(crate) fn release_table(
 pub(crate) fn release_all(
     db: &mut SqliteConnection,
     config: &ClientConfig,
-) -> Result<(), ClientError> {
+) -> Result<Released, ClientError> {
     release_account(db)?;
     if !config.shared_tables.is_empty() {
         diesel::delete(
@@ -440,7 +525,7 @@ pub(crate) fn release_all(
         )
         .execute(db)?;
     }
-    Ok(())
+    Ok(Released::every())
 }
 
 /// Release every holding in `main`, as a new shared store generation's
@@ -519,7 +604,11 @@ pub(crate) fn rewrite_unsent(
 ///
 /// [`ClientError`] when the records or the holdings cannot be read, or a
 /// holding cannot be deleted.
-pub(crate) fn prune(db: &mut SqliteConnection, config: &ClientConfig) -> Result<(), ClientError> {
+pub(crate) fn prune(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+) -> Result<Released, ClientError> {
+    let mut released = Released::default();
     let mut holders: Vec<String> = holding::table.select(holding::holder).distinct().load(db)?;
     if !config.shared_tables.is_empty() {
         holders.extend(
@@ -532,7 +621,7 @@ pub(crate) fn prune(db: &mut SqliteConnection, config: &ClientConfig) -> Result<
         );
     }
     if holders.is_empty() {
-        return Ok(());
+        return Ok(released);
     }
     let mut live: HashSet<String> = HashSet::new();
     let mut terms: HashSet<String> = HashSet::new();
@@ -548,8 +637,111 @@ pub(crate) fn prune(db: &mut SqliteConnection, config: &ClientConfig) -> Result<
             None => live.contains(&holder),
         };
         if !kept {
-            release_holder(db, config, &holder)?;
+            released.absorb(release_holder(db, config, &holder)?);
         }
     }
-    Ok(())
+    Ok(released)
+}
+
+/// The lowercased physical tables a pass reads (O8): every keyed application
+/// table in `main` and every shared table in the store. The tier lives in
+/// its own schema, and a rowid-only table has no key a holding could name.
+///
+/// # Errors
+///
+/// [`ClientError`] when a catalog cannot be read.
+pub(crate) fn synced_tables(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+) -> Result<BTreeSet<String>, ClientError> {
+    let mut tables: BTreeSet<String> = outbox::keyed_table_names(db, "main")?
+        .into_iter()
+        .map(|table| table.to_lowercase())
+        .collect();
+    if !config.shared_tables.is_empty() {
+        tables.extend(
+            outbox::keyed_table_names(db, SHARED_SCHEMA)?
+                .into_iter()
+                .map(|table| table.to_lowercase())
+                .filter(|table| is_shared(&config.shared_tables, table)),
+        );
+    }
+    Ok(tables)
+}
+
+/// The tables `released` names, resolving a session-wide release to every
+/// synced table.
+///
+/// # Errors
+///
+/// [`ClientError`] when a catalog cannot be read.
+pub(crate) fn tables_of(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+    released: &Released,
+) -> Result<BTreeSet<String>, ClientError> {
+    if released.every {
+        synced_tables(db, config)
+    } else {
+        Ok(released.tables.clone())
+    }
+}
+
+/// The schema, the qualified holdings table and the key SQL of `table`'s
+/// stored row aliased `r`, or `None` when the table has no key or is gone.
+fn holdable(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+    table: &str,
+) -> Result<Option<(&'static str, &'static str, String)>, ClientError> {
+    let (schema, holdings) = if is_shared(&config.shared_tables, table) {
+        (SHARED_SCHEMA, SHARED_HOLDINGS)
+    } else {
+        ("main", "main._connetto_holding")
+    };
+    let columns = outbox::columns(db, schema, table)?;
+    if !columns.iter().any(|column| column.pk > 0) {
+        return Ok(None);
+    }
+    Ok(Some((schema, holdings, outbox::key_clause("r", &columns))))
+}
+
+/// The condition that no holding names the row aliased `r`, whose key `key`
+/// computes, and no clause of `keep` matches it.
+fn unheld(holdings: &str, key: &str, keep: Option<&[String]>) -> String {
+    let mut condition = format!("{key} NOT IN (SELECT key FROM {holdings} WHERE tbl = ?)");
+    if let Some(keep) = keep.filter(|keep| !keep.is_empty()) {
+        let _ = write!(condition, " AND NOT ({})", keep.join(" OR "));
+    }
+    condition
+}
+
+/// Delete every row of `tables` no holding names and no clause of `keep`
+/// matches, `keep` holding this identity's own unsent writes by lowercased
+/// physical table. A shared table reads every identity's holdings. Returns
+/// the rows removed.
+///
+/// # Errors
+///
+/// [`ClientError`] when a catalog cannot be read or a row deleted.
+pub(crate) fn delete_unheld(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+    tables: &BTreeSet<String>,
+    keep: &HashMap<String, Vec<String>>,
+) -> Result<usize, ClientError> {
+    let mut removed = 0;
+    for table in tables {
+        let Some((schema, holdings, key)) = holdable(db, config, table)? else {
+            continue;
+        };
+        removed += diesel::sql_query(format!(
+            "DELETE FROM {schema}.{} AS r WHERE {}",
+            quote_ident(table),
+            unheld(holdings, &key, keep.get(table).map(Vec::as_slice))
+        ))
+        .bind::<Text, _>(table)
+        .execute(db)?;
+    }
+    Ok(removed)
 }

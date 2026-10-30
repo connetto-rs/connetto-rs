@@ -91,7 +91,7 @@ fn set_state(db: &mut SqliteConnection, store: &str, state: State, old_hash: &[u
     match state {
         State::Fresh => db.batch_execute(
             "DROP TABLE connetto_shared.vocabulary_store; DROP TABLE connetto_shared._connetto_build; \
-             DROP TABLE connetto_shared._connetto_interest; DROP TABLE connetto_shared._connetto_spare; \
+             DROP TABLE connetto_shared._connetto_identity; \
              DROP TABLE connetto_shared._connetto_shared_holding; \
              PRAGMA connetto_shared.user_version = 0",
         ).unwrap(),

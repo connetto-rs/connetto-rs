@@ -377,18 +377,28 @@ where
         .expect("read the replica")
 }
 
-/// A snapshot plus subscription over `orders` covering only `id = 1`, so the
-/// row at 2 is uncovered by every subscription and fair game for eviction.
+/// A subscription over `orders` holding only `id = 1`, and a row at 2 that a
+/// frame still in flight past an ended subscription delivered, so no
+/// subscription holds it and it is fair game for eviction.
 async fn orders_fixture() -> (ConnettoConnection<Script>, Script) {
     let (mut conn, server) = connected().await;
     conn.subscribe("a", "SELECT * FROM orders WHERE id = 1")
         .await
         .expect("subscribe");
-    send_snapshot(&server, "a", orders_payload(&[(1, "x"), (2, "y")]), 1);
+    send_snapshot(&server, "a", orders_payload(&[(1, "x")]), 1);
     pump_to(
         &mut conn,
         |event| matches!(event, ClientEvent::SnapshotEnd { sub_id, .. } if sub_id == "a"),
     )
+    .await;
+    server.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+        "ended".to_owned(),
+        cursor_byte(1),
+        orders_payload(&[(2, "y")]),
+    ))));
+    pump_to(&mut conn, |event| {
+        matches!(event, ClientEvent::LivePatch { .. })
+    })
     .await;
     (conn, server)
 }
@@ -696,10 +706,11 @@ async fn a_truncate_resync_drops_the_provenance_with_the_row() {
     );
 }
 
-/// A full resync clears every row whatever a subscription still claims, and
-/// the provenance of the cleared rows goes with them.
+/// A full resync takes every row its replacement does not deliver back, but
+/// a provisional row awaits the server's verdict, as an unsent write does,
+/// so it stays with its provenance (R11 Part B).
 #[tokio::test]
-async fn a_full_resync_clears_provenance_with_the_rows() {
+async fn a_full_resync_keeps_a_provisional_row_until_its_verdict() {
     let (mut conn, server) = orders_fixture().await;
     record_provenance(
         &mut conn,
@@ -708,6 +719,15 @@ async fn a_full_resync_clears_provenance_with_the_rows() {
         ProvisionalState::Provisional,
         None,
     );
+    server.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+        "ended".to_owned(),
+        cursor_byte(1),
+        orders_payload(&[(3, "z")]),
+    ))));
+    pump_to(&mut conn, |event| {
+        matches!(event, ClientEvent::LivePatch { .. })
+    })
+    .await;
     server.say(IncomingFrame::Control(ControlMessage::FullResyncRequired(
         FullResyncRequired {
             sub_id: "a".to_owned(),
@@ -724,8 +744,12 @@ async fn a_full_resync_clears_provenance_with_the_rows() {
         |event| matches!(event, ClientEvent::SnapshotEnd { sub_id, .. } if sub_id == "a"),
     )
     .await;
-    assert_eq!(order_ids(&mut conn), vec![1]);
-    assert_eq!(stored_provenance(&mut conn), Vec::new());
+    assert_eq!(
+        order_ids(&mut conn),
+        vec![1, 2],
+        "the unheld row 3 goes and the provisional row 2 stays"
+    );
+    assert_eq!(stored_provenance(&mut conn).len(), 1);
 }
 
 /// The reads stand the rows back from the table, decoded to their typed keys,
