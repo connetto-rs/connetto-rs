@@ -7067,17 +7067,7 @@ where
                 rows: Vec::new(),
             });
         }
-        let logical = self.to_logical(body.to_vec())?;
-        let diff = match ParsedDiffSet::parse(&logical)
-            .map_err(|err| ClientError::Apply(format!("parsing a peer entry's body: {err:?}")))?
-        {
-            ParsedDiffSet::Changeset(diff) => diff,
-            ParsedDiffSet::Patchset(_) => {
-                return Err(ClientError::Apply(
-                    "a peer entry must be a captured changeset".to_owned(),
-                ));
-            }
-        };
+        let diff = self.peer_changeset(body, "a peer entry")?;
         // The receiver's own writes still in the outbox queue first, so every
         // unsent write holds its key under a writer and sequence. The keys are
         // read before the mutable binds below take the connection.
@@ -7143,7 +7133,7 @@ where
                 Ok(peer::PeerApplyOutcome::Applied { rows })
             }
             Err(_) if refused => {
-                let rows = peer::entry_rows(&logical)?;
+                let rows = peer::entry_rows(diff.iter());
                 self.notices.push_back(ClientEvent::PeerWriteRefused {
                     author: author.key_id.clone(),
                     seq,
@@ -7177,19 +7167,7 @@ where
         let Some(entry) = peer::entry_of(&mut self.db, &author.key_id, seq)? else {
             return Ok(());
         };
-        let logical = self.to_logical(entry.changeset.clone())?;
-        let diff = match ParsedDiffSet::parse(&logical).map_err(|err| {
-            ClientError::Apply(format!(
-                "parsing a stored peer entry to retract it: {err:?}"
-            ))
-        })? {
-            ParsedDiffSet::Changeset(diff) => diff,
-            ParsedDiffSet::Patchset(_) => {
-                return Err(ClientError::Apply(
-                    "a stored peer entry must be a captured changeset".to_owned(),
-                ));
-            }
-        };
+        let diff = self.peer_changeset(&entry.changeset, "a stored peer entry")?;
         let ops: Vec<replay::PeerOp> = diff.iter().collect();
         let tables = &self.config.policy_tables;
         // The entry's ops by the key they touch, the inversion's lookup.
@@ -9729,6 +9707,29 @@ where
             return Ok(bytes);
         }
         rename_diffset(bytes, |name| tables.logical(name).map(str::to_owned))
+    }
+
+    /// A peer body parsed once into the changeset it carries, its tables
+    /// renamed onto the logical names the policy views go by. `what` names
+    /// the body in the failure.
+    #[cfg(feature = "peer")]
+    fn peer_changeset(
+        &self,
+        body: &[u8],
+        what: &str,
+    ) -> Result<replay::PeerChangeset, ClientError> {
+        let mut parsed = ParsedDiffSet::parse(body)
+            .map_err(|err| ClientError::Apply(format!("parsing {what}: {err:?}")))?;
+        let tables = &self.config.policy_tables;
+        if !tables.is_empty() {
+            parsed.rename_tables(|name| tables.logical(name).map(str::to_owned));
+        }
+        match parsed {
+            ParsedDiffSet::Changeset(diff) => Ok(diff),
+            ParsedDiffSet::Patchset(_) => Err(ClientError::Apply(format!(
+                "{what} must be a captured changeset"
+            ))),
+        }
     }
 
     /// The canonical bytes the queue chain hashes a payload under, the

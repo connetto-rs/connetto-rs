@@ -323,19 +323,24 @@ pub(crate) fn apply_ops<'d>(
     Ok(Some(rows))
 }
 
-/// The rows a logical entry body names, each table as the application
-/// writes it, deduplicated in payload order, a refusal's report.
-pub(crate) fn entry_rows(logical: &[u8]) -> Result<Vec<(String, Vec<KeyValue>)>, ClientError> {
+/// The rows an entry's ops name, each table as the application writes it,
+/// deduplicated in payload order, a refusal's report.
+pub(crate) fn entry_rows<'d>(
+    ops: impl IntoIterator<Item = crate::replay::PeerOp<'d>>,
+) -> Vec<(String, Vec<KeyValue>)> {
     let mut seen = std::collections::BTreeSet::new();
     let mut rows = Vec::new();
-    for (table, key) in crate::op_keys(logical)
-        .map_err(|err| ClientError::Apply(format!("reading a peer entry's keys: {err:?}")))?
-    {
+    for op in ops {
+        let key: Vec<KeyValue> = crate::replay::peer_key_values(&op)
+            .into_iter()
+            .map(KeyValue::from)
+            .collect();
+        let table = op.table().name().to_owned();
         if !key.is_empty() && seen.insert((table.clone(), crate::provisional::encode_key(&key))) {
             rows.push((table, key));
         }
     }
-    Ok(rows)
+    rows
 }
 
 /// The values the policy functions answer with before the bind, restored on

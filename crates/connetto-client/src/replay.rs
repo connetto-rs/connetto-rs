@@ -20,6 +20,10 @@ use sqlite_diff_rs::{
 #[cfg(feature = "peer")]
 pub(crate) type PeerOp<'a> = ChangesetOp<'a, TableSchema<String>, String, Vec<u8>>;
 
+/// A parsed peer entry body, the changeset its ops borrow from.
+#[cfg(feature = "peer")]
+pub(crate) type PeerChangeset = DiffSet<ChangesetFormat, TableSchema<String>, String, Vec<u8>>;
+
 use crate::ClientError;
 use crate::quote_ident;
 
