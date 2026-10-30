@@ -39,14 +39,14 @@ use connetto_core::messages::{
     AggregateUpdate, BindDevice, BindValue, BotRegistered, BulkMessage, CONTENT_TICKET_REFUSED,
     CONTENT_TICKET_SIGNER_ERROR, Challenge, ConflictRow, ContentTicketGrant, ContentTicketRequest,
     ContentVerb, ControlMessage, DeviceRevokedAck, DevicesList, DevicesRequest, EnrolChallenge,
-    EnrolRefusal, EnrolRefused, FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired,
-    Grant, Handshake, HandshakeAck, LivePatch, MembershipOpened, MutationApplied, MutationConflict,
-    MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError, PauseCause,
-    Pong, Provenance, RateLimited, RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate,
-    RevokeDeviceRequest, SUBSCRIPTION_REFUSED, ShareKeysReplaced, SignedList, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec, WriterAnswer, WriterGrant,
-    WriterOutcome, WriterRef, WriterRequest, WriterSecret, bot_registration_message,
-    writer_bind_message,
+    EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
+    FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MembershipOpened,
+    MutationApplied, MutationConflict, MutationHeader, MutationPatch, MutationReject,
+    MutationRejectReason, NonFatalError, PauseCause, Pong, Provenance, RateLimited, RegisterBot,
+    ReplaceShareKeys, RetireWriter, RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED,
+    ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
+    SubscriptionSpec, WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest,
+    WriterSecret, bot_registration_message, writer_bind_message,
 };
 use connetto_core::traits::{
     CheckedGrant, ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport,
@@ -5335,6 +5335,40 @@ where
         }
     }
 
+    /// An enrolment request: the grant or the refusal, the certificate
+    /// carrying the session's own bound list (R77 decision 12).
+    async fn handle_enrol_request<T: Transport>(
+        &self,
+        transport: &mut T,
+        req: EnrolRequest,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let request_id = req.request_id.clone();
+        let answer = match self.enrolling(state) {
+            Ok((enrolment, user)) => {
+                // The list the session's own connection binds (R77 decision 12).
+                enrolment
+                    .enrol(
+                        &user,
+                        state.session_id,
+                        &mut state.enrol_challenge,
+                        req,
+                        &crate::capability::bot_list_for(&state.principal),
+                    )
+                    .await
+            }
+            Err(refusal) => {
+                state.enrol_challenge = None;
+                Err(refusal)
+            }
+        };
+        let answer = answer.map_or_else(
+            |reason| ControlMessage::EnrolRefused(EnrolRefused { request_id, reason }),
+            ControlMessage::EnrolGrant,
+        );
+        transport.send_control(answer).await.map_err(transport_err)
+    }
+
     async fn handle_control<T: Transport>(
         self: &Arc<Self>,
         transport: &mut T,
@@ -5416,23 +5450,7 @@ where
                 .await
                 .map_err(transport_err),
             ControlMessage::EnrolRequest(req) => {
-                let request_id = req.request_id.clone();
-                let answer = match self.enrolling(state) {
-                    Ok((enrolment, user)) => {
-                        enrolment
-                            .enrol(&user, state.session_id, &mut state.enrol_challenge, req)
-                            .await
-                    }
-                    Err(refusal) => {
-                        state.enrol_challenge = None;
-                        Err(refusal)
-                    }
-                };
-                let answer = answer.map_or_else(
-                    |reason| ControlMessage::EnrolRefused(EnrolRefused { request_id, reason }),
-                    ControlMessage::EnrolGrant,
-                );
-                transport.send_control(answer).await.map_err(transport_err)
+                self.handle_enrol_request(transport, req, state).await
             }
             ControlMessage::DevicesRequest(req) => {
                 self.handle_devices_request(transport, req, state).await

@@ -326,6 +326,9 @@ fn renew(
     {
         slot.leaf = leaf.to_vec();
         slot.issuer = issuer.to_vec();
+        // The renewed certificate may carry a changed bot list (R77
+        // decision 12), so the read follows the chain.
+        slot.bot_list = certificate.bot_list().map(str::to_owned);
         // The renewed chain changes the leaf discovery fingerprints.
         #[cfg(feature = "discovery")]
         state
@@ -360,12 +363,19 @@ fn finish(state: &Arc<NodeState>, key: KeyId, seq: u64, reason: CloseReason) {
         match links.get(&key) {
             Some(SlotState::Live(slot)) if slot.seq == seq => {
                 let peer = slot.peer.clone();
+                let bot_list = slot.bot_list.clone();
                 links.remove(&key);
                 // The map and the slot move under the same lock, so the
                 // entry is this link's.
                 state.exchange_senders.write().remove(&key);
                 if reason == CloseReason::Duplicate {
-                    links.insert(key, SlotState::AwaitingKeeper(peer.clone()));
+                    links.insert(
+                        key,
+                        SlotState::AwaitingKeeper {
+                            peer: peer.clone(),
+                            bot_list,
+                        },
+                    );
                 }
                 Some(peer)
             }
@@ -383,7 +393,7 @@ fn finish(state: &Arc<NodeState>, key: KeyId, seq: u64, reason: CloseReason) {
             let mut links = state.links.lock();
             // A live slot is the keeper, and no slot means a stop or another
             // close resolved the wait.
-            if let Some(SlotState::AwaitingKeeper(peer)) = links.get(&key) {
+            if let Some(SlotState::AwaitingKeeper { peer, .. }) = links.get(&key) {
                 let peer = peer.clone();
                 links.remove(&key);
                 drop(links);

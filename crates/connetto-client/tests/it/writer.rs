@@ -1819,6 +1819,7 @@ fn mint_device_certificate(account: &str) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
             Duration::from_hours(720),
             CertificateSerial::new([2; 16]).expect("serial"),
             AttestationLevel::Unproven,
+            connetto_core::BOT_LIST_WILDCARD,
         )
         .expect("issued");
     let key_id = *DeviceCertificate::parse(&leaf)

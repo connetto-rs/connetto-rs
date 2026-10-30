@@ -10,6 +10,7 @@ use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::FromDer;
 
 use super::attestation::{ATTESTATION_EXTENSION, AttestationLevel};
+use super::bot_list::{self, BOT_LIST_EXTENSION};
 use super::identity::{DeploymentId, DeviceIdentity, KeyId};
 use super::request::CertificateRequest;
 use super::serial::CertificateSerial;
@@ -291,12 +292,17 @@ impl DeviceIssuer {
     }
 
     /// Issue the device certificate for `request`, naming `account`, valid from
-    /// `not_before` for `lifetime`, recording `attestation`.
+    /// `not_before` for `lifetime`, recording `attestation`, and carrying
+    /// `bot_list` as its own extension.
     ///
     /// # Errors
     ///
     /// [`IssueError`] when the account cannot be named, the certificate would
     /// outlive the issuer, or signing fails.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the serial and window join the identity and attestation the one issue carries, and a request struct would move the validation into a second type"
+    )]
     pub fn issue(
         &self,
         request: &CertificateRequest,
@@ -305,6 +311,7 @@ impl DeviceIssuer {
         lifetime: Duration,
         serial: CertificateSerial,
         attestation: AttestationLevel,
+        bot_list: &str,
     ) -> Result<Vec<u8>, IssueError> {
         let identity = DeviceIdentity::new(
             self.deployment,
@@ -330,10 +337,13 @@ impl DeviceIssuer {
         params.not_before = to_time(not_before).ok_or(IssueError::Validity)?;
         params.not_after = to_time(not_after).ok_or(IssueError::Validity)?;
         params.serial_number = Some(SerialNumber::from_slice(&serial.as_bytes()));
-        params.custom_extensions = vec![CustomExtension::from_oid_content(
-            ATTESTATION_EXTENSION,
-            attestation.extension_value(),
-        )];
+        params.custom_extensions = vec![
+            CustomExtension::from_oid_content(ATTESTATION_EXTENSION, attestation.extension_value()),
+            CustomExtension::from_oid_content(
+                BOT_LIST_EXTENSION,
+                bot_list::extension_value(bot_list),
+            ),
+        ];
         Ok(params.signed_by(&public, &signer)?.der().to_vec())
     }
 }

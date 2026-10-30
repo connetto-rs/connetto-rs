@@ -135,9 +135,14 @@ impl Deployment {
         }
     }
 
-    /// A device certificate under `issuer`, valid from `not_before` for `lifetime`.
+    /// A device certificate under `issuer`, valid from `not_before` for
+    /// `lifetime`, carrying `bot_list`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the serial and window join the identity and level the one fixture certificate carries, and a request struct would hide the same arity behind another type"
+    )]
     #[expect(clippy::unused_self, reason = "the issuer carries its own signer")]
-    pub(crate) fn device(
+    pub(crate) fn device_with_bot_list(
         &self,
         issuer: &Issuer,
         account: &str,
@@ -145,6 +150,7 @@ impl Deployment {
         lifetime: Duration,
         serial: [u8; 16],
         level: AttestationLevel,
+        bot_list: &str,
     ) -> Peer {
         let key = Device(Arc::new(
             KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("the device key"),
@@ -161,6 +167,7 @@ impl Deployment {
                 lifetime,
                 positive(serial),
                 level,
+                bot_list,
             )
             .expect("the certificate issues");
         let parsed = DeviceCertificate::parse(&leaf).expect("the profile holds");
@@ -169,12 +176,39 @@ impl Deployment {
             identity: parsed.identity().clone(),
             serial: parsed.serial().to_vec(),
             level,
+            bot_list: parsed
+                .bot_list()
+                .expect("the fixture always issues the extension")
+                .to_owned(),
             leaf,
             issuer: issuer.certificate.clone(),
         }
     }
 
-    /// Reissue the device `peer` under `issuer`, a new serial and window.
+    /// A device certificate under `issuer`, valid from `not_before` for `lifetime`, the
+    /// person's wildcard the fixture binds.
+    pub(crate) fn device(
+        &self,
+        issuer: &Issuer,
+        account: &str,
+        not_before: SystemTime,
+        lifetime: Duration,
+        serial: [u8; 16],
+        level: AttestationLevel,
+    ) -> Peer {
+        self.device_with_bot_list(
+            issuer,
+            account,
+            not_before,
+            lifetime,
+            serial,
+            level,
+            connetto_core::BOT_LIST_WILDCARD,
+        )
+    }
+
+    /// Reissue the device `peer` under `issuer`, a new serial and window,
+    /// carrying the peer's own bot list as a renewal does.
     #[expect(clippy::unused_self, reason = "the issuer carries its own signer")]
     pub(crate) fn reissue(
         &self,
@@ -197,6 +231,7 @@ impl Deployment {
                 lifetime,
                 positive(serial),
                 peer.level,
+                &peer.bot_list,
             )
             .expect("the reissue grants");
         let parsed = DeviceCertificate::parse(&leaf).expect("the profile holds");
@@ -205,6 +240,10 @@ impl Deployment {
             identity: parsed.identity().clone(),
             serial: parsed.serial().to_vec(),
             level: peer.level,
+            bot_list: parsed
+                .bot_list()
+                .expect("the fixture always issues the extension")
+                .to_owned(),
             leaf,
             issuer: issuer.certificate.clone(),
         }
@@ -246,6 +285,8 @@ pub(crate) struct Peer {
     serial: Vec<u8>,
     /// The attestation level the leaf records.
     level: AttestationLevel,
+    /// The bot list the leaf carries.
+    pub(crate) bot_list: String,
     /// The leaf, DER.
     pub(crate) leaf: Vec<u8>,
     /// The issuer certificate, DER.
@@ -3006,6 +3047,7 @@ async fn a_duplicate_close_holds_the_peer_in_the_link_read() {
         host_node.linked(),
         vec![crate::PeerLink {
             peer: gone.identity.clone(),
+            bot_list: Some(gone.bot_list.clone()),
             remote: None,
         }],
         "the held peer stays in the read without an address"
@@ -3094,6 +3136,7 @@ async fn the_hello_bound_drops_a_held_peer_in_the_link_read() {
         host_node.linked(),
         vec![crate::PeerLink {
             peer: gone.identity.clone(),
+            bot_list: Some(gone.bot_list.clone()),
             remote: None,
         }],
         "the held peer stays in the read without an address"
@@ -3709,6 +3752,62 @@ async fn an_exchange_frame_before_the_hello_refuses_the_link() {
     );
     no_events(&mut h_rx, Duration::from_millis(500)).await;
     host_node.stop(CloseReason::Closed);
+}
+
+/// A linked peer reports the bot list its leaf carries: the wildcard for a
+/// person's certificate, the list for a bot's (R77 decision 12).
+#[tokio::test]
+async fn a_linked_peer_reports_the_bot_list_its_leaf_carries() {
+    let now = whole_second();
+    let deployment = Deployment::new(77, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alpha = deployment.device(
+        &issuer,
+        "alpha",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let beta = deployment.device_with_bot_list(
+        &issuer,
+        "beta",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+        "orders:read",
+    );
+    let (a_tx, _a_rx) = events();
+    let (b_tx, _b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    let a_addr = serve(&a, &alpha);
+    let b_addr = serve(&b, &beta);
+
+    let linked = a.link(b_addr).await.expect("the dial links");
+    let links = a.linked();
+    let [link] = links.as_slice() else {
+        panic!("the node reports the link");
+    };
+    assert_eq!(link.peer, linked);
+    assert_eq!(
+        link.bot_list.as_deref(),
+        Some("orders:read"),
+        "the link reports the peer's list"
+    );
+
+    let linked = b.link(a_addr).await.expect("the reverse dial links");
+    let links = b.linked();
+    let [link] = links.as_slice() else {
+        panic!("the node reports the link");
+    };
+    assert_eq!(link.peer, linked);
+    assert_eq!(
+        link.bot_list.as_deref(),
+        Some(connetto_core::BOT_LIST_WILDCARD),
+        "the person's certificate carries the wildcard"
+    );
 }
 
 /// The peers a link read names, without their addresses.
