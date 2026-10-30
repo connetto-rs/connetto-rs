@@ -111,7 +111,7 @@ impl FlakyAppend {
 impl Oplog for FlakyAppend {
     type Error = AppendRefused;
 
-    async fn append(&self, record: ChangeRecord) -> Result<(), AppendRefused> {
+    async fn append(&self, record: &ChangeRecord) -> Result<(), AppendRefused> {
         // Only the first append is refused, so the retry's append goes through.
         if self.refusals.fetch_add(1, Ordering::Relaxed) == 0 {
             return Err(AppendRefused);
@@ -257,12 +257,12 @@ diesel::table! {
 }
 
 /// An append the engine has already applied is held, and the retry after the
-/// refusal rebuilds the record the failed append consumed, so the log ends
-/// with the event once and its answers move once.
+/// refusal appends the record the event still owes, so the log ends with the
+/// event once and its answers move once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_append_is_rebuilt_by_the_retry_that_follows_it() {
+async fn a_refused_append_is_retried_with_the_held_record() {
     crate::logging::with_capture(
-        "a_refused_append_is_rebuilt_by_the_retry_that_follows_it",
+        "a_refused_append_is_retried_with_the_held_record",
         |logs| async move {
             let fixture = Fixture::acquire().await;
             fixture.exec("DROP TABLE IF EXISTS counts CASCADE").await;
@@ -333,7 +333,7 @@ async fn a_refused_append_is_rebuilt_by_the_retry_that_follows_it() {
             assert_eq!(
                 records.len(),
                 1,
-                "the retry rebuilds the record the refusal consumed, so the log holds the event once"
+                "the retry appends the held record, so the log holds the event once"
             );
             assert_eq!(records[0].position(), event.position());
 

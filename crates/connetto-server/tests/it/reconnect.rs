@@ -861,7 +861,7 @@ impl Oplog for ScriptedOplog {
         err.transient
     }
 
-    async fn append(&self, record: ChangeRecord) -> Result<(), Refused> {
+    async fn append(&self, record: &ChangeRecord) -> Result<(), Refused> {
         self.inner
             .append(record)
             .await
