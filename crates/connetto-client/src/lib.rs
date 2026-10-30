@@ -9025,15 +9025,20 @@ where
         self.released.absorb(released);
         if let Some(table) = truncated {
             // Every row of an emptied table is stale, so only an unsent write
-            // keeps one, and the provenance records of the table go with it.
+            // keeps one, and the provenance records of the table go with the
+            // rows in one transaction, whatever their verdict.
             let keep = self.pending_spare()?;
             let tables = BTreeSet::from([table]);
-            self.delete_unheld(&tables, &keep)?;
-            #[cfg(feature = "peer")]
-            for table in &tables {
-                let _suspended = ExemptWrites::raise(&self.write_flags);
-                provisional::drop_table(&mut self.db, table)?;
-            }
+            let _suspended = ExemptWrites::raise(&self.write_flags);
+            let config = &self.config;
+            deleting_transaction(&mut self.db, config, |conn| {
+                holdings::delete_unheld(conn, config, &tables, &keep)?;
+                #[cfg(feature = "peer")]
+                for table in &tables {
+                    provisional::drop_table(conn, table)?;
+                }
+                Ok(())
+            })?;
         }
         Ok(aggregate)
     }
