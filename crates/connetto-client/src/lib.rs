@@ -42,6 +42,9 @@ use diesel::connection::{
 use diesel::expression::QueryMetadata;
 use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::result::{ConnectionError, ConnectionResult, QueryResult};
+use diesel::sqlite::pragma::{
+    AutoVacuum, FreelistCount, IncrementalVacuum, PageCount, SchemaPragma,
+};
 use diesel::sqlite::{
     AutoVacuumMode, CommitDecision, Sqlite, SqliteChangeOps, SqliteFunctionBehavior,
     SqliteUpdateRouter, WalCheckpointMode,
@@ -4296,7 +4299,7 @@ fn attach_shared_store<S: ReplicaStorage>(
     .optional()?
     .is_none();
     if fresh {
-        db.set_auto_vacuum(Some(SHARED_SCHEMA), AutoVacuumMode::Incremental)?;
+        AutoVacuum::set(AutoVacuumMode::Incremental, Some(SHARED_SCHEMA), db)?;
     }
     Ok(fresh)
 }
@@ -4552,7 +4555,7 @@ where
         // already carries it, and setting it after the first table is a silent
         // no-op (R15).
         if matches!(boot, Boot::Fresh(_)) {
-            db.set_auto_vacuum(None, AutoVacuumMode::Incremental)?;
+            AutoVacuum::set(AutoVacuumMode::Incremental, None, &mut db)?;
         }
         // Before any statement carrying outside input, and before the first
         // attach: R18's hardening surface, one helper for both open paths.
@@ -9349,11 +9352,11 @@ where
     /// `wal_checkpoint` fails inside one. A checkpoint a reader blocks reports
     /// busy and is left for the next pass rather than spun on.
     fn trim_replica(&mut self) -> Result<(), ClientError> {
-        let total = self.db.page_count(None)?;
+        let total = PageCount::get::<i64>(None, &mut self.db)?;
         if total == 0 {
             return Ok(());
         }
-        let free = self.db.freelist_count(None)?;
+        let free = FreelistCount::get::<i64>(None, &mut self.db)?;
         if free.saturating_mul(100)
             < i64::from(self.config.tuning.trim_threshold()).saturating_mul(total)
         {
@@ -9365,13 +9368,12 @@ where
         // the loop if a page cannot be reclaimed.
         let budget = self.config.tuning.trim_budget();
         loop {
-            let before = self.db.freelist_count(None)?;
+            let before = FreelistCount::get::<i64>(None, &mut self.db)?;
             if before == 0 {
                 break;
             }
-            self.db
-                .incremental_vacuum(None, (budget > 0).then_some(budget))?;
-            let after = self.db.freelist_count(None)?;
+            IncrementalVacuum::set(core::num::NonZeroU32::new(budget), None, &mut self.db)?;
+            let after = FreelistCount::get::<i64>(None, &mut self.db)?;
             if after >= before {
                 break;
             }
@@ -9464,8 +9466,8 @@ where
             |counts| counts.iter().map(|(t, n)| (t.clone(), *n)).collect(),
         );
         rows_applied.sort();
-        let total = self.db.page_count(None)?;
-        let free = self.db.freelist_count(None)?;
+        let total = PageCount::get::<i64>(None, &mut self.db)?;
+        let free = FreelistCount::get::<i64>(None, &mut self.db)?;
         let freelist_percent = if total > 0 {
             u8::try_from(free.saturating_mul(100) / total).unwrap_or(100)
         } else {

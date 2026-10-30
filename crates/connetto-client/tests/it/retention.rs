@@ -18,6 +18,7 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
 use diesel::prelude::*;
 use diesel::sqlite::AutoVacuumMode;
+use diesel::sqlite::pragma::{AutoVacuum, PageCount, SchemaPragma};
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 const DDL: &str =
@@ -193,7 +194,7 @@ async fn auto_vacuum_is_incremental_on_a_created_replica() {
     .open_driven()
     .expect("open a fresh replica");
     assert_eq!(
-        conn.conn().auto_vacuum(None).expect("read auto_vacuum"),
+        AutoVacuum::get::<AutoVacuumMode>(None, conn.conn()).expect("read auto_vacuum"),
         AutoVacuumMode::Incremental,
     );
 }
@@ -399,14 +400,14 @@ async fn trimming_returns_pages_after_a_bulk_eviction() {
         .expect("subscribe keep");
     pump_to_snapshot_end(&mut conn).await;
 
-    let before = conn.conn().page_count(None).expect("page_count before");
+    let before = PageCount::get::<i64>(None, conn.conn()).expect("page_count before");
     conn.unsubscribe("seed").await.expect("unsubscribe seed");
     conn.tidy().expect("tidy");
     assert!(
         replica_ids(&mut conn).is_empty(),
         "every seeded row is uncovered and evicted",
     );
-    let after = conn.conn().page_count(None).expect("page_count after");
+    let after = PageCount::get::<i64>(None, conn.conn()).expect("page_count after");
     assert!(
         after < before,
         "the trimming pass reclaimed pages ({before} -> {after})",
@@ -438,7 +439,7 @@ async fn tidy_trims_the_freelist_without_an_eviction() {
         .expect("subscribe all");
     pump_to_snapshot_end(&mut conn).await;
 
-    let before = conn.conn().page_count(None).expect("page_count before");
+    let before = PageCount::get::<i64>(None, conn.conn()).expect("page_count before");
     diesel::delete(orders::table.filter(orders::id.le(700)))
         .execute(conn.conn())
         .expect("delete most orders");
@@ -450,7 +451,7 @@ async fn tidy_trims_the_freelist_without_an_eviction() {
         (701..=800).collect::<Vec<_>>(),
         "tidy evicted nothing: every surviving row is still covered",
     );
-    let after = conn.conn().page_count(None).expect("page_count after");
+    let after = PageCount::get::<i64>(None, conn.conn()).expect("page_count after");
     assert!(
         after < before,
         "tidy reclaimed the delete's freelist with no eviction ({before} -> {after})",
@@ -528,9 +529,9 @@ async fn tidy_trims_while_the_transport_is_down() {
         .execute(conn.conn())
         .expect("delete every order");
 
-    let before = conn.conn().page_count(None).expect("page_count before");
+    let before = PageCount::get::<i64>(None, conn.conn()).expect("page_count before");
     conn.tidy().expect("tidy offline");
-    let after = conn.conn().page_count(None).expect("page_count after");
+    let after = PageCount::get::<i64>(None, conn.conn()).expect("page_count after");
     assert!(
         after < before,
         "tidy trimmed the freelist while offline ({before} -> {after})",

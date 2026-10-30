@@ -13,6 +13,7 @@ use connetto_core::messages::{FatalErrorReason, FullResyncReason, SyncStatus};
 use connetto_core::traits::{MaybeSend, Transport};
 use connetto_file_core::{FileId, MimeClass};
 use diesel::prelude::*;
+use diesel::sqlite::pragma::{FreelistCount, PageCount, SchemaPragma};
 use rosetta_uuid::Uuid;
 
 include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
@@ -232,8 +233,8 @@ where
     client
         .with_conn(|conn| {
             let db = conn.conn();
-            let pages = db.page_count(None).unwrap_or(0);
-            let free = db.freelist_count(None).unwrap_or(0);
+            let pages = PageCount::get::<i64>(None, db).unwrap_or(0);
+            let free = FreelistCount::get::<i64>(None, db).unwrap_or(0);
             (pages, free)
         })
         .await

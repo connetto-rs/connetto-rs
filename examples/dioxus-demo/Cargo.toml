@@ -140,7 +140,7 @@ required-features = []
 # graph will not resolve. The sources and revisions must match the root ones
 # exactly. The demo lockfile pins the rest of the graph.
 [patch.crates-io]
-diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "master" }
+diesel = { git = "https://github.com/diesel-rs/diesel" }
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 # R51, until both are released: the keychain store's shared authentication
@@ -157,9 +157,6 @@ android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/and
 # R53 and R74, until released: the fork's `future` branch, the sealed and
 # Windows Hello store stack merged with the TPM signing key (upstream #19).
 windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/windows-native-keyring-store", rev = "8a8ffde9913b36bd464c8cd5dd24bf80e39dce37" }
-
-[patch."https://github.com/diesel-rs/diesel"]
-diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "master" }
 
 # Fast test iteration: release-grade optimization without the fat link.
 # Mirrors the root workspace profile of the same name.

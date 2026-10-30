@@ -15,6 +15,7 @@ use connetto_wasm_smoke::build;
 use connetto_wasm_smoke::workers::demo_schema;
 
 use diesel::prelude::*;
+use diesel::sqlite::pragma::{FreelistCount, PageCount, SchemaPragma};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
@@ -81,8 +82,8 @@ async fn opfs_bytes(name: &str) -> f64 {
 /// `PRAGMA freelist_count` report them.
 fn page_stats(conn: &mut ConnettoConnection<BrowserSocket>) -> (i64, i64) {
     (
-        conn.conn().page_count(None).expect("page count"),
-        conn.conn().freelist_count(None).expect("freelist count"),
+        PageCount::get::<i64>(None, conn.conn()).expect("page count"),
+        FreelistCount::get::<i64>(None, conn.conn()).expect("freelist count"),
     )
 }
 

@@ -631,7 +631,7 @@ dependencies = [
  "bitflags 2.13.2",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "regex",
@@ -2387,7 +2387,7 @@ dependencies = [
 [[package]]
 name = "diesel"
 version = "2.3.14"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#a429c50c8eb01e93a6ea57154087439b3f121eac"
+source = "git+https://github.com/diesel-rs/diesel#04f6aafd45c84cc10214ac9b21cf18fe2498b157"
 dependencies = [
  "bigdecimal",
  "bitflags 2.13.2",
@@ -2444,7 +2444,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#a429c50c8eb01e93a6ea57154087439b3f121eac"
+source = "git+https://github.com/diesel-rs/diesel#04f6aafd45c84cc10214ac9b21cf18fe2498b157"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2454,7 +2454,7 @@ dependencies = [
 [[package]]
 name = "diesel_derives"
 version = "2.3.10"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#a429c50c8eb01e93a6ea57154087439b3f121eac"
+source = "git+https://github.com/diesel-rs/diesel#04f6aafd45c84cc10214ac9b21cf18fe2498b157"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -2467,7 +2467,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#a429c50c8eb01e93a6ea57154087439b3f121eac"
+source = "git+https://github.com/diesel-rs/diesel#04f6aafd45c84cc10214ac9b21cf18fe2498b157"
 dependencies = [
  "syn 3.0.5",
 ]
@@ -2973,7 +2973,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#a429c50c8eb01e93a6ea57154087439b3f121eac"
+source = "git+https://github.com/diesel-rs/diesel#04f6aafd45c84cc10214ac9b21cf18fe2498b157"
 dependencies = [
  "darling 0.24.1",
  "either",
@@ -4483,7 +4483,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -7350,8 +7350,8 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.13.0",
+ "heck 0.4.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph",
@@ -7370,7 +7370,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -7418,7 +7418,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb5cd191fad9142d096efc97c64715db73db4adb60c38ebdf22f5b54cd6ea712"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "prost",
  "prost-build",
  "prost-types",
@@ -8949,7 +8949,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
