@@ -276,11 +276,12 @@ pub trait Oplog: Send + Sync {
     /// covers. Pruning is not a separate seam: an external caller would race
     /// the append it belongs to. A record at a position already appended is
     /// ignored, since a source resuming after a failed dispatch delivers it again.
+    /// The record is borrowed, so a caller whose append failed retries with it.
     ///
     /// # Errors
     ///
     /// Implementation-defined: a backing-store write failure.
-    async fn append(&self, record: ChangeRecord) -> Result<(), Self::Error>;
+    async fn append(&self, record: &ChangeRecord) -> Result<(), Self::Error>;
 
     /// Records strictly after `after`, in commit order.
     ///
@@ -605,7 +606,7 @@ impl Oplog for InMemoryOplog {
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
-    async fn append(&self, record: ChangeRecord) -> Result<(), Infallible> {
+    async fn append(&self, record: &ChangeRecord) -> Result<(), Infallible> {
         let now = self.clock.now_micros();
         let mut inner = self.inner.lock();
         let position = record.position();
@@ -616,7 +617,7 @@ impl Oplog for InMemoryOplog {
         inner.max_position = Some(position);
         inner.entries.push_back(Entry {
             appended_micros: now,
-            record,
+            record: record.clone(),
         });
         self.prune_locked(&mut inner, now);
         Ok(())
@@ -1096,7 +1097,7 @@ mod pg {
             }
         }
 
-        async fn append(&self, record: ChangeRecord) -> Result<(), PgOplogError> {
+        async fn append(&self, record: &ChangeRecord) -> Result<(), PgOplogError> {
             let event_bytes = serde_json::to_vec(record.event().change())?;
             let (commit_lsn, xid, ordinal) = position_to_i64(record.position())?;
             let mut conn = self.pool.get().await.map_err(pool_err)?;
@@ -1439,8 +1440,8 @@ mod tests {
         let log = InMemoryOplog::default();
         let first = PgCommitPosition::new(PgLsn(0x100), PgXid(1), 1);
         let second = PgCommitPosition::new(PgLsn(0x100), PgXid(1), 2);
-        log.append(row(1, first)).await.expect("append");
-        log.append(row(2, second)).await.expect("append");
+        log.append(&row(1, first)).await.expect("append");
+        log.append(&row(2, second)).await.expect("append");
         let replayed: Vec<_> = log
             .entries_since(first)
             .await
@@ -1476,8 +1477,8 @@ mod tests {
     async fn a_row_appended_again_is_kept_once() {
         let log = InMemoryOplog::default();
         let position = PgCommitPosition::new(PgLsn(0x100), PgXid(1), 1);
-        log.append(row(1, position)).await.expect("append");
-        log.append(row(1, position)).await.expect("append again");
+        log.append(&row(1, position)).await.expect("append");
+        log.append(&row(1, position)).await.expect("append again");
         assert_eq!(
             log.entries_since(PgCommitPosition::before_commit(PgLsn(0)))
                 .await
@@ -1509,7 +1510,7 @@ mod tests {
     /// One single-row transaction `n` at commit `0x100 * n`, appended and committed.
     async fn commit_one(log: &InMemoryOplog, n: u32) {
         let commit_lsn = PgLsn(0x100 * u64::from(n));
-        log.append(row(
+        log.append(&row(
             i64::from(n),
             PgCommitPosition::new(commit_lsn, PgXid(n), 1),
         ))
@@ -1602,7 +1603,7 @@ mod tests {
             .map(|n| PgCommitPosition::new(PgLsn(0x100 * n), PgXid(1), 1))
             .collect();
         for (id, position) in (1..).zip(&at) {
-            log.append(row(id, *position)).await.expect("append");
+            log.append(&row(id, *position)).await.expect("append");
         }
         assert_eq!(
             page_positions(&log, at[0], at[3], 10).await,
@@ -1627,7 +1628,7 @@ mod tests {
             .map(|n| PgCommitPosition::new(PgLsn(0x100 * n), PgXid(1), 1))
             .collect();
         for (id, position) in (1..).zip(&at) {
-            log.append(row(id, *position)).await.expect("append");
+            log.append(&row(id, *position)).await.expect("append");
         }
         // Positions 1..=5 are pruned, so a cursor at one of them is before the retained front.
         assert_eq!(
@@ -1651,9 +1652,9 @@ mod tests {
         let first = PgCommitPosition::new(PgLsn(0x100), PgXid(1), 1);
         let second = PgCommitPosition::new(PgLsn(0x100), PgXid(1), 2);
         let after_commit = PgCommitPosition::new(PgLsn(0x200), PgXid(1), 1);
-        log.append(row(1, first)).await.expect("append");
-        log.append(row(2, second)).await.expect("append");
-        log.append(row(3, after_commit)).await.expect("append");
+        log.append(&row(1, first)).await.expect("append");
+        log.append(&row(2, second)).await.expect("append");
+        log.append(&row(3, after_commit)).await.expect("append");
         assert_eq!(page_positions(&log, first, first, 10).await, Vec::new());
         assert_eq!(
             page_positions(&log, first, after_commit, 10).await,
@@ -1673,7 +1674,7 @@ mod tests {
             .map(|n| PgCommitPosition::new(PgLsn(0x100 * n), PgXid(1), 1))
             .collect();
         for (id, position) in (1..).zip(&at) {
-            log.append(row(id, *position)).await.expect("append");
+            log.append(&row(id, *position)).await.expect("append");
         }
         let future = PgCommitPosition::new(PgLsn(0x100 * 6), PgXid(1), 1);
         assert_eq!(page_positions(&log, future, future, 10).await, Vec::new());
