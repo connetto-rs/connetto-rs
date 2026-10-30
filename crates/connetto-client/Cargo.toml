@@ -49,6 +49,7 @@ device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:
 # a second, server-independent channel, and dials them.
 peer = [
   "device-identity",
+  "dep:pg2sqlite",
   "dep:connetto-peer",
   "dep:btleplug",
   "dep:connetto-peer-android",
@@ -180,6 +181,9 @@ connetto-schema = { workspace = true, optional = true }
 # 3), and its bluetooth feature carries the beacon and the exchange (R76
 # slice 5).
 connetto-peer = { path = "../connetto-peer", optional = true, features = ["discovery", "bluetooth"] }
+# A peer apply tells a write guard's policy refusal apart from any other
+# failed write by the message the translated guards raise (R77).
+pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, optional = true }
 # The page codec, one per target, both selected here rather than by a feature
 # because `ReplicaCipher::Encrypted` cannot be honest without it: in a SQLite
 # with no codec, `PRAGMA key` is an unrecognised pragma that succeeds silently

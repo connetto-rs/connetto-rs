@@ -1807,7 +1807,9 @@ where
     where
         S: Future<Output = ()> + Send + 'static,
     {
-        let parts = self.build().await?;
+        // The build is boxed so a caller awaiting `serve` holds a pointer to
+        // it rather than its whole state.
+        let parts = Box::pin(self.build()).await?;
         let router = parts.router;
         let mut change_stream = tokio::spawn(parts.change_stream);
         let mut http = tokio::spawn(async move {

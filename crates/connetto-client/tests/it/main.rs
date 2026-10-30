@@ -80,6 +80,8 @@ mod offline_start;
 mod outbox;
 
 mod outbox_push;
+#[cfg(feature = "peer")]
+mod peer_apply;
 
 #[cfg(feature = "native-auth")]
 mod pump_fault;

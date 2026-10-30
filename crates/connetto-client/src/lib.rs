@@ -48,6 +48,8 @@ use diesel::sqlite::{
 };
 use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
 use diesel_sqlite_session::{ConflictAction, ConflictType, SqliteSessionExt, invert_changeset};
+#[cfg(feature = "peer")]
+use sha2::{Digest, Sha256};
 use sqlite_diff_rs::{
     DiffOps, DynTable, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK, TableSchema,
     Value,
@@ -91,6 +93,8 @@ mod memory_stores;
 #[cfg(all(feature = "peer", target_os = "android"))]
 mod multicast;
 mod outbox;
+#[cfg(feature = "peer")]
+pub mod peer;
 mod pending;
 #[cfg(feature = "peer")]
 pub mod provisional;
@@ -856,6 +860,27 @@ impl PolicyTables {
     #[must_use]
     pub fn logical(&self, physical: &str) -> Option<&str> {
         lookup(&self.to_logical, physical)
+    }
+
+    /// The name the application writes for the stored `table`, its logical
+    /// name when it backs one and itself otherwise.
+    #[cfg(feature = "peer")]
+    fn named(&self, table: String) -> String {
+        self.logical(&table).map_or(table, str::to_owned)
+    }
+
+    /// The lowercased table the replica stores the application's `table`
+    /// in, its backing table when it is split and itself otherwise.
+    #[cfg(feature = "peer")]
+    pub(crate) fn stored(&self, table: &str) -> String {
+        self.physical(table).unwrap_or(table).to_lowercase()
+    }
+
+    /// A provenance record as the application reads it, its table logical.
+    #[cfg(feature = "peer")]
+    fn named_row(&self, mut row: provisional::ProvisionalRow) -> provisional::ProvisionalRow {
+        row.table = self.named(row.table);
+        row
     }
 
     /// Whether no table was split.
@@ -1634,6 +1659,43 @@ pub enum ClientEvent {
         /// The confirmed provenance rows, as stored.
         rows: Vec<provisional::ProvisionalRow>,
     },
+    /// A peer entry's rows applied, its records written (R77), raised once
+    /// per entry naming every record the apply wrote, the receiver's own
+    /// keys it displaced among them.
+    #[cfg(feature = "peer")]
+    ProvisionalApplied {
+        /// The author's key id.
+        author: Vec<u8>,
+        /// The author's queue sequence.
+        seq: i64,
+        /// The records the apply wrote.
+        rows: Vec<provisional::ProvisionalRow>,
+    },
+    /// A peer entry's rows refused by the receiver's policies as the
+    /// author (R77), nothing of the entry having landed, naming the
+    /// entry's rows.
+    #[cfg(feature = "peer")]
+    PeerWriteRefused {
+        /// The author's key id.
+        author: Vec<u8>,
+        /// The author's queue sequence.
+        seq: i64,
+        /// The entry's rows, physical table and key.
+        rows: Vec<(String, Vec<KeyValue>)>,
+    },
+    /// A peer entry retracted, its rows inverted and its entry deleted
+    /// (R77), raised once per retracted entry naming the keys it inverted.
+    #[cfg(feature = "peer")]
+    ProvisionalRetracted {
+        /// The author's key id.
+        author: Vec<u8>,
+        /// The author's queue sequence.
+        seq: i64,
+        /// Why the author pulled the entry back.
+        cause: connetto_core::exchange::RetractCause,
+        /// The keys the retraction inverted.
+        rows: Vec<(String, Vec<KeyValue>)>,
+    },
     /// The server accepted a share-key replacement and queued its authorization resends.
     ShareKeysReplaced {
         /// The correlation token the swap it answers carried.
@@ -1856,6 +1918,11 @@ fn rollback_omit(_conflict: ConflictType) -> ConflictAction {
     ConflictAction::Omit
 }
 
+/// The keys the receiver's own unsent writes hold, by lowercased physical
+/// table and encoded key, each naming its writer and sequence (R77).
+#[cfg(feature = "peer")]
+pub(crate) type HeldKeys = HashMap<(String, Vec<u8>), (String, i64)>;
+
 /// The two switches over connetto's own writes, read by the SQL functions
 /// the translated schema's write guards and the outbox triggers call.
 #[derive(Default)]
@@ -1895,12 +1962,18 @@ impl Drop for ExemptWrites {
 /// down, for a write the translated schema's write guards judge and this
 /// device does not upload, as a peer's entry applied as its author is
 /// (R77). Lowered on drop.
-#[cfg_attr(not(test), expect(dead_code, reason = "R77's peer apply raises it"))]
+#[cfg_attr(
+    not(any(test, feature = "peer")),
+    expect(dead_code, reason = "R77's peer apply raises it")
+)]
 struct UnrecordedWrites {
     flags: Arc<WriteFlags>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "R77's peer apply raises it"))]
+#[cfg_attr(
+    not(any(test, feature = "peer")),
+    expect(dead_code, reason = "R77's peer apply raises it")
+)]
 impl UnrecordedWrites {
     fn raise(flags: &Arc<WriteFlags>) -> Self {
         flags.unrecorded.store(true, Ordering::Relaxed);
@@ -2227,7 +2300,7 @@ fn check_policy_tables(
 /// SQLite hoist it out of the policy predicate that otherwise runs per row,
 /// and innocuous because the generated view and triggers are exactly the
 /// schema objects it has to be callable from.
-fn register_caller(
+pub(crate) fn register_caller(
     db: &mut SqliteConnection,
     function: &str,
     identity: String,
@@ -2248,7 +2321,7 @@ fn register_caller(
 /// compiles unpacks. `NULL` for a caller holding no key, which is what makes
 /// an absent capability fail closed: a comparison against `NULL` is `NULL`
 /// rather than true.
-fn register_subjects(
+pub(crate) fn register_subjects(
     db: &mut SqliteConnection,
     function: &str,
     packed: Option<String>,
@@ -2264,8 +2337,11 @@ fn register_subjects(
 /// Register the no-argument function a translated cap policy calls for the
 /// caller's bot list, so the replica holds a caller to the same list
 /// Postgres holds it to.
-fn register_bot_list(db: &mut SqliteConnection, list: String) -> Result<(), ClientError> {
-    db.register_noarg_sql_function::<diesel::sql_types::Text, _, _>(
+pub(crate) fn register_bot_list(
+    db: &mut SqliteConnection,
+    list: Option<String>,
+) -> Result<(), ClientError> {
+    db.register_noarg_sql_function::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _, _>(
         connetto_core::BOT_LIST_FUNCTION,
         SqliteFunctionBehavior::DETERMINISTIC | SqliteFunctionBehavior::INNOCUOUS,
         move || list.clone(),
@@ -4038,6 +4114,11 @@ pub struct ConnettoConnection<T: Transport> {
     /// durable entries and advanced only after one commits, so the order of
     /// outstanding entries outlives every writer sequence.
     next_position: u64,
+    /// The position the next stored peer entry takes, rebuilt at open from
+    /// the stored entries and advanced only after one commits, a sibling of
+    /// `next_position` across every author (R77).
+    #[cfg(feature = "peer")]
+    peer_next_position: u64,
     /// The writer this connection writes as, absent on a device connection
     /// until its bind is answered.
     bound_writer: Option<WriterRef>,
@@ -4273,6 +4354,8 @@ fn install_replica_metadata(
     db.batch_execute(enrolment::CERTIFICATE_DDL)?;
     #[cfg(feature = "peer")]
     db.batch_execute(provisional::PROVISIONAL_DDL)?;
+    #[cfg(feature = "peer")]
+    db.batch_execute(peer::PEER_ENTRY_DDL)?;
     // A watch the previous run died still holding counts down from now.
     subscriptions::anchor_launch(db)?;
     Ok(())
@@ -4501,7 +4584,7 @@ where
         let write_flags = Arc::new(WriteFlags::default());
         register_write_flags(&mut db, &write_flags)?;
         // A person carries the wildcard, and a bot login reads its list here (R99).
-        register_bot_list(&mut db, connetto_core::BOT_LIST_WILDCARD.to_owned())?;
+        register_bot_list(&mut db, Some(connetto_core::BOT_LIST_WILDCARD.to_owned()))?;
         let (prior, reset_resume) = install_replica_schema(&mut db, replica, boot, config)?;
         let resume = if reset_resume { None } else { resume };
         // An explicit resume cursor wins. Otherwise the replica remembers
@@ -4519,6 +4602,8 @@ where
             (None, None) => (None, None),
         };
         let (writers, next_position) = load_writer_queues(&mut db)?;
+        #[cfg(feature = "peer")]
+        let peer_next_position = peer::load_next_position(&mut db)?;
         #[cfg(feature = "device-identity")]
         let retired_keys = load_retired_keys(&mut db)?;
         let changed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -4558,6 +4643,8 @@ where
             last_cursor: resume,
             writers,
             next_position,
+            #[cfg(feature = "peer")]
+            peer_next_position,
             bound_writer: None,
             writer_tasks: VecDeque::new(),
             writer_in_flight: None,
@@ -6896,13 +6983,9 @@ where
         table: &str,
         key: &[KeyValue],
     ) -> Result<Option<provisional::ProvisionalRow>, ClientError> {
-        let table = self
-            .config
-            .policy_tables
-            .physical(table)
-            .unwrap_or(table)
-            .to_lowercase();
-        provisional::row_of_key(&mut self.db, &table, key)
+        let table = self.config.policy_tables.stored(table);
+        Ok(provisional::row_of_key(&mut self.db, &table, key)?
+            .map(|row| self.config.policy_tables.named_row(row)))
     }
 
     /// Every provenance row the replica holds, keyed order (R77).
@@ -6912,7 +6995,317 @@ where
     /// [`ClientError`] when the replica cannot be read.
     #[cfg(feature = "peer")]
     pub fn provisional_rows(&mut self) -> Result<Vec<provisional::ProvisionalRow>, ClientError> {
-        provisional::rows(&mut self.db)
+        Ok(provisional::rows(&mut self.db)?
+            .into_iter()
+            .map(|row| self.config.policy_tables.named_row(row))
+            .collect())
+    }
+
+    /// The keys the pending, un-acknowledged writes hold, each by its
+    /// lowercased physical table and encoded key, naming the writer and
+    /// sequence of the latest position that holds it (R77).
+    #[cfg(feature = "peer")]
+    fn pending_key_set(&mut self) -> Result<HeldKeys, ClientError> {
+        let mut entries: Vec<(u64, &WriterRef, u64, &PendingEntry)> = self
+            .writers
+            .iter()
+            .flat_map(|(writer, queue)| {
+                queue
+                    .pending
+                    .iter()
+                    .map(move |(seq, entry)| (entry.position, writer, *seq, entry))
+            })
+            .collect();
+        entries.sort_unstable_by_key(|(position, _, _, _)| *position);
+        let mut held = HeldKeys::new();
+        for (_, writer, seq, entry) in entries {
+            for (table, key) in crate::op_keys(&entry.changeset).map_err(|err| {
+                ClientError::Apply(format!(
+                    "parsing a pending changeset to filter a peer apply: {err:?}"
+                ))
+            })? {
+                held.insert(
+                    (table.to_lowercase(), provisional::encode_key(&key)),
+                    (writer_id(writer), i64::try_from(seq).unwrap_or(i64::MAX)),
+                );
+            }
+        }
+        Ok(held)
+    }
+
+    /// Apply one verified peer entry as its author (R77 decisions 3 to 6):
+    /// the entry's ops run through the policy views with the author bound
+    /// and capture off, the keys the receiver's own unsent writes hold are
+    /// filtered, and the records and the entry land in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the body cannot be parsed, a statement the view
+    /// neither let through nor refused fails, or the bookkeeping cannot be
+    /// written; a refused entry and a skipped one are outcomes, not errors.
+    #[cfg(feature = "peer")]
+    pub fn apply_peer_entry(
+        &mut self,
+        author: &peer::PeerAuthor,
+        row: &connetto_core::exchange::ManifestRow,
+        body: &[u8],
+    ) -> Result<peer::PeerApplyOutcome, ClientError> {
+        // An entry another build captured crosses as its manifest row only,
+        // the version half of the test being the offer's (R77 slice 6).
+        if Some(row.major) != self.config.schema_major {
+            return Ok(peer::PeerApplyOutcome::Skipped);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        let digest: [u8; 32] = hasher.finalize().into();
+        if digest != row.digest {
+            return Ok(peer::PeerApplyOutcome::Refused {
+                cause: peer::PeerRefusal::DigestMismatch,
+                rows: Vec::new(),
+            });
+        }
+        let diff = self.peer_changeset(body, "a peer entry")?;
+        // The receiver's own writes still in the outbox queue first, so every
+        // unsent write holds its key under a writer and sequence. The keys are
+        // read before the mutable binds below take the connection.
+        self.queue_outbox()?;
+        let held = self.pending_key_set()?;
+        let now = crate::clock::now_secs(&mut self.db)?;
+        let receiver = self.account().unwrap_or_default();
+        let subjects = self
+            .config
+            .subjects
+            .as_ref()
+            .map(|subjects| (subjects.function.clone(), subjects.rendered(now)));
+        let seq = i64::try_from(row.seq).unwrap_or(i64::MAX);
+        let major = i64::from(row.major.get());
+        let next_position = i64::try_from(self.peer_next_position).unwrap_or(i64::MAX);
+        let cx = peer::OpsContext {
+            tables: &self.config.policy_tables,
+            held: &held,
+            author,
+            seq,
+            receiver: &receiver,
+            now,
+        };
+        // The author's ops are judged by the guards and never uploaded as this
+        // device's own.
+        let unrecorded = UnrecordedWrites::raise(&self.write_flags);
+        let bound = peer::AuthorBinding::new(
+            &mut self.db,
+            author,
+            self.config.caller.as_ref(),
+            subjects.as_ref(),
+        )?;
+        let mut refusal = None;
+        let tx = bound.db.transaction::<_, ClientError, _>(|db| {
+            let rows = match peer::apply_ops(db, diff.iter(), &cx)? {
+                Ok(rows) => rows,
+                Err(cause) => {
+                    refusal = Some(cause);
+                    return Err(ClientError::Apply("a peer entry was refused".to_owned()));
+                }
+            };
+            let position = if let Some(position) = peer::existing_position(db, &author.key_id, seq)?
+            {
+                position
+            } else {
+                peer::store_entry(db, author, seq, major, body, now, next_position)?;
+                next_position
+            };
+            Ok((rows, position))
+        });
+        drop(bound);
+        drop(unrecorded);
+        let tables = &self.config.policy_tables;
+        match tx {
+            Ok((rows, position)) => {
+                let position = u64::try_from(position).unwrap_or(u64::MAX);
+                self.peer_next_position = self.peer_next_position.max(position + 1);
+                let rows: Vec<_> = rows.into_iter().map(|row| tables.named_row(row)).collect();
+                self.notices.push_back(ClientEvent::ProvisionalApplied {
+                    author: author.key_id.clone(),
+                    seq,
+                    rows: rows.clone(),
+                });
+                Ok(peer::PeerApplyOutcome::Applied { rows })
+            }
+            Err(err) => {
+                let Some(cause) = refusal else {
+                    return Err(err);
+                };
+                let rows = peer::entry_rows(diff.iter());
+                self.notices.push_back(ClientEvent::PeerWriteRefused {
+                    author: author.key_id.clone(),
+                    seq,
+                    rows: rows.clone(),
+                });
+                Ok(peer::PeerApplyOutcome::Refused { cause, rows })
+            }
+        }
+    }
+
+    /// Retract one stored peer entry (R77): the ops whose record still names
+    /// the entry are inverted, a displaced author's provenance stands back
+    /// from its stored entry, and the entry goes. A retraction of an entry
+    /// the receiver never stored is a no-op that raises nothing. One undo the
+    /// store refuses fails the retraction whole, leaving every row, record
+    /// and the entry as they were, so a later retraction can try again.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the stored entry cannot be parsed, an undo is
+    /// refused, or the inversion cannot be written.
+    #[cfg(feature = "peer")]
+    pub fn retract_peer_entry(
+        &mut self,
+        author: &peer::PeerAuthor,
+        retraction: &connetto_core::exchange::Retraction,
+    ) -> Result<(), ClientError> {
+        let seq = i64::try_from(retraction.seq).unwrap_or(i64::MAX);
+        let Some(entry) = peer::entry_of(&mut self.db, &author.key_id, seq)? else {
+            return Ok(());
+        };
+        let diff = self.peer_changeset(&entry.changeset, "a stored peer entry")?;
+        let ops: Vec<replay::PeerOp> = diff.iter().collect();
+        let tables = &self.config.policy_tables;
+        // The entry's ops by the key they touch, the inversion's lookup. A
+        // key-less op holds no record, so it is never looked up.
+        let mut op_of: HashMap<(String, Vec<u8>), (usize, String)> = HashMap::new();
+        for (index, op) in ops.iter().enumerate() {
+            let table_logical = op.table().name().to_owned();
+            let physical = tables.stored(&table_logical);
+            let blob = provisional::encode_key(&peer::key_of(op));
+            op_of.insert((physical, blob), (index, table_logical));
+        }
+        let records = provisional::records_of_entry(&mut self.db, &author.key_id, seq)?
+            .into_iter()
+            .filter(|record| record.state == provisional::ProvisionalState::Provisional)
+            .collect::<Vec<_>>();
+        let mut inverted_rows: Vec<(String, Vec<KeyValue>)> = Vec::new();
+        let _exempt = ExemptWrites::raise(&self.write_flags);
+        self.db.transaction::<_, ClientError, _>(|db| {
+            for record in &records {
+                let blob = provisional::encode_key(&record.key);
+                let Some(&(index, ref logical_table)) = op_of.get(&(record.table.clone(), blob))
+                else {
+                    continue;
+                };
+                if replay::undo_peer_op(db, logical_table, &record.table, &ops[index])?
+                    == replay::PeerVerdict::Refused
+                {
+                    return Err(ClientError::Apply(format!(
+                        "the store refused putting back {} {:?} for a retraction",
+                        record.table, record.key
+                    )));
+                }
+                inverted_rows.push((record.table.clone(), record.key.clone()));
+                match (&record.displaced_author, record.displaced_seq) {
+                    (Some(displaced_author), Some(displaced_seq)) => {
+                        match peer::entry_of(db, displaced_author, displaced_seq)? {
+                            Some(displaced) => {
+                                // The displaced author's entry is still
+                                // stored, so its provenance stands back from
+                                // its own account and arrival.
+                                let record = provisional::ProvisionalRow {
+                                    table: record.table.clone(),
+                                    key: record.key.clone(),
+                                    author: displaced_author.clone(),
+                                    seq: displaced_seq,
+                                    account: displaced.account,
+                                    received_at: displaced.received_at,
+                                    state: provisional::ProvisionalState::Provisional,
+                                    displaced_author: None,
+                                    displaced_seq: None,
+                                };
+                                provisional::upsert_record(db, &record)?;
+                            }
+                            // The displaced author's entry is gone, so the
+                            // key keeps no record and the row stands as the
+                            // inversion left it.
+                            None => provisional::delete_record(db, &record.table, &record.key)?,
+                        }
+                    }
+                    _ => provisional::delete_record(db, &record.table, &record.key)?,
+                }
+            }
+            peer::delete_entry(db, &author.key_id, seq)
+        })?;
+        let inverted_rows: Vec<_> = inverted_rows
+            .into_iter()
+            .map(|(table, key)| (self.config.policy_tables.named(table), key))
+            .collect();
+        if !inverted_rows.is_empty() {
+            self.notices.push_back(ClientEvent::ProvisionalRetracted {
+                author: author.key_id.clone(),
+                seq,
+                cause: retraction.cause.clone(),
+                rows: inverted_rows,
+            });
+        }
+        Ok(())
+    }
+
+    /// Adjudicate the author's stored entries at or below a frontier (R77):
+    /// their records move to adjudicated and the entries go, the rows
+    /// handing to ordinary coverage.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the entries or records cannot be read or
+    /// written.
+    #[cfg(feature = "peer")]
+    pub fn adjudicate_peer_frontier(
+        &mut self,
+        author: &[u8],
+        frontier: u64,
+    ) -> Result<(), ClientError> {
+        let frontier = i64::try_from(frontier).unwrap_or(i64::MAX);
+        let _exempt = ExemptWrites::raise(&self.write_flags);
+        self.db.transaction::<_, ClientError, _>(|db| {
+            for entry in peer::entries_at_or_below(db, author, frontier)? {
+                provisional::adjudicate_entry(db, &entry.author, entry.seq)?;
+                peer::delete_entry(db, &entry.author, entry.seq)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Re-apply the stored peer entries after a resync's replacement
+    /// snapshot ends, in append-position order, ahead of the receiver's own
+    /// unsent writes (R77 decision 13).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when a stored entry cannot be re-applied.
+    #[cfg(feature = "peer")]
+    fn reapply_peer_entries(&mut self) -> Result<(), ClientError> {
+        let entries = peer::all_entries(&mut self.db)?;
+        for entry in entries {
+            let author = peer::PeerAuthor {
+                key_id: entry.author.clone(),
+                account: entry.account.clone(),
+                bot_list: entry.bot_list.clone(),
+            };
+            let major = u32::try_from(entry.major)
+                .ok()
+                .and_then(Major::new)
+                .ok_or_else(|| {
+                    ClientError::Session(
+                        "a stored peer entry holds a major the build cannot express".to_owned(),
+                    )
+                })?;
+            let mut hasher = Sha256::new();
+            hasher.update(&entry.changeset);
+            let row = connetto_core::exchange::ManifestRow {
+                seq: u64::try_from(entry.seq).unwrap_or(u64::MAX),
+                major,
+                origin: None,
+                digest: hasher.finalize().into(),
+            };
+            let _ = self.apply_peer_entry(&author, &row, &entry.changeset)?;
+        }
+        Ok(())
     }
 
     /// The lowercased names of the tables in the attached local tier, empty
@@ -8296,6 +8689,11 @@ where
                 }
                 self.open_snapshots.remove(&end.sub_id);
                 if self.resyncing.remove(&end.sub_id) {
+                    // The stored peer entries go back ahead of the receiver's
+                    // own unsent writes, in their append-position order (R77
+                    // decision 13).
+                    #[cfg(feature = "peer")]
+                    self.reapply_peer_entries()?;
                     self.reapply_pending()?;
                 }
                 // A plain end means the read was served, so a refusal
@@ -9249,6 +9647,10 @@ where
         applied?;
         #[cfg(feature = "peer")]
         if let Some(rows) = confirmed.filter(|rows| !rows.is_empty()) {
+            let rows = rows
+                .into_iter()
+                .map(|row| self.config.policy_tables.named_row(row))
+                .collect();
             self.notices
                 .push_back(ClientEvent::ProvisionalConfirmed { rows });
         }
@@ -9304,6 +9706,29 @@ where
             return Ok(bytes);
         }
         rename_diffset(bytes, |name| tables.logical(name).map(str::to_owned))
+    }
+
+    /// A peer body parsed once into the changeset it carries, its tables
+    /// renamed onto the logical names the policy views go by. `what` names
+    /// the body in the failure.
+    #[cfg(feature = "peer")]
+    fn peer_changeset(
+        &self,
+        body: &[u8],
+        what: &str,
+    ) -> Result<replay::PeerChangeset, ClientError> {
+        let mut parsed = ParsedDiffSet::parse(body)
+            .map_err(|err| ClientError::Apply(format!("parsing {what}: {err:?}")))?;
+        let tables = &self.config.policy_tables;
+        if !tables.is_empty() {
+            parsed.rename_tables(|name| tables.logical(name).map(str::to_owned));
+        }
+        match parsed {
+            ParsedDiffSet::Changeset(diff) => Ok(diff),
+            ParsedDiffSet::Patchset(_) => Err(ClientError::Apply(format!(
+                "{what} must be a captured changeset"
+            ))),
+        }
     }
 
     /// The canonical bytes the queue chain hashes a payload under, the
