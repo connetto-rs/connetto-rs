@@ -147,7 +147,8 @@ fn undo_queued_shared(db: &mut SqliteConnection, config: &ClientConfig) -> Resul
     crate::undo_shared(db, &config.shared_tables, queued.iter().map(Vec::as_slice))
 }
 
-#[cfg(all(test, feature = "native-auth", unix))]
+// APFS refuses a file name that is not UTF-8, so the test runs on Linux.
+#[cfg(all(test, feature = "native-auth", target_os = "linux"))]
 mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt as _;
