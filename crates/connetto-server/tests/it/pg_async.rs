@@ -517,7 +517,7 @@ async fn pg_oplog_appends_and_reads_back() {
                 record.is_tombstone(),
                 record.pk().to_vec(),
             ));
-            oplog.append(record).await.expect("append record");
+            oplog.append(&record).await.expect("append record");
         }
     }
     assert_eq!(expected.len(), 3, "one record per statement");
@@ -673,7 +673,7 @@ async fn pg_oplog_round_trips_a_composite_key() {
                 .expect("encode the event's patch")
                 .expect("build oplog record");
             appended.push(record.pk().to_vec());
-            oplog.append(record).await.expect("append record");
+            oplog.append(&record).await.expect("append record");
         }
     }
     assert_eq!(appended.len(), 3, "one record per insert");
@@ -778,11 +778,11 @@ async fn pg_oplog_orders_the_rows_of_one_transaction_by_their_ordinal() {
     };
 
     let oplog = fresh_oplog(&pool, "connetto_oplog_ordinals", 100).await;
-    for record in records.iter().cloned() {
+    for record in &records {
         oplog.append(record).await.expect("append");
     }
     oplog
-        .append(records[1].clone())
+        .append(&records[1])
         .await
         .expect("append a row delivered again");
     assert_eq!(
@@ -828,7 +828,7 @@ async fn pg_oplog_orders_the_rows_of_one_transaction_by_their_ordinal() {
     );
 
     let pruned = fresh_oplog(&pool, "connetto_oplog_pruned", 2).await;
-    for record in records.iter().cloned() {
+    for record in &records {
         pruned.append(record).await.expect("append");
     }
     assert_eq!(
@@ -945,7 +945,7 @@ async fn pg_oplog_tells_a_pruned_missed_transaction_from_a_retained_one() {
     let oplog = fresh_oplog(&pool, "connetto_oplog_xids", 10).await;
     for n in 1..=20 {
         let (record, commit) = single_row(n);
-        oplog.append(record).await.expect("append");
+        oplog.append(&record).await.expect("append");
         oplog.record_commit(commit).await.expect("record");
     }
     assert!(
@@ -961,7 +961,7 @@ async fn pg_oplog_tells_a_pruned_missed_transaction_from_a_retained_one() {
 
     for n in 21..=1_100 {
         let (record, commit) = single_row(n);
-        oplog.append(record).await.expect("append");
+        oplog.append(&record).await.expect("append");
         oplog.record_commit(commit).await.expect("record");
     }
     let unseen = UnseenIds {

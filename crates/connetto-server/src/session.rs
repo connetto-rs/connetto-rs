@@ -808,10 +808,8 @@ impl EventProgress {
 
 /// The work an applied event still owes.
 struct Applied {
-    /// The oplog record, absent once taken for an append.
+    /// The oplog record, absent once the oplog holds it or when the event needs none.
     record: Option<ChangeRecord>,
-    /// Whether the oplog holds the event or never needed it.
-    logged: bool,
     /// Row patches not yet sent.
     patches: Vec<MatchedPatch>,
     /// Membership moves, absent once fanned out.
@@ -829,7 +827,6 @@ struct Applied {
 impl Applied {
     fn new(dispatched: Dispatched) -> Self {
         Self {
-            logged: dispatched.record.is_none(),
             record: dispatched.record,
             patches: dispatched.patches,
             narrowings: Some(dispatched.narrowings),
@@ -2755,19 +2752,11 @@ where
         // Record the event in the oplog before fan-out. The append is per event,
         // not per consumer, since reconnect catchup re-filters per client, and
         // the record carries the patch dispatch built so catchup never folds
-        // the event again. A failed append consumed its record, so the retry
-        // folds a fresh one, and an append is idempotent by position.
-        if !applied.logged {
-            let record = match applied.record.take() {
-                Some(record) => Some(record),
-                None => counters::timed_lock(&self.materializer)
-                    .await
-                    .oplog_record(event)?,
-            };
-            if let Some(record) = record {
-                self.oplog.append(record).await.map_err(oplog_err)?;
-            }
-            applied.logged = true;
+        // the event again. The record is held until its append succeeds, so a
+        // retry appends the same one, and an append is idempotent by position.
+        if let Some(record) = &applied.record {
+            self.oplog.append(record).await.map_err(oplog_err)?;
+            applied.record = None;
         }
         // Every patch still owed, paired with the route it goes to now.
         // Collected before the visibility question because that question names
@@ -2825,7 +2814,12 @@ where
                         if *seen > Self::UNKNOWN_READ_RETRIES {
                             self.refuse_computed(subscription, ReadFailure::Other, *seen, &detail)
                                 .await;
-                        } else if let Some(wait) = self.read_retry.start().next_wait() {
+                        } else {
+                            let wait = self
+                                .read_retry
+                                .start()
+                                .next_wait()
+                                .unwrap_or_else(|| self.read_retry.max_backoff());
                             tokio::time::sleep(wait).await;
                         }
                     }
