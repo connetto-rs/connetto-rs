@@ -90,6 +90,36 @@ fn text_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// One key value as the SQL literal matching it in the stored row. An
+/// infinity is `9e999`, which SQLite reads back as the infinity it stores,
+/// and a `NaN` is `NULL`, which is what SQLite stores for one.
+fn key_literal(value: &sqlite_diff_rs::Value<String, Vec<u8>>) -> String {
+    use core::fmt::Write as _;
+    use sqlite_diff_rs::Value;
+    match value {
+        Value::Null => "NULL".to_owned(),
+        Value::Integer(integer) => integer.to_string(),
+        Value::Real(real) if real.is_nan() => "NULL".to_owned(),
+        Value::Real(real) if real.is_infinite() => if real.is_sign_positive() {
+            "9e999"
+        } else {
+            "-9e999"
+        }
+        .to_owned(),
+        Value::Real(real) => format!("{real:?}"),
+        Value::Text(text) => text_literal(text),
+        Value::Blob(bytes) => {
+            let mut literal = String::with_capacity(bytes.len() * 2 + 3);
+            literal.push_str("X'");
+            for byte in bytes {
+                let _ = write!(literal, "{byte:02X}");
+            }
+            literal.push('\'');
+            literal
+        }
+    }
+}
+
 /// The keys one server patch names in one table, each key as the SQL
 /// literals of its key columns in key order.
 struct TableKeys {
@@ -174,8 +204,7 @@ impl PatchHoldings {
     ///
     /// # Errors
     ///
-    /// [`ClientError`] when the catalog cannot be read or a key value has no
-    /// SQL literal.
+    /// [`ClientError`] when the catalog cannot be read.
     pub(crate) fn read(
         db: &mut SqliteConnection,
         config: &ClientConfig,
@@ -218,11 +247,7 @@ impl PatchHoldings {
                 tables.len() - 1
             };
             let keys = &mut tables[index];
-            let literals = op
-                .primary_key()
-                .iter()
-                .map(crate::live::bind_literal_of)
-                .collect::<Result<Vec<_>, _>>()?;
+            let literals: Vec<String> = op.primary_key().iter().map(key_literal).collect();
             match op {
                 PatchsetOp::Delete { .. } if op.indirect() => keys.left.push(literals),
                 PatchsetOp::Delete { .. } => keys.gone.push(literals),

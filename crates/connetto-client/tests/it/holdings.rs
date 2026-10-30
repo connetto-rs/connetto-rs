@@ -22,7 +22,8 @@ use sqlite_diff_rs::{
 };
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, quantity INTEGER); \
-    CREATE TABLE team_members (id INTEGER PRIMARY KEY, order_id INTEGER);";
+    CREATE TABLE team_members (id INTEGER PRIMARY KEY, order_id INTEGER); \
+    CREATE TABLE reals (id REAL PRIMARY KEY, label TEXT);";
 const ORDERS: &str = "SELECT * FROM orders WHERE quantity > 0";
 const TERM: &str =
     "SELECT * FROM orders WHERE id IN (SELECT order_id FROM team_members WHERE id > 0)";
@@ -496,6 +497,49 @@ async fn a_frame_for_a_subscription_no_longer_on_record_holds_nothing() {
     assert!(
         holdings(&mut s.conn).is_empty(),
         "a frame in flight past the unsubscribe names no holder"
+    );
+}
+
+/// An insert into or a departure from `reals`, keyed by `id`.
+fn real(patch: Patch, id: f64, departs: bool) -> Patch {
+    let table = SimpleTable::new("reals", &[("id", ""), ("label", "")], &[0]);
+    if departs {
+        return Patch(
+            patch
+                .0
+                .delete(PatchDelete::new(table, vec![Value::Real(id)]).indirect(true)),
+        );
+    }
+    let insert = Insert::<_, String, Vec<u8>>::from(table)
+        .set(0, Value::Real(id))
+        .expect("set id")
+        .set(1, Value::Text("x".to_owned()))
+        .expect("set label");
+    Patch(patch.0.insert(insert))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_infinite_real_key_is_held_and_released() {
+    let mut s = Session::connected().await;
+    s.conn
+        .subscribe("r", "SELECT * FROM reals")
+        .await
+        .expect("subscribe");
+    let page = [1.5, f64::INFINITY, f64::NEG_INFINITY]
+        .into_iter()
+        .fold(Patch::default(), |patch, id| real(patch, id, false));
+    s.snapshot("r", vec![page]).await;
+    assert_eq!(
+        holdings(&mut s.conn).len(),
+        3,
+        "a key SQLite stores as an infinity is held like any other"
+    );
+    s.live("r", real(Patch::default(), f64::INFINITY, true))
+        .await;
+    assert_eq!(
+        holdings(&mut s.conn).len(),
+        2,
+        "the departure finds the infinite key's holding"
     );
 }
 
