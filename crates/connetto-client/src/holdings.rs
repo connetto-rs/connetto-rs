@@ -51,6 +51,15 @@ pub(crate) const SHARED_HOLDING_DDL: &str = "CREATE TABLE IF NOT EXISTS \
 /// reserved `connetto-` namespace a membership label also uses.
 pub(crate) const UNSENT_HOLDER: &str = "connetto-unsent";
 
+/// The holder of every peer-applied row while its provenance record is
+/// provisional (R77 decision 14), reserved like the unsent marker, so no
+/// subscription release takes it.
+pub(crate) const PROVISIONAL_HOLDER: &str = "connetto-provisional";
+
+/// The holders no subscription release takes, since their holdings end with
+/// the write the server has not answered and the record not yet ruled on.
+const RESERVED_HOLDERS: [&str; 2] = [UNSENT_HOLDER, PROVISIONAL_HOLDER];
+
 /// The shared store's holdings table, qualified.
 const SHARED_HOLDINGS: &str = "connetto_shared._connetto_shared_holding";
 
@@ -96,7 +105,7 @@ fn text_literal(value: &str) -> String {
 /// One key value as the SQL literal matching it in the stored row. An
 /// infinity is `9e999`, which SQLite reads back as the infinity it stores,
 /// and a `NaN` is `NULL`, which is what SQLite stores for one.
-fn key_literal(value: &sqlite_diff_rs::Value<String, Vec<u8>>) -> String {
+pub(crate) fn key_literal(value: &sqlite_diff_rs::Value<String, Vec<u8>>) -> String {
     use sqlite_diff_rs::Value;
     match value {
         Value::Null => "NULL".to_owned(),
@@ -142,10 +151,64 @@ struct TableKeys {
 }
 
 impl TableKeys {
+    /// `table`'s keys, empty, read from the replica's own columns, or `None`
+    /// when the table is gone or has no key a holding could name.
+    fn of(
+        db: &mut SqliteConnection,
+        config: &ClientConfig,
+        table: &str,
+    ) -> Result<Option<Self>, ClientError> {
+        let shared = is_shared(&config.shared_tables, table);
+        let place = if shared { SHARED_SCHEMA } else { "main" };
+        let columns = outbox::columns(db, place, table)?;
+        if !columns.iter().any(|column| column.pk > 0) {
+            return Ok(None);
+        }
+        Ok(Some(Self::new(table.to_owned(), shared, &columns)))
+    }
+
+    fn new(table: String, shared: bool, columns: &[outbox::Column]) -> Self {
+        Self {
+            key: outbox::key_clause("r", columns),
+            columns: outbox::key_columns(columns)
+                .into_iter()
+                .map(|column| quote_ident(&column.name))
+                .collect(),
+            table,
+            shared,
+            written: Vec::new(),
+            left: Vec::new(),
+            gone: Vec::new(),
+        }
+    }
+
     /// The table's rows, qualified by the schema holding them.
     fn rows(&self) -> String {
         let schema = if self.shared { SHARED_SCHEMA } else { "main" };
         format!("{schema}.{}", quote_ident(&self.table))
+    }
+
+    /// The holdings table this table's rows are held in, and the column
+    /// list and value prefix an insert names this identity's holdings by.
+    fn holdings(&self, identity: &str) -> (&'static str, &'static str, String) {
+        if self.shared {
+            (
+                SHARED_HOLDINGS,
+                "identity, holder, tbl, key",
+                format!("{identity}, "),
+            )
+        } else {
+            ("_connetto_holding", "holder, tbl, key", String::new())
+        }
+    }
+
+    /// The filter naming this identity's holdings, empty in `main`.
+    fn mine(&self, identity: &str) -> String {
+        if self.shared {
+            format!("identity = {identity} AND ")
+        } else {
+            String::new()
+        }
     }
 
     /// `r."a" IS 1 AND r."b" IS 'x'` for each key in `keys`, joined by `OR`.
@@ -188,6 +251,54 @@ impl TableKeys {
             matching = self.matching(keys),
             literals = literal_rows.join(" UNION ALL "),
         )
+    }
+
+    /// `holder` holds every row of `keys` the replica stores, for the
+    /// identity `identity` names when the table is shared.
+    fn hold(
+        &self,
+        db: &mut SqliteConnection,
+        identity: &str,
+        holder: &str,
+        keys: &[Vec<String>],
+    ) -> Result<(), ClientError> {
+        let (holdings, columns, mine) = self.holdings(identity);
+        for chunk in keys.chunks(CHUNK) {
+            diesel::sql_query(format!(
+                "INSERT OR IGNORE INTO {holdings} ({columns}) \
+                 SELECT {mine}?, ?, {} FROM {} AS r WHERE {}",
+                self.key,
+                self.rows(),
+                self.matching(chunk)
+            ))
+            .bind::<Text, _>(holder)
+            .bind::<Text, _>(&self.table)
+            .execute(db)?;
+        }
+        Ok(())
+    }
+
+    /// Release `holder`'s holding of every row of `keys`, for the identity
+    /// `identity` names when the table is shared.
+    fn release(
+        &self,
+        db: &mut SqliteConnection,
+        identity: &str,
+        holder: &str,
+        keys: &[Vec<String>],
+    ) -> Result<(), ClientError> {
+        let (holdings, _, _) = self.holdings(identity);
+        let mine = self.mine(identity);
+        for chunk in keys.chunks(CHUNK) {
+            diesel::sql_query(format!(
+                "DELETE FROM {holdings} WHERE {mine}holder = ? AND tbl = ? AND key IN ({})",
+                self.keys_of(chunk)
+            ))
+            .bind::<Text, _>(holder)
+            .bind::<Text, _>(&self.table)
+            .execute(db)?;
+        }
+        Ok(())
     }
 }
 
@@ -234,18 +345,7 @@ impl PatchHoldings {
                     skipped.insert(physical);
                     continue;
                 }
-                tables.push(TableKeys {
-                    key: outbox::key_clause("r", &columns),
-                    columns: outbox::key_columns(&columns)
-                        .into_iter()
-                        .map(|column| quote_ident(&column.name))
-                        .collect(),
-                    table: physical,
-                    shared,
-                    written: Vec::new(),
-                    left: Vec::new(),
-                    gone: Vec::new(),
-                });
+                tables.push(TableKeys::new(physical, shared, &columns));
                 tables.len() - 1
             };
             let keys = &mut tables[index];
@@ -278,23 +378,8 @@ impl PatchHoldings {
         holder: &str,
     ) -> Result<(), ClientError> {
         for keys in &self.tables {
-            let (holdings, mine) = if keys.shared {
-                (
-                    SHARED_HOLDINGS,
-                    format!("identity = {} AND ", self.identity),
-                )
-            } else {
-                ("_connetto_holding", String::new())
-            };
-            for chunk in keys.left.chunks(CHUNK) {
-                diesel::sql_query(format!(
-                    "DELETE FROM {holdings} WHERE {mine}holder = ? AND tbl = ? AND key IN ({})",
-                    keys.keys_of(chunk)
-                ))
-                .bind::<Text, _>(holder)
-                .bind::<Text, _>(&keys.table)
-                .execute(db)?;
-            }
+            keys.release(db, &self.identity, holder, &keys.left)?;
+            let (holdings, _, _) = keys.holdings(&self.identity);
             for chunk in keys.gone.chunks(CHUNK) {
                 diesel::sql_query(format!(
                     "DELETE FROM {holdings} WHERE tbl = ? AND key IN ({})",
@@ -315,27 +400,7 @@ impl PatchHoldings {
     /// [`ClientError`] when a holding cannot be written.
     pub(crate) fn take(&self, db: &mut SqliteConnection, holder: &str) -> Result<(), ClientError> {
         for keys in &self.tables {
-            let (holdings, columns, mine) = if keys.shared {
-                (
-                    SHARED_HOLDINGS,
-                    "identity, holder, tbl, key",
-                    format!("{}, ", self.identity),
-                )
-            } else {
-                ("_connetto_holding", "holder, tbl, key", String::new())
-            };
-            for chunk in keys.written.chunks(CHUNK) {
-                diesel::sql_query(format!(
-                    "INSERT OR IGNORE INTO {holdings} ({columns}) \
-                     SELECT {mine}?, ?, {} FROM {} AS r WHERE {}",
-                    keys.key,
-                    keys.rows(),
-                    keys.matching(chunk)
-                ))
-                .bind::<Text, _>(holder)
-                .bind::<Text, _>(&keys.table)
-                .execute(db)?;
-            }
+            keys.hold(db, &self.identity, holder, &keys.written)?;
         }
         Ok(())
     }
@@ -515,7 +580,7 @@ pub(crate) fn release_table(
 }
 
 /// Release every subscription's holding of this identity, leaving its
-/// unsent writes held.
+/// unsent writes and its provisional rows held.
 ///
 /// # Errors
 ///
@@ -529,21 +594,84 @@ pub(crate) fn release_all(
         diesel::delete(
             shared_holding::table
                 .filter(shared_holding::identity.eq(&config.client_id))
-                .filter(shared_holding::holder.ne(UNSENT_HOLDER)),
+                .filter(shared_holding::holder.ne_all(RESERVED_HOLDERS)),
         )
         .execute(db)?;
     }
     Ok(Released::every())
 }
 
-/// Release every holding in `main`, as a new shared store generation's
-/// replays deliver every subscription's rows again.
+/// Release every subscription's holding in `main`, as a new shared store
+/// generation's replays deliver every subscription's rows again, leaving
+/// the provisional rows held.
 ///
 /// # Errors
 ///
 /// [`ClientError`] when the holdings cannot be deleted.
 pub(crate) fn release_account(db: &mut SqliteConnection) -> Result<(), ClientError> {
-    diesel::delete(holding::table).execute(db)?;
+    diesel::delete(holding::table.filter(holding::holder.ne_all(RESERVED_HOLDERS))).execute(db)?;
+    Ok(())
+}
+
+/// Group `rows`, lowercased physical tables and keys in key order, into the
+/// written keys of each table that has a key a holding could name.
+#[cfg(feature = "peer")]
+fn provisional_keys(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+    rows: &[(String, Vec<crate::KeyValue>)],
+) -> Result<Vec<TableKeys>, ClientError> {
+    let mut tables: Vec<TableKeys> = Vec::new();
+    for (table, key) in rows {
+        let literals: Vec<String> = key
+            .iter()
+            .map(|value| key_literal(&crate::provisional::value_of(value)))
+            .collect();
+        if let Some(keys) = tables.iter_mut().find(|keys| keys.table == *table) {
+            keys.written.push(literals);
+        } else if let Some(mut keys) = TableKeys::of(db, config, table)? {
+            keys.written.push(literals);
+            tables.push(keys);
+        }
+    }
+    Ok(tables)
+}
+
+/// Hold every stored row of `rows`, the keys of provisional records, under
+/// [`PROVISIONAL_HOLDER`] for this identity (R77 decision 14).
+///
+/// # Errors
+///
+/// [`ClientError`] when the catalog cannot be read or a holding written.
+#[cfg(feature = "peer")]
+pub(crate) fn hold_provisional(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+    rows: &[(String, Vec<crate::KeyValue>)],
+) -> Result<(), ClientError> {
+    let identity = text_literal(&config.client_id);
+    for table in provisional_keys(db, config, rows)? {
+        table.hold(db, &identity, PROVISIONAL_HOLDER, &table.written)?;
+    }
+    Ok(())
+}
+
+/// Release this identity's [`PROVISIONAL_HOLDER`] holding of `rows`, the
+/// keys of records no longer provisional (R77 decision 14).
+///
+/// # Errors
+///
+/// [`ClientError`] when the catalog cannot be read or a holding deleted.
+#[cfg(feature = "peer")]
+pub(crate) fn release_provisional(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+    rows: &[(String, Vec<crate::KeyValue>)],
+) -> Result<(), ClientError> {
+    let identity = text_literal(&config.client_id);
+    for table in provisional_keys(db, config, rows)? {
+        table.release(db, &identity, PROVISIONAL_HOLDER, &table.written)?;
+    }
     Ok(())
 }
 
@@ -617,12 +745,16 @@ pub(crate) fn prune(
     config: &ClientConfig,
 ) -> Result<Released, ClientError> {
     let mut released = Released::default();
-    let mut holders: Vec<String> = holding::table.select(holding::holder).distinct().load(db)?;
+    let mut holders: Vec<String> = holding::table
+        .filter(holding::holder.ne_all(RESERVED_HOLDERS))
+        .select(holding::holder)
+        .distinct()
+        .load(db)?;
     if !config.shared_tables.is_empty() {
         holders.extend(
             shared_holding::table
                 .filter(shared_holding::identity.eq(&config.client_id))
-                .filter(shared_holding::holder.ne(UNSENT_HOLDER))
+                .filter(shared_holding::holder.ne_all(RESERVED_HOLDERS))
                 .select(shared_holding::holder)
                 .distinct()
                 .load::<String>(db)?,

@@ -4117,7 +4117,7 @@ Decisions 6 and 7 computed retention from each subscription's predicate. Part B 
 - **O4.** A membership label's holdings end when no live query reads its table through a membership term.
 - **O5.** A truncate releases every subscription holding on the table and deletes at once, keeping unsent writes.
 - **O6.** A replica made before Part B is a pre-alpha file to delete and resync, with no migration code.
-- **O7.** A peer-applied row (R77) is held under its author's marker until the server rules on it, written by R77's apply. Until then the pass keeps `provisional::spare`.
+- **O7.** A peer-applied row (R77) is held until the server rules on it, written by R77's apply under the reserved holder `connetto-provisional` (R77 decision 14, 2026-10-30).
 - **O8.** A pass reads every synced table, the tier and connetto's own tables aside.
 - **O9.** The store records its identities in `_connetto_identity`, and the last identity out removes it.
 - **O10.** A provisional row survives a `CursorBeyondHistory` resync until its verdict, as pending changes survive replaced server state in Replicache and PowerSync.
@@ -5761,6 +5761,33 @@ The peer exchange itself, with every rule the review fixed: per-author-device cu
 
 13. **A resync keeps provisional rows until their verdict, and re-applies the stored entries when the replacement snapshot ends, ahead of the receiver's own unsent writes** (decided 2026-10-27, scope settled 2026-10-30). A provisional row is a write the server has not adjudicated, the same kind of write as the receiver's own unsent one, which R15's un-acked rule never lets vanish from its own device and R48 decision 3 puts back with `reapply_pending` once a replacement snapshot ends. A truncate empties its table at once, peer-applied rows and their records with every other row, keeping only the receiver's unsent writes (R11 Part B, O5). Every other resync, an authorization change, a cursor outside retention, an interrupted snapshot or a cursor beyond history, keeps a provisional row and its record in place, as R11 Part B keeps an unsent write (O7, O10). A replacement snapshot that writes a provisional key is no verdict, so during a resync the record stays and no `ProvisionalConfirmed` is raised, while a live server patch on the key still clears the record with `ProvisionalConfirmed`. At the `SnapshotEnd` that ends the resync, the receiver re-applies every entry still in `_connetto_peer_entry`, in the order of its `position`, through the peer apply of decisions 3 to 6, which judges the author's rights again on the resynced replica and rewrites each record, so after a truncate the entries come back and after any other resync the author's values stand over the replacement's. It then re-applies its own pending writes, so its own authorship still wins locally (decision 6). `position` is a durable append position across authors, assigned when an entry is stored and kept across a re-apply, the role a pending entry's position plays for `reapply_pending`, since the wall-clock `received_at` cannot order two entries of one second. An entry the resynced replica now refuses raises `PeerWriteRefused` and stays stored until the author's frontier or the server settles it. [Replicache](https://doc.replicache.dev/concepts/how-it-works) re-runs pending mutations on top of new server state before revealing it, and [Bayou](https://www.cs.cornell.edu/courses/cs6464/2009sp/papers/bayou.pdf) rolls tentative writes back and redoes them after the committed ones, the same shape. Dropping provisional rows at a resync was rejected, since a camp device that briefly reaches the server would lose every peer write it holds until the authors are met again or the server answers. Keeping them through a cursor beyond history alone was rejected, since an authorization change or a cursor outside retention says no more about a write the server has not seen. Reading a replacement snapshot's write as a confirmation was rejected, since the snapshot reports the server's state without the entry, so it would announce a confirmation nobody gave.
 
+
+### Decisions, taken with the maintainer on 2026-10-30
+
+14. **A provisional row is held by the reserved holder `connetto-provisional`, exactly while its provenance record is provisional** (R11 Part B, O7). R11 Part B keeps a row only while a holding names it or an unsent write of this identity keeps it, so the peer apply writes the holding in its own transaction, in `_connetto_holding` for a `main` table and in the store's `_connetto_shared_holding` under this identity for a shared one, and the record's every exit releases it in the transaction that changes the record: a server write on the key (`ProvisionalConfirmed`), the frontier or a verdict moving it to adjudicated, a retraction deleting it, and a truncate dropping the table's records. A retraction that stands a displaced author's record back keeps the holding, since the key is still provisional. A key the receiver's own unsent write holds keeps the holding as well, because its record is provisional too, so one rule covers every record. `holdings::prune`, `release_all` and `release_account` skip the holder as they skip `connetto-unsent`, so a dead subscription, a beyond-history resync and a new store generation leave a provisional row in place, and the resync's re-apply writes the holding again, which an existing one absorbs. The holding's key is the same `quote()` clause every holding uses, rendered from the record's key values, so a provisional delete's record, whose row is gone, still names its key. The pass then needs no provisional keep clause, and `provisional::spare` goes. Rejected: one holder per author, `connetto-peer:<key id>`, which repeats what the record already says and moves the holding at every displacement and its retraction. Rejected: holding only the keys a peer's value occupies, which leaves the receiver-held key to the unsent keep list alone and gives the records two rules.
+15. **A peer entry reaches a shared table through the store, as a server patch does.** A build that shares a table keeps the table, its policy view and its holdings in the attached store alone, and `apply_peer_entry` used to address `main` only, so an entry touching a shared table failed with `no such table` and nothing of it landed (found 2026-10-30 by a probe on `main` `32551c84f`). The peer apply, its undo and the provisional holding now route a shared table to the store through `shared_route`, the route server patches, rollbacks and undos already take, and the provenance record stays in this identity's own replica beside its entries. Another identity on the device then reads the row before the server rules on it, without its provenance, which is the exposure R11 slice 4 already accepted for an identity's unsent shared writes held under `connetto-unsent`. The identity's departure releases its holdings in the store, and the rows nothing else holds go with them. Rejected: refusing an entry that touches a shared table, which would refuse the whole author transaction, its private writes included, so marking a table shared would silently take it out of offline exchange.
+
+The `connetto-provisional` holding at every event, for a key in a `main` table and in a shared one (decisions 14 and 15):
+
+| Event | `main` table | Shared table |
+|---|---|---|
+| Peer apply lands an op, or leaves a key to the receiver's own unsent write | write the holding in `_connetto_holding` | write it in `_connetto_shared_holding` under this identity |
+| Peer apply refused, or failed | the transaction rolls back, no holding | same |
+| Re-apply at the `SnapshotEnd` ending a resync | write it again, an existing one absorbs it | same |
+| Server write on the key (`ProvisionalConfirmed`) | release it with the record | same, in the store |
+| Replacement snapshot write during a resync (slice 9) | keep it with the record | same |
+| Frontier or verdict adjudicates the record | release it with the record | same |
+| Retraction deletes the record | release it | same |
+| Retraction stands a displaced author's record back | keep it | same |
+| Retraction whose undo is refused | nothing changes | same |
+| Truncate drops the table's records | release the table's holdings | release this identity's holdings of the table |
+| Subscription ends, `prune` | skip the holder | same |
+| Beyond-history resync, `release_all` | skip the holder | same |
+| New store generation, `release_account` | skip the holder | n/a, the store is new |
+| Identity departs the store | n/a, the replica goes with it | `release_identity` releases it |
+| R31 rebuild at a newer major | dropped with the tables | dropped with the store's tables |
+| Eviction pass | keeps the row | keeps the row for every identity |
+
 ### Design
 
 **The wire.** `PROTOCOL_VERSION` becomes 2, which the hello, the TXT record and the beacon carry together, so a version 1 and a version 2 device refuse each other at hello. The writer is never sent, since each device offers only its own device writer's chain and the link has proven its key. A device with no device writer offers nothing and still receives.
@@ -5831,7 +5858,7 @@ Both roles run on every link at once. For one author as the receiver sees it: **
 | Peer certificate renewed | n/a | nothing | nothing | nothing | n/a | nothing | nothing |
 | Peer revoked or expired, link closes | as link lost | as link lost | as link lost | as link lost | as link lost | as link lost | as link lost |
 | Server patch on a provisional key | delete provenance, `ProvisionalConfirmed` | same | same | same, after the current row's transaction | n/a | n/a | n/a |
-| Eviction pass | spares state provisional | same | same | same | n/a | n/a | n/a |
+| Eviction pass | keeps a row `connetto-provisional` holds | same | same | same | n/a | n/a | n/a |
 | Replacement snapshot writes a provisional key during a resync | keep the record, raise nothing | same | same | same, after the current row's transaction | n/a | n/a | n/a |
 | Truncate notice for a table | delete its rows and records at once, keep unsent writes and stored entries | same | same | same, after the current row's transaction | n/a | n/a | n/a |
 | Replacement snapshot ends (`SnapshotEnd` ending a resync) | re-apply every stored entry through the peer apply, then own pending writes | same | same | same, after the current row's transaction | n/a | n/a | n/a |
@@ -5848,7 +5875,7 @@ Both roles run on every link at once. For one author as the receiver sees it: **
 2. A peer apply suspends capture as `apply_patch` does, or a peer's write re-uploads as the receiver's own, and keeps the policy guards on (decision 3).
 3. The conflict rule: the receiver's own unsent write is never displaced (decision 6), any other collision applies last-writer-locally with the displaced author recorded, `server_wins` stays reserved for server patches.
 4. Offline authorization: the translated policy evaluated as the author through `AuthorBinding` (decisions 3, 4 and 12), failing closed on share-key and locally unanswerable rights, with the partial-replica false-deny and bounded false-allow limits stated in chapter 19.
-5. `_connetto_provisional` in `main` (decision 2): provenance per (table, pk), a spare clause feeding `delete_unheld` beside `pending_spare`, server-sourced writes clearing provenance, typed provenance reads and applied, confirmed and retracted-with-cause events.
+5. `_connetto_provisional` in `main` (decision 2): provenance per (table, pk), a `connetto-provisional` holding per provisional record (decision 14), server-sourced writes clearing provenance, typed provenance reads and applied, confirmed and retracted-with-cause events.
 6. The acked frontier marks at-or-below provisional rows adjudicated, handing them to ordinary coverage, a signed retraction removes the copy and surfaces its cause, and the server settles the rest online (decision 11).
 
 ### Slices
@@ -5864,6 +5891,7 @@ One pull request each, in this order, each green and useful on its own (2026-10-
 7. **Online adjudication** (decision 11). Both server messages, proven Docker-gated by a receiver that never meets the author again and still confirms an applied write, retracts a refused one with its reason, and retracts an abandoned one after the author's enrolment is revoked.
 8. **The handheld proof.** The demo controls the runner drives and a run on R76 slice 9f's star (iPhone, iPad, Android) per R76 decision 4, which runs before each peer phase closes, and chapter 19's R77 statements marked **Built (R77)**.
 9. **A replacement snapshot is no verdict** (decision 13, after R11 Part B lands). During a resync a snapshot write on a provisional key keeps its record and raises no `ProvisionalConfirmed`, and the re-apply at `SnapshotEnd` puts the author's values back over the replacement's, proven in process for an authorization change, a cursor beyond history and a truncate. It needs nothing from slices 6 to 8 and may land before them.
+10. **The provisional holding and shared tables** (decisions 14 and 15). The `connetto-provisional` holding written and released with each record, the reserved-holder skip in `prune`, `release_all` and `release_account`, `provisional::spare` removed, and the peer apply, its undo and the holding routed to the store for a shared table, proven in process for every release and for a shared table's apply, retraction, resync and departure.
 
 ### Done when
 
