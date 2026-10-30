@@ -142,18 +142,28 @@ struct ColumnRow {
     pk: i32,
 }
 
+/// One table's or view's declared columns in `schema`, declaration order,
+/// empty when it is absent.
+fn declared_columns(
+    conn: &mut SqliteConnection,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<ColumnRow>, ClientError> {
+    Ok(diesel::sql_query(format!(
+        "SELECT name, pk FROM {}.pragma_table_info(?) ORDER BY cid",
+        quote_ident(schema)
+    ))
+    .bind::<Text, _>(table)
+    .load(conn)?)
+}
+
 /// Read one table's effective shape in `schema`, or `None` when it is absent.
 fn table_shape(
     conn: &mut SqliteConnection,
     schema: &str,
     table: &str,
 ) -> Result<Option<TableShape>, ClientError> {
-    let rows: Vec<ColumnRow> = diesel::sql_query(format!(
-        "SELECT name, pk FROM {}.pragma_table_info(?) ORDER BY cid",
-        quote_ident(schema)
-    ))
-    .bind::<Text, _>(table)
-    .load(conn)?;
+    let rows = declared_columns(conn, schema, table)?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -471,6 +481,18 @@ fn where_clause(shape: &TableShape, key_vals: &[(usize, Cell)]) -> String {
         .join(" AND ")
 }
 
+/// The statement deleting the row the key names.
+fn render_key_delete(target: &Target, table: &str, key_vals: &[(usize, Cell)]) -> Rendered {
+    (
+        format!(
+            "DELETE FROM {} WHERE {}",
+            table_ref(target.schema, table),
+            where_clause(&target.shape, key_vals)
+        ),
+        key_vals.iter().map(|(_, value)| value.clone()).collect(),
+    )
+}
+
 /// Delete the row the key names, a no-op when it is absent. A row-level
 /// constraint failure is dropped like the native apply does.
 fn delete_by_key(
@@ -479,13 +501,9 @@ fn delete_by_key(
     table: &str,
     key_vals: &[(usize, Cell)],
 ) -> Result<(), ClientError> {
-    let sql = format!(
-        "DELETE FROM {} WHERE {}",
-        table_ref(target.schema, table),
-        where_clause(&target.shape, key_vals)
-    );
+    let (sql, binds) = render_key_delete(target, table, key_vals);
     let mut query = diesel::sql_query(sql).into_boxed::<diesel::sqlite::Sqlite>();
-    for (_, value) in key_vals {
+    for value in &binds {
         query = bind_one(query, value);
     }
     match query.execute(conn) {
@@ -612,93 +630,163 @@ fn patchset_key_vals(section_pk: &[u8], pk: &[Cell]) -> Vec<(usize, Cell)> {
         .collect()
 }
 
-/// Whether the view let one peer op land a row, the caller's refusal.
+/// Whether a write through a view stood, the caller's refusal.
 #[cfg(feature = "peer")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerVerdict {
-    /// The statement landed a row.
+    /// The row stands as the write left it.
     Landed,
-    /// The statement touched no row the author may touch here.
+    /// A constraint or a guard stopped the write, or the row stands otherwise.
     Refused,
 }
 
-/// The view `table` stands as a peer apply sees it: its columns in the
-/// order the section names them. A view declares no primary key of its
-/// own, so no synthetic rowid slot is added: the section it is judged
-/// against was captured from a backing table whose key it carries.
+/// The view `table` as a peer write addresses it, its columns in the order
+/// the section names them. The section carries the key, so the shape holds
+/// no key flags and no synthetic rowid slot, which a view never declares.
 #[cfg(feature = "peer")]
-fn view_shape(conn: &mut SqliteConnection, table: &str) -> Result<TableShape, ClientError> {
-    let rows: Vec<ColumnRow> = diesel::sql_query(format!(
-        "SELECT name, pk FROM {}.pragma_table_info(?) ORDER BY cid",
-        quote_ident("main")
-    ))
-    .bind::<Text, _>(table)
-    .load(conn)?;
+fn view_target(conn: &mut SqliteConnection, table: &str) -> Result<Target, ClientError> {
+    let rows = declared_columns(conn, "main", table)?;
     if rows.is_empty() {
         return Err(ClientError::Apply(format!("no such table: main.{table}")));
     }
-    let mut columns = Vec::with_capacity(rows.len());
-    let mut pk = Vec::with_capacity(rows.len());
-    for row in rows {
-        columns.push(row.name);
-        pk.push(u8::try_from(row.pk).map_err(|_| {
-            ClientError::Apply(format!("{table} declares an out-of-range key ordinal"))
-        })?);
-    }
-    Ok(TableShape { columns, pk })
+    Ok(Target {
+        schema: "main",
+        shape: TableShape {
+            pk: vec![0; rows.len()],
+            columns: rows.into_iter().map(|row| row.name).collect(),
+        },
+    })
 }
 
-/// Run one peer statement, `None` when a constraint or a policy guard
+/// Run one peer statement, `false` when a constraint or a policy guard
 /// refused it.
 #[cfg(feature = "peer")]
-fn execute_peer(
-    conn: &mut SqliteConnection,
-    sql: String,
-    binds: &[Cell],
-) -> Result<Option<usize>, ClientError> {
+fn execute_peer(conn: &mut SqliteConnection, (sql, binds): Rendered) -> Result<bool, ClientError> {
     let mut query = diesel::sql_query(sql).into_boxed::<diesel::sqlite::Sqlite>();
-    for value in binds {
+    for value in &binds {
         query = bind_one(query, value);
     }
     match query.execute(conn) {
-        Ok(rows) => Ok(Some(rows)),
-        Err(err) if omit_on_constraint(&err) => Ok(None),
+        Ok(_) => Ok(true),
+        Err(err) if omit_on_constraint(&err) => Ok(false),
         Err(diesel::result::Error::DatabaseError(_, info))
             if pg2sqlite::prelude::is_policy_refusal(info.message()) =>
         {
-            Ok(None)
+            Ok(false)
         }
         Err(err) => Err(err.into()),
     }
 }
 
-/// The op's primary-key column values, in section-column order, reading
-/// them from the op the way the section stores them.
+/// One row write through a view: a peer op as it was captured, or the
+/// write that puts its row back.
 #[cfg(feature = "peer")]
-pub(crate) fn peer_key_values(op: &PeerOp) -> Vec<Cell> {
-    let at = |i: usize| match op {
-        ChangesetOp::Insert { values, .. } => values[i].clone(),
-        ChangesetOp::Update { values, .. } => values[i]
-            .0
-            .clone()
-            .or_else(|| values[i].1.clone())
-            .unwrap_or(Value::Null),
-        ChangesetOp::Delete { old_values, .. } => old_values[i].clone(),
-    };
-    let table = op.table();
-    let section_pk = table.pk_flags();
-    pk_values_by_column(section_pk, at)
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect()
+enum ViewWrite<'a> {
+    /// Replace the row the key names with these values.
+    Insert(&'a [Cell]),
+    /// Move the carried columns from the pair's old values to its new ones.
+    Update(std::borrow::Cow<'a, [ChangesetUpdatePair<String, Vec<u8>>]>),
+    /// Delete the row holding these values.
+    Delete(&'a [Cell]),
 }
 
-/// Judge one op of a peer entry through the view `table` names, the view's
-/// guards judging it as whoever the caller's author binding bound (R77).
+#[cfg(feature = "peer")]
+impl<'a> ViewWrite<'a> {
+    /// The write `op` makes.
+    fn of(op: &PeerOp<'a>) -> Self {
+        match *op {
+            ChangesetOp::Insert { values, .. } => Self::Insert(values),
+            ChangesetOp::Update { values, .. } => Self::Update(std::borrow::Cow::Borrowed(values)),
+            ChangesetOp::Delete { old_values, .. } => Self::Delete(old_values),
+        }
+    }
+
+    /// The write that puts back the row `op` changed: an insert's row goes,
+    /// a delete's old row returns, an update's old values stand again.
+    fn undoing(op: &PeerOp<'a>) -> Self {
+        match *op {
+            ChangesetOp::Insert { values, .. } => Self::Delete(values),
+            ChangesetOp::Update { values, .. } => Self::Update(std::borrow::Cow::Owned(
+                values
+                    .iter()
+                    .map(|(old, new)| (new.clone(), old.clone()))
+                    .collect(),
+            )),
+            ChangesetOp::Delete { old_values, .. } => Self::Insert(old_values),
+        }
+    }
+}
+
+/// Make one write through the view `table`, the view's guards judging it as
+/// whoever the caller bound.
 ///
 /// SQLite counts no change through an `INSTEAD OF` trigger, and a guard may
 /// skip a write silently, so the verdict reads the backing table `backing`
-/// afterwards: the op landed when the row stands as the op left it. An insert
-/// replaces the row its key names, the view judging that delete as the author.
+/// afterwards: the write landed when the row stands as it left it. An insert
+/// replaces the row its key names, the view judging that delete too.
+#[cfg(feature = "peer")]
+fn write_through_view(
+    conn: &mut SqliteConnection,
+    target: &Target,
+    table: &str,
+    backing: &str,
+    section_pk: &[u8],
+    write: &ViewWrite<'_>,
+) -> Result<PeerVerdict, ClientError> {
+    // The columns the row holds afterwards, and whether a row then stands on
+    // them.
+    let (after, present): (Vec<(usize, Cell)>, bool) = match write {
+        ViewWrite::Insert(values) => {
+            let key_vals = pk_values_by_column(section_pk, |i| values[i].clone());
+            if !key_vals.is_empty() {
+                execute_peer(conn, render_key_delete(target, table, &key_vals))?;
+            }
+            if !execute_peer(conn, render_insert(target, table, values))? {
+                return Ok(PeerVerdict::Refused);
+            }
+            (values.iter().cloned().enumerate().collect(), true)
+        }
+        ViewWrite::Update(pairs) => {
+            if !execute_peer(conn, render_update(target, table, pairs)?)? {
+                return Ok(PeerVerdict::Refused);
+            }
+            let after = pairs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (old, new))| {
+                    if section_pk.get(i).is_some_and(|flag| *flag != 0) {
+                        let key = new.clone().or_else(|| old.clone());
+                        Some((i, key.unwrap_or(Value::Null)))
+                    } else {
+                        new.clone().map(|new| (i, new))
+                    }
+                })
+                .collect();
+            (after, true)
+        }
+        ViewWrite::Delete(old_values) => {
+            if !execute_peer(conn, render_delete(target, table, old_values))? {
+                return Ok(PeerVerdict::Refused);
+            }
+            (
+                pk_values_by_column(section_pk, |i| old_values[i].clone()),
+                false,
+            )
+        }
+    };
+    Ok(
+        if backing_row_matches(conn, &target.shape, backing, &after)? == present {
+            PeerVerdict::Landed
+        } else {
+            PeerVerdict::Refused
+        },
+    )
+}
+
+/// Apply one op of a peer entry through the view `table` names, the view's
+/// guards judging it as whoever the caller's author binding bound (R77). A
+/// delete of a row the receiver does not hold as the op found it is refused,
+/// since nothing the receiver holds stands behind it.
 #[cfg(feature = "peer")]
 pub(crate) fn apply_peer_op(
     conn: &mut SqliteConnection,
@@ -706,78 +794,28 @@ pub(crate) fn apply_peer_op(
     backing: &str,
     op: &PeerOp,
 ) -> Result<PeerVerdict, ClientError> {
-    let shape = view_shape(conn, table)?;
-    let target = Target {
-        schema: "main",
-        shape,
-    };
-    let section_pk = op.table().pk_flags();
-    let expected: Vec<(usize, Cell)> = match op {
-        ChangesetOp::Insert { values, .. } => {
-            let key_vals = pk_values_by_column(section_pk, |i| values[i].clone());
-            if !key_vals.is_empty() {
-                let sql = format!(
-                    "DELETE FROM {} WHERE {}",
-                    table_ref(target.schema, table),
-                    where_clause(&target.shape, &key_vals)
-                );
-                let binds: Vec<Cell> = key_vals.iter().map(|(_, value)| value.clone()).collect();
-                execute_peer(conn, sql, &binds)?;
-            }
-            let (sql, binds) = render_insert(&target, table, values);
-            if execute_peer(conn, sql, &binds)?.is_none() {
-                return Ok(PeerVerdict::Refused);
-            }
-            values.iter().cloned().enumerate().collect()
+    let target = view_target(conn, table)?;
+    if let ChangesetOp::Delete { old_values, .. } = *op {
+        let held: Vec<(usize, Cell)> = old_values.iter().cloned().enumerate().collect();
+        if !backing_row_matches(conn, &target.shape, backing, &held)? {
+            return Ok(PeerVerdict::Refused);
         }
-        ChangesetOp::Update { values, .. } => {
-            let (sql, binds) = render_update(&target, table, values)?;
-            if execute_peer(conn, sql, &binds)?.is_none() {
-                return Ok(PeerVerdict::Refused);
-            }
-            let mut after = pk_values_by_column(section_pk, |i| {
-                values[i]
-                    .0
-                    .clone()
-                    .or_else(|| values[i].1.clone())
-                    .unwrap_or(Value::Null)
-            });
-            for (i, (_, new)) in values.iter().enumerate() {
-                if let Some(new) = new
-                    && section_pk.get(i).is_none_or(|flag| *flag == 0)
-                {
-                    after.push((i, new.clone()));
-                }
-            }
-            after
-        }
-        ChangesetOp::Delete { old_values, .. } => {
-            // A delete of a row the receiver never held changes nothing it can stand behind.
-            let held = old_values.iter().cloned().enumerate().collect::<Vec<_>>();
-            if !backing_row_matches(conn, &target.shape, backing, &held)? {
-                return Ok(PeerVerdict::Refused);
-            }
-            let (sql, binds) = render_delete(&target, table, old_values);
-            if execute_peer(conn, sql, &binds)?.is_none() {
-                return Ok(PeerVerdict::Refused);
-            }
-            let key = pk_values_by_column(section_pk, |i| old_values[i].clone());
-            return Ok(
-                if backing_row_matches(conn, &target.shape, backing, &key)? {
-                    PeerVerdict::Refused
-                } else {
-                    PeerVerdict::Landed
-                },
-            );
-        }
-    };
-    Ok(
-        if backing_row_matches(conn, &target.shape, backing, &expected)? {
-            PeerVerdict::Landed
-        } else {
-            PeerVerdict::Refused
-        },
-    )
+    }
+    let write = ViewWrite::of(op);
+    write_through_view(conn, &target, table, backing, op.table().pk_flags(), &write)
+}
+
+/// Put back the row one peer op changed, through the view `table` (R77).
+#[cfg(feature = "peer")]
+pub(crate) fn undo_peer_op(
+    conn: &mut SqliteConnection,
+    table: &str,
+    backing: &str,
+    op: &PeerOp,
+) -> Result<PeerVerdict, ClientError> {
+    let target = view_target(conn, table)?;
+    let write = ViewWrite::undoing(op);
+    write_through_view(conn, &target, table, backing, op.table().pk_flags(), &write)
 }
 
 /// Whether the backing table holds a row matching every `(column, value)`.
@@ -809,78 +847,6 @@ fn backing_row_matches(
         query = bind_one(query, value);
     }
     Ok(query.get_result::<Found>(conn)?.n > 0)
-}
-
-/// The inverted form of one peer op as one rendered statement through the
-/// view `table`, which puts the row back the way the entry found it (R77).
-///
-/// SQLite counts no change through an `INSTEAD OF` trigger, so whether the
-/// row went back is read off the backing table `backing` afterwards.
-#[cfg(feature = "peer")]
-pub(crate) fn invert_peer_op(
-    conn: &mut SqliteConnection,
-    table: &str,
-    backing: &str,
-    op: &PeerOp,
-) -> Result<bool, ClientError> {
-    let shape = view_shape(conn, table)?;
-    let target = Target {
-        schema: "main",
-        shape,
-    };
-    let section_pk = op.table().pk_flags();
-    // The statement, its binds, the columns the row holds once inverted,
-    // and whether a row should then stand on them.
-    let (sql, binds, columns, present) = match op {
-        // The insert's row goes the way it came.
-        ChangesetOp::Insert { values, .. } => {
-            let (sql, binds) = render_delete(&target, table, values);
-            let key = pk_values_by_column(section_pk, |i| values[i].clone());
-            (sql, binds, key, false)
-        }
-        // The delete's old values come back on the freed key.
-        ChangesetOp::Delete { old_values, .. } => {
-            let key_vals = pk_values_by_column(section_pk, |i| old_values[i].clone());
-            if !key_vals.is_empty() {
-                let del = format!(
-                    "DELETE FROM {} WHERE {}",
-                    table_ref(target.schema, table),
-                    where_clause(&target.shape, &key_vals)
-                );
-                let del_binds: Vec<Cell> =
-                    key_vals.iter().map(|(_, value)| value.clone()).collect();
-                execute_peer(conn, del, &del_binds)?;
-            }
-            let (sql, binds) = render_insert(&target, table, old_values);
-            let columns = old_values.iter().cloned().enumerate().collect();
-            (sql, binds, columns, true)
-        }
-        // The update's old values stand where its new ones went.
-        ChangesetOp::Update { values, .. } => {
-            let inverted: Vec<ChangesetUpdatePair<String, Vec<u8>>> = values
-                .iter()
-                .map(|(old, new)| (new.clone(), old.clone()))
-                .collect();
-            let (sql, binds) = render_update(&target, table, &inverted)?;
-            let columns = values
-                .iter()
-                .enumerate()
-                .filter_map(|(i, (old, new))| {
-                    let key = section_pk.get(i).is_some_and(|flag| *flag != 0);
-                    match (key, old) {
-                        (true, _) => Some((i, old.clone().or_else(|| new.clone())?)),
-                        (false, Some(old)) => Some((i, old.clone())),
-                        (false, None) => None,
-                    }
-                })
-                .collect();
-            (sql, binds, columns, true)
-        }
-    };
-    if execute_peer(conn, sql, &binds)?.is_none() {
-        return Ok(false);
-    }
-    Ok(backing_row_matches(conn, &target.shape, backing, &columns)? == present)
 }
 
 #[cfg(test)]

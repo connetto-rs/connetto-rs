@@ -58,6 +58,9 @@ pub enum PeerRefusal {
     Policy,
     /// The body is not the bytes the manifest row digests.
     DigestMismatch,
+    /// An op names its row by no key, which no synced table allows, so the
+    /// receiver can neither judge nor record it.
+    Unkeyed,
 }
 
 /// What a peer entry's apply settled.
@@ -261,9 +264,15 @@ pub(crate) struct OpsContext<'a> {
     pub(crate) now: i64,
 }
 
+/// The key the row `op` writes, in key order, the order every provenance
+/// record and every server write names it in.
+pub(crate) fn key_of(op: &crate::replay::PeerOp) -> Vec<KeyValue> {
+    op.primary_key().into_iter().map(KeyValue::from).collect()
+}
+
 /// Apply an entry's ops as its author through the policy views, one
-/// provisional record per key, or `None` when the views refused an op and
-/// the caller rolls the entry back whole.
+/// provisional record per key, or the refusal when an op names no key or the
+/// views refused one, the caller rolling the entry back whole.
 ///
 /// A key the receiver's own unsent write holds is left as it stands, the
 /// author recorded displaced by the write (R77 decision 6).
@@ -271,17 +280,14 @@ pub(crate) fn apply_ops<'d>(
     db: &mut SqliteConnection,
     ops: impl IntoIterator<Item = crate::replay::PeerOp<'d>>,
     cx: &OpsContext<'_>,
-) -> Result<Option<Vec<ProvisionalRow>>, ClientError> {
+) -> Result<Result<Vec<ProvisionalRow>, PeerRefusal>, ClientError> {
     let mut rows = Vec::new();
     for op in ops {
         let table_logical = op.table().name().to_owned();
         let table = cx.tables.stored(&table_logical);
-        let key: Vec<KeyValue> = crate::replay::peer_key_values(&op)
-            .into_iter()
-            .map(KeyValue::from)
-            .collect();
+        let key = key_of(&op);
         if key.is_empty() {
-            continue;
+            return Ok(Err(PeerRefusal::Unkeyed));
         }
         let held = cx
             .held
@@ -300,8 +306,8 @@ pub(crate) fn apply_ops<'d>(
             }
         } else {
             let verdict = crate::replay::apply_peer_op(db, &table_logical, &table, &op)?;
-            if matches!(verdict, crate::replay::PeerVerdict::Refused) {
-                return Ok(None);
+            if verdict == crate::replay::PeerVerdict::Refused {
+                return Ok(Err(PeerRefusal::Policy));
             }
             let displaced = crate::provisional::row_of_key(db, &table, &key)?
                 .filter(|existing| existing.author != cx.author.key_id);
@@ -320,7 +326,7 @@ pub(crate) fn apply_ops<'d>(
         crate::provisional::upsert_record(db, &record)?;
         rows.push(record);
     }
-    Ok(Some(rows))
+    Ok(Ok(rows))
 }
 
 /// The rows an entry's ops name, each table as the application writes it,
@@ -331,10 +337,7 @@ pub(crate) fn entry_rows<'d>(
     let mut seen = std::collections::BTreeSet::new();
     let mut rows = Vec::new();
     for op in ops {
-        let key: Vec<KeyValue> = crate::replay::peer_key_values(&op)
-            .into_iter()
-            .map(KeyValue::from)
-            .collect();
+        let key = key_of(&op);
         let table = op.table().name().to_owned();
         if !key.is_empty() && seen.insert((table.clone(), crate::provisional::encode_key(&key))) {
             rows.push((table, key));

@@ -7024,9 +7024,6 @@ where
                     "parsing a pending changeset to filter a peer apply: {err:?}"
                 ))
             })? {
-                if key.is_empty() {
-                    continue;
-                }
                 held.insert(
                     (table.to_lowercase(), provisional::encode_key(&key)),
                     (writer_id(writer), i64::try_from(seq).unwrap_or(i64::MAX)),
@@ -7100,13 +7097,14 @@ where
             self.config.caller.as_ref(),
             subjects.as_ref(),
         )?;
-        let mut refused = false;
+        let mut refusal = None;
         let tx = bound.db.transaction::<_, ClientError, _>(|db| {
-            let Some(rows) = peer::apply_ops(db, diff.iter(), &cx)? else {
-                refused = true;
-                return Err(ClientError::Apply(
-                    "a peer entry was refused by the policy views".to_owned(),
-                ));
+            let rows = match peer::apply_ops(db, diff.iter(), &cx)? {
+                Ok(rows) => rows,
+                Err(cause) => {
+                    refusal = Some(cause);
+                    return Err(ClientError::Apply("a peer entry was refused".to_owned()));
+                }
             };
             let position = if let Some(position) = peer::existing_position(db, &author.key_id, seq)?
             {
@@ -7132,31 +7130,32 @@ where
                 });
                 Ok(peer::PeerApplyOutcome::Applied { rows })
             }
-            Err(_) if refused => {
+            Err(err) => {
+                let Some(cause) = refusal else {
+                    return Err(err);
+                };
                 let rows = peer::entry_rows(diff.iter());
                 self.notices.push_back(ClientEvent::PeerWriteRefused {
                     author: author.key_id.clone(),
                     seq,
                     rows: rows.clone(),
                 });
-                Ok(peer::PeerApplyOutcome::Refused {
-                    cause: peer::PeerRefusal::Policy,
-                    rows,
-                })
+                Ok(peer::PeerApplyOutcome::Refused { cause, rows })
             }
-            Err(err) => Err(err),
         }
     }
 
     /// Retract one stored peer entry (R77): the ops whose record still names
     /// the entry are inverted, a displaced author's provenance stands back
     /// from its stored entry, and the entry goes. A retraction of an entry
-    /// the receiver never stored is a no-op that raises nothing.
+    /// the receiver never stored is a no-op that raises nothing. One undo the
+    /// store refuses fails the retraction whole, leaving every row, record
+    /// and the entry as they were, so a later retraction can try again.
     ///
     /// # Errors
     ///
-    /// [`ClientError`] when the stored entry cannot be parsed or the
-    /// inversion cannot be written.
+    /// [`ClientError`] when the stored entry cannot be parsed, an undo is
+    /// refused, or the inversion cannot be written.
     #[cfg(feature = "peer")]
     pub fn retract_peer_entry(
         &mut self,
@@ -7170,19 +7169,13 @@ where
         let diff = self.peer_changeset(&entry.changeset, "a stored peer entry")?;
         let ops: Vec<replay::PeerOp> = diff.iter().collect();
         let tables = &self.config.policy_tables;
-        // The entry's ops by the key they touch, the inversion's lookup.
+        // The entry's ops by the key they touch, the inversion's lookup. A
+        // key-less op holds no record, so it is never looked up.
         let mut op_of: HashMap<(String, Vec<u8>), (usize, String)> = HashMap::new();
         for (index, op) in ops.iter().enumerate() {
             let table_logical = op.table().name().to_owned();
             let physical = tables.stored(&table_logical);
-            let key: Vec<KeyValue> = replay::peer_key_values(op)
-                .into_iter()
-                .map(KeyValue::from)
-                .collect();
-            if key.is_empty() {
-                continue;
-            }
-            let blob = provisional::encode_key(&key);
+            let blob = provisional::encode_key(&peer::key_of(op));
             op_of.insert((physical, blob), (index, table_logical));
         }
         let records = provisional::records_of_entry(&mut self.db, &author.key_id, seq)?
@@ -7198,9 +7191,15 @@ where
                 else {
                     continue;
                 };
-                if replay::invert_peer_op(db, logical_table, &record.table, &ops[index])? {
-                    inverted_rows.push((record.table.clone(), record.key.clone()));
+                if replay::undo_peer_op(db, logical_table, &record.table, &ops[index])?
+                    == replay::PeerVerdict::Refused
+                {
+                    return Err(ClientError::Apply(format!(
+                        "the store refused putting back {} {:?} for a retraction",
+                        record.table, record.key
+                    )));
                 }
+                inverted_rows.push((record.table.clone(), record.key.clone()));
                 match (&record.displaced_author, record.displaced_seq) {
                     (Some(displaced_author), Some(displaced_seq)) => {
                         match peer::entry_of(db, displaced_author, displaced_seq)? {

@@ -24,7 +24,7 @@ use connetto_core::{Cursor, Major};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use sha2::{Digest, Sha256};
-use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
+use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 use super::support::{self, Script};
 
@@ -35,6 +35,8 @@ const PLAIN_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, owner TEXT
                           status TEXT NOT NULL); \
                           CREATE TABLE boards (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
                           CREATE TABLE shares (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
+                          CREATE TABLE pairs (a INTEGER NOT NULL, b INTEGER NOT NULL, \
+                          label TEXT NOT NULL, PRIMARY KEY (b, a)); \
                           CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL);";
 
 /// The receiver replica's source: the same tables behind translated
@@ -44,14 +46,18 @@ const POLICY_SCHEMA: &str = "-- connetto:major 1\n \
                              status TEXT NOT NULL); \
                              CREATE TABLE boards (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
                              CREATE TABLE shares (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
+                             CREATE TABLE pairs (a INTEGER NOT NULL, b INTEGER NOT NULL, \
+                             label TEXT NOT NULL, PRIMARY KEY (b, a)); \
                              ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
                              ALTER TABLE boards ENABLE ROW LEVEL SECURITY; \
-                             ALTER TABLE shares ENABLE ROW LEVEL SECURITY;";
+                             ALTER TABLE shares ENABLE ROW LEVEL SECURITY; \
+                             ALTER TABLE pairs ENABLE ROW LEVEL SECURITY;";
 
 /// Every person reads `orders` but writes only rows they own, so the receiver
 /// sees an author's rows. `boards` admits every person, so two authors can
 /// collide on one row, and the generated bot cap still holds a bot to its
 /// list. `shares` takes a row labelled with a share key the caller holds.
+/// `pairs` is open, its key declared in the other order than its columns.
 const POLICIES: &str = "CREATE POLICY orders_read ON orders FOR SELECT USING (true); \
                         CREATE POLICY orders_insert ON orders FOR INSERT \
                         WITH CHECK (owner = current_setting('app.user_id', true)); \
@@ -61,6 +67,7 @@ const POLICIES: &str = "CREATE POLICY orders_read ON orders FOR SELECT USING (tr
                         CREATE POLICY orders_delete ON orders FOR DELETE \
                         USING (owner = current_setting('app.user_id', true)); \
                         CREATE POLICY boards_open ON boards FOR ALL USING (true) WITH CHECK (true); \
+                        CREATE POLICY pairs_open ON pairs FOR ALL USING (true) WITH CHECK (true); \
                         CREATE POLICY shares_read ON shares FOR SELECT USING (true); \
                         CREATE POLICY shares_insert ON shares FOR INSERT WITH CHECK \
                         (label = ANY (string_to_array(current_setting('app.subjects', true), ',')));";
@@ -114,11 +121,12 @@ fn author(key: &str, account: &str, bot_list: Option<&str>) -> PeerAuthor {
     }
 }
 
-fn manifest(seq: u64, major: Major, body: &[u8]) -> ManifestRow {
+/// The manifest row of `body` at `seq`, captured under the schema's major 1.
+fn manifest(seq: u64, body: &[u8]) -> ManifestRow {
     let digest: [u8; 32] = Sha256::digest(body).into();
     ManifestRow {
         seq,
-        major,
+        major: Major::new(1).expect("major 1"),
         origin: None,
         digest,
     }
@@ -369,22 +377,12 @@ where
 /// `ProvisionalApplied`.
 #[tokio::test]
 async fn a_policy_passing_author_write_lands() {
-    let (mut author_replica, _) = plain_author().await;
-    insert_order(&mut author_replica, 1, "peer-anna", "open");
-    author_replica
-        .flush()
-        .await
-        .expect("flush the author's write");
-    let body = pending_changeset(&mut author_replica, 1);
+    let [body] = captured([&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
 
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
     let out = recv
-        .apply_peer_entry(
-            &a,
-            &manifest(7, Major::new(1).expect("major 1"), &body),
-            &body,
-        )
+        .apply_peer_entry(&a, &manifest(7, &body), &body)
         .expect("apply the entry");
     match &out {
         PeerApplyOutcome::Applied { rows } => {
@@ -427,23 +425,16 @@ async fn a_policy_passing_author_write_lands() {
 /// the entry lands and `PeerWriteRefused` names its rows.
 #[tokio::test]
 async fn a_write_the_author_may_not_make_is_refused_whole() {
-    let (mut author_replica, _) = plain_author().await;
-    insert_order(&mut author_replica, 1, "peer-anna", "open");
-    insert_order(&mut author_replica, 2, "mallory", "open");
-    author_replica
-        .flush()
-        .await
-        .expect("flush the author's writes");
-    let body = pending_changeset(&mut author_replica, 1);
+    let [body] = captured([&|conn| {
+        insert_order(conn, 1, "peer-anna", "open");
+        insert_order(conn, 2, "mallory", "open");
+    }])
+    .await;
 
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
     let out = recv
-        .apply_peer_entry(
-            &a,
-            &manifest(7, Major::new(1).expect("major 1"), &body),
-            &body,
-        )
+        .apply_peer_entry(&a, &manifest(7, &body), &body)
         .expect("apply the entry");
     match &out {
         PeerApplyOutcome::Refused { cause, rows } => {
@@ -481,14 +472,8 @@ async fn a_write_the_author_may_not_make_is_refused_whole() {
 /// certificate that carries none fails closed.
 #[tokio::test]
 async fn a_bot_author_is_judged_by_its_certificate_bot_list() {
-    let (mut author_replica, _) = plain_author().await;
-    write_board(&mut author_replica, 1, "from a bot", true);
-    author_replica
-        .flush()
-        .await
-        .expect("flush the author's write");
-    let body = pending_changeset(&mut author_replica, 1);
-    let row = || manifest(7, Major::new(1).expect("major 1"), &body);
+    let [body] = captured([&|conn| write_board(conn, 1, "from a bot", true)]).await;
+    let row = || manifest(7, &body);
 
     let (mut recv, _) = receiver().await;
     let allowed = author("bot-a", "bot-a", Some("boards:insert,boards:read"));
@@ -531,22 +516,15 @@ async fn receiver_owned_key_keeps_the_receiver_value(queued: bool) {
         recv.flush().await.expect("queue the receiver's write");
     }
 
-    let (mut author_replica, _) = plain_author().await;
-    insert_order(&mut author_replica, 2, "peer-anna", "theirs");
-    insert_order(&mut author_replica, 3, "peer-anna", "theirs");
-    author_replica
-        .flush()
-        .await
-        .expect("flush the author's writes");
-    let body = pending_changeset(&mut author_replica, 1);
+    let [body] = captured([&|conn| {
+        insert_order(conn, 2, "peer-anna", "theirs");
+        insert_order(conn, 3, "peer-anna", "theirs");
+    }])
+    .await;
 
     let a = author("author-a", "peer-anna", Some("*"));
     let out = recv
-        .apply_peer_entry(
-            &a,
-            &manifest(7, Major::new(1).expect("major 1"), &body),
-            &body,
-        )
+        .apply_peer_entry(&a, &manifest(7, &body), &body)
         .expect("apply the entry");
     assert!(matches!(out, PeerApplyOutcome::Applied { .. }));
     assert_eq!(
@@ -589,32 +567,18 @@ async fn a_receiver_write_still_in_the_outbox_keeps_its_key() {
 /// provenance from the first's stored entry.
 #[tokio::test]
 async fn a_second_author_displaces_the_first_and_a_retraction_restores_it() {
-    let (mut author_replica, _) = plain_author().await;
-    write_board(&mut author_replica, 1, "anna's", true);
-    author_replica.flush().await.expect("flush the first write");
-    let first = pending_changeset(&mut author_replica, 1);
-    write_board(&mut author_replica, 1, "bob's", false);
-    author_replica
-        .flush()
-        .await
-        .expect("flush the second write");
-    let second = pending_changeset(&mut author_replica, 2);
+    let [first, second] = captured([&|conn| write_board(conn, 1, "anna's", true), &|conn| {
+        write_board(conn, 1, "bob's", false);
+    }])
+    .await;
 
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
     let b = author("author-b", "peer-bob", Some("*"));
-    recv.apply_peer_entry(
-        &a,
-        &manifest(7, Major::new(1).expect("major 1"), &first),
-        &first,
-    )
-    .expect("apply the first entry");
-    recv.apply_peer_entry(
-        &b,
-        &manifest(8, Major::new(1).expect("major 1"), &second),
-        &second,
-    )
-    .expect("apply the second entry");
+    recv.apply_peer_entry(&a, &manifest(7, &first), &first)
+        .expect("apply the first entry");
+    recv.apply_peer_entry(&b, &manifest(8, &second), &second)
+        .expect("apply the second entry");
     assert_eq!(board_rows(&mut recv), vec![(1, "bob's".to_owned())]);
     let rows = recv.provisional_rows().expect("read the records");
     let record = provenance_of(&rows, "boards", &[KeyValue::Int(1)]).expect("a record");
@@ -648,10 +612,7 @@ async fn a_second_author_displaces_the_first_and_a_retraction_restores_it() {
     assert_eq!(record.state, ProvisionalState::Provisional);
     assert_eq!(record.displaced_author, None);
     // The retraction took its entry and left the first author's.
-    let entries: Vec<(Vec<u8>, i64)> = _connetto_peer_entry::table
-        .select((_connetto_peer_entry::author, _connetto_peer_entry::seq))
-        .load(recv.conn())
-        .expect("read the entries");
+    let entries = stored_entries(&mut recv);
     assert_eq!(entries, vec![("author-a".as_bytes().to_vec(), 7)]);
     let event = pump_to(&mut recv, |event| {
         matches!(event, ClientEvent::ProvisionalRetracted { .. })
@@ -678,28 +639,18 @@ async fn a_second_author_displaces_the_first_and_a_retraction_restores_it() {
 /// record outlives the row it describes.
 #[tokio::test]
 async fn a_retraction_inverts_a_delete_and_names_its_cause() {
-    let (mut author_replica, _) = plain_author().await;
-    insert_order(&mut author_replica, 1, "peer-anna", "open");
-    author_replica.flush().await.expect("flush the insert");
-    let inserted = pending_changeset(&mut author_replica, 1);
-    delete_order(&mut author_replica, 1);
-    author_replica.flush().await.expect("flush the delete");
-    let deleted = pending_changeset(&mut author_replica, 2);
+    let [inserted, deleted] = captured([
+        &|conn| insert_order(conn, 1, "peer-anna", "open"),
+        &|conn| delete_order(conn, 1),
+    ])
+    .await;
 
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
-    recv.apply_peer_entry(
-        &a,
-        &manifest(7, Major::new(1).expect("major 1"), &inserted),
-        &inserted,
-    )
-    .expect("apply the insert");
-    recv.apply_peer_entry(
-        &a,
-        &manifest(9, Major::new(1).expect("major 1"), &deleted),
-        &deleted,
-    )
-    .expect("apply the delete");
+    recv.apply_peer_entry(&a, &manifest(7, &inserted), &inserted)
+        .expect("apply the insert");
+    recv.apply_peer_entry(&a, &manifest(9, &deleted), &deleted)
+        .expect("apply the delete");
     assert_eq!(order_rows(&mut recv), Vec::new());
     // The delete's record stays, so a retraction can restore the row.
     let rows = recv.provisional_rows().expect("read the records");
@@ -725,10 +676,7 @@ async fn a_retraction_inverts_a_delete_and_names_its_cause() {
         provenance_of(&rows, "orders", &[KeyValue::Int(1)]).is_none(),
         "the inverted key keeps no record"
     );
-    let entries: Vec<(Vec<u8>, i64)> = _connetto_peer_entry::table
-        .select((_connetto_peer_entry::author, _connetto_peer_entry::seq))
-        .load(recv.conn())
-        .expect("read the entries");
+    let entries = stored_entries(&mut recv);
     assert_eq!(entries, vec![("author-a".as_bytes().to_vec(), 7)]);
     let event = pump_to(&mut recv, |event| {
         matches!(event, ClientEvent::ProvisionalRetracted { .. })
@@ -752,32 +700,18 @@ async fn a_retraction_inverts_a_delete_and_names_its_cause() {
 /// an entry the receiver never stored raises nothing.
 #[tokio::test]
 async fn a_retraction_with_the_displaced_entry_gone_keeps_no_record() {
-    let (mut author_replica, _) = plain_author().await;
-    write_board(&mut author_replica, 1, "anna's", true);
-    author_replica.flush().await.expect("flush the first write");
-    let first = pending_changeset(&mut author_replica, 1);
-    write_board(&mut author_replica, 1, "bob's", false);
-    author_replica
-        .flush()
-        .await
-        .expect("flush the second write");
-    let second = pending_changeset(&mut author_replica, 2);
+    let [first, second] = captured([&|conn| write_board(conn, 1, "anna's", true), &|conn| {
+        write_board(conn, 1, "bob's", false);
+    }])
+    .await;
 
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
     let b = author("author-b", "peer-bob", Some("*"));
-    recv.apply_peer_entry(
-        &a,
-        &manifest(7, Major::new(1).expect("major 1"), &first),
-        &first,
-    )
-    .expect("apply the first entry");
-    recv.apply_peer_entry(
-        &b,
-        &manifest(8, Major::new(1).expect("major 1"), &second),
-        &second,
-    )
-    .expect("apply the second entry");
+    recv.apply_peer_entry(&a, &manifest(7, &first), &first)
+        .expect("apply the first entry");
+    recv.apply_peer_entry(&b, &manifest(8, &second), &second)
+        .expect("apply the second entry");
     // The key's record names the second entry, the first author displaced,
     // so the first author's retraction inverts nothing and raises nothing.
     recv.retract_peer_entry(
@@ -857,17 +791,11 @@ async fn a_retraction_with_the_displaced_entry_gone_keeps_no_record() {
 /// entry captured under another major is skipped without an event.
 #[tokio::test]
 async fn a_digest_mismatch_is_refused_and_another_major_is_skipped() {
-    let (mut author_replica, _) = plain_author().await;
-    insert_order(&mut author_replica, 1, "peer-anna", "open");
-    author_replica
-        .flush()
-        .await
-        .expect("flush the author's write");
-    let body = pending_changeset(&mut author_replica, 1);
+    let [body] = captured([&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
     let a = author("author-a", "peer-anna", Some("*"));
 
     let (mut recv, _) = receiver().await;
-    let mut row = manifest(7, Major::new(1).expect("major 1"), &body);
+    let mut row = manifest(7, &body);
     row.digest[0] ^= 0xFF;
     let out = recv
         .apply_peer_entry(&a, &row, &body)
@@ -880,13 +808,13 @@ async fn a_digest_mismatch_is_refused_and_another_major_is_skipped() {
         }
     ));
     assert_eq!(order_rows(&mut recv), Vec::new());
-    let entries: Vec<(Vec<u8>, i64)> = _connetto_peer_entry::table
-        .select((_connetto_peer_entry::author, _connetto_peer_entry::seq))
-        .load(recv.conn())
-        .expect("read the entries");
+    let entries = stored_entries(&mut recv);
     assert_eq!(entries, Vec::new());
 
-    let row = manifest(7, Major::new(2).expect("major 2"), &body);
+    let row = ManifestRow {
+        major: Major::new(2).expect("major 2"),
+        ..manifest(7, &body)
+    };
     let out = recv
         .apply_peer_entry(&a, &row, &body)
         .expect("apply the entry");
@@ -908,22 +836,12 @@ async fn a_digest_mismatch_is_refused_and_another_major_is_skipped() {
 /// receiver's own.
 #[tokio::test]
 async fn a_peer_write_never_enters_the_receiver_queue() {
-    let (mut author_replica, _) = plain_author().await;
-    insert_order(&mut author_replica, 1, "peer-anna", "open");
-    author_replica
-        .flush()
-        .await
-        .expect("flush the author's write");
-    let body = pending_changeset(&mut author_replica, 1);
+    let [body] = captured([&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
 
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
-    recv.apply_peer_entry(
-        &a,
-        &manifest(7, Major::new(1).expect("major 1"), &body),
-        &body,
-    )
-    .expect("apply the entry");
+    recv.apply_peer_entry(&a, &manifest(7, &body), &body)
+        .expect("apply the entry");
     assert_eq!(
         recv.push().await.expect("push what the outbox holds"),
         None,
@@ -937,31 +855,18 @@ async fn a_peer_write_never_enters_the_receiver_queue() {
 /// and deletes the entries at or below it, leaving a newer entry alone.
 #[tokio::test]
 async fn adjudication_at_a_frontier_moves_records_and_drops_entries() {
-    let (mut author_replica, _) = plain_author().await;
-    insert_order(&mut author_replica, 1, "peer-anna", "open");
-    author_replica.flush().await.expect("flush the first write");
-    let first = pending_changeset(&mut author_replica, 1);
-    update_order(&mut author_replica, 1, "peer-anna", "closed");
-    author_replica
-        .flush()
-        .await
-        .expect("flush the second write");
-    let second = pending_changeset(&mut author_replica, 2);
+    let [first, second] = captured([
+        &|conn| insert_order(conn, 1, "peer-anna", "open"),
+        &|conn| update_order(conn, 1, "peer-anna", "closed"),
+    ])
+    .await;
 
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
-    recv.apply_peer_entry(
-        &a,
-        &manifest(7, Major::new(1).expect("major 1"), &first),
-        &first,
-    )
-    .expect("apply the first entry");
-    recv.apply_peer_entry(
-        &a,
-        &manifest(8, Major::new(1).expect("major 1"), &second),
-        &second,
-    )
-    .expect("apply the second entry");
+    recv.apply_peer_entry(&a, &manifest(7, &first), &first)
+        .expect("apply the first entry");
+    recv.apply_peer_entry(&a, &manifest(8, &second), &second)
+        .expect("apply the second entry");
 
     // A frontier below the newest entry adjudicates it only.
     recv.adjudicate_peer_frontier(&a.key_id, 7)
@@ -974,10 +879,7 @@ async fn adjudication_at_a_frontier_moves_records_and_drops_entries() {
         "the newer entry's record still awaits a verdict"
     );
     assert_eq!(record.state, ProvisionalState::Provisional);
-    let entries: Vec<(Vec<u8>, i64)> = _connetto_peer_entry::table
-        .select((_connetto_peer_entry::author, _connetto_peer_entry::seq))
-        .load(recv.conn())
-        .expect("read the entries");
+    let entries = stored_entries(&mut recv);
     assert_eq!(entries, vec![("author-a".as_bytes().to_vec(), 8)]);
 
     recv.adjudicate_peer_frontier(&a.key_id, 8)
@@ -985,10 +887,7 @@ async fn adjudication_at_a_frontier_moves_records_and_drops_entries() {
     let rows = recv.provisional_rows().expect("read the records");
     let record = provenance_of(&rows, "orders", &[KeyValue::Int(1)]).expect("the record");
     assert_eq!(record.state, ProvisionalState::Adjudicated);
-    let entries: Vec<(Vec<u8>, i64)> = _connetto_peer_entry::table
-        .select((_connetto_peer_entry::author, _connetto_peer_entry::seq))
-        .load(recv.conn())
-        .expect("read the entries");
+    let entries = stored_entries(&mut recv);
     assert_eq!(entries, Vec::new());
     // The rows stay: adjudication hands them to ordinary coverage.
     assert_eq!(
@@ -1042,32 +941,21 @@ async fn a_resync_reapplies_stored_entries_ahead_of_the_pending_writes() {
     insert_order(&mut recv, 2, "r77", "mine");
     recv.flush().await.expect("queue the receiver's write");
 
-    let (mut author_replica, _) = plain_author().await;
-    insert_order(&mut author_replica, 1, "peer-anna", "open");
-    insert_order(&mut author_replica, 2, "peer-anna", "theirs");
-    author_replica.flush().await.expect("flush the first write");
-    let first = pending_changeset(&mut author_replica, 1);
-    insert_order(&mut author_replica, 3, "peer-bob", "open");
-    author_replica
-        .flush()
-        .await
-        .expect("flush the second write");
-    let second = pending_changeset(&mut author_replica, 2);
+    let [first, second] = captured([
+        &|conn| {
+            insert_order(conn, 1, "peer-anna", "open");
+            insert_order(conn, 2, "peer-anna", "theirs");
+        },
+        &|conn| insert_order(conn, 3, "peer-bob", "open"),
+    ])
+    .await;
 
     let a = author("author-a", "peer-anna", Some("*"));
     let b = author("author-b", "peer-bob", Some("*"));
-    recv.apply_peer_entry(
-        &a,
-        &manifest(7, Major::new(1).expect("major 1"), &first),
-        &first,
-    )
-    .expect("apply the first entry");
-    recv.apply_peer_entry(
-        &b,
-        &manifest(8, Major::new(1).expect("major 1"), &second),
-        &second,
-    )
-    .expect("apply the second entry");
+    recv.apply_peer_entry(&a, &manifest(7, &first), &first)
+        .expect("apply the first entry");
+    recv.apply_peer_entry(&b, &manifest(8, &second), &second)
+        .expect("apply the second entry");
     let positions: Vec<i64> = _connetto_peer_entry::table
         .select(_connetto_peer_entry::position)
         .load(recv.conn())
@@ -1146,9 +1034,9 @@ type AuthorWrite<'a> = &'a dyn Fn(&mut ConnettoConnection<Script>);
 
 /// The bodies an author replica captures for `writes`, one flushed queue
 /// entry per write, in order.
-async fn captured(writes: &[AuthorWrite<'_>]) -> Vec<Vec<u8>> {
+async fn captured<const N: usize>(writes: [AuthorWrite<'_>; N]) -> [Vec<u8>; N] {
     let (mut author_replica, _) = plain_author().await;
-    let mut bodies = Vec::new();
+    let mut bodies = Vec::with_capacity(N);
     for (seq, write) in (1..).zip(writes) {
         write(&mut author_replica);
         author_replica
@@ -1157,7 +1045,7 @@ async fn captured(writes: &[AuthorWrite<'_>]) -> Vec<Vec<u8>> {
             .expect("flush the author's write");
         bodies.push(pending_changeset(&mut author_replica, seq));
     }
-    bodies
+    bodies.try_into().expect("one body per write")
 }
 
 /// The receiver's stored peer entries, by author and sequence.
@@ -1189,15 +1077,11 @@ where
 /// its entry, and names the row in `ProvisionalRetracted`.
 #[tokio::test]
 async fn a_retraction_of_an_insert_takes_the_row_away() {
-    let bodies = captured(&[&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
+    let bodies = captured([&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
-    recv.apply_peer_entry(
-        &a,
-        &manifest(7, Major::new(1).expect("major 1"), &bodies[0]),
-        &bodies[0],
-    )
-    .expect("apply the insert");
+    recv.apply_peer_entry(&a, &manifest(7, &bodies[0]), &bodies[0])
+        .expect("apply the insert");
     recv.retract_peer_entry(
         &a,
         &Retraction {
@@ -1227,7 +1111,7 @@ async fn a_retraction_of_an_insert_takes_the_row_away() {
 #[tokio::test]
 async fn an_update_or_delete_of_another_owners_row_is_refused() {
     let updated = captured(
-        &[&|conn| insert_order(conn, 1, "peer-bob", "open"), &|conn| {
+        [&|conn| insert_order(conn, 1, "peer-bob", "open"), &|conn| {
             update_order(conn, 1, "peer-bob", "taken");
         }],
     )
@@ -1235,7 +1119,7 @@ async fn an_update_or_delete_of_another_owners_row_is_refused() {
     // The delete is captured off the row as the receiver holds it, so only
     // the policy stands between it and the row.
     let deleted = captured(
-        &[&|conn| insert_order(conn, 1, "peer-bob", "open"), &|conn| {
+        [&|conn| insert_order(conn, 1, "peer-bob", "open"), &|conn| {
             delete_order(conn, 1);
         }],
     )
@@ -1243,19 +1127,11 @@ async fn an_update_or_delete_of_another_owners_row_is_refused() {
     let (mut recv, _) = receiver().await;
     let anna = author("author-a", "peer-anna", Some("*"));
     let bob = author("author-b", "peer-bob", Some("*"));
-    recv.apply_peer_entry(
-        &bob,
-        &manifest(4, Major::new(1).expect("major 1"), &updated[0]),
-        &updated[0],
-    )
-    .expect("apply bob's insert");
+    recv.apply_peer_entry(&bob, &manifest(4, &updated[0]), &updated[0])
+        .expect("apply bob's insert");
     for (seq, body) in [(7, &updated[1]), (8, &deleted[1])] {
         let out = recv
-            .apply_peer_entry(
-                &anna,
-                &manifest(seq, Major::new(1).expect("major 1"), body),
-                body,
-            )
+            .apply_peer_entry(&anna, &manifest(seq, body), body)
             .expect("apply anna's entry");
         assert!(
             matches!(
@@ -1285,7 +1161,7 @@ async fn an_update_or_delete_of_another_owners_row_is_refused() {
 /// holds stands behind it.
 #[tokio::test]
 async fn a_delete_of_a_row_the_receiver_never_held_is_refused() {
-    let bodies = captured(&[
+    let bodies = captured([
         &|conn| insert_order(conn, 1, "peer-anna", "open"),
         &|conn| delete_order(conn, 1),
     ])
@@ -1293,11 +1169,7 @@ async fn a_delete_of_a_row_the_receiver_never_held_is_refused() {
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
     let out = recv
-        .apply_peer_entry(
-            &a,
-            &manifest(8, Major::new(1).expect("major 1"), &bodies[1]),
-            &bodies[1],
-        )
+        .apply_peer_entry(&a, &manifest(8, &bodies[1]), &bodies[1])
         .expect("apply the delete");
     assert!(
         matches!(
@@ -1316,7 +1188,7 @@ async fn a_delete_of_a_row_the_receiver_never_held_is_refused() {
 /// nothing of it lands.
 #[tokio::test]
 async fn an_entry_naming_a_table_the_receiver_lacks_fails_whole() {
-    let bodies = captured(&[&|conn| {
+    let bodies = captured([&|conn| {
         insert_order(conn, 1, "peer-anna", "open");
         conn.conn()
             .batch_execute("INSERT INTO notes (id, body) VALUES (1, 'x')")
@@ -1326,11 +1198,7 @@ async fn an_entry_naming_a_table_the_receiver_lacks_fails_whole() {
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
     let err = recv
-        .apply_peer_entry(
-            &a,
-            &manifest(7, Major::new(1).expect("major 1"), &bodies[0]),
-            &bodies[0],
-        )
+        .apply_peer_entry(&a, &manifest(7, &bodies[0]), &bodies[0])
         .expect_err("the receiver has no notes table");
     assert!(
         err.to_string().contains("notes"),
@@ -1356,11 +1224,7 @@ async fn a_body_that_is_no_captured_changeset_fails_the_apply() {
         (patch, "must be a captured changeset"),
     ] {
         let err = recv
-            .apply_peer_entry(
-                &a,
-                &manifest(7, Major::new(1).expect("major 1"), &body),
-                &body,
-            )
+            .apply_peer_entry(&a, &manifest(7, &body), &body)
             .expect_err("the body is no changeset");
         assert!(err.to_string().contains(says), "{says}: {err}");
     }
@@ -1372,15 +1236,11 @@ async fn a_body_that_is_no_captured_changeset_fails_the_apply() {
 /// leaving the row, its record and the entry in place.
 #[tokio::test]
 async fn a_stored_body_that_is_no_captured_changeset_fails_the_retraction() {
-    let bodies = captured(&[&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
+    let bodies = captured([&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
-    recv.apply_peer_entry(
-        &a,
-        &manifest(7, Major::new(1).expect("major 1"), &bodies[0]),
-        &bodies[0],
-    )
-    .expect("apply the insert");
+    recv.apply_peer_entry(&a, &manifest(7, &bodies[0]), &bodies[0])
+        .expect("apply the insert");
     let retraction = Retraction {
         seq: 7,
         cause: RetractCause::Abandoned,
@@ -1413,7 +1273,7 @@ async fn a_stored_body_that_is_no_captured_changeset_fails_the_retraction() {
 /// its rows back, and the same entry applies once the store takes writes.
 #[tokio::test]
 async fn a_failed_entry_write_rolls_the_apply_back() {
-    let bodies = captured(&[&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
+    let bodies = captured([&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
     let (mut recv, _) = receiver().await;
     recv.conn()
         .batch_execute(
@@ -1422,7 +1282,7 @@ async fn a_failed_entry_write_rolls_the_apply_back() {
         )
         .expect("refuse the entry write");
     let a = author("author-a", "peer-anna", Some("*"));
-    let row = manifest(7, Major::new(1).expect("major 1"), &bodies[0]);
+    let row = manifest(7, &bodies[0]);
     let err = recv
         .apply_peer_entry(&a, &row, &bodies[0])
         .expect_err("the entry cannot be stored");
@@ -1453,15 +1313,11 @@ async fn a_failed_entry_write_rolls_the_apply_back() {
 /// leaves the row, its provisional record and the entry as they were.
 #[tokio::test]
 async fn a_verdict_whose_entry_cannot_go_changes_nothing() {
-    let bodies = captured(&[&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
+    let bodies = captured([&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
-    recv.apply_peer_entry(
-        &a,
-        &manifest(7, Major::new(1).expect("major 1"), &bodies[0]),
-        &bodies[0],
-    )
-    .expect("apply the insert");
+    recv.apply_peer_entry(&a, &manifest(7, &bodies[0]), &bodies[0])
+        .expect("apply the insert");
     recv.conn()
         .batch_execute(
             "CREATE TEMP TRIGGER keep_entry BEFORE DELETE ON main._connetto_peer_entry \
@@ -1501,19 +1357,15 @@ async fn a_verdict_whose_entry_cannot_go_changes_nothing() {
 /// records and the entries as they were.
 #[tokio::test]
 async fn a_record_the_store_refuses_fails_the_apply_and_the_verdicts() {
-    let bodies = captured(&[
+    let bodies = captured([
         &|conn| insert_order(conn, 1, "peer-anna", "open"),
         &|conn| write_board(conn, 1, "anna's", true),
     ])
     .await;
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
-    recv.apply_peer_entry(
-        &a,
-        &manifest(7, Major::new(1).expect("major 1"), &bodies[0]),
-        &bodies[0],
-    )
-    .expect("apply the insert");
+    recv.apply_peer_entry(&a, &manifest(7, &bodies[0]), &bodies[0])
+        .expect("apply the insert");
     recv.conn()
         .batch_execute(
             "CREATE TEMP TRIGGER keep_records_in BEFORE INSERT ON main._connetto_provisional \
@@ -1525,11 +1377,7 @@ async fn a_record_the_store_refuses_fails_the_apply_and_the_verdicts() {
         )
         .expect("pin the records");
     let applied = recv
-        .apply_peer_entry(
-            &a,
-            &manifest(8, Major::new(1).expect("major 1"), &bodies[1]),
-            &bodies[1],
-        )
+        .apply_peer_entry(&a, &manifest(8, &bodies[1]), &bodies[1])
         .map(|_| ());
     let retracted = recv.retract_peer_entry(
         &a,
@@ -1568,7 +1416,7 @@ async fn a_record_the_store_refuses_fails_the_apply_and_the_verdicts() {
 /// ones it did not touch.
 #[tokio::test]
 async fn a_retraction_of_an_update_restores_the_changed_columns() {
-    let bodies = captured(&[
+    let bodies = captured([
         &|conn| insert_order(conn, 1, "peer-anna", "open"),
         &|conn| update_order(conn, 1, "peer-anna", "closed"),
     ])
@@ -1576,12 +1424,8 @@ async fn a_retraction_of_an_update_restores_the_changed_columns() {
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
     for (seq, body) in [(7, &bodies[0]), (8, &bodies[1])] {
-        recv.apply_peer_entry(
-            &a,
-            &manifest(seq, Major::new(1).expect("major 1"), body),
-            body,
-        )
-        .expect("apply the entry");
+        recv.apply_peer_entry(&a, &manifest(seq, body), body)
+            .expect("apply the entry");
     }
     assert_eq!(
         order_rows(&mut recv),
@@ -1610,24 +1454,20 @@ async fn a_retraction_of_an_update_restores_the_changed_columns() {
 /// one of an entry never stored, and the rows stay as they were.
 #[tokio::test]
 async fn unreadable_bookkeeping_fails_every_peer_step() {
-    let bodies = captured(&[
+    let bodies = captured([
         &|conn| insert_order(conn, 1, "peer-anna", "open"),
         &|conn| write_board(conn, 1, "anna's", true),
     ])
     .await;
     let (mut recv, _) = receiver().await;
     let a = author("author-a", "peer-anna", Some("*"));
-    recv.apply_peer_entry(
-        &a,
-        &manifest(7, Major::new(1).expect("major 1"), &bodies[0]),
-        &bodies[0],
-    )
-    .expect("apply the insert");
+    recv.apply_peer_entry(&a, &manifest(7, &bodies[0]), &bodies[0])
+        .expect("apply the insert");
     let retraction = Retraction {
         seq: 7,
         cause: RetractCause::Abandoned,
     };
-    let second = manifest(8, Major::new(1).expect("major 1"), &bodies[1]);
+    let second = manifest(8, &bodies[1]);
     for table in ["_connetto_peer_entry", "_connetto_provisional"] {
         recv.conn()
             .batch_execute(&format!("ALTER TABLE {table} RENAME TO _connetto_hidden"))
@@ -1661,6 +1501,169 @@ async fn unreadable_bookkeeping_fails_every_peer_step() {
     );
 }
 
+/// The replica's `pairs`, as `(a, b, label)` in `a` order.
+fn pair_rows<T>(conn: &mut ConnettoConnection<T>) -> Vec<(i64, i64, String)>
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    #[derive(diesel::QueryableByName)]
+    struct Pair {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        a: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        b: i64,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        label: String,
+    }
+    diesel::sql_query("SELECT a, b, label FROM pairs ORDER BY a")
+        .load::<Pair>(conn.conn())
+        .expect("read the pairs")
+        .into_iter()
+        .map(|pair| (pair.a, pair.b, pair.label))
+        .collect()
+}
+
+/// A key declared in another order than its columns is recorded in key
+/// order, so the typed read finds it, and the receiver's own unsent write on
+/// such a key still keeps its value.
+#[tokio::test]
+async fn a_key_declared_out_of_column_order_is_held_in_key_order() {
+    let bodies = captured([&|conn| {
+        conn.conn()
+            .batch_execute(
+                "INSERT INTO pairs (a, b, label) VALUES (1, 2, 'theirs'), (3, 4, 'theirs')",
+            )
+            .expect("insert the pairs");
+    }])
+    .await;
+    let (mut recv, _) = receiver().await;
+    recv.conn()
+        .batch_execute("INSERT INTO pairs (a, b, label) VALUES (1, 2, 'mine')")
+        .expect("the receiver's own write");
+    let a = author("author-a", "peer-anna", Some("*"));
+    let out = recv
+        .apply_peer_entry(&a, &manifest(7, &bodies[0]), &bodies[0])
+        .expect("apply the entry");
+    assert!(matches!(out, PeerApplyOutcome::Applied { .. }), "{out:?}");
+    assert_eq!(
+        pair_rows(&mut recv),
+        vec![(1, 2, "mine".to_owned()), (3, 4, "theirs".to_owned())]
+    );
+    let landed = recv
+        .provenance("pairs", &[KeyValue::Int(4), KeyValue::Int(3)])
+        .expect("read the provenance")
+        .expect("the landed row holds a record under its key order");
+    assert_eq!(landed.author, "author-a".as_bytes());
+    let held = recv
+        .provenance("pairs", &[KeyValue::Int(2), KeyValue::Int(1)])
+        .expect("read the provenance")
+        .expect("the held row holds a record under its key order");
+    assert_eq!(held.displaced_author, Some("author-a".as_bytes().to_vec()));
+}
+
+/// An entry with an op that names its row by no key is refused whole, the
+/// keyed ops beside it landing nothing either.
+#[tokio::test]
+async fn an_entry_with_an_unkeyed_op_is_refused_whole() {
+    let keyed = SimpleTable::new("orders", &[("id", ""), ("owner", ""), ("status", "")], &[0]);
+    let unkeyed = SimpleTable::new("boards", &[("id", ""), ("label", "")], &[]);
+    let body = ChangeSet::<SimpleTable, String, Vec<u8>>::new()
+        .insert(
+            Insert::from(keyed)
+                .set(0, Value::Integer(1))
+                .expect("id")
+                .set(1, Value::Text("peer-anna".to_owned()))
+                .expect("owner")
+                .set(2, Value::Text("open".to_owned()))
+                .expect("status"),
+        )
+        .insert(
+            Insert::from(unkeyed)
+                .set(0, Value::Integer(1))
+                .expect("id")
+                .set(1, Value::Text("anna's".to_owned()))
+                .expect("label"),
+        )
+        .build();
+    let (mut recv, _) = receiver().await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    let out = recv
+        .apply_peer_entry(&a, &manifest(7, &body), &body)
+        .expect("apply the entry");
+    assert_eq!(
+        out,
+        PeerApplyOutcome::Refused {
+            cause: PeerRefusal::Unkeyed,
+            rows: vec![("orders".to_owned(), vec![KeyValue::Int(1)])],
+        }
+    );
+    assert_eq!(order_rows(&mut recv), Vec::new());
+    assert_eq!(board_rows(&mut recv), Vec::new());
+    assert_eq!(stored_entries(&mut recv), Vec::new());
+}
+
+/// A retraction whose undo the store skips, as a guard may silently, fails
+/// whole, leaving the row, its record and the entry as they were and raising
+/// nothing, and the same retraction goes through once the store takes it.
+#[tokio::test]
+async fn a_refused_undo_fails_the_retraction_whole() {
+    let [body] = captured([&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
+    let (mut recv, _) = receiver().await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    recv.apply_peer_entry(&a, &manifest(7, &body), &body)
+        .expect("apply the insert");
+    let backing: String = diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(
+        "(SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'orders_%')",
+    ))
+    .get_result(recv.conn())
+    .expect("name the backing table");
+    recv.conn()
+        .batch_execute(&format!(
+            "CREATE TEMP TRIGGER keep_orders BEFORE DELETE ON main.{backing} \
+             BEGIN SELECT RAISE(IGNORE); END;"
+        ))
+        .expect("keep the order");
+    let retraction = Retraction {
+        seq: 7,
+        cause: RetractCause::Abandoned,
+    };
+    let err = recv
+        .retract_peer_entry(&a, &retraction)
+        .expect_err("the undo is refused");
+    assert!(
+        err.to_string().contains("refused putting back"),
+        "the failure names the refused undo: {err}"
+    );
+    assert_eq!(
+        order_rows(&mut recv),
+        vec![(1, "peer-anna".to_owned(), "open".to_owned())]
+    );
+    let rows = recv.provisional_rows().expect("read the records");
+    let record = provenance_of(&rows, "orders", &[KeyValue::Int(1)]).expect("the record");
+    assert_eq!(record.author, "author-a".as_bytes());
+    assert_eq!(record.state, ProvisionalState::Provisional);
+    assert_eq!(
+        stored_entries(&mut recv),
+        vec![("author-a".as_bytes().to_vec(), 7)]
+    );
+    let quiet = drain_quiet(&mut recv, Duration::from_millis(50)).await;
+    assert!(
+        !quiet
+            .iter()
+            .any(|event| matches!(event, ClientEvent::ProvisionalRetracted { .. })),
+        "a failed retraction raises nothing"
+    );
+
+    recv.conn()
+        .batch_execute("DROP TRIGGER keep_orders")
+        .expect("take the undo again");
+    recv.retract_peer_entry(&a, &retraction)
+        .expect("retract the insert");
+    assert_eq!(order_rows(&mut recv), Vec::new());
+    assert_eq!(stored_entries(&mut recv), Vec::new());
+}
+
 /// The ids of the replica's `shares` rows, comma separated, `None` when it
 /// holds none.
 fn share_ids<T>(conn: &mut ConnettoConnection<T>) -> Option<String>
@@ -1679,7 +1682,7 @@ where
 /// receiver's own key admits its writes again once the apply is over.
 #[tokio::test]
 async fn an_author_is_judged_without_the_receivers_share_keys() {
-    let bodies = captured(&[&|conn| {
+    let bodies = captured([&|conn| {
         conn.conn()
             .batch_execute("INSERT INTO shares (id, label) VALUES (1, 'key:a')")
             .expect("insert the share");
@@ -1688,11 +1691,7 @@ async fn an_author_is_judged_without_the_receivers_share_keys() {
     let (mut recv, _) = receiver_holding(Some(("grant-a", "key:a"))).await;
     let a = author("author-a", "peer-anna", Some("*"));
     let out = recv
-        .apply_peer_entry(
-            &a,
-            &manifest(7, Major::new(1).expect("major 1"), &bodies[0]),
-            &bodies[0],
-        )
+        .apply_peer_entry(&a, &manifest(7, &bodies[0]), &bodies[0])
         .expect("apply the entry");
     assert!(
         matches!(
@@ -1715,19 +1714,15 @@ async fn an_author_is_judged_without_the_receivers_share_keys() {
 /// re-apply and names the major.
 #[tokio::test]
 async fn a_stored_entry_under_no_expressible_major_fails_the_reapply() {
-    let bodies = captured(&[&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
+    let bodies = captured([&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
     let (mut recv, server) = receiver().await;
     recv.subscribe("a", "SELECT * FROM orders")
         .await
         .expect("subscribe");
     deliver_snapshot(&mut recv, &server, &[], 1).await;
     let a = author("author-a", "peer-anna", Some("*"));
-    recv.apply_peer_entry(
-        &a,
-        &manifest(7, Major::new(1).expect("major 1"), &bodies[0]),
-        &bodies[0],
-    )
-    .expect("apply the insert");
+    recv.apply_peer_entry(&a, &manifest(7, &bodies[0]), &bodies[0])
+        .expect("apply the insert");
     recv.conn()
         .batch_execute("UPDATE _connetto_peer_entry SET major = 0")
         .expect("store a major no build expresses");
