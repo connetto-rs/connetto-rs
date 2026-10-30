@@ -10,12 +10,13 @@
 //! nor while [`UNRECORDED_FUNCTION`] answers true, which keeps out a write
 //! the policy guards still judge, as a peer's entry applied as its author is.
 //! A table in the shared store gets the same triggers on each identity's own
-//! connection, which write that identity's outbox in `main` and spare the
-//! written key in the store's `_connetto_spare` in the same transaction, so
-//! another identity's pass keeps the row before it is pushed. An authorizer
-//! refuses any other `CREATE`, `ALTER` or `DROP` of an application table in
-//! `main` and every one in the shared store, which is what keeps the
-//! triggers in step with the tables.
+//! connection, which write that identity's outbox in `main` and hold the
+//! written row in the store's `_connetto_shared_holding` under the
+//! identity's unsent-write marker in the same transaction, so another
+//! identity's pass keeps the row before it is pushed. An authorizer refuses
+//! any other `CREATE`, `ALTER` or `DROP` of an application table in `main`
+//! and every one in the shared store, which is what keeps the triggers in
+//! step with the tables.
 //!
 //! Each row carries the old and new values as JSON objects keyed by column
 //! name, holding what a SQLite changeset holds. An insert carries the whole
@@ -139,6 +140,21 @@ fn recorded_tables(db: &mut SqliteConnection) -> Result<Vec<(String, Vec<Column>
     keyed_tables(db, "main", |_| true)
 }
 
+/// The names of the keyed application tables in `schema`.
+///
+/// # Errors
+///
+/// [`ClientError`] when the catalog cannot be read.
+pub(crate) fn keyed_table_names(
+    db: &mut SqliteConnection,
+    schema: &str,
+) -> Result<Vec<String>, ClientError> {
+    Ok(keyed_tables(db, schema, |_| true)?
+        .into_iter()
+        .map(|(table, _)| table)
+        .collect())
+}
+
 /// The tables of `shared` in the shared store the outbox records, each with
 /// its columns.
 ///
@@ -196,9 +212,10 @@ pub(crate) fn install(db: &mut SqliteConnection) -> Result<(), ClientError> {
 }
 
 /// Create the outbox triggers for every table of `shared` in the shared
-/// store, which also spare each written key under `identity`, on a
-/// connection that holds none. Only a `TEMP` trigger may write another
-/// schema, so each identity's connection records its own writes alone.
+/// store, which also hold each written row under `identity`'s unsent-write
+/// marker, on a connection that holds none. Only a `TEMP` trigger may write
+/// another schema, so each identity's connection records its own writes
+/// alone.
 ///
 /// # Errors
 ///
@@ -236,12 +253,11 @@ fn carried(column: &Column, columns: &[Column]) -> String {
 }
 
 /// The three `TEMP` triggers recording writes to `table` in `schema`, each
-/// also sparing the keys it touched under `spare`'s identity when given, and
-/// holding the row it wrote under that identity's unsent-write marker. The
-/// unqualified `_connetto_outbox` and `_connetto_outbox_blob` resolve to
-/// `main`, and `_connetto_spare` and `_connetto_shared_holding` to the shared
-/// store, the only schemas holding them.
-fn triggers(schema: &str, table: &str, columns: &[Column], spare: Option<&str>) -> String {
+/// also holding the row it wrote under `holder`'s unsent-write marker when
+/// given. The unqualified `_connetto_outbox` and `_connetto_outbox_blob`
+/// resolve to `main`, and `_connetto_shared_holding` to the shared store, the
+/// only schemas holding them.
+fn triggers(schema: &str, table: &str, columns: &[Column], holder: Option<&str>) -> String {
     let target = format!("{}.{}", quote_ident(schema), quote_ident(table));
     let literal = table.replace('\'', "''");
     let whole = |_: &Column| "1".to_owned();
@@ -270,28 +286,18 @@ fn triggers(schema: &str, table: &str, columns: &[Column], spare: Option<&str>) 
     .into_iter()
     .map(|(op, event, old, new)| {
         let name = trigger_name(op, table);
-        let mut spares = String::new();
-        if let Some(identity) = spare {
-            let identity = identity.replace('\'', "''");
-            let lowered = table.to_lowercase().replace('\'', "''");
-            for (row, _) in old.into_iter().chain(new) {
-                let _ = write!(
-                    spares,
-                    "INSERT OR IGNORE INTO _connetto_spare (identity, tbl, clause) \
-                     VALUES ('{identity}', '{lowered}', {}); ",
-                    key_clause(row, columns)
-                );
-            }
-            if let Some((row, _)) = new {
-                let _ = write!(
-                    spares,
-                    "INSERT OR IGNORE INTO _connetto_shared_holding \
-                     (identity, holder, tbl, key) \
-                     VALUES ('{identity}', '{}', '{lowered}', {}); ",
-                    crate::holdings::UNSENT_HOLDER,
-                    key_clause(row, columns)
-                );
-            }
+        let mut held = String::new();
+        if let (Some(identity), Some((row, _))) = (holder, new) {
+            let _ = write!(
+                held,
+                "INSERT OR IGNORE INTO _connetto_shared_holding \
+                 (identity, holder, tbl, key) \
+                 VALUES ('{}', '{}', '{}', {}); ",
+                identity.replace('\'', "''"),
+                crate::holdings::UNSENT_HOLDER,
+                table.to_lowercase().replace('\'', "''"),
+                key_clause(row, columns)
+            );
         }
         let mut blobs = String::new();
         for ((row, carry), side) in old.into_iter().zip(["o"]).chain(new.into_iter().zip(["n"])) {
@@ -319,7 +325,7 @@ fn triggers(schema: &str, table: &str, columns: &[Column], spare: Option<&str>) 
             "CREATE TEMP TRIGGER {name} AFTER {event} ON {target} \
              WHEN NOT {WRITE_EXEMPTION_FUNCTION}() AND NOT {UNRECORDED_FUNCTION}() BEGIN \
              INSERT INTO _connetto_outbox (tbl, op, old, new) \
-             VALUES ('{literal}', '{op}', {old}, {new}); {blobs}{spares}END; "
+             VALUES ('{literal}', '{op}', {old}, {new}); {blobs}{held}END; "
         )
     })
     .collect::<Vec<_>>()
@@ -333,8 +339,8 @@ pub(crate) fn key_columns(columns: &[Column]) -> Vec<&Column> {
     keyed
 }
 
-/// The SQL rendering `row`'s key as the clause `record_spare` writes and a
-/// holding names, `("a" IS 1 AND "b" IS 'x')`, each value through `quote()`.
+/// The SQL rendering `row`'s key as the clause a holding names and a pass
+/// keeps, `("a" IS 1 AND "b" IS 'x')`, each value through `quote()`.
 pub(crate) fn key_clause(row: &str, columns: &[Column]) -> String {
     let parts: Vec<String> = key_columns(columns)
         .into_iter()
@@ -718,7 +724,7 @@ fn decode_row(
 }
 
 /// The key clauses of every write the outbox holds, the old key and the new
-/// one alike, by lowercased table, in the form `record_spare` writes, so a
+/// one alike, by lowercased table, in the form [`key_clause`] writes, so a
 /// pass spares a row written but not yet pushed. A table of `shared` is read
 /// from the shared store's catalog.
 ///

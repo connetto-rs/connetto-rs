@@ -926,9 +926,10 @@ async fn deliver_snapshot(
     .await;
 }
 
-/// A full resync drops the peer rows and their records, and the re-apply at
-/// the replacement snapshot's end brings them back with provenance, ahead of
-/// the receiver's own unsent writes.
+/// A full resync keeps the rows while its replacement streams. At the
+/// replacement's end the pass takes what nothing holds, and the re-apply
+/// brings the peer entries back with provenance, ahead of the receiver's
+/// own unsent writes.
 #[tokio::test]
 async fn a_resync_reapplies_stored_entries_ahead_of_the_pending_writes() {
     let (mut recv, server) = receiver().await;
@@ -962,7 +963,7 @@ async fn a_resync_reapplies_stored_entries_ahead_of_the_pending_writes() {
         .expect("read the positions");
     assert_eq!(positions, vec![1, 2]);
 
-    // The resync clear takes the rows and the records.
+    // The rows stay on screen while the replacement streams.
     server.say(IncomingFrame::Control(ControlMessage::FullResyncRequired(
         FullResyncRequired {
             sub_id: "a".to_owned(),
@@ -973,10 +974,14 @@ async fn a_resync_reapplies_stored_entries_ahead_of_the_pending_writes() {
         matches!(event, ClientEvent::FullResync { .. })
     })
     .await;
-    assert_eq!(order_rows(&mut recv), Vec::new());
     assert_eq!(
-        recv.provisional_rows().expect("read the records"),
-        Vec::new()
+        order_rows(&mut recv),
+        vec![
+            (1, "peer-anna".to_owned(), "open".to_owned()),
+            (2, "r77".to_owned(), "mine".to_owned()),
+            (3, "peer-bob".to_owned(), "open".to_owned()),
+            (9, "r77".to_owned(), "kept".to_owned()),
+        ]
     );
 
     // The replacement snapshot, empty, then the re-apply at its end.

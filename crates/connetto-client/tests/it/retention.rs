@@ -1,7 +1,7 @@
 //! R15: local eviction, physical trimming, and their guards.
 //!
 //! Eviction is triggered here through the public `tidy` pass, which shares the
-//! complement-of-union delete and the trimming pass with the automatic
+//! unheld-row delete and the trimming pass with the automatic
 //! subscription-end pass, so these prove the eviction and trimming logic
 //! deterministically without driving the background pump.
 
@@ -599,7 +599,7 @@ async fn a_local_tier_row_survives_eviction_of_synced_rows() {
 /// pinning is the client contract that made the defect expensive and that
 /// remains correct for a genuinely filterless row subscription: `SELECT *`
 /// with no filter receives every insert, and `tidy` evicts none of them,
-/// because an absent filter is a claim on the whole table. The final raw
+/// because the subscription holds every row it was delivered. The final raw
 /// unsubscribe is the internal control proving it was precisely the
 /// subscription holding the rows, and the R60 step 4 proof that the raw API
 /// reclaims on its own.
@@ -611,9 +611,9 @@ async fn a_filterless_subscription_holds_the_whole_table_and_tidy_removes_nothin
         while let Ok(Some(frame)) = server.recv().await {
             if let IncomingFrame::Control(ControlMessage::Subscribe(sub)) = frame {
                 if sub.sub_id != "w" {
-                    // The control subscription gets an empty snapshot: its row
-                    // is already on the replica.
-                    send_snapshot(&mut server, &sub.sub_id, &[], 2).await;
+                    // The control subscription's snapshot delivers the one
+                    // row it reads.
+                    send_snapshot(&mut server, &sub.sub_id, &[(8, "x")], 2).await;
                     continue;
                 }
                 // The snapshot: the three rows the table holds at subscribe.
@@ -676,13 +676,13 @@ async fn a_filterless_subscription_holds_the_whole_table_and_tidy_removes_nothin
     assert_eq!(
         replica_ids(&mut conn).len(),
         23,
-        "tidy removed nothing: the absent filter marks the whole table untouchable",
+        "tidy removed nothing: the subscription holds every row it was delivered",
     );
 
     // The control, rewritten on the raw API (R60 step 4): keep one narrow
     // survivor on the table and raw-unsubscribe the filterless subscription.
     // The unsubscribe itself evicts what its subscription synced, sparing what
-    // the survivor covers, with no tidy in between.
+    // the survivor holds, with no tidy in between.
     conn.subscribe("w2", "SELECT * FROM orders WHERE id = 8")
         .await
         .expect("subscribe control");
@@ -691,7 +691,7 @@ async fn a_filterless_subscription_holds_the_whole_table_and_tidy_removes_nothin
     assert_eq!(
         replica_ids(&mut conn),
         vec![8],
-        "raw unsubscribe evicts 22 of 23 rows on its own, sparing the survivor's row, so it was the absent filter alone holding them",
+        "raw unsubscribe evicts 22 of 23 rows on its own, sparing the survivor's row, so it was the filterless subscription alone holding them",
     );
 }
 

@@ -81,15 +81,16 @@ pub(super) fn held(entries: &[(&str, &str, &[i64])]) -> BTreeSet<Holding> {
         .collect()
 }
 
-/// Make the replica refuse `op` on `_connetto_holding`, as a full disk would.
-fn refuse_holdings<T>(conn: &mut ConnettoConnection<T>, op: &str)
+/// Make the replica refuse `op` on the main table `table`, as a full disk
+/// would.
+fn refuse<T>(conn: &mut ConnettoConnection<T>, op: &str, table: &str)
 where
     T: Transport,
     T::Error: core::fmt::Display,
 {
     conn.conn()
         .batch_execute(&format!(
-            "CREATE TEMP TRIGGER refuse_{op} BEFORE {op} ON main._connetto_holding \
+            "CREATE TEMP TRIGGER refuse_{op}_{table} BEFORE {op} ON main.{table} \
              BEGIN SELECT RAISE(ABORT, 'the replica refuses'); END"
         ))
         .expect("install the refusal");
@@ -446,7 +447,7 @@ async fn a_frame_applied_twice_leaves_the_holdings_of_one() {
 async fn a_frame_whose_holdings_cannot_be_written_applies_nothing() {
     let mut s = Session::connected().await;
     s.holding("a", ORDERS, "orders", &[1]).await;
-    refuse_holdings(&mut s.conn, "INSERT");
+    refuse(&mut s.conn, "INSERT", "_connetto_holding");
     let cursor = s.next_cursor();
     s.server
         .send_bulk(BulkMessage::LivePatch(LivePatch::new(
@@ -472,7 +473,7 @@ async fn a_frame_whose_holdings_cannot_be_written_applies_nothing() {
 async fn an_unsubscribe_whose_holdings_cannot_be_released_keeps_the_subscription() {
     let mut s = Session::connected().await;
     s.holding("a", ORDERS, "orders", &[1]).await;
-    refuse_holdings(&mut s.conn, "DELETE");
+    refuse(&mut s.conn, "DELETE", "_connetto_holding");
     s.conn
         .unsubscribe("a")
         .await
@@ -825,6 +826,256 @@ async fn local_writes_and_their_answers_leave_the_holdings_alone() {
         held(&[("a", "orders", &[1, 3, 9])]),
         "the echo holds the inserted row and releases the one deleted locally"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_departure_takes_a_row_only_once_no_holding_keeps_it() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1, 2]).await;
+    s.holding("b", ORDERS, "orders", &[1]).await;
+    s.live(
+        "a",
+        Patch::default().depart("orders", 1).depart("orders", 2),
+    )
+    .await;
+    assert_eq!(
+        order_ids(&mut s.conn),
+        vec![1],
+        "b still holds row 1, nothing holds row 2"
+    );
+    s.live("b", Patch::default().depart("orders", 1)).await;
+    assert!(order_ids(&mut s.conn).is_empty(), "the last holding went");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_departure_spares_an_unsent_write() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1]).await;
+    diesel::update(orders::table.find(1))
+        .set(orders::quantity.eq(9))
+        .execute(s.conn.conn())
+        .expect("a local write");
+    s.live("a", Patch::default().depart("orders", 1)).await;
+    assert_eq!(
+        order_ids(&mut s.conn),
+        vec![1],
+        "the row waits for its write's answer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tidy_takes_a_row_no_frame_delivered_to_a_live_subscription() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1]).await;
+    s.live("ended", Patch::default().insert("orders", 2)).await;
+    s.conn.tidy().expect("tidy");
+    assert_eq!(
+        order_ids(&mut s.conn),
+        vec![1],
+        "row 2 matches a's filter, but no frame addressed to a delivered it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tidy_takes_an_acknowledged_write_to_a_table_no_subscription_reads() {
+    let mut s = Session::connected().await;
+    diesel::insert_into(orders::table)
+        .values((orders::id.eq(7), orders::quantity.eq(1)))
+        .execute(s.conn.conn())
+        .expect("a local write");
+    s.conn.tidy().expect("tidy while unsent");
+    assert_eq!(order_ids(&mut s.conn), vec![7], "the outbox keeps it");
+    let seq = s.conn.push().await.expect("push").expect("a write");
+    s.conn.tidy().expect("tidy while queued");
+    assert_eq!(order_ids(&mut s.conn), vec![7], "the queue keeps it");
+    s.control(
+        ControlMessage::MutationApplied(MutationApplied { client_seq: seq }),
+        "the acknowledgement",
+        |event| matches!(event, ClientEvent::MutationApplied { .. }),
+    )
+    .await;
+    s.conn.tidy().expect("tidy once answered");
+    assert!(
+        order_ids(&mut s.conn).is_empty(),
+        "nothing holds an answered write no subscription reads (O8, B3)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resync_keeps_its_rows_until_its_replacement_ends() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1, 2]).await;
+    s.resync("a", FullResyncReason::CursorOutsideRetention)
+        .await;
+    assert_eq!(
+        order_ids(&mut s.conn),
+        vec![1, 2],
+        "the rows stay on screen while the replacement streams"
+    );
+    s.snapshot("a", vec![inserts("orders", &[2])]).await;
+    assert_eq!(
+        order_ids(&mut s.conn),
+        vec![2],
+        "what the replacement did not bring back goes at its end"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resync_takes_an_answered_write_its_replacement_did_not_bring() {
+    let compound = "SELECT * FROM orders WHERE id = 1 UNION SELECT * FROM orders WHERE id = 2";
+    for query in [ORDERS, compound] {
+        let mut s = Session::connected().await;
+        s.holding("a", ORDERS, "orders", &[1]).await;
+        s.holding("b", query, "orders", &[]).await;
+        diesel::insert_into(orders::table)
+            .values((orders::id.eq(7), orders::quantity.eq(1)))
+            .execute(s.conn.conn())
+            .expect("a local write");
+        let seq = s.conn.push().await.expect("push").expect("a write");
+        s.control(
+            ControlMessage::MutationApplied(MutationApplied { client_seq: seq }),
+            "the acknowledgement",
+            |event| matches!(event, ClientEvent::MutationApplied { .. }),
+        )
+        .await;
+        s.resync("b", FullResyncReason::AuthorizationChange).await;
+        s.snapshot("b", Vec::new()).await;
+        assert_eq!(
+            order_ids(&mut s.conn),
+            vec![1],
+            "{query}: the replacement is the server's whole answer for orders, \
+             so the answered write no holding names goes and a's row stays"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_truncate_of_a_table_the_replica_lacks_takes_nothing() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1]).await;
+    s.holding("b", ORDERS, "orders", &[]).await;
+    s.resync(
+        "b",
+        FullResyncReason::TableTruncated {
+            table: "server_only".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(order_ids(&mut s.conn), vec![1]);
+    assert_eq!(holdings(&mut s.conn), held(&[("a", "orders", &[1])]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_truncate_whose_holdings_cannot_be_released_keeps_them() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1]).await;
+    s.holding("b", ORDERS, "orders", &[]).await;
+    refuse(&mut s.conn, "DELETE", "_connetto_holding");
+    s.server
+        .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
+            sub_id: "b".to_owned(),
+            reason: FullResyncReason::TableTruncated {
+                table: "orders".to_owned(),
+            },
+        }))
+        .await
+        .expect("send the notice");
+    s.conn
+        .pump_one()
+        .await
+        .expect_err("the replica refuses a's release");
+    assert_eq!(holdings(&mut s.conn), held(&[("a", "orders", &[1])]));
+    assert_eq!(order_ids(&mut s.conn), vec![1]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resync_whose_holdings_cannot_be_released_keeps_them() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1]).await;
+    refuse(&mut s.conn, "DELETE", "_connetto_holding");
+    s.server
+        .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
+            sub_id: "a".to_owned(),
+            reason: FullResyncReason::AuthorizationChange,
+        }))
+        .await
+        .expect("send the notice");
+    s.conn
+        .pump_one()
+        .await
+        .expect_err("the replica refuses the release");
+    assert_eq!(holdings(&mut s.conn), held(&[("a", "orders", &[1])]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_truncate_whose_rows_cannot_go_fails_and_keeps_them() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1]).await;
+    refuse(&mut s.conn, "DELETE", "orders");
+    s.server
+        .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
+            sub_id: "a".to_owned(),
+            reason: FullResyncReason::TableTruncated {
+                table: "orders".to_owned(),
+            },
+        }))
+        .await
+        .expect("send the notice");
+    s.conn
+        .pump_one()
+        .await
+        .expect_err("the replica refuses the delete");
+    assert_eq!(order_ids(&mut s.conn), vec![1]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replacement_whose_pass_cannot_delete_fails_its_end() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1, 2]).await;
+    s.resync("a", FullResyncReason::CursorOutsideRetention)
+        .await;
+    s.control(
+        ControlMessage::SnapshotBegin(SnapshotBegin {
+            sub_id: "a".to_owned(),
+            priority: SubscriptionPriority::default(),
+        }),
+        "the replacement's begin",
+        |event| matches!(event, ClientEvent::SnapshotBegin { .. }),
+    )
+    .await;
+    refuse(&mut s.conn, "DELETE", "orders");
+    let cursor = s.next_cursor();
+    s.server
+        .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
+            sub_id: "a".to_owned(),
+            cursor,
+        }))
+        .await
+        .expect("send the end");
+    s.conn
+        .pump_one()
+        .await
+        .expect_err("the replica refuses the pass");
+    assert_eq!(order_ids(&mut s.conn), vec![1, 2]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_whose_pass_cannot_delete_fails() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1]).await;
+    let mut conn = s.offline().await;
+    conn.unsubscribe("a").await.expect("offline unsubscribe");
+    refuse(&mut conn, "DELETE", "orders");
+    let (mut server, client_end) = loopback();
+    let acked = tokio::spawn(async move {
+        ack_handshake(&mut server).await;
+        server
+    });
+    conn.attach(client_end)
+        .await
+        .expect_err("the replica refuses the pass the ended record owes");
+    drop(acked.await.expect("the handshake task"));
+    assert_eq!(order_ids(&mut conn), vec![1]);
 }
 
 /// A durable replica reopened at a newer major (R31), which needs a key store.

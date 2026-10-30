@@ -80,10 +80,11 @@ async fn only_a_committed_application_write_is_recorded() {
     assert_eq!(
         count(
             &mut alice,
-            "SELECT count(*) FROM connetto_shared._connetto_spare"
+            "SELECT count(*) FROM connetto_shared._connetto_shared_holding \
+             WHERE holder = 'connetto-unsent'"
         ),
         0,
-        "nor spared in the store"
+        "nor held as unsent in the store"
     );
     alice
         .conn()
@@ -97,10 +98,11 @@ async fn only_a_committed_application_write_is_recorded() {
     assert_eq!(
         count(
             &mut alice,
-            "SELECT count(*) FROM connetto_shared._connetto_spare"
+            "SELECT count(*) FROM connetto_shared._connetto_shared_holding \
+             WHERE holder = 'connetto-unsent'"
         ),
         1,
-        "and spared"
+        "and held as unsent"
     );
 }
 

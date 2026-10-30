@@ -417,3 +417,57 @@ async fn a_departure_whose_holdings_cannot_be_released_keeps_the_identity() {
         "the identity leaves with its holdings or not at all"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_store_stays_while_a_signed_in_identity_holds_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut alice = identity(directory.path(), &keys, "alice").await;
+    let bob = identity(directory.path(), &keys, "bob").await;
+    assert!(
+        store(&mut alice.conn).is_empty(),
+        "neither identity holds a row"
+    );
+    assert_eq!(
+        alice.conn.leave_shared_store(false).unwrap(),
+        connetto_client::SharedDeparture::Kept,
+        "bob is signed in, so the store is not alice's to remove (O9)"
+    );
+    let mut bob = bob.conn;
+    assert_eq!(
+        bob.leave_shared_store(false).unwrap(),
+        connetto_client::SharedDeparture::LastOut
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tidy_takes_a_shared_row_only_once_no_identity_holds_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = SharedKeys::default();
+    let mut alice = identity(directory.path(), &keys, "alice").await;
+    let mut bob = identity(directory.path(), &keys, "bob").await;
+    alice.holding("a", TAGS, "tags", &[1]).await;
+    bob.holding("b", TAGS, "tags", &[2]).await;
+    write(&mut bob.conn, "INSERT INTO tags VALUES (3, 'unsent')");
+    alice
+        .live("ended", Patch::default().insert("tags", 4))
+        .await;
+    alice.conn.tidy().unwrap();
+    let ids: Vec<i64> = diesel::sql_query("SELECT id FROM tags ORDER BY id")
+        .load::<Id>(alice.conn.conn())
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(
+        ids,
+        [1, 2, 3],
+        "bob's held row and his unsent row stay, the unheld row 4 goes"
+    );
+}
+
+#[derive(QueryableByName)]
+struct Id {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
+}

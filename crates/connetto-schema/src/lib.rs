@@ -35,8 +35,7 @@
 //! the current export is missing or stale, the gate a CI run adds to keep a
 //! history fresh.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::ops::ControlFlow;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use connetto_core::bots::BotRegistryIdSql;
@@ -57,9 +56,8 @@ use pg2sqlite::manifest::WrapperKind;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use pg2sqlite::script::{FreshFiles, Script};
 use sqlparser::ast::{
-    AlterTable, AlterTableOperation, ColumnDef, ColumnOption, CreateTable, CreateView, Expr,
-    Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart, Statement,
-    TableConstraint, Value, ValueWithSpan, visit_expressions, visit_relations,
+    AlterTable, AlterTableOperation, ColumnDef, ColumnOption, CreateTable, CreateView,
+    ObjectNamePart, Statement, TableConstraint,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -219,16 +217,6 @@ pub enum SchemaError {
         /// The listed name.
         table: String,
     },
-    /// A listed table's rows differ by caller, so one copy cannot serve every
-    /// account on a device.
-    #[error("`{table}` cannot be shared, because its policy `{policy}` reads the caller")]
-    SharedTableReadsCaller {
-        /// The listed table.
-        table: String,
-        /// The policy on it that reads the caller, directly or through a
-        /// table it reads.
-        policy: String,
-    },
     /// The schema source does not declare a usable major.
     #[error("the schema source does not declare a usable major: {0}")]
     Major(#[from] connetto_core::MajorError),
@@ -329,27 +317,22 @@ pub fn with_registry<Id: BotRegistryIdSql>(schema_sql: &str) -> String {
 /// The listed tables, as the schema declares them, that a device may store
 /// once for every account.
 ///
-/// A table qualifies only when every caller reads the same rows of it, since
-/// a withdrawal reaches its caller as a plain delete and would take a row out
-/// of the one copy another account still reads. A deployment policy reading
-/// any session setting but the bot list reads the caller, and so does one
-/// reading a table whose own policy does, because Postgres applies that
-/// table's policy inside the subquery.
+/// Any declared table qualifies, a caller-dependent one included: each
+/// identity holds the rows it was served, so a withdrawal releases only that
+/// identity's holding and the row stays while another identity holds it
+/// (R11 B4).
 ///
 /// # Errors
 ///
 /// [`SchemaError::SharedTableUndeclared`] for a name the synced schema does
-/// not declare, [`SchemaError::SharedTableReadsCaller`] for a table whose
-/// rows differ by caller, and [`SchemaError::Translate`] when a document does
-/// not parse.
+/// not declare, and [`SchemaError::Translate`] when the schema does not
+/// parse.
 pub fn shared_tables<Id: BotRegistryIdSql>(
     schema_sql: &str,
-    policies_sql: &str,
     tables: &[&str],
 ) -> Result<Vec<String>, SchemaError> {
     let schema_sql = with_registry::<Id>(schema_sql);
     let declared = schema_tables(&schema_sql)?;
-    let mut per_caller = per_caller_tables(&[&schema_sql, policies_sql])?;
     let mut shared: Vec<String> = Vec::new();
     for listed in tables {
         let table = declared
@@ -358,98 +341,11 @@ pub fn shared_tables<Id: BotRegistryIdSql>(
             .ok_or_else(|| SchemaError::SharedTableUndeclared {
                 table: (*listed).to_owned(),
             })?;
-        if let Some(policy) = per_caller.remove(&table.to_lowercase()) {
-            return Err(SchemaError::SharedTableReadsCaller {
-                table: table.clone(),
-                policy,
-            });
-        }
         if !shared.contains(table) {
             shared.push(table.clone());
         }
     }
     Ok(shared)
-}
-
-/// Every table whose rows differ by caller, lowercased, mapped to the policy
-/// that makes them differ.
-fn per_caller_tables(documents: &[&str]) -> Result<BTreeMap<String, String>, SchemaError> {
-    /// What one policy reads.
-    struct Reads {
-        table: String,
-        policy: String,
-        caller: bool,
-        tables: BTreeSet<String>,
-    }
-    let mut policies = Vec::new();
-    for document in documents {
-        for statement in parse(document, "a source document")? {
-            let Statement::CreatePolicy(policy) = statement else {
-                continue;
-            };
-            let Some(table) = table_name(&policy.table_name) else {
-                continue;
-            };
-            let mut reads = Reads {
-                table: table.to_lowercase(),
-                policy: policy.name.value,
-                caller: false,
-                tables: BTreeSet::new(),
-            };
-            for expr in policy.using.iter().chain(&policy.with_check) {
-                reads.caller |= reads_caller(expr);
-                let _ = visit_relations(expr, |relation| {
-                    if let Some(name) = table_name(relation) {
-                        reads.tables.insert(name.to_lowercase());
-                    }
-                    ControlFlow::<()>::Continue(())
-                });
-            }
-            policies.push(reads);
-        }
-    }
-    let mut per_caller = BTreeMap::new();
-    loop {
-        let known = per_caller.len();
-        for reads in &policies {
-            if !per_caller.contains_key(&reads.table)
-                && (reads.caller || reads.tables.iter().any(|t| per_caller.contains_key(t)))
-            {
-                per_caller.insert(reads.table.clone(), reads.policy.clone());
-            }
-        }
-        if per_caller.len() == known {
-            return Ok(per_caller);
-        }
-    }
-}
-
-/// Whether `expr` reads a session setting other than the bot list, which is
-/// how a policy reads the caller's identity or the keys it holds.
-fn reads_caller(expr: &Expr) -> bool {
-    visit_expressions(expr, |expr| match expr {
-        Expr::Function(function) if reads_a_caller_setting(function) => ControlFlow::Break(()),
-        _ => ControlFlow::Continue(()),
-    })
-    .is_break()
-}
-
-/// Whether `function` is `current_setting` over anything but the bot list.
-fn reads_a_caller_setting(function: &Function) -> bool {
-    if !table_name(&function.name).is_some_and(|name| name.eq_ignore_ascii_case("current_setting"))
-    {
-        return false;
-    }
-    let FunctionArguments::List(list) = &function.args else {
-        return true;
-    };
-    !matches!(
-        list.args.first(),
-        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(setting),
-            ..
-        })))) if setting == BOT_LIST_SETTING
-    )
 }
 
 /// Translate the two Postgres source documents with connetto's fixed options
@@ -491,14 +387,14 @@ pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
 ///
 /// # Errors
 ///
-/// As [`translate`], plus [`SchemaError::SharedTableUndeclared`] and
-/// [`SchemaError::SharedTableReadsCaller`] when the list is refused.
+/// As [`translate`], plus [`SchemaError::SharedTableUndeclared`] when the
+/// list names a table the schema does not declare.
 pub fn translate_shared<K: CapabilityKey, Id: BotRegistryIdSql>(
     schema_sql: &str,
     policies_sql: &str,
     shared: &[&str],
 ) -> Result<SchemaBundle, SchemaError> {
-    let shared = shared_tables::<Id>(schema_sql, policies_sql, shared)?;
+    let shared = shared_tables::<Id>(schema_sql, shared)?;
     translated::<K, Id>(schema_sql, policies_sql, &shared)
 }
 
@@ -1585,48 +1481,30 @@ mod tests {
     }
 
     fn shared(tables: &[&str]) -> Result<Vec<String>, SchemaError> {
-        shared_tables::<connetto_core::bots::TextIds>(SHARING_SCHEMA, &sharing_policies(), tables)
+        shared_tables::<connetto_core::bots::TextIds>(SHARING_SCHEMA, tables)
     }
 
-    /// A table every caller reads in full is shareable, whether it carries no
-    /// policy of its own or one naming neither the caller nor its keys.
+    /// A listed table comes back as the schema spells it, once.
     #[test]
-    fn caller_independent_tables_are_shareable() {
+    fn listed_tables_come_back_as_declared() {
         assert_eq!(
-            shared(&["Words", "posts"]).expect("both are shareable"),
+            shared(&["Words", "posts", "WORDS"]).expect("both are shareable"),
             ["words", "posts"]
         );
     }
 
-    /// A policy reading the caller makes the table's rows differ by account.
+    /// A table whose rows differ by caller, through its own policy, the keys
+    /// the caller holds or a per-caller table its policy reads, is shared too
+    /// (R11 B4), and translates with its policies.
     #[test]
-    fn a_table_whose_policy_reads_the_caller_is_refused() {
-        assert!(matches!(
-            shared(&["words", "notes"]),
-            Err(SchemaError::SharedTableReadsCaller { table, policy })
-                if table == "notes" && policy == "notes_p"
-        ));
-    }
-
-    /// A policy reading the keys the caller holds is refused the same way.
-    #[test]
-    fn a_table_whose_policy_reads_the_keys_is_refused() {
-        assert!(matches!(
-            shared(&["papers"]),
-            Err(SchemaError::SharedTableReadsCaller { table, policy })
-                if table == "papers" && policy == "papers_p"
-        ));
-    }
-
-    /// Postgres applies the read table's own policy inside a policy's
-    /// subquery, so reading a per-caller table makes this one per-caller too.
-    #[test]
-    fn a_table_whose_policy_reads_a_per_caller_table_is_refused() {
-        assert!(matches!(
-            shared(&["tags"]),
-            Err(SchemaError::SharedTableReadsCaller { table, policy })
-                if table == "tags" && policy == "tags_p"
-        ));
+    fn a_caller_dependent_table_is_shareable() {
+        let bundle = translate_shared::<String, connetto_core::bots::TextIds>(
+            &format!("-- connetto:major 1\n{SHARING_SCHEMA}"),
+            &sharing_policies(),
+            &["notes", "papers", "tags"],
+        )
+        .expect("every caller-dependent table translates shared");
+        assert_eq!(bundle.shared_tables(), ["notes", "papers", "tags"]);
     }
 
     /// A name the synced schema does not declare is refused rather than

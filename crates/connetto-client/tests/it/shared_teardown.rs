@@ -294,7 +294,7 @@ async fn a_start_finishing_the_last_identitys_pending_wipe_removes_the_store() {
 /// the shared store as the part that failed.
 #[tokio::test]
 async fn a_pending_wipe_whose_departure_fails_refuses_the_start() {
-    for broken in ["key", "file", "tags_rls", "_connetto_spare"] {
+    for broken in ["key", "file", "tags_rls", "_connetto_shared_holding"] {
         let directory = tempfile::tempdir().unwrap();
         let keys = super::support::SharedKeys::default();
         let record = shared_store_name(REPLICA_PREFIX);
@@ -453,7 +453,7 @@ fn refuse_deletes(db: &mut diesel::SqliteConnection, table: &str) {
 /// the unsent write it would have undone included.
 #[tokio::test]
 async fn a_departure_the_store_refuses_leaves_the_store_as_it_was() {
-    let tables = ["tags_rls", "_connetto_interest", "_connetto_spare"];
+    let tables = ["tags_rls", "_connetto_identity", "_connetto_shared_holding"];
     for refused in tables {
         let directory = tempfile::tempdir().unwrap();
         let keys = super::support::SharedKeys::default();
@@ -498,7 +498,7 @@ async fn a_forget_whose_departure_fails_still_wipes_the_replica() {
     let replica = super::support::held("bob").replica_name().to_owned();
     alice
         .conn()
-        .batch_execute("DROP TABLE connetto_shared._connetto_spare")
+        .batch_execute("DROP TABLE connetto_shared._connetto_shared_holding")
         .unwrap();
 
     let Err(ForgetError::Incomplete(report)) = bob.forget_device(false).await else {

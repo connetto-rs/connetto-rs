@@ -19,6 +19,10 @@ use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT);";
+/// A subscription id no record names, as a frame still in flight past its
+/// unsubscribe carries, so the rows it delivers apply and nothing holds them:
+/// the residual accumulation a pass reclaims.
+const ENDED: &str = "ended";
 
 diesel::table! {
     /// The one synced table these tests accumulate into and evict from.
@@ -70,7 +74,8 @@ async fn ack_handshake(server: &mut LoopbackTransport) {
 }
 
 /// A server that answers the one subscription with a one-row snapshot, then
-/// streams `extra` single-row live patches (rows 2 onward) and stays up.
+/// streams `extra` single-row live patches (rows 2 onward) addressed to an
+/// ended subscription, and stays up.
 fn accumulating_server(extra: u8) -> LoopbackTransport {
     let (mut server, client_end) = loopback();
     tokio::spawn(async move {
@@ -102,7 +107,7 @@ fn accumulating_server(extra: u8) -> LoopbackTransport {
                     for id in 0..extra {
                         server
                             .send_bulk(BulkMessage::LivePatch(LivePatch::new(
-                                sub.sub_id.clone(),
+                                ENDED.to_owned(),
                                 Cursor::new(vec![0, 0, 0, 0, 0, 0, 2, id]),
                                 payload(&[i64::from(id) + 2]),
                             )))
@@ -153,7 +158,7 @@ where
 }
 
 /// The default: the counter crosses, the event fires, the pass has already
-/// run and reset the measure, and the uncovered accumulation is gone.
+/// run and reset the measure, and the unheld accumulation is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_automatic_pass_runs_at_the_crossing_and_resets_the_measure() {
     let server = accumulating_server(12);
@@ -166,8 +171,8 @@ async fn the_automatic_pass_runs_at_the_crossing_and_resets_the_measure() {
     .connect_driven()
     .await
     .expect("connect");
-    // A narrow filter: only row 1 is covered, so everything the live stream
-    // delivers past it is residual accumulation the pass may reclaim.
+    // Only row 1 reaches this subscription, so everything the live stream
+    // delivers past it is held by nothing and the pass may reclaim it.
     conn.subscribe("w", "SELECT * FROM orders WHERE id = 1")
         .await
         .expect("subscribe");
@@ -180,7 +185,7 @@ async fn the_automatic_pass_runs_at_the_crossing_and_resets_the_measure() {
     assert_eq!(
         replica_ids(&mut conn),
         vec![1],
-        "the pass already ran: every row the narrow filter does not cover is gone",
+        "the pass already ran: every row no subscription holds is gone",
     );
     let pressure = conn.residual_pressure().expect("pressure");
     assert!(
@@ -254,7 +259,7 @@ async fn a_manual_application_sees_the_event_and_the_default_pass_stays_silent()
     assert_eq!(
         replica_ids(&mut conn),
         vec![1],
-        "the application's tidy reclaims what the filter does not cover",
+        "the application's tidy reclaims what no subscription holds",
     );
     let pressure = conn.residual_pressure().expect("pressure");
     assert!(
@@ -508,14 +513,15 @@ async fn failed_apply_leaves_no_phantom_counts() {
 }
 
 /// DDL whose orders table refuses deletes: the eviction inside an automatic
-/// pass fails on the first uncovered row, the seam for proving what a failed
+/// pass fails on the first unheld row, the seam for proving what a failed
 /// pass emits.
 const ABORT_DELETE_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT); \
     CREATE TRIGGER refuse_delete BEFORE DELETE ON orders \
     BEGIN SELECT RAISE(ABORT, 'deletes refused'); END;";
 
 /// Server for the failed-pass test: a one-row snapshot for the narrow filter,
-/// then two single-row live patches outside it, then pong echoes.
+/// then two single-row live patches addressed to an ended subscription, then
+/// pong echoes.
 fn failing_pass_server() -> LoopbackTransport {
     let (mut server, client_end) = loopback();
     tokio::spawn(async move {
@@ -547,7 +553,7 @@ fn failing_pass_server() -> LoopbackTransport {
                     for id in [2_i64, 3] {
                         server
                             .send_bulk(BulkMessage::LivePatch(LivePatch::new(
-                                sub.sub_id.clone(),
+                                ENDED.to_owned(),
                                 Cursor::new(vec![
                                     0,
                                     0,
@@ -582,7 +588,7 @@ fn failing_pass_server() -> LoopbackTransport {
 /// A failed automatic pass queues no `TidyDue` and re-arms, so the event
 /// never claims a pass that did not happen and the next apply retries.
 ///
-/// The narrow filter covers row 1 alone, so rows 2 and 3 are residual. At the
+/// The subscription holds row 1 alone, so rows 2 and 3 are residual. At the
 /// crossing the automatic `tidy` hits the delete-refusing trigger and fails,
 /// which must surface as the pump error and emit nothing. Dropping the
 /// trigger lets the retry at the next applied row succeed, and only then does
@@ -638,7 +644,7 @@ async fn a_failed_automatic_pass_emits_nothing_and_retries() {
     assert_eq!(
         replica_ids(&mut conn),
         vec![1],
-        "the retried pass evicted both uncovered rows",
+        "the retried pass evicted both unheld rows",
     );
     let pressure = conn.residual_pressure().expect("pressure");
     assert!(
