@@ -4231,6 +4231,7 @@ fn install_storage_layout(
     if let Some(layout) = &config.shared_layout {
         db.batch_execute(layout.sql(fresh_main, fresh_shared))?;
         db.batch_execute(interest::INTEREST_DDL)?;
+        db.batch_execute(holdings::SHARED_HOLDING_DDL)?;
         check_recorded_tables(db, SHARED_SCHEMA, &config.unrecorded_tables)?;
     } else if fresh_main {
         let (Boot::Fresh(ddl) | Boot::Existing(ddl)) = boot;
@@ -5744,6 +5745,7 @@ where
                         outbox::spare_clauses(db, &config.shared_tables)?,
                     );
                     interest::record_spare(db, config, &spare)?;
+                    holdings::rewrite_unsent(db, config, &spare)?;
                 }
                 Ok(())
             })?;
@@ -7501,7 +7503,7 @@ where
         self.db.transaction(|db| {
             let changed = change(db)?;
             interest::record(db, config)?;
-            holdings::prune(db)?;
+            holdings::prune(db, config)?;
             Ok(changed)
         })
     }
@@ -8606,13 +8608,14 @@ where
         };
         {
             let _suspended = ExemptWrites::raise(&self.write_flags);
+            let config = &self.config;
             self.db.transaction(|db| {
                 if every_holding {
-                    return holdings::release_all(db);
+                    return holdings::release_all(db, config);
                 }
-                holdings::release_holder(db, sub_id)?;
+                holdings::release_holder(db, config, sub_id)?;
                 match &truncated {
-                    Some(table) => holdings::release_table(db, table),
+                    Some(table) => holdings::release_table(db, config, table),
                     None => Ok(()),
                 }
             })?;
@@ -8833,14 +8836,19 @@ where
     }
 
     /// Rewrite the shared rows this identity's unacknowledged writes touched,
-    /// so another identity's pass spares them.
+    /// so another identity's pass spares them, and the holdings those writes
+    /// keep in the shared store.
     fn record_spare(&mut self) -> Result<(), ClientError> {
         if self.config.shared_tables.is_empty() {
             return Ok(());
         }
         let spare = self.pending_spare()?;
         let _suspended = ExemptWrites::raise(&self.write_flags);
-        interest::record_spare(&mut self.db, &self.config, &spare)
+        let config = &self.config;
+        self.db.transaction(|db| {
+            interest::record_spare(db, config, &spare)?;
+            holdings::rewrite_unsent(db, config, &spare)
+        })
     }
 
     /// Take this identity out of the shared store before its replica is

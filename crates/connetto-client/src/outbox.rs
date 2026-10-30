@@ -236,10 +236,11 @@ fn carried(column: &Column, columns: &[Column]) -> String {
 }
 
 /// The three `TEMP` triggers recording writes to `table` in `schema`, each
-/// also sparing the keys it touched under `spare`'s identity when given. The
+/// also sparing the keys it touched under `spare`'s identity when given, and
+/// holding the row it wrote under that identity's unsent-write marker. The
 /// unqualified `_connetto_outbox` and `_connetto_outbox_blob` resolve to
-/// `main` and `_connetto_spare` to the shared store, the only schemas holding
-/// them.
+/// `main`, and `_connetto_spare` and `_connetto_shared_holding` to the shared
+/// store, the only schemas holding them.
 fn triggers(schema: &str, table: &str, columns: &[Column], spare: Option<&str>) -> String {
     let target = format!("{}.{}", quote_ident(schema), quote_ident(table));
     let literal = table.replace('\'', "''");
@@ -278,6 +279,16 @@ fn triggers(schema: &str, table: &str, columns: &[Column], spare: Option<&str>) 
                     spares,
                     "INSERT OR IGNORE INTO _connetto_spare (identity, tbl, clause) \
                      VALUES ('{identity}', '{lowered}', {}); ",
+                    key_clause(row, columns)
+                );
+            }
+            if let Some((row, _)) = new {
+                let _ = write!(
+                    spares,
+                    "INSERT OR IGNORE INTO _connetto_shared_holding \
+                     (identity, holder, tbl, key) \
+                     VALUES ('{identity}', '{}', '{lowered}', {}); ",
+                    crate::holdings::UNSENT_HOLDER,
                     key_clause(row, columns)
                 );
             }
