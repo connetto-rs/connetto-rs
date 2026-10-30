@@ -1735,7 +1735,7 @@ where
                     .map(|(ordinal, (old, _))| match old {
                         Some(value) => crate::pk::from_wire(
                             value,
-                            crate::pk::scalar_kind(db, table_id, ordinal),
+                            crate::pk::wire_column(db, table_id, ordinal),
                         ),
                         None => PgValue::Missing,
                     })
@@ -1747,7 +1747,7 @@ where
                         |(ordinal, (old, new))| match new.as_ref().or(old.as_ref()) {
                             Some(value) => crate::pk::from_wire(
                                 value,
-                                crate::pk::scalar_kind(db, table_id, ordinal),
+                                crate::pk::wire_column(db, table_id, ordinal),
                             ),
                             None => PgValue::Missing,
                         },

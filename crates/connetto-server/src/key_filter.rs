@@ -6,9 +6,10 @@
 //! so the visibility check and the row the minting path reads cannot drift
 //! apart. Identifiers come from the parsed catalog and every value binds
 //! positionally with the scalar type the catalog gave it, so the row's own
-//! primary-key index answers the read. A date or time key reaches the filter
-//! as text, the form the replica carries it in, so its placeholder casts to
-//! the column's declared type and Postgres compares it as that type.
+//! primary-key index answers the read. A date or time key can reach the filter
+//! as text, the form the replica carries it in, and a decimal key binds as its
+//! decimal text, so each such placeholder casts to the column's declared type
+//! and Postgres compares it as that type.
 
 use core::fmt::Write as _;
 
@@ -55,7 +56,7 @@ enum KeyBind {
 }
 
 /// One key column: its name, and the declared type its placeholder casts to
-/// when the column is a date or time.
+/// when the column is a date, a time or a decimal.
 struct KeyColumn {
     name: String,
     cast: Option<String>,
@@ -188,6 +189,7 @@ impl KeyFilter {
                 Value::Int(value) => KeyBind::Int(value),
                 Value::Float(value) => KeyBind::Float(value),
                 Value::String(value) => KeyBind::Text(value),
+                Value::Decimal(value) => KeyBind::Text(value.to_string()),
                 Value::Bytes(value) => KeyBind::Bytes(value),
                 Value::Uuid(value) => KeyBind::Uuid(value),
                 Value::Date(value) => KeyBind::Date(value),
@@ -207,7 +209,7 @@ impl KeyFilter {
             };
             keys.push(KeyColumn {
                 name,
-                cast: temporal_type(catalog, table_id, column),
+                cast: declared_cast(catalog, table_id, column),
             });
             binds.push(bind);
         }
@@ -239,10 +241,10 @@ impl KeyFilter {
     }
 }
 
-/// The declared type of `column` when it is a date or time, which the
-/// placeholder casts to, and [`None`] for every other type, whose bind
-/// already carries it.
-fn temporal_type<DB: DatabaseLike>(
+/// The declared type of `column` when it is a date, a time or a decimal,
+/// which the placeholder casts to, and [`None`] for every other type, whose
+/// bind already carries it.
+fn declared_cast<DB: DatabaseLike>(
     catalog: &DB,
     table_id: TableId,
     column: ColumnId,
@@ -251,7 +253,8 @@ fn temporal_type<DB: DatabaseLike>(
         ScalarFamily::Date
         | ScalarFamily::Time
         | ScalarFamily::Timestamp
-        | ScalarFamily::TimestampTz => {
+        | ScalarFamily::TimestampTz
+        | ScalarFamily::Decimal => {
             let table = catalog.table_by_id(usize::try_from(table_id).ok()?)?;
             let declared = table.column_by_id(usize::from(column), catalog).ok()??;
             Some(declared.data_type(catalog).into_owned())

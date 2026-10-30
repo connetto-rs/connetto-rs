@@ -1726,7 +1726,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4309,7 +4309,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4662,7 +4662,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#829374dfd6469b189f1e1b79906e8092ad67634a"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#94b94ef8c065dffe50e2c4fb431e60d014147d16"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -4675,7 +4675,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#829374dfd6469b189f1e1b79906e8092ad67634a"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#94b94ef8c065dffe50e2c4fb431e60d014147d16"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -4782,7 +4782,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4839,7 +4839,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys 2.17.0",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5386,7 +5386,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#a24b6b9b2dfd969141405f6c48e5ae0c1ea6e08b"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#b95a605d00789e113e8dd40b78317b0430f9662a"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -5398,9 +5398,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.16.2"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa74d24e848c12eefcacb7d4d25f19890210017882f7da90ae948cbad9d7c771"
+checksum = "61123d20ec4d539aef6fcfe690fa4eaed2fa2ebe80dc07154e1468576821c5c6"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap 2.14.2",
@@ -5425,7 +5425,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#72ce6a8c34f8e2fd9c467be4c6f71093de4d7458"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#c45d1f4e5b8a8fb3b426f61ebae2a9202ee6ed78"
 dependencies = [
  "log",
  "recursive",
@@ -5436,7 +5436,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.2.1"
-source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#d335d07f39faed13da5838c80dd807a881118171"
+source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#34b89281df2b822243fb5981a1e55d1aad428170"
 dependencies = [
  "seahash",
  "sqlparser",
@@ -5455,7 +5455,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#72ce6a8c34f8e2fd9c467be4c6f71093de4d7458"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#c45d1f4e5b8a8fb3b426f61ebae2a9202ee6ed78"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5537,7 +5537,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#c408fb8a78725b3cf843ce3df20a99351b0ba0c2"
+source = "git+https://github.com/connetto-rs/subql?branch=main#77ea63c40e24752f31e6c0c39fff8057452a63cc"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -5994,7 +5994,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6963,7 +6963,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

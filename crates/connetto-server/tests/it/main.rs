@@ -77,6 +77,8 @@ mod logging;
 
 mod macro_hygiene;
 
+mod numeric;
+
 mod oidc_spine;
 
 mod openfga_live;

@@ -49,6 +49,9 @@ diesel = { workspace = true, features = ["postgres_backend", "serde_json", "uuid
 # and diesel maps those to chrono rather than to `std::time::SystemTime`, which it
 # only offers for a zone-less timestamp. Already in the build through subql.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# subql's `Value::Decimal` holds a `BigDecimal`, which an uploaded `NUMERIC(p,s)`
+# cell lifts to from its minor units. Already in the build through subql.
+bigdecimal = { version = "0.4", default-features = false }
 # Naming the Postgres dialect when building subql's catalog and engine, and the
 # visitor pass that substitutes subscription bind placeholders in the parsed
 # statement. Version and rev follow subql via the root [patch] blocks.
@@ -61,7 +64,7 @@ zstd = "0.13"
 # from this crate for the session layer and tests.
 # Parsing an uploaded diffset into ops for authorization and conflict detection,
 # and the Value type bound into conflict-detection queries.
-sqlite-diff-rs = { version = "0.16.2", default-features = false }
+sqlite-diff-rs = { version = "0.17", default-features = false }
 # Reading the current server row back as a JSON object for MutationConflict.
 serde_json = "1"
 # Reading the database's timeline history over a replication connection
