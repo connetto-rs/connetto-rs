@@ -922,28 +922,70 @@ async fn a_resync_keeps_its_rows_until_its_replacement_ends() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resync_takes_an_answered_write_its_replacement_did_not_bring() {
+    let compound = "SELECT * FROM orders WHERE id = 1 UNION SELECT * FROM orders WHERE id = 2";
+    for query in [ORDERS, compound] {
+        let mut s = Session::connected().await;
+        s.holding("a", ORDERS, "orders", &[1]).await;
+        s.holding("b", query, "orders", &[]).await;
+        diesel::insert_into(orders::table)
+            .values((orders::id.eq(7), orders::quantity.eq(1)))
+            .execute(s.conn.conn())
+            .expect("a local write");
+        let seq = s.conn.push().await.expect("push").expect("a write");
+        s.control(
+            ControlMessage::MutationApplied(MutationApplied { client_seq: seq }),
+            "the acknowledgement",
+            |event| matches!(event, ClientEvent::MutationApplied { .. }),
+        )
+        .await;
+        s.resync("b", FullResyncReason::AuthorizationChange).await;
+        s.snapshot("b", Vec::new()).await;
+        assert_eq!(
+            order_ids(&mut s.conn),
+            vec![1],
+            "{query}: the replacement is the server's whole answer for orders, \
+             so the answered write no holding names goes and a's row stays"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_truncate_of_a_table_the_replica_lacks_takes_nothing() {
     let mut s = Session::connected().await;
     s.holding("a", ORDERS, "orders", &[1]).await;
     s.holding("b", ORDERS, "orders", &[]).await;
-    diesel::insert_into(orders::table)
-        .values((orders::id.eq(7), orders::quantity.eq(1)))
-        .execute(s.conn.conn())
-        .expect("a local write");
-    let seq = s.conn.push().await.expect("push").expect("a write");
-    s.control(
-        ControlMessage::MutationApplied(MutationApplied { client_seq: seq }),
-        "the acknowledgement",
-        |event| matches!(event, ClientEvent::MutationApplied { .. }),
+    s.resync(
+        "b",
+        FullResyncReason::TableTruncated {
+            table: "server_only".to_owned(),
+        },
     )
     .await;
-    s.resync("b", FullResyncReason::AuthorizationChange).await;
-    s.snapshot("b", Vec::new()).await;
-    assert_eq!(
-        order_ids(&mut s.conn),
-        vec![1],
-        "the replacement is the server's whole answer for orders, so the \
-         answered write no holding names goes and a's row stays"
-    );
+    assert_eq!(order_ids(&mut s.conn), vec![1]);
+    assert_eq!(holdings(&mut s.conn), held(&[("a", "orders", &[1])]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_truncate_whose_holdings_cannot_be_released_keeps_them() {
+    let mut s = Session::connected().await;
+    s.holding("a", ORDERS, "orders", &[1]).await;
+    s.holding("b", ORDERS, "orders", &[]).await;
+    refuse(&mut s.conn, "DELETE", "_connetto_holding");
+    s.server
+        .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
+            sub_id: "b".to_owned(),
+            reason: FullResyncReason::TableTruncated {
+                table: "orders".to_owned(),
+            },
+        }))
+        .await
+        .expect("send the notice");
+    s.conn
+        .pump_one()
+        .await
+        .expect_err("the replica refuses a's release");
+    assert_eq!(holdings(&mut s.conn), held(&[("a", "orders", &[1])]));
+    assert_eq!(order_ids(&mut s.conn), vec![1]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

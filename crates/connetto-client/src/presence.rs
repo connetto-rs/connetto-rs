@@ -146,3 +146,32 @@ fn undo_queued_shared(db: &mut SqliteConnection, config: &ClientConfig) -> Resul
         .load(db)?;
     crate::undo_shared(db, &config.shared_tables, queued.iter().map(Vec::as_slice))
 }
+
+#[cfg(all(test, feature = "native-auth", unix))]
+mod tests {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    use crate::{ClientConfig, ClientError, ReplicaKey};
+
+    #[test]
+    fn a_departure_refuses_a_path_sqlite_cannot_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let named = dir.path().join("named.db");
+        let unnamed = dir.path().join(OsStr::from_bytes(b"unnamed-\xff.db"));
+        for path in [&named, &unnamed] {
+            std::fs::write(path, b"").expect("a file");
+        }
+        let key = ReplicaKey::from_bytes([0x42; ReplicaKey::LEN]);
+        let mut config = ClientConfig::new("alice".to_owned());
+        config.shared_tables.insert("tags".to_owned());
+        for (store, replica) in [(&unnamed, None), (&named, Some(unnamed.as_path()))] {
+            let refused =
+                super::depart_alone(store, Some(&key), replica.map(|path| (path, &key)), &config);
+            assert!(
+                matches!(&refused, Err(ClientError::Connect(message)) if message.contains("non-UTF-8")),
+                "{refused:?}"
+            );
+        }
+    }
+}
