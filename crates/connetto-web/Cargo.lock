@@ -709,7 +709,7 @@ dependencies = [
 [[package]]
 name = "diesel"
 version = "2.3.14"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#a429c50c8eb01e93a6ea57154087439b3f121eac"
+source = "git+https://github.com/diesel-rs/diesel#04f6aafd45c84cc10214ac9b21cf18fe2498b157"
 dependencies = [
  "bigdecimal",
  "bitflags",
@@ -742,7 +742,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#a429c50c8eb01e93a6ea57154087439b3f121eac"
+source = "git+https://github.com/diesel-rs/diesel#04f6aafd45c84cc10214ac9b21cf18fe2498b157"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -752,7 +752,7 @@ dependencies = [
 [[package]]
 name = "diesel_derives"
 version = "2.3.10"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#a429c50c8eb01e93a6ea57154087439b3f121eac"
+source = "git+https://github.com/diesel-rs/diesel#04f6aafd45c84cc10214ac9b21cf18fe2498b157"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -765,7 +765,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#a429c50c8eb01e93a6ea57154087439b3f121eac"
+source = "git+https://github.com/diesel-rs/diesel#04f6aafd45c84cc10214ac9b21cf18fe2498b157"
 dependencies = [
  "syn 3.0.6",
 ]
@@ -800,7 +800,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=master#a429c50c8eb01e93a6ea57154087439b3f121eac"
+source = "git+https://github.com/diesel-rs/diesel#04f6aafd45c84cc10214ac9b21cf18fe2498b157"
 dependencies = [
  "darling",
  "either",

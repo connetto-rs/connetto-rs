@@ -184,12 +184,9 @@ zip = { version = "4.6.1", default-features = false }
 # cross workspaces, so this crate needs the same routing or the diesel backed
 # graph will not resolve. The sources must match the root ones exactly.
 [patch.crates-io]
-diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "master" }
+diesel = { git = "https://github.com/diesel-rs/diesel" }
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
-
-[patch."https://github.com/diesel-rs/diesel"]
-diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "master" }
 
 # The same deny-level lint discipline the root workspace carries: this is
 # product code, proven by the smoke browser suite, not test scaffolding.

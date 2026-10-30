@@ -217,7 +217,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R52 native Android gate | **DONE** (2026-09-30) | nothing. The unlock-once store option requested of `android-native-keyring-store` under #16 is taken through a pinned patch until released. What holds the release is `rust-mobile/ndk-context` #6 (the Android context in a `RwLock` instead of an unsynchronised `static mut`, stacked on #7), unreviewed since 2026-09-27. Nine decisions shared with R51 in the R51 section | no |
 | R88 the mobile build of a demo | **DONE** (2026-09-24) | nothing. Android through #58, #60 and #66, iOS through #73, both proven unattended on the maintainer's devices. The Android emulator and iOS simulator proofs walk the Tauri demo since #165 (2026-10-17), and the peer proofs on real phones stay on the dioxus demo | no |
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no. The SQLSTATE follow-up that removes the timeout text match is R106 |
-| R106 database failures classified by their SQLSTATE | NOT STARTED, minted 2026-10-28 from R89's upstream cleanup note, three open questions in the section | diesel-rs/diesel#5232 reaching the followed fork's `master`, and `diesel_async`'s Postgres error answering the new `sqlstate()` in a revision the workspace can take | **yes, diesel and diesel_async** |
+| R106 database failures classified by their SQLSTATE | IN PROGRESS, minted 2026-10-28 from R89's upstream cleanup note, designed with the maintainer 2026-10-30, four decisions in the section | `diesel_async` answering `DatabaseErrorInformation::sqlstate`, open as [diesel-rs/diesel_async#306](https://github.com/diesel-rs/diesel_async/pull/306) (Postgres) and [#307](https://github.com/diesel-rs/diesel_async/pull/307) (MySQL-like). diesel's half is on diesel `main` | **yes, diesel_async** |
 | R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section and two settled in its review rounds (the cookie's lifetime, credentials for listed origins only), the 2026-08-06 parked BFF entry absorbed | no |
 | R91 apps, installations and the bot template | IN PROGRESS, designed and reviewed 2026-09-18, unblocked when R96 landed (2026-10-04, #122), and the registry and registration built 2026-10-13 to 2026-10-14 and merged as #152, #153 and #154 (2026-10-14) | nothing. The registry's five tables and the cap that holds a bot to its declared tables and verbs, the challenge on every connection and the bot registration over it, and `bots::install` and `create_registration_code` with the registry in the schema document are merged, and the bot template, the two demo apps and the design's app-token login exchange remain. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R93's. Every decision is in `plans/apps-and-bots.md` | no |
 | R92 synced tables carry no local references | **DONE** (2026-10-18, merged `e89f61e` #167, `e8b2694` #168, `46d2bef` #169), minted and designed 2026-09-22 by R21's decision 8 | nothing. Six decisions in the section | no |
@@ -461,7 +461,7 @@ graph TD
 
 **The last diesel request before R106's closed on 2026-08-18.** `diesel-rs/diesel#5150` added `SqliteConnection::wal_checkpoint` and merged on 2026-08-14, completing all five of the SQLite maintenance proposals. It was merged but unreachable for four days, because this workspace builds on the `LucaCappelletti94/diesel` fork's `future` branch and the pin at `ac4cdfc3` did not carry it. The fork was rebased and every workspace lock moved to `705e4340` on 2026-08-18, and R15 consumed all nine APIs from it. (Corrected 2026-08-21: this paragraph still described the rebase as pending after R15 had recorded it done.)
 
-**R106's request, open since 2026-10-28.** A Postgres error's SQLSTATE is unreachable from `diesel::result::DatabaseErrorInformation`. [diesel-rs/diesel#5232](https://github.com/diesel-rs/diesel/pull/5232) adds the `sqlstate()` accessor, and `diesel_async`'s Postgres error then has to answer it. R106 stays blocked until both reach revisions the workspace takes.
+**R106's requests.** diesel's half merged on diesel `main` as #5332 to #5336 on 2026-10-26, replacing #5232, and the workspace takes diesel from `diesel-rs/diesel` directly. `diesel_async`'s half, its Postgres and MySQL-like errors answering `sqlstate()`, is open as [diesel-rs/diesel_async#306](https://github.com/diesel-rs/diesel_async/pull/306) and [#307](https://github.com/diesel-rs/diesel_async/pull/307) since 2026-10-30 and holds R106's classification slice until it reaches a revision the workspace takes.
 
 ---
 
@@ -6762,9 +6762,9 @@ A person can see every place they are signed in, end any of them or all but the 
 
 ## R106: database failures classified by their SQLSTATE
 
-**Status.** NOT STARTED, minted 2026-10-28 from R89's upstream cleanup note so the follow-up stays on the work list. Not designed. The three open questions below are settled with the maintainer before any code.
+**Status.** IN PROGRESS. Minted 2026-10-28 from R89's upstream cleanup note so the follow-up stays on the work list, designed with the maintainer 2026-10-30, four decisions below.
 
-**Blocked on two upstream changes.** [diesel-rs/diesel#5232](https://github.com/diesel-rs/diesel/pull/5232) adds `sqlstate()` to `DatabaseErrorInformation`, and it reaches connetto through the `LucaCappelletti94/diesel` fork's `master` branch the workspace follows. `diesel_async`'s Postgres error, which keeps the `tokio_postgres` `DbError` private, then has to answer that method in a `diesel-async` release or a revision the workspace can take, since `diesel-async` comes from crates.io at 0.9.2. No `diesel_async` pull request for it existed on 2026-10-28.
+**Blocked on one upstream change, for slices 2 and 3.** diesel's half is merged on diesel `main` (#5332 to #5336, 2026-10-26, replacing #5232) and unreleased, so slice 1 follows `diesel-rs/diesel` directly. `diesel_async`'s Postgres error keeps the `tokio_postgres` `DbError` private and answers `None` from `sqlstate()`, shown on 2026-10-30 by the same `statement_timeout` cancellation reporting `57014` through `PgConnection` and nothing through `AsyncPgConnection`. The fix reuses diesel's `SqlState` and `diesel::pg::sql_state` constants and is open as [diesel-rs/diesel_async#306](https://github.com/diesel-rs/diesel_async/pull/306) (Postgres) and [#307](https://github.com/diesel-rs/diesel_async/pull/307) (MySQL-like), with the request in `upstream/diesel-async-sqlstate-not-forwarded.md`. `diesel-async` comes from crates.io at 0.9.2, so slice 2 follows its `main` until a release carries the change.
 
 **Changes state.** None. No table, wire message or stored format changes.
 
@@ -6772,26 +6772,33 @@ A person can see every place they are signed in, end any of them or all but the 
 
 `diesel_async` maps every SQLSTATE outside the eight it names to `DatabaseErrorKind::Unknown`, and `DatabaseErrorInformation` exposes no code, so connetto classifies database failures from what is left. `reexec::is_statement_timeout` recognises a statement timeout by the words `statement timeout` in the message, and the snapshot path uses the same test. `reexec::diesel_failure` sends a deadlock, `too_many_connections`, `admin_shutdown` and every other unnamed outage to `ReadFailure::Other`, so a computed subscription meeting one is retried once and then ended instead of delivery pausing. The same function decides which writes retry (`write_target.rs`) and which oplog failures count as an outage (`oplog.rs`), so the gap reaches past re-execution. Chapter 10's paragraph under the failure inventory states the shape this phase replaces.
 
-### Open questions the discussion must settle
+### Decisions, taken with the maintainer 2026-10-30
 
-1. **Which codes are transient.** R89 decision 1 made `Transient` the set the connector could name. With the code available the set is chosen afresh, for reads and for writes (chapter 10 rows 2 and 6). Candidates include class `08` connection exceptions, `53300` (`too_many_connections`), `57P01` to `57P03` (the shutdown codes), `40001` (`serialization_failure`) and `40P01` (`deadlock_detected`).
-2. **Whether `Other` keeps its one retry** once the deadlock and shutdown codes leave it.
-3. **Whether `DatabaseErrorKind` still decides anything** where the code is present, or the code alone decides.
+1. **One named list of transient codes, the same for reads, writes and the oplog.** Class `08` (connection exceptions), `40001` (`serialization_failure`), `40P01` (`deadlock_detected`), `25006` (`read_only_sql_transaction`, a standby after failover), `53100` (`disk_full`), `53200` (`out_of_memory`), `53300` (`too_many_connections`), `57P01` to `57P03` (the shutdown codes), `57P05` (`idle_session_timeout`), `58000` (`system_error`) and `58030` (`io_error`). A read meeting one pauses delivery and retries in place, a write answers `Transient`, and the oplog counts it as an outage. `57014` (`query_canceled`, which connetto raises only through `statement_timeout`) answers `Timeout`. Rejected: whole classes `08`, `40`, `53`, `57` and `58`, because `40002`, `57P04`, `58P01` and `53400` never clear on retry and delivery would pause for ever, the live-lock R89 removed. Rejected: the narrower candidate list, under which disk full, out of memory and I/O errors end subscriptions one by one during an outage that hits the whole deployment.
+2. **`Other` keeps its one retry only for an error carrying no code.** A coded failure outside the list ends its subscription at once, a dropped view's `42P01` included. An error with no code (subql's non-diesel variants, diesel's deserialization and query-builder errors) keeps R89's single retry as the floor. Rejected: removing the retry, under which a codeless transient a future subql variant surfaces ends subscriptions with no second chance. Rejected: keeping it for every `Other`, which spends one pointless read on every deterministic coded failure.
+3. **The code alone decides where it is present.** `DatabaseErrorKind` is read only for an error with no code, which is where `ClosedConnection` and `UnableToSendCommand` arrive from. `diesel_async` derives the kind from the code anyway. Rejected: either source marking a failure transient, two answers for one fact that a changed upstream kind mapping could silently override.
+4. **A write refused with `42501` (`insufficient_privilege`) answers `Unauthorized`, whatever refused it.** Postgres sends the same code for a `WITH CHECK` policy refusal and for a missing `GRANT`, and only the message text tells them apart. Both mean the caller may not write that row, and the server log keeps the code and the message, so an operator still sees a missing `GRANT`. `write_target::is_rls_violation` is deleted. Rejected: keeping the text search for the policy case, a message read the done-when forbids and a match a Postgres rewording breaks silently.
+
+### Slices
+
+1. **diesel from `diesel-rs/diesel`.** The eight workspaces' `[patch.crates-io]` entries take diesel from its default branch, the spelling `diesel-sqlite-session` uses, so one source serves both and the second `[patch]` block goes. The `LucaCappelletti94/diesel` fork's `master` last moved on 2026-10-17 and lacks the SQLSTATE stack, while upstream's default branch is `main`. Blocked on nothing.
+2. **The classification.** `diesel-async` followed from `diesel-rs/diesel_async` `main` once the upstream pull request merges, then steps 2 and 3 with their unit and Docker-gated proof.
+3. **Chapter 10.** Step 4.
 
 ### Steps
 
 1. Adopt the diesel and `diesel_async` revisions that carry the accessor.
-2. `reexec::diesel_failure` dispatches on the SQLSTATE as the questions settle it, `57014` (`query_canceled`, which connetto raises only through `statement_timeout`) answering `Timeout`, and its callers in `write_target.rs` and `oplog.rs` follow.
-3. Delete `reexec::is_statement_timeout` and move the snapshot path's timeout test onto the code.
+2. `reexec::diesel_failure` dispatches on the SQLSTATE per decisions 1 to 3, and its callers in `write_target.rs` and `oplog.rs` follow. `write_target::commit_failure` answers `Unauthorized` on `42501` per decision 4.
+3. Delete `reexec::is_statement_timeout` and `write_target::is_rls_violation`, and move the snapshot path's timeout test onto the code.
 4. Chapter 10's paragraph under the failure inventory gives way to the code-driven classification, and rows 2 and 6 name the codes in each class.
 
 ### Proof
 
-Unit tests over each decided code. Docker-gated beside the R89 tests, a read cancelled by `statement_timeout` still ends its subscription at once with `is_statement_timeout` gone, and one code decided transient, raised for real against the reader pool, pauses and resumes delivery without ending the subscription.
+Unit tests over each decided code, a codeless error and a `42501` write. Docker-gated beside the R89 tests, a read cancelled by `statement_timeout` still ends its subscription at once with `is_statement_timeout` gone, one code decided transient, raised for real against the reader pool, pauses and resumes delivery without ending the subscription, and a coded deterministic failure ends its subscription with no retry.
 
 ### Done when
 
-No failure classification in `connetto-server` reads an error message, `is_statement_timeout` does not exist, and chapter 10 states which codes fall in each class.
+No failure classification in `connetto-server` reads an error message, `is_statement_timeout` and `is_rls_violation` do not exist, and chapter 10 states which codes fall in each class.
 
 ---
 

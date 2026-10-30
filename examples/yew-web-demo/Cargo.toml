@@ -80,12 +80,9 @@ connetto-file-client = { path = "../../crates/connetto-file-client" }
 # graph will not resolve. The sources and revisions must match the root ones
 # exactly. The demo lockfile pins the rest of the graph.
 [patch.crates-io]
-diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "master" }
+diesel = { git = "https://github.com/diesel-rs/diesel" }
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
-
-[patch."https://github.com/diesel-rs/diesel"]
-diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "master" }
 
 # Headless tests retain function names without loading DWARF into each browser worker.
 [profile.test]

@@ -186,7 +186,7 @@ Chapter 14 is the authoritative source for the unlock ordering constraint. This 
 | `SqliteConnection::incremental_vacuum` | diesel #5145, merged 2026-08-05 |
 | `SqliteConnection::wal_checkpoint`, `WalCheckpointMode`, `WalCheckpointOutcome` | diesel #5150, merged 2026-08-14 |
 
-**Nothing upstream gates this phase.** The workspace builds on the `LucaCappelletti94/diesel` fork's `future` branch, pinned at `705e4340` in `Cargo.lock`, which carries `wal_checkpoint` and `WalCheckpointMode` alongside the other four, verified by reading the pinned sources rather than inferred from a merge date. Clearing the earlier pin cost something worth keeping: the rebase onto upstream dropped a commit that hid `diesel::table!`'s undocumented generated items from `missing_docs`, which the root `Cargo.toml` sets to `forbid`, so every column of every table in the workspace is documented and a new table must be too.
+**Nothing upstream gates this phase.** The workspace takes diesel from `diesel-rs/diesel`'s default branch, which carries `wal_checkpoint` and `WalCheckpointMode` alongside the other four. Upstream diesel does not hide `diesel::table!`'s undocumented generated items from `missing_docs`, which the root `Cargo.toml` sets to `forbid`, so every column of every table in the workspace is documented and a new table must be too.
 
 ## Open questions
 
