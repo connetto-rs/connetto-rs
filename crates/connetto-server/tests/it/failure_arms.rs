@@ -30,10 +30,10 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::IncomingFrame;
 use connetto_server::openfga::{Counted, FgaAuth, ModelSubject, Translated};
 use connetto_server::{
-    AbuseConfig, FailedAuthorization, InMemoryOplog, ManagerBuilder, Materializer, Oplog,
-    OplogConfig, PgOplog, PgReadConnector, PgSnapshotSource, Position, ReconnectEvent,
-    ReconnectPolicy, RequestGuard, ResumePoint, RuntimeWritableCatalog, SessionManager,
-    ThrottleConfig, TierLimits, TimelineHistory, loopback, pg_write_target,
+    AbuseConfig, FailedAuthorization, ManagerBuilder, Materializer, Oplog, OplogConfig, PgOplog,
+    PgReadConnector, PgSnapshotSource, Position, ReconnectEvent, ReconnectPolicy, RequestGuard,
+    ResumePoint, RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits,
+    TimelineHistory, loopback, pg_write_target,
 };
 use connetto_test_harness::fanout::caller_mapping;
 use connetto_test_harness::{
@@ -50,61 +50,13 @@ use diesel_async::pooled_connection::bb8::Pool;
 use openfga_client::client::OpenFgaServiceClient;
 use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value as WireValue};
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, Value};
+use subql::backend::Postgres;
+use subql::visibility::VisibilityPolicy;
 use subql::visibility::openfga::OpenFgaPolicy;
-use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{ParserDB, PgCommitPosition, PgLsn, PgStreamingCdcSource, PgStreamingConfig, PgXid};
 use tracing::Instrument;
 
-/// The owner is read off the row itself, the way a row-view policy sees it.
-struct OwnerPolicy;
-
-impl VisibilityPolicy for OwnerPolicy {
-    type Watcher = Arc<Principal>;
-    type Error = std::convert::Infallible;
-    type Backend = Postgres;
-
-    fn may_see<R>(
-        &self,
-        row: &R,
-        watchers: &[Self::Watcher],
-        verdicts: &mut [Verdict],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send
-    where
-        R: RowView<Backend = Postgres> + Sync + ?Sized,
-    {
-        let owner = match row.value_at(1) {
-            Ok(Value::String(owner)) => owner,
-            _ => String::new(),
-        };
-        async move {
-            for (watcher, verdict) in watchers.iter().zip(verdicts.iter_mut()) {
-                let admitted = watcher
-                    .identity()
-                    .is_some_and(|identity| identity.user_id == owner);
-                if admitted {
-                    *verdict = Verdict::Allow;
-                }
-            }
-            Ok(())
-        }
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn may_write<R>(
-        &self,
-        _write: RowWrite<'_, R>,
-        _watcher: &Self::Watcher,
-    ) -> Result<Verdict, Self::Error>
-    where
-        R: RowView<Backend = Postgres> + Sync + ?Sized,
-    {
-        Ok(Verdict::Allow)
-    }
-}
+use crate::owner_policy::OwnerPolicy;
 
 diesel::table! {
     /// One visible doc, the table the client subscribes.
@@ -126,27 +78,9 @@ diesel::table! {
     }
 }
 
-type Manager<A, O> = SessionManager<PgSnapshotSource, A, ConnettoDefaults, PgReadConnector, O>;
+type Manager<A> = SessionManager<PgSnapshotSource, A, ConnettoDefaults, PgReadConnector, PgOplog>;
 
-fn connect_to<A>(manager: &Arc<Manager<A, InMemoryOplog>>) -> Client
-where
-    A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres> + Send + Sync + 'static,
-    <A as VisibilityPolicy>::Error: std::fmt::Display + FailedAuthorization,
-{
-    let (server_end, client_end) = loopback();
-    let session = Arc::clone(manager);
-    tokio::spawn(
-        async move {
-            let _ = session.serve(server_end).await;
-        }
-        .instrument(tracing::Span::current()),
-    );
-    Client::new(client_end)
-}
-
-/// `connect_to` for a manager over the durable oplog, the oplog a client
-/// resumes through.
-fn connect_to_oplog<A>(manager: &Arc<Manager<A, PgOplog>>) -> Client
+fn connect_to<A>(manager: &Arc<Manager<A>>) -> Client
 where
     A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres> + Send + Sync + 'static,
     <A as VisibilityPolicy>::Error: std::fmt::Display + FailedAuthorization,
@@ -171,39 +105,15 @@ fn guard() -> Arc<RequestGuard<String>> {
     ))
 }
 
+/// A manager over the deployment's own wiring, the oplog the caller carries,
+/// so a test reads the records the stream kept out of the same table the
+/// stream wrote them to.
 fn full_manager<A>(
     pool: Pool<AsyncPgConnection>,
     schema_ddl: &str,
     auth: A,
-) -> Arc<Manager<A, InMemoryOplog>>
-where
-    A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres> + Send + Sync + 'static,
-    <A as VisibilityPolicy>::Error: std::fmt::Display + FailedAuthorization,
-{
-    ManagerBuilder::new(
-        Materializer::builder(schema_ddl)
-            .with_write_catalog(RuntimeWritableCatalog::default())
-            .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
-            .build()
-            .expect("build materializer"),
-        PgSnapshotSource::from_ddl(pool.clone(), schema_ddl).expect("snapshot source"),
-        auth,
-        Arc::new(TestGrantChecker),
-        PgReadConnector::with_session_setup(pool.clone()),
-        pg_write_target::<ConnettoDefaults>(pool, schema_ddl).expect("build write target"),
-    )
-    .with_guard(guard())
-    .build()
-}
-
-/// `full_manager` with the oplog the caller carries, so a test reads the
-/// records the stream kept out of the same table the stream wrote them to.
-fn full_manager_with_oplog<A>(
-    pool: Pool<AsyncPgConnection>,
-    schema_ddl: &str,
-    auth: A,
     oplog: PgOplog,
-) -> Arc<Manager<A, PgOplog>>
+) -> Arc<Manager<A>>
 where
     A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres> + Send + Sync + 'static,
     <A as VisibilityPolicy>::Error: std::fmt::Display + FailedAuthorization,
@@ -239,61 +149,7 @@ fn event_error_text<'a>(event: &ReconnectEvent<'a>) -> &'a str {
 /// One shared stream with a capped retry policy, counting every reconnect so a
 /// replay loop on the same event is observable.
 fn start_ingest<A>(
-    manager: &Arc<Manager<A, InMemoryOplog>>,
-    stream_url: String,
-    schema_ddl: &str,
-    retries: &Arc<AtomicU32>,
-    in_place: &Arc<AtomicU32>,
-) -> tokio::task::JoinHandle<()>
-where
-    A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres> + Send + Sync + 'static,
-    <A as VisibilityPolicy>::Error: std::fmt::Display + FailedAuthorization,
-{
-    let session = Arc::clone(manager);
-    let ddl = schema_ddl.to_owned();
-    let retries = Arc::clone(retries);
-    let in_place = Arc::clone(in_place);
-    tokio::spawn(async move {
-        let connect = |resume: ResumePoint| {
-            let url = stream_url.clone();
-            let ddl = ddl.clone();
-            async move {
-                let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
-                    .map_err(|err| format!("catalog: {err:?}"))?;
-                let config = PgStreamingConfig::new(url, SLOT, PUBLICATION).start(resume.get());
-                PgStreamingCdcSource::connect(config, catalog)
-                    .await
-                    .map_err(|err| err.to_string())
-            }
-        };
-        let policy = ReconnectPolicy::new()
-            .with_initial_backoff(Duration::from_millis(50))
-            .with_max_backoff(Duration::from_millis(200))
-            .with_max_attempts(Some(4));
-        let _ = session
-            .ingest_with_reconnect(connect, &policy, |event| match event {
-                ReconnectEvent::Retrying { attempt, .. } => {
-                    retries.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "stream retried (attempt {attempt}): {}",
-                        event_error_text(&event)
-                    );
-                }
-                ReconnectEvent::GaveUp { attempts, error } => {
-                    eprintln!("stream gave up after {attempts} attempts: {error}");
-                }
-                ReconnectEvent::ReadRetrying { .. } | ReconnectEvent::AuthRetrying { .. } => {
-                    in_place.fetch_add(1, Ordering::Relaxed);
-                }
-            })
-            .await;
-    })
-}
-
-/// `start_ingest` for a manager over the durable oplog, so the records the
-/// test reads out of the oplog table are the ones the stream kept.
-fn start_ingest_oplog<A>(
-    manager: &Arc<Manager<A, PgOplog>>,
+    manager: &Arc<Manager<A>>,
     stream_url: String,
     schema_ddl: &str,
     retries: &Arc<AtomicU32>,
@@ -402,7 +258,9 @@ async fn a_withdrawal_after_a_primary_key_change_uses_the_old_key() {
     fixture.start_replication(&["notes"]).await;
 
     let pool = fixture.admin().clone();
-    let manager = full_manager(pool.clone(), PG, OwnerPolicy);
+    let oplog = PgOplog::new(pool.clone(), OPLOG_TABLE, OplogConfig::default());
+    oplog.ensure_schema().await.expect("provision the oplog");
+    let manager = full_manager(pool.clone(), PG, OwnerPolicy, oplog);
     let mut client = connect_to(&manager);
     client.handshake_with("alice", "user:alice").await;
     client.subscribe("notes", "SELECT * FROM notes").await;
@@ -504,7 +362,9 @@ async fn a_withdrawal_from_a_wire_unencodable_old_value_must_not_kill_the_stream
     fixture.start_replication(&["instants", "notes"]).await;
 
     let pool = fixture.admin().clone();
-    let manager = full_manager(pool.clone(), INSTANTS_PG, OwnerPolicy);
+    let oplog = PgOplog::new(pool.clone(), OPLOG_TABLE, OplogConfig::default());
+    oplog.ensure_schema().await.expect("provision the oplog");
+    let manager = full_manager(pool.clone(), INSTANTS_PG, OwnerPolicy, oplog);
     let mut client = connect_to(&manager);
     client.handshake_with("alice", "user:alice").await;
     client.subscribe("instants", "SELECT * FROM instants").await;
@@ -652,9 +512,9 @@ async fn an_unencodable_event_must_refuse_the_subscriber_on_catchup() {
     let pool = fixture.admin().clone();
     let oplog = PgOplog::new(pool.clone(), OPLOG_TABLE, OplogConfig::default());
     oplog.ensure_schema().await.expect("provision the oplog");
-    let manager = full_manager_with_oplog(pool.clone(), INSTANTS_PG, OwnerPolicy, oplog);
+    let manager = full_manager(pool.clone(), INSTANTS_PG, OwnerPolicy, oplog);
 
-    let mut client = connect_to_oplog(&manager);
+    let mut client = connect_to(&manager);
     client.handshake_with("alice", "user:alice").await;
     client.subscribe("instants", "SELECT * FROM instants").await;
     client.expect_snapshot("instants").await;
@@ -666,7 +526,7 @@ async fn an_unencodable_event_must_refuse_the_subscriber_on_catchup() {
 
     let retries = Arc::new(AtomicU32::new(0));
     let in_place = Arc::new(AtomicU32::new(0));
-    let ingest = start_ingest_oplog(
+    let ingest = start_ingest(
         &manager,
         fixture.admin_url().to_owned(),
         INSTANTS_PG,
@@ -710,7 +570,7 @@ async fn an_unencodable_event_must_refuse_the_subscriber_on_catchup() {
         .await;
     logged_past(&log, ceiling, &["instants", "notes"]).await;
 
-    let mut resumed = connect_to_oplog(&manager);
+    let mut resumed = connect_to(&manager);
     // The client presents no held keys, so the subject coverage it declares
     // for the cursor is the empty set, which is what the identity grant
     // resolved to.
