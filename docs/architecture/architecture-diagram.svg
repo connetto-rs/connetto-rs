@@ -76,12 +76,12 @@
       <text x="16" y="72" font-size="9" fill="#555">any subscriber installable, aggregation is an ops choice outside connetto</text>
     </g>
 
-    <!-- ===== Shared public store (R11) ===== -->
+    <!-- ===== Shared public store (R11, built) ===== -->
     <g transform="translate(35, 656)">
-      <rect width="460" height="50" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
-      <rect width="4" height="50" rx="1" fill="#EF5350" />
-      <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Shared public store</text>
-      <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">R11, designed 2026-10-17, sliced into seven pull requests</text>
+      <rect width="460" height="50" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="50" rx="1" fill="#4CAF50" />
+      <text x="230" y="18" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Shared public store</text>
+      <text x="230" y="34" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: public tables held once per device, kept by row holdings, R11</text>
     </g>
 
     <!-- ===== Backup and restore (R70, built) ===== -->

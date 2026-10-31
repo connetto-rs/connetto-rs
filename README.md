@@ -21,7 +21,7 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 | Identity | OAuth 2.0 and OIDC login, durable sessions a person lists and ends, grants, shareable capabilities, audit table, throttling and bans, revoked devices that wipe themselves, bots registered by one-time code and held to their declared tables |
 | Authorization | RLS on snapshots and writes, the same policies as an OpenFGA model on the change path |
 | Clients | One builder per platform, a native Diesel connection on desktop, Android and iOS, a browser client on a worker over OPFS, Dioxus and Yew hooks |
-| At rest | SQLCipher and `sqlite3mc` with keyring or IndexedDB custody, passkey unlock in the browser and biometric or PIN unlock on Apple, Android and Windows, a device-private tier whose references SQLite enforces, retention, several accounts |
+| At rest | SQLCipher and `sqlite3mc` with keyring or IndexedDB custody, passkey unlock in the browser and biometric or PIN unlock on Apple, Android and Windows, a device-private tier whose references SQLite enforces, retention, several accounts that keep the tables a deployment declares public in one store per device |
 | Portability | Streamed device archives that restore the tier, unsent writes and unsent content |
 | Files | Chunked, encrypted content with a file server and a client for both platforms, per-identity storage quotas and deployment storage and bandwidth ceilings answered with `Retry-After` |
 | Schema | Postgres DDL translated to the replica at build time by `pg2sqlite`, with write guards, and a major per schema source, so one server runs per major and an updated app drains the writes and files the old build left to the major that captured them and migrates the device-private tier |
@@ -30,13 +30,12 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 101 phases, 86 done, 7 started and 8 not started, a phase built in parts counting once. The core is built and proven, and the app system's bot registry, registration and list cap are built with it. What remains is the last mile around it, plus the app system's bot login, runtime, template and demos, where a person mints a one-time code, a program registers with it, its public key and the tables and verbs it uses, an admin adds it to an owner, and Postgres holds it to that list (chapter 12), and queries an app keeps while closed with the wake that tells it they changed.
+The plan in `plans/master-implementation-plan.md` tracks 101 phases, 87 done, 6 started and 8 not started, a phase built in parts counting once. The core is built and proven, and the app system's bot registry, registration and list cap are built with it. What remains is the last mile around it, plus the app system's bot login, runtime, template and demos, where a person mints a one-time code, a program registers with it, its public key and the tables and verbs it uses, an admin adds it to an owner, and Postgres holds it to that list (chapter 12), and queries an app keeps while closed with the wake that tells it they changed.
 
 | Remaining | Phases |
 |---|---|
 | One page codec | R21 |
 | Failures classified by SQLSTATE, waiting on diesel_async | R106 |
-| Shared public store | R11 |
 | Demo gaps | R57 |
 | Bot login, the standard ownership schema, the bot runtime and template, the demos for apps and bots | R99, R100, R103, R104 |
 | Queries kept while an app is closed, and waking it | R101 |
