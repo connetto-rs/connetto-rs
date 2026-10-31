@@ -108,7 +108,7 @@ pub struct ChangeRecord {
     table: String,
     pk: Vec<u8>,
     event: PgChangeEvent,
-    payload: Vec<u8>,
+    payload: Option<Vec<u8>>,
 }
 
 impl ChangeRecord {
@@ -130,7 +130,20 @@ impl ChangeRecord {
             table: table.into(),
             pk,
             event,
-            payload,
+            payload: Some(payload),
+        }
+    }
+
+    /// Build the record an event keeps when the event holds a value the
+    /// replica cannot store, the event and no payload, so a catchup can match
+    /// the event and refuse the subscriptions the event would have sent.
+    #[must_use]
+    pub fn marker(table: impl Into<String>, pk: Vec<u8>, event: PgChangeEvent) -> Self {
+        Self {
+            table: table.into(),
+            pk,
+            event,
+            payload: None,
         }
     }
 
@@ -159,10 +172,11 @@ impl ChangeRecord {
         &self.event
     }
 
-    /// The event's compressed patch, built once when it was dispatched.
+    /// The event's compressed patch, built once when it was dispatched, or
+    /// `None` on a marker record kept for an event the replica cannot store.
     #[must_use]
-    pub fn payload(&self) -> &[u8] {
-        &self.payload
+    pub fn payload(&self) -> Option<&[u8]> {
+        self.payload.as_deref()
     }
 
     /// Whether this record is a delete tombstone.
@@ -1009,16 +1023,25 @@ mod pg {
             Ok(())
         }
 
-        /// A record read back from its row.
+        /// A record read back from its row. An empty stored payload is the
+        /// marker's form, because a zstd frame is never empty.
         fn record(row: OplogRow) -> Result<ChangeRecord, PgOplogError> {
             let change: ChangeEvent = serde_json::from_slice(&row.event)?;
             let position = position_from_i64(row.commit_lsn, row.xid, row.ordinal);
-            Ok(ChangeRecord::new(
-                row.table_name,
-                row.pk,
-                PgChangeEvent::new(change, position),
-                row.payload,
-            ))
+            if row.payload.is_empty() {
+                Ok(ChangeRecord::marker(
+                    row.table_name,
+                    row.pk,
+                    PgChangeEvent::new(change, position),
+                ))
+            } else {
+                Ok(ChangeRecord::new(
+                    row.table_name,
+                    row.pk,
+                    PgChangeEvent::new(change, position),
+                    row.payload,
+                ))
+            }
         }
 
         /// One end of the window, `direction` being `ASC` for the earliest or `DESC` for the latest.
@@ -1115,7 +1138,7 @@ mod pg {
                 .bind::<Binary, _>(record.pk().to_vec())
                 .bind::<Bool, _>(record.is_tombstone())
                 .bind::<Binary, _>(event_bytes)
-                .bind::<Binary, _>(record.payload().to_vec())
+                .bind::<Binary, _>(record.payload().unwrap_or_default().to_vec())
                 .execute(&mut *conn)
                 .await?;
             self.prune().await

@@ -329,10 +329,11 @@ fn orders_insert(columns: &[(&str, &str)], ordinal: u64) -> subql::PgChangeEvent
     )
 }
 
-/// An event the wire cannot encode fails its dispatch before the engine applies
-/// it, so retrying or skipping it never folds it into an answer.
+/// An event the wire cannot encode applies through the engine without a
+/// patch, so the fold still counts it, the oplog keeps the event as a marker
+/// the catchup refuses against, and the dispatch never fails on it.
 #[tokio::test]
-async fn an_event_that_cannot_be_encoded_is_not_applied() {
+async fn an_event_that_cannot_be_encoded_is_applied_without_a_patch() {
     let mut mat = Materializer::builder(PG_DDL)
         .build()
         .expect("build materializer");
@@ -347,20 +348,38 @@ async fn an_event_that_cannot_be_encoded_is_not_applied() {
 
     // A column the catalog does not know, as a schema change ahead of the deployment delivers.
     let drifted = orders_insert(&[("id", "1"), ("quantity", "10"), ("note", "x")], 1);
+    let dispatched = mat
+        .dispatch(&drifted)
+        .await
+        .expect("an unencodable event no longer fails the dispatch");
     assert!(
-        mat.dispatch(&drifted).await.is_err(),
-        "the patch cannot be encoded, so the dispatch fails"
+        dispatched.patches.is_empty(),
+        "the unencodable event owes no patch, and the dispatch owed one"
     );
-
-    let valid = orders_insert(&[("id", "2"), ("quantity", "20")], 2);
-    let computed = mat.dispatch(&valid).await.expect("dispatch").computed;
-    let values: Vec<Option<&str>> = computed
+    assert!(
+        dispatched
+            .record
+            .as_ref()
+            .is_some_and(|record| record.payload().is_none()),
+        "the oplog keeps the unencodable event as a marker without a payload"
+    );
+    let values: Vec<Option<&str>> = dispatched
+        .computed
         .iter()
         .map(|change| change.result_json.as_deref())
         .collect();
     assert_eq!(
         values,
         [Some("1")],
-        "only the encodable insert reached the count"
+        "the fold still counted the unencodable insert"
     );
+
+    let valid = orders_insert(&[("id", "2"), ("quantity", "20")], 2);
+    let dispatched = mat.dispatch(&valid).await.expect("dispatch");
+    let values: Vec<Option<&str>> = dispatched
+        .computed
+        .iter()
+        .map(|change| change.result_json.as_deref())
+        .collect();
+    assert_eq!(values, [Some("2")], "both inserts reached the count");
 }
