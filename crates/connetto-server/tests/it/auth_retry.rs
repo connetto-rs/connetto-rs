@@ -130,6 +130,22 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
     }
 }
 
+/// The aggregate updates `counter` receives until it goes idle, in order.
+async fn aggregate_updates(counter: &mut Client) -> Vec<Option<String>> {
+    let mut counts = Vec::new();
+    loop {
+        let control =
+            tokio::time::timeout(Duration::from_millis(500), counter.next_control()).await;
+        match control {
+            Err(_) => break,
+            Ok(ControlMessage::AggregateUpdate(update)) => counts.push(update.result_json),
+            Ok(ControlMessage::DeliveryPaused { .. } | ControlMessage::DeliveryResumed) => {}
+            Ok(other) => panic!("unexpected control {other:?}"),
+        }
+    }
+    counts
+}
+
 /// When `may_see` returns an error, `dispatch_event` must return
 /// `Err(SessionError::AuthUnavailable)` so the ingest loop withholds the
 /// source `ack`, keeping the replication slot cursor stationary until the
@@ -796,17 +812,7 @@ async fn an_auth_outage_retry_folds_the_held_event_once() {
     .expect("ingest drains the source")
     .expect("ingest succeeds after the outage");
 
-    let mut counts = Vec::new();
-    loop {
-        let control =
-            tokio::time::timeout(Duration::from_millis(500), counter.next_control()).await;
-        match control {
-            Err(_) => break,
-            Ok(ControlMessage::AggregateUpdate(update)) => counts.push(update.result_json),
-            Ok(ControlMessage::DeliveryPaused { .. } | ControlMessage::DeliveryResumed) => {}
-            Ok(other) => panic!("unexpected control {other:?}"),
-        }
-    }
+    let counts = aggregate_updates(&mut counter).await;
     assert_eq!(counts, [Some("1".to_owned())]);
     let live = rows.wait_for_live(Duration::from_secs(5)).await;
     assert_eq!(live.sub_id, "items");
@@ -965,17 +971,7 @@ async fn an_auth_outage_during_the_refusal_verdict_refuses_once_and_folds_once()
         .dispatch_event(&later)
         .await
         .expect("dispatch the later change");
-    let mut counts = Vec::new();
-    loop {
-        let control =
-            tokio::time::timeout(Duration::from_millis(500), counter.next_control()).await;
-        match control {
-            Err(_) => break,
-            Ok(ControlMessage::AggregateUpdate(update)) => counts.push(update.result_json),
-            Ok(ControlMessage::DeliveryPaused { .. } | ControlMessage::DeliveryResumed) => {}
-            Ok(other) => panic!("unexpected control {other:?}"),
-        }
-    }
+    let counts = aggregate_updates(&mut counter).await;
     assert_eq!(
         counts,
         [Some("1".to_owned()), Some("2".to_owned())],
