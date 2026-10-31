@@ -16,7 +16,7 @@ The Dioxus application queries local SQLite via Diesel. Several concerns must be
 
 1. **Aggregate query routing**: the app writes `SELECT region, COUNT(*) FROM orders GROUP BY region` against its domain table. But the client may not have all rows, so the result must come from a server-computed aggregate pushed to the client, not from a local computation over a partial replica.
 2. **Mutation interception**: writes against local SQLite must be recorded and queued for server-bound PatchSet generation.
-3. **Reactivity via update hooks**: diesel's SQLite hooks ([diesel-rs/diesel#4969](https://github.com/diesel-rs/diesel/pull/4969), landed in the pinned fork) fire during `sqlite3_step()`. The shipped wiring is an `on_update` router feeding a changed-tables set plus an `on_commit` dirty flag, driving re-queries and UI re-renders.
+3. **Reactivity via update hooks**: diesel's SQLite hooks (`on_update` from [diesel-rs/diesel#5098](https://github.com/diesel-rs/diesel/pull/5098) and `on_commit` from [diesel-rs/diesel#5077](https://github.com/diesel-rs/diesel/pull/5077), merged on diesel `main`) fire during `sqlite3_step()`. The shipped wiring is an `on_update` router feeding a changed-tables set plus an `on_commit` dirty flag, driving re-queries and UI re-renders.
 4. **Dedicated worker boundary**: in WASM, the real SQLite connection lives inside a dedicated `Worker` elected via Web Locks. Tabs in the main thread reach it over the wire protocol through the worker's relay.
 
 ---
@@ -173,7 +173,7 @@ When the server confirms (via CDC echo) or rejects, the pending status is update
 
 ## Reactivity via Diesel SQLite Hooks
 
-The hooks from [diesel-rs/diesel#4969](https://github.com/diesel-rs/diesel/pull/4969) are landed in the pinned fork, and the connection wires two of them:
+The hooks are merged on diesel `main` ([diesel-rs/diesel#5098](https://github.com/diesel-rs/diesel/pull/5098) for `on_update`, [diesel-rs/diesel#5077](https://github.com/diesel-rs/diesel/pull/5077) for `on_commit`), which connetto follows through `[patch.crates-io]` until a release carries them, and the connection wires two of them:
 
 - **`on_update`**, with `SqliteUpdateRouter::on_any` over every change op: records the name of each table whose rows change, local writes and applied server patches alike, into the shared changed-tables set that drives re-queries, surfaced as `Reactive::changed_tables` and as the live-query refresh in `ConnettoClient`'s pump.
 - **`on_commit`**: sets the auto-submit dirty flag when a local write commits. The hook only signals, because SQLite forbids using the connection inside it, and `flush()` drains the outbox afterwards.
