@@ -17,7 +17,7 @@ use connetto_core::messages::{
 use connetto_core::traits::IncomingFrame;
 use diesel::prelude::*;
 
-use super::support::{Script, handshake_ack, key_gated_notes as schema};
+use super::support::{Script, handshake_ack, key_gated_notes as schema, relay_tab as tab};
 
 impl Script {
     fn tell(&self, message: ControlMessage) {
@@ -66,24 +66,6 @@ fn subject(name: &str) -> CapabilitySubject<String> {
 struct Subjects {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     subjects: Option<String>,
-}
-
-/// A tab mirror attached to a scripted relay, its pump running.
-async fn tab() -> (ConnettoClient<Script>, Script, tokio::task::JoinHandle<()>) {
-    let script = Script::default();
-    script.say(handshake_ack());
-    let mut conn = ClientBuilder::new(
-        schema().relay_mirror(),
-        super::support::NeverDial::<Script>::default(),
-    )
-    .with_client_id("tab")
-    .open_driven()
-    .expect("the mirror opens");
-    conn.attach(script.clone())
-        .await
-        .expect("the relay acknowledges the tab");
-    let (client, pump) = ConnettoClient::with_pump(conn);
-    (client, script, tokio::spawn(pump))
 }
 
 async fn mirror_subjects(client: &ConnettoClient<Script>) -> Option<String> {

@@ -572,13 +572,7 @@ async fn free_up_space(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandE
     if let Err(err) = client.tidy().await {
         tracing::warn!(error = %err, "the trim pass failed");
     }
-    let (pages, free) = support::replica_footprint(&client).await;
-    let storage = support::storage_line(&client).await;
-    core.update(app, |v| {
-        v.pages = pages;
-        v.free_pages = free;
-        v.storage = storage;
-    });
+    reread_storage(core, app, &client).await;
     Ok(())
 }
 
@@ -953,15 +947,7 @@ async fn setup(
     // The footprint and the storage line are read once here, since the
     // feeds re-read them only when the covered rows move.
     let (app, client) = (app.clone(), client.clone());
-    tauri::async_runtime::spawn(async move {
-        let (pages, free) = support::replica_footprint(&client).await;
-        let storage = support::storage_line(&client).await;
-        core.update(&app, |v| {
-            v.pages = pages;
-            v.free_pages = free;
-            v.storage = storage;
-        });
-    });
+    tauri::async_runtime::spawn(async move { reread_storage(&core, &app, &client).await });
     Ok(())
 }
 
@@ -1261,14 +1247,17 @@ fn mirror(core: &Arc<Core>, app: &AppHandle, client: &ConnettoClient<Ws>, holds:
     }
     core.update(app, |v| v.covered_rows = total);
     let (core, app, client) = (Arc::clone(core), app.clone(), client.clone());
-    tauri::async_runtime::spawn(async move {
-        let (pages, free) = support::replica_footprint(&client).await;
-        let storage = support::storage_line(&client).await;
-        core.update(&app, |v| {
-            v.pages = pages;
-            v.free_pages = free;
-            v.storage = storage;
-        });
+    tauri::async_runtime::spawn(async move { reread_storage(&core, &app, &client).await });
+}
+
+/// Read the replica mirror's footprint and the storage line into the view.
+async fn reread_storage(core: &Core, app: &AppHandle, client: &ConnettoClient<Ws>) {
+    let (pages, free) = support::replica_footprint(client).await;
+    let storage = support::storage_line(client).await;
+    core.update(app, |v| {
+        v.pages = pages;
+        v.free_pages = free;
+        v.storage = storage;
     });
 }
 

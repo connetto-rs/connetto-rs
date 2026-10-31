@@ -3,13 +3,13 @@
 
 use std::time::Duration;
 
-use connetto_client::{ClientBuilder, ClientError, ConnettoClient, SharedStoreUse, StorageUse};
+use connetto_client::{ClientBuilder, ClientError, SharedStoreUse, StorageUse};
 use connetto_core::messages::{
     ControlMessage, GateState, StoreBytes, TabStorageAnswer, TabStorageOutcome, TabStorageUse,
 };
 use connetto_core::traits::IncomingFrame;
 
-use super::support::{Script, handshake_ack, key_gated_notes as schema};
+use super::support::{Script, key_gated_notes as schema, relay_tab as tab};
 
 impl Script {
     fn storage_reads(&self) -> Vec<TabStorageUse> {
@@ -43,24 +43,6 @@ impl Script {
             },
         )));
     }
-}
-
-/// A tab mirror attached to a scripted relay, its pump running.
-async fn tab() -> (ConnettoClient<Script>, Script, tokio::task::JoinHandle<()>) {
-    let script = Script::default();
-    script.say(handshake_ack());
-    let mut conn = ClientBuilder::new(
-        schema().relay_mirror(),
-        super::support::NeverDial::<Script>::default(),
-    )
-    .with_client_id("tab")
-    .open_driven()
-    .expect("the mirror opens");
-    conn.attach(script.clone())
-        .await
-        .expect("the relay acknowledges the tab");
-    let (client, pump) = ConnettoClient::with_pump(conn);
-    (client, script, tokio::spawn(pump))
 }
 
 fn worker_use() -> StorageUse {

@@ -11,27 +11,25 @@
 
 #![cfg(all(target_arch = "wasm32", feature = "web"))]
 
+mod common;
+
+use common::{connect_tab, glue_url, spawn_worker, stage, walk_login_as};
 use connetto_client::dsl::Watchable;
-use connetto_client::{
-    Auth, ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, FirstThen, LiveQuery,
-};
+use connetto_client::{Auth, ClientEvent, ConnettoClient, LiveQuery};
 use connetto_file_core::{FileId, MimeClass};
-use connetto_leptos_demo::{AUTH_BASE, auth_landing, demo_schema};
+use connetto_leptos_demo::{AUTH_BASE, auth_landing};
 use connetto_web::auth::{
     AccountStore, Acquired, BrowserAuthenticator, LOGIN_CHANNEL, LoginMessage, deliver_login_code,
 };
 use connetto_web::storage::ReplicaStorage;
-use connetto_web::{MessageTransport, TabContent, TabResolved, locks, workers};
+use connetto_web::{TabResolved, locks, workers};
 use diesel::prelude::*;
 use futures_channel::oneshot;
 use js_sys::{Array, Uint8Array};
 use wasm_bindgen::JsCast;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-use web_sys::{
-    BroadcastChannel, DedicatedWorkerGlobalScope, MessageEvent, Request, RequestInit, Worker,
-};
+use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope, MessageEvent};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
@@ -80,10 +78,6 @@ struct Photo {
     content_state: Option<String>,
 }
 
-fn stage(msg: &str) {
-    web_sys::console::log_1(&msg.into());
-}
-
 fn play_the_tab() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -99,67 +93,13 @@ fn play_the_tab() {
             return;
         };
         spawn_local(async move {
-            let (code, state) = walk_login(&url).await;
+            let (code, state) = walk_login_as(&url, AUTH_USERNAME).await;
             deliver_login_code(&code, &state).expect("deliver login code");
         });
     });
     ch.set_onmessage(Some(cb.as_ref().unchecked_ref()));
     cb.forget();
     std::mem::forget(ch);
-}
-
-async fn global_fetch_str(url: &str) -> web_sys::Response {
-    let promise = js_sys::global()
-        .dyn_into::<DedicatedWorkerGlobalScope>()
-        .map(|w| w.fetch_with_str(url))
-        .unwrap_or_else(|_| web_sys::window().expect("window").fetch_with_str(url));
-    JsFuture::from(promise)
-        .await
-        .expect("fetch")
-        .dyn_into()
-        .expect("Response")
-}
-
-async fn global_fetch_req(req: &Request) -> web_sys::Response {
-    let promise = js_sys::global()
-        .dyn_into::<DedicatedWorkerGlobalScope>()
-        .map(|w| w.fetch_with_request(req))
-        .unwrap_or_else(|_| web_sys::window().expect("window").fetch_with_request(req));
-    JsFuture::from(promise)
-        .await
-        .expect("fetch req")
-        .dyn_into()
-        .expect("Response")
-}
-
-async fn walk_login(login_url: &str) -> (String, String) {
-    let resp = global_fetch_str(login_url).await;
-    let form_url = resp.url();
-    let init = RequestInit::new();
-    init.set_method("POST");
-    init.set_body(&JsValue::from_str(&format!("username={AUTH_USERNAME}")));
-    let req = Request::new_with_str_and_init(&form_url, &init).expect("login request");
-    req.headers()
-        .set("content-type", "application/x-www-form-urlencoded")
-        .expect("header");
-    let resp = global_fetch_req(&req).await;
-    assert!(
-        resp.ok(),
-        "login chain ended at {} with status {}",
-        resp.url(),
-        resp.status()
-    );
-    let final_url = resp.url();
-    let parsed = web_sys::Url::new(&final_url).expect("parse url");
-    let params = parsed.search_params();
-    (
-        params
-            .get("code")
-            .unwrap_or_else(|| panic!("no code in {final_url}")),
-        params
-            .get("state")
-            .unwrap_or_else(|| panic!("no state in {final_url}")),
-    )
 }
 
 async fn mint_session() -> (String, String) {
@@ -174,7 +114,7 @@ async fn mint_session() -> (String, String) {
         Acquired::NeedLogin(p) => p,
         Acquired::Access(_) => panic!("fresh index cannot refresh silently"),
     };
-    let (code, state) = walk_login(&pending.login_url).await;
+    let (code, state) = walk_login_as(&pending.login_url, AUTH_USERNAME).await;
     let session = auth
         .complete::<String>(&pending, &code, &state, &store)
         .await
@@ -182,61 +122,6 @@ async fn mint_session() -> (String, String) {
     drop(store);
     storage.delete_db(&db).ok();
     (session.access_token, session.user_id)
-}
-
-fn glue_url() -> String {
-    let found = js_sys::eval(
-        r#"performance.getEntriesByType("resource").map(e=>e.name).find(n=>n.endsWith("_bg.wasm"))"#,
-    )
-    .expect("resource entries")
-    .as_string()
-    .expect("wasm resource entry");
-    let base = found.strip_suffix("_bg.wasm").expect("wasm suffix");
-    format!("{base}.js")
-}
-
-fn spawn_worker(glue_url: &str, boot_fn: &str) -> (Worker, workers::BootIdentity) {
-    let identity = workers::BootIdentity::mint();
-    let id = identity.to_string();
-    let src = format!(
-        r#"self.connettoBoot = {id:?};
-try {{
-    const module = await new Promise((resolve, reject) => {{
-        const timer = setTimeout(() => reject(new Error('compiled module handoff timed out')), 15000);
-        function receive(event) {{
-            const [boot, module] = event.data;
-            if (boot !== self.connettoBoot) return;
-            clearTimeout(timer);
-            removeEventListener('message', receive);
-            resolve(module);
-        }}
-        addEventListener('message', receive);
-    }});
-    const mod = await import({glue_url:?});
-    await mod.default({{module_or_path: module}});
-    await mod.{boot_fn}();
-}} catch (error) {{
-    new BroadcastChannel({hello:?}).postMessage('failed:' + self.connettoBoot + ':' + error);
-    throw error;
-}}
-"#,
-        hello = workers::HELLO_CHANNEL,
-    );
-    let parts = Array::of1(&JsValue::from_str(&src));
-    let opts = web_sys::BlobPropertyBag::new();
-    opts.set_type("text/javascript");
-    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &opts).expect("blob");
-    let url = web_sys::Url::create_object_url_with_blob(&blob).expect("object url");
-    let worker_opts = web_sys::WorkerOptions::new();
-    worker_opts.set_type(web_sys::WorkerType::Module);
-    let w = Worker::new_with_options(&url, &worker_opts).expect("spawn worker");
-    web_sys::Url::revoke_object_url(&url).ok();
-    w.post_message(&Array::of2(
-        &JsValue::from_str(&id),
-        &wasm_bindgen::module(),
-    ))
-    .expect("compiled worker module");
-    (w, identity)
 }
 
 fn photo_bytes() -> Vec<u8> {
@@ -276,29 +161,6 @@ async fn fetch_bytes(url: &str) -> Vec<u8> {
         .await
         .expect("array buffer");
     Uint8Array::new(&buf).to_vec()
-}
-
-/// A tab of the booted worker. The worker states who it is signed in as, so
-/// the tab's mirror answers its policy views as the worker's replica does.
-async fn connect_tab(
-    client_id: &str,
-) -> (
-    TabContent<BroadcastChannel>,
-    ConnettoConnection<MessageTransport<BroadcastChannel>>,
-) {
-    let wire = format!("connetto-wire-{client_id}");
-    workers::announce_tab(&wire).await.expect("announce tab");
-    let mut transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("transport");
-    let content = TabContent::new(&mut transport);
-    let conn = ClientBuilder::new(
-        demo_schema().relay_mirror(),
-        FirstThen::new(transport, workers::tab_wire_factory(client_id.to_owned())),
-    )
-    .with_client_id(client_id)
-    .connect_driven()
-    .await
-    .expect("tab connect");
-    (content, conn)
 }
 
 /// The alignment proof, version agreement before the photo test.

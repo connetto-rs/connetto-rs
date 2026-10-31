@@ -453,3 +453,26 @@ pub fn key_gated_notes() -> SyncSchema {
         .expect("the source declares major 1"),
     )
 }
+
+/// A tab mirror of [`key_gated_notes`] attached to a scripted relay that has
+/// acknowledged it, its pump running.
+pub async fn relay_tab() -> (
+    connetto_client::ConnettoClient<Script>,
+    Script,
+    tokio::task::JoinHandle<()>,
+) {
+    let script = Script::default();
+    script.say(handshake_ack());
+    let mut conn = connetto_client::ClientBuilder::new(
+        key_gated_notes().relay_mirror(),
+        NeverDial::<Script>::default(),
+    )
+    .with_client_id("tab")
+    .open_driven()
+    .expect("the mirror opens");
+    conn.attach(script.clone())
+        .await
+        .expect("the relay acknowledges the tab");
+    let (client, pump) = connetto_client::ConnettoClient::with_pump(conn);
+    (client, script, tokio::spawn(pump))
+}
