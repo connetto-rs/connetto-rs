@@ -151,6 +151,9 @@ anyhow = "1"
 diesel = { git = "https://github.com/diesel-rs/diesel" }
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+# Until a pg_walstream release carries the startup metadata API subql main
+# uses (isdaniel/pg-walstream #141) and `ChangeEvent::xid`.
+pg_walstream = { git = "https://github.com/isdaniel/pg-walstream", branch = "main" }
 # R51, until both are released: the keychain store's shared authentication
 # (apple-native-keyring-store #26) on security-framework's typed
 # authentication context (#263 and #264, on upstream main). Pinned by rev,

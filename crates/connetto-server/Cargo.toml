@@ -40,6 +40,8 @@ openfga-client = { version = "0.6.1", default-features = false }
 # same crate that way. A revision here put two copies of it in one graph,
 # because cargo treats a rev source and a branch source as different packages.
 pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
+# `DataTypeLike`, which subql does not re-export, from subql's own branch source.
+sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main", default-features = false }
 # `signal` is the binary's graceful shutdown: SIGINT and SIGTERM stop the
 # listener and close every live session with ServerShuttingDown.
 tokio = { workspace = true, features = ["signal"] }
@@ -64,7 +66,7 @@ zstd = "0.13"
 # from this crate for the session layer and tests.
 # Parsing an uploaded diffset into ops for authorization and conflict detection,
 # and the Value type bound into conflict-detection queries.
-sqlite-diff-rs = { version = "0.17", default-features = false }
+sqlite-diff-rs = { version = "0.18", default-features = false }
 # Reading the current server row back as a JSON object for MutationConflict.
 serde_json = "1"
 # Reading the database's timeline history over a replication connection
