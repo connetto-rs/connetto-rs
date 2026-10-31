@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use connetto_core::exchange::Origin;
+use connetto_core::exchange::{Origin, RetractCause};
 use connetto_core::messages::{
     ContentTicketRequest, ContentVerb, ControlMessage, FatalErrorReason, HeldWork, HeldWrite,
     MutationRejectReason, Provenance, ReplaceShareKeys, WriterRef, WriterRequest,
@@ -39,9 +39,10 @@ use crate::away::Clock as _;
 use crate::majors::held_batch;
 use crate::{
     ClientError, ClientEvent, ConnettoConnection, EntryRecord, ExemptWrites, HandshakeInput,
-    HandshakeOk, SHARE_KEY_REQUEST_WAIT, ShareKeyRequest, WriterQueue, clock, delete_pending,
-    delete_writer_pending, exchange_handshake, is_real_writer, live_share_grants, persist_pending,
-    persist_retire, persist_writer_state, share_key_request_id, unissued,
+    HandshakeOk, PendingEntry, SHARE_KEY_REQUEST_WAIT, ShareKeyRequest, WriterQueue, clock,
+    delete_pending, delete_writer_pending, exchange_handshake, is_real_writer, live_share_grants,
+    persist_pending, persist_retire, persist_writer_state, settle_pending, share_key_request_id,
+    unissued,
 };
 
 /// How a drain dial backs off, the reconnect loop's own shape: 200 ms first,
@@ -171,25 +172,10 @@ impl<T> Drain<T> {
 
 /// The oldest major a rebuild left work for.
 fn oldest_batch(db: &mut SqliteConnection) -> Result<Option<HeldBatch>, ClientError> {
-    if !crate::majors::has_held(db)? {
-        return Ok(None);
-    }
-    let Some((major, version)) = held_batch::table
-        .select((held_batch::major, held_batch::version))
-        .order(held_batch::major)
-        .first::<(i64, Vec<u8>)>(db)
-        .optional()?
-    else {
-        return Ok(None);
-    };
-    let major = u32::try_from(major)
-        .ok()
-        .and_then(Major::new)
-        .ok_or_else(|| ClientError::Session(format!("a held batch records major {major}")))?;
-    Ok(Some(HeldBatch {
-        major,
-        version: SchemaVersion::from_hash(version),
-    }))
+    Ok(crate::majors::held_builds(db)?
+        .into_iter()
+        .next()
+        .map(|(major, version)| HeldBatch { major, version }))
 }
 
 impl<T> ConnettoConnection<T>
@@ -658,7 +644,7 @@ where
             })
             .unwrap_or_default();
         for (seq, captured) in settled {
-            self.settle_entry(writer, seq)?;
+            self.settle_entry(writer, seq, None)?;
             if captured == Some(major) {
                 self.notices.push_back(ClientEvent::Held(HeldWork::Applied {
                     major,
@@ -725,19 +711,43 @@ where
         self.after_drain_settle(major).await
     }
 
-    /// Retire one entry of the drain's writer, settled one way or another.
-    fn settle_entry(&mut self, writer: WriterRef, seq: u64) -> Result<(), ClientError> {
-        let removed = self
-            .writers
-            .get_mut(&writer)
-            .and_then(|queue| queue.pending.remove(&seq))
-            .is_some();
-        if removed {
+    /// Retire one entry of the drain's writer that the old major answered
+    /// for good, `cause` naming a refusal (R77 decision 9).
+    fn settle_entry(
+        &mut self,
+        writer: WriterRef,
+        seq: u64,
+        cause: Option<&RetractCause>,
+    ) -> Result<(), ClientError> {
+        if let Some(entry) = self.take_entry(writer, seq) {
+            {
+                let _suspended = ExemptWrites::raise(&self.write_flags);
+                self.db.transaction::<_, ClientError, _>(|db| {
+                    settle_pending(db, &writer, seq, &entry.hash, cause)
+                })?;
+            }
+            self.offer_changed(&writer);
+        }
+        Ok(())
+    }
+
+    /// Retire one entry of a major no deployment serves any more, which no
+    /// server answered.
+    fn lose_entry(&mut self, writer: WriterRef, seq: u64) -> Result<(), ClientError> {
+        if self.take_entry(writer, seq).is_some() {
             let _suspended = ExemptWrites::raise(&self.write_flags);
             delete_pending(&mut self.db, &writer, seq)?;
         }
-        self.drain.in_flight.remove(&seq);
         Ok(())
+    }
+
+    /// Take one entry of `writer` off its queue and out of the drain's
+    /// flight.
+    fn take_entry(&mut self, writer: WriterRef, seq: u64) -> Option<PendingEntry> {
+        self.drain.in_flight.remove(&seq);
+        self.writers
+            .get_mut(&writer)
+            .and_then(|queue| queue.pending.remove(&seq))
     }
 
     /// Decide what follows a settled write: the batch finishes once nothing
@@ -798,7 +808,7 @@ where
             .collect();
         let hit: BTreeSet<WriterRef> = lost.iter().map(|write| write.writer).collect();
         for write in &lost {
-            self.settle_entry(write.writer, write.seq)?;
+            self.lose_entry(write.writer, write.seq)?;
         }
         let files = {
             let _suspended = ExemptWrites::raise(&self.write_flags);
@@ -977,7 +987,7 @@ where
         };
         match frame {
             Some(IncomingFrame::Control(ControlMessage::MutationApplied(ack))) => {
-                if let Some(write) = self.settle_held(ack.client_seq)? {
+                if let Some(write) = self.settle_held(ack.client_seq, None)? {
                     self.notices
                         .push_back(ClientEvent::Held(HeldWork::Applied { major, write }));
                 }
@@ -991,7 +1001,8 @@ where
                 return Ok(());
             }
             Some(IncomingFrame::Control(ControlMessage::MutationReject(reject))) => {
-                if let Some(write) = self.settle_held(reject.client_seq)? {
+                let cause = RetractCause::Rejected(reject.reason.clone());
+                if let Some(write) = self.settle_held(reject.client_seq, Some(&cause))? {
                     self.notices
                         .push_back(ClientEvent::Held(HeldWork::Rejected {
                             major,
@@ -1001,7 +1012,9 @@ where
                 }
             }
             Some(IncomingFrame::Control(ControlMessage::MutationConflict(conflict))) => {
-                if let Some(write) = self.settle_held(conflict.client_seq)? {
+                if let Some(write) =
+                    self.settle_held(conflict.client_seq, Some(&RetractCause::Conflict))?
+                {
                     self.notices
                         .push_back(ClientEvent::Held(HeldWork::Rejected {
                             major,
@@ -1090,13 +1103,17 @@ where
         self.after_drain_settle(major).await
     }
 
-    /// Settle one answered write of the drain's writer, returning it named
-    /// for the report.
-    fn settle_held(&mut self, seq: u64) -> Result<Option<HeldWrite>, ClientError> {
+    /// Settle one answered write of the drain's writer, `cause` naming a
+    /// refusal, returning it named for the report.
+    fn settle_held(
+        &mut self,
+        seq: u64,
+        cause: Option<&RetractCause>,
+    ) -> Result<Option<HeldWrite>, ClientError> {
         let Some(writer) = self.drain.writer else {
             return Ok(None);
         };
-        self.settle_entry(writer, seq)?;
+        self.settle_entry(writer, seq, cause)?;
         Ok(Some(HeldWrite { writer, seq }))
     }
 
