@@ -18,9 +18,11 @@ use sha2::{Digest, Sha256};
 
 #[cfg(feature = "device-cert")]
 use crate::device_cert::spki_point;
-use crate::exchange::{Frontier, Origin, RetractCause, Retraction};
+#[cfg(feature = "device-cert")]
+use crate::exchange::SignedOffer;
+use crate::exchange::{Frontier, Offer, Origin, RetractCause};
 use crate::messages::{MutationRejectReason, WriterRef};
-use crate::schema::{Major, SchemaVersion};
+use crate::schema::Major;
 
 /// The hash the first entry of every writer chains from.
 pub const GENESIS: [u8; 32] = [0; 32];
@@ -135,24 +137,18 @@ pub fn range_message(key_id: &[u8; 32], seq: u64, head: &[u8; 32]) -> Vec<u8> {
 /// When a list's length or a refusal's detail overflows its fixed-width
 /// encoding.
 #[must_use]
-pub fn offer_message(
-    key_id: &[u8; 32],
-    settled: Option<&Frontier>,
-    newest: Option<&Frontier>,
-    builds: &[(Major, SchemaVersion)],
-    retractions: &[Retraction],
-) -> Vec<u8> {
+pub fn offer_message(key_id: &[u8; 32], offer: &Offer) -> Vec<u8> {
     let mut message = Vec::new();
     message.extend_from_slice(OFFER_DOMAIN);
     message.extend_from_slice(key_id);
-    encode_frontier(&mut message, settled);
-    encode_frontier(&mut message, newest);
+    encode_frontier(&mut message, offer.settled.as_ref());
+    encode_frontier(&mut message, offer.newest.as_ref());
     message.extend_from_slice(
-        &u64::try_from(builds.len())
+        &u64::try_from(offer.builds.len())
             .expect("an offer's build count fits u64")
             .to_be_bytes(),
     );
-    for (major, version) in builds {
+    for (major, version) in &offer.builds {
         message.extend_from_slice(&major.get().to_be_bytes());
         message.extend_from_slice(
             &u32::try_from(version.hash().len())
@@ -162,11 +158,11 @@ pub fn offer_message(
         message.extend_from_slice(version.hash());
     }
     message.extend_from_slice(
-        &u64::try_from(retractions.len())
+        &u64::try_from(offer.retractions.len())
             .expect("an offer's retraction count fits u64")
             .to_be_bytes(),
     );
-    for retraction in retractions {
+    for retraction in &offer.retractions {
         message.extend_from_slice(&retraction.seq.to_be_bytes());
         encode_retract_cause(&mut message, &retraction.cause);
     }
@@ -233,26 +229,18 @@ pub fn verify_range(
     verify_signature(public_key, &range_message(key_id, seq, head), signature)
 }
 
-/// Whether `signature` is the key's ECDSA P-256 SHA-256 signature over the
-/// offer as [`offer_message`] encodes it.
+/// Whether `signed` carries the key's ECDSA P-256 SHA-256 signature over
+/// its offer as [`offer_message`] encodes it.
 ///
 /// `public_key` is the `SubjectPublicKeyInfo` the certificate and the
 /// server's writer row hold.
 #[cfg(feature = "device-cert")]
 #[must_use]
-pub fn verify_offer(
-    public_key: &[u8],
-    key_id: &[u8; 32],
-    settled: Option<&Frontier>,
-    newest: Option<&Frontier>,
-    builds: &[(Major, SchemaVersion)],
-    retractions: &[Retraction],
-    signature: &[u8],
-) -> bool {
+pub fn verify_offer(public_key: &[u8], key_id: &[u8; 32], signed: &SignedOffer) -> bool {
     verify_signature(
         public_key,
-        &offer_message(key_id, settled, newest, builds, retractions),
-        signature,
+        &offer_message(key_id, &signed.offer),
+        &signed.signature,
     )
 }
 
@@ -470,23 +458,18 @@ mod tests {
         );
     }
 
-    fn offer() -> (
-        Frontier,
-        Frontier,
-        Vec<(Major, SchemaVersion)>,
-        Vec<Retraction>,
-    ) {
-        (
-            Frontier {
+    fn offer() -> Offer {
+        Offer {
+            settled: Some(Frontier {
                 seq: 3,
                 head: [1; 32],
-            },
-            Frontier {
+            }),
+            newest: Some(Frontier {
                 seq: 5,
                 head: [2; 32],
-            },
-            vec![(major(2), version(1)), (major(3), version(2))],
-            vec![
+            }),
+            builds: vec![(major(2), version(1)), (major(3), version(2))],
+            retractions: vec![
                 Retraction {
                     seq: 2,
                     cause: RetractCause::Rejected(MutationRejectReason::Forked),
@@ -496,103 +479,69 @@ mod tests {
                     cause: RetractCause::Conflict,
                 },
             ],
-        )
+        }
     }
 
     #[test]
     fn an_offer_message_covers_every_field() {
-        let (settled, newest, builds, retractions) = offer();
-        let base = offer_message(
-            &[5; 32],
-            Some(&settled),
-            Some(&newest),
-            &builds,
-            &retractions,
-        );
+        let base = offer_message(&[5; 32], &offer());
+        let changed = |change: fn(&mut Offer)| {
+            let mut offer = offer();
+            change(&mut offer);
+            offer_message(&[5; 32], &offer)
+        };
         assert_ne!(
             base,
-            offer_message(
-                &[6; 32],
-                Some(&settled),
-                Some(&newest),
-                &builds,
-                &retractions
-            ),
+            offer_message(&[6; 32], &offer()),
             "the author key is inside the message"
         );
         assert_ne!(
             base,
-            offer_message(&[5; 32], None, Some(&newest), &builds, &retractions),
+            changed(|offer| offer.settled = None),
             "a dropped settled frontier is not the signed one"
         );
         assert_ne!(
             base,
-            offer_message(
-                &[5; 32],
-                Some(&Frontier {
+            changed(|offer| {
+                offer.settled = Some(Frontier {
                     seq: 4,
-                    head: [1; 32]
-                }),
-                Some(&newest),
-                &builds,
-                &retractions
-            ),
+                    head: [1; 32],
+                });
+            }),
             "a changed settled frontier is not the signed one"
         );
         assert_ne!(
             base,
-            offer_message(&[5; 32], Some(&settled), None, &builds, &retractions),
+            changed(|offer| offer.newest = None),
             "a dropped newest frontier is not the signed one"
         );
         assert_ne!(
             base,
-            offer_message(
-                &[5; 32],
-                Some(&settled),
-                Some(&newest),
-                &[(major(2), version(3))],
-                &retractions
-            ),
+            changed(|offer| offer.builds = vec![(major(2), version(3))]),
             "a changed build is not the signed one"
         );
-        let mut reordered = retractions.clone();
-        reordered.swap(0, 1);
         assert_ne!(
             base,
-            offer_message(&[5; 32], Some(&settled), Some(&newest), &builds, &reordered),
+            changed(|offer| offer.retractions.swap(0, 1)),
             "the retraction order is inside the message"
         );
         assert_ne!(
             base,
-            offer_message(
-                &[5; 32],
-                Some(&settled),
-                Some(&newest),
-                &builds,
-                &retractions[..1]
-            ),
+            changed(|offer| offer.retractions.truncate(1)),
             "a dropped retraction is not the signed one"
         );
-        let mut abandoned = retractions.clone();
-        abandoned[0] = Retraction {
-            seq: 2,
-            cause: RetractCause::Abandoned,
-        };
         assert_ne!(
             base,
-            offer_message(&[5; 32], Some(&settled), Some(&newest), &builds, &abandoned),
+            changed(|offer| offer.retractions[0].cause = RetractCause::Abandoned),
             "a changed retraction cause is not the signed one"
         );
-        let mut detailed = retractions.clone();
-        detailed[0] = Retraction {
-            seq: 2,
-            cause: RetractCause::Rejected(MutationRejectReason::Other {
-                detail: "the row is locked".to_owned(),
-            }),
-        };
         assert_ne!(
             base,
-            offer_message(&[5; 32], Some(&settled), Some(&newest), &builds, &detailed),
+            changed(|offer| {
+                offer.retractions[0].cause = RetractCause::Rejected(MutationRejectReason::Other {
+                    detail: "the row is locked".to_owned(),
+                });
+            }),
             "a changed refusal reason is not the signed one"
         );
     }
@@ -601,7 +550,6 @@ mod tests {
     /// the reason a retraction names under the author's signature.
     #[test]
     fn every_refusal_reason_signs_as_its_own_message() {
-        let (settled, newest, builds, _) = offer();
         let detail = || "the row is locked".to_owned();
         let reasons = [
             MutationRejectReason::Unauthorized,
@@ -615,17 +563,12 @@ mod tests {
         let messages: Vec<Vec<u8>> = reasons
             .iter()
             .map(|reason| {
-                let retraction = Retraction {
+                let mut offer = offer();
+                offer.retractions = vec![Retraction {
                     seq: 2,
                     cause: RetractCause::Rejected(reason.clone()),
-                };
-                offer_message(
-                    &[5; 32],
-                    Some(&settled),
-                    Some(&newest),
-                    &builds,
-                    &[retraction],
-                )
+                }];
+                offer_message(&[5; 32], &offer)
             })
             .collect();
         for (index, message) in messages.iter().enumerate() {
@@ -642,54 +585,33 @@ mod tests {
     fn an_offer_signature_verifies_through_the_public_verifier() {
         let (key, spki) = keypair();
         let (_, other_spki) = keypair();
-        let (settled, newest, builds, retractions) = offer();
-        let signature = sign(
-            &key,
-            &offer_message(
-                &[5; 32],
-                Some(&settled),
-                Some(&newest),
-                &builds,
-                &retractions,
-            ),
-        );
+        let signed = SignedOffer {
+            signature: sign(&key, &offer_message(&[5; 32], &offer())),
+            offer: offer(),
+        };
         assert!(
-            verify_offer(
-                &spki,
-                &[5; 32],
-                Some(&settled),
-                Some(&newest),
-                &builds,
-                &retractions,
-                &signature
-            ),
+            verify_offer(&spki, &[5; 32], &signed),
             "the author's signature verifies"
         );
         assert!(
-            !verify_offer(
-                &other_spki,
-                &[5; 32],
-                Some(&settled),
-                Some(&newest),
-                &builds,
-                &retractions,
-                &signature
-            ),
+            !verify_offer(&other_spki, &[5; 32], &signed),
             "another key does not verify"
         );
-        let mut flipped = signature.clone();
-        flipped[0] ^= 1;
         assert!(
-            !verify_offer(
-                &spki,
-                &[5; 32],
-                Some(&settled),
-                Some(&newest),
-                &builds,
-                &retractions,
-                &flipped
-            ),
+            !verify_offer(&spki, &[6; 32], &signed),
+            "another writer's key id does not verify"
+        );
+        let mut flipped = signed.clone();
+        flipped.signature[0] ^= 1;
+        assert!(
+            !verify_offer(&spki, &[5; 32], &flipped),
             "a flipped byte does not verify"
+        );
+        let mut moved = signed;
+        moved.offer.settled = None;
+        assert!(
+            !verify_offer(&spki, &[5; 32], &moved),
+            "a changed field does not verify"
         );
     }
 
@@ -699,34 +621,19 @@ mod tests {
     #[cfg(feature = "device-cert")]
     fn a_malformed_key_verifies_nothing() {
         let (key, _) = keypair();
-        let (settled, newest, builds, retractions) = offer();
         let head = entry_hash(&GENESIS, 1, Some(major(2)), None, b"one");
         let range = sign(&key, &range_message(&[9; 32], 1, &head));
-        let offered = sign(
-            &key,
-            &offer_message(
-                &[5; 32],
-                Some(&settled),
-                Some(&newest),
-                &builds,
-                &retractions,
-            ),
-        );
+        let offered = SignedOffer {
+            signature: sign(&key, &offer_message(&[5; 32], &offer())),
+            offer: offer(),
+        };
         for malformed in [&b""[..], b"not a key", &[0x30; 91]] {
             assert!(
                 !verify_range(malformed, &[9; 32], 1, &head, &range),
                 "{malformed:?} verifies a range"
             );
             assert!(
-                !verify_offer(
-                    malformed,
-                    &[5; 32],
-                    Some(&settled),
-                    Some(&newest),
-                    &builds,
-                    &retractions,
-                    &offered
-                ),
+                !verify_offer(malformed, &[5; 32], &offered),
                 "{malformed:?} verifies an offer"
             );
         }

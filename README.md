@@ -66,6 +66,7 @@ The drawing below is the whole system coloured by build status. It is too dense 
 | `connetto-file-core`, `connetto-file-server`, `connetto-file-client` | The file stack, which depends on connetto and never the reverse |
 | `connetto-ca`, `connetto-app-attest` | The device certificate authority's offline ceremonies, and Apple App Attest behind device enrolment |
 | `connetto-peer` | The mutual TLS link between certified devices |
+| `connetto-exchange` | The device-to-device exchange of signed writer chains, without I/O |
 | `connetto-peer-android`, `connetto-peer-apple` | The peer link's Android and Apple glue for permissions, hotspots, Bluetooth and discovery |
 | `connetto-test-harness` | The in-process CDC loop and the browser stack runner behind the tests |
 

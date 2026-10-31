@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 
 use parking_lot::Mutex;
 
-use crate::frame::{ExchangeFrame, MAX_MANIFEST_ROWS, PeerFrame, read_frame, write_frame};
+use crate::frame::{PeerFrame, read_frame, write_frame};
 use crate::node::{EXCHANGE_QUEUE, SlotState, client_config_for};
 use crate::{
     CloseReason, Identity, LinkError, Liveness, Node, PeerEvent, PeerSendError, Refusal,
@@ -23,10 +23,11 @@ use connetto_core::device_cert::{
     RootCa, certificate_key_id, key_id, public_key_info,
 };
 use connetto_core::exchange::{
-    EndOutcome, Frontier, ManifestRow, Origin, RetractCause, Retraction,
+    EndOutcome, Frontier, ManifestRow, Offer, Origin, RetractCause, Retraction, SignedOffer,
 };
 use connetto_core::messages::{MutationRejectReason, WriterRef};
 use connetto_core::schema::{Major, SchemaVersion};
+use connetto_exchange::{MAX_MANIFEST_ROWS, Message, Transfer};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, SigningKey as RcgenSigningKey};
 use socket2::SockRef;
 use tokio::sync::mpsc;
@@ -510,18 +511,8 @@ async fn two_nodes_link_and_a_kept_list_reaches_the_other() {
     let peer = a.link(addr).await.expect("the link completes");
     assert_eq!(peer, bob.identity);
 
-    assert_eq!(
-        next_events(&mut a_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: bob.identity.clone()
-        }]
-    );
-    assert_eq!(
-        next_events(&mut b_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: alice.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut a_rx, 1).await, vec![linked_event(&bob)]);
+    assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alice)]);
 
     // Bob's kept list reaches Alice as the raw ListReceived event.
     assert_eq!(
@@ -638,15 +629,11 @@ async fn a_root_list_revoking_an_issuer_closes_and_refuses() {
     assert_eq!(b_to_a.as_ref().ok(), Some(&under_one.identity));
     assert_eq!(
         next_events(&mut a_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: under_two.identity.clone()
-        }]
+        vec![linked_event(&under_two)]
     );
     assert_eq!(
         next_events(&mut b_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: under_one.identity.clone()
-        }]
+        vec![linked_event(&under_one)]
     );
 
     // The root signs a list revoking issuer one, and both nodes keep it.
@@ -897,12 +884,7 @@ async fn a_clock_outside_the_window_refuses_and_a_small_skew_links() {
         .await
         .expect("the tolerance covers four minutes");
     assert_eq!(peer, honest.identity);
-    assert_eq!(
-        next_events(&mut t_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: honest.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut t_rx, 1).await, vec![linked_event(&honest)]);
 
     honest_node.stop(CloseReason::Closed);
     skewed_node.stop(CloseReason::Closed);
@@ -1078,15 +1060,11 @@ async fn an_unaccepted_attestation_level_is_refused() {
     assert_eq!(peer, proven_b.identity);
     assert_eq!(
         next_events(&mut a_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: proven_b.identity.clone()
-        }]
+        vec![linked_event(&proven_b)]
     );
     assert_eq!(
         next_events(&mut b_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: proven_a.identity.clone()
-        }]
+        vec![linked_event(&proven_a)]
     );
 
     open.stop(CloseReason::Closed);
@@ -1096,10 +1074,6 @@ async fn an_unaccepted_attestation_level_is_refused() {
 
 /// Proof 7.
 #[tokio::test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the scenario walks the pings and the silence in the order they cross the link"
-)]
 async fn a_silent_peer_closes_with_peer_lost_and_pings_keep_a_link() {
     let now = whole_second();
     let deployment = Deployment::new(8, now);
@@ -1195,18 +1169,8 @@ async fn a_silent_peer_closes_with_peer_lost_and_pings_keep_a_link() {
     let bob_addr = serve(&bob_node, &bob);
     let peer = host_node.link(bob_addr).await.expect("the link completes");
     assert_eq!(peer, bob.identity);
-    assert_eq!(
-        next_events(&mut h_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: bob.identity.clone()
-        }]
-    );
-    assert_eq!(
-        next_events(&mut b_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: host.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut h_rx, 1).await, vec![linked_event(&bob)]);
+    assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&host)]);
 
     // Past the silence bound, a kept list still crosses the link.
     let (list, signer) = deployment.issuer_list(&issuer, 1, &[], now);
@@ -1260,18 +1224,8 @@ async fn two_devices_dialing_each_other_keep_one_link_each() {
     assert_eq!(b_to_a.as_ref().ok(), Some(&alpha.identity));
 
     // Exactly one link per side, and the duplicate rule raises nothing.
-    assert_eq!(
-        next_events(&mut a_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: beta.identity.clone()
-        }]
-    );
-    assert_eq!(
-        next_events(&mut b_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: alpha.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut a_rx, 1).await, vec![linked_event(&beta)]);
+    assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alpha)]);
     no_events(&mut a_rx, Duration::from_secs(1)).await;
     no_events(&mut b_rx, Duration::from_secs(1)).await;
 
@@ -1341,18 +1295,8 @@ async fn serving_again_with_a_new_certificate_keeps_port_and_link() {
     let _ = serve(&b, &bob);
     let peer = b.link(addr).await.expect("the link completes");
     assert_eq!(peer, alice.identity);
-    assert_eq!(
-        next_events(&mut b_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: alice.identity.clone()
-        }]
-    );
-    assert_eq!(
-        next_events(&mut a_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: bob.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alice)]);
+    assert_eq!(next_events(&mut a_rx, 1).await, vec![linked_event(&bob)]);
 
     // Alice renews, a new serial and window on the same key, and serves
     // again. The port and the live link stay.
@@ -1407,18 +1351,8 @@ async fn a_second_dial_from_the_same_node_keeps_the_same_link() {
     // The first dial links both ends.
     let first = a.link(b_addr).await;
     assert_eq!(first.as_ref().ok(), Some(&beta.identity));
-    assert_eq!(
-        next_events(&mut a_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: beta.identity.clone()
-        }]
-    );
-    assert_eq!(
-        next_events(&mut b_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: alpha.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut a_rx, 1).await, vec![linked_event(&beta)]);
+    assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alpha)]);
 
     // A dials the same peer again while the first link is live. The dial
     // counter decides, and the higher dial keeps the slot on both ends.
@@ -1472,12 +1406,7 @@ async fn dropping_the_last_node_closes_the_listener_and_links() {
     let b_addr = serve(&b, &beta);
     let a_to_b = a.link(b_addr).await;
     assert_eq!(a_to_b.as_ref().ok(), Some(&beta.identity));
-    assert_eq!(
-        next_events(&mut b_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: alpha.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alpha)]);
 
     // Drop the last handle of a. The stop teardown closes the links and the
     // listener.
@@ -1646,12 +1575,7 @@ async fn a_duplicate_close_holds_the_peer_until_the_bound_or_a_stop() {
     // A peer announcing a duplicate close whose kept link never arrives is
     // reported gone only once the hello bound runs out.
     let mut raw = raw_linked(deployment.root_der(), &gone, host_addr).await;
-    assert_eq!(
-        next_events(&mut h_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: gone.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut h_rx, 1).await, vec![linked_event(&gone)]);
     let close = PeerFrame::Close {
         reason: CloseReason::Duplicate,
     };
@@ -1680,12 +1604,7 @@ async fn a_duplicate_close_holds_the_peer_until_the_bound_or_a_stop() {
 
     // A stop during the wait reports the held peer with the stop's reason.
     let mut raw = raw_linked(deployment.root_der(), &held, host_addr).await;
-    assert_eq!(
-        next_events(&mut h_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: held.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut h_rx, 1).await, vec![linked_event(&held)]);
     write_frame(&mut raw, &close)
         .await
         .expect("the close writes");
@@ -1713,12 +1632,7 @@ async fn raw_with_unread_bytes(
     number: u64,
 ) -> tokio_rustls::TlsStream<tokio::net::TcpStream> {
     let raw = raw_linked(deployment.root_der(), peer, host_addr).await;
-    assert_eq!(
-        next_events(h_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: peer.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(h_rx, 1).await, vec![linked_event(peer)]);
     let (list, signer) = deployment.issuer_list(issuer, number, &[], whole_second());
     host_node.keep_list(list, signer);
     let (tcp, _) = raw.get_ref();
@@ -2055,12 +1969,7 @@ async fn a_seventeenth_inbound_connection_is_closed_at_accept() {
         matches!(event, PeerEvent::Linked { .. })
     })
     .await;
-    assert_eq!(
-        event,
-        PeerEvent::Linked {
-            peer: peer.identity.clone()
-        }
-    );
+    assert_eq!(event, linked_event(&peer));
 }
 
 #[tokio::test]
@@ -2377,18 +2286,8 @@ async fn a_certificate_for_another_key_closes_with_protocol() {
     let _ = serve(&a, &alice);
     let peer = a.link(b_addr).await.expect("the link completes");
     assert_eq!(peer, bob.identity);
-    assert_eq!(
-        next_events(&mut a_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: bob.identity.clone()
-        }]
-    );
-    assert_eq!(
-        next_events(&mut b_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: alice.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut a_rx, 1).await, vec![linked_event(&bob)]);
+    assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alice)]);
 
     // Bob serves again with a certificate for Carol's key, so the renewed
     // chain names a different key than the link proved.
@@ -2470,18 +2369,8 @@ async fn a_revoked_renewed_chain_closes_with_peer_revoked() {
     let _ = serve(&a, &alice);
     let peer = a.link(b_addr).await.expect("the link completes");
     assert_eq!(peer, bob.identity);
-    assert_eq!(
-        next_events(&mut a_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: bob.identity.clone()
-        }]
-    );
-    assert_eq!(
-        next_events(&mut b_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: alice.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut a_rx, 1).await, vec![linked_event(&bob)]);
+    assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alice)]);
 
     // Bob renews with a new serial, and Alice keeps a list revoking that
     // serial. Bob's current chain is unrevoked, so the link stays.
@@ -2944,18 +2833,8 @@ async fn linked_stands_its_live_peers_and_a_close_drops_one() {
     let (a_to_b, b_to_a) = tokio::join!(a.link(b_addr), b.link(a_addr));
     assert_eq!(a_to_b.as_ref().ok(), Some(&beta.identity));
     assert_eq!(b_to_a.as_ref().ok(), Some(&alpha.identity));
-    assert_eq!(
-        next_events(&mut a_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: beta.identity.clone()
-        }]
-    );
-    assert_eq!(
-        next_events(&mut b_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: alpha.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut a_rx, 1).await, vec![linked_event(&beta)]);
+    assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alpha)]);
     let (a_links, b_links) = (a.linked(), b.linked());
     assert_eq!(
         a_links.iter().map(|link| &link.peer).collect::<Vec<_>>(),
@@ -3023,12 +2902,7 @@ async fn a_duplicate_close_holds_the_peer_in_the_link_read() {
 
     // The live link's peer stands in the read.
     let mut raw = raw_linked(deployment.root_der(), &gone, host_addr).await;
-    assert_eq!(
-        next_events(&mut h_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: gone.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut h_rx, 1).await, vec![linked_event(&gone)]);
     assert_eq!(peers(host_node.linked()), vec![gone.identity.clone()]);
 
     // The duplicate close holds the peer in the read while its kept link
@@ -3047,6 +2921,7 @@ async fn a_duplicate_close_holds_the_peer_in_the_link_read() {
         host_node.linked(),
         vec![crate::PeerLink {
             peer: gone.identity.clone(),
+            public_key: public_key_info(&gone.key),
             bot_list: Some(gone.bot_list.clone()),
             remote: None,
         }],
@@ -3113,12 +2988,7 @@ async fn the_hello_bound_drops_a_held_peer_in_the_link_read() {
     // The live link's peer stands in the read, and the pause stands before
     // the close, so the keeper's wait runs on the paused clock.
     let mut raw = raw_linked(deployment.root_der(), &gone, host_addr).await;
-    assert_eq!(
-        next_events(&mut h_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: gone.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut h_rx, 1).await, vec![linked_event(&gone)]);
     assert_eq!(peers(host_node.linked()), vec![gone.identity.clone()]);
     time::pause();
     let started = time::Instant::now();
@@ -3136,6 +3006,7 @@ async fn the_hello_bound_drops_a_held_peer_in_the_link_read() {
         host_node.linked(),
         vec![crate::PeerLink {
             peer: gone.identity.clone(),
+            public_key: public_key_info(&gone.key),
             bot_list: Some(gone.bot_list.clone()),
             remote: None,
         }],
@@ -3157,41 +3028,45 @@ async fn the_hello_bound_drops_a_held_peer_in_the_link_read() {
     host_node.stop(CloseReason::Closed);
 }
 
-/// The five exchange frames a test sends across a link, in send order.
-fn exchange_frames(request_id: u64) -> [ExchangeFrame; 5] {
+/// The five exchange messages a test sends across a link, in send order.
+fn exchange_messages(request_id: u64) -> [Message; 5] {
     let major = Major::new(1).expect("a real major");
     [
-        ExchangeFrame::Offer {
-            builds: vec![(major, SchemaVersion::from_hash(vec![1, 2, 3]))],
-            settled: Some(Frontier {
-                seq: 2,
-                head: [1; 32],
-            }),
-            newest: Some(Frontier {
-                seq: 5,
-                head: [2; 32],
-            }),
-            retractions: vec![
-                Retraction {
+        Message::Offer(SignedOffer {
+            offer: Offer {
+                builds: vec![(major, SchemaVersion::from_hash(vec![1, 2, 3]))],
+                settled: Some(Frontier {
                     seq: 2,
-                    cause: RetractCause::Rejected(MutationRejectReason::Forked),
-                },
-                Retraction {
-                    seq: 4,
-                    cause: RetractCause::Conflict,
-                },
-                Retraction {
+                    head: [1; 32],
+                }),
+                newest: Some(Frontier {
                     seq: 5,
-                    cause: RetractCause::Abandoned,
-                },
-            ],
+                    head: [2; 32],
+                }),
+                retractions: vec![
+                    Retraction {
+                        seq: 2,
+                        cause: RetractCause::Rejected(MutationRejectReason::Forked),
+                    },
+                    Retraction {
+                        seq: 4,
+                        cause: RetractCause::Conflict,
+                    },
+                    Retraction {
+                        seq: 5,
+                        cause: RetractCause::Abandoned,
+                    },
+                ],
+            },
             signature: vec![4; 64],
-        },
-        ExchangeFrame::Request {
+        }),
+        Message::Transfer(Transfer::Request {
             request_id,
             from: 3,
-        },
-        ExchangeFrame::Manifest {
+            to: 5,
+            build: (major, SchemaVersion::from_hash(vec![1, 2, 3])),
+        }),
+        Message::Transfer(Transfer::Manifest {
             request_id,
             previous: [1; 32],
             rows: vec![
@@ -3212,34 +3087,34 @@ fn exchange_frames(request_id: u64) -> [ExchangeFrame; 5] {
                 },
             ],
             last: true,
-        },
-        ExchangeFrame::Body {
+        }),
+        Message::Transfer(Transfer::Body {
             request_id,
             seq: 3,
             changeset: vec![5; 1024],
-        },
-        ExchangeFrame::End {
+        }),
+        Message::Transfer(Transfer::End {
             request_id,
             outcome: EndOutcome::Complete,
-        },
+        }),
     ]
 }
 
 #[tokio::test]
-async fn every_exchange_frame_round_trips_its_encoding() {
-    let frames = exchange_frames(41);
+async fn every_exchange_message_round_trips_its_encoding() {
+    let messages = exchange_messages(41);
     let (mut tx, mut rx) = tokio::io::duplex(64 * 1024);
-    for frame in &frames {
-        write_frame(&mut tx, &PeerFrame::Exchange(frame.clone()))
+    for message in &messages {
+        write_frame(&mut tx, &PeerFrame::Exchange(message.clone()))
             .await
             .expect("the frame encodes");
     }
-    for frame in &frames {
+    for message in &messages {
         let read = read_frame(&mut rx)
             .await
             .expect("the frame decodes")
             .expect("the frame stands");
-        assert_eq!(read, PeerFrame::Exchange(frame.clone()));
+        assert_eq!(read, PeerFrame::Exchange(message.clone()));
     }
 }
 
@@ -3253,12 +3128,12 @@ async fn a_manifest_at_the_row_bound_encodes_under_the_ceiling() {
             digest: [7; 32],
         })
         .collect::<Vec<_>>();
-    let frame = PeerFrame::Exchange(ExchangeFrame::Manifest {
+    let frame = PeerFrame::Exchange(Message::Transfer(Transfer::Manifest {
         request_id: 7,
         previous: [1; 32],
         rows: rows.clone(),
         last: true,
-    });
+    }));
     let (mut tx, mut rx) = tokio::io::duplex(1024 * 1024);
     write_frame(&mut tx, &frame)
         .await
@@ -3268,7 +3143,7 @@ async fn a_manifest_at_the_row_bound_encodes_under_the_ceiling() {
         .expect("it decodes")
         .expect("it stands");
     assert_eq!(read, frame);
-    let PeerFrame::Exchange(ExchangeFrame::Manifest { rows, .. }) = read else {
+    let PeerFrame::Exchange(Message::Transfer(Transfer::Manifest { rows, .. })) = read else {
         panic!("the round trip keeps the frame")
     };
     assert_eq!(rows.len(), MAX_MANIFEST_ROWS);
@@ -3310,12 +3185,12 @@ async fn a_manifest_over_the_row_bound_is_refused_both_ways() {
             digest: [7; 32],
         })
         .collect::<Vec<_>>();
-    let manifest = ExchangeFrame::Manifest {
+    let manifest = Message::Transfer(Transfer::Manifest {
         request_id: 7,
         previous: [1; 32],
         rows,
         last: true,
-    };
+    });
 
     // The send refuses the frame before it queues.
     let err = host_node
@@ -3348,22 +3223,22 @@ async fn a_manifest_over_the_row_bound_is_refused_both_ways() {
     host_node.stop(CloseReason::Closed);
 }
 
-/// Send `frames` from `sender` to `to` and see each reach `rx` in send
+/// Send `messages` from `sender` to `to` and see each reach `rx` in send
 /// order, naming `from`.
 async fn exchange_reaches_in_order(
     sender: &Node,
     from: &DeviceIdentity,
     to: &DeviceIdentity,
     rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
-    frames: [ExchangeFrame; 5],
+    messages: [Message; 5],
 ) {
-    for frame in &frames {
+    for message in &messages {
         sender
-            .send_exchange(to, frame.clone())
+            .send_exchange(to, message.clone())
             .await
             .expect("the queue takes it");
     }
-    for frame in frames {
+    for message in messages {
         let event = await_event(rx, Duration::from_secs(10), |event| {
             matches!(event, PeerEvent::Exchange { .. })
         })
@@ -3372,14 +3247,14 @@ async fn exchange_reaches_in_order(
             event,
             PeerEvent::Exchange {
                 peer: from.clone(),
-                frame
+                message
             }
         );
     }
 }
 
 #[tokio::test]
-async fn linked_nodes_deliver_each_exchange_frame_in_order_naming_the_sender() {
+async fn linked_nodes_deliver_each_exchange_message_in_order_naming_the_sender() {
     let now = whole_second();
     let deployment = Deployment::new(29, now);
     let issuer = deployment.add_issuer(now, [1; 16]);
@@ -3409,25 +3284,15 @@ async fn linked_nodes_deliver_each_exchange_frame_in_order_naming_the_sender() {
     let _ = serve(&a, &alice);
     let peer = a.link(addr).await.expect("the link completes");
     assert_eq!(peer, bob.identity);
-    assert_eq!(
-        next_events(&mut a_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: bob.identity.clone()
-        }]
-    );
-    assert_eq!(
-        next_events(&mut b_rx, 1).await,
-        vec![PeerEvent::Linked {
-            peer: alice.identity.clone()
-        }]
-    );
+    assert_eq!(next_events(&mut a_rx, 1).await, vec![linked_event(&bob)]);
+    assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alice)]);
 
     exchange_reaches_in_order(
         &a,
         &alice.identity,
         &bob.identity,
         &mut b_rx,
-        exchange_frames(7),
+        exchange_messages(7),
     )
     .await;
     exchange_reaches_in_order(
@@ -3435,7 +3300,7 @@ async fn linked_nodes_deliver_each_exchange_frame_in_order_naming_the_sender() {
         &bob.identity,
         &alice.identity,
         &mut a_rx,
-        exchange_frames(8),
+        exchange_messages(8),
     )
     .await;
 
@@ -3469,16 +3334,16 @@ async fn a_send_to_an_unlinked_peer_is_refused() {
     let (b_tx, _b_rx) = events();
     let a = node(deployment.root_der(), a_tx);
     let b = node(deployment.root_der(), b_tx);
-    let frame = exchange_frames(1)[1].clone();
+    let message = exchange_messages(1)[1].clone();
 
-    // No link to bob, so the send is refused with the frame handed back.
+    // No link to bob, so the send is refused with the message handed back.
     let err = a
-        .send_exchange(&bob.identity, frame.clone())
+        .send_exchange(&bob.identity, message.clone())
         .await
         .expect_err("no link stands");
     assert!(
-        matches!(err, PeerSendError::Unlinked { frame: f } if f == frame),
-        "the frame comes back to its sender"
+        matches!(err, PeerSendError::Unlinked { message: m } if m == message),
+        "the message comes back to its sender"
     );
 
     // Once the linked link falls, the send is refused the same way.
@@ -3500,7 +3365,7 @@ async fn a_send_to_an_unlinked_peer_is_refused() {
         }
     );
     let err = a
-        .send_exchange(&bob.identity, frame)
+        .send_exchange(&bob.identity, message)
         .await
         .expect_err("the link fell");
     assert!(matches!(err, PeerSendError::Unlinked { .. }));
@@ -3558,12 +3423,7 @@ async fn a_sender_blocked_on_a_full_exchange_queue_is_released_when_the_link_clo
         matches!(event, PeerEvent::Linked { .. })
     })
     .await;
-    assert_eq!(
-        event,
-        PeerEvent::Linked {
-            peer: raw_dev.identity.clone()
-        }
-    );
+    assert_eq!(event, linked_event(&raw_dev));
 
     // The held links lock parks the link task once its List command reaches
     // its lock, and the raw peer stops reading after the list frame crosses.
@@ -3600,21 +3460,31 @@ async fn a_sender_blocked_on_a_full_exchange_queue_is_released_when_the_link_clo
 
     // The link task is parked on the held lock, so the queue cannot drain.
     for i in 0..EXCHANGE_QUEUE {
-        let frame = ExchangeFrame::Request {
+        let message = Message::Transfer(Transfer::Request {
             request_id: u64::try_from(i).expect("the queue fits a request id"),
             from: 1,
-        };
+            to: 1,
+            build: (
+                Major::new(1).expect("a real major"),
+                SchemaVersion::from_hash(vec![1]),
+            ),
+        });
         host_node
-            .send_exchange(&raw_dev.identity, frame)
+            .send_exchange(&raw_dev.identity, message)
             .await
             .expect("the queue takes it");
     }
     let mut blocked = Box::pin(host_node.send_exchange(
         &raw_dev.identity,
-        ExchangeFrame::Request {
+        Message::Transfer(Transfer::Request {
             request_id: 99,
             from: 1,
-        },
+            to: 1,
+            build: (
+                Major::new(1).expect("a real major"),
+                SchemaVersion::from_hash(vec![1]),
+            ),
+        }),
     ));
     let waiting = core::future::poll_fn(|cx| {
         core::task::Poll::Ready(core::future::Future::poll(blocked.as_mut(), cx).is_pending())
@@ -3630,16 +3500,16 @@ async fn a_sender_blocked_on_a_full_exchange_queue_is_released_when_the_link_clo
     assert!(
         matches!(
             err,
-            PeerSendError::LinkClosed { frame }
+            PeerSendError::LinkClosed { message }
                 if matches!(
-                    frame,
-                    ExchangeFrame::Request {
+                    message,
+                    Message::Transfer(Transfer::Request {
                         request_id: 99,
                         ..
-                    }
+                    })
                 )
         ),
-        "the blocked send ends refused, its frame handed back"
+        "the blocked send ends refused, its message handed back"
     );
     let event = await_event(&mut h_rx, Duration::from_secs(10), |event| {
         matches!(event, PeerEvent::Unlinked { .. })
@@ -3656,7 +3526,7 @@ async fn a_sender_blocked_on_a_full_exchange_queue_is_released_when_the_link_clo
 }
 
 #[tokio::test]
-async fn an_exchange_frame_before_the_hello_refuses_the_link() {
+async fn an_exchange_message_before_the_hello_refuses_the_link() {
     let now = whole_second();
     let deployment = Deployment::new(32, now);
     let issuer = deployment.add_issuer(now, [1; 16]);
@@ -3689,8 +3559,8 @@ async fn an_exchange_frame_before_the_hello_refuses_the_link() {
     let host_node = node(deployment.root_der(), h_tx);
     let host_addr = serve(&host_node, &host);
 
-    // A listener that answers the dial with an exchange frame, so the dial
-    // reads it where its hello comes.
+    // A listener that answers the dial with an exchange message, so the
+    // dial reads it where its hello comes.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("a loopback port");
@@ -3718,7 +3588,7 @@ async fn an_exchange_frame_before_the_hello_refuses_the_link() {
         assert!(matches!(first, PeerFrame::Hello { .. }));
         write_frame(
             &mut tls,
-            &PeerFrame::Exchange(exchange_frames(1)[2].clone()),
+            &PeerFrame::Exchange(exchange_messages(1)[2].clone()),
         )
         .await
         .expect("the manifest writes");
@@ -3731,12 +3601,12 @@ async fn an_exchange_frame_before_the_hello_refuses_the_link() {
     assert!(matches!(err, LinkError::Protocol(_)));
     server.await.expect("the listener task ends");
 
-    // An exchange frame before the hello on the inbound side closes the
+    // An exchange message before the hello on the inbound side closes the
     // connection, and no link registers.
     let mut raw = raw_peer_connect(deployment.root_der(), &late, host_addr).await;
     write_frame(
         &mut raw,
-        &PeerFrame::Exchange(exchange_frames(1)[2].clone()),
+        &PeerFrame::Exchange(exchange_messages(1)[2].clone()),
     )
     .await
     .expect("the manifest writes");
@@ -3808,6 +3678,74 @@ async fn a_linked_peer_reports_the_bot_list_its_leaf_carries() {
         Some(connetto_core::BOT_LIST_WILDCARD),
         "the person's certificate carries the wildcard"
     );
+}
+
+/// Both sides of one loopback link report, in their `Linked` event, the
+/// peer key their certificate proved, matching the peer's own
+/// `SubjectPublicKeyInfo` (R77).
+#[tokio::test]
+async fn a_link_up_reports_the_peer_key_its_certificate_proved() {
+    let now = whole_second();
+    let deployment = Deployment::new(78, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alpha = deployment.device(
+        &issuer,
+        "alpha",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let beta = deployment.device(
+        &issuer,
+        "beta",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (a_tx, mut a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    let addr = serve(&b, &beta);
+    let _ = serve(&a, &alpha);
+    let _ = a.link(addr).await.expect("the dial links");
+
+    // The dialer sees the key the listener's certificate proved.
+    let event = await_event(&mut a_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::Linked { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        linked_event(&beta),
+        "the dialer sees the listener's key"
+    );
+
+    // The listener sees the key the dialer's certificate proved.
+    let event = await_event(&mut b_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::Linked { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        linked_event(&alpha),
+        "the listener sees the dialer's key"
+    );
+    a.stop(CloseReason::Closed);
+    b.stop(CloseReason::Closed);
+}
+
+/// The `Linked` event the node reports when `peer` comes up, the key its
+/// certificate proved and the list it carries.
+fn linked_event(peer: &Peer) -> PeerEvent {
+    PeerEvent::Linked {
+        peer: peer.identity.clone(),
+        public_key: public_key_info(&peer.key),
+        bot_list: Some(peer.bot_list.clone()),
+    }
 }
 
 /// The peers a link read names, without their addresses.

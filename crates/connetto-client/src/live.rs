@@ -3308,6 +3308,16 @@ struct EnrolLink<T: Transport> {
 }
 
 #[cfg(feature = "device-identity")]
+impl<T: Transport> Clone for EnrolLink<T> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            alive: Weak::clone(&self.alive),
+        }
+    }
+}
+
+#[cfg(feature = "device-identity")]
 impl<T> crate::enrolment::Link for EnrolLink<T>
 where
     T: Transport + Send + 'static,
@@ -3371,9 +3381,69 @@ where
     async fn offer(
         &self,
         key_id: [u8; 32],
-    ) -> Result<Option<crate::author::OfferDraft>, ClientError> {
+    ) -> Result<Option<connetto_core::exchange::Offer>, ClientError> {
         let mut state = self.shared.lock_interrupting().await;
-        state.conn.offer_draft(key_id)
+        state.conn.own_offer(key_id)
+    }
+
+    #[cfg(feature = "peer")]
+    async fn build(&self) -> Option<(connetto_core::Major, connetto_core::SchemaVersion)> {
+        self.shared.lock_interrupting().await.conn.own_build()
+    }
+
+    #[cfg(feature = "peer")]
+    async fn serve_range(
+        &self,
+        key_id: [u8; 32],
+        from: u64,
+        to: u64,
+        build: (connetto_core::Major, connetto_core::SchemaVersion),
+    ) -> Result<Option<crate::exchange::Served>, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.serve_range(key_id, from, to, &build)
+    }
+
+    #[cfg(feature = "peer")]
+    async fn serve_body(&self, key_id: [u8; 32], seq: u64) -> Result<Option<Vec<u8>>, ClientError> {
+        self.shared
+            .lock_interrupting()
+            .await
+            .conn
+            .serve_body(key_id, seq)
+    }
+
+    #[cfg(feature = "peer")]
+    async fn peer_cursor(
+        &self,
+        author: Vec<u8>,
+    ) -> Result<connetto_core::exchange::Frontier, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.peer_cursor(&author)
+    }
+
+    #[cfg(feature = "peer")]
+    async fn adopt(
+        &self,
+        author: crate::peer::PeerAuthor,
+        offer: connetto_core::exchange::SignedOffer,
+        cursor: connetto_core::exchange::Frontier,
+    ) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.adopt_peer_offer(&author, &offer, &cursor)
+    }
+
+    #[cfg(feature = "peer")]
+    async fn take_row(
+        &self,
+        author: crate::peer::PeerAuthor,
+        row: connetto_core::exchange::ManifestRow,
+        body: Option<Vec<u8>>,
+        cursor: connetto_core::exchange::Frontier,
+    ) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state
+            .conn
+            .take_peer_row(&author, &row, body.as_deref(), &cursor)
     }
 }
 

@@ -5817,17 +5817,30 @@ The `connetto-provisional` holding at every event, for a key in a `main` table a
 | R31 rebuild at a newer major | dropped with the tables | dropped with the store's tables |
 | Eviction pass | keeps the row | keeps the row for every identity |
 
+### Decisions, taken with the maintainer on 2026-10-31
+
+17. **A request names its whole range and the receiver's build.** `Request { request_id, from, to, build }` asks for `from..=to`, `to` being the `newest.seq` of the offer the receiver verified, and the sender serves exactly that range, so an entry the author writes after signing never reaches a manifest checked against the older head. This is how a [Hypercore request](https://github.com/holepunchto/hypercore/blob/main/lib/messages.js) names the length whose signed tree it wants proven. `build` is the receiver's own `(major, version)`, and the sender sends a body only for an entry captured under it, the others crossing as their manifest row alone (decision 8), since a device with no device writer sends no offer and the sender would otherwise not know the receiver's build. Rejected: serving up to the sender's last sent offer, which bends the state table's rule that an offer arriving during a request waits for its end, and serving everything the sender holds, which sends bodies for nothing.
+18. **A range the author no longer holds is answered `NotAvailable`.** An entry the server answered meanwhile has left the author's queue, so the author cannot serve a range starting at or below its settled frontier and answers `End { outcome: NotAvailable }`, kept apart from `Busy` as Hypercore's `noData` keeps `NOT_AVAILABLE` apart from `INVALID_REQUEST`. The receiver drops the request and acts on the author's next offer, which every settlement produces. A device whose writer retired answers every request `NotAvailable`.
+19. **The signed offer is one `connetto-core` type.** `Offer { builds, settled, newest, retractions }` and `SignedOffer { offer, signature }` live in `connetto-core::exchange`, the peer message carries `SignedOffer`, the cursor row stores it as MessagePack, and the server decodes the same type in slice 7. The signed bytes are rebuilt from the fields by `offer_message`, as Hypercore rebuilds `treeSignable` from the tree fields it stores beside the signature, so no encoding has to round-trip byte for byte.
+20. **A head contradicting a verified one is caught at the cursor.** The receiver keeps one verified `(seq, head)` per author, its cursor, and raises `PeerChainInvalid` when the offer's `settled` or `newest` sits at the cursor's sequence with another head. A fork below the cursor is left to the server's chain check at settlement. Rejected: keeping every verified hash, which adds a column and catches forks the server refuses anyway.
+21. **The exchange protocol is a sans-IO crate, `connetto-exchange`.** No Rust crate fits. Hypercore, p2panda, iroh-docs, willow25 and bamboo all sign with ed25519, which the [Secure Enclave](https://developer.apple.com/documentation/security/protecting-keys-with-the-secure-enclave) ("works only with NIST P-256 elliptic curve keys") and [StrongBox](https://android.googlesource.com/platform/hardware/interfaces/+/refs/heads/master/security/keymint/aidl/android/hardware/security/keymint/IKeyMintDevice.aidl) ("StrongBox implementations do not support CURVE_25519") cannot hold. Each would also replace a merged piece of connetto, the chain the server recomputes, the SQLite queue or the mTLS link, and an upstream signature PR would fix none of those. The crate holds the exchange messages and the R0 to R3 and S0 to S2 state machine, fed events and returning actions with no SQLite, runtime or socket, as `quinn-proto` holds QUIC's. `connetto-peer` carries its messages, and the client's enrolment task feeds it and carries out its actions.
+22. **A stalled request is retried by both sides.** An author that answered `Busy` sends its current offer again to that peer once its stream ends, and a receiver whose request timed out requests again from its kept offer after a backoff of 5 s doubling to 5 min while the link lives, reset by a completed range or a fresh offer. Either alone leaves a case stalled until the author writes again.
+
 ### Design
 
 **The wire.** `PROTOCOL_VERSION` becomes 2, which the hello, the TXT record and the beacon carry together, so a version 1 and a version 2 device refuse each other at hello. The writer is never sent, since each device offers only its own device writer's chain and the link has proven its key. A device with no device writer offers nothing and still receives.
 
 ```rust
-// PeerFrame variants
-ExchangeOffer { builds: Vec<(Major, SchemaVersion)>, settled: Option<Frontier>, newest: Option<Frontier>, retractions: Vec<Retraction>, signature: Vec<u8> }
-ExchangeRequest { request_id: u64, from: u64 }
-ExchangeManifest { request_id: u64, previous: [u8; 32], rows: Vec<ManifestRow>, last: bool }
-ExchangeBody { request_id: u64, seq: u64, changeset: Vec<u8> }
-ExchangeEnd { request_id: u64, outcome: EndOutcome }
+// connetto-exchange::Message, carried as PeerFrame::Exchange
+Offer(SignedOffer)
+Request { request_id: u64, from: u64, to: u64, build: (Major, SchemaVersion) }
+Manifest { request_id: u64, previous: [u8; 32], rows: Vec<ManifestRow>, last: bool }
+Body { request_id: u64, seq: u64, changeset: Vec<u8> }
+End { request_id: u64, outcome: EndOutcome }
+
+struct Offer { builds: Vec<(Major, SchemaVersion)>, settled: Option<Frontier>, newest: Option<Frontier>, retractions: Vec<Retraction> }
+struct SignedOffer { offer: Offer, signature: Vec<u8> }
+enum EndOutcome { Complete, Busy, NotAvailable }
 
 struct Frontier { seq: u64, head: [u8; 32] }
 struct ManifestRow { seq: u64, major: Major, origin: Option<Origin>, digest: [u8; 32] }
@@ -5841,9 +5854,9 @@ ProvisionalVerdicts { request_id: String, verdicts: Vec<(u64, Verdict)> }
 enum Verdict { Applied, Settled, Refused(RetractCause), Abandoned, Pending }
 ```
 
-The manifest always runs to the signed `newest`, at most 8192 rows per frame, so the receiver verifies the chain from `previous` to the signed head before any body arrives. Bodies follow in sequence order for the entries the receiver's build can apply, each checked against its digest. `RetractCause::Conflict` exists because R75's `SettledOutcome::Conflict` applied nothing and carries no `MutationRejectReason`. A row names an entry's original writer as an `Origin`, the writer and sequence of a `Provenance` without the number writer's secret, which names that writer to the server (R70 decision 22) and so must never reach a peer. The type has no place for it, and the chain hash covers the same two fields.
+The manifest always runs to the request's `to`, the `newest` of the offer the receiver verified, at most 8192 rows per frame, so the receiver verifies the chain from `previous` to the signed head before any body arrives. Bodies follow in sequence order for the entries captured under the request's build, each checked against its digest. `RetractCause::Conflict` exists because R75's `SettledOutcome::Conflict` applied nothing and carries no `MutationRejectReason`. A row names an entry's original writer as an `Origin`, the writer and sequence of a `Provenance` without the number writer's secret, which names that writer to the server (R70 decision 22) and so must never reach a peer. The type has no place for it, and the chain hash covers the same two fields.
 
-**One exchange, as the receiver sees it.** The link comes up and each side sends its offer, whose signature the receiver checks against the key the link proved. The receiver applies the offer's frontier and retractions, then requests from `max(cursor, settled.seq) + 1` when `newest.seq` is above it. It recomputes the chain over the manifest and compares the last hash with `newest.head`, and a mismatch, or a `settled` head contradicting one already verified at that sequence, raises `PeerChainInvalid` and ends the exchange. Each row then commits in its own transaction. A row at another build advances the cursor alone. Otherwise the body is checked against its digest, keys held by the receiver's own unsent writes are filtered, the remaining ops run through the views under `AuthorBinding`, and the provenance, the stored entry and the cursor are written, or on refusal the cursor alone.
+**One exchange, as the receiver sees it.** The link comes up and each side sends its offer, whose signature the receiver checks against the key the link proved. The receiver applies the offer's frontier and retractions and moves its cursor up to `settled` when that is higher, then requests `cursor.seq + 1 ..= newest.seq` under its own build when `newest.seq` is above the cursor (decision 17). It recomputes the chain over the manifest from the cursor's head and compares the last hash with `newest.head`, and a mismatch, or a `settled` or `newest` head contradicting the cursor's head at its sequence (decision 20), raises `PeerChainInvalid` and ends the exchange. Each row then commits in its own transaction. A row at another build advances the cursor alone. Otherwise the body is checked against its digest, keys held by the receiver's own unsent writes are filtered, the remaining ops run through the views under `AuthorBinding`, and the provenance, the stored entry and the cursor are written, or on refusal the cursor alone.
 
 **Client tables, in `main`.**
 
@@ -5871,16 +5884,24 @@ Both roles run on every link at once. For one author as the receiver sees it: **
 |---|---|---|---|---|---|---|---|
 | Link up | send own offer, enter R1 | n/a | n/a | n/a | enter S1 | n/a | n/a |
 | Link lost | nothing | enter R0 | enter R0 | abort request, the current row's transaction rolls back, enter R0 | nothing | enter S0 | stop streaming, enter S0 |
-| Offer received, signature valid | n/a | apply frontier and retractions, request if behind (R3) or enter R2 | same as R1 | keep it, act on it at `ExchangeEnd` | n/a | n/a | n/a |
+| Offer received, signature valid | n/a | apply frontier and retractions, move the cursor up to `settled`, request the rest under the own build (R3) or enter R2 | same as R1 | keep it, act on it at `End` | n/a | n/a | n/a |
 | Offer received, signature invalid | n/a | `PeerChainInvalid`, stay R1 | same | abort request, same | n/a | n/a | n/a |
+| Offer received, `settled` or `newest` contradicts the cursor's head (decision 20) | n/a | `PeerChainInvalid`, stay R1 | same | keep it, checked when acted on at `End` | n/a | n/a | n/a |
 | Manifest chain mismatch or fork | n/a | n/a | n/a | `PeerChainInvalid`, abort, enter R1 until a new offer | n/a | n/a | n/a |
 | Body digest mismatch | n/a | n/a | n/a | same as a chain mismatch | n/a | n/a | n/a |
+| A frame out of order within a request, or `End { Complete }` before every row | n/a | n/a | n/a | same as a chain mismatch | n/a | n/a | n/a |
+| A reply quoting another request id, or arriving with no request outstanding | n/a | ignore it | ignore it | ignore it | n/a | n/a | n/a |
 | Row at another build | n/a | n/a | n/a | advance the cursor alone | n/a | n/a | n/a |
 | Row refused by policy | n/a | n/a | n/a | advance the cursor, `PeerWriteRefused` | n/a | n/a | n/a |
 | Row applied | n/a | n/a | n/a | provenance, entry and cursor in one transaction, `ProvisionalApplied` | n/a | n/a | n/a |
-| `ExchangeEnd` | n/a | n/a | n/a | act on a kept offer or enter R2 | n/a | n/a | n/a |
-| 30 s without the next frame | n/a | n/a | n/a | abort request, enter R1, retry at the next offer | n/a | n/a | n/a |
-| Request received | n/a | n/a | n/a | n/a | n/a | stream manifest and bodies, enter S2 | refuse with `ExchangeEnd { Busy }` |
+| `End { Complete }` | n/a | n/a | n/a | act on a kept offer or enter R2, reset the backoff | n/a | n/a | n/a |
+| `End { Busy }` | n/a | n/a | n/a | act on a kept offer or enter R2, the author re-offers when its stream ends (decision 22) | n/a | n/a | n/a |
+| `End { NotAvailable }` | n/a | n/a | n/a | drop the request, act on a kept offer or enter R2 until the next offer (decision 18) | n/a | n/a | n/a |
+| 30 s without the next frame | n/a | n/a | n/a | abort request, enter R1, request again from the kept offer after the backoff (decision 22) | n/a | n/a | n/a |
+| Adopting an offer or applying a row fails to commit | n/a | the cursor returns to the one the replica holds | same | the row's transaction rolls back, the commits queued after it are dropped, the cursor returns to the one the replica holds, abort request, enter R1, request again from it after the backoff | n/a | n/a | n/a |
+| Retry backoff elapses | n/a | request again from the kept offer, enter R3 | n/a | n/a | n/a | n/a | n/a |
+| Request received | n/a | n/a | n/a | n/a | n/a | stream the range with bodies for the request's build alone, enter S2, or answer `End { NotAvailable }` when the range starts at or below the settled frontier (decisions 17 and 18) | refuse with `End { Busy }`, send the current offer when the stream ends (decision 22) |
+| Own stream ends | n/a | n/a | n/a | n/a | n/a | n/a | send the offer that waited, or the current one to a peer answered `Busy`, enter S1 |
 | Own new local write | nothing | nothing | nothing | nothing | nothing | sign and send a fresh offer | send it after the stream ends |
 | Own entry settled, applied | nothing | nothing | nothing | nothing | nothing | update `settled_*`, fresh offer | after the stream |
 | Own entry rejected or conflicted | nothing | nothing | nothing | nothing | write `_connetto_retraction` | same, fresh offer | after the stream |
@@ -5893,7 +5914,7 @@ Both roles run on every link at once. For one author as the receiver sees it: **
 | Replacement snapshot ends (`SnapshotEnd` ending a resync) | re-apply every stored entry through the peer apply, then own pending writes | same | same | same, after the current row's transaction | n/a | n/a | n/a |
 | R31 rebuild at a newer major | provisional rows and entries dropped, cursors kept | links close first, as R0 | same | same | n/a | n/a | n/a |
 | Archive import | peer tables restored, as R0 | n/a, import runs closed | n/a | n/a | own writer retired, its retraction log kept | n/a | n/a |
-| Own device writer retired | nothing | nothing | nothing | nothing | offers stop until the fresh key enrols | end the exchange, as S0 | stop streaming |
+| Own device writer retired | nothing | nothing | nothing | nothing | offers stop until the fresh key enrols | offers stop, every request answered `End { NotAvailable }` | stop streaming with `End { NotAvailable }`, enter S1 |
 | Server session established | send `ProvisionalStatus` per author with provisional rows | same | same | same | n/a | n/a | n/a |
 | `ProvisionalVerdicts` received | adjudicate, retract or keep per verdict | same | same | same, after the current row's transaction | n/a | n/a | n/a |
 | 30 s without `ProvisionalVerdicts` | drop the wait, ask at the next server session | same | same | same | n/a | n/a | n/a |
@@ -5918,7 +5939,7 @@ One pull request each, in this order, each green and useful on its own (2026-10-
 5. **The peer apply** (decisions 3 to 6, 8 and 13). `connetto-client`, from a verified manifest and bodies to applied rows, refusal and retraction, under `UnrecordedWrites`, `_connetto_peer_entry` and `AuthorBinding`, and the re-apply of stored entries when a resync's replacement snapshot ends, proven in process with two replicas and no link. Needs R31.
 6. **The exchange driver**, in four pull requests (decided with the maintainer 2026-10-31), each green on its own. The driver runs in the enrolment task, which already receives the link's events and holds the device key, and reaches the replica through the client's lock. An offer names no peer, so one signature serves every linked peer, and writes arriving while a signature is in flight fold into the next offer.
    - **6a, the author's state** (decisions 7 and 9). `settled_seq` and `settled_head` on `_connetto_writers` written as each acknowledged entry leaves the queue, `_connetto_retraction` written when the server rejects or conflicts one of the device writer's entries and kept until the writer retires, and the offer built from them with the build's majors, signed by the device key and sent to every linked peer on link up and on every change the state table names. Proven in process against a bare peer node.
-   - **6b, the exchange both ways** (decisions 8 and 10, the receiver flow above). `_connetto_peer_cursor`, the offer's signature checked against the key the link proved, requests from the cursor with an id every reply quotes, the manifest's chain checked against the signed head with `PeerChainInvalid` on a mismatch, each row applied with its cursor in one transaction, the 30 s bound per frame, and the sender serving a range or answering `Busy`. Proven between two clients on loopback.
+   - **6b, the exchange both ways** (decisions 8, 10 and 17 to 22, the receiver flow above). The `connetto-exchange` crate with the messages, `SignedOffer` in `connetto-core`, and the state machine of the table above tested row by row without SQLite or sockets. In the client, `_connetto_peer_cursor`, the offer's signature checked against the key the link proved, a request naming its range and build with an id every reply quotes, the manifest's chain checked against the signed head with `PeerChainInvalid` on a mismatch, each row applied with its cursor in one transaction, the 30 s bound per frame with the backoff retry, and the sender serving a range, answering `Busy` or `NotAvailable`, and re-offering after a stream. Proven between two clients on loopback.
    - **6c, the archive and the rebuild** (decision 16). The four peer tables in the archive with the import's re-apply, and R31's rebuild keeping the cursors and the retraction log while it drops the entries and the records.
    - **6d, the harness proof.** Two clients of different accounts against the real server, exchanging offline and reconciling online, which the Done when names.
 7. **Online adjudication** (decision 11). Both server messages, proven Docker-gated by a receiver that never meets the author again and still confirms an applied write, retracts a refused one with its reason, and retracts an abandoned one after the author's enrolment is revoked.

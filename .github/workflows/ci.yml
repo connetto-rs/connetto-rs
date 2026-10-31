@@ -477,6 +477,7 @@ jobs:
               -p connetto-dioxus
               -p connetto-yew
               -p connetto-peer
+              -p connetto-exchange
               -p connetto-demo-support
             bins: ''
     steps:
