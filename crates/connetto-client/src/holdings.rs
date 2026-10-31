@@ -153,6 +153,7 @@ struct TableKeys {
 impl TableKeys {
     /// `table`'s keys, empty, read from the replica's own columns, or `None`
     /// when the table is gone or has no key a holding could name.
+    #[cfg(feature = "peer")]
     fn of(
         db: &mut SqliteConnection,
         config: &ClientConfig,
