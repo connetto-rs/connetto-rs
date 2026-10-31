@@ -5729,7 +5729,7 @@ Two native processes with valid certificates discover each other on one network 
 
 ## R77: the exchange and the provisional tier
 
-**Status.** IN PROGRESS. Slices 1 to 5 merged on 2026-10-29 and 2026-10-30 as #310, #296, #297, #300 and #342. Designed 2026-10-26 against `main` `ab408112` and the R31 series tip `2d75a9f1`. Aimed first at offline data between the iPhone, the iPad and an Android phone over R76 slice 9f's star (decided with the maintainer 2026-10-18). Decisions 1 to 10 were settled on evidence while grounding the design, and decisions 11 and 12 with the maintainer the same day.
+**Status.** IN PROGRESS. Slices 1 to 5 merged on 2026-10-29 and 2026-10-30 as #310, #296, #297, #300 and #342, and slice 10 on 2026-10-31 as #344. Designed 2026-10-26 against `main` `ab408112` and the R31 series tip `2d75a9f1`. Aimed first at offline data between the iPhone, the iPad and an Android phone over R76 slice 9f's star (decided with the maintainer 2026-10-18). Decisions 1 to 10 were settled on evidence while grounding the design, and decisions 11 and 12 with the maintainer the same day.
 
 **Blocked on** R75 and R76, both merged for everything this phase uses. R31 is merged, and slices 1, 4 and 5 carry its capture major. The retraction's reason rides on R57 step 8, merged as #205 (2026-10-20), which surfaces the `MutationRejectReason` the client used to drop.
 

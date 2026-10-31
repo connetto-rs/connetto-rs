@@ -2151,3 +2151,140 @@ async fn a_retraction_undoes_a_shared_row_in_the_store() {
         Vec::new()
     );
 }
+
+/// Resync subscription `a` for `reason`, serve its replacement `rows`, and
+/// collect every event up to the replacement's end and the re-apply after it.
+async fn resync_orders(
+    recv: &mut ConnettoConnection<Script>,
+    server: &Script,
+    reason: FullResyncReason,
+    rows: &[(i64, &str, &str)],
+    cursor: u8,
+) -> Vec<ClientEvent> {
+    server.say(IncomingFrame::Control(ControlMessage::FullResyncRequired(
+        FullResyncRequired {
+            sub_id: "a".to_owned(),
+            reason,
+        },
+    )));
+    server.say(IncomingFrame::Control(ControlMessage::SnapshotBegin(
+        SnapshotBegin {
+            sub_id: "a".to_owned(),
+            priority: SubscriptionPriority::default(),
+        },
+    )));
+    server.say(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(
+        SnapshotPatch::new("a".to_owned(), orders_payload(rows)),
+    )));
+    server.say(IncomingFrame::Control(ControlMessage::SnapshotEnd(
+        SnapshotEnd {
+            sub_id: "a".to_owned(),
+            cursor: cursor_byte(cursor),
+        },
+    )));
+    let mut seen = Vec::new();
+    loop {
+        let event = recv.pump_one().await.expect("pump");
+        assert!(!matches!(event, ClientEvent::Closed), "closed early");
+        let end = matches!(&event, ClientEvent::SnapshotEnd { sub_id, .. } if sub_id == "a");
+        seen.push(event);
+        if end {
+            break;
+        }
+    }
+    seen.extend(drain_quiet(recv, Duration::from_millis(50)).await);
+    seen
+}
+
+/// A replacement snapshot that writes a provisional key is no verdict: the
+/// record stays, no `ProvisionalConfirmed` is raised, and the re-apply at
+/// the replacement's end puts the author's value back over the server's
+/// (R77 decision 13).
+async fn a_replacement_snapshot_is_no_verdict(reason: FullResyncReason) {
+    // The insert gives the author the row its update changes, and the
+    // receiver holds that row from the server instead.
+    let [_, update] = captured([
+        &|conn| insert_order(conn, 1, "peer-anna", "open"),
+        &|conn| update_order(conn, 1, "peer-anna", "taken"),
+    ])
+    .await;
+    let (mut recv, server) = receiver().await;
+    recv.subscribe("a", "SELECT * FROM orders")
+        .await
+        .expect("subscribe");
+    deliver_snapshot(&mut recv, &server, &[(1, "peer-anna", "open")], 1).await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    recv.apply_peer_entry(&a, &manifest(8, &update), &update)
+        .expect("apply the update");
+    drain_quiet(&mut recv, Duration::from_millis(50)).await;
+
+    let seen = resync_orders(
+        &mut recv,
+        &server,
+        reason.clone(),
+        &[(1, "peer-anna", "open")],
+        2,
+    )
+    .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, ClientEvent::ProvisionalConfirmed { .. })),
+        "{reason:?}: the replacement confirmed nothing: {seen:?}"
+    );
+    assert_eq!(
+        order_rows(&mut recv),
+        vec![(1, "peer-anna".to_owned(), "taken".to_owned())],
+        "{reason:?}: the author's value stands over the replacement's"
+    );
+    let rows = recv.provisional_rows().expect("read the records");
+    let record = provenance_of(&rows, "orders", &[KeyValue::Int(1)]).expect("the record");
+    assert_eq!(record.author, "author-a".as_bytes());
+    assert_eq!(record.seq, 8);
+    assert_eq!(record.state, ProvisionalState::Provisional);
+}
+
+#[tokio::test]
+async fn an_authorization_change_replacement_is_no_verdict() {
+    a_replacement_snapshot_is_no_verdict(FullResyncReason::AuthorizationChange).await;
+}
+
+#[tokio::test]
+async fn a_beyond_history_replacement_is_no_verdict() {
+    a_replacement_snapshot_is_no_verdict(FullResyncReason::CursorBeyondHistory).await;
+}
+
+#[tokio::test]
+async fn a_truncate_replacement_is_no_verdict() {
+    a_replacement_snapshot_is_no_verdict(FullResyncReason::TableTruncated {
+        table: "orders".to_owned(),
+    })
+    .await;
+}
+
+/// A live patch is a verdict still: it clears the record and confirms it.
+#[tokio::test]
+async fn a_live_patch_confirms_a_provisional_row() {
+    let [body] = captured([&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
+    let (mut recv, server) = receiver().await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    recv.apply_peer_entry(&a, &manifest(7, &body), &body)
+        .expect("apply the insert");
+    server.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+        "ended".to_owned(),
+        cursor_byte(1),
+        orders_payload(&[(1, "peer-anna", "open")]),
+    ))));
+    let event = pump_to(&mut recv, |event| {
+        matches!(event, ClientEvent::ProvisionalConfirmed { .. })
+    })
+    .await;
+    let ClientEvent::ProvisionalConfirmed { rows } = event else {
+        unreachable!("pump_to returns the event it matched");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        recv.provisional_rows().expect("read the records"),
+        Vec::new()
+    );
+}
