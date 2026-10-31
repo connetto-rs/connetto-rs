@@ -9435,6 +9435,12 @@ where
     /// patchset of indirect deletes and nothing else (R44), is not applied
     /// natively: each departed row goes only once no holding names it and no
     /// unsent write of this identity keeps it.
+    ///
+    /// A server write on a provisional key confirms it, except a resync's
+    /// replacement snapshot, which reports the server's state without the
+    /// peer entry and so is no verdict: the record and its holding stay, and
+    /// the re-apply at the replacement's end puts the author's value back
+    /// (R77 decision 13).
     fn apply_patch(
         &mut self,
         payload_zstd: &[u8],
@@ -9472,6 +9478,8 @@ where
         let shared = &config.shared_tables;
         #[cfg(feature = "peer")]
         let mut confirmed: Option<Vec<provisional::ProvisionalRow>> = None;
+        #[cfg(feature = "peer")]
+        let replacing = cursor.is_none() && self.resyncing.contains(addressed_to);
         let applied = deleting_transaction(&mut self.db, config, |conn| {
             let held = match set {
                 Some(set) => Some(holdings::PatchHoldings::read(conn, config, set)?),
@@ -9498,9 +9506,10 @@ where
                         )?;
                     }
                     // A server write confirms the keys it lands on, and their
-                    // rows stand on the subscriptions holding them (R77).
+                    // rows stand on the subscriptions holding them, unless it
+                    // is a resync's replacement (R77 decisions 13 and 14).
                     #[cfg(feature = "peer")]
-                    {
+                    if !replacing {
                         let keys = provisional::written_keys(&bytes)?;
                         let cleared = provisional::clear_written(conn, &keys)?;
                         let released: Vec<(String, Vec<KeyValue>)> = cleared
