@@ -1415,10 +1415,11 @@ impl<L: Link> Run<L> {
     }
 
     /// Draft the device writer's offer and start its signature. A device
-    /// without a certificate, or whose writer retired, offers nothing.
+    /// without a certificate, or whose writer retired, offers nothing. A
+    /// certificate is only held beside the key the run opened for it.
     async fn sign_offer(&mut self) {
         self.offers.stale = false;
-        let Some(held) = &self.held else {
+        let (Some(held), Some(key)) = (&self.held, self.key.clone()) else {
             return;
         };
         let key_id = *held.leaf.identity().key().as_bytes();
@@ -1427,13 +1428,6 @@ impl<L: Link> Run<L> {
             Ok(None) => return,
             Err(err) => {
                 tracing::warn!(error = %err, "the device writer's offer could not be read");
-                return;
-            }
-        };
-        let key = match self.key().await {
-            Ok(key) => key,
-            Err(err) => {
-                tracing::warn!(error = %err, "the device key could not be opened to sign the offer");
                 return;
             }
         };
@@ -1446,9 +1440,11 @@ impl<L: Link> Run<L> {
     /// drafted and signed again, and otherwise every linked peer gets the
     /// offer.
     async fn offer_signed(&mut self, signed: NextSigned) {
-        let Some((draft, _)) = self.offers.signing.take() else {
-            return;
-        };
+        let (draft, _) = self
+            .offers
+            .signing
+            .take()
+            .expect("a signature lands only while one is in flight");
         if self.offers.stale {
             self.sign_offer().await;
             return;
@@ -1466,20 +1462,21 @@ impl<L: Link> Run<L> {
         };
         let offer = draft.signed(signature);
         self.offers.current = Some(offer.clone());
-        let mut reached = HashSet::new();
-        for link in self.peer.linked() {
-            if reached.insert(link.peer.key()) {
-                self.send_offer(&link.peer, offer.clone()).await;
-            }
+        let peers: HashSet<DeviceIdentity> = self
+            .peer
+            .linked()
+            .into_iter()
+            .map(|link| link.peer)
+            .collect();
+        for peer in &peers {
+            self.send_offer(peer, offer.clone()).await;
         }
     }
 
     /// Queue `offer` on the link to `peer`. A peer whose link closed meanwhile
-    /// gets the offer at its next link up.
+    /// gets the offer at its next link up, so a failed send is left alone.
     async fn send_offer(&self, peer: &DeviceIdentity, offer: ExchangeFrame) {
-        if let Err(err) = self.peer.send_exchange(peer, offer).await {
-            tracing::debug!(error = %err, "the offer did not reach a peer");
-        }
+        let _ = self.peer.send_exchange(peer, offer).await;
     }
 }
 

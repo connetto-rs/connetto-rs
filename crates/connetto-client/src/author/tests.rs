@@ -4,6 +4,8 @@ use connetto_core::messages::{
     ControlMessage, MutationApplied, MutationConflict, MutationReject, MutationRejectReason,
     WriterRef,
 };
+use diesel::connection::SimpleConnection as _;
+use diesel::prelude::*;
 use tokio::sync::mpsc;
 
 use super::OfferDraft;
@@ -212,4 +214,137 @@ async fn every_change_to_the_device_writers_offer_asks_for_a_fresh_one() {
     .await
     .expect("the deferral lands");
     assert_eq!(refreshes(&mut steered), 0, "a deferral changes no offer");
+}
+
+/// Refuse every statement `when` names inside its transaction, as a full
+/// disk or a lost lock refuses a write.
+fn refuse(conn: &mut Conn, when: &str) {
+    conn.db
+        .batch_execute(&format!(
+            "CREATE TEMP TRIGGER refuse {when} BEGIN SELECT RAISE(ABORT, 'refused'); END"
+        ))
+        .expect("install the refusal");
+}
+
+/// The rows of the durable queue.
+fn queued(conn: &mut Conn) -> i64 {
+    diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+        "(SELECT count(*) FROM _connetto_pending)",
+    ))
+    .get_result(&mut conn.db)
+    .expect("count the queue")
+}
+
+/// R77 decision 9: an answer whose frontier, retraction or queue deletion
+/// cannot be written fails whole, the entry staying in the durable queue
+/// for the next run to settle.
+#[tokio::test]
+async fn a_settlement_that_cannot_be_written_fails_and_keeps_the_entry() {
+    let applied = |seq| ControlMessage::MutationApplied(MutationApplied { client_seq: seq });
+    let rejected = |seq| {
+        ControlMessage::MutationReject(MutationReject {
+            client_seq: seq,
+            reason: MutationRejectReason::Unauthorized,
+        })
+    };
+    let conflicted = |seq| {
+        ControlMessage::MutationConflict(MutationConflict {
+            client_seq: seq,
+            table: "items".to_owned(),
+            server_row: None,
+        })
+    };
+    let cases: [(&str, &dyn Fn(u64) -> ControlMessage); 4] = [
+        (
+            "BEFORE UPDATE OF settled_seq ON _connetto_writers",
+            &applied,
+        ),
+        ("BEFORE DELETE ON _connetto_pending", &applied),
+        ("BEFORE INSERT ON _connetto_retraction", &rejected),
+        ("BEFORE INSERT ON _connetto_retraction", &conflicted),
+    ];
+    for (when, answer) in cases {
+        let (mut conn, seqs, _steered) = device_replica(1);
+        refuse(&mut conn, when);
+        assert!(
+            conn.handle_control(answer(seqs[0])).await.is_err(),
+            "{when} fails the answer"
+        );
+        assert_eq!(queued(&mut conn), 1, "{when} keeps the entry queued");
+    }
+}
+
+/// R77 decision 9: a retirement whose retraction log cannot be dropped
+/// fails whole, the device writer keeping its queue and its log.
+#[tokio::test]
+async fn a_retirement_whose_log_cannot_be_dropped_keeps_the_writer() {
+    let (mut conn, seqs, _steered) = device_replica(2);
+    conn.handle_control(ControlMessage::MutationReject(MutationReject {
+        client_seq: seqs[0],
+        reason: MutationRejectReason::Unauthorized,
+    }))
+    .await
+    .expect("the refusal lands");
+    refuse(&mut conn, "BEFORE DELETE ON _connetto_retraction");
+    assert!(conn.retire_device(Carry::Named).is_err());
+    assert_eq!(queued(&mut conn), 1, "the device writer keeps its entry");
+    assert_eq!(offer(&mut conn).retractions.len(), 1, "and its log");
+}
+
+/// R77 decisions 7 and 9: bookkeeping that is corrupt or unreadable is an
+/// error, never an offer a peer would trust.
+#[test]
+fn corrupt_bookkeeping_is_refused_and_never_offered() {
+    let writer = crate::writer_id(&WRITER);
+    let corruptions = [
+        "UPDATE _connetto_writers SET settled_seq = -1, settled_head = zeroblob(32)".to_owned(),
+        "UPDATE _connetto_writers SET settled_seq = 1, settled_head = zeroblob(31)".to_owned(),
+        format!(
+            "INSERT INTO _connetto_retraction (writer, seq, cause) \
+             VALUES ('{writer}', -1, CAST('\"Conflict\"' AS BLOB))"
+        ),
+        format!(
+            "INSERT INTO _connetto_retraction (writer, seq, cause) \
+             VALUES ('{writer}', 1, CAST('not a cause' AS BLOB))"
+        ),
+        format!(
+            "{}; INSERT INTO _connetto_held_batch (major, version) VALUES (0, x'00')",
+            crate::majors::HELD_DDL
+        ),
+        "ALTER TABLE _connetto_writers DROP COLUMN settled_head".to_owned(),
+        "DROP TABLE _connetto_retraction".to_owned(),
+    ];
+    for corruption in corruptions {
+        let (mut conn, _seqs, _steered) = device_replica(1);
+        conn.db
+            .batch_execute(&corruption)
+            .expect("corrupt the bookkeeping");
+        assert!(conn.offer_draft(KEY).is_err(), "{corruption} is refused");
+    }
+}
+
+/// R77 decision 9: a sequence past what the replica stores is refused
+/// before anything is written.
+#[test]
+fn a_sequence_past_storage_is_refused() {
+    let (mut conn, _seqs, _steered) = device_replica(1);
+    assert!(super::settle(&mut conn.db, &WRITER, u64::MAX, &[0; 32], None).is_err());
+}
+
+/// R77 decision 8: a build that declares no schema version names no build
+/// in its offer.
+#[test]
+fn a_build_without_a_schema_version_offers_no_build() {
+    let mut conn = crate::ConnettoConnection::<crate::drain::tests::Wire>::open(
+        &crate::Replica::in_memory(),
+        "CREATE TABLE items (id INTEGER PRIMARY KEY)",
+        &crate::ClientConfig::new("plain"),
+        None,
+    )
+    .expect("open the replica");
+    let offer = conn
+        .offer_draft(KEY)
+        .expect("read the offer")
+        .expect("the key is not retired");
+    assert_eq!(offer.builds, []);
 }
