@@ -274,16 +274,16 @@
       <text x="150" y="72" text-anchor="middle" font-size="9" fill="#555">each grant resolves into a Principal</text>
     </g>
 
-    <!-- App registry and bot login (R91) -->
+    <!-- App registry and bot login (R91 built, R99 and R104 to come) -->
     <g transform="translate(550, 1146)">
       <rect width="300" height="108" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="4" height="108" rx="1" fill="#4CAF50" />
       <text x="150" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">App registry and bot login</text>
-      <text x="150" y="36" text-anchor="middle" font-size="9" fill="#555">R91 (chapters 12 and 11)</text>
+      <text x="150" y="36" text-anchor="middle" font-size="9" fill="#555">R91 built, R99 and R104 to come (chapters 12 and 11)</text>
       <text x="150" y="53" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: the bot registry, the installs, the challenge</text>
       <text x="150" y="68" text-anchor="middle" font-size="8.5" fill="#4CAF50">apps add bots, mint codes, the registry synced to replicas</text>
-      <text x="150" y="83" text-anchor="middle" font-size="8.5" fill="#C62828">R91: the app-token login exchange, the demo apps</text>
-      <text x="150" y="98" text-anchor="middle" font-size="8.5" fill="#C62828">R91: the bot template, examples/bot-template</text>
+      <text x="150" y="83" text-anchor="middle" font-size="8.5" fill="#C62828">R99: key login on every connection, one per installation</text>
+      <text x="150" y="98" text-anchor="middle" font-size="8.5" fill="#C62828">R104: the demo apps, on R100's ownership schema</text>
     </g>
 
     <!-- Arrows and labels between the panels, painted after the column fills so they stay visible -->
@@ -582,14 +582,14 @@
   <g id="bot-client-zone">
     <rect x="980" y="1520" width="660" height="150" rx="10" fill="#F5F5F5" stroke="#BDBDBD" stroke-width="1.5" />
     <text x="1310" y="1546" text-anchor="middle" font-size="15" font-weight="700" fill="#555">Headless client (a bot)</text>
-    <text x="1310" y="1562" text-anchor="middle" font-size="10" fill="#C62828">connetto-client with no screen, R91 (chapter 13, template examples/bot-template)</text>
+    <text x="1310" y="1562" text-anchor="middle" font-size="10" fill="#C62828">the connetto-bot runtime on connetto-client with no screen, R103 (chapter 13)</text>
     <g transform="translate(995, 1574)">
       <rect width="630" height="84" rx="6" fill="#FFEBEE" stroke="#EF5350" stroke-width="1.5" />
       <text x="315" y="18" text-anchor="middle" font-size="9" fill="#555">a program holds a query, is told when it changed, and writes values back through the same client as a screen</text>
-      <text x="315" y="34" text-anchor="middle" font-size="9" fill="#555">it logs in with a key it holds, as the app's bot user, and keeps that session across restarts</text>
-      <text x="315" y="50" text-anchor="middle" font-size="9" fill="#555">it sees only the rows its installers shared with it, either one user at a time or all together</text>
-      <text x="315" y="66" text-anchor="middle" font-size="9" fill="#555">its traffic is charged to the user it acts for, or to the developer's app allowance, never to the bot</text>
-      <text x="315" y="80" text-anchor="middle" font-size="9" fill="#555">its replica lives in memory, a durable one is R93, on R71's Linux key custody</text>
+      <text x="315" y="34" text-anchor="middle" font-size="9" fill="#555">it signs each connection's challenge with its key, for one installation or as itself (R99)</text>
+      <text x="315" y="50" text-anchor="middle" font-size="9" fill="#555">it acts as the installation an admin added, and Postgres holds it to its declared tables and verbs</text>
+      <text x="315" y="66" text-anchor="middle" font-size="9" fill="#555">an installation's traffic is charged to the owner it serves, never to the bot (R99)</text>
+      <text x="315" y="80" text-anchor="middle" font-size="9" fill="#555">one encrypted file replica per installation, run connected or woken (R103, R101)</text>
     </g>
   </g>
 
