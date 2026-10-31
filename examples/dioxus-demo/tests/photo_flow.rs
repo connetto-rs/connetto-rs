@@ -42,7 +42,9 @@ use web_sys::{
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 const AUTH_PROVIDER: &str = "dev-idp";
-const AUTH_USERNAME: &str = "startup";
+/// The suite's own login, so the photos it pins and fetches are its own and
+/// not those an earlier suite on the same stack left under a shared name.
+const AUTH_USERNAME: &str = "dioxus-photo";
 
 const SUITE_LOCK_ALIGN: &str = "connetto-dioxus-photo-suite-align";
 const SUITE_LOCK_PHOTO: &str = "connetto-dioxus-photo-suite-photo";

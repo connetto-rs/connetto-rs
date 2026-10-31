@@ -35,6 +35,8 @@ async fn the_shared_store_counts_the_identities_using_it() {
     assert_eq!(identities(&mut bob), 1);
 }
 
+/// An identity whose client closed stays in the store, and a native client
+/// reads its own replica's use while offline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_identity_that_closed_still_counts() {
     let directory = tempfile::tempdir().unwrap();
@@ -47,9 +49,13 @@ async fn an_identity_that_closed_still_counts() {
         .unwrap();
     alice.snapshot("a", vec![inserts("tags", &[1, 2])]).await;
     drop(alice.offline().await);
-    let mut bob = identity(directory.path(), &keys, "bob").await;
-    let used = bob.conn.storage_use().expect("read the storage use");
+    let bob = identity(directory.path(), &keys, "bob").await;
+    let (client, pump) = connetto_client::ConnettoClient::with_pump(bob.offline().await);
+    let pump = tokio::spawn(pump);
+    let used = client.storage_use().await.expect("read the storage use");
     assert_eq!(used.shared.expect("shared").identities, 2, "{used:?}");
+    drop(client);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), pump).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
