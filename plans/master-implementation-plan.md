@@ -262,7 +262,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R43 the browser opens the local tier twice | **DONE** (2026-08-07) | nothing | no, discharged |
 | R18 SQLite hardening surface | **DONE** (2026-08-18) | nothing | no |
 | R60 a limited request syncs the whole table and blocks its cleanup | **DONE** (2026-09-02) | nothing. The defect dissolved at the `3d75cca` pin, steps 4 to 6 landed 2026-09-02 and are proven by `crates/connetto-client/tests/it/residual.rs`. The plan carried this row as IN PROGRESS until 2026-09-12 | no longer: the upstream request superseded itself, never sent |
-| R11 shared public store | IN PROGRESS, slices 1 to 6 merged (#179, #238, #239, #259, #270, #286), the outbox for every table merged (#298, #318, #327), row holdings in place of recomputed coverage merged (#334, #337, #340), the demos built (2026-10-31) | nothing. Seven decisions in the section, and Part B's below | no |
+| R11 shared public store | **DONE** (2026-10-31), designed 2026-10-17 | nothing. Slices 1 to 6 merged as #179, #238, #239, #259, #270 and #286, the outbox for every table as #298, #318 and #327, row holdings in place of recomputed coverage as #334, #337 and #340, the demos as #349. Seven decisions in the section, and Part B's below | no |
 | R61 the portability download | **DONE** (2026-10-29), fully designed (2026-08-22), revised (2026-10-25), built in four pull requests (#288, #269, #271, #284) | nothing. Twenty-two decisions in the section | no |
 | R105 answering a stolen account | **DONE** (2026-10-26), designed and sliced 2026-10-25 | nothing. Merged as #262, #268, #274, #283, #287 and #289, ten decisions in the section | no |
 | R62 refuse a table with no declared primary key | **DONE** (2026-08-22) | nothing. Four decisions: three before any code, the fourth (the tier is re-checked before a write too) taken in execution | no |
@@ -4105,7 +4105,7 @@ Every knob has a recorded value and a reason, both open paths set them, and the 
 
 ## R11: the shared public store
 
-**Status.** IN PROGRESS. Designed 2026-10-17 with the maintainer, seven decisions below and seven slices. Slices 1 to 6 merged as #179, #238, #239, #259, #270 and #286. Part A, the outbox for every table, merged as #298, #318 and #327. Part B, row holdings, merged as #334, #337 and #340. Slice 7, the demos, built 2026-10-31.
+**Status.** **DONE** (2026-10-31). Designed 2026-10-17 with the maintainer, seven decisions below and seven slices. Slices 1 to 6 merged as #179, #238, #239, #259, #270 and #286. Part A, the outbox for every table, merged as #298, #318 and #327. Part B, row holdings, merged as #334, #337 and #340. Slice 7, the demos, merged as #349.
 
 **Blocked on nothing.** Off the critical path and independent of every other phase, so it lands whenever it is wanted.
 
