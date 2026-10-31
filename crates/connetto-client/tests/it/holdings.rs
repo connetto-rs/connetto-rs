@@ -208,7 +208,7 @@ pub(super) struct Session {
 }
 
 impl Session {
-    async fn connected() -> Self {
+    pub(super) async fn connected() -> Self {
         let (mut server, client_end) = loopback();
         let acked = tokio::spawn(async move {
             ack_handshake(&mut server).await;

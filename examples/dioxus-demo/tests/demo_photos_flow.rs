@@ -31,7 +31,7 @@ use connetto_client::{
 };
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_core::transport::LoopbackTransport;
-use connetto_demo_deployment::{CONTENT_SQL, POLICIES_SQL, ROLES_SQL, SCHEMA_SQL};
+use connetto_demo_deployment::{CONTENT_SQL, POLICIES_SQL, ROLES_SQL, SCHEMA_SQL, SEED_SQL};
 use connetto_demo_support::{demo_schema, notes, photos, stage_photo_row};
 use connetto_file_client::{ContentClient, FsStore, MimeClass, ReqwestHttp, Resolved};
 use connetto_file_server::{
@@ -266,13 +266,14 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
 }
 
 /// Applies the deployment's `schema.sql`, the file server's `DEPLOYMENT_DDL`,
-/// the epoch DDL, `roles.sql`, `content.sql` and `policies.sql`, in the order
-/// the deployment documents. `provision_writers` runs before `roles.sql`
-/// because `roles.sql` grants on the writer tables, which the writer step
-/// creates.
+/// the epoch DDL, `roles.sql`, `content.sql`, `policies.sql` and `seed.sql`,
+/// in the order the deployment documents. `provision_writers` runs before
+/// `roles.sql` because `roles.sql` grants on the writer tables, which the
+/// writer step creates.
 async fn provision(fixture: &Fixture) {
     fixture
         .setup(&[
+            "DROP TABLE IF EXISTS products",
             "DROP TABLE IF EXISTS photos CASCADE",
             "DROP TABLE IF EXISTS order_lines CASCADE",
             "DROP TABLE IF EXISTS orders CASCADE",
@@ -291,6 +292,7 @@ async fn provision(fixture: &Fixture) {
     fixture.exec(ROLES_SQL).await;
     fixture.exec(CONTENT_SQL).await;
     fixture.exec(POLICIES_SQL).await;
+    fixture.exec(SEED_SQL).await;
     // `app_writer` is a test-infrastructure writer role; not part of the
     // deployment's SQL files. The server's mutation path uses it to apply
     // changesets, and it is subject to the row-level security that
@@ -303,6 +305,7 @@ async fn provision(fixture: &Fixture) {
             "GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO app_writer",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON order_lines TO app_writer",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON photos TO app_writer",
+            "GRANT SELECT ON products TO app_writer",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
              _connetto_session_writers TO app_writer",
             "GRANT SELECT ON _cfs_manifests TO app_writer",
@@ -365,7 +368,7 @@ async fn spawn_sync_server(fixture: &Fixture, signer: TicketSigner) -> Server {
                     .writable("photos")
                     .build(),
             )
-            .with_replication(["orders", "order_lines", "photos"])
+            .with_replication(["orders", "order_lines", "photos", "products"])
             .with_content_signer(signer),
         snapshot,
         auth,

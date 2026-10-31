@@ -95,6 +95,7 @@ use super::{
     reconnect::FullResyncRequired,
     registration::{BotRegistered, Challenge, RegisterBot},
     share_keys::{ReplaceShareKeys, ShareKeysReplaced, TabShareKeyAnswer, TabShareKeyChange},
+    storage::{TabStorageAnswer, TabStorageUse},
     subscription::{MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, Unsubscribe},
     writer::{BindDevice, RetireWriter, WriterAnswer},
 };
@@ -217,6 +218,11 @@ pub enum ControlMessage {
     TabShareKeyChange(TabShareKeyChange),
     /// A relay answers a tab's share-key change. Never sent by a real server.
     TabShareKeyAnswer(TabShareKeyAnswer),
+    /// A relay tab asks its worker what the account's data takes on the
+    /// device. Never sent to a real server, which ignores it.
+    TabStorageUse(TabStorageUse),
+    /// A relay answers a tab's storage read. Never sent by a real server.
+    TabStorageAnswer(TabStorageAnswer),
     /// A relay tells a tab how work held from an older application schema
     /// major settled, since the worker owns the drain (R31). Never sent by a
     /// real server.

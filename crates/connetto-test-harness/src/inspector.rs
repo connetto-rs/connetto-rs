@@ -310,6 +310,38 @@ impl PageSession {
         }
     }
 
+    /// Click the one button whose label starts with `prefix`, such as the
+    /// account bar's switch to an account the run only knows by its order.
+    ///
+    /// # Errors
+    ///
+    /// When no button or more than one starts with `prefix`, or as
+    /// [`PageSession::call`].
+    pub async fn click_starting_with(&mut self, prefix: &str) -> Result<()> {
+        let script = format!(
+            "(() => {{ const found = [...document.querySelectorAll('button')].filter(b => b.textContent.trim().startsWith({})); if (found.length !== 1) return found.length; found[0].click(); return true; }})()",
+            serde_json::Value::String(prefix.to_owned())
+        );
+        match self.evaluate(&script).await? {
+            serde_json::Value::Bool(true) => Ok(()),
+            found => bail!("the page has {found} buttons starting with {prefix:?}, not one"),
+        }
+    }
+
+    /// The first line of the page's text that starts with `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// When no line starts with `prefix`, or as [`Self::page_text`].
+    pub async fn line_starting_with(&mut self, prefix: &str) -> Result<String> {
+        let text = self.page_text().await?;
+        text.lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(prefix))
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("no line starts with {prefix:?}, the page shows:\n{text}"))
+    }
+
     /// Wait until the button labelled `label` is present and enabled, then
     /// click it.
     ///

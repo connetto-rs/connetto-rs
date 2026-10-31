@@ -376,6 +376,7 @@ pub fn App() -> Element {
     let mut gate_line: Signal<Option<String>> = use_signal(|| None);
     let mut custody_snap: Signal<Option<Custody>> = use_signal(|| None);
     let device_line: Signal<String> = use_signal(|| "no device identity in this build".to_owned());
+    let mut storage_line: Signal<String> = use_signal(|| support::STORAGE_UNREAD.to_owned());
     let logout_state: Signal<LogoutState> = use_signal(|| LogoutState::Idle);
     let refused_pending: Signal<Option<u64>> = use_signal(|| None);
     let mut gate: Signal<&'static str> = use_signal(|| "open");
@@ -390,6 +391,7 @@ pub fn App() -> Element {
     use_context_provider(|| CustodyLine(custody_line));
     use_context_provider(|| GateLine(gate_line));
     use_context_provider(|| DeviceLine(device_line));
+    use_context_provider(|| StorageLine(storage_line));
     use_context_provider(|| ExpiryWarn(expiry_warn));
     use_context_provider(|| ClientSlot(client_slot));
     use_context_provider(|| ContentSlot(content_slot));
@@ -537,6 +539,7 @@ pub fn App() -> Element {
                     let mut events = boot.client.events();
                     client_slot.set(Some(boot.client.clone()));
                     status.set("connected".to_owned());
+                    storage_line.set(support::storage_line(&boot.client).await);
                     *boot_inner.borrow_mut() = Some(boot);
                     while let Ok(event) = events.recv().await {
                         // The worker states its gate to every tab as the
@@ -575,6 +578,7 @@ pub fn App() -> Element {
                     }
                     if let Some(client) = client_slot.read().clone() {
                         footprint.set(support::replica_footprint(&client).await);
+                        storage_line.set(support::storage_line(&client).await);
                     }
                 }
             })

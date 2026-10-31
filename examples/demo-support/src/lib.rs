@@ -60,6 +60,7 @@ h1, h2 { display: flex; align-items: center; gap: 8px; }
 .synced { background: #ddf4ff; color: #0a3069; }
 .local { background: #ffebe9; color: #82071e; }
 .trim { background: #dafbe1; color: #116329; }
+.shared { background: #fbefff; color: #663996; }
 .status { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
 .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; background: var(--surface); border-radius: 4px; padding: 0 4px; }
 table { border-collapse: collapse; width: 100%; margin-top: 8px; }
@@ -158,6 +159,21 @@ pub fn retention_readout(pages: i64, free: i64, covered_rows: usize) -> String {
 
 /// The retention pane's second line.
 pub const RETENTION_EXPLAINER: &str = "Ending a subscription evicts the rows no live subscription still covers, and the trimming pass hands the freed pages back to storage.";
+
+/// The catalogue pane's heading.
+pub const CATALOGUE_HEADING: &str = "Catalogue";
+/// The catalogue pane's intro line.
+pub const CATALOGUE_INTRO: &str = "Every account on this device reads these rows from one shared copy, so switching account shows them at once.";
+/// The storage line before its first read.
+pub const STORAGE_UNREAD: &str = "storage: reading";
+
+/// A price in cents, as the catalogue shows it.
+#[must_use]
+pub fn price_label(cents: i64) -> String {
+    let sign = if cents < 0 { "-" } else { "" };
+    let cents = cents.unsigned_abs();
+    format!("{sign}{}.{:02}", cents / 100, cents % 100)
+}
 
 /// The your-data pane's intro line.
 pub const YOUR_DATA_INTRO: &str = "Save a zip archive of this device's local data. The archive is not encrypted and holds every row the device can read: whoever holds the file holds the data.";

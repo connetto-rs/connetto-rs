@@ -5,7 +5,7 @@
 -- CONNETTO_WRITABLE. Apply in this order: this file,
 -- connetto_file_server::DEPLOYMENT_DDL, connetto_server::epoch::EPOCH_DDL,
 -- roles.sql (the non-owner role required by CONNETTO_READER_URL),
--- content.sql, then policies.sql.
+-- content.sql, policies.sql, then seed.sql.
 -- The key default is load-bearing on the client rather than here: build.rs
 -- translates it through pg2sqlite into the replica's own DEFAULT (uuidv4()),
 -- which mints the key when a local write omits it. Both ends mint version 4.
@@ -18,7 +18,7 @@
 -- it, since a replica default leaves the changeset value NULL, and Postgres
 -- refuses that on the non-null column.
 -- The application schema major R31 routes and refuses connections by.
--- connetto:major 1
+-- connetto:major 2
 CREATE TABLE orders (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), owner_id TEXT NOT NULL, quantity BIGINT NOT NULL CHECK (quantity >= 0), created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 
 -- The lines of an order, keyed by the order and the line number together. It is
@@ -37,3 +37,8 @@ CREATE TABLE order_lines (order_id UUID NOT NULL REFERENCES orders(id), line_no 
 -- repeats from the parent order as it does on order_lines, so the visibility
 -- policy settles from the row itself.
 CREATE TABLE photos (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), order_id UUID NOT NULL REFERENCES orders(id), owner_id TEXT NOT NULL, content_id BYTEA NOT NULL, content_state TEXT);
+
+-- The catalogue the demo sells from, the one public table of the deployment.
+-- It has no policy of its own, so every account reads every row, and it is
+-- read-only, since no grant on it admits a write and no writer lists it.
+CREATE TABLE products (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL, price_cents BIGINT NOT NULL CHECK (price_cents >= 0));

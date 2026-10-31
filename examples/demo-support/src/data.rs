@@ -6,8 +6,8 @@ use std::time::SystemTime;
 
 use connetto_client::teardown::ExpiryWarning;
 use connetto_client::{
-    ClientError, ClientEvent, ConnettoClient, LiveGroups, LiveQuery, LiveValue, SyncSchema,
-    Watchable,
+    ClientError, ClientEvent, ConnettoClient, LiveGroups, LiveQuery, LiveValue, StorageUse,
+    SyncSchema, Watchable,
 };
 use connetto_core::messages::{FatalErrorReason, FullResyncReason, SyncStatus};
 use connetto_core::traits::{MaybeSend, Transport};
@@ -24,6 +24,9 @@ pub use connetto_demo_deployment::{AUTH_BASE, DEMO_WS_URL, auth_landing};
 pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The extra upstream subscription for the photos rows.
 pub const PHOTO_QUERY: &str = "SELECT * FROM photos";
+/// The catalogue every account reads, one copy per device in the shared
+/// store (R11).
+pub const PRODUCT_QUERY: &str = "SELECT * FROM products";
 
 // The synced tier, as the deployment schema translates it to the replica.
 diesel::table! {
@@ -64,6 +67,18 @@ diesel::table! {
         content_id -> diesel::sql_types::Binary,
         /// `NULL` until the file server commit writes `available`.
         content_state -> Nullable<diesel::sql_types::Text>,
+    }
+}
+
+diesel::table! {
+    /// The public catalogue, shared by every account on the device.
+    products (id) {
+        /// The deployment's key.
+        id -> rosetta_uuid::sql_types::Uuid,
+        /// The product's name.
+        name -> diesel::sql_types::Text,
+        /// The price in cents.
+        price_cents -> diesel::sql_types::BigInt,
     }
 }
 
@@ -108,6 +123,19 @@ pub struct Photo {
     pub content_id: Vec<u8>,
     /// The row's content state, absent while the bytes are pending.
     pub content_state: Option<String>,
+}
+
+/// One row of the shared `products` catalogue.
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[diesel(table_name = products)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct Product {
+    /// The row's id.
+    pub id: Uuid,
+    /// The product's name.
+    pub name: String,
+    /// The price in cents.
+    pub price_cents: i64,
 }
 
 /// The one sync schema the worker, every tab and every device build from.
@@ -239,6 +267,53 @@ where
         })
         .await
         .unwrap_or((0, 0))
+}
+
+/// The storage line, what this account's replica and the device's shared
+/// store take, read from the worker in a tab.
+pub async fn storage_line<T>(client: &ConnettoClient<T>) -> String
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
+    match client.storage_use().await {
+        Ok(used) => describe_storage(&used),
+        Err(err) => format!("storage: unread ({err})"),
+    }
+}
+
+/// `used` as the storage line words it, the bytes in use rounded to KiB.
+#[must_use]
+pub fn describe_storage(used: &StorageUse) -> String {
+    let kib =
+        |bytes: connetto_core::messages::StoreBytes| bytes.file.saturating_sub(bytes.free) / 1024;
+    let replica = kib(used.replica);
+    match &used.shared {
+        Some(shared) => {
+            let accounts = if shared.identities == 1 {
+                "1 account".to_owned()
+            } else {
+                format!("{} accounts", shared.identities)
+            };
+            format!(
+                "storage: this account {replica} KiB, shared store {} KiB used by {accounts}",
+                kib(shared.bytes)
+            )
+        }
+        None => format!("storage: this account {replica} KiB, nothing shared"),
+    }
+}
+
+/// The catalogue rows as the pane shows them.
+#[must_use]
+pub fn product_rows(products: &[Product]) -> Vec<crate::view::ProductRow> {
+    products
+        .iter()
+        .map(|product| crate::view::ProductRow {
+            name: product.name.clone(),
+            price: crate::price_label(product.price_cents),
+        })
+        .collect()
 }
 
 /// The label the account bar shows for a stored credential key, the decoded identity.
@@ -382,6 +457,16 @@ where
     T::Error: core::fmt::Display,
 {
     photos::table.order(photos::id.asc())
+}
+
+/// The catalogue, by name.
+#[must_use]
+pub fn products_by_name<T>() -> impl Watchable<T, Product, Handle = LiveQuery<Product>>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
+    products::table.order(products::name.asc())
 }
 
 /// Insert one orders row the add button names.

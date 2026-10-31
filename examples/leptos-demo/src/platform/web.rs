@@ -358,6 +358,8 @@ fn boot_page() -> RwSignal<View> {
                     spawn_grouped(&view, client.clone());
                     spawn_notes(&holds, &view, client.clone());
                     spawn_photos(&holds, &view, client.clone(), content);
+                    spawn_products(&view, client.clone());
+                    refresh_storage(&view, &client);
                     let mut events = client.events();
                     while let Ok(event) = events.recv().await {
                         // The worker states its gate to every tab as the
@@ -367,6 +369,12 @@ fn boot_page() -> RwSignal<View> {
                                 holds.gate.set("locked")
                             }
                             ClientEvent::Unlocked => holds.gate.set("open"),
+                            // An account switch replaces the worker, which the
+                            // tab meets again through a reconnect, and the store
+                            // it reads may now count another account.
+                            ClientEvent::Reconnected | ClientEvent::SyncStatus(_) => {
+                                refresh_storage(&view, &client);
+                            }
                             _ => {}
                         }
                         set_header_lines(&holds, &view);
@@ -449,6 +457,36 @@ fn refresh_footprint(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: &Clie
     });
 }
 
+/// The shared catalogue rows, by name, the pane's list subscription.
+fn spawn_products(view: &RwSignal<View>, client: Client) {
+    let view = *view;
+    spawn_local(async move {
+        let Ok(mut handle) = support::products_by_name().live(&client).await else {
+            return;
+        };
+        let mut rows: Vec<support::Product> = handle.snapshot();
+        loop {
+            view.update(|v| v.products = support::product_rows(&rows));
+            refresh_storage(&view, &client);
+            if handle.changed().await.is_err() {
+                break;
+            }
+            rows = handle.snapshot();
+        }
+    });
+}
+
+/// The storage line the header shows, refreshed wherever the footprint
+/// moves.
+fn refresh_storage(view: &RwSignal<View>, client: &Client) {
+    let view = *view;
+    let client = client.clone();
+    spawn_local(async move {
+        let line = support::storage_line(&client).await;
+        view.update(|v| v.storage = line);
+    });
+}
+
 /// The orders rows, newest first, the pane's list subscription.
 fn spawn_orders(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: Client) {
     let holds = Rc::clone(holds);
@@ -471,6 +509,7 @@ fn spawn_orders(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: Client) {
                     .collect();
             });
             refresh_footprint(&holds, &view, &client);
+            refresh_storage(&view, &client);
             if handle.changed().await.is_err() {
                 break;
             }
@@ -536,6 +575,7 @@ fn spawn_notes(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: Client) {
                     .collect();
             });
             refresh_footprint(&holds, &view, &client);
+            refresh_storage(&view, &client);
             if handle.changed().await.is_err() {
                 break;
             }
@@ -570,6 +610,7 @@ fn spawn_photos(
                     .collect();
             });
             refresh_footprint(&holds, &view, &client);
+            refresh_storage(&view, &client);
             // The display sources refetch on a row's id or content state
             // change and when the fetch button restores bytes, so a stale
             // ticket never wedges the panel.

@@ -55,6 +55,15 @@ pub struct NoteRow {
     pub body: String,
 }
 
+/// One catalogue row as the pane shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductRow {
+    /// The product's name.
+    pub name: String,
+    /// The price, as [`price_label`](crate::price_label) words it.
+    pub price: String,
+}
+
 /// One stored account, its credential-store key and the label the account
 /// bar shows for it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +150,12 @@ pub struct View {
     /// The last staging line.
     pub stage_line: Option<String>,
 
+    // The catalogue pane.
+    /// The shared catalogue rows, by name.
+    pub products: Vec<ProductRow>,
+    /// The storage line, what this account and the shared store take.
+    pub storage: String,
+
     // The notes pane.
     /// The device-private notes rows, oldest first.
     pub notes: Vec<NoteRow>,
@@ -173,6 +188,7 @@ impl View {
             status: "connecting to the connetto stack".to_owned(),
             device_line: "no device identity in this build".to_owned(),
             grouped: crate::grouped_label(&HashMap::new()),
+            storage: crate::STORAGE_UNREAD.to_owned(),
             ..Self::default()
         }
     }

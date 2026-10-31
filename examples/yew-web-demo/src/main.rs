@@ -352,6 +352,8 @@ fn app() -> Html {
     // The content lane split off the transport at boot; held here so Dashboard can use it.
     let content = use_state(|| None::<ContentHandle>);
     let status = use_state(|| "connecting to the connetto stack".to_owned());
+    // The storage line, what this account and the shared store take, shown in the header.
+    let storage = use_state(|| support::STORAGE_UNREAD.to_owned());
     // The boot tokens live as long as the app, since dropping them resigns leadership and frees
     // the tab lock, which reaps this tab.
     let boot_hold = use_mut_ref(|| None::<Boot>);
@@ -785,7 +787,7 @@ fn app() -> Html {
 
     let dashboard = if let (Some(handle), Some(content_handle)) = (&*client, &*content) {
         let id = (*identity).clone().unwrap_or_default();
-        html! { <Dashboard client={handle.clone()} content={content_handle.clone()} identity={id} /> }
+        html! { <Dashboard client={handle.clone()} content={content_handle.clone()} identity={id} storage={storage.clone()} /> }
     } else if (*stored_account).is_some() {
         // A restore is under way, so the page stays a signed-in page.
         html! { <PanesSkeleton /> }
@@ -816,6 +818,7 @@ fn app() -> Html {
                 <p class="status">{ format!("status: {}", &*status) }</p>
                 { gate_line_html }
                 <p class="status">{ "device: no device identity in this build" }</p>
+                <p class="status">{ (*storage).clone() }</p>
                 { custody_line_html }
                 { picker_html }
                 { expiry_html }
@@ -837,6 +840,14 @@ fn panes_skeleton() -> Html {
                 <p>{ support::orders_readout(0, 0) }</p>
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "quantity" }</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <div class="pane">
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_STORE} width={"14"} height={"14"} />{ support::CATALOGUE_HEADING }<span class="badge shared">{ "shared" }</span></h2>
+                <p>{ support::CATALOGUE_INTRO }</p>
+                <table>
+                    <thead><tr><th>{ "name" }</th><th>{ "price" }</th></tr></thead>
                     <tbody></tbody>
                 </table>
             </div>
@@ -984,6 +995,8 @@ struct DashboardProps {
     client: ClientHandle,
     content: ContentHandle,
     identity: String,
+    /// The header's storage line state, refreshed from the dashboard where its rows live.
+    storage: UseStateHandle<String>,
 }
 
 #[function_component(Dashboard)]
@@ -994,12 +1007,14 @@ fn dashboard(props: &DashboardProps) -> Html {
     let orders = use_live::<_, _, support::Order>(&client, support::orders_newest_first());
     let notes = use_live::<_, _, support::Note>(&client, support::notes_rows());
     let photos = use_live::<_, _, support::Photo>(&client, support::photos_rows());
+    let products = use_live::<_, _, support::Product>(&client, support::products_by_name());
     let count = use_live(&client, support::orders_count());
     let counts_by_quantity = use_live(&client, support::orders_counts_by_quantity());
 
     let order_rows = orders.value();
     let note_rows = notes.value();
     let photo_rows = photos.value();
+    let products_rows = products.value();
     let order_count = order_rows.len();
     let order_sum: i64 = order_rows.iter().map(|row| row.quantity).sum();
     let note_count = note_rows.len();
@@ -1059,17 +1074,22 @@ fn dashboard(props: &DashboardProps) -> Html {
 
     let note_text = use_state(String::new);
 
-    // Tab mirror page footprint, refreshed whenever the covered rows move.
+    // Tab mirror page footprint and the storage line, refreshed whenever the covered rows or
+    // the account move.
     let footprint = use_state(|| (0_i64, 0_i64));
     {
         let client = client.clone();
         let footprint = footprint.clone();
-        let covered = order_count + note_count + photo_count;
-        use_effect_with(covered, move |_| {
+        let storage = props.storage.clone();
+        let covered = order_count + note_count + photo_count + products_rows.len();
+        let identity = identity.clone();
+        use_effect_with((covered, identity), move |_| {
             let client = client.clone();
             let footprint = footprint.clone();
+            let storage = storage.clone();
             spawn_local(async move {
                 footprint.set(support::replica_footprint(&client).await);
+                storage.set(support::storage_line(&client).await);
             });
             || ()
         });
@@ -1177,14 +1197,17 @@ fn dashboard(props: &DashboardProps) -> Html {
     let tidy = {
         let client = client.clone();
         let footprint = footprint.clone();
+        let storage = props.storage.clone();
         Callback::from(move |_| {
             let client = client.clone();
             let footprint = footprint.clone();
+            let storage = storage.clone();
             spawn_local(async move {
                 if let Err(err) = client.tidy().await {
                     tracing::error!(error = %err, "free up space failed");
                 }
                 footprint.set(support::replica_footprint(&client).await);
+                storage.set(support::storage_line(&client).await);
             });
         })
     };
@@ -1228,6 +1251,9 @@ fn dashboard(props: &DashboardProps) -> Html {
     let photos_error = photos.error().map(|err| {
         html! { <p class="error">{ format!("photos error: {err}") }</p> }
     });
+    let products_error = products.error().map(|err| {
+        html! { <p class="error">{ format!("catalogue error: {err}") }</p> }
+    });
     let count_error = count.error().map(|err| {
         html! { <p class="error">{ format!("count error: {err}") }</p> }
     });
@@ -1235,6 +1261,7 @@ fn dashboard(props: &DashboardProps) -> Html {
         html! { <p class="error">{ format!("grouped subscription error: {err}") }</p> }
     });
     let urls = (*photo_urls).clone();
+    let catalogue_rows = support::product_rows(&products_rows);
 
     html! {
         <div class="panes">
@@ -1267,6 +1294,24 @@ fn dashboard(props: &DashboardProps) -> Html {
                                 <tr key={id.clone()}>
                                     <td><code class="id" title={id.clone()}>{ support::short_id(&id) }</code></td>
                                     <td>{ row.quantity.to_string() }</td>
+                                </tr>
+                            }
+                        }) }
+                    </tbody>
+                </table>
+            </div>
+            <div class="pane">
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_STORE} width={"14"} height={"14"} />{ support::CATALOGUE_HEADING }<span class="badge shared">{ "shared" }</span></h2>
+                <p>{ support::CATALOGUE_INTRO }</p>
+                { products_error.unwrap_or_default() }
+                <table>
+                    <thead><tr><th>{ "name" }</th><th>{ "price" }</th></tr></thead>
+                    <tbody>
+                        { for catalogue_rows.iter().map(|row| {
+                            html! {
+                                <tr key={row.name.clone()}>
+                                    <td>{ row.name.clone() }</td>
+                                    <td>{ row.price.clone() }</td>
                                 </tr>
                             }
                         }) }

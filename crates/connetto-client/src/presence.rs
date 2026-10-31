@@ -44,6 +44,16 @@ pub(crate) fn join(db: &mut SqliteConnection, config: &ClientConfig) -> Result<(
     Ok(())
 }
 
+/// How many identities use the shared store.
+///
+/// # Errors
+///
+/// [`ClientError`] when the store cannot be read.
+pub(crate) fn count(db: &mut SqliteConnection) -> Result<u64, ClientError> {
+    let present: i64 = _connetto_identity::table.count().get_result(db)?;
+    Ok(u64::try_from(present).unwrap_or(0))
+}
+
 /// Take `identity` out of the shared store: its presence and every holding
 /// it has there go, its unsent writes' included, and every shared row no
 /// remaining holding names is deleted, online or not (R11 decision 7).

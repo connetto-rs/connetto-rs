@@ -36,7 +36,8 @@ fn short_code(id: String) -> impl IntoView {
     view! { <code class="id" title=id>{short}</code> }
 }
 
-/// The app name, and the status, gate, device, custody and expiry lines.
+/// The app name, and the status, gate, device, storage, custody and expiry
+/// lines.
 #[component]
 fn Header(view: RwSignal<View>) -> impl IntoView {
     view! {
@@ -45,6 +46,7 @@ fn Header(view: RwSignal<View>) -> impl IntoView {
             <p class="status">"status: " {move || view.with(|v| v.status.clone())}</p>
             {move || status_line(view.with(|v| v.gate_line.clone()))}
             <p class="status">"device: " {move || view.with(|v| v.device_line.clone())}</p>
+            <p class="status">{move || view.with(|v| v.storage.clone())}</p>
             <Show when=move || view.with(|v| v.offers_unlock)>
                 <button on:click=move |_| act(Action::Unlock)>
                     <Fa icon=Icon::Fingerprint />
@@ -277,7 +279,7 @@ fn LogoutControls(view: RwSignal<View>) -> impl IntoView {
     }
 }
 
-/// The five panes once the tab attached, the skeleton while a stored session
+/// The six panes once the tab attached, the skeleton while a stored session
 /// lands, or the connecting line before either.
 #[component]
 fn Dashboard(view: RwSignal<View>) -> impl IntoView {
@@ -288,6 +290,7 @@ fn Dashboard(view: RwSignal<View>) -> impl IntoView {
                 <div class="panes">
                     <OrdersPane view=view />
                     <PhotosPane view=view />
+                    <ProductsPane view=view />
                     <NotesPane view=view />
                     <RetentionPane view=view />
                     <YourDataPane view=view />
@@ -337,6 +340,14 @@ fn PanesSkeleton() -> impl IntoView {
                 <p>{support::photos_readout(0)}</p>
                 <table>
                     <thead><tr><th>"id"</th><th>"state"</th><th>"image"</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <div class="pane">
+                {pane_heading(Icon::Tags, support::CATALOGUE_HEADING, "badge shared", "shared")}
+                <p>{support::CATALOGUE_INTRO}</p>
+                <table>
+                    <thead><tr><th>"name"</th><th>"price"</th></tr></thead>
                     <tbody></tbody>
                 </table>
             </div>
@@ -586,6 +597,40 @@ fn LostBytes(view: RwSignal<View>) -> impl IntoView {
                 </div>
             }
         })
+    }
+}
+
+/// The catalogue pane with the shared rows in name order, read from the one
+/// copy the shared store keeps on this device.
+#[component]
+fn ProductsPane(view: RwSignal<View>) -> impl IntoView {
+    view! {
+        <div class="pane">
+            {pane_heading(Icon::Tags, support::CATALOGUE_HEADING, "badge shared", "shared")}
+            <p>{support::CATALOGUE_INTRO}</p>
+            <table>
+                <thead><tr><th>"name"</th><th>"price"</th></tr></thead>
+                <tbody>
+                    {move || {
+                        view.with(|v| {
+                            v.products
+                                .iter()
+                                .map(|row| {
+                                    let name = row.name.clone();
+                                    let price = row.price.clone();
+                                    view! {
+                                        <tr>
+                                            <td>{name}</td>
+                                            <td>{price}</td>
+                                        </tr>
+                                    }
+                                })
+                                .collect_view()
+                        })
+                    }}
+                </tbody>
+            </table>
+        </div>
     }
 }
 

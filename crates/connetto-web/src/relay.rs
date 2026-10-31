@@ -85,7 +85,7 @@ use connetto_core::messages::{
     MutationConflict, MutationReject, MutationRejectReason, NonFatalError, Pong, RateLimited,
     SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
     SubscriptionPriority, SubscriptionSpec, SyncStatus, TabShareKeyAnswer, TabShareKeyChange,
-    TabShareKeyOutcome,
+    TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Major, Transport};
@@ -3060,7 +3060,9 @@ fn recovery_interrupts_attach(event: &HubEvent) -> bool {
             | HubEvent::LeaveShared(_, _)
             | HubEvent::Frame(
                 _,
-                IncomingFrame::Control(ControlMessage::TabShareKeyChange(_))
+                IncomingFrame::Control(
+                    ControlMessage::TabShareKeyChange(_) | ControlMessage::TabStorageUse(_)
+                )
             )
             | HubEvent::Export(_, _)
             | HubEvent::Import(_, _)
@@ -3461,6 +3463,10 @@ where
         }
         ControlMessage::TabShareKeyChange(request) if tab.handshaken => {
             serve_tab_share_key_change(worker, state, id, request).await?;
+            Ok(())
+        }
+        ControlMessage::TabStorageUse(request) if tab.handshaken => {
+            serve_tab_storage_use(worker, state, id, request);
             Ok(())
         }
         ControlMessage::BindDevice(_) | ControlMessage::RetireWriter(_) => {
@@ -4727,6 +4733,38 @@ where
             )));
     }
     Ok(())
+}
+
+/// Answer a tab's storage read from the worker's connection, which holds the
+/// replica and the shared store the tab's mirror does not.
+fn serve_tab_storage_use<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &HubState,
+    id: TabId,
+    request: TabStorageUse,
+) where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let outcome = if hub_locked(state) {
+        TabStorageOutcome::Locked
+    } else {
+        match worker.storage_use() {
+            Ok(used) => TabStorageOutcome::Use(used),
+            Err(ClientError::Locked) => TabStorageOutcome::Locked,
+            Err(other) => TabStorageOutcome::Refused(other.to_string()),
+        }
+    };
+    if let Some(tab) = state.tabs.get(&id) {
+        let _ = tab
+            .out
+            .send(TabOut::Control(ControlMessage::TabStorageAnswer(
+                TabStorageAnswer {
+                    request_id: request.request_id,
+                    outcome,
+                },
+            )));
+    }
 }
 
 /// Answers `Unavailable` to every resolve whose wait ran out.

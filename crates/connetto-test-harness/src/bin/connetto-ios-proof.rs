@@ -144,6 +144,9 @@ fn is_demo_page(url: &str) -> bool {
 }
 
 const USER: &str = "alice";
+/// The second account the Tauri demo signs in beside the first, so the
+/// catalogue step sees the shared store's identities go from one to two.
+const SECOND_USER: &str = "carol";
 /// The simulator a run uses when none is named.
 const DEFAULT_SIMULATOR: &str = "iPhone 17 Pro";
 /// The variable naming the team ID a simulator build's entitlements carry.
@@ -511,6 +514,11 @@ async fn prove(
     .await?;
     target.record(&mut app, evidence, "synced").await?;
 
+    if matches!(demo(), Demo::Tauri) {
+        app = second_account_shares_catalogue(target, &mut inspector, &login_prefix, evidence, app)
+            .await?;
+    }
+
     step("write offline");
     relay.stop().await;
     app.wait_for_text("status: reconnecting", Duration::from_secs(60))
@@ -614,6 +622,45 @@ async fn sign_in(
             inspector.state()
         );
     }
+}
+
+/// Sign a second account in beside the first and check it reads the
+/// catalogue the first fetched from the shared store, the store's identities
+/// going from one to two (R11 slice 7), then switch back to the first
+/// account and return the page the later steps drive.
+async fn second_account_shares_catalogue(
+    target: &Target,
+    inspector: &mut Inspector,
+    login_prefix: &str,
+    evidence: &Path,
+    mut app: PageSession,
+) -> Result<PageSession> {
+    step("second account shares the catalogue");
+    app.wait_for_text("Espresso machine", Duration::from_secs(90))
+        .await?;
+    app.wait_for_text("used by 1 account", Duration::from_secs(90))
+        .await?;
+    target
+        .record(&mut app, evidence, "catalogue-one-account")
+        .await?;
+    let first = app.line_starting_with("Signed in as ").await?;
+    app.click("Add another account").await?;
+    let mut app = sign_in_tauri(target, inspector, login_prefix, evidence, SECOND_USER).await?;
+    app.wait_for_text("Espresso machine", Duration::from_secs(90))
+        .await?;
+    app.wait_for_text("used by 2 accounts", Duration::from_secs(90))
+        .await?;
+    target
+        .record(&mut app, evidence, "catalogue-two-accounts")
+        .await?;
+    // The account bar names each account by its identity, which the run only
+    // learns from the signed-in line, and the first is the one other account.
+    app.click_starting_with("Switch to ").await?;
+    app.wait_for_text(&first, Duration::from_secs(90)).await?;
+    target
+        .record(&mut app, evidence, "back-to-first-account")
+        .await?;
+    Ok(app)
 }
 
 /// Sign in the Tauri demo, which parks the login URL and opens the login on

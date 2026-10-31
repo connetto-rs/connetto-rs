@@ -14,8 +14,8 @@ use core::time::Duration;
 use std::rc::Rc;
 
 use connetto_client::{
-    ClientBuilder, ClientError, ConnettoConnection, ContentPlace, Custody, FirstThen, Gate, Grant,
-    HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema,
+    ClientBuilder, ClientError, ConnettoClient, ConnettoConnection, ContentPlace, Custody,
+    FirstThen, Gate, Grant, HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema,
 };
 use connetto_core::messages::{BulkMessage, ControlMessage, SubscriptionSpec};
 use connetto_core::schema::{SchemaBundle, SharedLayout};
@@ -357,6 +357,12 @@ async fn a_second_identitys_late_tab_reads_the_first_identitys_shared_rows() {
         .values((orders::id.eq(2), orders::label.eq("two")))
         .execute(&mut *bob.conn())
         .expect("bob writes his private rows");
+    let used = bob.storage_use().expect("bob reads what the device holds");
+    assert_eq!(
+        used.shared.map(|shared| shared.identities),
+        Some(2),
+        "alice's presence outlives her run in the store bob opened"
+    );
 
     let (_hub, mut tab) = hub_with_late_tab(bob).await;
     tab.subscribe_spec("s1", SubscriptionSpec::new("SELECT id, label FROM orders"))
@@ -386,6 +392,17 @@ async fn a_second_identitys_late_tab_reads_the_first_identitys_shared_rows() {
     assert_eq!(
         got, expected,
         "the join lands private and shared rows together"
+    );
+    let (client, pump) = ConnettoClient::with_pump(tab);
+    spawn_local(pump);
+    let used = client
+        .storage_use()
+        .await
+        .expect("the hub answers the tab's storage read");
+    assert_eq!(
+        used.shared.map(|shared| shared.identities),
+        Some(2),
+        "the tab reads its worker's store, with both identities in it"
     );
 }
 

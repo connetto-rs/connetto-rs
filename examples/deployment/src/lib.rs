@@ -27,6 +27,10 @@ pub const ROLES_SQL: &str = include_str!("../roles.sql");
 /// The file server's deployment contracts, applied beside the roles.
 pub const CONTENT_SQL: &str = include_str!("../content.sql");
 
+/// The seed rows the stacks apply after the schema and the policies. It is
+/// data the server serves, never DDL the clients translate.
+pub const SEED_SQL: &str = include_str!("../seed.sql");
+
 /// The browser stack's sync endpoint, as `CONNETTO_TEST_WS` named it when this
 /// crate was built.
 pub const DEMO_WS_URL: &str = match option_env!("CONNETTO_TEST_WS") {

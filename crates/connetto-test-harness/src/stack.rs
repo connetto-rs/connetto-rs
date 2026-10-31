@@ -29,6 +29,8 @@ pub struct Deployment {
     pub content: &'static str,
     /// The row policies, also served as `CONNETTO_PG_POLICIES`.
     pub policies: &'static str,
+    /// The seed rows applied after the policies, as one batch.
+    pub seed: &'static str,
     /// The tables the publication carries.
     pub published: &'static [&'static str],
     /// The tables clients may write, as `CONNETTO_WRITABLE` lists them.
@@ -120,6 +122,7 @@ pub async fn provision(
     fixture.setup(&[deployment.policies]).await;
     // The server's startup check requires the cap on every synced table.
     provision_cap_policies(fixture.admin(), deployment.schema, deployment.policies).await;
+    fixture.setup(&[deployment.seed]).await;
     fixture.start_replication(deployment.published).await;
     let fga_url = fixture.fga_url().await.to_owned();
     let (_, fga_store) = fixture.fga_store().await;

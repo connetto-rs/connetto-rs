@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::FaBroom;
 
-use super::{ClientSlot, Footprint};
+use super::{ClientSlot, Footprint, StorageLine};
 
 /// The retention pane.
 #[component]
@@ -14,6 +14,7 @@ pub fn RetentionPane() -> Element {
     let ClientSlot(client_slot) = use_context::<ClientSlot>();
     let client = client_slot.read().clone().expect("mounted with a client");
     let Footprint(footprint) = use_context::<Footprint>();
+    let StorageLine(storage_line) = use_context::<StorageLine>();
     let (pages, free) = *footprint.read();
     let tidy_client = client.clone();
     // The rows the live subscriptions still cover, which the trim pass spares.
@@ -38,12 +39,14 @@ pub fn RetentionPane() -> Element {
                     onclick: move |_| {
                         let client = tidy_client.clone();
                         let footprint = footprint;
+                        let mut storage_line = storage_line;
                         spawn(async move {
                             let mut footprint = footprint;
                             if let Err(err) = client.tidy().await {
                                 tracing::error!(error = %err, "free up space failed");
                             }
                             footprint.set(support::replica_footprint(&client).await);
+                            storage_line.set(support::storage_line(&client).await);
                         });
                     },
                     Icon { icon: FaBroom, width: 14, height: 14 }

@@ -43,7 +43,11 @@ fn schema() -> SyncSchema {
 
 /// `owner`'s client over the shared device directory, online over a wire the
 /// test drives.
-async fn identity(directory: &std::path::Path, keys: &SharedKeys, owner: &str) -> Session {
+pub(super) async fn identity(
+    directory: &std::path::Path,
+    keys: &SharedKeys,
+    owner: &str,
+) -> Session {
     let conn = ClientBuilder::new(
         schema(),
         super::support::NeverDial::<LoopbackTransport>::default(),
