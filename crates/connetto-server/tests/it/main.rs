@@ -109,6 +109,7 @@ mod read_rule_fold;
 
 mod reconnect;
 
+mod failure_arms;
 mod reexec;
 mod reexec_failure;
 

@@ -827,6 +827,9 @@ struct Applied {
     record: Option<ChangeRecord>,
     /// Row patches not yet sent.
     patches: Vec<MatchedPatch>,
+    /// Matched consumers left without a patch because the event holds a value
+    /// the replica cannot store, not yet told.
+    refused: Vec<u64>,
     /// Membership moves, absent once fanned out.
     narrowings: Option<Vec<TermMove>>,
     /// Computed changes not yet delivered, in delivery order.
@@ -844,6 +847,7 @@ impl Applied {
         Self {
             record: dispatched.record,
             patches: dispatched.patches,
+            refused: dispatched.refused,
             narrowings: Some(dispatched.narrowings),
             computed: dispatched.computed.into(),
             failure: dispatched.failure,
@@ -1007,6 +1011,17 @@ pub enum SessionError {
     /// A catch-up walk shared with other resuming subscriptions failed for every subscription it served, so the detail is the walk's rather than this connection's.
     #[error("catch-up failed: {0}")]
     CatchupFailed(String),
+}
+
+/// What one replayed record owes the caller it is replayed for.
+enum Replayed {
+    /// The bytes the caller is sent.
+    Bytes(Vec<u8>),
+    /// Nothing, the caller's verdict skips the row.
+    Skipped,
+    /// A marker record the caller's verdict reaches, which has no bytes to
+    /// send, so the replay refuses the subscription.
+    Unsendable,
 }
 
 /// Whether an authorization failure can clear by itself, which decides between holding an event and ending the change stream.
@@ -1388,8 +1403,8 @@ enum Outbound {
         sub_id: String,
         retired_id: SubscriptionId,
     },
-    /// End one row subscription a key change left unservable, in order behind
-    /// the frames already queued for it (R95).
+    /// End one row subscription the server can no longer serve, in order
+    /// behind the frames already queued for it (R95).
     Refuse {
         /// The client-facing label of the subscription.
         sub_id: String,
@@ -1854,6 +1869,9 @@ enum WaveEnd {
     Done,
     /// The subscription has to be replaced instead.
     Resync(FullResyncReason),
+    /// The walk met a marker record whose verdict would have sent bytes, so the
+    /// subscription is refused like a live delivery of that event.
+    Refused,
     /// The walk failed for it, ending its session.
     Failed(SessionError),
 }
@@ -2817,24 +2835,85 @@ where
                 return Err(err);
             }
         }
+        // An event the replica cannot store owes no patch. The row verdict
+        // decides which callers it reaches, and each of those ends in order
+        // behind the frames its route already queued. A caller the verdict
+        // skips keeps its subscription and is told nothing, so a hidden row
+        // reveals nothing. The list is cleared only once the verdict answers,
+        // so a retry asks it again.
+        if !applied.refused.is_empty() {
+            let routes: Vec<_> = {
+                let table = self.routes.lock().await;
+                applied
+                    .refused
+                    .iter()
+                    .filter_map(|consumer_id| table.get(consumer_id).cloned())
+                    .collect()
+            };
+            let watchers: Vec<_> = routes
+                .iter()
+                .map(|route| Arc::clone(&route.principal))
+                .collect();
+            let mut verdicts = Transitions::new();
+            if !watchers.is_empty() {
+                if let Err(err) = transitions(
+                    &self.auth,
+                    event,
+                    self.catalog.as_ref(),
+                    &watchers,
+                    &mut verdicts,
+                )
+                .await
+                {
+                    return Err(self.transition_refusal(event, err));
+                }
+                self.ask_second_opinion(event, &watchers, verdicts.get())
+                    .await;
+            }
+            for (route, verdict) in routes.iter().zip(verdicts.get().iter().copied()) {
+                if verdict == Transition::Nothing {
+                    continue;
+                }
+                tracing::warn!(
+                    sub_id = %route.label,
+                    "a value the replica cannot store refused the subscription"
+                );
+                let _ = route.tx.send(Outbound::Refuse {
+                    sub_id: route.label.clone(),
+                });
+            }
+            applied.refused.clear();
+        }
         if let Some(narrowings) = applied.narrowings.take() {
             self.fan_out_moves(event, narrowings, &progress.grant_moves)
                 .await;
         }
         self.deliver_owed(applied).await;
+        self.dispose_read_failure(applied).await
+    }
 
-        // Three classes, three dispositions (R89 decision 1). A timeout is
-        // policy and ends its subscription, retrying it replaces nothing. The
-        // unknown class gets one retry per subscription and a second failure
-        // ends it, so a poisoned query costs one extra read and a blip costs
-        // one read and survives. Each retry draws the policy's
-        // first-attempt wait from a fresh episode rather than one shared
-        // escalating schedule, so one poisoned migration ending many
-        // subscriptions costs one short wait each. A transient failure
-        // returns to the ingest loop, which pauses delivery in place (R89
-        // decision 2), never a change-stream teardown. A retry drains the
-        // queued reads and never applies the event again. Each pass ends at
-        // most one subscription or spends one retry, so the loop terminates.
+    /// Dispose of the read failure an applied event carries, and drain the
+    /// reads a retry or refusal left queued.
+    ///
+    /// Three classes, three dispositions (R89 decision 1). A timeout is
+    /// policy and ends its subscription, retrying it replaces nothing. The
+    /// unknown class gets one retry per subscription and a second failure
+    /// ends it, so a poisoned query costs one extra read and a blip costs
+    /// one read and survives. Each retry draws the policy's first-attempt
+    /// wait from a fresh episode rather than one shared escalating schedule,
+    /// so one poisoned migration ending many subscriptions costs one short
+    /// wait each. A transient failure returns to the ingest loop, which
+    /// pauses delivery in place (R89 decision 2), never a change-stream
+    /// teardown. A retry drains the queued reads and never applies the
+    /// event again. Each pass ends at most one subscription or spends one
+    /// retry, so the loop terminates.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::ReadUnavailable`] when a transient read failure
+    /// pauses delivery in place, and [`SessionError::Materializer`] when the
+    /// failure is one this path does not dispose of.
+    async fn dispose_read_failure(&self, applied: &mut Applied) -> Result<(), SessionError> {
         loop {
             if let Some(failure) = applied.failure.take() {
                 applied.drain_due = true;
@@ -8019,7 +8098,7 @@ where
 
     /// Send each fenced snapshot the rows of the transactions its fence missed that the log already holds, in commit order, as live patches under the snapshot's own cursor.
     ///
-    /// Those were dispatched before the route existed, so the live path never sent them, and the snapshot does not hold them either (the state table in `plans/design-commit-positions.md`). A client that drops before they arrive resumes from that cursor and is sent them again. A missed truncate cannot be sent as a patch and a read taken now would miss it again, so the subscription is refused.
+    /// Those were dispatched before the route existed, so the live path never sent them, and the snapshot does not hold them either (the state table in `plans/design-commit-positions.md`). A client that drops before they arrive resumes from that cursor and is sent them again. A missed truncate refuses the subscription, and so does a missed event the replica cannot store, when its transition would have sent bytes, because a read taken now would miss it again.
     async fn replay_missed<T: Transport>(
         &self,
         transport: &mut T,
@@ -8049,6 +8128,7 @@ where
             let mut verdicts = Transitions::new();
             let mut payloads = Vec::new();
             let mut truncated = false;
+            let mut unencodable = false;
             for record in records {
                 if replay.fence.seen(record.position()) != Seen::Missed {
                     continue;
@@ -8066,15 +8146,24 @@ where
                     truncated = true;
                     break;
                 }
-                if let Some(payload) = self
+                match self
                     .replay_payload(transport, &record, departing, &watchers, &mut verdicts)
                     .await?
                 {
-                    payloads.push(payload);
+                    Replayed::Bytes(payload) => payloads.push(payload),
+                    Replayed::Skipped => {}
+                    // The rest of the replay is dropped like after a truncate.
+                    Replayed::Unsendable => {
+                        unencodable = true;
+                        break;
+                    }
                 }
             }
-            if truncated {
-                tracing::warn!(sub_id = %replay.label, "a truncate the snapshot missed is not yet visible, refusing the subscription");
+            if truncated || unencodable {
+                tracing::warn!(
+                    sub_id = %replay.label,
+                    "a missed record the client cannot be sent is refused instead"
+                );
                 self.refuse_subscription(transport, state, &replay.label)
                     .await?;
                 continue;
@@ -8452,6 +8541,10 @@ where
             .map_err(transport_err),
             CatchupWait::Ready(WaveEnd::Resync(reason)) => {
                 self.resnapshot_row(transport, state, &sub.sub_id, &reason, None)
+                    .await
+            }
+            CatchupWait::Ready(WaveEnd::Refused) => {
+                self.refuse_subscription(transport, state, &sub.sub_id)
                     .await
             }
             CatchupWait::Ready(WaveEnd::Failed(error)) => Err(error),
@@ -8849,7 +8942,9 @@ where
     ///
     /// A delivered record goes out as the patch logged with it, as R44's
     /// marked departure notice when the row left a member's window, or as the
-    /// withdrawal that takes it back, each built at most once per record.
+    /// withdrawal that takes it back, each built at most once per record. A
+    /// marker record asks the same question, and only the members whose
+    /// transition would have sent bytes are refused.
     async fn deliver_record(
         &self,
         members: &mut [Member<Id, Key>],
@@ -8894,7 +8989,19 @@ where
             if !members[at].is_open() || self.shutting_down.load(Ordering::Acquire) {
                 continue;
             }
+            if verdict == Transition::Nothing {
+                continue;
+            }
+            let Some(payload) = record.payload() else {
+                // A record without a payload is the marker the oplog keeps for
+                // an event the replica cannot store, and this caller's
+                // transition would have sent bytes, so the subscription is
+                // refused like a live delivery of the event.
+                members[at].end(WaveEnd::Refused);
+                continue;
+            };
             let payload = match verdict {
+                // The Nothing verdict is answered above. The arm keeps the match total.
                 Transition::Nothing => continue,
                 Transition::Deliver if departing => {
                     if notice.is_none() {
@@ -8909,15 +9016,13 @@ where
                     }
                     match &notice {
                         Some(Ok(Some(bytes))) => Ok(bytes.clone()),
-                        Some(Ok(None)) | None => Ok(record.payload().to_vec()),
+                        Some(Ok(None)) | None => Ok(payload.to_vec()),
                         Some(Err(detail)) => Err(detail.clone()),
                     }
                 }
-                Transition::Deliver => Ok(record.payload().to_vec()),
+                Transition::Deliver => Ok(payload.to_vec()),
                 // A delete's own patch already is the withdrawal, so only an update pays a second fold.
-                Transition::Withdraw if event.kind() == EventKind::Delete => {
-                    Ok(record.payload().to_vec())
-                }
+                Transition::Withdraw if event.kind() == EventKind::Delete => Ok(payload.to_vec()),
                 Transition::Withdraw => {
                     if withdrawal.is_none() {
                         let Some(materializer) = self
@@ -9073,7 +9178,7 @@ where
         departing: bool,
         watchers: &[Arc<Principal<Id, Key>>],
         verdicts: &mut Transitions,
-    ) -> Result<Option<Vec<u8>>, SessionError> {
+    ) -> Result<Replayed, SessionError> {
         let event = record.event();
         // A truncate never reaches here: `catch_up_row` turns one into a
         // replacement before asking anything about it (R48).
@@ -9125,21 +9230,30 @@ where
         }
         self.ask_second_opinion(event, watchers, verdicts.get())
             .await;
+        let verdict = verdicts.get().first().copied().unwrap_or_default();
+        if verdict == Transition::Nothing {
+            return Ok(Replayed::Skipped);
+        }
+        // A record without a payload is the marker the oplog keeps for an
+        // event the replica cannot store.
+        let Some(payload) = record.payload() else {
+            return Ok(Replayed::Unsendable);
+        };
         // R44's departure notice takes the same three-way answer as the live
         // path: still visible and out of the window keeps the marked notice, out
         // of reach becomes the plain delete, and never in reach becomes silence
         // (R6 decision 6).
-        match verdicts.get().first().copied().unwrap_or_default() {
-            Transition::Nothing => Ok(None),
+        match verdict {
+            Transition::Nothing => Ok(Replayed::Skipped),
             Transition::Deliver if departing => {
                 let notice = { self.materializer.lock().await.departure_notice(event)? };
-                Ok(Some(notice.unwrap_or_else(|| record.payload().to_vec())))
+                Ok(Replayed::Bytes(notice.unwrap_or_else(|| payload.to_vec())))
             }
-            Transition::Deliver => Ok(Some(record.payload().to_vec())),
+            Transition::Deliver => Ok(Replayed::Bytes(payload.to_vec())),
             // A replayed delete's own patch already is the withdrawal, as on the
             // live path, so only an update pays a second fold.
             Transition::Withdraw if event.kind() == EventKind::Delete => {
-                Ok(Some(record.payload().to_vec()))
+                Ok(Replayed::Bytes(payload.to_vec()))
             }
             Transition::Withdraw => {
                 let withdrawal = { self.materializer.lock().await.withdrawal_patch(event)? };
@@ -9150,7 +9264,7 @@ where
                             .to_owned(),
                     )
                 })?;
-                Ok(Some(withdrawal))
+                Ok(Replayed::Bytes(withdrawal))
             }
         }
     }

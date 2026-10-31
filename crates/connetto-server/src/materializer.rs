@@ -415,6 +415,10 @@ pub enum SeedPlan {
 pub struct Dispatched {
     /// Row patches to fan out to matched consumers.
     pub patches: Vec<MatchedPatch>,
+    /// Matched consumers left without a patch because the event holds a value
+    /// the replica cannot store. The session asks the row verdict and ends the
+    /// ones it reaches.
+    pub refused: Vec<u64>,
     /// Server-computed results that moved: fold deltas per group, replaced
     /// scalar extremes, re-read row answers, and keyed row changes, each
     /// already shaped for the wire.
@@ -437,7 +441,8 @@ struct PatchTarget {
     departure: bool,
 }
 
-/// An event's wire encodings, built before the engine applies it so a failure applies nothing.
+/// An event's wire encodings, the fold built before the engine applies it so a
+/// compression failure applies nothing.
 struct Encoded {
     /// The compressed patchset every matched consumer shares and the oplog keeps.
     payload: Vec<u8>,
@@ -1247,22 +1252,29 @@ where
     ///
     /// The event folds once into a compressed patchset, shared across the
     /// matched consumers and kept in the record, so a catchup sends the same
-    /// bytes later instead of folding it again. It is built for every event,
-    /// matched or not, since the consumer that needs it may be away. The engine
-    /// applies the event exactly once per call, and what fails after that rides
-    /// in the result, so recovering it never applies the event again.
+    /// bytes later instead of folding it again. The fold runs before the
+    /// engine applies the event, and when the event holds a value the replica
+    /// cannot store, the callers the row verdict would have sent are refused
+    /// and the record keeps the event with no payload. The engine applies the
+    /// event exactly once per call, and what fails after that rides in the
+    /// result, so recovering it never applies the event again.
     ///
     /// # Errors
     ///
     /// [`MaterializerError::Dispatch`] when the engine cannot apply the event,
-    /// and [`MaterializerError::Emit`] or [`MaterializerError::Compression`]
-    /// when the event cannot be encoded, each before anything is applied.
+    /// and [`MaterializerError::Compression`] when the event's patchset cannot
+    /// be compressed, before anything is applied.
     pub async fn dispatch(
         &mut self,
         event: &PgChangeEvent,
     ) -> Result<Dispatched, MaterializerError> {
-        // Encoded before the engine applies the event, so an encoding failure leaves nothing applied.
-        let encoded = self.encode(event)?;
+        // Folded before the engine applies, so a compression failure leaves nothing applied.
+        // An event the replica cannot store is no failure here, it owes no patch.
+        let encoded = match self.encode(event) {
+            Ok(encoded) => Some(encoded),
+            Err(MaterializerError::Emit(_)) => None,
+            Err(err) => return Err(err),
+        };
         let identity = self.event_identity(event);
         // The drain is the only way to the in-process half, which is what
         // keeps one delivery path for every computed movement (R82). Whole-row
@@ -1315,14 +1327,25 @@ where
                 departure: departing.contains(&consumer_id),
             })
             .collect();
-        let patches = Self::patches_for(event, &matched, &encoded);
-        let record = identity
-            .map(|(table, pk)| ChangeRecord::new(table, pk, event.clone(), encoded.payload));
+        // No fold, no patch. The session asks the row verdict and ends the
+        // callers it reaches, and the record keeps the event as a marker.
+        let (patches, refused) = match &encoded {
+            Some(encoded) => (Self::patches_for(event, &matched, encoded), Vec::new()),
+            None => (
+                Vec::new(),
+                matched.iter().map(|target| target.consumer_id).collect(),
+            ),
+        };
+        let record = identity.map(|(table, pk)| match encoded {
+            Some(encoded) => ChangeRecord::new(table, pk, event.clone(), encoded.payload),
+            None => ChangeRecord::marker(table, pk, event.clone()),
+        });
 
         let narrowings = term_moves(&self.catalog, notifications.engine.narrowings());
 
         Ok(Dispatched {
             patches,
+            refused,
             computed,
             narrowings,
             record,
