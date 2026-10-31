@@ -25,17 +25,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::messages::{
-    AckCredits, BulkMessage, ControlMessage, FullResyncReason, Handshake, Ping, Subscribe,
-    SubscriptionSpec,
+    AckCredits, BulkMessage, ControlMessage, FullResyncReason, Handshake, Ping,
+    SUBSCRIPTION_REFUSED, Subscribe, SubscriptionSpec,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    ChangeRecord, InMemoryOplog, LoopbackTransport, ManagerBuilder, Materializer, NoConnector,
-    Oplog, OplogConfig, PageSpec, PgOplog, Position, ReadFence, SessionConfig, SessionManager,
-    SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory, Unseen, UnseenIds, loopback,
-    pg_write_target,
+    ChangeRecord, InMemoryOplog, LoopbackTransport, ManagerBuilder, Materializer,
+    MaterializerError, NoConnector, Oplog, OplogConfig, PageSpec, PgOplog, Position, ReadFence,
+    SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory,
+    Unseen, UnseenIds, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -1591,10 +1591,45 @@ async fn a_restarted_feed_replaying_rows_a_caught_up_client_holds_keeps_running(
     expect_idle(&mut client).await;
 }
 
-/// A snapshot source serving the one seed row under a cursor the test sets once it knows the positions.
-#[derive(Clone, Default)]
+/// A snapshot source serving either the one seed row or no rows, under a cursor the test sets once it knows the positions.
+#[derive(Clone)]
 struct FencedSeed {
     cursor: Arc<parking_lot::Mutex<Vec<u8>>>,
+    /// Whether the page serves the one seed row, or no rows.
+    seed_row: bool,
+}
+
+impl Default for FencedSeed {
+    fn default() -> Self {
+        Self {
+            cursor: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            seed_row: true,
+        }
+    }
+}
+
+impl FencedSeed {
+    /// A seed that serves no rows.
+    #[must_use]
+    fn empty() -> Self {
+        Self {
+            cursor: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            seed_row: false,
+        }
+    }
+}
+
+/// The page a seed that serves no rows issues.
+fn empty_page() -> SnapshotPage {
+    SnapshotPage {
+        patchset: Vec::new(),
+        cursor: Cursor::new(Vec::new()),
+        next: None,
+        filled: false,
+        widest_row: 0,
+        rows: 0,
+        bytes: 0,
+    }
 }
 
 impl SnapshotSource for FencedSeed {
@@ -1616,9 +1651,13 @@ impl SnapshotSource for FencedSeed {
         auth: &connetto_core::Principal,
         page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
-        let seed = SeedSnapshot
-            .snapshot_page(select_sql, binds, auth, page)
-            .await?;
+        let seed = if self.seed_row {
+            SeedSnapshot
+                .snapshot_page(select_sql, binds, auth, page)
+                .await?
+        } else {
+            empty_page()
+        };
         Ok(SnapshotPage {
             cursor: Cursor::new(self.cursor.lock().clone()),
             ..seed
@@ -1628,16 +1667,17 @@ impl SnapshotSource for FencedSeed {
 
 type FencedManager = SessionManager<FencedSeed, RosterAuth, ConnettoDefaults>;
 
-fn fenced_manager(fixture: &Fixture, seed: FencedSeed) -> Arc<FencedManager> {
+/// Build the fenced manager over `ddl`, the DDL its materializer and write target share.
+fn fenced_manager(fixture: &Fixture, seed: FencedSeed, ddl: &str) -> Arc<FencedManager> {
     ManagerBuilder::new(
-        Materializer::builder(PG_DDL)
+        Materializer::builder(ddl)
             .build()
             .expect("build materializer"),
         seed,
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), ddl)
             .expect("build write target"),
     )
     .build()
@@ -1709,7 +1749,7 @@ async fn insert(source: &mut PgSqliteEmuSource, id: i64) -> PgChangeEvent {
 async fn a_snapshot_replays_a_transaction_it_missed_that_was_dispatched_before_it() {
     let fixture = Fixture::acquire().await;
     let seed = FencedSeed::default();
-    let manager = fenced_manager(&fixture, seed.clone());
+    let manager = fenced_manager(&fixture, seed.clone(), PG_DDL);
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     let held = insert(&mut source, 1).await;
     let missed = insert(&mut source, 2).await;
@@ -1774,11 +1814,107 @@ async fn a_snapshot_replays_a_transaction_it_missed_that_was_dispatched_before_i
     expect_idle(&mut client).await;
 }
 
+/// A `timestamptz` column, the value Postgres holds that the SQLite wire cannot carry.
+const STAMPS_PG: &str = "CREATE TABLE stamps (id INT PRIMARY KEY, at TIMESTAMPTZ NOT NULL);";
+
+/// One insert of order `id` at instant `at`, as the emulator stamps it.
+async fn stamp(source: &mut PgSqliteEmuSource, id: i64, at: &str) -> PgChangeEvent {
+    source
+        .execute_sql(&format!(
+            "INSERT INTO stamps (id, at) VALUES ({id}, '{at}')"
+        ))
+        .expect("execute dml");
+    let mut events = Vec::new();
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        if let SourceItem::Event(event) = item {
+            events.push(event);
+        }
+    }
+    let [event] = <[PgChangeEvent; 1]>::try_from(events).expect("one row per insert");
+    event
+}
+
+/// A fresh snapshot whose read fence missed a transaction the replica cannot
+/// store refuses the subscription instead of replaying it, and the connection
+/// stays open behind the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fenced_snapshot_that_missed_an_unencodable_transaction_is_refused() {
+    let fixture = Fixture::acquire().await;
+    let seed = FencedSeed::empty();
+    let manager = fenced_manager(&fixture, seed.clone(), STAMPS_PG);
+    let mut source = PgSqliteEmuSource::open_in_memory(STAMPS_PG).expect("open emu source");
+    let held = stamp(&mut source, 1, "2026-01-01 00:00:00+00").await;
+    let missed = stamp(&mut source, 2, "infinity").await;
+    // The value the wire cannot carry, so the fold owes no patch for it and
+    // the oplog keeps the event as a marker without a payload.
+    let probe = Materializer::builder(STAMPS_PG)
+        .build()
+        .expect("build probe");
+    assert!(
+        matches!(probe.encode_patch(&missed), Err(MaterializerError::Emit(_))),
+        "the infinity value must stay unencodable for the scenario to hold"
+    );
+    manager.dispatch_event(&held).await.expect("dispatch");
+    manager.dispatch_event(&missed).await.expect("dispatch");
+
+    // The read sees the first transaction and not the second, which is still running.
+    let after = PgLsn(missed.position().commit_lsn().0 + 1);
+    let (held_xid, missed_xid) = (held.position().xid().0, missed.position().xid().0);
+    let fence = ReadFence::parse(
+        &format!("{held_xid}:{}:{missed_xid}", missed_xid + 1),
+        after,
+    )
+    .expect("fence");
+    *seed.cursor.lock() =
+        connetto_server::snapshot_cursor(PgCommitPosition::before_commit(after), Some(&fence));
+
+    let mut client = open_fenced_session(&manager, None).await;
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: "stamps".to_owned(),
+            spec: SubscriptionSpec::new("SELECT * FROM stamps"),
+        }))
+        .await
+        .expect("send subscribe");
+    let ControlMessage::SnapshotBegin(_) = next_control(&mut client).await else {
+        panic!("expected snapshot begin");
+    };
+    loop {
+        let frame = next_frame_bounded(&mut client).await;
+        match frame {
+            IncomingFrame::Bulk(BulkMessage::SnapshotPatch(_)) => {}
+            IncomingFrame::Control(ControlMessage::SnapshotEnd(end)) => {
+                let snapshot_cursor =
+                    fenced_cursor(PgCommitPosition::before_commit(after), Some(&fence));
+                assert_eq!(
+                    end.cursor, snapshot_cursor,
+                    "the snapshot's cursor names its read and carries its fence"
+                );
+                break;
+            }
+            other => panic!("expected the seed page or its end, met {other:?}"),
+        }
+    }
+    // The missed marker has no payload to send, so the subscription the
+    // marker matches is refused instead of replayed.
+    let frame = next_frame_bounded(&mut client).await;
+    let IncomingFrame::Control(ControlMessage::NonFatalError(fatal)) = frame else {
+        panic!("the missed unencodable transaction was refused, the client met {frame:?}");
+    };
+    assert_eq!(
+        fatal.related_to.as_deref(),
+        Some("stamps"),
+        "the refusal names the subscription the marker matched"
+    );
+    assert_eq!(fatal.detail, SUBSCRIPTION_REFUSED);
+    expect_idle(&mut client).await;
+}
+
 /// A client resuming from a snapshot's fenced cursor catches up on what the snapshot missed and skips what it held, and a missed transaction dispatched later still reaches it below its cursor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fenced_cursor_catches_up_what_its_snapshot_missed_and_nothing_it_held() {
     let fixture = Fixture::acquire().await;
-    let manager = fenced_manager(&fixture, FencedSeed::default());
+    let manager = fenced_manager(&fixture, FencedSeed::default(), PG_DDL);
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     let mut events = Vec::new();
     for id in 1..=5 {
