@@ -52,7 +52,8 @@ impl VisibilityPolicy for QuantityCeiling {
     }
 }
 
-fn single_delete_of(frame: &[u8], id: i64, marked: bool) {
+/// A frame of one delete of `orders` row `id`, `indirect` when `marked`.
+pub(in crate::reconnect) fn single_delete_of(frame: &[u8], id: i64, marked: bool) {
     let raw = zstd::decode_all(frame).expect("the frame decompresses");
     let ParsedDiffSet::Patchset(set) = ParsedDiffSet::parse(&raw).expect("the frame parses") else {
         panic!("the frame is a patchset");
