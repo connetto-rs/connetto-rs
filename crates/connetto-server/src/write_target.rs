@@ -106,9 +106,9 @@ impl From<diesel::result::Error> for WriteError {
     fn from(err: diesel::result::Error) -> Self {
         match crate::reexec::diesel_failure(&err) {
             crate::reexec::ReadFailure::Transient => Self::Transient(err.to_string()),
-            crate::reexec::ReadFailure::Timeout | crate::reexec::ReadFailure::Other => {
-                Self::Backend(err.to_string())
-            }
+            crate::reexec::ReadFailure::Timeout
+            | crate::reexec::ReadFailure::Deterministic
+            | crate::reexec::ReadFailure::Other => Self::Backend(err.to_string()),
         }
     }
 }
@@ -211,9 +211,13 @@ impl From<diesel::result::Error> for CommitError {
     }
 }
 
-/// True when a Postgres error is an RLS policy violation.
-fn is_rls_violation(text: &str) -> bool {
-    text.to_lowercase().contains("row-level security")
+/// Whether Postgres refused a statement with `42501` (`insufficient_privilege`).
+///
+/// A policy's `WITH CHECK` and a missing grant raise the same code, and both
+/// mean the caller may not write the row (R106 decision 4).
+fn is_insufficient_privilege(err: &diesel::result::Error) -> bool {
+    matches!(err, diesel::result::Error::DatabaseError(_, info)
+        if info.sqlstate() == Some(diesel::pg::sql_state::INSUFFICIENT_PRIVILEGE))
 }
 
 impl<D: ConnettoSchema> PgWriteTarget<D> {
@@ -657,7 +661,11 @@ fn commit_failure(err: CommitError) -> WriteError {
     match err {
         CommitError::Frontier => WriteError::Frontier,
         CommitError::Denied => WriteError::Unauthorized,
-        CommitError::Db(err) if is_rls_violation(&err.to_string()) => WriteError::Unauthorized,
+        // The client hears only `Unauthorized`, so the log is where an operator tells a policy refusal from a missing grant.
+        CommitError::Db(err) if is_insufficient_privilege(&err) => {
+            tracing::warn!(error = %err, "the database refused a write for lack of privilege");
+            WriteError::Unauthorized
+        }
         CommitError::Db(err) => err.into(),
         // The conflict probe reads inside the same transaction, so its connection failing is the same outage.
         CommitError::Probe(MaterializerError::Apply(err))
@@ -672,10 +680,58 @@ fn commit_failure(err: CommitError) -> WriteError {
 #[cfg(test)]
 mod tests {
     use super::{CommitError, MaterializerError, WriteError, commit_failure};
+    use crate::reexec::coded_error;
     use diesel::result::{DatabaseErrorKind, Error};
 
     fn db_error(kind: DatabaseErrorKind, message: &str) -> Error {
         Error::DatabaseError(kind, Box::new(message.to_owned()))
+    }
+
+    /// `42501` refuses the write as unauthorized whether a policy or a missing grant raised it, and no message decides.
+    #[test]
+    fn insufficient_privilege_is_unauthorized_and_its_message_is_not() {
+        for message in [
+            "new row violates row-level security policy for table \"notes\"",
+            "permission denied for table notes",
+        ] {
+            assert!(matches!(
+                commit_failure(CommitError::Db(coded_error(
+                    DatabaseErrorKind::Unknown,
+                    "42501",
+                    message
+                ))),
+                WriteError::Unauthorized
+            ));
+        }
+        let codeless = db_error(
+            DatabaseErrorKind::Unknown,
+            "new row violates row-level security policy for table \"notes\"",
+        );
+        assert!(matches!(
+            commit_failure(CommitError::Db(codeless)),
+            WriteError::Backend(_)
+        ));
+    }
+
+    /// A listed code makes the write retryable, and any other code does not.
+    #[test]
+    fn a_write_retries_on_a_listed_code_only() {
+        assert!(matches!(
+            commit_failure(CommitError::Db(coded_error(
+                DatabaseErrorKind::Unknown,
+                "40P01",
+                "deadlock detected"
+            ))),
+            WriteError::Transient(_)
+        ));
+        assert!(matches!(
+            commit_failure(CommitError::Db(coded_error(
+                DatabaseErrorKind::Unknown,
+                "22012",
+                "division by zero"
+            ))),
+            WriteError::Backend(_)
+        ));
     }
 
     /// The conflict probe reads inside the commit transaction, so a connection cut there is the outage the apply retries.

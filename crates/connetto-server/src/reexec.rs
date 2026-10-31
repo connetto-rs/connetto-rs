@@ -26,6 +26,9 @@
 use core::future::Future;
 use core::time::Duration;
 
+use diesel::pg::sql_state;
+use diesel::result::{SqlState, SqlStateClass};
+
 use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
     AsyncConnector, DieselAsyncError, PgAsyncDieselConnector, ReadQuery, RowPage, SessionSetup,
@@ -110,7 +113,9 @@ pub enum ReadFailure {
     Timeout,
     /// The database or its pool was unreachable or cut off. Delivery pauses and retries in place (R89 decision 2).
     Transient,
-    /// Everything unnamed, including transients whose SQLSTATE diesel drops. One retry, then the subscription ends.
+    /// The database answered with a code outside the transient list. Asking again asks the same question, so the subscription ends at once (R106 decision 2).
+    Deterministic,
+    /// A failure carrying no code. One retry, then the subscription ends.
     Other,
 }
 
@@ -119,6 +124,7 @@ impl core::fmt::Display for ReadFailure {
         f.write_str(match self {
             Self::Timeout => "timeout",
             Self::Transient => "transient",
+            Self::Deterministic => "deterministic",
             Self::Other => "unknown",
         })
     }
@@ -144,23 +150,51 @@ impl FailedRead for DieselAsyncError {
     }
 }
 
-/// Bounded floor until the SQLSTATE reaches a diesel error
-/// (<https://github.com/diesel-rs/diesel/pull/5232>).
-/// Deadlock arrives as `Unknown`, so it classifies as `Other`, one retry rather than an outage loop.
+/// The codes besides class `08` that clear on retry (R106 decision 1).
+///
+/// Named one by one, because their classes also hold codes that never clear:
+/// `40002`, `53400`, `57P04` and `58P01` would pause delivery for ever.
+const TRANSIENT_CODES: [SqlState; 12] = [
+    sql_state::T_R_SERIALIZATION_FAILURE,
+    sql_state::T_R_DEADLOCK_DETECTED,
+    sql_state::READ_ONLY_SQL_TRANSACTION,
+    sql_state::DISK_FULL,
+    sql_state::OUT_OF_MEMORY,
+    sql_state::TOO_MANY_CONNECTIONS,
+    sql_state::ADMIN_SHUTDOWN,
+    sql_state::CRASH_SHUTDOWN,
+    sql_state::CANNOT_CONNECT_NOW,
+    sql_state::IDLE_SESSION_TIMEOUT,
+    sql_state::SYSTEM_ERROR,
+    sql_state::IO_ERROR,
+];
+
+/// The class of a diesel error, the one classifier the read, write, snapshot
+/// and oplog paths share.
+///
+/// The SQLSTATE decides wherever the database reported one, and the kind
+/// decides only for an error without one (R106 decision 3).
 pub(crate) fn diesel_failure(err: &diesel::result::Error) -> ReadFailure {
     use diesel::result::{DatabaseErrorKind, Error};
-    if is_statement_timeout(err) {
-        return ReadFailure::Timeout;
-    }
-    match err {
-        Error::DatabaseError(
+    let Error::DatabaseError(kind, info) = err else {
+        return ReadFailure::Other;
+    };
+    match info.sqlstate() {
+        Some(sql_state::QUERY_CANCELED) => ReadFailure::Timeout,
+        Some(code)
+            if code.class() == SqlStateClass::CONNECTION_EXCEPTION
+                || TRANSIENT_CODES.contains(&code) =>
+        {
+            ReadFailure::Transient
+        }
+        Some(_) => ReadFailure::Deterministic,
+        None => match kind {
             DatabaseErrorKind::SerializationFailure
             | DatabaseErrorKind::ReadOnlyTransaction
             | DatabaseErrorKind::ClosedConnection
-            | DatabaseErrorKind::UnableToSendCommand,
-            _,
-        ) => ReadFailure::Transient,
-        _ => ReadFailure::Other,
+            | DatabaseErrorKind::UnableToSendCommand => ReadFailure::Transient,
+            _ => ReadFailure::Other,
+        },
     }
 }
 
@@ -191,17 +225,50 @@ impl FailedRead for crate::snapshot::SnapshotError {
     }
 }
 
-/// Whether a diesel error is Postgres cancelling a statement at its timeout.
-///
-/// By message, because the SQLSTATE is dropped on the way here: `diesel-async`
-/// maps every code it does not name to `DatabaseErrorKind::Unknown` and its
-/// `DatabaseErrorInformation` exposes no code, so 57014 (`query_canceled`)
-/// arrives indistinguishable from any other unnamed error except by its text.
-/// Postgres spells a cancellation's cause in that text, and a user request
-/// (which connetto never issues) spells a different one.
-pub(crate) fn is_statement_timeout(err: &diesel::result::Error) -> bool {
-    matches!(err, diesel::result::Error::DatabaseError(_, info)
-        if info.message().contains("statement timeout"))
+/// A diesel database error carrying `code` as its SQLSTATE, the shape `diesel_async` reports.
+#[cfg(test)]
+pub(crate) fn coded_error(
+    kind: diesel::result::DatabaseErrorKind,
+    code: &str,
+    message: &str,
+) -> diesel::result::Error {
+    struct Coded {
+        code: diesel::result::SqlState,
+        message: String,
+    }
+    impl diesel::result::DatabaseErrorInformation for Coded {
+        fn message(&self) -> &str {
+            &self.message
+        }
+        fn details(&self) -> Option<&str> {
+            None
+        }
+        fn hint(&self) -> Option<&str> {
+            None
+        }
+        fn table_name(&self) -> Option<&str> {
+            None
+        }
+        fn column_name(&self) -> Option<&str> {
+            None
+        }
+        fn constraint_name(&self) -> Option<&str> {
+            None
+        }
+        fn statement_position(&self) -> Option<i32> {
+            None
+        }
+        fn sqlstate(&self) -> Option<diesel::result::SqlState> {
+            Some(self.code)
+        }
+    }
+    diesel::result::Error::DatabaseError(
+        kind,
+        Box::new(Coded {
+            code: code.parse().expect("a five-character SQLSTATE"),
+            message: message.to_owned(),
+        }),
+    )
 }
 
 /// The value Postgres accepts for `statement_timeout`, in milliseconds, for a
@@ -266,7 +333,7 @@ impl AsyncConnector for NoConnector {
 mod tests {
     use super::{
         ConnettoReadSetup, Duration, FailedRead, ReadBudget, ReadFailure, SessionSetup,
-        statement_timeout_ms,
+        coded_error, statement_timeout_ms,
     };
     use diesel::result::{DatabaseErrorKind, Error};
     use subql::reexec::DieselAsyncError;
@@ -299,9 +366,13 @@ mod tests {
         );
     }
 
-    /// Stands in for a diesel database error once the SQLSTATE is dropped, `String` being diesel's own information type.
-    fn db_error(kind: DatabaseErrorKind, message: &str) -> Error {
+    /// A database error carrying no code, `String` being diesel's own information type.
+    fn codeless(kind: DatabaseErrorKind, message: &str) -> Error {
         Error::DatabaseError(kind, Box::new(message.to_owned()))
+    }
+
+    fn class_of(err: Error) -> ReadFailure {
+        DieselAsyncError::Diesel(err).read_failure()
     }
 
     /// A pool that cannot hand out a connection is an outage, not an unknown.
@@ -311,70 +382,110 @@ mod tests {
         assert_eq!(err.read_failure(), ReadFailure::Transient);
     }
 
+    /// `57014` is the timeout whatever the message says, and the message alone is nothing.
     #[test]
-    fn the_statement_cancellation_text_is_the_timeout_class() {
-        let err = DieselAsyncError::Diesel(db_error(
-            DatabaseErrorKind::Unknown,
-            "canceling statement due to statement timeout",
-        ));
-        assert_eq!(err.read_failure(), ReadFailure::Timeout);
+    fn the_statement_timeout_is_known_by_its_code_alone() {
+        assert_eq!(
+            class_of(coded_error(
+                DatabaseErrorKind::Unknown,
+                "57014",
+                "query canceled"
+            )),
+            ReadFailure::Timeout
+        );
+        assert_eq!(
+            class_of(codeless(
+                DatabaseErrorKind::Unknown,
+                "canceling statement due to statement timeout"
+            )),
+            ReadFailure::Other
+        );
     }
 
-    /// A user cancellation spells a different cause in the same sentence.
+    /// Decision 1's list, every code on it, class `08` sampled across its standard members.
     #[test]
-    fn a_user_cancellation_is_not_the_timeout_class() {
-        let err = DieselAsyncError::Diesel(db_error(
-            DatabaseErrorKind::Unknown,
-            "canceling statement due to user request",
-        ));
-        assert_eq!(err.read_failure(), ReadFailure::Other);
+    fn every_listed_code_is_transient() {
+        for code in [
+            "08000", "08001", "08003", "08004", "08006", "08007", "08P01", "40001", "40P01",
+            "25006", "53100", "53200", "53300", "57P01", "57P02", "57P03", "57P05", "58000",
+            "58030",
+        ] {
+            assert_eq!(
+                class_of(coded_error(DatabaseErrorKind::Unknown, code, "listed")),
+                ReadFailure::Transient,
+                "for {code}"
+            );
+        }
     }
 
-    /// The outage kinds diesel-async names, `ReadOnlyTransaction` being the standby recovery conflict.
+    /// Codes beside the list in its own classes never clear on retry, and a schema drift ends at once.
     #[test]
-    fn the_named_outage_kinds_are_transient() {
+    fn every_other_code_is_deterministic() {
+        for code in [
+            "40002", "40003", "53400", "57000", "57P04", "58P01", "58P02", "42P01", "42703",
+            "42501", "22012", "23505", "P0001",
+        ] {
+            assert_eq!(
+                class_of(coded_error(DatabaseErrorKind::Unknown, code, "unlisted")),
+                ReadFailure::Deterministic,
+                "for {code}"
+            );
+        }
+    }
+
+    /// Where a code is present the kind decides nothing, in either direction.
+    #[test]
+    fn the_code_overrides_the_kind() {
+        assert_eq!(
+            class_of(coded_error(
+                DatabaseErrorKind::ClosedConnection,
+                "42601",
+                "syntax"
+            )),
+            ReadFailure::Deterministic
+        );
+        assert_eq!(
+            class_of(coded_error(
+                DatabaseErrorKind::UniqueViolation,
+                "40P01",
+                "deadlock"
+            )),
+            ReadFailure::Transient
+        );
+    }
+
+    /// Without a code the kind decides, and only the kinds an outage arrives as are transient.
+    #[test]
+    fn without_a_code_the_kind_decides() {
         for kind in [
             DatabaseErrorKind::SerializationFailure,
             DatabaseErrorKind::ReadOnlyTransaction,
             DatabaseErrorKind::ClosedConnection,
             DatabaseErrorKind::UnableToSendCommand,
         ] {
-            let err = DieselAsyncError::Diesel(db_error(kind, "whatever the server said"));
             assert_eq!(
-                err.read_failure(),
+                class_of(codeless(kind, "whatever the server said")),
                 ReadFailure::Transient,
+                "for kind {kind:?}"
+            );
+        }
+        for kind in [
+            DatabaseErrorKind::Unknown,
+            DatabaseErrorKind::UniqueViolation,
+        ] {
+            assert_eq!(
+                class_of(codeless(kind, "relation \"v\" does not exist")),
+                ReadFailure::Other,
                 "for kind {kind:?}"
             );
         }
     }
 
-    /// A dropped view arrives as `Unknown`, the poisoned query that must cost one retry and end.
+    /// Errors that never reached the database carry no code and keep the one retry.
     #[test]
-    fn unnamed_database_errors_are_other() {
-        let dropped_view = DieselAsyncError::Diesel(db_error(
-            DatabaseErrorKind::Unknown,
-            "relation \"v\" does not exist",
-        ));
-        assert_eq!(dropped_view.read_failure(), ReadFailure::Other);
-        let syntax = DieselAsyncError::Diesel(Error::QueryBuilderError(Box::new(
-            std::io::Error::other("nope"),
-        )));
-        assert_eq!(syntax.read_failure(), ReadFailure::Other);
-    }
-
-    /// Constraint violations are deterministic refusals of the query.
-    #[test]
-    fn constraint_violations_are_other() {
-        let err = DieselAsyncError::Diesel(db_error(
-            DatabaseErrorKind::UniqueViolation,
-            "duplicate key value violates unique constraint",
-        ));
-        assert_eq!(err.read_failure(), ReadFailure::Other);
-    }
-
-    /// Configuration refusals clear no retry.
-    #[test]
-    fn configuration_refusals_are_other() {
+    fn errors_outside_the_database_are_other() {
+        let builder = Error::QueryBuilderError(Box::new(std::io::Error::other("nope")));
+        assert_eq!(class_of(builder), ReadFailure::Other);
         assert_eq!(
             DieselAsyncError::RowsUnsupported.read_failure(),
             ReadFailure::Other

@@ -825,7 +825,7 @@ mod pg {
                 })
                 .await
                 .map_err(|err| {
-                    if crate::reexec::is_statement_timeout(&err) {
+                    if crate::reexec::diesel_failure(&err) == crate::reexec::ReadFailure::Timeout {
                         SnapshotError::TimedOut(page.timeout)
                     } else {
                         SnapshotError::Backend(err.to_string())

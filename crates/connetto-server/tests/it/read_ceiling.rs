@@ -391,28 +391,44 @@ async fn a_table_wider_than_the_ceiling_is_refused_before_the_read() {
 
 /// A read whose plan needs a sort is stopped by the time limit rather than
 /// running to completion, because a row cap bounds connetto's memory and the
-/// wire and not Postgres's work.
+/// wire and not Postgres's work. The cancellation is known by its `57014`, so
+/// the log names the time limit rather than a backend failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sort_shaped_read_is_stopped_by_the_time_limit() {
-    let fixture = Fixture::acquire().await;
-    fill(&fixture, 40_000, 200).await;
-    let manager = manager(
-        &fixture,
-        limits(8 * 1024, 32 * 1024, Duration::from_millis(1)),
-    );
+    crate::logging::with_capture(
+        "a_sort_shaped_read_is_stopped_by_the_time_limit",
+        |logs| async move {
+            let fixture = Fixture::acquire().await;
+            fill(&fixture, 40_000, 200).await;
+            let manager = manager(
+                &fixture,
+                limits(8 * 1024, 32 * 1024, Duration::from_millis(1)),
+            );
 
-    let mut client = connect(&manager);
-    client.handshake_with("sorter", "user:sorter").await;
-    // `body` carries no index, so the plan sorts the whole table to return one
-    // page of it.
-    client
-        .subscribe("sorted", "SELECT * FROM things ORDER BY body")
-        .await;
+            let mut client = connect(&manager);
+            client.handshake_with("sorter", "user:sorter").await;
+            // `body` carries no index, so the plan sorts the whole table to return one
+            // page of it.
+            client
+                .subscribe("sorted", "SELECT * FROM things ORDER BY body")
+                .await;
 
-    let ControlMessage::NonFatalError(refusal) = client.next_control().await else {
-        panic!("a read past its time limit must be refused");
-    };
-    assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
+            let ControlMessage::NonFatalError(refusal) = client.next_control().await else {
+                panic!("a read past its time limit must be refused");
+            };
+            assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
+            let lines = logs.lines();
+            let timed_out = lines.iter().any(|line| {
+                line["message"] == "snapshot failed"
+                    && line["sub_id"] == "sorted"
+                    && line["error"]
+                        .as_str()
+                        .is_some_and(|error| error.starts_with("the read ran past its"))
+            });
+            assert!(timed_out, "the refusal is the time limit: {lines:?}");
+        },
+    )
+    .await;
 }
 
 /// Every read refusal is the same bytes on the wire, whatever stopped it.
@@ -691,8 +707,13 @@ mod aggregates {
                     line["message"]
                         == "a computed subscription's read was refused, ending the subscription"
                         && line["sub_id"] == "cheapest"
+                        && line["class"] == "timeout"
+                        && line["attempts"].as_u64() == Some(1)
                 });
-                assert!(named, "the log names the subscription it ended");
+                assert!(
+                    named,
+                    "the log names the subscription and the timeout class"
+                );
             },
         )
         .await;

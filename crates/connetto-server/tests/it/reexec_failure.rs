@@ -1,4 +1,4 @@
-//! R89 read-failure classification end-to-end tests.
+//! R89 and R106 read-failure classification end-to-end tests.
 //!
 //! Needs Docker.
 
@@ -19,6 +19,8 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tracing::Instrument;
+
+use crate::one_event::OneEvent;
 
 const DDL: &str = "CREATE TABLE counts (id INT PRIMARY KEY, n INT)";
 
@@ -71,13 +73,14 @@ fn full_manager(
 }
 
 /// Dropping column n poisons re-execution of SELECT MIN(n): the database returns
-/// 42703 which maps to `ReadFailure::Other`. The session refuses the subscription
-/// after one retry (attempts=2, class=unknown in the log), while a sibling
-/// `SELECT *` subscription receives its live patch from the same event unchanged.
+/// 42703, a code outside the transient list, which is `ReadFailure::Deterministic`.
+/// The session refuses the subscription at the first failure (attempts=1,
+/// class=deterministic in the log), while a sibling `SELECT *` subscription
+/// receives its live patch from the same event unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_poisoned_computed_read_ends_alone_after_one_retry() {
+async fn a_poisoned_computed_read_ends_alone_without_a_retry() {
     crate::logging::with_capture(
-        "a_poisoned_computed_read_ends_alone_after_one_retry",
+        "a_poisoned_computed_read_ends_alone_without_a_retry",
         |logs| async move {
             let fixture = Fixture::acquire().await;
             fixture.exec("DROP TABLE IF EXISTS counts CASCADE").await;
@@ -119,7 +122,7 @@ async fn a_poisoned_computed_read_ends_alone_after_one_retry() {
 
             // Drop column n from Postgres; the next connector re-execution of
             // SELECT MIN(n) FROM counts fails with 42703, arriving as
-            // `ReadFailure::Other`.
+            // `ReadFailure::Deterministic`.
             fixture.exec("ALTER TABLE counts DROP COLUMN n").await;
 
             let mut source = PgSqliteEmuSource::open_in_memory(DDL).expect("open emu source");
@@ -162,12 +165,12 @@ async fn a_poisoned_computed_read_ends_alone_after_one_retry() {
                 line["message"]
                     == "a computed subscription's read was refused, ending the subscription"
                     && line["sub_id"] == "cheapest"
-                    && line["class"] == "unknown"
-                    && line["attempts"].as_u64() == Some(2)
+                    && line["class"] == "deterministic"
+                    && line["attempts"].as_u64() == Some(1)
             });
             assert!(
                 refused_log,
-                "log must record sub_id=cheapest class=unknown attempts=2: {log_lines:?}"
+                "log must record sub_id=cheapest class=deterministic attempts=1: {log_lines:?}"
             );
 
             let live = row_client.wait_for_live(Duration::from_secs(5)).await;
@@ -328,4 +331,176 @@ async fn a_transient_read_pause_resumes_delivery_without_ending_anything() {
     );
 
     ingest_task.abort();
+}
+
+/// The catalog shape of the gated view below, as the materializer and the emulator see it.
+const GATED_DDL: &str = "CREATE TABLE gated (id INT PRIMARY KEY, n INT)";
+
+/// A listed code raised by Postgres itself pauses delivery and resumes it once
+/// the database stops raising it, ending nothing (R106 decision 1).
+///
+/// `gated` is a view over `gated_base` whose rows pass through a function that
+/// raises `40P01` (`deadlock_detected`) while `gated_fail` holds a row, so the
+/// re-execution fails with exactly that code and nothing else differs.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test walks setup, gate, pause, assert, open, and resume in order"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listed_code_raised_for_real_pauses_and_resumes_delivery() {
+    crate::logging::with_capture(
+        "a_listed_code_raised_for_real_pauses_and_resumes_delivery",
+        |logs| async move {
+            let fixture = Fixture::acquire().await;
+            fixture.exec("DROP VIEW IF EXISTS gated").await;
+            fixture.exec("DROP FUNCTION IF EXISTS gated_open()").await;
+            fixture
+                .exec("DROP TABLE IF EXISTS gated_base, gated_fail CASCADE")
+                .await;
+            fixture
+                .exec("CREATE TABLE gated_base (id INT PRIMARY KEY, n INT)")
+                .await;
+            fixture.exec("CREATE TABLE gated_fail (on_ INT)").await;
+            fixture
+                .exec(
+                    "CREATE FUNCTION gated_open() RETURNS boolean LANGUAGE plpgsql VOLATILE AS $$ \
+                     BEGIN \
+                       IF EXISTS (SELECT 1 FROM gated_fail) THEN \
+                         RAISE EXCEPTION 'a deadlock stand-in' USING ERRCODE = '40P01'; \
+                       END IF; \
+                       RETURN true; \
+                     END $$",
+                )
+                .await;
+            fixture
+                .exec("CREATE VIEW gated AS SELECT id, n FROM gated_base WHERE gated_open()")
+                .await;
+            fixture
+                .exec("INSERT INTO gated_base (id, n) VALUES (10, 10)")
+                .await;
+
+            let pool = fixture.admin().clone();
+            let manager = full_manager(
+                pool.clone(),
+                GATED_DDL,
+                GATED_DDL,
+                RosterAuth::granting_nobody(),
+                guard(Duration::from_secs(30), Duration::from_secs(30)),
+                pool.clone(),
+                pool,
+            );
+
+            let mut client = connect_to(&manager);
+            client.handshake_with("watcher", "user:watcher").await;
+            client
+                .subscribe("smallest", "SELECT MIN(n) FROM gated")
+                .await;
+            let ControlMessage::AggregateUpdate(seeded) = client.next_control().await else {
+                panic!("expected aggregate seed");
+            };
+            assert_eq!(seeded.result_json.as_deref(), Some("10"));
+
+            // The emulator builds the DELETE of the seeded extreme, which forces a
+            // re-execution, and the event is stamped where Postgres can place it.
+            let mut emu = PgSqliteEmuSource::open_in_memory(GATED_DDL).expect("open emu source");
+            emu.execute_sql("INSERT INTO gated (id, n) VALUES (10, 10)")
+                .expect("seed emu");
+            emu.next_item()
+                .await
+                .expect("drain emu")
+                .expect("insert event");
+            emu.execute_sql("DELETE FROM gated WHERE id = 10")
+                .expect("stage delete");
+            let mut delete = None;
+            while let Some(item) = emu.next_item().await.expect("poll emu") {
+                if let SourceItem::Event(event) = item {
+                    delete = Some(event);
+                }
+            }
+            let delete = delete.expect("the delete event");
+
+            fixture
+                .exec("INSERT INTO gated_fail (on_) VALUES (1)")
+                .await;
+            let mut source = OneEvent(Some(committed_at(delete, fixture.commit_now().await)));
+
+            let saw_read_retrying = Arc::new(AtomicBool::new(false));
+            let saw_stream_retry = Arc::new(AtomicBool::new(false));
+            let saw_gave_up = Arc::new(AtomicBool::new(false));
+            let r_clone = Arc::clone(&saw_read_retrying);
+            let s_clone = Arc::clone(&saw_stream_retry);
+            let g_clone = Arc::clone(&saw_gave_up);
+
+            let manager_clone = Arc::clone(&manager);
+            let ingest_task = tokio::spawn(
+                async move {
+                    let _ = manager_clone
+                        .ingest(&mut source, &mut |event| match event {
+                            ReconnectEvent::ReadRetrying { .. } => {
+                                r_clone.store(true, Ordering::Relaxed);
+                            }
+                            ReconnectEvent::Retrying { .. } => {
+                                s_clone.store(true, Ordering::Relaxed);
+                            }
+                            ReconnectEvent::GaveUp { .. } => {
+                                g_clone.store(true, Ordering::Relaxed);
+                            }
+                            ReconnectEvent::AuthRetrying { .. } => {}
+                        })
+                        .await;
+                }
+                .instrument(tracing::Span::current()),
+            );
+
+            let paused = tokio::time::timeout(Duration::from_secs(5), client.next_control())
+                .await
+                .unwrap_or_else(|_| panic!("DeliveryPaused within 5 s: {:?}", logs.lines()));
+            assert!(
+                matches!(
+                    paused,
+                    ControlMessage::DeliveryPaused {
+                        cause: PauseCause::DatabaseUnreachable
+                    }
+                ),
+                "a 40P01 re-execution pauses delivery, got {paused:?}: {:?}",
+                logs.lines()
+            );
+
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert!(
+                saw_read_retrying.load(Ordering::Relaxed),
+                "the read retries in place while Postgres raises 40P01"
+            );
+            assert!(
+                !saw_stream_retry.load(Ordering::Relaxed),
+                "the change stream must not be reconnected"
+            );
+            assert!(
+                !saw_gave_up.load(Ordering::Relaxed),
+                "the ingest loop must not give up"
+            );
+
+            fixture.exec("DELETE FROM gated_fail").await;
+
+            // Postgres still holds the row, so the re-execution answers the same extreme.
+            let reexec = tokio::time::timeout(Duration::from_secs(10), client.next_control())
+                .await
+                .expect("AggregateUpdate within 10 s");
+            let ControlMessage::AggregateUpdate(result) = reexec else {
+                panic!("the subscription survives the outage, got {reexec:?}");
+            };
+            assert_eq!(result.result_json.as_deref(), Some("10"));
+
+            let resumed = tokio::time::timeout(Duration::from_secs(5), client.next_control())
+                .await
+                .expect("DeliveryResumed within 5 s");
+            assert!(
+                matches!(resumed, ControlMessage::DeliveryResumed),
+                "expected DeliveryResumed, got {resumed:?}"
+            );
+
+            ingest_task.abort();
+        },
+    )
+    .await;
 }

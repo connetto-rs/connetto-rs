@@ -1338,6 +1338,16 @@ mod tests {
         assert!(!PgOplog::is_transient(&PgOplogError::Query(
             Error::NotFound
         )));
+        let refused_with = |code| {
+            PgOplogError::Query(crate::reexec::coded_error(
+                DatabaseErrorKind::Unknown,
+                code,
+                "the server said",
+            ))
+        };
+        assert!(PgOplog::is_transient(&refused_with("57P01")));
+        assert!(PgOplog::is_transient(&refused_with("53300")));
+        assert!(!PgOplog::is_transient(&refused_with("42P01")));
         assert!(!PgOplog::is_transient(&PgOplogError::LsnRange(u64::MAX)));
         let codec = serde_json::from_str::<u8>("not a number").expect_err("malformed");
         assert!(!PgOplog::is_transient(&PgOplogError::Codec(codec)));

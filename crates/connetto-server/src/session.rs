@@ -2719,17 +2719,7 @@ where
         grant_moves: &[GrantMove],
     ) -> Result<(), SessionError> {
         let _gate = self.dispatch_gate.lock().await;
-        // Three classes, three dispositions (R89 decision 1). A timeout is
-        // policy and ends its subscription, retrying it replaces nothing. The
-        // unknown class gets one retry per subscription and a second failure
-        // ends it, so a poisoned query costs one extra read and a blip costs
-        // one read and survives. Each retry draws the policy's
-        // first-attempt wait from a fresh episode rather than one shared
-        // escalating schedule, so one poisoned migration ending many
-        // subscriptions costs one short wait each. A transient failure
-        // returns to the ingest loop, which pauses delivery in place (R89
-        // decision 2), never a change-stream teardown. Each pass ends at most
-        // one subscription, so the loop terminates.
+        // Each pass ends at most one subscription, so the loop terminates.
         let mut unknown_attempts: HashMap<SubscriptionId, u32> = HashMap::new();
         let mut dispatched = loop {
             let outcome = {
@@ -2742,12 +2732,12 @@ where
                 Ok(dispatched) => break dispatched,
                 Err(MaterializerError::Read {
                     subscription,
-                    class: ReadFailure::Timeout,
+                    class: class @ (ReadFailure::Timeout | ReadFailure::Deterministic),
                     detail,
                 }) => {
-                    self.refuse_computed(subscription, ReadFailure::Timeout, 1, &detail)
-                        .await;
+                    self.refuse_computed(subscription, class, 1, &detail).await;
                 }
+                // A codeless failure may be a blip, so it gets one retry after a fresh first-attempt wait.
                 Err(MaterializerError::Read {
                     subscription,
                     class: ReadFailure::Other,
