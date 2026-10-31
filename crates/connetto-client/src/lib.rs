@@ -1,8 +1,8 @@
 #![doc = include_str!("../README.md")]
 
 pub use connetto_core::messages::{
-    FullResyncReason, Grant, PauseCause, SyncStatus, WriterGrant, WriterRef, WriterRequest,
-    WriterSecret,
+    FullResyncReason, Grant, PauseCause, SharedStoreUse, StorageUse, StoreBytes, SyncStatus,
+    WriterGrant, WriterRef, WriterRequest, WriterSecret,
 };
 pub use connetto_core::{Custody, NoGate};
 /// The peer link's close reasons, dial errors and chain refusals (R76).
@@ -24,7 +24,8 @@ use connetto_core::messages::{
     ControlMessage, FatalErrorReason, GateState, Handshake, HeldWork, MutationHeader,
     MutationPatch, MutationReject, MutationRejectReason, Ping, Provenance, ReplaceShareKeys,
     RetireWriter, SUBSCRIPTION_REFUSED, ShareKeyChange, Subscribe, SubscriptionSpec, TabIdentity,
-    TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, Unsubscribe, WriterAnswer,
+    TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome,
+    TabStorageUse, Unsubscribe, WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -1883,13 +1884,45 @@ struct ShareKeyRequest {
     deadline: Duration,
 }
 
-/// A tab's share-key change awaiting its relay's answer.
+/// A tab's request awaiting its relay's answer.
 #[derive(Debug)]
-struct RelayShareKeyWait {
+struct RelayWait<T> {
     /// Where the outcome goes.
-    answer: tokio::sync::oneshot::Sender<Result<(), ClientError>>,
+    answer: tokio::sync::oneshot::Sender<Result<T, ClientError>>,
     /// The instant the answer bound expires.
     deadline: Duration,
+}
+
+/// The waits of one kind of relay request, by request id.
+type RelayWaits<T> = HashMap<String, RelayWait<T>>;
+
+/// A wait for `request_id`, bounded from now.
+fn relay_wait<T>(
+    waits: &mut RelayWaits<T>,
+    request_id: String,
+) -> tokio::sync::oneshot::Receiver<Result<T, ClientError>> {
+    let (answer, receiver) = tokio::sync::oneshot::channel();
+    waits.insert(
+        request_id,
+        RelayWait {
+            answer,
+            deadline: crate::away::SystemClock.monotonic() + SHARE_KEY_REQUEST_WAIT,
+        },
+    );
+    receiver
+}
+
+/// End every wait in `waits` past its bound at `now` with an unknown outcome,
+/// `request` naming what was asked. Returns whether any ended.
+fn expire_relay_waits<T>(waits: &mut RelayWaits<T>, now: Duration, request: &str) -> bool {
+    let mut expired = false;
+    for (_, wait) in waits.extract_if(|_, wait| now >= wait.deadline) {
+        expired = true;
+        let _ = wait.answer.send(Err(ClientError::Transport(format!(
+            "the relay did not answer {request} in time, so its outcome is unknown"
+        ))));
+    }
+    expired
 }
 
 /// The next share-key wake for a pump driver.
@@ -2161,6 +2194,29 @@ const META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_meta \
 /// databases and duplicate names across tiers are a generation-time error.
 const LOCAL_SCHEMA: &str = "connetto_local";
 const SHARED_SCHEMA: &str = "connetto_shared";
+
+/// `PRAGMA page_size`, the bytes one page of a database takes.
+struct PageSize;
+
+impl diesel::sqlite::pragma::Pragma for PageSize {
+    const NAME: &'static str = "page_size";
+    type Scope = diesel::sqlite::pragma::PerSchema;
+}
+
+impl diesel::sqlite::pragma::ReadPragma for PageSize {
+    type SqlType = diesel::sql_types::BigInt;
+}
+
+/// The room the database attached as `schema` takes, `main` when `None`.
+fn store_bytes(db: &mut SqliteConnection, schema: Option<&str>) -> Result<StoreBytes, ClientError> {
+    let page = u64::try_from(PageSize::get::<i64>(schema, db)?).unwrap_or(0);
+    let pages = u64::try_from(PageCount::get::<i64>(schema, db)?).unwrap_or(0);
+    let free = u64::try_from(FreelistCount::get::<i64>(schema, db)?).unwrap_or(0);
+    Ok(StoreBytes {
+        file: pages.saturating_mul(page),
+        free: free.saturating_mul(page),
+    })
+}
 
 /// A table name row from an attached schema's catalog.
 #[derive(diesel::QueryableByName)]
@@ -3979,6 +4035,14 @@ fn share_key_request_id() -> String {
     )
 }
 
+/// A fresh request id for a relay tab's storage read.
+fn storage_request_id() -> String {
+    format!(
+        "storage-{}",
+        NEXT_SHARE_KEY_REQUEST.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 static NEXT_DECLARATION_FENCE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(1);
 
@@ -4230,8 +4294,10 @@ pub struct ConnettoConnection<T: Transport> {
     share_key_persistence: Option<ShareKeyPersistence>,
     /// A changed share-key set still owed its save to the store.
     share_key_save_pending: bool,
-    /// A relay mirror's share-key changes awaiting their answers, by request id.
-    relay_share_key_waits: HashMap<String, RelayShareKeyWait>,
+    /// A relay mirror's share-key changes awaiting their answers.
+    relay_share_key_waits: RelayWaits<()>,
+    /// A relay mirror's storage reads awaiting their answers.
+    relay_storage_waits: RelayWaits<StorageUse>,
     /// The earliest parsed expiry of a held key, refreshed at every set
     /// change, so an unrelated frame never parses a grant.
     share_key_expiry: Option<i64>,
@@ -4686,6 +4752,7 @@ where
             share_key_persistence: None,
             share_key_save_pending: false,
             relay_share_key_waits: HashMap::new(),
+            relay_storage_waits: HashMap::new(),
             share_key_expiry: None,
             share_key_deadline: None,
             share_key_armed: 0,
@@ -6144,6 +6211,7 @@ where
         self.enrol_waiters.clear();
         // A relay answer can no longer arrive, so each waiting tab call fails now.
         self.relay_share_key_waits.clear();
+        self.relay_storage_waits.clear();
         // Desired keys and durable coverage survive a transport failure.
         self.share_key_request = None;
         self.declaration_fence = None;
@@ -6286,6 +6354,7 @@ where
             .relay_share_key_waits
             .values()
             .map(|wait| wait.deadline)
+            .chain(self.relay_storage_waits.values().map(|wait| wait.deadline))
             .min()
         {
             deadline = Some(deadline.map_or(relay, |armed| armed.min(relay)));
@@ -6300,21 +6369,11 @@ where
     /// every relay wait past its own bound with an unknown outcome.
     fn check_share_key_deadlines(&mut self) {
         let now = crate::away::SystemClock.monotonic();
-        let overdue: Vec<String> = self
-            .relay_share_key_waits
-            .iter()
-            .filter(|(_, wait)| now >= wait.deadline)
-            .map(|(id, _)| id.clone())
-            .collect();
-        let expired = !overdue.is_empty();
-        for id in overdue {
-            if let Some(wait) = self.relay_share_key_waits.remove(&id) {
-                let _ = wait.answer.send(Err(ClientError::Transport(
-                    "the relay did not answer the share-key change in time, so its outcome is unknown"
-                        .to_owned(),
-                )));
-            }
-        }
+        let share_key_expired =
+            expire_relay_waits(&mut self.relay_share_key_waits, now, "the share-key change");
+        let storage_expired =
+            expire_relay_waits(&mut self.relay_storage_waits, now, "the storage read");
+        let expired = share_key_expired || storage_expired;
         if self
             .share_key_request
             .as_ref()
@@ -6594,14 +6653,27 @@ where
             }))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))?;
-        let (answer, receiver) = tokio::sync::oneshot::channel();
-        self.relay_share_key_waits.insert(
-            request_id,
-            RelayShareKeyWait {
-                answer,
-                deadline: crate::away::SystemClock.monotonic() + SHARE_KEY_REQUEST_WAIT,
-            },
-        );
+        let receiver = relay_wait(&mut self.relay_share_key_waits, request_id);
+        self.recompute_share_key_deadline();
+        Ok(receiver)
+    }
+
+    /// Ask a relay tab's worker what the account's data takes, and the
+    /// receiver its answer arrives on, within [`SHARE_KEY_REQUEST_WAIT`].
+    ///
+    /// The receiver fails at once when the connection drops.
+    pub(crate) async fn ask_relay_storage_use(
+        &mut self,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<StorageUse, ClientError>>, ClientError> {
+        let request_id = storage_request_id();
+        self.wire()?
+            .transport
+            .send_control(ControlMessage::TabStorageUse(TabStorageUse {
+                request_id: request_id.clone(),
+            }))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        let receiver = relay_wait(&mut self.relay_storage_waits, request_id);
         self.recompute_share_key_deadline();
         Ok(receiver)
     }
@@ -6618,6 +6690,22 @@ where
             TabShareKeyOutcome::Locked => Err(ClientError::Locked),
             TabShareKeyOutcome::StoreRefused(detail) => Err(ClientError::Auth(detail)),
             TabShareKeyOutcome::ReplicaRefused(detail) => Err(ClientError::Session(detail)),
+        };
+        let _ = wait.answer.send(outcome);
+        self.recompute_share_key_deadline();
+    }
+
+    /// Hand a relay's storage answer to the read waiting on it. An answer
+    /// nobody waits for arrived after its wait ended, and is dropped.
+    fn settle_relay_storage(&mut self, answer: TabStorageAnswer) {
+        let Some(wait) = self.relay_storage_waits.remove(&answer.request_id) else {
+            tracing::debug!(request_id = %answer.request_id, "a storage answer arrived after its wait");
+            return;
+        };
+        let outcome = match answer.outcome {
+            TabStorageOutcome::Use(used) => Ok(used),
+            TabStorageOutcome::Locked => Err(ClientError::Locked),
+            TabStorageOutcome::Refused(detail) => Err(ClientError::Session(detail)),
         };
         let _ = wait.answer.send(outcome);
         self.recompute_share_key_deadline();
@@ -8234,6 +8322,10 @@ where
                 self.settle_relay_share_key(answer);
                 return Ok(None);
             }
+            Some(IncomingFrame::Control(ControlMessage::TabStorageAnswer(answer))) => {
+                self.settle_relay_storage(answer);
+                return Ok(None);
+            }
             Some(IncomingFrame::Control(msg)) => {
                 #[cfg(feature = "device-identity")]
                 if enrolment::Answer::is_answer(&msg) {
@@ -9349,6 +9441,36 @@ where
             rows_applied,
             freelist_percent,
         })
+    }
+
+    /// What this account's data takes on the device: its replica and, when
+    /// the build shares tables, the shared store with the number of
+    /// identities using it (R11 slice 7). Constant time, since it reads page
+    /// counts and never scans a table. Which identities use the store is not
+    /// said.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] on a relay tab, whose database mirrors its
+    /// worker's, so a tab asks through
+    /// [`ConnettoClient::storage_use`](crate::live::ConnettoClient::storage_use).
+    /// [`ClientError`] when a page statistic cannot be read.
+    pub fn storage_use(&mut self) -> Result<StorageUse, ClientError> {
+        if self.config.relay_mirror {
+            return Err(ClientError::Session(
+                "a relay tab's storage is its worker's, read through the client".to_owned(),
+            ));
+        }
+        let replica = store_bytes(&mut self.db, None)?;
+        let shared = if self.config.shared_layout.is_some() {
+            Some(SharedStoreUse {
+                bytes: store_bytes(&mut self.db, Some(SHARED_SCHEMA))?,
+                identities: presence::count(&mut self.db)?,
+            })
+        } else {
+            None
+        };
+        Ok(StorageUse { replica, shared })
     }
 
     /// Put this replica's own unacknowledged writes back after a replacement

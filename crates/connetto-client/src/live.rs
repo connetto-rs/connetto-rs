@@ -56,7 +56,7 @@ use crate::away::{GateAskFuture, GateAskOutcome, GateController, GateMechanism, 
 use crate::reconnect::{NoReconnect, NoSleep, ReconnectPolicy, Sleeper, TransportFactory};
 use crate::{
     ClientError, ClientEvent, ConnettoConnection, DrainTimer, KeepaliveTimer, ResendTimer,
-    ShareKeyTimer,
+    ShareKeyTimer, StorageUse,
 };
 
 /// Render a typed diesel query to its SQLite SQL (with `?` placeholders) and
@@ -2579,7 +2579,7 @@ where
         subject: &CapabilitySubject<K>,
     ) -> Result<(), ClientError> {
         let mut state = self.shared.lock_interrupting().await;
-        self.allow_share_key_change()?;
+        self.allow_relay_request()?;
         if state.conn.is_relay_mirror() {
             let answer = state
                 .conn
@@ -2589,7 +2589,7 @@ where
                 })
                 .await?;
             drop(state);
-            return self.await_relay_share_key(answer).await;
+            return self.await_relay(answer, "the share-key change").await;
         }
         state.conn.add_share_key(grant, subject).await?;
         refresh_changed(&mut state, &self.shared.events);
@@ -2611,7 +2611,7 @@ where
         subject: &CapabilitySubject<K>,
     ) -> Result<(), ClientError> {
         let mut state = self.shared.lock_interrupting().await;
-        self.allow_share_key_change()?;
+        self.allow_relay_request()?;
         if state.conn.is_relay_mirror() {
             let answer = state
                 .conn
@@ -2620,7 +2620,7 @@ where
                 })
                 .await?;
             drop(state);
-            return self.await_relay_share_key(answer).await;
+            return self.await_relay(answer, "the share-key change").await;
         }
         state.conn.remove_share_key(subject).await?;
         refresh_changed(&mut state, &self.shared.events);
@@ -2629,21 +2629,45 @@ where
         Ok(())
     }
 
-    /// Wait for the relay's answer, which the pump delivers or ends at its
-    /// bound, so the pump is woken to arm that bound.
-    async fn await_relay_share_key(
+    /// What this account's data takes on the device, as
+    /// [`ConnettoConnection::storage_use`] reads it (R11 slice 7).
+    ///
+    /// A relay tab's mirror holds no store of its own, so in a tab the call
+    /// asks the worker and returns its answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the client is closed, locked, its replica
+    /// refuses the read, or a tab's worker does not answer in time.
+    pub async fn storage_use(&self) -> Result<StorageUse, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        self.allow_relay_request()?;
+        if state.conn.is_relay_mirror() {
+            let answer = state.conn.ask_relay_storage_use().await?;
+            drop(state);
+            return self.await_relay(answer, "the storage read").await;
+        }
+        state.conn.storage_use()
+    }
+
+    /// Wait for the relay's answer to `request`, which the pump delivers or
+    /// ends at its bound, so the pump is woken to arm that bound.
+    async fn await_relay<A>(
         &self,
-        answer: tokio::sync::oneshot::Receiver<Result<(), ClientError>>,
-    ) -> Result<(), ClientError> {
+        answer: tokio::sync::oneshot::Receiver<Result<A, ClientError>>,
+        request: &str,
+    ) -> Result<A, ClientError> {
         self.shared.wake.notify_one();
         answer.await.unwrap_or_else(|_| {
-            Err(ClientError::Transport(
-                "the relay connection dropped before answering the share-key change".to_owned(),
-            ))
+            Err(ClientError::Transport(format!(
+                "the relay connection dropped before answering {request}"
+            )))
         })
     }
 
-    fn allow_share_key_change(&self) -> Result<(), ClientError> {
+    /// Refuse a request a closed or locked client cannot serve. A relay tab's
+    /// request waits on the pump, so a client whose pump ended refuses too.
+    fn allow_relay_request(&self) -> Result<(), ClientError> {
         if self.shared.close_requested.load(Ordering::Acquire)
             || self.shared.pump_done.done.load(Ordering::Acquire)
         {

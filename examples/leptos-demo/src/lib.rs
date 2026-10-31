@@ -12,6 +12,10 @@ const ALIGN_AUTH_DB: &str = "connetto-leptos-align-auth.sqlite";
 const PHOTO_DB_PREFIX: &str = "connetto-leptos-photo";
 const PHOTO_AUTH_DB: &str = "connetto-leptos-photo-auth.sqlite";
 
+const CATALOGUE_DB_PREFIX: &str = "connetto-leptos-catalogue";
+const CATALOGUE_AUTH_DB: &str = "connetto-leptos-catalogue-auth.sqlite";
+const CATALOGUE_SECOND_AUTH_DB: &str = "connetto-leptos-catalogue-second-auth.sqlite";
+
 /// The one sync schema the worker and every tab build from.
 pub use connetto_demo_support::demo_schema;
 /// The deployment's base URLs and landing page, the browser tests' sign-in.
@@ -38,4 +42,28 @@ pub async fn db_worker_boot_align() -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub async fn db_worker_photo_boot() -> Result<(), JsValue> {
     connetto_demo_support::web::boot_with(PHOTO_DB_PREFIX, PHOTO_AUTH_DB).await
+}
+
+/// Worker entry point for the catalogue test's first account, on
+/// `connetto-leptos-catalogue*` OPFS files.
+///
+/// # Errors
+///
+/// A string describing the VFS, upstream connect, or subscribe failure.
+#[wasm_bindgen]
+pub async fn db_worker_catalogue_boot() -> Result<(), JsValue> {
+    connetto_demo_support::web::boot_with(CATALOGUE_DB_PREFIX, CATALOGUE_AUTH_DB).await
+}
+
+/// Worker entry point for the catalogue test's second account, on the first
+/// account's replica and shared store, which the shared replica prefix
+/// carries, with its own account index, so the boot signs in anew instead of
+/// refreshing the first account.
+///
+/// # Errors
+///
+/// A string describing the VFS, upstream connect, or subscribe failure.
+#[wasm_bindgen]
+pub async fn db_worker_catalogue_second_boot() -> Result<(), JsValue> {
+    connetto_demo_support::web::boot_with(CATALOGUE_DB_PREFIX, CATALOGUE_SECOND_AUTH_DB).await
 }

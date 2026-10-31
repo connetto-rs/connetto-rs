@@ -310,6 +310,38 @@ impl PageSession {
         }
     }
 
+    /// Click the one button whose label starts with `prefix`, such as the
+    /// account bar's switch to an account the run only knows by its order.
+    ///
+    /// # Errors
+    ///
+    /// When no button or more than one starts with `prefix`, or as
+    /// [`PageSession::call`].
+    pub async fn click_starting_with(&mut self, prefix: &str) -> Result<()> {
+        let script = format!(
+            "(() => {{ const found = [...document.querySelectorAll('button')].filter(b => b.textContent.trim().startsWith({})); if (found.length !== 1) return found.length; found[0].click(); return true; }})()",
+            serde_json::Value::String(prefix.to_owned())
+        );
+        match self.evaluate(&script).await? {
+            serde_json::Value::Bool(true) => Ok(()),
+            found => bail!("the page has {found} buttons starting with {prefix:?}, not one"),
+        }
+    }
+
+    /// The first line of the page's text that starts with `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// When no line starts with `prefix`, or as [`Self::page_text`].
+    pub async fn line_starting_with(&mut self, prefix: &str) -> Result<String> {
+        let text = self.page_text().await?;
+        text.lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(prefix))
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("no line starts with {prefix:?}, the page shows:\n{text}"))
+    }
+
     /// Wait until the button labelled `label` is present and enabled, then
     /// click it.
     ///
@@ -451,6 +483,12 @@ mod tests {
     /// A `DevTools` endpoint answering each `Runtime.evaluate` with the next
     /// boolean of `replies`.
     async fn bool_endpoint(replies: Vec<bool>) -> String {
+        value_endpoint(replies.into_iter().map(serde_json::Value::Bool).collect()).await
+    }
+
+    /// A `DevTools` endpoint answering each `Runtime.evaluate` with the next
+    /// value of `replies`.
+    async fn value_endpoint(replies: Vec<serde_json::Value>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -463,7 +501,7 @@ mod tests {
                 let request: serde_json::Value = serde_json::from_str(&text).unwrap();
                 let answer = serde_json::json!({
                     "id": request["id"],
-                    "result": { "result": { "type": "boolean", "value": reply } },
+                    "result": { "result": { "value": reply } },
                 });
                 socket
                     .send(Message::Text(answer.to_string()))
@@ -472,6 +510,42 @@ mod tests {
             }
         });
         format!("ws://{address}")
+    }
+
+    /// A prefix click needs exactly one button, and names how many the page
+    /// found otherwise.
+    #[tokio::test]
+    async fn a_prefix_click_needs_exactly_one_button() {
+        let url = value_endpoint(vec![
+            serde_json::Value::Bool(true),
+            serde_json::json!(2),
+            serde_json::json!(0),
+        ])
+        .await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.click_starting_with("Switch to ").await.unwrap();
+        for found in ["2 buttons", "0 buttons"] {
+            let error = page.click_starting_with("Switch to ").await.unwrap_err();
+            assert!(error.to_string().contains(found), "{error:#}");
+        }
+    }
+
+    /// A line is found by its prefix among the page's trimmed lines, and a
+    /// page without one names what it shows.
+    #[tokio::test]
+    async fn a_line_is_found_by_its_prefix() {
+        let url = endpoint(vec![
+            Ok("status: online\n  Signed in as d5e24135\nSwitch to cc072008"),
+            Ok("status: online"),
+        ])
+        .await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        assert_eq!(
+            page.line_starting_with("Signed in as ").await.unwrap(),
+            "Signed in as d5e24135"
+        );
+        let error = page.line_starting_with("Signed in as ").await.unwrap_err();
+        assert!(error.to_string().contains("status: online"), "{error:#}");
     }
 
     /// A click waits for the button to stand enabled, and clicks it the

@@ -14,4 +14,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON order_lines TO connetto_reader;
 -- Photo rows travel the same path as the orders, and the demo write path
 -- inserts them as connetto_reader, so the writer grant sits with the others.
 GRANT SELECT, INSERT, UPDATE, DELETE ON photos TO connetto_reader;
+-- The catalogue carries no policy of its own, so the read is public. The
+-- writer grants stay off it, because the demo never writes its rows.
+GRANT SELECT ON products TO connetto_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, _connetto_session_writers TO connetto_reader;

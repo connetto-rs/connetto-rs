@@ -5,6 +5,7 @@
 mod notes;
 mod orders;
 mod photos;
+mod products;
 mod retention;
 mod your_data;
 
@@ -16,6 +17,7 @@ pub(crate) use peer::PeerPanel;
 pub use notes::NotesPane;
 pub use orders::OrdersPane;
 pub use photos::PhotosPane;
+pub use products::ProductsPane;
 pub use retention::RetentionPane;
 pub use your_data::YourDataPane;
 
@@ -100,8 +102,14 @@ pub struct Clock(pub Signal<Option<&'static str>>);
 #[derive(Clone, Copy)]
 pub struct DeviceLine(pub Signal<String>);
 
-/// The app name, and the status, gate, device, custody and expiry lines,
-/// each as the platform's own functions report them.
+/// The header's storage line, what this account's replica and the device's
+/// shared store take, the platform's `storage_line` words or its reading
+/// placeholder before the first read.
+#[derive(Clone, Copy)]
+pub struct StorageLine(pub Signal<String>);
+
+/// The app name, and the status, gate, device, storage, custody and expiry
+/// lines, each as the platform's own functions report them.
 #[component]
 fn Header() -> Element {
     let Status(status) = use_context::<Status>();
@@ -111,6 +119,7 @@ fn Header() -> Element {
     let ExpiryWarn(expiry) = use_context::<ExpiryWarn>();
     let Gate(gate) = use_context::<Gate>();
     let Clock(clock) = use_context::<Clock>();
+    let StorageLine(storage_line) = use_context::<StorageLine>();
     let ops = use_context::<Ops>();
 
     let device_now = match clock() {
@@ -142,6 +151,7 @@ fn Header() -> Element {
                 p { class: "status", {line} }
             }
             p { class: "status", "device: {device_now}" }
+            p { class: "status", {storage_line.read().clone()} }
             if let Some(extra) = unlock {
                 {extra}
             }
@@ -475,11 +485,19 @@ fn PanesSkeleton() -> Element {
                 h2 { {support::YOUR_DATA_PANE_TITLE} " " span { class: "badge local", {support::YOUR_DATA_BADGE} } }
                 p { {support::YOUR_DATA_INTRO} }
             }
+            div { class: "pane",
+                h2 { {support::CATALOGUE_HEADING} " " span { class: "badge shared", "shared" } }
+                p { {support::CATALOGUE_INTRO} }
+                table {
+                    thead { tr { th { "name" } th { "price" } } }
+                    tbody {}
+                }
+            }
         }
     }
 }
 
-/// The five panes, mounted once the client is ready.
+/// The six panes, mounted once the client is ready.
 #[component]
 fn Panes() -> Element {
     rsx! {
@@ -489,6 +507,7 @@ fn Panes() -> Element {
             NotesPane {}
             RetentionPane {}
             YourDataPane {}
+            ProductsPane {}
         }
     }
 }

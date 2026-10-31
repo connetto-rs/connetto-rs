@@ -94,6 +94,7 @@ struct Holds {
     covered_orders: AtomicUsize,
     covered_notes: AtomicUsize,
     covered_photos: AtomicUsize,
+    covered_products: AtomicUsize,
     thumb_refresh: AtomicU64,
 }
 
@@ -105,6 +106,7 @@ impl Default for Holds {
             covered_orders: AtomicUsize::new(0),
             covered_notes: AtomicUsize::new(0),
             covered_photos: AtomicUsize::new(0),
+            covered_products: AtomicUsize::new(0),
             thumb_refresh: AtomicU64::new(0),
         }
     }
@@ -570,11 +572,7 @@ async fn free_up_space(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandE
     if let Err(err) = client.tidy().await {
         tracing::warn!(error = %err, "the trim pass failed");
     }
-    let (pages, free) = support::replica_footprint(&client).await;
-    core.update(app, |v| {
-        v.pages = pages;
-        v.free_pages = free;
-    });
+    reread_storage(core, app, &client).await;
     Ok(())
 }
 
@@ -915,6 +913,12 @@ async fn setup(
             Arc::clone(&content),
             Arc::clone(&holds),
         ));
+        tasks.spawn(feed_products(
+            app.clone(),
+            Arc::clone(&core),
+            client.clone(),
+            Arc::clone(&holds),
+        ));
         tasks.spawn(feed_device(app.clone(), Arc::clone(&core), parts.clone()));
         tasks.spawn(feed_content(
             app.clone(),
@@ -940,16 +944,10 @@ async fn setup(
         *slot = Slot::Ready(Arc::clone(&parts));
     }
 
-    // The footprint is read once here, since the feeds re-read it only when
-    // the covered rows move.
+    // The footprint and the storage line are read once here, since the
+    // feeds re-read them only when the covered rows move.
     let (app, client) = (app.clone(), client.clone());
-    tauri::async_runtime::spawn(async move {
-        let (pages, free) = support::replica_footprint(&client).await;
-        core.update(&app, |v| {
-            v.pages = pages;
-            v.free_pages = free;
-        });
-    });
+    tauri::async_runtime::spawn(async move { reread_storage(&core, &app, &client).await });
     Ok(())
 }
 
@@ -1137,6 +1135,32 @@ async fn feed_photos(
     }
 }
 
+/// The shared catalogue rows, by name.
+async fn feed_products(
+    app: AppHandle,
+    core: Arc<Core>,
+    client: ConnettoClient<Ws>,
+    holds: Arc<Holds>,
+) {
+    let mut handle = match support::products_by_name::<Ws>().live(&client).await {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(error = %err, "the catalogue list stopped");
+            return;
+        }
+    };
+    loop {
+        let rows = handle.snapshot();
+        let products = support::product_rows(&rows);
+        holds.covered_products.store(rows.len(), Ordering::Release);
+        mirror(&core, &app, &client, &holds);
+        core.update(&app, |v| v.products = products);
+        if handle.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
 /// The display source of each row, a server URL or local bytes as a `data:`
 /// URL.
 async fn thumbs(rows: Vec<support::Photo>, content: Content) -> HashMap<String, String> {
@@ -1215,19 +1239,25 @@ async fn feed_content(app: AppHandle, core: Arc<Core>, content: Content) {
 fn mirror(core: &Arc<Core>, app: &AppHandle, client: &ConnettoClient<Ws>, holds: &Holds) {
     let total = holds.covered_orders.load(Ordering::Acquire)
         + holds.covered_notes.load(Ordering::Acquire)
-        + holds.covered_photos.load(Ordering::Acquire);
+        + holds.covered_photos.load(Ordering::Acquire)
+        + holds.covered_products.load(Ordering::Acquire);
     let changed = holds.covered.lock().replace(total) != Some(total);
     if !changed {
         return;
     }
     core.update(app, |v| v.covered_rows = total);
     let (core, app, client) = (Arc::clone(core), app.clone(), client.clone());
-    tauri::async_runtime::spawn(async move {
-        let (pages, free) = support::replica_footprint(&client).await;
-        core.update(&app, |v| {
-            v.pages = pages;
-            v.free_pages = free;
-        });
+    tauri::async_runtime::spawn(async move { reread_storage(&core, &app, &client).await });
+}
+
+/// Read the replica mirror's footprint and the storage line into the view.
+async fn reread_storage(core: &Core, app: &AppHandle, client: &ConnettoClient<Ws>) {
+    let (pages, free) = support::replica_footprint(client).await;
+    let storage = support::storage_line(client).await;
+    core.update(app, |v| {
+        v.pages = pages;
+        v.free_pages = free;
+        v.storage = storage;
     });
 }
 

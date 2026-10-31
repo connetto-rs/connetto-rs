@@ -101,6 +101,9 @@ use tokio::process::Command;
 use tokio::time::{Instant, sleep};
 
 const USER: &str = "alice";
+/// The second account the Tauri demo signs in beside the first, so the
+/// catalogue step sees the shared store's identities go from one to two.
+const SECOND_USER: &str = "carol";
 /// The log targets of the demo's away and return inputs and of its gate,
 /// printed when the proof fails.
 const GATE_TRACE_TARGETS: [&str; 3] = [
@@ -421,6 +424,8 @@ async fn prove(
     .await?;
     device.screenshot(evidence, "synced").await?;
 
+    second_account_shares_catalogue(device, stack, evidence, &mut app).await?;
+
     step("write offline");
     device.drop_sync_link(&stack.reverse).await?;
     let mut app = device.app().await?;
@@ -559,6 +564,55 @@ async fn sign_in_across_a_killed_process(
     app.wait_for_text(signed_in_line(), Duration::from_secs(90))
         .await?;
     device.screenshot(evidence, "resumed").await
+}
+
+/// The Tauri demo's second account. One login more on the same device, whose
+/// replica opens the shared store the first account created, so the storage
+/// line goes from one identity to two. The step ends switched back to the
+/// first account, and it is a no-op for the dioxus demo, which signs one
+/// account in.
+async fn second_account_shares_catalogue(
+    device: &Device,
+    stack: &Stack,
+    evidence: &Path,
+    app: &mut PageSession,
+) -> Result<()> {
+    if !matches!(demo_app(), Demo::Tauri) {
+        return Ok(());
+    }
+    step("second account shares the catalogue");
+    app.wait_for_text("Espresso machine", Duration::from_secs(90))
+        .await?;
+    app.wait_for_text("used by 1 account", Duration::from_secs(90))
+        .await?;
+    device.screenshot(evidence, "catalogue-one-account").await?;
+    let first = app.line_starting_with("Signed in as ").await?;
+    app.click("Add another account").await?;
+    app.wait_for_text("Sign in to begin.", Duration::from_secs(90))
+        .await?;
+    app.click_when_enabled("Sign in", Duration::from_secs(90))
+        .await?;
+    let mut tab = device.login_tab(&stack.issuer).await?;
+    device.screenshot(evidence, "second-login-page").await?;
+    submit_login(&mut tab, SECOND_USER).await?;
+    drop(tab);
+    // The login's redirect restarts the app on its custom scheme, so the
+    // page the driver attached to is gone and a fresh page has to stand.
+    *app = app_page(device).await?;
+    app.wait_for_text(signed_in_line(), Duration::from_secs(90))
+        .await?;
+    app.wait_for_text("Espresso machine", Duration::from_secs(90))
+        .await?;
+    app.wait_for_text("used by 2 accounts", Duration::from_secs(90))
+        .await?;
+    device
+        .screenshot(evidence, "catalogue-two-accounts")
+        .await?;
+    // The account bar names each account by its identity, which the run only
+    // learns from the signed-in line, and the first is the one other account.
+    app.click_starting_with("Switch to ").await?;
+    app.wait_for_text(&first, Duration::from_secs(90)).await?;
+    device.screenshot(evidence, "back-to-first-account").await
 }
 
 /// The system setting whose change rebuilds the demo's screen, which the

@@ -12,7 +12,8 @@ const DEMO: Deployment = Deployment {
     roles: include_str!("../../../../examples/deployment/roles.sql"),
     content: include_str!("../../../../examples/deployment/content.sql"),
     policies: include_str!("../../../../examples/deployment/policies.sql"),
-    published: &["orders", "order_lines", "photos"],
+    seed: include_str!("../../../../examples/deployment/seed.sql"),
+    published: &["orders", "order_lines", "photos", "products"],
     writable: "orders,photos",
 };
 

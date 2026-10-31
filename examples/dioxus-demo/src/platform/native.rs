@@ -274,6 +274,7 @@ pub fn Shell() -> Element {
     let gate_line: Signal<Option<String>> = use_signal(|| None);
     let custody_line: Signal<Option<String>> = use_signal(|| None);
     let device_line: Signal<String> = use_signal(|| "no device identity in this build".to_owned());
+    let storage_line: Signal<String> = use_signal(|| support::STORAGE_UNREAD.to_owned());
     let clock: Signal<Option<&'static str>> = use_signal(|| None);
     let expiry_warn: Signal<Option<String>> = use_signal(|| None);
     let footprint: Signal<(i64, i64)> = use_signal(|| (0_i64, 0_i64));
@@ -319,6 +320,7 @@ pub fn Shell() -> Element {
     use_context_provider(|| CustodyLine(custody_line));
     use_context_provider(|| GateLine(gate_line));
     use_context_provider(|| DeviceLine(device_line));
+    use_context_provider(|| StorageLine(storage_line));
     use_context_provider(|| ExpiryWarn(expiry_warn));
     use_context_provider(|| Footprint(footprint));
     use_context_provider(|| crate::ui::Gate(gate));
@@ -362,6 +364,7 @@ pub fn Shell() -> Element {
         let mut cs = client_slot;
         let mut cslot = content_slot;
         let mut st = status;
+        let mut sl = storage_line;
         p.set(None);
         uid.set(None);
         ak.set(None);
@@ -390,12 +393,14 @@ pub fn Shell() -> Element {
             match outcome {
                 Ok(Ok(sp)) => {
                     let sp = SessionParts(Rc::new(sp));
-                    cs.set(Some(sp.0.client.clone()));
+                    let client = sp.0.client.clone();
+                    cs.set(Some(client));
                     cslot.set(Some(DemoContent::new(Arc::clone(&sp.0.content))));
                     let session = sp.0.native.session();
                     uid.set(session.map(|s| s.user_id().to_owned()));
                     ak.set(session.map(|s| s.account().to_owned()));
                     st.set("connected".to_owned());
+                    sl.set(support::storage_line(&sp.0.client).await);
                     p.set(Some(sp));
                 }
                 Ok(Err(err)) => st.set(err),
@@ -448,6 +453,7 @@ fn Session(parts: SessionParts) -> Element {
     let CustodyLine(mut custody_line) = use_context::<CustodyLine>();
     let ExpiryWarn(mut expiry_warn) = use_context::<ExpiryWarn>();
     let Footprint(mut footprint) = use_context::<Footprint>();
+    let StorageLine(mut storage_line) = use_context::<StorageLine>();
 
     use_away_input(&client);
     let orders_rows = use_live::<_, _, support::Order>(&client, support::orders_newest_first());
@@ -527,6 +533,7 @@ fn Session(parts: SessionParts) -> Element {
                     None => None,
                 });
                 footprint.set(support::replica_footprint(&client).await);
+                storage_line.set(support::storage_line(&client).await);
             });
         });
     }

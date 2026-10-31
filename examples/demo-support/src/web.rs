@@ -45,6 +45,7 @@ pub fn demo_builder() -> WebClientBuilder {
         )
         .with_upstream("db-upstream", crate::DEMO_QUERY)
         .with_upstream("db-photos-upstream", crate::PHOTO_QUERY)
+        .with_upstream("db-products-upstream", crate::PRODUCT_QUERY)
         .with_content_namespace("connetto-photo-content")
         .with_content_heal_lost(
             "SELECT content_id FROM photos WHERE content_state = 'lost'",
@@ -596,6 +597,7 @@ pub async fn boot_with(db_prefix: &'static str, auth_db: &'static str) -> Result
     WebClientBuilder::new(crate::DEMO_WS_URL, crate::demo_schema())
         .with_upstream("db-upstream", crate::DEMO_QUERY)
         .with_upstream("db-photos-upstream", crate::PHOTO_QUERY)
+        .with_upstream("db-products-upstream", crate::PRODUCT_QUERY)
         .with_content_namespace("connetto-photo-content")
         .with_content_heal_lost(
             "SELECT content_id FROM photos WHERE content_state = 'lost'",

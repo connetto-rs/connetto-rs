@@ -262,7 +262,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R43 the browser opens the local tier twice | **DONE** (2026-08-07) | nothing | no, discharged |
 | R18 SQLite hardening surface | **DONE** (2026-08-18) | nothing | no |
 | R60 a limited request syncs the whole table and blocks its cleanup | **DONE** (2026-09-02) | nothing. The defect dissolved at the `3d75cca` pin, steps 4 to 6 landed 2026-09-02 and are proven by `crates/connetto-client/tests/it/residual.rs`. The plan carried this row as IN PROGRESS until 2026-09-12 | no longer: the upstream request superseded itself, never sent |
-| R11 shared public store | IN PROGRESS, slices 1 to 6 merged (#179, #238, #239, #259, #270, #286), the outbox for every table merged (#298, #318, #327), row holdings in place of recomputed coverage merged (#334, #337) and the switch to them built (2026-10-30), the demos left | nothing. Seven decisions in the section, and Part B's below | no |
+| R11 shared public store | IN PROGRESS, slices 1 to 6 merged (#179, #238, #239, #259, #270, #286), the outbox for every table merged (#298, #318, #327), row holdings in place of recomputed coverage merged (#334, #337, #340), the demos built (2026-10-31) | nothing. Seven decisions in the section, and Part B's below | no |
 | R61 the portability download | **DONE** (2026-10-29), fully designed (2026-08-22), revised (2026-10-25), built in four pull requests (#288, #269, #271, #284) | nothing. Twenty-two decisions in the section | no |
 | R105 answering a stolen account | **DONE** (2026-10-26), designed and sliced 2026-10-25 | nothing. Merged as #262, #268, #274, #283, #287 and #289, ten decisions in the section | no |
 | R62 refuse a table with no declared primary key | **DONE** (2026-08-22) | nothing. Four decisions: three before any code, the fourth (the tier is re-checked before a write too) taken in execution | no |
@@ -4105,7 +4105,7 @@ Every knob has a recorded value and a reason, both open paths set them, and the 
 
 ## R11: the shared public store
 
-**Status.** IN PROGRESS. Designed 2026-10-17 with the maintainer, seven decisions below and seven slices. Slices 1 to 6 merged as #179, #238, #239, #259, #270 and #286. Part A, the outbox for every table, merged as #298, #318 and #327. Part B, row holdings, merged as #334 and #337, and its switch built 2026-10-30. Slice 7, the demos, is left.
+**Status.** IN PROGRESS. Designed 2026-10-17 with the maintainer, seven decisions below and seven slices. Slices 1 to 6 merged as #179, #238, #239, #259, #270 and #286. Part A, the outbox for every table, merged as #298, #318 and #327. Part B, row holdings, merged as #334, #337 and #340. Slice 7, the demos, built 2026-10-31.
 
 **Blocked on nothing.** Off the critical path and independent of every other phase, so it lands whenever it is wanted.
 
@@ -4166,7 +4166,7 @@ One pull request each, in this order, each green and useful on its own (2026-10-
 4. **Writes** (step 4). Proven by a rejected write to a public table undone in the shared store, and a rejected write spanning a public and a private table undone in both.
 5. **Union coverage** (step 5). Proven by identity B's pass sparing a row only A covers, and evicting it once A unsubscribes, by B's pass and a departure B receives both keeping every row of a table A wants whole, by a resync that empties B's table keeping A's rows, by B's pass sparing a row A wrote and has not uploaded, by a departure B receives withheld while A covers the row, and by a watch A released no longer covering once its grace runs out.
 6. **Teardown** (step 6). Proven natively by forgetting one of two identities, after which the other still reads its rows from the store, by an identity leaving keeping what another covers and evicting the rest, by a forced departure undoing its unsent shared write, by the last identity out emptying the store and then removing its file and key record, by an identity that never left retired by another, and by a store found without its key starting afresh. In headless Chrome by the next boot removing the store a last identity left, and by an owed departure keeping its wipe until it is settled. R105's wipes leave the store with no client open, proven by a start finishing a revoked identity's pending wipe undoing its queued shared writes and evicting what only it covered, by the last identity's pending wipe removing the store and its key, and by a departure that cannot read the store keeping the wipe pending and refusing the start.
-7. **The demos.** Two accounts in one demo share a public table, and chapter 12 records the built state.
+7. **The demos.** Two accounts in one demo share a public table, and chapter 12 records the built state. The maintainer chose on 2026-10-30 and 2026-10-31 a public read-only `products` catalogue seeded by the deployment (major 2), a catalogue pane and a storage line in all four demos, the storage line read through `ConnettoClient::storage_use` (the replica's and the shared store's bytes and how many identities use the store, never which), a browser test of a second account reading the first one's catalogue, and the Tauri phone proofs walking a second account to it. Rejected: sharing `orders`, whose rows never overlap between accounts, per-table row counts, which scan every table, and identity names, which only add disclosure.
 
 ### Proof
 

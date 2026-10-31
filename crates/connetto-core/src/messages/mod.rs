@@ -17,6 +17,7 @@ pub mod mutation;
 pub mod reconnect;
 pub mod registration;
 pub mod share_keys;
+pub mod storage;
 pub mod subscription;
 pub mod writer;
 
@@ -47,6 +48,9 @@ pub use registration::{
 pub use share_keys::{
     ReplaceShareKeys, ShareKeyChange, ShareKeysReplaced, TabShareKeyAnswer, TabShareKeyChange,
     TabShareKeyOutcome,
+};
+pub use storage::{
+    SharedStoreUse, StorageUse, StoreBytes, TabStorageAnswer, TabStorageOutcome, TabStorageUse,
 };
 pub use subscription::{
     BindValue, MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority,
