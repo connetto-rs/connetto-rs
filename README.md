@@ -30,13 +30,13 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 97 phases, 84 done and 13 open, a phase built in parts counting once. The core is built and proven, and the app system's registry and registration are built with it. What remains is the last mile around it, plus the app system's bot template and demo apps, the extension where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
+The plan in `plans/master-implementation-plan.md` tracks 97 phases, 85 done, 7 started and 5 not started, a phase built in parts counting once. The core is built and proven, and the app system's registry and registration are built with it. What remains is the last mile around it, plus the app system's bot template and demo apps, the extension where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
 
 | Remaining | Phases |
 |---|---|
 | One page codec | R21 |
-| Failures classified by SQLSTATE, waiting on diesel | R106 |
-| Shared public store, portability download | R11, R61 |
+| Failures classified by SQLSTATE, waiting on diesel_async | R106 |
+| Shared public store | R11 |
 | Demo gaps | R57 |
 | Apps, installations and the bot template, the file replica for bots | R91, R93 |
 | Device identity, missing only a Windows device's enrolment record | R74 |

@@ -164,7 +164,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R79 | Media over the peer link. Needs R77 and R67 |
 | any | R80 | Peer sync in every demo. Needs R77, R78 and R79 |
 | done | ~~R89~~ | A failing re-execution read ends its subscription, not live delivery |
-| blocked | R106 | Database failures classified by their SQLSTATE. Blocked on diesel-rs/diesel#5232 and the matching `diesel_async` change |
+| blocked | R106 | Database failures classified by their SQLSTATE. diesel's half is merged on diesel `main`, and slices 2 and 3 are blocked on `diesel_async` answering `sqlstate()`, open as diesel-rs/diesel_async#306 and #307 |
 | done | ~~R90~~ | The browser's refresh token into an `HttpOnly` cookie |
 | any | R91 | Apps, installations and the bot template. Needs nothing since the caller fixes of 2026-09-20 (PRs #41 and #42). The file replica for bots is R93's |
 | done | ~~R92~~ | Synced tables without local references, with SQLite's own enforcement for the tier |
@@ -278,7 +278,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R74 device identity and certificates | IN PROGRESS, merged (2026-10-06, #130) with the follow-ups #139 (2026-10-12), #138 (2026-10-14), #146 (2026-10-15), #161 (2026-10-16) and #132 (2026-10-18), and step 7's peer half with proofs 3, 4 and 6's peer half built by R76's slices 1 and 2 (2026-10-07, merged 2026-10-14 as #134 and #135) | proof 5's Windows `unproven` record, which R76's slice 9d run produces once 9d is taken up again | no |
 | R75 the per-device applied frontier | **DONE** (2026-10-28) | nothing. Merged as #196, #197, #199, #200 and #206, the three proofs in the `writer_frontier` and `courier_frontier` suites and the restore run end to end in `mutation_replay` | no |
 | R76 the peer link | IN PROGRESS, sliced into pull requests 2026-10-06 (its section's **Slices**), the Android slices first. Slices 1 to 4 merged 2026-10-14 as #134, #135, #136 and #137, slices 5 to 8 merged 2026-10-15 as #140, #141, #142 and #143, slice 9a, iPhone hosting and iPad joining, merged 2026-10-16 as #148, slice 9b, Linux, and slice 9c, macOS, merged 2026-10-18 as #162 and #163, slice 9f, three handhelds over one hotspot with the Bonjour discovery on iOS, merged 2026-10-20 as #204, with the duplicate close's keep across a reset as #158 (2026-10-15) | nothing. Slice 9d (Windows, designed with decisions 36 to 41) and 9e's home run are parked while the work goes mobile first (decided with the maintainer 2026-10-20) | no |
-| R77 the peer exchange and provisional tier | NOT STARTED, designed 2026-10-26 with eight slices | R75 and R76, merged for everything this phase uses. R31's capture major, which slices 1, 4 and 5 carry on an exchanged entry, is merged. The retraction's reason rides on R57 step 8, merged as #205 | no |
+| R77 the peer exchange and provisional tier | IN PROGRESS, designed 2026-10-26 with eight slices, slices 1 to 5 merged (#310, #296, #297, #300, #342) | nothing. R75 and R76 are merged for everything this phase uses. R31's capture major, which slices 1, 4 and 5 carry on an exchanged entry, is merged. The retraction's reason rides on R57 step 8, merged as #205 | no |
 | R78 courier recovery | NOT STARTED | R75 and R77. The capture major a couriered entry carries on the wire is R31's, merged | no |
 | R79 media over the peer link | NOT STARTED | R77, and R64 to R67 for the chunk machinery | no |
 | R80 peer sync in every demo | NOT STARTED | R77, R78 and R79 | no |
@@ -3307,10 +3307,10 @@ So the only missing piece is the scope, and it is the same missing piece for bot
 
 Decided with the maintainer on 2026-10-25, one pull request each, in this order.
 
-1. **The audit contract.** Decisions 8 and 11: the `data_downloaded` and `data_erased` values, the `query_list_hash`, `archive_bytes` and `acted_by` columns with `session` made nullable, the awaited insert, and `ServerHandle::record_erasure`. It lands after `R105`'s first slice and takes its `logged_in` value.
-2. **Registration and the rows download.** Steps 1, 2, 3 and 5 without the files: the subql-validated registration, the session check with the operator opt-out, the one paged snapshot, the plain SQLite file, the manifest and the streamed zip into the application's sink, with the download's awaited record. Needs slice 1. **Built 2026-10-25** (`ServerBuilder::portability`, `ServerHandle::download_data`, with decision 12).
-3. **The files part.** Step 4, the `files/` directory reassembled chunk by chunk. Needs slice 2. **Built 2026-10-25** (`PortabilityQuery::file`, with decisions 13 to 17).
-4. **The erasure recipe.** Step 6 in chapter 20, with the erasure record call slice 1 built. Needs slice 1, and stacks on slice 3 so the decisions number in one sequence. **Built 2026-10-25** (the chapter 20 recipe and `ServerHandle::end_person`, with decisions 18 to 22).
+1. **The audit contract.** Decisions 8 and 11: the `data_downloaded` and `data_erased` values, the `query_list_hash`, `archive_bytes` and `acted_by` columns with `session` made nullable, the awaited insert, and `ServerHandle::record_erasure`. It lands after `R105`'s first slice and takes its `logged_in` value. **Merged as #288.**
+2. **Registration and the rows download.** Steps 1, 2, 3 and 5 without the files: the subql-validated registration, the session check with the operator opt-out, the one paged snapshot, the plain SQLite file, the manifest and the streamed zip into the application's sink, with the download's awaited record. Needs slice 1. **Built 2026-10-25** (`ServerBuilder::portability`, `ServerHandle::download_data`, with decision 12), **merged as #269.**
+3. **The files part.** Step 4, the `files/` directory reassembled chunk by chunk. Needs slice 2. **Built 2026-10-25** (`PortabilityQuery::file`, with decisions 13 to 17), **merged as #271.**
+4. **The erasure recipe.** Step 6 in chapter 20, with the erasure record call slice 1 built. Needs slice 1, and stacks on slice 3 so the decisions number in one sequence. **Built 2026-10-25** (the chapter 20 recipe and `ServerHandle::end_person`, with decisions 18 to 22), **merged as #284.**
 
 ### Proof
 
