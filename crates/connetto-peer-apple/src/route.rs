@@ -10,7 +10,7 @@ pub(crate) const HEADER: usize = 92;
 /// The route is up.
 const RTF_UP: u32 = 0x1;
 /// The route goes through a gateway.
-const RTF_GATEWAY: u32 = 0x2;
+pub(crate) const RTF_GATEWAY: u32 = 0x2;
 /// The route's destination address follows the header.
 const RTA_DST: u32 = 0x1;
 /// The route's gateway address follows the destination.
