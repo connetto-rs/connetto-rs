@@ -443,6 +443,13 @@ struct FakeState {
     /// The number of the connection the fake stands on, moved by a test to
     /// stand for a new connection.
     connection: u64,
+    /// The device writer's offer the replica states, `None` for a retired
+    /// writer.
+    #[cfg(feature = "peer")]
+    offer: Option<crate::author::OfferDraft>,
+    /// How many times the run read the offer.
+    #[cfg(feature = "peer")]
+    offer_reads: usize,
 }
 
 /// How the fake link drives one enrolment.
@@ -606,6 +613,19 @@ impl Link for FakeLink {
             }
             state.lock().lists.push(kept);
             Ok(())
+        })
+    }
+
+    #[cfg(feature = "peer")]
+    fn offer(
+        &self,
+        key_id: [u8; 32],
+    ) -> impl Future<Output = Result<Option<crate::author::OfferDraft>, ClientError>> + Send {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let mut state = state.lock();
+            state.offer_reads += 1;
+            Ok(state.offer.clone().filter(|offer| offer.key_id == key_id))
         })
     }
 }
@@ -2411,6 +2431,346 @@ async fn a_granted_renewal_keeps_the_peer_port_and_the_live_link() {
     run.await.expect("the run ends");
 }
 
+/// Holds back the device key's signature over the messages it names until a
+/// test opens it, counting those signatures, so an offer's signature stays
+/// in flight while the link's own handshakes sign freely (R77).
+#[cfg(feature = "peer")]
+#[derive(Default)]
+struct Gate {
+    /// The messages held back, and whether the gate is open.
+    held: Mutex<(Vec<Vec<u8>>, bool)>,
+    opened: parking_lot::Condvar,
+    /// How many held-back messages were signed.
+    signed: core::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "peer")]
+impl Gate {
+    fn holding(messages: Vec<Vec<u8>>) -> Arc<Self> {
+        Arc::new(Self {
+            held: Mutex::new((messages, false)),
+            ..Self::default()
+        })
+    }
+
+    fn open(&self) {
+        self.held.lock().1 = true;
+        self.opened.notify_all();
+    }
+
+    fn pass(&self, message: &[u8]) {
+        let mut held = self.held.lock();
+        if !held.0.iter().any(|gated| gated == message) {
+            return;
+        }
+        while !held.1 {
+            self.opened.wait(&mut held);
+        }
+        self.signed
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn signed(&self) -> usize {
+        self.signed.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The attesting key behind a [`Gate`].
+#[cfg(feature = "peer")]
+struct GatedKey {
+    inner: AttestingKey,
+    gate: Arc<Gate>,
+}
+
+#[cfg(feature = "peer")]
+impl DeviceKey for GatedKey {
+    fn public_point(&self) -> [u8; 65] {
+        self.inner.public_point()
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, DeviceKeyError> {
+        self.gate.pass(message);
+        self.inner.sign(message)
+    }
+
+    fn home(&self) -> KeyHome {
+        self.inner.home()
+    }
+
+    fn attestation(&self, csr: &[u8]) -> Result<Option<DeviceAttestation>, DeviceKeyError> {
+        self.inner.attestation(csr)
+    }
+}
+
+/// The keys the run opens, the attesting key behind `gate`.
+#[cfg(feature = "peer")]
+struct GatedKeys {
+    der: Vec<u8>,
+    gate: Arc<Gate>,
+}
+
+#[cfg(feature = "peer")]
+impl DeviceKeys for GatedKeys {
+    fn open(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<OpenedKey<Box<dyn DeviceKey>>, ClientError>> + Send + '_>>
+    {
+        let key: Box<dyn DeviceKey> = Box::new(GatedKey {
+            inner: AttestingKey::from_pkcs8(&self.der),
+            gate: Arc::clone(&self.gate),
+        });
+        Box::pin(async move {
+            Ok(OpenedKey {
+                key,
+                created: false,
+            })
+        })
+    }
+
+    fn delete(&self) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A device writer's offer whose every field moves with `step`.
+#[cfg(feature = "peer")]
+fn offer_at(key_id: [u8; 32], step: u8) -> crate::author::OfferDraft {
+    use connetto_core::exchange::{Frontier, RetractCause, Retraction};
+    crate::author::OfferDraft {
+        key_id,
+        builds: vec![(
+            connetto_core::Major::new(2).expect("a major"),
+            connetto_core::SchemaVersion::from_hash(vec![step; 32]),
+        )],
+        settled: Some(Frontier {
+            seq: u64::from(step),
+            head: [step; 32],
+        }),
+        newest: Some(Frontier {
+            seq: u64::from(step) + 1,
+            head: [step + 1; 32],
+        }),
+        retractions: vec![Retraction {
+            seq: u64::from(step),
+            cause: RetractCause::Conflict,
+        }],
+    }
+}
+
+/// The next offer a far node receives, bounded, after checking that the
+/// device key `spki` signed it over `draft`'s fields.
+#[cfg(feature = "peer")]
+async fn offer_received(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<connetto_peer::PeerEvent>,
+    draft: &crate::author::OfferDraft,
+    spki: &[u8],
+) {
+    let frame = loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("an offer within the bound")
+            .expect("the far node lives");
+        if let connetto_peer::PeerEvent::Exchange { frame, .. } = event {
+            break frame;
+        }
+    };
+    let connetto_peer::ExchangeFrame::Offer {
+        builds,
+        settled,
+        newest,
+        retractions,
+        signature,
+    } = frame
+    else {
+        panic!("the first exchange frame is the offer, got {frame:?}");
+    };
+    assert_eq!(
+        (&builds, &settled, &newest, &retractions),
+        (
+            &draft.builds,
+            &draft.settled,
+            &draft.newest,
+            &draft.retractions
+        ),
+        "the offer states the replica's draft"
+    );
+    assert!(
+        connetto_core::chain::verify_offer(
+            spki,
+            &draft.key_id,
+            settled.as_ref(),
+            newest.as_ref(),
+            &builds,
+            &retractions,
+            &signature,
+        ),
+        "the device key signs the offer"
+    );
+}
+
+/// A device holding `held` under `keys`, its run, the fake link's state, the
+/// task's handle and the switch that ends the run, with its peer listener
+/// up (R77).
+#[cfg(feature = "peer")]
+async fn offering_device(
+    authority: Authority,
+    keys: Arc<dyn DeviceKeys>,
+    held: Held,
+    offer: Option<crate::author::OfferDraft>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    Arc<Mutex<FakeState>>,
+    EnrolHandle,
+    watch::Sender<()>,
+) {
+    let state = Arc::new(Mutex::new(FakeState {
+        offer,
+        ..FakeState::default()
+    }));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let peer = peer(&authority);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        keys,
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        Vec::new(),
+        inbox(),
+        peer,
+        hotspot_tx,
+        bluetooth_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+    poll_until(|| handle.peer_address().is_some()).await;
+    (run, state, handle, end_tx)
+}
+
+/// R77 slice 6a: a peer linking gets the device writer's offer signed by the
+/// device key, and the next change to the replica's offer reaches it as a
+/// fresh signed offer, while a device whose writer offers nothing sends
+/// nothing.
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_linked_peer_gets_the_signed_offer_and_a_fresh_one_on_change() {
+    let (key, der) = attesting_key();
+    let spki = public_key_info(&key);
+    let key_id = *connetto_core::device_cert::key_id(&key).as_bytes();
+    let now = whole_second();
+    let authority = authority(now).await;
+    let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
+    let (far, mut far_events) = far_peer(&authority, positive_serial(9));
+    let (run, state, handle, end_tx) = offering_device(
+        authority,
+        Arc::new(RunKeys { der }),
+        held,
+        Some(offer_at(key_id, 1)),
+    )
+    .await;
+
+    far.link(handle.peer_address().expect("the listener"))
+        .await
+        .expect("the link completes");
+    offer_received(&mut far_events, &offer_at(key_id, 1), &spki).await;
+
+    state.lock().offer = Some(offer_at(key_id, 2));
+    handle
+        .steering()
+        .send(super::Command::OfferChanged)
+        .expect("the run steers");
+    offer_received(&mut far_events, &offer_at(key_id, 2), &spki).await;
+
+    // A retired writer offers nothing, and its return offers again.
+    state.lock().offer = None;
+    handle
+        .steering()
+        .send(super::Command::OfferChanged)
+        .expect("the run steers");
+    let _ = handle.devices::<()>().await;
+    state.lock().offer = Some(offer_at(key_id, 3));
+    handle
+        .steering()
+        .send(super::Command::OfferChanged)
+        .expect("the run steers");
+    offer_received(&mut far_events, &offer_at(key_id, 3), &spki).await;
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// R77 slice 6a: changes arriving while the offer's signature is in flight
+/// fold into one fresh signature, and the peer gets only the offer stating
+/// the replica as it stands.
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn changes_during_a_signature_fold_into_one_fresh_offer() {
+    let (key, der) = attesting_key();
+    let spki = public_key_info(&key);
+    let key_id = *connetto_core::device_cert::key_id(&key).as_bytes();
+    let now = whole_second();
+    let authority = authority(now).await;
+    let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
+    let gate = Gate::holding(vec![
+        offer_at(key_id, 1).message(),
+        offer_at(key_id, 4).message(),
+    ]);
+    let (far, mut far_events) = far_peer(&authority, positive_serial(9));
+    let (run, state, handle, end_tx) = offering_device(
+        authority,
+        Arc::new(GatedKeys {
+            der,
+            gate: Arc::clone(&gate),
+        }),
+        held,
+        Some(offer_at(key_id, 1)),
+    )
+    .await;
+
+    far.link(handle.peer_address().expect("the listener"))
+        .await
+        .expect("the link completes");
+    poll_until(|| state.lock().offer_reads == 1).await;
+    for step in 2..=4 {
+        state.lock().offer = Some(offer_at(key_id, step));
+        handle
+            .steering()
+            .send(super::Command::OfferChanged)
+            .expect("the run steers");
+    }
+    // The run takes its commands in order, so this answer comes after it
+    // read every change.
+    let _ = handle.devices::<()>().await;
+    assert_eq!(
+        state.lock().offer_reads,
+        1,
+        "no change drafts again while the signature is in flight"
+    );
+
+    gate.open();
+    offer_received(&mut far_events, &offer_at(key_id, 4), &spki).await;
+    assert_eq!(
+        (state.lock().offer_reads, gate.signed()),
+        (2, 2),
+        "the stale signature is followed by exactly one fresh one"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
 /// A peer-received list that revokes this device's own serial ends in
 /// `ClientEvent::DeviceRevoked` with every peer link closed (R76 proof 7).
 #[cfg(feature = "peer")]
@@ -3636,6 +3996,71 @@ async fn an_older_majors_device_write_drains_under_the_bound_device() {
         "the write is reported applied under the device, saw {events:?}"
     );
     assert_eq!(conn.unsynced(), [] as [crate::UnsyncedWrite; 0]);
+}
+
+/// R77 decision 9 on R31: an older major's refusal of a held device write
+/// settles it into the device writer's offer as a retraction, as the live
+/// wire's refusal does.
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_held_device_write_refused_on_the_drain_is_retracted_in_the_offer() {
+    use crate::drain::tests::{Then, ack, dial, major, pump, sent};
+    use connetto_core::exchange::{Frontier, RetractCause, Retraction};
+    use connetto_core::messages::{
+        BindDevice, HeldWork, MutationReject, MutationRejectReason, WriterAnswer, WriterOutcome,
+        WriterRef,
+    };
+    use connetto_core::traits::Transport as _;
+
+    let HeldDevice {
+        mut conn,
+        key_id,
+        seq,
+        ..
+    } = held_device_write(HeldKey::Standing).await;
+    let head = conn.writers[&WriterRef::Device(key_id)].pending[&seq].hash;
+    let (_, mut old, _broken) =
+        dial(&mut conn, vec![drain_challenge(), ack(None)], Then::Stay).await;
+    let Some(ControlMessage::BindDevice(BindDevice { request_id, .. })) = sent(&mut old).await
+    else {
+        panic!("the drain binds before it sends anything");
+    };
+    old.send_control(ControlMessage::WriterAnswer(WriterAnswer {
+        request_id,
+        outcome: WriterOutcome::Bound { frontier: 0 },
+    }))
+    .await
+    .expect("answer the bind");
+    let old_major = tokio::spawn(async move {
+        let Some(ControlMessage::MutationHeader(header)) = sent(&mut old).await else {
+            panic!("the held write goes up");
+        };
+        old.send_control(ControlMessage::MutationReject(MutationReject {
+            client_seq: header.client_seq,
+            reason: MutationRejectReason::Unauthorized,
+        }))
+        .await
+        .expect("refuse the write");
+        while sent(&mut old).await.is_some() {}
+    });
+
+    let mut events = Vec::new();
+    while !events.contains(&ClientEvent::Held(HeldWork::Drained { major: major(1) })) {
+        events.push(pump(&mut conn).await);
+    }
+    old_major.await.expect("the old major ran");
+    let offer = conn
+        .offer_draft(key_id)
+        .expect("read the offer")
+        .expect("the key stands");
+    assert_eq!(offer.settled, Some(Frontier { seq, head }));
+    assert_eq!(
+        offer.retractions,
+        [Retraction {
+            seq,
+            cause: RetractCause::Rejected(MutationRejectReason::Unauthorized),
+        }]
+    );
 }
 
 /// R31 on R75: a held device write whose key this device cannot bind asks
