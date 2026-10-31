@@ -51,10 +51,11 @@ const PG_DDL: &str = "-- connetto:major 1\n\
                                             score DOUBLE PRECISION, avatar BYTEA);\
                       CREATE TABLE mod_notes (id INT PRIMARY KEY, about TEXT, kind TEXT, body TEXT);\
                       CREATE TABLE stamps (at TIMESTAMPTZ PRIMARY KEY, owner TEXT, body TEXT);\
+                      CREATE TABLE amounts (k NUMERIC(10,2) PRIMARY KEY, owner TEXT, price NUMERIC(10,2));\
                       CREATE TABLE media (id INT PRIMARY KEY, owner TEXT, content_id BYTEA, title TEXT);";
 /// A record is visible to its owner or a named share key, a note only when it
-/// is kind `visible`, which the owner-declared query overrides, and a stamp
-/// or a media row to its owner.
+/// is kind `visible`, which the owner-declared query overrides, and a stamp,
+/// an amount or a media row to its owner.
 const POLICIES: &str = "ALTER TABLE records ENABLE ROW LEVEL SECURITY;\n\
      CREATE POLICY records_p ON records USING (\
          owner = current_setting('app.user_id', true) \
@@ -64,6 +65,8 @@ const POLICIES: &str = "ALTER TABLE records ENABLE ROW LEVEL SECURITY;\n\
          about = current_setting('app.user_id', true) AND kind = 'visible');\n\
      ALTER TABLE stamps ENABLE ROW LEVEL SECURITY;\n\
      CREATE POLICY stamps_p ON stamps USING (owner = current_setting('app.user_id', true));\n\
+     ALTER TABLE amounts ENABLE ROW LEVEL SECURITY;\n\
+     CREATE POLICY amounts_p ON amounts USING (owner = current_setting('app.user_id', true));\n\
      ALTER TABLE media ENABLE ROW LEVEL SECURITY;\n\
      CREATE POLICY media_p ON media USING (owner = current_setting('app.user_id', true));";
 
@@ -172,6 +175,7 @@ async fn reset_portability_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fix
     exec(pool, "DROP TABLE IF EXISTS records CASCADE").await;
     exec(pool, "DROP TABLE IF EXISTS mod_notes CASCADE").await;
     exec(pool, "DROP TABLE IF EXISTS stamps CASCADE").await;
+    exec(pool, "DROP TABLE IF EXISTS amounts CASCADE").await;
     exec(pool, "DROP TABLE IF EXISTS media CASCADE").await;
     exec(pool, "DROP TABLE IF EXISTS _connetto_settled").await;
     exec(pool, "DROP TABLE IF EXISTS _connetto_writers").await;
@@ -194,7 +198,7 @@ async fn reset_portability_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fix
     exec(pool, "GRANT USAGE ON SCHEMA public TO app_reader").await;
     exec(
         pool,
-        "GRANT SELECT ON records, mod_notes, stamps, media TO app_reader",
+        "GRANT SELECT ON records, mod_notes, stamps, amounts, media TO app_reader",
     )
     .await;
     exec(
@@ -253,7 +257,7 @@ async fn reset_portability_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fix
         .await
         .expect("seed notes");
     fixture
-        .start_replication(&["records", "mod_notes", "stamps", "media"])
+        .start_replication(&["records", "mod_notes", "stamps", "amounts", "media"])
         .await;
 }
 
@@ -1225,6 +1229,78 @@ async fn a_download_pages_through_a_table_keyed_by_a_timestamp() {
         bodies.into_iter().map(|row| row.body).collect::<Vec<_>>(),
         expected,
         "every one of alice's stamps arrives once and none of bob's"
+    );
+}
+
+/// A table keyed by a `NUMERIC(p,s)` downloads whole, each page resuming past
+/// the last decimal the one before delivered, and the archive holds the key
+/// and every other scaled decimal as the replica's integer minor units.
+#[tokio::test]
+async fn a_download_pages_through_a_table_keyed_by_a_scaled_decimal() {
+    #[derive(Debug, PartialEq, QueryableByName)]
+    struct Amount {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        k: i64,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        k_type: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        price: i64,
+    }
+
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_portability_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    // Every third amount is bob's, so the pages skip rows the policy hides.
+    exec(
+        &pool,
+        "INSERT INTO amounts (k, owner, price) \
+         SELECT n * 0.25, CASE WHEN n % 3 = 0 THEN 'bob' ELSE 'alice' END, n * 0.50 \
+         FROM generate_series(1, 3200) AS n",
+    )
+    .await;
+    let list = PortabilityList::new("r61-fixture").query(PortabilityQuery::new(
+        "SELECT k, owner, price FROM amounts",
+        "amounts",
+    ));
+
+    let (builder, _idp, _keys) = portability_builder(&fixture, list).await;
+    let parts = builder.build().await.expect("the deployment assembles");
+    let mut sink = BytesSink::default();
+    parts
+        .handle
+        .download_data(
+            "alice".to_owned(),
+            &DataRequester::Operator("staff:marco".to_owned()),
+            &mut sink,
+        )
+        .await
+        .expect("the download finishes");
+
+    let (data, _manifest) = unzip_rows(&sink.bytes);
+    let (mut db, _file) = archive_db(&data);
+    let amounts: Vec<Amount> = diesel::RunQueryDsl::load(
+        diesel::sql_query("SELECT k, typeof(k) AS k_type, price FROM amounts ORDER BY k"),
+        &mut db,
+    )
+    .expect("read the amounts");
+    let expected: Vec<Amount> = (1..=3200)
+        .filter(|n| n % 3 != 0)
+        .map(|n| Amount {
+            k: n * 25,
+            k_type: "integer".to_owned(),
+            price: n * 50,
+        })
+        .collect();
+    assert!(
+        expected.len() > 2 * 1024,
+        "alice's rows fill more than two pages"
+    );
+    assert_eq!(
+        amounts, expected,
+        "every one of alice's amounts arrives once in minor units and none of bob's"
     );
 }
 

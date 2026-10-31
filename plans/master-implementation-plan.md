@@ -149,7 +149,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R53~~ | Windows gate through a Windows Hello PRF store, one upstream store patched in until released |
 | blocked | R21 | One page codec. Blocked on the maintainers agreeing to the shared cipher source crates in `rusqlite/rusqlite` discussion #1908, without which it would run on permanent forks |
 | any | R57 | The demo feature gaps. Its step 8, the `MutationRejectReason` surface, gates R77 |
-| any | R61 | The portability download. Deadline is the first real deployment, the R31 class |
+| done | ~~R61~~ | The portability download |
 | any | R11 | The shared public store. Off the critical path |
 | done | ~~R31~~ | Application schema majors |
 | done | ~~R87~~ | Storage quotas and deployment ceilings |
@@ -253,7 +253,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R18 SQLite hardening surface | **DONE** (2026-08-18) | nothing | no |
 | R60 a limited request syncs the whole table and blocks its cleanup | **DONE** (2026-09-02) | nothing. The defect dissolved at the `3d75cca` pin, steps 4 to 6 landed 2026-09-02 and are proven by `crates/connetto-client/tests/it/residual.rs`. The plan carried this row as IN PROGRESS until 2026-09-12 | no longer: the upstream request superseded itself, never sent |
 | R11 shared public store | IN PROGRESS, slices 1 to 6 merged (#179, #238, #239, #259, #270, #286), the outbox for every table merged (#298, #318, #327), row holdings in place of recomputed coverage merged (#334, #337) and the switch to them built (2026-10-30), the demos left | nothing. Seven decisions in the section, and Part B's below | no |
-| R61 the portability download | STARTED 2026-10-25, fully designed (2026-08-22), revised (2026-10-25), sliced into four pull requests, all four built (2026-10-25) | nothing, started at the maintainer's word ahead of the first real deployment. Twenty-two decisions in the section | no |
+| R61 the portability download | **DONE** (2026-10-29), fully designed (2026-08-22), revised (2026-10-25), built in four pull requests (#288, #269, #271, #284) | nothing. Twenty-two decisions in the section | no |
 | R105 answering a stolen account | **DONE** (2026-10-26), designed and sliced 2026-10-25 | nothing. Merged as #262, #268, #274, #283, #287 and #289, ten decisions in the section | no |
 | R62 refuse a table with no declared primary key | **DONE** (2026-08-22) | nothing. Four decisions: three before any code, the fourth (the tier is re-checked before a write too) taken in execution | no |
 | R63 rewire the membership term onto subql's own APIs | **DONE** (2026-08-30) | nothing. Steps 1 to 3 landed 2026-08-23, step 4 (caller bind retired onto the self-seeding term) and decision 3's proof landed 2026-08-30 in the pin-move working tree | landed: `TermDescription::Caller` since subql `1e5382f` |
@@ -3242,7 +3242,7 @@ A `LIMIT n` request registers as a computed read and holds no replica rows, raw 
 
 ## R61: the portability download, whose scope only the application knows
 
-**Status.** STARTED 2026-10-25 at the maintainer's word, sliced into four pull requests the same day (**Slices** below). Fully designed 2026-08-22 and revised with the maintainer 2026-10-25 against the tree and current regulator guidance (decisions 4 to 22). Split out of `R26` on 2026-08-21 when the maintainer separated moving data between devices from handing a person all their data.
+**Status.** **DONE (2026-10-29).** Built in four pull requests, #288 (the audit contract), #269 (registration and the rows download), #271 (the files part) and #284 (the erasure recipe). A table keyed by a date or time pages by its own type (#313). A `NUMERIC(p,s)` column, key or not, lands in the archive as the replica's integer minor units, the form subql carries it in on the wire, and a table keyed by one pages by the decimal. Started 2026-10-25 at the maintainer's word. Fully designed 2026-08-22 and revised with the maintainer 2026-10-25 against the tree and current regulator guidance (decisions 4 to 22). Split out of `R26` on 2026-08-21 when the maintainer separated moving data between devices from handing a person all their data.
 
 **Blocked on nothing.** Nothing in the tree needed it and no deployment was yet obliged by it, and the maintainer started it ahead of that deadline. The file half builds on `R65` to `R69`, all done.
 

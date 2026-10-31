@@ -12,8 +12,11 @@
 //! sixteen-byte blob, so it has to lift the blob the same way. Otherwise the
 //! two spellings of one row name it differently, and every identity comparison
 //! spanning both (the authorization seam names a row by rendering its key)
-//! misses.
+//! misses. A `NUMERIC(p,s)` column is the other such type. The wire carries it
+//! as the replica's integer count of minor units, and the read path as the
+//! decimal.
 
+use bigdecimal::BigDecimal;
 use sqlite_diff_rs::Value as WireValue;
 use subql::backend::{DeclaredType, Postgres, ScalarKind, ScalarKindOf, Value};
 use subql::{ColumnId, DatabaseLike, TableId, catalog_helpers};
@@ -21,27 +24,40 @@ use subql::{ColumnId, DatabaseLike, TableId, catalog_helpers};
 /// The sqlite-diff value shape carried by an uploaded row image.
 type Wire = WireValue<String, Vec<u8>>;
 
+/// What the catalog declares about one column that decides how its wire cell
+/// lifts.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct WireColumn {
+    /// The declared scalar kind, [`None`] past the table's columns.
+    kind: Option<ScalarKindOf<Postgres>>,
+    /// The scale a `NUMERIC(p,s)` column's minor units travel at.
+    minor_unit_scale: Option<u32>,
+}
+
 /// Map one uploaded sqlite-diff cell to the canonical [`Value<Postgres>`],
-/// directed by the column's declared scalar `kind`.
+/// directed by its `column`.
 ///
 /// sqlite-diff carries only SQLite's four storage classes plus NULL. Integers,
 /// reals, text, and blobs map straight across and NULL stays NULL, which is
 /// exactly right whenever the storage class already matches the Postgres type.
-/// The exception is a column whose type has no matching storage class: a
-/// `UUID`, which pg2sqlite stores as a sixteen-byte blob and the read path
-/// decodes to [`Value::Uuid`] from the catalog. A blob under a `UUID` column is
-/// lifted the same way here so the two paths agree. A `kind` of [`None`], or a
-/// blob that is not sixteen bytes, keeps the plain storage mapping.
-pub(crate) fn from_wire(value: &Wire, kind: Option<ScalarKindOf<Postgres>>) -> Value<Postgres> {
-    match (value, kind) {
-        (WireValue::Blob(blob), Some(ScalarKind::Builtin(DeclaredType::Uuid))) => {
+/// The exceptions are the columns whose type has no matching storage class. A
+/// `UUID` is a sixteen-byte blob the read path decodes to [`Value::Uuid`], and
+/// a blob of any other length keeps the plain storage mapping. A
+/// `NUMERIC(p,s)` is an integer of minor units, which lifts to the
+/// [`Value::Decimal`] it counts.
+pub(crate) fn from_wire(value: &Wire, column: WireColumn) -> Value<Postgres> {
+    match (value, column.kind, column.minor_unit_scale) {
+        (WireValue::Blob(blob), Some(ScalarKind::Builtin(DeclaredType::Uuid)), _) => {
             uuid_from_blob(blob)
         }
-        (WireValue::Null, _) => Value::Null,
-        (WireValue::Integer(int), _) => Value::Int(*int),
-        (WireValue::Real(real), _) => Value::Float(*real),
-        (WireValue::Text(text), _) => Value::String(text.clone()),
-        (WireValue::Blob(blob), _) => Value::Bytes(blob.clone()),
+        (WireValue::Integer(units), _, Some(scale)) => {
+            Value::Decimal(BigDecimal::new((*units).into(), i64::from(scale)))
+        }
+        (WireValue::Null, ..) => Value::Null,
+        (WireValue::Integer(int), ..) => Value::Int(*int),
+        (WireValue::Real(real), ..) => Value::Float(*real),
+        (WireValue::Text(text), ..) => Value::String(text.clone()),
+        (WireValue::Blob(blob), ..) => Value::Bytes(blob.clone()),
     }
 }
 
@@ -55,18 +71,28 @@ fn uuid_from_blob(blob: &[u8]) -> Value<Postgres> {
     )
 }
 
-/// The declared scalar kind of the column at `ordinal` in `table_id`, or
-/// [`None`] when the ordinal is past the table's columns.
-pub(crate) fn scalar_kind<DB: DatabaseLike>(
+/// What the catalog declares about the column at `ordinal` in `table_id`,
+/// nothing when the ordinal is past the table's columns.
+pub(crate) fn wire_column<DB: DatabaseLike>(
     db: &DB,
     table_id: TableId,
     ordinal: usize,
-) -> Option<ScalarKindOf<Postgres>> {
-    catalog_helpers::column_scalar_kind::<Postgres, _>(
-        db,
-        table_id,
-        ColumnId::try_from(ordinal).ok()?,
-    )
+) -> WireColumn {
+    let Ok(column_id) = ColumnId::try_from(ordinal) else {
+        return WireColumn::default();
+    };
+    let kind = catalog_helpers::column_scalar_kind::<Postgres, _>(db, table_id, column_id);
+    let minor_unit_scale = match kind {
+        Some(ScalarKind::Builtin(DeclaredType::Decimal)) => {
+            catalog_helpers::column(db, table_id, column_id)
+                .and_then(|column| catalog_helpers::minor_unit_scale(db, column))
+        }
+        _ => None,
+    };
+    WireColumn {
+        kind,
+        minor_unit_scale,
+    }
 }
 
 /// Map a full uploaded row image to canonical values, directing each cell by
@@ -79,7 +105,7 @@ pub(crate) fn row_from_wire<DB: DatabaseLike>(
     values
         .iter()
         .enumerate()
-        .map(|(ordinal, value)| from_wire(value, scalar_kind(db, table_id, ordinal)))
+        .map(|(ordinal, value)| from_wire(value, wire_column(db, table_id, ordinal)))
         .collect()
 }
 
@@ -99,7 +125,23 @@ pub fn encode(values: &[Value<Postgres>]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subql::backend::{IntWidth, TextWidth};
+    use core::str::FromStr as _;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use subql::ParserDB;
+
+    /// How each column of a table holding one column of each mapping lifts,
+    /// plus one ordinal past its last column.
+    fn columns() -> Vec<WireColumn> {
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT, ref UUID, \
+             amount NUMERIC(10,2), bare NUMERIC);",
+        )
+        .expect("the DDL parses");
+        let table = catalog_helpers::table_id::<Postgres, _>(&db, "t").expect("t resolves");
+        (0..6)
+            .map(|ordinal| wire_column(&db, table, ordinal))
+            .collect()
+    }
 
     #[test]
     fn a_composite_key_encodes_to_a_stable_string() {
@@ -111,63 +153,77 @@ mod tests {
         assert_ne!(encode(&key), encode(&key[..1]));
     }
 
+    /// A UUID travels as a sixteen-byte blob and a `NUMERIC(10,2)` as minor
+    /// units, while the read path types both from the catalog, so a row named
+    /// from either spelling encodes to the same identity.
     #[test]
     fn wire_and_read_paths_agree() {
-        // A UUID column is where the two paths used to disagree: the read path
-        // types it from the catalog to `Value::Uuid`, while the upload carries
-        // it as a sixteen-byte blob. Integer and text coincide on both paths.
         let id = uuid::Uuid::from_u128(0xab4a_f609_f3d2_5ebd_b482_fbe8_b7db_00c6);
         let wire = [
             Wire::Integer(7),
             Wire::Text("x".to_owned()),
             Wire::Blob(id.as_bytes().to_vec()),
-        ];
-        let kinds = [
-            Some(ScalarKind::Builtin(DeclaredType::Int(IntWidth::SixtyFour))),
-            Some(ScalarKind::Builtin(DeclaredType::Text(TextWidth::Varying))),
-            Some(ScalarKind::Builtin(DeclaredType::Uuid)),
+            Wire::Integer(1250),
+            Wire::Text("3.125".to_owned()),
         ];
         let read = [
             Value::<Postgres>::Int(7),
             Value::<Postgres>::String("x".to_owned()),
             Value::<Postgres>::Uuid(id),
+            Value::<Postgres>::Decimal(BigDecimal::from_str("12.50").expect("a decimal")),
+            Value::<Postgres>::String("3.125".to_owned()),
         ];
         let mapped: Vec<Value<Postgres>> = wire
             .iter()
-            .zip(kinds)
-            .map(|(value, kind)| from_wire(value, kind))
+            .zip(columns())
+            .map(|(value, column)| from_wire(value, column))
             .collect();
+        assert_eq!(mapped, read);
         assert_eq!(encode(&mapped), encode(&read));
+    }
+
+    /// Minor units lift at the column's own scale, negative counts included,
+    /// and NULL stays NULL.
+    #[test]
+    fn minor_units_lift_to_the_decimal_they_count() {
+        let amount = columns()[3];
+        for (units, decimal) in [(14, "0.14"), (700, "7.00"), (-350, "-3.50"), (0, "0.00")] {
+            assert_eq!(
+                from_wire(&Wire::Integer(units), amount),
+                Value::Decimal(BigDecimal::from_str(decimal).expect("a decimal")),
+                "{units} minor units"
+            );
+        }
+        assert_eq!(from_wire(&Wire::Null, amount), Value::<Postgres>::Null);
     }
 
     #[test]
     fn a_blob_under_a_uuid_column_lifts_to_a_uuid() {
+        let uuid = columns()[2];
         let id = uuid::Uuid::from_u128(1);
         assert_eq!(
-            from_wire(
-                &Wire::Blob(id.as_bytes().to_vec()),
-                Some(ScalarKind::Builtin(DeclaredType::Uuid))
-            ),
+            from_wire(&Wire::Blob(id.as_bytes().to_vec()), uuid),
             Value::<Postgres>::Uuid(id),
         );
         // A blob that is not sixteen bytes is not a UUID image, so it stays
         // bytes rather than being forced into one.
         assert_eq!(
-            from_wire(
-                &Wire::Blob(vec![0, 1, 2]),
-                Some(ScalarKind::Builtin(DeclaredType::Uuid))
-            ),
+            from_wire(&Wire::Blob(vec![0, 1, 2]), uuid),
             Value::<Postgres>::Bytes(vec![0, 1, 2]),
         );
     }
 
     #[test]
-    fn preserves_blob_and_null() {
-        // Without a UUID kind a blob stays bytes and NULL stays NULL.
+    fn past_the_columns_a_cell_keeps_its_storage_class() {
+        let past = columns()[5];
         assert_eq!(
-            from_wire(&Wire::Blob(vec![0, 1, 2, 255]), None),
+            from_wire(&Wire::Blob(vec![0, 1, 2, 255]), past),
             Value::<Postgres>::Bytes(vec![0, 1, 2, 255]),
         );
-        assert_eq!(from_wire(&Wire::Null, None), Value::<Postgres>::Null);
+        assert_eq!(
+            from_wire(&Wire::Integer(1250), past),
+            Value::<Postgres>::Int(1250)
+        );
+        assert_eq!(from_wire(&Wire::Null, past), Value::<Postgres>::Null);
     }
 }
