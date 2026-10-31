@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use connetto_core::auth::Principal;
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, Handshake, PauseCause, Subscribe, SubscriptionSpec,
+    BulkMessage, ControlMessage, Handshake, PauseCause, SUBSCRIPTION_REFUSED, Subscribe,
+    SubscriptionSpec,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -27,7 +28,7 @@ use connetto_test_harness::{Client, ConnettoDefaults, Fixture, committed_at};
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaError;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, PgChangeEvent, PgSqliteEmuSource};
 
 use crate::one_event::OneEvent;
 
@@ -809,4 +810,180 @@ async fn an_auth_outage_retry_folds_the_held_event_once() {
     assert_eq!(counts, [Some("1".to_owned())]);
     let live = rows.wait_for_live(Duration::from_secs(5)).await;
     assert_eq!(live.sub_id, "items");
+}
+
+/// A `timestamptz` column, the value Postgres holds that the SQLite wire
+/// cannot carry, so the fold keeps no patch for its event.
+const STAMPS_PG: &str = "CREATE TABLE stamps (id INT PRIMARY KEY, at TIMESTAMPTZ NOT NULL);";
+
+/// An authorization outage that lands on the refusal's own verdict holds the
+/// unencodable event like a row patch, the retry answers the held question,
+/// the matched caller is refused exactly once, the fold stays single, and a
+/// later change still arrives.
+#[expect(
+    clippy::too_many_lines,
+    reason = "The outage, the held retry and the refusal answer form one scenario."
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_auth_outage_during_the_refusal_verdict_refuses_once_and_folds_once() {
+    let fixture = Fixture::acquire().await;
+    fixture.exec("DROP TABLE IF EXISTS stamps CASCADE").await;
+    fixture.exec(STAMPS_PG).await;
+    let pool = fixture.admin().clone();
+    let manager = ManagerBuilder::new(
+        Materializer::builder(STAMPS_PG)
+            .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
+            .build()
+            .expect("materializer"),
+        PgSnapshotSource::from_ddl(pool.clone(), STAMPS_PG).expect("snapshot source"),
+        FailsFirstSee {
+            failed: std::sync::atomic::AtomicBool::new(false),
+        },
+        Arc::new(TestGrantChecker),
+        PgReadConnector::with_session_setup(pool.clone()),
+        pg_write_target::<ConnettoDefaults>(pool, STAMPS_PG).expect("build write target"),
+    )
+    .build();
+    let connect = || {
+        let (server, client) = loopback();
+        tokio::spawn(manager.clone().serve(server));
+        Client::new(client)
+    };
+    let mut rows = connect();
+    rows.handshake_with("rows", "user:rows").await;
+    rows.subscribe("stamps", "SELECT * FROM stamps").await;
+    rows.expect_snapshot("stamps").await;
+    let mut counter = connect();
+    counter.handshake_with("counter", "user:counter").await;
+    counter
+        .subscribe("count", "SELECT COUNT(*) FROM stamps")
+        .await;
+    let ControlMessage::AggregateUpdate(seed) = counter.next_control().await else {
+        panic!("expected the count seed");
+    };
+    assert_eq!(seed.result_json.as_deref(), Some("0"));
+
+    // The event the replica cannot store, stamped the way a committed row arrives.
+    let mut source = PgSqliteEmuSource::open_in_memory(STAMPS_PG).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO stamps (id, at) VALUES (1, 'infinity')")
+        .expect("execute dml");
+    let insert = source
+        .next_item()
+        .await
+        .expect("poll source")
+        .and_then(subql::SourceItem::into_event)
+        .expect("one event");
+    fixture
+        .exec("INSERT INTO stamps (id, at) VALUES (1, 'infinity')")
+        .await;
+    let insert = committed_at(insert, fixture.commit_now().await);
+
+    let retries = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.ingest(&mut OneEvent(Some(insert)), &mut |event| {
+            if matches!(event, ReconnectEvent::AuthRetrying { .. }) {
+                retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }),
+    )
+    .await
+    .expect("ingest drains the source")
+    .expect("ingest succeeds after the outage");
+    assert_eq!(
+        retries.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the held event asked its verdict once more after the outage"
+    );
+
+    // The outage that hit the verdict paused delivery before the answer, and
+    // the matched caller is refused once behind the recovery, nothing more.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut paused = false;
+    let mut resumed = false;
+    let mut refusals = 0;
+    while !(refusals > 0 && resumed) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = tokio::time::timeout(remaining, rows.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the rows client never finished the outage answer, \
+                     paused={paused} resumed={resumed} refusals={refusals}"
+                )
+            })
+            .expect("the connection stayed open");
+        match frame {
+            IncomingFrame::Control(ControlMessage::DeliveryPaused { cause }) => {
+                assert_eq!(
+                    cause,
+                    PauseCause::AuthServiceUnreachable,
+                    "the outage that holds the event is the unreachable authorization service"
+                );
+                paused = true;
+            }
+            IncomingFrame::Control(ControlMessage::DeliveryResumed) => {
+                resumed = true;
+            }
+            IncomingFrame::Control(ControlMessage::NonFatalError(fatal)) => {
+                refusals += 1;
+                assert_eq!(
+                    fatal.related_to.as_deref(),
+                    Some("stamps"),
+                    "the refusal names the subscription the event matched"
+                );
+                assert_eq!(fatal.detail, SUBSCRIPTION_REFUSED);
+            }
+            other => panic!("the refused caller met an unexpected frame {other:?}"),
+        }
+    }
+    assert!(
+        paused,
+        "the outage must pause delivery before the refusal answers"
+    );
+    assert_eq!(refusals, 1, "the matched caller is refused exactly once");
+
+    // The fold happened once, so the count stands at 1, and a later change
+    // still moves it. The first commit still sits in the source's queue, so
+    // the drain takes every item, not just the first.
+    source
+        .execute_sql("INSERT INTO stamps (id, at) VALUES (2, '2026-01-02 00:00:00+00')")
+        .expect("execute dml");
+    let mut later_events = Vec::new();
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        if let subql::SourceItem::Event(event) = item {
+            later_events.push(event);
+        }
+    }
+    let [later] = <[PgChangeEvent; 1]>::try_from(later_events).expect("one row per insert");
+    fixture
+        .exec("INSERT INTO stamps (id, at) VALUES (2, '2026-01-02 00:00:00+00')")
+        .await;
+    let later = committed_at(later, fixture.commit_now().await);
+    manager
+        .dispatch_event(&later)
+        .await
+        .expect("dispatch the later change");
+    let mut counts = Vec::new();
+    loop {
+        let control =
+            tokio::time::timeout(Duration::from_millis(500), counter.next_control()).await;
+        match control {
+            Err(_) => break,
+            Ok(ControlMessage::AggregateUpdate(update)) => counts.push(update.result_json),
+            Ok(ControlMessage::DeliveryPaused { .. } | ControlMessage::DeliveryResumed) => {}
+            Ok(other) => panic!("unexpected control {other:?}"),
+        }
+    }
+    assert_eq!(
+        counts,
+        [Some("1".to_owned()), Some("2".to_owned())],
+        "the held event folded once and the later change still arrived"
+    );
+    let later_live = rows.try_live(Duration::from_millis(500)).await;
+    assert!(
+        later_live.is_none(),
+        "the refused subscription receives nothing more, and the rows client met {later_live:?}"
+    );
 }
