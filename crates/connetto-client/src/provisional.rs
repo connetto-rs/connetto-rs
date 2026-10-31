@@ -2,17 +2,15 @@
 //!
 //! A row a peer applies lands in the ordinary replica tables, so the
 //! application's own SQL sees it, and this table keeps, beside the row, who
-//! wrote it and from which entry of the author's queue. The eviction passes
-//! spare the rows still awaiting a verdict, a server write on a key clears
-//! the row's record and confirms it, and the application stands the records
-//! back from the table, since the broadcast event stream can drop events.
-
-use std::collections::HashMap;
+//! wrote it and from which entry of the author's queue. A row still awaiting
+//! a verdict is held under `connetto-provisional`, so the eviction passes
+//! keep it, a server write on a key clears the row's record and confirms
+//! it, and the application stands the records back from the table, since
+//! the broadcast event stream can drop events.
 
 use diesel::prelude::*;
 use sqlite_diff_rs::Value;
 
-use crate::live::bind_literal_of;
 use crate::{ClientError, KeyValue};
 use connetto_core::quote_ident;
 
@@ -53,8 +51,8 @@ use _connetto_provisional::dsl;
 /// Whether a row's provenance still awaits a verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvisionalState {
-    /// The row still awaits a server or peer verdict, so the eviction passes
-    /// spare it.
+    /// The row still awaits a server or peer verdict, so its holding keeps it
+    /// through the eviction passes.
     Provisional,
     /// A verdict settled the key, so the row falls under ordinary coverage.
     Adjudicated,
@@ -222,7 +220,7 @@ fn short() -> ClientError {
 }
 
 /// The wire shape a stored key column takes.
-fn value_of(value: &KeyValue) -> Value<String, Vec<u8>> {
+pub(crate) fn value_of(value: &KeyValue) -> Value<String, Vec<u8>> {
     match value {
         KeyValue::Null => Value::Null,
         KeyValue::Int(int) => Value::Integer(*int),
@@ -250,9 +248,9 @@ fn pk_column_names(db: &mut SqliteConnection, table: &str) -> Result<Vec<String>
     Ok(rows.into_iter().map(|row| row.name).collect())
 }
 
-/// One keep clause for a stored key, the same `(col IS literal AND ...)`
-/// shape the pending spare builds, or `None` when the table's key layout
-/// cannot express the key, whose row is then provably gone.
+/// The `(col IS literal AND ...)` clause naming a stored key's row, or
+/// `None` when the table's key layout cannot express the key, whose row is
+/// then provably gone.
 fn key_clause(
     db: &mut SqliteConnection,
     table: &str,
@@ -266,40 +264,14 @@ fn key_clause(
         .iter()
         .zip(key)
         .map(|(name, value)| {
-            Ok(format!(
+            format!(
                 "{} IS {}",
                 quote_ident(name),
-                bind_literal_of(&value_of(value))?
-            ))
+                crate::holdings::key_literal(&value_of(value))
+            )
         })
-        .collect::<Result<_, ClientError>>()?;
+        .collect();
     Ok(Some(format!("({})", wheres.join(" AND "))))
-}
-
-/// The eviction passes' keep clauses over the rows still awaiting a
-/// verdict: per lowercased physical table, one clause per row, the same
-/// shape and keys the pending spare carries.
-pub(crate) fn spare(
-    db: &mut SqliteConnection,
-) -> Result<HashMap<String, Vec<String>>, ClientError> {
-    let mut spare: HashMap<String, Vec<String>> = HashMap::new();
-    let stored: Vec<(String, Vec<u8>, i64)> = dsl::_connetto_provisional
-        .select((dsl::tbl, dsl::pk, dsl::state))
-        .load(db)?;
-    for record in stored {
-        let (tbl, pk, state) = record;
-        if state != ProvisionalState::Provisional.db() {
-            continue;
-        }
-        let Ok(key) = decode_key(&pk) else {
-            continue;
-        };
-        let Some(clause) = key_clause(db, &tbl, &key)? else {
-            continue;
-        };
-        spare.entry(tbl).or_default().push(clause);
-    }
-    Ok(spare)
 }
 
 /// The records, keyed order across tables.

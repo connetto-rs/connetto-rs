@@ -50,18 +50,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    /// The synced parts table, composite text-plus-blob key.
-    parts (name, size) {
-        /// First key column.
-        name -> Text,
-        /// Second key column.
-        size -> Binary,
-        /// Free-text payload.
-        label -> Nullable<Text>,
-    }
-}
-
-diesel::table! {
     /// The synced reals table, a real primary key.
     reals (id) {
         /// Primary key.
@@ -187,26 +175,6 @@ fn orders_payload(rows: &[(i64, &str)]) -> Vec<u8> {
         .expect("set the key")
         .set(1, Value::<String, Vec<u8>>::Text(status.to_string()))
         .expect("set the status");
-        patch = patch.insert(insert);
-    }
-    zstd::encode_all(patch.build().as_slice(), 3).expect("compress the patch")
-}
-
-/// A compressed insert patchset over `parts`.
-fn parts_payload(rows: &[(&str, &[u8], &str)]) -> Vec<u8> {
-    let mut patch = PatchSet::<SimpleTable, String, Vec<u8>>::new();
-    for (name, size, label) in rows {
-        let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
-            "parts",
-            &[("name", ""), ("size", ""), ("label", "")],
-            &[0, 1],
-        ))
-        .set(0, Value::<String, Vec<u8>>::Text(name.to_string()))
-        .expect("set the name")
-        .set(1, Value::<String, Vec<u8>>::Blob(size.to_vec()))
-        .expect("set the size")
-        .set(2, Value::<String, Vec<u8>>::Text(label.to_string()))
-        .expect("set the label");
         patch = patch.insert(insert);
     }
     zstd::encode_all(patch.build().as_slice(), 3).expect("compress the patch")
@@ -403,139 +371,6 @@ async fn orders_fixture() -> (ConnettoConnection<Script>, Script) {
     (conn, server)
 }
 
-/// An uncovered provisional row survives the tidy pass, whose keep list takes
-/// its key from the provenance table.
-#[tokio::test]
-async fn an_uncovered_provisional_row_survives_tidy() {
-    let (mut conn, _server) = orders_fixture().await;
-    record_provenance(
-        &mut conn,
-        "orders",
-        &[KeyValue::Int(2)],
-        ProvisionalState::Provisional,
-        None,
-    );
-    conn.tidy().expect("tidy");
-    assert_eq!(
-        order_ids(&mut conn),
-        vec![1, 2],
-        "the row the subscription does not cover stays while its provenance is provisional"
-    );
-    assert_eq!(
-        stored_provenance(&mut conn).len(),
-        1,
-        "the provenance row stays beside the row it describes"
-    );
-}
-
-/// Once the provenance stops saying provisional, the row is ordinary coverage
-/// again and the pass takes it, with the provenance of the taken row removed.
-#[tokio::test]
-async fn a_provisional_row_is_evicted_once_it_is_no_longer_provisional() {
-    let (mut conn, _server) = orders_fixture().await;
-    record_provenance(
-        &mut conn,
-        "orders",
-        &[KeyValue::Int(2)],
-        ProvisionalState::Provisional,
-        None,
-    );
-    adjudicate_all(&mut conn);
-    conn.tidy().expect("tidy");
-    assert_eq!(
-        order_ids(&mut conn),
-        vec![1],
-        "an adjudicated row is no longer spared"
-    );
-    assert!(
-        stored_provenance(&mut conn).is_empty(),
-        "the provenance of a row the pass took does not linger"
-    );
-}
-
-/// A provisional row whose provenance is gone is no longer spared either.
-#[tokio::test]
-async fn a_provisional_row_is_evicted_once_its_provenance_is_gone() {
-    let (mut conn, _server) = orders_fixture().await;
-    record_provenance(
-        &mut conn,
-        "orders",
-        &[KeyValue::Int(2)],
-        ProvisionalState::Provisional,
-        None,
-    );
-    conn.conn()
-        .batch_execute("DELETE FROM _connetto_provisional")
-        .expect("drop the provenance");
-    conn.tidy().expect("tidy");
-    assert_eq!(
-        order_ids(&mut conn),
-        vec![1],
-        "without its provenance the uncovered row is ordinary coverage"
-    );
-}
-
-/// The subscription-end eviction pass spares the provisional row and takes
-/// the ended subscription's own row.
-#[tokio::test]
-async fn a_provisional_row_survives_the_subscription_end_eviction() {
-    let (mut conn, _server) = orders_fixture().await;
-    record_provenance(
-        &mut conn,
-        "orders",
-        &[KeyValue::Int(2)],
-        ProvisionalState::Provisional,
-        None,
-    );
-    conn.unsubscribe("a").await.expect("unsubscribe");
-    assert_eq!(
-        order_ids(&mut conn),
-        vec![2],
-        "the ended subscription takes its own row and spares the provisional one"
-    );
-    assert_eq!(stored_provenance(&mut conn).len(), 1);
-}
-
-/// The spare clause is the same `(col IS literal)` shape the pending spare
-/// builds, which is what a composite key with a text and a blob column checks.
-#[tokio::test]
-async fn a_composite_key_provisional_row_survives_tidy() {
-    let (mut conn, server) = connected().await;
-    conn.subscribe("p", "SELECT * FROM parts WHERE name = 'keep'")
-        .await
-        .expect("subscribe");
-    send_snapshot(
-        &server,
-        "p",
-        parts_payload(&[("keep", &[1], "k"), ("gone", &[2], "g")]),
-        1,
-    );
-    pump_to(
-        &mut conn,
-        |event| matches!(event, ClientEvent::SnapshotEnd { sub_id, .. } if sub_id == "p"),
-    )
-    .await;
-    record_provenance(
-        &mut conn,
-        "parts",
-        &[KeyValue::Text("gone".to_owned()), KeyValue::Blob(vec![2])],
-        ProvisionalState::Provisional,
-        None,
-    );
-    conn.tidy().expect("tidy");
-    let kept: Vec<(String, Vec<u8>)> = parts::table
-        .select((parts::name, parts::size))
-        .order(parts::name.asc())
-        .load(conn.conn())
-        .expect("read the replica");
-    assert_eq!(
-        kept,
-        vec![("gone".to_owned(), vec![2]), ("keep".to_owned(), vec![1])],
-        "the composite-keyed row the filter does not name stays"
-    );
-    assert_eq!(stored_provenance(&mut conn).len(), 1);
-}
-
 /// A live patch writing a provisional key clears the provenance in the same
 /// apply and raises one `ProvisionalConfirmed` carrying the row.
 #[tokio::test]
@@ -704,52 +539,6 @@ async fn a_truncate_resync_drops_the_provenance_with_the_row() {
         stored_provenance(&mut conn).is_empty(),
         "the provenance of a row the truncate took does not linger"
     );
-}
-
-/// A full resync takes every row its replacement does not deliver back, but
-/// a provisional row awaits the server's verdict, as an unsent write does,
-/// so it stays with its provenance (R11 Part B).
-#[tokio::test]
-async fn a_full_resync_keeps_a_provisional_row_until_its_verdict() {
-    let (mut conn, server) = orders_fixture().await;
-    record_provenance(
-        &mut conn,
-        "orders",
-        &[KeyValue::Int(2)],
-        ProvisionalState::Provisional,
-        None,
-    );
-    server.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
-        "ended".to_owned(),
-        cursor_byte(1),
-        orders_payload(&[(3, "z")]),
-    ))));
-    pump_to(&mut conn, |event| {
-        matches!(event, ClientEvent::LivePatch { .. })
-    })
-    .await;
-    server.say(IncomingFrame::Control(ControlMessage::FullResyncRequired(
-        FullResyncRequired {
-            sub_id: "a".to_owned(),
-            reason: FullResyncReason::CursorBeyondHistory,
-        },
-    )));
-    pump_to(&mut conn, |event| {
-        matches!(event, ClientEvent::FullResync { .. })
-    })
-    .await;
-    send_snapshot(&server, "a", orders_payload(&[(1, "x")]), 6);
-    pump_to(
-        &mut conn,
-        |event| matches!(event, ClientEvent::SnapshotEnd { sub_id, .. } if sub_id == "a"),
-    )
-    .await;
-    assert_eq!(
-        order_ids(&mut conn),
-        vec![1, 2],
-        "the unheld row 3 goes and the provisional row 2 stays"
-    );
-    assert_eq!(stored_provenance(&mut conn).len(), 1);
 }
 
 /// The reads stand the rows back from the table, decoded to their typed keys,
@@ -1131,19 +920,12 @@ where
         .expect("adjudicate the records");
 }
 
-/// A record whose key the table's layout cannot express spares no row and
-/// stays while it awaits its verdict, as a provisional delete does. Once
-/// adjudicated it is swept with the rows it cannot name.
+/// A record whose key the table's layout cannot express names no row, so it
+/// stays while it awaits its verdict, as a provisional delete does, and once
+/// adjudicated the pass sweeps it.
 #[tokio::test]
-async fn a_key_the_table_cannot_express_spares_nothing_and_goes_once_adjudicated() {
+async fn a_key_the_table_cannot_express_goes_once_adjudicated() {
     let (mut conn, _server) = orders_fixture().await;
-    record_provenance(
-        &mut conn,
-        "orders",
-        &[KeyValue::Int(2)],
-        ProvisionalState::Provisional,
-        None,
-    );
     raw_record(
         &mut conn,
         "orders",
@@ -1151,20 +933,15 @@ async fn a_key_the_table_cannot_express_spares_nothing_and_goes_once_adjudicated
         ProvisionalState::Provisional.db(),
     );
     conn.tidy().expect("tidy");
-    assert_eq!(
-        order_ids(&mut conn),
-        vec![1, 2],
-        "the matching record spares 2"
-    );
-    assert_eq!(stored_provenance(&mut conn).len(), 2);
+    assert_eq!(order_ids(&mut conn), vec![1]);
+    assert_eq!(stored_provenance(&mut conn).len(), 1);
 
     adjudicate_all(&mut conn);
-    conn.tidy().expect("tidy after the verdicts");
-    assert_eq!(order_ids(&mut conn), vec![1]);
+    conn.tidy().expect("tidy after the verdict");
     assert_eq!(
         stored_provenance(&mut conn),
         Vec::new(),
-        "the mismatched record names no row, and the other's row went"
+        "the mismatched record names no row"
     );
 }
 
@@ -1188,12 +965,12 @@ async fn an_undecodable_key_is_left_alone_by_the_passes() {
     );
 }
 
-/// A key column with no SQL literal fails the pass, and the failed pass
-/// leaves the rows and the record as it found them.
+/// An adjudicated record on an infinite `REAL` key is probed like any other:
+/// the pass finds its row still stored and keeps the record beside it.
 #[tokio::test]
-async fn a_key_column_with_no_sql_literal_fails_the_pass() {
+async fn an_adjudicated_infinite_key_is_probed_like_any_other() {
     let (mut conn, server) = connected().await;
-    conn.subscribe("a", "SELECT * FROM reals WHERE id = 1.0")
+    conn.subscribe("a", "SELECT * FROM reals")
         .await
         .expect("subscribe");
     send_snapshot(
@@ -1211,21 +988,15 @@ async fn a_key_column_with_no_sql_literal_fails_the_pass() {
         &mut conn,
         "reals",
         &hex(&encode_key(&[KeyValue::Real(f64::INFINITY)])),
-        ProvisionalState::Provisional.db(),
+        ProvisionalState::Adjudicated.db(),
     );
-    let err = conn
-        .tidy()
-        .expect_err("the non-finite key has no SQL literal");
-    assert!(
-        err.to_string().contains("non-finite float bind"),
-        "the failure names the bind: {err}"
-    );
+    conn.tidy().expect("the pass probes an infinite key");
+    assert_eq!(real_ids(&mut conn), vec![1.0, f64::INFINITY]);
     assert_eq!(
-        real_ids(&mut conn),
-        vec![1.0, f64::INFINITY],
-        "the failed pass rolled back, so the rows are as they were"
+        stored_provenance(&mut conn).len(),
+        1,
+        "the record's row is stored, so the record stays"
     );
-    assert_eq!(stored_provenance(&mut conn).len(), 1);
 }
 
 /// A record whose key column is null spares no row, since no row has a null

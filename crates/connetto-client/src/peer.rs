@@ -250,8 +250,9 @@ pub(crate) fn delete_entry(
 
 /// The receiver's side of one peer apply, what its ops are judged against.
 pub(crate) struct OpsContext<'a> {
-    /// The replica's logical to physical table map.
-    pub(crate) tables: &'a crate::PolicyTables,
+    /// The receiver's configuration: its table map, its shared tables and
+    /// the identity its shared holdings name.
+    pub(crate) config: &'a crate::ClientConfig,
     /// The keys the receiver's own unsent writes hold.
     pub(crate) held: &'a crate::HeldKeys,
     /// The entry's author.
@@ -270,9 +271,10 @@ pub(crate) fn key_of(op: &crate::replay::PeerOp) -> Vec<KeyValue> {
     op.primary_key().into_iter().map(KeyValue::from).collect()
 }
 
-/// Apply an entry's ops as its author through the policy views, one
-/// provisional record per key, or the refusal when an op names no key or the
-/// views refused one, the caller rolling the entry back whole.
+/// Apply an entry's ops as its author through the policy views, a shared
+/// table's in the store, one provisional record and its holding per key, or
+/// the refusal when an op names no key or the views refused one, the caller
+/// rolling the entry back whole (R77 decisions 14 and 15).
 ///
 /// A key the receiver's own unsent write holds is left as it stands, the
 /// author recorded displaced by the write (R77 decision 6).
@@ -284,7 +286,7 @@ pub(crate) fn apply_ops<'d>(
     let mut rows = Vec::new();
     for op in ops {
         let table_logical = op.table().name().to_owned();
-        let table = cx.tables.stored(&table_logical);
+        let table = cx.config.policy_tables.stored(&table_logical);
         let key = key_of(&op);
         if key.is_empty() {
             return Ok(Err(PeerRefusal::Unkeyed));
@@ -305,7 +307,8 @@ pub(crate) fn apply_ops<'d>(
                 displaced_seq: Some(cx.seq),
             }
         } else {
-            let verdict = crate::replay::apply_peer_op(db, &table_logical, &table, &op)?;
+            let backing = crate::backing_of(&cx.config.shared_tables, &table);
+            let verdict = crate::replay::apply_peer_op(db, &table_logical, backing, &op)?;
             if verdict == crate::replay::PeerVerdict::Refused {
                 return Ok(Err(PeerRefusal::Policy));
             }
@@ -326,6 +329,11 @@ pub(crate) fn apply_ops<'d>(
         crate::provisional::upsert_record(db, &record)?;
         rows.push(record);
     }
+    let keys: Vec<(String, Vec<KeyValue>)> = rows
+        .iter()
+        .map(|row| (row.table.clone(), row.key.clone()))
+        .collect();
+    crate::holdings::hold_provisional(db, cx.config, &keys)?;
     Ok(Ok(rows))
 }
 

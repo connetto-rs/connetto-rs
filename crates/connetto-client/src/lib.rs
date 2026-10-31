@@ -2000,6 +2000,16 @@ fn shared_route(shared: &HashSet<String>) -> impl Fn(&str) -> Option<&'static st
     move |table| is_shared(shared, table).then_some(SHARED_SCHEMA)
 }
 
+/// Where `table`'s rows are stored: the shared store for a table the build
+/// shares, `main` for any other (R77 decision 15).
+#[cfg(feature = "peer")]
+fn backing_of<'t>(shared: &HashSet<String>, table: &'t str) -> replay::Backing<'t> {
+    replay::Backing {
+        schema: shared_route(shared)(table).unwrap_or("main"),
+        table,
+    }
+}
+
 /// Undo the shared part of each changeset in `newest_first`, in that order,
 /// under the rollback's rule of leaving a row a later change touched, so
 /// values the server never received leave the rows other identities read.
@@ -7059,7 +7069,7 @@ where
         let major = i64::from(row.major.get());
         let next_position = i64::try_from(self.peer_next_position).unwrap_or(i64::MAX);
         let cx = peer::OpsContext {
-            tables: &self.config.policy_tables,
+            config: &self.config,
             held: &held,
             author,
             seq,
@@ -7162,14 +7172,25 @@ where
             .collect::<Vec<_>>();
         let mut inverted_rows: Vec<(String, Vec<KeyValue>)> = Vec::new();
         let _exempt = ExemptWrites::raise(&self.write_flags);
+        let config = &self.config;
         self.db.transaction::<_, ClientError, _>(|db| {
+            // Each inverted key's holding goes while its row is still stored,
+            // so the stored key text matches, and a key standing a displaced
+            // author back is held again once the undo has put its row back.
+            let mut still: Vec<(String, Vec<KeyValue>)> = Vec::new();
             for record in &records {
                 let blob = provisional::encode_key(&record.key);
                 let Some(&(index, ref logical_table)) = op_of.get(&(record.table.clone(), blob))
                 else {
                     continue;
                 };
-                if replay::undo_peer_op(db, logical_table, &record.table, &ops[index])?
+                holdings::release_provisional(
+                    db,
+                    config,
+                    &[(record.table.clone(), record.key.clone())],
+                )?;
+                let backing = backing_of(&config.shared_tables, &record.table);
+                if replay::undo_peer_op(db, logical_table, backing, &ops[index])?
                     == replay::PeerVerdict::Refused
                 {
                     return Err(ClientError::Apply(format!(
@@ -7197,6 +7218,7 @@ where
                                     displaced_seq: None,
                                 };
                                 provisional::upsert_record(db, &record)?;
+                                still.push((record.table, record.key));
                             }
                             // The displaced author's entry is gone, so the
                             // key keeps no record and the row stands as the
@@ -7207,6 +7229,7 @@ where
                     _ => provisional::delete_record(db, &record.table, &record.key)?,
                 }
             }
+            holdings::hold_provisional(db, config, &still)?;
             peer::delete_entry(db, &author.key_id, seq)
         })?;
         let inverted_rows: Vec<_> = inverted_rows
@@ -7240,9 +7263,17 @@ where
     ) -> Result<(), ClientError> {
         let frontier = i64::try_from(frontier).unwrap_or(i64::MAX);
         let _exempt = ExemptWrites::raise(&self.write_flags);
+        let config = &self.config;
         self.db.transaction::<_, ClientError, _>(|db| {
             for entry in peer::entries_at_or_below(db, author, frontier)? {
+                let settled: Vec<(String, Vec<KeyValue>)> =
+                    provisional::records_of_entry(db, &entry.author, entry.seq)?
+                        .into_iter()
+                        .filter(|record| record.state == provisional::ProvisionalState::Provisional)
+                        .map(|record| (record.table, record.key))
+                        .collect();
                 provisional::adjudicate_entry(db, &entry.author, entry.seq)?;
+                holdings::release_provisional(db, config, &settled)?;
                 peer::delete_entry(db, &entry.author, entry.seq)?;
             }
             Ok(())
@@ -9097,7 +9128,7 @@ where
             return Ok(());
         }
         let tables = holdings::tables_of(&mut self.db, &self.config, &self.released)?;
-        let keep = self.keep_clauses()?;
+        let keep = self.pending_spare()?;
         let removed = self.delete_unheld(&tables, &keep)?;
         self.released = holdings::Released::default();
         if removed > 0 {
@@ -9217,26 +9248,6 @@ where
             .map(drop)
     }
 
-    /// The peer-applied rows still awaiting a verdict, as per-table primary-key
-    /// match clauses, so the passes spare them beside the pending writes
-    /// (R77). The same shape as [`pending_spare`].
-    #[cfg(feature = "peer")]
-    fn provisional_spare(&mut self) -> Result<HashMap<String, Vec<String>>, ClientError> {
-        provisional::spare(&mut self.db)
-    }
-
-    /// The keep clauses a pass hands [`holdings::delete_unheld`]: this
-    /// identity's unsent writes' keys, and, with a device, the
-    /// still-provisional rows' keys, one clause list per physical table.
-    fn keep_clauses(&mut self) -> Result<HashMap<String, Vec<String>>, ClientError> {
-        let keep = self.pending_spare()?;
-        #[cfg(feature = "peer")]
-        let mut keep = keep;
-        #[cfg(feature = "peer")]
-        merge_clauses(&mut keep, self.provisional_spare()?);
-        Ok(keep)
-    }
-
     /// Return freelist pages to the filesystem: reclaim in
     /// bounded `incremental_vacuum` steps once the freelist is a large enough
     /// fraction of the file (D1), then truncate the write-ahead log so the pages
@@ -9299,7 +9310,7 @@ where
     pub fn tidy(&mut self) -> Result<(), ClientError> {
         if self.is_connected() {
             let tables = holdings::synced_tables(&mut self.db, &self.config)?;
-            let keep = self.keep_clauses()?;
+            let keep = self.pending_spare()?;
             self.delete_unheld(&tables, &keep)?;
             self.released = holdings::Released::default();
         }
@@ -9443,7 +9454,7 @@ where
                     .all(|op| matches!(op, PatchsetOp::Delete { .. }) && op.indirect())
         });
         let keep = if departures {
-            self.keep_clauses()?
+            self.pending_spare()?
         } else {
             HashMap::new()
         };
@@ -9486,11 +9497,18 @@ where
                             &shared_route(shared),
                         )?;
                     }
-                    // A server write confirms the keys it lands on (R77).
+                    // A server write confirms the keys it lands on, and their
+                    // rows stand on the subscriptions holding them (R77).
                     #[cfg(feature = "peer")]
                     {
                         let keys = provisional::written_keys(&bytes)?;
-                        confirmed = Some(provisional::clear_written(conn, &keys)?);
+                        let cleared = provisional::clear_written(conn, &keys)?;
+                        let released: Vec<(String, Vec<KeyValue>)> = cleared
+                            .iter()
+                            .map(|row| (row.table.clone(), row.key.clone()))
+                            .collect();
+                        holdings::release_provisional(conn, config, &released)?;
+                        confirmed = Some(cleared);
                     }
                     if let Some(held) = &held
                         && holdings::is_holder(conn, addressed_to)?

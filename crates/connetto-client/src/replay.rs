@@ -143,18 +143,20 @@ struct ColumnRow {
 }
 
 /// One table's or view's declared columns in `schema`, declaration order,
-/// empty when it is absent.
+/// empty when it is absent there. The schema goes in as the pragma's
+/// argument, since a schema-qualified `pragma_table_info` still searches
+/// every schema for the name.
 fn declared_columns(
     conn: &mut SqliteConnection,
     schema: &str,
     table: &str,
 ) -> Result<Vec<ColumnRow>, ClientError> {
-    Ok(diesel::sql_query(format!(
-        "SELECT name, pk FROM {}.pragma_table_info(?) ORDER BY cid",
-        quote_ident(schema)
-    ))
-    .bind::<Text, _>(table)
-    .load(conn)?)
+    Ok(
+        diesel::sql_query("SELECT name, pk FROM pragma_table_info(?, ?) ORDER BY cid")
+            .bind::<Text, _>(table)
+            .bind::<Text, _>(schema)
+            .load(conn)?,
+    )
 }
 
 /// Read one table's effective shape in `schema`, or `None` when it is absent.
@@ -640,22 +642,43 @@ pub(crate) enum PeerVerdict {
     Refused,
 }
 
-/// The view `table` as a peer write addresses it, its columns in the order
-/// the section names them. The section carries the key, so the shape holds
-/// no key flags and no synthetic rowid slot, which a view never declares.
+/// The view `table` as a peer write addresses it, found where the
+/// application's own unqualified SQL finds it: `temp`, where a shared
+/// table's readers live, then `main`, then `backing_schema`, the schema the
+/// rows are stored in. Its columns come in the order the section names
+/// them. The section carries the key, so the shape holds no key flags and no
+/// synthetic rowid slot, which a view never declares.
 #[cfg(feature = "peer")]
-fn view_target(conn: &mut SqliteConnection, table: &str) -> Result<Target, ClientError> {
-    let rows = declared_columns(conn, "main", table)?;
-    if rows.is_empty() {
-        return Err(ClientError::Apply(format!("no such table: main.{table}")));
+fn view_target(
+    conn: &mut SqliteConnection,
+    backing_schema: &'static str,
+    table: &str,
+) -> Result<Target, ClientError> {
+    for schema in ["temp", "main", backing_schema] {
+        let rows = declared_columns(conn, schema, table)?;
+        if !rows.is_empty() {
+            return Ok(Target {
+                schema,
+                shape: TableShape {
+                    pk: vec![0; rows.len()],
+                    columns: rows.into_iter().map(|row| row.name).collect(),
+                },
+            });
+        }
     }
-    Ok(Target {
-        schema: "main",
-        shape: TableShape {
-            pk: vec![0; rows.len()],
-            columns: rows.into_iter().map(|row| row.name).collect(),
-        },
-    })
+    Err(ClientError::Apply(format!(
+        "no such table: {backing_schema}.{table}"
+    )))
+}
+
+/// The table a peer write's rows are stored in, the view's backing table.
+#[cfg(feature = "peer")]
+#[derive(Clone, Copy)]
+pub(crate) struct Backing<'a> {
+    /// The schema the rows live in: the shared store or `main`.
+    pub(crate) schema: &'static str,
+    /// The lowercased physical table.
+    pub(crate) table: &'a str,
 }
 
 /// Run one peer statement, `false` when a constraint or a policy guard
@@ -721,15 +744,15 @@ impl<'a> ViewWrite<'a> {
 /// whoever the caller bound.
 ///
 /// SQLite counts no change through an `INSTEAD OF` trigger, and a guard may
-/// skip a write silently, so the verdict reads the backing table `backing`
-/// afterwards: the write landed when the row stands as it left it. An insert
-/// replaces the row its key names, the view judging that delete too.
+/// skip a write silently, so the verdict reads the backing table afterwards:
+/// the write landed when the row stands as it left it. An insert replaces
+/// the row its key names, the view judging that delete too.
 #[cfg(feature = "peer")]
 fn write_through_view(
     conn: &mut SqliteConnection,
     target: &Target,
     table: &str,
-    backing: &str,
+    backing: Backing<'_>,
     section_pk: &[u8],
     write: &ViewWrite<'_>,
 ) -> Result<PeerVerdict, ClientError> {
@@ -775,7 +798,7 @@ fn write_through_view(
         }
     };
     Ok(
-        if backing_row_matches(conn, &target.shape, backing, &after)? == present {
+        if backing_row_matches(conn, target, backing, &after)? == present {
             PeerVerdict::Landed
         } else {
             PeerVerdict::Refused
@@ -783,21 +806,21 @@ fn write_through_view(
     )
 }
 
-/// Apply one op of a peer entry through the view `table` names, the view's
-/// guards judging it as whoever the caller's author binding bound (R77). A
-/// delete of a row the receiver does not hold as the op found it is refused,
-/// since nothing the receiver holds stands behind it.
+/// Apply one op of a peer entry through the view `table`, the view's guards
+/// judging it as whoever the caller's author binding bound (R77). A delete
+/// of a row the receiver does not hold as the op found it is refused, since
+/// nothing the receiver holds stands behind it.
 #[cfg(feature = "peer")]
 pub(crate) fn apply_peer_op(
     conn: &mut SqliteConnection,
     table: &str,
-    backing: &str,
+    backing: Backing<'_>,
     op: &PeerOp,
 ) -> Result<PeerVerdict, ClientError> {
-    let target = view_target(conn, table)?;
+    let target = view_target(conn, backing.schema, table)?;
     if let ChangesetOp::Delete { old_values, .. } = *op {
         let held: Vec<(usize, Cell)> = old_values.iter().cloned().enumerate().collect();
-        if !backing_row_matches(conn, &target.shape, backing, &held)? {
+        if !backing_row_matches(conn, &target, backing, &held)? {
             return Ok(PeerVerdict::Refused);
         }
     }
@@ -810,20 +833,21 @@ pub(crate) fn apply_peer_op(
 pub(crate) fn undo_peer_op(
     conn: &mut SqliteConnection,
     table: &str,
-    backing: &str,
+    backing: Backing<'_>,
     op: &PeerOp,
 ) -> Result<PeerVerdict, ClientError> {
-    let target = view_target(conn, table)?;
+    let target = view_target(conn, backing.schema, table)?;
     let write = ViewWrite::undoing(op);
     write_through_view(conn, &target, table, backing, op.table().pk_flags(), &write)
 }
 
-/// Whether the backing table holds a row matching every `(column, value)`.
+/// Whether the backing table holds a row matching every `(column, value)`,
+/// the columns counted as the view `target` lists them.
 #[cfg(feature = "peer")]
 fn backing_row_matches(
     conn: &mut SqliteConnection,
-    shape: &TableShape,
-    backing: &str,
+    target: &Target,
+    backing: Backing<'_>,
     columns: &[(usize, Cell)],
 ) -> Result<bool, ClientError> {
     #[derive(diesel::QueryableByName)]
@@ -834,12 +858,12 @@ fn backing_row_matches(
     let mut terms = Vec::new();
     let mut binds = Vec::new();
     for (i, value) in columns {
-        predicate_term(&mut terms, &mut binds, &shape.columns[*i], value);
+        predicate_term(&mut terms, &mut binds, &target.shape.columns[*i], value);
     }
     // The backing table is named by the policy map, so the DSL cannot reach it.
     let sql = format!(
         "SELECT COUNT(*) AS n FROM {} WHERE {}",
-        table_ref("main", backing),
+        table_ref(backing.schema, backing.table),
         terms.join(" AND ")
     );
     let mut query = diesel::sql_query(sql).into_boxed::<diesel::sqlite::Sqlite>();

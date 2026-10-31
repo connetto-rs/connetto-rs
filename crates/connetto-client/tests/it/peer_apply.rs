@@ -16,8 +16,8 @@ use connetto_client::{
 use connetto_core::auth::CapabilitySubject;
 use connetto_core::exchange::{ManifestRow, RetractCause, Retraction};
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, SnapshotBegin, SnapshotEnd,
-    SnapshotPatch, SubscriptionPriority,
+    BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, LivePatch, SnapshotBegin,
+    SnapshotEnd, SnapshotPatch, SubscriptionPriority,
 };
 use connetto_core::traits::IncomingFrame;
 use connetto_core::{Cursor, Major};
@@ -29,15 +29,16 @@ use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, PatchSet, SimpleTable, Value};
 use super::support::{self, Script};
 
 /// The author replica's schema: the same tables, no policies, so its own
-/// writes capture whatever it chooses, and a `notes` table the receiver's
-/// build does not declare.
+/// writes capture whatever it chooses, a `notes` table the receiver's build
+/// does not declare, and the `vocabulary` a shared receiver keeps in its store.
 const PLAIN_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
                           status TEXT NOT NULL); \
                           CREATE TABLE boards (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
                           CREATE TABLE shares (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
                           CREATE TABLE pairs (a INTEGER NOT NULL, b INTEGER NOT NULL, \
                           label TEXT NOT NULL, PRIMARY KEY (b, a)); \
-                          CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL);";
+                          CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL); \
+                          CREATE TABLE vocabulary (id INTEGER PRIMARY KEY, label TEXT NOT NULL);";
 
 /// The receiver replica's source: the same tables behind translated
 /// policies, so a peer apply is judged as the author.
@@ -1357,6 +1358,80 @@ async fn a_verdict_whose_entry_cannot_go_changes_nothing() {
     );
 }
 
+/// A provisional holding the store refuses to write or delete fails the
+/// apply, the retraction, the adjudication and a server write's
+/// confirmation alike, each leaving the rows, the records and the entries
+/// as they were.
+#[tokio::test]
+async fn a_holding_the_store_refuses_fails_every_peer_step() {
+    let [order, board] = captured([
+        &|conn| insert_order(conn, 1, "peer-anna", "open"),
+        &|conn| write_board(conn, 1, "anna's", true),
+    ])
+    .await;
+    let (mut recv, server) = receiver().await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    recv.apply_peer_entry(&a, &manifest(7, &order), &order)
+        .expect("apply the insert");
+    recv.conn()
+        .batch_execute(
+            "CREATE TEMP TRIGGER keep_holdings_in BEFORE INSERT ON main._connetto_holding \
+             BEGIN SELECT RAISE(ABORT, 'the holdings are pinned'); END; \
+             CREATE TEMP TRIGGER keep_holdings_out BEFORE DELETE ON main._connetto_holding \
+             BEGIN SELECT RAISE(ABORT, 'the holdings are pinned'); END;",
+        )
+        .expect("pin the holdings");
+    let applied = recv
+        .apply_peer_entry(&a, &manifest(8, &board), &board)
+        .map(|_| ());
+    let retracted = recv.retract_peer_entry(
+        &a,
+        &Retraction {
+            seq: 7,
+            cause: RetractCause::Abandoned,
+        },
+    );
+    let adjudicated = recv.adjudicate_peer_frontier(&a.key_id, 7);
+    server.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+        "ended".to_owned(),
+        cursor_byte(1),
+        orders_payload(&[(1, "peer-anna", "open")]),
+    ))));
+    // The first apply's notice is queued ahead of the patch.
+    let confirmed = loop {
+        match recv.pump_one().await {
+            Ok(ClientEvent::LivePatch { .. }) => break Ok(()),
+            Ok(ClientEvent::Closed) => panic!("closed before the patch"),
+            Ok(_) => {}
+            Err(err) => break Err(err),
+        }
+    };
+    for (step, result) in [
+        ("apply", applied),
+        ("retraction", retracted),
+        ("adjudication", adjudicated),
+        ("confirmation", confirmed),
+    ] {
+        let err = result.expect_err("the holding cannot change");
+        assert!(
+            err.to_string().contains("the holdings are pinned"),
+            "the {step} fails on the store: {err}"
+        );
+    }
+    assert_eq!(board_rows(&mut recv), Vec::new());
+    assert_eq!(
+        order_rows(&mut recv),
+        vec![(1, "peer-anna".to_owned(), "open".to_owned())]
+    );
+    let rows = recv.provisional_rows().expect("read the records");
+    let record = provenance_of(&rows, "orders", &[KeyValue::Int(1)]).expect("the record");
+    assert_eq!(record.state, ProvisionalState::Provisional);
+    assert_eq!(
+        stored_entries(&mut recv),
+        vec![("author-a".as_bytes().to_vec(), 7)]
+    );
+}
+
 /// A provisional record the store refuses to write fails the apply, the
 /// retraction and the adjudication alike, and each leaves the rows, the
 /// records and the entries as they were.
@@ -1565,6 +1640,12 @@ async fn a_key_declared_out_of_column_order_is_held_in_key_order() {
         .expect("read the provenance")
         .expect("the held row holds a record under its key order");
     assert_eq!(held.displaced_author, Some("author-a".as_bytes().to_vec()));
+    recv.tidy().expect("tidy");
+    assert_eq!(
+        pair_rows(&mut recv),
+        vec![(1, 2, "mine".to_owned()), (3, 4, "theirs".to_owned())],
+        "the provisional row's holding names its key in key order, so the pass keeps it"
+    );
 }
 
 /// An entry with an op that names its row by no key is refused whole, the
@@ -1764,5 +1845,309 @@ async fn a_stored_entry_under_no_expressible_major_fails_the_reapply() {
     assert!(
         err.to_string().contains("major"),
         "the failure names the major: {err}"
+    );
+}
+
+/// Serve a live patch of `rows` over `orders`, addressed to `sub_id`, and
+/// pump until it lands.
+async fn live_orders(
+    recv: &mut ConnettoConnection<Script>,
+    server: &Script,
+    sub_id: &str,
+    rows: &[(i64, &str, &str)],
+    cursor: u8,
+) {
+    server.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+        sub_id.to_owned(),
+        cursor_byte(cursor),
+        orders_payload(rows),
+    ))));
+    pump_to(recv, |event| matches!(event, ClientEvent::LivePatch { .. })).await;
+}
+
+/// A provisional row no subscription holds stays through every pass until
+/// its verdict, and the pass after the verdict takes it, nothing else
+/// holding it (R77 decision 14).
+#[tokio::test]
+async fn a_provisional_row_stays_until_its_verdict() {
+    let [body] = captured([&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
+    let (mut recv, _) = receiver().await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    recv.apply_peer_entry(&a, &manifest(7, &body), &body)
+        .expect("apply the insert");
+    recv.tidy().expect("tidy");
+    assert_eq!(
+        order_rows(&mut recv),
+        vec![(1, "peer-anna".to_owned(), "open".to_owned())],
+        "no subscription holds the row, its provisional record does"
+    );
+    recv.adjudicate_peer_frontier(&a.key_id, 7)
+        .expect("adjudicate");
+    recv.tidy().expect("tidy");
+    assert_eq!(
+        order_rows(&mut recv),
+        Vec::new(),
+        "the verdict releases the row to ordinary coverage, and nothing covers it"
+    );
+}
+
+/// A server write confirms a provisional row and releases its holding, so a
+/// write no live subscription takes leaves the row to the next pass.
+#[tokio::test]
+async fn a_confirmed_row_stays_only_while_a_subscription_holds_it() {
+    let [body] = captured([&|conn| insert_order(conn, 1, "peer-anna", "open")]).await;
+    let (mut recv, server) = receiver().await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    recv.apply_peer_entry(&a, &manifest(7, &body), &body)
+        .expect("apply the insert");
+    live_orders(&mut recv, &server, "ended", &[(1, "peer-anna", "open")], 1).await;
+    assert_eq!(
+        recv.provisional_rows().expect("read the records"),
+        Vec::new()
+    );
+    recv.tidy().expect("tidy");
+    assert_eq!(
+        order_rows(&mut recv),
+        Vec::new(),
+        "the confirmation released the row, and the ended subscription took nothing"
+    );
+}
+
+/// A cursor beyond history resyncs every subscription, and the rows its
+/// replacement does not deliver back go, but a provisional row awaits its
+/// verdict, as an unsent write does, and stays with its record (R11 Part B,
+/// O10, R77 decision 13).
+#[tokio::test]
+async fn a_beyond_history_resync_keeps_a_provisional_row() {
+    let [body] = captured([&|conn| insert_order(conn, 2, "peer-anna", "open")]).await;
+    let (mut recv, server) = receiver().await;
+    recv.subscribe("a", "SELECT * FROM orders")
+        .await
+        .expect("subscribe");
+    deliver_snapshot(&mut recv, &server, &[(1, "r77", "x")], 1).await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    recv.apply_peer_entry(&a, &manifest(7, &body), &body)
+        .expect("apply the insert");
+    live_orders(&mut recv, &server, "ended", &[(3, "r77", "z")], 2).await;
+    server.say(IncomingFrame::Control(ControlMessage::FullResyncRequired(
+        FullResyncRequired {
+            sub_id: "a".to_owned(),
+            reason: FullResyncReason::CursorBeyondHistory,
+        },
+    )));
+    pump_to(&mut recv, |event| {
+        matches!(event, ClientEvent::FullResync { .. })
+    })
+    .await;
+    deliver_snapshot(&mut recv, &server, &[(1, "r77", "x")], 3).await;
+    assert_eq!(
+        order_rows(&mut recv),
+        vec![
+            (1, "r77".to_owned(), "x".to_owned()),
+            (2, "peer-anna".to_owned(), "open".to_owned()),
+        ],
+        "the unheld row 3 goes and the provisional row 2 stays"
+    );
+    assert_eq!(recv.provisional_rows().expect("read the records").len(), 1);
+}
+
+/// A provisional row outlives the subscription that delivered it, since its
+/// holding is no subscription's.
+#[tokio::test]
+async fn a_provisional_row_outlives_its_subscription() {
+    let [_, update] = captured([
+        &|conn| insert_order(conn, 9, "peer-anna", "kept"),
+        &|conn| update_order(conn, 9, "peer-anna", "moved"),
+    ])
+    .await;
+    let (mut recv, server) = receiver().await;
+    recv.subscribe("a", "SELECT * FROM orders")
+        .await
+        .expect("subscribe");
+    deliver_snapshot(
+        &mut recv,
+        &server,
+        &[(9, "peer-anna", "kept"), (8, "r77", "x")],
+        1,
+    )
+    .await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    recv.apply_peer_entry(&a, &manifest(7, &update), &update)
+        .expect("apply the update");
+    recv.unsubscribe("a").await.expect("unsubscribe");
+    assert_eq!(
+        order_rows(&mut recv),
+        vec![(9, "peer-anna".to_owned(), "moved".to_owned())],
+        "the ended subscription's row 8 goes, the provisional row 9 stays"
+    );
+}
+
+/// A retraction that leaves a row with no record releases its holding, and
+/// one that stands a displaced author's record back keeps it.
+#[tokio::test]
+async fn a_retraction_releases_only_a_key_left_without_a_record() {
+    let [first, second] = captured([&|conn| write_board(conn, 1, "anna's", true), &|conn| {
+        write_board(conn, 1, "bob's", false);
+    }])
+    .await;
+    let (mut recv, _) = receiver().await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    let b = author("author-b", "peer-bob", Some("*"));
+    recv.apply_peer_entry(&a, &manifest(7, &first), &first)
+        .expect("apply the first entry");
+    recv.apply_peer_entry(&b, &manifest(8, &second), &second)
+        .expect("apply the second entry");
+    let retract = |seq| Retraction {
+        seq,
+        cause: RetractCause::Abandoned,
+    };
+    recv.retract_peer_entry(&b, &retract(8))
+        .expect("retract the second entry");
+    recv.tidy().expect("tidy");
+    assert_eq!(
+        board_rows(&mut recv),
+        vec![(1, "anna's".to_owned())],
+        "the first author's record stands back and keeps the row"
+    );
+    recv.adjudicate_peer_frontier(&a.key_id, 6)
+        .expect("a frontier below the entry settles nothing");
+    let [again] = captured([&|conn| write_board(conn, 1, "bob's", true)]).await;
+    recv.apply_peer_entry(&b, &manifest(9, &again), &again)
+        .expect("apply a third entry over the first");
+    recv.adjudicate_peer_frontier(&a.key_id, 7)
+        .expect("the first author's entry goes");
+    recv.retract_peer_entry(&b, &retract(9))
+        .expect("retract the third entry");
+    recv.tidy().expect("tidy");
+    assert_eq!(
+        board_rows(&mut recv),
+        Vec::new(),
+        "with the displaced entry gone the key keeps no record and no holding"
+    );
+}
+
+/// A shared receiver: `vocabulary` lives in the store, open to every
+/// person, and `orders` in `main` under its owner policy.
+async fn shared_receiver() -> (ConnettoConnection<Script>, Script) {
+    let script = Script::default();
+    script.say(support::handshake_ack());
+    let schema = SyncSchema::new(
+        connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(
+            "-- connetto:major 1\n \
+             CREATE TABLE orders (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
+             status TEXT NOT NULL); \
+             CREATE TABLE vocabulary (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
+             ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
+             ALTER TABLE vocabulary ENABLE ROW LEVEL SECURITY;",
+            "CREATE POLICY orders_read ON orders FOR SELECT USING (true); \
+             CREATE POLICY orders_insert ON orders FOR INSERT \
+             WITH CHECK (owner = current_setting('app.user_id', true)); \
+             CREATE POLICY vocabulary_open ON vocabulary FOR ALL USING (true) WITH CHECK (true);",
+            &["vocabulary"],
+        )
+        .expect("translate the shared vocabulary"),
+    );
+    let conn = ClientBuilder::new(schema, support::Once::new(script.clone()))
+        .signed_in(support::held("r77"))
+        .connect_driven()
+        .await
+        .expect("connect");
+    (conn, script)
+}
+
+/// The replica's vocabulary, id order.
+fn vocabulary_rows<T>(conn: &mut ConnettoConnection<T>) -> Vec<(i64, String)>
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    #[derive(diesel::QueryableByName)]
+    struct Word {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        id: i64,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        label: String,
+    }
+    diesel::sql_query("SELECT id, label FROM vocabulary ORDER BY id")
+        .load::<Word>(conn.conn())
+        .expect("read the vocabulary")
+        .into_iter()
+        .map(|word| (word.id, word.label))
+        .collect()
+}
+
+/// An entry touching a shared table and a private one lands whole, the
+/// shared row in the store, both held until their verdict, and none of it
+/// enters the receiver's own queue (R77 decision 15).
+#[tokio::test]
+async fn a_peer_entry_reaches_a_shared_table_through_the_store() {
+    let [body] = captured([&|conn| {
+        insert_order(conn, 1, "peer-anna", "open");
+        conn.conn()
+            .batch_execute("INSERT INTO vocabulary (id, label) VALUES (5, 'peer-word')")
+            .expect("insert the word");
+    }])
+    .await;
+    let (mut recv, _) = shared_receiver().await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    let out = recv
+        .apply_peer_entry(&a, &manifest(7, &body), &body)
+        .expect("apply the entry");
+    assert!(matches!(out, PeerApplyOutcome::Applied { .. }), "{out:?}");
+    assert_eq!(
+        vocabulary_rows(&mut recv),
+        vec![(5, "peer-word".to_owned())]
+    );
+    assert_eq!(
+        order_rows(&mut recv),
+        vec![(1, "peer-anna".to_owned(), "open".to_owned())]
+    );
+    let records = recv.provisional_rows().expect("read the records");
+    assert!(provenance_of(&records, "vocabulary", &[KeyValue::Int(5)]).is_some());
+    assert!(provenance_of(&records, "orders", &[KeyValue::Int(1)]).is_some());
+    assert_eq!(pending_count(&mut recv), 0);
+    assert_eq!(
+        recv.push().await.expect("push what the outbox holds"),
+        None,
+        "the outbox recorded none of the author's rows"
+    );
+    recv.tidy().expect("tidy");
+    assert_eq!(
+        vocabulary_rows(&mut recv),
+        vec![(5, "peer-word".to_owned())]
+    );
+
+    recv.adjudicate_peer_frontier(&a.key_id, 7)
+        .expect("adjudicate");
+    recv.tidy().expect("tidy");
+    assert_eq!(vocabulary_rows(&mut recv), Vec::new());
+    assert_eq!(order_rows(&mut recv), Vec::new());
+}
+
+/// A retraction undoes a shared row in the store.
+#[tokio::test]
+async fn a_retraction_undoes_a_shared_row_in_the_store() {
+    let [body] = captured([&|conn| {
+        conn.conn()
+            .batch_execute("INSERT INTO vocabulary (id, label) VALUES (5, 'peer-word')")
+            .expect("insert the word");
+    }])
+    .await;
+    let (mut recv, _) = shared_receiver().await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    recv.apply_peer_entry(&a, &manifest(7, &body), &body)
+        .expect("apply the entry");
+    recv.retract_peer_entry(
+        &a,
+        &Retraction {
+            seq: 7,
+            cause: RetractCause::Conflict,
+        },
+    )
+    .expect("retract the entry");
+    assert_eq!(vocabulary_rows(&mut recv), Vec::new());
+    assert_eq!(
+        recv.provisional_rows().expect("read the records"),
+        Vec::new()
     );
 }
