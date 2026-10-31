@@ -76,6 +76,8 @@ mod lifecycle;
 mod logging;
 mod loopback_session;
 
+mod owner_policy;
+
 mod macro_hygiene;
 
 mod numeric;
