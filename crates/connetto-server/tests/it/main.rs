@@ -74,6 +74,9 @@ mod idle_limit;
 mod inprocess_loop;
 mod lifecycle;
 mod logging;
+mod loopback_session;
+
+mod one_event;
 
 mod macro_hygiene;
 
@@ -84,6 +87,7 @@ mod oidc_spine;
 mod openfga_live;
 
 mod oplog_previous_image;
+mod oplog_retry;
 
 mod pg_async;
 

@@ -84,6 +84,10 @@ type ScalarUpd = ScalarUpdate<DefaultIds, Postgres, subql::PgCommitPosition>;
 type RowsUpd = RowsUpdate<DefaultIds, Postgres, subql::PgCommitPosition>;
 /// Row-level keyed delta pinned to connetto's backend and default id set.
 type RowDlt = RowDelta<DefaultIds, Postgres, subql::PgCommitPosition>;
+/// Read deliveries pinned to connetto's backend and default id set.
+type ResolvedReads = subql::reexec::ResolvedReads<DefaultIds, Postgres, subql::PgCommitPosition>;
+/// The wire patchset one event folds into.
+type WirePatchSet = PatchSet<WireTable, String, Vec<u8>>;
 
 /// Zstd level for bulk payloads. Level 3 is the library default: a sound size
 /// versus speed tradeoff for patchset-sized blobs.
@@ -407,7 +411,7 @@ pub enum SeedPlan {
     Snapshot,
 }
 
-/// The result of dispatching one CDC event.
+/// The result of dispatching one CDC event, owed in full to its consumers even when `failure` is set.
 pub struct Dispatched {
     /// Row patches to fan out to matched consumers.
     pub patches: Vec<MatchedPatch>,
@@ -422,6 +426,32 @@ pub struct Dispatched {
     /// What the oplog keeps for this event, its compressed patch included, or
     /// `None` when the event's table is absent from the catalog.
     pub record: Option<ChangeRecord>,
+    /// The failure that stopped the queued reads, which stay queued for [`Materializer::resolve_reads`].
+    pub failure: Option<MaterializerError>,
+}
+
+/// A matched consumer and whether the row left its window rather than changing in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PatchTarget {
+    consumer_id: u64,
+    departure: bool,
+}
+
+/// An event's wire encodings, built before the engine applies it so a failure applies nothing.
+struct Encoded {
+    /// The compressed patchset every matched consumer shares and the oplog keeps.
+    payload: Vec<u8>,
+    /// The compressed departure notice, for an update only, since only an update moves a row out of a window.
+    departure: Option<Vec<u8>>,
+}
+
+/// What one drain of the queued reads delivered, and the failure that
+/// stopped it.
+pub struct Drained {
+    /// Every answer the drain installed before it stopped.
+    pub computed: Vec<ComputedChange>,
+    /// The failure that stopped the drain. Retryable reads stay queued.
+    pub failure: Option<MaterializerError>,
 }
 
 /// One server-computed result movement, ready to frame on the wire.
@@ -1217,49 +1247,48 @@ where
     ///
     /// The event folds once into a compressed patchset, shared across the
     /// matched consumers and kept in the record, so a catchup sends the same
-    /// bytes later instead of folding it again. It is built whenever the event
-    /// is logged, matched or not, since the consumer that needs it may be away.
-    /// Everything the engine's tiers produced (fold deltas, replaced extremes,
-    /// re-read row answers, keyed row changes) arrives already resolved: the
-    /// engine drove its connector for every read this event required, each
-    /// bounded by its registration's budget.
+    /// bytes later instead of folding it again. It is built for every event,
+    /// matched or not, since the consumer that needs it may be away. The engine
+    /// applies the event exactly once per call, and what fails after that rides
+    /// in the result, so recovering it never applies the event again.
     ///
     /// # Errors
     ///
-    /// [`MaterializerError::Dispatch`] on a dispatch failure,
-    /// [`MaterializerError::Read`] when a triggered read failed,
-    /// [`MaterializerError::Emit`] when the event cannot be folded, and
-    /// [`MaterializerError::Compression`] on a compression failure.
+    /// [`MaterializerError::Dispatch`] when the engine cannot apply the event,
+    /// and [`MaterializerError::Emit`] or [`MaterializerError::Compression`]
+    /// when the event cannot be encoded, each before anything is applied.
     pub async fn dispatch(
         &mut self,
         event: &PgChangeEvent,
     ) -> Result<Dispatched, MaterializerError> {
+        // Encoded before the engine applies the event, so an encoding failure leaves nothing applied.
+        let encoded = self.encode(event)?;
+        let identity = self.event_identity(event);
         // The drain is the only way to the in-process half, which is what
         // keeps one delivery path for every computed movement (R82). Whole-row
         // captures, scalar extremes and keyed rows arrive as the read half,
-        // everything the fold answered without a round trip as the other, and
-        // both are read off one value. An event that queued no read drains in
-        // place, so the ordinary event still pays nothing for the call.
+        // everything the fold answered without a round trip as the other.
+        // Every read that answered reaches the sink even when a sibling fails.
+        let mut reads = ResolvedReads::default();
         let settled = self
             .engine
             .consumers(event)
             .await
             .map_err(MaterializerError::Dispatch)?
-            .resolve_collect()
+            .resolve(|delivery| reads.push(delivery))
             .await;
         let notifications = settled.dispatched;
-        let resolved = settled.reads.map_err(reexec_error)?;
-        Self::log_transitions(&resolved.transitions);
-        let cursor = event.position().to_opaque().0;
+        let failure = settled.reads.err().map(reexec_error);
+        Self::log_transitions(&reads.transitions);
         Self::log_transitions(&notifications.transitions);
 
         let computed = Self::computed_changes(
             notifications.aggregate_updates,
-            resolved.aggregate_updates,
+            reads.aggregate_updates,
             notifications.scalar_updates,
-            resolved.scalar_updates,
-            resolved.rows_updates,
-            resolved.row_deltas,
+            reads.scalar_updates,
+            reads.rows_updates,
+            reads.row_deltas,
             &self.scalar_rereads,
         );
 
@@ -1279,50 +1308,16 @@ where
         consumers.extend_from_slice(engine.deleted());
         consumers.sort_unstable();
         consumers.dedup();
-        let identity = self.event_identity(event);
-        let (patches, record) = if consumers.is_empty() && identity.is_none() {
-            (Vec::new(), None)
-        } else {
-            let built =
-                pgoutput_patchset_builder(&self.catalog, std::slice::from_ref(event.change()))
-                    .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
-            // One extra encode on an event that has departures, not one per
-            // departing consumer: the notice carries a table and a primary key
-            // and nothing consumer-specific, so every consumer that lost this
-            // row receives the same bytes.
-            let departure = if departing.is_empty() {
-                None
-            } else {
-                Self::departure_patchset(&built)
-                    .map(|bytes| compress(&bytes))
-                    .transpose()?
-            };
-            let payload = compress(&built.build())?;
-            // Fallible only in theory: usize to u64 cannot lose on any
-            // supported pointer width, and a counter saturates rather than
-            // panics regardless.
-            let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-            let patches = consumers
-                .into_iter()
-                .map(|consumer_id| {
-                    let leaving = departing.contains(&consumer_id);
-                    let bytes = match (leaving, departure.as_ref()) {
-                        (true, Some(notice)) => notice.clone(),
-                        _ => payload.clone(),
-                    };
-                    crate::counters::add(&crate::counters::FANOUT_PAYLOAD_BYTES, payload_len);
-                    MatchedPatch {
-                        consumer_id,
-                        payload_zstd: bytes,
-                        cursor: cursor.clone(),
-                        departure: leaving && departure.is_some(),
-                    }
-                })
-                .collect();
-            let record =
-                identity.map(|(table, pk)| ChangeRecord::new(table, pk, event.clone(), payload));
-            (patches, record)
-        };
+        let matched: Vec<PatchTarget> = consumers
+            .into_iter()
+            .map(|consumer_id| PatchTarget {
+                consumer_id,
+                departure: departing.contains(&consumer_id),
+            })
+            .collect();
+        let patches = Self::patches_for(event, &matched, &encoded);
+        let record = identity
+            .map(|(table, pk)| ChangeRecord::new(table, pk, event.clone(), encoded.payload));
 
         let narrowings = term_moves(&self.catalog, notifications.engine.narrowings());
 
@@ -1331,7 +1326,85 @@ where
             computed,
             narrowings,
             record,
+            failure,
         })
+    }
+
+    /// Drain the reads an earlier dispatch left queued, without applying any event.
+    pub async fn resolve_reads(&mut self) -> Drained {
+        let mut reads = ResolvedReads::default();
+        let failure = self
+            .engine
+            .resolve(|delivery| reads.push(delivery))
+            .await
+            .err()
+            .map(reexec_error);
+        Self::log_transitions(&reads.transitions);
+        Drained {
+            computed: Self::computed_changes(
+                Vec::new(),
+                reads.aggregate_updates,
+                Vec::new(),
+                reads.scalar_updates,
+                reads.rows_updates,
+                reads.row_deltas,
+                &self.scalar_rereads,
+            ),
+            failure,
+        }
+    }
+
+    /// One event's patchset and its compressed bytes.
+    fn fold(&self, event: &PgChangeEvent) -> Result<(WirePatchSet, Vec<u8>), MaterializerError> {
+        let folded = pgoutput_patchset_builder(&self.catalog, std::slice::from_ref(event.change()))
+            .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
+        let payload = compress(&folded.build())?;
+        Ok((folded, payload))
+    }
+
+    /// Every encoding the event's matched consumers can need.
+    ///
+    /// The departure notice carries a table and a primary key and nothing
+    /// consumer-specific, so one notice serves every consumer that lost the row.
+    fn encode(&self, event: &PgChangeEvent) -> Result<Encoded, MaterializerError> {
+        let (folded, payload) = self.fold(event)?;
+        let departure = if matches!(event.kind(), EventKind::Update) {
+            Self::departure_patchset(&folded)
+                .map(|bytes| compress(&bytes))
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(Encoded { payload, departure })
+    }
+
+    /// The patch each matched consumer receives, sharing one payload.
+    fn patches_for(
+        event: &PgChangeEvent,
+        matched: &[PatchTarget],
+        encoded: &Encoded,
+    ) -> Vec<MatchedPatch> {
+        let cursor = event.position().to_opaque().0;
+        // Fallible only in theory: usize to u64 cannot lose on any
+        // supported pointer width, and a counter saturates rather than
+        // panics regardless.
+        let payload_len = u64::try_from(encoded.payload.len()).unwrap_or(u64::MAX);
+        matched
+            .iter()
+            .map(|target| {
+                let bytes = match (target.departure, encoded.departure.as_ref()) {
+                    (true, Some(notice)) => notice.clone(),
+                    _ => encoded.payload.clone(),
+                };
+                crate::counters::add(&crate::counters::FANOUT_PAYLOAD_BYTES, payload_len);
+                MatchedPatch {
+                    consumer_id: target.consumer_id,
+                    payload_zstd: bytes,
+                    cursor: cursor.clone(),
+                    departure: target.departure && encoded.departure.is_some(),
+                }
+            })
+            .collect()
     }
 
     /// Build the computed-result changes from a dispatch's immediate results
@@ -1381,7 +1454,9 @@ where
     /// within one engine call, and a higher generation replaces a lower, so
     /// only the newest generation per subscription survives and its pages
     /// concatenate into one wire frame: the wire's full-result replacement is
-    /// atomic where a paged delivery would show a half-replaced answer.
+    /// atomic where a paged delivery would show a half-replaced answer. A
+    /// generation whose read failed before its final page is dropped, and its
+    /// retry delivers a higher one.
     fn rows_changes(
         updates: Vec<RowsUpd>,
         scalar_rereads: &HashSet<SubscriptionId>,
@@ -1390,6 +1465,7 @@ where
         struct PendingRows {
             consumer_id: u64,
             generation: u64,
+            complete: bool,
             columns: Vec<String>,
             rows: Vec<Vec<PgValue<Postgres>>>,
         }
@@ -1400,6 +1476,7 @@ where
                 .or_insert_with(|| PendingRows {
                     consumer_id: update.consumer_id,
                     generation: update.generation,
+                    complete: false,
                     columns: Vec::new(),
                     rows: Vec::new(),
                 });
@@ -1407,6 +1484,7 @@ where
                 *entry = PendingRows {
                     consumer_id: update.consumer_id,
                     generation: update.generation,
+                    complete: false,
                     columns: Vec::new(),
                     rows: Vec::new(),
                 };
@@ -1415,9 +1493,11 @@ where
                 entry.columns = update.columns;
             }
             entry.rows.extend(update.rows);
+            entry.complete = !update.more;
         }
         latest
             .into_iter()
+            .filter(|(_, pending)| pending.complete)
             .map(|(subscription_id, pending)| ComputedChange {
                 subscription_id,
                 consumer_id: pending.consumer_id,
@@ -3180,5 +3260,70 @@ mod membership_term_tests {
             .map(|patch| patch.consumer_id)
             .collect();
         assert_eq!(consumers, [2], "the row admits user-1 alone");
+    }
+}
+
+#[cfg(test)]
+mod rows_update_merge_tests {
+    //! How a re-read's pages merge into one full answer, and what a higher
+    //! generation does to a lower one still pending.
+
+    use std::collections::HashSet;
+
+    use super::{Materializer, ParserDB, PgValue, Postgres, RowsUpd, SubscriptionId};
+
+    /// One page of one subscription's re-read.
+    fn page(
+        subscription: SubscriptionId,
+        generation: u64,
+        column: &str,
+        rows: Vec<PgValue<Postgres>>,
+        more: bool,
+    ) -> RowsUpd {
+        RowsUpd {
+            subscription_id: subscription,
+            consumer_id: 1,
+            generation,
+            columns: vec![column.to_owned()],
+            rows: rows.into_iter().map(|value| vec![value]).collect(),
+            more,
+            checkpoint: None,
+        }
+    }
+
+    /// A higher generation starts a new answer, so the lower generation's
+    /// pages never mix into the frame that goes out.
+    #[test]
+    fn a_newer_generation_replaces_the_pending_older_one() {
+        let older = page(7, 5, "old", vec![PgValue::Int(1)], true);
+        let newer = page(7, 9, "new", vec![PgValue::Int(2), PgValue::Int(3)], false);
+        let changes = Materializer::<ParserDB>::rows_changes(vec![older, newer], &HashSet::new());
+        assert_eq!(
+            changes.len(),
+            1,
+            "one full answer per subscription, the newest generation's"
+        );
+        assert!(
+            changes[0].is_full_result,
+            "a re-read replacement is atomic, not a page"
+        );
+        assert_eq!(
+            changes[0].result_json.as_deref(),
+            Some("[{\"new\":2},{\"new\":3}]"),
+            "the frame carries the newer generation's columns and rows, never the older's"
+        );
+    }
+
+    /// A generation that ends without its final page is dropped whole, even
+    /// though the generation below it finished.
+    #[test]
+    fn a_newer_generation_with_no_final_page_delivers_nothing() {
+        let older = page(7, 5, "old", vec![PgValue::Int(1)], false);
+        let newer = page(7, 9, "new", vec![PgValue::Int(2)], true);
+        let changes = Materializer::<ParserDB>::rows_changes(vec![older, newer], &HashSet::new());
+        assert!(
+            changes.is_empty(),
+            "the retry delivers the higher generation that supersedes it"
+        );
     }
 }

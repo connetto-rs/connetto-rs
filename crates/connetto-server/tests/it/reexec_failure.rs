@@ -10,7 +10,7 @@ use connetto_core::messages::{ControlMessage, PauseCause, SUBSCRIPTION_REFUSED};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
     AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, ReconnectEvent,
-    RequestGuard, RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, loopback,
+    RequestGuard, RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits,
     pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, committed_at};
@@ -18,22 +18,15 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
-use tracing::Instrument;
+
+use crate::one_event::OneEvent;
 
 const DDL: &str = "CREATE TABLE counts (id INT PRIMARY KEY, n INT)";
 
 type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults, PgReadConnector>;
 
 fn connect_to(manager: &Arc<Manager>) -> Client {
-    let (server_end, client_end) = loopback();
-    let session = Arc::clone(manager);
-    tokio::spawn(
-        async move {
-            let _ = session.serve(server_end).await;
-        }
-        .instrument(tracing::Span::current()),
-    );
-    Client::new(client_end)
+    super::loopback_session::connect(|end| Arc::clone(manager).serve(end))
 }
 
 fn guard(seed: Duration, triggered: Duration) -> Arc<RequestGuard<String>> {
@@ -328,4 +321,189 @@ async fn a_transient_read_pause_resumes_delivery_without_ending_anything() {
     );
 
     ingest_task.abort();
+}
+
+const PAIR_DDL: &str = "CREATE TABLE counts (id INT PRIMARY KEY, n INT, m INT)";
+
+/// A subscribed client that has received its seed.
+async fn seeded(manager: &Arc<Manager>, label: &str, sql: &str, seed: &str) -> Client {
+    let mut client = connect_to(manager);
+    client.handshake_with(label, &format!("user:{label}")).await;
+    client.subscribe(label, sql).await;
+    let ControlMessage::AggregateUpdate(update) = client.next_control().await else {
+        panic!("expected the {label} seed");
+    };
+    assert_eq!(update.result_json.as_deref(), Some(seed));
+    client
+}
+
+/// The next aggregate value a client receives within five seconds.
+async fn next_value(client: &mut Client) -> Option<String> {
+    let control = tokio::time::timeout(Duration::from_secs(5), client.next_control())
+        .await
+        .expect("an update within 5 s");
+    let ControlMessage::AggregateUpdate(update) = control else {
+        panic!("expected an aggregate update, got {control:?}");
+    };
+    update.result_json
+}
+
+/// Nothing more reaches a client for half a second.
+async fn assert_quiet(client: &mut Client) {
+    let extra = tokio::time::timeout(Duration::from_millis(500), client.next_control()).await;
+    assert!(extra.is_err(), "unexpected further control {extra:?}");
+}
+
+/// One poisoned read among siblings: the event folds once, so the count moves
+/// by one, and the healthy sibling read keeps its answer while the poisoned
+/// subscription alone ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_poisoned_read_neither_refolds_the_event_nor_loses_a_sibling_answer() {
+    let fixture = Fixture::acquire().await;
+    fixture.exec("DROP TABLE IF EXISTS counts CASCADE").await;
+    fixture.exec(PAIR_DDL).await;
+    fixture
+        .exec("INSERT INTO counts VALUES (10, 10, 10), (20, 20, 20)")
+        .await;
+    let pool = fixture.admin().clone();
+    let manager = full_manager(
+        pool.clone(),
+        PAIR_DDL,
+        PAIR_DDL,
+        RosterAuth::granting("reader"),
+        guard(Duration::from_secs(30), Duration::from_secs(30)),
+        pool.clone(),
+        pool,
+    );
+    let mut poisoned = seeded(&manager, "poisoned", "SELECT MIN(n) FROM counts", "10").await;
+    let mut healthy = seeded(&manager, "healthy", "SELECT MIN(m) FROM counts", "10").await;
+    let mut counter = seeded(&manager, "counter", "SELECT COUNT(*) FROM counts", "2").await;
+
+    fixture.exec("ALTER TABLE counts DROP COLUMN n").await;
+    fixture.exec("DELETE FROM counts WHERE id = 10").await;
+    let mut source = PgSqliteEmuSource::open_in_memory(PAIR_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO counts VALUES (10, 10, 10)")
+        .expect("stage the deleted row");
+    source
+        .next_item()
+        .await
+        .expect("drain emu")
+        .expect("insert event");
+    source
+        .execute_sql("DELETE FROM counts WHERE id = 10")
+        .expect("delete the extreme");
+    let at = fixture.commit_now().await;
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        if let SourceItem::Event(event) = item {
+            manager
+                .dispatch_event(&committed_at(event, at))
+                .await
+                .expect("dispatch");
+        }
+    }
+
+    let ControlMessage::NonFatalError(refusal) = poisoned.next_control().await else {
+        panic!("expected the poisoned subscription's refusal");
+    };
+    assert_eq!(refusal.related_to.as_deref(), Some("poisoned"));
+    assert_eq!(next_value(&mut counter).await.as_deref(), Some("1"));
+    assert_quiet(&mut counter).await;
+    assert_eq!(next_value(&mut healthy).await.as_deref(), Some("20"));
+    assert_quiet(&mut healthy).await;
+}
+
+/// A transient read outage holds the event, and the retry after it drains the
+/// held read without folding the event a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transient_read_pause_folds_the_held_event_once() {
+    let fixture = Fixture::acquire().await;
+    fixture.exec("DROP TABLE IF EXISTS counts CASCADE").await;
+    fixture.exec(DDL).await;
+    fixture
+        .exec("INSERT INTO counts VALUES (10, 10), (1, 1)")
+        .await;
+    let tiny_pool = Pool::builder()
+        .max_size(1)
+        .min_idle(1)
+        .connection_timeout(Duration::from_millis(150))
+        .build(AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            fixture.admin_url().to_owned(),
+        ))
+        .await
+        .expect("build tiny pool");
+    let manager = full_manager(
+        tiny_pool.clone(),
+        DDL,
+        DDL,
+        RosterAuth::granting_nobody(),
+        guard(Duration::from_secs(30), Duration::from_secs(30)),
+        fixture.admin().clone(),
+        fixture.admin().clone(),
+    );
+    let mut smallest = seeded(&manager, "smallest", "SELECT MIN(n) FROM counts", "1").await;
+    let mut counter = seeded(&manager, "counter", "SELECT COUNT(*) FROM counts", "2").await;
+
+    let mut source = PgSqliteEmuSource::open_in_memory(DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO counts VALUES (1, 1)")
+        .expect("stage the deleted row");
+    source
+        .next_item()
+        .await
+        .expect("drain emu")
+        .expect("insert event");
+    source
+        .execute_sql("DELETE FROM counts WHERE id = 1")
+        .expect("delete the extreme");
+    let mut delete = None;
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        if let SourceItem::Event(event) = item {
+            delete = Some(event);
+        }
+    }
+    fixture.exec("DELETE FROM counts WHERE id = 1").await;
+    let delete = committed_at(
+        delete.expect("the delete event"),
+        fixture.commit_now().await,
+    );
+    let held = tiny_pool.get().await.expect("hold the only connection");
+    let serving = Arc::clone(&manager);
+    let ingest = tokio::spawn(async move {
+        let _ = serving
+            .ingest(&mut OneEvent(Some(delete)), &mut |_| {})
+            .await;
+    });
+
+    let paused = tokio::time::timeout(Duration::from_secs(3), smallest.next_control())
+        .await
+        .expect("DeliveryPaused within 3 s");
+    assert!(
+        matches!(
+            paused,
+            ControlMessage::DeliveryPaused {
+                cause: PauseCause::DatabaseUnreachable
+            }
+        ),
+        "expected DeliveryPaused, got {paused:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    drop(held);
+
+    assert_eq!(next_value(&mut smallest).await.as_deref(), Some("10"));
+    let mut counts = Vec::new();
+    loop {
+        let control = tokio::time::timeout(Duration::from_secs(5), counter.next_control())
+            .await
+            .expect("a control within 5 s");
+        match control {
+            ControlMessage::AggregateUpdate(update) => counts.push(update.result_json),
+            ControlMessage::DeliveryResumed => break,
+            ControlMessage::DeliveryPaused { .. } => {}
+            other => panic!("unexpected control {other:?}"),
+        }
+    }
+    assert_eq!(counts, [Some("1".to_owned())]);
+    assert_quiet(&mut counter).await;
+    ingest.abort();
 }
