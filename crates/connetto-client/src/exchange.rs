@@ -44,18 +44,25 @@ pub(crate) const FRESH_CURSOR: Frontier = Frontier {
     head: GENESIS,
 };
 
-/// Store `cursor` as `author`'s, on the row its adopted offer created.
+/// Store `cursor` as `author`'s, on the row its adopted offer created. An
+/// author with no row was never adopted, so taking its entries would move a
+/// cursor nothing records and fails instead.
 pub(crate) fn store_cursor(
     db: &mut SqliteConnection,
     author: &[u8],
     cursor: &Frontier,
 ) -> Result<(), ClientError> {
-    diesel::update(dsl::_connetto_peer_cursor.filter(dsl::author.eq(author)))
+    let updated = diesel::update(dsl::_connetto_peer_cursor.filter(dsl::author.eq(author)))
         .set((
             dsl::seq.eq(stored_seq(cursor.seq)?),
             dsl::head.eq(cursor.head.as_slice()),
         ))
         .execute(db)?;
+    if updated == 0 {
+        return Err(ClientError::Session(
+            "a peer's entry arrived before its offer was adopted".to_owned(),
+        ));
+    }
     Ok(())
 }
 

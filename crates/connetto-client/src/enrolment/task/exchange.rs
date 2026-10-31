@@ -19,6 +19,8 @@ use connetto_core::{Major, SchemaVersion};
 #[cfg(feature = "peer")]
 use connetto_exchange::{Action, Exchange, Message, Transfer, manifest};
 #[cfg(feature = "peer")]
+use connetto_peer::{CloseReason, PeerSendError};
+#[cfg(feature = "peer")]
 use tokio::sync::mpsc;
 
 #[cfg(feature = "peer")]
@@ -75,9 +77,9 @@ pub(super) struct PeerExchange {
     /// The linked authors.
     #[cfg(feature = "peer")]
     linked: HashMap<DeviceIdentity, Linked>,
-    /// The range each peer is being served.
+    /// The range each peer is being served, under its request id.
     #[cfg(feature = "peer")]
-    streams: HashMap<DeviceIdentity, tokio::task::JoinHandle<()>>,
+    streams: HashMap<DeviceIdentity, (u64, tokio::task::JoinHandle<()>)>,
     /// Where a stream reports its end.
     #[cfg(feature = "peer")]
     served_tx: mpsc::UnboundedSender<(DeviceIdentity, u64)>,
@@ -196,7 +198,15 @@ impl<L: Link> Run<L> {
         match wake {
             Wake::Signed(signed) => self.offer_signed(signed).await,
             Wake::Served(peer, request_id) => {
-                self.exchange.streams.remove(&peer);
+                // A late end of an earlier stream leaves the current one.
+                if self
+                    .exchange
+                    .streams
+                    .get(&peer)
+                    .is_some_and(|(serving, _)| *serving == request_id)
+                {
+                    self.exchange.streams.remove(&peer);
+                }
                 let actions = self.exchange.machine.served(&peer, request_id);
                 self.act(actions).await;
             }
@@ -297,10 +307,8 @@ impl<L: Link> Run<L> {
         let mut actions = VecDeque::from(actions);
         while let Some(action) = actions.pop_front() {
             match action {
-                // A peer whose link closed meanwhile reaches the machine as
-                // unlinked, so a failed send is left alone.
                 Action::Send { peer, message } => {
-                    let _ = self.peer.send_exchange(&peer, message).await;
+                    self.send(&peer, message).await;
                 }
                 Action::Adopt {
                     peer,
@@ -310,7 +318,7 @@ impl<L: Link> Run<L> {
                     let author = self.linked_author(&peer);
                     if let Err(err) = self.link.adopt(author, offer, cursor).await {
                         tracing::warn!(error = %err, "a peer's offer could not be taken");
-                        self.commit_failed(&peer, &mut actions).await;
+                        self.commit_failed(&peer, Commit::Adopt, &mut actions).await;
                     }
                 }
                 Action::Apply {
@@ -354,11 +362,11 @@ impl<L: Link> Run<L> {
                         },
                         self.exchange.served_tx.clone(),
                     ));
-                    let previous = self.exchange.streams.insert(peer, stream);
+                    let previous = self.exchange.streams.insert(peer, (request_id, stream));
                     debug_assert!(previous.is_none(), "a peer is served one range at a time");
                 }
                 Action::StopServing { peer } => {
-                    if let Some(stream) = self.exchange.streams.remove(&peer) {
+                    if let Some((_, stream)) = self.exchange.streams.remove(&peer) {
                         stream.abort();
                     }
                 }
@@ -379,17 +387,32 @@ impl<L: Link> Run<L> {
         let author = self.linked_author(peer);
         if let Err(err) = self.link.take_row(author, row, body, cursor).await {
             tracing::warn!(error = %err, "a peer's entry could not be taken");
-            self.commit_failed(peer, actions).await;
+            self.commit_failed(peer, Commit::Row, actions).await;
+        }
+    }
+
+    /// Queue `message` on the link to `peer`. A link that closed meanwhile
+    /// reaches the machine as unlinked, while a message over the wire's
+    /// bounds is a defect of this device the receiver would wait out.
+    async fn send(&self, peer: &DeviceIdentity, message: Message) {
+        match self.peer.send_exchange(peer, message).await {
+            Ok(()) => {}
+            Err(err @ PeerSendError::FrameAboveBounds { .. }) => {
+                tracing::error!(error = %err, "an exchange message could not be sent");
+            }
+            Err(err) => tracing::debug!(error = %err, "an exchange message did not reach a peer"),
         }
     }
 
     /// A commit for `peer` failed, so the commits queued after it for that
     /// peer are dropped and the machine restarts from the cursor the replica
-    /// holds. A replica that cannot even read that cursor ends the exchange
-    /// with `peer` until its next link up.
+    /// holds, owing the offer again when it was the adopt that failed. A
+    /// replica that cannot even read that cursor closes the link, so the
+    /// exchange starts over from a fresh read at the next link up.
     async fn commit_failed(
         &mut self,
         peer: &DeviceIdentity,
+        commit: Commit,
         actions: &mut VecDeque<Action<DeviceIdentity>>,
     ) {
         actions.retain(|action| match action {
@@ -400,14 +423,19 @@ impl<L: Link> Run<L> {
         });
         let key_id = self.linked_author(peer).key_id;
         match self.link.peer_cursor(key_id).await {
-            Ok(stored) => self
-                .exchange
-                .machine
-                .commit_failed(peer, stored, Instant::now()),
+            Ok(stored) => match commit {
+                Commit::Adopt => self
+                    .exchange
+                    .machine
+                    .adopt_failed(peer, stored, Instant::now()),
+                Commit::Row => self
+                    .exchange
+                    .machine
+                    .commit_failed(peer, stored, Instant::now()),
+            },
             Err(err) => {
                 tracing::warn!(error = %err, "a peer's cursor could not be read after a failed commit");
-                self.exchange.linked.remove(peer);
-                actions.extend(self.exchange.machine.unlinked(peer));
+                self.peer.close(peer, CloseReason::Closed);
             }
         }
     }
@@ -422,6 +450,16 @@ impl<L: Link> Run<L> {
             .author
             .clone()
     }
+}
+
+/// Which commit of a peer's exchange failed.
+#[cfg(feature = "peer")]
+#[derive(Clone, Copy)]
+enum Commit {
+    /// The adopt of the peer's offer.
+    Adopt,
+    /// An entry's apply or skip.
+    Row,
 }
 
 /// A range a peer requested.

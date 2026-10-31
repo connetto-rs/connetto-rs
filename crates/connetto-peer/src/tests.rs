@@ -3738,6 +3738,60 @@ async fn a_link_up_reports_the_peer_key_its_certificate_proved() {
     b.stop(CloseReason::Closed);
 }
 
+/// Closing one peer's link ends it on both sides with the reason named,
+/// while the node keeps serving.
+#[tokio::test]
+async fn closing_one_peer_ends_its_link_on_both_sides() {
+    let now = whole_second();
+    let deployment = Deployment::new(79, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alpha = deployment.device(
+        &issuer,
+        "alpha",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let beta = deployment.device(
+        &issuer,
+        "beta",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (a_tx, mut a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    let addr = serve(&b, &beta);
+    let _ = serve(&a, &alpha);
+    let linked = a.link(addr).await.expect("the dial links");
+    let _ = await_event(&mut b_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::Linked { .. })
+    })
+    .await;
+
+    a.close(&linked, CloseReason::Closed);
+    let closed = |event: &PeerEvent| {
+        matches!(
+            event,
+            PeerEvent::Unlinked {
+                reason: CloseReason::Closed,
+                ..
+            }
+        )
+    };
+    let _ = await_event(&mut a_rx, Duration::from_secs(10), closed).await;
+    let _ = await_event(&mut b_rx, Duration::from_secs(10), closed).await;
+    assert!(a.linked().is_empty(), "the closing side keeps no link");
+    assert!(a.local_addr().is_some(), "the node still serves");
+
+    a.stop(CloseReason::Closed);
+    b.stop(CloseReason::Closed);
+}
+
 /// The `Linked` event the node reports when `peer` comes up, the key its
 /// certificate proved and the list it carries.
 fn linked_event(peer: &Peer) -> PeerEvent {

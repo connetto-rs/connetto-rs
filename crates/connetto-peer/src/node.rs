@@ -387,6 +387,19 @@ impl Node {
         stop_state(&self.state, reason);
     }
 
+    /// Close the live link to `peer` with `reason`, which reports
+    /// [`PeerEvent::Unlinked`] as the link ends. A peer with no live link is
+    /// left alone.
+    pub fn close(&self, peer: &DeviceIdentity, reason: CloseReason) {
+        for slot_state in self.state.links.lock().values() {
+            if let SlotState::Live(slot) = slot_state
+                && slot.peer.key() == peer.key()
+            {
+                let _ = slot.command.send(LinkCommand::Close(reason));
+            }
+        }
+    }
+
     /// Prepare the dials' sockets through `prep` before their connect, or
     /// stop preparing them with `None`.
     pub fn set_socket_prep(&self, prep: Option<Arc<dyn SocketPrep>>) {

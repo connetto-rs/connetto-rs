@@ -1478,6 +1478,48 @@ fn first_frontier() -> Frontier {
     }
 }
 
+/// A failed adopt puts the cursor back, aborts the request, and the retry
+/// adopts the same offer again before it requests the range, so the
+/// offer's cursor row and retractions are not left to the author's next
+/// offer. A receiver with no build re-adopts and requests nothing.
+#[test]
+fn a_failed_adopt_is_adopted_again_before_the_retry_requests() {
+    let now = Instant::now();
+    let Ctx { mut receiver, .. } = ctx(2, now);
+    receiver.adopt_failed(&"a", first_frontier(), now);
+    assert_eq!(receiver.next_deadline(), Some(now + RETRY_FIRST));
+    let actions = receiver.timeout(now + RETRY_FIRST);
+    assert!(
+        matches!(
+            actions.as_slice(),
+            [
+                Action::Adopt { cursor, .. },
+                Action::Send {
+                    message: Message::Transfer(Transfer::Request {
+                        from: 1,
+                        to: 2,
+                        ..
+                    }),
+                    ..
+                },
+            ] if *cursor == first_frontier()
+        ),
+        "the retry adopts, then requests, got {actions:?}"
+    );
+
+    let (offer, _, _) = author(2);
+    let mut bare = Exchange::<&str>::new(None);
+    bare.linked("a", first_frontier());
+    let _ = bare.offer(&"a", offer, true, now);
+    bare.adopt_failed(&"a", first_frontier(), now);
+    let actions = bare.timeout(now + RETRY_FIRST);
+    assert!(
+        matches!(actions.as_slice(), [Action::Adopt { .. }]),
+        "a receiver without a build only adopts, got {actions:?}"
+    );
+    bare.adopt_failed(&"b", first_frontier(), now);
+}
+
 /// A request from an idle peer is streamed, and the sender returns to idle
 /// when the stream ends.
 #[test]

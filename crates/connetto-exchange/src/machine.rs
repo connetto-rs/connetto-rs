@@ -112,6 +112,9 @@ struct Receiver {
     cursor: Frontier,
     request: Option<Request>,
     last_offer: Option<SignedOffer>,
+    /// Whether the last offer's `Adopt` failed to commit, so the retry adopts
+    /// it again before it requests.
+    adopt_owed: bool,
     backoff: Duration,
     retry_at: Option<Instant>,
 }
@@ -282,6 +285,7 @@ impl<P: Clone + Eq + Hash + Debug> Exchange<P> {
                     cursor,
                     request: None,
                     last_offer: None,
+                    adopt_owed: false,
                     backoff: RETRY_FIRST,
                     retry_at: None,
                 },
@@ -395,9 +399,9 @@ impl<P: Clone + Eq + Hash + Debug> Exchange<P> {
         }
     }
 
-    /// The driver's `Adopt`, `Apply` or `Skip` for `peer` failed to commit,
-    /// so `stored`, the cursor the driver's store holds, is the truth again.
-    /// An outstanding request aborts and is re-issued from `stored` after the
+    /// The driver's `Apply` or `Skip` for `peer` failed to commit, so
+    /// `stored`, the cursor the driver's store holds, is the truth again. An
+    /// outstanding request aborts and is re-issued from `stored` after the
     /// backoff.
     pub fn commit_failed(&mut self, peer: &P, stored: Frontier, now: Instant) {
         let Some(state) = self.peers.get_mut(peer) else {
@@ -407,6 +411,19 @@ impl<P: Clone + Eq + Hash + Debug> Exchange<P> {
         if state.receiver.request.is_some() {
             abort_with_retry(&mut state.receiver, now);
         }
+    }
+
+    /// The driver's `Adopt` for `peer` failed to commit, so `stored` is the
+    /// truth again and the offer is owed. Any outstanding request aborts,
+    /// and after the backoff the retry adopts the offer again before it
+    /// requests whatever still sits behind the cursor.
+    pub fn adopt_failed(&mut self, peer: &P, stored: Frontier, now: Instant) {
+        let Some(state) = self.peers.get_mut(peer) else {
+            return;
+        };
+        state.receiver.cursor = stored;
+        state.receiver.adopt_owed = true;
+        abort_with_retry(&mut state.receiver, now);
     }
 
     /// The earliest instant [`Exchange::timeout`] has work, a request's
@@ -434,9 +451,6 @@ impl<P: Clone + Eq + Hash + Debug> Exchange<P> {
     /// kept offer's request when the offer's range still sits behind the
     /// cursor.
     pub fn timeout(&mut self, now: Instant) -> Vec<Action<P>> {
-        let Some(build) = self.build.as_ref() else {
-            return Vec::new();
-        };
         let mut actions = Vec::new();
         for (peer, state) in &mut self.peers {
             if let Some(request) = state.receiver.request.as_ref() {
@@ -448,7 +462,7 @@ impl<P: Clone + Eq + Hash + Debug> Exchange<P> {
                 actions.extend(retry_request(
                     state,
                     peer.clone(),
-                    build.clone(),
+                    self.build.as_ref(),
                     &mut self.next_id,
                     now,
                 ));
@@ -494,6 +508,7 @@ fn act_on_valid_offer<P: Clone>(
         .map(|newest| newest.seq);
     receiver.cursor = cursor.clone();
     receiver.last_offer = Some(signed.clone());
+    receiver.adopt_owed = false;
     receiver.backoff = RETRY_FIRST;
     receiver.retry_at = None;
     let mut actions = vec![Action::Adopt {
@@ -560,37 +575,49 @@ fn begin_request<P>(
 /// Re-issue the kept offer's request from the current cursor, a new id and a
 /// fresh frame deadline, when the offer's range still sits behind the
 /// cursor.
-fn retry_request<P>(
+fn retry_request<P: Clone>(
     state: &mut Peer,
     peer: P,
-    build: (Major, SchemaVersion),
+    build: Option<&(Major, SchemaVersion)>,
     next_id: &mut u64,
     now: Instant,
 ) -> Vec<Action<P>> {
-    // A due retry was set only when a request stalled, and a request was
-    // issued only for an adopted offer whose range sat behind the cursor.
+    // A retry is set only after an offer was taken, by a stalled request
+    // or by a failed adopt.
     let offer = state
         .receiver
         .last_offer
         .clone()
-        .expect("a due retry is set only when an offer was adopted");
-    let newest = offer
-        .offer
-        .newest
-        .clone()
-        .expect("a stalled request was issued for the offer's newest range");
-    if newest.seq <= state.receiver.cursor.seq {
-        return Vec::new();
+        .expect("a due retry is set only after an offer was taken");
+    let mut actions = Vec::new();
+    if state.receiver.adopt_owed {
+        state.receiver.adopt_owed = false;
+        if let Some(settled) = &offer.offer.settled
+            && settled.seq > state.receiver.cursor.seq
+        {
+            state.receiver.cursor = settled.clone();
+        }
+        actions.push(Action::Adopt {
+            peer: peer.clone(),
+            offer: offer.clone(),
+            cursor: state.receiver.cursor.clone(),
+        });
     }
-    begin_request(
-        &mut state.receiver,
-        next_id,
-        peer,
-        offer,
-        build,
-        newest.seq,
-        now,
-    )
+    if let Some(build) = build
+        && let Some(newest) = offer.offer.newest.clone()
+        && newest.seq > state.receiver.cursor.seq
+    {
+        actions.extend(begin_request(
+            &mut state.receiver,
+            next_id,
+            peer,
+            offer,
+            build.clone(),
+            newest.seq,
+            now,
+        ));
+    }
+    actions
 }
 
 /// Abort the outstanding request, keep what has been processed, and schedule
