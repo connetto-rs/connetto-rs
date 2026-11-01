@@ -101,6 +101,35 @@ fn request(request_id: u64, from: u64, to: u64) -> Transfer {
     }
 }
 
+/// Hand request 1's body of each of `rows` to `receiver` from "a", each
+/// applying at once, and return every action in order.
+fn apply_bodies(
+    receiver: &mut Exchange<&'static str>,
+    rows: &[ManifestRow],
+    bodies: &[Vec<u8>],
+    now: Instant,
+) -> Vec<Action<&'static str>> {
+    let mut applied = Vec::new();
+    for (row, body) in rows.iter().zip(bodies) {
+        let actions = receiver.message(
+            &"a",
+            Transfer::Body {
+                request_id: 1,
+                seq: row.seq,
+                changeset: body.clone(),
+            },
+            now,
+        );
+        assert!(
+            matches!(actions.first(), Some(Action::Apply { .. })),
+            "body {} applies, got {actions:?}",
+            row.seq
+        );
+        applied.extend(actions);
+    }
+    applied
+}
+
 /// The apply actions among `actions`.
 fn applies(actions: &[Action<&'static str>]) -> usize {
     actions
@@ -679,18 +708,7 @@ fn a_manifest_split_across_frames_verifies_the_chain() {
         last: true,
     };
     assert_eq!(receiver.message(&"a", frame2, now), Vec::new());
-    for (row, body) in rows.iter().zip(&bodies) {
-        let actions = receiver.message(
-            &"a",
-            Transfer::Body {
-                request_id: 1,
-                seq: row.seq,
-                changeset: body.clone(),
-            },
-            now,
-        );
-        assert!(matches!(actions[0], Action::Apply { .. }));
-    }
+    apply_bodies(&mut receiver, &rows, &bodies, now);
     let actions = receiver.message(
         &"a",
         Transfer::End {
@@ -1154,18 +1172,7 @@ fn a_complete_end_with_rows_left_raises_chain_invalid() {
         last: true,
     };
     assert_eq!(receiver.message(&"a", manifest, now), Vec::new());
-    for (row, body) in rows.iter().zip(&bodies).take(2) {
-        let actions = receiver.message(
-            &"a",
-            Transfer::Body {
-                request_id: 1,
-                seq: row.seq,
-                changeset: body.clone(),
-            },
-            now,
-        );
-        assert!(matches!(actions[0], Action::Apply { .. }));
-    }
+    apply_bodies(&mut receiver, &rows[..2], &bodies, now);
     let actions = receiver.message(
         &"a",
         Transfer::End {
@@ -1382,18 +1389,7 @@ fn a_frame_timeout_retries_from_the_advanced_cursor() {
         last: true,
     };
     assert_eq!(receiver.message(&"a", manifest, now), Vec::new());
-    for (row, body) in rows.iter().zip(&bodies).take(2) {
-        let actions = receiver.message(
-            &"a",
-            Transfer::Body {
-                request_id: 1,
-                seq: row.seq,
-                changeset: body.clone(),
-            },
-            now,
-        );
-        assert!(matches!(actions[0], Action::Apply { .. }));
-    }
+    apply_bodies(&mut receiver, &rows[..2], &bodies, now);
     let stall = now + FRAME_BOUND;
     let actions = receiver.timeout(stall);
     assert_eq!(actions, Vec::new());
@@ -1430,18 +1426,7 @@ fn a_failed_commit_retries_from_the_stored_cursor() {
         last: true,
     };
     assert_eq!(receiver.message(&"a", manifest, now), Vec::new());
-    let mut applied = Vec::new();
-    for (row, body) in rows.iter().zip(&bodies).take(2) {
-        applied.extend(receiver.message(
-            &"a",
-            Transfer::Body {
-                request_id: 1,
-                seq: row.seq,
-                changeset: body.clone(),
-            },
-            now,
-        ));
-    }
+    let applied = apply_bodies(&mut receiver, &rows[..2], &bodies, now);
     let Some(Action::Apply { cursor: first, .. }) = applied.first().cloned() else {
         panic!("the first body applies, got {applied:?}");
     };
@@ -1984,18 +1969,7 @@ fn a_retry_with_nothing_behind_sends_nothing() {
         last: true,
     };
     assert_eq!(receiver.message(&"a", manifest, now), Vec::new());
-    for (row, body) in rows.iter().zip(&bodies) {
-        let actions = receiver.message(
-            &"a",
-            Transfer::Body {
-                request_id: 1,
-                seq: row.seq,
-                changeset: body.clone(),
-            },
-            now,
-        );
-        assert!(matches!(actions[0], Action::Apply { .. }));
-    }
+    apply_bodies(&mut receiver, &rows, &bodies, now);
     assert_eq!(receiver.timeout(deadline), Vec::new());
     assert_eq!(receiver.next_deadline(), Some(deadline + RETRY_FIRST));
     assert_eq!(receiver.timeout(deadline + RETRY_FIRST), Vec::new());
