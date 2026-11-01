@@ -23,14 +23,11 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
 use connetto_client::{
-    AccountChoice, Auth, BrowserOpener, ClientEvent, KeyValue, Keyring, KeyringAuth,
-    KeyringKeyStore, LiveQuery, NativeClient, NativeClientBuilder, NativeDurable, NativeTransport,
-    SyncSchema,
+    ClientEvent, KeyValue, KeyringAuth, LiveQuery, NativeClient, NativeTransport, SyncSchema,
     provisional::{ProvisionalRow, ProvisionalState},
 };
 use connetto_core::bots::TextIds;
@@ -38,6 +35,7 @@ use connetto_core::device_cert::DeviceCertificate;
 use connetto_core::exchange::RetractCause;
 use connetto_core::messages::MutationRejectReason;
 use connetto_server::authn::identity::deterministic_uuid;
+use connetto_test_harness::native_client;
 use connetto_test_harness::stack::{
     Deployment, demo_device_ca, ensure_server_bin, provision, provision_enrolment_tables,
     spawn_server, wait_until_closed,
@@ -130,93 +128,17 @@ fn bundle() -> SyncSchema {
 
 /// A fresh-login keyring sign-in as `subject`, the services named by `app_id`.
 fn fresh_login(base: &str, app_id: &str, subject: &str) -> KeyringAuth {
-    Auth::new(base, PROVIDER)
-        .with_account(AccountChoice::New)
-        .keyring(app_id)
-        .with_browser_opener(fake_browser(subject))
+    native_client::fresh_login(base, PROVIDER, app_id, subject)
 }
 
 /// The silent sign-back-in the reconnect phases use.
 fn last_used(base: &str, app_id: &str) -> KeyringAuth {
-    Auth::new(base, PROVIDER)
-        .keyring(app_id)
-        .with_browser_opener(no_browser())
+    native_client::last_used(base, PROVIDER, app_id)
 }
 
-/// A browser opener that fails the test, for a sign-in that must not log in
-/// interactively.
-fn no_browser() -> BrowserOpener {
-    Arc::new(|_url: &str| panic!("the sign-in opened a browser"))
-}
-
-/// A fake browser. Given connetto's login URL, walk the real OIDC redirect
-/// chain until the authenticator's loopback listener receives the code.
-fn fake_browser(subject: &str) -> BrowserOpener {
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("http client");
-    let subject = subject.to_owned();
-    Arc::new(move |login_url: &str| {
-        let http = http.clone();
-        let subject = subject.clone();
-        let login_url = login_url.to_owned();
-        tokio::spawn(async move {
-            let mut next_url = login_url;
-            let mut submitted = false;
-            for _ in 0..6 {
-                let resp = http.get(&next_url).send().await.expect("hop");
-                if !submitted && resp.url().path().ends_with("/authorize") {
-                    let form_url = resp.url().to_string();
-                    let posted = http
-                        .post(form_url)
-                        .header("content-type", "application/x-www-form-urlencoded")
-                        .body(format!("username={subject}"))
-                        .send()
-                        .await
-                        .expect("submit the login form");
-                    submitted = true;
-                    let Some(loc) = posted.headers().get("location") else {
-                        break;
-                    };
-                    loc.to_str()
-                        .expect("utf8 location")
-                        .clone_into(&mut next_url);
-                    continue;
-                }
-                match resp.headers().get("location") {
-                    Some(loc) => {
-                        loc.to_str()
-                            .expect("utf8 location")
-                            .clone_into(&mut next_url);
-                    }
-                    None => break,
-                }
-            }
-        });
-        Ok(())
-    })
-}
-
-/// A signed-in build over `addr`, the sign-in it names, the data directory it
-/// keeps and the deployment root it verifies device certificates against,
-/// with the peer link on `peer_listener` and the auto-link off.
-fn signed_in(
-    addr: SocketAddr,
-    sign_in: KeyringAuth,
-    dir: &Path,
-    root: &[u8],
-    peer_listener: SocketAddr,
-) -> NativeDurable<NativeTransport, (), Keyring, KeyringKeyStore> {
-    NativeClientBuilder::new(format!("ws://{addr}/sync"), bundle())
-        .signed_in(sign_in)
-        .durable(dir)
-        .with_deployment_roots([root.to_owned()])
-        .with_peer_listener(peer_listener)
-        .with_peer_autolink(false)
-}
-
-/// Connect one of [`signed_in`]'s builds.
+/// A signed-in build over `addr`, the sign-in it names, the data directory
+/// it keeps and the deployment root it verifies device certificates against,
+/// with the peer link on `peer_listener` and the auto-link off, connected.
 async fn connect_client(
     addr: SocketAddr,
     sign_in: KeyringAuth,
@@ -224,10 +146,18 @@ async fn connect_client(
     root: &[u8],
     peer_listener: SocketAddr,
 ) -> NativeClient<NativeTransport> {
-    signed_in(addr, sign_in, dir, root, peer_listener)
-        .connect()
-        .await
-        .expect("connects")
+    native_client::signed_in(
+        format!("ws://{addr}/sync"),
+        bundle(),
+        sign_in,
+        dir,
+        vec![root.to_owned()],
+    )
+    .with_peer_listener(peer_listener)
+    .with_peer_autolink(false)
+    .connect()
+    .await
+    .expect("connects")
 }
 
 /// Connect, declare the watches, and close, remembering the subscriptions in
@@ -251,18 +181,7 @@ async fn next_event(
     deadline: Duration,
     is: impl Fn(&ClientEvent) -> bool,
 ) -> Option<ClientEvent> {
-    let until = Instant::now() + deadline;
-    loop {
-        let remaining = until.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return None;
-        }
-        match tokio::time::timeout(remaining, events.recv()).await {
-            Ok(Ok(event)) if is(&event) => return Some(event),
-            Ok(Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
-            _ => return None,
-        }
-    }
+    native_client::next_event(events, deadline, is).await
 }
 
 /// Poll `device_certificate` until it holds a certificate, bounded by
@@ -271,16 +190,7 @@ async fn wait_for_certificate(
     client: &NativeClient<NativeTransport>,
     deadline: Duration,
 ) -> Option<DeviceCertificate> {
-    let until = Instant::now() + deadline;
-    loop {
-        if let Some(cert) = client.device_certificate() {
-            return Some(cert);
-        }
-        if Instant::now() >= until {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    native_client::wait_for_certificate(client, deadline).await
 }
 
 /// Poll the device's peer listener until it answers, bounded by `deadline`.
@@ -397,23 +307,9 @@ async fn wait_roster(
     }
 }
 
-/// Poll `unsynced` until it holds nothing, bounded by `deadline`.
+/// Poll `unsynced` until it holds nothing, bounded by `BOUND`.
 async fn wait_unsynced_empty(client: &NativeClient<NativeTransport>) -> bool {
-    let until = Instant::now() + BOUND;
-    loop {
-        if client
-            .client()
-            .unsynced()
-            .await
-            .is_ok_and(|entries| entries.is_empty())
-        {
-            return true;
-        }
-        if Instant::now() >= until {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    native_client::wait_unsynced_empty(client, BOUND).await
 }
 
 /// Alice's note of `team` with `body`.

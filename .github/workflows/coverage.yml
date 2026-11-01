@@ -100,6 +100,12 @@ jobs:
       - name: Run Rust suite under coverage
         run: |
           source <(cargo +stable llvm-cov show-env --sh)
+          # The offline-exchange proof spawns the server binary, built here
+          # with the same instrumentation so the report counts it too.
+          if [ "${{ matrix.name }}" = rest ]; then
+            cargo +stable build --profile testfast --all-features -p connetto-server --bin connetto-server
+            export CONNETTO_SERVER_BIN="$PWD/target/testfast/connetto-server"
+          fi
           keyctl session -- cargo +stable nextest run \
             --cargo-profile testfast \
             --all-features \

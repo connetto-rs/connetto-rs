@@ -479,7 +479,9 @@ jobs:
               -p connetto-peer
               -p connetto-exchange
               -p connetto-demo-support
-            bins: ''
+            # The offline-exchange proof names the server binary, so the rest
+            # shard compiles it beside its test binaries.
+            bins: -p connetto-server
     steps:
       - uses: actions/checkout@v7
 
@@ -531,6 +533,10 @@ jobs:
       # log-capture isolation, and a wedged test is killed and named instead
       # of holding the shard to the job timeout.
       - name: Run Rust suite
+        env:
+          # The offline-exchange proof reads the binary the build step
+          # compiled, so the test does not build a server of its own.
+          CONNETTO_SERVER_BIN: ${{ matrix.name == 'rest' && format('{0}/target/{1}/connetto-server', github.workspace, github.event_name == 'pull_request' && 'testfast' || 'release') || '' }}
         run: keyctl session -- cargo +stable nextest run --cargo-profile "$CARGO_TEST_PROFILE" --all-features --test-threads 4 ${{ matrix.packages }}
 
       - name: Prune target cache
