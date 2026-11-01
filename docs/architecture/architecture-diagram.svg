@@ -64,10 +64,11 @@
     <g transform="translate(55, 444)">
       <rect width="420" height="82" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="4" height="82" rx="1" fill="#4CAF50" />
-      <text x="210" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">OpenFGA</text>
-      <text x="210" y="38" text-anchor="middle" font-size="9.5" fill="#78909C">authorization service, external service</text>
-      <text x="210" y="56" text-anchor="middle" font-size="9.5" fill="#555">change-path visibility executor: batched checks, fail closed, R5b</text>
-      <text x="210" y="70" text-anchor="middle" font-size="9.5" fill="#4CAF50">re-run reconciliation, R86</text>
+      <text x="210" y="18" text-anchor="middle" font-size="12" font-weight="600" fill="#333">OpenFGA</text>
+      <text x="210" y="34" text-anchor="middle" font-size="9.5" fill="#78909C">authorization service, external service</text>
+      <text x="210" y="50" text-anchor="middle" font-size="9.5" fill="#555">change-path visibility executor: batched checks, fail closed, R5b</text>
+      <text x="210" y="64" text-anchor="middle" font-size="9.5" fill="#4CAF50">re-run reconciliation, R86</text>
+      <text x="210" y="77" text-anchor="middle" font-size="8.5" fill="#C62828">R108: each check carries the caller's kind as a contextual tuple</text>
     </g>
 
     <!-- ===== Structured logging ===== -->
@@ -128,6 +129,16 @@
       <text x="230" y="134" text-anchor="middle" font-size="8.5" fill="#555">a manifest is the ordered (hash, length) list, transport metadata only</text>
       <text x="230" y="150" text-anchor="middle" font-size="8.5" fill="#555">the same bytes chunk and hash identically on native and wasm</text>
       <text x="230" y="164" text-anchor="middle" font-size="8.5" fill="#4CAF50">the file core, R64</text>
+    </g>
+
+    <!-- ===== sql-traits ===== -->
+    <g transform="translate(35, 1156)">
+      <rect width="460" height="76" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="76" rx="1" fill="#4CAF50" />
+      <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">sql-traits</text>
+      <text x="230" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">our library, git pin: the parsed schema pg2sqlite and rls2fga both read</text>
+      <text x="230" y="52" text-anchor="middle" font-size="8.5" fill="#C62828">R108: one answer for both translators on the callers' roles and settings,</text>
+      <text x="230" y="66" text-anchor="middle" font-size="8.5" fill="#C62828">privileges per command and column, and the policies applying to each role</text>
     </g>
 
     <!-- ==================== connetto-server ==================== -->
@@ -311,6 +322,11 @@
     <path d="M 550 1121 L 499 1121 L 499 492 L 475 492" fill="none" stroke="#4CAF50" stroke-width="1.5" marker-end="url(#arrow-green)" />
     <text x="511" y="860" text-anchor="middle" font-size="9" fill="#2E7D32" transform="rotate(-90 511 860)">(5) FGA model write (startup)</text>
 
+    <!-- sql-traits read by both translators -->
+    <path d="M 495 1194 L 530 1194 L 530 1042 L 550 1042" fill="none" stroke="#4CAF50" stroke-width="1.5" marker-end="url(#arrow-green)" />
+    <line x1="530" y1="1140" x2="550" y2="1140" stroke="#4CAF50" stroke-width="1.5" marker-end="url(#arrow-green)" />
+    <text x="512" y="1210" text-anchor="middle" font-size="8" fill="#2E7D32">schema</text>
+
   </g>
 
   <!-- ==================== TRANSPORT ==================== -->
@@ -408,13 +424,14 @@
 
     <!-- Schema pipeline (build time) -->
     <g transform="translate(995, 486)">
-      <rect width="630" height="80" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
-      <rect width="4" height="80" rx="1" fill="#4CAF50" />
-      <text x="315" y="16" text-anchor="middle" font-size="11.5" font-weight="600" fill="#333">Schema pipeline (build time)</text>
-      <text x="315" y="30" text-anchor="middle" font-size="9" fill="#555">pg2sqlite translates PG DDL to replica DDL plus translation manifest</text>
-      <text x="315" y="43" text-anchor="middle" font-size="8.5" fill="#555">translation emits fail-closed write guards, server applies land exempt (connetto_write_exempt), R40</text>
-      <text x="315" y="56" text-anchor="middle" font-size="8.5" fill="#4CAF50">one schema contract for deployment tables, R98</text>
-      <text x="315" y="70" text-anchor="middle" font-size="8.5" fill="#C62828">R107: a running server notices a schema change and refuses the table</text>
+      <rect width="630" height="88" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="88" rx="1" fill="#4CAF50" />
+      <text x="315" y="15" text-anchor="middle" font-size="11.5" font-weight="600" fill="#333">Schema pipeline (build time)</text>
+      <text x="315" y="28" text-anchor="middle" font-size="9" fill="#555">pg2sqlite translates PG DDL to replica DDL plus translation manifest</text>
+      <text x="315" y="41" text-anchor="middle" font-size="8.5" fill="#555">translation emits fail-closed write guards, server applies land exempt (connetto_write_exempt), R40</text>
+      <text x="315" y="54" text-anchor="middle" font-size="8.5" fill="#4CAF50">one schema contract for deployment tables, R98</text>
+      <text x="315" y="67" text-anchor="middle" font-size="8.5" fill="#C62828">R107: a running server notices a schema change and refuses the table</text>
+      <text x="315" y="80" text-anchor="middle" font-size="8.5" fill="#C62828">R108: one translation per kind of caller, a client opens its replica with its own</text>
     </g>
 
     <!-- OAuth login and retention -->
