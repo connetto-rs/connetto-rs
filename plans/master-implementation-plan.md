@@ -166,6 +166,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R89~~ | A failing re-execution read ends its subscription, not live delivery |
 | done | ~~R106~~ | Database failures classified by their SQLSTATE |
 | blocked | R107 | Schema changes under running servers. Slice 1 needs nothing, and slice 2 is blocked on subql passing pgoutput `Relation` messages on |
+| blocked | R108 | Caller kinds as database roles. Slice 1 needs nothing, and the rest waits on rls2fga modelling table privileges per role |
 | done | ~~R90~~ | The browser's refresh token into an `HttpOnly` cookie |
 | done | ~~R91~~ | The bot registry and the list cap |
 | done | ~~R92~~ | Synced tables without local references, with SQLite's own enforcement for the tier |
@@ -225,6 +226,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no. The SQLSTATE follow-up that removes the timeout text match is R106 |
 | R106 database failures classified by their SQLSTATE | **DONE** (2026-11-01), minted 2026-10-28 from R89's upstream cleanup note, designed with the maintainer 2026-10-30 | nothing. Merged as #343 and #356, four decisions in the section. diesel's and `diesel_async`'s halves are followed on `main` until released | no longer: every request is merged |
 | R107 schema changes under running servers | NOT STARTED, minted and designed 2026-11-01 from R101's failure-refusal work, twelve decisions in the section | subql passing pgoutput `Relation` messages to consumers, for slice 2 | **yes, subql** |
+| R108 caller kinds as database roles | NOT STARTED, minted and designed 2026-11-01 from the docs audit's finding that a policy `TO` a named role means one thing to Postgres and another to OpenFGA, eleven decisions in the section | nothing for slice 1. Slices 2 to 5 wait on rls2fga modelling table privileges per role, requested as `upstream/table-privileges-per-role` in rls2fga, and the bot kinds on R99 | **yes, rls2fga** |
 | R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section and two settled in its review rounds (the cookie's lifetime, credentials for listed origins only), the 2026-08-06 parked BFF entry absorbed | no |
 | R91 the bot registry and the list cap | **DONE** (2026-10-14, merged as #152, #153 and #154), redesigned 2026-10-05 replacing the 2026-09-18 design, split with R99, R100, R101, R103 and R104 | nothing. The registry's five tables, the four generated `AS RESTRICTIVE` cap policies per synced and registry table with the startup refusal, registration over the connection's challenge, and `bots::install` and `bots::create_registration_code` with the registry in the schema document. Every decision is in `plans/apps-and-bots.md` | no, rls2fga and pg2sqlite took the cap rule as measured 2026-10-06 |
 | R92 synced tables carry no local references | **DONE** (2026-10-18, merged `e89f61e` #167, `e8b2694` #168, `46d2bef` #169), minted and designed 2026-09-22 by R21's decision 8 | nothing. Six decisions in the section | no |
@@ -470,6 +472,9 @@ graph TD
   R62[R62 refuse an undeclared primary key]
   U5[upstream subql:<br/>term planning and seeding, landed] --> R63[R63 membership-term rewire]
   R27 --> R63
+  U16[upstream rls2fga:<br/>table privileges per role] -->|slices 2 to 5| R108[R108 caller kinds as database roles]
+  R106 -->|the permission refusal| R108
+  R99 -->|the bot kinds| R108
 ```
 
 ## Upstream dependencies
@@ -7058,6 +7063,71 @@ Docker-gated, against two servers of consecutive majors on one database. The exp
 ### Done when
 
 A deployment can move between majors by the documented procedure with old clients working through the window, an old client learns its sunset before its server goes away, and a change the procedure does not allow refuses only the tables it touched, whether it arrives while the server runs or before it boots.
+
+---
+
+## R108: caller kinds as database roles
+
+**Status.** NOT STARTED. Minted 2026-11-01 from the docs audit, designed with the maintainer the same day, eleven decisions below.
+
+**Blocked on one upstream change, for slices 2 to 5.** rls2fga translates policies and never table privileges, so a kind that lacks a privilege would be admitted by OpenFGA and refused by Postgres. The request is launched in rls2fga as `upstream/table-privileges-per-role`. The two bot kinds take effect once R99 gives bots their logins. Slice 1 is blocked on nothing.
+
+**Changes state.** Client tables: none, but the build's schema bundle becomes one bundle per kind, and a client opens its replica with the bundle of its kind. Server tables: none of connetto's. The deployment adds a third document, its kind roles and their grants, beside the schema and the policies. Wire messages: a refusal reason naming a table and a kind, for a subscription and for a write. Archive format: none.
+
+### Purpose
+
+Every caller reaches Postgres through connetto's one reader role, and a policy tells callers apart only through the settings connetto binds (`app.user_id`, `app.subjects`, `app.bot_list`). A policy written `TO app_admin` therefore means one thing to Postgres, which judges it by the reader role, and another to OpenFGA, which rls2fga gates on `pg_role` memberships nobody loads or watches. Today such a deployment fails to start only by accident: pg2sqlite refuses a role-scoped policy because connetto never names a session role, with a message naming a pg2sqlite builder call, after the server has already written the model and the facts to OpenFGA (`build_write_side`, `builder/mod.rs`). This phase makes the refusal explicit and early, then gives each kind of caller its own database role, so policies can name kinds and table grants can differ per kind.
+
+### Decisions, taken with the maintainer 2026-11-01
+
+1. **Four kind roles, flat.** Anonymous callers, signed-in users, a bot acting for the owner that added it, and a bot as itself, by default named `anon`, `authenticated`, `bot_installation` and `bot`, each renameable in the server builder. No kind implies another, as in Hasura's flat model ("Roles in Hasura are defined in a flat, non-hierarchical model"), so a rule for every caller has no `TO` clause. A role per user is rejected, and so is a role bypassing row-level security in the manner of Supabase's `service_role`, whose own guide warns that "A leaked secret key exposes all of your project's data". connetto's callers are devices, and a machine acting through connetto comes as a bot, held to its list.
+2. **Finer states stay settings.** Share keys, the bot list, and any later assurance level or attestation stay in the settings connetto binds, as Supabase keeps anonymous sign-ins and MFA as claims under one role.
+3. **The switch is per transaction.** The reader role holds every kind role `WITH INHERIT FALSE, SET TRUE`, since Postgres applies a `TO` clause by `has_privs_of_role` and an inherited membership would apply every kind's rules before any switch. `CallerBinding` runs `SET LOCAL ROLE` beside the settings it binds today, so no path runs a caller's statements as the bare reader role.
+4. **A policy's `TO` names only `PUBLIC` or a kind role.** Any other role is refused at startup, before anything is written to OpenFGA, with a typed error naming the policy, its table and the role. Until slice 2, only `PUBLIC` passes.
+5. **The kind roles and their grants are a third document.** connetto translates it beside the schema and the policies, and grants may differ per kind. At startup connetto compares each kind's privileges in the database (`has_table_privilege` per role and command) with the document and refuses to start on any difference. It refuses a kind role that can log in, is `SUPERUSER` or `BYPASSRLS`, belongs to `pg_read_all_data` or `pg_write_all_data`, or is held by the reader role with inheritance. A deployment that shares a role name with another API on the same database, such as Supabase's own `anon`, renames connetto's kinds, since that API's grants would otherwise differ from the document.
+6. **connetto's own bookkeeping is never granted to a kind.** The write path writes `_connetto_writers`, `_connetto_settled` and `_connetto_session_writers` after `RESET ROLE`, back under the reader role, in the same transaction as the caller's change.
+7. **The registry tables are granted per kind.**
+
+   | Table | `anon` | `authenticated` | `bot_installation` | `bot` |
+   |---|---|---|---|---|
+   | `connetto_registration_codes` | none | create and read its own | none | none |
+   | `connetto_bots`, `connetto_bot_lists` | none | read | read its own bot | read its own rows |
+   | `connetto_installations`, `connetto_installation_optional_tables` | none | read and write as admin of the owner served | read its own | read its own |
+
+8. **A command a kind lacks is refused up front.** A subscription to a table the kind cannot read is refused at subscribe with the new reason, a write it cannot make is refused before it is applied and settles as refused, and its client copy omits the table. A `permission denied` that still arrives is classified through R106 as a permanent refusal and never retried.
+9. **The client copy is translated once per kind.** pg2sqlite already keeps one session role's policies and shapes each table by that role's grants, omitting a table it cannot read and making read-only one it cannot write (`with_session_user_role`, `test_grant_filtering.rs`). Each replica file holds one kind only, since an anonymous caller runs in memory and signing in opens the file named from the identity, so the build emits a bundle per kind and the client picks its own. `current_user` in a clause maps to a function returning the kind role's name.
+10. **connetto states the kind memberships in OpenFGA.** A producer connetto owns writes each caller's kind membership, so R70's reconcile keeps it current and nothing is loaded by hand.
+11. **Whether connetto creates the kind roles is a server builder choice.** It can create them at startup, where its owner role has `CREATEROLE`, or only check that the document created them.
+
+### Open points
+
+1. **The default of decision 11.** Creating the roles needs `CREATEROLE`, which managed Postgres often withholds, and checking alone needs one more step from the deployment.
+
+### Slices
+
+1. **The early refusal.** Step 1. Blocked on nothing.
+2. **The kind roles.** Steps 2 to 4. Blocked on the rls2fga request.
+3. **The client copy per kind.** Step 5. Needs slice 2.
+4. **Refusing what a kind lacks.** Step 6. Needs slices 2 and 3.
+5. **OpenFGA and the client copy agree.** Step 7. Needs slice 3.
+
+### Steps
+
+1. `Translated::of` refuses a policy whose `TO` names anything but `PUBLIC`, before `build_authorization` writes to OpenFGA, with the typed error of decision 4.
+2. The server builder takes the four kind role names and decision 11's choice. Preflight checks decision 5's attributes and the grants against the roles-and-grants document, and the refusal of step 1 widens to the kind roles.
+3. `CallerBinding` switches to the caller's kind role, and the write path resets to the reader role for connetto's bookkeeping.
+4. connetto turns on rls2fga's privilege modelling, translates the roles-and-grants document with the other two, and loads each caller's kind membership as a fact it owns.
+5. `connetto_schema` translates with `with_session_user_role` once per kind, the generated bundle carries one entry per kind, and the client opens its replica with the bundle of its kind.
+6. The subscription and write refusals of decision 8, and the client's error for a table its copy lacks.
+7. A client leg in `connetto-test-harness`'s parity test, comparing the rows one policy set admits through OpenFGA and through the client copy of each kind.
+
+### Proof
+
+Docker-gated. A `TO app_admin` policy refuses startup before the OpenFGA store sees a write. With the four kind roles and grants that differ per kind, an anonymous caller's write to a table it may only read is refused before the database, its subscription to a table it may not read is refused at subscribe, and its client copy lacks that table, while a signed-in caller reads and writes both. A grant applied by hand and missing from the document refuses startup. For one policy set, Postgres as each kind, OpenFGA and each kind's client copy admit the same rows.
+
+### Done when
+
+A deployment can name connetto's kinds in its policies and grant each kind its own table privileges, every other role in a `TO` clause refuses startup before anything is written, and Postgres, OpenFGA and each kind's client copy agree on what each kind may read and write.
 
 ---
 
