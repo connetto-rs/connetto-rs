@@ -6962,7 +6962,7 @@ A person can see every place they are signed in, end any of them or all but the 
 
 ### Purpose
 
-`diesel_async` maps every SQLSTATE outside the eight it names to `DatabaseErrorKind::Unknown`, and `DatabaseErrorInformation` exposes no code, so connetto classifies database failures from what is left. `reexec::is_statement_timeout` recognises a statement timeout by the words `statement timeout` in the message, and the snapshot path uses the same test. `reexec::diesel_failure` sends a deadlock, `too_many_connections`, `admin_shutdown` and every other unnamed outage to `ReadFailure::Other`, so a computed subscription meeting one is retried once and then ended instead of delivery pausing. The same function decides which writes retry (`write_target.rs`) and which oplog failures count as an outage (`oplog.rs`), so the gap reaches past re-execution. Chapter 10's paragraph under the failure inventory states the shape this phase replaces.
+A failed database read or write has to be answered by what caused it. A statement timeout is policy and ends the subscription, a deadlock or a shutdown is an outage that pauses delivery and retries, and a dropped column asks the same failing question on every retry. Postgres states the cause as a SQLSTATE, and nothing else it sends carries it reliably. The diesel kind names eight codes and leaves the rest `Unknown`, and the message is English prose that a Postgres release may reword. So classification reads the code, in the one classifier that decides re-execution reads (`reexec::diesel_failure`), which writes retry (`write_target.rs`) and which oplog failures count as an outage (`oplog.rs`), and chapter 10's failure inventory states which codes fall in each class.
 
 ### Decisions, taken with the maintainer 2026-10-30
 
