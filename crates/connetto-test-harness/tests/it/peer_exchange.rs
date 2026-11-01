@@ -37,7 +37,7 @@ use connetto_core::messages::MutationRejectReason;
 use connetto_server::authn::identity::deterministic_uuid;
 use connetto_test_harness::native_client;
 use connetto_test_harness::stack::{
-    Deployment, demo_device_ca, ensure_server_bin, provision, provision_enrolment_tables,
+    DEMO_DEPLOYMENT, demo_device_ca, ensure_server_bin, provision, provision_enrolment_tables,
     spawn_server, wait_until_closed,
 };
 use connetto_test_harness::{MockOauth, isolated_session_keyring};
@@ -45,25 +45,6 @@ use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
 use tempfile::tempdir;
-
-/// The demo's own deployment, provisioned exactly as `connetto-demo-stack`
-/// does.
-const DEMO: Deployment = Deployment {
-    schema: include_str!("../../../../examples/deployment/schema.sql"),
-    roles: include_str!("../../../../examples/deployment/roles.sql"),
-    content: include_str!("../../../../examples/deployment/content.sql"),
-    policies: include_str!("../../../../examples/deployment/policies.sql"),
-    seed: include_str!("../../../../examples/deployment/seed.sql"),
-    published: &[
-        "orders",
-        "order_lines",
-        "photos",
-        "products",
-        "team_members",
-        "team_notes",
-    ],
-    writable: "orders,photos,team_notes",
-};
 
 /// The provider name the server binary registers the containerised identity
 /// provider under.
@@ -121,8 +102,11 @@ diesel::table! {
 /// The translated bundle the builds present.
 fn bundle() -> SyncSchema {
     SyncSchema::new(
-        connetto_schema::translate::<String, TextIds>(DEMO.schema, DEMO.policies)
-            .expect("the deployment translates"),
+        connetto_schema::translate::<String, TextIds>(
+            DEMO_DEPLOYMENT.schema,
+            DEMO_DEPLOYMENT.policies,
+        )
+        .expect("the deployment translates"),
     )
 }
 
@@ -459,7 +443,7 @@ async fn an_offline_peer_exchange_phase() {
 async fn run_exchange() {
     let _keyring = isolated_session_keyring();
 
-    let provisioned = provision(&DEMO, "peer-exchange", None)
+    let provisioned = provision(&DEMO_DEPLOYMENT, "peer-exchange", None)
         .await
         .expect("provision");
     provision_enrolment_tables(&provisioned.fixture).await;
@@ -475,7 +459,7 @@ async fn run_exchange() {
     drop(listener);
     let base = format!("http://{bind}");
 
-    let mut envs = provisioned.server_env(&DEMO, &bind, &base);
+    let mut envs = provisioned.server_env(&DEMO_DEPLOYMENT, &bind, &base);
     envs.push((
         "CONNETTO_DEVICE_ROOT".to_owned(),
         device_ca.root.display().to_string(),

@@ -49,7 +49,7 @@ use connetto_server::builder::{
 use connetto_server::capability::MintCapabilityKey;
 use connetto_server::{CookieSameSite, RuntimeWritableCatalog};
 use connetto_test_harness::stack::{
-    Deployment, KeyDir, SYNC_PORT_VAR, display_command, ensure_server_bin, exe_name, ports,
+    DEMO_DEPLOYMENT, KeyDir, SYNC_PORT_VAR, display_command, ensure_server_bin, exe_name, ports,
     provision, repo_path, require_free, require_success, run_process, strings, test_profile,
     wait_for_tcp, wait_until_closed,
 };
@@ -70,23 +70,6 @@ const BROWSER_PROVIDER: &str = "dev-idp";
 /// credentialed logins.
 const DEFAULT_PAGE_PORT: u16 = 18101;
 const PAGE_PORT_VAR: &str = "CONNETTO_STACK_PAGE_PORT";
-
-const DEPLOYMENT: Deployment = Deployment {
-    schema: include_str!("../../../../examples/deployment/schema.sql"),
-    roles: include_str!("../../../../examples/deployment/roles.sql"),
-    content: include_str!("../../../../examples/deployment/content.sql"),
-    policies: include_str!("../../../../examples/deployment/policies.sql"),
-    seed: include_str!("../../../../examples/deployment/seed.sql"),
-    published: &[
-        "orders",
-        "order_lines",
-        "photos",
-        "products",
-        "team_members",
-        "team_notes",
-    ],
-    writable: "orders,photos,team_notes",
-};
 
 diesel::table! {
     /// The file server's chunk rows, as the lose-content route reads them.
@@ -237,7 +220,7 @@ impl InProcServer {
                     admin.clone(),
                     with_user(&admin, "connetto_reader", "connetto_reader"),
                 ),
-                schema: ServerSchema::new(DEPLOYMENT.schema, DEPLOYMENT.policies),
+                schema: ServerSchema::new(DEMO_DEPLOYMENT.schema, DEMO_DEPLOYMENT.policies),
                 keys: TokenKeys::from_pem(
                     fs::read(&keys.private)
                         .with_context(|| format!("reading {}", keys.private.display()))?,
@@ -250,7 +233,7 @@ impl InProcServer {
                         .idp
                         .oidc_config(BROWSER_PROVIDER, &services.addresses.callback),
                 ),
-                writable: writable_catalog(DEPLOYMENT.writable),
+                writable: writable_catalog(DEMO_DEPLOYMENT.writable),
                 content,
                 page_origin: format!("http://{}", services.addresses.page_bind),
             }),
@@ -581,7 +564,7 @@ fn parse_shard(value: &str) -> Result<Shard> {
 }
 
 async fn prepare_services(server_bin: PathBuf, addresses: Addresses) -> Result<Services> {
-    let provisioned = provision(&DEPLOYMENT, "connetto-browser-stack", None).await?;
+    let provisioned = provision(&DEMO_DEPLOYMENT, "connetto-browser-stack", None).await?;
     let share = seed_share(&provisioned.fixture, &provisioned.keys).await?;
     let idp = MockOauth::start().await;
     let schema_file = repo_path(&["examples", "deployment", "schema.sql"])?;
@@ -605,7 +588,7 @@ async fn prepare_services(server_bin: PathBuf, addresses: Addresses) -> Result<S
     );
     // The real binary the verified-topology run spawns reads the same
     // single-port contract the in-process server builds from.
-    envs.extend(provisioned.server_env(&DEPLOYMENT, &addresses.bind, &addresses.base));
+    envs.extend(provisioned.server_env(&DEMO_DEPLOYMENT, &addresses.bind, &addresses.base));
     envs.extend(idp.env_pairs(BROWSER_PROVIDER, &addresses.callback));
 
     Ok(Services {
