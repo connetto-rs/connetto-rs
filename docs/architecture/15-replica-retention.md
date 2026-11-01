@@ -110,7 +110,7 @@ One cost, stated rather than buried. A holding is one bookkeeping row per held r
 
 SQLite deletion does not shrink the file. Freed pages go onto the freelist and are available for reuse by future inserts, but the file is not truncated. A bulk eviction that removes a large time window produces a freelist of the same size and the file occupies the same disk space as before. Physical trimming returns those pages to the filesystem.
 
-### The auto_vacuum mode
+### The `auto_vacuum` mode
 
 The `INCREMENTAL` auto-vacuum mode keeps freelist bookkeeping up to date at every commit without reclaiming pages at commit time. `FULL` mode reclaims pages at every commit, which would stall the pump on every server patch. `INCREMENTAL` defers reclamation to an explicit `PRAGMA incremental_vacuum` call, which the trimming pass controls.
 
@@ -142,7 +142,7 @@ connetto creates the replica through `open_inner` in [lib.rs](../../crates/conne
 
 ## Browser constraints
 
-OPFS quota is the scarce resource in the browser, so a replica that grows large faces a higher eviction risk under storage pressure, and the bounded `incremental_vacuum` the trimming pass runs matters more there than natively. It reclaims a configurable number of pages per call and never blocks the pump. No full-compaction path exists, in the browser or anywhere else, because every replica is `INCREMENTAL` from creation (see The auto_vacuum mode and The create path), so no `VACUUM` rewrite and no `vacuum_into` output to swap into service ever arise.
+OPFS quota is the scarce resource in the browser, so a replica that grows large faces a higher eviction risk under storage pressure, and the bounded `incremental_vacuum` the trimming pass runs matters more there than natively. It reclaims a configurable number of pages per call and never blocks the pump. No full-compaction path exists, in the browser or anywhere else, because every replica is `INCREMENTAL` from creation (see The `auto_vacuum` mode and The create path), so no `VACUUM` rewrite and no `vacuum_into` output to swap into service ever arise.
 
 ## Upstream dependency
 

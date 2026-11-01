@@ -9,7 +9,7 @@ Every durable replica on a device is ciphertext, and the local tier that attache
 | Store | Native | Browser |
 |---|---|---|
 | Replica | SQLCipher file, per-replica key | sqlite3mc file in OPFS, per-replica key |
-| Local (never-syncing) tier | ATTACHed, inherits replica key | Separate connection, same per-replica key passed explicitly |
+| Local (never-syncing) tier | attached, inherits replica key | Separate connection, same per-replica key passed explicitly |
 | Refresh token | OS keyring, no SQLite involved | none, an `HttpOnly` cookie the browser keeps |
 | Account index and last-used marker | OS keyring index record | plain OPFS SQLite database, never secret |
 
@@ -46,7 +46,7 @@ The account is an argument rather than a field, because one store instance serve
 
 Both stores await, because the browser reaches `IndexedDB` and `SubtleCrypto` through promises that have no synchronous form in a worker, and the Linux desktop reaches the Secret Service only over D-Bus. The refresh-token trait returns boxed `Send` futures, so the native authenticator can hold it as `dyn RefreshTokenStore`. The Apple, Windows and Android stores still answer from a call that returns immediately.
 
-The seam buys one caller. The store tests run the shared exercises from [test_support.rs](../../crates/connetto-core/src/test_support.rs), written against the traits alone, against the native and the browser stores.
+The seam buys one caller. The store tests run the shared exercises from [`test_support.rs`](../../crates/connetto-core/src/test_support.rs), written against the traits alone, against the native and the browser stores.
 
 ### The key store
 
@@ -66,7 +66,7 @@ Every durable Linux secret, the replica key, the refresh token and the device-sc
 
 A rotated wrap key reseals every record once from the previous key. On KDE, `ksecretd` writes a wallet to disk 5 s after a change and not when it is stopped, so a secret stored in that window before a logout or reboot is lost and reads back empty. With none of these reachable the client refuses with a typed error unless the application explicitly chooses keyutils and accepts losing its keys at reboot. `KeyringStore::backend` and `KeyringKeyStore::backend` report which backend is in use, which store holds the keys, and whether the previous wrap key is still needed.
 
-The test implementation is [`connetto_client::MemoryKeyStore`], an in-memory `HashMap` in [memory_stores.rs](../../crates/connetto-client/src/memory_stores.rs).
+The test implementation is [`connetto_client::MemoryKeyStore`], an in-memory `HashMap` in [`memory_stores.rs`](../../crates/connetto-client/src/memory_stores.rs).
 
 ### The refresh store
 
@@ -223,13 +223,13 @@ One further pragma follows `PRAGMA journal_mode=WAL` and precedes the first `CRE
 
 `PRAGMA foreign_keys = ON` follows on every open, reconnects included, through `SqliteConnection::set_foreign_keys_enabled` in `open_inner`, and before the first statement that writes a row. Enforcement is connection state, and the browser build does not enforce by default, so connetto sets it on both. It precedes the replica DDL, which runs with every synced `REFERENCES` and `FOREIGN KEY` clause removed, so it governs the device-local tier's references alone. Two transactions move their checks to commit with `PRAGMA defer_foreign_keys = ON`, which SQLite clears at the commit or the rollback. They are the archive import (`apply_import_with_bookkeeping`) and the relay hub's replay of a tab's tier mutation.
 
-A bare `ATTACH` gives the attached database the connection's derived key. A database it creates takes the main database's key salt, and an existing one is read under the main database's derived key. This holds on both codecs, as the tests in [encrypted_replica.rs](../../crates/connetto-client/tests/it/encrypted_replica.rs) show.
+A bare `ATTACH` gives the attached database the connection's derived key. A database it creates takes the main database's key salt, and an existing one is read under the main database's derived key. This holds on both codecs, as the tests in [`encrypted_replica.rs`](../../crates/connetto-client/tests/it/encrypted_replica.rs) show.
 
 A local tier must therefore be first-booted through the replica connection, which is what `Replica::with_tier` asks for, so both databases share the same key salt. A tier file created by any other connection carries its own salt and will fail to decrypt through the replica connection. A later run says `with_existing_tier` and it works because the salt already matches. The tier is named on the replica rather than attached afterwards, which is what makes a durable tier beside an unkeyed replica unrepresentable.
 
 An attached database can carry a key of its own, given as the `KEY` clause's text `x'<64 hex digits>'`, which both codecs apply to that database alone as a raw key. `attach_keyed_in_window` in [harden.rs](../../crates/connetto-client/src/harden.rs) attaches that way, and it is how every identity's connection reaches the shared public store under the device-scoped key. The same bytes given as a blob literal are taken for a passphrase and run through the KDF into a different key, and `PRAGMA <schema>.key` after the attach is ignored by SQLCipher while sqlite3mc fails it with `SQLITE_NOTADB`. Neither is used.
 
-`sqlite-wasm-rs` allows one connection per database and the sahpool VFS keys its bookkeeping by name, so two live connections to one OPFS file trip a `debug_assert`. The browser local tier is therefore attached to the DB worker's replica connection, exactly as natively, and nothing else opens it ([local_tier_one_handle.rs](../../crates/connetto-web/tests/local_tier_one_handle.rs)). It inherits the replica connection's key and its enforcement of references with the attachment. The shared public store is attached to the same connection, under its own key ([shared_store.rs](../../crates/connetto-web/tests/shared_store.rs)).
+`sqlite-wasm-rs` allows one connection per database and the sahpool VFS keys its bookkeeping by name, so two live connections to one OPFS file trip a `debug_assert`. The browser local tier is therefore attached to the DB worker's replica connection, exactly as natively, and nothing else opens it ([`local_tier_one_handle.rs`](../../crates/connetto-web/tests/local_tier_one_handle.rs)). It inherits the replica connection's key and its enforcement of references with the attachment. The shared public store is attached to the same connection, under its own key ([`shared_store.rs`](../../crates/connetto-web/tests/shared_store.rs)).
 
 ## How a replica is named
 
