@@ -201,6 +201,7 @@ pub(crate) fn ack(grant: Option<WriterGrant>) -> ControlMessage {
         resume_token: "old".to_owned(),
         current_cursor: Cursor::new(Vec::new()),
         schema_version: Some(old_version()),
+        sunset_at_secs: None,
         initial_credits: 64,
         writer: grant,
     })

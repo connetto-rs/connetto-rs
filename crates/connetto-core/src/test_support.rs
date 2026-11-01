@@ -309,6 +309,7 @@ impl FakeTransport {
                     resume_token: "run:00000000-0000-4000-8000-000000000000".to_owned(),
                     current_cursor: Cursor::new(Vec::new()),
                     schema_version: None::<SchemaVersion>,
+                    sunset_at_secs: None,
                     initial_credits: 64,
                     writer,
                 }))

@@ -227,6 +227,10 @@ pub enum ControlMessage {
     /// major settled, since the worker owns the drain (R31). Never sent by a
     /// real server.
     HeldWork(HeldWork),
+    /// A relay tells a tab the worker's major's sunset, in seconds since the
+    /// Unix epoch, since the worker owns the announcement (R107). Never sent
+    /// by a real server, which says it in its own acknowledgement.
+    TabSunset(u64),
     /// Session-terminating error.
     FatalError(FatalError),
     /// Server reports that live delivery is temporarily paused.
