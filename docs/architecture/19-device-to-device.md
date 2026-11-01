@@ -113,7 +113,7 @@ Offline authorization is the translated replica policy evaluated with the author
 
 ## The archive
 
-**Decided (R75, R77, the peer state 2026-10-31).** The peer bookkeeping lives in `main`, which the R26/R56 archive does not otherwise carry, so the archive carries the four peer tables of its own, and an import restores the cursors and the retraction log and re-applies the stored entries through the peer apply, so a restored device shows its peer rows again with provenance and resumes exchanges correctly. Peer-fetched cache chunks stay out, and the archive is not the survivability mechanism, the courier path is. The one archive rule the frontier adds is that an import retires the archived writer, an enrolment or a number, and the importing replica writes under a fresh one.
+**Decided (R75, R77, the peer state 2026-10-31).** The peer bookkeeping lives in `main`, which the R26/R56 archive does not otherwise carry, so the archive carries the peer entries and cursors of its own. An import re-applies the entries through the peer apply, which writes their provisional records, and keeps per author the further of its own cursor and the archived one, so a restored device shows its peer rows again with provenance and resumes each exchange where it stopped. The retraction log stays out, since the import retires the archived writer and a retired writer offers nothing, and the server answers for that writer's refused entries. Peer-fetched cache chunks stay out, and the archive is not the survivability mechanism, the courier path is. The one archive rule the frontier adds is that an import retires the archived writer, an enrolment or a number, and the importing replica writes under a fresh one.
 
 ## Phases
 
