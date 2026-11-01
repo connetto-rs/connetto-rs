@@ -1,46 +1,35 @@
-# Architecture index
+# Architecture
 
-What each chapter owns, so a reader starts here rather than following mentions between chapters. Add a line when you add a chapter.
-
-The numbering records the order chapters were written, not a reading order and not a dependency order. Read `00` first, then whichever chapter owns the question you have.
+How connetto works, one chapter per question. Start with the [overview](00-overview.md), then read the chapter that owns your question. The [plan](../../plans/master-implementation-plan.md) holds what is not built yet.
 
 ## Chapters
 
 | Chapter | Owns |
 |---|---|
-| `00-overview.md` | What connetto is, what it does not do, and the vocabulary the other chapters use |
-| `01-pieces.md` | A catalogue of every component that must exist, and the ten crates in the workspace |
-| `02-protocol.md` | How client and server talk: the two planes, the framing, the message types, and the sequencing rules |
-| `03-sync-pipeline.md` | How writes travel to the server and how server-side changes travel back |
-| `04-subscriptions.md` | How a client declares interest in data, and the life of a subscription |
-| `05-aggregate-queries.md` | Counts, sums and grouped results, which are a different problem from row subscriptions |
-| `06-reconnect.md` | Going offline and coming back: resume, catchup, the oplog and its retention window |
-| `07-file-sync.md` | The historical record behind the file-handling decisions. Superseded by chapter 18, which is normative where they disagree |
-| `08-authorization.md` | Which caller may see which row, on reads, on changes and on writes. The two executors and the revocation path |
-| `09-wasm.md` | Running the client in a browser: the worker topology, storage, and what the platform does and does not offer |
-| `10-subscription-materializer.md` | The server component that hosts `subql` and turns its per-consumer output into per-session wire output |
-| `11-authentication.md` | How a caller proves who it is, from login to a verified identity bound onto a session, and the bot login by key challenge. **Decided (R99, 2026-10-05), not built** for the key login |
-| `12-identity-session-capability.md` | **The canonical chapter for identity.** The three concepts, what each keys, the status-marker discipline, the threat model that bounds the encryption design, and apps, bots and installations. It governs where other chapters disagree with it. **Built (R91)** for bots, lists and installations |
-| `13-client-connection.md` | The client-side Diesel connection, reactivity, the two framework adapters, and the bot runtime and template. **Decided (R103, 2026-10-05), not built** for the `connetto-bot` crate and template |
-| `14-at-rest-encryption.md` | The replica page codec, key custody, ordering constraints, and what the encryption does and does not defend |
-| `15-replica-retention.md` | Why the replica grows, and eviction and physical trimming |
-| `16-server-capacity.md` | What the server holds in flight at once, the two connection pools, and the share reserved for identified callers |
-| `17-fan-out.md` | How one change event reaches many subscribers: the unit of computation, what stays proportional to subscriber count, catchup, and what adopting the shape costs. **Built** for the fan-out and the oplog's stored patches, **Decided (R16 part B), not built** for the shared frame and the byte bound |
-| `18-file-handling.md` | File handling: identity, chunking, the encrypted stores, tickets, the availability convention, and the abuse surface. **Built through R68** (the core, the file server, the connetto seam, the native client and the browser client), with R69 the demos, R87 the quotas and R70's boot reconcile and healing built |
-| `19-device-to-device.md` | Offline collaboration between devices: certificates, the per-device frontier, the LAN link, the exchange, the provisional tier, and courier recovery. **Built (R74)** for device identity, enrolment, revocation, issuer rotation, the client's half of the clock rule and the lost-key path, **Built (R75)** for the per-device frontier, **Built (R76)** for the link, discovery, the Android hosting and joining, the beacon and the exchange, the text and QR fallback, the iPhone host and iPad join, the Linux hosting and joining and the Mac join, **Decided, not built** for Windows and R77 to R80 |
-| `20-deployment.md` | What a deployment holds and what each backup method carries, what a restore to an earlier point does to connected clients (R70), and the failover recipe (R73). **Built** for the inventory, the chunk store, rows, logins and the authorization store, every adopted boot reconciling the whole OpenFGA store against Postgres |
-| `21-clocks.md` | Which clock every timer and deadline reads, what each does across a suspend, and the skew two machines' wall clocks may have. **Built (R72)** |
+| [00 Overview](00-overview.md) | What connetto is, what it does not do, and the vocabulary the other chapters use |
+| [01 Pieces](01-pieces.md) | Every component, the crates of the workspace, and the separate workspaces |
+| [02 Protocol](02-protocol.md) | The two planes, the framing, the message families, writers and sequencing, flow control and the wire version |
+| [03 Sync pipeline](03-sync-pipeline.md) | How a write travels to the server and how a server-side change travels back |
+| [04 Subscriptions](04-subscriptions.md) | How a client declares interest in data, the snapshot and its fence, and the life of a subscription |
+| [05 Aggregate queries](05-aggregate-queries.md) | Counts, sums and grouped results, and where each is answered |
+| [06 Reconnect](06-reconnect.md) | Going offline and coming back, the oplog and its retention window, and the failover recipe |
+| [08 Authorization](08-authorization.md) | Which caller may see or write which row, the executors, grant changes and capabilities |
+| [09 Browser](09-wasm.md) | The client in a browser, the worker hub, storage, and what the platform offers |
+| [10 Subscription materializer](10-subscription-materializer.md) | The boundary between connetto and `subql`, and who retries what |
+| [11 Authentication](11-authentication.md) | How a caller proves who it is, from login to an identity bound onto a session, and session lifetimes |
+| [12 Identity, session, capability](12-identity-session-capability.md) | The three concepts and what each keys, the threat model, and apps, bots and installations |
+| [13 Client connection](13-client-connection.md) | The client-side Diesel connection, reactivity and the framework adapters |
+| [14 At-rest encryption](14-at-rest-encryption.md) | The replica page codec, key custody per platform, ordering constraints, and what the encryption defends |
+| [15 Replica retention](15-replica-retention.md) | Why the replica grows, holdings, eviction and physical trimming |
+| [16 Server capacity](16-server-capacity.md) | What the server holds in flight, its three pools, the share reserved for identified callers, and the write meter |
+| [17 Fan-out](17-fan-out.md) | How one change event reaches many subscribers and what stays proportional to their number |
+| [18 File handling](18-file-handling.md) | File identity, chunking, the encrypted stores, tickets, availability and the abuse surface |
+| [19 Device to device](19-device-to-device.md) | Offline collaboration between devices, certificates, the per-device frontier, the link, the exchange and the provisional tier |
+| [20 Deployment](20-deployment.md) | What a deployment holds, what a restore does to connected clients, erasing a person, running the server and the replication slot |
+| [21 Clocks](21-clocks.md) | Which clock every timer reads, what each does across a suspend, and the skew between machines |
 
-## Not chapters
+[subql.md](subql.md) tracks what connetto relies on from `subql`. [architecture-diagram.svg](architecture-diagram.svg) is a picture of the whole.
 
-| File | What it is |
-|---|---|
-| `open-questions.md` | Every question ever raised, with its recorded decision. The index of record for what is settled |
-| `subql.md` | A tracking document for responsibilities connetto's decisions have assigned to `subql`, and whether each has shipped |
-| `architecture-diagram.svg` | A picture of the whole, coloured by build status |
+## Conventions
 
-## Two conventions that apply to every chapter
-
-**Every normative statement carries a status marker**, one of `Built`, `Built, defective`, or `Decided (RN)` naming a phase in `plans/master-implementation-plan.md`. A chapter may not claim a mechanism exists without either marking it built or naming the phase that builds it. Table cells carry markers too. The convention is defined in `12-identity-session-capability.md`.
-
-**Citations name a file and a symbol, not a line number**, because line numbers rot silently and several in this repository already had.
+A chapter describes what is built and links the plan for what is planned. Each fact has one owning chapter, and the others link to it. A public symbol is cited as a rustdoc link with its full path, which the `connetto-architecture` crate checks on every docs build. That crate exists only for the check, and the chapters are read here as Markdown. Anything else is a file link, which the link check in CI follows. Never a line number.

@@ -5,7 +5,7 @@
 [![docs.rs](https://docs.rs/connetto-client/badge.svg)](https://docs.rs/connetto-client)
 [![crates.io](https://img.shields.io/crates/v/connetto-client.svg)](https://crates.io/crates/connetto-client)
 
-The native local-first sync client for connetto-rs, a transparent sync layer over a `connetto-server`. The application runs ordinary `diesel` queries against a managed local SQLite connection, and local writes are captured by a SQLite session and drained by `ConnettoConnection::push` into a compressed changeset that carries the old row image. Server patches apply on the same connection with capture suspended, so server-originated changes are never re-uploaded.
+The native local-first sync client for connetto-rs, a transparent sync layer over a `connetto-server`. The application runs ordinary `diesel` queries against a managed local SQLite connection, and local writes are recorded by the outbox triggers on the replica and drained by `ConnettoConnection::push` into a compressed changeset that carries the old row image. Server patches apply on the same connection under the write exemption, so server-originated changes are never re-uploaded.
 
 The server produces patches with `sqlite-diff-rs`, whose output is the native SQLite session patchset format, so `SqliteSessionExt::apply_patchset` applies them directly. The connection holds a raw SQLite handle, is `!Send`, and is driven from one task with `ConnettoConnection::pump_one`.
 

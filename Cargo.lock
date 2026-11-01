@@ -1231,6 +1231,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "connetto-architecture"
+version = "0.0.0"
+dependencies = [
+ "connetto-app-attest",
+ "connetto-auth-session",
+ "connetto-ca",
+ "connetto-client",
+ "connetto-core",
+ "connetto-dioxus",
+ "connetto-file-client",
+ "connetto-file-core",
+ "connetto-file-server",
+ "connetto-peer",
+ "connetto-schema",
+ "connetto-server",
+ "connetto-yew",
+]
+
+[[package]]
 name = "connetto-auth-session"
 version = "0.0.0"
 dependencies = [

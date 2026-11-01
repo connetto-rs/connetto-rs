@@ -1,259 +1,142 @@
 # 04: Subscriptions
 
-**Status**: draft
+A subscription is how a client names the rows it wants and how the server keeps them current. This chapter covers the wire lifecycle of a row subscription, the ordering guarantees the server's run loop carries, the snapshot cursor and the fence it carries, the server-side registry, and the membership term in the subscription language. Aggregate subscriptions have their own chapter, [05-aggregate-queries.md](05-aggregate-queries.md). The CDC path the live updates ride is [03-sync-pipeline.md](03-sync-pipeline.md), the reconnect flow is [06-reconnect.md](06-reconnect.md), and row visibility is decided by [08-authorization.md](08-authorization.md).
 
----
+## What a subscription is
 
-## Purpose
+A subscription is a standing query. The client says which rows it wants and asks to be updated as they change. A subscription has three parts.
 
-Define how clients express interest in data: the lifecycle of a subscription from creation through update to cancellation, and how the server manages the active subscription set.
+- A **subscription ID** (`sub_id`), a client-chosen string, unique within the session, that correlates the snapshot and update messages.
+- A **spec**, [`connetto_core::messages::SubscriptionSpec`], the query the client wants to observe.
+- A **resume cursor**, [`connetto_core::cursor::Cursor`], opaque bytes the server issues and the client stores as-is and returns verbatim in its next `Handshake`.
 
-Aggregate subscriptions are a distinct enough topic to have their own file (`05-aggregate-queries.md`). This file covers row-level SELECT subscriptions.
+The shipped spec carries three fields.
 
----
-
-## What Is a Subscription?
-
-A subscription is a standing query: the client says "give me all rows matching this predicate and keep me updated as they change."
-
-A subscription has:
-
-- A **subscription ID** (`sub_id`): a client-chosen string, unique within the session, used to correlate snapshot and update messages.
-- A **spec** (`SubscriptionSpec`): describes what data the client wants.
-- A **resume cursor**: the server position at which the client last received an update for this subscription, stamped with the database's timeline (R73).
-
----
-
-## SubscriptionSpec
-
-The spec describes the query the client wants to observe. The shipped shape (`SubscriptionSpec` in `crates/connetto-core/src/messages/subscription.rs`) is:
-
-```
+```text
 SubscriptionSpec {
-  priority: SubscriptionPriority,  // delivery tier
+  priority: SubscriptionPriority,  // 0 to 3, 0 highest, 1 the default
   query:    String,                // full SELECT in the client's SQLite dialect
   binds:    Vec<BindValue>,        // values for the ? placeholders, in order
 }
 ```
 
-An earlier sketch here showed `table`, `filter`, `columns`, `order_by`, and `limit` as struct fields. That shape predates Q4.1: the table and the filter became the SQL text itself, a column list rides inside `query` like everything else (Q4.5), and ordering or pagination (`LIMIT` with any `OFFSET`) ride inside `query`, where pagination shapes the snapshot only and live updates ignore it (see the design note at the end of this chapter).
+The `query` is a full `SELECT`, and the filter rides in its `WHERE` clause as SQL text. `subql` parses that text and rejects anything it cannot compile at registration. The supported comparison set is `=`, `!=`, `<`, `>`, `IN`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `AND`, `OR`, `NOT`, and arithmetic. A custom predicate tree is the alternative a reader would propose, and it was rejected because the language is owned by `subql` and a second AST connetto maintains would have to grow in lockstep with it. Column projection rides inside the `SELECT` as well. A subscription may name a subset of a table's columns, and the server widens it to whole rows before registration and before the snapshot reads, because the replica holds the application's whole table and `subql` reports no change that touches only a column the list leaves out.
 
-### Predicate
+The `priority` field travels on the wire and is echoed by `SnapshotBegin`, and it schedules nothing. Snapshots are delivered serially in message-arrival order. [G12](../../plans/master-implementation-plan.md#g12) records the gap.
 
-A `Predicate` is a tree of conditions:
+A subscription selects from one table. A join as an output shape is composed locally from several subscriptions over the tables it reads. A join as a membership predicate, deciding which rows of a second table the client should hold because of a relationship to rows it already holds, is answered by row-level security and by the [membership term](#the-membership-term) below.
 
-```
-Predicate =
-  | Eq(column, value)
-  | Ne(column, value)
-  | Lt(column, value)
-  | Gt(column, value)
-  | Le(column, value)
-  | Ge(column, value)
-  | In(column, [value])
-  | And([Predicate])
-  | Or([Predicate])
-  | Not(Predicate)
-```
-
-Predicates are restricted to column comparisons against literal values: no subqueries, no cross-table joins in the predicate itself. This constraint makes server-side subscription matching feasible without issuing a SQL query per CDC event for simple cases.
-
-**The tree above is superseded by Q4.1 below.** The subscription language is SQL `WHERE` clause text, parsed by `subql`, which accepts `=`, `!=`, `<`, `>`, `IN`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `AND`, `OR`, `NOT` and arithmetic, and rejects anything else at registration. The tree is retained as a statement of the intended expressiveness. What matters for the section below is that the restriction to literals is unchanged, and that the language is owned upstream.
-
-### Cross-table and join subscriptions
-
-**Researched from primary sources.** This section previously declined joins in two sentences and offered "one subscription per table, join locally in SQLite" as the workaround. That workaround answers half the question, and the half it leaves out is already answered elsewhere in this architecture without this chapter saying so. Seven systems were read at pinned commits: PowerSync, ElectricSQL, Zero, Convex, Supabase realtime and walrus, Phoenix, and Materialize.
-
-**"Support joins" is two capabilities, and no system treats them as one.**
-
-A **join as output shape** puts columns from two tables in one result row. A client holding both tables can do this itself, so local SQLite genuinely solves it. This is what the old workaround addressed.
-
-A **join as membership predicate** decides which rows of the second table the client receives at all, based on a relationship to a row in the first: the line items of my orders, the documents in the workspaces I belong to. **A client cannot solve this locally, because it would have to already hold the rows in order to decide whether it should hold them.**
-
-**Only two of the seven support the output-shape join, and six of the seven still provide a membership mechanism.** PowerSync rejects with `Must SELECT from a single table` on the legacy data-query path and `Sync streams can only select from a single table` in the current compiler, then supplies membership through a second query language whose parameter queries populate a bucket index. Electric rejects with `Expected a single table reference`, then supplies membership through `IN (SELECT ...)` tracked as a shape dependency with incremental move-in and move-out. Supabase accepts thirteen filter operators over one table against literals, then lets row-level security decide actual visibility. Convex dissolves the distinction by subscribing to a function's read set, and pays for it with hard caps of 32000 documents, 16 MiB, and 4096 index intervals per transaction. Only Zero and Materialize support the output-shape join outright, both by maintaining materialized state per query. Only Phoenix has no membership mechanism, because it has no data model to attach one to.
-
-**The single-table boundary is therefore correct and stays.** What was missing is the statement of where membership comes from.
-
-### Where membership comes from here
-
-**It comes from row-level security, exactly as in Supabase.** The snapshot query runs with `app.user_id` bound on a pool subject to RLS, and change-time delivery is authorized per row (`08-authorization.md`). A policy is arbitrary SQL and may contain a subquery over another table, so "the line items of my orders" is already expressible today, as a policy rather than as a subscription. The predicate above is the equivalent of Supabase's stage one, and the policy is stage two.
-
-### The membership term (R27, built 2026-08-18)
-
-Three gaps motivated it, and only the first was about joins. Authorization is not interest: RLS returns everything the caller may see, whereas a subscription says what the caller wants now, and the two diverge once the authorized set is large. Revising an `IN` list of parent keys cost a full re-snapshot, so adding one order re-snapshotted the line items of every order. And the only move-out was `FullResyncRequired`, the coarsest option every peer system improves on.
-
-**Built: a subscription's `WHERE` clause narrows through a membership.** The motivating filter is `team_id IN (SELECT team_id FROM team_members WHERE member = current_app_user())`, written in the client's own SQLite dialect. Reverse translation rewrites the caller with the deployment's pairing, the SQLite function `current_app_user` against the identity setting, so the subquery reaches Postgres as `current_setting` text the classifier reads. The term is one SQL text with two executors, exactly as policy is: the subquery serves the snapshot on Postgres under row-level security, and `subql`'s compiled term answers the per-row question on the change path. It is seeded at registration (`SessionManager::register_subscription`) from the membership table read as the caller, under the same binding the snapshot uses and inside the same materializer-lock hold as the register, so no dispatch lands between the seed's snapshot and the engine watching. The subscriber is typed at the membership column's own catalog kind, because a mistyped subscriber would admit nobody in silence. A term `rls2fga` cannot classify is refused at registration in R38's fixed shape, bounded by `PatternClass` in `rls2fga`, which is the only correct statement of what classifies. A term whose membership table the publication does not carry is refused the same way, probed live in the seed's own transaction.
-
-**A membership change moves rows, it never resends the subscription.** `subql` reports each move as a narrowing and the server answers it incrementally (`SessionManager::fan_out_moves`). A value entering the set is served by the subscription's own SELECT with `AND <column> = <value>` conjoined, read as the caller so the rest of the filter and the policy still apply. A value leaving it is served by indirect deletes for the keys the change-path executor now denies, read on the privileged pool, because the policy that made them visible is exactly the membership that ended, and sent only when the same event moved a grant reaching the subscribed table, which is what keeps a never-held key undisclosed. The R7 resend yields to the term on exactly the membership tables the term watches, and a failed move escalates through the same ordered replace instruction a moved grant uses rather than skipping. The proof asserts the absence of `FullResyncRequired` in both directions: `crates/connetto-test-harness/tests/membership_term.rs`.
-
-**The server opens a membership subscription on the client's behalf.** The replica needs the caller's own membership rows twice over: the application's query names the membership table locally, and a translated membership policy reads it inside the replica's view, so without those rows the local answer is empty while the server sends the right rows. Registering a term therefore opens one hidden subscription per membership table, labelled `connetto-membership:<table>` and announced with `MembershipOpened` ahead of its own snapshot. It carries the caller's own rows and nothing wider, is counted against R19's allowance before the term is served so a caller at its ceiling is refused as a unit, reads under the term's own R39 reader-share slot so the share never throttles it once the term is admitted, and is torn down with the last term subscription that needs it. The client keeps its table out of the application-facing changed-tables signal, unconditionally, while the live-query refresh still sees it, which is what re-runs a narrowed query when the membership moves. **Built (2026-09-24).** A membership read that fails refuses the term with it, `subscription refused` on the term's label, and the connection and every sibling subscription stay up, because a term served without its membership rows answers wrongly on the replica.
-
-**The term intersects the policy, never widening it.** A row the term admits and the policy forbids never arrives, because every move-in is read as the caller and every withdrawal key passes the visibility question. A row the policy admits and the term excludes never arrives, because interest excludes it. Both directions are asserted in the proof above, on a fixture whose policy never reads the membership so the two can disagree.
-
----
-
-## Subscription Lifecycle
+## The wire lifecycle
 
 ### Registration
 
-Client sends:
+The client sends `Subscribe { sub_id, spec }`. The server reverse translates the query from the client's SQLite dialect to Postgres, registers it with the engine under a fresh consumer id, and serves the snapshot or the catch-up.
 
-```
-Subscribe {
-  sub_id:  String,
-  spec:    SubscriptionSpec,
-}
-```
+Two gates can answer `RateLimited` with a wait instead of serving. A reader-share permit is taken before the creation allowance, so a subscribe the share defers has spent nothing and its retry is not refused by count. A per-tier per-minute meter on subscription creation (`subscription` in [guard.rs](../../crates/connetto-server/src/guard.rs)) refuses a caller at its allowance and answers the same frame with the wait.
 
-Server:
-
-1. Validates the spec (table exists, client has read permission, predicate is well-formed).
-2. Records the subscription in the registry: `(session_id, sub_id) → (spec, principal, lsn=None)`.
-3. Begins snapshot delivery (see below).
-
-On any failure, before or after registration, the server sends one `Error` frame whose `detail` is the fixed refusal text and does not add the subscription. The cause never reaches the wire and goes to the structured log instead (R38): a detail or a frame sequence that varied with the cause told a caller which stage refused, and so whether the table or column it guessed exists.
+On any failure, before or after registration, the server answers one `NonFatalError` frame whose `detail` is the fixed [`connetto_core::messages::SUBSCRIPTION_REFUSED`] text and does not add the subscription. The cause never reaches the wire and goes to the structured log, because a detail that varied with the cause would tell a caller which stage refused and so whether a table it guessed exists.
 
 ### Snapshot delivery
 
-After registration, the server delivers an initial snapshot. `SnapshotBegin { sub_id }` and `SnapshotEnd { sub_id, lsn: u64 }` are control-plane frames that bracket the snapshot. The row data travels on the bulk plane as one or more `SnapshotPatch` frames, each carrying `sub_id` and `patchset_zstd` (a Zstd-compressed SQLite patchset).
+After registration the server delivers an initial snapshot. `SnapshotBegin { sub_id, priority }` opens it, the rows travel as one or more `SnapshotPatch` bulk frames, each carrying `sub_id` and a Zstd-compressed SQLite patchset, and `SnapshotEnd { sub_id, cursor }` completes it. The `priority` in `SnapshotBegin` is informational and matches the value registered in the spec.
 
-**The bracket is not free of the rows it brackets. Built (R33, 2026-08-09).** `SnapshotEnd` shares the outbound queue with the patches rather than going straight to the socket, so it cannot reach a backlogged client ahead of the data it completes. It costs no credit, it only waits its turn. Before this it went out immediately and a client whose window was shut recorded the resume position that frame carries over an empty replica, so the next attach asked only for what followed rows it never had. Demonstrated first, then fixed, at both the server and the browser relay, which had copied the shape.
+The completion frame is not free of the rows it completes. It shares the session's outbound queue with the patches and costs no credit, so a backlogged client cannot record the resume position over an empty replica and skip the rows it never had.
 
-The snapshot is read after the route is installed, so live delivery runs throughout it. A change committed while the snapshot is in flight reaches the client as a `LivePatch` queued behind `SnapshotEnd`, which is what keeps it from being lost. Installing the route afterwards dropped every such change silently, which was phase R28 part A. Since R38 no frame goes out until that read has succeeded, so a subscription failing at the snapshot refuses as bare as one refused at registration.
+The route is installed before the read, so live delivery runs throughout the snapshot. A change committed while the snapshot is in flight reaches the client as a `LivePatch` queued behind `SnapshotEnd`. A snapshot read that fails refuses the subscription with the same fixed detail as a registration refusal, rolls the registration back, and leaves the connection and every sibling subscription up.
 
-**The overlap is re-applied, not filtered. Decided (R28 part A, 2026-08-03), and this paragraph replaces one that said any `LivePatch` at or below the snapshot's LSN is discarded.** Such a filter looks obvious and loses data. The `lsn` in `SnapshotEnd` is `pg_current_wal_lsn()` read after the rows inside a `REPEATABLE READ` transaction, and a `LivePatch` carries the WAL position of the change record. Neither number orders by visibility: a writer that starts before the snapshot and commits after it produces a change whose position is below the snapshot's, while the snapshot cannot contain its row. Measured on Postgres 16: two writers, the snapshot saw only the committed one and reported `0/151BA18`, and the other writer's row arrived at `0/151B868`. Discarding it would have deleted a row permanently, which is the defect R28 exists to remove.
+### The wire order
 
-**Amended 2026-09-25.** The `SnapshotEnd` position is read in its own statement before the `REPEATABLE READ` transaction opens. A position read after the rows counts changes the snapshot cannot see, and a client that drops before their live patches arrive and resumes from it skips them for good (reproduced in `transitions.rs`). A change committed between that read and the snapshot is both in the snapshot and replayed, which this paragraph's re-application already absorbs.
+The client does not buffer updates during snapshot delivery, and it does not need to. Ordering is guaranteed by the shape of the server's run loop. That loop is a single two-armed `tokio::select!`, and the code serving a subscribe, including its first page of rows, is awaited inside the arm that reads from the transport, so the arm draining outbound live patches is not polled meanwhile. Overlapping patches queue in memory and reach the wire in order.
 
-**Built (2026-09-27): the snapshot's cursor carries its fence.** A commit record flushed before that position can belong to a transaction the snapshot cannot see yet, one waiting for a synchronous standby or between `XLogFlush` and `ProcArrayEndTransaction`, so a position alone would sit past a change the client never received. The first page reads `pg_current_snapshot()` and `pg_current_wal_insert_lsn()` inside its transaction, and subql judges a change against that fence as `Held`, `Missed` or `Beyond` (its commit is at or past the insert position). A later page's snapshot sees everything the first one saw, so the first page's fence decides for the whole read. The log's entries of the transactions the fence did not see that it missed were dispatched before the route existed, so the session loop sends them before its next frame, ahead of every live patch still queued, as live patches under the snapshot's own fenced cursor. A client that drops before they arrive resumes from that cursor and is sent them again, and every subscription's snapshot frames stay contiguous. `SnapshotEnd` carries the stamped position followed by the fence. A client resuming from it catches up on the entries past the position that the fence does not hold and on the missed ones at or below it, and its route keeps the fence, so a missed transaction dispatched later is delivered even below where catchup left its cursor. A missed truncate cannot be sent as a patch, and a read taken while it is still invisible would miss it again, so the subscription is refused. The design record with its state table is `plans/design-commit-positions.md`.
+The guarantee is structural, so the loop carries a comment saying that moving either arm onto its own task breaks it silently. The queue side of the guarantee is asserted rather than argued. `snapshot_order_holds_when_the_credit_window_is_closed` in [`snapshot_order.rs`](../../crates/connetto-server/tests/it/snapshot_order.rs) shuts the credit window by configuration and reads frames in wire order, so a change routing the completion frame around the queue fails a test rather than passing silently.
 
-Re-application is safe instead, and needs nothing on the client. Patches arrive in commit order, so for any row the last patch applied carries that row's current value, and the replica settles on the same state whether or not the snapshot already held it. The cost is that a row can briefly show an older value between `SnapshotEnd` and the end of the overlap, and that the resume cursor moves backwards for that moment, which replays rather than loses. Making the filter correct would need the change stream to report each change's commit position and the snapshot to be paired with a matching consistent point through a replication slot, which buys only the removal of that flicker.
+A read still arriving in pages is the one exception. Its later pages are taken when the client acknowledges the previous one, so a `LivePatch` may land between two pages. The direction is the safe one, because a later page is read after every frame already sent and so can never carry a value older than one the client has applied.
 
-**A snapshot larger than one delivery arrives as several pages. Built (R58, 2026-08-21).** The read is capped at a per-tier byte budget, and a read past it is served in pages ordered by primary key, each resuming past the last row of the one before, never by offset (measured: offset paging costs O(offset) per page). The next page is taken when the client acknowledges the last, so the credit window paces the database reads as well as the wire and the server holds one page at a time. `SnapshotBegin` and `SnapshotEnd` still bracket exactly one read, and the position `SnapshotEnd` carries is the first page's, which can only replay rather than skip. Delivery order carries no promise: the client reads its replica with its own queries, and pagination inside the query text remains a snapshot-shaping device rather than an ordering one. **A `LivePatch` may now arrive between two pages**, which the paragraphs above already cover, because a later page is read after every frame already sent and so can never carry a value older than one the client has applied.
+### The cursor and its fence
 
-A read the server will not serve is refused rather than truncated: a row above a per-tier ceiling, a table whose typical row is already above it, or a read whose plan needs a sort and runs past its time limit. Every cause is the one fixed refusal on the wire with the cause in the server's log. A read that fails part way through its pages is replaced once, announced as `FullResyncReason::SnapshotInterrupted`, and refused if the replacement fails too.
+The position a snapshot reports is read in its own statement before the read transaction opens, so the cursor never counts a change the snapshot cannot see. A position alone would still be wrong. A commit record flushed before that position can belong to a transaction the snapshot cannot see yet, one waiting for a synchronous standby or between `XLogFlush` and `ProcArrayEndTransaction`, and a cursor on that position alone would sit past a change the client never received. The cursor therefore carries the fence of the read's own snapshot beside the position.
 
-**The client does not buffer updates during snapshot delivery, and it does not need to. Decided (R28 part A), and this paragraph replaces one that said it did.** Ordering is guaranteed by the shape of the server's run loop rather than by anything on the client: that loop is a single two-armed `tokio::select!`, and the code delivering a page is awaited inside the arm that reads from the transport, so the arm draining outbound live patches is not polled meanwhile. Overlapping patches therefore queue in memory and reach the wire in order. **Corrected by R58:** a client could not observe a `LivePatch` before that subscription's `SnapshotEnd` at all until reads were paged, and now it can, between two pages, because a later page is taken from the acknowledgement rather than inside the first arm's turn. A buffer would still never help, since the ordering that matters is per row and the last patch applied for a row is that row's current value.
+The first page reads `pg_current_snapshot()` and `pg_current_wal_insert_lsn()` inside its `REPEATABLE READ` transaction, and [`connetto_server::fence::ReadFence`] wraps the two as subql's `PgSnapshotFence`. The cursor on the wire is the stamped position followed by the encoded fence ([`connetto_server::fence::snapshot_cursor`]). A later page reads at a later moment. A later page's snapshot sees everything the first one saw, so the first page's fence decides for the whole read, and `SnapshotEnd` carries the first page's cursor. A client resuming from it catches up on the entries past the position the fence does not hold and on the missed ones at or below it.
 
-**That guarantee is structural, so it is worth knowing what would break it.** Moving the snapshot send onto its own task, or splitting the two select arms across tasks, would let a live patch overtake the snapshot with no test failing. The loop carries a comment saying so, because the alternative is a silent dependency.
+subql's `Seen` judges a change at a position against the fence, and the server acts on each state.
 
-**The second structural guarantee is the queue, and it is asserted rather than argued.** `snapshot_order_holds_when_the_credit_window_is_closed` shuts the window by configuration and reads frames in wire order, so a change routing the completion frame around the queue fails a test rather than passing silently.
+| State | What the fence says | What the server does |
+|---|---|---|
+| `Held` | The read's rows already reflect the change, so applying it again would count it twice. | The overlap is re-applied rather than discarded. A catch-up walk does not resend the record, and a live dispatch at or below the stored cursor is skipped as one already past. |
+| `Missed` | The read's rows lack the change, and a later change may still be one the read holds. | The rows are owed from the oplog. The run loop replays them between two frames, ahead of every live patch still queued, as live patches under the snapshot's own fenced cursor, and a missed transaction dispatched later is delivered even at or below the cursor catch-up left. A missed `Truncate` refuses the subscription. |
+| `Beyond` | The change commits at or past the fence's insert position, so the read's rows are all before it and the fence has nothing left to decide. | Nothing is owed, and a dispatch at or below the stored cursor is skipped as a re-delivery. |
+
+Three properties make the table safe. Re-application is safe because patches arrive in commit order, so for any row the last patch applied carries that row's current value, and the replica settles on the same state whether or not the snapshot already held it. A row can briefly show an older value between `SnapshotEnd` and the end of the overlap, and the resume cursor moves backwards for that moment, which replays rather than loses. The replay runs between two frames because the queued live patches all commit later than the missed rows, so sending the missed rows first keeps commit order on the wire. The fence rides with the cursor and stays with the route, so a client that drops before the replay arrives resumes from it and is sent the missed rows again.
+
+A `Truncate` the fence missed cannot be sent as a patch, and a read taken now would miss it again, so the subscription is refused. If the oplog's retention no longer covers the transactions the fence did not see, the snapshot's rows cannot be completed, and the subscription is resnapshotted with `FullResyncReason::CursorOutsideRetention`.
+
+### Paging
+
+A snapshot larger than one delivery arrives as several pages. The read is capped at a per-tier byte budget, and a read past it is served in pages ordered by primary key, each resuming past the last row of the one before, never by offset. The next page is taken when the client acknowledges the last, so the credit window paces the database reads as well as the wire and the server holds one page at a time. `SnapshotBegin` and `SnapshotEnd` still bracket exactly one read, and the position `SnapshotEnd` carries is the first page's, which can only replay rather than skip.
+
+A read the server will not serve is refused rather than truncated. A row above a per-tier ceiling, a table whose typical row is already above it, or a read whose plan needs a sort and runs past its time limit all answer the one fixed refusal on the wire, with the cause in the server's log. A read that fails part way through its pages is replaced once, announced as `FullResyncReason::SnapshotInterrupted`, and refused if the replacement fails too.
 
 ### Ongoing updates
 
-After `SnapshotEnd`, the server delivers incremental updates via `LivePatch` bulk frames as the underlying data changes. See `03-sync-pipeline.md` for the CDC fanout path.
+After `SnapshotEnd`, the server delivers incremental updates via `LivePatch` bulk frames as the underlying data changes. The CDC fanout path is [03-sync-pipeline.md](03-sync-pipeline.md).
 
 ### Cancellation
 
-Client sends:
+The client sends `Unsubscribe { sub_id }`. The server removes the subscription, and no further updates are delivered for the id, which the server tolerates when it is unknown. The client may delete the locally cached data for the subscription or retain it for offline use.
 
-```
-Unsubscribe { sub_id }
-```
+### Update
 
-Server removes the subscription from the registry. No further updates are delivered for this `sub_id`.
+There is no in-place modify. To change a subscription the client sends `Unsubscribe(sub_id)` and then `Subscribe(sub_id, new_spec)`, which serves a new snapshot. The client may retain the old local data until the new snapshot arrives.
 
-The client may delete the locally cached data for this subscription, or retain it for offline use: application's choice.
+## Matching changes to subscriptions
 
-### Update (modify a subscription)
+The engine routes an event by the tables it references and answers each covering subscription's compiled predicate against the changed row, in SQL three-valued logic. The transition a row takes through the result set decides the delivery.
 
-There is no in-place "modify subscription" message. To change a subscription:
+| Event | old row | new row | Delivery |
+|---|---|---|---|
+| `Insert` | absent | matches | insert |
+| `Delete` | matches | absent | delete |
+| `Update` | matches | matches | update |
+| `Update` | matches | does not | delete, the row left the result set |
+| `Update` | does not | matches | insert, the row entered the result set |
+| `Update` | does not | does not | none |
 
-1. Client sends `Unsubscribe(sub_id)`.
-2. Client sends `Subscribe(sub_id, new_spec)`.
+Each delivery still passes the visibility question before it is sent, against both versions of the row. That check is owned by [08-authorization.md](08-authorization.md).
 
-This triggers a new snapshot. The client may choose to retain the old local data until the new snapshot arrives to avoid a blank state.
+### The two deletes
 
----
+The two deletes are different events, and the wire distinguishes them. The `Delete` case removes a row that no longer exists. The departure case removes a row that still exists and merely left this subscription's window. The marker is the patchset op's own session-format indirect flag, set on synthesized departure deletes, so no frame or format changed.
 
-## Server Subscription Registry
+On an event with departures the server encodes a second patchset carrying only the departed rows' table, primary key and `indirect(true)` ([`connetto_server::materializer::Materializer::dispatch`]), identical bytes to every departed subscriber, and splits the consumer list in two rather than fanning out per subscriber. The client releases the addressed subscription's holding of the row and deletes it only when no holding and no unsent write keeps it (`apply_patch` in [lib.rs](../../crates/connetto-client/src/lib.rs)). A direct delete applies unconditionally and releases every holding of the row. The holding rules are [15-replica-retention.md](15-replica-retention.md#departures-and-deletes).
 
-The registry maps `(session_id, sub_id)` to:
+The distinction is load-bearing once two subscriptions share a table, because patches from both apply into the same replica table. A departure delivered as an unmarked delete would remove a row out from under a sibling subscription that still covers it. Nor can the client repair that by predicate-checking alone. On a genuine deletion the server sends a delete to every covering subscription, each would be held back by the others still matching the stale local row, and the row would never be removed at all. Only the marker is correct in both directions.
 
-```
-SubscriptionEntry {
-  spec:         SubscriptionSpec,
-  principal:    Principal,         // optional identity plus resolved capabilities
-  last_lsn:     Option<u64>,    // None until SnapshotEnd is sent
-  snapshot_lsn: Option<u64>,    // LSN at which snapshot was taken
-}
-```
+## The membership term
 
-**Decided (R3).** The caller may have no identity at all. See `12-identity-session-capability.md`.
+A subscription's `WHERE` clause may narrow through a membership. The motivating filter is `team_id IN (SELECT team_id FROM team_members WHERE member = current_app_user())`, written in the client's own SQLite dialect. Reverse translation rewrites the caller with the deployment's pairing, the SQLite function `current_app_user` against the identity session setting, so the subquery reaches Postgres as `current_setting` text the classifier reads.
 
-The registry is in-memory (session lifetime). It is not persisted server-side, and on reconnect the client re-declares all subscriptions. Across a client restart the same re-declaration comes from the client's own persisted subscription set, pins always and watch-backed entries still within their grace (`15-replica-retention.md` under "What covers a row", phase R29).
+The term is one SQL text with two executors, exactly as policy is. The subquery serves the snapshot on Postgres under row-level security, and `subql`'s compiled term answers the per-row question on the change path. It is seeded at registration from the membership table read as the caller, under the same binding the snapshot uses and inside the same materializer-lock hold as the register, so no dispatch lands between the seed's snapshot and the engine watching. The subscriber is typed at the membership column's own catalog kind, because a mistyped subscriber would admit nobody in silence. A term `rls2fga` cannot classify is refused at registration, and a term whose membership table the publication does not carry is refused the same way, probed live in the seed's own transaction.
 
----
+A membership change moves rows, and it never resends the subscription. `subql` reports each move as a narrowing, and the server answers it incrementally. A value entering the set is served by the subscription's own `SELECT` with `AND <column> = <value>` conjoined, read as the caller so the rest of the filter and the policy still apply. A value leaving it is served by indirect deletes for the keys the change-path executor now denies, read on the privileged pool, because the policy that made them visible is exactly the membership that ended, and sent only when the same event moved a grant reaching the subscribed table, which is what keeps a never-held key undisclosed. The proof asserts the absence of `FullResyncRequired` in both directions in [`membership_term.rs`](../../crates/connetto-test-harness/tests/it/membership_term.rs).
 
-## Matching CDC Events to Subscriptions
+The server opens a membership subscription on the client's behalf. The replica needs the caller's own membership rows twice over. The application's query names the membership table locally, and a translated membership policy reads it inside the replica's view, so without those rows the local answer is empty while the server sends the right rows. Registering a term therefore opens one hidden subscription per membership table, labelled `connetto-membership:<table>` and announced with `MembershipOpened` ahead of its own snapshot. It carries the caller's own rows and nothing wider, is counted against the caller's allowance before the term is served so a caller at its ceiling is refused as a unit, reads under the term's own reader-share slot so the share never throttles it once the term is admitted, and is torn down with the last term subscription that needs it. The client keeps the table out of the application-facing changed-tables signal, unconditionally, while the live-query refresh still sees it, which is what re-runs a narrowed query when the membership moves. A membership read that fails refuses the term with it, `subscription refused` on the term's label, and the connection and every sibling subscription stay up.
 
-The fanout engine indexes subscriptions by table name. When a `ChangeRecord` arrives for table `T`:
+The term intersects the policy, never widening it. A row the term admits and the policy forbids never arrives, because every move-in is read as the caller and every withdrawal key passes the visibility question. A row the policy admits and the term excludes never arrives, because interest excludes it.
 
-1. Fetch all subscription entries for table `T` across all sessions.
-2. For each entry, evaluate the subscription predicate against the changed row.
-3. For subscriptions where the predicate matches (either `old_row` or `new_row`, or both), proceed to auth filter.
+## Reconnect
 
-### Predicate evaluation on CDC events
+After reconnect the client re-sends all `Subscribe` messages, and across a client restart the same re-declaration comes from its own persisted subscription set. The server judges the handshake cursor against the database's timeline before serving any of them. A cursor past where its timeline ended answers `FullResyncRequired` with `CursorBeyondHistory` ahead of every snapshot.
 
-For each CDC event:
+Each re-declared row subscription is then judged against the oplog. A catch-up never shows or hides a row that did not change, so a subscription a key change reaches, while the connection's subject coverage is unknown, is resnapshotted with `FullResyncReason::AuthorizationChange`. Otherwise the decision is [`connetto_server::oplog::catchup_decision`]. The gap replays when the resume position sits at or after the oldest retained entry, and resyncs with `FullResyncReason::CursorOutsideRetention` when it does not or when the log is empty, since nothing retained can prove the client has everything.
 
-- If `op = Insert`: evaluate predicate against `new_row`. If matches → deliver as insert.
-- If `op = Delete`: evaluate predicate against `old_row`. If matches → deliver as delete.
-- If `op = Update`:
-  - Evaluate predicate against `old_row` and `new_row` separately.
-  - `old matches, new matches` → deliver as update.
-  - `old matches, new does not` → deliver as delete (row left the result set).
-  - `old does not, new matches` → deliver as insert (row entered the result set).
-  - `old does not, new does not` → no delivery needed.
+A catch-up installs the route first, carrying the fence of the snapshot that issued the cursor, then takes a ceiling from the oplog and walks it, sending what the subscription wants past its cursor and the rows its fence missed at or below it. It ends with a `SnapshotEnd` stamped at the ceiling. The full reconnect flow is [06-reconnect.md](06-reconnect.md).
 
-**The two deletes above are different events and the wire distinguishes them. Decided (R29), built by R44 (2026-08-08).** The `op = Delete` case removes a row that no longer exists. The `old matches, new does not` case removes a row that still exists and merely left this subscription's window. The marker is the patchset op's own session-format indirect flag, set on synthesized departure deletes, so no frame or format changed (`15-replica-retention.md`, The one case predicates cannot answer).
+## The server's registry
 
-**What the server does, since R44.** On an event with departures it encodes a second patchset carrying only the departed rows' table, primary key and `indirect(true)` (`Materializer` in `crates/connetto-server/src/materializer.rs`), identical bytes to every departed subscriber, and splits the consumer list in two rather than fanning out per subscriber. The client releases the addressed subscription's holding of the row and deletes it only when no holding and no unsent write keeps it (`apply_patch` in `crates/connetto-client/src/lib.rs`, chapter 15). A direct delete applies unconditionally and releases every holding of the row.
+The registry is in-memory for the session's life and not persisted server-side. A session keeps two maps. `subs` holds the row subscriptions, keyed by the client's label, each keeping the engine's consumer and subscription ids, the reverse-translated query, the membership tables it watches, and the bytes its deliveries have carried, which the growth warning is measured against. `computed_subs` holds the computed reads, one engine id space for every tier, and whether each answer depends on the caller's subject set. Both live in the session state (`RowSub` and `ComputedSub` in [session.rs](../../crates/connetto-server/src/session.rs)). The resume position a subscription holds is an opaque `Cursor`, not a number the caller can read.
 
-**History, kept because this section went wrong once.** Until 2026-08-08 it read "today both arrive as a delete and the client cannot tell them apart", and that was wrong in a way that mattered: no departure delete was produced at all. The server encoded one patchset per CDC event and sent the identical bytes to every matched consumer, having merged the entered, still-matching and departed lists into one, so a subscriber whose row departed received the update as though the row still matched and the row stayed in that replica for ever. R29 step 4 was written against the delete this section wrongly described and the phase had to be split mid-execution, which is why the departure work is R44.
+The caller may have no identity at all. See [12-identity-session-capability.md](12-identity-session-capability.md).
 
-The distinction is load-bearing once two subscriptions share a table, because patches from both apply into the same replica table. A departure delivered as an unmarked delete would remove a row out from under a sibling subscription that still covers it. Nor can the client repair that by predicate-checking alone: on a genuine deletion the server sends a delete to every covering subscription, each would be held back by the others still matching the stale local row, and the row would never be removed at all. Only the marker is correct in both directions.
+Registry memory management, the cap and the eviction policy, is owned by `subql`. Its engine is uncapped by default and exposes `with_max_subscriptions` and an `EvictionPolicy`, and connetto sets neither. The tracking item is [subql.md](subql.md#subscription-registry-limits-q42). Connetto meters creation instead, per minute per tier, and the hidden membership subscriptions spend the same allowance, so a caller at its ceiling is refused as a unit rather than served half. The per-tier defaults are recorded in [R19](https://github.com/connetto-rs/connetto-rs/blob/82983dff19effa9cfb521370a7794d29e51afb51/plans/master-implementation-plan.md#r19-request-throttling-tiered-by-identity).
 
-This ensures clients maintain correct result sets even when rows move in and out of filter bounds.
-
----
-
-## Re-subscribe on Reconnect
-
-After reconnect, the client re-sends all `Subscribe` messages. The server treats each as a fresh subscription.
-
-If the client's last known LSN for a subscription is still within the server's oplog window:
-
-- The server can deliver a catchup patch (changes since that LSN) instead of a full snapshot.
-- This optimization avoids re-sending the full snapshot for subscriptions where little has changed.
-
-If the LSN is outside the window, or if the server does not support catchup patches: full snapshot re-delivery.
-
-*(See `06-reconnect.md` for the full reconnect flow.)*
-
----
-
-## Open Questions
-
-1. ~~**Predicate language scope**: is the current predicate tree sufficient, or do clients need more expressive filters (e.g. LIKE, IS NULL, array containment)? More expressiveness makes server-side in-process evaluation harder.~~ **Decided (Q4.1):** connetto accepts SQL WHERE clause text directly, matching `subql`'s input format. The custom predicate tree is superseded. `subql` supports `=`, `!=`, `<`, `>`, `IN`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `AND`, `OR`, `NOT`, and arithmetic, rejecting unsupported constructs at registration time.
-2. ~~**Subscription count limits**: should the server enforce a maximum number of subscriptions per session? What happens when the limit is hit?~~ **Decided (Q4.2):** Not a connetto concern. Subscription registry memory management is owned by `subql` (`subql.md`, "Subscription registry limits (Q4.2)"). connetto imposes no limits of its own.
-3. ~~**Snapshot parallelism**: should the server deliver snapshots for multiple subscriptions concurrently, or serially? Concurrency helps latency but increases server load.~~ **Decided (Q4.3):** Priority-tiered delivery. Higher-priority tiers complete before lower-priority tiers begin. Within a tier, subscriptions are delivered concurrently, interleaved on the WebSocket and tagged by `sub_id` (the PowerSync model).
-4. ~~**Catchup patch optimization**: is the "deliver catchup patch instead of full snapshot on reconnect" optimization in scope for v1?~~ **Decided (Q4.4):** Yes, in scope. On reconnect, if the client's LSN falls within the oplog retention window, the server delivers only changes since that LSN rather than a full snapshot.
-5. ~~**Column projection**: if a client subscribes with `columns: Some([...])`, does the server track only those columns for matching, or does it always track all columns and project at delivery time?~~ **Decided (Q4.5), amended 2026-10-25:** a subscription may name a subset of a table's columns, and the server widens it to whole rows before `subql` registers it and before the snapshot reads, because the replica holds the application's whole table. The client runs the query as written against its replica, so the caller sees the columns it named, while the columns it left out travel and are stored as any whole-row subscription on the table stores them. Trimming rows to the named columns at delivery was rejected: the replica's other columns would land empty, a required one would drop the row, and `subql` reports no change that touches only a column the list leaves out.
-
----
-
-## Decisions
-
-- **A subscription names one table, and that boundary stays.** Established from seven systems at pinned commits. Only two allow an output-shape join (Zero, Materialize) and both pay with materialized state per query. Materialize additionally has no parameterized view, so per-viewer incremental maintenance would mean one dataflow per client.
-- **Membership comes from row-level security, and this chapter now says so.** The previous workaround, one subscription per table joined locally, answers only the output-shape half. The half a client cannot answer locally was already answered by RLS in `08-authorization.md`, unstated here until now.
-- **A membership term is added to the subscription language, after R5b and R6, and it lands in `subql`.** Four independent systems converged on the same shape: keep the subscription single-table and let the predicate name a relationship rather than a value. Sequenced behind the change-time visibility machinery it depends on.
-- **The membership term is one written filter with two executors**, the subquery for the snapshot and the compiled relationships for the change path, mirroring the policy split for the same reason. The per-row-query alternative rebuilds the bottleneck R5b removes, and the compile-everything alternative cannot serve a snapshot under the enumeration caps. Cost accepted: a second pair of executors that must agree, and R27 must establish the query set in advance for itself, since compilation needs it and the phase that once promised it is deleted.
-- **The set of queries a caller may run is never a maintained list.** No curated allow-list, no enum of permitted requests, no menu anyone keeps up to date. What a caller may not do is decided by row-level security, by OpenFGA and by roles. Knowing the application's queries ahead of time is a compilation requirement and nothing else, and it is satisfied by deriving them from what the application already wrote.
-
----
-
-## Notes
-
-- ~~Pagination in a subscription query (`LIMIT` and any `OFFSET` riding with it) is an approximation: it applies to the initial snapshot only. As rows are inserted or deleted, the live result set may grow beyond the original window without the server enforcing it. Clients that need a strict top-N should manage this locally.~~ **Superseded by the read tiers (R60 decision 1, delivered by R82).** An `ORDER BY` plus `LIMIT` query registers as a whole-answer computed read, delivers computed frames rather than row patchsets, and puts nothing in the replica, so the server maintains the window and there is no growing live set to manage locally. A request for n rows costs n rows and never a table. Plain row subscriptions carry no pagination approximation to note: a filterless one is a whole-table claim by definition, and its accumulation is what the residual pass in `15-replica-retention.md` reclaims when coverage lapses.
-- The predicate tree is intentionally simple. Complex logic (full-text search, geographic queries) should be handled by materializing a computed column in PostgreSQL that can then be filtered simply. This applies to scalar expressiveness and is unaffected by the membership term above, which adds a relationship rather than a richer scalar comparison.
+A subscription with no filter is a whole-table claim by definition, and the accumulation its rows leave behind is what the trimming pass in [15-replica-retention.md](15-replica-retention.md#the-trimming-pass) reclaims when coverage lapses.
