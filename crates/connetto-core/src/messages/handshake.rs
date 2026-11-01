@@ -201,6 +201,12 @@ pub struct HandshakeAck {
     /// Schema version in force server-side, or `None` when the server declares
     /// no version (staleness detection off).
     pub schema_version: Option<SchemaVersion>,
+    /// This major's sunset, in seconds since the Unix epoch, when the
+    /// deployment set one (R107). The client raises an event carrying it so
+    /// the application can prompt an update before the server enforces it,
+    /// and absent, like `schema_version`, when the server set none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sunset_at_secs: Option<u64>,
     /// Initial flow-control credit granted to the server for delivery.
     pub initial_credits: u32,
     /// The number writer the handshake confirmed or issued, with its
@@ -241,5 +247,73 @@ mod tests {
     fn a_grant_is_transparent_on_the_wire() {
         let encoded = serde_json::to_string(&Grant::new("tok")).unwrap();
         assert_eq!(encoded, "\"tok\"");
+    }
+
+    fn ack(sunset_at_secs: Option<u64>) -> HandshakeAck {
+        HandshakeAck {
+            connection_id: "connection-1".to_owned(),
+            session_token: "00000000-0000-4000-8000-000000000000".to_owned(),
+            resume_token: "run:00000000-0000-4000-8000-000000000000".to_owned(),
+            current_cursor: Cursor::new(Vec::new()),
+            schema_version: None,
+            sunset_at_secs,
+            initial_credits: 64,
+            writer: None,
+        }
+    }
+
+    /// The acknowledgement as it rode the wire before the sunset field (R107),
+    /// what an older server sends to a newer client.
+    #[derive(Serialize)]
+    struct LegacyAck {
+        connection_id: String,
+        session_token: String,
+        resume_token: String,
+        current_cursor: Cursor,
+        schema_version: Option<SchemaVersion>,
+        initial_credits: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        writer: Option<WriterGrant>,
+    }
+
+    fn legacy_ack() -> LegacyAck {
+        LegacyAck {
+            connection_id: "connection-1".to_owned(),
+            session_token: "00000000-0000-4000-8000-000000000000".to_owned(),
+            resume_token: "run:00000000-0000-4000-8000-000000000000".to_owned(),
+            current_cursor: Cursor::new(Vec::new()),
+            schema_version: None,
+            initial_credits: 64,
+            writer: None,
+        }
+    }
+
+    #[test]
+    fn an_ack_with_a_sunset_round_trips_and_a_server_without_one_sends_no_field() {
+        let with_sunset = ack(Some(1_900_000_000));
+        let encoded = rmp_serde::to_vec_named(&with_sunset).expect("encode the ack");
+        let decoded: HandshakeAck = rmp_serde::from_slice(&encoded).expect("decode the ack");
+        assert_eq!(decoded, with_sunset, "the seconds ride the ack");
+
+        // A server that set no sunset omits the field, so the named payload
+        // it sends is byte for byte the pre-sunset payload, which a client
+        // built before the field existed decodes unchanged.
+        let plain = ack(None);
+        let payload = rmp_serde::to_vec_named(&plain).expect("encode the ack");
+        assert_eq!(
+            payload,
+            rmp_serde::to_vec_named(&legacy_ack()).expect("encode the legacy payload"),
+            "the absent sunset leaves the payload unchanged"
+        );
+        let decoded: HandshakeAck = rmp_serde::from_slice(&payload).expect("decode the ack");
+        assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn an_ack_payload_without_the_sunset_field_reads_none() {
+        // A payload an older server sends, the field never in it.
+        let payload = rmp_serde::to_vec_named(&legacy_ack()).expect("encode the old payload");
+        let decoded: HandshakeAck = rmp_serde::from_slice(&payload).expect("decode the ack");
+        assert_eq!(decoded, ack(None), "the absent field reads as none");
     }
 }

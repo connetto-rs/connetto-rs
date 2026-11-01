@@ -135,6 +135,7 @@ fn handshake_and_ack_round_trip() {
             resume_token: "opaque-credential".into(),
             current_cursor: Cursor::new(vec![1, 2, 3, 4]),
             schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),
+            sunset_at_secs: None,
             initial_credits: 128,
             writer,
         }));
@@ -437,6 +438,19 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
         // SessionManager::run_handshake, on a number no writer of the
         // account carries (R75).
         FatalErrorReason::WriterUnknown,
+        // SessionManager::run_handshake, on the major's configured sunset
+        // having been reached (R107), and SessionManager::close_at_sunset,
+        // closing the live connections at the instant.
+        FatalErrorReason::Sunset {
+            server: Major::new(1).expect("one is a major"),
+            client: Some(Major::new(1).expect("one is a major")),
+            sunset_at_secs: 1_900_000_000,
+        },
+        FatalErrorReason::Sunset {
+            server: Major::new(1).expect("one is a major"),
+            client: None,
+            sunset_at_secs: 1_900_000_000,
+        },
     ];
     for reason in &reasons {
         match reason {
@@ -452,7 +466,8 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
             | FatalErrorReason::DatabaseTimelineChanged
             | FatalErrorReason::SequenceGap { .. }
             | FatalErrorReason::WriterRetired
-            | FatalErrorReason::WriterUnknown => {}
+            | FatalErrorReason::WriterUnknown
+            | FatalErrorReason::Sunset { .. } => {}
         }
     }
     reasons

@@ -245,6 +245,7 @@ impl Transport for Wire {
                                 resume_token: "run:wire".to_owned(),
                                 current_cursor: Cursor::new(Vec::new()),
                                 schema_version: None,
+                                sunset_at_secs: None,
                                 initial_credits: 64,
                                 writer,
                             },

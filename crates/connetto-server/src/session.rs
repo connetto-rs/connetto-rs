@@ -28,6 +28,7 @@ use input::HeldInput;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -567,6 +568,11 @@ pub struct SessionConfig {
     /// The application schema major a handshake must declare, or `None` to
     /// check none, for a manager built without a schema.
     schema_major: Option<Major>,
+    /// The major's sunset (R107), when the deployment set one. A handshake
+    /// at or after it is refused, and the live connections are closed with
+    /// it at the instant, checked against the deployment's wall clock
+    /// (chapter 21). A sunset without a `schema_major` is ignored.
+    sunset: Option<time::OffsetDateTime>,
     /// The total time one connection may wait on reconnect-log reads that failed transiently while resuming.
     resume_read_budget: Duration,
     /// Tagged encoded bytes of peer input a catch-up may hold before ending its connection.
@@ -587,6 +593,7 @@ impl Default for SessionConfig {
             initial_credits: 64,
             schema_version: None,
             schema_major: None,
+            sunset: None,
             resume_read_budget: Duration::from_secs(30),
             catchup_input_budget: 64 * 1024,
             write_retry_budget: Duration::from_secs(5),
@@ -623,6 +630,15 @@ impl SessionConfig {
     #[must_use]
     pub const fn with_schema_major(mut self, schema_major: Option<Major>) -> Self {
         self.schema_major = schema_major;
+        self
+    }
+
+    /// Sets the major's sunset (R107), the instant a handshake is refused and
+    /// the live connections close with it, and a `None` manager keeps every
+    /// major served.
+    #[must_use]
+    pub fn with_sunset(mut self, sunset: Option<time::OffsetDateTime>) -> Self {
+        self.sunset = sunset;
         self
     }
 
@@ -888,6 +904,14 @@ pub enum SessionError {
     /// The client was built against another application schema major (R31).
     #[error("application schema major mismatch: server {server}, client {}", client.map_or_else(|| "none".to_owned(), |major| major.to_string()))]
     MajorMismatch {
+        /// The server's major.
+        server: Major,
+        /// The major the client declared, if any.
+        client: Option<Major>,
+    },
+    /// The major's configured sunset has been reached (R107).
+    #[error("application major {server} has passed its sunset")]
+    Sunset {
         /// The server's major.
         server: Major,
         /// The major the client declared, if any.
@@ -2101,12 +2125,58 @@ impl Drop for OpenSessionTally {
 pub(crate) type ConnettoManager<Snap, Auth, D, C, O, S> =
     SessionManager<Snap, Auth, D, C, O, <D as ConnettoSchema>::Id, String, S>;
 
+/// The sunset's seconds since the Unix epoch, which the wire carries (R107).
+fn sunset_secs(sunset: time::OffsetDateTime) -> u64 {
+    u64::try_from(sunset.unix_timestamp()).expect("a configured sunset is after the Unix epoch")
+}
+
+/// How often the sunset watch reads the wall clock (R107), the periodic
+/// server sweep of chapter 21, so a slow tick's missed pass is delayed and
+/// enforcement precision is bounded by the cadence.
+const SUNSET_WATCH_CADENCE: Duration = Duration::from_secs(1);
+
+/// The watch that closes every live connection once the major's sunset is
+/// reached (R107), paced on a monotonic interval and checked against the
+/// wall clock, the deadline a wall instant the operator wrote.
+///
+/// The weak handle ends the task within one cadence of the manager dropping,
+/// so a dropped manager leaks no watch.
+async fn sunset_watch<Snap, Auth, D, C, O, S>(
+    manager: Weak<ConnettoManager<Snap, Auth, D, C, O, S>>,
+    sunset: time::OffsetDateTime,
+) where
+    Snap: SnapshotSource<D::Id>,
+    Auth: VisibilityPolicy<Watcher = Arc<Principal<D::Id>>, Backend = Postgres>,
+    Auth::Error: core::fmt::Display + FailedAuthorization,
+    C: ReadConnector,
+    C::Error: FailedRead,
+    O: Oplog,
+    D: ConnettoSchema,
+    D::Id: core::fmt::Display + Clone + Send + Sync + 'static,
+    S: ContentTicketSigner,
+{
+    let mut ticker = tokio::time::interval(SUNSET_WATCH_CADENCE);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let Some(manager) = manager.upgrade() else {
+            break;
+        };
+        if time::OffsetDateTime::now_utc() >= sunset {
+            manager.close_at_sunset().await;
+            break;
+        }
+    }
+}
+
 /// The single assembly every manager construction goes through, which
 /// `ManagerBuilder` owns.
 #[expect(
     clippy::too_many_arguments,
     reason = "every collaborator the manager owns is named here and a config struct would move the same arity behind another type"
 )]
+/// `Snap`, `Auth`, `C`, `O` and `S` outlive the task the sunset watch joins
+/// (R107), which holds the manager's weak handle until the manager drops.
 pub(crate) fn assemble_manager<Snap, Auth, C, O, D, S>(
     materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,
     snapshot_source: Snap,
@@ -2124,15 +2194,22 @@ pub(crate) fn assemble_manager<Snap, Auth, C, O, D, S>(
     bot_registry: Option<PgBotRegistry<D::Bots>>,
 ) -> Arc<ConnettoManager<Snap, Auth, D, C, O, S>>
 where
-    Snap: SnapshotSource<D::Id>,
-    Auth: VisibilityPolicy<Watcher = Arc<Principal<D::Id>>, Backend = Postgres>,
-    C: ReadConnector,
+    Snap: SnapshotSource<D::Id> + 'static,
+    Auth: VisibilityPolicy<Watcher = Arc<Principal<D::Id>>, Backend = Postgres> + 'static,
+    Auth::Error: core::fmt::Display + FailedAuthorization,
+    C: ReadConnector + 'static,
     C::Error: FailedRead,
-    O: Oplog,
+    O: Oplog + 'static,
     D: ConnettoSchema,
-    S: ContentTicketSigner,
+    D::Id: core::fmt::Display + Clone + Send + Sync + 'static,
+    S: ContentTicketSigner + 'static,
+    // The sunset watch spawns on the manager's weak handle, which the
+    // runtime shares across threads (R107).
+    ConnettoManager<Snap, Auth, D, C, O, S>: Send + Sync,
 {
-    Arc::new(SessionManager {
+    let sunset = config.sunset;
+    let has_major = config.schema_major.is_some();
+    let manager = Arc::new(SessionManager {
         catalog: Arc::new(materializer.catalog().clone()),
         materializer: Arc::new(Mutex::new(materializer)),
         routes: Mutex::new(HashMap::new()),
@@ -2163,7 +2240,24 @@ where
         shutting_down: AtomicBool::new(false),
         bot_registry,
         writer_sessions: Mutex::new(HashMap::new()),
-    })
+    });
+    // A configured sunset is enforced by the watch, which every construction
+    // shares here, the binary's and the in-process builder's alike (R107).
+    if let Some(sunset) = sunset
+        && has_major
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(sunset_watch(Arc::downgrade(&manager), sunset));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "the sunset is set, but there is no runtime to watch it, so it is not enforced"
+                );
+            }
+        }
+    }
+    manager
 }
 
 /// The verdict a device bind settles. `Writer` answers the connection,
@@ -2398,6 +2492,33 @@ where
         self.shutting_down.store(true, Ordering::Release);
         self.catchup.changed.notify_one();
         self.close_all(FatalErrorReason::ServerShuttingDown).await
+    }
+
+    /// Close every live connection with the major's sunset (R107), returning
+    /// how many were told, the way the sunset watch calls it at the instant.
+    ///
+    /// A sunset without a major, or without a sunset, tells nobody, since the
+    /// reason names the major a sunset retires and a manager with neither has
+    /// nothing to enforce.
+    pub async fn close_at_sunset(&self) -> usize {
+        let Some(server) = self.config.schema_major else {
+            return 0;
+        };
+        let Some(sunset) = self.config.sunset else {
+            return 0;
+        };
+        let closed = self
+            .close_all(FatalErrorReason::Sunset {
+                server,
+                client: None,
+                sunset_at_secs: sunset_secs(sunset),
+            })
+            .await;
+        tracing::info!(
+            closed,
+            "the major's sunset reached, closing every live connection"
+        );
+        closed
     }
 
     /// How many connections the registry holds right now.
@@ -3814,28 +3935,53 @@ where
                 handshake.protocol_version
             )));
         }
-        if let Some(server) = self.config.schema_major
-            && handshake.schema_major != Some(server)
-        {
-            // Before any grant check, since a client at another major reached the wrong server.
-            tracing::warn!(
-                client_id = %handshake.client_id,
-                server = %server,
-                client = ?handshake.schema_major,
-                "handshake refused, application schema major mismatch"
-            );
-            let _ = transport
-                .send_control(ControlMessage::FatalError(FatalError::new(
-                    FatalErrorReason::MajorMismatch {
-                        server,
-                        client: handshake.schema_major,
-                    },
-                )))
-                .await;
-            return Err(SessionError::MajorMismatch {
-                server,
-                client: handshake.schema_major,
-            });
+        if let Some(server) = self.config.schema_major {
+            if handshake.schema_major != Some(server) {
+                // Before any grant check, since a client at another major reached the wrong server.
+                tracing::warn!(
+                    client_id = %handshake.client_id,
+                    server = %server,
+                    client = ?handshake.schema_major,
+                    "handshake refused, application schema major mismatch"
+                );
+                let _ = transport
+                    .send_control(ControlMessage::FatalError(FatalError::new(
+                        FatalErrorReason::MajorMismatch {
+                            server,
+                            client: handshake.schema_major,
+                        },
+                    )))
+                    .await;
+                return Err(SessionError::MajorMismatch {
+                    server,
+                    client: handshake.schema_major,
+                });
+            }
+            // The right-major client reaches the sunset only, refused the way
+            // a decommissioned major is refused, since the update is the
+            // remedy (R107).
+            else if let Some(sunset) = self.config.sunset
+                && sunset <= time::OffsetDateTime::now_utc()
+            {
+                tracing::warn!(
+                    client_id = %handshake.client_id,
+                    server = %server,
+                    "handshake refused, the major's sunset has been reached"
+                );
+                let _ = transport
+                    .send_control(ControlMessage::FatalError(FatalError::new(
+                        FatalErrorReason::Sunset {
+                            server,
+                            client: handshake.schema_major,
+                            sunset_at_secs: sunset_secs(sunset),
+                        },
+                    )))
+                    .await;
+                return Err(SessionError::Sunset {
+                    server,
+                    client: handshake.schema_major,
+                });
+            }
         }
 
         let connection_num = self.next_connection_num();
@@ -4053,6 +4199,9 @@ where
                 resume_token,
                 current_cursor,
                 schema_version: self.config.schema_version.clone(),
+                // The major's configured sunset, so the client's application
+                // can prompt an update before the server enforces it (R107).
+                sunset_at_secs: self.config.sunset.map(sunset_secs),
                 initial_credits: self.config.initial_credits,
                 writer: writer_grant,
             }))

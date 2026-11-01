@@ -35,7 +35,7 @@ Planned in [the shared frame design](../../plans/master-implementation-plan.md#s
 - Device enrolment. [`connetto_core::messages::EnrolChallengeRequest`], [`connetto_core::messages::EnrolChallenge`], [`connetto_core::messages::EnrolRequest`], [`connetto_core::messages::EnrolGrant`], [`connetto_core::messages::EnrolRefused`], [`connetto_core::messages::RevocationUpdate`], [`connetto_core::messages::DevicesRequest`], [`connetto_core::messages::DevicesList`], [`connetto_core::messages::RevokeDeviceRequest`], [`connetto_core::messages::DeviceRevokedAck`]
 - Content tickets. [`connetto_core::messages::ContentTicketRequest`], [`connetto_core::messages::ContentTicketGrant`]
 - Share keys. [`connetto_core::messages::ReplaceShareKeys`], [`connetto_core::messages::ShareKeysReplaced`], [`connetto_core::messages::TabShareKeyChange`], [`connetto_core::messages::TabShareKeyAnswer`]
-- Relay to tabs. [`connetto_core::messages::SyncStatus`], [`connetto_core::messages::GateState`], [`connetto_core::messages::TabIdentity`], [`connetto_core::messages::TabStorageUse`], [`connetto_core::messages::TabStorageAnswer`], [`connetto_core::messages::HeldWork`]
+- Relay to tabs. [`connetto_core::messages::SyncStatus`], [`connetto_core::messages::GateState`], [`connetto_core::messages::TabIdentity`], [`connetto_core::messages::TabStorageUse`], [`connetto_core::messages::TabStorageAnswer`], [`connetto_core::messages::HeldWork`], [`connetto_core::messages::ControlMessage::TabSunset`]
 - Outage and error. `DeliveryPaused` and `DeliveryResumed` on `ControlMessage`, [`connetto_core::messages::FatalError`], [`connetto_core::messages::NonFatalError`], [`connetto_core::messages::RateLimited`]
 
 The relay-to-tab frames are never sent by a real server. The browser worker's hub states them to the tabs it serves, and [09](09-wasm.md) owns the semantics.
@@ -77,6 +77,18 @@ Every incompatible application schema change is a new major, an integer from 1 u
 The client sends its major as `Handshake.schema_major`. The server compares it with its own before checking any grant and refuses a mismatch with `FatalErrorReason::MajorMismatch`, sent before the ack as `ProtocolVersionMismatch` is. A client whose major is older than the server's, or that sent none, surfaces `ClientError::UpdateRequired`, and one whose major is newer surfaces `ClientError::ServerBehind`. A deployment hosting several majors puts a proxy in front of one server per major and routes on that field, so every client keeps one URL. A browser relay hub holds its tabs to the worker's major the same way, so a tab left open across a deploy is refused rather than reading a replica built for another schema.
 
 The major and the version answer different questions. The major is what routing, refusal and the replica's record use. The version still catches the same major built from different sources.
+
+## The sunset
+
+A major retires on its own schedule. The deployment configures the major's sunset, and the server announces the instant on every handshake, refuses every new handshake once it is reached, and closes every live connection at it, all with the same reason the client classifies update-required.
+
+The acknowledgement carries it as `sunset_at_secs` on `HandshakeAck`, the seconds since the Unix epoch, on the protocol's optional-field convention the way `schema_version` does. A server that set no sunset never sends the field, so an old client sees no change and keeps working. The client raises `ClientEvent::Sunset { at_secs }` on every attach whose ack carries it, before the `Connected` notice, so the application prompts an update before the server enforces anything.
+
+At the instant the server refuses a right-major handshake with `FatalErrorReason::Sunset { server, client, sunset_at_secs }`, checked after the major and before any grant, the way the mismatch is checked. It opens no session and answers `SessionError::Sunset`. The client maps the reason to `ClientError::UpdateRequired { client, server }`, the typed error a decommissioned major produces, and the terminal recovery is the one [06](06-reconnect.md) states.
+
+The server enforces the instant on its own clock. A watch spawned with the manager reads the wall clock on a one-second cadence, and on the first pass that finds the instant reached, it closes every live connection with `Sunset { server, client: None, sunset_at_secs }` through the same close a shutdown uses, and ends. A client that was live at the instant is closed with the same reason, and one that returns after it draws the refusal.
+
+The relay hub learns the sunset from its own acknowledgement and puts it into every tab's acknowledgement. When its own live session is closed with the reason it tells every attached tab [`connetto_core::messages::ControlMessage::TabSunset`], the relay-to-tab frame, before it ends, and the tab's client maps the frame to the same `ClientEvent::Sunset` the acknowledgement path raises, so one event answers both arrivals.
 
 ## Writers and sequencing
 

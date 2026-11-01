@@ -110,6 +110,7 @@ impl Transport for StaleTransport {
                         resume_token: "run:00000000-0000-4000-8000-000000000000".to_owned(),
                         current_cursor: Cursor::new(Vec::new()),
                         schema_version: self.version.clone(),
+                        sunset_at_secs: None,
                         initial_credits: 64,
                         writer: match &handshake.writer {
                             WriterRequest::Device => None,
