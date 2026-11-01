@@ -3,7 +3,7 @@
 //! Clients send [`PROTOCOL_VERSION`] inside [`crate::messages::Handshake`].
 //! Servers hard-reject on mismatch with a [`crate::messages::FatalError`] carrying
 //! [`crate::messages::FatalErrorReason::ProtocolVersionMismatch`]. No negotiation.
-//! Decision recorded as Q2.3 in `docs/architecture/open-questions.md`.
+//! `docs/architecture/02-protocol.md` states the versioning rules.
 
 /// Current wire protocol version.
 ///

@@ -26,28 +26,15 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 | Files | Chunked, encrypted content with a file server and a client for both platforms, per-identity storage quotas and deployment storage and bandwidth ceilings answered with `Retry-After` |
 | Schema | Postgres DDL translated to the replica at build time by `pg2sqlite`, with write guards, and a major per schema source, so one server runs per major and an updated app drains the writes and files the old build left to the major that captured them and migrates the device-private tier |
 | Peers | Device certificates with hardware attestation, and a mutual TLS link between certified devices found over mDNS or a hotspot handed over by Bluetooth beacon or QR code, hosted on Android, iPhone and Linux and joined from those, the iPad and the Mac |
-| Operations | `tracing` logs everywhere, Docker and headless Chrome suites, CI over eight workspaces with proofs on an Android emulator and an iOS simulator, both walking the Tauri demo |
+| Operations | `tracing` logs everywhere, Docker and headless Chrome suites, and CI over every workspace |
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 103 phases, 88 done, 5 started and 10 not started, a phase built in parts counting once. The core is built and proven, and the app system's bot registry, registration and list cap are built with it. What remains is the last mile around it, plus the app system's bot login, runtime, template and demos, where a person mints a one-time code, a program registers with it, its public key and the tables and verbs it uses, an admin adds it to an owner, and Postgres holds it to that list (chapter 12), and queries an app keeps while closed with the wake that tells it they changed.
-
-| Remaining | Phases |
-|---|---|
-| One page codec | R21 |
-| Schema changes under running servers | R107 |
-| Caller kinds as database roles | R108 |
-| Demo gaps | R57 |
-| Bot login, the standard ownership schema, the bot runtime and template, the demos for apps and bots | R99, R100, R103, R104 |
-| Queries kept while an app is closed, and waking it | R101 |
-| Device identity, missing only a Windows device's enrolment record | R74 |
-| Device-to-device sync without a server | R76 to R80 |
-
-A per-check consistency token, Zanzibar's zookie, is not supported and owned by no phase, since OpenFGA lists it as future work. A withdrawn permission therefore takes effect on the change path within the read cache lifetime, while writes and teardowns are refused at once (chapter 08).
+What remains, and the phase it belongs to, is tracked in `plans/master-implementation-plan.md`.
 
 ## The design
 
-`docs/architecture/README.md` indexes the chapters. `00-overview.md` is the entry point, `open-questions.md` the index of every numbered question and its decision. Every statement in a chapter carries a status marker, and a chapter outranks the plan on decisions while the plan outranks a chapter on phases.
+`docs/architecture/README.md` indexes the chapters, and `00-overview.md` is the entry point. A chapter describes what is built and links the plan for what is planned.
 
 The drawing below is the whole system coloured by build status. It is too dense to read inline, so open it in the browser and zoom.
 

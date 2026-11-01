@@ -37,8 +37,8 @@
 //! `banned_at` carries no column default, unlike `auth_events.at`, because the
 //! insert stamps both columns from one `now()` in one statement, and a ban
 //! whose start and expiry disagree would be a lie. `session` is the run the
-//! crossing happened on, kept because `auth_events.session` is `NOT NULL` and
-//! a lift performed months later has no run of its own to name.
+//! crossing happened on, which a lift performed months later names in
+//! `auth_events` because it has no run of its own.
 
 use core::pin::Pin;
 use std::marker::PhantomData;

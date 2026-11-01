@@ -1,0 +1,31 @@
+[package]
+name = "connetto-architecture"
+description = "Includes the architecture chapters as rustdoc only so the docs build checks every symbol they cite. Read the chapters as Markdown, since their file links do not resolve in the rendered rustdoc."
+readme = "../../docs/architecture/README.md"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+# Only for the chapters' intra-doc links. Nothing here is called.
+[dependencies]
+connetto-app-attest = { path = "../connetto-app-attest" }
+connetto-auth-session = { path = "../connetto-auth-session" }
+connetto-ca = { path = "../connetto-ca" }
+connetto-client = { path = "../connetto-client" }
+connetto-core.workspace = true
+connetto-dioxus = { path = "../connetto-dioxus" }
+connetto-file-client = { path = "../connetto-file-client" }
+connetto-file-core = { path = "../connetto-file-core" }
+connetto-file-server = { path = "../connetto-file-server" }
+connetto-peer = { path = "../connetto-peer" }
+connetto-schema.workspace = true
+connetto-server = { path = "../connetto-server" }
+connetto-yew = { path = "../connetto-yew" }
