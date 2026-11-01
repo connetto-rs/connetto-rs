@@ -2904,7 +2904,9 @@ struct PeerImportState {
 /// further cursor of each author and re-applies only the entries above its
 /// own, since it already took the rest. Two cursors at one sequence with
 /// different heads keep the receiver's and name the author as a forked
-/// chain.
+/// chain. The entries replay in the archive's order, the order the exporting
+/// replica applied them in, so interleaved authors on one key end as they did
+/// there and keep that order for a later re-apply.
 ///
 /// # Errors
 ///
@@ -2920,18 +2922,15 @@ fn reapply_imported_peer_state(
     cursors: &[archive::ArchivedPeerCursor],
 ) -> Result<PeerImportState, ClientError> {
     let mut state = PeerImportState::default();
-    let mut authors: Vec<&[u8]> = Vec::new();
+    let mut above: HashMap<&[u8], i64> = HashMap::new();
     for author in cursors
         .iter()
         .map(|cursor| cursor.author.as_slice())
         .chain(entries.iter().map(|entry| entry.author.as_slice()))
     {
-        if !authors.contains(&author) {
-            authors.push(author);
+        if above.contains_key(author) {
+            continue;
         }
-    }
-    let mut next_position = i64::try_from(peer::load_next_position(db)?).unwrap_or(i64::MAX);
-    for author in authors {
         let archived = cursors.iter().find(|cursor| cursor.author == author);
         let own = exchange::cursor_of(db, author)?.map(|frontier| {
             (
@@ -2939,7 +2938,7 @@ fn reapply_imported_peer_state(
                 frontier.head,
             )
         });
-        let (above, adopt) = match (own, archived) {
+        let (threshold, adopt) = match (own, archived) {
             (None, archived) => (0, archived),
             (Some((seq, _)), Some(archived)) if seq < archived.seq => (seq, Some(archived)),
             (Some((seq, head)), Some(archived)) => {
@@ -2965,9 +2964,13 @@ fn reapply_imported_peer_state(
                 &cursor.offer,
             )?;
         }
-        for entry in entries
-            .iter()
-            .filter(|entry| entry.author == author && entry.seq > above)
+        above.insert(author, threshold);
+    }
+    let mut next_position = i64::try_from(peer::load_next_position(db)?).unwrap_or(i64::MAX);
+    for entry in entries {
+        if above
+            .get(entry.author.as_slice())
+            .is_some_and(|threshold| entry.seq > *threshold)
         {
             reapply_archived_entry(db, config, frame, entry, &mut next_position, &mut state)?;
         }

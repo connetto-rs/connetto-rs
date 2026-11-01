@@ -23,16 +23,20 @@ use super::support::{self, Script};
 /// The author replica's schema, no policies, so its own writes capture
 /// whatever it chooses.
 const PLAIN_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
-                          status TEXT NOT NULL);";
+                          status TEXT NOT NULL); \
+                          CREATE TABLE boards (id INTEGER PRIMARY KEY, label TEXT NOT NULL);";
 
 /// The receiver replica's source, the same table behind translated policies,
 /// so a peer apply is judged as the author.
 const POLICY_SCHEMA: &str = "-- connetto:major 1\n \
                              CREATE TABLE orders (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
                              status TEXT NOT NULL); \
-                             ALTER TABLE orders ENABLE ROW LEVEL SECURITY;";
+                             CREATE TABLE boards (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
+                             ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
+                             ALTER TABLE boards ENABLE ROW LEVEL SECURITY;";
 
 /// Everyone reads `orders`, but a person writes only the rows they own.
+/// `boards` admits every person, so two authors can write one row.
 const POLICIES: &str = "CREATE POLICY orders_read ON orders FOR SELECT USING (true); \
                         CREATE POLICY orders_insert ON orders FOR INSERT \
                         WITH CHECK (owner = current_setting('app.user_id', true)); \
@@ -40,7 +44,8 @@ const POLICIES: &str = "CREATE POLICY orders_read ON orders FOR SELECT USING (tr
                         USING (owner = current_setting('app.user_id', true)) \
                         WITH CHECK (owner = current_setting('app.user_id', true)); \
                         CREATE POLICY orders_delete ON orders FOR DELETE \
-                        USING (owner = current_setting('app.user_id', true));";
+                        USING (owner = current_setting('app.user_id', true)); \
+                        CREATE POLICY boards_open ON boards FOR ALL USING (true) WITH CHECK (true);";
 
 diesel::table! {
     /// The synced orders table, read off the replica.
@@ -51,6 +56,16 @@ diesel::table! {
         owner -> Text,
         /// Free-text payload.
         status -> Text,
+    }
+}
+
+diesel::table! {
+    /// The synced boards table, open to every author.
+    boards (id) {
+        /// Primary key.
+        id -> BigInt,
+        /// Free-text payload.
+        label -> Text,
     }
 }
 
@@ -168,6 +183,36 @@ where
         .order(orders::id.asc())
         .load(conn.conn())
         .expect("read the orders")
+}
+
+fn write_board<T>(conn: &mut ConnettoConnection<T>, id: i64, label: &str, insert: bool)
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    if insert {
+        diesel::insert_into(boards::table)
+            .values((boards::id.eq(id), boards::label.eq(label)))
+            .execute(conn.conn())
+            .expect("insert the board");
+    } else {
+        diesel::update(boards::table.filter(boards::id.eq(id)))
+            .set(boards::label.eq(label))
+            .execute(conn.conn())
+            .expect("update the board");
+    }
+}
+
+fn board_rows<T>(conn: &mut ConnettoConnection<T>) -> Vec<(i64, String)>
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    boards::table
+        .select((boards::id, boards::label))
+        .order(boards::id.asc())
+        .load(conn.conn())
+        .expect("read the boards")
 }
 
 type AuthorWrite<'a> = &'a dyn Fn(&mut ConnettoConnection<Script>);
@@ -365,6 +410,50 @@ async fn an_import_reapplies_the_archived_entries_in_both_scopes() {
             "nothing contradicts, so nothing raises"
         );
     }
+}
+
+/// Two authors writing one key interleave in the archive, and the import
+/// replays them in the order the receiver first applied them, so the row
+/// ends on the last write and the stored positions keep that order for a
+/// later re-apply.
+#[tokio::test]
+async fn an_import_replays_interleaved_authors_in_their_archived_order() {
+    let [a1, b1, a2] = captured([
+        &|conn| write_board(conn, 1, "anna one", true),
+        &|conn| write_board(conn, 1, "bob one", false),
+        &|conn| write_board(conn, 1, "anna two", false),
+    ])
+    .await;
+
+    let (mut r1, _) = receiver().await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    let b = author("author-b", "peer-bob", Some("*"));
+    for (who, seq, body) in [(&a, 1, &a1), (&b, 1, &b1), (&a, 2, &a2)] {
+        assert!(matches!(
+            r1.apply_peer_entry(who, &manifest(seq, body), body)
+                .expect("apply the entry"),
+            PeerApplyOutcome::Applied { .. }
+        ));
+    }
+    assert_eq!(board_rows(&mut r1), vec![(1, "anna two".to_owned())]);
+    let bytes = export(&mut r1, ExportScope::Unsynced);
+
+    let (mut r2, _) = restore(&bytes).await;
+
+    assert_eq!(
+        board_rows(&mut r2),
+        vec![(1, "anna two".to_owned())],
+        "the last write in archived order wins"
+    );
+    assert_eq!(
+        stored_entries(&mut r2),
+        vec![
+            ("author-a".as_bytes().to_vec(), 1),
+            ("author-b".as_bytes().to_vec(), 1),
+            ("author-a".as_bytes().to_vec(), 2),
+        ],
+        "the positions keep the archived order"
+    );
 }
 
 /// An author whose entries were all adjudicated keeps no stored entry, and
