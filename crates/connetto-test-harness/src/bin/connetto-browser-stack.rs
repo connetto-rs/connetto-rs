@@ -77,8 +77,15 @@ const DEPLOYMENT: Deployment = Deployment {
     content: include_str!("../../../../examples/deployment/content.sql"),
     policies: include_str!("../../../../examples/deployment/policies.sql"),
     seed: include_str!("../../../../examples/deployment/seed.sql"),
-    published: &["orders", "order_lines", "photos", "products"],
-    writable: "orders,photos",
+    published: &[
+        "orders",
+        "order_lines",
+        "photos",
+        "products",
+        "team_members",
+        "team_notes",
+    ],
+    writable: "orders,photos,team_notes",
 };
 
 diesel::table! {
