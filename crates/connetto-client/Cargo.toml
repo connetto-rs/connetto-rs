@@ -341,6 +341,9 @@ tempfile = "3"
 # Building a NaiveDateTime the emulator connector returns as a re-executed
 # timestamp aggregate, so the typed live() path decodes a temporal scalar.
 chrono = "0.4"
+# Naming the sunset instants the sunset test configures on the manager, and
+# `now_utc` the instants it computes from.
+time = { version = "0.3", default-features = false, features = ["std"] }
 # The extension-seam test decodes a custom aggregate through the public wire
 # primitives, which hand back a serde_json::Value the impl matches on.
 serde_json = "1"

@@ -148,6 +148,20 @@ The major and the version answer different questions. The major is what routing,
 
 ---
 
+## Sunset
+
+**Built (R107).** A major retires on its own schedule. The deployment configures the major's sunset, an RFC 3339 instant in UTC, and the server announces it on every handshake, refuses every new handshake once the instant is reached, and closes every live connection at the instant, all with the same reason the client classifies update-required.
+
+The acknowledgement carries it as `HandshakeAck.sunset_at_secs`, the seconds since the Unix epoch, on the protocol's optional-field convention the way `schema_version` does. A server that set no sunset never sends the field, so an old client sees no change and keeps working. The client raises `ClientEvent::Sunset { at_secs }` on every attach whose ack carries it, before the `Connected` notice, so the application prompts an update before the server enforces anything.
+
+At the instant the server refuses a right-major handshake with `FatalErrorReason::Sunset { server, client, sunset_at_secs }`, checked after the major and before any grant, the way the mismatch is checked. It registers into nothing and answers `SessionError::Sunset`. The client maps the reason to `ClientError::UpdateRequired { client, server }`, the typed error a decommissioned major produces, so the terminal recovery is the one already proven there. The pump ends `Stopped` naming the reason and `Closed` after it, and a live close of the reason skips the first redial.
+
+The server enforces the instant on its own clock. A watch spawned with the manager reads the wall clock on a one-second cadence, and on the first pass that finds the instant reached it closes every live connection with `Sunset { server, client: None, sunset_at_secs }` through the same `close_all` a shutdown uses, and ends. A client that was live at the instant is closed with the same reason, and one that returns after it draws the refusal.
+
+The relay hub learns the sunset from its own acknowledgement and puts it into every tab's acknowledgement. When its own live session is closed with the reason it tells every attached tab `ControlMessage::TabSunset`, the relay-to-tab frame, before it ends, and the tab's client maps the frame to the same `ClientEvent::Sunset` the acknowledgement path raises, so one event answers both arrivals.
+
+---
+
 ## Session token
 
 **Built (R2, R3).** The request field is `resume_token`, the credential a run presents to continue, and the reply carries both `session_token`, the handle in the clear, and `resume_token`, the credential for next time. The server refuses a credential it did not sign, so a caller can neither invent a handle nor resume as a visitor whose handle it obtained. An identified run takes its handle from its login grant instead and ignores the field.

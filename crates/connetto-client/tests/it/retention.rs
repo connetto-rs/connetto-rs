@@ -91,6 +91,7 @@ async fn ack_handshake(server: &mut LoopbackTransport) {
             resume_token: "r15".to_owned(),
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
+            sunset_at_secs: None,
             initial_credits: 256,
             writer: Some(connetto_core::messages::WriterGrant {
                 number: 1,

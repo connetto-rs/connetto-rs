@@ -222,6 +222,7 @@ fn black_hole() -> LoopbackTransport {
                 current_cursor: Cursor::new(Vec::new()),
                 resume_token: "black-hole".to_owned(),
                 schema_version: None,
+                sunset_at_secs: None,
                 initial_credits: 64,
                 writer: Some(connetto_core::messages::WriterGrant {
                     number,

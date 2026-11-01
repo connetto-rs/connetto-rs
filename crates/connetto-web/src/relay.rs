@@ -583,9 +583,14 @@ struct HubState {
     /// The share-key timer the hub last woke on, so an unmoved deadline is not
     /// slept on again.
     fired_key_timer: Option<ShareKeyTimer>,
-    /// The worker drain's owed dial, with the monotonic reading it falls due
-    /// at, kept the same way as the resend (R31).
+    /// The worker drain's owed dial, with the monotonic reading it falls due at,
+    /// kept the same way as the resend (R31).
     drain: Option<(DrainTimer, Duration)>,
+    /// The worker's major's sunset, in seconds since the Unix epoch, when the
+    /// worker's acknowledgement named one (R107). A tab handshaking while the
+    /// hub knows it learns it from its own ack, and a tab already handshaken
+    /// hears the relay frame the first time the hub learns it.
+    sunset: Option<u64>,
 }
 
 /// One resolve whose ticket request is in flight, kept in the hub state so
@@ -3391,6 +3396,10 @@ where
                     resume_token: "relay".to_owned(),
                     current_cursor: relay_cursor(worker),
                     schema_version: worker.schema_version().cloned(),
+                    // The worker's major's sunset, when the hub learned it, so
+                    // the tab's client raises the event from its own ack and
+                    // prompts its application to update (R107).
+                    sunset_at_secs: state.sunset,
                     initial_credits: INITIAL_CREDITS,
                     writer: Some(WriterGrant {
                         number,
@@ -5025,6 +5034,19 @@ where
             }
             Ok(())
         }
+        // The worker owns the announcement of its major's sunset (R107).
+        // It re-asserts the same instant on every attach, so the replace
+        // guard pushes the frame once per hub lifetime.
+        ClientEvent::Sunset { at_secs } => {
+            if state.sunset.replace(at_secs) != Some(at_secs) {
+                for tab in state.tabs.values().filter(|tab| tab.handshaken) {
+                    let _ = tab
+                        .out
+                        .send(TabOut::Control(ControlMessage::TabSunset(at_secs)));
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -5914,6 +5936,7 @@ mod tests {
                     resume_token: "gate-deadline".to_owned(),
                     current_cursor: Cursor::new(Vec::new()),
                     schema_version: Some(version),
+                    sunset_at_secs: None,
                     initial_credits: 64,
                     writer: Some(WriterGrant {
                         number: 7,

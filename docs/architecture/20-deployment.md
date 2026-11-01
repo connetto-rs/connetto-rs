@@ -69,6 +69,22 @@
 
 ---
 
+## Changing the schema under a running server
+
+**Decided (R107).** The deployment moves a major in five ordered steps, each of which leaves the old major serving until its own step ends it. The order is what makes every step safe to run while live clients are still attached.
+
+**1. Run the expand**, while the old major's server is on. It adds only what old clients and servers can ignore, a new table, index or constraint the old major never reads, a new nullable column or one with a default so old clients' inserts still succeed, and it relaxes an old `NOT NULL` column without a default so the new major's inserts succeed. A renamed or retyped column keeps its successor in step with an application-owned trigger the expand adds, copying between the two, because connetto applies no server DDL.
+
+**2. Start the new major's server.** Each major's server names its own `CONNETTO_OPLOG_TABLE`, `CONNETTO_SLOT` and `CONNETTO_PUBLICATION`, one set per major. The slot name is unique across the whole cluster (`10-subscription-materializer.md`, the replication slot), which is what makes two majors on one Postgres need two names, and the publication and the oplog table are per-database. The new server is built from the contracted schema it will end at, so it never needs a rebuild and its clients see no second schema change.
+
+**3. Set the old major's sunset** on its servers, `CONNETTO_SUNSET`, an RFC 3339 instant in UTC. Every old client learns it from the acknowledgement and the application prompts an update.
+
+**4. Turn the old major's servers off and drop their stream artifacts**, once its clients are drained. The slot is dropped by SQL, the one artifact no backup holds, and the publication and the oplog tables by the deployment's migration, which owns them the way it owns the slot. Old clients that return after the sunset draw the refusal and stop, and a client that was live at the instant was closed with the same reason.
+
+**5. Run the contract**, the drops, renames and type changes, and the removal of the expand's trigger. Nothing the old major served is changed before this step, and the new major's server never reads what the contract removes.
+
+---
+
 ## Erasing a person
 
 **Decided (R61 question 2, step 6 and decisions 18 to 22).** connetto has no erase function. A function erasing over a list of queries could not know the list is complete, and an incomplete erasure fails silently while its name claims success. The deployment erases a person with this recipe instead, walking the inventory above, and records that it did. The recipe reaches further than the download, which carries the registered queries only.
@@ -106,3 +122,5 @@
 **Built (R96, 2026-10-04).** A program embeds the same builder. `ServerBuilder::build` returns the parts, the merged router, the sync routes and the HTTP routes separately, the change-stream future and the shutdown handle, and a program that embeds the server mounts them into its own application. `ServerBuilder::serve` binds them and runs the serving lifecycle without ever ending the process, the change-stream future closes every session when a terminal outcome arrives, and the shutdown signal closes every session with `ServerShuttingDown` on its own drain. `crates/connetto-server/examples/embed.rs` builds the parts and mounts them beside a route of its own, so the application serves the sync, login and file routes from its own listener.
 
 **Built (R98, 2026-10-04). The builder takes the deployment's schema as its one type parameter.** `ServerBuilder` defaults to `ConnettoDefaults`, the tables `connetto_schema!` emits under the names this chapter lists, with a `String` user id and `DefaultUuidResolver` mapping each login to it. `ServerBuilder::deployment_schema::<D>(resolver)` serves over a deployment's own `ConnettoSchema` instead, with any user id type, and takes the `IdentityResolver` typed by that id at the same call, so a schema switch without one does not compile. `identity_resolver` replaces the resolver without switching schema, which is how a deployment maps logins into its own users table. `crates/connetto-server/tests/it/deployment_schema.rs` serves a deployment with its own watermark table and a `uuid::Uuid` user id.
+
+**Built (R107).** `CONNETTO_SUNSET` (unset) names the application schema major's sunset, an RFC 3339 instant in UTC. The server sends the instant in seconds on every handshake acknowledgement, so the clients of the major learn it and the application prompts an update. Once the instant is reached the server refuses every new handshake of the major with the update-required reason and closes every live connection with the same reason, checked against the deployment's own disciplined clock (`21-clocks.md`), so no skew can arise. The value must be an RFC 3339 instant in UTC at or after the Unix epoch, or the process refuses to start and names it.

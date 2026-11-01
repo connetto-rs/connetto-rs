@@ -1483,6 +1483,16 @@ pub enum ClientEvent {
         /// The fault, as text.
         detail: String,
     },
+    /// The server's acknowledgement named this major's sunset (R107), so the
+    /// application can prompt an update before the server enforces it,
+    /// refusing every handshake and closing every live connection with a
+    /// reason this build classifies update-required. Raised on every attach
+    /// whose ack carries the instant, which re-asserts it, and a browser tab
+    /// receives it from its own ack or from the relay's frame.
+    Sunset {
+        /// The instant the server enforces, in seconds since the Unix epoch.
+        at_secs: u64,
+    },
     /// The connection closed.
     Closed,
     /// The credential was rejected and refresh could not recover it, so the
@@ -3699,6 +3709,7 @@ struct HandshakeOk {
     resume_token: String,
     writer: Option<WriterGrant>,
     schema_version: Option<SchemaVersion>,
+    sunset_at_secs: Option<u64>,
     #[cfg(feature = "device-identity")]
     challenge: Option<[u8; 32]>,
 }
@@ -3763,6 +3774,12 @@ fn refusal_error(reason: &FatalErrorReason) -> ClientError {
                 client: *client,
                 server: *server,
             },
+        },
+        // The sunset retires the major this build speaks, so the update is
+        // the only remedy (R107).
+        FatalErrorReason::Sunset { server, client, .. } => ClientError::UpdateRequired {
+            client: *client,
+            server: *server,
         },
         reason => ClientError::Refused {
             reason: reason.clone(),
@@ -3860,6 +3877,7 @@ where
                 resume_token: ack.resume_token,
                 writer: ack.writer,
                 schema_version: ack.schema_version,
+                sunset_at_secs: ack.sunset_at_secs,
                 #[cfg(feature = "device-identity")]
                 challenge,
             })
@@ -5033,6 +5051,12 @@ where
         self.forget_sent();
         self.share_key_settled = self.share_key_generation;
         self.attach_replay = AttachReplay::Pending { frontier };
+        // The sunset, when the ack named it, goes before the connected
+        // notice, so an application reading the stream sees the prompt it
+        // owes its user before the state that made it urgent (R107).
+        if let Some(at_secs) = ack.sunset_at_secs {
+            self.notices.push_back(ClientEvent::Sunset { at_secs });
+        }
         self.notices
             .push_back(ClientEvent::SyncStatus(SyncStatus::Connected));
         // Relaxed: same-task flag, no ordering dependency.
@@ -8917,6 +8941,9 @@ where
             // A relay stating how the worker's drain of held work settled
             // (R31). The application acts on it wherever it runs.
             ControlMessage::HeldWork(held) => Ok(ClientEvent::Held(held)),
+            // A relay telling the tab the worker's major's sunset (R107),
+            // which the worker's ack already raised natively.
+            ControlMessage::TabSunset(at_secs) => Ok(ClientEvent::Sunset { at_secs }),
             // A relay stating who its worker is. The tab's mirror runs the
             // worker's translated schema, whose views filter on both values.
             ControlMessage::TabIdentity(identity) => {

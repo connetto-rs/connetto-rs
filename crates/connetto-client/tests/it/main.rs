@@ -127,6 +127,9 @@ mod shared_teardown;
 mod shared_writes;
 
 mod sql_functions;
+
+mod sunset;
+
 mod storage_relay;
 mod storage_use;
 mod subscription_refusal;
