@@ -8,17 +8,17 @@
 use std::time::Duration;
 
 use connetto_client::peer::{PeerApplyOutcome, PeerAuthor};
-use connetto_client::provisional::{ProvisionalRow, ProvisionalState};
+use connetto_client::provisional::ProvisionalState;
 use connetto_client::{
-    ClientBuilder, ClientEvent, ConnettoConnection, ExportScope, ImportChoices, ImportOutcome,
-    KeyValue, SyncSchema,
+    ClientEvent, ConnettoConnection, ExportScope, ImportChoices, ImportOutcome, KeyValue,
 };
-use connetto_core::Major;
-use connetto_core::exchange::ManifestRow;
 use diesel::prelude::*;
-use sha2::{Digest, Sha256};
 
-use super::support::{self, Script};
+use super::peer_support::{
+    author, board_rows, captured, insert_order, manifest, order_rows, provenance_of, receiver,
+    stored_entries, write_board,
+};
+use super::support::Script;
 
 /// The author replica's schema, no policies, so its own writes capture
 /// whatever it chooses.
@@ -48,46 +48,6 @@ const POLICIES: &str = "CREATE POLICY orders_read ON orders FOR SELECT USING (tr
                         CREATE POLICY boards_open ON boards FOR ALL USING (true) WITH CHECK (true);";
 
 diesel::table! {
-    /// The synced orders table, read off the replica.
-    orders (id) {
-        /// Primary key.
-        id -> BigInt,
-        /// The row's owner.
-        owner -> Text,
-        /// Free-text payload.
-        status -> Text,
-    }
-}
-
-diesel::table! {
-    /// The synced boards table, open to every author.
-    boards (id) {
-        /// Primary key.
-        id -> BigInt,
-        /// Free-text payload.
-        label -> Text,
-    }
-}
-
-diesel::table! {
-    /// The stored peer entries, read through the typed schema.
-    _connetto_peer_entry (author, seq) {
-        /// The author's key id.
-        author -> Binary,
-        /// The author's queue sequence.
-        seq -> BigInt,
-        /// The major the entry was captured under.
-        major -> BigInt,
-        /// The author's certificate account.
-        account -> Text,
-        /// The wall clock the entry was received at.
-        received_at -> BigInt,
-        /// The replica-wide append position.
-        position -> BigInt,
-    }
-}
-
-diesel::table! {
     /// The per-author frontier the receiver verified.
     _connetto_peer_cursor (author) {
         /// The author's key id.
@@ -109,152 +69,6 @@ const HEAD2: [u8; 32] = [2; 32];
 const HEAD3: [u8; 32] = [3; 32];
 const HEAD_A: [u8; 32] = [0xAA; 32];
 const HEAD_B: [u8; 32] = [0xBB; 32];
-
-fn author(key: &str, account: &str, bot_list: Option<&str>) -> PeerAuthor {
-    PeerAuthor {
-        key_id: key.as_bytes().to_vec(),
-        account: account.to_owned(),
-        bot_list: bot_list.map(str::to_owned),
-    }
-}
-
-/// The manifest row of `body` at `seq`, captured under the schema's major 1.
-fn manifest(seq: u64, body: &[u8]) -> ManifestRow {
-    let digest: [u8; 32] = Sha256::digest(body).into();
-    ManifestRow {
-        seq,
-        major: Major::new(1).expect("major 1"),
-        origin: None,
-        digest,
-    }
-}
-
-async fn plain_author() -> (ConnettoConnection<Script>, Script) {
-    let script = Script::default();
-    script.say(support::handshake_ack());
-    let conn = ClientBuilder::new(
-        support::bundle(PLAIN_DDL),
-        support::Once::new(script.clone()),
-    )
-    .signed_in(support::held("r77"))
-    .connect_driven()
-    .await
-    .expect("connect");
-    (conn, script)
-}
-
-async fn receiver() -> (ConnettoConnection<Script>, Script) {
-    let script = Script::default();
-    script.say(support::handshake_ack());
-    let schema = SyncSchema::new(
-        connetto_schema::translate::<String, connetto_core::bots::TextIds>(POLICY_SCHEMA, POLICIES)
-            .expect("translate the policy schema"),
-    );
-    let conn = ClientBuilder::new(schema, support::Once::new(script.clone()))
-        .signed_in(support::held("r77"))
-        .connect_driven()
-        .await
-        .expect("connect");
-    (conn, script)
-}
-
-fn insert_order<T>(conn: &mut ConnettoConnection<T>, id: i64, owner: &str, status: &str)
-where
-    T: connetto_core::traits::Transport,
-    T::Error: core::fmt::Display,
-{
-    diesel::insert_into(orders::table)
-        .values((
-            orders::id.eq(id),
-            orders::owner.eq(owner),
-            orders::status.eq(status),
-        ))
-        .execute(conn.conn())
-        .expect("insert the order");
-}
-
-fn order_rows<T>(conn: &mut ConnettoConnection<T>) -> Vec<(i64, String, String)>
-where
-    T: connetto_core::traits::Transport,
-    T::Error: core::fmt::Display,
-{
-    orders::table
-        .select((orders::id, orders::owner, orders::status))
-        .order(orders::id.asc())
-        .load(conn.conn())
-        .expect("read the orders")
-}
-
-fn write_board<T>(conn: &mut ConnettoConnection<T>, id: i64, label: &str, insert: bool)
-where
-    T: connetto_core::traits::Transport,
-    T::Error: core::fmt::Display,
-{
-    if insert {
-        diesel::insert_into(boards::table)
-            .values((boards::id.eq(id), boards::label.eq(label)))
-            .execute(conn.conn())
-            .expect("insert the board");
-    } else {
-        diesel::update(boards::table.filter(boards::id.eq(id)))
-            .set(boards::label.eq(label))
-            .execute(conn.conn())
-            .expect("update the board");
-    }
-}
-
-fn board_rows<T>(conn: &mut ConnettoConnection<T>) -> Vec<(i64, String)>
-where
-    T: connetto_core::traits::Transport,
-    T::Error: core::fmt::Display,
-{
-    boards::table
-        .select((boards::id, boards::label))
-        .order(boards::id.asc())
-        .load(conn.conn())
-        .expect("read the boards")
-}
-
-type AuthorWrite<'a> = &'a dyn Fn(&mut ConnettoConnection<Script>);
-
-/// One captured body per write, read off the author's durable queue.
-async fn captured<const N: usize>(writes: [AuthorWrite<'_>; N]) -> [Vec<u8>; N] {
-    // The internal queue table, read raw because the typed schema does
-    // not name connetto's internals.
-    #[derive(diesel::QueryableByName)]
-    struct Body {
-        #[diesel(sql_type = diesel::sql_types::Binary)]
-        changeset: Vec<u8>,
-    }
-    let (mut author_replica, _) = plain_author().await;
-    let mut bodies = Vec::with_capacity(N);
-    for (seq, write) in (1..).zip(writes) {
-        write(&mut author_replica);
-        author_replica
-            .flush()
-            .await
-            .expect("flush the author's write");
-        let row: Body = diesel::sql_query(format!(
-            "SELECT changeset FROM _connetto_pending WHERE writer = 'number:1' AND seq = {seq}"
-        ))
-        .get_result(author_replica.conn())
-        .expect("read the captured changeset");
-        bodies.push(row.changeset);
-    }
-    bodies.try_into().expect("one body per write")
-}
-
-fn stored_entries<T>(conn: &mut ConnettoConnection<T>) -> Vec<(Vec<u8>, i64)>
-where
-    T: connetto_core::traits::Transport,
-    T::Error: core::fmt::Display,
-{
-    _connetto_peer_entry::table
-        .select((_connetto_peer_entry::author, _connetto_peer_entry::seq))
-        .order(_connetto_peer_entry::position.asc())
-        .load(conn.conn())
-        .expect("read the entries")
-}
 
 fn seed_cursor<T>(
     conn: &mut ConnettoConnection<T>,
@@ -320,15 +134,6 @@ where
     out
 }
 
-fn provenance_of<'a>(
-    rows: &'a [ProvisionalRow],
-    table: &str,
-    key: &[KeyValue],
-) -> Option<&'a ProvisionalRow> {
-    rows.iter()
-        .find(|row| row.table == table && row.key == *key)
-}
-
 fn export<T>(conn: &mut ConnettoConnection<T>, scope: ExportScope) -> Vec<u8>
 where
     T: connetto_core::traits::Transport,
@@ -339,7 +144,7 @@ where
 }
 
 async fn restore(bytes: &[u8]) -> (ConnettoConnection<Script>, ImportOutcome) {
-    let (mut conn, _) = receiver().await;
+    let (mut conn, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     let plan = conn
         .import_local_data(std::io::Cursor::new(bytes))
         .expect("plan the import");
@@ -354,12 +159,15 @@ async fn restore(bytes: &[u8]) -> (ConnettoConnection<Script>, ImportOutcome) {
 /// coming over with its offer.
 #[tokio::test]
 async fn an_import_reapplies_the_archived_entries_in_both_scopes() {
-    let [b1, b2] = captured([&|conn| insert_order(conn, 1, "peer-anna", "a"), &|conn| {
-        insert_order(conn, 2, "peer-anna", "b");
-    }])
+    let [b1, b2] = captured(
+        PLAIN_DDL,
+        [&|conn| insert_order(conn, 1, "peer-anna", "a"), &|conn| {
+            insert_order(conn, 2, "peer-anna", "b");
+        }],
+    )
     .await;
 
-    let (mut r1, _) = receiver().await;
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     let a = author("author-a", "peer-anna", Some("*"));
     for (seq, body) in [(1, b1.as_slice()), (2, b2.as_slice())] {
         assert!(matches!(
@@ -418,14 +226,17 @@ async fn an_import_reapplies_the_archived_entries_in_both_scopes() {
 /// later re-apply.
 #[tokio::test]
 async fn an_import_replays_interleaved_authors_in_their_archived_order() {
-    let [a1, b1, a2] = captured([
-        &|conn| write_board(conn, 1, "anna one", true),
-        &|conn| write_board(conn, 1, "bob one", false),
-        &|conn| write_board(conn, 1, "anna two", false),
-    ])
+    let [a1, b1, a2] = captured(
+        PLAIN_DDL,
+        [
+            &|conn| write_board(conn, 1, "anna one", true),
+            &|conn| write_board(conn, 1, "bob one", false),
+            &|conn| write_board(conn, 1, "anna two", false),
+        ],
+    )
     .await;
 
-    let (mut r1, _) = receiver().await;
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     let a = author("author-a", "peer-anna", Some("*"));
     let b = author("author-b", "peer-bob", Some("*"));
     for (who, seq, body) in [(&a, 1, &a1), (&b, 1, &b1), (&a, 2, &a2)] {
@@ -472,7 +283,7 @@ async fn an_import_replays_interleaved_authors_in_their_archived_order() {
 /// ask the author again for what it already took.
 #[tokio::test]
 async fn an_archived_cursor_with_no_entries_still_comes_over() {
-    let (mut r1, _) = receiver().await;
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     seed_cursor(&mut r1, b"author-b", "peer-bob", 3, &HEAD3, b"offer-three");
     let bytes = export(&mut r1, ExportScope::Unsynced);
 
@@ -489,12 +300,15 @@ async fn an_archived_cursor_with_no_entries_still_comes_over() {
 /// only what is above the receiver's frontier and moves the cursor over.
 #[tokio::test]
 async fn an_archived_cursor_ahead_of_the_receiver_applies_only_what_is_new() {
-    let [b1, b2] = captured([&|conn| insert_order(conn, 1, "peer-anna", "a"), &|conn| {
-        insert_order(conn, 2, "peer-anna", "b");
-    }])
+    let [b1, b2] = captured(
+        PLAIN_DDL,
+        [&|conn| insert_order(conn, 1, "peer-anna", "a"), &|conn| {
+            insert_order(conn, 2, "peer-anna", "b");
+        }],
+    )
     .await;
 
-    let (mut r1, _) = receiver().await;
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     let a = author("author-a", "peer-anna", Some("*"));
     r1.apply_peer_entry(&a, &manifest(1, b1.as_slice()), b1.as_slice())
         .expect("apply the first entry");
@@ -503,7 +317,7 @@ async fn an_archived_cursor_ahead_of_the_receiver_applies_only_what_is_new() {
     seed_cursor(&mut r1, b"author-a", "peer-anna", 2, &HEAD2, b"offer-two");
     let bytes = export(&mut r1, ExportScope::Unsynced);
 
-    let (mut r2, _) = receiver().await;
+    let (mut r2, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     r2.apply_peer_entry(&a, &manifest(1, b1.as_slice()), b1.as_slice())
         .expect("apply the first entry itself");
     seed_cursor(&mut r2, b"author-a", "peer-anna", 1, &HEAD1, b"offer-one");
@@ -545,14 +359,17 @@ async fn an_archived_cursor_ahead_of_the_receiver_applies_only_what_is_new() {
 /// keeps the receiver's frontier and re-applies nothing.
 #[tokio::test]
 async fn a_receiver_ahead_of_the_archived_cursor_keeps_its_frontier() {
-    let [b1, b2, b3] = captured([
-        &|conn| insert_order(conn, 1, "peer-anna", "a"),
-        &|conn| insert_order(conn, 2, "peer-anna", "b"),
-        &|conn| insert_order(conn, 3, "peer-anna", "c"),
-    ])
+    let [b1, b2, b3] = captured(
+        PLAIN_DDL,
+        [
+            &|conn| insert_order(conn, 1, "peer-anna", "a"),
+            &|conn| insert_order(conn, 2, "peer-anna", "b"),
+            &|conn| insert_order(conn, 3, "peer-anna", "c"),
+        ],
+    )
     .await;
 
-    let (mut r1, _) = receiver().await;
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     let a = author("author-a", "peer-anna", Some("*"));
     for (seq, body) in [(1, b1.as_slice()), (2, b2.as_slice())] {
         r1.apply_peer_entry(&a, &manifest(seq, body), body)
@@ -561,7 +378,7 @@ async fn a_receiver_ahead_of_the_archived_cursor_keeps_its_frontier() {
     seed_cursor(&mut r1, b"author-a", "peer-anna", 2, &HEAD2, b"offer-two");
     let bytes = export(&mut r1, ExportScope::Unsynced);
 
-    let (mut r2, _) = receiver().await;
+    let (mut r2, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     for (seq, body) in [(1, b1.as_slice()), (2, b2.as_slice()), (3, b3.as_slice())] {
         r2.apply_peer_entry(&a, &manifest(seq, body), body)
             .expect("apply the entry");
@@ -609,19 +426,22 @@ async fn a_receiver_ahead_of_the_archived_cursor_keeps_its_frontier() {
 /// invalid for the author.
 #[tokio::test]
 async fn an_archived_cursor_that_contradicts_the_receiver_raises_chain_invalid() {
-    let [_, b2] = captured([&|conn| insert_order(conn, 1, "peer-anna", "a"), &|conn| {
-        insert_order(conn, 2, "peer-anna", "b");
-    }])
+    let [_, b2] = captured(
+        PLAIN_DDL,
+        [&|conn| insert_order(conn, 1, "peer-anna", "a"), &|conn| {
+            insert_order(conn, 2, "peer-anna", "b");
+        }],
+    )
     .await;
 
-    let (mut r1, _) = receiver().await;
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     let a = author("author-a", "peer-anna", Some("*"));
     r1.apply_peer_entry(&a, &manifest(2, b2.as_slice()), b2.as_slice())
         .expect("apply the entry");
     seed_cursor(&mut r1, b"author-a", "peer-anna", 2, &HEAD_A, b"offer-a");
     let bytes = export(&mut r1, ExportScope::Unsynced);
 
-    let (mut r2, _) = receiver().await;
+    let (mut r2, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     r2.apply_peer_entry(&a, &manifest(2, b2.as_slice()), b2.as_slice())
         .expect("apply the entry itself");
     seed_cursor(&mut r2, b"author-a", "peer-anna", 2, &HEAD_B, b"offer-b");
@@ -663,13 +483,16 @@ async fn an_archived_cursor_that_contradicts_the_receiver_raises_chain_invalid()
 /// archived record naming the own write over the displaced author.
 #[tokio::test]
 async fn an_own_unsent_write_holds_its_key_over_the_archived_entry() {
-    let [body] = captured([&|conn| {
-        insert_order(conn, 1, "peer-anna", "theirs");
-        insert_order(conn, 2, "peer-anna", "theirs");
-    }])
+    let [body] = captured(
+        PLAIN_DDL,
+        [&|conn| {
+            insert_order(conn, 1, "peer-anna", "theirs");
+            insert_order(conn, 2, "peer-anna", "theirs");
+        }],
+    )
     .await;
 
-    let (mut r1, _) = receiver().await;
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     insert_order(&mut r1, 1, "r77", "mine");
     r1.flush().await.expect("queue the receiver's write");
 
@@ -749,13 +572,13 @@ fn store_raw_entry<T>(
 /// that exchanges with peers leaves no entry out.
 #[tokio::test]
 async fn an_archived_entry_the_policies_refuse_is_reported_and_left_out() {
-    let [foreign] = captured([&|conn| insert_order(conn, 3, "peer-bob", "x")]).await;
-    let (mut r1, _) = receiver().await;
+    let [foreign] = captured(PLAIN_DDL, [&|conn| insert_order(conn, 3, "peer-bob", "x")]).await;
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     let anna = author("author-a", "peer-anna", Some("*"));
     store_raw_entry(&mut r1, &anna, 1, 1, &foreign);
     let bytes = export(&mut r1, ExportScope::Unsynced);
 
-    let (mut r2, _) = receiver().await;
+    let (mut r2, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     let plan = r2
         .import_local_data(std::io::Cursor::new(&bytes))
         .expect("plan the import");
@@ -781,11 +604,14 @@ async fn an_archived_entry_the_policies_refuse_is_reported_and_left_out() {
 /// stays the receiver's.
 #[tokio::test]
 async fn archived_entries_without_a_cursor_land_only_above_the_receivers() {
-    let [b1, b2] = captured([&|conn| insert_order(conn, 1, "peer-anna", "a"), &|conn| {
-        insert_order(conn, 2, "peer-anna", "b");
-    }])
+    let [b1, b2] = captured(
+        PLAIN_DDL,
+        [&|conn| insert_order(conn, 1, "peer-anna", "a"), &|conn| {
+            insert_order(conn, 2, "peer-anna", "b");
+        }],
+    )
     .await;
-    let (mut r1, _) = receiver().await;
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     let a = author("author-a", "peer-anna", Some("*"));
     for (seq, body) in [(1, &b1), (2, &b2)] {
         r1.apply_peer_entry(&a, &manifest(seq, body), body)
@@ -793,7 +619,7 @@ async fn archived_entries_without_a_cursor_land_only_above_the_receivers() {
     }
     let bytes = export(&mut r1, ExportScope::Unsynced);
 
-    let (mut r2, _) = receiver().await;
+    let (mut r2, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     seed_cursor(&mut r2, b"author-a", "peer-anna", 1, &HEAD1, b"offer-one");
     let plan = r2
         .import_local_data(std::io::Cursor::new(&bytes))
@@ -816,11 +642,11 @@ async fn archived_entries_without_a_cursor_land_only_above_the_receivers() {
 /// whole import and lands nothing of it.
 #[tokio::test]
 async fn an_impossible_peer_record_refuses_the_whole_import() {
-    let [body] = captured([&|conn| insert_order(conn, 1, "peer-anna", "a")]).await;
+    let [body] = captured(PLAIN_DDL, [&|conn| insert_order(conn, 1, "peer-anna", "a")]).await;
     let a = author("author-a", "peer-anna", Some("*"));
-    let (mut bad_major, _) = receiver().await;
+    let (mut bad_major, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     store_raw_entry(&mut bad_major, &a, 1, -1, &body);
-    let (mut bad_cursor, _) = receiver().await;
+    let (mut bad_cursor, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     seed_cursor(
         &mut bad_cursor,
         b"author-a",
@@ -832,7 +658,7 @@ async fn an_impossible_peer_record_refuses_the_whole_import() {
 
     for source in [&mut bad_major, &mut bad_cursor] {
         let bytes = export(source, ExportScope::Unsynced);
-        let (mut r2, _) = receiver().await;
+        let (mut r2, _) = receiver(POLICY_SCHEMA, POLICIES).await;
         let plan = r2
             .import_local_data(std::io::Cursor::new(&bytes))
             .expect("plan the import");
@@ -849,7 +675,7 @@ async fn an_impossible_peer_record_refuses_the_whole_import() {
 /// than written into a file no import could verify.
 #[tokio::test]
 async fn a_cursor_with_a_corrupt_head_refuses_the_export() {
-    let (mut r1, _) = receiver().await;
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     diesel::sql_query(
         "INSERT INTO _connetto_peer_cursor (author, account, seq, head, offer) \
          VALUES (x'aa', 'peer-anna', 1, x'0102', x'00')",
