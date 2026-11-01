@@ -30,12 +30,12 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 101 phases, 87 done, 6 started and 8 not started, a phase built in parts counting once. The core is built and proven, and the app system's bot registry, registration and list cap are built with it. What remains is the last mile around it, plus the app system's bot login, runtime, template and demos, where a person mints a one-time code, a program registers with it, its public key and the tables and verbs it uses, an admin adds it to an owner, and Postgres holds it to that list (chapter 12), and queries an app keeps while closed with the wake that tells it they changed.
+The plan in `plans/master-implementation-plan.md` tracks 103 phases, 89 done, 5 started and 9 not started, a phase built in parts counting once. The core is built and proven, and the app system's bot registry, registration and list cap are built with it. What remains is the last mile around it, plus the app system's bot login, runtime, template and demos, where a person mints a one-time code, a program registers with it, its public key and the tables and verbs it uses, an admin adds it to an owner, and Postgres holds it to that list (chapter 12), and queries an app keeps while closed with the wake that tells it they changed.
 
 | Remaining | Phases |
 |---|---|
 | One page codec | R21 |
-| Failures classified by SQLSTATE, waiting on diesel_async | R106 |
+| Schema changes under running servers | R107 |
 | Demo gaps | R57 |
 | Bot login, the standard ownership schema, the bot runtime and template, the demos for apps and bots | R99, R100, R103, R104 |
 | Queries kept while an app is closed, and waking it | R101 |
