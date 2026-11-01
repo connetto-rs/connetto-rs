@@ -210,7 +210,7 @@ async fn a_tab_receives_both_tiers_as_patchsets() {
     let manifest: serde_json::Value =
         serde_json::from_slice(&entry_raw(&mut archive, "manifest.json")).expect("manifest json");
     assert_eq!(manifest["format"], "connetto-local-data");
-    assert_eq!(manifest["version"], 6, "archive version");
+    assert_eq!(manifest["version"], 7, "archive version");
     assert_eq!(manifest["major"], 1, "the major the source declares");
     assert_eq!(
         manifest["entries"][0]["path"], "synced.patchset",
