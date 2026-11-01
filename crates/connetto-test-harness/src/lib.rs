@@ -54,6 +54,7 @@ pub mod inspector;
 pub mod ios_signing;
 pub mod leg;
 pub mod leg_wire;
+pub mod native_client;
 pub mod peer_devices;
 pub mod peer_proof;
 pub mod relay;
