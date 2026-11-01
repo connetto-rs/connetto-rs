@@ -97,6 +97,8 @@ mod preflight_oplog_payload;
 
 mod provider;
 
+mod one_event;
+
 mod read_ceiling;
 
 mod read_filter;

@@ -34,10 +34,9 @@ use diesel::prelude::*;
 use diesel::sql_query;
 use subql::backend::{Postgres, Value};
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
-use subql::{
-    CdcSource, ChangeEvent, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource,
-    PgXid, SourceItem,
-};
+use subql::{CdcSource, ChangeEvent, PgChangeEvent, PgLsn, PgSqliteEmuSource, PgXid, SourceItem};
+
+use crate::one_event::OneEvent;
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -314,35 +313,6 @@ async fn live_read_filter_withholds_a_denied_row_and_its_tombstone() {
 
     client.close().await.expect("close client");
     server.await.expect("join server").expect("session ok");
-}
-
-/// A source that yields one event and then ends cleanly, so what the ingest loop
-/// does with that event is the whole of what a run observes.
-struct OneEvent(Option<PgChangeEvent>);
-
-impl CdcSource for OneEvent {
-    type Commit = PgCommit;
-    type Event = PgChangeEvent;
-    type Error = std::io::Error;
-
-    fn next_item(
-        &mut self,
-    ) -> impl Future<Output = Result<Option<SourceItem<PgChangeEvent, PgCommit>>, std::io::Error>> + Send
-    {
-        let next = self.0.take();
-        async move { Ok(next.map(SourceItem::Event)) }
-    }
-
-    // reason: the trait wants a `Send` future and clippy's other arm wants
-    // `async fn`, so one of the two fires whichever form this takes. Matching the
-    // form the rest of this file uses.
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn ack(&mut self, _upto: PgCommitPosition) -> Result<(), std::io::Error> {
-        Ok(())
-    }
 }
 
 /// A change the stream cannot report the previous version of refuses to serve,

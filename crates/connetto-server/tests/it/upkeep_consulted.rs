@@ -8,7 +8,6 @@
 //!
 //! Needs Docker: the fixture starts its own Postgres for the write target.
 
-use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +22,9 @@ use connetto_server::{
     SnapshotSource, pg_write_target,
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
-use subql::{CdcSource, PgChangeEvent, PgCommit, PgCommitPosition, PgSqliteEmuSource, SourceItem};
+use subql::{CdcSource, PgChangeEvent, PgSqliteEmuSource};
+
+use crate::one_event::OneEvent;
 
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);";
 
@@ -86,31 +87,6 @@ impl SnapshotSource for EmptySnapshot {
             rows: 0,
             bytes: 0,
         })
-    }
-}
-
-/// A source that yields one event then signals a clean shutdown.
-struct OneEvent(Option<PgChangeEvent>);
-
-impl CdcSource for OneEvent {
-    type Commit = PgCommit;
-    type Event = PgChangeEvent;
-    type Error = io::Error;
-
-    fn next_item(
-        &mut self,
-    ) -> impl Future<Output = Result<Option<SourceItem<PgChangeEvent, PgCommit>>, io::Error>> + Send
-    {
-        let next = self.0.take();
-        async move { Ok(next.map(SourceItem::Event)) }
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "test double has no async work to do"
-    )]
-    async fn ack(&mut self, _upto: PgCommitPosition) -> Result<(), io::Error> {
-        Ok(())
     }
 }
 

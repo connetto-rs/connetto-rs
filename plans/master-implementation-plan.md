@@ -223,7 +223,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R52 native Android gate | **DONE** (2026-09-30) | nothing. The unlock-once store option requested of `android-native-keyring-store` under #16 is taken through a pinned patch until released. What holds the release is `rust-mobile/ndk-context` #6 (the Android context in a `RwLock` instead of an unsynchronised `static mut`, stacked on #7), unreviewed since 2026-09-27. Nine decisions shared with R51 in the R51 section | no |
 | R88 the mobile build of a demo | **DONE** (2026-09-24) | nothing. Android through #58, #60 and #66, iOS through #73, both proven unattended on the maintainer's devices. The Android emulator and iOS simulator proofs walk the Tauri demo since #165 (2026-10-17), and the peer proofs on real phones stay on the dioxus demo | no |
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no. The SQLSTATE follow-up that removes the timeout text match is R106 |
-| R106 database failures classified by their SQLSTATE | IN PROGRESS, minted 2026-10-28 from R89's upstream cleanup note, designed with the maintainer 2026-10-30, four decisions in the section | `diesel_async` answering `DatabaseErrorInformation::sqlstate`, open as [diesel-rs/diesel_async#306](https://github.com/diesel-rs/diesel_async/pull/306) (Postgres) and [#307](https://github.com/diesel-rs/diesel_async/pull/307) (MySQL-like). diesel's half is on diesel `main` | **yes, diesel_async** |
+| R106 database failures classified by their SQLSTATE | IN PROGRESS, minted 2026-10-28 from R89's upstream cleanup note, designed with the maintainer 2026-10-30, slice 1 merged as #343 (2026-10-30), slice 2 built (2026-10-31) | nothing. diesel's and `diesel_async`'s halves are merged and unreleased, followed on `main`, and `sqlite-diff-rs` 0.18.1 carries the fix `diesel_async` `main` needed | no longer: every request is merged, and diesel's and `diesel_async`'s are followed on `main` until released |
 | R107 schema changes under running servers | NOT STARTED, minted and designed 2026-11-01 from R101's failure-refusal work, twelve decisions in the section | subql passing pgoutput `Relation` messages to consumers, for slice 2 | **yes, subql** |
 | R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section and two settled in its review rounds (the cookie's lifetime, credentials for listed origins only), the 2026-08-06 parked BFF entry absorbed | no |
 | R91 the bot registry and the list cap | **DONE** (2026-10-14, merged as #152, #153 and #154), redesigned 2026-10-05 replacing the 2026-09-18 design, split with R99, R100, R101, R103 and R104 | nothing. The registry's five tables, the four generated `AS RESTRICTIVE` cap policies per synced and registry table with the startup refusal, registration over the connection's challenge, and `bots::install` and `bots::create_registration_code` with the registry in the schema document. Every decision is in `plans/apps-and-bots.md` | no, rls2fga and pg2sqlite took the cap rule as measured 2026-10-06 |
@@ -456,7 +456,8 @@ graph TD
   R26 --> R61[R61 the portability download]
   R65 -.->|the files/ half| R61
   R61 -.->|both extend connetto_auth_op| R78
-  U14[upstream diesel and diesel_async:<br/>SQLSTATE on a database error] --> R106[R106 failures classified by SQLSTATE]
+  U14[upstream diesel and diesel_async:<br/>SQLSTATE on a database error, merged] --> R106[R106 failures classified by SQLSTATE]
+  U15[upstream sqlite-diff-rs:<br/>async apply off RunQueryDsl, released] --> R106
   R105[R105 answering a stolen account, DONE]
   R74 -->|the device list| R105
   R91 -->|the installations it lists| R105
@@ -473,7 +474,7 @@ graph TD
 
 ## Upstream dependencies
 
-**One request here still blocks a phase, R106's, recorded at the end of this section.** Every other request this section tracked has landed and been pinned, and the section is kept as the record of the order they went in, because that order was load-bearing and the reasoning is worth not relearning. **One document is one filable request**, which is why the subql work was two files rather than one: the trait landed alone and before the rls2fga work, while everything built on it landed after. A single file would have been mostly blocked work at the moment of filing.
+**Every request this section tracked has landed and been pinned**, and the section is kept as the record of the order they went in, because that order was load-bearing and the reasoning is worth not relearning. **One document is one filable request**, which is why the subql work was two files rather than one: the trait landed alone and before the rls2fga work, while everything built on it landed after. A single file would have been mostly blocked work at the moment of filing.
 
 **The order, and it was not a preference:**
 
@@ -488,7 +489,7 @@ graph TD
 
 **The last diesel request before R106's closed on 2026-08-18.** `diesel-rs/diesel#5150` added `SqliteConnection::wal_checkpoint` and merged on 2026-08-14, completing all five of the SQLite maintenance proposals. It was merged but unreachable for four days, because this workspace builds on the `LucaCappelletti94/diesel` fork's `future` branch and the pin at `ac4cdfc3` did not carry it. The fork was rebased and every workspace lock moved to `705e4340` on 2026-08-18, and R15 consumed all nine APIs from it. (Corrected 2026-08-21: this paragraph still described the rebase as pending after R15 had recorded it done.)
 
-**R106's requests.** diesel's half merged on diesel `main` as #5332 to #5336 on 2026-10-26, replacing #5232, and the workspace takes diesel from `diesel-rs/diesel` directly. `diesel_async`'s half, its Postgres and MySQL-like errors answering `sqlstate()`, is open as [diesel-rs/diesel_async#306](https://github.com/diesel-rs/diesel_async/pull/306) and [#307](https://github.com/diesel-rs/diesel_async/pull/307) since 2026-10-30 and holds R106's classification slice until it reaches a revision the workspace takes.
+**R106's requests.** diesel's half merged on diesel `main` as #5332 to #5336 on 2026-10-26, replacing #5232, and `diesel_async`'s as [diesel-rs/diesel_async#306](https://github.com/diesel-rs/diesel_async/pull/306) and [#307](https://github.com/diesel-rs/diesel_async/pull/307) on 2026-10-31. Both are unreleased, so the workspace follows both `main` branches. `diesel_async` `main` also carries [#214](https://github.com/diesel-rs/diesel_async/pull/214), which implements `RunQueryDsl` only for diesel's `RunQueryDslSupport` types, and `sqlite-diff-rs`'s async apply called `execute` through `RunQueryDsl` on its own query type, so it stopped building. [sqlite-diff-rs#112](https://github.com/connetto-rs/sqlite-diff-rs/pull/112) calls `diesel_async::methods::ExecuteDsl` directly (request `upstream/sqlite-diff-rs-async-apply-relies-on-run-query-dsl-blanket.md`), and it was published on 2026-10-31 as 0.16.3, 0.17.1 and 0.18.1.
 
 ---
 
@@ -6955,13 +6956,13 @@ A person can see every place they are signed in, end any of them or all but the 
 
 **Status.** IN PROGRESS. Minted 2026-10-28 from R89's upstream cleanup note so the follow-up stays on the work list, designed with the maintainer 2026-10-30, four decisions below.
 
-**Blocked on one upstream change, for slices 2 and 3.** diesel's half is merged on diesel `main` (#5332 to #5336, 2026-10-26, replacing #5232) and unreleased, so slice 1 follows `diesel-rs/diesel` directly. `diesel_async`'s Postgres error keeps the `tokio_postgres` `DbError` private and answers `None` from `sqlstate()`, shown on 2026-10-30 by the same `statement_timeout` cancellation reporting `57014` through `PgConnection` and nothing through `AsyncPgConnection`. The fix reuses diesel's `SqlState` and `diesel::pg::sql_state` constants and is open as [diesel-rs/diesel_async#306](https://github.com/diesel-rs/diesel_async/pull/306) (Postgres) and [#307](https://github.com/diesel-rs/diesel_async/pull/307) (MySQL-like), with the request in `upstream/diesel-async-sqlstate-not-forwarded.md`. `diesel-async` comes from crates.io at 0.9.2, so slice 2 follows its `main` until a release carries the change.
+**Blocked on nothing since 2026-10-31.** diesel's half merged on diesel `main` (#5332 to #5336, 2026-10-26, replacing #5232) and `diesel_async`'s as [diesel-rs/diesel_async#306](https://github.com/diesel-rs/diesel_async/pull/306) (Postgres, 2026-10-31) and [#307](https://github.com/diesel-rs/diesel_async/pull/307) (MySQL-like), reusing diesel's `SqlState` and `diesel::pg::sql_state` constants. Both are unreleased, so the root workspace follows both `main` branches. Before #306 the same `statement_timeout` cancellation reported `57014` through `PgConnection` and nothing through `AsyncPgConnection` (`upstream/diesel-async-sqlstate-not-forwarded.md`). `diesel_async` `main` also carries [#214](https://github.com/diesel-rs/diesel_async/pull/214), which implements `RunQueryDsl` only for diesel's `RunQueryDslSupport` types, so every release reporting the code carries it too. Decided with the maintainer 2026-10-31 to follow `main` and migrate now rather than ask for a 0.9.x backport. connetto's own migration is `connetto-file-server`'s `ConnettoFileSchema` advertising `RunQueryDslSupport` beside every `AsyncLoadQuery` bound. `sqlite-diff-rs`'s async apply called `execute` through `RunQueryDsl` on its own query type, fixed upstream as [sqlite-diff-rs#112](https://github.com/connetto-rs/sqlite-diff-rs/pull/112) and published as 0.16.3, 0.17.1 and 0.18.1. subql needs nothing.
 
 **Changes state.** None. No table, wire message or stored format changes.
 
 ### Purpose
 
-`diesel_async` maps every SQLSTATE outside the eight it names to `DatabaseErrorKind::Unknown`, and `DatabaseErrorInformation` exposes no code, so connetto classifies database failures from what is left. `reexec::is_statement_timeout` recognises a statement timeout by the words `statement timeout` in the message, and the snapshot path uses the same test. `reexec::diesel_failure` sends a deadlock, `too_many_connections`, `admin_shutdown` and every other unnamed outage to `ReadFailure::Other`, so a computed subscription meeting one is retried once and then ended instead of delivery pausing. The same function decides which writes retry (`write_target.rs`) and which oplog failures count as an outage (`oplog.rs`), so the gap reaches past re-execution. Chapter 10's paragraph under the failure inventory states the shape this phase replaces.
+A failed database read or write has to be answered by what caused it. A statement timeout is policy and ends the subscription, a deadlock or a shutdown is an outage that pauses delivery and retries, and a dropped column asks the same failing question on every retry. Postgres states the cause as a SQLSTATE, and nothing else it sends carries it reliably. The diesel kind names eight codes and leaves the rest `Unknown`, and the message is English prose that a Postgres release may reword. So classification reads the code, in the one classifier that decides re-execution reads (`reexec::diesel_failure`), which writes retry (`write_target.rs`) and which oplog failures count as an outage (`oplog.rs`), and chapter 10's failure inventory states which codes fall in each class.
 
 ### Decisions, taken with the maintainer 2026-10-30
 
@@ -6970,11 +6971,22 @@ A person can see every place they are signed in, end any of them or all but the 
 3. **The code alone decides where it is present.** `DatabaseErrorKind` is read only for an error with no code, which is where `ClosedConnection` and `UnableToSendCommand` arrive from. `diesel_async` derives the kind from the code anyway. Rejected: either source marking a failure transient, two answers for one fact that a changed upstream kind mapping could silently override.
 4. **A write refused with `42501` (`insufficient_privilege`) answers `Unauthorized`, whatever refused it.** Postgres sends the same code for a `WITH CHECK` policy refusal and for a missing `GRANT`, and only the message text tells them apart. Both mean the caller may not write that row, and the server log keeps the code and the message, so an operator still sees a missing `GRANT`. `write_target::is_rls_violation` is deleted. Rejected: keeping the text search for the policy case, a message read the done-when forbids and a match a Postgres rewording breaks silently.
 
+### The four classes against every path that reads them
+
+Decision 2 needs a class of its own, since a coded failure outside the list ends at once while a codeless one keeps its retry. `ReadFailure` gains `Deterministic` beside `Timeout`, `Transient` and `Other`, logged as `deterministic`. `diesel_failure` is the one classifier, and every path below reads its answer, so no path classifies on its own.
+
+| Failure | Becomes | Computed re-execution read (`dispatch_with_grants`) | Snapshot page read | Write commit (`WriteError`) | Conflict probe inside a commit | Oplog operation (`is_transient`) |
+|---|---|---|---|---|---|---|
+| `57014` | `Timeout` | ends the subscription at once | `SnapshotError::TimedOut`, the subscribe is refused | `Backend` | `Materializer` | not an outage |
+| A listed transient code, or no code with kind `ClosedConnection`, `UnableToSendCommand`, `SerializationFailure` or `ReadOnlyTransaction`, or a pool checkout failure | `Transient` | delivery pauses and the read retries in place | `Backend` | `Transient`, the client retries | `Transient` | an outage, retried |
+| `42501` on a write | not a read class | as any other coded failure, `Deterministic` | `Backend` | `Unauthorized` | `Materializer` | not an outage |
+| Any other code | `Deterministic` | ends the subscription at once | `Backend` | `Backend` | `Materializer` | not an outage |
+| No code and any other kind, a non-database diesel error, or a connector error that is not diesel's | `Other` | one retry, then the subscription ends | `Backend` | `Backend` | `Materializer` | not an outage |
+
 ### Slices
 
 1. **diesel from `diesel-rs/diesel`.** The eight workspaces' `[patch.crates-io]` entries take diesel from its default branch, the spelling `diesel-sqlite-session` uses, so one source serves both and the second `[patch]` block goes. The `LucaCappelletti94/diesel` fork's `master` last moved on 2026-10-17 and lacks the SQLSTATE stack, while upstream's default branch is `main`. Blocked on nothing.
-2. **The classification.** `diesel-async` followed from `diesel-rs/diesel_async` `main` once the upstream pull request merges, then steps 2 and 3 with their unit and Docker-gated proof.
-3. **Chapter 10.** Step 4.
+2. **The classification and chapter 10.** `diesel-async` followed from `diesel-rs/diesel_async` `main`, `sqlite-diff-rs` 0.18.1 and the `RunQueryDslSupport` migration, then steps 2 to 4 with their unit and Docker-gated proof, as #356. Built 2026-10-31. Chapter 10 rides in the same pull request, decided with the maintainer 2026-11-01, so `main` never carries a chapter describing the deleted text match.
 
 ### Steps
 

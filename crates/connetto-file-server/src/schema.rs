@@ -14,6 +14,7 @@ use diesel::helper_types;
 use diesel::pg::Pg;
 use diesel::prelude::*;
 use diesel::query_builder::{QueryFragment, QueryId};
+use diesel::query_dsl::RunQueryDslSupport;
 use diesel::query_dsl::methods::{FilterDsl, LimitDsl, OrderDsl, SelectDsl};
 use diesel::sql_types::{BigInt, Bool, Bytea, Integer, Text, Timestamptz};
 use diesel_async::AsyncPgConnection;
@@ -70,7 +71,7 @@ where
             helper_types::Filter<Self::ManifestsQuery, Self::ManifestPkEq>,
             (Self::MColFileId, Self::MColCommitted),
         >,
-    >: AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, bool)> + Send,
+    >: AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, bool)> + RunQueryDslSupport + Send,
     // ---------------------------------------------------------------
     // Shape MC1: SELECT chunk_hash, chunk_len FROM manifest_chunks
     //            WHERE file_id = ? AND uploaded_by = ? ORDER BY position
@@ -87,7 +88,7 @@ where
             Self::MCColPosition,
         >,
         (Self::MCColChunkHash, Self::MCColChunkLen),
-    >: AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, i64)> + Send,
+    >: AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, i64)> + RunQueryDslSupport + Send,
     // ---------------------------------------------------------------
     // Shape MC2: SELECT chunk_len WHERE file_id = ? AND uploaded_by = ?
     //            AND chunk_hash = ?
@@ -112,7 +113,7 @@ where
             >,
             Self::MCColChunkLen,
         >,
-    >: AsyncLoadQuery<'q, AsyncPgConnection, i64> + Send,
+    >: AsyncLoadQuery<'q, AsyncPgConnection, i64> + RunQueryDslSupport + Send,
     // ---------------------------------------------------------------
     // Shape CR1: SELECT state FROM chunk_registry WHERE chunk_hash = ?
     // ---------------------------------------------------------------
@@ -128,7 +129,7 @@ where
             helper_types::Filter<Self::ChunkRegistryQuery, Self::CRChunkHashEq>,
             Self::CRColState,
         >,
-    >: AsyncLoadQuery<'q, AsyncPgConnection, String> + Send,
+    >: AsyncLoadQuery<'q, AsyncPgConnection, String> + RunQueryDslSupport + Send,
     // ---------------------------------------------------------------
     // Shape CR2: SELECT chunk_hash FROM chunk_registry WHERE state = 'deleting'
     // ---------------------------------------------------------------
@@ -138,7 +139,7 @@ where
     for<'q> helper_types::Select<
         helper_types::Filter<Self::ChunkRegistryQuery, Self::CRStateEq>,
         Self::CRColChunkHash,
-    >: AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send,
+    >: AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + RunQueryDslSupport + Send,
 {
     /// The manifests table.
     type Manifests: Table + QueryId + Default + Send + Sync + 'static;
@@ -246,14 +247,17 @@ where
     /// Lock the named registry rows in hash order and return their states.
     fn lock_registry_rows_stmt(
         hashes: Vec<Vec<u8>>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, String)> + Send + 'static;
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, String)>
+    + RunQueryDslSupport
+    + Send
+    + 'static;
 
     /// Lock, in hash order, the registry rows whose only references will not
     /// survive the grace, so a sweep never blocks uploads of live content.
     /// The cutoff is `now() - grace` in the statement (chapter 21, class H).
     fn lock_sweep_rows_stmt(
         grace: i32,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + RunQueryDslSupport + Send + 'static;
 
     /// Lock one manifest row and return its committed state.
     ///
@@ -263,7 +267,7 @@ where
     fn lock_manifest_row_stmt(
         file_id: Vec<u8>,
         caller: String,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, bool> + Send + 'static;
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, bool> + RunQueryDslSupport + Send + 'static;
 
     /// Build `UPDATE manifest_chunks SET stored=TRUE WHERE file_id=? AND uploaded_by=?
     /// AND chunk_hash=? AND chunk_len=? AND stored=FALSE`.
@@ -301,7 +305,7 @@ where
     /// Mark locked, still-unreferenced registry rows `deleting` and return their hashes.
     fn mark_unreferenced_deleting_stmt(
         hashes: Vec<Vec<u8>>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + RunQueryDslSupport + Send + 'static;
 
     /// Batch-insert chunk rows in one statement.
     ///
@@ -328,7 +332,7 @@ where
     /// separate SELECT-then-DELETE.
     fn delete_orphaned_stmt(
         grace: i32,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + RunQueryDslSupport + Send + 'static;
 
     /// Build `SELECT chunk_hash FROM manifest_chunks
     /// WHERE file_id = ? AND uploaded_by = ? AND stored = FALSE`.
@@ -338,7 +342,7 @@ where
     fn all_unstored_chunk_hashes_stmt(
         file_id: Vec<u8>,
         caller: String,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + RunQueryDslSupport + Send + 'static;
 
     /// Returns the `uploaded_by` of the alphabetically first committed manifest for
     /// `file_id`, limited to one row.
@@ -349,18 +353,23 @@ where
     /// committed rows for the same file.
     fn any_committed_manifest_caller_stmt(
         file_id: Vec<u8>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, String> + Send + 'static;
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, String> + RunQueryDslSupport + Send + 'static;
 
     /// Build `SELECT chunk_hash, state FROM chunk_registry`, every row.
-    fn registry_rows_stmt()
-    -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, String)> + Send + 'static;
+    fn registry_rows_stmt() -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, String)>
+    + RunQueryDslSupport
+    + Send
+    + 'static;
 
     /// Build `SELECT file_id, uploaded_by, chunk_len FROM manifest_chunks
     /// WHERE chunk_hash = ANY(hashes) AND stored` over the rows whose manifest
     /// is committed or already lost.
     fn stored_rows_naming_stmt(
         hashes: Vec<Vec<u8>>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, String, i64)> + Send + 'static;
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, String, i64)>
+    + RunQueryDslSupport
+    + Send
+    + 'static;
 
     /// Build `UPDATE manifests SET committed = FALSE, lost = TRUE,
     /// accepted_bytes = accepted_bytes - missing WHERE file_id = ? AND uploaded_by = ? AND NOT lost`.
@@ -393,7 +402,7 @@ where
     /// Build `SELECT uploaded_by FROM manifests WHERE file_id = ? AND lost FOR UPDATE`.
     fn lost_manifest_callers_stmt(
         file_id: Vec<u8>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, String> + Send + 'static;
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, String> + RunQueryDslSupport + Send + 'static;
 
     /// Build `UPDATE manifest_chunks SET stored = TRUE WHERE file_id = ?` over
     /// the rows of the file's lost manifests.
@@ -405,7 +414,7 @@ where
     /// file_id = ? AND lost RETURNING uploaded_by`.
     fn restore_lost_manifests_stmt(
         file_id: Vec<u8>,
-    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, String> + Send + 'static;
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, String> + RunQueryDslSupport + Send + 'static;
 
     /// Build `DELETE FROM manifest_chunks WHERE file_id = ? AND uploaded_by = ?`.
     fn delete_manifest_chunks_stmt(
@@ -607,7 +616,8 @@ macro_rules! connetto_file_tables {
                 'q,
                 diesel_async::AsyncPgConnection,
                 (Vec<u8>, String),
-            > + Send
+            > + diesel::query_dsl::RunQueryDslSupport
+            + Send
             + 'static {
                 diesel::QueryDsl::select(
                     diesel::QueryDsl::for_update(diesel::QueryDsl::order(
@@ -626,7 +636,8 @@ macro_rules! connetto_file_tables {
                 'q,
                 diesel_async::AsyncPgConnection,
                 Vec<u8>,
-            > + Send
+            > + diesel::query_dsl::RunQueryDslSupport
+            + Send
             + 'static {
                 let surviving = diesel::dsl::exists(diesel::query_dsl::methods::SelectDsl::select(
                     diesel::QueryDsl::filter(
@@ -690,7 +701,8 @@ macro_rules! connetto_file_tables {
                 'q,
                 diesel_async::AsyncPgConnection,
                 bool,
-            > + Send
+            > + diesel::query_dsl::RunQueryDslSupport
+            + Send
             + 'static {
                 diesel::QueryDsl::select(
                     diesel::QueryDsl::for_update(diesel::QueryDsl::filter(
@@ -800,7 +812,8 @@ macro_rules! connetto_file_tables {
                 'q,
                 diesel_async::AsyncPgConnection,
                 Vec<u8>,
-            > + Send
+            > + diesel::query_dsl::RunQueryDslSupport
+            + Send
             + 'static {
                 diesel::update(diesel::QueryDsl::filter(
                     diesel::QueryDsl::filter(
@@ -893,7 +906,8 @@ macro_rules! connetto_file_tables {
                 'q,
                 diesel_async::AsyncPgConnection,
                 Vec<u8>,
-            > + Send
+            > + diesel::query_dsl::RunQueryDslSupport
+            + Send
             + 'static {
                 diesel::delete(diesel::QueryDsl::filter(
                     diesel::QueryDsl::filter(
@@ -921,7 +935,8 @@ macro_rules! connetto_file_tables {
                 'q,
                 diesel_async::AsyncPgConnection,
                 Vec<u8>,
-            > + Send
+            > + diesel::query_dsl::RunQueryDslSupport
+            + Send
             + 'static {
                 diesel::QueryDsl::select(
                     diesel::QueryDsl::filter(
@@ -943,7 +958,8 @@ macro_rules! connetto_file_tables {
                 'q,
                 diesel_async::AsyncPgConnection,
                 String,
-            > + Send
+            > + diesel::query_dsl::RunQueryDslSupport
+            + Send
             + 'static {
                 diesel::QueryDsl::select(
                     diesel::QueryDsl::limit(
@@ -966,7 +982,8 @@ macro_rules! connetto_file_tables {
                 'q,
                 diesel_async::AsyncPgConnection,
                 (Vec<u8>, String),
-            > + Send
+            > + diesel::query_dsl::RunQueryDslSupport
+            + Send
             + 'static {
                 diesel::QueryDsl::select(
                     $chunk_registry::table,
@@ -979,7 +996,8 @@ macro_rules! connetto_file_tables {
                 'q,
                 diesel_async::AsyncPgConnection,
                 (Vec<u8>, String, i64),
-            > + Send
+            > + diesel::query_dsl::RunQueryDslSupport
+            + Send
             + 'static {
                 diesel::QueryDsl::select(
                     diesel::QueryDsl::filter(
@@ -1106,7 +1124,8 @@ macro_rules! connetto_file_tables {
                 'q,
                 diesel_async::AsyncPgConnection,
                 String,
-            > + Send
+            > + diesel::query_dsl::RunQueryDslSupport
+            + Send
             + 'static {
                 diesel::QueryDsl::for_update(diesel::QueryDsl::select(
                     diesel::QueryDsl::filter(
@@ -1161,7 +1180,8 @@ macro_rules! connetto_file_tables {
                 'q,
                 diesel_async::AsyncPgConnection,
                 String,
-            > + Send
+            > + diesel::query_dsl::RunQueryDslSupport
+            + Send
             + 'static {
                 diesel::update(diesel::QueryDsl::filter(
                     diesel::QueryDsl::filter(
