@@ -27,6 +27,22 @@ connetto retains the provider token in the auth store rather than discarding it,
 
 Provider tokens never touch frontend JavaScript, which removes the cross-site-scripting exfiltration surface that storing them in the page creates, and every hard part stays on the backend. The frontend holds only a credential connetto can revoke by deleting a row.
 
+```mermaid
+sequenceDiagram
+    participant C as Client, native or browser
+    participant S as connetto-server
+    participant P as Identity provider
+    C->>S: open the login endpoint
+    S->>P: Authorization Code request with PKCE
+    P->>S: authorization code, at the login callback
+    S->>P: exchange the code
+    P->>S: provider token
+    S->>S: verify the provider token, map it to a user, mint the session
+    S->>C: access token and refresh token
+    C->>S: handshake carrying the access token as a grant
+    S->>S: check each grant, confirm the run is live, bind a Principal
+```
+
 ## Identity resolution
 
 ### Providers
