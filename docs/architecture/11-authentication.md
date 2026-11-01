@@ -6,7 +6,7 @@ This chapter covers authentication, from a user logging in to the server binding
 
 Authentication answers who is this caller, and its output is [`connetto_core::auth::Principal`]. A caller that authenticated nothing holds an empty `Principal` rather than whoever it claimed to be. Authorization answers may this caller see or write this row, and it reads that `Principal`. Where the `Principal` carries an identity, [`connetto_server::PgSnapshotSource`] and [`connetto_server::PgWriteTarget`] bind its user id into `SELECT set_config('app.user_id', $1, true)`, so whatever this chapter resolves as the identity becomes the RLS principal directly. Where it carries none, that setting takes the absent marker [08-authorization.md](08-authorization.md) describes.
 
-No constructor supplies a default for the identity story. A deployment states one, or the server refuses to start. The one stand-in that checks nothing and reads the subject straight out of the grant string, `TestGrantChecker` in [test_support.rs](../../crates/connetto-core/src/test_support.rs), lives behind a test-only feature no production build enables, beside the authorization one, `RosterAuth` in [roster.rs](../../crates/connetto-test-harness/src/roster.rs).
+No constructor supplies a default for the identity story. A deployment states one, or the server refuses to start. The one stand-in that checks nothing and reads the subject straight out of the grant string, `TestGrantChecker` in [`test_support.rs`](../../crates/connetto-core/src/test_support.rs), lives behind a test-only feature no production build enables, beside the authorization one, `RosterAuth` in [roster.rs](../../crates/connetto-test-harness/src/roster.rs).
 
 ## Principles
 
