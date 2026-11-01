@@ -42,7 +42,9 @@ fn ipv4_on(
     })
 }
 
-/// The routing table dump's header, as the route parser reads it.
+/// The routing table dump's header, as the route parser reads it. libc
+/// declares `rt_msghdr` on macOS alone, and iOS shares its XNU layout.
+#[cfg(target_os = "macos")]
 const _: () = assert!(std::mem::size_of::<libc::rt_msghdr>() == crate::route::HEADER);
 
 /// The gateway of the default route on the interface named `wifi`, read
@@ -58,7 +60,7 @@ pub(crate) fn default_route_gateway(wifi: &str) -> Option<IpAddr> {
         0,
         libc::AF_INET,
         libc::NET_RT_FLAGS,
-        libc::RTF_GATEWAY,
+        libc::c_int::try_from(crate::route::RTF_GATEWAY).ok()?,
     ];
     let depth = libc::c_uint::try_from(name.len()).ok()?;
     let mut length: libc::size_t = 0;

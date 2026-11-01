@@ -19,7 +19,7 @@
 use bigdecimal::BigDecimal;
 use sqlite_diff_rs::Value as WireValue;
 use subql::backend::{DeclaredType, Postgres, ScalarKind, ScalarKindOf, Value};
-use subql::{ColumnId, DatabaseLike, TableId, catalog_helpers};
+use subql::{ColumnId, ColumnLike as _, DatabaseLike, TableId, TableLike as _, catalog_helpers};
 
 /// The sqlite-diff value shape carried by an uploaded row image.
 type Wire = WireValue<String, Vec<u8>>;
@@ -83,10 +83,16 @@ pub(crate) fn wire_column<DB: DatabaseLike>(
     };
     let kind = catalog_helpers::column_scalar_kind::<Postgres, _>(db, table_id, column_id);
     let minor_unit_scale = match kind {
-        Some(ScalarKind::Builtin(DeclaredType::Decimal)) => {
-            catalog_helpers::column(db, table_id, column_id)
-                .and_then(|column| catalog_helpers::minor_unit_scale(db, column))
-        }
+        Some(ScalarKind::Builtin(DeclaredType::Decimal)) => usize::try_from(table_id)
+            .ok()
+            .and_then(|index| db.table_by_id(index))
+            .and_then(|table| {
+                table
+                    .column_by_id(usize::from(column_id), db)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|column| catalog_helpers::minor_unit_scale(db, column.data_type(db))),
         _ => None,
     };
     WireColumn {

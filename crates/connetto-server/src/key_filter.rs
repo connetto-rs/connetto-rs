@@ -17,6 +17,7 @@ use connetto_core::quote_ident;
 use diesel::pg::Pg;
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_types::{BigInt, Binary, Bool, Date, Double, Text, Time, Timestamp, Timestamptz};
+use sql_traits::prelude::DataTypeLike as _;
 use subql::backend::{Postgres, ScalarFamily, Value};
 use subql::{
     ColumnId, ColumnLike as _, DatabaseLike, TableId, TableLike as _, ValueError, catalog_helpers,
@@ -257,7 +258,7 @@ fn declared_cast<DB: DatabaseLike>(
         | ScalarFamily::Decimal => {
             let table = catalog.table_by_id(usize::try_from(table_id).ok()?)?;
             let declared = table.column_by_id(usize::from(column), catalog).ok()??;
-            Some(declared.data_type(catalog).into_owned())
+            Some(declared.data_type(catalog).name(catalog).into_owned())
         }
         _ => None,
     }

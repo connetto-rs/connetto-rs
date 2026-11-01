@@ -109,7 +109,7 @@ web-sys = { version = "0.3", features = [
 diesel-sqlite-session = { git = "https://github.com/connetto-rs/diesel-sqlite-session" }
 # Routing live patches by table needs the patchset parser, and snapshot
 # payloads ride the wire zstd compressed like the server's snapshot leg.
-sqlite-diff-rs = { version = "0.17", default-features = false }
+sqlite-diff-rs = { version = "0.18", default-features = false }
 connetto-file-core = { path = "../connetto-file-core" }
 zstd = "0.13"
 # tokio::select! races the hub's channels against the upstream pump, and the
@@ -187,6 +187,9 @@ zip = { version = "4.6.1", default-features = false }
 diesel = { git = "https://github.com/diesel-rs/diesel" }
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+# Until a pg_walstream release carries the startup metadata API subql main
+# uses (isdaniel/pg-walstream #141) and `ChangeEvent::xid`.
+pg_walstream = { git = "https://github.com/isdaniel/pg-walstream", branch = "main" }
 
 # The same deny-level lint discipline the root workspace carries: this is
 # product code, proven by the smoke browser suite, not test scaffolding.
