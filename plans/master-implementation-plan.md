@@ -268,11 +268,14 @@ The built rows of the per-event and per-subscriber tables are in [17-fan-out.md]
 
 A bulk frame becomes the tag, a short encoded header, then the compressed payload appended untouched. Two records already describe that shape. The bulk-plane row in [02-protocol.md](../docs/architecture/02-protocol.md) gives the encoding as Zstd-precompressed opaque bytes, and the module comment on `crates/connetto-core/src/messages/bulk.rs` says the payload is carried so the transport never re-compresses it. The code disagrees with both. `encode_bulk` runs `rmp_serde::to_vec_named` over a `BulkMessage` whose variants embed the payload as a field, so every send copies the payload into a MessagePack buffer and then again into the tagged frame.
 
-Layout, on a message-delimited transport where the frame boundary is the WebSocket frame.
+The layout, in order, on a message-delimited transport where the frame boundary is the WebSocket frame.
 
-```text
-[ 1 byte: tag ][ 4 bytes: header length, big-endian u32 ][ header ][ compressed payload ]
-```
+| Field | Size | Content |
+|---|---|---|
+| Tag | 1 byte | The bulk tag |
+| Header length | 4 bytes | Big-endian `u32` |
+| Header | Header length | The encoded header |
+| Payload | The rest of the frame | The compressed payload, untouched |
 
 The header is a MessagePack-encoded enum mirroring `BulkMessage`'s variants with the payload field removed, so it carries the subscription handle and the cursor on a live patch, the handle alone on a snapshot patch, and the client sequence on a mutation patch. On a byte-stream transport `encode_bulk_framed` wraps the same three parts in the existing outer length, so the length-prefixed pair needs the identical split and nothing else.
 

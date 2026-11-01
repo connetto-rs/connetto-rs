@@ -25,32 +25,27 @@ The transport is one persistent, full-duplex WebSocket per client, and the proto
 
 ## Data flow
 
-```text
-+---------------------------------------------------------
-| Client (edge or browser)                               |
-|                                                        |
-|   +-----------+               +-------------------+    |
-|   |   Local   |  mutations    |    Sync client    |    |
-|   |   SQLite  |---------->    |     (worker or    |    |
-|   |  replica  |< row updates  |    background)    |    |
-|   +-----------+               +-------------------+    |
-+----------------------------|----------------------------
-                             |  WebSocket
-+---------------------------------------------------------
-| Server                                                 |
-|                                                        |
-|    +-------------+             +-----------------+     |
-|    |  PostgreSQL | change events     Session     |     |
-|    |  (source of |------------>|   manager, one  |     |
-|    |    truth)   |             |    per client   |     |
-|    |  CDC / WAL  |             +--------|--------+     |
-|    +-------------+                      v              |
-|                              +-------------------+     |
-|                              |     CDC fanout    |     |
-|                              |   matching, auth  |     |
-|                              |  filter, delivery |     |
-|                              +-------------------+     |
-+---------------------------------------------------------
+```mermaid
+flowchart LR
+    subgraph client["Client, native or browser"]
+        direction TB
+        replica[("Local SQLite replica")]
+        sync["Sync client"]
+        replica -- "local writes" --> sync
+        sync -- "row updates" --> replica
+    end
+    subgraph server["connetto-server"]
+        direction TB
+        sessions["Session manager, one session per client"]
+        fanout["Fan-out, matching, authorization, delivery"]
+        fanout -- "patches per subscriber" --> sessions
+    end
+    pg[("PostgreSQL, the source of truth")]
+    fga[("OpenFGA")]
+    sync <-->|WebSocket| sessions
+    sessions -- "validated writes" --> pg
+    pg -- "logical replication" --> fanout
+    fga -. "visibility and write checks" .- server
 ```
 
 **Mutation path**, local to server:
