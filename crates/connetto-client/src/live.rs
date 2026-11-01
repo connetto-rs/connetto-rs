@@ -3429,7 +3429,11 @@ where
         cursor: connetto_core::exchange::Frontier,
     ) -> Result<(), ClientError> {
         let mut state = self.shared.lock_interrupting().await;
-        state.conn.adopt_peer_offer(&author, &offer, &cursor)
+        let adopted = state.conn.adopt_peer_offer(&author, &offer, &cursor);
+        drop(state);
+        // The pump hands on what the adopt raised, offline too.
+        self.shared.wake.notify_one();
+        adopted
     }
 
     #[cfg(feature = "peer")]
@@ -3441,9 +3445,13 @@ where
         cursor: connetto_core::exchange::Frontier,
     ) -> Result<(), ClientError> {
         let mut state = self.shared.lock_interrupting().await;
-        state
+        let taken = state
             .conn
-            .take_peer_row(&author, &row, body.as_deref(), &cursor)
+            .take_peer_row(&author, &row, body.as_deref(), &cursor);
+        drop(state);
+        // The pump hands on what the apply raised, offline too.
+        self.shared.wake.notify_one();
+        taken
     }
 }
 
@@ -3704,7 +3712,7 @@ where
 /// routed and forwarded, and a lost transport marks recovery.
 fn route_step_result<T>(
     state: &mut State<T>,
-    shared: &Arc<Shared<T>>,
+    shared: &Shared<T>,
     stepped: Result<Option<ClientEvent>, ClientError>,
     has_driver: bool,
 ) -> PumpFlow
@@ -4055,7 +4063,9 @@ enum Offline<O> {
     Closing,
 }
 
-/// Keep local work, key deadlines and the gate running during a backoff or dial.
+/// Keep local work, key deadlines and the gate running during a backoff or
+/// dial, and hand on every notice a commit queued meanwhile, a peer apply's
+/// among them, so the app hears it with no server reachable.
 async fn serve_offline<T, F, S>(
     shared: &Shared<T>,
     pending: F,
@@ -4065,6 +4075,7 @@ async fn serve_offline<T, F, S>(
 ) -> Result<Offline<F::Output>, ClientError>
 where
     T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
     F: Future,
     S: Sleeper + 'static,
 {
@@ -4083,6 +4094,9 @@ where
         }
         if !shared.gate.is_locked() {
             refresh_changed(&mut state, &shared.events);
+        }
+        while let Some(notice) = state.conn.take_notice() {
+            let _ = route_step_result(&mut state, shared, Ok(Some(notice)), true);
         }
         arm_share_key_timer(state.conn.share_key_timer(), key_timer, Some(sleeper));
         drop(state);

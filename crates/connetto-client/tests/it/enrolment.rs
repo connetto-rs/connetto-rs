@@ -2413,6 +2413,7 @@ async fn peer_report() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+    let mut b_applies = b2.client().events();
     let linked = b2.link_peer(a_addr).await.expect("b links a");
     assert_eq!(
         linked.key(),
@@ -2443,6 +2444,18 @@ async fn peer_report() {
         wait_for_device_row(&b2, 6, Duration::ZERO).await,
         None,
         "the settled row is left to the server"
+    );
+    assert!(
+        next_event(&mut b_applies, BOUND, |event| {
+            matches!(
+                event,
+                ClientEvent::ProvisionalApplied { author, .. }
+                    if author.as_slice() == a_cert.identity().key().as_bytes()
+            )
+        })
+        .await
+        .is_some(),
+        "b's app hears the apply while no server is reachable"
     );
 
     // C reopens with the server still down and dials b, whose handshake
