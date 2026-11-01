@@ -435,23 +435,34 @@ async fn an_import_replays_interleaved_authors_in_their_archived_order() {
             PeerApplyOutcome::Applied { .. }
         ));
     }
-    assert_eq!(board_rows(&mut r1), vec![(1, "anna two".to_owned())]);
+    // An earlier receipt than the import's own clock, so a restore that
+    // stamped its records afresh would show.
+    for table in ["_connetto_peer_entry", "_connetto_provisional"] {
+        diesel::sql_query(format!("UPDATE {table} SET received_at = 1000"))
+            .execute(r1.conn())
+            .expect("age the receipt");
+    }
+    let source_rows = board_rows(&mut r1);
+    assert_eq!(source_rows, vec![(1, "anna two".to_owned())]);
+    let source_records = r1.provisional_rows().expect("read the records");
+    let source_entries = stored_entries(&mut r1);
     let bytes = export(&mut r1, ExportScope::Unsynced);
 
     let (mut r2, _) = restore(&bytes).await;
 
     assert_eq!(
         board_rows(&mut r2),
-        vec![(1, "anna two".to_owned())],
+        source_rows,
         "the last write in archived order wins"
     );
     assert_eq!(
+        r2.provisional_rows().expect("read the records"),
+        source_records,
+        "the records keep their author, displacement and receipt time"
+    );
+    assert_eq!(
         stored_entries(&mut r2),
-        vec![
-            ("author-a".as_bytes().to_vec(), 1),
-            ("author-b".as_bytes().to_vec(), 1),
-            ("author-a".as_bytes().to_vec(), 2),
-        ],
+        source_entries,
         "the positions keep the archived order"
     );
 }
@@ -704,4 +715,149 @@ async fn an_own_unsent_write_holds_its_key_over_the_archived_entry() {
             .all(|event| !matches!(event, ClientEvent::PeerChainInvalid { .. })),
         "nothing contradicts, so nothing raises"
     );
+}
+
+/// Store `body` as `author`'s entry `seq` on `conn` directly, as an
+/// exporting device that applied it under different policies would hold it.
+fn store_raw_entry<T>(
+    conn: &mut ConnettoConnection<T>,
+    author: &PeerAuthor,
+    seq: i64,
+    major: i64,
+    body: &[u8],
+) where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    diesel::sql_query(
+        "INSERT INTO _connetto_peer_entry \
+         (author, seq, major, changeset, account, bot_list, received_at, position) \
+         VALUES (?, ?, ?, ?, ?, NULL, 1000, \
+         (SELECT coalesce(max(position), 0) + 1 FROM _connetto_peer_entry))",
+    )
+    .bind::<diesel::sql_types::Binary, _>(&author.key_id)
+    .bind::<diesel::sql_types::BigInt, _>(seq)
+    .bind::<diesel::sql_types::BigInt, _>(major)
+    .bind::<diesel::sql_types::Binary, _>(body)
+    .bind::<diesel::sql_types::Text, _>(&author.account)
+    .execute(conn.conn())
+    .expect("store the entry");
+}
+
+/// An archived entry the importing replica's policies refuse lands nothing,
+/// and the import says so with `PeerWriteRefused`, while the plan of a build
+/// that exchanges with peers leaves no entry out.
+#[tokio::test]
+async fn an_archived_entry_the_policies_refuse_is_reported_and_left_out() {
+    let [foreign] = captured([&|conn| insert_order(conn, 3, "peer-bob", "x")]).await;
+    let (mut r1, _) = receiver().await;
+    let anna = author("author-a", "peer-anna", Some("*"));
+    store_raw_entry(&mut r1, &anna, 1, 1, &foreign);
+    let bytes = export(&mut r1, ExportScope::Unsynced);
+
+    let (mut r2, _) = receiver().await;
+    let plan = r2
+        .import_local_data(std::io::Cursor::new(&bytes))
+        .expect("plan the import");
+    assert_eq!(plan.peer_entries_left_out(), 0);
+    r2.apply_import(&plan, &ImportChoices::keeping_the_file())
+        .expect("apply the import");
+
+    assert_eq!(order_rows(&mut r2), Vec::new());
+    assert_eq!(stored_entries(&mut r2), Vec::new());
+    let events = drain_events(&mut r2).await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ClientEvent::PeerWriteRefused { author, seq: 1, rows }
+                if author == b"author-a" && rows == &[("orders".to_owned(), vec![KeyValue::Int(3)])]
+        )),
+        "the refusal surfaces, got {events:?}"
+    );
+}
+
+/// Archived entries of an author the file holds no cursor for still stop at
+/// the receiver's own cursor, so only what lies above it lands and the cursor
+/// stays the receiver's.
+#[tokio::test]
+async fn archived_entries_without_a_cursor_land_only_above_the_receivers() {
+    let [b1, b2] = captured([&|conn| insert_order(conn, 1, "peer-anna", "a"), &|conn| {
+        insert_order(conn, 2, "peer-anna", "b");
+    }])
+    .await;
+    let (mut r1, _) = receiver().await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    for (seq, body) in [(1, &b1), (2, &b2)] {
+        r1.apply_peer_entry(&a, &manifest(seq, body), body)
+            .expect("apply the entry");
+    }
+    let bytes = export(&mut r1, ExportScope::Unsynced);
+
+    let (mut r2, _) = receiver().await;
+    seed_cursor(&mut r2, b"author-a", "peer-anna", 1, &HEAD1, b"offer-one");
+    let plan = r2
+        .import_local_data(std::io::Cursor::new(&bytes))
+        .expect("plan the import");
+    r2.apply_import(&plan, &ImportChoices::keeping_the_file())
+        .expect("apply the import");
+
+    assert_eq!(
+        order_rows(&mut r2),
+        vec![(2, "peer-anna".to_owned(), "b".to_owned())]
+    );
+    assert_eq!(
+        cursor_row(&mut r2, b"author-a"),
+        Some((1, HEAD1.to_vec(), b"offer-one".to_vec()))
+    );
+}
+
+/// A peer record the file carries that no replica could hold, an entry under
+/// a major no build expresses or a cursor below sequence zero, refuses the
+/// whole import and lands nothing of it.
+#[tokio::test]
+async fn an_impossible_peer_record_refuses_the_whole_import() {
+    let [body] = captured([&|conn| insert_order(conn, 1, "peer-anna", "a")]).await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    let (mut bad_major, _) = receiver().await;
+    store_raw_entry(&mut bad_major, &a, 1, -1, &body);
+    let (mut bad_cursor, _) = receiver().await;
+    seed_cursor(
+        &mut bad_cursor,
+        b"author-a",
+        "peer-anna",
+        -1,
+        &HEAD1,
+        b"offer",
+    );
+
+    for source in [&mut bad_major, &mut bad_cursor] {
+        let bytes = export(source, ExportScope::Unsynced);
+        let (mut r2, _) = receiver().await;
+        let plan = r2
+            .import_local_data(std::io::Cursor::new(&bytes))
+            .expect("plan the import");
+        assert!(matches!(
+            r2.apply_import(&plan, &ImportChoices::keeping_the_file()),
+            Err(connetto_client::ClientError::Import(_))
+        ));
+        assert_eq!(order_rows(&mut r2), Vec::new());
+        assert_eq!(cursor_row(&mut r2, b"author-a"), None);
+    }
+}
+
+/// A stored cursor whose head is not a chain hash cannot be exported, rather
+/// than written into a file no import could verify.
+#[tokio::test]
+async fn a_cursor_with_a_corrupt_head_refuses_the_export() {
+    let (mut r1, _) = receiver().await;
+    diesel::sql_query(
+        "INSERT INTO _connetto_peer_cursor (author, account, seq, head, offer) \
+         VALUES (x'aa', 'peer-anna', 1, x'0102', x'00')",
+    )
+    .execute(r1.conn())
+    .expect("seed a corrupt cursor");
+    assert!(matches!(
+        r1.export_local_data(ExportScope::Unsynced, Vec::new()),
+        Err(connetto_client::ClientError::Session(_))
+    ));
 }

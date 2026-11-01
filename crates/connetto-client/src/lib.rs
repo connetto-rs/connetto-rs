@@ -3020,7 +3020,7 @@ fn reapply_archived_entry(
         author: &author,
         seq: entry.seq,
         receiver: &frame.receiver,
-        now: frame.now,
+        now: entry.received_at,
     };
     let store = EntryToStore {
         major: entry.major,

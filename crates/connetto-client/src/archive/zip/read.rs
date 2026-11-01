@@ -433,45 +433,26 @@ pub(super) fn decode_peer_entries(
     use super::super::ArchivedPeerEntry;
 
     let malformed = || ClientError::Import("the peer entry record is malformed".to_owned());
-    let count = u64::from_be_bytes(
-        bytes
-            .get(..8)
-            .ok_or_else(malformed)?
-            .try_into()
-            .map_err(|_| malformed())?,
-    );
+    let mut at: usize = 0;
+    let count = u64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
     // Every entry costs at least its fixed 59 bytes, so a count above what the
     // entry can hold is refused before one vector per entry is allocated.
-    let capacity = u64::try_from(bytes.len().saturating_sub(8) / 59).unwrap_or(u64::MAX);
-    if count > capacity {
+    if count > u64::try_from((bytes.len() - at) / 59).unwrap_or(u64::MAX) {
         return Err(malformed());
     }
-    let mut at: usize = 8;
     let mut entries = Vec::new();
     for _ in 0..count {
         let author = read_bytes_field(bytes, &mut at, &malformed)?;
-        let seq = read_i64_field(bytes, &mut at, &malformed)?;
-        let major = read_i64_field(bytes, &mut at, &malformed)?;
+        let seq = i64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
+        let major = i64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
         let changeset = read_bytes_field(bytes, &mut at, &malformed)?;
-        let account = std::str::from_utf8(&read_bytes_field(bytes, &mut at, &malformed)?)
-            .map_err(|_| malformed())?
-            .to_owned();
-        let bot_list = match *bytes.get(at).ok_or_else(malformed)? {
-            0 => {
-                at += 1;
-                None
-            }
-            1 => {
-                at += 1;
-                Some(
-                    std::str::from_utf8(&read_bytes_field(bytes, &mut at, &malformed)?)
-                        .map_err(|_| malformed())?
-                        .to_owned(),
-                )
-            }
+        let account = read_text_field(bytes, &mut at, &malformed)?;
+        let bot_list = match read_array::<1>(bytes, &mut at, &malformed)? {
+            [0] => None,
+            [1] => Some(read_text_field(bytes, &mut at, &malformed)?),
             _ => return Err(malformed()),
         };
-        let received_at = read_i64_field(bytes, &mut at, &malformed)?;
+        let received_at = i64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
         entries.push(ArchivedPeerEntry {
             author,
             seq,
@@ -492,33 +473,19 @@ pub(super) fn decode_peer_cursors(
     use super::super::ArchivedPeerCursor;
 
     let malformed = || ClientError::Import("the peer cursor record is malformed".to_owned());
-    let count = u64::from_be_bytes(
-        bytes
-            .get(..8)
-            .ok_or_else(malformed)?
-            .try_into()
-            .map_err(|_| malformed())?,
-    );
+    let mut at: usize = 0;
+    let count = u64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
     // Every cursor costs at least its fixed 64 bytes, so a count above what
     // the entry can hold is refused before one vector per cursor is allocated.
-    let capacity = u64::try_from(bytes.len().saturating_sub(8) / 64).unwrap_or(u64::MAX);
-    if count > capacity {
+    if count > u64::try_from((bytes.len() - at) / 64).unwrap_or(u64::MAX) {
         return Err(malformed());
     }
-    let mut at: usize = 8;
     let mut cursors = Vec::new();
     for _ in 0..count {
         let author = read_bytes_field(bytes, &mut at, &malformed)?;
-        let account = std::str::from_utf8(&read_bytes_field(bytes, &mut at, &malformed)?)
-            .map_err(|_| malformed())?
-            .to_owned();
-        let seq = read_i64_field(bytes, &mut at, &malformed)?;
-        let head: [u8; 32] = bytes
-            .get(at..at.checked_add(32).ok_or_else(malformed)?)
-            .ok_or_else(malformed)?
-            .try_into()
-            .map_err(|_| malformed())?;
-        at = at.checked_add(32).ok_or_else(malformed)?;
+        let account = read_text_field(bytes, &mut at, &malformed)?;
+        let seq = i64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
+        let head = read_array(bytes, &mut at, &malformed)?;
         let offer = read_bytes_field(bytes, &mut at, &malformed)?;
         cursors.push(ArchivedPeerCursor {
             author,
@@ -531,22 +498,18 @@ pub(super) fn decode_peer_cursors(
     Ok(cursors)
 }
 
-/// An eight-byte big-endian integer at `at`, advancing past it.
-fn read_i64_field(
+/// The `N` bytes at `at`, advancing past them.
+fn read_array<const N: usize>(
     bytes: &[u8],
     at: &mut usize,
     malformed: &impl Fn() -> ClientError,
-) -> Result<i64, ClientError> {
-    let end = at.checked_add(8).ok_or_else(malformed)?;
-    let value = i64::from_be_bytes(
-        bytes
-            .get(*at..end)
-            .ok_or_else(malformed)?
-            .try_into()
-            .map_err(|_| malformed())?,
-    );
-    *at = end;
-    Ok(value)
+) -> Result<[u8; N], ClientError> {
+    let field = *bytes
+        .get(*at..)
+        .and_then(<[u8]>::first_chunk::<N>)
+        .ok_or_else(malformed)?;
+    *at += N;
+    Ok(field)
 }
 
 /// A big-endian length-prefixed byte string at `at`, advancing past it.
@@ -555,11 +518,22 @@ fn read_bytes_field(
     at: &mut usize,
     malformed: &impl Fn() -> ClientError,
 ) -> Result<Vec<u8>, ClientError> {
-    let len = usize::try_from(read_i64_field(bytes, at, malformed)?).map_err(|_| malformed())?;
-    let end = at.checked_add(len).ok_or_else(malformed)?;
-    let value = bytes.get(*at..end).ok_or_else(malformed)?.to_vec();
-    *at = end;
-    Ok(value)
+    let len = u64::from_be_bytes(read_array(bytes, at, malformed)?);
+    let value = usize::try_from(len)
+        .ok()
+        .and_then(|len| bytes.get(*at..)?.get(..len))
+        .ok_or_else(malformed)?;
+    *at += value.len();
+    Ok(value.to_vec())
+}
+
+/// A length-prefixed UTF-8 string at `at`, advancing past it.
+fn read_text_field(
+    bytes: &[u8],
+    at: &mut usize,
+    malformed: &impl Fn() -> ClientError,
+) -> Result<String, ClientError> {
+    String::from_utf8(read_bytes_field(bytes, at, malformed)?).map_err(|_| malformed())
 }
 
 /// A writer secret behind its presence byte, absent when the byte is zero.
@@ -995,8 +969,10 @@ mod tests {
         }
     }
 
-    /// A peer entry record cut short, or carrying a presence byte the framing
-    /// does not name, is refused rather than read as the fields after it.
+    /// A peer entry record cut short at any byte, counting more entries than
+    /// it holds, carrying an account that is not text or a presence byte the
+    /// framing does not name, is refused rather than read as the fields
+    /// after it.
     #[test]
     fn a_malformed_peer_entry_record_is_refused() {
         use super::super::super::ArchivedPeerEntry;
@@ -1019,9 +995,14 @@ mod tests {
         let presence_at = 8 + 8 + 2 + 8 + 8 + 8 + 3 + 8 + 10;
         let mut unknown = bytes.clone();
         unknown[presence_at] = 2;
-        let mut cut = bytes;
-        cut.truncate(presence_at + 1);
-        for malformed in [unknown, cut] {
+        // The account's first byte, made invalid UTF-8.
+        let mut not_text = bytes.clone();
+        not_text[presence_at - 9] = 0xFF;
+        // A count above what the record can hold.
+        let mut overcount = bytes.clone();
+        overcount[..8].copy_from_slice(&2u64.to_be_bytes());
+        let cuts = (0..bytes.len()).map(|len| bytes[..len].to_vec());
+        for malformed in [unknown, not_text, overcount].into_iter().chain(cuts) {
             assert!(matches!(
                 decode_peer_entries(&malformed),
                 Err(crate::ClientError::Import(_))
@@ -1029,8 +1010,9 @@ mod tests {
         }
     }
 
-    /// A peer cursor whose head is not the chain hash's 32 bytes is refused,
-    /// and a record cut short is refused rather than read shorter.
+    /// A peer cursor record cut short at any byte, its head included,
+    /// counting more cursors than it holds or carrying an account that is not
+    /// text, is refused rather than read shorter.
     #[test]
     fn a_malformed_peer_cursor_record_is_refused() {
         use super::super::super::ArchivedPeerCursor;
@@ -1047,13 +1029,14 @@ mod tests {
             decode_peer_cursors(&bytes).expect("a valid peer cursor"),
             std::slice::from_ref(&cursor).to_vec()
         );
-        // The head follows the count, the author and the account.
-        let head_at = 8 + 8 + 2 + 8 + 10;
-        let mut cut_head = bytes.clone();
-        cut_head.truncate(head_at + 10);
-        let mut cut_offer = bytes;
-        cut_offer.truncate(cut_offer.len() - 1);
-        for malformed in [cut_head, cut_offer] {
+        // The account's first byte, made invalid UTF-8.
+        let mut not_text = bytes.clone();
+        not_text[8 + 8 + 2 + 8] = 0xFF;
+        // A count above what the record can hold.
+        let mut overcount = bytes.clone();
+        overcount[..8].copy_from_slice(&2u64.to_be_bytes());
+        let cuts = (0..bytes.len()).map(|len| bytes[..len].to_vec());
+        for malformed in [not_text, overcount].into_iter().chain(cuts) {
             assert!(matches!(
                 decode_peer_cursors(&malformed),
                 Err(crate::ClientError::Import(_))
