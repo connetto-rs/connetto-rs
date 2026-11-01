@@ -992,7 +992,7 @@ where
                     bluetooth_tx,
                 );
                 core.client()
-                    .with_device_writer(keys, handle.writer_retirement())
+                    .with_device_writer(keys, handle.steering())
                     .await?;
                 let enrolment = core.client().enrolment(enroller);
                 #[cfg(feature = "peer")]

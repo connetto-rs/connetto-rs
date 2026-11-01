@@ -65,6 +65,8 @@ mod aggregates;
 pub mod archive;
 #[cfg(feature = "native-auth")]
 pub mod auth;
+#[cfg(feature = "peer")]
+mod author;
 pub mod away;
 #[cfg(feature = "peer")]
 mod bluetooth;
@@ -3364,6 +3366,8 @@ fn drop_writer_state(db: &mut SqliteConnection, writer: &WriterRef) -> Result<()
     let id = writer_id(writer);
     diesel::delete(_connetto_writers::table.filter(_connetto_writers::id.eq(&id))).execute(db)?;
     delete_writer_pending(db, writer)?;
+    #[cfg(feature = "peer")]
+    author::forget(db, writer)?;
     Ok(())
 }
 
@@ -3471,6 +3475,29 @@ fn delete_pending(
             .filter(_connetto_pending::seq.eq(seq_storage(seq)?)),
     )
     .execute(db)?;
+    Ok(())
+}
+
+/// Retire one queued entry the server answered for good, the peer build
+/// keeping its hash as the settled frontier and a refusal's `cause` in the
+/// device writer's retraction log (R77 decision 9).
+#[cfg_attr(
+    not(feature = "peer"),
+    expect(
+        unused_variables,
+        reason = "only a peer build keeps the settled frontier and the retraction log"
+    )
+)]
+fn settle_pending(
+    db: &mut SqliteConnection,
+    writer: &WriterRef,
+    seq: u64,
+    hash: &[u8; 32],
+    cause: Option<&connetto_core::exchange::RetractCause>,
+) -> Result<(), ClientError> {
+    delete_pending(db, writer, seq)?;
+    #[cfg(feature = "peer")]
+    author::settle(db, writer, seq, hash, cause)?;
     Ok(())
 }
 
@@ -4186,9 +4213,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// The device key opened to sign a bind, device identity only.
     #[cfg(feature = "device-identity")]
     opened_key: Option<Arc<dyn DeviceKey>>,
-    /// Steers the enrolment task to a fresh key, device identity only.
+    /// Steers the enrolment task to a fresh key and, on a peer build, to a
+    /// fresh offer, device identity only.
     #[cfg(feature = "device-identity")]
-    writer_retired: Option<tokio::sync::mpsc::UnboundedSender<crate::enrolment::Command>>,
+    steering: Option<tokio::sync::mpsc::UnboundedSender<crate::enrolment::Command>>,
     /// The device's keys, opened at a bind to sign it, device identity only.
     #[cfg(feature = "device-identity")]
     writer_keys: Option<Arc<dyn crate::enrolment::DeviceKeys>>,
@@ -4393,10 +4421,14 @@ fn install_replica_metadata(
     check_recorded_tables(db, "main", &config.unrecorded_tables)?;
     db.batch_execute(META_DDL)?;
     db.batch_execute(outbox::OUTBOX_DDL)?;
-    for ddl in [
+    let added = [
         "ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB",
         "ALTER TABLE _connetto_pending ADD COLUMN major INTEGER",
-    ] {
+    ]
+    .into_iter();
+    #[cfg(feature = "peer")]
+    let added = added.chain(author::SETTLED_COLUMNS);
+    for ddl in added {
         match db.batch_execute(ddl) {
             Ok(()) => {}
             Err(diesel::result::Error::DatabaseError(_, info))
@@ -4414,6 +4446,8 @@ fn install_replica_metadata(
     db.batch_execute(provisional::PROVISIONAL_DDL)?;
     #[cfg(feature = "peer")]
     db.batch_execute(peer::PEER_ENTRY_DDL)?;
+    #[cfg(feature = "peer")]
+    db.batch_execute(author::RETRACTION_DDL)?;
     // A watch the previous run died still holding counts down from now.
     subscriptions::anchor_launch(db)?;
     Ok(())
@@ -4711,7 +4745,7 @@ where
             #[cfg(feature = "device-identity")]
             opened_key: None,
             #[cfg(feature = "device-identity")]
-            writer_retired: None,
+            steering: None,
             #[cfg(feature = "device-identity")]
             writer_keys: None,
             #[cfg(feature = "device-identity")]
@@ -4915,7 +4949,7 @@ where
     }
 
     /// Give this connection the device's keys and the enrolment task's
-    /// retirement steering, device identity only. A restarted device reached
+    /// steering, device identity only. A restarted device reached
     /// its server before the keys were handed over, so the bind it owed at the
     /// handshake arms here, on the live wire, once they arrive.
     ///
@@ -4926,10 +4960,10 @@ where
     pub(crate) async fn with_device_writer(
         &mut self,
         keys: Arc<dyn crate::enrolment::DeviceKeys>,
-        retired: tokio::sync::mpsc::UnboundedSender<crate::enrolment::Command>,
+        steering: tokio::sync::mpsc::UnboundedSender<crate::enrolment::Command>,
     ) -> Result<(), ClientError> {
         self.writer_keys = Some(keys);
-        self.writer_retired = Some(retired);
+        self.steering = Some(steering);
         if self.wire.is_some() {
             self.plan_bind().await?;
             self.flush_writer_tasks().await?;
@@ -5903,6 +5937,7 @@ where
         queue.head = hash;
         queue.pending.insert(seq, entry);
         self.next_position = position + 1;
+        self.offer_changed(writer);
         Ok(seq)
     }
 
@@ -5950,7 +5985,7 @@ where
     fn retire_device(&mut self, carry: Carry) -> Result<ClientEvent, ClientError> {
         self.exclude_device_writers(carry)?;
         #[cfg(feature = "device-identity")]
-        if let Some(sender) = &self.writer_retired {
+        if let Some(sender) = &self.steering {
             let _ = sender.send(crate::enrolment::Command::WriterRetired);
         }
         Ok(ClientEvent::NonFatal {
@@ -7763,7 +7798,7 @@ where
             self.carry_writers(&[current], &live, Carry::Named)?;
             #[cfg(feature = "device-identity")]
             if matches!(current, WriterRef::Device(_))
-                && let Some(sender) = &self.writer_retired
+                && let Some(sender) = &self.steering
             {
                 let _ = sender.send(crate::enrolment::Command::WriterRetired);
             }
@@ -8536,6 +8571,60 @@ where
         }
     }
 
+    /// Ask the enrolment task for a fresh offer when `writer`, the device
+    /// writer peers are offered, changed its queue, its settled frontier or
+    /// its retraction log (R77).
+    #[cfg_attr(
+        not(feature = "peer"),
+        expect(
+            clippy::unused_self,
+            unused_variables,
+            reason = "only a peer build offers its device writer"
+        )
+    )]
+    fn offer_changed(&self, writer: &WriterRef) {
+        #[cfg(feature = "peer")]
+        if matches!(writer, WriterRef::Device(_))
+            && let Some(sender) = &self.steering
+        {
+            let _ = sender.send(crate::enrolment::Command::OfferChanged);
+        }
+    }
+
+    /// The device writer `key_id`'s offer before the device key signs it:
+    /// the builds this replica holds entries of, oldest first, the settled
+    /// frontier, the newest queued entry and the retraction log. `None` once
+    /// a retirement excluded the key, which offers nothing until a fresh key
+    /// enrols (R77 decisions 7 to 9).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the bookkeeping cannot be read.
+    #[cfg(feature = "peer")]
+    pub(crate) fn offer_draft(
+        &mut self,
+        key_id: [u8; 32],
+    ) -> Result<Option<author::OfferDraft>, ClientError> {
+        if self.retired_keys.contains(&key_id) {
+            return Ok(None);
+        }
+        let newest = self
+            .writers
+            .get(&WriterRef::Device(key_id))
+            .and_then(|queue| queue.pending.last_key_value())
+            .map(|(seq, entry)| connetto_core::exchange::Frontier {
+                seq: *seq,
+                head: entry.hash,
+            });
+        let mut builds = majors::held_builds(&mut self.db)?;
+        if let (Some(major), Some(version)) =
+            (self.config.schema_major, &self.config.schema_version)
+        {
+            builds.push((major, version.clone()));
+        }
+        author::OfferDraft::read(&mut self.db, key_id, newest, builds).map(Some)
+    }
+
     /// Send one mutation as its header and patchset frame pair, as `writer`'s
     /// sequence `seq`, and remember it as sent on this transport. Shared by
     /// [`push`](Self::push) and the replay in
@@ -8566,12 +8655,14 @@ where
         Ok(())
     }
 
-    /// Undo `writer`'s rejected `client_seq` in both schemas under the write
-    /// exemption, leaving a row a later change touched, and return its rows.
+    /// Undo `writer`'s refused `client_seq` in both schemas under the write
+    /// exemption, leaving a row a later change touched, settle it with
+    /// `cause`, and return its rows.
     fn rollback(
         &mut self,
         writer: WriterRef,
         client_seq: u64,
+        cause: &connetto_core::exchange::RetractCause,
     ) -> Result<Vec<AffectedRow>, ClientError> {
         let Some(queue) = self.writers.get_mut(&writer) else {
             return Ok(Vec::new());
@@ -8579,7 +8670,7 @@ where
         let Some(entry) = queue.pending.remove(&client_seq) else {
             return Ok(Vec::new());
         };
-        let changeset = entry.changeset;
+        let (changeset, hash) = (entry.changeset, entry.hash);
         let rows = affected_rows(&changeset, &self.config.policy_tables)?;
         let inverse = invert_changeset(&changeset)
             .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?;
@@ -8587,7 +8678,7 @@ where
         {
             let _suspended = ExemptWrites::raise(&self.write_flags);
             self.db.transaction::<_, ClientError, _>(|db| {
-                delete_pending(db, &writer, client_seq)?;
+                settle_pending(db, &writer, client_seq, &hash, Some(cause))?;
                 db.apply_changeset(&inverse, rollback_omit)
                     .map_err(|err| ClientError::Apply(err.to_string()))?;
                 if !shared.is_empty() {
@@ -8596,6 +8687,7 @@ where
                 Ok(())
             })?;
         }
+        self.offer_changed(&writer);
         self.record_unsent()?;
         Ok(rows)
     }
@@ -8854,7 +8946,11 @@ where
                 let writer = self
                     .bound_writer
                     .expect("a conflict arrives for the bound writer");
-                let rows = self.rollback(writer, conflict.client_seq)?;
+                let rows = self.rollback(
+                    writer,
+                    conflict.client_seq,
+                    &connetto_core::exchange::RetractCause::Conflict,
+                )?;
                 #[cfg(feature = "device-identity")]
                 self.finish_number_tail().await?;
                 Ok(ClientEvent::MutationConflict {
@@ -9012,13 +9108,15 @@ where
             let removed = self
                 .writers
                 .get_mut(&writer)
-                .and_then(|queue| queue.pending.remove(&client_seq))
-                .is_some();
-            if removed {
+                .and_then(|queue| queue.pending.remove(&client_seq));
+            if let Some(entry) = removed {
                 {
                     let _suspended = ExemptWrites::raise(&self.write_flags);
-                    delete_pending(&mut self.db, &writer, client_seq)?;
+                    self.db.transaction::<_, ClientError, _>(|db| {
+                        settle_pending(db, &writer, client_seq, &entry.hash, None)
+                    })?;
                 }
+                self.offer_changed(&writer);
                 self.record_unsent()?;
             }
         }
@@ -9060,7 +9158,11 @@ where
         }
         self.settle_resend();
         let rows = match writer {
-            Some(writer) => self.rollback(writer, client_seq)?,
+            Some(writer) => self.rollback(
+                writer,
+                client_seq,
+                &connetto_core::exchange::RetractCause::Rejected(reject.reason.clone()),
+            )?,
             None => Vec::new(),
         };
         #[cfg(feature = "device-identity")]

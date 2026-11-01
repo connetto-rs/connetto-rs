@@ -3366,6 +3366,15 @@ where
         let mut state = self.shared.lock_interrupting().await;
         state.conn.store_revocation_list(&kept)
     }
+
+    #[cfg(feature = "peer")]
+    async fn offer(
+        &self,
+        key_id: [u8; 32],
+    ) -> Result<Option<crate::author::OfferDraft>, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.offer_draft(key_id)
+    }
 }
 
 #[cfg(feature = "device-identity")]
@@ -3411,7 +3420,7 @@ where
     }
 
     /// Give the shared connection the device's keys and the enrolment task's
-    /// retirement steering, so a device writer can be bound (R75). The bind a
+    /// steering, so a device writer can be bound (R75). The bind a
     /// restarted device owed at its handshake arms here, on the live wire, now
     /// that the keys are handed over.
     ///
@@ -3421,10 +3430,10 @@ where
     pub(crate) async fn with_device_writer(
         &self,
         keys: Arc<dyn crate::enrolment::DeviceKeys>,
-        retired: tokio::sync::mpsc::UnboundedSender<crate::enrolment::Command>,
+        steering: tokio::sync::mpsc::UnboundedSender<crate::enrolment::Command>,
     ) -> Result<(), ClientError> {
         let mut state = self.shared.lock_interrupting().await;
-        state.conn.with_device_writer(keys, retired).await
+        state.conn.with_device_writer(keys, steering).await
     }
 }
 

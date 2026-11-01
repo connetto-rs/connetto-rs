@@ -289,6 +289,35 @@ pub(crate) fn has_held(db: &mut SqliteConnection) -> Result<bool, ClientError> {
     has_table(db, "_connetto_held_batch")
 }
 
+/// The build each held batch was captured under, as `(major, version)`,
+/// oldest major first.
+///
+/// # Errors
+///
+/// A database failure, or a batch row naming no valid major.
+pub(crate) fn held_builds(
+    db: &mut SqliteConnection,
+) -> Result<Vec<(Major, SchemaVersion)>, ClientError> {
+    if !has_held(db)? {
+        return Ok(Vec::new());
+    }
+    held_batch::table
+        .select((held_batch::major, held_batch::version))
+        .order(held_batch::major)
+        .load::<(i64, Vec<u8>)>(db)?
+        .into_iter()
+        .map(|(major, version)| {
+            let major = u32::try_from(major)
+                .ok()
+                .and_then(Major::new)
+                .ok_or_else(|| {
+                    ClientError::Session(format!("a held batch records major {major}"))
+                })?;
+            Ok((major, SchemaVersion::from_hash(version)))
+        })
+        .collect()
+}
+
 /// Forget the batch row of `major` and, through `content`, its files. Says how
 /// many files there were. The writes it captured live in the writer queues,
 /// which settle or lose them on their own.
