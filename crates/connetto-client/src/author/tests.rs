@@ -1,5 +1,5 @@
 use connetto_core::SchemaVersion;
-use connetto_core::exchange::{Frontier, RetractCause, Retraction};
+use connetto_core::exchange::{Frontier, Offer, RetractCause, Retraction};
 use connetto_core::messages::{
     ControlMessage, MutationApplied, MutationConflict, MutationReject, MutationRejectReason,
     WriterRef,
@@ -8,7 +8,6 @@ use diesel::connection::SimpleConnection as _;
 use diesel::prelude::*;
 use tokio::sync::mpsc;
 
-use super::OfferDraft;
 use crate::Carry;
 use crate::drain::tests::{Conn, hold_major_one, major, old_version, queue, replica};
 use crate::enrolment::Command;
@@ -35,8 +34,8 @@ fn hash_at(conn: &Conn, seq: u64) -> [u8; 32] {
 }
 
 /// The device writer's offer as the replica states it.
-fn offer(conn: &mut Conn) -> OfferDraft {
-    conn.offer_draft(KEY)
+fn offer(conn: &mut Conn) -> Offer {
+    conn.own_offer(KEY)
         .expect("read the offer")
         .expect("the key is not retired")
 }
@@ -178,7 +177,7 @@ fn the_offer_names_this_build_and_every_held_major() {
 fn a_retired_device_writer_offers_nothing() {
     let (mut conn, _seqs, _steered) = device_replica(1);
     conn.retire_device(Carry::Named).expect("retire the writer");
-    assert_eq!(conn.offer_draft(KEY).expect("read the offer"), None);
+    assert_eq!(conn.own_offer(KEY).expect("read the offer"), None);
 }
 
 /// R77 state table: a local write, a settled entry and a refusal of the
@@ -319,7 +318,7 @@ fn corrupt_bookkeeping_is_refused_and_never_offered() {
         conn.db
             .batch_execute(&corruption)
             .expect("corrupt the bookkeeping");
-        assert!(conn.offer_draft(KEY).is_err(), "{corruption} is refused");
+        assert!(conn.own_offer(KEY).is_err(), "{corruption} is refused");
     }
 }
 
@@ -343,7 +342,7 @@ fn a_build_without_a_schema_version_offers_no_build() {
     )
     .expect("open the replica");
     let offer = conn
-        .offer_draft(KEY)
+        .own_offer(KEY)
         .expect("read the offer")
         .expect("the key is not retired");
     assert_eq!(offer.builds, []);

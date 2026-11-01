@@ -12,6 +12,7 @@ use connetto_core::device_cert::{
     DeviceCertificate, DeviceIdentity, KeyId, RevocationList, certificate_key_id,
     certificate_serial, key_id,
 };
+use connetto_exchange::Message;
 use parking_lot::{Mutex, RwLock};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{AlertDescription, ClientConfig, ServerConfig, version};
@@ -29,9 +30,7 @@ use crate::error::{CloseReason, LinkError, PeerSendError, Refusal, TrustError};
 use crate::event::PeerEvent;
 #[cfg(feature = "bluetooth")]
 use crate::exchange::OfferFrame;
-use crate::frame::{
-    ExchangeFrame, FrameError, PROTOCOL_VERSION, PeerFrame, read_frame, write_frame,
-};
+use crate::frame::{FrameError, PROTOCOL_VERSION, PeerFrame, read_frame, write_frame};
 use crate::identity::{Clock, Identity, Trust};
 use crate::signer::{IdentityClientCert, IdentityServerCert};
 use crate::verify::{Crl, KeptList, PeerVerifier};
@@ -54,7 +53,7 @@ pub(crate) const SILENCE_LIMIT: Duration = Duration::from_secs(45);
 /// The inbound handshakes the listener runs at once, the unauthenticated
 /// network's bound on its sockets.
 const MAX_INBOUND_HANDSHAKES: usize = 16;
-/// The exchange frames one link's queue holds, the backpressure a sender
+/// The exchange messages one link's queue holds, the backpressure a sender
 /// waits on while the link drains.
 pub(crate) const EXCHANGE_QUEUE: usize = 8;
 pub(crate) const DIAL_NAME: &str = "connetto-peer";
@@ -105,7 +104,7 @@ pub(crate) struct NodeState {
     /// The exchange senders of the live links, by peer key and
     /// registration order, so a send awaits the link's bounded queue
     /// without the links lock.
-    pub(crate) exchange_senders: RwLock<HashMap<KeyId, (u64, mpsc::Sender<ExchangeFrame>)>>,
+    pub(crate) exchange_senders: RwLock<HashMap<KeyId, (u64, mpsc::Sender<Message>)>>,
     listener: RwLock<Option<ListenerSlot>>,
     /// Whether the node still serves, checked under the links lock.
     pub(crate) serving: AtomicBool,
@@ -134,6 +133,8 @@ pub(crate) enum SlotState {
     AwaitingKeeper {
         /// What the peer's certificate names.
         peer: DeviceIdentity,
+        /// The peer's `SubjectPublicKeyInfo`, DER.
+        public_key: Vec<u8>,
         /// The bot list the peer's certificate carries.
         bot_list: Option<String>,
     },
@@ -144,6 +145,9 @@ pub(crate) enum SlotState {
 pub struct PeerLink {
     /// What the peer's certificate names.
     pub peer: DeviceIdentity,
+    /// The peer's `SubjectPublicKeyInfo`, DER, which its offers verify
+    /// against.
+    pub public_key: Vec<u8>,
     /// The bot list the peer's certificate carries, `None` for a
     /// certificate without the extension, which readers bind as `NULL`
     /// (R77 decision 12).
@@ -164,6 +168,8 @@ pub(crate) struct LinkSlot {
     pub(crate) peer: DeviceIdentity,
     /// The connection's remote address.
     remote: SocketAddr,
+    /// The peer's `SubjectPublicKeyInfo`, DER.
+    pub(crate) public_key: Vec<u8>,
     /// The peer's leaf, DER.
     pub(crate) leaf: Vec<u8>,
     /// The peer's issuer, DER.
@@ -381,6 +387,19 @@ impl Node {
         stop_state(&self.state, reason);
     }
 
+    /// Close the live link to `peer` with `reason`, which reports
+    /// [`PeerEvent::Unlinked`] as the link ends. A peer with no live link is
+    /// left alone.
+    pub fn close(&self, peer: &DeviceIdentity, reason: CloseReason) {
+        for slot_state in self.state.links.lock().values() {
+            if let SlotState::Live(slot) = slot_state
+                && slot.peer.key() == peer.key()
+            {
+                let _ = slot.command.send(LinkCommand::Close(reason));
+            }
+        }
+    }
+
     /// Prepare the dials' sockets through `prep` before their connect, or
     /// stop preparing them with `None`.
     pub fn set_socket_prep(&self, prep: Option<Arc<dyn SocketPrep>>) {
@@ -406,11 +425,17 @@ impl Node {
             .map(|slot_state| match slot_state {
                 SlotState::Live(slot) => PeerLink {
                     peer: slot.peer.clone(),
+                    public_key: slot.public_key.clone(),
                     bot_list: slot.bot_list.clone(),
                     remote: Some(slot.remote),
                 },
-                SlotState::AwaitingKeeper { peer, bot_list } => PeerLink {
+                SlotState::AwaitingKeeper {
+                    peer,
+                    public_key,
+                    bot_list,
+                } => PeerLink {
                     peer: peer.clone(),
+                    public_key: public_key.clone(),
                     bot_list: bot_list.clone(),
                     remote: None,
                 },
@@ -432,37 +457,37 @@ impl Node {
 
     #[expect(
         clippy::result_large_err,
-        reason = "the refusal hands the frame back to its sender by value"
+        reason = "the refusal hands the message back to its sender by value"
     )]
-    /// Queue an exchange frame on the link to `peer`, awaiting the link's
+    /// Queue an exchange message on the link to `peer`, awaiting the link's
     /// bounded queue so a sender that outruns the link waits rather than
-    /// piling frames up in memory (R77).
+    /// piling messages up in memory (R77).
     ///
     /// # Errors
     ///
-    /// [`PeerSendError`] with the frame handed back when it breaks the
+    /// [`PeerSendError`] with the message handed back when it breaks the
     /// wire's bounds, when the peer holds no live link, and when the link
     /// closes while the send waits on a full queue.
     pub async fn send_exchange(
         &self,
         peer: &DeviceIdentity,
-        frame: ExchangeFrame,
+        message: Message,
     ) -> Result<(), PeerSendError> {
-        match frame.within_bounds() {
+        match message.within_bounds() {
             Ok(()) => {}
-            Err(_) => return Err(PeerSendError::FrameAboveBounds { frame }),
+            Err(_) => return Err(PeerSendError::FrameAboveBounds { message }),
         }
         let key = peer.key();
         let sender = {
             let senders = self.state.exchange_senders.read();
             match senders.get(&key) {
                 Some((_, sender)) => sender.clone(),
-                None => return Err(PeerSendError::Unlinked { frame }),
+                None => return Err(PeerSendError::Unlinked { message }),
             }
         };
-        match sender.send(frame).await {
+        match sender.send(message).await {
             Ok(()) => Ok(()),
-            Err(err) => Err(PeerSendError::LinkClosed { frame: err.0 }),
+            Err(err) => Err(PeerSendError::LinkClosed { message: err.0 }),
         }
     }
 
@@ -530,6 +555,7 @@ impl Node {
         let certificate =
             DeviceCertificate::parse(&leaf).expect("the profile was verified at the handshake");
         let peer = certificate.identity().clone();
+        let public_key = leaf_public_key(&leaf);
         let bot_list = certificate.bot_list().map(str::to_owned);
         let mut tls = tls;
         let (peer_numbers, _peer_dial) = exchange_hello(&mut tls, &self.state, dial).await?;
@@ -537,6 +563,7 @@ impl Node {
             &self.state,
             Handshaken {
                 peer: peer.clone(),
+                public_key,
                 bot_list,
                 leaf,
                 issuer,
@@ -721,6 +748,17 @@ fn chain_revoked(state: &NodeState, leaf: &[u8], issuer: &[u8]) -> bool {
         (kept.issuer == issuer_key && kept.parsed.revokes(&leaf_serial))
             || (state.root_key_ids.contains(&kept.issuer) && kept.parsed.revokes(&issuer_serial))
     })
+}
+
+/// The `SubjectPublicKeyInfo` the leaf's key holds, DER, which the driver
+/// verifies the peer's offers against.
+fn leaf_public_key(leaf: &[u8]) -> Vec<u8> {
+    let der = CertificateDer::from(leaf);
+    webpki::EndEntityCert::try_from(&der)
+        .expect("the leaf was verified at the handshake")
+        .subject_public_key_info()
+        .as_ref()
+        .to_vec()
 }
 
 /// The dialer's TLS config, for `identity` on a standalone trust and CRLs.
@@ -960,6 +998,7 @@ async fn inbound(state: Arc<NodeState>, tcp: TcpStream, remote: SocketAddr, iden
         }
     };
     let peer = certificate.identity().clone();
+    let public_key = leaf_public_key(&leaf);
     let bot_list = certificate.bot_list().map(str::to_owned);
     let mut tls = tls;
     let (peer_numbers, dial) = match exchange_hello(&mut tls, &state, 0).await {
@@ -976,6 +1015,7 @@ async fn inbound(state: Arc<NodeState>, tcp: TcpStream, remote: SocketAddr, iden
         &state,
         Handshaken {
             peer,
+            public_key,
             bot_list,
             leaf,
             issuer,
@@ -1068,6 +1108,8 @@ pub(crate) async fn exchange_hello<S: AsyncRead + AsyncWrite + Unpin>(
 struct Handshaken {
     /// What the peer's certificate names.
     peer: DeviceIdentity,
+    /// The peer's `SubjectPublicKeyInfo`, DER.
+    public_key: Vec<u8>,
     /// The bot list the peer's certificate carries.
     bot_list: Option<String>,
     /// The peer's leaf, DER.
@@ -1119,6 +1161,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 ) -> Result<(), LinkError> {
     let Handshaken {
         peer,
+        public_key,
         bot_list,
         leaf,
         issuer,
@@ -1177,6 +1220,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             let slot = LinkSlot {
                 peer: (*peer).clone(),
                 remote: SocketAddr::new(remote.ip().to_canonical(), remote.port()),
+                public_key,
                 leaf,
                 issuer,
                 bot_list,
@@ -1195,11 +1239,13 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 .insert(peer_key, (seq, exchange_tx));
             #[cfg(feature = "discovery")]
             state.peer_fingerprints.lock().insert(peer_key, fingerprint);
-            if fresh {
+            if fresh && let Some(SlotState::Live(slot)) = links.get(&peer_key) {
                 state
                     .events
                     .send(PeerEvent::Linked {
-                        peer: (*peer).clone(),
+                        peer: slot.peer.clone(),
+                        public_key: slot.public_key.clone(),
+                        bot_list: slot.bot_list.clone(),
                     })
                     .ok();
             }

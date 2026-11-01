@@ -1272,6 +1272,7 @@ dependencies = [
  "chrono",
  "connetto-app-attest",
  "connetto-core",
+ "connetto-exchange",
  "connetto-peer",
  "connetto-peer-android",
  "connetto-peer-apple",
@@ -1412,6 +1413,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "connetto-exchange"
+version = "0.0.0"
+dependencies = [
+ "connetto-core",
+ "indexmap 2.14.2",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "connetto-file-client"
 version = "0.0.0"
 dependencies = [
@@ -1494,6 +1508,7 @@ version = "0.0.0"
 dependencies = [
  "bluer",
  "connetto-core",
+ "connetto-exchange",
  "futures-util",
  "mdns-sd",
  "nix",

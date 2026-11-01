@@ -44,7 +44,7 @@ pub mod test_support;
 
 pub use error::{CloseReason, LinkError, PeerSendError, Refusal, TrustError};
 pub use event::PeerEvent;
-pub use frame::{ExchangeFrame, MAX_MANIFEST_ROWS, PeerFrame};
+pub use frame::PeerFrame;
 pub use identity::{Clock, Identity, SystemClock, Trust};
 pub use node::{Liveness, Node, PeerLink, SocketPrep};
 
