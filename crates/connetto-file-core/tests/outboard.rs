@@ -221,8 +221,9 @@ fn stored_pairs_rebuild_an_outboard_only_at_the_files_length() {
     assert_eq!(Outboard::new(manifest.file_id(), size, longer), None);
 }
 
-/// A sink that refuses every write, as a link that went away.
-struct Refusing;
+/// A sink that refuses every write with one error kind, as a link that went
+/// away.
+struct Refusing(std::io::ErrorKind);
 
 #[expect(
     clippy::unused_async_trait_impl,
@@ -230,11 +231,11 @@ struct Refusing;
 )]
 impl AsyncStreamWriter for Refusing {
     async fn write(&mut self, _data: &[u8]) -> std::io::Result<()> {
-        Err(std::io::ErrorKind::BrokenPipe.into())
+        Err(self.0.into())
     }
 
     async fn write_bytes(&mut self, _data: bytes::Bytes) -> std::io::Result<()> {
-        Err(std::io::ErrorKind::BrokenPipe.into())
+        Err(self.0.into())
     }
 
     async fn sync(&mut self) -> std::io::Result<()> {
@@ -245,10 +246,20 @@ impl AsyncStreamWriter for Refusing {
 #[test]
 fn a_refusing_sink_is_a_write_error() {
     let (_, store, manifest, outboard) = several_chunks(47);
-    let served = rt().block_on(encode_range(
-        &manifest, &store, &outboard, 0, 70_000, Refusing,
-    ));
-    assert!(matches!(served, Err(RangeError::Write(_))), "{served:?}");
+    for kind in [
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::ConnectionReset,
+    ] {
+        let served = rt().block_on(encode_range(
+            &manifest,
+            &store,
+            &outboard,
+            0,
+            70_000,
+            Refusing(kind),
+        ));
+        assert!(matches!(served, Err(RangeError::Write(_))), "{served:?}");
+    }
 }
 
 #[test]

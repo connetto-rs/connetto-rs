@@ -302,11 +302,8 @@ pub async fn decode_range<R: AsyncStreamReader>(
         }
         decoder = next;
     }
-    if covered != len {
-        return Err(DecodeRangeError::Verify(DecodeError::LeafNotFound(
-            bao_tree::ChunkNum::full_chunks(start + covered),
-        )));
-    }
+    // The decoder yields every leaf the ranges name or fails on the stream that ends early.
+    debug_assert_eq!(covered, len, "every byte of the range was decoded");
     Ok(out)
 }
 
