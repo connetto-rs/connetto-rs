@@ -631,7 +631,7 @@ dependencies = [
  "bitflags 2.13.2",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -6812,7 +6812,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#963e08927b84130173929281a5c682f309af7d6d"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#b800d154ae5ba932d29ac0e81212bb0ffe71474f"
 dependencies = [
  "git2",
  "recursive",
@@ -6826,7 +6826,7 @@ dependencies = [
 [[package]]
 name = "pg_walstream"
 version = "0.9.0"
-source = "git+https://github.com/isdaniel/pg-walstream?branch=main#bc4a2df334f40101052e89248e506ebfb2f499ea"
+source = "git+https://github.com/isdaniel/pg-walstream?branch=main#f706d1f2985a5a2736388bf1f1b739da4ee7d226"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -7366,8 +7366,8 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.4.1",
- "itertools 0.14.0",
+ "heck 0.5.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -7386,7 +7386,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -7434,7 +7434,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb5cd191fad9142d096efc97c64715db73db4adb60c38ebdf22f5b54cd6ea712"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "prost",
  "prost-build",
  "prost-types",
@@ -8112,7 +8112,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#40437eb2be811ff0fdad0a86a77848925288abda"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#1e2362e8465d73e29b6caa9148d364d6c2950eb2"
 dependencies = [
  "openfga-client",
  "prost",
@@ -8127,7 +8127,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#40437eb2be811ff0fdad0a86a77848925288abda"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#1e2362e8465d73e29b6caa9148d364d6c2950eb2"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -8965,7 +8965,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -9040,8 +9040,7 @@ dependencies = [
 [[package]]
 name = "sql-scalar-text"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe4d9c3734c9dfc32e255461a2ae1fb7493956adf798817f9adaa0af7f7c9d6c"
+source = "git+https://github.com/connetto-rs/sql-scalar-text?branch=main#db1be3824f3c7be5e97293d3d01982897196ef9d"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -9050,7 +9049,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#d3043e70b328ac0823ae6772b4ad2e771b46ccc0"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#cc0b24d6d08e224ed9ac5021b6c18c29bb9cc4f5"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -9108,7 +9107,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#7812d864aa107178d2650f94382361da52166eb8"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#c9d2612306e0884063762e3b78be443e8a297c38"
 dependencies = [
  "log",
  "recursive",
@@ -9129,7 +9128,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#a467e8703c714595902a896c5e8b317eec848f78"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#6caa0cec7051bb14da114f5730b1dea6b59f95e8"
 dependencies = [
  "sqlparser",
  "thiserror 2.0.21",
@@ -9138,7 +9137,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#7812d864aa107178d2650f94382361da52166eb8"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#c9d2612306e0884063762e3b78be443e8a297c38"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9266,7 +9265,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#7dc7ab29ae4b3c850a8a6e21ff330ae2e13ee602"
+source = "git+https://github.com/connetto-rs/subql?branch=main#dab0eabe33529dac2e80c166960b3373252e461e"
 dependencies = [
  "arc-swap",
  "async-lock",
