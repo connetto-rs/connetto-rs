@@ -327,8 +327,9 @@ fn manager(fixture: &Fixture, service: &Arc<AuthService<InMemoryAuthStore>>) -> 
     .build()
 }
 
-/// Serve `manager` on a fresh loopback listener, each connection in its own
-/// task, and return the address and the guard.
+/// Serve `manager` on a fresh loopback listener, each connection in a task
+/// the guard owns, and return the address and the guard. Aborting the guard
+/// drops the listener and ends every live session with it.
 async fn spawn_server(
     manager: Arc<Manager>,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -337,13 +338,21 @@ async fn spawn_server(
         .expect("bind the sync listener");
     let addr = listener.local_addr().expect("address");
     let server = tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let manager = Arc::clone(&manager);
-            tokio::spawn(async move {
-                let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
-                let _ = manager.serve(transport).await;
-            });
+        let mut sessions = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { break };
+                    let manager = Arc::clone(&manager);
+                    sessions.spawn(async move {
+                        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+                        let _ = manager.serve(transport).await;
+                    });
+                }
+                Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
+            }
         }
+        while sessions.join_next().await.is_some() {}
     });
     (addr, server)
 }
@@ -601,6 +610,34 @@ async fn write_device_row(client: &NativeClient<connetto_client::NativeTransport
         })
         .await
         .expect("the write is captured");
+}
+
+/// Poll the `devices` row `id` until it shows, bounded by `deadline`, and
+/// return its label.
+async fn wait_for_device_row(
+    client: &NativeClient<connetto_client::NativeTransport>,
+    id: i32,
+    deadline: Duration,
+) -> Option<String> {
+    let until = Instant::now() + deadline;
+    loop {
+        let label = client
+            .client()
+            .with_conn(move |conn| {
+                devices::table
+                    .find(id)
+                    .select(devices::label)
+                    .first::<String>(conn.conn())
+                    .optional()
+                    .expect("read a device row")
+            })
+            .await
+            .expect("the read runs");
+        if label.is_some() || Instant::now() >= until {
+            return label;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 diesel::table! {
@@ -2252,7 +2289,8 @@ async fn attestation() {
 
 /// A device reported lost through the peer link is refused by a peer that
 /// learned the report from a peer, with the server out of the loop for both
-/// (R76 proof 3).
+/// (R76 proof 3). The same link carries a row the reporter wrote after the
+/// server stopped, which the peer applies (R77).
 #[cfg(feature = "peer")]
 #[test]
 fn a_reported_device_is_refused_by_a_peer_that_learned_it_from_a_peer() {
@@ -2336,8 +2374,16 @@ async fn peer_report() {
         "a keeps a list naming c"
     );
 
-    // The server stops.
+    // A row the server answers under a's key shows the device bound.
+    write_device_row(&a, 6).await;
+    assert!(
+        wait_for_unsynced_empty(&a, BOUND).await,
+        "the server answers a's row"
+    );
+
+    // The server stops, and a writes a row only its own chain carries.
     server.abort();
+    write_device_row(&a, 7).await;
 
     // B signs back in silently, with no server, and links a.
     let (b2, b2_pump) = Box::pin(
@@ -2367,6 +2413,7 @@ async fn peer_report() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+    let mut b_applies = b2.client().events();
     let linked = b2.link_peer(a_addr).await.expect("b links a");
     assert_eq!(
         linked.key(),
@@ -2387,6 +2434,28 @@ async fn peer_report() {
     assert!(
         wait_for_listed(&b2, c_cert.serial(), BOUND).await,
         "b keeps the list it learned only from a"
+    );
+    assert_eq!(
+        wait_for_device_row(&b2, 7, BOUND).await,
+        Some("row".to_owned()),
+        "b applies the row a wrote after the server stopped"
+    );
+    assert_eq!(
+        wait_for_device_row(&b2, 6, Duration::ZERO).await,
+        None,
+        "the settled row is left to the server"
+    );
+    assert!(
+        next_event(&mut b_applies, BOUND, |event| {
+            matches!(
+                event,
+                ClientEvent::ProvisionalApplied { author, .. }
+                    if author.as_slice() == a_cert.identity().key().as_bytes()
+            )
+        })
+        .await
+        .is_some(),
+        "b's app hears the apply while no server is reachable"
     );
 
     // C reopens with the server still down and dials b, whose handshake

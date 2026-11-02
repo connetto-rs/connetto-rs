@@ -3308,6 +3308,16 @@ struct EnrolLink<T: Transport> {
 }
 
 #[cfg(feature = "device-identity")]
+impl<T: Transport> Clone for EnrolLink<T> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            alive: Weak::clone(&self.alive),
+        }
+    }
+}
+
+#[cfg(feature = "device-identity")]
 impl<T> crate::enrolment::Link for EnrolLink<T>
 where
     T: Transport + Send + 'static,
@@ -3371,9 +3381,77 @@ where
     async fn offer(
         &self,
         key_id: [u8; 32],
-    ) -> Result<Option<crate::author::OfferDraft>, ClientError> {
+    ) -> Result<Option<connetto_core::exchange::Offer>, ClientError> {
         let mut state = self.shared.lock_interrupting().await;
-        state.conn.offer_draft(key_id)
+        state.conn.own_offer(key_id)
+    }
+
+    #[cfg(feature = "peer")]
+    async fn build(&self) -> Option<(connetto_core::Major, connetto_core::SchemaVersion)> {
+        self.shared.lock_interrupting().await.conn.own_build()
+    }
+
+    #[cfg(feature = "peer")]
+    async fn serve_range(
+        &self,
+        key_id: [u8; 32],
+        from: u64,
+        to: u64,
+        build: (connetto_core::Major, connetto_core::SchemaVersion),
+    ) -> Result<Option<crate::exchange::Served>, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.serve_range(key_id, from, to, &build)
+    }
+
+    #[cfg(feature = "peer")]
+    async fn serve_body(&self, key_id: [u8; 32], seq: u64) -> Result<Option<Vec<u8>>, ClientError> {
+        self.shared
+            .lock_interrupting()
+            .await
+            .conn
+            .serve_body(key_id, seq)
+    }
+
+    #[cfg(feature = "peer")]
+    async fn peer_cursor(
+        &self,
+        author: Vec<u8>,
+    ) -> Result<connetto_core::exchange::Frontier, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.peer_cursor(&author)
+    }
+
+    #[cfg(feature = "peer")]
+    async fn adopt(
+        &self,
+        author: crate::peer::PeerAuthor,
+        offer: connetto_core::exchange::SignedOffer,
+        cursor: connetto_core::exchange::Frontier,
+    ) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        let adopted = state.conn.adopt_peer_offer(&author, &offer, &cursor);
+        drop(state);
+        // The pump hands on what the adopt raised, offline too.
+        self.shared.wake.notify_one();
+        adopted
+    }
+
+    #[cfg(feature = "peer")]
+    async fn take_row(
+        &self,
+        author: crate::peer::PeerAuthor,
+        row: connetto_core::exchange::ManifestRow,
+        body: Option<Vec<u8>>,
+        cursor: connetto_core::exchange::Frontier,
+    ) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        let taken = state
+            .conn
+            .take_peer_row(&author, &row, body.as_deref(), &cursor);
+        drop(state);
+        // The pump hands on what the apply raised, offline too.
+        self.shared.wake.notify_one();
+        taken
     }
 }
 
@@ -3634,7 +3712,7 @@ where
 /// routed and forwarded, and a lost transport marks recovery.
 fn route_step_result<T>(
     state: &mut State<T>,
-    shared: &Arc<Shared<T>>,
+    shared: &Shared<T>,
     stepped: Result<Option<ClientEvent>, ClientError>,
     has_driver: bool,
 ) -> PumpFlow
@@ -3985,7 +4063,9 @@ enum Offline<O> {
     Closing,
 }
 
-/// Keep local work, key deadlines and the gate running during a backoff or dial.
+/// Keep local work, key deadlines and the gate running during a backoff or
+/// dial, and hand on every notice a commit queued meanwhile, a peer apply's
+/// among them, so the app hears it with no server reachable.
 async fn serve_offline<T, F, S>(
     shared: &Shared<T>,
     pending: F,
@@ -3995,6 +4075,7 @@ async fn serve_offline<T, F, S>(
 ) -> Result<Offline<F::Output>, ClientError>
 where
     T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
     F: Future,
     S: Sleeper + 'static,
 {
@@ -4013,6 +4094,9 @@ where
         }
         if !shared.gate.is_locked() {
             refresh_changed(&mut state, &shared.events);
+        }
+        while let Some(notice) = state.conn.take_notice() {
+            let _ = route_step_result(&mut state, shared, Ok(Some(notice)), true);
         }
         arm_share_key_timer(state.conn.share_key_timer(), key_timer, Some(sleeper));
         drop(state);

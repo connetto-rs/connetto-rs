@@ -8,27 +8,27 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use std::collections::HashMap;
-#[cfg(feature = "peer")]
-use std::collections::HashSet;
 
 #[cfg(feature = "peer")]
 use std::net::SocketAddr;
 
 use connetto_core::clock::DEVICE_SKEW;
+#[cfg(feature = "peer")]
+use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::device_cert::{
     CertificateRequest, CertificateSigner, DeviceCertificate, DeviceDescriptor, DeviceKey, KeyHome,
     KeyId, RevocationList, certificate_key_id, certificate_serial, key_id, verify_chain,
 };
 #[cfg(feature = "peer")]
-use connetto_core::device_cert::{DeviceIdentity, DeviceKeyError};
+use connetto_core::exchange::{Frontier, ManifestRow, Offer, SignedOffer};
 use connetto_core::messages::{
     ControlMessage, DeviceSummary, DevicesRequest, EnrolChallengeRequest, EnrolRefusal,
     EnrolRequest, FatalErrorReason, RevokeDeviceRequest, SignedList, SyncStatus,
 };
 #[cfg(feature = "peer")]
-use connetto_peer::{
-    CloseReason, DiscoveryEvent, EXCHANGE_BOUND, ExchangeFrame, LinkError, PeerEvent,
-};
+use connetto_core::{Major, SchemaVersion};
+#[cfg(feature = "peer")]
+use connetto_peer::{CloseReason, DiscoveryEvent, EXCHANGE_BOUND, LinkError, PeerEvent};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -36,14 +36,16 @@ use super::{Answer, Held, KeptList, Standing, half_life};
 #[cfg(feature = "peer")]
 use crate::PeerError;
 #[cfg(feature = "peer")]
-use crate::author::OfferDraft;
-#[cfg(feature = "peer")]
 use crate::bluetooth::{BluetoothError, HostId, JoinNearbyError, PROMPT_BOUND};
 use crate::device_key::{ChipError, ChipKeys, KeyRecords, OpenedKey};
+#[cfg(feature = "peer")]
+use crate::exchange::Served;
 #[cfg(feature = "peer")]
 use crate::hotspot::{HOST_BOUND, HotspotError, HotspotOffer, JOIN_BOUND, JoinError, MARGIN};
 #[cfg(all(feature = "peer", target_os = "android"))]
 use crate::multicast::MulticastLock;
+#[cfg(feature = "peer")]
+use crate::peer::PeerAuthor;
 use crate::{ClientError, ClientEvent, ConnectionNumber};
 
 /// How long one answer is waited for.
@@ -122,8 +124,9 @@ where
     }
 }
 
-/// What the task needs of the running client.
-pub(crate) trait Link: Send + Sync + 'static {
+/// What the task needs of the running client. A clone reaches the same
+/// client, so a served range streams beside the task.
+pub(crate) trait Link: Clone + Send + Sync + 'static {
     /// Whether any handle on the client remains.
     fn alive(&self) -> bool;
     /// The client's event stream.
@@ -153,7 +156,52 @@ pub(crate) trait Link: Send + Sync + 'static {
     fn offer(
         &self,
         key_id: [u8; 32],
-    ) -> impl Future<Output = Result<Option<OfferDraft>, ClientError>> + Send;
+    ) -> impl Future<Output = Result<Option<Offer>, ClientError>> + Send;
+    /// This build's own `(major, version)`, which every request names (R77).
+    #[cfg(feature = "peer")]
+    fn build(&self) -> impl Future<Output = Option<(Major, SchemaVersion)>> + Send;
+    /// The device writer `key_id`'s range `from..=to` under `build`, `None`
+    /// once it is no longer held whole (R77 decisions 17 and 18).
+    #[cfg(feature = "peer")]
+    fn serve_range(
+        &self,
+        key_id: [u8; 32],
+        from: u64,
+        to: u64,
+        build: (Major, SchemaVersion),
+    ) -> impl Future<Output = Result<Option<Served>, ClientError>> + Send;
+    /// The body of the device writer `key_id`'s entry `seq`, `None` once it
+    /// left the queue (R77).
+    #[cfg(feature = "peer")]
+    fn serve_body(
+        &self,
+        key_id: [u8; 32],
+        seq: u64,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, ClientError>> + Send;
+    /// `author`'s stored cursor (R77).
+    #[cfg(feature = "peer")]
+    fn peer_cursor(
+        &self,
+        author: Vec<u8>,
+    ) -> impl Future<Output = Result<Frontier, ClientError>> + Send;
+    /// Take `author`'s verified offer with `cursor` (R77).
+    #[cfg(feature = "peer")]
+    fn adopt(
+        &self,
+        author: PeerAuthor,
+        offer: SignedOffer,
+        cursor: Frontier,
+    ) -> impl Future<Output = Result<(), ClientError>> + Send;
+    /// Take `author`'s entry `row`, applying `body` when it crosses, with
+    /// the cursor at it (R77).
+    #[cfg(feature = "peer")]
+    fn take_row(
+        &self,
+        author: PeerAuthor,
+        row: ManifestRow,
+        body: Option<Vec<u8>>,
+        cursor: Frontier,
+    ) -> impl Future<Output = Result<(), ClientError>> + Send;
 }
 
 /// One enrolled device of the account, as the lost-device list shows it.
@@ -283,46 +331,9 @@ impl DiscoveryEvents {
     }
 }
 
-/// A signature over an offer, computed on the blocking pool since a chip
-/// signs slowly (R77).
-#[cfg(feature = "peer")]
-type Signing = tokio::task::JoinHandle<Result<Vec<u8>, DeviceKeyError>>;
+mod exchange;
 
-/// What the signature in flight came to, or nothing when the build has no
-/// peer link (R77).
-#[cfg(feature = "peer")]
-type NextSigned = Result<Result<Vec<u8>, DeviceKeyError>, tokio::task::JoinError>;
-#[cfg(not(feature = "peer"))]
-type NextSigned = core::convert::Infallible;
-
-/// The device writer's signed offer to its linked peers, empty when the
-/// build has no peer link (R77 decision 7). One signature serves every
-/// linked peer, and changes arriving while a signature is in flight fold
-/// into the next one.
-#[derive(Default)]
-struct Offers {
-    /// The draft being signed and its signature in flight.
-    #[cfg(feature = "peer")]
-    signing: Option<(OfferDraft, Signing)>,
-    /// Whether the replica changed while the signature was in flight, so the
-    /// offer is drafted and signed again once it lands.
-    #[cfg(feature = "peer")]
-    stale: bool,
-    /// The last signed offer, while it still states the replica.
-    #[cfg(feature = "peer")]
-    current: Option<ExchangeFrame>,
-}
-
-impl Offers {
-    /// The signature in flight, or a future that never resolves without one.
-    async fn signed(&mut self) -> NextSigned {
-        #[cfg(feature = "peer")]
-        if let Some((_, signing)) = &mut self.signing {
-            return signing.await;
-        }
-        core::future::pending().await
-    }
-}
+use exchange::PeerExchange;
 
 /// The task's half the builder hands to the client.
 pub(crate) struct Enroller {
@@ -833,8 +844,8 @@ struct Run<L: Link> {
     /// The multicast lock the browse holds, until the standing leaves (R76).
     #[cfg(all(feature = "peer", target_os = "android"))]
     multicast: Option<MulticastLock>,
-    /// The device writer's offer to the linked peers (R77).
-    offers: Offers,
+    /// The device-to-device exchange with the linked peers (R77).
+    exchange: PeerExchange,
 }
 
 /// A certificate withdrawn because the root revoked its issuer.
@@ -1125,7 +1136,7 @@ impl<L: Link> Run<L> {
         self.publish();
         // A retired writer offers nothing until the fresh key enrols.
         #[cfg(feature = "peer")]
-        self.offer_changed().await;
+        self.offers_retired().await;
     }
 
     /// Keep each verified list newer than the one kept from its signer, and
@@ -1387,99 +1398,6 @@ impl<L: Link> Drop for Run<L> {
     }
 }
 
-/// The device writer's offer (R77 decision 7), one line of the exchange's
-/// state table per entry point.
-#[cfg(feature = "peer")]
-impl<L: Link> Run<L> {
-    /// The replica's offer changed, by a local write, a settled or refused
-    /// entry, or a fresh or retired key. A signature in flight comes out
-    /// stale, and otherwise the linked peers get a fresh offer, or the next
-    /// link up signs one when no peer is linked.
-    async fn offer_changed(&mut self) {
-        self.offers.current = None;
-        if self.offers.signing.is_some() {
-            self.offers.stale = true;
-        } else if !self.peer.linked().is_empty() {
-            self.sign_offer().await;
-        }
-    }
-
-    /// A link came up: `peer` gets the signed offer, or a signature starts,
-    /// whose offer reaches every peer linked once it lands.
-    async fn offer_to(&mut self, peer: &DeviceIdentity) {
-        if let Some(offer) = self.offers.current.clone() {
-            self.send_offer(peer, offer).await;
-        } else if self.offers.signing.is_none() {
-            self.sign_offer().await;
-        }
-    }
-
-    /// Draft the device writer's offer and start its signature. A device
-    /// without a certificate, or whose writer retired, offers nothing. A
-    /// certificate is only held beside the key the run opened for it.
-    async fn sign_offer(&mut self) {
-        self.offers.stale = false;
-        let (Some(held), Some(key)) = (&self.held, self.key.clone()) else {
-            return;
-        };
-        let key_id = *held.leaf.identity().key().as_bytes();
-        let draft = match self.link.offer(key_id).await {
-            Ok(Some(draft)) => draft,
-            Ok(None) => return,
-            Err(err) => {
-                tracing::warn!(error = %err, "the device writer's offer could not be read");
-                return;
-            }
-        };
-        let message = draft.message();
-        let signing = tokio::task::spawn_blocking(move || key.sign(&message));
-        self.offers.signing = Some((draft, signing));
-    }
-
-    /// The signature in flight landed. A replica that changed meanwhile is
-    /// drafted and signed again, and otherwise every linked peer gets the
-    /// offer.
-    async fn offer_signed(&mut self, signed: NextSigned) {
-        let (draft, _) = self
-            .offers
-            .signing
-            .take()
-            .expect("a signature lands only while one is in flight");
-        if self.offers.stale {
-            self.sign_offer().await;
-            return;
-        }
-        let signature = match signed {
-            Ok(Ok(signature)) => signature,
-            Ok(Err(err)) => {
-                tracing::warn!(error = %err, "the device key could not sign the offer");
-                return;
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "the offer's signature did not finish");
-                return;
-            }
-        };
-        let offer = draft.signed(signature);
-        self.offers.current = Some(offer.clone());
-        let peers: HashSet<DeviceIdentity> = self
-            .peer
-            .linked()
-            .into_iter()
-            .map(|link| link.peer)
-            .collect();
-        for peer in &peers {
-            self.send_offer(peer, offer.clone()).await;
-        }
-    }
-
-    /// Queue `offer` on the link to `peer`. A peer whose link closed meanwhile
-    /// gets the offer at its next link up, so a failed send is left alone.
-    async fn send_offer(&self, peer: &DeviceIdentity, offer: ExchangeFrame) {
-        let _ = self.peer.send_exchange(peer, offer).await;
-    }
-}
-
 /// Run the enrolment task until the client ends.
 #[expect(
     clippy::too_many_lines,
@@ -1502,6 +1420,8 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
     for kept in kept.values() {
         peer.node.keep_list(kept.list.clone(), kept.signer.clone());
     }
+    #[cfg(feature = "peer")]
+    let build = link.build().await;
     let mut run = Run {
         link,
         enroller,
@@ -1534,7 +1454,10 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         peer_events: PeerEvents {},
         #[cfg(not(feature = "peer"))]
         discovery_events: DiscoveryEvents {},
-        offers: Offers::default(),
+        exchange: PeerExchange::new(
+            #[cfg(feature = "peer")]
+            build,
+        ),
     };
     // Opened at once, so a lost key is noticed before any connection.
     if let Err(err) = run.key().await {
@@ -1620,11 +1543,12 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 if let Some(event) = peer {
                     run.discovery.on_node_event(&event);
                     match event {
-                        PeerEvent::Linked { peer } => {
-                            run.offer_to(&peer).await;
+                        PeerEvent::Linked { peer, public_key, bot_list } => {
+                            run.peer_linked(peer.clone(), public_key, bot_list).await;
                             run.link.emit(ClientEvent::PeerLinked { peer });
                         }
                         PeerEvent::Unlinked { peer, reason } => {
+                            run.peer_unlinked(&peer).await;
                             run.link.emit(ClientEvent::PeerUnlinked { peer, reason });
                         }
                         PeerEvent::ListReceived { list, signer } => {
@@ -1633,10 +1557,9 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                                 due = run.link.connection().await.is_some();
                             }
                         }
-                        // This client sends its offer and answers no
-                        // exchange, so a peer's frames are dropped as they
-                        // arrive.
-                        PeerEvent::Exchange { .. } => {}
+                        PeerEvent::Exchange { peer, message } => {
+                            run.peer_message(&peer, message).await;
+                        }
                     }
                 }
                 #[cfg(not(feature = "peer"))]
@@ -1658,11 +1581,11 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 #[cfg(not(feature = "peer"))]
                 match discovery {}
             },
-            signed = run.offers.signed() => {
+            wake = run.exchange.next() => {
                 #[cfg(feature = "peer")]
-                run.offer_signed(signed).await;
+                run.exchange_woke(wake).await;
                 #[cfg(not(feature = "peer"))]
-                match signed {}
+                match wake {}
             },
             () = tokio::time::sleep(look) => {
                 let _ = run.stand_by().await;

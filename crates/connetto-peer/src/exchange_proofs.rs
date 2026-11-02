@@ -10,10 +10,11 @@ use connetto_core::device_cert::{
     DeviceKeyError, KeyHome, key_id,
 };
 use connetto_core::exchange::{
-    EndOutcome, Frontier, ManifestRow, Origin, RetractCause, Retraction,
+    EndOutcome, Frontier, ManifestRow, Offer, Origin, RetractCause, Retraction, SignedOffer,
 };
 use connetto_core::messages::{MutationRejectReason, WriterRef};
 use connetto_core::schema::{Major, SchemaVersion};
+use connetto_exchange::{Message, Transfer};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, SigningKey as _};
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,7 +23,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::error::{ExchangeError, Refusal};
 use crate::exchange::{ChunkStream, EXCHANGE_BOUND, OfferFrame};
-use crate::frame::{ExchangeFrame, PeerFrame, read_frame, write_frame};
+use crate::frame::{PeerFrame, read_frame, write_frame};
 use crate::node::{client_config_for, server_config_for};
 use crate::signer::{IdentityClientCert, IdentityServerCert};
 use crate::tests::{Deployment, Peer, events, node, serve, whole_second};
@@ -1131,7 +1132,7 @@ fn every_frame_names_itself_and_only_the_offer_hides_a_field() {
         },
         Ping,
         Pong,
-        Exchange(ExchangeFrame),
+        Exchange(Message),
     }
 
     let bytes = |byte: u8| ByteBuf::from(vec![byte; 3]);
@@ -1183,59 +1184,73 @@ fn every_frame_names_itself_and_only_the_offer_hides_a_field() {
         (PeerFrame::Ping, Derived::Ping, "a Ping"),
         (PeerFrame::Pong, Derived::Pong, "a Pong"),
         (
-            PeerFrame::Exchange(ExchangeFrame::Offer {
-                builds: vec![(
-                    Major::new(1).expect("a real major"),
-                    SchemaVersion::from_hash(vec![6, 6, 6]),
-                )],
-                settled: Some(Frontier {
-                    seq: 2,
-                    head: [1; 32],
-                }),
-                newest: Some(Frontier {
-                    seq: 5,
-                    head: [2; 32],
-                }),
-                retractions: vec![Retraction {
-                    seq: 4,
-                    cause: RetractCause::Rejected(MutationRejectReason::Forked),
-                }],
+            PeerFrame::Exchange(Message::Offer(SignedOffer {
+                offer: Offer {
+                    builds: vec![(
+                        Major::new(1).expect("a real major"),
+                        SchemaVersion::from_hash(vec![6, 6, 6]),
+                    )],
+                    settled: Some(Frontier {
+                        seq: 2,
+                        head: [1; 32],
+                    }),
+                    newest: Some(Frontier {
+                        seq: 5,
+                        head: [2; 32],
+                    }),
+                    retractions: vec![Retraction {
+                        seq: 4,
+                        cause: RetractCause::Rejected(MutationRejectReason::Forked),
+                    }],
+                },
                 signature: vec![7, 7, 7],
-            }),
-            Derived::Exchange(ExchangeFrame::Offer {
-                builds: vec![(
-                    Major::new(1).expect("a real major"),
-                    SchemaVersion::from_hash(vec![6, 6, 6]),
-                )],
-                settled: Some(Frontier {
-                    seq: 2,
-                    head: [1; 32],
-                }),
-                newest: Some(Frontier {
-                    seq: 5,
-                    head: [2; 32],
-                }),
-                retractions: vec![Retraction {
-                    seq: 4,
-                    cause: RetractCause::Rejected(MutationRejectReason::Forked),
-                }],
+            })),
+            Derived::Exchange(Message::Offer(SignedOffer {
+                offer: Offer {
+                    builds: vec![(
+                        Major::new(1).expect("a real major"),
+                        SchemaVersion::from_hash(vec![6, 6, 6]),
+                    )],
+                    settled: Some(Frontier {
+                        seq: 2,
+                        head: [1; 32],
+                    }),
+                    newest: Some(Frontier {
+                        seq: 5,
+                        head: [2; 32],
+                    }),
+                    retractions: vec![Retraction {
+                        seq: 4,
+                        cause: RetractCause::Rejected(MutationRejectReason::Forked),
+                    }],
+                },
                 signature: vec![7, 7, 7],
-            }),
+            })),
             "an Exchange::Offer",
         ),
         (
-            PeerFrame::Exchange(ExchangeFrame::Request {
+            PeerFrame::Exchange(Message::Transfer(Transfer::Request {
                 request_id: 3,
                 from: 9,
-            }),
-            Derived::Exchange(ExchangeFrame::Request {
+                to: 9,
+                build: (
+                    Major::new(1).expect("a real major"),
+                    SchemaVersion::from_hash(vec![9, 9, 9]),
+                ),
+            })),
+            Derived::Exchange(Message::Transfer(Transfer::Request {
                 request_id: 3,
                 from: 9,
-            }),
+                to: 9,
+                build: (
+                    Major::new(1).expect("a real major"),
+                    SchemaVersion::from_hash(vec![9, 9, 9]),
+                ),
+            })),
             "an Exchange::Request",
         ),
         (
-            PeerFrame::Exchange(ExchangeFrame::Manifest {
+            PeerFrame::Exchange(Message::Transfer(Transfer::Manifest {
                 request_id: 3,
                 previous: [8; 32],
                 rows: vec![ManifestRow {
@@ -1248,8 +1263,8 @@ fn every_frame_names_itself_and_only_the_offer_hides_a_field() {
                     digest: [6; 32],
                 }],
                 last: true,
-            }),
-            Derived::Exchange(ExchangeFrame::Manifest {
+            })),
+            Derived::Exchange(Message::Transfer(Transfer::Manifest {
                 request_id: 3,
                 previous: [8; 32],
                 rows: vec![ManifestRow {
@@ -1262,31 +1277,31 @@ fn every_frame_names_itself_and_only_the_offer_hides_a_field() {
                     digest: [6; 32],
                 }],
                 last: true,
-            }),
+            })),
             "an Exchange::Manifest",
         ),
         (
-            PeerFrame::Exchange(ExchangeFrame::Body {
+            PeerFrame::Exchange(Message::Transfer(Transfer::Body {
                 request_id: 3,
                 seq: 4,
                 changeset: vec![10, 10, 10],
-            }),
-            Derived::Exchange(ExchangeFrame::Body {
+            })),
+            Derived::Exchange(Message::Transfer(Transfer::Body {
                 request_id: 3,
                 seq: 4,
                 changeset: vec![10, 10, 10],
-            }),
+            })),
             "an Exchange::Body",
         ),
         (
-            PeerFrame::Exchange(ExchangeFrame::End {
+            PeerFrame::Exchange(Message::Transfer(Transfer::End {
                 request_id: 3,
                 outcome: EndOutcome::Complete,
-            }),
-            Derived::Exchange(ExchangeFrame::End {
+            })),
+            Derived::Exchange(Message::Transfer(Transfer::End {
                 request_id: 3,
                 outcome: EndOutcome::Complete,
-            }),
+            })),
             "an Exchange::End",
         ),
     ];

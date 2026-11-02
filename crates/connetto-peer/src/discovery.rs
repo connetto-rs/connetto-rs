@@ -340,7 +340,7 @@ impl Discovery {
     /// leaf.
     pub fn on_node_event(&self, event: &PeerEvent) {
         let command = match event {
-            PeerEvent::Linked { peer } => Command::NodeEvent {
+            PeerEvent::Linked { peer, .. } => Command::NodeEvent {
                 peer: peer.clone(),
                 reason: None,
             },

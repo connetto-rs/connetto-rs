@@ -1,12 +1,10 @@
-//! The author's side of the exchange (R77 decisions 7 and 9): each writer's
+//! The author's side of the exchange (R77 decisions 7 and 9), each writer's
 //! settled frontier, the device writer's retraction log, and the offer built
 //! from them that the device key signs for every linked peer.
 
-use connetto_core::chain::offer_message;
-use connetto_core::exchange::{Frontier, RetractCause, Retraction};
+use connetto_core::exchange::{Frontier, Offer, RetractCause, Retraction};
 use connetto_core::messages::WriterRef;
 use connetto_core::{Major, SchemaVersion};
-use connetto_peer::ExchangeFrame;
 use diesel::prelude::*;
 
 use crate::{ClientError, seq_storage, writer_id};
@@ -90,7 +88,7 @@ pub(crate) fn forget(db: &mut SqliteConnection, writer: &WriterRef) -> Result<()
 }
 
 /// `writer`'s settled frontier, `None` before the server answered any entry.
-fn settled_of(
+pub(crate) fn settled_of(
     db: &mut SqliteConnection,
     writer: &WriterRef,
 ) -> Result<Option<Frontier>, ClientError> {
@@ -130,63 +128,21 @@ fn retractions_of(
         .collect()
 }
 
-/// The device writer's state as its offer states it, before the device key
-/// signs it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OfferDraft {
-    /// The device writer's key id.
-    pub(crate) key_id: [u8; 32],
-    /// The builds whose entries the queue holds, as `(major, version)`.
-    pub(crate) builds: Vec<(Major, SchemaVersion)>,
-    /// The settled frontier.
-    pub(crate) settled: Option<Frontier>,
-    /// The newest queued entry.
-    pub(crate) newest: Option<Frontier>,
-    /// The retraction log.
-    pub(crate) retractions: Vec<Retraction>,
-}
-
-impl OfferDraft {
-    /// Read the offer of device writer `key_id`, given its newest queued
-    /// entry and the builds this replica holds.
-    pub(crate) fn read(
-        db: &mut SqliteConnection,
-        key_id: [u8; 32],
-        newest: Option<Frontier>,
-        builds: Vec<(Major, SchemaVersion)>,
-    ) -> Result<Self, ClientError> {
-        let writer = WriterRef::Device(key_id);
-        Ok(Self {
-            key_id,
-            builds,
-            settled: settled_of(db, &writer)?,
-            newest,
-            retractions: retractions_of(db, &writer)?,
-        })
-    }
-
-    /// The bytes the device key signs.
-    pub(crate) fn message(&self) -> Vec<u8> {
-        offer_message(
-            &self.key_id,
-            self.settled.as_ref(),
-            self.newest.as_ref(),
-            &self.builds,
-            &self.retractions,
-        )
-    }
-
-    /// The offer frame carrying the device key's `signature` over
-    /// [`message`](Self::message).
-    pub(crate) fn signed(self, signature: Vec<u8>) -> ExchangeFrame {
-        ExchangeFrame::Offer {
-            builds: self.builds,
-            settled: self.settled,
-            newest: self.newest,
-            retractions: self.retractions,
-            signature,
-        }
-    }
+/// The offer of device writer `key_id`, given its newest queued entry and
+/// the builds this replica holds, before the device key signs it.
+pub(crate) fn offer(
+    db: &mut SqliteConnection,
+    key_id: [u8; 32],
+    newest: Option<Frontier>,
+    builds: Vec<(Major, SchemaVersion)>,
+) -> Result<Offer, ClientError> {
+    let writer = WriterRef::Device(key_id);
+    Ok(Offer {
+        builds,
+        settled: settled_of(db, &writer)?,
+        newest,
+        retractions: retractions_of(db, &writer)?,
+    })
 }
 
 #[cfg(test)]

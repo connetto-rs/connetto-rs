@@ -40,6 +40,9 @@ use crate::device_key::{KeyRecords, OpenedKey, open_software_key};
 #[cfg(feature = "peer")]
 use connetto_peer::test_support::loopback_multicast;
 
+#[cfg(feature = "peer")]
+mod exchange;
+
 const HOUR: Duration = Duration::from_hours(1);
 const MINUTE: Duration = Duration::from_mins(1);
 const ALICE: &str = "alice";
@@ -446,13 +449,30 @@ struct FakeState {
     /// The device writer's offer the replica states, `None` for a retired
     /// writer.
     #[cfg(feature = "peer")]
-    offer: Option<crate::author::OfferDraft>,
+    offer: Option<connetto_core::exchange::Offer>,
     /// How many times the run read the offer.
     #[cfg(feature = "peer")]
     offer_reads: usize,
     /// Whether reading the offer fails, as unreadable bookkeeping does.
     #[cfg(feature = "peer")]
     offer_fails: bool,
+    /// What each requested range reads as, in order, nothing held once the
+    /// script runs out. `Err` stands for unreadable bookkeeping.
+    #[cfg(feature = "peer")]
+    ranges: VecDeque<Result<Option<crate::exchange::Served>, ()>>,
+    /// What each requested body reads as, in order, gone once the script
+    /// runs out. `Err` stands for unreadable bookkeeping.
+    #[cfg(feature = "peer")]
+    bodies: VecDeque<Result<Option<Vec<u8>>, ()>>,
+    /// Whether reading a peer's cursor fails.
+    #[cfg(feature = "peer")]
+    cursor_fails: bool,
+}
+
+/// The fake's stand-in for unreadable bookkeeping.
+#[cfg(feature = "peer")]
+fn unreadable() -> ClientError {
+    ClientError::Session("the bookkeeping is unreadable".to_owned())
 }
 
 /// How the fake link drives one enrolment.
@@ -472,6 +492,7 @@ enum Ask {
 
 /// A link the run drives, answering enrolment as configured and recording
 /// what it sees.
+#[derive(Clone)]
 struct FakeLink {
     state: Arc<Mutex<FakeState>>,
     events: broadcast::Sender<ClientEvent>,
@@ -622,8 +643,9 @@ impl Link for FakeLink {
     #[cfg(feature = "peer")]
     fn offer(
         &self,
-        key_id: [u8; 32],
-    ) -> impl Future<Output = Result<Option<crate::author::OfferDraft>, ClientError>> + Send {
+        _key_id: [u8; 32],
+    ) -> impl Future<Output = Result<Option<connetto_core::exchange::Offer>, ClientError>> + Send
+    {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             let mut state = state.lock();
@@ -633,8 +655,72 @@ impl Link for FakeLink {
                     "the bookkeeping is unreadable".to_owned(),
                 ));
             }
-            Ok(state.offer.clone().filter(|offer| offer.key_id == key_id))
+            Ok(state.offer.clone())
         })
+    }
+
+    #[cfg(feature = "peer")]
+    fn build(
+        &self,
+    ) -> impl Future<Output = Option<(connetto_core::Major, connetto_core::SchemaVersion)>> + Send
+    {
+        core::future::ready(None)
+    }
+
+    #[cfg(feature = "peer")]
+    fn serve_range(
+        &self,
+        _key_id: [u8; 32],
+        _from: u64,
+        _to: u64,
+        _build: (connetto_core::Major, connetto_core::SchemaVersion),
+    ) -> impl Future<Output = Result<Option<crate::exchange::Served>, ClientError>> + Send {
+        let next = self.state.lock().ranges.pop_front().unwrap_or(Ok(None));
+        core::future::ready(next.map_err(|()| unreadable()))
+    }
+
+    #[cfg(feature = "peer")]
+    fn serve_body(
+        &self,
+        _key_id: [u8; 32],
+        _seq: u64,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, ClientError>> + Send {
+        let next = self.state.lock().bodies.pop_front().unwrap_or(Ok(None));
+        core::future::ready(next.map_err(|()| unreadable()))
+    }
+
+    #[cfg(feature = "peer")]
+    fn peer_cursor(
+        &self,
+        _author: Vec<u8>,
+    ) -> impl Future<Output = Result<connetto_core::exchange::Frontier, ClientError>> + Send {
+        let fails = self.state.lock().cursor_fails;
+        core::future::ready(if fails {
+            Err(unreadable())
+        } else {
+            Ok(crate::exchange::FRESH_CURSOR)
+        })
+    }
+
+    #[cfg(feature = "peer")]
+    fn adopt(
+        &self,
+        _author: crate::peer::PeerAuthor,
+        _offer: connetto_core::exchange::SignedOffer,
+        _cursor: connetto_core::exchange::Frontier,
+    ) -> impl Future<Output = Result<(), ClientError>> + Send {
+        core::future::ready(Ok(()))
+    }
+
+    #[cfg(feature = "peer")]
+    fn take_row(
+        &self,
+        _author: crate::peer::PeerAuthor,
+        _row: connetto_core::exchange::ManifestRow,
+        _body: Option<Vec<u8>>,
+        _cursor: connetto_core::exchange::Frontier,
+    ) -> impl Future<Output = Result<(), ClientError>> + Send {
+        core::future::ready(Ok(()))
     }
 }
 
@@ -2576,10 +2662,9 @@ impl DeviceKeys for GatedKeys {
 
 /// A device writer's offer whose every field moves with `step`.
 #[cfg(feature = "peer")]
-fn offer_at(key_id: [u8; 32], step: u8) -> crate::author::OfferDraft {
-    use connetto_core::exchange::{Frontier, RetractCause, Retraction};
-    crate::author::OfferDraft {
-        key_id,
+fn offer_at(step: u8) -> connetto_core::exchange::Offer {
+    use connetto_core::exchange::{Frontier, Offer, RetractCause, Retraction};
+    Offer {
         builds: vec![(
             connetto_core::Major::new(2).expect("a major"),
             connetto_core::SchemaVersion::from_hash(vec![step; 32]),
@@ -2599,53 +2684,33 @@ fn offer_at(key_id: [u8; 32], step: u8) -> crate::author::OfferDraft {
     }
 }
 
-/// The next offer a far node receives, bounded, after checking that the
-/// device key `spki` signed it over `draft`'s fields.
+/// The next offer a far node receives, bounded, after checking that it
+/// states `expected` under the device key `spki` of writer `key_id`.
 #[cfg(feature = "peer")]
 async fn offer_received(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<connetto_peer::PeerEvent>,
-    draft: &crate::author::OfferDraft,
+    key_id: [u8; 32],
+    expected: &connetto_core::exchange::Offer,
     spki: &[u8],
 ) {
-    let frame = loop {
+    let message = loop {
         let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("an offer within the bound")
             .expect("the far node lives");
-        if let connetto_peer::PeerEvent::Exchange { frame, .. } = event {
-            break frame;
+        if let connetto_peer::PeerEvent::Exchange { message, .. } = event {
+            break message;
         }
     };
-    let connetto_peer::ExchangeFrame::Offer {
-        builds,
-        settled,
-        newest,
-        retractions,
-        signature,
-    } = frame
-    else {
-        panic!("the first exchange frame is the offer, got {frame:?}");
+    let connetto_exchange::Message::Offer(signed) = message else {
+        panic!("the first exchange message is the offer, got {message:?}");
     };
     assert_eq!(
-        (&builds, &settled, &newest, &retractions),
-        (
-            &draft.builds,
-            &draft.settled,
-            &draft.newest,
-            &draft.retractions
-        ),
-        "the offer states the replica's draft"
+        &signed.offer, expected,
+        "the offer states the replica's offer"
     );
     assert!(
-        connetto_core::chain::verify_offer(
-            spki,
-            &draft.key_id,
-            settled.as_ref(),
-            newest.as_ref(),
-            &builds,
-            &retractions,
-            &signature,
-        ),
+        connetto_core::chain::verify_offer(spki, &key_id, &signed),
         "the device key signs the offer"
     );
 }
@@ -2658,7 +2723,7 @@ async fn offering_device(
     authority: Authority,
     keys: Arc<dyn DeviceKeys>,
     held: Held,
-    offer: Option<crate::author::OfferDraft>,
+    offer: Option<connetto_core::exchange::Offer>,
 ) -> (
     tokio::task::JoinHandle<()>,
     Arc<Mutex<FakeState>>,
@@ -2719,21 +2784,21 @@ async fn a_linked_peer_gets_the_signed_offer_and_a_fresh_one_on_change() {
         authority,
         Arc::new(RunKeys { der }),
         held,
-        Some(offer_at(key_id, 1)),
+        Some(offer_at(1)),
     )
     .await;
 
     far.link(handle.peer_address().expect("the listener"))
         .await
         .expect("the link completes");
-    offer_received(&mut far_events, &offer_at(key_id, 1), &spki).await;
+    offer_received(&mut far_events, key_id, &offer_at(1), &spki).await;
 
-    state.lock().offer = Some(offer_at(key_id, 2));
+    state.lock().offer = Some(offer_at(2));
     handle
         .steering()
         .send(super::Command::OfferChanged)
         .expect("the run steers");
-    offer_received(&mut far_events, &offer_at(key_id, 2), &spki).await;
+    offer_received(&mut far_events, key_id, &offer_at(2), &spki).await;
 
     // A retired writer offers nothing, and its return offers again.
     state.lock().offer = None;
@@ -2742,12 +2807,12 @@ async fn a_linked_peer_gets_the_signed_offer_and_a_fresh_one_on_change() {
         .send(super::Command::OfferChanged)
         .expect("the run steers");
     let _ = handle.devices::<()>().await;
-    state.lock().offer = Some(offer_at(key_id, 3));
+    state.lock().offer = Some(offer_at(3));
     handle
         .steering()
         .send(super::Command::OfferChanged)
         .expect("the run steers");
-    offer_received(&mut far_events, &offer_at(key_id, 3), &spki).await;
+    offer_received(&mut far_events, key_id, &offer_at(3), &spki).await;
 
     end_tx.send(()).expect("the run ends");
     run.await.expect("the run ends");
@@ -2766,8 +2831,8 @@ async fn changes_during_a_signature_fold_into_one_fresh_offer() {
     let authority = authority(now).await;
     let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
     let gate = Gate::holding(vec![
-        offer_at(key_id, 1).message(),
-        offer_at(key_id, 4).message(),
+        connetto_core::chain::offer_message(&key_id, &offer_at(1)),
+        connetto_core::chain::offer_message(&key_id, &offer_at(4)),
     ]);
     let (far, mut far_events) = far_peer(&authority, positive_serial(9));
     let (run, state, handle, end_tx) = offering_device(
@@ -2777,7 +2842,7 @@ async fn changes_during_a_signature_fold_into_one_fresh_offer() {
             gate: Arc::clone(&gate),
         }),
         held,
-        Some(offer_at(key_id, 1)),
+        Some(offer_at(1)),
     )
     .await;
 
@@ -2786,7 +2851,7 @@ async fn changes_during_a_signature_fold_into_one_fresh_offer() {
         .expect("the link completes");
     poll_until(|| state.lock().offer_reads == 1).await;
     for step in 2..=4 {
-        state.lock().offer = Some(offer_at(key_id, step));
+        state.lock().offer = Some(offer_at(step));
         handle
             .steering()
             .send(super::Command::OfferChanged)
@@ -2802,7 +2867,7 @@ async fn changes_during_a_signature_fold_into_one_fresh_offer() {
     );
 
     gate.open();
-    offer_received(&mut far_events, &offer_at(key_id, 4), &spki).await;
+    offer_received(&mut far_events, key_id, &offer_at(4), &spki).await;
     assert_eq!(
         (state.lock().offer_reads, gate.signed()),
         (2, 2),
@@ -2824,7 +2889,10 @@ async fn a_later_peer_gets_the_signed_offer_without_a_new_signature() {
     let now = whole_second();
     let authority = authority(now).await;
     let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
-    let gate = Gate::failing(vec![offer_at(key_id, 1).message()], Vec::new());
+    let gate = Gate::failing(
+        vec![connetto_core::chain::offer_message(&key_id, &offer_at(1))],
+        Vec::new(),
+    );
     let (first, mut first_events) = far_peer(&authority, positive_serial(9));
     let (second, mut second_events) = far_peer(&authority, positive_serial(10));
     let (run, _state, handle, end_tx) = offering_device(
@@ -2834,15 +2902,15 @@ async fn a_later_peer_gets_the_signed_offer_without_a_new_signature() {
             gate: Arc::clone(&gate),
         }),
         held,
-        Some(offer_at(key_id, 1)),
+        Some(offer_at(1)),
     )
     .await;
     let addr = handle.peer_address().expect("the listener");
 
     first.link(addr).await.expect("the first link completes");
-    offer_received(&mut first_events, &offer_at(key_id, 1), &spki).await;
+    offer_received(&mut first_events, key_id, &offer_at(1), &spki).await;
     second.link(addr).await.expect("the second link completes");
-    offer_received(&mut second_events, &offer_at(key_id, 1), &spki).await;
+    offer_received(&mut second_events, key_id, &offer_at(1), &spki).await;
     assert_eq!(gate.signed(), 1, "one signature served both peers");
 
     end_tx.send(()).expect("the run ends");
@@ -2862,7 +2930,7 @@ async fn a_failed_read_or_signature_sends_nothing_until_the_next_change() {
     let authority = authority(now).await;
     let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
     let gate = Gate::failing(
-        vec![offer_at(key_id, 1).message()],
+        vec![connetto_core::chain::offer_message(&key_id, &offer_at(1))],
         vec![Fate::Refused, Fate::Panics],
     );
     let (far, mut far_events) = far_peer(&authority, positive_serial(9));
@@ -2873,7 +2941,7 @@ async fn a_failed_read_or_signature_sends_nothing_until_the_next_change() {
             gate: Arc::clone(&gate),
         }),
         held,
-        Some(offer_at(key_id, 1)),
+        Some(offer_at(1)),
     )
     .await;
     state.lock().offer_fails = true;
@@ -2891,7 +2959,7 @@ async fn a_failed_read_or_signature_sends_nothing_until_the_next_change() {
             .expect("the run steers");
         poll_until(|| state.lock().offer_reads == reads).await;
     }
-    offer_received(&mut far_events, &offer_at(key_id, 1), &spki).await;
+    offer_received(&mut far_events, key_id, &offer_at(1), &spki).await;
     assert_eq!(gate.signed(), 1, "only the last attempt signed");
 
     end_tx.send(()).expect("the run ends");
@@ -2914,19 +2982,19 @@ async fn a_retired_writer_stops_offering() {
         authority,
         Arc::new(RunKeys { der }),
         held,
-        Some(offer_at(key_id, 1)),
+        Some(offer_at(1)),
     )
     .await;
     far.link(handle.peer_address().expect("the listener"))
         .await
         .expect("the link completes");
-    offer_received(&mut far_events, &offer_at(key_id, 1), &spki).await;
+    offer_received(&mut far_events, key_id, &offer_at(1), &spki).await;
 
     let steering = handle.steering();
     steering
         .send(super::Command::WriterRetired)
         .expect("the run steers");
-    state.lock().offer = Some(offer_at(key_id, 2));
+    state.lock().offer = Some(offer_at(2));
     steering
         .send(super::Command::OfferChanged)
         .expect("the run steers");
@@ -4221,7 +4289,7 @@ async fn a_held_device_write_refused_on_the_drain_is_retracted_in_the_offer() {
     }
     old_major.await.expect("the old major ran");
     let offer = conn
-        .offer_draft(key_id)
+        .own_offer(key_id)
         .expect("read the offer")
         .expect("the key stands");
     assert_eq!(offer.settled, Some(Frontier { seq, head }));

@@ -78,7 +78,7 @@ async fn await_linked(rx: &mut mpsc::UnboundedReceiver<PeerEvent>, peer: &Device
             .expect("the link lands within the bound")
             .expect("the channel stays open");
         match event {
-            PeerEvent::Linked { peer: linked } if &linked == peer => return,
+            PeerEvent::Linked { peer: linked, .. } if &linked == peer => return,
             _ => {}
         }
     }

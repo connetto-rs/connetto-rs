@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::messages::{MutationRejectReason, Provenance, WriterRef};
-use crate::schema::Major;
+use crate::schema::{Major, SchemaVersion};
 
 /// A chain frontier, the sequence a device has settled and the hash at it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,4 +79,35 @@ pub enum EndOutcome {
     Complete,
     /// The answering device is busy and will not serve the request now.
     Busy,
+    /// The answering device no longer holds the range, because the server
+    /// answered part of it or its writer retired, so the requester waits
+    /// for its next offer.
+    NotAvailable,
+}
+
+/// What a device states about its own writer's chain to a linked peer, the
+/// builds its entries were captured under, its settled and newest
+/// frontiers and its retraction log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Offer {
+    /// The author's builds, as `(major, schema version)` pairs.
+    pub builds: Vec<(Major, SchemaVersion)>,
+    /// The author's acked frontier, `None` when it has settled nothing.
+    pub settled: Option<Frontier>,
+    /// The author's newest entry, `None` when it holds no queue.
+    pub newest: Option<Frontier>,
+    /// The author's retraction log.
+    pub retractions: Vec<Retraction>,
+}
+
+/// An [`Offer`] with the device key's signature over
+/// [`offer_message`](crate::chain::offer_message), which rebuilds the
+/// signed bytes from the fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedOffer {
+    /// What the author states.
+    pub offer: Offer,
+    /// The device key's signature over it.
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
 }

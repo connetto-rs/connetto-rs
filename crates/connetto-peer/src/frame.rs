@@ -8,16 +8,12 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use connetto_core::exchange::{EndOutcome, Frontier, ManifestRow, Retraction};
-use connetto_core::schema::{Major, SchemaVersion};
+use connetto_exchange::Message;
 
 use crate::error::CloseReason;
 
 /// The frame length ceiling, four megabytes.
 pub(crate) const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
-/// The rows one manifest frame carries, the bound a manifest over is
-/// refused on both ends of the link.
-pub const MAX_MANIFEST_ROWS: usize = 8192;
 /// The frame version this crate speaks.
 pub(crate) const PROTOCOL_VERSION: u16 = 2;
 
@@ -68,94 +64,13 @@ pub enum PeerFrame {
         /// The host's peer port, while the host serves.
         port: Option<u16>,
     },
-    /// One of the exchange's five frames (R77).
-    Exchange(ExchangeFrame),
+    /// The exchange's message, one of its five, in the order an exchange
+    /// runs (R77).
+    Exchange(Message),
     /// A liveness probe.
     Ping,
     /// The answer to a liveness probe.
     Pong,
-}
-
-/// The exchange's five frames, in the wire order an exchange runs (R77).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExchangeFrame {
-    /// The device's own offer, its builds, its settled and newest frontiers,
-    /// its retraction log and the signature over them all.
-    Offer {
-        /// The author's builds, as `(major, schema version)` pairs.
-        builds: Vec<(Major, SchemaVersion)>,
-        /// The author's acked frontier, `None` when it has settled nothing.
-        settled: Option<Frontier>,
-        /// The author's newest entry, `None` when it holds no queue.
-        newest: Option<Frontier>,
-        /// The author's retraction log.
-        retractions: Vec<Retraction>,
-        /// The device key's signature over the offer's fields.
-        signature: Vec<u8>,
-    },
-    /// A request for the manifest and bodies from `from` onward.
-    Request {
-        /// The id the replies quote.
-        request_id: u64,
-        /// The first sequence requested.
-        from: u64,
-    },
-    /// A manifest frame, at most [`MAX_MANIFEST_ROWS`] rows.
-    Manifest {
-        /// The id the request named.
-        request_id: u64,
-        /// The hash the range chains from.
-        previous: [u8; 32],
-        /// The range's rows, in sequence order.
-        rows: Vec<ManifestRow>,
-        /// Whether this is the range's last manifest frame.
-        last: bool,
-    },
-    /// A changeset body for one sequence.
-    Body {
-        /// The id the request named.
-        request_id: u64,
-        /// The sequence the changeset covers.
-        seq: u64,
-        /// The changeset bytes.
-        changeset: Vec<u8>,
-    },
-    /// The end of a request's stream, with its outcome.
-    End {
-        /// The id the request named.
-        request_id: u64,
-        /// How the request ended.
-        outcome: EndOutcome,
-    },
-}
-
-impl ExchangeFrame {
-    /// The frame name and article for diagnostics, naming the variant.
-    pub(crate) fn named(&self) -> &'static str {
-        match self {
-            ExchangeFrame::Offer { .. } => "an Exchange::Offer",
-            ExchangeFrame::Request { .. } => "an Exchange::Request",
-            ExchangeFrame::Manifest { .. } => "an Exchange::Manifest",
-            ExchangeFrame::Body { .. } => "an Exchange::Body",
-            ExchangeFrame::End { .. } => "an Exchange::End",
-        }
-    }
-
-    /// Whether the frame keeps the wire's row bound, which only a manifest
-    /// can break.
-    ///
-    /// # Errors
-    ///
-    /// [`FrameError::TooManyRows`] when a manifest carries more than
-    /// [`MAX_MANIFEST_ROWS`] rows.
-    pub(crate) fn within_bounds(&self) -> Result<(), FrameError> {
-        if let ExchangeFrame::Manifest { rows, .. } = self
-            && rows.len() > MAX_MANIFEST_ROWS
-        {
-            return Err(FrameError::TooManyRows);
-        }
-        Ok(())
-    }
 }
 
 impl PeerFrame {
@@ -167,7 +82,7 @@ impl PeerFrame {
             PeerFrame::Close { .. } => "a Close",
             PeerFrame::Certificate { .. } => "a Certificate",
             PeerFrame::Offer { .. } => "an Offer",
-            PeerFrame::Exchange(frame) => frame.named(),
+            PeerFrame::Exchange(message) => message.named(),
             PeerFrame::Ping => "a Ping",
             PeerFrame::Pong => "a Pong",
         }
@@ -209,7 +124,7 @@ impl fmt::Debug for PeerFrame {
                 .field("security", security)
                 .field("port", port)
                 .finish(),
-            PeerFrame::Exchange(frame) => f.debug_tuple("Exchange").field(frame).finish(),
+            PeerFrame::Exchange(message) => f.debug_tuple("Exchange").field(message).finish(),
             PeerFrame::Ping => f.debug_struct("Ping").finish(),
             PeerFrame::Pong => f.debug_struct("Pong").finish(),
         }
@@ -237,7 +152,9 @@ pub(crate) enum FrameError {
 /// on both ends of the link.
 fn wire_bounds(frame: &PeerFrame) -> Result<(), FrameError> {
     match frame {
-        PeerFrame::Exchange(frame) => frame.within_bounds(),
+        PeerFrame::Exchange(message) => {
+            message.within_bounds().map_err(|_| FrameError::TooManyRows)
+        }
         _ => Ok(()),
     }
 }

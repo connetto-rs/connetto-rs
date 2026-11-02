@@ -51,6 +51,7 @@ peer = [
   "device-identity",
   "dep:pg2sqlite",
   "dep:connetto-peer",
+  "dep:connetto-exchange",
   "dep:btleplug",
   "dep:connetto-peer-android",
   "dep:connetto-peer-apple",
@@ -181,6 +182,9 @@ connetto-schema = { workspace = true, optional = true }
 # 3), and its bluetooth feature carries the beacon and the exchange (R76
 # slice 5).
 connetto-peer = { path = "../connetto-peer", optional = true, features = ["discovery", "bluetooth"] }
+# The exchange's messages and state machine, which the enrolment task drives
+# over the peer link (R77).
+connetto-exchange = { workspace = true, optional = true }
 # A peer apply tells a write guard's policy refusal apart from any other
 # failed write by the message the translated guards raise (R77).
 pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, optional = true }

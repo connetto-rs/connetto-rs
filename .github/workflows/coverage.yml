@@ -59,6 +59,7 @@ jobs:
               -p connetto-file-server
               -p connetto-file-client
               -p connetto-peer
+              -p connetto-exchange
     steps:
       - uses: actions/checkout@v7
 

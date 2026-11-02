@@ -1,0 +1,27 @@
+[package]
+name = "connetto-exchange"
+description = "The sans-IO device-to-device exchange of signed writer chains: offers, ranged requests, verified manifests and bodies (R77)."
+readme = "README.md"
+categories = ["network-programming", "cryptography"]
+keywords = ["sans-io", "append-only-log", "replication", "local-first"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+connetto-core.workspace = true
+indexmap = "2"
+serde.workspace = true
+serde_bytes.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+
+[dev-dependencies]
+rmp-serde.workspace = true

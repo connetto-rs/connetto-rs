@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use connetto_core::clock::DEVICE_SKEW;
 use connetto_core::device_cert::{DeviceCertificate, KeyId};
+use connetto_exchange::Message;
 use rustls::pki_types::CertificateDer;
 use serde_bytes::ByteBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -14,7 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::error::{CloseReason, Refusal};
 use crate::event::PeerEvent;
-use crate::frame::{ExchangeFrame, FrameError, FrameReader, PeerFrame, write_frame};
+use crate::frame::{FrameError, FrameReader, PeerFrame, write_frame};
 use crate::node::{HELLO_TIMEOUT, LinkCommand, NodeState, WRITE_BOUND};
 
 /// How long a link whose write failed reads on for a close the peer queued.
@@ -27,7 +28,7 @@ pub(crate) async fn run<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     state: Arc<NodeState>,
     mut io: S,
     mut commands: mpsc::UnboundedReceiver<LinkCommand>,
-    mut exchange: mpsc::Receiver<ExchangeFrame>,
+    mut exchange: mpsc::Receiver<Message>,
     key: KeyId,
     seq: u64,
 ) {
@@ -196,9 +197,9 @@ async fn on_frame<S: AsyncRead + AsyncWrite + Unpin>(
                 CloseReason::Closed
             }))
         }
-        // An exchange frame reaches the device's owner on its event channel,
-        // naming the peer it crossed from (R77).
-        Ok(Some(PeerFrame::Exchange(frame))) => {
+        // An exchange message reaches the device's owner on its event
+        // channel, naming the peer it crossed from (R77).
+        Ok(Some(PeerFrame::Exchange(message))) => {
             *last_seen = tokio::time::Instant::now();
             let peer = {
                 let links = state.links.lock();
@@ -211,10 +212,7 @@ async fn on_frame<S: AsyncRead + AsyncWrite + Unpin>(
             };
             state
                 .events
-                .send(PeerEvent::Exchange {
-                    peer,
-                    frame: frame.clone(),
-                })
+                .send(PeerEvent::Exchange { peer, message })
                 .ok();
             None
         }
@@ -279,14 +277,14 @@ async fn on_command<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// What an exchange frame queued by the node does to the link, `Some` when
-/// it stops it. The frame was checked against the wire's bounds before it
-/// was queued, so the write only fails on the link itself.
+/// What an exchange message queued by the node does to the link, `Some`
+/// when it stops it. The message was checked against the wire's bounds
+/// before it was queued, so the write only fails on the link itself.
 async fn on_exchange<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut S,
-    frame: ExchangeFrame,
+    message: Message,
 ) -> Option<Stop> {
-    match bounded_write(io, &PeerFrame::Exchange(frame)).await {
+    match bounded_write(io, &PeerFrame::Exchange(message)).await {
         Ok(()) => None,
         Err(_) => Some(Stop::WriteFailed),
     }
@@ -363,6 +361,7 @@ fn finish(state: &Arc<NodeState>, key: KeyId, seq: u64, reason: CloseReason) {
         match links.get(&key) {
             Some(SlotState::Live(slot)) if slot.seq == seq => {
                 let peer = slot.peer.clone();
+                let public_key = slot.public_key.clone();
                 let bot_list = slot.bot_list.clone();
                 links.remove(&key);
                 // The map and the slot move under the same lock, so the
@@ -373,6 +372,7 @@ fn finish(state: &Arc<NodeState>, key: KeyId, seq: u64, reason: CloseReason) {
                         key,
                         SlotState::AwaitingKeeper {
                             peer: peer.clone(),
+                            public_key,
                             bot_list,
                         },
                     );

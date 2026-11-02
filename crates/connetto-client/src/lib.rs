@@ -82,6 +82,8 @@ mod drain;
 pub mod dsl;
 #[cfg(feature = "device-identity")]
 mod enrolment;
+#[cfg(feature = "peer")]
+mod exchange;
 mod grant_expiry;
 pub mod harden;
 mod holdings;
@@ -1685,6 +1687,15 @@ pub enum ClientEvent {
         seq: i64,
         /// The entry's rows, physical table and key.
         rows: Vec<(String, Vec<KeyValue>)>,
+    },
+    /// An author presented an offer whose signature the key its link proved
+    /// does not verify, a head contradicting the one this replica verified,
+    /// or a range whose chain or bodies do not match its signed head (R77),
+    /// so the exchange with it ended until its next offer.
+    #[cfg(feature = "peer")]
+    PeerChainInvalid {
+        /// The author's key id.
+        author: Vec<u8>,
     },
     /// A peer entry retracted, its rows inverted and its entry deleted
     /// (R77), raised once per retracted entry naming the keys it inverted.
@@ -4448,6 +4459,8 @@ fn install_replica_metadata(
     db.batch_execute(peer::PEER_ENTRY_DDL)?;
     #[cfg(feature = "peer")]
     db.batch_execute(author::RETRACTION_DDL)?;
+    #[cfg(feature = "peer")]
+    db.batch_execute(exchange::PEER_CURSOR_DDL)?;
     // A watch the previous run died still holding counts down from now.
     subscriptions::anchor_launch(db)?;
     Ok(())
@@ -7161,6 +7174,20 @@ where
         row: &connetto_core::exchange::ManifestRow,
         body: &[u8],
     ) -> Result<peer::PeerApplyOutcome, ClientError> {
+        self.apply_peer_entry_at(author, row, body, None)
+    }
+
+    /// [`apply_peer_entry`](Self::apply_peer_entry), storing `cursor` as
+    /// the author's in the transaction that applies the entry (R77 slice
+    /// 6b).
+    #[cfg(feature = "peer")]
+    pub(crate) fn apply_peer_entry_at(
+        &mut self,
+        author: &peer::PeerAuthor,
+        row: &connetto_core::exchange::ManifestRow,
+        body: &[u8],
+        cursor: Option<&connetto_core::exchange::Frontier>,
+    ) -> Result<peer::PeerApplyOutcome, ClientError> {
         // An entry another build captured crosses as its manifest row only,
         // the version half of the test being the offer's (R77 slice 6).
         if Some(row.major) != self.config.schema_major {
@@ -7224,6 +7251,9 @@ where
                 peer::store_entry(db, author, seq, major, body, now, next_position)?;
                 next_position
             };
+            if let Some(cursor) = cursor {
+                exchange::store_cursor(db, &author.key_id, cursor)?;
+            }
             Ok((rows, position))
         });
         drop(bound);
@@ -8589,40 +8619,6 @@ where
         {
             let _ = sender.send(crate::enrolment::Command::OfferChanged);
         }
-    }
-
-    /// The device writer `key_id`'s offer before the device key signs it:
-    /// the builds this replica holds entries of, oldest first, the settled
-    /// frontier, the newest queued entry and the retraction log. `None` once
-    /// a retirement excluded the key, which offers nothing until a fresh key
-    /// enrols (R77 decisions 7 to 9).
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`] when the bookkeeping cannot be read.
-    #[cfg(feature = "peer")]
-    pub(crate) fn offer_draft(
-        &mut self,
-        key_id: [u8; 32],
-    ) -> Result<Option<author::OfferDraft>, ClientError> {
-        if self.retired_keys.contains(&key_id) {
-            return Ok(None);
-        }
-        let newest = self
-            .writers
-            .get(&WriterRef::Device(key_id))
-            .and_then(|queue| queue.pending.last_key_value())
-            .map(|(seq, entry)| connetto_core::exchange::Frontier {
-                seq: *seq,
-                head: entry.hash,
-            });
-        let mut builds = majors::held_builds(&mut self.db)?;
-        if let (Some(major), Some(version)) =
-            (self.config.schema_major, &self.config.schema_version)
-        {
-            builds.push((major, version.clone()));
-        }
-        author::OfferDraft::read(&mut self.db, key_id, newest, builds).map(Some)
     }
 
     /// Send one mutation as its header and patchset frame pair, as `writer`'s
