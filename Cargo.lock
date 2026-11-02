@@ -1240,6 +1240,7 @@ dependencies = [
  "connetto-client",
  "connetto-core",
  "connetto-dioxus",
+ "connetto-exchange",
  "connetto-file-client",
  "connetto-file-core",
  "connetto-file-server",
