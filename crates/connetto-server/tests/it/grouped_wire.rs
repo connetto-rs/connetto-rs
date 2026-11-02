@@ -14,11 +14,10 @@ use connetto_core::messages::ControlMessage;
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
     AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
-    RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, loopback, pg_write_target,
+    RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, committed_at};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
-use tracing::Instrument;
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);";
 
@@ -50,19 +49,8 @@ fn manager(fixture: &Fixture) -> Arc<Manager> {
 }
 
 /// One in-process client on its own session.
-///
-/// The session task runs under the span the caller was in, so a record it
-/// emits carries whatever opened the connection.
 fn connect(manager: &Arc<Manager>) -> Client {
-    let (server_end, client_end) = loopback();
-    let session = Arc::clone(manager);
-    tokio::spawn(
-        async move {
-            let _ = session.serve(server_end).await;
-        }
-        .instrument(tracing::Span::current()),
-    );
-    Client::new(client_end)
+    super::loopback_session::connect(|end| Arc::clone(manager).serve(end))
 }
 
 /// Pump the client for exactly `n` aggregate frames on `sub_id`.

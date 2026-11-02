@@ -129,7 +129,7 @@ async fn forgetting_through_the_gap_makes_the_catchup_question_honest() {
     let (first, last) = (records[0].position(), records[2].position());
     let oplog = InMemoryOplog::new(OplogConfig::default());
     for record in records {
-        oplog.append(record).await.expect("append");
+        oplog.append(&record).await.expect("append");
     }
     assert_eq!(
         catchup_decision(
@@ -281,7 +281,7 @@ async fn declaring_an_epoch_trims_the_log_and_closes_every_connection() {
     let (records, commits) = records();
     let last = records[2].position();
     for record in records {
-        probe.append(record).await.expect("append");
+        probe.append(&record).await.expect("append");
     }
     // The ingest records each commit before acknowledging it, and the slot then resumes exactly at its end.
     for commit in &commits {
