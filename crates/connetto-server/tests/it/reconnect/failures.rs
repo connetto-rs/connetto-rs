@@ -20,6 +20,8 @@ mod term_termination;
 mod transport_lifetime;
 mod worker_cancellation;
 
+pub(super) use replay_departures::single_delete_of;
+
 const WAIT: Duration = Duration::from_secs(15);
 
 type SessionTask = JoinHandle<Result<(), SessionError>>;

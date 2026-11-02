@@ -76,6 +76,8 @@ mod lifecycle;
 mod logging;
 mod loopback_session;
 
+mod owner_policy;
+
 mod macro_hygiene;
 
 mod numeric;
@@ -109,6 +111,7 @@ mod read_rule_fold;
 
 mod reconnect;
 
+mod failure_arms;
 mod reexec;
 mod reexec_failure;
 

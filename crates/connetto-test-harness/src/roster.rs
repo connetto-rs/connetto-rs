@@ -51,6 +51,8 @@ pub struct RosterAuth {
     unnamed: bool,
     /// Primary keys refused to everybody.
     withheld: Vec<i64>,
+    /// A value at `column` at or above `threshold` is refused to everybody.
+    ceiling: Option<(u16, i64)>,
 }
 
 impl RosterAuth {
@@ -60,6 +62,7 @@ impl RosterAuth {
             names: vec![name.into()],
             unnamed: false,
             withheld: Vec::new(),
+            ceiling: None,
         }
     }
 
@@ -75,6 +78,7 @@ impl RosterAuth {
             names: Vec::new(),
             unnamed: false,
             withheld: Vec::new(),
+            ceiling: None,
         }
     }
 
@@ -105,6 +109,14 @@ impl RosterAuth {
         self
     }
 
+    /// Refuse every row whose value at `column` reaches `threshold`, so a
+    /// fixture can cross one row past a policy ceiling.
+    #[must_use]
+    pub fn ceiling(mut self, column: u16, threshold: i64) -> Self {
+        self.ceiling = Some((column, threshold));
+        self
+    }
+
     /// Whether the roster names this caller.
     fn grants(&self, caller: &Principal) -> bool {
         if let Some(identity) = caller.identity()
@@ -127,12 +139,18 @@ impl RosterAuth {
     /// The key is read straight off the row view, the way the row-level-security
     /// policy reads it. A row whose first column is not an integer is not
     /// withheld, so a fixture over a table with a binary or text key cannot
-    /// withhold anything and must not claim to.
+    /// withhold anything and must not claim that. A ceiling refuses by value,
+    /// so it withholds only a row whose column holds an integer.
     fn withholds<R>(&self, row: &R) -> bool
     where
         R: RowView<Backend = Postgres> + ?Sized,
     {
-        matches!(row.value_at(0), Ok(Value::Int(key)) if self.withheld.contains(&key))
+        if matches!(row.value_at(0), Ok(Value::Int(key)) if self.withheld.contains(&key)) {
+            return true;
+        }
+        self.ceiling.is_some_and(|(column, threshold)| {
+            matches!(row.value_at(column), Ok(Value::Int(value)) if value >= threshold)
+        })
     }
 }
 
