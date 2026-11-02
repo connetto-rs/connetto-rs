@@ -219,7 +219,7 @@ async fn assert_survivor_intact(
 
 /// A deterministic pseudorandom buffer, so chunk boundaries are reproducible
 /// and the data does not compress away.
-fn pseudorandom(seed: u32, len: usize) -> Vec<u8> {
+pub(crate) fn pseudorandom(seed: u32, len: usize) -> Vec<u8> {
     let mut state = seed | 1;
     let mut out = Vec::with_capacity(len);
     while out.len() < len {

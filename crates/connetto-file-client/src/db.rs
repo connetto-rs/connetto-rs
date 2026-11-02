@@ -102,6 +102,17 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// One row per held file of more than one 16 KiB group, naming the chunk
+    /// store object that holds its BLAKE3 outboard (R79).
+    _connetto_content_outboard (file_id) {
+        /// BLAKE3 identity of the file the outboard proves.
+        file_id -> Binary,
+        /// BLAKE3 hash of the outboard's bytes, its key in the chunk store.
+        hash -> Binary,
+    }
+}
+
 allow_tables_to_appear_in_same_query!(_connetto_content_chunks, _connetto_content_outbox);
 
 /// The bookkeeping schema, applied on every open so a new replica gains all
@@ -115,7 +126,9 @@ pub(crate) const CONTENT_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS _connetto_content_retired \
     (file_id BLOB NOT NULL PRIMARY KEY); \
     CREATE TABLE IF NOT EXISTS _connetto_content_pins \
-    (name TEXT NOT NULL PRIMARY KEY, query TEXT NOT NULL, file_id_column TEXT NOT NULL)";
+    (name TEXT NOT NULL PRIMARY KEY, query TEXT NOT NULL, file_id_column TEXT NOT NULL); \
+    CREATE TABLE IF NOT EXISTS _connetto_content_outboard \
+    (file_id BLOB NOT NULL PRIMARY KEY, hash BLOB NOT NULL)";
 
 /// The held-content half of the schema (R31), created by a rebuild inside
 /// the rebuild transaction and on every content attach.
@@ -401,15 +414,48 @@ pub(crate) fn forget_held_file(
     .map(|_| ())
 }
 
-/// Deletes a manifest's chunk rows.
+/// Deletes a manifest's chunk rows and its outboard row.
 pub(crate) fn drop_manifest(
     conn: &mut SqliteConnection,
     file_id: FileId,
 ) -> Result<(), diesel::result::Error> {
+    let id = file_id.as_bytes().to_vec();
     diesel::delete(_connetto_content_chunks::table)
-        .filter(_connetto_content_chunks::file_id.eq(file_id.as_bytes().to_vec()))
+        .filter(_connetto_content_chunks::file_id.eq(&id))
+        .execute(conn)?;
+    diesel::delete(_connetto_content_outboard::table)
+        .filter(_connetto_content_outboard::file_id.eq(&id))
         .execute(conn)
         .map(|_| ())
+}
+
+/// Names the store object holding a file's outboard, replacing any earlier one.
+pub(crate) fn put_outboard(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+    hash: &ChunkHash,
+) -> Result<(), diesel::result::Error> {
+    diesel::replace_into(_connetto_content_outboard::table)
+        .values((
+            _connetto_content_outboard::file_id.eq(file_id.as_bytes().to_vec()),
+            _connetto_content_outboard::hash.eq(hash.as_bytes().to_vec()),
+        ))
+        .execute(conn)
+        .map(|_| ())
+}
+
+/// The store object holding a file's outboard, or `None` when none is named.
+pub(crate) fn outboard_hash(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<Option<ChunkHash>, ContentError> {
+    let hash: Option<Vec<u8>> = _connetto_content_outboard::table
+        .filter(_connetto_content_outboard::file_id.eq(file_id.as_bytes().to_vec()))
+        .select(_connetto_content_outboard::hash)
+        .first(conn)
+        .optional()?;
+    hash.map(|hash| Ok(ChunkHash::from_bytes(exactly_32(&hash)?)))
+        .transpose()
 }
 
 /// Every file this device holds a manifest for.
@@ -442,6 +488,11 @@ pub(crate) fn referenced_hashes(
         _connetto_held_content_chunks::table
             .select(_connetto_held_content_chunks::hash)
             .distinct()
+            .load(conn)?,
+    );
+    rows.extend(
+        _connetto_content_outboard::table
+            .select(_connetto_content_outboard::hash)
             .load(conn)?,
     );
     rows.into_iter()
@@ -671,7 +722,7 @@ pub(crate) fn is_unsent(
         .map(|n| n > 0)
 }
 
-/// Whether any manifest, held or not, still names this chunk.
+/// Whether any manifest, held or not, or any outboard still names this chunk.
 pub(crate) fn hash_is_referenced(
     conn: &mut SqliteConnection,
     hash: &ChunkHash,
@@ -682,10 +733,14 @@ pub(crate) fn hash_is_referenced(
         .count()
         .get_result::<i64>(conn)?;
     let held = _connetto_held_content_chunks::table
-        .filter(_connetto_held_content_chunks::hash.eq(bytes))
+        .filter(_connetto_held_content_chunks::hash.eq(bytes.clone()))
         .count()
         .get_result::<i64>(conn)?;
-    Ok(live > 0 || held > 0)
+    let outboards = _connetto_content_outboard::table
+        .filter(_connetto_content_outboard::hash.eq(bytes))
+        .count()
+        .get_result::<i64>(conn)?;
+    Ok(live > 0 || held > 0 || outboards > 0)
 }
 
 /// Creates or replaces a pin under `name`.

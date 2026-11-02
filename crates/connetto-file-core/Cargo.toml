@@ -16,8 +16,13 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
-# File identity and chunk-key derivation.
-blake3 = "1"
+# File identity, chunk keys, and the outboard through the stable hazmat API.
+blake3 = "1.8"
+# Proves a byte range against the file identity as it streams, wasm32 included.
+bao-tree = { version = "0.17", default-features = false, features = ["tokio_fsm"] }
+# The async reader and writer traits bao-tree's streaming encoder takes.
+iroh-io = { version = "0.6", default-features = false }
+bytes = "1"
 # Content-defined chunking with the 2020 algorithm.
 fastcdc = "3"
 # XChaCha20-Poly1305: 192-bit nonce eliminates the birthday-bound risk of
