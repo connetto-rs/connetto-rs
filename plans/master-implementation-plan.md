@@ -57,7 +57,7 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | [R57](#r57-the-demo-feature-gaps-the-export-audit-found) | in progress |  | The application-visible features the export audit found missing from the demos, steps 1 to 5 and 7 found built in the demos on `examples/demo-support` (2026-10-26), step 6 found already fixed (2026-09-12), step 8 merged (2026-10-20), and the human proof pass remaining |  | [#205](https://github.com/connetto-rs/connetto-rs/pull/205), [#216](https://github.com/connetto-rs/connetto-rs/pull/216) |
 | [R77](#r77-the-exchange-and-the-provisional-tier) | in progress |  | Slices 7 (online adjudication) and 8 (the handheld proof) remain, the rest of the exchange and the provisional tier is merged |  | [#296](https://github.com/connetto-rs/connetto-rs/pull/296), [#297](https://github.com/connetto-rs/connetto-rs/pull/297), [#300](https://github.com/connetto-rs/connetto-rs/pull/300), [#304](https://github.com/connetto-rs/connetto-rs/pull/304), [#310](https://github.com/connetto-rs/connetto-rs/pull/310), [#342](https://github.com/connetto-rs/connetto-rs/pull/342), [#344](https://github.com/connetto-rs/connetto-rs/pull/344), [#348](https://github.com/connetto-rs/connetto-rs/pull/348), [#351](https://github.com/connetto-rs/connetto-rs/pull/351), [#354](https://github.com/connetto-rs/connetto-rs/pull/354), [#357](https://github.com/connetto-rs/connetto-rs/pull/357), [#365](https://github.com/connetto-rs/connetto-rs/pull/365) |
 | [R78](#r78-courier-recovery) | not started | R77 | The server courier path under the five constraints, deployment-opt-in and default off, and the client's explicit offer of another author's held changesets |  |  |
-| [R79](#r79-media-over-the-peer-link) | not started | R77 | Pull-on-demand by chunk hash over the peer link, the receiver's verification and re-encryption, the peer-fetched spare clause, the thumbnail prefetch and the opt-in replication |  |  |
+| [R79](#r79-media-over-the-peer-link) | designed | R78 (step 4) | Steps 1 to 3 in eight slices, the outboards, the media frames, the media port and gate, the holder, the receiver, the retention, the thumbnails and the harness proof, and step 4's opt-in replication |  | [#371](https://github.com/connetto-rs/connetto-rs/pull/371) |
 | [R80](#r80-peer-sync-in-every-demo) | not started | R76 (slice 9d), R77, R78, R79 | The camp flow in every native-capable demo on every native platform, the iOS zero-coverage field test, and the grown phone and home runs |  |  |
 | [R107](#r107-schema-changes-under-running-servers) | not started | subql passing pgoutput `Relation` messages to consumers (slice 2) | The expand and contract procedure with the sunset, the table refusal when a running server notices a change, and the two-model boot check |  |  |
 | [R108](#r108-caller-kinds-as-database-roles) | not started | sql-traits answering the caller contract, privileges and effective policies for both translators, for slices 2 to 5. R99, for the bot kinds | Caller kinds as database roles, every startup refusal before OpenFGA, four flat kind roles switched per transaction, grants per kind, and a client copy per kind |  |  |
@@ -1231,26 +1231,119 @@ A device's writes reach the server through a different account's session with ex
 
 ## R79: media over the peer link
 
-**Status.** NOT STARTED.
+**Status.** DESIGNED, not started. Steps 1 to 3 are sliced into eight pull requests below, and step 4 waits for R78. Decisions 1 to 10 were taken with the maintainer, and decision 11 was settled on evidence.
 
-**Blocked on** R77, and on R64 to R67 for the chunk machinery.
+**Blocked on** R77, and on R64 to R67 for the chunk machinery, all merged for steps 1 to 3. R77's open slices 7 and 8 block none of them. Step 4 is blocked on R78.
 
-**Changes state.** Client tables, none, the receiver keeping chunks under its own file identity (step 3). Server tables, none. Wire messages, the chunk messages over the peer link, decided with the maintainer (step 2), and the re-served entry carrying the chunk's content hash (step 6). Archive format, none.
+**Changes state.** Client tables, `_connetto_content_outboard` in `main` beside the manifests (decision 4). Server tables, none. Wire messages, the media frames at peer protocol version 3 (decision 1). Archive format, none, since an outboard is derived and peer-fetched content is cache. Demo deployment, `photos.thumb_id` (decision 9).
 
 ### Purpose
 
-Sample photos in camp. This is the join point with chapter 18's identity, chunking and manifest, metadata rows travel in the exchange like any rows, so this phase adds content, pull-on-demand by chunk hash over the established link, the author's device answering after evaluating the requester against its translated policy fail-closed, the receiver verifying against the hashes the signed row carries, re-encrypting under its own key, and storing in the never-exported cache class. The application can additionally mark content for replication to present peers, the survivability half of couriering.
+Sample photos in camp. This is the join point with chapter 18's identity, chunking and manifest, metadata rows travel in the exchange like any rows, so this phase adds content, pull-on-demand by chunk over the established link, a holding device answering after evaluating the requester against its translated policy fail-closed, the receiver verifying against the file id the signed row carries, re-encrypting under its own key, and storing in the never-exported cache class. The application can additionally mark content for replication to present peers, the survivability half of couriering.
 
 ### Steps
 
-1. The chunk-request frames on the peer link and the author-side policy gate.
-2. Receiver verification against the signed row's hashes, re-encryption, cache-class storage, orphan sweep after retraction. **Peer-fetched content has its own spare clause**, `tidy_content` keeps a manifest only while unsent or pinned and R60 made the residual pass automatic, so without this a photo pulled in camp would be deleted at the next crossing, offline and unrefetchable. Peer-fetched chunks are spared while their row is provisional, mirroring the spare clause provisional rows themselves have, and become ordinary cache when the row is adjudicated, at which point the server can serve them again.
-3. Thumbnail prefetch, ordinary derived files behind `thumb_hash` a peer prefetches over the link, instant at their size, and the resolver's peer source slotting into R67's extension point.
-4. Opt-in replication, the application marks content for push to present peers, the survivability half of R78.
+1. The chunk-request frames on the peer link and the holder-side policy gate.
+2. Receiver verification against the file id the signed row carries, re-encryption, cache-class storage, orphan sweep after retraction. **Peer-fetched content has its own spare clause**, `tidy_content` keeps a manifest only while unsent or pinned and R60 made the residual pass automatic, so without this a photo pulled in camp would be deleted at the next crossing, offline and unrefetchable. Peer-fetched chunks are spared while their row is provisional, mirroring the spare clause provisional rows themselves have, and become ordinary cache when the row is adjudicated, at which point the server can serve them again.
+3. Thumbnail prefetch (ordinary derived files behind a thumbnail column, instant at their size), and the peer fetch as a stage of the resolver (decision 10).
+4. Opt-in replication, the application marks content for push to present peers, the survivability half of R78. Not designed, waiting for R78.
+
+### Decisions, taken with the maintainer
+
+1. **Chunks cross as per-chunk pulls on a media queue of their own, at peer protocol version 3.** `PeerFrame::Media` carries the messages below on a second bounded queue per link, eight frames deep like the exchange's, so a 16 MiB chunk never waits ahead of an offer or a range and an offer never stalls a photo. `PROTOCOL_VERSION` becomes 3 in the hello, the TXT record and the beacon together, because a version 2 end decodes an unknown variant as malformed and closes the link with `CloseReason::Protocol`. A receiver asks for a file's manifest with `Want` and then for each chunk it lacks with `Fetch`, which names the chunk by its byte range of the file, since two holders can chunk one file differently (the author under its mime class, a server-fetched copy under the generic class) while a byte range of `F` is the same on every holder. A holder answers `Manifest` frames of at most 8192 rows, then the range as `Piece` frames of at most 1 MiB of file bytes with their proof hashes (decision 4), and answers `Refused` alike for a file it lacks and a requester its gate refuses, the rule the file server keeps by answering 404 for both (R38). Each side keeps at most one request outstanding per peer, a holder serves at most two peers at once and answers `Busy` beyond that, since each serve holds one decrypted chunk of up to 16 MiB, every reply quotes the request id, and a receiver waits at most 30 s for the next frame on a monotonic clock (R77 decision 10). A lost link resumes at the next chunk the receiver lacks, since every verified chunk is already in its store. Rejected: one request per file, which restarts the whole file on a lost link. Rejected: sharing the exchange queue, which puts a 16 MiB chunk ahead of the next offer.
+2. **The serving device judges the requester through declared content columns, failing closed.** The application declares each column holding a file id on its content client, `with_peer_content("photos", "content_id")`, the same declaration in every build of the application. A holder asked for `F` binds the requester's certificate `account`, `NULL` subjects and the certificate's bot list on its own connection for one statement, the `AuthorBinding` mechanism R77 decision 4 built for an author, and runs `SELECT 1 FROM photos WHERE content_id = ? LIMIT 1` through the policy view for each declared column, serving when any answers a row. It refuses when the application declared no column, when the build has no caller mapping and so no view, and on any error, and a certificate with no bot list binds `NULL`, which the views refuse. The gate runs again at every `Fetch`, so a right the holder's replica withdraws ends the transfer at the next chunk. The answer comes from the holder's partial replica, with chapter 19's false-deny and bounded false-allow limits. The same declaration names the rows a receiver routes by (decision 3), the rows the spare clause reads (decision 6) and the thumbnail columns (decision 8). Rejected: query-shaped declarations like pins, which cannot name a row for the routing and the spare clause.
+3. **Any linked device holding the file answers, the row's provisional author first.** A receiver resolving `F` asks, in order, the linked authors of the provisional rows whose declared columns name `F`, then every other linked peer in the order its link came up, moving to the next on `Refused`, `Busy`, a lapse or a failed verification. Each holder runs the gate on its own replica, so a teammate who synced the row and its bytes before camp serves them while the author is out of range. Rejected: the author alone, under which a row synced from the server has nobody to ask in camp.
+4. **Every piece is verified against the file id by BLAKE3 verified streaming.** `FileId` is the plain BLAKE3 of the file, the root of BLAKE3's own hash tree, so [`bao-tree`](https://github.com/n0-computer/bao-tree) streams any byte range of `F` with the sibling hashes that prove it, with no format change, the upgrade chapter 18 names. [BitTorrent v2](https://www.bittorrent.org/beps/bep_0052.html) checks each 16 KiB block against a file's Merkle root the same way, and [iroh-blobs](https://www.iroh.computer/blog/blake3-hazmat-api) streams BLAKE3 content with this crate. Chunk groups are 16 KiB, so the outboard, the tree's parent hashes, costs 64 bytes per 16 KiB, about 0.4% of the file. A device keeps each file's outboard as an encrypted object in its chunk store, named by `_connetto_content_outboard (file_id BLOB PRIMARY KEY, hash BLOB NOT NULL)`, computed in the native staging and fetching pass that already hashes the file for its identity, and on first serve for a file staged in a browser or before this phase. An outboard leaves with its manifest in the same transaction, and the orphan sweep keeps every outboard the table names. A receiver checks every piece against `F` as it arrives and each completed chunk against the hash its manifest row names, so a forged piece fails within 16 KiB and a lying manifest at its first chunk, and it keeps the outboard its decoding builds, so it can serve the file in turn. Rejected: chunk hashes with the identity checked at commit, under which a lying holder costs up to the whole file's transfer and ranged reads stay unverifiable.
+5. **The receiver keeps the holder's chunk boundaries and re-encrypts each chunk under its own key.** A verified chunk is written under its own hash through the receiver's `EncryptingStore` of the generic class, with the receiver's root key, a fresh nonce and the chunk hash as associated data, holding one chunk in memory, and a resumed fetch skips every chunk the store already holds. The manifest rows and the outboard row commit in one transaction once every chunk is in, with no outbox row, which is what makes content cache, never exported and evictable (chapter 18). Rejected: re-chunking the whole file as `fetch_one` does, which holds the file in memory and cannot resume.
+6. **Peer-fetched content is spared while a provisional row names it** (the rule in step 2). `tidy_content` keeps a manifest while it is unsent, pinned, or named by a declared column of a row whose `_connetto_provisional` record is still provisional. Adjudication or a server write on the row makes the file ordinary cache, which the next pass removes and the server serves once its author has uploaded it, so a receiver online before that upload shows `Unavailable` until it lands. A file fetched for a row that was never provisional, from a teammate's synced copy, is ordinary cache from the moment it lands. A provisional delete names no file, since its row is gone. Rejected: sparing an adjudicated row's file until a read ticket succeeds, which needs the `content_state` column declared and a ticket round trip per kept file.
+7. **A retraction runs the content retention pass.** The content client runs its retention pass on every `ClientEvent::ProvisionalRetracted` and once when its driver starts, since the event broadcast can drop events, so the bytes of a write the server or its author refused leave the receiver at once. The pass is the whole retention pass, so it also removes ordinary cache, which a linked holder can serve again. Rejected: waiting for the next upload or a manual tidy, which keeps a refused write's bytes readable on disk until then.
+8. **Thumbnails are prefetched through a flag on the declaration.** `with_peer_content("photos", "thumb_id").prefetch()` marks a thumbnail column. A receiver fetches each prefetch-column file of an author's provisional rows that it lacks from that author, when a peer apply raises `ProvisionalApplied` and when the author's link comes up, the second reading the records since the broadcast can drop events. A prefetch is dropped when its manifest totals more than 1 MiB, so a misdeclared column never pulls a video unasked, and the file stays fetchable on demand. An on-demand fetch to a peer goes before every prefetch queued for it. The application generates a thumbnail and stages it as an ordinary file (chapter 18). Rejected: pins fetching from peers, which keeps every thumbnail until unpinned and gives pins a second source. Rejected: no prefetch, under which the first view of every photo waits a round trip.
+9. **The demo deployment's `photos` gains `thumb_id`.** `schema.sql` adds `thumb_id BYTEA`, `content.sql`'s `connetto_visible_files` admits a file either column names, and R80's demos inherit the column. The Done when's proof is a Docker-gated test in `connetto-test-harness` with two native clients in one process on the loopback peer link, as R77 slice 6d's is. Rejected: a fixture table in the test alone, which leaves R80 to add the column.
+10. **The peer fetch is a stage of `resolve` after the local answer** (amending R67 decision 8). `resolve` answers locally for any manifest whose chunks are all held, whether unsent, pinned or cached. Online it then asks the server for a signed URL and turns to a linked holder when the server refuses the ticket, which is the case of a provisional row whose author has not uploaded yet. Offline it turns to a linked holder directly. The fetched chunks land in the store and `ChunkStoreSource` answers from them, so the `LocalContentSource` list keeps local sources alone. R67 decision 8 expected the peer to register in that list, but the list is asked only for a held manifest, and its `bytes` takes a `Manifest` a receiver does not have. Rejected: a `LocalContentSource` taking a `FileId`, whose bytes would come back uncached and need a second store write path for the spare clause.
+
+### Decision, settled on evidence
+
+11. **The pull lives in `connetto-file-client` behind a `peer` feature, over a media port `connetto-client` opens.** `connetto-peer` cannot host it, since `connetto-file-client` depends on `connetto-client`, which depends on `connetto-peer` under its own `peer` feature. The messages and a sans-IO machine per peer, with the request ids, the one outstanding request each way, the 30 s bound and the candidate order, live in `connetto-exchange::media` beside the exchange's machine (R77 decision 21). The outboard and the verified range codec live in `connetto-file-core`, which every platform tests under wasm, and the frame and its queue in `connetto-peer`. `connetto-client` gives the file client a port that lists the linked peers with their certificates' accounts and bot lists, sends and receives media messages, runs the gate statement under the requester's binding, and reads the values of a declared column on provisional rows with their authors. The enrolment task, which already receives the link's events, forwards `PeerEvent::Media` to that port.
+
+### Design
+
+```rust
+// connetto-exchange::media::Media, carried as PeerFrame::Media on its own queue
+Want { request_id: u64, file_id: [u8; 32] }
+Manifest { request_id: u64, chunks: Vec<([u8; 32], u64)>, last: bool }
+Fetch { request_id: u64, file_id: [u8; 32], start: u64, len: u64 }
+Piece { request_id: u64, encoded: Vec<u8>, last: bool }
+Refused { request_id: u64 }
+Busy { request_id: u64 }
+```
+
+```sql
+CREATE TABLE _connetto_content_outboard (file_id BLOB PRIMARY KEY, hash BLOB NOT NULL);
+```
+
+`Fetch` asks for at most 16 MiB, the largest chunk. `Piece.encoded` is the bao encoding of the next part of the range, at most 1 MiB of file bytes with the parent hashes that prove it, whole 16 KiB groups, so a chunk boundary inside a group costs the edge bytes of that group, verified and discarded.
+
+### Every event in every situation
+
+For one peer as the receiver sees it: **Q0** not linked, **Q1** linked with no media request outstanding, **Q2** a `Want` outstanding, **Q3** a `Fetch` outstanding. As the holder sees it: **H0** not linked, **H1** linked and serving this peer nothing, **H2** serving this peer. A fetch moves to the next candidate (decision 3) wherever a row says so, and when no candidate is left, an on-demand fetch answers `Unavailable` and a prefetch is dropped until the next trigger.
+
+| Event | Q0 | Q1 | Q2 | Q3 | H0 | H1 | H2 |
+|---|---|---|---|---|---|---|---|
+| Link up | enter Q1, queue the prefetches of this author's provisional rows, resume fetches waiting for a candidate | n/a | n/a | n/a | enter H1 | n/a | n/a |
+| Link lost | nothing | enter Q0 | abort, next candidate, enter Q0 | abort, the chunk's verified pieces dropped, earlier chunks kept, next candidate, enter Q0 | nothing | enter H0 | stop serving, enter H0 |
+| `resolve` with every chunk of a manifest held | answer locally, no frame | same | same | same | n/a | n/a | n/a |
+| `resolve` with no local bytes, offline or with the ticket refused | next candidate | send `Want`, enter Q2 | queue it ahead of every prefetch | same | n/a | n/a | n/a |
+| Prefetch due, `ProvisionalApplied` naming a prefetch-column file this device lacks | nothing, link up queues it | send `Want`, enter Q2 | queue it behind every on-demand fetch | same | n/a | n/a | n/a |
+| `Manifest`, not last | n/a | ignore it | keep the rows, wait for the next frame | ignore it | n/a | n/a | n/a |
+| `Manifest`, last | n/a | ignore it | a prefetch above 1 MiB is dropped, else `Fetch` the first chunk not held (Q3), or commit when every chunk is held (Q1) | ignore it | n/a | n/a | n/a |
+| `Manifest` above 8192 rows, or rows after the last | n/a | n/a | abort, next candidate | n/a | n/a | n/a | n/a |
+| `Piece` verifies against `F` | n/a | ignore it | ignore it | keep it, and at the last piece check the chunk against its manifest hash, write it, then `Fetch` the next chunk not held, or commit the manifest and outboard rows in one transaction, raise `ContentEvent::Fetched` and enter Q1 | n/a | n/a | n/a |
+| `Piece` fails verification, or a chunk disagrees with its manifest hash | n/a | n/a | n/a | abort, drop the chunk's pieces and this holder's manifest, next candidate from `Want` | n/a | n/a | n/a |
+| `Refused` | n/a | ignore it | next candidate | next candidate | n/a | n/a | n/a |
+| `Busy` | n/a | ignore it | next candidate, and once every candidate answered `Busy`, the first again after 5 s doubling to 5 min (R77 decision 22), an on-demand fetch answering `Unavailable` 30 s after it began or after its last verified piece | same | n/a | n/a | n/a |
+| A reply quoting another request id | n/a | ignore it | ignore it | ignore it | n/a | n/a | n/a |
+| 30 s without the next frame | n/a | n/a | abort, next candidate, enter Q1 | same | n/a | n/a | n/a |
+| A chunk write or the commit fails | n/a | n/a | n/a | abort, the fetch fails with the store's or the replica's error, written chunks left to the orphan sweep, enter Q1 | n/a | n/a | n/a |
+| `Want` received | n/a | n/a | n/a | n/a | n/a | gate and manifest held, stream `Manifest` frames and enter H2, else `Refused` | `Busy` |
+| `Fetch` received | n/a | n/a | n/a | n/a | n/a | gate again, range within the file and its chunks held, outboard computed when absent, stream `Piece` frames and enter H2, else `Refused`, and `Busy` while two other peers are served | `Busy` |
+| Own stream ends | n/a | n/a | n/a | n/a | n/a | n/a | enter H1 |
+| Own file evicted or a chunk unreadable mid-stream | n/a | n/a | n/a | n/a | n/a | n/a | stop, `Refused`, enter H1 |
+| Peer certificate renewed | nothing | nothing | nothing | nothing | n/a | the next gate binds the renewed bot list | same |
+| Peer revoked or expired, link closes | as link lost | as link lost | as link lost | as link lost | as link lost | as link lost | as link lost |
+| R31 rebuild at a newer major | n/a | links close first, as link lost | same | same | n/a | same | same |
+| Data wipe or destructive logout | n/a | links close first, the store goes with the replica | same | same | n/a | same | same |
+
+A held peer-fetched manifest is **K1** spared, a declared column of a provisional row naming it, **K2** ordinary cache, or **K3** kept by another clause, unsent or pinned.
+
+| Event | K1 | K2 | K3 |
+|---|---|---|---|
+| Peer fetch commits | enters K1 when a provisional row names it | else enters K2 | n/a |
+| Retention pass, after an upload, on `tidy_content`, on `ProvisionalRetracted` or at driver start | kept | manifest and outboard rows deleted, then their unreferenced chunks swept | kept |
+| `ProvisionalRetracted` for the naming row | the pass runs, the file moves to K2 and goes unless another row names it | the pass runs | the pass runs |
+| Frontier, verdict or server write adjudicates the row | moves to K2, the next pass removes it | nothing | nothing |
+| A pin covers it | moves to K3 | moves to K3 | nothing |
+| Its pin goes | n/a | n/a | back to K1 or K2 |
+| Export | not carried | not carried | unsent carried with its chunks, pinned not |
+| Truncate of the naming table or R31's rebuild dropping the records | moves to K2 | nothing | nothing |
+
+### Slices
+
+One pull request each, in this order, each green and useful on its own.
+
+1. **Outboards** (decision 4). `connetto-file-core` gains the outboard and the verified range codec over a `ChunkStore` and a manifest, and `connetto-file-client` the `_connetto_content_outboard` table, the outboard written in the native staging and fetching pass and computed on demand, and its eviction and sweep with its manifest. Proven in process, every range of a held file decoding against its id and a forged byte refused.
+2. **The media frames** (decisions 1 and 11). `connetto-exchange::media` with the messages, their bounds and the per-peer machine tested row by row without sockets, and `connetto-peer` at protocol version 3 with `PeerFrame::Media`, its own queue, `Node::send_media` and `PeerEvent::Media`, proven between two nodes on loopback.
+3. **The media port and the gate** (decisions 2 and 11). `connetto-client`'s port, the enrolment task forwarding media events to it, the gate statement under the requester's binding, and the provisional values of a declared column with their authors, proven in process for a permitted requester, a refused one, a certificate with no bot list and a build with no caller mapping.
+4. **The holder** (decisions 1, 2 and 4). `connetto-file-client`'s `peer` feature, the declarations, and the serving of `Want` and `Fetch` with `Refused` and `Busy`, proven between a client and a bare peer node on loopback.
+5. **The receiver** (decisions 3, 5 and 10). The fetch stage of `resolve`, the candidate order, verification, storage and the commit, proven between two clients on loopback, a forged piece and a lying manifest refused and a fetch resumed after a lost link.
+6. **The retention** (decisions 6 and 7). The spare clause in `tidy_content` and the retention pass on `ProvisionalRetracted` and at driver start, proven in process for a provisional, an adjudicated and a retracted row's file.
+7. **Thumbnails** (decisions 8 and 9). The prefetch flag, its 1 MiB bound and its order behind on-demand fetches, and the demo deployment's `thumb_id`, proven between two clients on loopback.
+8. **The harness proof** (decision 9). The Docker-gated test of the Done when's first three clauses, and chapters 18 and 19 brought to what is built.
 
 ### Done when
 
-A photo authored offline on one device displays on a peer in camp (thumbnail immediately, full image on tap), a policy-refused requester gets nothing, a retraction sweeps the cached chunks, and replicated content survives the author device's loss end to end with R78, proven in the harness.
+A photo authored offline on one device displays on a peer in camp (thumbnail immediately, full image on tap), a policy-refused requester gets nothing, a retraction sweeps the cached chunks, proven in the harness. With step 4, replicated content survives the author device's loss end to end with R78.
+
+---
 
 ---
 
