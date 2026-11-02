@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
+  # The architecture chapters as rustdoc, so the docs build checks every symbol they cite.
+  "crates/connetto-architecture",
   "crates/connetto-core",
   "crates/connetto-schema",
   "crates/connetto-server",

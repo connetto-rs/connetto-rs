@@ -2938,7 +2938,7 @@ where
 /// connection the attach owns nor the replica.
 ///
 /// The tab's own announce gives up after fifteen seconds, so holding it for the length of
-/// a reconnect fails a healthy tab. Everything else follows chapter 18's attach column.
+/// a reconnect fails a healthy tab. Everything else follows the attach column of chapter 09's worker hub table.
 fn attach_during_recovery(
     state: &mut HubState,
     deferred: &mut VecDeque<HubEvent>,
@@ -3007,7 +3007,7 @@ where
     .await
 }
 
-/// Queues `event` unless it is served where it arrives, which chapter 18's table decides
+/// Queues `event` unless it is served where it arrives, which chapter 09's worker hub table decides
 /// per situation through `served`.
 ///
 /// One order rule covers every served cell: anything older already queued keeps its place,
@@ -6091,7 +6091,7 @@ mod tests {
         );
     }
 
-    /// Chapter 18's attach column: a departure or a kill unsubscribes through the
+    /// Chapter 09's worker hub table, attach column: a departure or a kill unsubscribes through the
     /// connection the attach owns, so it keeps its place instead of interrupting.
     #[wasm_bindgen_test]
     fn a_departure_does_not_interrupt_an_attach() {

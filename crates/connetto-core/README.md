@@ -5,7 +5,7 @@
 [![docs.rs](https://docs.rs/connetto-core/badge.svg)](https://docs.rs/connetto-core)
 [![crates.io](https://img.shields.io/crates/v/connetto-core.svg)](https://crates.io/crates/connetto-core)
 
-Shared wire types, framing and I/O traits for the server, native client and browser client. `ControlMessage` carries uncompressed `MessagePack` metadata, while `BulkMessage` carries patchsets and schema payloads whose content is already compressed. The `codec` module adds a `u32` length prefix for byte-stream transports.
+Shared wire types, framing and I/O traits for the server, native client and browser client. `ControlMessage` carries uncompressed `MessagePack` metadata, while `BulkMessage` carries the `SnapshotPatch`, `LivePatch` and `MutationPatch` payloads whose content is already compressed. The `codec` module adds a `u32` length prefix for byte-stream transports.
 
 ```rust
 use connetto_core::codec::{decode_control_framed, encode_control_framed};

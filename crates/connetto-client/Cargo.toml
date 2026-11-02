@@ -1,6 +1,6 @@
 [package]
 name = "connetto-client"
-description = "Native local-first sync client for connetto-rs: transparent SQLite-session mutation capture and server patch apply."
+description = "Native local-first sync client for connetto-rs: outbox-trigger mutation capture and server patch apply."
 categories = ["database", "asynchronous"]
 keywords = ["sync", "cdc", "sqlite", "offline", "websocket"]
 version.workspace = true

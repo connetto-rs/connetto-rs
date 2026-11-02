@@ -1,7 +1,6 @@
 //! Relay-parity test harness.
 //!
-//! The relay-parity plan (`docs/plan-relay-parity.md`) makes the browser
-//! relay hub protocol-transparent against the direct server: a tab client
+//! The browser relay hub is protocol-transparent against the direct server: a tab client
 //! behind the `RelayHub` must observe the same handshake, snapshots, live
 //! patches, events, and values as a client on a direct socket to
 //! `connetto-server`. This harness is the reusable way to assert that. It
