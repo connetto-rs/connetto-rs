@@ -14,7 +14,10 @@ use connetto_server::{
     pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, committed_at};
+use diesel::prelude::{ExpressionMethods, QueryDsl};
+use diesel::{delete, sql_query};
 use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use subql::{CdcSource, PgChangeEvent, PgCommit, PgSqliteEmuSource, SourceItem};
@@ -627,4 +630,187 @@ async fn a_transient_read_pause_folds_the_held_event_once() {
     assert_eq!(counts, [Some("1".to_owned())]);
     assert_quiet(&mut counter).await;
     ingest.abort();
+}
+const CODELESS_DDL: &str = "CREATE TABLE mins (id INT PRIMARY KEY, n DOUBLE PRECISION); \
+                            CREATE TABLE counts (id INT PRIMARY KEY, n INT)";
+
+diesel::table! {
+    mins (id) {
+        id -> Integer,
+        n -> Nullable<Double>,
+    }
+}
+
+diesel::table! {
+    pg_stat_user_tables (relname) {
+        relname -> Text,
+        seq_scan -> BigInt,
+        idx_scan -> BigInt,
+    }
+}
+
+/// The scans Postgres has recorded against one table, read on the connection that made them after a forced stats flush.
+async fn table_scans(pool: &Pool<AsyncPgConnection>, table: &str) -> i64 {
+    let mut conn = pool.get().await.expect("the read connection");
+    // A stats function the diesel DSL cannot name, so raw SQL is the only form.
+    sql_query("SELECT pg_stat_force_next_flush()")
+        .execute(&mut conn)
+        .await
+        .expect("force the stats flush");
+    let scans: (i64, i64) = pg_stat_user_tables::table
+        .select((pg_stat_user_tables::seq_scan, pg_stat_user_tables::idx_scan))
+        .filter(pg_stat_user_tables::relname.eq(table))
+        .get_result(&mut conn)
+        .await
+        .expect("the table's scan count");
+    scans.0 + scans.1
+}
+
+/// A codeless deserialization failure costs exactly one re-read and then
+/// refuses the subscription alone (R89 decision 1, R106 decision 2).
+#[expect(
+    clippy::too_many_lines,
+    reason = "The trigger, the retry, the refusal and the sibling's flow form one scenario."
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_codeless_computed_read_retries_once_then_refuses_alone() {
+    let fixture = Fixture::acquire().await;
+    fixture
+        .exec("DROP TABLE IF EXISTS mins, counts CASCADE")
+        .await;
+    fixture.exec(CODELESS_DDL).await;
+    fixture
+        .exec(
+            "INSERT INTO mins (id, n) VALUES (1, 1.0), (10, 10.0); \
+               INSERT INTO counts (id, n) VALUES (1, 1), (10, 10)",
+        )
+        .await;
+
+    // One connection serves the seeds, the mirror delete and the re-reads, so one backend's stats count the reads this test measures.
+    let reads = Pool::builder()
+        .max_size(1)
+        .min_idle(1)
+        .build(AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            fixture.admin_url().to_owned(),
+        ))
+        .await
+        .expect("build the read pool");
+
+    let manager = full_manager(
+        reads.clone(),
+        CODELESS_DDL,
+        CODELESS_DDL,
+        RosterAuth::granting("reader"),
+        guard(Duration::from_secs(30), Duration::from_secs(30)),
+        fixture.admin().clone(),
+        fixture.admin().clone(),
+    );
+
+    let mut smallest = seeded(&manager, "smallest", "SELECT MIN(n) FROM mins", "1.0").await;
+    let mut counter = seeded(&manager, "counter", "SELECT COUNT(*) FROM counts", "2").await;
+
+    // n is now real, so the double decode of the re-executed MIN projection fails without a SQLSTATE and is classified Other.
+    {
+        let mut conn = reads.get().await.expect("the read connection");
+        // The column narrowing is DDL the diesel DSL cannot express, so raw SQL is the only form.
+        sql_query("ALTER TABLE mins ALTER COLUMN n TYPE real USING n::real")
+            .execute(&mut conn)
+            .await
+            .expect("narrow the column");
+        delete(mins::table.filter(mins::id.eq(1)))
+            .execute(&mut conn)
+            .await
+            .expect("mirror the delete");
+    }
+    let base = table_scans(&reads, "mins").await;
+
+    let mut source = PgSqliteEmuSource::open_in_memory(CODELESS_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO mins (id, n) VALUES (1, 1.0)")
+        .expect("seed emu");
+    source
+        .next_item()
+        .await
+        .expect("drain emu")
+        .expect("insert event");
+    source
+        .execute_sql("DELETE FROM mins WHERE id = 1")
+        .expect("stage delete");
+    let mut delete = None;
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        if let SourceItem::Event(event) = item {
+            delete = Some(event);
+        }
+    }
+    let delete = committed_at(
+        delete.expect("the delete event"),
+        fixture.commit_now().await,
+    );
+
+    let ingest = WatchedIngest::spawn(&manager, OneEvent(Some(delete)));
+
+    // Nothing pauses or updates the poisoned subscription before its one retry is spent, so the refusal is its first and only frame.
+    let refused = tokio::time::timeout(Duration::from_secs(15), smallest.next_control())
+        .await
+        .expect("the refusal within 15 s");
+    let ControlMessage::NonFatalError(refusal) = refused else {
+        panic!("expected the codeless subscription's refusal");
+    };
+    assert_eq!(refusal.related_to.as_deref(), Some("smallest"));
+    assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
+    assert_quiet(&mut smallest).await;
+
+    // The ingest loop spent the retry in place, so it ends the event without reconnecting the stream or giving up.
+    ingest.task.await.expect("the ingest loop ends normally");
+    assert!(
+        !ingest.read_retrying.load(Ordering::Relaxed),
+        "a codeless read fails in place, it does not pause delivery"
+    );
+    assert!(
+        !ingest.stream_retry.load(Ordering::Relaxed),
+        "the change stream must not be reconnected"
+    );
+    assert!(
+        !ingest.gave_up.load(Ordering::Relaxed),
+        "the ingest loop must not give up"
+    );
+
+    // R89's rule costs the poisoned query one extra read, so the table sees the first read and its retry and nothing else.
+    assert_eq!(
+        table_scans(&reads, "mins").await - base,
+        2,
+        "the poisoned query's re-reads cost its one retry and nothing more"
+    );
+
+    // The stream flows on, so a second delete still reaches the sibling.
+    fixture.exec("DELETE FROM counts WHERE id = 10").await;
+    let mut second = PgSqliteEmuSource::open_in_memory(CODELESS_DDL).expect("open emu source");
+    second
+        .execute_sql("INSERT INTO counts (id, n) VALUES (10, 10)")
+        .expect("seed emu");
+    second
+        .next_item()
+        .await
+        .expect("drain emu")
+        .expect("insert event");
+    second
+        .execute_sql("DELETE FROM counts WHERE id = 10")
+        .expect("stage delete");
+    let mut second_delete = None;
+    while let Some(item) = second.next_item().await.expect("poll source") {
+        if let SourceItem::Event(event) = item {
+            second_delete = Some(event);
+        }
+    }
+    let second_delete = committed_at(
+        second_delete.expect("the second delete event"),
+        fixture.commit_now().await,
+    );
+    manager
+        .dispatch_event(&second_delete)
+        .await
+        .unwrap_or_else(|err| panic!("dispatch failed: {err:?}"));
+    assert_eq!(next_value(&mut counter).await.as_deref(), Some("1"));
+    assert_quiet(&mut counter).await;
+    assert_quiet(&mut smallest).await;
 }
