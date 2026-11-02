@@ -256,7 +256,7 @@ fn build_two(ran: &Arc<AtomicUsize>) -> SyncSchema {
 /// The held credential for a device, the grant the test grant checker
 /// resolves.
 #[must_use]
-fn credential(device: &str) -> HeldCredential {
+pub(super) fn credential(device: &str) -> HeldCredential {
     super::support::held_grant(Grant::new(format!("user:token#{device}")), "token")
 }
 
@@ -287,7 +287,7 @@ async fn open_offline(
 /// The reconnect policy the test pumps drive, with a short backoff so a
 /// broken dial surfaces inside the test bounds.
 #[must_use]
-fn test_policy() -> ReconnectPolicy {
+pub(super) fn test_policy() -> ReconnectPolicy {
     ReconnectPolicy::new()
         .with_initial_backoff(Duration::from_millis(1))
         .with_max_backoff(Duration::from_millis(20))
@@ -295,7 +295,7 @@ fn test_policy() -> ReconnectPolicy {
 
 /// Connect the build at `dir` through the router with the live pump, the
 /// path a deployed app takes.
-async fn connect_pumped(
+pub(super) async fn connect_pumped(
     router: &Router,
     schema: SyncSchema,
     device: &str,
