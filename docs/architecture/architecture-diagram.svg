@@ -128,7 +128,7 @@
       <text x="230" y="118" text-anchor="middle" font-size="8.5" fill="#555">seam: ChunkInventory, for the stores that can list what they hold</text>
       <text x="230" y="134" text-anchor="middle" font-size="8.5" fill="#555">a manifest is the ordered (hash, length) list, transport metadata only</text>
       <text x="230" y="150" text-anchor="middle" font-size="8.5" fill="#555">the same bytes chunk and hash identically on native and wasm</text>
-      <text x="230" y="164" text-anchor="middle" font-size="8.5" fill="#4CAF50">the file core, R64</text>
+      <text x="230" y="164" text-anchor="middle" font-size="8.5" fill="#4CAF50">the file core, R64. <tspan fill="#C62828">R79: BLAKE3 outboards, verified range streaming</tspan></text>
     </g>
 
     <!-- ===== sql-traits ===== -->
@@ -478,21 +478,22 @@
 
     <!-- connetto-file-client (native) -->
     <g transform="translate(995, 834)">
-      <rect width="300" height="110" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
-      <rect width="4" height="110" rx="1" fill="#4CAF50" />
+      <rect width="300" height="118" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="118" rx="1" fill="#4CAF50" />
       <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">connetto-file-client</text>
-      <text x="150" y="34" text-anchor="middle" font-size="8.5" fill="#4CAF50">in this repo: store, outbox, resolver and pins (R67)</text>
-      <text x="150" y="49" text-anchor="middle" font-size="8.5" fill="#555">manifests, outbox and pins in the replica, committed with the row</text>
-      <text x="150" y="63" text-anchor="middle" font-size="8.5" fill="#555">encrypted store on std::fs, bytes over HTTP under one ticket</text>
-      <text x="150" y="77" text-anchor="middle" font-size="8.5" fill="#555">outbox walk with a boot pass, a server refusal stays queued</text>
-      <text x="150" y="91" text-anchor="middle" font-size="8.5" fill="#555">resolver: a signed URL by default, local bytes when unsent or pinned</text>
-      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: the demos drive the content surface end to end, R69</text>
+      <text x="150" y="33" text-anchor="middle" font-size="8.5" fill="#4CAF50">in this repo: store, outbox, resolver and pins (R67)</text>
+      <text x="150" y="46" text-anchor="middle" font-size="8.5" fill="#555">manifests, outbox and pins in the replica, committed with the row</text>
+      <text x="150" y="59" text-anchor="middle" font-size="8.5" fill="#555">encrypted store on std::fs, bytes over HTTP under one ticket</text>
+      <text x="150" y="72" text-anchor="middle" font-size="8.5" fill="#555">outbox walk with a boot pass, a server refusal stays queued</text>
+      <text x="150" y="85" text-anchor="middle" font-size="8.5" fill="#555">resolver: a signed URL by default, local bytes when unsent or pinned</text>
+      <text x="150" y="98" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: the demos drive the content surface end to end, R69</text>
+      <text x="150" y="111" text-anchor="middle" font-size="8.5" fill="#C62828">R79: peer fetch, holder gate, the provisional spare</text>
     </g>
 
     <!-- Device-to-device sync (R74 to R80) -->
     <g transform="translate(1325, 834)">
-      <rect width="300" height="110" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
-      <rect width="4" height="110" rx="1" fill="#4CAF50" />
+      <rect width="300" height="118" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="118" rx="1" fill="#4CAF50" />
       <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Device-to-device sync</text>
       <text x="150" y="34" text-anchor="middle" font-size="8.5" fill="#4CAF50">R74: chip key, certificates, attestation under PEN 67105</text>
       <text x="150" y="49" text-anchor="middle" font-size="8.5" fill="#4CAF50">R76 slices 1 to 9c: the link, mDNS, hotspots, beacon</text>

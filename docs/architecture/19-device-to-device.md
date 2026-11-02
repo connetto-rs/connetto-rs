@@ -104,7 +104,7 @@ Peer-applied rows live in the ordinary replica tables so the application's own S
 
 ## Planned
 
-Courier recovery, a certified bearer relaying a lost device's signed work to the server, is planned in [R78](../../plans/master-implementation-plan.md#r78-courier-recovery). Media over the link, content fetched from a peer by chunk hash, is planned in [R79](../../plans/master-implementation-plan.md#r79-media-over-the-peer-link). Peer sync in every demo is planned in [R80](../../plans/master-implementation-plan.md#r80-peer-sync-in-every-demo).
+Courier recovery, a certified bearer relaying a lost device's signed work to the server, is planned in [R78](../../plans/master-implementation-plan.md#r78-courier-recovery). Media over the link, content pulled chunk by chunk from any linked device that holds it and verified against the file id as it arrives, is planned in [R79](../../plans/master-implementation-plan.md#r79-media-over-the-peer-link). Peer sync in every demo is planned in [R80](../../plans/master-implementation-plan.md#r80-peer-sync-in-every-demo).
 
 ## The archive
 
