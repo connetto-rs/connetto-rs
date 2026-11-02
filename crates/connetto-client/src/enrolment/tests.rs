@@ -2818,6 +2818,144 @@ async fn a_linked_peer_gets_the_signed_offer_and_a_fresh_one_on_change() {
     run.await.expect("the run ends");
 }
 
+/// The next media message a far node receives, bounded.
+#[cfg(feature = "peer")]
+async fn media_received(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<connetto_peer::PeerEvent>,
+) -> connetto_exchange::media::Media {
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("a media message within the bound")
+            .expect("the far node lives");
+        if let connetto_peer::PeerEvent::Media { message, .. } = event {
+            return message;
+        }
+    }
+}
+
+/// The next event a media port hands over, bounded.
+#[cfg(feature = "peer")]
+async fn port_event(port: &mut crate::media::MediaPort) -> crate::media::MediaEvent {
+    tokio::time::timeout(Duration::from_secs(10), port.recv())
+        .await
+        .expect("an event within the bound")
+        .expect("the client lives")
+}
+
+/// R79 slice 3: with no media port taken, a linked peer's media request is
+/// refused at once rather than left to lapse.
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_media_request_with_no_port_is_refused_at_once() {
+    use connetto_exchange::media::Media;
+
+    let (key, der) = attesting_key();
+    let now = whole_second();
+    let authority = authority(now).await;
+    let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
+    let (far, mut far_events) = far_peer(&authority, positive_serial(9));
+    let (run, _state, handle, end_tx) =
+        offering_device(authority, Arc::new(RunKeys { der }), held, None).await;
+
+    let device = far
+        .link(handle.peer_address().expect("the listener"))
+        .await
+        .expect("the link completes");
+    far.send_media(
+        &device,
+        Media::Want {
+            request_id: 4,
+            file_id: [1; 32],
+        },
+    )
+    .await
+    .expect("the request queues");
+    assert_eq!(
+        media_received(&mut far_events).await,
+        Media::Refused { request_id: 4 }
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// R79 slice 3: one live port at a time takes the links, the unlinks and the
+/// media frames, and answers through the link, and a dropped port hands the
+/// requests back to the refusal.
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_media_port_takes_the_links_and_frames_and_answers_through_the_link() {
+    use crate::media::MediaEvent;
+    use connetto_exchange::media::Media;
+
+    let (key, der) = attesting_key();
+    let now = whole_second();
+    let authority = authority(now).await;
+    let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
+    let (far, mut far_events) = far_peer(&authority, positive_serial(9));
+    let (run, _state, handle, end_tx) =
+        offering_device(authority, Arc::new(RunKeys { der }), held, None).await;
+    let mut port = handle.media_port().expect("the first port");
+    assert!(handle.media_port().is_none(), "one port lives at a time");
+
+    let device = far
+        .link(handle.peer_address().expect("the listener"))
+        .await
+        .expect("the link completes");
+    let MediaEvent::Linked { peer, bot_list } = port_event(&mut port).await else {
+        panic!("the link comes first");
+    };
+    assert_eq!(bot_list.as_deref(), Some(connetto_core::BOT_LIST_WILDCARD));
+    assert_eq!(port.linked().len(), 1);
+
+    let want = Media::Want {
+        request_id: 4,
+        file_id: [1; 32],
+    };
+    far.send_media(&device, want.clone())
+        .await
+        .expect("the request queues");
+    assert_eq!(
+        port_event(&mut port).await,
+        MediaEvent::Message {
+            peer: peer.clone(),
+            message: want
+        }
+    );
+    port.send(&peer, Media::Busy { request_id: 4 })
+        .await
+        .expect("the answer queues");
+    assert_eq!(
+        media_received(&mut far_events).await,
+        Media::Busy { request_id: 4 }
+    );
+
+    drop(port);
+    far.send_media(
+        &device,
+        Media::Want {
+            request_id: 5,
+            file_id: [1; 32],
+        },
+    )
+    .await
+    .expect("the request queues");
+    assert_eq!(
+        media_received(&mut far_events).await,
+        Media::Refused { request_id: 5 }
+    );
+    let mut again = handle
+        .media_port()
+        .expect("a port again once the first is gone");
+
+    far.stop(connetto_peer::CloseReason::Closed);
+    assert_eq!(port_event(&mut again).await, MediaEvent::Unlinked { peer });
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
 /// R77 slice 6a: changes arriving while the offer's signature is in flight
 /// fold into one fresh signature, and the peer gets only the offer stating
 /// the replica as it stands.

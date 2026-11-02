@@ -81,6 +81,9 @@ mod outbox;
 
 mod outbox_push;
 #[cfg(feature = "peer")]
+mod peer_media;
+
+#[cfg(feature = "peer")]
 mod peer_apply;
 
 #[cfg(feature = "peer")]
