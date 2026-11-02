@@ -1569,7 +1569,7 @@ A browser that refuses OPFS but runs JSPI keeps the replica and its queued write
 
 # Cross-cutting checklist
 
-**Wire changes, and why they need no version coordination.** This is the normative bump doctrine, decided with the maintainer, and the phase sections defer to it. Change the wire freely and do not plan bumps around it. The workspace is at `version = "0.0.0"`, nothing is published, and no client exists that a server must remain compatible with, so a bump protects nothing and coordinating bumps across phases is pure ceremony. `PROTOCOL_VERSION` in `crates/connetto-core/src/version.rs` (currently 1) keeps earning its place because a mismatch stays detectable, and it gets one deliberate bump at the first release.
+**Wire changes.** A phase that breaks the wire bumps `PROTOCOL_VERSION` in the same pull request, by the rule [02-protocol.md](../docs/architecture/02-protocol.md#the-wire-version) states. Nothing is released, so a bump needs no coordination with older clients, and a mismatch stays detectable at the handshake.
 
 **Type-enforced guards, not documentation.** The value handed to `connect` carries a marker for what the run keeps at rest and owns the device-private database beside it, so a durable one paired with an unkeyed replica is not a program, proven by `compile_fail` doctests on `Replica`. `Principal` makes all four arrival cases representable and, being an optional identity beside a set of capabilities, has no fifth state.
 
