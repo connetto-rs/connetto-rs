@@ -1560,6 +1560,8 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                         PeerEvent::Exchange { peer, message } => {
                             run.peer_message(&peer, message).await;
                         }
+                        // No holder answers here, so a requester's bound lapses.
+                        PeerEvent::Media { .. } => {}
                     }
                 }
                 #[cfg(not(feature = "peer"))]

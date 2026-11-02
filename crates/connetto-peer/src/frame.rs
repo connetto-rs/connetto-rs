@@ -9,13 +9,14 @@ use serde_bytes::ByteBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use connetto_exchange::Message;
+use connetto_exchange::media::Media;
 
 use crate::error::CloseReason;
 
 /// The frame length ceiling, four megabytes.
 pub(crate) const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
 /// The frame version this crate speaks.
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
+pub(crate) const PROTOCOL_VERSION: u16 = 3;
 
 /// A peer-link frame with hotspot passphrases redacted from its `Debug` output.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +68,8 @@ pub enum PeerFrame {
     /// The exchange's message, one of its five, in the order an exchange
     /// runs (R77).
     Exchange(Message),
+    /// A media message, a chunk pull or its answer (R79).
+    Media(Media),
     /// A liveness probe.
     Ping,
     /// The answer to a liveness probe.
@@ -83,6 +86,7 @@ impl PeerFrame {
             PeerFrame::Certificate { .. } => "a Certificate",
             PeerFrame::Offer { .. } => "an Offer",
             PeerFrame::Exchange(message) => message.named(),
+            PeerFrame::Media(message) => message.named(),
             PeerFrame::Ping => "a Ping",
             PeerFrame::Pong => "a Pong",
         }
@@ -125,6 +129,7 @@ impl fmt::Debug for PeerFrame {
                 .field("port", port)
                 .finish(),
             PeerFrame::Exchange(message) => f.debug_tuple("Exchange").field(message).finish(),
+            PeerFrame::Media(message) => f.debug_tuple("Media").field(message).finish(),
             PeerFrame::Ping => f.debug_struct("Ping").finish(),
             PeerFrame::Pong => f.debug_struct("Pong").finish(),
         }
@@ -140,21 +145,22 @@ pub(crate) enum FrameError {
     /// The peer's frame exceeds the ceiling.
     #[error("the frame exceeds the ceiling")]
     TooLong,
-    /// A manifest carries more rows than the bound.
-    #[error("the manifest carries more rows than the bound")]
-    TooManyRows,
+    /// A message breaks the wire's bounds.
+    #[error("the message breaks the wire's bounds")]
+    AboveBounds,
     /// The frame is not a `PeerFrame`.
     #[error("the frame does not decode")]
     Malformed,
 }
 
-/// The wire's row bound, which only an exchange manifest can break, checked
-/// on both ends of the link.
+/// The wire's bounds on an exchange manifest and on media manifests, pieces
+/// and fetches, checked on both ends of the link.
 fn wire_bounds(frame: &PeerFrame) -> Result<(), FrameError> {
     match frame {
         PeerFrame::Exchange(message) => {
-            message.within_bounds().map_err(|_| FrameError::TooManyRows)
+            message.within_bounds().map_err(|_| FrameError::AboveBounds)
         }
+        PeerFrame::Media(message) => message.within_bounds().map_err(|_| FrameError::AboveBounds),
         _ => Ok(()),
     }
 }

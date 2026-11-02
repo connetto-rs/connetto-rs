@@ -32,6 +32,8 @@ mod exchange;
 pub mod linux;
 
 #[cfg(test)]
+mod media_proofs;
+#[cfg(test)]
 mod tests;
 
 #[cfg(all(test, feature = "discovery"))]

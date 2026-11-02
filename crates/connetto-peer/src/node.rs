@@ -12,7 +12,8 @@ use connetto_core::device_cert::{
     DeviceCertificate, DeviceIdentity, KeyId, RevocationList, certificate_key_id,
     certificate_serial, key_id,
 };
-use connetto_exchange::Message;
+use connetto_exchange::media::Media;
+use connetto_exchange::{BoundsError, Message};
 use parking_lot::{Mutex, RwLock};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{AlertDescription, ClientConfig, ServerConfig, version};
@@ -56,7 +57,16 @@ const MAX_INBOUND_HANDSHAKES: usize = 16;
 /// The exchange messages one link's queue holds, the backpressure a sender
 /// waits on while the link drains.
 pub(crate) const EXCHANGE_QUEUE: usize = 8;
+/// The media messages one link's own queue holds, apart from the exchange's
+/// so a chunk never waits ahead of an offer (R79 decision 1).
+pub(crate) const MEDIA_QUEUE: usize = 8;
 pub(crate) const DIAL_NAME: &str = "connetto-peer";
+
+/// The two bounded queues of one live link, the exchange's and the media's.
+pub(crate) struct LinkSenders {
+    pub(crate) exchange: mpsc::Sender<Message>,
+    pub(crate) media: mpsc::Sender<Media>,
+}
 
 /// The links' liveness bounds, the ping pace and the silence that takes a
 /// link down.
@@ -101,10 +111,9 @@ pub(crate) struct NodeState {
     /// The live links and the peers awaiting their keeper, under one lock so
     /// a close and a registration never race.
     pub(crate) links: Mutex<HashMap<KeyId, SlotState>>,
-    /// The exchange senders of the live links, by peer key and
-    /// registration order, so a send awaits the link's bounded queue
-    /// without the links lock.
-    pub(crate) exchange_senders: RwLock<HashMap<KeyId, (u64, mpsc::Sender<Message>)>>,
+    /// The queue senders of the live links, by peer key, so a send awaits
+    /// the link's bounded queue without the links lock.
+    pub(crate) senders: RwLock<HashMap<KeyId, LinkSenders>>,
     listener: RwLock<Option<ListenerSlot>>,
     /// Whether the node still serves, checked under the links lock.
     pub(crate) serving: AtomicBool,
@@ -302,7 +311,7 @@ impl Node {
             lists,
             crls,
             links: Mutex::new(HashMap::new()),
-            exchange_senders: RwLock::new(HashMap::new()),
+            senders: RwLock::new(HashMap::new()),
             listener: RwLock::new(None),
             serving: AtomicBool::new(false),
             dial_count: Mutex::new(0),
@@ -473,15 +482,44 @@ impl Node {
         peer: &DeviceIdentity,
         message: Message,
     ) -> Result<(), PeerSendError> {
-        match message.within_bounds() {
-            Ok(()) => {}
-            Err(_) => return Err(PeerSendError::FrameAboveBounds { message }),
+        let bounds = message.within_bounds();
+        self.queue(peer, message, bounds, |senders| &senders.exchange)
+            .await
+    }
+
+    /// Queue a media message on the link to `peer`, on the link's own media
+    /// queue, awaiting it as [`Node::send_exchange`] awaits the exchange's
+    /// (R79).
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::send_exchange`].
+    pub async fn send_media(
+        &self,
+        peer: &DeviceIdentity,
+        message: Media,
+    ) -> Result<(), PeerSendError<Media>> {
+        let bounds = message.within_bounds();
+        self.queue(peer, message, bounds, |senders| &senders.media)
+            .await
+    }
+
+    /// Queue `message` on the queue `pick` names of `peer`'s link, refused
+    /// before queueing when `bounds` failed.
+    async fn queue<M>(
+        &self,
+        peer: &DeviceIdentity,
+        message: M,
+        bounds: Result<(), BoundsError>,
+        pick: impl FnOnce(&LinkSenders) -> &mpsc::Sender<M>,
+    ) -> Result<(), PeerSendError<M>> {
+        if bounds.is_err() {
+            return Err(PeerSendError::FrameAboveBounds { message });
         }
-        let key = peer.key();
         let sender = {
-            let senders = self.state.exchange_senders.read();
-            match senders.get(&key) {
-                Some((_, sender)) => sender.clone(),
+            let senders = self.state.senders.read();
+            match senders.get(&peer.key()) {
+                Some(link) => pick(link).clone(),
                 None => return Err(PeerSendError::Unlinked { message }),
             }
         };
@@ -897,7 +935,7 @@ pub(crate) fn classify_io(err: io::Error) -> Failure {
 pub(crate) fn classify_frame(err: FrameError) -> Failure {
     match err {
         FrameError::Io(io_err) => classify_io(io_err),
-        FrameError::TooLong | FrameError::TooManyRows | FrameError::Malformed => {
+        FrameError::TooLong | FrameError::AboveBounds | FrameError::Malformed => {
             Failure::Protocol(err.to_string())
         }
     }
@@ -1180,6 +1218,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     };
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (exchange_tx, exchange_rx) = mpsc::channel(EXCHANGE_QUEUE);
+    let (media_tx, media_rx) = mpsc::channel(MEDIA_QUEUE);
     // The keep decision, the serving check and the insert, atomic under the
     // one links lock so a stop and a duplicate close cannot race a
     // registration.
@@ -1233,10 +1272,13 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             };
             catch_up_renewal(state, &slot, &presented);
             links.insert(peer_key, SlotState::Live(slot));
-            state
-                .exchange_senders
-                .write()
-                .insert(peer_key, (seq, exchange_tx));
+            state.senders.write().insert(
+                peer_key,
+                LinkSenders {
+                    exchange: exchange_tx,
+                    media: media_tx,
+                },
+            );
             #[cfg(feature = "discovery")]
             state.peer_fingerprints.lock().insert(peer_key, fingerprint);
             if fresh && let Some(SlotState::Live(slot)) = links.get(&peer_key) {
@@ -1257,7 +1299,10 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             Arc::clone(state),
             tls,
             cmd_rx,
-            exchange_rx,
+            crate::link::Queues {
+                exchange: exchange_rx,
+                media: media_rx,
+            },
             peer_key,
             seq,
         ));

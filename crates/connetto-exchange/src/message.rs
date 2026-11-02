@@ -114,6 +114,13 @@ pub enum BoundsError {
     /// A manifest carries more than [`MAX_MANIFEST_ROWS`] rows.
     #[error("the manifest carries more rows than the bound")]
     TooManyRows,
+    /// A media piece carries more than [`crate::media::MAX_PIECE_BYTES`].
+    #[error("the media piece carries more bytes than the bound")]
+    PieceTooLong,
+    /// A media fetch asks for no bytes, more than
+    /// [`crate::media::MAX_FETCH_LEN`], or a range past the largest offset.
+    #[error("the media fetch asks for a range outside the bound")]
+    RangeOutOfBounds,
 }
 
 /// The manifest messages of one range, `rows` cut into runs of at most
