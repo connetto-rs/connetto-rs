@@ -13,302 +13,21 @@ use parking_lot::Mutex;
 
 use crate::frame::{PeerFrame, read_frame, write_frame};
 use crate::node::{EXCHANGE_QUEUE, SlotState, client_config_for};
+use crate::test_support::{DAY, Deployment, Issuer, Peer, events, node, serve, whole_second};
 use crate::{
-    CloseReason, Identity, LinkError, Liveness, Node, PeerEvent, PeerSendError, Refusal,
-    SocketPrep, SystemClock, Trust,
+    CloseReason, LinkError, Liveness, Node, PeerEvent, PeerSendError, Refusal, SocketPrep,
+    SystemClock, Trust,
 };
-use connetto_core::device_cert::{
-    AttestationLevel, CertificateRequest, CertificateSerial, CertificateSigner, DeploymentId,
-    DeviceCertificate, DeviceIdentity, DeviceIssuer, DeviceKey, DeviceKeyError, KeyHome, Revoked,
-    RootCa, certificate_key_id, key_id, public_key_info,
-};
+use connetto_core::device_cert::{AttestationLevel, DeviceIdentity, Revoked, certificate_key_id};
 use connetto_core::exchange::{
     EndOutcome, Frontier, ManifestRow, Offer, Origin, RetractCause, Retraction, SignedOffer,
 };
 use connetto_core::messages::{MutationRejectReason, WriterRef};
 use connetto_core::schema::{Major, SchemaVersion};
 use connetto_exchange::{MAX_MANIFEST_ROWS, Message, Transfer};
-use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, SigningKey as RcgenSigningKey};
 use socket2::SockRef;
 use tokio::sync::mpsc;
 use tokio::time;
-
-/// A test serial as the issuer takes it, its first byte positive.
-fn positive(bytes: [u8; 16]) -> CertificateSerial {
-    CertificateSerial::new(bytes).expect("the test serial is positive")
-}
-
-pub(crate) const DAY: Duration = Duration::from_hours(24);
-
-/// A device key held in memory, standing in for a chip.
-struct Device(Arc<KeyPair>);
-
-impl Clone for Device {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
-}
-
-impl DeviceKey for Device {
-    fn public_point(&self) -> [u8; 65] {
-        self.0
-            .public_key_raw()
-            .try_into()
-            .expect("an uncompressed P-256 point")
-    }
-
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, DeviceKeyError> {
-        self.0
-            .sign(message)
-            .map_err(|err| DeviceKeyError::Platform(Box::new(err)))
-    }
-
-    fn home(&self) -> KeyHome {
-        KeyHome::Software
-    }
-}
-
-/// An issuer beside the certificate and key it signs with.
-pub(crate) struct Issuer {
-    /// The issuer certificate, DER.
-    certificate: Vec<u8>,
-    /// The signing key, for the lists it signs.
-    signer: DeviceIssuer,
-    /// The serial the root used when signing the issuer.
-    serial: [u8; 16],
-}
-
-/// A deployment a test mints: one root and the issuers and devices it
-/// signs.
-pub(crate) struct Deployment {
-    root: RootCa,
-}
-
-impl Deployment {
-    /// Mint a root for deployment `id`, valid around `now`.
-    pub(crate) fn new(id: u128, now: SystemTime) -> Self {
-        let root = RootCa::create(
-            DeploymentId::from_uuid(uuid::Uuid::from_u128(id)),
-            now - 10 * DAY,
-            3650 * DAY,
-        )
-        .expect("the root mints");
-        Self { root }
-    }
-
-    /// The root's DER, what a device is built with.
-    pub(crate) fn root_der(&self) -> Vec<u8> {
-        self.root.certificate().to_vec()
-    }
-
-    /// The root as a signer, so a proof can mint a leaf under its own key.
-    pub(crate) fn root_signer(&self) -> DeviceIssuer {
-        DeviceIssuer::from_pkcs8(
-            self.root.certificate().to_vec(),
-            &self.root.private_key_der(),
-            self.root.certificate(),
-        )
-        .expect("the root signs its own name")
-    }
-
-    /// Sign one more issuer, valid around `now`.
-    pub(crate) fn add_issuer(&self, now: SystemTime, serial: [u8; 16]) -> Issuer {
-        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("the issuer key");
-        let holder = Device(Arc::new(key));
-        let stored = rustls_pki_types::PrivatePkcs8KeyDer::from(holder.0.serialize_der());
-        let key = KeyPair::from_pkcs8_der_and_sign_algo(&stored, &PKCS_ECDSA_P256_SHA256)
-            .expect("the key round-trips");
-        let certificate = self
-            .root
-            .sign_issuer(
-                &public_key_info(&holder),
-                now - 10 * DAY,
-                366 * DAY,
-                positive(serial),
-            )
-            .expect("the issuer signs");
-        let signer = DeviceIssuer::new(certificate.clone(), key, self.root.certificate())
-            .expect("the issuer loads");
-        Issuer {
-            certificate,
-            signer,
-            serial,
-        }
-    }
-
-    /// A device certificate under `issuer`, valid from `not_before` for
-    /// `lifetime`, carrying `bot_list`.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the serial and window join the identity and level the one fixture certificate carries, and a request struct would hide the same arity behind another type"
-    )]
-    #[expect(clippy::unused_self, reason = "the issuer carries its own signer")]
-    pub(crate) fn device_with_bot_list(
-        &self,
-        issuer: &Issuer,
-        account: &str,
-        not_before: SystemTime,
-        lifetime: Duration,
-        serial: [u8; 16],
-        level: AttestationLevel,
-        bot_list: &str,
-    ) -> Peer {
-        let key = Device(Arc::new(
-            KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("the device key"),
-        ));
-        let csr =
-            CertificateRequest::build(&CertificateSigner::new(&key), &[1; 32]).expect("the csr");
-        let request = CertificateRequest::parse(&csr).expect("the request parses");
-        let leaf = issuer
-            .signer
-            .issue(
-                &request,
-                account,
-                not_before,
-                lifetime,
-                positive(serial),
-                level,
-                bot_list,
-            )
-            .expect("the certificate issues");
-        let parsed = DeviceCertificate::parse(&leaf).expect("the profile holds");
-        Peer {
-            key,
-            identity: parsed.identity().clone(),
-            serial: parsed.serial().to_vec(),
-            level,
-            bot_list: parsed
-                .bot_list()
-                .expect("the fixture always issues the extension")
-                .to_owned(),
-            leaf,
-            issuer: issuer.certificate.clone(),
-        }
-    }
-
-    /// A device certificate under `issuer`, valid from `not_before` for `lifetime`, the
-    /// person's wildcard the fixture binds.
-    pub(crate) fn device(
-        &self,
-        issuer: &Issuer,
-        account: &str,
-        not_before: SystemTime,
-        lifetime: Duration,
-        serial: [u8; 16],
-        level: AttestationLevel,
-    ) -> Peer {
-        self.device_with_bot_list(
-            issuer,
-            account,
-            not_before,
-            lifetime,
-            serial,
-            level,
-            connetto_core::BOT_LIST_WILDCARD,
-        )
-    }
-
-    /// Reissue the device `peer` under `issuer`, a new serial and window,
-    /// carrying the peer's own bot list as a renewal does.
-    #[expect(clippy::unused_self, reason = "the issuer carries its own signer")]
-    pub(crate) fn reissue(
-        &self,
-        issuer: &Issuer,
-        peer: &Peer,
-        not_before: SystemTime,
-        lifetime: Duration,
-        serial: [u8; 16],
-    ) -> Peer {
-        let key = peer.key.clone();
-        let csr =
-            CertificateRequest::build(&CertificateSigner::new(&key), &[1; 32]).expect("the csr");
-        let request = CertificateRequest::parse(&csr).expect("the request parses");
-        let leaf = issuer
-            .signer
-            .issue(
-                &request,
-                peer.identity.account(),
-                not_before,
-                lifetime,
-                positive(serial),
-                peer.level,
-                &peer.bot_list,
-            )
-            .expect("the reissue grants");
-        let parsed = DeviceCertificate::parse(&leaf).expect("the profile holds");
-        Peer {
-            key,
-            identity: parsed.identity().clone(),
-            serial: parsed.serial().to_vec(),
-            level: peer.level,
-            bot_list: parsed
-                .bot_list()
-                .expect("the fixture always issues the extension")
-                .to_owned(),
-            leaf,
-            issuer: issuer.certificate.clone(),
-        }
-    }
-
-    /// An issuer-signed list `number` revoking `revoked`, dated at `now`.
-    #[expect(clippy::unused_self, reason = "the issuer carries its own signer")]
-    pub(crate) fn issuer_list(
-        &self,
-        issuer: &Issuer,
-        number: u64,
-        revoked: &[Revoked],
-        now: SystemTime,
-    ) -> (Vec<u8>, Vec<u8>) {
-        let list = issuer
-            .signer
-            .sign_list(number, revoked, now, now + 7 * DAY)
-            .expect("the list signs");
-        (list, issuer.certificate.clone())
-    }
-
-    /// A root-signed list `number` revoking `revoked`, dated at `now`.
-    fn root_list(&self, number: u64, revoked: &[Revoked], now: SystemTime) -> (Vec<u8>, Vec<u8>) {
-        let list = self
-            .root
-            .sign_list(number, revoked, now, now + 7 * DAY)
-            .expect("the list signs");
-        (list, self.root_der())
-    }
-}
-
-/// A device certificate beside the key that signs for it.
-pub(crate) struct Peer {
-    /// The key, held in memory.
-    key: Device,
-    /// What the certificate names.
-    pub(crate) identity: DeviceIdentity,
-    /// The serial a list names the leaf by.
-    serial: Vec<u8>,
-    /// The attestation level the leaf records.
-    level: AttestationLevel,
-    /// The bot list the leaf carries.
-    pub(crate) bot_list: String,
-    /// The leaf, DER.
-    pub(crate) leaf: Vec<u8>,
-    /// The issuer certificate, DER.
-    issuer: Vec<u8>,
-}
-
-impl Peer {
-    /// The presented identity the node serves and dials with.
-    pub(crate) fn identity(&self) -> Identity {
-        Identity {
-            certificate: self.leaf.clone(),
-            issuer: self.issuer.clone(),
-            key: Arc::new(self.key.clone()),
-        }
-    }
-
-    /// The key id, what the duplicate rule compares.
-    pub(crate) fn key_id(&self) -> connetto_core::device_cert::KeyId {
-        key_id(&self.key)
-    }
-}
 
 /// Every attestation level, the deployment default.
 fn all_levels() -> Vec<AttestationLevel> {
@@ -356,11 +75,6 @@ fn node_on(
     Node::new(Trust { roots, accepted }, clock, events).expect("the roots hold keys")
 }
 
-/// A node on one deployment root and the system clock.
-pub(crate) fn node(root_der: Vec<u8>, events: mpsc::UnboundedSender<PeerEvent>) -> Node {
-    node_on(vec![root_der], all_levels(), Arc::new(SystemClock), events)
-}
-
 /// A node on one deployment root and the system clock, with its links'
 /// liveness bounds set.
 fn node_liveness(
@@ -378,29 +92,6 @@ fn node_liveness(
         liveness,
     )
     .expect("the roots hold keys")
-}
-
-/// An event channel pair.
-pub(crate) fn events() -> (
-    mpsc::UnboundedSender<PeerEvent>,
-    mpsc::UnboundedReceiver<PeerEvent>,
-) {
-    mpsc::unbounded_channel()
-}
-
-/// The whole second the wall clock stands on, as X.509 carries time.
-pub(crate) fn whole_second() -> SystemTime {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_secs();
-    SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-}
-
-/// Serve `peer` on loopback, answering the bound address.
-pub(crate) fn serve(node: &Node, peer: &Peer) -> SocketAddr {
-    node.serve(SocketAddr::from(([127, 0, 0, 1], 0)), peer.identity())
-        .expect("the listener binds")
 }
 
 /// Collect `count` events, failing if ten seconds run out.
@@ -2925,7 +2616,7 @@ async fn a_duplicate_close_holds_the_peer_in_the_link_read() {
         host_node.linked(),
         vec![crate::PeerLink {
             peer: gone.identity.clone(),
-            public_key: public_key_info(&gone.key),
+            public_key: gone.public_key_info(),
             bot_list: Some(gone.bot_list.clone()),
             remote: None,
         }],
@@ -3010,7 +2701,7 @@ async fn the_hello_bound_drops_a_held_peer_in_the_link_read() {
         host_node.linked(),
         vec![crate::PeerLink {
             peer: gone.identity.clone(),
-            public_key: public_key_info(&gone.key),
+            public_key: gone.public_key_info(),
             bot_list: Some(gone.bot_list.clone()),
             remote: None,
         }],
@@ -3801,7 +3492,7 @@ async fn closing_one_peer_ends_its_link_on_both_sides() {
 pub(crate) fn linked_event(peer: &Peer) -> PeerEvent {
     PeerEvent::Linked {
         peer: peer.identity.clone(),
-        public_key: public_key_info(&peer.key),
+        public_key: peer.public_key_info(),
         bot_list: Some(peer.bot_list.clone()),
     }
 }

@@ -1,5 +1,7 @@
-//! The loopback multicast probe the discovery proofs run before they trust
-//! the interface, here and in `connetto-client`'s suite (R76 slice 3).
+//! What proofs here and in the crates above share: a deployment minted in
+//! memory with nodes serving its devices on loopback, and the loopback
+//! multicast probe the discovery proofs run before they trust the interface
+//! (R76 slice 3).
 //!
 //! A proof whose probe fails skips itself, so a host without loopback
 //! multicast never reads as a discovery failure. Setting
@@ -10,6 +12,10 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
 use socket2::{Domain, SockAddr, Socket, Type};
+
+mod deployment;
+
+pub use deployment::{DAY, Deployment, Issuer, Peer, events, node, positive, serve, whole_second};
 
 /// A loopback multicast round-trip, answered when the host lets it through.
 ///

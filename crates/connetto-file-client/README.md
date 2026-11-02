@@ -9,6 +9,8 @@ The local encrypted chunk store, the upload outbox, and the content resolver for
 
 `ContentClient::attach` adds file handling to a running `ConnettoClient`. `stage` chunks a file into the store and commits its manifest in the same transaction as the application row that names it, offline or not. `flush_outbox` uploads what is waiting, under a write ticket the websocket mints. `resolve` answers where a file's bytes are: a short-lived signed URL in the common case, local bytes when the content is unsent or pinned, and `Unavailable` when neither this device nor a server can produce them. `pin_content` keeps a query's files on the device and `tidy_content` reclaims what nothing covers.
 
+Behind the `peer` feature, `with_peer_content` declares the columns that hold file ids, and `drive_media` serves a linked device's manifest and range requests over the client's media port once the policy views, under the requester's certificate, show it a row naming the file.
+
 In a dedicated browser worker, `BrowserStore` uses an account-isolated `OPFS` namespace and falls back to worker-lifetime memory when persistence or atomic moves are unavailable. `BrowserHttp` supplies the same protocol through `fetch`. `connetto-web` exposes local bytes through reference-counted object URLs and revokes each URL when its last owner drops.
 
 Device archives include only unsent content as plaintext `content/manifests.json` metadata and deduplicated `content/chunks/<hash>` entries. Import verifies chunk lengths, chunk hashes, and file identities before encrypting chunks under the receiving key and committing application rows, manifests, and outbox entries together.

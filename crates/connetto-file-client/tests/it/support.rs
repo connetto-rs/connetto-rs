@@ -308,7 +308,8 @@ where
     T: Transport + Send + 'static,
     T::Error: core::fmt::Display,
 {
-    ClientBuilder::new(
+    cold_over(
+        path,
         SyncSchema::new(
             SchemaBundle::new(
                 SOURCE,
@@ -320,25 +321,35 @@ where
             )
             .expect("the source declares major 1"),
         ),
-        || async { Err::<T, _>("no server") },
     )
-    .signed_in(
-        HeldCredential::new(Grant::new("user:tester"), "tester")
-            .expect("a string identity serializes"),
-    )
-    .durable(
-        At(path.to_path_buf()),
-        FixedKey,
-        MemoryRefreshStore::default(),
-    )
-    .with_gate(Gate::off())
-    .open_driven()
     .await
-    .expect("open with no server")
+}
+
+/// The durable replica at `path` over `schema`, signed in as the suite's
+/// tester, with no transport attached.
+pub async fn cold_over<T>(path: &std::path::Path, schema: SyncSchema) -> ConnettoConnection<T>
+where
+    T: Transport + Send + 'static,
+    T::Error: core::fmt::Display,
+{
+    ClientBuilder::new(schema, || async { Err::<T, _>("no server") })
+        .signed_in(
+            HeldCredential::new(Grant::new("user:tester"), "tester")
+                .expect("a string identity serializes"),
+        )
+        .durable(
+            At(path.to_path_buf()),
+            FixedKey,
+            MemoryRefreshStore::default(),
+        )
+        .with_gate(Gate::off())
+        .open_driven()
+        .await
+        .expect("open with no server")
 }
 
 /// A running client over `conn`, its pump spawned.
-fn started<T>(conn: ConnettoConnection<T>) -> ConnettoClient<T>
+pub fn started<T>(conn: ConnettoConnection<T>) -> ConnettoClient<T>
 where
     T: Transport + Send + 'static,
     T::Error: core::fmt::Display,

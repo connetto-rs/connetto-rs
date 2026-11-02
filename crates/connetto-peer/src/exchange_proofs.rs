@@ -27,10 +27,8 @@ use crate::exchange::{ChunkStream, EXCHANGE_BOUND, OfferFrame};
 use crate::frame::{PeerFrame, read_frame, write_frame};
 use crate::node::{client_config_for, server_config_for};
 use crate::signer::{IdentityClientCert, IdentityServerCert};
-use crate::tests::{Deployment, Peer, events, node, serve, whole_second};
+use crate::test_support::{DAY, Deployment, Peer, events, node, serve, whole_second};
 use crate::{CloseReason, PeerEvent, SystemClock, Trust};
-
-const DAY: Duration = Duration::from_hours(24);
 
 /// Every attestation level, the deployment default.
 fn all_levels() -> Vec<AttestationLevel> {

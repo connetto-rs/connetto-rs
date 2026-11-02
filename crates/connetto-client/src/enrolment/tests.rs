@@ -2907,7 +2907,7 @@ async fn a_media_port_takes_the_links_and_frames_and_answers_through_the_link() 
         panic!("the link comes first");
     };
     assert_eq!(bot_list.as_deref(), Some(connetto_core::BOT_LIST_WILDCARD));
-    assert_eq!(port.linked().len(), 1);
+    assert_eq!(port.sender().linked().len(), 1);
 
     let want = Media::Want {
         request_id: 4,
@@ -2923,7 +2923,8 @@ async fn a_media_port_takes_the_links_and_frames_and_answers_through_the_link() 
             message: want
         }
     );
-    port.send(&peer, Media::Busy { request_id: 4 })
+    port.sender()
+        .send(&peer, Media::Busy { request_id: 4 })
         .await
         .expect("the answer queues");
     assert_eq!(

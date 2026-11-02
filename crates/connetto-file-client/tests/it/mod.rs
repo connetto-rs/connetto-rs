@@ -10,6 +10,8 @@ mod held_wire;
 mod negotiation;
 mod offline_photo;
 mod outboards;
+#[cfg(feature = "peer")]
+mod peer_holder;
 mod photo_fixture;
 mod resolving;
 mod retention;

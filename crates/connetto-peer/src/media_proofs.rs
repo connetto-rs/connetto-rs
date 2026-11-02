@@ -9,10 +9,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::frame::{PeerFrame, read_frame, write_frame};
-use crate::tests::{
-    DAY, Deployment, await_event, events, linked_event, next_events, node, raw_linked, serve,
-    whole_second,
-};
+use crate::test_support::{DAY, Deployment, events, node, serve, whole_second};
+use crate::tests::{await_event, linked_event, next_events, raw_linked};
 use crate::{CloseReason, Node, PeerEvent, PeerSendError};
 
 /// One message of each kind, every reply quoting `request_id`.

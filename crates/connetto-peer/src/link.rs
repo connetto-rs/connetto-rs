@@ -449,7 +449,7 @@ mod tests {
     use crate::error::CloseReason;
     use crate::frame::{FrameReader, PeerFrame, write_frame};
     use crate::node::LinkCommand;
-    use crate::tests::{Deployment, events, node, whole_second};
+    use crate::test_support::{Deployment, events, node, whole_second};
 
     /// The bytes a peer sent before its end went away.
     async fn sent(frames: &[PeerFrame]) -> Vec<u8> {
