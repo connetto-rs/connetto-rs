@@ -1,11 +1,12 @@
 //! A content client fetching a file from linked holders on loopback: every
 //! piece verified against the file id, a forged piece and a lying manifest
-//! refused, and a fetch resumed at the next chunk after a lost link (R79
-//! decisions 3, 4, 5 and 10).
+//! refused, a fetch resumed at the next chunk after a lost link, busy and
+//! silent holders bounded in time (R79 decisions 1, 3, 4, 5 and 10).
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use connetto_client::media::MediaPort;
 use connetto_exchange::media::{MAX_PIECE_BYTES, Media};
 use connetto_file_client::{ContentEvent, FileId, Resolved};
 use connetto_file_core::{MemStore, MimeClass, encode_range, process_file_with_outboard};
@@ -30,6 +31,14 @@ enum Fault {
     LieInManifest,
     /// It closes every link at its second `Fetch`.
     DropAtSecondFetch,
+    /// It answers every request `Busy`.
+    AlwaysBusy,
+    /// It answers nothing.
+    Silent,
+    /// It names a chunk of no bytes.
+    EmptyChunk,
+    /// It sends more manifest rows than a manifest may hold, in two runs.
+    TooManyRows,
 }
 
 /// A bare node serving `bytes` as a holder would, chunked as the generic
@@ -54,8 +63,23 @@ fn bare_holder(
                 continue;
             };
             record.lock().push(message.clone());
-            match message {
-                Media::Want { request_id, .. } => {
+            let request_id = message.request_id();
+            match (fault, message) {
+                (Fault::Silent, _) => {}
+                (Fault::AlwaysBusy, _) => {
+                    let _ = node.send_media(&peer, Media::Busy { request_id }).await;
+                }
+                (Fault::TooManyRows, Media::Want { .. }) => {
+                    for last in [false, true] {
+                        let run = Media::Manifest {
+                            request_id,
+                            chunks: vec![([7; 32], 1); 5_000],
+                            last,
+                        };
+                        let _ = node.send_media(&peer, run).await;
+                    }
+                }
+                (_, Media::Want { .. }) => {
                     let chunks = manifest
                         .chunks()
                         .iter()
@@ -64,7 +88,12 @@ fn bare_holder(
                             if fault == Fault::LieInManifest {
                                 hash[0] ^= 1;
                             }
-                            (hash, chunk.len)
+                            let len = if fault == Fault::EmptyChunk {
+                                0
+                            } else {
+                                chunk.len
+                            };
+                            (hash, len)
                         })
                         .collect();
                     let run = Media::Manifest {
@@ -74,12 +103,15 @@ fn bare_holder(
                     };
                     let _ = node.send_media(&peer, run).await;
                 }
-                Media::Fetch {
-                    request_id,
-                    start,
-                    len,
-                    ..
-                } => {
+                (
+                    _,
+                    Media::Fetch {
+                        request_id,
+                        start,
+                        len,
+                        ..
+                    },
+                ) => {
                     fetches += 1;
                     if fault == Fault::DropAtSecondFetch && fetches == 2 {
                         node.stop(CloseReason::Closed);
@@ -109,6 +141,15 @@ fn bare_holder(
         }
     });
     asked
+}
+
+/// How many `Want` requests a bare holder saw.
+fn wants(asked: &Mutex<Vec<Media>>) -> usize {
+    asked
+        .lock()
+        .iter()
+        .filter(|message| matches!(message, Media::Want { .. }))
+        .count()
 }
 
 /// The `Fetch` requests a bare holder saw, as `(start, len)`.
@@ -362,4 +403,186 @@ async fn a_fetch_resumes_at_the_next_chunk_after_a_lost_link() {
         );
     })
     .await;
+}
+
+/// A receiver in camp with bare holders of one file, none linked yet.
+struct Camp {
+    _dir: tempfile::TempDir,
+    receiver: Device,
+    devices: Devices,
+    anna: Node,
+    port: Option<MediaPort>,
+    bytes: Vec<u8>,
+    file_id: FileId,
+    serial: u8,
+}
+
+impl Camp {
+    async fn new(bytes: Vec<u8>) -> Self {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (_, receiver) = declared(dir.path()).await;
+        let file_id = crate::support::learn_file_id(&bytes).await;
+        let devices = Devices::new();
+        let (anna, _, events) = devices.node(&devices.device("anna", 3));
+        let port = Some(port(anna.clone(), events));
+        Self {
+            _dir: dir,
+            receiver,
+            devices,
+            anna,
+            port,
+            bytes,
+            file_id,
+            serial: 10,
+        }
+    }
+
+    /// A bare holder with `fault`, its address and what it was asked.
+    fn holder(&mut self, fault: Fault) -> (std::net::SocketAddr, Arc<Mutex<Vec<Media>>>) {
+        self.serial += 1;
+        let device = self.devices.device("r77", self.serial);
+        let (node, addr, events) = self.devices.node(&device);
+        (addr, bare_holder(node, events, self.bytes.clone(), fault))
+    }
+
+    /// A bare holder with `fault`, linked now.
+    async fn linked_holder(&mut self, fault: Fault) -> Arc<Mutex<Vec<Media>>> {
+        let (addr, asked) = self.holder(fault);
+        self.anna.link(addr).await.expect("the link completes");
+        asked
+    }
+
+    fn port(&mut self) -> MediaPort {
+        self.port.take().expect("one driver per camp")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_holders_are_asked_again_until_the_on_demand_bound() {
+    let mut camp = Camp::new(pseudorandom(10, 100_000)).await;
+    let busy = camp.linked_holder(Fault::AlwaysBusy).await;
+    let port = camp.port();
+    beside(&camp.receiver, port, async {
+        let began = std::time::Instant::now();
+        assert_eq!(
+            camp.receiver.resolve(camp.file_id).await.expect("resolve"),
+            Resolved::Unavailable
+        );
+        let waited = began.elapsed();
+        assert_eq!(
+            wants(&busy),
+            3,
+            "asked at once, after 5 s and after 10 s more, and not again past 30 s"
+        );
+        assert!(
+            waited >= Duration::from_secs(15) && waited < Duration::from_secs(30),
+            "{waited:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_holder_linking_while_the_others_are_busy_is_asked_at_once() {
+    let mut camp = Camp::new(pseudorandom(11, 100_000)).await;
+    let busy = camp.linked_holder(Fault::AlwaysBusy).await;
+    let (free_addr, free) = camp.holder(Fault::None);
+    let port = camp.port();
+    beside(&camp.receiver, port, async {
+        let link_when_busy = async {
+            while wants(&busy) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            camp.anna.link(free_addr).await.expect("the link completes");
+            std::time::Instant::now()
+        };
+        let (resolved, linked_at) =
+            tokio::join!(camp.receiver.resolve(camp.file_id), link_when_busy);
+        assert_local(&resolved.expect("resolve"), &camp.bytes);
+        assert!(
+            linked_at.elapsed() < Duration::from_secs(5),
+            "the new link wakes the fetch before its backoff ends"
+        );
+        assert_eq!(wants(&free), 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_holder_lapses_after_the_frame_bound() {
+    let mut camp = Camp::new(pseudorandom(12, 100_000)).await;
+    let silent = camp.linked_holder(Fault::Silent).await;
+    let port = camp.port();
+    beside(&camp.receiver, port, async {
+        let began = std::time::Instant::now();
+        assert_eq!(
+            camp.receiver.resolve(camp.file_id).await.expect("resolve"),
+            Resolved::Unavailable
+        );
+        assert!(began.elapsed() >= Duration::from_secs(30));
+        assert_eq!(wants(&silent), 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_resolves_of_one_file_share_one_fetch() {
+    let mut camp = Camp::new(pseudorandom(13, 3 * 1024 * 1024)).await;
+    let holder = camp.linked_holder(Fault::None).await;
+    let port = camp.port();
+    beside(&camp.receiver, port, async {
+        let (first, second) = tokio::join!(
+            camp.receiver.resolve(camp.file_id),
+            camp.receiver.resolve(camp.file_id)
+        );
+        assert_local(&first.expect("resolve"), &camp.bytes);
+        assert_local(&second.expect("resolve"), &camp.bytes);
+        assert_eq!(
+            wants(&holder),
+            1,
+            "the second resolve joined the first fetch"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manifest_no_file_can_have_is_refused_before_any_fetch() {
+    for fault in [Fault::EmptyChunk, Fault::TooManyRows] {
+        let mut camp = Camp::new(pseudorandom(14, 100_000)).await;
+        let holder = camp.linked_holder(fault).await;
+        let port = camp.port();
+        beside(&camp.receiver, port, async {
+            assert_eq!(
+                camp.receiver.resolve(camp.file_id).await.expect("resolve"),
+                Resolved::Unavailable
+            );
+            assert_eq!(fetches(&holder), Vec::new());
+        })
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resolve_waiting_when_the_driver_stops_answers_unavailable() {
+    let mut camp = Camp::new(pseudorandom(15, 100_000)).await;
+    let silent = camp.linked_holder(Fault::Silent).await;
+    let port = camp.port();
+    let stopped_driver = async {
+        while wants(&silent) == 0 {
+            tokio::task::yield_now().await;
+        }
+    };
+    let (resolved, ()) = tokio::join!(camp.receiver.resolve(camp.file_id), async {
+        tokio::select! {
+            () = camp.receiver.drive_media(port) => panic!("the port ended"),
+            () = stopped_driver => {}
+        }
+    });
+    assert_eq!(resolved.expect("resolve"), Resolved::Unavailable);
+    assert_eq!(
+        camp.receiver.resolve(camp.file_id).await.expect("resolve"),
+        Resolved::Unavailable,
+        "with no driver running an offline device asks nobody"
+    );
 }

@@ -252,6 +252,65 @@ async fn a_right_withdrawn_after_the_manifest_refuses_the_next_fetch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_whose_link_falls_stops_and_the_holder_serves_on() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (_, content) = declared(dir.path()).await;
+    let bytes = pseudorandom(4, 7 * 1024 * 1024);
+    let file_id = stage(&content, 1, "anna", &bytes).await;
+
+    let devices = Devices::new();
+    let holder_device = devices.device("r77", 2);
+    let (leaving_device, staying_device) = (devices.device("anna", 3), devices.device("anna", 4));
+    let (holder_node, holder_addr, holder_events) = devices.node(&holder_device);
+    let (leaving, _, mut leaving_events) = devices.node(&leaving_device);
+    let (staying, _, mut staying_events) = devices.node(&staying_device);
+    let port = port(holder_node, holder_events);
+
+    beside(&content, port, async {
+        let holder = leaving.link(holder_addr).await.expect("the link completes");
+        leaving
+            .send_media(
+                &holder,
+                Media::Fetch {
+                    request_id: 1,
+                    file_id: *file_id.as_bytes(),
+                    start: 0,
+                    len: 6 * 1024 * 1024,
+                },
+            )
+            .await
+            .expect("the request queues");
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), leaving_events.recv())
+                .await
+                .expect("a piece within the bound")
+                .expect("the requester lives");
+            if matches!(event, PeerEvent::Media { .. }) {
+                break;
+            }
+        }
+        leaving.stop(connetto_peer::CloseReason::Closed);
+
+        let holder = staying.link(holder_addr).await.expect("the link completes");
+        let replies = ask(
+            &staying,
+            &mut staying_events,
+            &holder,
+            Media::Want {
+                request_id: 2,
+                file_id: *file_id.as_bytes(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(replies.last(), Some(Media::Manifest { last: true, .. })),
+            "the holder serves the next requester, got {replies:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_holder_with_no_declared_column_refuses_every_request() {
     let dir = tempfile::tempdir().expect("temp dir");
     let (_, content) = replica(dir.path(), None).await;
