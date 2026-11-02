@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod machine;
+pub mod media;
 mod message;
 
 pub use machine::{Action, Exchange, FRAME_BOUND, RETRY_CEILING, RETRY_FIRST};

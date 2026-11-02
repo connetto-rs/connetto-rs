@@ -74,27 +74,27 @@ pub enum Refusal {
     OwnKey,
 }
 
-/// Why an exchange message could not be queued on a link.
+/// Why an exchange or media message could not be queued on a link.
 #[derive(Debug, thiserror::Error)]
-pub enum PeerSendError {
+pub enum PeerSendError<M = Message> {
     /// The message breaks the wire's bounds, so it was refused before
     /// queueing.
     #[error("the message breaks the wire's bounds")]
     FrameAboveBounds {
         /// The message handed back to its sender.
-        message: Message,
+        message: M,
     },
     /// The peer holds no live link.
     #[error("the peer holds no live link")]
     Unlinked {
         /// The message handed back to its sender.
-        message: Message,
+        message: M,
     },
     /// The link closed while the send waited on its full queue.
     #[error("the link closed while the send waited")]
     LinkClosed {
         /// The message handed back to its sender.
-        message: Message,
+        message: M,
     },
 }
 

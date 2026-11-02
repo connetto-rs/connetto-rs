@@ -38,7 +38,7 @@ fn positive(bytes: [u8; 16]) -> CertificateSerial {
     CertificateSerial::new(bytes).expect("the test serial is positive")
 }
 
-const DAY: Duration = Duration::from_hours(24);
+pub(crate) const DAY: Duration = Duration::from_hours(24);
 
 /// A device key held in memory, standing in for a chip.
 struct Device(Arc<KeyPair>);
@@ -404,7 +404,10 @@ pub(crate) fn serve(node: &Node, peer: &Peer) -> SocketAddr {
 }
 
 /// Collect `count` events, failing if ten seconds run out.
-async fn next_events(rx: &mut mpsc::UnboundedReceiver<PeerEvent>, count: usize) -> Vec<PeerEvent> {
+pub(crate) async fn next_events(
+    rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
+    count: usize,
+) -> Vec<PeerEvent> {
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         out.push(
@@ -418,7 +421,7 @@ async fn next_events(rx: &mut mpsc::UnboundedReceiver<PeerEvent>, count: usize) 
 }
 
 /// Wait for one event matching `keep`, draining the ones that do not.
-async fn await_event(
+pub(crate) async fn await_event(
     rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
     bound: Duration,
     mut keep: impl FnMut(&PeerEvent) -> bool,
@@ -1441,7 +1444,7 @@ async fn dropping_the_last_node_closes_the_listener_and_links() {
 
 /// A raw peer that completed the handshake and its `Hello` with the node at
 /// `addr`.
-async fn raw_linked(
+pub(crate) async fn raw_linked(
     root_der: Vec<u8>,
     peer: &Peer,
     addr: SocketAddr,
@@ -1997,10 +2000,11 @@ async fn a_peer_speaking_another_version_is_refused_both_ways() {
     let host_node = node(deployment.root_der(), h_tx);
     let host_addr = serve(&host_node, &host);
 
-    // A dialler speaking version 1 never links, and the host closes on it.
+    // A dialler speaking version 2, the exchange without media frames,
+    // never links, and the host closes on it.
     let mut raw = raw_peer_connect(deployment.root_der(), &future, host_addr).await;
     let hello = PeerFrame::Hello {
-        version: 1,
+        version: 2,
         dial: 1,
         numbers: Vec::new(),
     };
@@ -2024,7 +2028,7 @@ async fn a_peer_speaking_another_version_is_refused_both_ways() {
     assert!(ended, "the host closes on a peer of another version");
     no_events(&mut h_rx, Duration::from_millis(500)).await;
 
-    // A listener speaking version 1 answers the dial with its version.
+    // A listener speaking version 2 answers the dial with its version.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("a loopback port");
@@ -2052,7 +2056,7 @@ async fn a_peer_speaking_another_version_is_refused_both_ways() {
     });
     assert!(matches!(
         host_node.link(future_addr).await,
-        Err(LinkError::UnsupportedVersion { their: 1 })
+        Err(LinkError::UnsupportedVersion { their: 2 })
     ));
     server.await.expect("the listener task ends");
 }
@@ -3794,7 +3798,7 @@ async fn closing_one_peer_ends_its_link_on_both_sides() {
 
 /// The `Linked` event the node reports when `peer` comes up, the key its
 /// certificate proved and the list it carries.
-fn linked_event(peer: &Peer) -> PeerEvent {
+pub(crate) fn linked_event(peer: &Peer) -> PeerEvent {
     PeerEvent::Linked {
         peer: peer.identity.clone(),
         public_key: public_key_info(&peer.key),

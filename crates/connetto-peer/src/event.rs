@@ -2,6 +2,7 @@
 
 use connetto_core::device_cert::DeviceIdentity;
 use connetto_exchange::Message;
+use connetto_exchange::media::Media;
 
 use crate::CloseReason;
 
@@ -40,5 +41,12 @@ pub enum PeerEvent {
         peer: DeviceIdentity,
         /// The message as it crossed.
         message: Message,
+    },
+    /// A link delivered a media message (R79).
+    Media {
+        /// The peer the message crossed from.
+        peer: DeviceIdentity,
+        /// The message as it crossed.
+        message: Media,
     },
 }

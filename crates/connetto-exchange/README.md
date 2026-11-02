@@ -222,3 +222,24 @@ assert!(
 );
 assert!(b.served(&"a", 1).is_empty());
 ```
+
+The `media` module carries the pull of a file's content from a linked device that holds it. A receiver asks for the manifest with `Want` and for each chunk's byte range with `Fetch`, and `MediaLinks` keeps one request outstanding per peer, every reply quoting its id, until the driver proceeds.
+
+```rust
+use std::time::Instant;
+
+use connetto_exchange::media::{Ask, Media, MediaAction, MediaLinks, Priority};
+
+let mut links = MediaLinks::<&str, u32>::new();
+links.linked(&"alice");
+let now = Instant::now();
+let sent = links.ask(&"alice", Ask::Want { file_id: [7; 32] }, 1, Priority::OnDemand, now);
+let [MediaAction::Send { message, .. }] = sent.as_slice() else {
+    panic!("an idle link sends at once");
+};
+let refused = Media::Refused { request_id: message.request_id() };
+assert!(matches!(
+    links.received(&"alice", refused, now).as_slice(),
+    [MediaAction::Reply { tag: 1, done: true, .. }]
+));
+```

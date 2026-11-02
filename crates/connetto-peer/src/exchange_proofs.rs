@@ -14,6 +14,7 @@ use connetto_core::exchange::{
 };
 use connetto_core::messages::{MutationRejectReason, WriterRef};
 use connetto_core::schema::{Major, SchemaVersion};
+use connetto_exchange::media::Media;
 use connetto_exchange::{Message, Transfer};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, SigningKey as _};
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -1133,6 +1134,7 @@ fn every_frame_names_itself_and_only_the_offer_hides_a_field() {
         Ping,
         Pong,
         Exchange(Message),
+        Media(Media),
     }
 
     let bytes = |byte: u8| ByteBuf::from(vec![byte; 3]);
@@ -1305,6 +1307,51 @@ fn every_frame_names_itself_and_only_the_offer_hides_a_field() {
             "an Exchange::End",
         ),
     ];
+    let media = [
+        (
+            Media::Want {
+                request_id: 4,
+                file_id: [1; 32],
+            },
+            "a Media::Want",
+        ),
+        (
+            Media::Manifest {
+                request_id: 4,
+                chunks: vec![([2; 32], 3)],
+                last: false,
+            },
+            "a Media::Manifest",
+        ),
+        (
+            Media::Fetch {
+                request_id: 4,
+                file_id: [1; 32],
+                start: 5,
+                len: 6,
+            },
+            "a Media::Fetch",
+        ),
+        (
+            Media::Piece {
+                request_id: 4,
+                encoded: vec![7, 7],
+                last: true,
+            },
+            "a Media::Piece",
+        ),
+        (Media::Refused { request_id: 4 }, "a Media::Refused"),
+        (Media::Busy { request_id: 4 }, "a Media::Busy"),
+    ];
+    let cases = cases
+        .into_iter()
+        .chain(media.into_iter().map(|(message, named)| {
+            (
+                PeerFrame::Media(message.clone()),
+                Derived::Media(message),
+                named,
+            )
+        }));
     for (frame, derived, named) in cases {
         assert_eq!(format!("{frame:?}"), format!("{derived:?}"));
         assert_eq!(frame.named(), named);
