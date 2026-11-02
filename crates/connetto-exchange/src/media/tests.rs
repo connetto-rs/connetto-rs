@@ -508,6 +508,39 @@ fn candidates_follow_link_up_order_and_a_relink_moves_to_the_end() {
 }
 
 #[test]
+fn a_continuation_for_an_unlinked_peer_is_lost_and_an_unknown_unlink_is_quiet() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    assert_eq!(
+        links.proceed(&"carol", Some((want(), 5)), now),
+        vec![MediaAction::Lost {
+            peer: "carol",
+            tag: 5
+        }]
+    );
+    assert_eq!(links.proceed(&"carol", None, now), Vec::new());
+    assert_eq!(links.unlinked(&"carol"), Vec::new());
+}
+
+#[test]
+fn a_continuation_handed_over_while_a_request_waits_goes_first_after_it() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    let id = sent(
+        &links.ask(&"bob", want(), 1, Priority::OnDemand, now),
+        "bob",
+        &want(),
+    );
+    assert_eq!(
+        links.ask(&"bob", fetch(4096), 2, Priority::OnDemand, now),
+        Vec::new()
+    );
+    assert_eq!(links.proceed(&"bob", Some((fetch(0), 3)), now), Vec::new());
+    links.received(&"bob", manifest(id, true), now);
+    sent(&links.proceed(&"bob", None, now), "bob", &fetch(0));
+}
+
+#[test]
 fn the_wire_bounds_hold() {
     let rows = vec![([0; 32], 1); MAX_MANIFEST_ROWS + 1];
     let over = Media::Manifest {
@@ -545,11 +578,4 @@ fn the_wire_bounds_hold() {
         len: MAX_FETCH_LEN,
     };
     assert_eq!(fine.within_bounds(), Ok(()));
-}
-
-#[test]
-fn a_piece_prints_its_length_and_never_its_bytes() {
-    let printed = format!("{:?}", piece(4, true));
-    assert!(printed.contains("16"), "{printed}");
-    assert!(!printed.contains("[3, 3"), "{printed}");
 }

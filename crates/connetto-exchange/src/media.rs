@@ -8,7 +8,6 @@
 //! with its gate and checks every piece against the file id.
 
 use std::collections::VecDeque;
-use std::fmt;
 use std::hash::Hash;
 use std::time::Instant;
 
@@ -29,7 +28,7 @@ pub const MAX_SERVING: usize = 2;
 
 /// One media message between two linked devices, carried on the link's
 /// media queue.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Media {
     /// A request for a file's manifest.
     Want {
@@ -152,61 +151,6 @@ impl Media {
                 Err(BoundsError::RangeOutOfBounds)
             }
             _ => Ok(()),
-        }
-    }
-}
-
-impl fmt::Debug for Media {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Media::Want {
-                request_id,
-                file_id,
-            } => f
-                .debug_struct("Want")
-                .field("request_id", request_id)
-                .field("file_id", file_id)
-                .finish(),
-            Media::Manifest {
-                request_id,
-                chunks,
-                last,
-            } => f
-                .debug_struct("Manifest")
-                .field("request_id", request_id)
-                .field("chunks", &chunks.len())
-                .field("last", last)
-                .finish(),
-            Media::Fetch {
-                request_id,
-                file_id,
-                start,
-                len,
-            } => f
-                .debug_struct("Fetch")
-                .field("request_id", request_id)
-                .field("file_id", file_id)
-                .field("start", start)
-                .field("len", len)
-                .finish(),
-            Media::Piece {
-                request_id,
-                encoded,
-                last,
-            } => f
-                .debug_struct("Piece")
-                .field("request_id", request_id)
-                .field("encoded", &encoded.len())
-                .field("last", last)
-                .finish(),
-            Media::Refused { request_id } => f
-                .debug_struct("Refused")
-                .field("request_id", request_id)
-                .finish(),
-            Media::Busy { request_id } => f
-                .debug_struct("Busy")
-                .field("request_id", request_id)
-                .finish(),
         }
     }
 }
