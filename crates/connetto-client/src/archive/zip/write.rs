@@ -4,8 +4,8 @@ use std::io::Write;
 use crate::ClientError;
 
 use super::super::{
-    Archive, ArchiveAttachment, FORMAT, LOCAL_ROWS, MANIFEST, NOTE, PENDING, SYNCED_ROWS, VERSION,
-    zip_error,
+    Archive, ArchiveAttachment, FORMAT, LOCAL_ROWS, MANIFEST, NOTE, PEER_CURSORS, PEER_ENTRIES,
+    PENDING, SYNCED_ROWS, VERSION, zip_error,
 };
 use super::{Entry, Manifest, checked_attachment_total, validate_attachment_path};
 
@@ -129,6 +129,12 @@ fn manifest_entries(archive: &Archive<'_>) -> Vec<Entry> {
     if !archive.pending.is_empty() {
         entries.push(encoded_entry("pending", PENDING, "zstd"));
     }
+    if !archive.peer_entries.is_empty() {
+        entries.push(encoded_entry("peer-entries", PEER_ENTRIES, "zstd"));
+    }
+    if !archive.peer_cursors.is_empty() {
+        entries.push(encoded_entry("peer-cursors", PEER_CURSORS, "zstd"));
+    }
     entries.extend(
         archive
             .attachments
@@ -158,6 +164,20 @@ fn write_payloads<W: Write>(
     }
     if !archive.pending.is_empty() {
         write_entry(zip, PENDING, &encode_pending(&archive.pending))?;
+    }
+    if !archive.peer_entries.is_empty() {
+        write_entry(
+            zip,
+            PEER_ENTRIES,
+            &encode_peer_entries(&archive.peer_entries),
+        )?;
+    }
+    if !archive.peer_cursors.is_empty() {
+        write_entry(
+            zip,
+            PEER_CURSORS,
+            &encode_peer_cursors(&archive.peer_cursors),
+        )?;
     }
     Ok(())
 }
@@ -276,6 +296,55 @@ fn write_writer(out: &mut Vec<u8>, writer: &connetto_core::messages::WriterRef) 
     out.extend_from_slice(id.as_bytes());
 }
 
+/// A byte string behind its big-endian length, the peer state's framing.
+fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u64::try_from(bytes.len()).expect("slice length exceeds u64");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// The stored peer entries as one entry, in position order, each carrying
+/// its author, sequence, capture major, body, the author's account and bot
+/// list and its arrival (R77 decision 16).
+pub(super) fn encode_peer_entries(entries: &[super::super::ArchivedPeerEntry]) -> Vec<u8> {
+    let count = u64::try_from(entries.len()).expect("slice length exceeds u64");
+    let mut out = Vec::new();
+    out.extend_from_slice(&count.to_be_bytes());
+    for entry in entries {
+        write_bytes(&mut out, &entry.author);
+        out.extend_from_slice(&entry.seq.to_be_bytes());
+        out.extend_from_slice(&entry.major.to_be_bytes());
+        write_bytes(&mut out, &entry.changeset);
+        write_bytes(&mut out, entry.account.as_bytes());
+        match &entry.bot_list {
+            Some(bot_list) => {
+                out.push(1);
+                write_bytes(&mut out, bot_list.as_bytes());
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&entry.received_at.to_be_bytes());
+    }
+    out
+}
+
+/// The per-author peer cursors as one entry, each carrying its author,
+/// account, verified sequence and head, and the signed offer it was last
+/// verified under (R77 decision 16).
+pub(super) fn encode_peer_cursors(cursors: &[super::super::ArchivedPeerCursor]) -> Vec<u8> {
+    let count = u64::try_from(cursors.len()).expect("slice length exceeds u64");
+    let mut out = Vec::new();
+    out.extend_from_slice(&count.to_be_bytes());
+    for cursor in cursors {
+        write_bytes(&mut out, &cursor.author);
+        write_bytes(&mut out, cursor.account.as_bytes());
+        out.extend_from_slice(&cursor.seq.to_be_bytes());
+        out.extend_from_slice(&cursor.head);
+        write_bytes(&mut out, &cursor.offer);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::{Archive, ArchiveAttachment, ExportScope};
@@ -291,6 +360,8 @@ mod tests {
                 synced_rows: None,
                 local_rows: None,
                 pending: Vec::new(),
+                peer_entries: Vec::new(),
+                peer_cursors: Vec::new(),
                 attachments: std::slice::from_ref(declaration),
             },
         )

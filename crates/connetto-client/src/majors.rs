@@ -92,13 +92,16 @@ diesel::table! {
 }
 
 /// Connetto's own tables a rebuild keeps beside the held batches: the build
-/// record, the device's enrolment, and the writer queues with their
-/// retirement bookkeeping, whose frontiers the server keeps across majors.
-const KEPT: [&str; 8] = [
+/// record, the device's enrolment, the writer queues with their retirement
+/// bookkeeping, whose frontiers the server keeps across majors, and the peer
+/// cursors and retraction log, whose owners settle across majors (R77).
+const KEPT: [&str; 10] = [
     "_connetto_build",
     "_connetto_build_renames",
     "_connetto_device_certificate",
     "_connetto_revocation_list",
+    "_connetto_peer_cursor",
+    "_connetto_retraction",
     "_connetto_writers",
     "_connetto_pending",
     "_connetto_retire",

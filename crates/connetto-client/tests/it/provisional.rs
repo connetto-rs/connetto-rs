@@ -17,7 +17,6 @@ use connetto_client::{
     SystemClock,
 };
 
-use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, LivePatch, SnapshotBegin,
     SnapshotEnd, SnapshotPatch, SubscriptionPriority,
@@ -27,6 +26,7 @@ use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, PatchsetFormat, SimpleTable, Update, Value};
 
+use super::peer_support::{cursor_byte, drain_quiet, plain_author, pump_to};
 use super::support::{self, Script};
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT); \
@@ -233,23 +233,6 @@ fn update_payload(table: &str, columns: &[&str], new: Vec<Value<String, Vec<u8>>
     .expect("compress the patch")
 }
 
-fn cursor_byte(byte: u8) -> Cursor {
-    Cursor::new(vec![0, 0, 0, 0, 0, 0, 0, byte])
-}
-
-/// Open a connected replica whose scripted server answers the handshake and
-/// nothing else until a test queues frames.
-async fn connected() -> (ConnettoConnection<Script>, Script) {
-    let script = Script::default();
-    script.say(support::handshake_ack());
-    let conn = ClientBuilder::new(support::bundle(DDL), support::Once::new(script.clone()))
-        .signed_in(support::held("r77"))
-        .connect_driven()
-        .await
-        .expect("connect");
-    (conn, script)
-}
-
 /// A connected replica over the shared-store schema, its `vocabulary` table
 /// living in the shared tier.
 async fn connected_shared() -> (ConnettoConnection<Script>, Script) {
@@ -295,44 +278,6 @@ fn send_snapshot(server: &Script, sub_id: &str, payload: Vec<u8>, cursor: u8) {
     )));
 }
 
-/// Pump until `pred` matches, refusing to outlive the wire.
-async fn pump_to<T>(
-    conn: &mut ConnettoConnection<T>,
-    pred: impl Fn(&ClientEvent) -> bool,
-) -> ClientEvent
-where
-    T: connetto_core::traits::Transport,
-    T::Error: core::fmt::Display,
-{
-    loop {
-        let event = conn.pump_one().await.expect("pump");
-        assert!(!matches!(event, ClientEvent::Closed), "closed early");
-        if pred(&event) {
-            return event;
-        }
-    }
-}
-
-/// Drain events for a bounded quiet window, so a test can say what did and
-/// did not arrive when the absence is the point.
-async fn drain_quiet<T>(conn: &mut ConnettoConnection<T>, window: Duration) -> Vec<ClientEvent>
-where
-    T: connetto_core::traits::Transport,
-    T::Error: core::fmt::Display,
-{
-    let mut seen = Vec::new();
-    loop {
-        match conn
-            .pump_one_or(tokio::time::sleep(window))
-            .await
-            .expect("pump")
-        {
-            Some(event) => seen.push(event),
-            None => return seen,
-        }
-    }
-}
-
 fn order_ids<T>(conn: &mut ConnettoConnection<T>) -> Vec<i64>
 where
     T: connetto_core::traits::Transport,
@@ -349,7 +294,7 @@ where
 /// frame still in flight past an ended subscription delivered, so no
 /// subscription holds it and it is fair game for eviction.
 async fn orders_fixture() -> (ConnettoConnection<Script>, Script) {
-    let (mut conn, server) = connected().await;
+    let (mut conn, server) = plain_author(DDL).await;
     conn.subscribe("a", "SELECT * FROM orders WHERE id = 1")
         .await
         .expect("subscribe");
@@ -545,7 +490,7 @@ async fn a_truncate_resync_drops_the_provenance_with_the_row() {
 /// and answer nothing for a key that holds no provenance.
 #[tokio::test]
 async fn reads_return_what_is_stored() {
-    let (mut conn, _server) = connected().await;
+    let (mut conn, _server) = plain_author(DDL).await;
     record_provenance(
         &mut conn,
         "orders",
@@ -881,7 +826,7 @@ async fn a_native_client_answers_provenance_from_the_table() {
 /// stand a row back from nothing.
 #[tokio::test]
 async fn a_record_with_no_defined_state_fails_the_reads() {
-    let (mut conn, _server) = connected().await;
+    let (mut conn, _server) = plain_author(DDL).await;
     raw_record(
         &mut conn,
         "orders",
@@ -969,7 +914,7 @@ async fn an_undecodable_key_is_left_alone_by_the_passes() {
 /// the pass finds its row still stored and keeps the record beside it.
 #[tokio::test]
 async fn an_adjudicated_infinite_key_is_probed_like_any_other() {
-    let (mut conn, server) = connected().await;
+    let (mut conn, server) = plain_author(DDL).await;
     conn.subscribe("a", "SELECT * FROM reals")
         .await
         .expect("subscribe");

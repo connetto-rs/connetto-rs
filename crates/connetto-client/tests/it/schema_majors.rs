@@ -497,3 +497,62 @@ async fn a_rebuild_stores_a_split_tables_older_entry_under_its_wire_name() {
         "the stored bytes are the bytes the hash was taken over"
     );
 }
+
+/// The number of rows `table` holds.
+#[cfg(feature = "peer")]
+fn count(conn: &mut ConnettoConnection<FakeTransport>, table: &str) -> i64 {
+    diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(&format!(
+        "(SELECT count(*) FROM {table})"
+    )))
+    .get_result(conn.conn())
+    .expect("count the rows")
+}
+
+/// A rebuild keeps each author's cursor and the device writer's retraction
+/// log, so the exchange resumes where it stopped and peers still learn the
+/// refusals, while the stored peer entries and their records go with the
+/// synced rows they named (R77 decision 16).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_rebuild_keeps_the_peer_cursors_and_retractions_and_drops_the_entries() {
+    let dir = tempdir().expect("temp dir");
+    {
+        let mut conn = open(&dir, schema(1, V1_DDL)).await.expect("fresh open");
+        conn.conn()
+            .batch_execute(
+                "INSERT INTO _connetto_peer_cursor VALUES (x'aa', 'anna', 4, x'01', x'02'); \
+                 INSERT INTO _connetto_retraction VALUES ('device:aa', 2, x'7b7d'); \
+                 INSERT INTO _connetto_peer_entry \
+                 VALUES (x'aa', 4, 1, x'00', 'anna', NULL, 10, 1); \
+                 INSERT INTO _connetto_provisional \
+                 VALUES ('items', x'01', x'aa', 4, 'anna', 10, 0, NULL, NULL);",
+            )
+            .expect("seed the peer state");
+    }
+
+    let mut conn = open(&dir, schema(2, V2_DDL))
+        .await
+        .expect("open the newer build");
+
+    assert_eq!(user_version(&mut conn), 2);
+    assert_eq!(
+        count(&mut conn, "_connetto_peer_cursor"),
+        1,
+        "the cursor stays"
+    );
+    assert_eq!(
+        count(&mut conn, "_connetto_retraction"),
+        1,
+        "the retraction log stays"
+    );
+    assert_eq!(
+        count(&mut conn, "_connetto_peer_entry"),
+        0,
+        "the entries go"
+    );
+    assert_eq!(
+        count(&mut conn, "_connetto_provisional"),
+        0,
+        "the records go"
+    );
+}

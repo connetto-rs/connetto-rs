@@ -4,7 +4,8 @@ pub(super) mod write;
 use crate::ClientError;
 
 use super::{
-    LOCAL_ROWS, MANIFEST, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS_BYTES, PENDING, SYNCED_ROWS,
+    LOCAL_ROWS, MANIFEST, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS_BYTES, PEER_CURSORS, PEER_ENTRIES,
+    PENDING, SYNCED_ROWS,
 };
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -36,7 +37,14 @@ pub(super) fn validate_attachment_path(
     path: &str,
     error: fn(String) -> ClientError,
 ) -> Result<(), ClientError> {
-    let reserved = [MANIFEST, SYNCED_ROWS, LOCAL_ROWS, PENDING];
+    let reserved = [
+        MANIFEST,
+        SYNCED_ROWS,
+        LOCAL_ROWS,
+        PENDING,
+        PEER_ENTRIES,
+        PEER_CURSORS,
+    ];
     let valid = !path.is_empty()
         && !path.starts_with('/')
         && !path.contains('\\')

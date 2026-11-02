@@ -7,7 +7,7 @@ use crate::ClientError;
 
 use super::super::{
     ArchiveAttachment, ExportScope, FORMAT, Incoming, LOCAL_ROWS, MANIFEST, MAX_ATTACHMENTS_BYTES,
-    PENDING, SYNCED_ROWS, VERSION, read_error,
+    PEER_CURSORS, PEER_ENTRIES, PENDING, SYNCED_ROWS, VERSION, read_error,
 };
 use super::{Entry, Manifest, checked_attachment_total, validate_attachment_path};
 
@@ -42,6 +42,8 @@ pub(crate) fn open<R: Read + Seek>(source: R) -> Result<(Incoming, ArchiveReader
     let synced_present = declared.contains(SYNCED_ROWS);
     let local_rows = read_entry(&mut zip, LOCAL_ROWS)?;
     let pending = read_pending_queue(&mut zip)?;
+    let peer_entries = read_peer_entries(&mut zip)?;
+    let peer_cursors = read_peer_cursors(&mut zip)?;
     let attachments = declare_attachments(&mut zip, &manifest.entries)?;
     Ok((
         Incoming {
@@ -52,6 +54,8 @@ pub(crate) fn open<R: Read + Seek>(source: R) -> Result<(Incoming, ArchiveReader
             synced_present,
             local_rows,
             pending,
+            peer_entries,
+            peer_cursors,
             attachments,
         },
         ArchiveReader { zip },
@@ -122,6 +126,28 @@ fn read_pending_queue<R: Read + Seek>(
 ) -> Result<Vec<super::super::ArchivedEntry>, ClientError> {
     match read_entry(zip, PENDING)? {
         Some(bytes) => decode_pending(&bytes),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The stored peer entries, position order, absent from an archive a build
+/// without the peer tables made (R77 decision 16).
+fn read_peer_entries<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<Vec<super::super::ArchivedPeerEntry>, ClientError> {
+    match read_entry(zip, PEER_ENTRIES)? {
+        Some(bytes) => decode_peer_entries(&bytes),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The per-author peer cursors, absent from an archive a build without the
+/// peer tables made (R77 decision 16).
+fn read_peer_cursors<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<Vec<super::super::ArchivedPeerCursor>, ClientError> {
+    match read_entry(zip, PEER_CURSORS)? {
+        Some(bytes) => decode_peer_cursors(&bytes),
         None => Ok(Vec::new()),
     }
 }
@@ -209,11 +235,13 @@ fn validate_entry_declaration(entry: &Entry) -> Result<(), ClientError> {
             require_encoding(entry, "zstd")
         }
         "pending" if entry.path == PENDING => require_encoding(entry, "zstd"),
+        "peer-entries" if entry.path == PEER_ENTRIES => require_encoding(entry, "zstd"),
+        "peer-cursors" if entry.path == PEER_CURSORS => require_encoding(entry, "zstd"),
         "attachment" => {
             validate_attachment_path(&entry.path, ClientError::Import)?;
             require_encoding(entry, "identity")
         }
-        "rows" | "pending" => Err(ClientError::Import(format!(
+        "rows" | "pending" | "peer-entries" | "peer-cursors" => Err(ClientError::Import(format!(
             "archive entry {} contradicts kind {}",
             entry.path, entry.kind
         ))),
@@ -397,6 +425,117 @@ pub(super) fn decode_pending(
     Ok(entries)
 }
 
+/// The stored peer entries behind their framing, in position order
+/// (R77 decision 16).
+pub(super) fn decode_peer_entries(
+    bytes: &[u8],
+) -> Result<Vec<super::super::ArchivedPeerEntry>, ClientError> {
+    use super::super::ArchivedPeerEntry;
+
+    let malformed = || ClientError::Import("the peer entry record is malformed".to_owned());
+    let mut at: usize = 0;
+    let count = u64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
+    // Every entry costs at least its fixed 59 bytes, so a count above what the
+    // entry can hold is refused before one vector per entry is allocated.
+    if count > u64::try_from((bytes.len() - at) / 59).unwrap_or(u64::MAX) {
+        return Err(malformed());
+    }
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        let author = read_bytes_field(bytes, &mut at, &malformed)?;
+        let seq = i64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
+        let major = i64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
+        let changeset = read_bytes_field(bytes, &mut at, &malformed)?;
+        let account = read_text_field(bytes, &mut at, &malformed)?;
+        let bot_list = match read_array::<1>(bytes, &mut at, &malformed)? {
+            [0] => None,
+            [1] => Some(read_text_field(bytes, &mut at, &malformed)?),
+            _ => return Err(malformed()),
+        };
+        let received_at = i64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
+        entries.push(ArchivedPeerEntry {
+            author,
+            seq,
+            major,
+            changeset,
+            account,
+            bot_list,
+            received_at,
+        });
+    }
+    Ok(entries)
+}
+
+/// The per-author peer cursors behind their framing (R77 decision 16).
+pub(super) fn decode_peer_cursors(
+    bytes: &[u8],
+) -> Result<Vec<super::super::ArchivedPeerCursor>, ClientError> {
+    use super::super::ArchivedPeerCursor;
+
+    let malformed = || ClientError::Import("the peer cursor record is malformed".to_owned());
+    let mut at: usize = 0;
+    let count = u64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
+    // Every cursor costs at least its fixed 64 bytes, so a count above what
+    // the entry can hold is refused before one vector per cursor is allocated.
+    if count > u64::try_from((bytes.len() - at) / 64).unwrap_or(u64::MAX) {
+        return Err(malformed());
+    }
+    let mut cursors = Vec::new();
+    for _ in 0..count {
+        let author = read_bytes_field(bytes, &mut at, &malformed)?;
+        let account = read_text_field(bytes, &mut at, &malformed)?;
+        let seq = i64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
+        let head = read_array(bytes, &mut at, &malformed)?;
+        let offer = read_bytes_field(bytes, &mut at, &malformed)?;
+        cursors.push(ArchivedPeerCursor {
+            author,
+            account,
+            seq,
+            head,
+            offer,
+        });
+    }
+    Ok(cursors)
+}
+
+/// The `N` bytes at `at`, advancing past them.
+fn read_array<const N: usize>(
+    bytes: &[u8],
+    at: &mut usize,
+    malformed: &impl Fn() -> ClientError,
+) -> Result<[u8; N], ClientError> {
+    let field = *bytes
+        .get(*at..)
+        .and_then(<[u8]>::first_chunk::<N>)
+        .ok_or_else(malformed)?;
+    *at += N;
+    Ok(field)
+}
+
+/// A big-endian length-prefixed byte string at `at`, advancing past it.
+fn read_bytes_field(
+    bytes: &[u8],
+    at: &mut usize,
+    malformed: &impl Fn() -> ClientError,
+) -> Result<Vec<u8>, ClientError> {
+    let len = u64::from_be_bytes(read_array(bytes, at, malformed)?);
+    let value = usize::try_from(len)
+        .ok()
+        .and_then(|len| bytes.get(*at..)?.get(..len))
+        .ok_or_else(malformed)?;
+    *at += value.len();
+    Ok(value.to_vec())
+}
+
+/// A length-prefixed UTF-8 string at `at`, advancing past it.
+fn read_text_field(
+    bytes: &[u8],
+    at: &mut usize,
+    malformed: &impl Fn() -> ClientError,
+) -> Result<String, ClientError> {
+    String::from_utf8(read_bytes_field(bytes, at, malformed)?).map_err(|_| malformed())
+}
+
 /// A writer secret behind its presence byte, absent when the byte is zero.
 fn read_secret(
     bytes: &[u8],
@@ -455,7 +594,7 @@ mod tests {
 
     use super::super::super::ExportScope;
     use super::super::super::{Archive, Incoming};
-    use super::decode_pending;
+    use super::{decode_peer_cursors, decode_peer_entries, decode_pending};
     use connetto_core::Major;
 
     /// Opens one archive held in a buffer and keeps only what it declares.
@@ -515,6 +654,7 @@ mod tests {
                 }),
             },
         ];
+        let (peer_entries, peer_cursors) = peer_fixture();
         let archive = Archive {
             scope: ExportScope::Unsynced,
             fingerprint: "abc123".to_owned(),
@@ -523,6 +663,8 @@ mod tests {
             synced_rows: None,
             local_rows: Some(vec![7u8; 64]),
             pending: pending.clone(),
+            peer_entries: peer_entries.clone(),
+            peer_cursors: peer_cursors.clone(),
             attachments: &[],
         };
         let bytes = write(&archive).expect("write");
@@ -534,6 +676,74 @@ mod tests {
         assert!(!read_back.synced_present);
         assert_eq!(read_back.local_rows, Some(vec![7u8; 64]));
         assert_eq!(read_back.pending, pending);
+        let (expected_entries, expected_cursors) = peer_fixture();
+        assert_eq!(read_back.peer_entries, expected_entries);
+        assert_eq!(read_back.peer_cursors, expected_cursors);
+
+        // The peer state rides in the other scope as well.
+        let (peer_entries, peer_cursors) = peer_fixture();
+        let everything = Archive {
+            scope: ExportScope::Everything,
+            fingerprint: "abc123".to_owned(),
+            major: Major::new(2),
+            account: None,
+            synced_rows: Some(vec![3u8; 32]),
+            local_rows: None,
+            pending: Vec::new(),
+            peer_entries,
+            peer_cursors,
+            attachments: &[],
+        };
+        let read_back = read(&write(&everything).expect("write")).expect("read");
+        let (expected_entries, expected_cursors) = peer_fixture();
+        assert_eq!(read_back.peer_entries, expected_entries);
+        assert_eq!(read_back.peer_cursors, expected_cursors);
+    }
+
+    /// One author's entries and cursors the round-trip tests name.
+    fn peer_fixture() -> (
+        Vec<super::super::super::ArchivedPeerEntry>,
+        Vec<super::super::super::ArchivedPeerCursor>,
+    ) {
+        use super::super::super::{ArchivedPeerCursor, ArchivedPeerEntry};
+
+        let entries = vec![
+            ArchivedPeerEntry {
+                author: vec![1u8, 2],
+                seq: 7,
+                major: 3,
+                changeset: vec![4u8, 5, 6],
+                account: "peer-anna".to_owned(),
+                bot_list: Some("*".to_owned()),
+                received_at: 1_700_000_000,
+            },
+            ArchivedPeerEntry {
+                author: vec![9u8],
+                seq: 1,
+                major: 1,
+                changeset: vec![],
+                account: "peer-ben".to_owned(),
+                bot_list: None,
+                received_at: 1_700_000_001,
+            },
+        ];
+        let cursors = vec![
+            ArchivedPeerCursor {
+                author: vec![1u8, 2],
+                account: "peer-anna".to_owned(),
+                seq: 7,
+                head: [3u8; 32],
+                offer: vec![77u8, 88],
+            },
+            ArchivedPeerCursor {
+                author: vec![9u8],
+                account: "peer-ben".to_owned(),
+                seq: 1,
+                head: [4u8; 32],
+                offer: vec![],
+            },
+        ];
+        (entries, cursors)
     }
 
     /// A version 4 archive carries no capture major per write, so this build
@@ -759,6 +969,109 @@ mod tests {
         }
     }
 
+    /// A peer entry record cut short at any byte, counting more entries than
+    /// it holds, carrying an account that is not text or a presence byte the
+    /// framing does not name, is refused rather than read as the fields
+    /// after it.
+    #[test]
+    fn a_malformed_peer_entry_record_is_refused() {
+        use super::super::super::ArchivedPeerEntry;
+
+        let entry = ArchivedPeerEntry {
+            author: vec![1u8, 2],
+            seq: 7,
+            major: 3,
+            changeset: vec![4u8, 5, 6],
+            account: "peer-anna".to_owned(),
+            bot_list: Some("*".to_owned()),
+            received_at: 1_700_000_000,
+        };
+        let bytes = super::super::write::encode_peer_entries(std::slice::from_ref(&entry));
+        assert_eq!(
+            decode_peer_entries(&bytes).expect("a valid peer entry"),
+            std::slice::from_ref(&entry).to_vec()
+        );
+        // The bot-list presence byte, the count and the fields preceding it.
+        let presence_at = 8 + 8 + 2 + 8 + 8 + 8 + 3 + 8 + 10;
+        let mut unknown = bytes.clone();
+        unknown[presence_at] = 2;
+        // The account's first byte, made invalid UTF-8.
+        let mut not_text = bytes.clone();
+        not_text[presence_at - 9] = 0xFF;
+        // A count above what the record can hold.
+        let mut overcount = bytes.clone();
+        overcount[..8].copy_from_slice(&2u64.to_be_bytes());
+        let cuts = (0..bytes.len()).map(|len| bytes[..len].to_vec());
+        for malformed in [unknown, not_text, overcount].into_iter().chain(cuts) {
+            assert!(matches!(
+                decode_peer_entries(&malformed),
+                Err(crate::ClientError::Import(_))
+            ));
+        }
+    }
+
+    /// A peer cursor record cut short at any byte, its head included,
+    /// counting more cursors than it holds or carrying an account that is not
+    /// text, is refused rather than read shorter.
+    #[test]
+    fn a_malformed_peer_cursor_record_is_refused() {
+        use super::super::super::ArchivedPeerCursor;
+
+        let cursor = ArchivedPeerCursor {
+            author: vec![1u8, 2],
+            account: "peer-anna".to_owned(),
+            seq: 7,
+            head: [3u8; 32],
+            offer: vec![77u8],
+        };
+        let bytes = super::super::write::encode_peer_cursors(std::slice::from_ref(&cursor));
+        assert_eq!(
+            decode_peer_cursors(&bytes).expect("a valid peer cursor"),
+            std::slice::from_ref(&cursor).to_vec()
+        );
+        // The account's first byte, made invalid UTF-8.
+        let mut not_text = bytes.clone();
+        not_text[8 + 8 + 2 + 8] = 0xFF;
+        // A count above what the record can hold.
+        let mut overcount = bytes.clone();
+        overcount[..8].copy_from_slice(&2u64.to_be_bytes());
+        let cuts = (0..bytes.len()).map(|len| bytes[..len].to_vec());
+        for malformed in [not_text, overcount].into_iter().chain(cuts) {
+            assert!(matches!(
+                decode_peer_cursors(&malformed),
+                Err(crate::ClientError::Import(_))
+            ));
+        }
+    }
+
+    /// A version 6 archive carries no peer state, so this build refuses it
+    /// instead of guessing the cursors it did not record.
+    #[test]
+    fn a_version_6_archive_is_refused() {
+        let manifest = json!({
+            "format": "connetto-local-data",
+            "version": 6,
+            "scope": "unsynced",
+            "schema_fingerprint": "abc123",
+            "major": 1,
+            "account": null,
+            "compression": "per-entry",
+            "note": "test",
+            "entries": [],
+        });
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("manifest.json", zip::write::SimpleFileOptions::default())
+            .expect("start manifest");
+        zip.write_all(&serde_json::to_vec(&manifest).expect("encode manifest"))
+            .expect("write manifest");
+        let bytes = zip.finish().expect("finish archive").into_inner();
+        let error = read(&bytes).expect_err("a version 6 archive must be refused");
+        assert!(
+            error.to_string().contains("version 6"),
+            "the refusal names the version: {error}"
+        );
+    }
+
     /// An attachment above the per-entry ceiling is refused from what the
     /// directory declares, so the bytes it claims never have to exist.
     ///
@@ -779,6 +1092,8 @@ mod tests {
                 synced_rows: None,
                 local_rows: None,
                 pending: Vec::new(),
+                peer_entries: Vec::new(),
+                peer_cursors: Vec::new(),
                 attachments: std::slice::from_ref(&declaration),
             },
         )

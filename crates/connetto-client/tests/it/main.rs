@@ -83,6 +83,12 @@ mod outbox_push;
 #[cfg(feature = "peer")]
 mod peer_apply;
 
+#[cfg(feature = "peer")]
+mod peer_archive;
+
+#[cfg(feature = "peer")]
+mod peer_support;
+
 #[cfg(feature = "native-auth")]
 mod pump_fault;
 

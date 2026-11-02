@@ -36,15 +36,22 @@ impl ExportScope {
 
 /// The archive format name.
 const FORMAT: &str = "connetto-local-data";
-/// Version 6 carries each queued write's writer, the secret a number writer
+/// Version 7 carries each queued write's writer, the secret a number writer
 /// was issued under (R70), sequence, chain hash and the application schema
 /// major it was captured under, beside the major the archive was made under
-/// (R31).
-const VERSION: u32 = 6;
+/// (R31), and for a build that exchanges with peers (R77 decision 16) the
+/// stored peer entries in their position order and the per-author cursors
+/// with their last verified offers, the retraction log and the provisional
+/// records apart from them.
+const VERSION: u32 = 7;
 const MANIFEST: &str = "manifest.json";
 const SYNCED_ROWS: &str = "synced.patchset";
 const LOCAL_ROWS: &str = "device-private.patchset";
 const PENDING: &str = "pending.changesets";
+/// The stored peer entries a build that exchanges with peers carries.
+const PEER_ENTRIES: &str = "_connetto_peer_entry";
+/// The per-author peer cursors a build that exchanges with peers carries.
+const PEER_CURSORS: &str = "_connetto_peer_cursor";
 /// Human-readable description of the entry encodings.
 const NOTE: &str = "rows are zstd SQLite change records. Attachments declare their encoding";
 /// The most one attachment may ask a device to hold on disk, and in memory
@@ -119,6 +126,12 @@ pub(crate) struct Archive<'a> {
     pub(crate) local_rows: Option<Vec<u8>>,
     /// Unconfirmed writes in causal append order.
     pub(crate) pending: Vec<ArchivedEntry>,
+    /// The stored peer entries in their position order, carried by a build
+    /// that exchanges with peers (R77 decision 16).
+    pub(crate) peer_entries: Vec<ArchivedPeerEntry>,
+    /// The per-author peer cursors, carried by a build that exchanges with
+    /// peers (R77 decision 16).
+    pub(crate) peer_cursors: Vec<ArchivedPeerCursor>,
     /// Opaque files supplied by an optional client layer.
     pub(crate) attachments: &'a [ArchiveAttachment],
 }
@@ -146,6 +159,41 @@ pub(crate) struct ArchivedEntry {
     pub(crate) provenance: Option<connetto_core::messages::Provenance>,
 }
 
+/// One stored peer entry an archive carries, as the store holds it (R77
+/// decision 16), the entries travelling in their position order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArchivedPeerEntry {
+    /// The author's key id.
+    pub(crate) author: Vec<u8>,
+    /// The author's queue sequence.
+    pub(crate) seq: i64,
+    /// The major the entry was captured under.
+    pub(crate) major: i64,
+    /// The entry's body, as stored.
+    pub(crate) changeset: Vec<u8>,
+    /// The author's certificate account.
+    pub(crate) account: String,
+    /// The author's certificate bot list, absent when it carried none.
+    pub(crate) bot_list: Option<String>,
+    /// The wall clock the entry was received at, in seconds.
+    pub(crate) received_at: i64,
+}
+
+/// One per-author peer cursor an archive carries (R77 decision 16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArchivedPeerCursor {
+    /// The author's key id.
+    pub(crate) author: Vec<u8>,
+    /// The author's certificate account.
+    pub(crate) account: String,
+    /// The last verified sequence.
+    pub(crate) seq: i64,
+    /// The chain hash at it.
+    pub(crate) head: [u8; 32],
+    /// The author's last verified signed offer, as stored.
+    pub(crate) offer: Vec<u8>,
+}
+
 /// What an import reads out of an archive.
 ///
 /// The synced replica's rows are named rather than carried: an import never
@@ -168,6 +216,19 @@ pub(crate) struct Incoming {
     pub(crate) local_rows: Option<Vec<u8>>,
     /// Unconfirmed writes in causal append order.
     pub(crate) pending: Vec<ArchivedEntry>,
+    /// The stored peer entries in their position order, absent from an
+    /// archive made by a build that exchanges with no peers.
+    pub(crate) peer_entries: Vec<ArchivedPeerEntry>,
+    /// The per-author peer cursors, absent from an archive made by a build
+    /// that exchanges with no peers.
+    #[cfg_attr(
+        not(feature = "peer"),
+        expect(
+            dead_code,
+            reason = "a build without peer tables counts the entries and reads no cursors"
+        )
+    )]
+    pub(crate) peer_cursors: Vec<ArchivedPeerCursor>,
     /// Opaque files supplied by optional client layers.
     pub(crate) attachments: Vec<ArchiveAttachment>,
 }
@@ -340,6 +401,21 @@ impl<R> ImportPlan<R> {
     #[must_use]
     pub fn queued_writes(&self) -> usize {
         self.archive.pending.len()
+    }
+
+    /// How many stored peer entries the file carries and this import leaves
+    /// out, `0` for a build that exchanges with peers, which re-applies
+    /// them. The rows arrive on this device once the server holds them.
+    #[must_use]
+    pub fn peer_entries_left_out(&self) -> usize {
+        #[cfg(feature = "peer")]
+        {
+            0
+        }
+        #[cfg(not(feature = "peer"))]
+        {
+            self.archive.peer_entries.len()
+        }
     }
 
     /// The opaque files optional client layers supplied, each named and sized.

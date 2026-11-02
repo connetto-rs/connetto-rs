@@ -71,6 +71,102 @@ fn stored_seq(seq: u64) -> Result<i64, ClientError> {
         .map_err(|_| ClientError::Session(format!("a peer cursor at {seq} overflows storage")))
 }
 
+/// `author`'s stored cursor, `None` when nothing of it was ever verified.
+///
+/// # Errors
+///
+/// [`ClientError`] when the cursor cannot be read or is corrupt.
+pub(crate) fn cursor_of(
+    db: &mut SqliteConnection,
+    author: &[u8],
+) -> Result<Option<Frontier>, ClientError> {
+    let row: Option<(i64, Vec<u8>)> = dsl::_connetto_peer_cursor
+        .filter(dsl::author.eq(author))
+        .select((dsl::seq, dsl::head))
+        .first(db)
+        .optional()?;
+    let Some((seq, head)) = row else {
+        return Ok(None);
+    };
+    let corrupt = || ClientError::Session(format!("a peer cursor records sequence {seq}"));
+    Ok(Some(Frontier {
+        seq: u64::try_from(seq).map_err(|_| corrupt())?,
+        head: head.try_into().map_err(|_| corrupt())?,
+    }))
+}
+
+/// Every stored cursor, author order, the archive's copy of the peer state
+/// (R77 decision 16).
+///
+/// # Errors
+///
+/// [`ClientError`] when a cursor cannot be read or its head is corrupt.
+pub(crate) fn all_cursors(
+    db: &mut SqliteConnection,
+) -> Result<Vec<crate::archive::ArchivedPeerCursor>, ClientError> {
+    #[derive(diesel::Queryable)]
+    struct Row {
+        author: Vec<u8>,
+        account: String,
+        seq: i64,
+        head: Vec<u8>,
+        offer: Vec<u8>,
+    }
+    let rows: Vec<Row> = dsl::_connetto_peer_cursor
+        .select((dsl::author, dsl::account, dsl::seq, dsl::head, dsl::offer))
+        .order(dsl::author.asc())
+        .load(db)?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(crate::archive::ArchivedPeerCursor {
+                head: row.head.try_into().map_err(|_| {
+                    ClientError::Session("a peer cursor records no chain head".to_owned())
+                })?,
+                author: row.author,
+                account: row.account,
+                seq: row.seq,
+                offer: row.offer,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+/// Store or replace `author`'s cursor with `cursor` and its verified `offer`
+/// (R77 decision 16), the archive's import writing it where the receiver held
+/// none.
+///
+/// # Errors
+///
+/// [`ClientError`] when the sequence overflows storage or the cursor cannot
+/// be written.
+pub(crate) fn upsert_cursor(
+    db: &mut SqliteConnection,
+    author: &[u8],
+    account: &str,
+    cursor: &Frontier,
+    offer: &[u8],
+) -> Result<(), ClientError> {
+    let seq = stored_seq(cursor.seq)?;
+    diesel::insert_into(dsl::_connetto_peer_cursor)
+        .values((
+            dsl::author.eq(author),
+            dsl::account.eq(account),
+            dsl::seq.eq(seq),
+            dsl::head.eq(cursor.head.as_slice()),
+            dsl::offer.eq(offer),
+        ))
+        .on_conflict(dsl::author)
+        .do_update()
+        .set((
+            dsl::account.eq(account),
+            dsl::seq.eq(seq),
+            dsl::head.eq(cursor.head.as_slice()),
+            dsl::offer.eq(offer),
+        ))
+        .execute(db)?;
+    Ok(())
+}
+
 /// A range the device writer serves, with the hash it chains from, its rows,
 /// and the sequences whose bodies cross under the requester's build.
 #[derive(Debug, Clone, PartialEq, Eq)]
