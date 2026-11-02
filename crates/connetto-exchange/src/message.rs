@@ -5,9 +5,9 @@ use connetto_core::exchange::{EndOutcome, ManifestRow, SignedOffer};
 use connetto_core::schema::{Major, SchemaVersion};
 use serde::{Deserialize, Serialize};
 
-/// The rows one manifest message carries, the bound a manifest over is
-/// refused on both ends of the link.
-pub const MAX_MANIFEST_ROWS: usize = 8192;
+/// The rows one manifest frame carries, re-exported from the core, which the
+/// server's ask bound shares (R77 decision 11).
+pub use connetto_core::exchange::MAX_MANIFEST_ROWS;
 
 /// One exchange message between two linked devices, the signed offer or a
 /// transfer of the peer's writer chain.

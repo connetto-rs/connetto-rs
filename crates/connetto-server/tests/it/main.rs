@@ -151,6 +151,8 @@ mod write_attribution;
 
 mod writer_frontier;
 
+mod provisional;
+
 mod courier_frontier;
 
 mod upkeep_consulted;

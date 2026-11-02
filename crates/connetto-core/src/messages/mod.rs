@@ -14,6 +14,7 @@ pub mod error;
 pub mod flow;
 pub mod handshake;
 pub mod mutation;
+pub mod provisional;
 pub mod reconnect;
 pub mod registration;
 pub mod share_keys;
@@ -21,6 +22,7 @@ pub mod storage;
 pub mod subscription;
 pub mod writer;
 
+pub use crate::exchange::Verdict;
 pub use aggregate::AggregateUpdate;
 pub use bulk::{BulkMessage, LivePatch, MutationPatch, SnapshotPatch};
 pub use content::{ContentTicketGrant, ContentTicketRequest, ContentVerb};
@@ -40,6 +42,7 @@ pub use mutation::{
     ConflictRow, HeldWork, HeldWrite, MutationApplied, MutationConflict, MutationHeader,
     MutationReject, MutationRejectReason,
 };
+pub use provisional::{PROVISIONAL_ASK_REFUSED, ProvisionalStatus, ProvisionalVerdicts};
 pub use reconnect::{FullResyncReason, FullResyncRequired};
 pub use registration::{
     BOT_REGISTRATION_DOMAIN, BotListEntry, BotRegistered, Challenge, RegisterBot,

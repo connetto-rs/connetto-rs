@@ -1,0 +1,602 @@
+//! The server's ruling on the receiver's provisional rows (R77 decision 11).
+//!
+//! Each replica here applies the author's entries over a link and holds them
+//! provisionally, then asks over a server connection. What is proved is the
+//! client half of the ruling, the asks it plans at attach, the single ask it
+//! carries per author, the verdicts it applies to the rows, and the drops
+//! that end the session's ask of an author.
+
+use std::time::Duration;
+
+use connetto_client::peer::PeerAuthor;
+use connetto_client::provisional::{ProvisionalState, encode_key};
+use connetto_client::{ClientEvent, ConnettoConnection, KeyValue};
+use connetto_core::exchange::{RetractCause, Verdict};
+use connetto_core::messages::{
+    ControlMessage, MutationRejectReason, NonFatalError, PROVISIONAL_ASK_REFUSED,
+    ProvisionalStatus, ProvisionalVerdicts, RateLimited,
+};
+use connetto_core::traits::IncomingFrame;
+use diesel::prelude::*;
+
+use super::peer_support::{captured, manifest, pump_to, receiver};
+use super::support::{self, Script};
+
+/// The author replica's schema, the receiver's `orders` table with no
+/// policies, so its own writes capture whatever it chooses.
+const PLAIN_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
+                          status TEXT NOT NULL);";
+
+/// The receiver replica's source, the same table behind translated policies.
+const DDL: &str = "-- connetto:major 1\n \
+                   CREATE TABLE orders (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
+                   status TEXT NOT NULL); \
+                   ALTER TABLE orders ENABLE ROW LEVEL SECURITY;";
+
+/// Every person reads `orders` but writes only rows they own, so the
+/// receiver sees an author's rows as that author.
+const POLICIES: &str = "CREATE POLICY orders_read ON orders FOR SELECT USING (true); \
+                        CREATE POLICY orders_insert ON orders FOR INSERT \
+                        WITH CHECK (owner = current_setting('app.user_id', true)); \
+                        CREATE POLICY orders_update ON orders FOR UPDATE \
+                        USING (owner = current_setting('app.user_id', true)) \
+                        WITH CHECK (owner = current_setting('app.user_id', true)); \
+                        CREATE POLICY orders_delete ON orders FOR DELETE \
+                        USING (owner = current_setting('app.user_id', true));";
+
+const AUTHOR_A: [u8; 32] = [7; 32];
+const AUTHOR_B: [u8; 32] = [8; 32];
+const AUTHOR_C: [u8; 32] = [9; 32];
+const OFFER_A: &[u8] = b"signed-offer-a";
+const OFFER_C: &[u8] = b"signed-offer-c";
+
+diesel::table! {
+    /// The synced orders table, read off the replica.
+    orders (id) {
+        /// Primary key.
+        id -> BigInt,
+        /// The row's owner.
+        owner -> Text,
+        /// Free-text payload.
+        status -> Text,
+    }
+}
+
+diesel::table! {
+    /// The stored peer entries, read raw because the typed schema does not
+    /// name connetto's internals.
+    _connetto_peer_entry (author, seq) {
+        /// The author's key id.
+        author -> Binary,
+        /// The author's queue sequence.
+        seq -> BigInt,
+        /// The major the entry was captured under.
+        major -> BigInt,
+        /// The entry's body, as received.
+        changeset -> Binary,
+        /// The author's certificate account.
+        account -> Text,
+        /// The author's bot list, when the author carries one.
+        bot_list -> Nullable<Text>,
+        /// The wall clock the entry was received at.
+        received_at -> BigInt,
+        /// The replica-wide append position.
+        position -> BigInt,
+    }
+}
+
+diesel::table! {
+    /// The author's stored cursor, head and offer, read raw.
+    _connetto_peer_cursor (author) {
+        /// The author's key id.
+        author -> Binary,
+        /// The author's certificate account.
+        account -> Text,
+        /// The last verified sequence.
+        seq -> BigInt,
+        /// The chain head at it.
+        head -> Binary,
+        /// The author's last verified signed offer, as `MessagePack`.
+        offer -> Binary,
+    }
+}
+
+diesel::table! {
+    /// The peer-applied rows' provenance, read raw.
+    _connetto_provisional (tbl, pk) {
+        /// The replica table holding the row.
+        tbl -> Text,
+        /// The row's primary key, encoded.
+        pk -> Binary,
+        /// The author's key id.
+        author -> Binary,
+        /// The author's queue sequence the row came from.
+        seq -> BigInt,
+        /// The author's certificate account.
+        account -> Text,
+        /// The wall clock the row was received at.
+        received_at -> BigInt,
+        /// Whether the row still awaits a verdict.
+        state -> BigInt,
+        /// The author the receiver's own write displaced.
+        displaced_author -> Nullable<Binary>,
+        /// That author's queue sequence.
+        displaced_seq -> Nullable<BigInt>,
+    }
+}
+
+/// The 32-byte device author the entries apply under.
+fn author_of(key: [u8; 32]) -> PeerAuthor {
+    PeerAuthor {
+        key_id: key.to_vec(),
+        account: "peer-anna".to_owned(),
+        bot_list: Some("*".to_owned()),
+    }
+}
+
+/// Insert one order through the connection's capture.
+fn insert_order(conn: &mut ConnettoConnection<Script>, id: i64) {
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(id),
+            orders::owner.eq("peer-anna"),
+            orders::status.eq("open"),
+        ))
+        .execute(conn.conn())
+        .expect("insert the order");
+}
+
+/// Store `author`'s cursor row with `offer`, the offer the ask will carry.
+fn seed_cursor<T>(conn: &mut ConnettoConnection<T>, author: &[u8; 32], seq: i64, offer: &[u8])
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    diesel::insert_into(_connetto_peer_cursor::table)
+        .values((
+            _connetto_peer_cursor::author.eq(author.to_vec()),
+            _connetto_peer_cursor::account.eq("peer-anna"),
+            _connetto_peer_cursor::seq.eq(seq),
+            _connetto_peer_cursor::head.eq(vec![0u8; 32]),
+            _connetto_peer_cursor::offer.eq(offer.to_vec()),
+        ))
+        .execute(conn.conn())
+        .expect("seed the cursor");
+}
+
+/// Write `count` provisional records naming `author`, at sequences 1 to
+/// `count`, no replica row or stored entry beside them, the keys standing at
+/// `key_offset` past any of the replica's own rows.
+fn bulk_records<T>(conn: &mut ConnettoConnection<T>, author: &[u8; 32], count: i64, key_offset: i64)
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    for seq in 1..=count {
+        diesel::insert_into(_connetto_provisional::table)
+            .values((
+                _connetto_provisional::tbl.eq("orders"),
+                _connetto_provisional::pk.eq(encode_key(&[KeyValue::Int(seq + key_offset)])),
+                _connetto_provisional::author.eq(author.to_vec()),
+                _connetto_provisional::seq.eq(seq),
+                _connetto_provisional::account.eq("peer-anna"),
+                _connetto_provisional::received_at.eq(1_700_000_000),
+                _connetto_provisional::state.eq(ProvisionalState::Provisional.db()),
+            ))
+            .execute(conn.conn())
+            .expect("seed the record");
+    }
+}
+
+/// The records naming `author`, sequence and stored state, seq order.
+fn record_states<T>(conn: &mut ConnettoConnection<T>, author: &[u8; 32]) -> Vec<(i64, i64)>
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    _connetto_provisional::table
+        .filter(_connetto_provisional::author.eq(author.to_vec()))
+        .select((_connetto_provisional::seq, _connetto_provisional::state))
+        .order(_connetto_provisional::seq.asc())
+        .load(conn.conn())
+        .expect("read the records")
+}
+
+/// The stored entry sequences of `author`, seq order.
+fn entry_seqs<T>(conn: &mut ConnettoConnection<T>, author: &[u8; 32]) -> Vec<i64>
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    _connetto_peer_entry::table
+        .filter(_connetto_peer_entry::author.eq(author.to_vec()))
+        .select(_connetto_peer_entry::seq)
+        .order(_connetto_peer_entry::seq.asc())
+        .load(conn.conn())
+        .expect("read the entries")
+}
+
+/// The replica's orders, id order.
+fn order_ids<T>(conn: &mut ConnettoConnection<T>) -> Vec<i64>
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    orders::table
+        .select(orders::id)
+        .order(orders::id.asc())
+        .load(conn.conn())
+        .expect("read the orders")
+}
+
+/// A receiver replica with the author's entries applied provisionally at
+/// sequences 1 to `bodies.len()`, the author's offer stored, its wired
+/// script dropped.
+async fn provisioned(bodies: &[Vec<u8>]) -> ConnettoConnection<Script> {
+    let (mut conn, _) = receiver(DDL, POLICIES).await;
+    let author = author_of(AUTHOR_A);
+    for (seq, body) in bodies.iter().enumerate() {
+        let seq = u64::try_from(seq).expect("a test sequence fits a u64") + 1;
+        conn.apply_peer_entry(&author, &manifest(seq, body), body)
+            .expect("apply the entry");
+    }
+    seed_cursor(
+        &mut conn,
+        &AUTHOR_A,
+        i64::try_from(bodies.len()).expect("a count fits an i64"),
+        OFFER_A,
+    );
+    conn
+}
+
+/// Re-attach `conn` over a fresh scripted wire that answers the handshake.
+async fn attach(mut conn: ConnettoConnection<Script>) -> (ConnettoConnection<Script>, Script) {
+    let script = Script::default();
+    script.say(support::handshake_ack());
+    conn.attach(script.clone()).await.expect("attach");
+    (conn, script)
+}
+
+/// The provisional asks the client sent, in the order it sent them.
+fn asks(script: &Script) -> Vec<ProvisionalStatus> {
+    script.sent(|message| match message {
+        ControlMessage::ProvisionalStatus(ask) => Some(ask.clone()),
+        _ => None,
+    })
+}
+
+/// Queue one ruling on `script`, the frames a ruling of `verdicts` carries.
+fn rule(script: &Script, request_id: &str, verdicts: Vec<(u64, Verdict)>) {
+    script.say(IncomingFrame::Control(ControlMessage::ProvisionalVerdicts(
+        ProvisionalVerdicts {
+            request_id: request_id.to_owned(),
+            verdicts,
+        },
+    )));
+}
+
+const APPLIED: &str = "a provisional ruling was applied";
+const NO_OPEN_ASK: &str = "a provisional ruling arrived with no open ask";
+
+fn applied(event: &ClientEvent) -> bool {
+    matches!(event, ClientEvent::NonFatal { detail, .. } if detail == APPLIED)
+}
+
+fn no_open_ask(event: &ClientEvent) -> bool {
+    matches!(event, ClientEvent::NonFatal { detail, .. } if detail == NO_OPEN_ASK)
+}
+
+/// The ask carries the author's lowest sequences up to the bound and the
+/// stored offer, and the next author's ask goes out only once the first
+/// ruling stands. An author with no stored offer is never asked.
+#[tokio::test]
+async fn attach_asks_each_author_it_holds_an_offer_from() {
+    let (mut conn, _) = receiver(DDL, POLICIES).await;
+    let author = author_of(AUTHOR_A);
+    let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
+    let w2 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 2);
+    let w3 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 3);
+    let [b1, b2, b3] = captured(PLAIN_DDL, [&w1, &w2, &w3]).await;
+    conn.apply_peer_entry(&author, &manifest(1, &b1), &b1)
+        .expect("apply sequence 1");
+    conn.apply_peer_entry(&author, &manifest(2, &b2), &b2)
+        .expect("apply sequence 2");
+    conn.apply_peer_entry(&author, &manifest(3, &b3), &b3)
+        .expect("apply sequence 3");
+    seed_cursor(&mut conn, &AUTHOR_A, 3, OFFER_A);
+    // AUTHOR_B's rows hold no stored offer, so nothing of the author is
+    // ever asked.
+    bulk_records(&mut conn, &AUTHOR_B, 3, 1_000);
+    // AUTHOR_C is asked once the ruling for AUTHOR_A stands, one at a time.
+    bulk_records(&mut conn, &AUTHOR_C, 3, 2_000);
+    seed_cursor(&mut conn, &AUTHOR_C, 3, OFFER_C);
+
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+
+    let [first] = asks(&script).try_into().expect("one ask at a time");
+    assert_eq!(first.author, AUTHOR_A);
+    assert_eq!(first.seqs, vec![1, 2, 3]);
+    assert_eq!(first.offer, OFFER_A);
+
+    rule(
+        &script,
+        &first.request_id,
+        vec![
+            (1, Verdict::Pending),
+            (2, Verdict::Pending),
+            (3, Verdict::Pending),
+        ],
+    );
+    pump_to(&mut conn, applied).await;
+
+    let asks = asks(&script);
+    let second = &asks[1];
+    assert_eq!(second.author, AUTHOR_C);
+    assert_eq!(second.seqs, vec![1, 2, 3]);
+    assert_eq!(second.offer, OFFER_C);
+    assert!(
+        !asks.iter().any(|ask| ask.author == AUTHOR_B),
+        "an author with no stored offer is never asked"
+    );
+}
+
+/// `Applied` and `Settled` adjudicate the entry the way the frontier does,
+/// the records move and the entries go, the rows standing. `Pending` keeps.
+#[tokio::test]
+async fn an_applied_ruling_adjudicates_the_entry_and_keeps_its_rows() {
+    let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
+    let w2 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 2);
+    let w3 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 3);
+    let bodies = captured(PLAIN_DDL, [&w1, &w2, &w3]).await;
+    let mut conn = provisioned(&bodies).await;
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [ask] = asks(&script).try_into().expect("one ask");
+
+    rule(
+        &script,
+        &ask.request_id,
+        vec![
+            (1, Verdict::Applied),
+            (2, Verdict::Settled),
+            (3, Verdict::Pending),
+        ],
+    );
+    pump_to(&mut conn, applied).await;
+
+    assert_eq!(
+        record_states(&mut conn, &AUTHOR_A),
+        vec![
+            (1, ProvisionalState::Adjudicated.db()),
+            (2, ProvisionalState::Adjudicated.db()),
+            (3, ProvisionalState::Provisional.db()),
+        ]
+    );
+    assert_eq!(entry_seqs(&mut conn, &AUTHOR_A), vec![3]);
+    assert_eq!(order_ids(&mut conn), vec![1, 2, 3]);
+}
+
+/// `Refused` and `Abandoned` retract the entry through the retraction, with
+/// the cause, the rows rolling back.
+#[tokio::test]
+async fn a_refused_ruling_retracts_the_entry_with_its_cause() {
+    let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
+    let w2 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 2);
+    let w3 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 3);
+    let bodies = captured(PLAIN_DDL, [&w1, &w2, &w3]).await;
+    let mut conn = provisioned(&bodies).await;
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [ask] = asks(&script).try_into().expect("one ask");
+
+    rule(
+        &script,
+        &ask.request_id,
+        vec![
+            (
+                1,
+                Verdict::Refused(RetractCause::Rejected(MutationRejectReason::Unauthorized)),
+            ),
+            (2, Verdict::Refused(RetractCause::Conflict)),
+            (3, Verdict::Abandoned),
+        ],
+    );
+
+    // The ruling's own result stands first, then each retraction it raised.
+    pump_to(&mut conn, applied).await;
+
+    let ClientEvent::ProvisionalRetracted {
+        author,
+        seq,
+        cause,
+        rows,
+    } = pump_to(&mut conn, |event| {
+        matches!(event, ClientEvent::ProvisionalRetracted { seq: 1, .. })
+    })
+    .await
+    else {
+        unreachable!("pump_to matched the retraction");
+    };
+    assert_eq!(author, AUTHOR_A);
+    assert_eq!(seq, 1);
+    assert_eq!(
+        cause,
+        RetractCause::Rejected(MutationRejectReason::Unauthorized)
+    );
+    assert_eq!(rows, vec![("orders".to_owned(), vec![KeyValue::Int(1)])]);
+
+    let seen = pump_to(&mut conn, |event| {
+        matches!(event, ClientEvent::ProvisionalRetracted { seq: 2, .. })
+    })
+    .await;
+    assert!(matches!(
+        seen,
+        ClientEvent::ProvisionalRetracted {
+            cause: RetractCause::Conflict,
+            ..
+        }
+    ));
+    let seen = pump_to(&mut conn, |event| {
+        matches!(event, ClientEvent::ProvisionalRetracted { seq: 3, .. })
+    })
+    .await;
+    assert!(matches!(
+        seen,
+        ClientEvent::ProvisionalRetracted {
+            cause: RetractCause::Abandoned,
+            ..
+        }
+    ));
+
+    assert_eq!(record_states(&mut conn, &AUTHOR_A), [] as [(i64, i64); 0]);
+    assert_eq!(entry_seqs(&mut conn, &AUTHOR_A), [] as [i64; 0]);
+    assert_eq!(order_ids(&mut conn), [] as [i64; 0]);
+}
+
+/// A ruling that quotes no open ask stands ignored, the rows and records
+/// standing as they stood.
+#[tokio::test]
+async fn a_ruling_for_no_open_ask_stands_ignored() {
+    let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
+    let bodies = captured(PLAIN_DDL, [&w1]).await;
+    let mut conn = provisioned(&bodies).await;
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [ask] = asks(&script).try_into().expect("one ask");
+
+    rule(&script, "never-sent", vec![(1, Verdict::Abandoned)]);
+    pump_to(&mut conn, no_open_ask).await;
+
+    assert_eq!(
+        record_states(&mut conn, &AUTHOR_A),
+        vec![(1, ProvisionalState::Provisional.db())]
+    );
+    assert_eq!(order_ids(&mut conn), vec![1]);
+
+    // The ask itself still stands, so its own ruling applies.
+    rule(&script, &ask.request_id, vec![(1, Verdict::Pending)]);
+    pump_to(&mut conn, applied).await;
+    assert_eq!(
+        record_states(&mut conn, &AUTHOR_A),
+        vec![(1, ProvisionalState::Provisional.db())]
+    );
+}
+
+/// One ask carries at most the manifest bound, the author's lowest sequences.
+#[tokio::test]
+async fn an_overbound_ask_carries_the_lowest_manifest_bound() {
+    let bound = i64::try_from(connetto_core::exchange::MAX_MANIFEST_ROWS)
+        .expect("the manifest bound fits an i64");
+    let count = bound + 1;
+    let (mut conn, _) = receiver(DDL, POLICIES).await;
+    bulk_records(&mut conn, &AUTHOR_A, count, 0);
+    seed_cursor(&mut conn, &AUTHOR_A, count, OFFER_A);
+
+    conn.disconnect();
+    let (_, script) = attach(conn).await;
+    let [ask] = asks(&script).try_into().expect("one ask");
+
+    assert_eq!(ask.author, AUTHOR_A);
+    assert_eq!(ask.seqs.len(), connetto_core::exchange::MAX_MANIFEST_ROWS);
+    assert_eq!(ask.seqs.first().copied(), Some(1));
+    assert_eq!(
+        ask.seqs.last().copied(),
+        Some(u64::try_from(bound).expect("the bound fits a u64"))
+    );
+}
+
+/// A ruling that overruns its bound drops the ask without dropping the
+/// connection, and the next session re-asks the author.
+#[tokio::test]
+async fn a_lapsed_ask_drops_and_the_next_session_re_asks() {
+    let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
+    let bodies = captured(PLAIN_DDL, [&w1]).await;
+    let mut conn = provisioned(&bodies).await;
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [ask] = asks(&script).try_into().expect("one ask");
+
+    // The ruling overruns its bound before any pump checks it.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    conn.pump_one().await.expect("pump");
+
+    // A ruling that arrives after the drop is one for no open ask.
+    rule(&script, &ask.request_id, vec![(1, Verdict::Abandoned)]);
+    pump_to(&mut conn, no_open_ask).await;
+    assert_eq!(
+        record_states(&mut conn, &AUTHOR_A),
+        vec![(1, ProvisionalState::Provisional.db())]
+    );
+
+    // The next session re-asks the author, whose rows still stand.
+    conn.disconnect();
+    let (_, script) = attach(conn).await;
+    let [again] = asks(&script).try_into().expect("the re-ask");
+    assert_eq!(again.author, AUTHOR_A);
+    assert_eq!(again.seqs, vec![1]);
+}
+
+/// A deferral that names the open ask drops it for the session, the next
+/// session re-asking the author.
+#[tokio::test]
+async fn a_deferral_naming_the_ask_drops_it_for_the_session() {
+    let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
+    let bodies = captured(PLAIN_DDL, [&w1]).await;
+    let mut conn = provisioned(&bodies).await;
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [ask] = asks(&script).try_into().expect("one ask");
+
+    script.say(IncomingFrame::Control(ControlMessage::RateLimited(
+        RateLimited {
+            related_to: Some(ask.request_id.clone()),
+            retry_after_ms: 0,
+        },
+    )));
+    pump_to(&mut conn, |event| {
+        matches!(event, ClientEvent::RateLimited { related_to, .. }
+                if related_to.as_deref() == Some(ask.request_id.as_str()))
+    })
+    .await;
+
+    rule(&script, &ask.request_id, vec![(1, Verdict::Abandoned)]);
+    pump_to(&mut conn, no_open_ask).await;
+
+    conn.disconnect();
+    let (_, script) = attach(conn).await;
+    let [again] = asks(&script).try_into().expect("the re-ask");
+    assert_eq!(again.author, AUTHOR_A);
+}
+
+/// A refusal that names the open ask drops it for the session, the next
+/// session re-asking the author.
+#[tokio::test]
+async fn a_refusal_naming_the_ask_drops_it_for_the_session() {
+    let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
+    let bodies = captured(PLAIN_DDL, [&w1]).await;
+    let mut conn = provisioned(&bodies).await;
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [ask] = asks(&script).try_into().expect("one ask");
+
+    script.say(IncomingFrame::Control(ControlMessage::NonFatalError(
+        NonFatalError {
+            related_to: Some(ask.request_id.clone()),
+            detail: PROVISIONAL_ASK_REFUSED.to_owned(),
+        },
+    )));
+    pump_to(&mut conn, |event| {
+        matches!(event, ClientEvent::NonFatal { detail, .. }
+                if detail == PROVISIONAL_ASK_REFUSED)
+    })
+    .await;
+
+    rule(&script, &ask.request_id, vec![(1, Verdict::Abandoned)]);
+    pump_to(&mut conn, no_open_ask).await;
+
+    conn.disconnect();
+    let (_, script) = attach(conn).await;
+    let [again] = asks(&script).try_into().expect("the re-ask");
+    assert_eq!(again.author, AUTHOR_A);
+}

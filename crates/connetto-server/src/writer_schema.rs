@@ -311,6 +311,15 @@ pub trait ConnettoWriterSchema: Send + Sync + 'static {
         writer: i64,
         seq: i64,
     ) -> Statement<'_, Option<SettledRow>>;
+    /// `SELECT` the settled rows of `writer` with sequences in `from..=to`,
+    /// in sequence order, the ask's one read of the records its sequences
+    /// name (R77 decision 11).
+    fn settled_range(
+        conn: &mut AsyncPgConnection,
+        writer: i64,
+        from: i64,
+        to: i64,
+    ) -> Statement<'_, Vec<(i64, SettledRow)>>;
     /// `INSERT ... ON CONFLICT (writer, seq) DO NOTHING`, settling one entry
     /// with `entry_hash`, `previous_hash`, `outcome` and `path`, reporting
     /// whether this statement won the sequence.
@@ -340,11 +349,16 @@ pub trait ConnettoWriterSchema: Send + Sync + 'static {
         seq: i64,
         outcome: &'c str,
     ) -> Statement<'c, bool>;
-    /// `DELETE` the settled rows of `writer` at or below `seq`, the
-    /// `settled_through` prune of a number writer.
+    /// `DELETE` the `writer`'s settled rows with outcome `Applied` at or
+    /// below `seq`, the `settled_through` prune of a number writer. A
+    /// refused or conflicted record stays while its writer row stays, so a
+    /// refusal at or below the frontier keeps answering its cause (R77
+    /// decision 11).
     fn prune(conn: &mut AsyncPgConnection, writer: i64, seq: i64) -> Statement<'_, i64>;
-    /// `DELETE` every settled row of `writer`, the sweep of a device writer
-    /// whose enrolment can no longer deliver.
+    /// `DELETE` every `writer` settled row with outcome `Applied`, the sweep
+    /// of a device writer whose enrolment can no longer deliver. A refused or
+    /// conflicted record stays while its writer row stays, so a refusal at or
+    /// below the frontier keeps answering its cause (R77 decision 11).
     fn prune_all(conn: &mut AsyncPgConnection, writer: i64) -> Statement<'_, i64>;
     /// `SELECT writer, device_key` of every device writer, the sweep's input.
     fn device_writers(conn: &mut AsyncPgConnection) -> Statement<'_, Vec<(i64, Option<Vec<u8>>)>>;
@@ -729,6 +743,64 @@ macro_rules! connetto_writers_table {
                 })
             }
 
+            fn settled_range(
+                conn: &mut diesel_async::AsyncPgConnection,
+                writer: i64,
+                from: i64,
+                to: i64,
+            ) -> $crate::writer_schema::Statement<'_, Vec<(i64, $crate::writer_schema::SettledRow)>>
+            {
+                Box::pin(async move {
+                    use diesel::{ExpressionMethods as _, QueryDsl};
+                    use diesel_async::RunQueryDsl;
+                    let query = QueryDsl::select(
+                        QueryDsl::order(
+                            QueryDsl::filter(
+                                QueryDsl::filter(
+                                    QueryDsl::filter(
+                                        _connetto_settled::table,
+                                        _connetto_settled::writer.eq(writer),
+                                    ),
+                                    _connetto_settled::seq.ge(from),
+                                ),
+                                _connetto_settled::seq.le(to),
+                            ),
+                            _connetto_settled::seq.asc(),
+                        ),
+                        (
+                            _connetto_settled::seq,
+                            _connetto_settled::entry_hash,
+                            _connetto_settled::previous_hash,
+                            _connetto_settled::outcome,
+                            _connetto_settled::path,
+                        ),
+                    );
+                    let rows: Vec<(
+                        i64,
+                        Vec<u8>,
+                        Vec<u8>,
+                        String,
+                        $crate::writer_schema::SettlePath,
+                    )> = RunQueryDsl::load(query, &mut *conn).await?;
+                    Ok(rows
+                        .into_iter()
+                        .map(
+                            |(seq, entry_hash, previous_hash, outcome, path)| {
+                                (
+                                    seq,
+                                    $crate::writer_schema::SettledRow {
+                                        entry_hash,
+                                        previous_hash,
+                                        outcome: outcome.into_bytes(),
+                                        path,
+                                    },
+                                )
+                            },
+                        )
+                        .collect())
+                })
+            }
+
             fn settle<'c>(
                 conn: &'c mut diesel_async::AsyncPgConnection,
                 writer: i64,
@@ -813,12 +885,17 @@ macro_rules! connetto_writers_table {
                 Box::pin(async move {
                     use diesel::{ExpressionMethods as _, QueryDsl};
                     use diesel_async::RunQueryDsl;
+                    // Refusals keep answering their cause past the prune (R77 decision 11).
+                    let applied = $crate::writer_schema::SettledOutcome::Applied.json();
                     let query = diesel::delete(QueryDsl::filter(
                         QueryDsl::filter(
-                            _connetto_settled::table,
-                            _connetto_settled::writer.eq(writer),
+                            QueryDsl::filter(
+                                _connetto_settled::table,
+                                _connetto_settled::writer.eq(writer),
+                            ),
+                            _connetto_settled::seq.le(seq),
                         ),
-                        _connetto_settled::seq.le(seq),
+                        _connetto_settled::outcome.eq(applied),
                     ));
                     let removed = RunQueryDsl::execute(query, &mut *conn).await?;
                     Ok(i64::try_from(removed).unwrap_or(i64::MAX))
@@ -832,9 +909,14 @@ macro_rules! connetto_writers_table {
                 Box::pin(async move {
                     use diesel::{ExpressionMethods as _, QueryDsl};
                     use diesel_async::RunQueryDsl;
+                    // Refusals keep answering their cause past the sweep (R77 decision 11).
+                    let applied = $crate::writer_schema::SettledOutcome::Applied.json();
                     let query = diesel::delete(QueryDsl::filter(
-                        _connetto_settled::table,
-                        _connetto_settled::writer.eq(writer),
+                        QueryDsl::filter(
+                            _connetto_settled::table,
+                            _connetto_settled::writer.eq(writer),
+                        ),
+                        _connetto_settled::outcome.eq(applied),
                     ));
                     let removed = RunQueryDsl::execute(query, &mut *conn).await?;
                     Ok(i64::try_from(removed).unwrap_or(i64::MAX))

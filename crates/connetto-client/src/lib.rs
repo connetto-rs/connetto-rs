@@ -4424,6 +4424,52 @@ enum WriterTaskKind {
 /// connection drops and the pump redials. R74's enrolment uses the same bound.
 const WRITER_ANSWER_WAIT: Duration = Duration::from_secs(30);
 
+/// How long a provisional ask waits for its ruling before the wait drops and
+/// the next session re-asks (R77 decision 11).
+#[cfg(feature = "peer")]
+const PROVISIONAL_ASK_WAIT: Duration = Duration::from_secs(30);
+
+/// One provisional ask a session sends, at most one per author (R77
+/// decision 11).
+#[derive(Debug, Clone)]
+#[cfg(feature = "peer")]
+struct ProvisionalAsk {
+    /// The author's device key.
+    author: [u8; 32],
+    /// The id the ruling quotes.
+    request_id: String,
+    /// The author's last verified signed offer, the cursor's stored bytes.
+    offer: Vec<u8>,
+    /// The sequences asked about, at most one manifest frame's rows.
+    seqs: Vec<u64>,
+    /// The monotonic deadline the ruling is owed by.
+    deadline: Duration,
+}
+
+/// The session's provisional asks, the queued ones and the one sent and
+/// awaited, held together so the connection's future stays small.
+#[derive(Debug, Default, Clone)]
+#[cfg(feature = "peer")]
+struct ProvisionalQueue {
+    /// The asks queued to send, one per author, in plan order.
+    pending: VecDeque<ProvisionalAsk>,
+    /// The ask sent and awaited, at most one at a time.
+    in_flight: Option<ProvisionalAsk>,
+}
+
+#[cfg(feature = "peer")]
+static NEXT_PROVISIONAL_REQUEST: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+/// A fresh request id for a provisional ask this session will send.
+#[cfg(feature = "peer")]
+fn provisional_request_id() -> String {
+    format!(
+        "provisional-{}",
+        NEXT_PROVISIONAL_REQUEST.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 static NEXT_WRITER_REQUEST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// A fresh request id for a bind or retirement this connection will send.
@@ -4492,6 +4538,10 @@ pub struct ConnettoConnection<T: Transport> {
     writer_tasks: VecDeque<WriterTask>,
     /// The bind or retirement sent and awaited, at most one at a time.
     writer_in_flight: Option<WriterTask>,
+    /// The session's provisional asks, boxed so the connection's future stays
+    /// small.
+    #[cfg(feature = "peer")]
+    provisional: Box<ProvisionalQueue>,
     /// A device bind signed and held, sent once the number's tail settles.
     #[cfg(feature = "device-identity")]
     pending_bind: Option<WriterTask>,
@@ -5027,6 +5077,8 @@ where
             bound_writer: None,
             writer_tasks: VecDeque::new(),
             writer_in_flight: None,
+            #[cfg(feature = "peer")]
+            provisional: Box::default(),
             #[cfg(feature = "device-identity")]
             pending_bind: None,
             #[cfg(feature = "device-identity")]
@@ -5370,7 +5422,10 @@ where
             });
         }
         self.flush_writer_tasks().await?;
-        self.resume_attach().await
+        self.resume_attach().await?;
+        // The session's asks go out once the replay stands, one per author.
+        #[cfg(feature = "peer")]
+        self.plan_provisional_asks().await
     }
 
     /// Finishes post-handshake replay after an outer operation temporarily
@@ -5805,6 +5860,224 @@ where
             tracing::warn!("the writer answer overran its bound, dropping the connection");
             self.disconnected();
         }
+    }
+
+    /// Plan the session's provisional asks (R77 decision 11), one per author
+    /// its provisional records name and the replica holds a signed offer from,
+    /// each carrying the author's lowest sequences up to one manifest frame.
+    ///
+    /// An author the replica holds no stored offer from is never asked, its
+    /// rows waiting for the author's frontier over a link.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the records or the offers cannot be read or a
+    /// send fails.
+    #[cfg(feature = "peer")]
+    async fn plan_provisional_asks(&mut self) -> Result<(), ClientError> {
+        let mut by_author: BTreeMap<Vec<u8>, Vec<i64>> = BTreeMap::new();
+        for row in provisional::rows(&mut self.db)? {
+            if row.state == provisional::ProvisionalState::Provisional {
+                by_author
+                    .entry(row.author.clone())
+                    .or_default()
+                    .push(row.seq);
+            }
+        }
+        let now = crate::away::SystemClock.monotonic();
+        for (author, mut seqs) in by_author {
+            let Ok(key) = <[u8; 32]>::try_from(author.as_slice()) else {
+                continue;
+            };
+            let Some(offer) = exchange::offer_of(&mut self.db, &key)? else {
+                continue;
+            };
+            seqs.sort_unstable();
+            seqs.dedup();
+            let seqs: Vec<u64> = seqs
+                .into_iter()
+                .map(|seq| u64::try_from(seq).unwrap_or(u64::MAX))
+                .take(connetto_core::exchange::MAX_MANIFEST_ROWS)
+                .collect();
+            self.provisional.pending.push_back(ProvisionalAsk {
+                author: key,
+                request_id: provisional_request_id(),
+                offer,
+                seqs,
+                deadline: now + PROVISIONAL_ASK_WAIT,
+            });
+        }
+        self.flush_provisional_asks().await
+    }
+
+    /// Send the next queued provisional ask, one at a time.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the send fails.
+    #[cfg(feature = "peer")]
+    async fn flush_provisional_asks(&mut self) -> Result<(), ClientError> {
+        if self.provisional.in_flight.is_some() {
+            return Ok(());
+        }
+        let Some(wire) = self.wire.as_mut() else {
+            return Ok(());
+        };
+        let Some(ask) = self.provisional.pending.pop_front() else {
+            return Ok(());
+        };
+        wire.transport
+            .send_control(ControlMessage::ProvisionalStatus(
+                connetto_core::messages::ProvisionalStatus {
+                    request_id: ask.request_id.clone(),
+                    author: ask.author,
+                    offer: ask.offer.clone(),
+                    seqs: ask.seqs.clone(),
+                },
+            ))
+            .await
+            .map_err(|err| ClientError::Transport(err.to_string()))?;
+        self.provisional.in_flight = Some(ask);
+        Ok(())
+    }
+
+    /// Settle the ask a `NonFatalError` or `RateLimited` names, stopping this
+    /// session's ask of that author, which the next one re-asks (R77
+    /// decision 11).
+    #[cfg(feature = "peer")]
+    fn drop_provisional_ask(&mut self, related_to: Option<&str>) {
+        let Some(related_to) = related_to else {
+            return;
+        };
+        if self
+            .provisional
+            .in_flight
+            .as_ref()
+            .is_some_and(|ask| ask.request_id == related_to)
+        {
+            let author = self
+                .provisional
+                .in_flight
+                .take()
+                .expect("the ask matched")
+                .author;
+            self.provisional.pending.retain(|ask| ask.author != author);
+        }
+    }
+
+    /// Drop the wait on a provisional ask that overran its bound, the ask
+    /// re-owing itself at the next session, the connection standing (R77
+    /// decision 11).
+    #[cfg(feature = "peer")]
+    fn check_provisional_deadlines(&mut self) {
+        let Some(ask) = self.provisional.in_flight.as_ref() else {
+            return;
+        };
+        if crate::away::SystemClock.monotonic() >= ask.deadline {
+            tracing::debug!("the provisional ruling overran its bound, dropping the ask");
+            let request_id = ask.request_id.clone();
+            self.drop_provisional_ask(Some(request_id.as_str()));
+        }
+    }
+
+    /// Apply a ruling's verdicts (R77 decision 11): `Applied` and `Settled`
+    /// adjudicate the sequence the way the frontier does, `Refused` and
+    /// `Abandoned` retract the entry through the retraction, and `Pending`
+    /// keeps it.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when a verdict cannot be applied or a send fails.
+    #[cfg(feature = "peer")]
+    async fn settle_provisional_ask(
+        &mut self,
+        answer: &connetto_core::messages::ProvisionalVerdicts,
+    ) -> Result<ClientEvent, ClientError> {
+        // A ruling that quotes no open ask stands ignored, and the one it
+        // stands beside stays owed (R77).
+        if self
+            .provisional
+            .in_flight
+            .as_ref()
+            .is_none_or(|ask| ask.request_id != answer.request_id)
+        {
+            return Ok(ClientEvent::NonFatal {
+                related_to: Some(answer.request_id.clone()),
+                detail: "a provisional ruling arrived with no open ask".to_owned(),
+            });
+        }
+        let ask = self
+            .provisional
+            .in_flight
+            .take()
+            .expect("the ruling named the open ask");
+        for (seq, verdict) in &answer.verdicts {
+            match verdict {
+                connetto_core::exchange::Verdict::Applied
+                | connetto_core::exchange::Verdict::Settled => {
+                    self.adjudicate_peer_seq(&ask.author, *seq)?;
+                }
+                connetto_core::exchange::Verdict::Refused(cause) => {
+                    self.retract_peer_entry(
+                        &peer::PeerAuthor {
+                            key_id: ask.author.to_vec(),
+                            account: String::new(),
+                            bot_list: None,
+                        },
+                        &connetto_core::exchange::Retraction {
+                            seq: *seq,
+                            cause: cause.clone(),
+                        },
+                    )?;
+                }
+                connetto_core::exchange::Verdict::Abandoned => {
+                    self.retract_peer_entry(
+                        &peer::PeerAuthor {
+                            key_id: ask.author.to_vec(),
+                            account: String::new(),
+                            bot_list: None,
+                        },
+                        &connetto_core::exchange::Retraction {
+                            seq: *seq,
+                            cause: connetto_core::exchange::RetractCause::Abandoned,
+                        },
+                    )?;
+                }
+                connetto_core::exchange::Verdict::Pending => {}
+            }
+        }
+        self.flush_provisional_asks().await?;
+        Ok(ClientEvent::NonFatal {
+            related_to: Some(answer.request_id.clone()),
+            detail: "a provisional ruling was applied".to_owned(),
+        })
+    }
+
+    /// Adjudicate one stored peer entry on a verdict (R77): its records move
+    /// to adjudicated and the entry goes, the rows handing to ordinary
+    /// coverage.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the entry or the records cannot be read or
+    /// written.
+    #[cfg(feature = "peer")]
+    fn adjudicate_peer_seq(&mut self, author: &[u8], seq: u64) -> Result<(), ClientError> {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        let _exempt = ExemptWrites::raise(&self.write_flags);
+        let config = &self.config;
+        self.db.transaction::<_, ClientError, _>(|db| {
+            let settled: Vec<(String, Vec<KeyValue>)> =
+                provisional::records_of_entry(db, author, seq)?
+                    .into_iter()
+                    .filter(|record| record.state == provisional::ProvisionalState::Provisional)
+                    .map(|record| (record.table, record.key))
+                    .collect();
+            provisional::adjudicate_entry(db, author, seq)?;
+            holdings::release_provisional(db, config, &settled)?;
+            peer::delete_entry(db, author, seq)?;
+            Ok(())
+        })
     }
 
     /// Settle a `WriterAnswer` for a bind or retirement this connection sent.
@@ -6525,6 +6798,11 @@ where
         self.forget_sent();
         self.writer_tasks.clear();
         self.writer_in_flight = None;
+        #[cfg(feature = "peer")]
+        {
+            self.provisional.pending.clear();
+            self.provisional.in_flight = None;
+        }
         #[cfg(feature = "device-identity")]
         {
             self.pending_bind = None;
@@ -7435,6 +7713,10 @@ where
     /// the entry's ops run through the policy views with the author bound
     /// and capture off, the keys the receiver's own unsent writes hold are
     /// filtered, and the records and the entry land in one transaction.
+    ///
+    /// An author this path alone applies, which stores no verified offer, is
+    /// never asked by the server, and its rows wait for the author's frontier
+    /// over a link (R77 decision 11).
     ///
     /// # Errors
     ///
@@ -8637,6 +8919,8 @@ where
             self.check_share_key_deadlines();
             self.step_share_keys().await?;
             self.check_writer_deadlines();
+            #[cfg(feature = "peer")]
+            self.check_provisional_deadlines();
             self.check_drain_deadline().await;
             self.step_drain_share_keys().await?;
             if let Some(notice) = self.notices.pop_front() {
@@ -8669,6 +8953,8 @@ where
         // A writer answer that overran its bound drops the connection before
         // the next frame is waited on, so the pump redials without stalling.
         self.check_writer_deadlines();
+        #[cfg(feature = "peer")]
+        self.check_provisional_deadlines();
         self.check_share_key_deadlines();
         self.step_share_keys().await?;
         self.check_drain_deadline().await;
@@ -9214,6 +9500,10 @@ where
     /// A server throttle, deferring the pending write it names.
     fn rate_limited(&mut self, limited: connetto_core::messages::RateLimited) -> ClientEvent {
         self.refuse_declaration(limited.related_to.as_deref());
+        // A deferral naming the open provisional ask is the session's lapse,
+        // the next one re-asking (R77 decision 11).
+        #[cfg(feature = "peer")]
+        self.drop_provisional_ask(limited.related_to.as_deref());
         // A mutation is correlated by its sequence, and one still pending waits for its resend.
         let throttled_write = limited
             .related_to
@@ -9355,6 +9645,10 @@ where
                 })
             }
             ControlMessage::WriterAnswer(answer) => self.settle_writer_task(&answer).await,
+            #[cfg(feature = "peer")]
+            ControlMessage::ProvisionalVerdicts(answer) => {
+                self.settle_provisional_ask(&answer).await
+            }
             ControlMessage::Pong(pong) => {
                 let fence = if self
                     .declaration_fence
@@ -9385,6 +9679,10 @@ where
                 {
                     self.refused.insert(id.clone());
                 }
+                // A refusal naming the open provisional ask settles it for
+                // the session, the next one re-asking (R77 decision 11).
+                #[cfg(feature = "peer")]
+                self.drop_provisional_ask(err.related_to.as_deref());
                 self.refuse_declaration(err.related_to.as_deref());
                 Ok(ClientEvent::NonFatal {
                     related_to: err.related_to,
