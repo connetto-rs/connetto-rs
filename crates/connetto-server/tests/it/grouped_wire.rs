@@ -10,11 +10,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use connetto_core::messages::ControlMessage;
+use connetto_core::messages::{BulkMessage, ControlMessage, FatalErrorReason};
 use connetto_core::test_support::TestGrantChecker;
+use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
-    RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, pg_write_target,
+    AbuseConfig, LoopbackError, LoopbackTransport, ManagerBuilder, Materializer, PgReadConnector,
+    PgSnapshotSource, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager,
+    ThrottleConfig, TierLimits, loopback, pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, committed_at};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
@@ -25,6 +27,10 @@ const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);";
 type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults, PgReadConnector>;
 
 fn manager(fixture: &Fixture) -> Arc<Manager> {
+    manager_with_session(fixture, SessionConfig::default())
+}
+
+fn manager_with_session(fixture: &Fixture, session: SessionConfig) -> Arc<Manager> {
     let guard = Arc::new(RequestGuard::new(
         ThrottleConfig::default()
             .with_identified(TierLimits::identified().with_read_timeout(Duration::from_secs(30))),
@@ -45,6 +51,7 @@ fn manager(fixture: &Fixture) -> Arc<Manager> {
         pg_write_target::<ConnettoDefaults>(pool, PG_DDL).expect("build write target"),
     )
     .with_guard(guard)
+    .with_session(session)
     .build()
 }
 
@@ -224,4 +231,104 @@ async fn a_demoted_subscription_answers_whole_and_logs_the_transition() {
             assert!(named, "the log names the transition");
     })
     .await;
+}
+
+/// A server transport whose sends wait while its gate is shut, standing in for a client that stopped reading its socket.
+struct Gated {
+    inner: LoopbackTransport,
+    open: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Gated {
+    async fn wait_open(&mut self) {
+        let _ = self.open.wait_for(|open| *open).await;
+    }
+}
+
+impl Transport for Gated {
+    type Error = LoopbackError;
+
+    async fn send_control(&mut self, message: ControlMessage) -> Result<(), Self::Error> {
+        self.wait_open().await;
+        self.inner.send_control(message).await
+    }
+
+    async fn send_bulk(&mut self, message: BulkMessage) -> Result<(), Self::Error> {
+        self.wait_open().await;
+        self.inner.send_bulk(message).await
+    }
+
+    async fn recv(&mut self) -> Result<Option<IncomingFrame>, Self::Error> {
+        self.inner.recv().await
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.inner.close().await
+    }
+}
+
+/// A client subscribed only to a computed query that stops reading its socket is closed at its send budget, so the aggregate updates queued for it stay bounded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocked_reader_of_aggregates_is_closed_at_its_send_budget() {
+    const CHANGES: i64 = 40;
+    let fixture = Fixture::acquire().await;
+    fixture.exec("DROP TABLE IF EXISTS orders CASCADE").await;
+    fixture
+        .exec("CREATE TABLE orders (id INT PRIMARY KEY, status TEXT)")
+        .await;
+    fixture.exec("INSERT INTO orders VALUES (1, 'open')").await;
+    // Room for a handful of aggregate updates, far fewer than the changes below.
+    let manager = manager_with_session(&fixture, SessionConfig::new().with_send_queue_bytes(1_000));
+
+    let (server_end, client_end) = loopback();
+    let (gate, open) = tokio::sync::watch::channel(true);
+    let session = Arc::clone(&manager);
+    let served = tokio::spawn(async move {
+        session
+            .serve(Gated {
+                inner: server_end,
+                open,
+            })
+            .await
+    });
+    let mut client = Client::new(client_end);
+    client.handshake_with("stalled", "user:stalled").await;
+    client
+        .subscribe(
+            "by-status",
+            "SELECT status, COUNT(*) FROM orders GROUP BY status",
+        )
+        .await;
+    take_aggregates(&mut client, "by-status", 1).await;
+
+    gate.send(false).expect("shut the gate");
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    for id in 2..2 + CHANGES {
+        apply(
+            &fixture,
+            &mut source,
+            &manager,
+            &format!("INSERT INTO orders VALUES ({id}, 'open')"),
+        )
+        .await;
+    }
+    gate.send(true).expect("open the gate");
+
+    let mut delivered = 0;
+    let reason = loop {
+        let frame = tokio::time::timeout(Duration::from_secs(10), client.next_control())
+            .await
+            .expect("the connection closes once its queued updates pass the budget");
+        match frame {
+            ControlMessage::AggregateUpdate(_) => delivered += 1,
+            ControlMessage::FatalError(fatal) => break fatal.reason,
+            other => panic!("unexpected frame {other:?}"),
+        }
+    };
+    assert_eq!(reason, FatalErrorReason::SendQueueExceeded);
+    assert!(
+        delivered < CHANGES,
+        "the budget held back updates, {delivered} of {CHANGES} delivered"
+    );
+    let _ = served.await;
 }

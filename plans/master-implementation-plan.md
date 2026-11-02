@@ -217,12 +217,6 @@ Taken by [R108](#r108-caller-kinds-as-database-roles), which has both translator
 
 Decided. The byte bound ships ahead of the rest of the shared-frame design, in one pull request, with a default budget of 1 GiB and pruning that logs which bound fired.
 
-### G10
-
-**Session send queues are unbounded.** A session's `pending` queue and its outbound channel in [session.rs](../crates/connetto-server/src/session.rs) have no length check, so a client that stops granting credits makes the server buffer every patch for it.
-
-Decided. A per-session byte budget over `pending` and the outbound channel, in one pull request independent of the shared-frame design. Overflow closes the connection with a fatal reason, and the client resumes through oplog catchup.
-
 ### G11
 
 **Over-restriction notes reach no operator.** At the pinned `rls2fga`, a policy translated to no access, a self-referential read policy for one, hides every row without a diverging note, and connetto surfaces no other note. Postgres answers such a policy with `42P17` and `pg2sqlite` refuses it, so a deployment carrying one fails boot on the replica side today.
@@ -253,6 +247,10 @@ Fixed in one pull request, by stating the rule on `SnapshotSource::snapshot_page
 
 Fixed in one pull request, by a browser CI shard with its own restartable stack and a suite that restarts the server mid-run.
 
+### G19
+
+**Catchup replay is paced by nothing.** A reconnecting client's catchup walks the reconnect log from its cursor to the ceiling, and the walker pushes every patch into an unbounded per-member channel while `drain_catchup` in [session.rs](../crates/connetto-server/src/session.rs) moves each one into the credit queue whether or not the client has granted a credit. Acknowledgements arriving during catchup are held with the rest of the input, so the replay never waits for them. A client resuming from an old cursor therefore has its whole replay window, bounded only by the log's retention, in server memory at once, outside the connection's send budget. Pacing it needs the walker to apply backpressure per member and the session to honour credits during catchup, without one slow member stalling the others in its wave.
+
 ## Upstream dependencies
 
 **No phase waits on an upstream merge.** A phase that needs a change in a dependency requests it upstream, then builds against the fork through a `[patch.crates-io]` entry pinned to a revision, and drops the entry once a release carries the change. A review that takes months therefore holds nothing, and an upstream finding lists no phase in its blockers. What follows holds only the requests still open, each checked against its upstream.
@@ -275,7 +273,7 @@ Decided designs no phase builds yet. A phase that takes one moves it into its se
 
 ## Shared frames and the oplog byte bound
 
-Decided in R16 part B, which wrote no implementation phase. [G9](#g9) and [G10](#g10) are the defects it answers.
+Decided in R16 part B, which wrote no implementation phase. [G9](#g9) is the defect it answers, and the shared frame cuts the per-subscriber copies the send budget bounds.
 
 **The unit is one change event, not one subscriber and not one subscription.** Every computation a change requires happens once per event. What remains per subscriber is a route lookup, a verdict entry and a socket write, and none of the three recomputes anything the event already produced. The reason the unit is the event rather than the subscriber is that a change event is the only thing in the system that happens once. A subscriber is a destination, not a computation.
 

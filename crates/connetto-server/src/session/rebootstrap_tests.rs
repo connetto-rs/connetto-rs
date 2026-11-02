@@ -61,7 +61,7 @@ async fn manager(fixture: &Fixture) -> Manager {
 }
 
 fn state() -> State {
-    let (outbound, receiver) = mpsc::unbounded_channel();
+    let (outbound, receiver) = super::outbound_channel(u64::MAX);
     let session_id = SessionId::from_token_hash("rebootstrap-owner");
     let principal =
         Principal::unidentified(session_id).with_capabilities([CapabilitySubject::new("key:a")]);

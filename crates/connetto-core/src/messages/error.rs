@@ -159,6 +159,11 @@ pub enum FatalErrorReason {
         /// When the sunset is enforced, in seconds since the Unix epoch.
         sunset_at_secs: u64,
     },
+    /// The frames queued for this connection passed its send budget,
+    /// because the client stopped granting credits or stopped reading. Nothing
+    /// queued after the overflow is sent, so the client reconnects and resumes
+    /// through catchup from the last patch it applied.
+    SendQueueExceeded,
 }
 
 impl FatalErrorReason {

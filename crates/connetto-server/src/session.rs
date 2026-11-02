@@ -583,6 +583,8 @@ pub struct SessionConfig {
     first_frame_budget: Duration,
     /// The silence after which an idle session is closed, reset by every inbound frame.
     idle_limit: Duration,
+    /// Bytes of live patches one connection may have queued and unsent before it is closed.
+    send_queue_bytes: u64,
     #[cfg(feature = "test-seams")]
     key_expiry_clock: Option<tokio::sync::watch::Receiver<SystemTime>>,
 }
@@ -599,6 +601,7 @@ impl Default for SessionConfig {
             write_retry_budget: Duration::from_secs(5),
             first_frame_budget: Duration::from_secs(30),
             idle_limit: Duration::from_secs(60),
+            send_queue_bytes: 64 * 1024 * 1024,
             #[cfg(feature = "test-seams")]
             key_expiry_clock: None,
         }
@@ -674,6 +677,15 @@ impl SessionConfig {
     #[must_use]
     pub const fn with_idle_limit(mut self, limit: Duration) -> Self {
         self.idle_limit = limit;
+        self
+    }
+
+    /// Sets how many bytes of live patches one connection may have queued and unsent before it is closed with `SendQueueExceeded`.
+    ///
+    /// A patch arriving at an empty queue is always admitted, so one change larger than the budget still reaches an honest client.
+    #[must_use]
+    pub const fn with_send_queue_bytes(mut self, bytes: u64) -> Self {
+        self.send_queue_bytes = bytes;
         self
     }
     /// Uses the supplied time for share-key expiry scheduling and comparison.
@@ -1387,6 +1399,59 @@ fn same_account<Id: core::fmt::Display>(row_user: Option<&Id>, caller_user: Opti
     }
 }
 
+/// The bytes of live patches one connection has queued and not yet sent, against its budget.
+///
+/// The fan-out admits a patch here before queuing it, and the session releases it once the
+/// patch is on the socket, so the count covers the outbound channel and the credit queue alike.
+struct SendQueue {
+    budget: u64,
+    queued: AtomicU64,
+    overflowed: AtomicBool,
+}
+
+/// What admitting one live patch to a connection's send queue decided.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    /// The patch is queued and counted.
+    Queued,
+    /// The patch passed the budget first, so the connection closes.
+    Overflowed,
+    /// The connection already overflowed, so the patch is dropped.
+    Dropped,
+}
+
+impl SendQueue {
+    fn new(budget: u64) -> Self {
+        Self {
+            budget,
+            queued: AtomicU64::new(0),
+            overflowed: AtomicBool::new(false),
+        }
+    }
+
+    /// Counts `len` bytes in, or refuses them past the budget. A patch reaching an empty queue is always admitted.
+    fn admit(&self, len: u64) -> Admission {
+        if self.overflowed.load(Ordering::Acquire) {
+            return Admission::Dropped;
+        }
+        let before = self.queued.fetch_add(len, Ordering::AcqRel);
+        if before == 0 || before.saturating_add(len) <= self.budget {
+            return Admission::Queued;
+        }
+        self.queued.fetch_sub(len, Ordering::AcqRel);
+        if self.overflowed.swap(true, Ordering::AcqRel) {
+            Admission::Dropped
+        } else {
+            Admission::Overflowed
+        }
+    }
+
+    /// Counts `len` bytes out once their patch is sent.
+    fn release(&self, len: u64) {
+        self.queued.fetch_sub(len, Ordering::AcqRel);
+    }
+}
+
 /// A frame queued for a session's outbound path.
 enum Outbound {
     /// A live row patch (bulk plane, credit-gated).
@@ -1444,7 +1509,7 @@ struct Route<Id, Key> {
     session_key: u64,
     sub_id: SubscriptionId,
     label: String,
-    tx: mpsc::UnboundedSender<Outbound>,
+    tx: OutboundTx,
     /// The subscribing session's caller, consulted per event for the read
     /// filter before a live patch is delivered. Shared rather than copied,
     /// because the fan-out clones one route per subscriber per event.
@@ -1468,19 +1533,123 @@ struct Route<Id, Key> {
     fence: Option<Arc<ReadFence>>,
 }
 
+/// The fixed bytes an outbound item counts beyond its variable payload, for its envelope and bookkeeping.
+const OUTBOUND_ITEM_BYTES: u64 = 64;
+
+/// `len` bytes as a budget count, saturating where `usize` is wider than `u64`.
+fn len_bytes(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+/// The bytes a live patch counts against its connection's send budget, released when it is sent.
+///
+/// The label is the client's own and is copied into every patch, so it counts with the payload and the cursor.
+fn budgeted_bytes(patch: &LivePatch) -> u64 {
+    OUTBOUND_ITEM_BYTES
+        .saturating_add(len_bytes(patch.sub_id.len()))
+        .saturating_add(len_bytes(patch.cursor.len()))
+        .saturating_add(len_bytes(patch.patchset_zstd.len()))
+}
+
+impl Outbound {
+    /// The bytes this item counts against the connection's send budget while it waits.
+    ///
+    /// A close counts nothing, so it is never refused.
+    fn budgeted(&self) -> u64 {
+        match self {
+            Self::Live(patch) => budgeted_bytes(patch),
+            Self::Aggregate(update) => OUTBOUND_ITEM_BYTES
+                .saturating_add(len_bytes(update.sub_id.len()))
+                .saturating_add(len_bytes(update.group_key.as_ref().map_or(0, Vec::len)))
+                .saturating_add(len_bytes(
+                    update.group_values_json.as_ref().map_or(0, String::len),
+                ))
+                .saturating_add(len_bytes(
+                    update.result_json.as_ref().map_or(0, String::len),
+                )),
+            Self::Fatal(_) | Self::Drop => 0,
+            // Rare and of any shape, so it is measured by its encoding.
+            Self::Control(msg) => OUTBOUND_ITEM_BYTES.saturating_add(
+                connetto_core::codec::encode_control(msg).map_or(0, |frame| len_bytes(frame.len())),
+            ),
+            Self::Resnapshot { sub_id, .. }
+            | Self::Refuse { sub_id }
+            | Self::ReservedResnapshot { sub_id, .. }
+            | Self::Rebootstrap { sub_id, .. } => {
+                OUTBOUND_ITEM_BYTES.saturating_add(len_bytes(sub_id.len()))
+            }
+        }
+    }
+
+    /// The bytes released once the run loop has handled this item. A live patch is released later, when it leaves the credit queue for the socket.
+    fn released_when_handled(&self) -> u64 {
+        match self {
+            Self::Live(_) => 0,
+            other => other.budgeted(),
+        }
+    }
+}
+
+/// The sending half of one connection's outbound channel, which admits every item against the connection's send budget.
+#[derive(Clone)]
+struct OutboundTx {
+    tx: mpsc::UnboundedSender<Outbound>,
+    queue: Arc<SendQueue>,
+}
+
+/// A connection's outbound channel, with `budget` bytes of room for queued items.
+fn outbound_channel(budget: u64) -> (OutboundTx, mpsc::UnboundedReceiver<Outbound>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (
+        OutboundTx {
+            tx,
+            queue: Arc::new(SendQueue::new(budget)),
+        },
+        rx,
+    )
+}
+
+impl OutboundTx {
+    /// Queues `item` within the connection's send budget, and closes the connection the first time the budget overflows.
+    ///
+    /// Every item after the overflow is dropped, so the client never receives a frame past a gap and resumes from the last patch it applied. A close is always queued. Answers whether the session is still there to receive.
+    #[must_use]
+    fn send(&self, item: Outbound) -> bool {
+        let bytes = item.budgeted();
+        if bytes == 0 {
+            return self.tx.send(item).is_ok();
+        }
+        match self.queue.admit(bytes) {
+            Admission::Queued => self.tx.send(item).is_ok(),
+            Admission::Overflowed => {
+                tracing::warn!(
+                    budget = self.queue.budget,
+                    "a connection's queued outbound frames passed its send budget, closing it"
+                );
+                self.tx
+                    .send(Outbound::Fatal(FatalError::new(
+                        FatalErrorReason::SendQueueExceeded,
+                    )))
+                    .is_ok()
+            }
+            Admission::Dropped => !self.tx.is_closed(),
+        }
+    }
+}
+
 /// Route from an aggregate subscription (re-execution query or delta aggregate)
 /// to its session's outbound channel.
 #[derive(Clone)]
 struct AggRoute {
     label: String,
-    tx: mpsc::UnboundedSender<Outbound>,
+    tx: OutboundTx,
 }
 
 /// A live connection in the session registry: the socket counter that owns
 /// the entry, the outbound channel a close is delivered on, and who holds it.
 struct LiveSession {
     connection_num: u64,
-    tx: mpsc::UnboundedSender<Outbound>,
+    tx: OutboundTx,
     /// The identity's rendering, absent for a caller with no identity, so a ban
     /// can find every connection one person holds.
     user: Option<String>,
@@ -1507,7 +1676,7 @@ struct HandshakeOutcome<Id, Key> {
     /// refused grant is recorded inside it.
     span: tracing::Span,
     /// The sending half of the outbound channel, held by `SessionState`. Created here rather than in the run loop so the session is registered before the handshake ack leaves, since a revocation crossing that gap would otherwise find no session to close.
-    outbound_tx: mpsc::UnboundedSender<Outbound>,
+    outbound_tx: OutboundTx,
     /// The receiving half of the outbound channel, drained by the run loop.
     outbound_rx: mpsc::UnboundedReceiver<Outbound>,
     /// When each held share key dies, by its rendering.
@@ -1533,6 +1702,8 @@ struct HandshakeOutcome<Id, Key> {
 enum Deliverable {
     /// A bulk frame. Costs one credit.
     Rows(BulkMessage),
+    /// A live patch admitted against the connection's send budget, released once sent. Costs one credit.
+    Budgeted(LivePatch),
     /// The frame closing a snapshot. Ordered, never charged.
     SnapshotComplete(SnapshotEnd),
 }
@@ -1540,13 +1711,15 @@ enum Deliverable {
 impl Deliverable {
     /// Whether sending this spends one of the client's delivery credits.
     const fn costs_credit(&self) -> bool {
-        matches!(self, Self::Rows(_))
+        matches!(self, Self::Rows(_) | Self::Budgeted(_))
     }
 
     /// The subscription this frame belongs to.
     fn sub_id(&self) -> Option<&str> {
         match self {
-            Self::Rows(BulkMessage::LivePatch(patch)) => Some(&patch.sub_id),
+            Self::Rows(BulkMessage::LivePatch(patch)) | Self::Budgeted(patch) => {
+                Some(&patch.sub_id)
+            }
             Self::Rows(BulkMessage::SnapshotPatch(patch)) => Some(&patch.sub_id),
             Self::Rows(BulkMessage::MutationPatch(_)) => None,
             Self::SnapshotComplete(end) => Some(&end.sub_id),
@@ -1799,7 +1972,7 @@ struct SessionState<Id, Key> {
     /// Computed subscriptions by client label, one engine id space for every
     /// tier.
     computed_subs: HashMap<String, ComputedSub>,
-    outbound: mpsc::UnboundedSender<Outbound>,
+    outbound: OutboundTx,
     /// The caller, established at handshake and consulted per read and write.
     principal: Arc<Principal<Id, Key>>,
     /// The `MutationHeader` awaiting its paired `MutationPatch`.
@@ -2829,7 +3002,7 @@ where
         session_id: SessionId,
         connection_num: u64,
         user: Option<String>,
-        tx: &mpsc::UnboundedSender<Outbound>,
+        tx: &OutboundTx,
     ) -> bool {
         let superseded = {
             let mut sessions = self.sessions.lock().await;
@@ -3591,7 +3764,7 @@ where
                         sub_id: route.label.clone(),
                         reason: FullResyncReason::AuthorizationChange,
                     });
-                    sent.is_ok().then(|| {
+                    sent.then(|| {
                         (
                             route.principal.session_id(),
                             route
@@ -4359,7 +4532,7 @@ where
         // this session handle is addressable: close_session and revocation hooks
         // fire as soon as the ack arrives. Without the entry already in the map
         // those calls see None and the fatal frame is never delivered.
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Outbound>();
+        let (outbound_tx, outbound_rx) = outbound_channel(self.config.send_queue_bytes);
         if !self
             .register_connection(
                 session_id,
@@ -4908,7 +5081,10 @@ where
                     }
                 } => {
                     let Some(outbound) = outbound else { break Ok(()) };
-                    match self.handle_outbound(&mut transport, outbound, &mut state).await {
+                    let handled = outbound.released_when_handled();
+                    let outcome = self.handle_outbound(&mut transport, outbound, &mut state).await;
+                    state.outbound.queue.release(handled);
+                    match outcome {
                         Ok(true) => {}
                         Ok(false) => break Ok(()),
                         Err(err) => break Err(err),
@@ -5002,7 +5178,8 @@ where
                     transport,
                     &mut state.credits,
                     &mut state.pending,
-                    Deliverable::Rows(BulkMessage::LivePatch(patch)),
+                    &state.outbound.queue,
+                    Deliverable::Budgeted(patch),
                 )
                 .await
                 .map_err(transport_err)?;
@@ -5738,9 +5915,14 @@ where
                 .map_err(transport_err),
             ControlMessage::AckCredits(ack) => {
                 state.credits = state.credits.saturating_add(ack.credits);
-                flush(transport, &mut state.credits, &mut state.pending)
-                    .await
-                    .map_err(transport_err)?;
+                flush(
+                    transport,
+                    &mut state.credits,
+                    &mut state.pending,
+                    &state.outbound.queue,
+                )
+                .await
+                .map_err(transport_err)?;
                 // The acknowledgement is what paces a read still arriving in
                 // pages: one page per acknowledgement, so the server holds one
                 // page at a time and a client that stops reading stops the
@@ -8313,6 +8495,7 @@ where
                     transport,
                     &mut state.credits,
                     &mut state.pending,
+                    &state.outbound.queue,
                     Deliverable::Rows(BulkMessage::LivePatch(live)),
                 )
                 .await
@@ -8389,6 +8572,7 @@ where
             transport,
             &mut state.credits,
             &mut state.pending,
+            &state.outbound.queue,
             Deliverable::Rows(BulkMessage::SnapshotPatch(SnapshotPatch::new(
                 label.to_owned(),
                 payload,
@@ -8424,6 +8608,7 @@ where
             transport,
             &mut state.credits,
             &mut state.pending,
+            &state.outbound.queue,
             Deliverable::SnapshotComplete(SnapshotEnd {
                 sub_id: label,
                 cursor,
@@ -8671,6 +8856,7 @@ where
                 transport,
                 &mut state.credits,
                 &mut state.pending,
+                &state.outbound.queue,
                 Deliverable::SnapshotComplete(SnapshotEnd {
                     sub_id: sub.sub_id,
                     cursor: Cursor::new(self.stamp(ceiling.unwrap_or(from))),
@@ -8741,6 +8927,7 @@ where
                         transport,
                         &mut state.credits,
                         &mut state.pending,
+                        &state.outbound.queue,
                         Deliverable::Rows(BulkMessage::LivePatch(patch)),
                     )
                     .await
@@ -9613,10 +9800,11 @@ async fn enqueue_and_flush<T: Transport>(
     transport: &mut T,
     credits: &mut u32,
     pending: &mut VecDeque<Deliverable>,
+    queue: &SendQueue,
     msg: Deliverable,
 ) -> Result<(), T::Error> {
     pending.push_back(msg);
-    flush(transport, credits, pending).await
+    flush(transport, credits, pending, queue).await
 }
 
 /// Drain the outbound queue in order, stopping at the first bulk frame the
@@ -9629,6 +9817,7 @@ async fn flush<T: Transport>(
     transport: &mut T,
     credits: &mut u32,
     pending: &mut VecDeque<Deliverable>,
+    queue: &SendQueue,
 ) -> Result<(), T::Error> {
     loop {
         if *credits == 0 && pending.front().is_some_and(Deliverable::costs_credit) {
@@ -9640,6 +9829,12 @@ async fn flush<T: Transport>(
         match next {
             Deliverable::Rows(msg) => {
                 transport.send_bulk(msg).await?;
+                *credits -= 1;
+            }
+            Deliverable::Budgeted(patch) => {
+                let bytes = budgeted_bytes(&patch);
+                transport.send_bulk(BulkMessage::LivePatch(patch)).await?;
+                queue.release(bytes);
                 *credits -= 1;
             }
             Deliverable::SnapshotComplete(end) => {
@@ -9663,12 +9858,25 @@ mod tests {
     use subql::backend::{ScalarFamily, Value as PgValue};
 
     use super::{
-        GrantHolder, MemberTable, MirrorGap, Resume, SubscribeRefusal, attempt_limit_reached,
-        caller_subjects, concerns, mirror_predicate, page_rows,
+        Admission, GrantHolder, MemberTable, MirrorGap, Resume, SendQueue, SubscribeRefusal,
+        attempt_limit_reached, caller_subjects, concerns, mirror_predicate, page_rows,
     };
     use crate::timeline::{Position, TimelineHistory};
     use connetto_core::Cursor;
     use subql::{PgCommitPosition, PgLsn, PgXid};
+
+    /// Bytes released by a sent patch make room again, and an overflow stays final even once the queue drains.
+    #[test]
+    fn the_send_queue_frees_sent_bytes_and_keeps_an_overflow() {
+        let queue = SendQueue::new(10);
+        assert_eq!(queue.admit(8), Admission::Queued);
+        queue.release(8);
+        assert_eq!(queue.admit(8), Admission::Queued);
+        assert_eq!(queue.admit(2), Admission::Queued);
+        assert_eq!(queue.admit(1), Admission::Overflowed);
+        queue.release(10);
+        assert_eq!(queue.admit(1), Admission::Dropped);
+    }
 
     fn judged(cursor: &[u8], history: &TimelineHistory) -> Resume {
         Resume::of(Some(&Cursor::new(cursor.to_vec())), history)
