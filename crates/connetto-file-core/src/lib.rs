@@ -5,6 +5,7 @@ mod identity;
 mod manifest;
 mod maybe_send;
 mod mem;
+mod outboard;
 mod params;
 mod process;
 mod store;
@@ -14,8 +15,14 @@ pub use identity::{ChunkHash, FileId, FileIdHasher};
 pub use manifest::{ChunkMeta, Manifest};
 pub use maybe_send::MaybeSend;
 pub use mem::{MemStore, MemStoreError};
+pub use outboard::{
+    BLOCK_SIZE, DecodeRangeError, Outboard, OutboardBuilder, RangeError, decode_range,
+    encode_range, outboard_of,
+};
 pub use params::{ChunkParams, MEDIA_PARAMS, MimeClass, TEXT_PARAMS};
-pub use process::{ProcessError, process_file, process_file_from_reader, reassemble};
+pub use process::{
+    ProcessError, process_file, process_file_from_reader, process_file_with_outboard, reassemble,
+};
 pub use store::{ChunkInventory, ChunkStore};
 
 #[cfg(test)]

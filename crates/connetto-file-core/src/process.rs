@@ -5,9 +5,10 @@ use std::io::Read;
 use fastcdc::v2020::StreamCDC;
 use thiserror::Error;
 
-use crate::identity::{ChunkHash, FileIdHasher};
+use crate::identity::ChunkHash;
 use crate::manifest::{ChunkMeta, Manifest};
 use crate::maybe_send::MaybeSend;
+use crate::outboard::{Outboard, OutboardBuilder};
 use crate::params::MimeClass;
 use crate::store::ChunkStore;
 
@@ -38,7 +39,7 @@ pub enum ProcessError<E: std::error::Error + Send + Sync + 'static> {
 ///
 /// Does not panic in practice. Converting `params.max` from `u32` to `usize` cannot fail on any Rust target because `usize` is at least 32 bits wide.
 pub async fn process_file_from_reader<R, S>(
-    mut reader: R,
+    reader: R,
     mime: MimeClass,
     store: &S,
 ) -> Result<Manifest, ProcessError<S::Error>>
@@ -46,9 +47,33 @@ where
     R: Read + MaybeSend,
     S: ChunkStore,
 {
+    process_file_with_outboard(reader, mime, store)
+        .await
+        .map(|(manifest, _)| manifest)
+}
+
+/// As [`process_file_from_reader`], also answering the file's [`Outboard`],
+/// built in the same pass that hashes its identity.
+///
+/// # Errors
+///
+/// As [`process_file_from_reader`].
+///
+/// # Panics
+///
+/// As [`process_file_from_reader`].
+pub async fn process_file_with_outboard<R, S>(
+    mut reader: R,
+    mime: MimeClass,
+    store: &S,
+) -> Result<(Manifest, Outboard), ProcessError<S::Error>>
+where
+    R: Read + MaybeSend,
+    S: ChunkStore,
+{
     let params = mime.params();
     let max = usize::try_from(params.max).expect("max chunk size fits in usize");
-    let mut file_hasher = FileIdHasher::new();
+    let mut file_hasher = OutboardBuilder::new();
     let mut chunk_metas = Vec::new();
     let mut buf = read_prefix(&mut reader, max + 1)?;
 
@@ -81,8 +106,8 @@ where
         }
     }
 
-    let file_id = file_hasher.finalize();
-    Ok(Manifest::new(file_id, chunk_metas))
+    let outboard = file_hasher.finish();
+    Ok((Manifest::new(outboard.file_id(), chunk_metas), outboard))
 }
 
 /// Processes a file slice in one pass.
@@ -143,7 +168,7 @@ fn read_prefix<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>, std::io
 /// Hashes `data`, writes it to `store`, and records the chunk metadata.
 async fn store_chunk<S: ChunkStore>(
     data: &[u8],
-    file_hasher: &mut FileIdHasher,
+    file_hasher: &mut OutboardBuilder,
     metas: &mut Vec<ChunkMeta>,
     store: &S,
 ) -> Result<(), S::Error> {
@@ -161,7 +186,7 @@ async fn store_chunk<S: ChunkStore>(
 async fn stream_slabs<R, S>(
     mut reader: R,
     slab_size: usize,
-    file_hasher: &mut FileIdHasher,
+    file_hasher: &mut OutboardBuilder,
     metas: &mut Vec<ChunkMeta>,
     store: &S,
 ) -> Result<(), ProcessError<S::Error>>
@@ -187,7 +212,7 @@ async fn stream_cdc_chunks<R, S>(
     min: u32,
     avg: u32,
     max: u32,
-    file_hasher: &mut FileIdHasher,
+    file_hasher: &mut OutboardBuilder,
     metas: &mut Vec<ChunkMeta>,
     store: &S,
 ) -> Result<(), ProcessError<S::Error>>

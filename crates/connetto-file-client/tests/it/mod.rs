@@ -9,6 +9,7 @@ mod held_files;
 mod held_wire;
 mod negotiation;
 mod offline_photo;
+mod outboards;
 mod photo_fixture;
 mod resolving;
 mod retention;

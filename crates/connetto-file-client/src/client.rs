@@ -14,8 +14,8 @@ use connetto_core::Major;
 use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
 use connetto_file_core::{
-    ChunkInventory, ChunkStore, EncryptingStore, FileId, Manifest, MaybeSend, MimeClass,
-    process_file_from_reader,
+    ChunkHash, ChunkInventory, ChunkStore, EncryptingStore, FileId, Manifest, MaybeSend, MimeClass,
+    Outboard, outboard_of, process_file_with_outboard,
 };
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -344,16 +344,20 @@ where
     {
         let _writing = self.content_writes.lock().await;
         let store = self.store_for(mime);
-        let manifest = process_file_from_reader(reader, mime, &store)
+        let (manifest, outboard) = process_file_with_outboard(reader, mime, &store)
             .await
             .map_err(|err| ContentError::Store(err.to_string()))?;
         let file_id = manifest.file_id();
+        let outboard = self.store_outboard(&outboard).await?;
         let out = self
             .client
             .with_conn(|conn| {
                 conn.transact_with_bookkeeping(
                     |c| {
                         db::put_manifest(c, &manifest)?;
+                        if let Some(hash) = &outboard {
+                            db::put_outboard(c, file_id, hash)?;
+                        }
                         db::enqueue(c, file_id)
                     },
                     |c| row(c, file_id),
@@ -362,6 +366,83 @@ where
             })
             .await??;
         Ok((file_id, out))
+    }
+
+    /// This file's BLAKE3 outboard, `None` when the device holds no manifest
+    /// for it.
+    ///
+    /// A file of one 16 KiB group has no parent hashes and stores nothing.
+    /// Any other file's outboard is read from the chunk store, or computed
+    /// from its stored chunks and kept when its object is missing or does not
+    /// read back as one, as for a file an archive import restored.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] on a bookkeeping failure, and
+    /// [`ContentError::Store`] when a chunk read fails or the stored chunks do
+    /// not hash to the file id.
+    pub async fn outboard(&self, file_id: FileId) -> Result<Option<Outboard>, ContentError> {
+        let Some(manifest) = self
+            .client
+            .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
+            .await??
+        else {
+            return Ok(None);
+        };
+        let size = manifest.chunks().iter().map(|chunk| chunk.len).sum();
+        if let Some(empty) = Outboard::new(file_id, size, Vec::new()) {
+            return Ok(Some(empty));
+        }
+        let store = self.store_for(FETCHED_CLASS);
+        let named = self
+            .client
+            .with_conn(|conn| db::outboard_hash(conn.conn(), file_id))
+            .await??;
+        if let Some(hash) = named {
+            match store.read_chunk(&hash).await {
+                Ok(pairs) => {
+                    if let Some(outboard) = Outboard::new(file_id, size, pairs) {
+                        return Ok(Some(outboard));
+                    }
+                }
+                Err(err) if store.read_failure_is_ambiguous(&err) => {
+                    return Err(ContentError::Store(err.to_string()));
+                }
+                Err(_) => {}
+            }
+        }
+        let _writing = self.content_writes.lock().await;
+        let outboard = outboard_of(&manifest, &store)
+            .await
+            .map_err(|err| ContentError::Store(err.to_string()))?;
+        if let Some(hash) = self.store_outboard(&outboard).await? {
+            self.client
+                .with_conn(|conn| {
+                    let c = conn.conn();
+                    match db::load_manifest(c, file_id)? {
+                        Some(_) => db::put_outboard(c, file_id, &hash).map_err(ContentError::from),
+                        None => Ok(()),
+                    }
+                })
+                .await??;
+        }
+        Ok(Some(outboard))
+    }
+
+    /// Writes an outboard's parent hashes into the chunk store under their own
+    /// hash, answering it, or `None` for a file with no parent hashes. The
+    /// caller holds `content_writes`, so the sweep cannot take the object
+    /// before its row commits.
+    async fn store_outboard(&self, outboard: &Outboard) -> Result<Option<ChunkHash>, ContentError> {
+        if outboard.pairs().is_empty() {
+            return Ok(None);
+        }
+        let hash = ChunkHash::from_data(outboard.pairs());
+        self.store_for(FETCHED_CLASS)
+            .write_chunk(&hash, outboard.pairs())
+            .await
+            .map_err(|err| ContentError::Store(err.to_string()))?;
+        Ok(Some(hash))
     }
 
     /// Reads every unsent file's chunks and retires the entries whose bytes
@@ -863,19 +944,27 @@ where
         let bytes = upload::download(&self.http, &url).await?;
         let _writing = self.content_writes.lock().await;
         let store = self.store_for(FETCHED_CLASS);
-        let manifest = process_file_from_reader(bytes.as_slice(), FETCHED_CLASS, &store)
-            .await
-            .map_err(|err| ContentError::Store(err.to_string()))?;
+        let (manifest, outboard) =
+            process_file_with_outboard(bytes.as_slice(), FETCHED_CLASS, &store)
+                .await
+                .map_err(|err| ContentError::Store(err.to_string()))?;
         if manifest.file_id() != file_id {
             return Err(ContentError::IdentityMismatch {
                 expected: file_id,
                 actual: manifest.file_id(),
             });
         }
+        let outboard = self.store_outboard(&outboard).await?;
         self.client
             .with_conn(|conn| {
                 conn.transact_with_bookkeeping(
-                    |c| db::put_manifest(c, &manifest),
+                    |c| {
+                        db::put_manifest(c, &manifest)?;
+                        match &outboard {
+                            Some(hash) => db::put_outboard(c, file_id, hash),
+                            None => Ok(()),
+                        }
+                    },
                     |_| Ok::<(), diesel::result::Error>(()),
                 )
             })

@@ -5,8 +5,8 @@ use core::fmt;
 /// Content identity of a file: BLAKE3 hash of its raw bytes.
 ///
 /// The identity is chunking-independent by design: re-tuning chunk parameters
-/// never re-identifies a file, and verified range streaming (bao) is a free
-/// future upgrade because BLAKE3 is internally a Merkle tree.
+/// never re-identifies a file, and as the root of BLAKE3's own hash tree it is
+/// what an [`crate::Outboard`] proves a byte range against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId([u8; 32]);
 
