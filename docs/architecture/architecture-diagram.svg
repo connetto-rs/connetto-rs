@@ -84,11 +84,12 @@
 
     <!-- ===== Backup and restore (R70, built) ===== -->
     <g transform="translate(35, 656)">
-      <rect width="460" height="50" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
-      <rect width="4" height="50" rx="1" fill="#4CAF50" />
+      <rect width="460" height="64" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="64" rx="1" fill="#4CAF50" />
       <text x="230" y="18" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Deployment backup and restore</text>
       <text x="230" y="34" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: restores resync clients and revoke sessions, the OpenFGA store and chunks reconciled at boot</text>
-      <text x="230" y="46" text-anchor="middle" font-size="8.5" fill="#4CAF50">a writer a restore rewound moves to a fresh writer, numbers named by their secret</text>
+      <text x="230" y="46" text-anchor="middle" font-size="8.5" fill="#4CAF50">a rewound writer re-sends the run it kept (R78) or moves on, numbers named by their secret</text>
+      <text x="230" y="58" text-anchor="middle" font-size="8.5" fill="#C62828">R78: a courier brings back a lost device's writes acknowledged after the backup</text>
     </g>
 
     <!-- ===== Clock discipline (R72, built) ===== -->
@@ -152,10 +153,11 @@
       <rect width="300" height="84" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="84" rx="1" fill="#4CAF50" />
       <text x="150" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">Identity and session</text>
-      <text x="150" y="31" text-anchor="middle" font-size="8.5" fill="#555">grants to a Principal, registry, resume tokens (R2, R3)</text>
-      <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#555">a person's sessions listed and ended live, writes attributed (R105)</text>
-      <text x="150" y="59" text-anchor="middle" font-size="8.5" fill="#4CAF50">security defaults (R1), revocation teardown (R7)</text>
-      <text x="150" y="73" text-anchor="middle" font-size="8.5" fill="#4CAF50">silent refusals (R38)</text>
+      <text x="150" y="30" text-anchor="middle" font-size="8.5" fill="#555">grants to a Principal, registry, resume tokens (R2, R3)</text>
+      <text x="150" y="42" text-anchor="middle" font-size="8.5" fill="#555">a person's sessions listed and ended live, writes attributed (R105)</text>
+      <text x="150" y="54" text-anchor="middle" font-size="8.5" fill="#4CAF50">security defaults (R1), revocation teardown (R7)</text>
+      <text x="150" y="66" text-anchor="middle" font-size="8.5" fill="#4CAF50">silent refusals (R38)</text>
+      <text x="150" y="78" text-anchor="middle" font-size="8.5" fill="#C62828">R78: the courier path, the author told at its next login</text>
     </g>
 
     <!-- Cluster: capabilities -->
@@ -170,20 +172,22 @@
 
     <!-- Cluster: admission control -->
     <g transform="translate(550, 280)">
-      <rect width="300" height="56" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
-      <rect width="3" height="56" rx="1" fill="#4CAF50" />
-      <text x="150" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">Admission control</text>
-      <text x="150" y="31" text-anchor="middle" font-size="8.5" fill="#555">throttling (R19), abuse and bans end sessions (R36, R105)</text>
-      <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#555">reserved pool share (R39), page cap, read bound (R58)</text>
+      <rect width="300" height="58" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
+      <rect width="3" height="58" rx="1" fill="#4CAF50" />
+      <text x="150" y="15" text-anchor="middle" font-size="11" font-weight="600" fill="#333">Admission control</text>
+      <text x="150" y="28" text-anchor="middle" font-size="8.5" fill="#555">throttling (R19), abuse and bans end sessions (R36, R105)</text>
+      <text x="150" y="40" text-anchor="middle" font-size="8.5" fill="#555">reserved pool share (R39), page cap, read bound (R58)</text>
+      <text x="150" y="52" text-anchor="middle" font-size="8.5" fill="#C62828">R78: a byte bucket per courier</text>
     </g>
 
     <!-- Cluster: audit -->
     <g transform="translate(550, 344)">
-      <rect width="300" height="56" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
-      <rect width="3" height="56" rx="1" fill="#4CAF50" />
-      <text x="150" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">Audit</text>
-      <text x="150" y="31" text-anchor="middle" font-size="8.5" fill="#555">auth_events required (R13, R105), every producer emits its op</text>
-      <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#555">high-volume stream goes to the structured log</text>
+      <rect width="300" height="58" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
+      <rect width="3" height="58" rx="1" fill="#4CAF50" />
+      <text x="150" y="15" text-anchor="middle" font-size="11" font-weight="600" fill="#333">Audit</text>
+      <text x="150" y="28" text-anchor="middle" font-size="8.5" fill="#555">auth_events required (R13, R105), every producer emits its op</text>
+      <text x="150" y="40" text-anchor="middle" font-size="8.5" fill="#555">high-volume stream goes to the structured log</text>
+      <text x="150" y="52" text-anchor="middle" font-size="8.5" fill="#C62828">R78: write_couriered names courier and author</text>
     </g>
 
     <!-- Cluster: slot lifecycle -->
@@ -371,10 +375,11 @@
       <text x="148" y="51" text-anchor="middle" font-size="8.5" fill="#4CAF50">typed keyed and row handles, R84</text>
     </g>
     <g transform="translate(1320, 120)">
-      <rect width="296" height="44" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
-      <rect width="3" height="44" rx="1" fill="#4CAF50" />
+      <rect width="296" height="58" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
+      <rect width="3" height="58" rx="1" fill="#4CAF50" />
       <text x="148" y="17" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Mutation interception</text>
       <text x="148" y="33" text-anchor="middle" font-size="9" font-family="monospace" fill="#888">to _connetto_pending, exactly once</text>
+      <text x="148" y="48" text-anchor="middle" font-size="8.5" fill="#4CAF50">acknowledged entries kept, re-sent after a restore (R78)</text>
     </g>
     <g transform="translate(1008, 188)">
       <rect width="296" height="56" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
@@ -453,13 +458,14 @@
 
     <!-- R26 and R42 -->
     <g transform="translate(995, 682)">
-      <rect width="300" height="80" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
-      <rect width="4" height="80" rx="1" fill="#4CAF50" />
+      <rect width="300" height="88" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="88" rx="1" fill="#4CAF50" />
       <text x="150" y="16" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Local data export and import</text>
       <text x="150" y="30" text-anchor="middle" font-size="8.5" fill="#4CAF50">zipped change records and unsent content, one entry at a time</text>
       <text x="150" y="43" text-anchor="middle" font-size="8.5" fill="#4CAF50">import restores device tier and unsent writes, same account</text>
       <text x="150" y="56" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: a person's data download and erasure recipe, R61</text>
       <text x="150" y="69" text-anchor="middle" font-size="8.5" fill="#4CAF50">import in one transaction, R56</text>
+      <text x="150" y="82" text-anchor="middle" font-size="8.5" fill="#C62828">R78: the rows held for a courier travel too</text>
     </g>
     <g transform="translate(1325, 682)">
       <rect width="300" height="52" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
@@ -494,13 +500,14 @@
     <g transform="translate(1325, 834)">
       <rect width="300" height="118" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="4" height="118" rx="1" fill="#4CAF50" />
-      <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Device-to-device sync</text>
-      <text x="150" y="34" text-anchor="middle" font-size="8.5" fill="#4CAF50">R74: chip key, certificates, attestation under PEN 67105</text>
-      <text x="150" y="49" text-anchor="middle" font-size="8.5" fill="#4CAF50">R76 slices 1 to 9c: the link, mDNS, hotspots, beacon</text>
-      <text x="150" y="63" text-anchor="middle" font-size="8.5" fill="#4CAF50">Android, iPhone, Linux host, the iPad and Mac join</text>
-      <text x="150" y="77" text-anchor="middle" font-size="8.5" fill="#4CAF50">R75 frontiers, R77 slices 1 to 5, R79 media frames and port</text>
-      <text x="150" y="91" text-anchor="middle" font-size="8.5" fill="#C62828">R76 slices 9d and 9e, R74's Windows record</text>
-      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#C62828">R77 slices 6 to 8, R78, R79 slice 8, R80 (chapter 19)</text>
+      <text x="150" y="19" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Device-to-device sync</text>
+      <text x="150" y="32" text-anchor="middle" font-size="8.5" fill="#4CAF50">R74: chip key, certificates, attestation under PEN 67105</text>
+      <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#4CAF50">R76 slices 1 to 9c: the link, mDNS, hotspots, beacon</text>
+      <text x="150" y="58" text-anchor="middle" font-size="8.5" fill="#4CAF50">Android, iPhone, Linux host, the iPad and Mac join</text>
+      <text x="150" y="71" text-anchor="middle" font-size="8.5" fill="#4CAF50">R75 frontiers, R77 slices 1 to 5, R79 media frames and port</text>
+      <text x="150" y="84" text-anchor="middle" font-size="8.5" fill="#C62828">R76 slices 9d and 9e, R74's Windows record</text>
+      <text x="150" y="97" text-anchor="middle" font-size="8.5" fill="#C62828">R77 slices 6 to 8, R79 slice 8, R80 (chapter 19)</text>
+      <text x="150" y="110" text-anchor="middle" font-size="8.5" fill="#C62828">R78: the courier hold and the explicit courier offer</text>
     </g>
   </g>
 
@@ -550,12 +557,13 @@
       <rect width="296" height="116" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="116" rx="1" fill="#4CAF50" />
       <text x="148" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#2E7D32">DB worker (connetto-web)</text>
-      <text x="148" y="32" text-anchor="middle" font-size="8.5" fill="#888">WebClientBuilder boot, account choice, OPFS replica (R54)</text>
-      <text x="148" y="47" text-anchor="middle" font-size="8.5" fill="#888">upstream ConnettoClient plus capture</text>
-      <text x="148" y="62" text-anchor="middle" font-size="8.5" fill="#888">RelayHub fan-out, tab key changes (R95)</text>
-      <text x="148" y="76" text-anchor="middle" font-size="8.5" fill="#4CAF50">identity-named local tier (R17), one tier handle (R43)</text>
-      <text x="148" y="90" text-anchor="middle" font-size="8.5" fill="#4CAF50">offline boot (R20), one builder per platform (R94)</text>
-      <text x="148" y="104" text-anchor="middle" font-size="8.5" fill="#4CAF50">resting results table (R83), synced tables, no refs (R92)</text>
+      <text x="148" y="30" text-anchor="middle" font-size="8.5" fill="#888">WebClientBuilder boot, account choice, OPFS replica (R54)</text>
+      <text x="148" y="43" text-anchor="middle" font-size="8.5" fill="#888">upstream ConnettoClient plus capture</text>
+      <text x="148" y="56" text-anchor="middle" font-size="8.5" fill="#888">RelayHub fan-out, tab key changes (R95)</text>
+      <text x="148" y="69" text-anchor="middle" font-size="8.5" fill="#4CAF50">identity-named local tier (R17), one tier handle (R43)</text>
+      <text x="148" y="82" text-anchor="middle" font-size="8.5" fill="#4CAF50">offline boot (R20), one builder per platform (R94)</text>
+      <text x="148" y="95" text-anchor="middle" font-size="8.5" fill="#4CAF50">resting results table (R83), synced tables, no refs (R92)</text>
+      <text x="148" y="108" text-anchor="middle" font-size="8.5" fill="#4CAF50">acknowledged writes re-sent after a restore (R78)</text>
     </g>
     <g transform="translate(1320, 962)">
       <rect width="296" height="76" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
@@ -707,5 +715,5 @@
   </g>
 
   <!-- Title -->
-  <text x="20" y="1970" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-11-01 to the plan's current state.</text>
+  <text x="20" y="1970" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-11-02 to the plan's current state.</text>
 </svg>

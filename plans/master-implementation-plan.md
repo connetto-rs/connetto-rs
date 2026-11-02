@@ -56,7 +56,7 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | [R76](#r76-the-peer-link) | in progress |  | Slices 9d (Windows hosting, joining, beacon and proof) and 9e (the recorded home run) remain, parked while the work goes mobile first |  | [#134](https://github.com/connetto-rs/connetto-rs/pull/134), [#135](https://github.com/connetto-rs/connetto-rs/pull/135), [#136](https://github.com/connetto-rs/connetto-rs/pull/136), [#137](https://github.com/connetto-rs/connetto-rs/pull/137), [#140](https://github.com/connetto-rs/connetto-rs/pull/140), [#141](https://github.com/connetto-rs/connetto-rs/pull/141), [#142](https://github.com/connetto-rs/connetto-rs/pull/142), [#143](https://github.com/connetto-rs/connetto-rs/pull/143), [#148](https://github.com/connetto-rs/connetto-rs/pull/148), [#158](https://github.com/connetto-rs/connetto-rs/pull/158), [#162](https://github.com/connetto-rs/connetto-rs/pull/162), [#163](https://github.com/connetto-rs/connetto-rs/pull/163), [#204](https://github.com/connetto-rs/connetto-rs/pull/204) |
 | [R57](#r57-the-demo-feature-gaps-the-export-audit-found) | in progress |  | The application-visible features the export audit found missing from the demos, steps 1 to 5 and 7 found built in the demos on `examples/demo-support` (2026-10-26), step 6 found already fixed (2026-09-12), step 8 merged (2026-10-20), and the human proof pass remaining |  | [#205](https://github.com/connetto-rs/connetto-rs/pull/205), [#216](https://github.com/connetto-rs/connetto-rs/pull/216) |
 | [R77](#r77-the-exchange-and-the-provisional-tier) | in progress |  | Slices 7 (online adjudication) and 8 (the handheld proof) remain, the rest of the exchange and the provisional tier is merged |  | [#296](https://github.com/connetto-rs/connetto-rs/pull/296), [#297](https://github.com/connetto-rs/connetto-rs/pull/297), [#300](https://github.com/connetto-rs/connetto-rs/pull/300), [#304](https://github.com/connetto-rs/connetto-rs/pull/304), [#310](https://github.com/connetto-rs/connetto-rs/pull/310), [#342](https://github.com/connetto-rs/connetto-rs/pull/342), [#344](https://github.com/connetto-rs/connetto-rs/pull/344), [#348](https://github.com/connetto-rs/connetto-rs/pull/348), [#351](https://github.com/connetto-rs/connetto-rs/pull/351), [#354](https://github.com/connetto-rs/connetto-rs/pull/354), [#357](https://github.com/connetto-rs/connetto-rs/pull/357), [#365](https://github.com/connetto-rs/connetto-rs/pull/365) |
-| [R78](#r78-courier-recovery) | not started | R77 | The server courier path under the five constraints, deployment-opt-in and default off, and the client's explicit offer of another author's held changesets |  |  |
+| [R78](#r78-courier-recovery) | not started | R77 slice 7 ([#377](https://github.com/connetto-rs/connetto-rs/pull/377)) for slices 1a, 3a, 4 and 6 | Designed in eight slices, the server courier path under the five constraints, deployment-opt-in and default off, the receiver's courier hold, the client's explicit offer, and a restored server's acknowledged writes coming back from their author or a courier |  |  |
 | [R79](#r79-media-over-the-peer-link) | in progress | R78 (step 4) | Slice 8, the harness proof, and step 4's opt-in replication |  | [#371](https://github.com/connetto-rs/connetto-rs/pull/371), [#373](https://github.com/connetto-rs/connetto-rs/pull/373), [#376](https://github.com/connetto-rs/connetto-rs/pull/376), [#379](https://github.com/connetto-rs/connetto-rs/pull/379), [#383](https://github.com/connetto-rs/connetto-rs/pull/383), [#385](https://github.com/connetto-rs/connetto-rs/pull/385), [#388](https://github.com/connetto-rs/connetto-rs/pull/388) |
 | [R80](#r80-peer-sync-in-every-demo) | not started | R76 (slice 9d), R77, R78, R79 | The camp flow in every native-capable demo on every native platform, the iOS zero-coverage field test, and the grown phone and home runs |  |  |
 | [R107](#r107-schema-changes-under-running-servers) | in progress | subql passing pgoutput `Relation` messages to consumers (slice 2) | The expand and contract procedure with the sunset, the table refusal when a running server notices a change, and the two-model boot check |  |  |
@@ -1212,26 +1212,174 @@ Two devices of different accounts exchange offline and reconcile online with not
 
 ## R78: courier recovery
 
-**Status.** NOT STARTED.
+**Status.** NOT STARTED. Designed with the maintainer on 2026-11-02, decisions 1 to 22 below, in eight pull requests, none open.
 
-**Blocked on** R75 and R77. The capture major a couriered entry carries on the wire is R31's, merged.
+**Blocked on** R77 slice 7, open as [#377](https://github.com/connetto-rs/connetto-rs/pull/377), for slices 1a, 3a, 4 and 6. Slice 1a reads #377's `settled_range`, its `verdict_of` ruling, its pruning that keeps refused records and its `certificate_live_past_skew`. Slice 3a changes the adjudication code #377 adds to the client (`settle_provisional_ask`, `adjudicate_peer_seq`). Slice 4 builds its candidates on #377's `ProvisionalStatus` asks and settles a courier answer the way #377 settles `ProvisionalVerdicts`. Slices 1b, 2 and 3b wait only for the slices before them, and slice 5 waits for nothing. R75 and R31 are merged.
 
-**Changes state.** Client tables, none, the courier's entry reading the record R75 settles into. Server tables, the settled record the courier replay answers from, with its audit rows. Wire messages, the couriered entry with its capture major. Archive format, none.
+**Changes state.** Client tables, `_connetto_peer_entry` gains `state`, `origin` and `digest` with a nullable `changeset` (decision 19), `_connetto_peer_cursor` gains `expires_at` (decision 17), and `_connetto_acked` in `main` (decision 21). Server tables, `bot_list` on `connetto_device_enrolments` (decision 9), `courier_user_id` and the `write_couriered` label on `auth_events` (decision 10), and a courier notice table in the `Writers` member (decision 12). Wire messages, `CourierRange`, `CourierBody` and `CourierAnswer` (decision 5), `CourierNotice` and `CourierNoticeAck` (decision 12), and `HandshakeAck.courier` (decision 1), with `range_message` and `verify_range` deleted (decision 2). Archive format, the courier-held rows with their state (decision 20).
 
 ### Purpose
 
-Field survivability, a lost device's work is recoverable from the camp. The server accepts author-signed changesets from any certified bearer, deduplicated by the same frontier every path consults. The boundary is cryptographic, not trusted. The courier authenticates as itself and can only relay verbatim what the author's device key signed, its range attestation covering the chain, whose hashes bind each entry's capture major and provenance original, so a courier cannot strip or substitute either, and its own document rights are never consulted. What a malicious courier can do is withhold, no worse than not couriering, with sequence-gap refusal preventing reordering, and delay, no worse than the author's own delayed reconnect, policy evaluated at apply time. The maintainer's impersonation concern is met by this confinement and rides as five constraints, none optional.
+Field survivability, a lost device's work is recoverable from the camp. The server accepts author-signed changesets from any certified bearer, deduplicated by the same frontier every path consults. The boundary is cryptographic, not trusted. The courier authenticates as itself and can only relay verbatim what the author's device key signed, its signed offer covering the chain, whose hashes bind each entry's capture major and provenance original, so a courier cannot strip or substitute either, and its own document rights are never consulted. What a malicious courier can do is withhold, no worse than not couriering, with sequence-gap refusal preventing reordering, and delay, no worse than the author's own delayed reconnect, policy evaluated at apply time. The maintainer's impersonation concern is met by this confinement and rides as five constraints, none optional.
 
 ### Steps
 
 1. The server courier path, **deployment-opt-in, default off**, verify the author's signature against its enrolment, apply under the author's identity, refuse sequence gaps, dedup by the frontier.
 2. The five constraints, which ride with the path because it is the first place session identity and write author differ, a distinct R13 `auth_events` record per couriered application naming courier and author, per-courier metering under R19's machinery, refusal of revoked enrolments, author notification on next login, and acceptance governed by the account's and enrolment's standing at apply time, since signatures carry no trusted timestamp, with the author's certificate live at delivery, a same-key renewal keeping the author's records and standing.
 3. The client side, offering another author's held changesets for courier upload, explicit, never automatic.
-4. A courier re-delivering the author's changesets to a server restored to an earlier point, whose rewound frontier accepts them again byte for byte, demonstrated and written into chapter 20 beside R70's legs (R70 decision 20).
+4. A courier re-delivering the author's changesets to a server restored to an earlier point, whose rewound frontier accepts them again byte for byte, and the author re-sending its own retained acknowledged entries the same way, demonstrated and written into chapter 20 beside R70's legs (R70 decision 20).
+
+### Decisions, taken with the maintainer
+
+1. **The courier path is a deployment switch, and the handshake tells the client.** `ServerBuilder::courier(true)` and `CONNETTO_COURIER=on` in the binary turn it on, off by default. `HandshakeAck` gains `courier: bool`, so the client's offer answers `CourierUnavailable` without uploading anything, and a courier frame reaching a server with the path off is refused `CourierRefusal::Disabled`. Rejected: the switch alone, under which a client learns it is off only after uploading a range. Rejected: a per-account consent beside the deployment switch.
+2. **The courier presents the author's stored `SignedOffer`.** No client ever signs `range_message`. The exchange signs one `SignedOffer` per hand-off over the settled and newest frontiers, the builds and the retraction log (R77 decision 7), and the receiver keeps the author's last verified one in `_connetto_peer_cursor.offer`, so `courier_deliver`'s range signature was one nobody could produce. The server checks the offer with `verify_offer` against the author's key and recomputes the chain from its own head to `offer.newest.head`. `range_message`, `verify_range` and the signature argument of `courier_deliver` are deleted, and R77 decision 1's sentence on one `range_message` serving both paths is corrected in slice 1a. Rejected: a second range signature per hand-off, which doubles the chip operations R77 decision 7 bounds to one.
+3. **A receiver keeps every manifest row it verified and every body of its own build.** Today `_connetto_peer_entry` holds only applied entries, so a local policy refusal on the receiver's partial replica, a false deny chapter 19 accepts, or an entry of another build leaves a hole no chain walk can cross, and the table holds no origin, so a carried entry's hash cannot be recomputed at all. Until adjudication the receiver keeps the manifest row (`seq`, `major`, `origin`, `digest`) of every entry it verified, and the body of every entry captured under its build, a refused one in a courier-only state that is never applied locally. The courier sends bodies and digest-only rows up to the signed head, and the server settles bodies in order and stops at the first digest-only row. Rejected: couriering an author only when every body up to the offer's newest applied locally, under which one local false deny stops couriering that author for good.
+4. **The server skips the settled prefix.** A range may start at or below the writer's frontier. The server skips those rows without applying or auditing them, answers each with the verdict R77 decision 11's ask would give (`Applied`, `Refused` or `Settled`), and checks the chain from its own head at the frontier, so one round trip suffices and an author reconnecting meanwhile turns nothing into a gap. Rejected: the courier trimming by a prior `ProvisionalVerdicts` with today's `SequenceGap` for anything else, which races the author's own reconnect.
+5. **The wire is a control header, bulk bodies and one answer.** `CourierRange { request_id, author, offer, rows }` on the control plane carries the offer's MessagePack bytes and at most `MAX_MANIFEST_ROWS` manifest rows from the first row the courier holds to the offer's newest. One `CourierBody { request_id, seq, changeset_zstd }` per row with a body follows on the bulk plane in sequence order, as a mutation's header and patch travel, and draws on the meter as it arrives. One `CourierAnswer { request_id, outcome }` ends the exchange, a refusal before anything settled or one outcome per row. Rejected: one control frame carrying every body, bounded by the 64 MiB WebSocket frame.
+6. **A couriered entry's capture major is the connection's.** A courier holds bodies of its own build alone (R77 decision 8), so the major its connection declared is each body's, as `courier_deliver` takes it today, and the chain hash refuses a relabel. Rejected: a major per entry on the wire, redundant with the hash.
+7. **R31's rebuild keeps the courier-held rows.** The rebuild at a newer major keeps every row of `_connetto_peer_entry` with its major and the offers, turns a provisional row into a courier-only one, since its record goes with the synced tables, and the courier delivers rows of an older major on R31's drain wire for that major, as its own held writes drain. Rejected: dropping them as today, under which a camp whose couriers all updated before reaching the server loses the lost device's work.
+8. **A number-writer origin stops the range.** A carried entry naming a number writer as its original arises from a browser archive imported into a native device, and the courier never holds the number's secret (R70 decision 22). The server answers that row `NotCouriered` and settles nothing past it, and the author's own device delivers it with the secret. Such an entry is lost with the author's device. Rejected: settling the original by its origin alone, which after a restore re-issued that number to another replica of the account settles the wrong writer and forks the legitimate one. Rejected: applying it plain, as today, which the original writer's own replay applies a second time.
+9. **A couriered entry applies under the bot list the author's certificate carries.** `courier_deliver` binds `bot_list: None` today, which `bot_list_for` renders as the person wildcard `*`, so a bot author's couriered write would run with person rights. `connetto_device_enrolments` gains `bot_list TEXT`, written at enrolment, renewal and reissue with the text the certificate's extension carries (R77 decision 12), and the courier path binds it for the author, `NULL` failing closed, with no subjects, as a peer binds an author (R77 decisions 3 and 4). Rejected: the bot's current list from the bot registry at apply time, blocked since no server code resolves a bot's list yet. Rejected: refusing bot authors, which leaves field bots without recovery.
+10. **Every couriered entry that settles writes one `write_couriered` audit row naming both accounts.** `AuthOp::WriteCouriered`, applied or refused alike since both fix the sequence, with `user_id` the author, `writer` and `seq` the author's, `path` courier, `session` the courier's session, and a new nullable `courier_user_id` column naming the courier's account. A range refused before anything settles goes to the structured log, as every denial does. A deployment's migration adds the column and the enum label. Rejected: naming the courier by `session` alone, which an erasure or session cleanup leaves pointing at nothing. Rejected: the courier's account in `acted_by`, a column meant for staff acting with no session.
+11. **Each courier draws on a courier byte bucket of its own.** `ThrottleConfig::with_courier_bytes(bytes, window)`, a token bucket keyed by the courier's `meter_key`, defaulting to the mutation bucket's 64 MiB a minute, so relaying a teammate's backlog never starves the courier's own writes and an operator sizes it apart. A body arriving past the budget ends the range with `Retry` and the answer carries the wait. Rejected: drawing on the courier's own mutation bucket.
+12. **The author's next login hears what was couriered.** A deployment table in the `Writers` member keeps one row per couriered entry that settled, naming the author's account, the courier's account, the writer, the sequence and the outcome. After the handshake of the author account's next identified session the server sends `CourierNotice { notice_id, notices }`, at most `MAX_MANIFEST_ROWS` rows per frame, the client raises `ClientEvent::WritesCouriered` and answers `CourierNoticeAck { notice_id }`, and the server deletes those rows. Rejected: reading the audit rows back at login, a second audit read against audit.rs's contract and bounded by the deployment's audit retention. Rejected: an application hook, which reaches no session unless the application builds it.
+13. **A banned author's range is refused unsettled.** `CourierRefusal::AuthorBanned`, nothing settles, so the entries stay deliverable after a lift, as the author's own pending writes would. Rejected: settling each entry `Rejected(Unauthorized)`, which a lift could never bring back.
+14. **The author's certificate counts until its expiry plus `DEVICE_SKEW`.** The courier path accepts while `certificate_live_past_skew` holds, the instant at which #377's ask turns `Pending` into `Abandoned`, so the two paths agree. A same-key renewal keeps the writer row, its records and its standing. Rejected: `certificate_live`, under which for five minutes the ask answers `Pending` while the courier is refused.
+15. **A revoked key is refused whatever the reason.** Reporting a device lost revokes it, so from that moment no courier delivers its unsent work and peers retract that work as `Abandoned`. `revoke_device`'s documentation and chapter 19 state that a report abandons the device's unsent work, so a team couriers before reporting. Rejected: a destroyed report that keeps couriering open until expiry, since signatures carry no time and anyone holding the key could sign new entries as the author until then.
+16. **The courier's offer is a candidates read and a call per author.** `NativeClient::courier_candidates()` reads, per author, the account, the held sequences and bytes and the last verdict, `ClientEvent::CourierCandidates` is raised when a session with the path on finds candidates, and `NativeClient::courier(author)` sends that author's held rows on the current session. The answer settles the courier's own rows as a `ProvisionalVerdicts` does. Nothing runs unless the application calls it. Rejected: a per-sequence selection, which can only shorten the range. Rejected: a builder switch couriering automatically, against step 3.
+17. **A write the server acknowledged after a backup comes back from its author or from a courier.** Receivers keep adjudicated entries, bodies, offers and manifest rows, as retained rows, until the author certificate they last saw over a link expires plus `DEVICE_SKEW`, which `_connetto_peer_cursor.expires_at` records, ask about them after a full resync, which every restore method forces, and offer the `Pending` ones as candidates. The author keeps its own acknowledged entries (decisions 21 and 22) and, meeting a rewound frontier they cover, re-sends them through the direct path instead of retiring, retiring only when they leave a gap. This amends chapter 20's restore rule and R75's deletion at acknowledgement. Rejected: receivers retaining while the author still retires, under which the author's acknowledged writes come back only when a courier reaches the server first. Rejected: no retention, under which a write every receiver saw adjudicated before the restore stays lost.
+18. **A courier reaching a writer its author already retired is refused `WriterRetired`.** The author's moved entries applied under its fresh writer first, so nothing applies out of order, and the courier drops that author's courier-only, digest-only and retained rows. Rejected: accepting entries below the first sequence the author carried, which land after the author's newer writes so an older value can overwrite a newer one.
+19. **One table holds every courier-held row, with a state.** `_connetto_peer_entry` gains `state` (provisional, courier-only, digest-only, retained), `origin` and `digest`, and `changeset` becomes nullable for a digest-only row. R77 decision 13's re-apply, the archive import's re-apply and every other R77 reader take provisional rows alone, and no body is stored twice. Rejected: a separate courier table, which stores an applied entry's body twice until adjudication.
+20. **The archive carries the courier-held rows.** Both export scopes carry courier-only, digest-only and retained rows beside the provisional ones, the import re-applies only the provisional ones and restores the others as they are, so a courier restored from its archive still couriers. The archive format's version moves. Rejected: carrying provisional rows alone.
+21. **The author keeps its acknowledged entries in a table of their own.** `_connetto_acked (writer, seq, major, origin, changeset, hash, acked_at)` in `main`, written in the transaction that deletes the acknowledged entry from `_connetto_pending`, so `_connetto_pending` keeps holding exactly the unsent writes its readers (replay, export, the drain, reconcile, the offer) take it for. Rejected: an acknowledged flag on `_connetto_pending`, which every present and later reader would have to filter.
+22. **One configurable window covers both writer kinds.** `with_acked_retention(Duration)`, defaulting to 30 days, the default of the certificate lifetime ceiling, pruned by `acked_at`. A device writer and a number writer alike re-send on a rewound frontier their retained entries cover and retire otherwise, a number re-sending only once the restored server confirms it under its secret (R70 decision 22), and a number issued after the backup still answers `WriterUnknown` and retires. Rejected: devices alone, which leaves a browser's acknowledged writes lost. Rejected: the device's certificate life, which never ends for a live device that renews at half-life.
+
+### Design
+
+```text
+the server wire, control plane unless marked
+  CourierRange      { request_id, author: [u8; 32], offer: Vec<u8>, rows: Vec<ManifestRow> }
+  CourierBody       { request_id, seq, changeset_zstd }                    bulk plane
+  CourierAnswer     { request_id, outcome: CourierOutcome }
+  CourierOutcome    = Refused(CourierRefusal) | Entries(Vec<(u64, CourierEntryOutcome)>)
+  CourierRefusal    = Disabled | Malformed | NotEnrolled | AuthorBanned | WriterRetired
+                    | Unverified | SequenceGap { expected, got }
+  CourierEntryOutcome = Ruled(Verdict) | NotCouriered | Retry { retry_after_ms }
+  CourierNotice     { notice_id, notices: Vec<CourierNoticeRow> }
+  CourierNoticeRow  { courier, writer: WriterRef, seq, verdict: Verdict }
+  CourierNoticeAck  { notice_id }
+  HandshakeAck      gains courier: bool
+```
+
+`ManifestRow` and `Verdict` are R77's types in `connetto-core::exchange`, and `Verdict::Pending` never answers a couriered row. The client waits at most 30 s for `CourierAnswer` on a monotonic clock, R77 decision 10's bound, and holds one range per author open at a time.
+
+```sql
+-- client, in main, the two R77 tables as they become
+CREATE TABLE _connetto_peer_entry (author BLOB, seq INTEGER, state INTEGER NOT NULL, major INTEGER NOT NULL, origin BLOB, digest BLOB NOT NULL, changeset BLOB, account TEXT NOT NULL, bot_list TEXT, received_at INTEGER NOT NULL, position INTEGER NOT NULL, PRIMARY KEY (author, seq));
+CREATE TABLE _connetto_peer_cursor (author BLOB PRIMARY KEY, account TEXT NOT NULL, seq INTEGER NOT NULL, head BLOB NOT NULL, offer BLOB NOT NULL, expires_at INTEGER NOT NULL);
+CREATE TABLE _connetto_acked (writer BLOB, seq INTEGER, major INTEGER NOT NULL, origin BLOB, changeset BLOB NOT NULL, hash BLOB NOT NULL, acked_at INTEGER NOT NULL, PRIMARY KEY (writer, seq));
+-- server, deployment-owned, courier_user_id taking the deployment's user id type
+ALTER TABLE connetto_device_enrolments ADD COLUMN bot_list TEXT;
+ALTER TABLE auth_events ADD COLUMN courier_user_id TEXT;
+ALTER TYPE connetto_auth_op ADD VALUE 'write_couriered';
+-- and one notice row per couriered entry that settled, in a table of the Writers member
+```
+
+**One courier range on the server.** The checks run in this order, and the first that answers ends the range. `f` is the writer row's frontier and `h` its head, `GENESIS` and 0 for a writer the courier path creates, as `courier_deliver` creates one today.
+
+| Situation | Answer |
+|---|---|
+| The courier switch is off | `Refused(Disabled)`, nothing read |
+| The offer does not decode, rows exceed the bound or skip a sequence, a body names no row, arrives out of order, or disagrees with its row's digest | `Refused(Malformed)` |
+| The enrolment is absent, revoked, or past its expiry plus `DEVICE_SKEW` | `Refused(NotEnrolled)` |
+| The author's account is banned | `Refused(AuthorBanned)` |
+| The writer is retired | `Refused(WriterRetired)` |
+| The offer's signature does not verify, or the chain from `h` through rows `f + 1` to the offer's newest misses `newest.head` | `Refused(Unverified)` |
+| The first row is above `f + 1` | `Refused(SequenceGap { expected: f + 1, got })` |
+| A row at or below `f` | `Ruled` with #377's verdict for it, nothing applied or audited |
+| A row above `f` with a body and no number origin | applied under the author's account, the enrolment row's bot list and no subjects, settled `Applied`, `Rejected` or `Conflict`, one audit row and one notice row, answered `Ruled` |
+| A digest-only row or a number origin above `f` | `NotCouriered`, nothing past it settles |
+| An entry settles `Indeterminate`, or the courier bucket runs dry | `Retry`, nothing past it settles |
+
+**The courier on the client.** `courier(author)` sends the rows held for the author from the lowest one not known settled to the offer's newest, with every body it holds, and settles the answer row by row in one transaction each, `Applied` and `Settled` adjudicating as a verdict does, `Refused` retracting with its cause, `NotCouriered` and `Retry` keeping the row.
+
+**The author's re-send.** At the handshake for a number and the bind for a device the client compares the frontier the server answers, `f`, with the writer's `settled_seq`, `s`. Below `s` it re-sends `f + 1` to `s` from `_connetto_acked` in order through the direct path when every one is retained, then replays its pending entries, and otherwise retires the writer as chapter 20 states.
+
+### Every event in every situation
+
+For one author as the courier sees it, **C0** no server session, or the session's `courier` flag is off, **C1** a session with the path on and nothing of this author to offer, **C2** the author is a candidate, a held provisional, courier-only or digest-only row not known settled, or after a full resync a retained row the server answers `Pending`, **C3** a `CourierRange` for this author outstanding.
+
+| Event | C0 | C1 | C2 | C3 |
+|---|---|---|---|---|
+| Server session established, `courier` off | stay | enter C0 | enter C0 | n/a |
+| Server session established, `courier` on | #377's asks, then C2 raising `CourierCandidates` when a row is a candidate, else C1 | n/a | n/a | n/a |
+| Full resync ends | ask about retained rows too | same | same | same, after the answer |
+| `ProvisionalVerdicts` answers a held row | settle it as #377 does | same, enter C2 on a `Pending` row | same, enter C1 when no candidate row is left | same |
+| A verified offer over a link adds rows | nothing | enter C2 | stay | stay, the next call sends them |
+| `courier(author)` | answer `CourierUnavailable` | answer that nothing is held | send the range and its bodies, enter C3 | answer `CourierBusy` |
+| `Ruled(Applied)` or `Ruled(Settled)` for a row | n/a | n/a | n/a | the row becomes retained, a provisional record adjudicated |
+| `Ruled(Refused(cause))` for a row | n/a | n/a | n/a | a provisional row retracted with the cause, a courier-only or digest-only row deleted |
+| `NotCouriered` | n/a | n/a | n/a | the rows from it stay, enter C1 until a new offer adds rows |
+| `Retry` | n/a | n/a | n/a | the rows from it stay, enter C2, the call answers the wait |
+| `Refused(Disabled)` | n/a | n/a | n/a | enter C0 |
+| `Refused(Malformed)` | n/a | n/a | n/a | log it, enter C2 |
+| `Refused(NotEnrolled)`, `Refused(WriterRetired)` or `Refused(Unverified)` | n/a | n/a | n/a | delete the author's courier-only, digest-only and retained rows, provisional rows wait for their verdict, raise `PeerChainInvalid` on `Unverified`, enter C1 |
+| `Refused(AuthorBanned)` | n/a | n/a | n/a | keep every row, enter C1 until the next session |
+| `Refused(SequenceGap)` | n/a | n/a | n/a | keep every row, enter C1 until a new offer adds rows |
+| 30 s without `CourierAnswer` | n/a | n/a | n/a | drop the wait, keep every row, enter C2 |
+| Session lost | stay | enter C0 | enter C0 | enter C0, the unanswered rows kept |
+| Retention of a retained row runs out | delete it | same | same, enter C1 when no candidate is left | same, after the answer |
+| R31 rebuild at a newer major | rows kept under their major (decision 7) | links and session close first, as C0 | same | same |
+| Data wipe, destructive logout or revocation of this device | every row goes with the replica | same | same | same |
+
+For one held row of `_connetto_peer_entry`, **P** provisional, applied with its record, **O** courier-only, an own-build body the receiver refused, **D** digest-only, an entry of another build, **T** retained, adjudicated and kept for a restore.
+
+| Event | P | O | D | T |
+|---|---|---|---|---|
+| Entry verified in a range (R77) | written when it applies | written when the receiver's policy refuses it | written for another build | n/a |
+| Author's frontier over a link, a verdict or a courier answer `Applied` or `Settled` | record adjudicated and holding released, enter T | enter T | enter T | nothing |
+| Retraction, verdict `Refused` or `Abandoned`, or courier answer `Refused` | inverted and deleted (R77) | deleted | deleted | n/a |
+| Server write on the key | `ProvisionalConfirmed` (R77), the row stays P | nothing | nothing | nothing |
+| `SnapshotEnd` ending a resync | re-applied (R77 decision 13) | not applied | not applied | not applied |
+| Truncate of the table | record dropped, the row stays (R77 decision 13) | nothing | nothing | nothing |
+| R31 rebuild at a newer major | enter O under its major | kept under its major | kept | kept |
+| Author's certificate renewed over a link | nothing | nothing | nothing | the window moves to the new expiry |
+| The last seen expiry plus `DEVICE_SKEW` passes | waits for the server's `Abandoned` | same | same | deleted |
+| Courier refused `NotEnrolled`, `WriterRetired` or `Unverified` | waits for its verdict | deleted | deleted | deleted |
+| Archive export | carried | carried | carried | carried |
+| Archive import | re-applied (R77 decision 16) | restored as it is | restored as it is | restored as it is |
+| Eviction pass | keeps the row through its holding | n/a, no row in a table | n/a | n/a |
+
+For one writer of the author's own, its server frontier `f` against its `settled_seq` `s`, **A0** `f` equals `s`, **A1** `f` below `s` with `_connetto_acked` holding every sequence from `f + 1` to `s`, **A2** `f` below `s` with one of them missing, or `WriterUnknown`.
+
+| Event | A0 | A1 | A2 |
+|---|---|---|---|
+| Handshake grant or device bind answers `f` | replay pending entries from `s + 1` | re-send `f + 1` to `s` from `_connetto_acked` in order, then replay pending entries | retire the writer and move pending entries to a fresh one (chapter 20) |
+| The server acknowledges an entry | move it from `_connetto_pending` to `_connetto_acked` in one transaction | same | n/a |
+| A re-sent entry answered applied or from the record | n/a | keep its acked row, go on | n/a |
+| A re-sent entry answered rejected or conflicted | n/a | write `_connetto_retraction` as any refusal does, go on | n/a |
+| A re-sent entry answered `Forked` | n/a | stop, enter A2 | n/a |
+| An acked row passes the retention window | deleted | deleted, which can turn a later restore into A2 | deleted |
+| Writer retired or revoked | its acked rows deleted | same | same |
+| R31 rebuild at a newer major | acked rows kept under their major, re-sent on the drain wire | same | same |
+| Archive export | not carried, the import retires the archived writer | same | same |
+
+### Slices
+
+One pull request each, in this order, each green and useful on its own (decided with the maintainer).
+
+- **1a, the server's courier rules** (decisions 2 to 4, 6, 8, 9, 13 to 15). `courier_deliver` checks the `SignedOffer` with digest rows to the signed head, skips the settled prefix with #377's verdicts, stops at a digest-only row or a number origin, binds the enrolment row's bot list and refuses a banned author, a key past expiry plus `DEVICE_SKEW` and a revoked key, `range_message` and `verify_range` go, and R77 decision 1 is corrected. Proven Docker-gated by calling `courier_deliver` as `courier_frontier.rs` does, for a forged offer, a gap, a revoked key, a banned author, a bot author's list and the author's own later replay answered once. Waits for #377.
+- **1b, the courier wire** (decisions 1 and 5). `CourierRange`, `CourierBody` and `CourierAnswer`, the switch and `CONNETTO_COURIER`, and `HandshakeAck.courier`. Proven Docker-gated over a socket with the switch on and off.
+- **2, audit, meter and notice** (decisions 10 to 12). `write_couriered` with `courier_user_id`, the courier bucket, the notice table, `CourierNotice` and its ack. Proven Docker-gated, every settled couriered entry audited naming both accounts, a range past the budget answered `Retry`, and the author's next session receiving its notices once.
+- **3a, the courier hold** (decisions 3, 17 and 19). The state column, manifest rows, courier-only bodies, retained rows with `expires_at`, and the re-apply and every R77 reader taking provisional rows alone. Proven in process for each row of the held-row table. Waits for #377.
+- **3b, the rebuild and the archive** (decisions 7 and 20). R31's rebuild keeping the rows under their major, and the archive carrying them with the format version moved. Proven in process.
+- **4, the offer** (decisions 7 and 16). `courier_candidates`, `CourierCandidates`, `courier(author)`, the answer settling the courier's rows, and older-major rows on the drain wire. Proven Docker-gated in `connetto-test-harness`, a device's writes reaching the server through a different account's session. Waits for #377.
+- **5, the author's re-send** (decisions 17, 21 and 22). `_connetto_acked`, `with_acked_retention` and the re-send on a rewound frontier for a device and a number writer. Proven Docker-gated by a same-cluster dump restore beside `a_restore_moves_rewound_writers_to_fresh_numbers`.
+- **6, the harness proof** (decisions 17 and 18). The Done when end to end, a courier's re-delivery to a restored server and a courier refused after the author retired, with chapters 19 and 20 and the diagram brought to what is built. Waits for every slice before it.
 
 ### Done when
 
-A device's writes reach the server through a different account's session with exactly-once held against the author's own later replay, a malicious courier can neither forge nor reorder (gap refusal proven), a revoked enrolment is refused, every couriered application is audited, and a courier's re-delivery restores the author's writes a restored server lost, all Docker-gated.
+A device's writes reach the server through a different account's session with exactly-once held against the author's own later replay, a malicious courier can neither forge nor reorder (gap refusal proven), a revoked enrolment is refused, every couriered application is audited, and a restored server gets back the writes it acknowledged after its backup from their author or from a courier, all Docker-gated.
 
 ---
 
