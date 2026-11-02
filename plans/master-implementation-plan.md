@@ -1552,6 +1552,10 @@ A browser that refuses OPFS, Firefox private windows among them, runs the replic
 1. **The VFS is built upstream first.** It is proven in Luca's `sqlite-wasm-rs` fork before any issue or pull request, and it depends on `rsqlite-vfs` alone so it can become a standalone crate if upstream declines it.
 2. **The storage order is OPFS, then the IndexedDB VFS where JSPI is present, then memory**, and the boot report says which one the replica runs on.
 
+### Open points
+
+1. **Loading the fallback.** A wasm module built with JSPI imports fails to instantiate where `WebAssembly.Suspending` or exnref is missing (Safari, Firefox before 153, Chrome before 137), before any Rust runs, so one binary cannot fall back by itself. Either the worker ships two builds and picks one in JavaScript by `typeof WebAssembly.Suspending`, or wasm-bindgen gains suspending imports that degrade to a throwing stub, an upstream change.
+
 ### Steps
 
 1. The DB worker builds with JSPI and opens the replica on the IndexedDB VFS when OPFS is refused and JSPI is present.
