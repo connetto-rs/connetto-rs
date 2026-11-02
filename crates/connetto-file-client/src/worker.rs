@@ -436,9 +436,9 @@ where
     /// The answer about this file's bytes this device can give on its own.
     ///
     /// The shape of [`ContentClient`](crate::ContentClient)'s own local
-    /// answer: unsent content answers from the chunk store or nowhere, pinned
-    /// content prefers what the pin paid to keep, and anything else answers
-    /// `None`, which means only a server knows.
+    /// answer: a held manifest whose chunks are all present answers from the
+    /// chunk store, unsent content answers there or nowhere, and anything
+    /// else answers `None`, which means only a server knows.
     ///
     /// # Errors
     ///
@@ -453,22 +453,16 @@ where
         };
         let source =
             ChunkStoreSource::new(EncryptingStore::new(self.store.clone(), &self.root_key));
-        if db::is_unsent(connection.conn(), file_id)? {
-            return Ok(Some(match source.bytes(&manifest).await? {
-                Some(bytes) => Resolved::Local {
-                    source: source.name(),
-                    bytes,
-                },
-                None => Resolved::Unavailable,
+        if let Some(bytes) = source.bytes(&manifest).await? {
+            return Ok(Some(Resolved::Local {
+                source: source.name(),
+                bytes,
             }));
         }
-        if !crate::retain::pinned_ids(connection.conn())?.contains(&file_id) {
-            return Ok(None);
+        if db::is_unsent(connection.conn(), file_id)? {
+            return Ok(Some(Resolved::Unavailable));
         }
-        Ok(source.bytes(&manifest).await?.map(|bytes| Resolved::Local {
-            source: source.name(),
-            bytes,
-        }))
+        Ok(None)
     }
 
     /// Where this file's bytes are to be had, answering the way the owning
@@ -2849,8 +2843,7 @@ mod tests {
     }
 
     /// A fetched file answers from the store and is never sent back, because
-    /// the record the fetch writes has no outbox entry. The pin is what makes
-    /// the answer local at all.
+    /// the record the fetch writes has no outbox entry.
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     #[tokio::test]
     async fn a_fetched_file_resolves_locally_and_queues_no_upload() {
@@ -2873,14 +2866,6 @@ mod tests {
             ))
             .execute(connection.conn())
             .expect("the naming row lands");
-        archive
-            .pin_content(
-                &mut connection,
-                "album",
-                "SELECT content_id FROM photos",
-                "content_id",
-            )
-            .expect("the pin lands");
 
         archive
             .record_fetched(&mut connection, &manifest)
@@ -2902,22 +2887,22 @@ mod tests {
             .await;
         match answer {
             Resolved::Local { bytes: served, .. } => assert_eq!(served, bytes),
-            other => panic!("a fetched pinned file must resolve locally, got {other:?}"),
+            other => panic!("a fetched file must resolve locally, got {other:?}"),
         }
         assert!(observed.is_empty(), "no round trip ran");
     }
 
     /// Content the worker cannot produce answers `Unavailable`: a file with no
-    /// manifest, and an uploaded file no pin covers, both with no server
-    /// online.
+    /// manifest, and an uploaded file whose chunks the device no longer
+    /// holds, both with no server online.
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     #[tokio::test]
     async fn content_the_worker_cannot_produce_resolves_unavailable_offline() {
         use crate::db;
         use crate::resolve::Resolved;
-        use connetto_file_core::{EncryptingStore, MimeClass, process_file};
+        use connetto_file_core::{MemStore, MimeClass, process_file};
 
-        let (dir, archive, mut connection) = staged_fixture();
+        let (_dir, archive, mut connection) = staged_fixture();
         let (answer, _) = archive
             .resolve_connection(
                 &mut connection,
@@ -2930,11 +2915,8 @@ mod tests {
             "an unknown file must resolve Unavailable, got {answer:?}"
         );
 
-        let encrypted = EncryptingStore::new(
-            crate::store::FsStore::new(dir.path().join("chunks")),
-            &[1; 32],
-        );
-        let uploaded = process_file(&vec![4u8; 1024], MimeClass::Jpeg, &encrypted)
+        let elsewhere = MemStore::new();
+        let uploaded = process_file(&vec![4u8; 1024], MimeClass::Jpeg, &elsewhere)
             .await
             .expect("the file chunks");
         db::put_manifest(connection.conn(), &uploaded).expect("record the manifest");
@@ -2947,7 +2929,7 @@ mod tests {
             .await;
         assert!(
             matches!(answer, Resolved::Unavailable),
-            "an uploaded unpinned file offline must resolve Unavailable, got {answer:?}"
+            "an uploaded file whose chunks are gone must resolve Unavailable offline, got {answer:?}"
         );
     }
 }

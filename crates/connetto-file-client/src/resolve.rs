@@ -1,9 +1,9 @@
 //! The content resolver and the local sources it asks.
 //!
 //! Display is not sync (chapter 18): the common case answers a short-lived
-//! signed URL and never touches the chunk store. Local bytes are the answer in
-//! two of the three cases that chapter names, unsent content and pinned
-//! content, and the third, a locally processed input, is a direct
+//! signed URL and never touches the chunk store. Local bytes are the answer
+//! for every file whose manifest and chunks the device holds, unsent, pinned
+//! or cached, and a locally processed input is a direct
 //! [`bytes`](crate::ContentClient::bytes) call rather than a display decision.
 
 use core::pin::Pin;
@@ -34,8 +34,8 @@ pub type BoxedSource = Box<dyn LocalContentSource>;
 ///
 /// The resolver holds an ordered list and asks each in turn, so a further
 /// source is registered rather than folded into the resolver's own decisions.
-/// R25's design names the two that follow: chunks fetched from a peer, and a
-/// pull from a peer that is present right now (R79).
+/// A file fetched from a linked peer lands in the chunk store, so the chunk
+/// store's source answers for it.
 pub trait LocalContentSource {
     /// A short name for this source, carried on the answer so a caller can
     /// tell where bytes came from.

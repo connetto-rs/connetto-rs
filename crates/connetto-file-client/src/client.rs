@@ -86,7 +86,8 @@ pub enum ContentEvent {
         /// The file queued again.
         file_id: FileId,
     },
-    /// A pinned file's bytes arrived and are now local.
+    /// A file's bytes arrived and are now local, fetched for a pin or from a
+    /// linked peer.
     Fetched {
         /// The file now held locally.
         file_id: FileId,
@@ -133,6 +134,10 @@ pub struct ContentClient<T: Transport, B: ChunkStore + Clone, H: ContentHttp> {
     /// served through, judged by the requester's read of a row naming the file.
     #[cfg(feature = "peer")]
     peer_content: Vec<(String, String)>,
+    /// Where `resolve` hands a peer fetch to the running media driver, `None`
+    /// while none runs.
+    #[cfg(feature = "peer")]
+    peer_orders: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<peer::Order>>>,
 }
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -181,6 +186,8 @@ where
             heal_queries: Vec::new(),
             #[cfg(feature = "peer")]
             peer_content: Vec::new(),
+            #[cfg(feature = "peer")]
+            peer_orders: parking_lot::Mutex::new(None),
         })
     }
 
@@ -726,39 +733,58 @@ where
 
     /// Where this file's bytes are to be had, for display.
     ///
-    /// Unsent content answers from the chunk store or not at all: the server
-    /// has never held it, so there is no URL to grant. Pinned content prefers
-    /// local bytes, which is what the pin bought. Everything else answers a
-    /// signed URL, and answers [`Resolved::Unavailable`] when there is no
-    /// server to ask.
+    /// A file whose chunks the device holds answers locally, whether unsent,
+    /// pinned or cached. Unsent content answers from the chunk store or not at
+    /// all, since the server has never held it. Everything else answers a
+    /// signed URL. With the `peer` feature and a running
+    /// [`drive_media`](Self::drive_media), a file the server refuses a ticket
+    /// for, or any file while offline, is fetched from a linked peer and then
+    /// answers locally. Otherwise an offline device answers
+    /// [`Resolved::Unavailable`].
     ///
     /// # Errors
     ///
-    /// [`ContentError::TicketRefused`] when the server will not grant a read,
-    /// and [`ContentError::Replica`] on a bookkeeping read failure.
+    /// [`ContentError::TicketRefused`] when the server will not grant a read
+    /// and no media driver runs, [`ContentError::Replica`] on a bookkeeping
+    /// read failure, and [`ContentError::Store`] when a peer-fetched chunk
+    /// cannot be written.
     pub async fn resolve(&self, file_id: FileId) -> Result<Resolved, ContentError> {
         if let Some(answer) = self.local_answer(file_id).await? {
             return Ok(answer);
         }
         if !self.client.with_conn(|conn| conn.is_connected()).await? {
+            #[cfg(feature = "peer")]
+            if let Some(answer) = self.peer_stage(file_id).await? {
+                return Ok(answer);
+            }
             return Ok(Resolved::Unavailable);
         }
-        let url = ticket::request(
+        match ticket::request(
             &self.client,
             file_id,
             ContentVerb::Read,
             ticket::TicketWire::Main,
         )
-        .await?;
-        Ok(Resolved::Remote { url })
+        .await
+        {
+            Ok(url) => Ok(Resolved::Remote { url }),
+            Err(refused @ ContentError::TicketRefused { .. }) => {
+                #[cfg(feature = "peer")]
+                if let Some(answer) = self.peer_stage(file_id).await? {
+                    return Ok(answer);
+                }
+                Err(refused)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// The answer the device can give on its own, or `None` to ask a server.
     ///
-    /// Unsent content answers here or nowhere, because the server has never
-    /// held it. Pinned content prefers what the pin paid to keep. Anything
-    /// else falls through, which is the common case chapter 18 describes as
-    /// never touching the chunk store at all.
+    /// A held manifest whose chunks are all present answers locally, and an
+    /// unsent one answers here or nowhere, because the server has never held
+    /// it. A file with no manifest falls through, which is the common case
+    /// chapter 18 describes as never touching the chunk store at all.
     async fn local_answer(&self, file_id: FileId) -> Result<Option<Resolved>, ContentError> {
         let Some(manifest) = self
             .client
@@ -767,21 +793,17 @@ where
         else {
             return Ok(None);
         };
+        if let Some(local) = self.local_bytes(&manifest).await? {
+            return Ok(Some(local));
+        }
         if self
             .client
             .with_conn(|conn| db::is_unsent(conn.conn(), file_id))
             .await??
         {
-            return Ok(Some(
-                self.local_bytes(&manifest)
-                    .await?
-                    .unwrap_or(Resolved::Unavailable),
-            ));
+            return Ok(Some(Resolved::Unavailable));
         }
-        if !self.pinned().await?.contains(&file_id) {
-            return Ok(None);
-        }
-        self.local_bytes(&manifest).await
+        Ok(None)
     }
 
     /// This file's bytes, from a local source or from the server.
@@ -964,11 +986,23 @@ where
             });
         }
         let outboard = self.store_outboard(&outboard).await?;
+        self.commit_cached(&manifest, outboard).await
+    }
+
+    /// Commits a fetched file's manifest and outboard rows in one
+    /// transaction, with no outbox row, which makes the file cache. The
+    /// caller holds `content_writes` from its chunk writes to here.
+    async fn commit_cached(
+        &self,
+        manifest: &Manifest,
+        outboard: Option<ChunkHash>,
+    ) -> Result<(), ContentError> {
+        let file_id = manifest.file_id();
         self.client
             .with_conn(|conn| {
                 conn.transact_with_bookkeeping(
                     |c| {
-                        db::put_manifest(c, &manifest)?;
+                        db::put_manifest(c, manifest)?;
                         match &outboard {
                             Some(hash) => db::put_outboard(c, file_id, hash),
                             None => Ok(()),

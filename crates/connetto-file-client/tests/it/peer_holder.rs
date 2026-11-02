@@ -4,157 +4,15 @@
 
 use std::time::Duration;
 
-use connetto_client::SyncSchema;
-use connetto_client::live::ConnettoClient;
-use connetto_client::media::{MediaEvent, MediaPort};
-use connetto_core::device_cert::{AttestationLevel, DeviceIdentity};
+use connetto_core::device_cert::DeviceIdentity;
 use connetto_exchange::media::Media;
-use connetto_file_client::{ContentClient, ContentError, FsStore, MimeClass};
-use connetto_file_core::{FileId, decode_range};
-use connetto_peer::test_support::{DAY, Deployment, Issuer, Peer, node, serve, whole_second};
+use connetto_file_client::ContentError;
+use connetto_file_core::decode_range;
 use connetto_peer::{Node, PeerEvent};
-use diesel::prelude::*;
 use tokio::sync::mpsc;
 
+use crate::peer_support::{Devices, beside, declared, hand_over, port, replica, stage};
 use crate::retention::pseudorandom;
-use crate::support::{RecordingHttp, Scripted, attach_content, cold_over, started};
-
-/// A photo table each person reads only their own rows of, which the
-/// holder, signed in as the suite's tester, curates whole.
-const PHOTO_SCHEMA: &str = "-- connetto:major 1\n \
-                            CREATE TABLE photos (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
-                            content_id BYTEA NOT NULL); \
-                            ALTER TABLE photos ENABLE ROW LEVEL SECURITY;";
-
-const PHOTO_POLICIES: &str = "CREATE POLICY photos_read ON photos FOR SELECT \
-                              USING (owner = current_setting('app.user_id', true)); \
-                              CREATE POLICY photos_curate ON photos FOR SELECT \
-                              USING (current_setting('app.user_id', true) = 'tester'); \
-                              CREATE POLICY photos_insert ON photos FOR INSERT WITH CHECK (true); \
-                              CREATE POLICY photos_update ON photos FOR UPDATE USING (true) \
-                              WITH CHECK (true);";
-
-diesel::table! {
-    /// The holder's photos.
-    photos (id) {
-        /// Primary key.
-        id -> BigInt,
-        /// The row's owner.
-        owner -> Text,
-        /// The file the row names.
-        content_id -> Binary,
-    }
-}
-
-type Holder = ContentClient<Scripted, FsStore, RecordingHttp>;
-
-/// One minted deployment and the devices the proofs link.
-struct Devices {
-    deployment: Deployment,
-    issuer: Issuer,
-}
-
-impl Devices {
-    fn new() -> Self {
-        let deployment = Deployment::new(79, whole_second());
-        let issuer = deployment.add_issuer(whole_second(), [1; 16]);
-        Self { deployment, issuer }
-    }
-
-    fn device(&self, account: &str, serial: u8) -> Peer {
-        self.deployment.device(
-            &self.issuer,
-            account,
-            whole_second(),
-            DAY,
-            [serial; 16],
-            AttestationLevel::Unproven,
-        )
-    }
-
-    /// A node serving `peer` on loopback, with its events.
-    fn node(
-        &self,
-        peer: &Peer,
-    ) -> (
-        Node,
-        std::net::SocketAddr,
-        mpsc::UnboundedReceiver<PeerEvent>,
-    ) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let node = node(self.deployment.root_der(), tx);
-        let addr = serve(&node, peer);
-        (node, addr, rx)
-    }
-}
-
-/// The holder's media port over its bare node, fed the link events and
-/// media frames the enrolment task would forward.
-fn port(node: Node, mut events: mpsc::UnboundedReceiver<PeerEvent>) -> MediaPort {
-    let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
-            let forwarded = match event {
-                PeerEvent::Linked { peer, bot_list, .. } => MediaEvent::Linked { peer, bot_list },
-                PeerEvent::Unlinked { peer, .. } => MediaEvent::Unlinked { peer },
-                PeerEvent::Media { peer, message } => MediaEvent::Message { peer, message },
-                _ => continue,
-            };
-            if tx.send(forwarded).is_err() {
-                return;
-            }
-        }
-    });
-    MediaPort::over(node, rx)
-}
-
-/// A holder replica over the photo policies, and its content client.
-async fn holder(dir: &std::path::Path) -> (ConnettoClient<Scripted>, Holder) {
-    let schema = SyncSchema::new(
-        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            PHOTO_SCHEMA,
-            PHOTO_POLICIES,
-        )
-        .expect("translate the photo schema"),
-    );
-    let client = started(cold_over::<Scripted>(&dir.join("replica.sqlite"), schema).await);
-    let content = attach_content(
-        client.clone(),
-        &dir.join("chunks"),
-        RecordingHttp::default(),
-    )
-    .await;
-    (client, content)
-}
-
-/// A holder declaring `photos.content_id`.
-async fn declared(dir: &std::path::Path) -> (ConnettoClient<Scripted>, Holder) {
-    let (client, content) = holder(dir).await;
-    let content = content
-        .with_peer_content("photos", "content_id")
-        .await
-        .expect("declare the content column");
-    (client, content)
-}
-
-/// Stages `bytes` as photo `id` owned by `owner`.
-async fn stage(content: &Holder, id: i64, owner: &str, bytes: &[u8]) -> FileId {
-    let owner = owner.to_owned();
-    let (file_id, ()) = content
-        .stage(bytes, MimeClass::Generic, move |conn, file_id| {
-            diesel::insert_into(photos::table)
-                .values((
-                    photos::id.eq(id),
-                    photos::owner.eq(owner),
-                    photos::content_id.eq(file_id.as_bytes().to_vec()),
-                ))
-                .execute(conn)
-                .map(|_| ())
-        })
-        .await
-        .expect("stage the photo");
-    file_id
-}
 
 /// The replies to `request` from `holder`, up to the last one, bounded.
 async fn ask(
@@ -210,14 +68,6 @@ fn encoded(replies: &[Media]) -> Vec<u8> {
             other => panic!("a piece, not {other:?}"),
         })
         .collect()
-}
-
-/// Runs `proof` beside the holder's media driver.
-async fn beside(content: &Holder, port: MediaPort, proof: impl Future<Output = ()>) {
-    tokio::select! {
-        () = content.drive_media(port) => panic!("the port ended under the proof"),
-        () = proof => {}
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -380,20 +230,7 @@ async fn a_right_withdrawn_after_the_manifest_refuses_the_next_fetch() {
         .await;
         assert_eq!(manifest_rows(&replies).len(), 1);
 
-        let owner = client
-            .with_conn(|conn| {
-                diesel::update(photos::table.filter(photos::id.eq(1)))
-                    .set(photos::owner.eq("carl"))
-                    .execute(conn.conn())?;
-                photos::table
-                    .filter(photos::id.eq(1))
-                    .select(photos::owner)
-                    .first::<String>(conn.conn())
-            })
-            .await
-            .expect("the replica is open")
-            .expect("hand the photo to carl");
-        assert_eq!(owner, "carl");
+        hand_over(&client, 1, "carl").await;
         assert_eq!(
             ask(
                 &anna,
@@ -417,7 +254,7 @@ async fn a_right_withdrawn_after_the_manifest_refuses_the_next_fetch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_holder_with_no_declared_column_refuses_every_request() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let (_, content) = holder(dir.path()).await;
+    let (_, content) = replica(dir.path(), None).await;
     let annas = stage(&content, 1, "anna", &pseudorandom(3, 40_000)).await;
 
     let devices = Devices::new();
@@ -449,7 +286,7 @@ async fn a_holder_with_no_declared_column_refuses_every_request() {
 async fn a_declaration_naming_a_column_the_replica_lacks_is_refused() {
     for (table, column) in [("photos", "thumb_id"), ("albums", "content_id")] {
         let dir = tempfile::tempdir().expect("temp dir");
-        let refused = holder(dir.path())
+        let refused = replica(dir.path(), None)
             .await
             .1
             .with_peer_content(table, column)

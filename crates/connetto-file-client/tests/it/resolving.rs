@@ -78,9 +78,10 @@ async fn an_unsent_file_never_answers_a_url() {
     );
 }
 
-/// A pin prefers the bytes it paid to keep, which is the whole point of it.
+/// Held bytes answer locally, and a pin keeps them through a tidy that would
+/// otherwise send the answer to the server (R79 decision 10).
 #[tokio::test]
-async fn a_pinned_file_prefers_local_bytes_to_a_url() {
+async fn a_pin_keeps_a_held_file_local_through_a_tidy() {
     let dir = tempdir().expect("temp dir");
     // The upload's intent, its commit, then nothing further is needed.
     let http = RecordingHttp::new(vec![(200, br#"{"needed":[]}"#.to_vec()), (200, Vec::new())]);
@@ -97,21 +98,27 @@ async fn a_pinned_file_prefers_local_bytes_to_a_url() {
         1,
         "the file is uploaded, so it is no longer unsent"
     );
-
-    // Without the pin, a file the server holds answers a URL.
     assert!(
-        matches!(content.resolve(file_id).await, Ok(Resolved::Remote { .. })),
-        "cache with nothing covering it points at the server"
+        matches!(content.resolve(file_id).await, Ok(Resolved::Local { .. })),
+        "an uploaded file still held answers from the store"
     );
 
     content
         .pin_content("album", "SELECT content_id FROM photos", "content_id")
         .await
         .expect("pin the album");
+    content.tidy_content().await.expect("tidy");
     let resolved = content.resolve(file_id).await.expect("resolve");
     assert!(
         matches!(&resolved, Resolved::Local { bytes, .. } if bytes == PHOTO),
-        "the pin is what makes the answer local, got {resolved:?}"
+        "the pin keeps the bytes through the tidy, got {resolved:?}"
+    );
+
+    content.unpin_content("album").await.expect("unpin");
+    content.tidy_content().await.expect("tidy");
+    assert!(
+        matches!(content.resolve(file_id).await, Ok(Resolved::Remote { .. })),
+        "with nothing covering it the tidy removes the cache and the server answers"
     );
 }
 

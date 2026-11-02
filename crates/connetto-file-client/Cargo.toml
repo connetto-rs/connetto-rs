@@ -21,7 +21,7 @@ default = ["native-tests"]
 native-tests = []
 # Serving content to linked devices over the peer link's media port (R79).
 # Native only, like the peer link.
-peer = ["connetto-client/peer", "dep:connetto-exchange", "dep:iroh-io"]
+peer = ["connetto-client/peer", "dep:connetto-exchange", "dep:iroh-io", "dep:parking_lot"]
 
 [[test]]
 name = "it"
@@ -40,10 +40,12 @@ serde_json = "1"
 # The ticket address rule is the mint's own, decided on a parsed URL.
 url = "2"
 tokio = { version = "1", default-features = false, features = ["sync"] }
-# The media messages and the per-peer machine the holder drives.
+# The media messages and the per-peer machine the media driver runs.
 connetto-exchange = { workspace = true, optional = true }
-# The sink trait the verified range encoder writes the holder's pieces into.
+# The sink and source traits the verified range codec streams pieces through.
 iroh-io = { version = "0.6", default-features = false, optional = true }
+# The slot `resolve` reaches the running media driver through.
+parking_lot = { version = "0.12", optional = true }
 
 # The filesystem chunk store and the reqwest transport are native only. R68
 # adds the OPFS store and a worker transport for wasm behind the same seams.
