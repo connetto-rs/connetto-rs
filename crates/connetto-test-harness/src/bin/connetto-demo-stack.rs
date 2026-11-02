@@ -47,7 +47,7 @@ use std::ffi::OsString;
 use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_test_harness::relay::Relay;
 use connetto_test_harness::stack::{
-    DemoDeviceCa, Deployment, PUBLIC_HOST_VAR, RunningServices, SYNC_PORT_VAR, TLS_CERT_VAR,
+    DEMO_DEPLOYMENT, DemoDeviceCa, PUBLIC_HOST_VAR, RunningServices, SYNC_PORT_VAR, TLS_CERT_VAR,
     TLS_KEY_VAR, demo_device_ca, ensure_server_bin, ports, provision, provision_enrolment_tables,
     require_free, run_process, spawn_server,
 };
@@ -66,16 +66,6 @@ const APP_REDIRECTS: &str =
     "dev.connetto.dioxusdemo:/oauth2redirect,dev.connetto.tauridemo:/oauth2redirect";
 /// The demos' bundle identifiers, the App IDs App Attest names after the team.
 const DEMO_BUNDLES: [&str; 2] = ["dev.connetto.dioxusdemo", "dev.connetto.tauridemo"];
-
-const DEPLOYMENT: Deployment = Deployment {
-    schema: include_str!("../../../../examples/deployment/schema.sql"),
-    roles: include_str!("../../../../examples/deployment/roles.sql"),
-    content: include_str!("../../../../examples/deployment/content.sql"),
-    policies: include_str!("../../../../examples/deployment/policies.sql"),
-    seed: include_str!("../../../../examples/deployment/seed.sql"),
-    published: &["orders", "order_lines", "photos", "products"],
-    writable: "orders,photos",
-};
 
 /// Mint the demo's device CA, or keep the one already there, and print the
 /// root's path alone, for a build that ships it before the stack starts.
@@ -115,11 +105,11 @@ async fn main() -> Result<()> {
         bail!("a running identity provider cannot serve {TLS_CERT_VAR}");
     }
     let server_bin = ensure_server_bin().await?;
-    let provisioned = provision(&DEPLOYMENT, "connetto-demo-stack", running.as_ref()).await?;
+    let provisioned = provision(&DEMO_DEPLOYMENT, "connetto-demo-stack", running.as_ref()).await?;
     provision_enrolment_tables(&provisioned.fixture).await;
     let device_ca = demo_device_ca(std::time::SystemTime::now())?;
     let idp = identity_provider(running, public_host.as_deref(), tls.as_ref()).await?;
-    let mut envs = provisioned.server_env(&DEPLOYMENT, &server_bind, &base);
+    let mut envs = provisioned.server_env(&DEMO_DEPLOYMENT, &server_bind, &base);
     envs.extend(device_env(&device_ca));
     envs.extend(idp.env_pairs(PROVIDER, &format!("{base}/auth/callback")));
     envs.push((

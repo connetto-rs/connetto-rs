@@ -3,19 +3,8 @@
 //!
 //! Needs Docker: the fixture starts its own Postgres and authorization service.
 
-use connetto_test_harness::stack::{Deployment, provision};
+use connetto_test_harness::stack::{DEMO_DEPLOYMENT, provision};
 use diesel_async::RunQueryDsl as _;
-
-/// The demo's own deployment, provisioned exactly as `connetto-demo-stack` does.
-const DEMO: Deployment = Deployment {
-    schema: include_str!("../../../../examples/deployment/schema.sql"),
-    roles: include_str!("../../../../examples/deployment/roles.sql"),
-    content: include_str!("../../../../examples/deployment/content.sql"),
-    policies: include_str!("../../../../examples/deployment/policies.sql"),
-    seed: include_str!("../../../../examples/deployment/seed.sql"),
-    published: &["orders", "order_lines", "photos", "products"],
-    writable: "orders,photos",
-};
 
 /// One row of `pg_policies`, read by table name.
 #[derive(diesel::QueryableByName)]
@@ -26,7 +15,7 @@ struct CapRow {
 
 #[tokio::test]
 async fn a_provisioned_stack_carries_the_generated_cap_document() {
-    let provisioned = provision(&DEMO, "cap-doc-test", None)
+    let provisioned = provision(&DEMO_DEPLOYMENT, "cap-doc-test", None)
         .await
         .expect("provision");
     let pool = provisioned.fixture.admin();

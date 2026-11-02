@@ -81,7 +81,7 @@ async fn maybe_spawn_server() -> Option<ServerGuard> {
     command
         .env("CONNETTO_BIND", &bind)
         .env("CONNETTO_AUTH", "database")
-        .env("CONNETTO_WRITABLE", "orders,photos")
+        .env("CONNETTO_WRITABLE", "orders,photos,team_notes")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     if let Ok(path) = std::env::var("CONNETTO_TEST_PG_DDL_FILE") {

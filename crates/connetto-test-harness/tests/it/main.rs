@@ -23,6 +23,8 @@ mod outage;
 
 mod parity;
 
+mod peer_exchange;
+
 mod read_rule_fold;
 
 mod session_handle;

@@ -17,4 +17,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON photos TO connetto_reader;
 -- The catalogue carries no policy of its own, so the read is public. The
 -- writer grants stay off it, because the demo never writes its rows.
 GRANT SELECT ON products TO connetto_reader;
+
+-- The team tables the demo's accounts share through the membership rows, the
+-- rows the reader role only reads and the notes it writes like the orders.
+GRANT SELECT ON team_members TO connetto_reader;
+GRANT SELECT, INSERT, UPDATE, DELETE ON team_notes TO connetto_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, _connetto_session_writers TO connetto_reader;

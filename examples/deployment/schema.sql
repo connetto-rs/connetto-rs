@@ -38,7 +38,21 @@ CREATE TABLE order_lines (order_id UUID NOT NULL REFERENCES orders(id), line_no 
 -- policy settles from the row itself.
 CREATE TABLE photos (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), order_id UUID NOT NULL REFERENCES orders(id), owner_id TEXT NOT NULL, content_id BYTEA NOT NULL, content_state TEXT);
 
--- The catalogue the demo sells from, the one public table of the deployment.
--- It has no policy of its own, so every account reads every row, and it is
--- read-only, since no grant on it admits a write and no writer lists it.
+-- The catalogue the demo sells from. It has no policy of its own, so every
+-- account reads every row, and it is read-only, since no grant on it admits a
+-- write and no writer lists it.
 CREATE TABLE products (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL, price_cents BIGINT NOT NULL CHECK (price_cents >= 0));
+
+-- The team's membership rows, one per account in a team. The rows are what
+-- the team_notes policy reads, the membership that gates the note rows, and
+-- they sync to every replica of the demo, so a replica can settle a member's
+-- write from the rows alone. member_id repeats the demo's account ids, the
+-- identity a replica settles an author against when the author carries no
+-- subjects (R77).
+CREATE TABLE team_members (team_id TEXT NOT NULL, member_id TEXT NOT NULL, PRIMARY KEY (team_id, member_id));
+
+-- A note any member of its team reads and writes, the row the team's
+-- membership rows settle in policies.sql. author_id repeats who wrote the row
+-- the way owner_id repeats who an order belongs to, so the replica that
+-- settles the row against its author knows the author from the row itself.
+CREATE TABLE team_notes (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), team_id TEXT NOT NULL, author_id TEXT NOT NULL, body TEXT NOT NULL);

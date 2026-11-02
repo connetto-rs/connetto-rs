@@ -34,3 +34,16 @@ CREATE POLICY photos_p ON photos USING (
   owner_id = current_setting('app.user_id', true)
   OR owner_id = ANY(string_to_array(current_setting('app.subjects', true), ','))
 );
+
+-- The membership rows carry no policy of their own. A policy on the table
+-- that holds the membership has to read that same table to answer who is a
+-- member, and PostgreSQL refuses that loop for a reader the table does not
+-- own. The roster is the demo's shared reference data, and the note rows are
+-- what the membership gates.
+-- The notes of a team settle from the membership rows the replica syncs, so
+-- the write of an author the replica knows only through those rows settles
+-- the same way on every end of the team.
+ALTER TABLE team_notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY team_notes_p ON team_notes USING (
+  team_id IN (SELECT team_id FROM team_members WHERE member_id = current_setting('app.user_id', true))
+);

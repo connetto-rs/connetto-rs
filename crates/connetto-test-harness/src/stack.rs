@@ -37,6 +37,25 @@ pub struct Deployment {
     pub writable: &'static str,
 }
 
+/// The demo deployment in `examples/deployment`, which the demo stacks serve
+/// and the harness proofs provision.
+pub const DEMO_DEPLOYMENT: Deployment = Deployment {
+    schema: include_str!("../../../examples/deployment/schema.sql"),
+    roles: include_str!("../../../examples/deployment/roles.sql"),
+    content: include_str!("../../../examples/deployment/content.sql"),
+    policies: include_str!("../../../examples/deployment/policies.sql"),
+    seed: include_str!("../../../examples/deployment/seed.sql"),
+    published: &[
+        "orders",
+        "order_lines",
+        "photos",
+        "products",
+        "team_members",
+        "team_notes",
+    ],
+    writable: "orders,photos,team_notes",
+};
+
 /// A temporary directory removed on drop.
 pub struct TempDir {
     /// The directory itself.
