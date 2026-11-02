@@ -879,9 +879,9 @@ pub fn narrowed_sql(pg_sql: &str, pairs: &[(String, PgValue<Postgres>)]) -> Opti
 }
 
 /// One term value as a SQL literal expression. Every kind subql admits as a
-/// term key renders: temporal and uuid kinds ride as quoted strings, which
-/// PostgreSQL casts against the compared column, and bytes as `\x` bytea
-/// input. `Missing`, `Null`, floats and json are not term keys.
+/// term key renders: temporal, interval and uuid kinds ride as quoted strings,
+/// which PostgreSQL casts against the compared column, and bytes as `\x`
+/// bytea input. `Missing`, `Null`, floats and json are not term keys.
 fn value_literal(value: &PgValue<Postgres>) -> Option<Expr> {
     use sqlparser::ast::Value as AstValue;
     let literal = match value {
@@ -894,6 +894,7 @@ fn value_literal(value: &PgValue<Postgres>) -> Option<Expr> {
         PgValue::TimestampTz(t) => AstValue::SingleQuotedString(t.to_rfc3339()),
         PgValue::Date(d) => AstValue::SingleQuotedString(d.to_string()),
         PgValue::Time(t) => AstValue::SingleQuotedString(t.to_string()),
+        PgValue::Interval(i) => AstValue::SingleQuotedString(i.to_string()),
         PgValue::Bytes(bytes) => {
             use core::fmt::Write;
             let mut hex = String::with_capacity(bytes.len() * 2 + 2);
@@ -2233,6 +2234,7 @@ fn value_json(value: &PgValue<Postgres>) -> serde_json::Value {
         PgValue::TimestampTz(t) => serde_json::Value::String(t.to_string()),
         PgValue::Date(d) => serde_json::Value::String(d.to_string()),
         PgValue::Time(t) => serde_json::Value::String(t.to_string()),
+        PgValue::Interval(i) => serde_json::Value::String(i.to_string()),
         PgValue::Decimal(d) => serde_json::Value::String(d.to_string()),
         PgValue::Json(j) | PgValue::Jsonb(j) => j.clone(),
         // Uninhabited for this backend, as above.
@@ -2252,6 +2254,7 @@ pub(crate) fn value_to_json(value: &PgValue<Postgres>) -> String {
 /// - `CountStar`/`CountColumn` → JSON integer (same as `PgValue::Int`)
 /// - `Sum`/`Avg` with `Integer` → JSON integer (same as `PgValue::Int`)
 /// - `Sum`/`Avg` with `Decimal` → JSON string (same as `PgValue::Decimal`)
+/// - `Sum`/`Avg` with `Interval` → JSON string (same as `PgValue::Interval`)
 /// - `Sum`/`Avg`/`VarPop`/`VarSamp`/`StddevPop`/`StddevSamp` with `Double` → JSON float
 /// - any `None` → JSON null (no rows contributed; SQL returns NULL for an empty aggregate)
 ///
@@ -2264,6 +2267,10 @@ pub(crate) fn agg_value_to_json(value: AggValue) -> String {
         | AggValue::Avg(Some(NumericValue::Integer(i))) => serde_json::Value::from(i),
         AggValue::Sum(Some(NumericValue::Decimal(d)))
         | AggValue::Avg(Some(NumericValue::Decimal(d))) => serde_json::Value::String(d.to_string()),
+        AggValue::Sum(Some(NumericValue::Interval(i)))
+        | AggValue::Avg(Some(NumericValue::Interval(i))) => {
+            serde_json::Value::String(i.to_string())
+        }
         AggValue::Sum(Some(NumericValue::Double(f)))
         | AggValue::Avg(Some(NumericValue::Double(f)))
         | AggValue::VarPop(Some(f))
@@ -2680,6 +2687,12 @@ mod wire_contract {
             "{\"k\":1}",
         );
         assert_eq!(value_to_json(&PgValue::<Postgres>::Jsonb(doc)), "{\"k\":1}");
+
+        // An interval is a JSON string of PostgreSQL's own output.
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::Interval(interval())),
+            "\"1 day 02:03:04.5\"",
+        );
     }
 
     #[test]
@@ -2737,6 +2750,16 @@ mod wire_contract {
             "15.0",
         );
 
+        // SUM and AVG over an interval column spell the scalar path's string.
+        assert_eq!(
+            agg_value_to_json(AggValue::Sum(Some(NumericValue::Interval(interval())))),
+            value_to_json(&PgValue::<Postgres>::Interval(interval())),
+        );
+        assert_eq!(
+            agg_value_to_json(AggValue::Avg(Some(NumericValue::Interval(interval())))),
+            value_to_json(&PgValue::<Postgres>::Interval(interval())),
+        );
+
         // VAR_POP: population variance. Each variant is now distinct so a
         // consumer can tell them apart (VarPop(1.0) != StddevPop(1.0) on the
         // wire even though their payloads over rows 5 and 7 are byte-identical).
@@ -2763,6 +2786,23 @@ mod wire_contract {
         // close to a named constant so the literal lint does not fire.
         assert_eq!(agg_value_to_json(AggValue::StddevSamp(Some(3.5))), "3.5");
         assert_eq!(agg_value_to_json(AggValue::StddevSamp(None)), "null");
+    }
+
+    fn interval() -> subql::backend::Interval {
+        subql::backend::Interval::parse("1 day 02:03:04.5").expect("PostgreSQL interval input")
+    }
+
+    /// An interval term key narrows as the quoted text PostgreSQL casts to the column.
+    #[test]
+    fn an_interval_term_key_narrows_as_its_postgres_text() {
+        assert_eq!(
+            super::narrowed_sql(
+                "SELECT * FROM shifts",
+                &[("span".to_owned(), PgValue::<Postgres>::Interval(interval()))],
+            )
+            .as_deref(),
+            Some("SELECT * FROM shifts WHERE \"span\" = '1 day 02:03:04.5'"),
+        );
     }
 }
 
