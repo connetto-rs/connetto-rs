@@ -343,6 +343,111 @@ async fn loopback_session_full_lifecycle() {
     server.await.expect("join server").expect("session ok");
 }
 
+/// A client that keeps its connection alive but grants no credits is closed once the live patches queued for it pass the connection's send budget, and nothing after the overflow is ever sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_granting_no_credits_is_closed_at_its_send_budget() {
+    closes_at_send_budget("orders", 1).await;
+}
+
+/// The subscription's label counts against the budget with its patch, so a client naming a long label cannot queue far more than the budget behind tiny patches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_subscription_label_counts_against_the_send_budget() {
+    // Two patches of a few hundred bytes fit easily, two copies of the label do not.
+    closes_at_send_budget(&"x".repeat(20_000), 30_000).await;
+}
+
+/// Subscribe as `label` under a `budget`-byte send budget with one credit, which the snapshot spends, and assert the second queued patch closes the connection.
+async fn closes_at_send_budget(label: &str, budget: u64) {
+    let fixture = Fixture::acquire().await;
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let config = SessionConfig::new()
+        .with_initial_credits(1)
+        .with_send_queue_bytes(budget);
+    let manager = ManagerBuilder::new(
+        materializer,
+        SeedSnapshot,
+        RosterAuth::granting("client-a"),
+        Arc::new(TestGrantChecker),
+        NoConnector,
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
+    )
+    .with_session(config)
+    .build();
+
+    let (server_transport, mut client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    client
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "client-a")
+                .with_grant(connetto_core::messages::Grant::new("user:client-a")),
+        ))
+        .await
+        .expect("send handshake");
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
+    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+        panic!("expected handshake ack");
+    };
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: label.to_owned(),
+            spec: SubscriptionSpec::new("SELECT * FROM orders WHERE quantity > 0"),
+        }))
+        .await
+        .expect("send subscribe");
+    let ControlMessage::SnapshotBegin(_) = next_control(&mut client).await else {
+        panic!("expected snapshot begin");
+    };
+    let BulkMessage::SnapshotPatch(_) = next_bulk(&mut client).await else {
+        panic!("expected snapshot patch");
+    };
+    let ControlMessage::SnapshotEnd(_) = next_control(&mut client).await else {
+        panic!("expected snapshot end");
+    };
+
+    // The first patch over an empty queue is always admitted, so one large change never closes an honest client.
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    drive_cdc(
+        &mut source,
+        &manager,
+        "INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 5, 'paid')",
+    )
+    .await;
+    // A ping keeps the connection alive, which the idle limit alone would not close.
+    client
+        .send_control(ControlMessage::Ping(Ping { nonce: 1 }))
+        .await
+        .expect("send ping");
+    let ControlMessage::Pong(_) = next_control(&mut client).await else {
+        panic!("expected pong while the first patch waits for a credit");
+    };
+
+    drive_cdc(
+        &mut source,
+        &manager,
+        "INSERT INTO orders (id, price, quantity, status) VALUES (8, 1.5, 2, 'paid')",
+    )
+    .await;
+    let closed = tokio::time::timeout(Duration::from_secs(10), next_control(&mut client))
+        .await
+        .expect("the connection is closed once its queued patches pass the budget");
+    let ControlMessage::FatalError(fatal) = closed else {
+        panic!("expected the connection closed at its send budget, got {closed:?}");
+    };
+    assert_eq!(fatal.reason, FatalErrorReason::SendQueueExceeded);
+    server.await.expect("join server").expect("session ok");
+    // The queued patch was never sent, so the client resumes from the last one it applied.
+    let tail = client.recv().await;
+    assert!(
+        matches!(tail, Ok(None) | Err(_)),
+        "no frame follows the close, got {tail:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_session_delivers_snapshot_and_live_patch() {
     let fixture = Fixture::acquire().await;

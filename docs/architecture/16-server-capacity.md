@@ -8,7 +8,7 @@ Rate limiting bounds what one caller may ask for over time and answers a caller 
 
 They also fail differently, which is why they are separate mechanisms rather than one. A rate limit has to recognise the caller, so a caller that discards its name escapes it. Admission only has to count, so nothing escapes it.
 
-The queues a session can fill are unbounded [G10](../../plans/master-implementation-plan.md#g10), so a client that writes without pause can fill the process's memory. Nothing in this chapter bounds that.
+Each connection's queued outbound frames are bounded by its send budget, which [02-protocol.md](02-protocol.md#flow-control) states.
 
 ## The three pools
 

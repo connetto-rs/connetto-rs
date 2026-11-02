@@ -451,6 +451,8 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
             client: None,
             sunset_at_secs: 1_900_000_000,
         },
+        // A route admitting a live patch past its connection's send budget (G10).
+        FatalErrorReason::SendQueueExceeded,
     ];
     for reason in &reasons {
         match reason {
@@ -467,7 +469,8 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
             | FatalErrorReason::SequenceGap { .. }
             | FatalErrorReason::WriterRetired
             | FatalErrorReason::WriterUnknown
-            | FatalErrorReason::Sunset { .. } => {}
+            | FatalErrorReason::Sunset { .. }
+            | FatalErrorReason::SendQueueExceeded => {}
         }
     }
     reasons
