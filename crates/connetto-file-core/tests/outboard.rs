@@ -19,16 +19,15 @@ fn rt() -> tokio::runtime::Runtime {
         .expect("single-thread runtime")
 }
 
-fn xorshift_bytes(seed: u32, len: usize) -> Vec<u8> {
-    let mut state = seed.max(1);
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state.to_le_bytes()[0]
-        })
-        .collect()
+/// Deterministic bytes that do not compress, drawn from BLAKE3's extendable
+/// output.
+fn random_bytes(seed: u32, len: usize) -> Vec<u8> {
+    let mut out = vec![0; len];
+    blake3::Hasher::new()
+        .update(&seed.to_le_bytes())
+        .finalize_xof()
+        .fill(&mut out);
+    out
 }
 
 fn len_of(data: &[u8]) -> u64 {
@@ -39,7 +38,7 @@ fn len_of(data: &[u8]) -> u64 {
 fn file_and_range() -> impl Strategy<Value = (Vec<u8>, u64, u64)> {
     (1usize..=200_000, any::<u32>())
         .prop_flat_map(|(len, seed)| {
-            (Just(xorshift_bytes(seed, len)), 0..len)
+            (Just(random_bytes(seed, len)), 0..len)
                 .prop_flat_map(move |(data, start)| (Just(data), Just(start), 1..=len - start))
         })
         .prop_map(|(data, start, len)| {
@@ -93,7 +92,7 @@ proptest! {
 
 #[test]
 fn staging_outboard_is_the_one_the_stored_chunks_give() {
-    let data = xorshift_bytes(7, 5 * 1024 * 1024);
+    let data = random_bytes(7, 5 * 1024 * 1024);
     let store = EncryptingStore::new(MemStore::new(), &[1u8; 32]);
     let (manifest, staged) = rt()
         .block_on(process_file_with_outboard(
@@ -113,7 +112,7 @@ fn staging_outboard_is_the_one_the_stored_chunks_give() {
 
 /// A stored file of several chunks, its manifest and its outboard.
 fn several_chunks(seed: u32) -> (Vec<u8>, MemStore, Manifest, Outboard) {
-    let data = xorshift_bytes(seed, 5 * 1024 * 1024);
+    let data = random_bytes(seed, 5 * 1024 * 1024);
     let store = MemStore::new();
     let (manifest, outboard) = rt()
         .block_on(process_file_with_outboard(
@@ -264,7 +263,7 @@ fn a_refusing_sink_is_a_write_error() {
 
 #[test]
 fn a_forged_byte_is_refused() {
-    let data = xorshift_bytes(11, 300_000);
+    let data = random_bytes(11, 300_000);
     let store = MemStore::new();
     let (manifest, outboard) = rt()
         .block_on(process_file_with_outboard(
@@ -297,7 +296,7 @@ fn a_forged_byte_is_refused() {
 
 #[test]
 fn a_range_against_another_file_id_is_refused() {
-    let data = xorshift_bytes(13, 70_000);
+    let data = random_bytes(13, 70_000);
     let store = MemStore::new();
     let (manifest, outboard) = rt()
         .block_on(process_file_with_outboard(
@@ -326,7 +325,7 @@ fn a_range_against_another_file_id_is_refused() {
 
 #[test]
 fn a_store_holding_other_bytes_is_caught_on_both_ends() {
-    let data = xorshift_bytes(17, 90_000);
+    let data = random_bytes(17, 90_000);
     let store = MemStore::new();
     let (manifest, outboard) = rt()
         .block_on(process_file_with_outboard(
@@ -357,7 +356,7 @@ fn a_store_holding_other_bytes_is_caught_on_both_ends() {
 
 #[test]
 fn a_range_past_the_end_is_refused() {
-    let data = xorshift_bytes(19, 20_000);
+    let data = random_bytes(19, 20_000);
     let store = MemStore::new();
     let (manifest, outboard) = rt()
         .block_on(process_file_with_outboard(

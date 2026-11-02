@@ -6,6 +6,7 @@ use connetto_file_client::{ContentClient, FsStore};
 use connetto_file_core::{ChunkHash, MimeClass, OutboardBuilder};
 use tempfile::tempdir;
 
+use crate::retention::pseudorandom;
 use crate::staging::walk_files;
 use crate::support::{
     RecordingHttp, Scripted, attach_content, connected_client, insert_row_and_pin_album,
@@ -14,18 +15,6 @@ use crate::support::{
 
 const INTENT_URL: &str = "https://files.test/files/aa/intent?t=TOKEN";
 const READ_URL: &str = "https://files.test/files/ab?t=TOKEN";
-
-fn pseudorandom(seed: u32, len: usize) -> Vec<u8> {
-    let mut state = seed.max(1);
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state.to_le_bytes()[0]
-        })
-        .collect()
-}
 
 /// The parent hashes `bytes` have, built straight from the bytes.
 fn pairs_of(bytes: &[u8]) -> Vec<u8> {
