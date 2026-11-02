@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,7 +91,6 @@ fn state() -> State {
         key_expiry: BTreeMap::new(),
         closing: false,
         enrol_challenge: None,
-        provisional_asks: HashSet::new(),
     }
 }
 

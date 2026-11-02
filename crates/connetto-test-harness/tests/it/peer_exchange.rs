@@ -280,26 +280,7 @@ async fn run_exchange() {
     );
     // Bob's app hears each applied entry with no server reachable, one event
     // per entry of alice's that the records name.
-    let mut entries: Vec<i64> = rows.iter().map(|row| row.seq).collect();
-    entries.sort_unstable();
-    entries.dedup();
-    let mut heard: Vec<i64> = Vec::new();
-    let heard_deadline = Instant::now() + BOUND;
-    while heard.len() < entries.len() && Instant::now() < heard_deadline {
-        if let Some(ClientEvent::ProvisionalApplied { seq, .. }) =
-            next_event(&mut bob_events, Duration::from_millis(200), |event| {
-                matches!(
-                    event,
-                    ClientEvent::ProvisionalApplied { author, .. } if *author == alice_key
-                )
-            })
-            .await
-        {
-            heard.push(seq);
-        }
-    }
-    heard.sort_unstable();
-    assert_eq!(heard, entries, "bob's app hears every apply while offline");
+    hear_applies(&mut bob_events, &rows, &alice_key).await;
 
     // The eviction pass runs on bob's replica, and the provisional rows
     // survive it while they await a verdict.
@@ -375,43 +356,13 @@ async fn run_exchange() {
         .await
         .expect("alice holds her device");
     let mut alice_events = alice2.client().events();
-    let rejected = next_event(&mut alice_events, BOUND, |event| {
-        matches!(event, ClientEvent::MutationRejected { .. })
-    })
-    .await
-    .expect("the server refuses the removed team's note");
-    if let ClientEvent::MutationRejected {
-        reason,
-        rows: refused,
-        ..
-    } = &rejected
-    {
-        assert!(
-            matches!(reason, MutationRejectReason::Unauthorized),
-            "the removal lands as an unauthorized refusal, the server spelled {reason:?}"
-        );
-        assert_eq!(
-            refused
-                .iter()
-                .map(|row| row.table.clone())
-                .collect::<Vec<_>>(),
-            vec!["team_notes".to_owned()],
-            "the refusal names the refused note"
-        );
-    }
-    assert!(
-        wait_unsynced_empty(&alice2).await,
-        "alice's queue settles, the two applies and the refusal among them"
-    );
-    assert_eq!(
-        note_bodies(&alice2).await,
-        vec!["the team row".to_owned()],
-        "alice rolled the refused note back on her own replica"
-    );
-    assert!(
-        wait_roster(&alice2, &remaining).await,
-        "alice's snapshot dropped the removed row"
-    );
+    expect_removed_note_refusal(
+        &mut alice_events,
+        &alice2,
+        &remaining,
+        &["the team row".to_owned()],
+    )
+    .await;
 
     // Bob re-links alice, and her next offer carries the frontier and the
     // retraction.

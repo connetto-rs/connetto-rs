@@ -43,9 +43,7 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport as _};
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
 use connetto_server::defaults::{_connetto_session_writers, _connetto_settled, _connetto_writers};
-use connetto_server::device_cert::{
-    DeviceCertConfig, DeviceEnrolment, Enrolment, EnrolmentStore, MemoryEnrolments,
-};
+use connetto_server::device_cert::{DeviceEnrolment, Enrolment, EnrolmentStore};
 use connetto_server::writer_schema::SettlePath;
 use connetto_server::{
     AbuseConfig, LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PageSpec,
@@ -63,10 +61,11 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use parking_lot::Mutex;
 use rcgen::{KeyPair, PublicKeyData as _, SigningKey as _};
 use sha2::{Digest, Sha256};
-use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, Insert, SimpleTable, Update, Value};
+use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, SimpleTable, Update, Value};
 
-/// The notes table these tests sync.
-const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
+use super::writer_shared::{
+    Enrolments, PG_DDL, insert_changeset, notes, seed_notes, writable_catalog, writer_for_key,
+};
 
 /// The handshake authority every test manager takes.
 fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
@@ -120,18 +119,6 @@ impl SnapshotSource for NoSnapshot {
 }
 
 diesel::table! {
-    /// Row from the notes test fixture.
-    notes (id) {
-        /// Note identifier, the primary key.
-        id -> diesel::sql_types::Integer,
-        /// Note text.
-        body -> diesel::sql_types::Text,
-        /// Timestamp of the last edit.
-        edited_at -> diesel::sql_types::Text,
-    }
-}
-
-diesel::table! {
     /// The client's private pending queue, read from its replica by the
     /// acceptance assertions.
     _connetto_pending (writer, seq) {
@@ -180,59 +167,6 @@ async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
         .expect("read notes")
 }
 
-/// Reset the fixture to a fresh `notes` table seeded with one versioned row
-/// and the writer tables provisioned by the admin.
-async fn seed_notes(fixture: &Fixture) {
-    fixture
-        .setup(&[
-            "DROP TABLE IF EXISTS notes CASCADE",
-            "DROP TABLE IF EXISTS _connetto_settled",
-            "DROP TABLE IF EXISTS _connetto_session_writers",
-            "DROP TABLE IF EXISTS _connetto_writers",
-            "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
-        ])
-        .await;
-    connetto_test_harness::provision_writers(fixture.admin()).await;
-    let mut conn = fixture.admin().get().await.expect("admin connection");
-    diesel::insert_into(notes::table)
-        .values((
-            notes::id.eq(1_i32),
-            notes::body.eq("hello"),
-            notes::edited_at.eq("t0"),
-        ))
-        .execute(&mut *conn)
-        .await
-        .expect("seed row");
-}
-
-fn writable_catalog() -> RuntimeWritableCatalog {
-    RuntimeWritableCatalog::builder()
-        .versioned("notes", "edited_at")
-        .build()
-}
-
-fn note_table() -> SimpleTable {
-    SimpleTable::new(
-        "notes",
-        &[("id", ""), ("body", ""), ("edited_at", "")],
-        &[0],
-    )
-}
-
-/// A changeset that inserts one full row.
-fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(note_table())
-        .set(0, Value::Integer(id))
-        .expect("set id")
-        .set(1, Value::Text(body.to_owned()))
-        .expect("set body")
-        .set(2, Value::Text(edited_at.to_owned()))
-        .expect("set edited_at");
-    ChangeSet::<SimpleTable, String, Vec<u8>>::new()
-        .insert(insert)
-        .build()
-}
-
 /// The writer's frontier, head and retirement state, read as admin.
 struct WriterFacts {
     frontier: i64,
@@ -257,17 +191,6 @@ async fn writer_facts(pool: &Pool<AsyncPgConnection>, writer: i64) -> WriterFact
         head,
         retired,
     }
-}
-
-/// The writer number a device key bound to.
-async fn writer_for_key(pool: &Pool<AsyncPgConnection>, key_id: [u8; 32]) -> i64 {
-    let mut conn = pool.get().await.expect("admin connection");
-    _connetto_writers::table
-        .filter(_connetto_writers::device_key.eq(key_id.to_vec()))
-        .select(_connetto_writers::writer)
-        .get_result(&mut *conn)
-        .await
-        .expect("read the device writer")
 }
 
 /// One settled entry, read as admin, ordered by sequence.
@@ -326,40 +249,11 @@ impl Captured {
     }
 }
 
-/// The device key enrolments the test installs on the manager, in memory.
-struct Enrolments {
-    store: Arc<MemoryEnrolments<String>>,
-}
-
 impl Enrolments {
-    /// An empty store, fresh per test.
-    fn new() -> Self {
-        Self {
-            store: Arc::new(MemoryEnrolments::default()),
-        }
-    }
-
-    /// Enrol `user`'s fresh key with a certificate that stands until
-    /// `expires_at`, and hand back the key and its id.
-    async fn enrol(&self, user: &str, expires_at: SystemTime) -> (Signer, [u8; 32]) {
-        let key = device_key();
-        let key_id = *KeyId::of_public_key(&key.subject_public_key_info()).as_bytes();
-        let record = Enrolment {
-            user: user.to_owned(),
-            key: KeyId::from_bytes(key_id),
-            serial: [7; 16],
-            issuer: KeyId::from_bytes([9; 32]),
-            issued_at: SystemTime::now(),
-            expires_at,
-            session: SessionId::from_uuid(uuid::Uuid::new_v4()),
-            public_key: key.subject_public_key_info().clone(),
-            descriptor: vec![0x91, 0x01],
-            attestation: AttestationLevel::Unproven,
-        };
-        self.store
-            .record(record)
-            .await
-            .expect("record the certificate");
+    /// Enrol `user`'s fresh key and hand back the suite's [`Signer`] and its
+    /// id.
+    async fn enrol_signer(&self, user: &str, expires_at: SystemTime) -> (Signer, [u8; 32]) {
+        let (key, key_id) = self.enrol(user, expires_at).await;
         (Signer(key), key_id)
     }
 
@@ -392,19 +286,6 @@ impl Enrolments {
             .expect("record the certificate");
         key
     }
-
-    /// Revoke `key_id` whoever enrolled it, as an operator would.
-    fn revoke(&self, key_id: [u8; 32]) {
-        self.store.revoke_key(KeyId::from_bytes(key_id));
-    }
-
-    /// The enrolment the manager takes, over this store and a fresh issuer.
-    fn installable(&self) -> DeviceEnrolment<String> {
-        let (_, _, issuer) = rooted_issuer();
-        let store = Arc::clone(&self.store);
-        let store: Arc<dyn EnrolmentStore<String>> = store;
-        DeviceEnrolment::new(DeviceCertConfig::new(issuer), store)
-    }
 }
 
 /// The device key the test signs as, wrapped so its bind signatures are one
@@ -421,8 +302,7 @@ impl Signer {
     }
 }
 
-/// The enrolment test helpers shared by every suite in this crate.
-use super::enrolment::{device_key, rooted_issuer};
+use super::enrolment::device_key;
 
 fn writing_manager(
     pool: &Pool<AsyncPgConnection>,
@@ -981,7 +861,7 @@ async fn a_good_bind_binds_a_live_enrolment_and_rebinds_at_its_frontier() {
     guard.set_audit_hook(hook);
     let store = Enrolments::new();
     let device = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -1116,7 +996,7 @@ async fn a_device_bind_records_its_session_once_and_an_anonymous_run_records_non
     ));
     let store = Enrolments::new();
     let device = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -1217,7 +1097,7 @@ async fn a_bind_with_a_bad_signature_is_not_enrolled() {
     guard.set_audit_hook(hook);
     let store = Enrolments::new();
     let device = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -1321,7 +1201,7 @@ async fn a_bind_of_a_retired_writer_is_retired() {
     guard.set_audit_hook(hook);
     let store = Enrolments::new();
     let device = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -1400,7 +1280,7 @@ async fn a_bind_of_a_revoked_key_closes_device_revoked() {
     guard.set_audit_hook(hook);
     let store = Enrolments::new();
     let device = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -1963,7 +1843,7 @@ async fn a_provenance_write_naming_an_enrolled_key_that_never_bound_stands_its_r
     guard.set_audit_hook(hook);
     let store = Enrolments::new();
     let key = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -2032,7 +1912,7 @@ async fn a_provenance_write_naming_a_foreign_writer_applies_plainly() {
     guard.set_audit_hook(hook);
     let store = Enrolments::new();
     let bob_key = store
-        .enrol("bob", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("bob", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -2162,7 +2042,7 @@ async fn retiring_a_bound_writer_closes_its_live_connection() {
     guard.set_audit_hook(hook);
     let store = Enrolments::new();
     let device = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -2314,7 +2194,7 @@ async fn retiring_an_enrolled_device_key_that_never_bound_creates_its_row_retire
     guard.set_audit_hook(hook);
     let store = Enrolments::new();
     let device = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -2383,7 +2263,7 @@ async fn a_forged_changeset_at_a_device_sequence_is_refused_forked_and_audited()
     guard.set_audit_hook(hook);
     let store = Enrolments::new();
     let device = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -2564,10 +2444,10 @@ async fn a_device_restore_then_reupload_is_answered_from_the_record_and_audited(
     guard.set_audit_hook(hook);
     let store = Enrolments::new();
     let k = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let k2 = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -3667,7 +3547,7 @@ async fn an_anonymous_bind_is_not_enrolled() {
     ));
     let enrolments = Enrolments::new();
     let (_, key_id) = enrolments
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -3756,7 +3636,7 @@ async fn retiring_a_device_key_another_account_holds_is_unknown() {
     ));
     let enrolments = Enrolments::new();
     let (signer, key_id) = enrolments
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -3810,7 +3690,7 @@ async fn an_anonymous_retire_of_a_device_key_is_unknown() {
     ));
     let enrolments = Enrolments::new();
     let (signer, key_id) = enrolments
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -3912,7 +3792,7 @@ async fn retiring_a_revoked_enrolled_key_that_never_bound_is_unknown() {
     ));
     let enrolments = Enrolments::new();
     let (_, key_id) = enrolments
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     enrolments.revoke(key_id);
     let manager = writing_manager(
@@ -3953,11 +3833,11 @@ async fn a_provenance_write_of_a_device_key_that_cannot_stand_applies_plain() {
     ));
     let enrolments = Enrolments::new();
     let (_, revoked) = enrolments
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     enrolments.revoke(revoked);
     let (_, foreign) = enrolments
-        .enrol("bob", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("bob", SystemTime::now() + Duration::from_hours(24))
         .await;
     let unknown = [77; 32];
     let manager = writing_manager(
@@ -4021,10 +3901,10 @@ async fn an_anonymous_provenance_copy_of_a_device_key_settles_nothing() {
     ));
     let enrolments = Enrolments::new();
     let (signer, held) = enrolments
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let (_, unbound) = enrolments
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),
@@ -4100,7 +3980,7 @@ async fn a_refused_provenance_write_settles_its_unbound_original() {
     ));
     let store = Enrolments::new();
     let (_, key) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
     let manager = writing_manager(
         fixture.admin(),

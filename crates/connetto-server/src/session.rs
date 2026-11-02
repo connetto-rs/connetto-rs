@@ -1747,9 +1747,6 @@ struct SessionState<Id, Key> {
     closing: bool,
     /// The enrolment nonce this session was last handed, spent by its next enrolment request.
     enrol_challenge: Option<crate::device_cert::PendingChallenge>,
-    /// The authors this session already answered a provisional ask about,
-    /// a second ask naming one answers the deferral (R77 decision 11).
-    provisional_asks: HashSet<[u8; 32]>,
 }
 
 /// One computed subscription, as a key change has to find it again.
@@ -4530,7 +4527,6 @@ where
             key_expiry,
             closing: refused == Reaction::Close,
             enrol_challenge: None,
-            provisional_asks: HashSet::new(),
         };
         self.send_revocation_lists(&mut transport, &state).await;
 
@@ -5465,7 +5461,7 @@ where
                 self.handle_retire_writer(transport, retire, state).await
             }
             ControlMessage::ProvisionalStatus(ask) => {
-                self.handle_provisional_status(transport, ask, state).await
+                self.handle_provisional_status(transport, ask).await
             }
             // Server-origin frames received from a client are ignored.
             _ => Ok(()),
@@ -5638,25 +5634,13 @@ where
     /// ruled from the writer's settled records (R77 decision 11).
     #[expect(
         clippy::too_many_lines,
-        reason = "one ask walks the deferral, the verifications and the ruling in order and a split would hide the sequence"
+        reason = "one ask walks the verifications and the ruling in order and a split would hide the sequence"
     )]
     async fn handle_provisional_status<T: Transport>(
         &self,
         transport: &mut T,
         ask: ProvisionalStatus,
-        state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
-        // A second ask for one author on one session takes the deferral, the
-        // receiver treating it as its lapse (R77 decision 11).
-        if state.provisional_asks.contains(&ask.author) {
-            return transport
-                .send_control(ControlMessage::RateLimited(RateLimited {
-                    related_to: Some(ask.request_id),
-                    retry_after_ms: 0,
-                }))
-                .await
-                .map_err(transport_err);
-        }
         let refused = || {
             ControlMessage::NonFatalError(NonFatalError {
                 related_to: Some(ask.request_id.clone()),
@@ -5769,7 +5753,6 @@ where
                 )
             })
             .collect();
-        state.provisional_asks.insert(ask.author);
         transport
             .send_control(ControlMessage::ProvisionalVerdicts(ProvisionalVerdicts {
                 request_id: ask.request_id,

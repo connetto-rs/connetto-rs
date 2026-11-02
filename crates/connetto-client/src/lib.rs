@@ -4429,8 +4429,8 @@ const WRITER_ANSWER_WAIT: Duration = Duration::from_secs(30);
 #[cfg(feature = "peer")]
 const PROVISIONAL_ASK_WAIT: Duration = Duration::from_secs(30);
 
-/// One provisional ask a session sends, at most one per author (R77
-/// decision 11).
+/// One provisional ask a session sends, one manifest frame of an author's
+/// sequences (R77 decision 11).
 #[derive(Debug, Clone)]
 #[cfg(feature = "peer")]
 struct ProvisionalAsk {
@@ -4442,6 +4442,15 @@ struct ProvisionalAsk {
     offer: Vec<u8>,
     /// The sequences asked about, at most one manifest frame's rows.
     seqs: Vec<u64>,
+}
+
+/// The provisional ask sent and awaited, with the monotonic deadline its
+/// ruling is owed by, counted from the send.
+#[derive(Debug, Clone)]
+#[cfg(feature = "peer")]
+struct SentAsk {
+    /// The ask as sent.
+    ask: ProvisionalAsk,
     /// The monotonic deadline the ruling is owed by.
     deadline: Duration,
 }
@@ -4451,10 +4460,10 @@ struct ProvisionalAsk {
 #[derive(Debug, Default, Clone)]
 #[cfg(feature = "peer")]
 struct ProvisionalQueue {
-    /// The asks queued to send, one per author, in plan order.
+    /// The asks queued to send, in plan order.
     pending: VecDeque<ProvisionalAsk>,
     /// The ask sent and awaited, at most one at a time.
-    in_flight: Option<ProvisionalAsk>,
+    in_flight: Option<SentAsk>,
 }
 
 #[cfg(feature = "peer")]
@@ -5425,7 +5434,8 @@ where
         self.resume_attach().await?;
         // The session's asks go out once the replay stands, one per author.
         #[cfg(feature = "peer")]
-        self.plan_provisional_asks().await
+        self.plan_provisional_asks().await?;
+        Ok(())
     }
 
     /// Finishes post-handshake replay after an outer operation temporarily
@@ -5862,9 +5872,10 @@ where
         }
     }
 
-    /// Plan the session's provisional asks (R77 decision 11), one per author
+    /// Plan the session's provisional asks (R77 decision 11) for every author
     /// its provisional records name and the replica holds a signed offer from,
-    /// each carrying the author's lowest sequences up to one manifest frame.
+    /// the author's sequences in ascending chunks of one manifest frame, one
+    /// ask each.
     ///
     /// An author the replica holds no stored offer from is never asked, its
     /// rows waiting for the author's frontier over a link.
@@ -5884,7 +5895,6 @@ where
                     .push(row.seq);
             }
         }
-        let now = crate::away::SystemClock.monotonic();
         for (author, mut seqs) in by_author {
             let Ok(key) = <[u8; 32]>::try_from(author.as_slice()) else {
                 continue;
@@ -5897,15 +5907,15 @@ where
             let seqs: Vec<u64> = seqs
                 .into_iter()
                 .map(|seq| u64::try_from(seq).unwrap_or(u64::MAX))
-                .take(connetto_core::exchange::MAX_MANIFEST_ROWS)
                 .collect();
-            self.provisional.pending.push_back(ProvisionalAsk {
-                author: key,
-                request_id: provisional_request_id(),
-                offer,
-                seqs,
-                deadline: now + PROVISIONAL_ASK_WAIT,
-            });
+            for chunk in seqs.chunks(connetto_core::exchange::MAX_MANIFEST_ROWS) {
+                self.provisional.pending.push_back(ProvisionalAsk {
+                    author: key,
+                    request_id: provisional_request_id(),
+                    offer: offer.clone(),
+                    seqs: chunk.to_vec(),
+                });
+            }
         }
         self.flush_provisional_asks().await
     }
@@ -5937,7 +5947,10 @@ where
             ))
             .await
             .map_err(|err| ClientError::Transport(err.to_string()))?;
-        self.provisional.in_flight = Some(ask);
+        self.provisional.in_flight = Some(SentAsk {
+            ask,
+            deadline: crate::away::SystemClock.monotonic() + PROVISIONAL_ASK_WAIT,
+        });
         Ok(())
     }
 
@@ -5953,13 +5966,14 @@ where
             .provisional
             .in_flight
             .as_ref()
-            .is_some_and(|ask| ask.request_id == related_to)
+            .is_some_and(|sent| sent.ask.request_id == related_to)
         {
             let author = self
                 .provisional
                 .in_flight
                 .take()
                 .expect("the ask matched")
+                .ask
                 .author;
             self.provisional.pending.retain(|ask| ask.author != author);
         }
@@ -5970,12 +5984,12 @@ where
     /// decision 11).
     #[cfg(feature = "peer")]
     fn check_provisional_deadlines(&mut self) {
-        let Some(ask) = self.provisional.in_flight.as_ref() else {
+        let Some(sent) = self.provisional.in_flight.as_ref() else {
             return;
         };
-        if crate::away::SystemClock.monotonic() >= ask.deadline {
+        if crate::away::SystemClock.monotonic() >= sent.deadline {
             tracing::debug!("the provisional ruling overran its bound, dropping the ask");
-            let request_id = ask.request_id.clone();
+            let request_id = sent.ask.request_id.clone();
             self.drop_provisional_ask(Some(request_id.as_str()));
         }
     }
@@ -5999,7 +6013,7 @@ where
             .provisional
             .in_flight
             .as_ref()
-            .is_none_or(|ask| ask.request_id != answer.request_id)
+            .is_none_or(|sent| sent.ask.request_id != answer.request_id)
         {
             return Ok(ClientEvent::NonFatal {
                 related_to: Some(answer.request_id.clone()),
@@ -6010,7 +6024,8 @@ where
             .provisional
             .in_flight
             .take()
-            .expect("the ruling named the open ask");
+            .expect("the ruling named the open ask")
+            .ask;
         for (seq, verdict) in &answer.verdicts {
             match verdict {
                 connetto_core::exchange::Verdict::Applied
@@ -8920,7 +8935,10 @@ where
             self.step_share_keys().await?;
             self.check_writer_deadlines();
             #[cfg(feature = "peer")]
-            self.check_provisional_deadlines();
+            {
+                self.check_provisional_deadlines();
+                self.flush_provisional_asks().await?;
+            }
             self.check_drain_deadline().await;
             self.step_drain_share_keys().await?;
             if let Some(notice) = self.notices.pop_front() {
@@ -8953,8 +8971,12 @@ where
         // A writer answer that overran its bound drops the connection before
         // the next frame is waited on, so the pump redials without stalling.
         self.check_writer_deadlines();
+        // A lapsed, deferred or refused ask hands the session's next ask on.
         #[cfg(feature = "peer")]
-        self.check_provisional_deadlines();
+        {
+            self.check_provisional_deadlines();
+            self.flush_provisional_asks().await?;
+        }
         self.check_share_key_deadlines();
         self.step_share_keys().await?;
         self.check_drain_deadline().await;

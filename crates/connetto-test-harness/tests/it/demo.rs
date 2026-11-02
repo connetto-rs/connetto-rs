@@ -20,6 +20,7 @@ use connetto_client::{
 };
 use connetto_core::bots::TextIds;
 use connetto_core::device_cert::DeviceCertificate;
+use connetto_core::messages::MutationRejectReason;
 use connetto_test_harness::native_client;
 use connetto_test_harness::stack::DEMO_DEPLOYMENT;
 use diesel::prelude::*;
@@ -321,6 +322,85 @@ pub fn key_of(rows: &[ProvisionalRow], note_id: &[u8]) -> Vec<KeyValue> {
         .find(|row| row.key == vec![KeyValue::Blob(note_id.to_owned())])
         .map(|row| row.key.clone())
         .expect("the note's provisional record holds its id as the key")
+}
+
+/// Await one apply event per record of `author` on the receiver's stream,
+/// bounded by `BOUND`, and assert the app heard every one of them.
+pub async fn hear_applies(
+    events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
+    rows: &[ProvisionalRow],
+    author: &[u8],
+) {
+    let mut expected: Vec<i64> = rows.iter().map(|row| row.seq).collect();
+    expected.sort_unstable();
+    expected.dedup();
+    let mut heard: Vec<i64> = Vec::new();
+    let heard_deadline = Instant::now() + BOUND;
+    while heard.len() < expected.len() && Instant::now() < heard_deadline {
+        if let Some(ClientEvent::ProvisionalApplied { seq, .. }) =
+            next_event(events, Duration::from_millis(200), |event| {
+                matches!(
+                    event,
+                    ClientEvent::ProvisionalApplied {
+                        author: event_author, ..
+                    } if *event_author == author
+                )
+            })
+            .await
+        {
+            heard.push(seq);
+        }
+    }
+    heard.sort_unstable();
+    assert_eq!(heard, expected, "bob's app hears every apply while offline");
+}
+
+/// The server's refusal of the removed team's note on alice's stream, the
+/// refusal naming the note, her queue settling and the note rolled back on
+/// her replica behind it.
+pub async fn expect_removed_note_refusal(
+    events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
+    alice: &NativeClient<NativeTransport>,
+    remaining: &[(String, String)],
+    bodies: &[String],
+) {
+    let rejected = next_event(events, BOUND, |event| {
+        matches!(event, ClientEvent::MutationRejected { .. })
+    })
+    .await
+    .expect("the server refuses the removed team's note");
+    if let ClientEvent::MutationRejected {
+        reason,
+        rows: refused,
+        ..
+    } = &rejected
+    {
+        assert!(
+            matches!(reason, MutationRejectReason::Unauthorized),
+            "the removal lands as an unauthorized refusal, the server spelled {reason:?}"
+        );
+        assert_eq!(
+            refused
+                .iter()
+                .map(|row| row.table.clone())
+                .collect::<Vec<_>>(),
+            vec!["team_notes".to_owned()],
+            "the refusal names the refused note"
+        );
+    }
+    assert!(
+        wait_unsynced_empty(alice).await,
+        "alice's queue settles behind the applies and the refusal"
+    );
+    assert_eq!(
+        note_bodies(alice).await,
+        bodies,
+        "alice rolled the refused note back on her own replica"
+    );
+    assert!(
+        wait_roster(alice, remaining).await,
+        "alice's snapshot dropped the removed row"
+    );
 }
 
 /// Alice's one-line order of `quantity` items, owned by her server-minted id.

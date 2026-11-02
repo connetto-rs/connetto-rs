@@ -483,9 +483,10 @@ async fn a_ruling_for_no_open_ask_stands_ignored() {
     );
 }
 
-/// One ask carries at most the manifest bound, the author's lowest sequences.
+/// An author with more sequences than the manifest bound is asked about in
+/// ascending chunks of the bound, the next sent once the last is ruled.
 #[tokio::test]
-async fn an_overbound_ask_carries_the_lowest_manifest_bound() {
+async fn an_overbound_author_is_asked_in_chunks_one_at_a_time() {
     let bound = i64::try_from(connetto_core::exchange::MAX_MANIFEST_ROWS)
         .expect("the manifest bound fits an i64");
     let count = bound + 1;
@@ -494,15 +495,30 @@ async fn an_overbound_ask_carries_the_lowest_manifest_bound() {
     seed_cursor(&mut conn, &AUTHOR_A, count, OFFER_A);
 
     conn.disconnect();
-    let (_, script) = attach(conn).await;
-    let [ask] = asks(&script).try_into().expect("one ask");
-
-    assert_eq!(ask.author, AUTHOR_A);
-    assert_eq!(ask.seqs.len(), connetto_core::exchange::MAX_MANIFEST_ROWS);
-    assert_eq!(ask.seqs.first().copied(), Some(1));
+    let (mut conn, script) = attach(conn).await;
+    let [first] = asks(&script).try_into().expect("one ask at a time");
+    assert_eq!(first.author, AUTHOR_A);
+    assert_eq!(first.seqs.len(), connetto_core::exchange::MAX_MANIFEST_ROWS);
+    assert_eq!(first.seqs.first().copied(), Some(1));
     assert_eq!(
-        ask.seqs.last().copied(),
+        first.seqs.last().copied(),
         Some(u64::try_from(bound).expect("the bound fits a u64"))
+    );
+
+    let pending = first
+        .seqs
+        .iter()
+        .map(|seq| (*seq, Verdict::Pending))
+        .collect();
+    rule(&script, &first.request_id, pending);
+    pump_to(&mut conn, applied).await;
+
+    let [_, second] = asks(&script).try_into().expect("the next chunk follows");
+    assert_eq!(second.author, AUTHOR_A);
+    assert_ne!(second.request_id, first.request_id);
+    assert_eq!(
+        second.seqs,
+        vec![u64::try_from(count).expect("the count fits a u64")]
     );
 }
 
@@ -599,4 +615,39 @@ async fn a_refusal_naming_the_ask_drops_it_for_the_session() {
     let (_, script) = attach(conn).await;
     let [again] = asks(&script).try_into().expect("the re-ask");
     assert_eq!(again.author, AUTHOR_A);
+}
+
+/// A refusal that drops one author's ask hands the session on to the next
+/// author's ask, so one refused author never holds the others back.
+#[tokio::test]
+async fn a_dropped_ask_hands_the_session_on_to_the_next_author() {
+    let (mut conn, _) = receiver(DDL, POLICIES).await;
+    bulk_records(&mut conn, &AUTHOR_A, 1, 0);
+    seed_cursor(&mut conn, &AUTHOR_A, 1, OFFER_A);
+    bulk_records(&mut conn, &AUTHOR_C, 1, 100);
+    seed_cursor(&mut conn, &AUTHOR_C, 1, OFFER_C);
+
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [first] = asks(&script).try_into().expect("one ask at a time");
+    assert_eq!(first.author, AUTHOR_A);
+
+    script.say(IncomingFrame::Control(ControlMessage::NonFatalError(
+        NonFatalError {
+            related_to: Some(first.request_id.clone()),
+            detail: PROVISIONAL_ASK_REFUSED.to_owned(),
+        },
+    )));
+    pump_to(&mut conn, |event| {
+        matches!(event, ClientEvent::NonFatal { detail, .. }
+                if detail == PROVISIONAL_ASK_REFUSED)
+    })
+    .await;
+    rule(&script, &first.request_id, vec![(1, Verdict::Pending)]);
+    pump_to(&mut conn, no_open_ask).await;
+
+    let [_, second] = asks(&script)
+        .try_into()
+        .expect("the next author's ask follows");
+    assert_eq!(second.author, AUTHOR_C);
 }

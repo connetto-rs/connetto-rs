@@ -151,6 +151,8 @@ mod write_attribution;
 
 mod writer_frontier;
 
+mod writer_shared;
+
 mod provisional;
 
 mod courier_frontier;

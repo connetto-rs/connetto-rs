@@ -17,10 +17,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use connetto_core::Major;
-use connetto_core::SessionId;
 use connetto_core::auth::Principal;
 use connetto_core::chain::offer_message;
-use connetto_core::device_cert::{AttestationLevel, KeyId};
 use connetto_core::exchange::{Frontier, Offer, RetractCause, SignedOffer, Verdict};
 use connetto_core::messages::{
     ControlMessage, MutationRejectReason, PROVISIONAL_ASK_REFUSED, ProvisionalStatus,
@@ -30,14 +28,12 @@ use connetto_core::schema::SchemaVersion;
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport as _};
 use connetto_server::defaults::{_connetto_settled, _connetto_writers};
-use connetto_server::device_cert::{
-    DeviceCertConfig, DeviceEnrolment, Enrolment, EnrolmentStore, MemoryEnrolments,
-};
+use connetto_server::device_cert::DeviceEnrolment;
 use connetto_server::writer_schema::{SettlePath, SettledOutcome, StoredValue};
 use connetto_server::{
     AbuseConfig, LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PageSpec,
-    RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate,
-    SnapshotPage, SnapshotSource, ThrottleConfig, loopback, pg_write_target,
+    RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
+    ThrottleConfig, loopback, pg_write_target,
 };
 use connetto_test_harness::{
     Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID, issue_writer, number_writer,
@@ -45,11 +41,11 @@ use connetto_test_harness::{
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use rcgen::{KeyPair, PublicKeyData as _, SigningKey as _};
-use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
+use rcgen::{KeyPair, SigningKey as _};
 
-/// The notes table these tests sync.
-const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
+use super::writer_shared::{
+    Enrolments, PG_DDL, insert_changeset, seed_notes, writable_catalog, writer_for_key,
+};
 
 /// The handshake authority every test manager takes.
 fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
@@ -100,82 +96,6 @@ impl SnapshotSource for NoSnapshot {
             bytes: 0,
         })
     }
-}
-
-diesel::table! {
-    /// Row from the notes test fixture.
-    notes (id) {
-        /// Note identifier, the primary key.
-        id -> diesel::sql_types::Integer,
-        /// Note text.
-        body -> diesel::sql_types::Text,
-        /// Timestamp of the last edit.
-        edited_at -> diesel::sql_types::Text,
-    }
-}
-
-/// Reset the fixture to a fresh `notes` table seeded with one row and the
-/// writer tables provisioned by the admin.
-async fn seed_notes(fixture: &Fixture) {
-    fixture
-        .setup(&[
-            "DROP TABLE IF EXISTS notes CASCADE",
-            "DROP TABLE IF EXISTS _connetto_settled",
-            "DROP TABLE IF EXISTS _connetto_session_writers",
-            "DROP TABLE IF EXISTS _connetto_writers",
-            "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
-        ])
-        .await;
-    connetto_test_harness::provision_writers(fixture.admin()).await;
-    let mut conn = fixture.admin().get().await.expect("admin connection");
-    diesel::insert_into(notes::table)
-        .values((
-            notes::id.eq(1_i32),
-            notes::body.eq("hello"),
-            notes::edited_at.eq("t0"),
-        ))
-        .execute(&mut *conn)
-        .await
-        .expect("seed row");
-}
-
-fn writable_catalog() -> RuntimeWritableCatalog {
-    RuntimeWritableCatalog::builder()
-        .versioned("notes", "edited_at")
-        .build()
-}
-
-fn note_table() -> SimpleTable {
-    SimpleTable::new(
-        "notes",
-        &[("id", ""), ("body", ""), ("edited_at", "")],
-        &[0],
-    )
-}
-
-/// A changeset that inserts one full row.
-fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(note_table())
-        .set(0, Value::Integer(id))
-        .expect("set id")
-        .set(1, Value::Text(body.to_owned()))
-        .expect("set body")
-        .set(2, Value::Text(edited_at.to_owned()))
-        .expect("set edited_at");
-    ChangeSet::<SimpleTable, String, Vec<u8>>::new()
-        .insert(insert)
-        .build()
-}
-
-/// The writer number a device key bound to.
-async fn writer_for_key(pool: &Pool<AsyncPgConnection>, key_id: [u8; 32]) -> i64 {
-    let mut conn = pool.get().await.expect("admin connection");
-    _connetto_writers::table
-        .filter(_connetto_writers::device_key.eq(key_id.to_vec()))
-        .select(_connetto_writers::writer)
-        .get_result(&mut *conn)
-        .await
-        .expect("read the device writer")
 }
 
 /// One settled entry, read as admin, ordered by sequence.
@@ -264,9 +184,6 @@ async fn set_frontier(pool: &Pool<AsyncPgConnection>, writer: i64, frontier: i64
         .expect("set the frontier");
 }
 
-/// The enrolment test helpers shared by every suite in this crate.
-use super::enrolment::{device_key, rooted_issuer};
-
 /// The device key the test signs as, its id and both the bind and the offer
 /// signatures.
 struct Key {
@@ -326,60 +243,11 @@ impl Key {
     }
 }
 
-/// The device key enrolments the test installs on the manager, in memory.
-struct Enrolments {
-    store: Arc<MemoryEnrolments<String>>,
-}
-
 impl Enrolments {
-    /// An empty store, fresh per test.
-    fn new() -> Self {
-        Self {
-            store: Arc::new(MemoryEnrolments::default()),
-        }
-    }
-
-    /// Enrol `user`'s fresh key with a certificate that stands until
-    /// `expires_at`, and hand back the key and its id.
-    async fn enrol(&self, user: &str, expires_at: SystemTime) -> (Key, [u8; 32]) {
-        let key = device_key();
-        let key_id = *KeyId::of_public_key(&key.subject_public_key_info()).as_bytes();
-        let record = Enrolment {
-            user: user.to_owned(),
-            key: KeyId::from_bytes(key_id),
-            serial: [7; 16],
-            issuer: KeyId::from_bytes([9; 32]),
-            issued_at: SystemTime::now(),
-            expires_at,
-            session: SessionId::from_uuid(uuid::Uuid::new_v4()),
-            public_key: key.subject_public_key_info().clone(),
-            descriptor: vec![0x91, 0x01],
-            attestation: AttestationLevel::Unproven,
-        };
-        self.store
-            .record(record)
-            .await
-            .expect("record the certificate");
-        (
-            Key {
-                pair: key,
-                id: key_id,
-            },
-            key_id,
-        )
-    }
-
-    /// Revoke `key_id` whoever enrolled it, as an operator would.
-    fn revoke(&self, key_id: [u8; 32]) {
-        self.store.revoke_key(KeyId::from_bytes(key_id));
-    }
-
-    /// The enrolment the manager takes, over this store and a fresh issuer.
-    fn installable(&self) -> DeviceEnrolment<String> {
-        let (_, _, issuer) = rooted_issuer();
-        let store = Arc::clone(&self.store);
-        let store: Arc<dyn EnrolmentStore<String>> = store;
-        DeviceEnrolment::new(DeviceCertConfig::new(issuer), store)
+    /// Enrol `user`'s fresh key and hand back the suite's [`Key`] and its id.
+    async fn enrol_key(&self, user: &str, expires_at: SystemTime) -> (Key, [u8; 32]) {
+        let (pair, id) = self.enrol(user, expires_at).await;
+        (Key { pair, id }, id)
     }
 }
 
@@ -454,9 +322,9 @@ async fn a_ruling_answers_every_row_of_the_verdict_table() {
     ));
     let live = SystemTime::now() + Duration::from_hours(24);
     let enrol = Enrolments::new();
-    let (alice, alice_id) = enrol.enrol("alice", live).await;
-    let (carol, carol_id) = enrol.enrol("carol", live).await;
-    let (dave, dave_id) = enrol.enrol("dave", live).await;
+    let (alice, alice_id) = enrol.enrol_key("alice", live).await;
+    let (carol, carol_id) = enrol.enrol_key("carol", live).await;
+    let (dave, dave_id) = enrol.enrol_key("dave", live).await;
     enrol.revoke(carol_id);
     let manager = manager(fixture.admin(), guard, Some(enrol.installable()));
 
@@ -603,10 +471,10 @@ async fn an_overbound_or_forged_ask_is_refused() {
     ));
     let live = SystemTime::now() + Duration::from_hours(24);
     let enrol = Enrolments::new();
-    let (x1, x1_id) = enrol.enrol("x1", live).await;
-    let (x2, x2_id) = enrol.enrol("x2", live).await;
-    let (x3, x3_id) = enrol.enrol("x3", live).await;
-    let (_x4, x4_id) = enrol.enrol("x4", live).await;
+    let (x1, x1_id) = enrol.enrol_key("x1", live).await;
+    let (x2, x2_id) = enrol.enrol_key("x2", live).await;
+    let (x3, x3_id) = enrol.enrol_key("x3", live).await;
+    let (_x4, x4_id) = enrol.enrol_key("x4", live).await;
     let manager = manager(fixture.admin(), guard, Some(enrol.installable()));
 
     let (server_transport, mut recv) = loopback();
@@ -717,10 +585,10 @@ async fn an_overbound_or_forged_ask_is_refused() {
     server.await.expect("join bob").expect("session ok");
 }
 
-/// A second ask for one author on one session takes the deferral naming the
-/// ask, and the latch releases on the disconnect.
+/// A follow-up ask for the same author on the same session gets its own
+/// ruling, the way the receiver's next chunk is answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_second_ask_for_one_author_is_rate_limited() {
+async fn a_follow_up_ask_for_the_same_author_gets_its_own_verdicts() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
     let guard = Arc::new(RequestGuard::new(
@@ -729,7 +597,7 @@ async fn a_second_ask_for_one_author_is_rate_limited() {
     ));
     let live = SystemTime::now() + Duration::from_hours(24);
     let enrol = Enrolments::new();
-    let (x1, x1_id) = enrol.enrol("x1", live).await;
+    let (x1, x1_id) = enrol.enrol_key("x1", live).await;
     let manager = manager(fixture.admin(), guard, Some(enrol.installable()));
 
     let (server_transport, mut recv) = loopback();
@@ -738,7 +606,7 @@ async fn a_second_ask_for_one_author_is_rate_limited() {
 
     // the first ask stands.
     let offer = x1.signed_offer(Some(Frontier {
-        seq: 1,
+        seq: 2,
         head: [1; 32],
     }));
     let reply = ask_provisional(
@@ -757,48 +625,25 @@ async fn a_second_ask_for_one_author_is_rate_limited() {
     assert_eq!(verdicts.request_id, "r1");
     assert_eq!(verdicts.verdicts, vec![(1, Verdict::Pending)]);
 
-    // the second ask for the same author takes the deferral.
+    // the follow-up ask for the same author gets its own ruling.
     let reply = ask_provisional(
         &mut recv,
         ProvisionalStatus {
             request_id: "r2".to_owned(),
             author: x1_id,
-            offer: offer.clone(),
-            seqs: vec![2],
-        },
-    )
-    .await;
-    let ControlMessage::RateLimited(deferred) = reply else {
-        panic!("expected the deferral, got {reply:?}");
-    };
-    assert_eq!(deferred.related_to.as_deref(), Some("r2"));
-    assert_eq!(deferred.retry_after_ms, 0);
-
-    let _ = recv.close().await;
-    server.await.expect("join bob").expect("session ok");
-
-    // the latch releases on the disconnect, the next session asks again.
-    let (server_transport, mut recv) = loopback();
-    let server = tokio::spawn(manager.clone().serve(server_transport));
-    super::ticket_shared::do_handshake_with(&mut recv, "pv-recv-2", &["user:bob"]).await;
-    let reply = ask_provisional(
-        &mut recv,
-        ProvisionalStatus {
-            request_id: "r3".to_owned(),
-            author: x1_id,
             offer,
-            seqs: vec![1],
+            seqs: vec![2],
         },
     )
     .await;
     let ControlMessage::ProvisionalVerdicts(verdicts) = reply else {
         panic!("expected the ruling, got {reply:?}");
     };
-    assert_eq!(verdicts.request_id, "r3");
-    assert_eq!(verdicts.verdicts, vec![(1, Verdict::Pending)]);
+    assert_eq!(verdicts.request_id, "r2");
+    assert_eq!(verdicts.verdicts, vec![(2, Verdict::Pending)]);
 
     let _ = recv.close().await;
-    server.await.expect("join bob 2").expect("session ok");
+    server.await.expect("join bob").expect("session ok");
 }
 
 /// A prune and the revocation sweep drop only the applied records, the
@@ -813,7 +658,7 @@ async fn a_prune_keeps_the_refusals_while_the_writer_row_stands() {
     ));
     let live = SystemTime::now() + Duration::from_hours(24);
     let enrol = Enrolments::new();
-    let (alice, alice_id) = enrol.enrol("alice", live).await;
+    let (alice, alice_id) = enrol.enrol_key("alice", live).await;
     let manager = manager(fixture.admin(), guard, Some(enrol.installable()));
     let admin = fixture.admin();
 
