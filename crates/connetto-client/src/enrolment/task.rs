@@ -360,6 +360,9 @@ pub(crate) struct Enroller {
     peer_serving: watch::Sender<Option<connetto_peer::Fingerprint>>,
     #[cfg(feature = "peer")]
     peer: Option<Peer>,
+    #[cfg(feature = "peer")]
+    /// The port the media frames go to while one lives (R79).
+    media: crate::media::MediaSlot,
 }
 
 /// The application's half, held by the native client.
@@ -386,6 +389,9 @@ pub(crate) struct EnrolHandle {
     #[cfg(feature = "peer")]
     /// The fingerprint the device serves, once it serves (R76).
     peer_serving: watch::Receiver<Option<connetto_peer::Fingerprint>>,
+    #[cfg(feature = "peer")]
+    /// The port the media frames go to while one lives (R79).
+    media: crate::media::MediaSlot,
 }
 
 impl Enroller {
@@ -422,6 +428,8 @@ impl Enroller {
         let peer_node = peer.node.clone();
         #[cfg(feature = "peer")]
         let (peer_serving, peer_serving_rx) = watch::channel(None);
+        #[cfg(feature = "peer")]
+        let media = crate::media::MediaSlot::default();
         (
             Self {
                 keys: Arc::clone(&keys),
@@ -440,6 +448,8 @@ impl Enroller {
                 peer_serving,
                 #[cfg(feature = "peer")]
                 peer: Some(peer),
+                #[cfg(feature = "peer")]
+                media: media.clone(),
             },
             EnrolHandle {
                 keys,
@@ -457,12 +467,21 @@ impl Enroller {
                 bluetooth,
                 #[cfg(feature = "peer")]
                 peer_serving: peer_serving_rx,
+                #[cfg(feature = "peer")]
+                media,
             },
         )
     }
 }
 
 impl EnrolHandle {
+    /// A port for the peer links' media traffic, `None` while another lives
+    /// (R79).
+    #[cfg(feature = "peer")]
+    pub(crate) fn media_port(&self) -> Option<crate::media::MediaPort> {
+        self.media.take(self.peer.clone())
+    }
+
     /// Ask for a certificate at `lifetime` now.
     pub(crate) async fn reissue(&self, lifetime: Duration) -> Result<(), CertificateError> {
         let (reply, answer) = oneshot::channel();
@@ -1544,10 +1563,18 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                     run.discovery.on_node_event(&event);
                     match event {
                         PeerEvent::Linked { peer, public_key, bot_list } => {
+                            let _ = run.enroller.media.forward(crate::media::MediaEvent::Linked {
+                                peer: peer.clone(),
+                                bot_list: bot_list.clone(),
+                            });
                             run.peer_linked(peer.clone(), public_key, bot_list).await;
                             run.link.emit(ClientEvent::PeerLinked { peer });
                         }
                         PeerEvent::Unlinked { peer, reason } => {
+                            let _ = run
+                                .enroller
+                                .media
+                                .forward(crate::media::MediaEvent::Unlinked { peer: peer.clone() });
                             run.peer_unlinked(&peer).await;
                             run.link.emit(ClientEvent::PeerUnlinked { peer, reason });
                         }
@@ -1560,8 +1587,9 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                         PeerEvent::Exchange { peer, message } => {
                             run.peer_message(&peer, message).await;
                         }
-                        // No holder answers here, so a requester's bound lapses.
-                        PeerEvent::Media { .. } => {}
+                        PeerEvent::Media { peer, message } => {
+                            run.media_message(peer, message).await;
+                        }
                     }
                 }
                 #[cfg(not(feature = "peer"))]
@@ -1593,6 +1621,29 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 let _ = run.stand_by().await;
                 due = run.link.connection().await.is_some();
                 by_look = true;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "peer")]
+impl<L: Link> Run<L> {
+    /// Hand a media frame to the live port, or answer a request `Refused`
+    /// when none lives, as a holder answers for a file it lacks (R79).
+    async fn media_message(&self, peer: DeviceIdentity, message: connetto_exchange::media::Media) {
+        let Err(crate::media::MediaEvent::Message { peer, message }) = self
+            .enroller
+            .media
+            .forward(crate::media::MediaEvent::Message { peer, message })
+        else {
+            return;
+        };
+        if message.ask().is_some() {
+            let refused = connetto_exchange::media::Media::Refused {
+                request_id: message.request_id(),
+            };
+            if let Err(err) = self.peer.send_media(&peer, refused).await {
+                tracing::debug!(error = %err, "a media refusal did not reach its peer");
             }
         }
     }

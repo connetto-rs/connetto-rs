@@ -841,6 +841,49 @@ pub(crate) fn undo_peer_op(
     write_through_view(conn, &target, table, backing, op.table().pk_flags(), &write)
 }
 
+/// Whether the view `table` shows a row whose `column` is `value` to the
+/// identity the caller's binding bound (R79 decision 2). A table or column
+/// the build lacks is an error, never a refusal the caller cannot tell apart.
+#[cfg(feature = "peer")]
+pub(crate) fn view_shows(
+    conn: &mut SqliteConnection,
+    table: &str,
+    backing_schema: &'static str,
+    column: &str,
+    value: &[u8],
+) -> Result<bool, ClientError> {
+    #[derive(QueryableByName)]
+    struct Hit {
+        #[diesel(sql_type = BigInt)]
+        #[expect(dead_code, reason = "a row's presence is the answer")]
+        hit: i64,
+    }
+    let target = view_target(conn, backing_schema, table)?;
+    // A double-quoted name that matches no column reads as a string literal,
+    // so an undeclared column has to be refused before the statement runs.
+    if !target
+        .shape
+        .columns
+        .iter()
+        .any(|declared| declared.eq_ignore_ascii_case(column))
+    {
+        return Err(ClientError::Apply(format!(
+            "no such column: {table}.{column}"
+        )));
+    }
+    // The table and column are the application's declaration, which the
+    // typed DSL cannot name at runtime.
+    let hit: Option<Hit> = diesel::sql_query(format!(
+        "SELECT 1 AS hit FROM {} WHERE {} = ? LIMIT 1",
+        table_ref(target.schema, table),
+        quote_ident(column)
+    ))
+    .bind::<Binary, _>(value)
+    .get_result(conn)
+    .optional()?;
+    Ok(hit.is_some())
+}
+
 /// Whether the backing table holds a row matching every `(column, value)`,
 /// the columns counted as the view `target` lists them.
 #[cfg(feature = "peer")]

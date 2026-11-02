@@ -93,6 +93,8 @@ mod hotspot;
 mod keyring;
 pub mod live;
 mod majors;
+#[cfg(feature = "peer")]
+pub mod media;
 mod memory_stores;
 #[cfg(all(feature = "peer", target_os = "android"))]
 mod multicast;
@@ -7397,6 +7399,60 @@ where
             .into_iter()
             .map(|row| self.config.policy_tables.named_row(row))
             .collect())
+    }
+
+    /// The value of the content column `column` on every row of `table` whose
+    /// record still awaits a verdict, with the record's author, in key order
+    /// (R79 decision 6). Only BLOB values count, since a file id is one.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the replica cannot be read or the build lacks the
+    /// column.
+    #[cfg(feature = "peer")]
+    pub fn provisional_blobs(
+        &mut self,
+        table: &str,
+        column: &str,
+    ) -> Result<Vec<provisional::ProvisionalBlob>, ClientError> {
+        let physical = self.config.policy_tables.stored(table);
+        let backing = backing_of(&self.config.shared_tables, &physical);
+        provisional::provisional_blobs(&mut self.db, backing.schema, &physical, column)
+    }
+
+    /// Whether `requester`, a linked peer, reads a row of `table` whose
+    /// `column` names `value`, judged through the policy views with the
+    /// requester's account, `NULL` subjects and the bot list its certificate
+    /// carries bound for the one statement, and this device's own values
+    /// bound again afterwards (R79 decision 2). A build with no caller
+    /// mapping judges nobody and refuses every requester.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the build lacks the table or the column, or the
+    /// statement fails, which the caller refuses as it refuses a `false`.
+    #[cfg(feature = "peer")]
+    pub fn peer_may_read(
+        &mut self,
+        requester: &peer::PeerAuthor,
+        table: &str,
+        column: &str,
+        value: &[u8],
+    ) -> Result<bool, ClientError> {
+        let Some(caller) = self.config.caller.as_ref() else {
+            return Ok(false);
+        };
+        let now = crate::clock::now_secs(&mut self.db)?;
+        let subjects = self
+            .config
+            .subjects
+            .as_ref()
+            .map(|subjects| (subjects.function.clone(), subjects.rendered(now)));
+        let physical = self.config.policy_tables.stored(table);
+        let backing = backing_of(&self.config.shared_tables, &physical);
+        let bound =
+            peer::AuthorBinding::new(&mut self.db, requester, Some(caller), subjects.as_ref())?;
+        replay::view_shows(bound.db, table, backing.schema, column, value)
     }
 
     /// The keys the pending, un-acknowledged writes hold, each by its

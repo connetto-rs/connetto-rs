@@ -300,6 +300,90 @@ pub(crate) fn rows(db: &mut SqliteConnection) -> Result<Vec<ProvisionalRow>, Cli
     load_all(db)?.into_iter().map(row_of).collect()
 }
 
+/// The value of a declared column on a row whose record still awaits a
+/// verdict, with the record's author (R79 decision 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionalBlob {
+    /// The column's value, a file id for a content column.
+    pub value: Vec<u8>,
+    /// The record's author key id.
+    pub author: Vec<u8>,
+}
+
+/// The BLOB values of `column` on the rows of the physical `table`, stored in
+/// `schema`, whose records are still provisional, in key order. A record whose
+/// row is gone, or whose value is not a BLOB, names nothing.
+pub(crate) fn provisional_blobs(
+    db: &mut SqliteConnection,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> Result<Vec<ProvisionalBlob>, ClientError> {
+    #[derive(diesel::QueryableByName)]
+    struct Cell {
+        #[diesel(sql_type = diesel::sql_types::Binary)]
+        value: Vec<u8>,
+    }
+    if !declares_column(db, table, column)? {
+        return Err(ClientError::Apply(format!(
+            "no such column: {table}.{column}"
+        )));
+    }
+    let records: Vec<Stored> = dsl::_connetto_provisional
+        .filter(dsl::tbl.eq(table))
+        .filter(dsl::state.eq(ProvisionalState::Provisional.db()))
+        .order(dsl::pk.asc())
+        .load(db)?;
+    let mut out = Vec::new();
+    for record in records {
+        let key = decode_key(&record.pk)?;
+        let Some(clause) = key_clause(db, table, &key)? else {
+            continue;
+        };
+        // The table and column are the application's declaration, which the
+        // typed DSL cannot name at runtime.
+        let cell: Option<Cell> = diesel::sql_query(format!(
+            "SELECT {column} AS value FROM {schema}.{table} WHERE {clause} \
+             AND typeof({column}) = 'blob'",
+            column = quote_ident(column),
+            schema = quote_ident(schema),
+            table = quote_ident(table),
+        ))
+        .get_result(db)
+        .optional()?;
+        if let Some(cell) = cell {
+            out.push(ProvisionalBlob {
+                value: cell.value,
+                author: record.author,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Whether the physical `table` declares `column`. A double-quoted name that
+/// matches no column reads as a string literal, so a read checks it first.
+fn declares_column(
+    db: &mut SqliteConnection,
+    table: &str,
+    column: &str,
+) -> Result<bool, ClientError> {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    // A table-valued pragma names its table as an argument, which the typed
+    // DSL cannot express.
+    let count: Count = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM pragma_table_info(?) WHERE name = ? COLLATE NOCASE",
+    )
+    .bind::<diesel::sql_types::Text, _>(table)
+    .bind::<diesel::sql_types::Text, _>(column)
+    .get_result(db)?;
+    Ok(count.n > 0)
+}
+
 /// The record of one key, `None` when the key holds none.
 pub(crate) fn row_of_key(
     db: &mut SqliteConnection,

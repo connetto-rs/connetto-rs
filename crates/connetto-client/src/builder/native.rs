@@ -1603,6 +1603,15 @@ where
             .map_or_else(Vec::new, EnrolHandle::linked_peers)
     }
 
+    /// A port for the peer links' media traffic, the frames a content client
+    /// serves and fetches file chunks with, `None` without a device or while
+    /// another port lives (R79).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn media_port(&self) -> Option<crate::media::MediaPort> {
+        self.device.as_ref().and_then(EnrolHandle::media_port)
+    }
+
     /// The provenance of a peer-applied row, as the client's connection
     /// answers it (R77).
     ///
