@@ -1112,6 +1112,7 @@ async fn the_pump_closes_the_wire_on_an_unanswered_expiry_deadline() {
                 resume_token: "deadline-pump".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: Some(schema().version()),
+                sunset_at_secs: None,
                 initial_credits: 64,
                 writer: Some(WriterGrant {
                     number: 7,

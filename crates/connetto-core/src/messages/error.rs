@@ -145,6 +145,20 @@ pub enum FatalErrorReason {
     /// The number writer the handshake named is no writer of this account
     /// (R75). The client takes a fresh writer as it would for a retired one.
     WriterUnknown,
+    /// This major's configured sunset has been reached, so the server serves
+    /// no new connection of it and closed every live one with the same
+    /// reason (R107). At the sunset the client's major is the server's, so
+    /// the client classifies the close update-required and a retry against
+    /// the same peer changes nothing.
+    Sunset {
+        /// The server's major.
+        server: Major,
+        /// The major the client declared, absent from a client built before
+        /// majors existed.
+        client: Option<Major>,
+        /// When the sunset is enforced, in seconds since the Unix epoch.
+        sunset_at_secs: u64,
+    },
 }
 
 impl FatalErrorReason {
@@ -158,7 +172,7 @@ impl FatalErrorReason {
     pub fn is_build_mismatch(&self) -> bool {
         matches!(
             self,
-            Self::MajorMismatch { .. } | Self::ProtocolVersionMismatch { .. }
+            Self::MajorMismatch { .. } | Self::ProtocolVersionMismatch { .. } | Self::Sunset { .. }
         )
     }
 }
@@ -195,6 +209,14 @@ mod tests {
             FatalErrorReason::ProtocolVersionMismatch {
                 expected: 2,
                 got: 1,
+            }
+            .is_build_mismatch()
+        );
+        assert!(
+            FatalErrorReason::Sunset {
+                server: other,
+                client: Some(other),
+                sunset_at_secs: 1_900_000_000,
             }
             .is_build_mismatch()
         );

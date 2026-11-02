@@ -1153,6 +1153,7 @@ pub struct ServerBuilder<D: ConnettoSchema = ConnettoDefaults> {
     oplog_table: String,
     owner_pool_size: u32,
     slot_lag_watch: Duration,
+    sunset: Option<time::OffsetDateTime>,
     oplog_config: OplogConfig,
     reader_reserve: ReaderReserve,
     throttle: ThrottleConfig,
@@ -1231,6 +1232,7 @@ impl ServerBuilder {
             oplog_table: "connetto_oplog".to_owned(),
             owner_pool_size: 10,
             slot_lag_watch: Duration::from_secs(60),
+            sunset: None,
             oplog_config: OplogConfig::default(),
             reader_reserve: ReaderReserve::new(),
             throttle: ThrottleConfig::default(),
@@ -1278,6 +1280,7 @@ where
             oplog_table,
             owner_pool_size,
             slot_lag_watch,
+            sunset,
             oplog_config,
             reader_reserve,
             throttle,
@@ -1310,6 +1313,7 @@ where
             oplog_table,
             owner_pool_size,
             slot_lag_watch,
+            sunset,
             oplog_config,
             reader_reserve,
             throttle,
@@ -1376,6 +1380,16 @@ where
     #[must_use]
     pub fn slot_lag_watch(mut self, every: Duration) -> Self {
         self.slot_lag_watch = every;
+        self
+    }
+
+    /// Set the application schema major's sunset (R107), the instant a
+    /// handshake is refused with the update-required reason and every live
+    /// connection is closed with it, checked against the deployment's wall
+    /// clock. `None` turns the sunset off.
+    #[must_use]
+    pub fn sunset(mut self, sunset: Option<time::OffsetDateTime>) -> Self {
+        self.sunset = sunset;
         self
     }
 
@@ -1561,6 +1575,7 @@ where
             oplog_table,
             owner_pool_size,
             slot_lag_watch,
+            sunset,
             oplog_config,
             reader_reserve,
             throttle,
@@ -1749,7 +1764,8 @@ where
         .with_session(
             session_config
                 .with_schema_version(Some(write_side.version))
-                .with_schema_major(Some(write_side.major)),
+                .with_schema_major(Some(write_side.major))
+                .with_sunset(sunset),
         )
         .with_upkeep(write_side.upkeep)
         .with_signer(reader.signer)

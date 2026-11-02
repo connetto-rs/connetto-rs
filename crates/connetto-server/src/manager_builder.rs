@@ -22,7 +22,7 @@ use crate::oplog::{InMemoryOplog, Oplog};
 use crate::parity::SecondOpinion;
 use crate::reexec::FailedRead;
 use crate::schema::ConnettoSchema;
-use crate::session::{NoSigner, SessionConfig, SnapshotSource};
+use crate::session::{FailedAuthorization, NoSigner, SessionConfig, SnapshotSource};
 use crate::write_target::PgWriteTarget;
 
 /// Assembles one [`SessionManager`](crate::session::SessionManager).
@@ -239,8 +239,22 @@ where
     }
 
     /// Build the manager.
+    ///
+    /// The extra bounds are the sunset watch's (R107), which spawns on the
+    /// manager's weak handle and so needs the manager shareable across
+    /// threads, and the session close path's, which the watch reaches.
     #[must_use]
-    pub fn build(self) -> Arc<crate::session::ConnettoManager<Snap, Auth, D, C, O, S>> {
+    pub fn build(self) -> Arc<crate::session::ConnettoManager<Snap, Auth, D, C, O, S>>
+    where
+        Snap: 'static,
+        Auth: 'static,
+        Auth::Error: core::fmt::Display + FailedAuthorization,
+        C: 'static,
+        D::Id: core::fmt::Display + Clone + Send + Sync + 'static,
+        O: 'static,
+        S: 'static,
+        crate::session::ConnettoManager<Snap, Auth, D, C, O, S>: Send + Sync,
+    {
         let guard = self
             .guard
             .unwrap_or_else(|| Arc::new(RequestGuard::default()));

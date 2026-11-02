@@ -34,6 +34,12 @@
 //! - `CONNETTO_SLOT_LAG_SECS` (default `60`, `0` turning the watch off): how
 //!   far behind the owner's timeline the slot may run before one warning
 //!   fires.
+//! - `CONNETTO_SUNSET` (unset): the application schema major's sunset (R107),
+//!   an RFC 3339 instant in UTC. The server sends it on every handshake
+//!   acknowledgement, and at the instant it refuses every new handshake and
+//!   closes every live connection with the update-required reason. Refused
+//!   at boot when the value is not an RFC 3339 instant in UTC at or after
+//!   the Unix epoch, naming it.
 //! - `CONNETTO_AUTH`: the login machinery. Only `database` is served, which
 //!   stores sessions and provider tokens in Postgres and signs users in
 //!   through the identity providers below.
@@ -161,6 +167,32 @@ fn comma_list(text: &str) -> Vec<String> {
         .filter(|entry| !entry.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+/// The instant one RFC 3339 value of UTC names (R107), the major's sunset.
+///
+/// Refused, naming the value, when it is not an RFC 3339 instant, when its
+/// offset is not UTC, or when it falls before the Unix epoch, since the wire
+/// carries the sunset as seconds and a pre-epoch instant has no such seconds.
+fn parse_sunset(text: &str) -> Result<time::OffsetDateTime> {
+    let instant = time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+        .map_err(|err| anyhow!("CONNETTO_SUNSET {text:?} is not an RFC 3339 instant: {err}"))?;
+    if instant.offset() != time::UtcOffset::UTC {
+        return Err(anyhow!("CONNETTO_SUNSET {text:?} is not in UTC"));
+    }
+    if instant < time::OffsetDateTime::UNIX_EPOCH {
+        return Err(anyhow!(
+            "CONNETTO_SUNSET {text:?} falls before the Unix epoch"
+        ));
+    }
+    Ok(instant)
+}
+
+/// `CONNETTO_SUNSET` as the major's sunset, or none when unset (R107).
+fn sunset_from_env() -> Result<Option<time::OffsetDateTime>> {
+    var_nonempty("CONNETTO_SUNSET")
+        .map(|value| parse_sunset(&value))
+        .transpose()
 }
 
 /// Whether `key` asks for the database-backed table it names.
@@ -523,6 +555,7 @@ async fn builder_from_env() -> Result<ServerBuilder> {
     let keys = jwt_keys()?;
     let content = content_settings().await?;
     let device_identity = device_certs()?;
+    let sunset = sunset_from_env()?;
     let openfga = OpenFga::new(
         var_or("CONNETTO_FGA_URL", "http://127.0.0.1:8081"),
         std::env::var("CONNETTO_FGA_STORE").map_err(|_| {
@@ -546,7 +579,8 @@ async fn builder_from_env() -> Result<ServerBuilder> {
         .cookie_same_site(cookie_same_site()?)
         .writable(writable_catalog())
         .content(content)
-        .device_identity(device_identity))
+        .device_identity(device_identity)
+        .sunset(sunset))
 }
 
 /// Resolve on the first SIGINT or SIGTERM. On a platform without SIGTERM only
@@ -604,6 +638,58 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sunset_parser_reads_an_rfc3339_utc_instant() {
+        let instant = parse_sunset("2027-02-03T04:05:06Z").expect("the instant is valid");
+        assert_eq!(
+            instant,
+            time::OffsetDateTime::parse(
+                "2027-02-03T04:05:06Z",
+                &time::format_description::well_known::Rfc3339,
+            )
+            .expect("the reference parse"),
+            "the typed instant comes through"
+        );
+        assert_eq!(
+            instant.unix_timestamp(),
+            1_801_627_506,
+            "the instant is the seconds the wire will carry"
+        );
+    }
+
+    #[test]
+    fn the_sunset_parser_refuses_a_non_utc_offset() {
+        let err = parse_sunset("2027-02-03T04:05:06+02:00")
+            .expect_err("an offset is not UTC")
+            .to_string();
+        assert!(
+            err.contains("2027-02-03T04:05:06+02:00"),
+            "the refusal names the value, got {err}"
+        );
+    }
+
+    #[test]
+    fn the_sunset_parser_refuses_malformed_text() {
+        let err = parse_sunset("next tuesday")
+            .expect_err("not an instant")
+            .to_string();
+        assert!(
+            err.contains("next tuesday"),
+            "the refusal names the value, got {err}"
+        );
+    }
+
+    #[test]
+    fn the_sunset_parser_refuses_an_instant_before_the_epoch() {
+        let err = parse_sunset("1969-12-31T23:59:59Z")
+            .expect_err("pre-epoch cannot ride the wire")
+            .to_string();
+        assert!(
+            err.contains("1969-12-31T23:59:59Z"),
+            "the refusal names the value, got {err}"
+        );
+    }
 
     #[test]
     fn comma_lists_trim_and_drop_empties() {

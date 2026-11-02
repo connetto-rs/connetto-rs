@@ -4157,9 +4157,9 @@ impl SnapshotSource for StatusSnapshot {
 /// once the log is durable.
 ///
 /// The socket is left to the caller: `Oplog`'s methods are plain `async fn`, so
-/// a generic `O` carries no `Send` guarantee and the spawn has to happen where
-/// the type is concrete.
-fn status_manager<O: Oplog>(
+/// the spawn has to happen where the type is concrete. The `Send + Sync + 'static`
+/// bounds are what the builder's sunset watch (R107) needs of the manager it spawns.
+fn status_manager<O: Oplog + core::marker::Send + core::marker::Sync + 'static>(
     fixture: &Fixture,
     status: &'static str,
     oplog: O,

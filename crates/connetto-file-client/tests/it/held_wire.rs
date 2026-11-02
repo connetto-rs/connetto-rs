@@ -101,6 +101,7 @@ fn drain_server(
                 resume_token: "old".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: Some(version),
+                sunset_at_secs: None,
                 initial_credits: 64,
                 writer: None,
             }))
@@ -473,6 +474,7 @@ async fn attach_held(conn: &mut ConnettoConnection<LoopbackTransport>) -> Loopba
                 resume_token: "held-key-fence".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: Some(schema(1).version()),
+                sunset_at_secs: None,
                 initial_credits: 64,
                 writer: None,
             }))

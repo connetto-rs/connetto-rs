@@ -35,6 +35,7 @@ fn aggregate_pusher(update: AggregateUpdate) -> LoopbackTransport {
                 resume_token: "agg".to_owned(),
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: None,
+                sunset_at_secs: None,
                 initial_credits: 64,
                 writer: Some(connetto_core::messages::WriterGrant {
                     number: 1,

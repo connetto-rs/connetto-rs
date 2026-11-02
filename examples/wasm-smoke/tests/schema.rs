@@ -44,6 +44,7 @@ async fn schema_upstream(mut server: LoopbackTransport, server_version: SchemaVe
             resume_token: String::new(),
             current_cursor: Cursor::new(Vec::new()),
             schema_version: Some(server_version),
+            sunset_at_secs: None,
             initial_credits: 64,
             writer: Some(WriterGrant {
                 number: 1,

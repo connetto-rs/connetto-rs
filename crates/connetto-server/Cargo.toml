@@ -142,7 +142,9 @@ connetto-file-server = { path = "../connetto-file-server", optional = true }
 # The file identity and manifest types a download reads files through (R61).
 connetto-file-core = { path = "../connetto-file-core", optional = true }
 axum-extra = { version = "0.12.6", default-features = false, features = ["cookie"] }
-time = { version = "0.3.55", default-features = false }
+# `std` gives the sunset watch its `now_utc` wall reading, and `parsing` the
+# binary's boot validation of `CONNETTO_SUNSET` (R107).
+time = { version = "0.3.55", default-features = false, features = ["std", "parsing"] }
 # Device attestation (R74 step 4): x509-parser verifies the Android chain's
 # signatures and Apple's `x5c`, reqwest fetches Google's status list, pem
 # reads the bundled attestation roots, ciborium decodes the App Attest

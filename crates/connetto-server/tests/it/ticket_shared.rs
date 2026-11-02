@@ -384,7 +384,9 @@ pub(crate) type TicketManager<S> = SessionManager<
 ///
 /// The name is set once, on the write target that owns it, so nothing here can
 /// paper over a second field disagreeing with it.
-pub(crate) fn build_manager_named_setting<S: ContentTicketSigner>(
+pub(crate) fn build_manager_named_setting<
+    S: ContentTicketSigner + core::marker::Send + core::marker::Sync + 'static,
+>(
     reader_pool: Pool<AsyncPgConnection>,
     roster: RosterAuth,
     guard: Arc<RequestGuard<String>>,
@@ -409,7 +411,9 @@ pub(crate) fn build_manager_named_setting<S: ContentTicketSigner>(
 }
 
 /// Build a session manager whose guard the caller chooses.
-pub(crate) fn build_manager_with_guard<S: ContentTicketSigner>(
+pub(crate) fn build_manager_with_guard<
+    S: ContentTicketSigner + core::marker::Send + core::marker::Sync + 'static,
+>(
     reader_pool: Pool<AsyncPgConnection>,
     roster: RosterAuth,
     guard: Arc<RequestGuard<String>>,
@@ -419,7 +423,9 @@ pub(crate) fn build_manager_with_guard<S: ContentTicketSigner>(
 }
 
 /// Build a session manager whose guard carries `throttle`, with the default oplog.
-pub(crate) fn build_standard_manager<S: ContentTicketSigner>(
+pub(crate) fn build_standard_manager<
+    S: ContentTicketSigner + core::marker::Send + core::marker::Sync + 'static,
+>(
     reader_pool: Pool<AsyncPgConnection>,
     roster: RosterAuth,
     signer: S,
