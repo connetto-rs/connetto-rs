@@ -103,6 +103,20 @@ async fn a_lost_outboard_object_is_computed_again_and_kept() {
 }
 
 #[tokio::test]
+async fn an_outboard_object_that_does_not_decrypt_is_computed_again() {
+    let dir = tempdir().expect("temp dir");
+    let chunks = dir.path().join("chunks");
+    let (_client, content) = offline_content(dir.path()).await;
+    let bytes = pseudorandom(17, 40 * 1024);
+    let file_id = stage_photo(&content, 1, &bytes, MimeClass::Generic).await;
+    let expected = pairs_of(&bytes);
+    std::fs::write(object_path(&chunks, &expected), vec![0u8; 200])
+        .expect("damage the outboard object");
+
+    assert_eq!(outboard_pairs(&content, file_id).await, expected);
+}
+
+#[tokio::test]
 async fn a_file_not_held_has_no_outboard() {
     let dir = tempdir().expect("temp dir");
     let (_client, content) = offline_content(dir.path()).await;

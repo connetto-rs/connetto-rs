@@ -6,9 +6,11 @@
 use bao_tree::BlockSize;
 use bao_tree::io::outboard::PostOrderMemOutboard;
 use connetto_file_core::{
-    ChunkHash, ChunkStore, EncryptingStore, FileId, MemStore, MimeClass, OutboardBuilder,
-    RangeError, decode_range, encode_range, outboard_of, process_file_with_outboard,
+    ChunkHash, ChunkStore, EncryptingStore, FileId, Manifest, MemStore, MimeClass, Outboard,
+    OutboardBuilder, RangeError, decode_range, encode_range, outboard_of,
+    process_file_with_outboard,
 };
+use iroh_io::AsyncStreamWriter;
 use proptest::prelude::*;
 
 fn rt() -> tokio::runtime::Runtime {
@@ -107,6 +109,146 @@ fn staging_outboard_is_the_one_the_stored_chunks_give() {
     assert_eq!(staged.file_id(), manifest.file_id());
     let computed = rt().block_on(outboard_of(&manifest, &store)).unwrap();
     assert_eq!(computed, staged);
+}
+
+/// A stored file of several chunks, its manifest and its outboard.
+fn several_chunks(seed: u32) -> (Vec<u8>, MemStore, Manifest, Outboard) {
+    let data = xorshift_bytes(seed, 5 * 1024 * 1024);
+    let store = MemStore::new();
+    let (manifest, outboard) = rt()
+        .block_on(process_file_with_outboard(
+            data.as_slice(),
+            MimeClass::Generic,
+            &store,
+        ))
+        .unwrap();
+    assert!(
+        manifest.chunks().len() > 1,
+        "the file must span several chunks"
+    );
+    (data, store, manifest, outboard)
+}
+
+#[test]
+fn ranges_across_chunk_boundaries_decode() {
+    let (data, store, manifest, outboard) = several_chunks(23);
+    let first = manifest.chunks()[0].len;
+    for (start, len) in [(0, len_of(&data)), (first - 1000, 5000), (first, 1)] {
+        let mut encoded = Vec::new();
+        rt().block_on(encode_range(
+            &manifest,
+            &store,
+            &outboard,
+            start,
+            len,
+            &mut encoded,
+        ))
+        .unwrap();
+        let decoded = rt()
+            .block_on(decode_range(
+                manifest.file_id(),
+                len_of(&data),
+                start,
+                len,
+                encoded.as_slice(),
+            ))
+            .unwrap();
+        let from = usize::try_from(start).unwrap();
+        assert_eq!(decoded.as_slice(), &data[from..from + decoded.len()]);
+        assert_eq!(len_of(&decoded), len);
+    }
+}
+
+#[test]
+fn a_missing_chunk_is_a_store_error_on_both_reads() {
+    let (_, store, manifest, outboard) = several_chunks(29);
+    rt().block_on(store.delete_chunk(&manifest.chunks()[1].hash))
+        .unwrap();
+    let mut encoded = Vec::new();
+    let served = rt().block_on(encode_range(
+        &manifest,
+        &store,
+        &outboard,
+        0,
+        outboard.size(),
+        &mut encoded,
+    ));
+    assert!(matches!(served, Err(RangeError::Store(_))), "{served:?}");
+    assert!(matches!(
+        rt().block_on(outboard_of(&manifest, &store)),
+        Err(RangeError::Store(_))
+    ));
+}
+
+#[test]
+fn a_stored_chunk_of_another_length_is_a_mismatch() {
+    let (data, store, manifest, outboard) = several_chunks(31);
+    let hash = manifest.chunks()[0].hash;
+    rt().block_on(store.write_chunk(&hash, &data[..100]))
+        .unwrap();
+    let mut encoded = Vec::new();
+    let served = rt().block_on(encode_range(
+        &manifest,
+        &store,
+        &outboard,
+        0,
+        10,
+        &mut encoded,
+    ));
+    assert!(matches!(served, Err(RangeError::Mismatch)), "{served:?}");
+}
+
+#[test]
+fn another_files_outboard_is_a_mismatch() {
+    let (_, store, manifest, _) = several_chunks(37);
+    let (_, _, _, other) = several_chunks(41);
+    let mut encoded = Vec::new();
+    let served = rt().block_on(encode_range(&manifest, &store, &other, 0, 10, &mut encoded));
+    assert!(matches!(served, Err(RangeError::Mismatch)), "{served:?}");
+}
+
+#[test]
+fn stored_pairs_rebuild_an_outboard_only_at_the_files_length() {
+    let (_, _, manifest, outboard) = several_chunks(43);
+    let size = outboard.size();
+    let pairs = outboard.clone().into_pairs();
+    assert_eq!(
+        Outboard::new(manifest.file_id(), size, pairs.clone()),
+        Some(outboard)
+    );
+    let mut longer = pairs;
+    longer.extend_from_slice(&[0; 64]);
+    assert_eq!(Outboard::new(manifest.file_id(), size, longer), None);
+}
+
+/// A sink that refuses every write, as a link that went away.
+struct Refusing;
+
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the trait methods are async and the refusal needs no await"
+)]
+impl AsyncStreamWriter for Refusing {
+    async fn write(&mut self, _data: &[u8]) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    async fn write_bytes(&mut self, _data: bytes::Bytes) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    async fn sync(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_refusing_sink_is_a_write_error() {
+    let (_, store, manifest, outboard) = several_chunks(47);
+    let served = rt().block_on(encode_range(
+        &manifest, &store, &outboard, 0, 70_000, Refusing,
+    ));
+    assert!(matches!(served, Err(RangeError::Write(_))), "{served:?}");
 }
 
 #[test]
