@@ -128,7 +128,7 @@
       <text x="230" y="118" text-anchor="middle" font-size="8.5" fill="#555">seam: ChunkInventory, for the stores that can list what they hold</text>
       <text x="230" y="134" text-anchor="middle" font-size="8.5" fill="#555">a manifest is the ordered (hash, length) list, transport metadata only</text>
       <text x="230" y="150" text-anchor="middle" font-size="8.5" fill="#555">the same bytes chunk and hash identically on native and wasm</text>
-      <text x="230" y="164" text-anchor="middle" font-size="8.5" fill="#4CAF50">the file core, R64. <tspan fill="#C62828">R79: BLAKE3 outboards, verified range streaming</tspan></text>
+      <text x="230" y="164" text-anchor="middle" font-size="8.5" fill="#4CAF50">the file core, R64. BLAKE3 outboards and verified ranges, R79</text>
     </g>
 
     <!-- ===== sql-traits ===== -->
@@ -498,9 +498,9 @@
       <text x="150" y="34" text-anchor="middle" font-size="8.5" fill="#4CAF50">R74: chip key, certificates, attestation under PEN 67105</text>
       <text x="150" y="49" text-anchor="middle" font-size="8.5" fill="#4CAF50">R76 slices 1 to 9c: the link, mDNS, hotspots, beacon</text>
       <text x="150" y="63" text-anchor="middle" font-size="8.5" fill="#4CAF50">Android, iPhone, Linux host, the iPad and Mac join</text>
-      <text x="150" y="77" text-anchor="middle" font-size="8.5" fill="#4CAF50">R75: one applied frontier per writer, R77 slices 1 to 5</text>
+      <text x="150" y="77" text-anchor="middle" font-size="8.5" fill="#4CAF50">R75 frontiers, R77 slices 1 to 5, R79 media frames and port</text>
       <text x="150" y="91" text-anchor="middle" font-size="8.5" fill="#C62828">R76 slices 9d and 9e, R74's Windows record</text>
-      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#C62828">R77 slices 6 to 8, R78, R79, R80 (chapter 19)</text>
+      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#C62828">R77 slices 6 to 8, R78, R79 slices 4 to 8, R80 (chapter 19)</text>
     </g>
   </g>
 
