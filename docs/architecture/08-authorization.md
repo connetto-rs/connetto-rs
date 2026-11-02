@@ -174,7 +174,7 @@ File metadata is authorized as an ordinary row on the files table, by the same p
 
 The content path binds the caller the same way the data path does, at four places. The ticket mint, where the session checks the file's visibility on the reader pool before it mints anything, and the file server's serve recheck, its needed-hashes answer and its commit dedup check. In each, the caller is bound under the names the deployment's policies read, by [`connetto_file_server::CallerSettings`] and `bind_caller` in [caller.rs](../../crates/connetto-file-server/src/caller.rs), so a caller whose rights come from a share key is answered on its keys and a caller with a login on its login. The ticket carries the caller, so the checks after the mint run on what the ticket says rather than on what the connection says. The ticket model itself is in [18-file-handling.md](18-file-handling.md#the-wire-tickets-and-the-mint).
 
-A ticket outlives the session that minted it for its own lifetime, so a revoked or ended session can still use one until it expires, and the ticket's lifetime is what bounds that. [G5](../../plans/master-implementation-plan.md#g5).
+Every fetch rechecks the file's visibility to the ticket's caller, so a revoked share or grant denies at once. A ticket does outlive the session that minted it, so a revoked or ended session can still read through one until it expires, [G5](../../plans/master-implementation-plan.md#g5). Binding the ticket to its session is planned in [R109](../../plans/master-implementation-plan.md#r109-content-tickets-bound-to-their-session).
 
 ## When the authorization service is unreachable
 

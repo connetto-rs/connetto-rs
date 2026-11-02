@@ -58,9 +58,12 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | [R77](#r77-the-exchange-and-the-provisional-tier) | in progress |  | Slices 7 (online adjudication) and 8 (the handheld proof) remain, the rest of the exchange and the provisional tier is merged |  | [#296](https://github.com/connetto-rs/connetto-rs/pull/296), [#297](https://github.com/connetto-rs/connetto-rs/pull/297), [#300](https://github.com/connetto-rs/connetto-rs/pull/300), [#304](https://github.com/connetto-rs/connetto-rs/pull/304), [#310](https://github.com/connetto-rs/connetto-rs/pull/310), [#342](https://github.com/connetto-rs/connetto-rs/pull/342), [#344](https://github.com/connetto-rs/connetto-rs/pull/344), [#348](https://github.com/connetto-rs/connetto-rs/pull/348), [#351](https://github.com/connetto-rs/connetto-rs/pull/351), [#354](https://github.com/connetto-rs/connetto-rs/pull/354), [#357](https://github.com/connetto-rs/connetto-rs/pull/357), [#365](https://github.com/connetto-rs/connetto-rs/pull/365) |
 | [R78](#r78-courier-recovery) | not started | R77 | The server courier path under the five constraints, deployment-opt-in and default off, and the client's explicit offer of another author's held changesets |  |  |
 | [R79](#r79-media-over-the-peer-link) | not started | R77 | Pull-on-demand by chunk hash over the peer link, the receiver's verification and re-encryption, the peer-fetched spare clause, the thumbnail prefetch and the opt-in replication |  |  |
-| [R80](#r80-peer-sync-in-every-demo) | not started | R76 (slice 9d), [G15](#g15), R77, R78, R79 | The camp flow in every native-capable demo on every native platform, the iOS zero-coverage field test, and the grown phone and home runs |  |  |
+| [R80](#r80-peer-sync-in-every-demo) | not started | R76 (slice 9d), R77, R78, R79 | The camp flow in every native-capable demo on every native platform, the iOS zero-coverage field test, and the grown phone and home runs |  |  |
 | [R107](#r107-schema-changes-under-running-servers) | not started | subql passing pgoutput `Relation` messages to consumers (slice 2) | The expand and contract procedure with the sunset, the table refusal when a running server notices a change, and the two-model boot check |  |  |
 | [R108](#r108-caller-kinds-as-database-roles) | not started | sql-traits answering the caller contract, privileges and effective policies for both translators, for slices 2 to 5. R99, for the bot kinds | Caller kinds as database roles, every startup refusal before OpenFGA, four flat kind roles switched per transaction, grants per kind, and a client copy per kind |  |  |
+| [R109](#r109-content-tickets-bound-to-their-session) | not started |  | Content tickets carry their session, and every fetch confirms the session is live, so a ticket dies with the session that minted it |  |  |
+| [R110](#r110-a-session-bound-by-provider-staleness) | not started |  | Session lifetime bounded by the time since the identity provider last confirmed the user, replacing the fixed idle window and ceiling |  |  |
+| [R111](#r111-a-durable-replica-where-opfs-is-refused) | blocked | the JSPI IndexedDB VFS upstream in `sqlite-wasm-rs` | A durable browser replica on IndexedDB through JSPI where OPFS is refused, memory kept only where JSPI is missing |  |  |
 | [R21](#r21-one-page-codec-on-both-backends) | blocked | where `sqlcipher-src` and `sqlite3mc-src` live and who maintains them, in [rusqlite discussion #1908](https://github.com/rusqlite/rusqlite/discussions/1908) | One SQLite3MC codec on the native and browser backends, so the cipher pin stops being load-bearing |  |  |
 | R0 | done | | The always-on change-path counters in `counters.rs` and the `fanout_load` harness that priced the dispatch loop, with the ceiling measured as one sequential visibility round trip per subscriber per event and the lock wait at zero | [fanout_counters.rs](../crates/connetto-test-harness/tests/it/fanout_counters.rs), [fanout_load.rs](../crates/connetto-test-harness/tests/it/fanout_load.rs) | |
 | R1 | done | | The three permissive stand-ins reachable from configuration alone are gone, and the reference binary refuses to start without a reader role and a recognised `CONNETTO_OIDC_PROVIDER` | [e2e.rs](../crates/connetto-server/tests/it/e2e.rs) | |
@@ -114,7 +117,7 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | R50 | done | | The row-level-security policy answers the write question from the database. `RlsAuth::may_write` asks the two verbs a share can certify through a locking read, refuses the delete verb where the schema writes a separate rule, and maps a failed question to `ShareError::WriteUndecidable` | [rls_write_question.rs](../crates/connetto-server/tests/it/rls_write_question.rs) | |
 | R51 | done | | The native Apple gate on the two keychain items, gated through `AccessPolicy::RequireUserPresence` behind one shared `LAContext` unlock per launch, macOS joins the protected store under the provisioned app, and custody reports `Verified` | [gate_recheck.rs](../crates/connetto-client/tests/it/gate_recheck.rs), [connetto-ios-proof.rs](../crates/connetto-test-harness/src/bin/connetto-ios-proof.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
 | R52 | done | | The native Android gate through the unlock-once store option. One approval opens the store until connetto locks it, the `BiometricPrompt` waits for the app's window focus, and a lost store key wipes and resyncs | [gate_recheck.rs](../crates/connetto-client/tests/it/gate_recheck.rs), [connetto-android-proof.rs](../crates/connetto-test-harness/src/bin/connetto-android-proof.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
-| R53 | done | | The Windows gate through the `HelloStore`, sealing each secret under a key derived from a Windows Hello passkey PRF. One approval unlocks each launch, and the fingerprint-change survival stays unmeasured as G16 | [gate.rs](../crates/connetto-client/src/keyring/gate.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
+| R53 | done | | The Windows gate through the `HelloStore`, sealing each secret under a key derived from a Windows Hello passkey PRF. One approval unlocks each launch, and whether the credential survives a fingerprint re-enrolment is measured in R76 slice 9d | [gate.rs](../crates/connetto-client/src/keyring/gate.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
 | R54 | done | | Every demo carries every application-visible feature. The multi-account picker and switch, the passkey gate with its custody display, the session expiry warning, the over-limit signal, the several-provider `CONNETTO_OIDC_PROVIDERS` environment, and the parity fills | [browser_auth.rs](../examples/wasm-smoke/tests/browser_auth.rs) | |
 | R55 | done | | Containerised test services and the CI that runs them. `testcontainers` behind the service-backed suites, `connetto-browser-stack` driving the browser gates, the `ci.yml` workflow as the gate, and `docs/devstack-local.md` deleted | [ci.yml](../.github/workflows/ci.yml) | |
 | R56 | done |  | A device import that restores the device-private tier and the unsent writes from the archive, on the changeset format R26's plain databases gave way to | [local_import.rs](../crates/connetto-client/tests/it/local_import.rs), [apply_behaviour.rs](../crates/connetto-client/tests/it/apply_behaviour.rs), [local_import.rs](../crates/connetto-web/tests/local_import.rs) |  |
@@ -164,25 +167,37 @@ Defects and unowned risks with no phase yet. Each states what the code does and 
 
 **Handshake liveness ignores the idle deadline.** `session_is_live` checks only `revoked` and the absolute deadline, in [`InMemoryAuthStore`](../crates/connetto-server/src/authn/store.rs) and in `live_session` in [schema.rs](../crates/connetto-server/src/authn/schema.rs), while the refresh path checks both. A session past its idle window passes the handshake until its access token expires.
 
+Fixed in one pull request with [G2](#g2), by checking the idle deadline in both stores, proven by a session past its idle window refused at the handshake.
+
 ### G2
 
 **The refresh lock map is never pruned.** `AuthService::refresh_locks` in [service.rs](../crates/connetto-server/src/authn/service.rs) gains an entry per session that ever refreshed and keeps it for the life of the process.
+
+Fixed with [G1](#g1), by holding the locks weakly and pruning dead entries on insert.
 
 ### G3
 
 **Browser tabs do not receive membership rows.** The relay in [relay.rs](../crates/connetto-web/src/relay.rs) neither forwards `MembershipOpened` nor opens tab-level membership subscriptions, so a tab reading through a membership-shaped policy sees empty results.
 
+Fixed in one pull request in `relay.rs`. The hub forwards `MembershipOpened`, mirrors membership tables into tab snapshots, live routing and resync, proven by a tab reading the demo's membership-shaped `team_notes_p` policy.
+
 ### G4
 
 **Without OPFS the web client runs on an in-memory replica.** `ReplicaStorage::install` in [storage.rs](../crates/connetto-web/src/storage.rs) falls back to a memory VFS, so queued writes and the replica are lost on reload and nothing tells the user.
 
+Decided. The client keeps the in-memory replica where OPFS is refused and reports the replica's persistence in its boot report, so the application can warn that a reload loses unsent writes, in one pull request. A durable fallback is [R111](#r111-a-durable-replica-where-opfs-is-refused).
+
 ### G5
 
-**A content ticket outlives the session that minted it.** Tickets expire after `CONNETTO_CONTENT_TICKET_TTL_SECS` (default 3600 s), so after logout or a wipe a cached ticket keeps reading content for up to that long plus the server skew.
+**A content ticket outlives the session that minted it.** Every fetch rechecks the file's visibility to the ticket's caller (`file_visible_to_caller` in [serve.rs](../crates/connetto-file-server/src/serve.rs)), so a revoked share, a revoked grant or an erased row denies at once. What outlives the session is the caller's identity. After a logout or a revoked session, a cached ticket keeps reading the files that identity can still see until its expiry, `CONNETTO_CONTENT_TICKET_TTL_SECS` (default 3600 s) plus the server skew.
+
+Taken by [R109](#r109-content-tickets-bound-to-their-session).
 
 ### G6
 
 **Session lifetime does not follow the provider.** `RefreshLifetimes` runs a 336 h idle window, extended by connetto's own refresh, under a 2160 h absolute ceiling. A user deactivated at the provider keeps a session until one of those lapses, and a continuously active user is signed out at the ceiling.
+
+Taken by [R110](#r110-a-session-bound-by-provider-staleness).
 
 ### G7
 
@@ -200,41 +215,43 @@ Taken by [R108](#r108-caller-kinds-as-database-roles), which has both translator
 
 **The oplog has no byte bound.** `OplogConfig` bounds entries (1M) and age (72 h). Each entry stores the compressed patch, so wide rows reach gigabytes before either bound prunes, on the heap for `InMemoryOplog`.
 
+Decided. The byte bound ships ahead of the rest of the shared-frame design, in one pull request, with a default budget of 1 GiB and pruning that logs which bound fired.
+
 ### G10
 
 **Session send queues are unbounded.** A session's `pending` queue and its outbound channel in [session.rs](../crates/connetto-server/src/session.rs) have no length check, so a client that stops granting credits makes the server buffer every patch for it.
+
+Decided. A per-session byte budget over `pending` and the outbound channel, in one pull request independent of the shared-frame design. Overflow closes the connection with a fatal reason, and the client resumes through oplog catchup.
 
 ### G11
 
 **Over-restriction notes reach no operator.** At the pinned `rls2fga`, a policy translated to no access, a self-referential read policy for one, hides every row without a diverging note, and connetto surfaces no other note. Postgres answers such a policy with `42P17` and `pg2sqlite` refuses it, so a deployment carrying one fails boot on the replica side today.
 
+Taken by [R108](#r108-caller-kinds-as-database-roles) for connetto's half, whose first slice refuses before OpenFGA and reports the translators' notes. A diverging note from `rls2fga` for a policy translated to no access is an upstream request.
+
 ### G12
 
 **Snapshot priority is not scheduled.** `SubscriptionPriority` travels on the wire and the server delivers snapshots in arrival order.
 
-### G13
-
-**A mutation settles whole.** The server returns one outcome per `client_seq`, so one failing operation fails the whole patchset and the client rolls back all of it. Per-operation results do not exist.
+Decided. `SubscriptionPriority` leaves the wire with a `PROTOCOL_VERSION` bump, in one pull request.
 
 ### G14
 
 **The local gate and CI run different clippy.** The gate prescribes `+nightly`, the CI Check job runs `+stable`, so a nightly-only lint can land on `main` with CI green.
 
-### G15
-
-**R80 waits on a parked slice.** R80's acceptance needs every native platform, and Windows needs R76 slice 9d, which is parked with no owner. R80's blocked-on list does not name it.
-
-### G16
-
-**Windows Hello credential survival is unmeasured.** Whether a Hello PRF credential survives a fingerprint re-enrolment is unknown, and the only Windows machine available is lent.
+Fixed in one pull request, by a CI leg running the gate's clippy on a pinned dated nightly.
 
 ### G17
 
 **A snapshot source's cursor contract is unverified.** The resume cursor is opaque to the client, so the client cannot compare two of them, and a stale but non-empty snapshot cursor would regress the resume point. The Postgres source returns the watermark of the commit its read sat at, which is `page_cursor` in [snapshot.rs](../crates/connetto-server/src/snapshot.rs), so production is safe, but no test pins that contract across sources. A regressed cursor widens the catchup or forces a resync.
 
+Fixed in one pull request, by stating the rule on `SnapshotSource::snapshot_page` and a non-regression test of the watermark in `pg_async.rs`.
+
 ### G18
 
-**The browser hub's upstream reconnect is tested only indirectly.** The hub's resume and re-subscribe path, `hub_recover` in [relay.rs](../crates/connetto-web/src/relay.rs), is the machinery the native suites pin, and no browser suite drives it, because that would mean killing the shared demo server mid-run.
+**The browser hub's upstream reconnect is never tested against a real server.** The fake-transport browser suites drive `hub_recover` in [relay.rs](../crates/connetto-web/src/relay.rs) through attach refusal, terminal close, rate limiting, resubscription and resync fan-out. No suite drives it across a real server restart, because the shared demo stack cannot be killed mid-run.
+
+Fixed in one pull request, by a browser CI shard with its own restartable stack and a suite that restarts the server mid-run.
 
 ## Upstream dependencies
 
@@ -342,18 +359,6 @@ It does not foreclose the zero-copy send. `bytes::Bytes::from_owner` accepts any
 | `OplogConfig` gains a byte bound, and pruning names the bound that fired | `oplog.rs` |
 
 Nothing goes upstream. The frame split is a breaking framing change, and `PROTOCOL_VERSION` (currently 2, `crates/connetto-core/src/version.rs`) bumps on breaking changes to `ControlMessage`, `BulkMessage`, framing or compression, so the new wire takes a version bump rather than riding on a frozen one.
-
-## A session staleness bound
-
-The decided replacement for the session lifetime [G6](#g6) describes.
-
-The recommended default bounds staleness. The clock measures the time since the identity provider last confirmed the user, and it resets on every successful provider refresh. It does not measure how old the session is. A continuously connected user therefore never reaches it, for months or for years, and a user the provider has deactivated is cut off at their next reconnect, sooner than any fixed deadline would manage.
-
-What counts as a check, and what a failure means. A successful provider refresh resets the clock. A failure does not end the session and does not touch local data. It means the provider's answer is unknown, and the clock simply keeps running until the bound is reached, at which point an interactive login is required. That login is where the answer becomes unambiguous, because a genuinely removed user fails it and everyone else succeeds and resets the clock. This is forced by the protocol rather than chosen. RFC 6749 defines a single `invalid_grant` code covering a token that is "invalid, expired, revoked, does not match the redirection URI... or was issued to another client", and Google documents its own causes as including a password change, six months of disuse, and exceeding a cap on live tokens. Most are benign, none are distinguishable from the error, so no destructive action may depend on that signal.
-
-Long-lived access is always requested, so the check always exists. Without a retained provider refresh token there is no probe, and the staleness bound silently degenerates into the session-age ceiling it replaced. connetto therefore requests offline access at login even when the application never calls provider APIs, and treats the probe as part of the session mechanism rather than a side effect of whatever scopes were configured. The cost is not uniform. Microsoft lists `offline_access` among the scopes a user consents to, while Google grants the refresh token through a request parameter with no separate consent line.
-
-A failed provider refresh means unknown, never revoked. It ends nothing and destroys nothing, it only stops resetting the clock, because `invalid_grant` cannot distinguish revocation from a password change or six months of disuse. The interactive login at the bound is where the answer becomes unambiguous.
 
 # Phases
 
@@ -973,7 +978,7 @@ Slices 1 to 8 each merged as one pull request and proved as stated below, and sl
      1. The Windows check job of decision 41 and the btleplug central widened to Windows, so the joiner's Bluetooth half builds and is checked from the start.
      2. `connetto-peer-windows` with hosting and joining (decisions 36 and 38) and `WindowsHotspotBackend`, every table row under a fake of the crate's I/O trait.
      3. The beacon and exchange through `GattServiceProvider` (decision 37) and the readiness through `Windows.Devices.Radios`, as `WindowsBluetoothBackend` under a fake.
-     4. The Windows proof leg of decision 40 and its six-join run against a phone, which also records R74 proof 5's Windows `unproven` record, once decision 40's machine is at hand.
+     4. The Windows proof leg of decision 40 and its six-join run against a phone, which also records R74 proof 5's Windows `unproven` record, once decision 40's machine is at hand. The same machine measures whether a Windows Hello PRF credential survives a fingerprint re-enrolment, which R53 left unmeasured because its only Windows machine was lent. A credential that does not survive takes the bounded wipe and resync of `start_over` in [windows.rs](../crates/connetto-client/src/keyring/windows.rs).
    - 9e. **The recorded home run**, parked, across every local machine as decision 4's mesh, one round per machine that can host, every other machine joining and every pair linked.
    - 9f. **The handheld star**, the iPhone, the iPad and an Android phone, taken before 9d and 9e, since a field group carries handhelds and these three are the first that must work together offline. Two rounds, the Android phone hosting while the iPhone and the iPad join, then the iPhone hosting while the Android phone and the iPad join, and in each round every device links to every other over the one hotspot. One runner on the Mac drives the iPhone and the iPad through the XCUITest tapper and the Android phone, cabled to the Mac, through adb. It proves what no earlier slice has, an Apple device joining Android's local-only hotspot, an Android joiner reading the iPhone's UUID-only beacon (decision 25), and two joiners on one host at once, and R77 then carries data over this star first. An Android phone under a VPN it cannot bypass cannot dial out over a joined hotspot, so its client reports `JoinedNetworkBlockedByVpn` and stops redialling, while the other devices still reach it by dialling in.
 
@@ -1253,7 +1258,7 @@ A photo authored offline on one device displays on a peer in camp (thumbnail imm
 
 **Status.** NOT STARTED.
 
-**Blocked on** R77, R78 and R79, plus R76's slice 9d, which R76 parked with no owner, and [G15](#g15), which names the same run.
+**Blocked on** R77, R78 and R79, plus R76's slice 9d, which R76 parked until decision 40's machine is at hand.
 
 **Changes state.** Client tables, none, the receiver's file table recording the completed media by its content hash. Server tables, none. Wire messages, the completed media entry on the peer link (step 3). Archive format, none.
 
@@ -1265,6 +1270,10 @@ A photo authored offline on one device displays on a peer in camp (thumbnail imm
 4. The gate section and CI gain whatever new legs the peer crates added.
 
 ### Done when
+
+The camp flow runs through a demo on every local machine in the recorded home run and in the on-demand run on two attached phones, and the field test's answer is recorded in chapter 19.
+
+---
 
 ## R107: schema changes under running servers
 
@@ -1438,7 +1447,7 @@ Every caller reaches Postgres through connetto's one reader role, and a policy t
 
 ### Steps
 
-1. Every startup refusal runs before `build_authorization` writes to OpenFGA, so a refused deployment leaves the store untouched, the replica translation's included.
+1. Every startup refusal runs before `build_authorization` writes to OpenFGA, so a refused deployment leaves the store untouched, the replica translation's included. A refusal names the policy and the role it could not settle, never a translator's builder call.
 2. connetto builds sql-traits' deployment description once, with the reader role as the only acting role and its three settings declared always bound, and hands the same description to pg2sqlite and rls2fga. A policy for a role outside connetto is then reported and left out on both sides instead of refusing startup through pg2sqlite.
 3. The server builder takes the four kind role names and decision 11's choice. Preflight checks decision 5's attributes and the grants against the roles-and-grants document, and the four kinds become the description's acting roles.
 4. `CallerBinding` switches to the caller's kind role, and the write path resets to the reader role for connetto's bookkeeping.
@@ -1448,11 +1457,115 @@ Every caller reaches Postgres through connetto's one reader role, and a policy t
 
 ### Proof
 
-Docker-gated. A deployment refused at startup leaves the OpenFGA store untouched. A policy `TO support_staff` for a role outside connetto is reported and serves no connetto caller, in OpenFGA and in the client copy alike, and a `TO` role the schema never creates refuses startup. With the four kind roles and grants that differ per kind, an anonymous caller's write to a table it may only read is refused before the database, its subscription to a table it may not read is refused at subscribe, and its client copy lacks that table, while a signed-in caller reads and writes both. A share key used by an anonymous and by a signed-in caller is answered by each one's kind. A grant applied by hand and missing from the document refuses startup. The differential harness that compares PostgreSQL, OpenFGA and the SQLite copy for one policy set, built on the same deployment description, agrees for each kind on connetto's example deployment.
+Docker-gated. A deployment refused at startup leaves the OpenFGA store untouched. A policy `TO support_staff` for a role outside connetto is reported and serves no connetto caller, in OpenFGA and in the client copy alike, and a `TO` role the schema never creates refuses startup. With the four kind roles and grants that differ per kind, an anonymous caller's write to a table it may only read is refused before the database, its subscription to a table it may not read is refused at subscribe, and its client copy lacks that table, while a signed-in caller reads and writes both. A share key used by an anonymous and by a signed-in caller is answered by each one's kind. A grant applied by hand and missing from the document refuses startup. The differential harness that compares PostgreSQL, OpenFGA and the SQLite copy for one policy set, built on the same deployment description, agrees for each kind on connetto's example deployment. The harness is seeded with the alignment review's probes, including a dropped `::uuid` cast over an untyped `pg2sqlite` mapping and `->>` on a non-string `jsonb` value, the two replica-side defects that go to `pg2sqlite` as upstream requests.
 
 ### Done when
 
 A deployment can name connetto's kinds in its policies and grant each kind its own table privileges, a policy for a role outside connetto serves none of connetto's callers, every refusal comes before anything is written, and Postgres, OpenFGA and each kind's client copy agree on what each kind may read and write.
+
+## R109: content tickets bound to their session
+
+**Blocked on** nothing.
+
+**Changes state.** Client tables, none. Server tables, none. Wire messages, the content ticket gains the minting session. Archive format, none.
+
+### Purpose
+
+Every fetch already rechecks that the ticket's caller may see the file, so a revoked share or an erased row denies at once. What a ticket outlives is its session, [G5](#g5). After a logout or a revoked session, a cached ticket keeps reading the files that identity can still see until it expires. This phase makes the session's end the ticket's end.
+
+### Decisions, taken with the maintainer
+
+1. **The ticket names its session and every fetch confirms it is live.** The signed payload gains the session that minted it, and the file server consults the session's liveness on every read through a check the server builder wires to `AuthService::session_is_live`, so a logout or a revocation cuts every cached ticket of that session at its next request.
+
+### Open points
+
+1. **A ticket minted by a share key alone**, with no session behind it. Whether it binds to the share key's own liveness or keeps the expiry as its only bound.
+2. **The cost of the check.** One store read per fetch, or a short-lived cache of live sessions, and what the cache's lifetime adds to the lag.
+
+### Steps
+
+1. The ticket payload carries the minting session, signed with the rest.
+2. The file server's configuration takes a liveness check, the builder wires it to the auth store, and every read refuses a ticket whose session is not live, answering as it answers a file the caller may not see.
+
+### Proof
+
+Docker-gated. A ticket minted in a session reads a file, the session logs out, and the same ticket is refused at once, while a ticket of another live session of the same identity keeps reading.
+
+### Done when
+
+No content read succeeds for a ticket whose session has ended.
+
+---
+
+## R110: a session bound by provider staleness
+
+**Blocked on** nothing.
+
+**Changes state.** Client tables, none. Server tables, the session record gains the time of the provider's last confirmation. Wire messages, none. Archive format, none.
+
+### Purpose
+
+A session lives for a fixed idle window extended by connetto's own refresh, under a fixed absolute ceiling, [G6](#g6). A user the identity provider deactivated keeps a session until one of those lapses, and a user active every day is signed out at the ceiling. This phase bounds a session by how long ago the provider last confirmed the user.
+
+### Decisions, taken with the maintainer
+
+The recommended default bounds staleness. The clock measures the time since the identity provider last confirmed the user, and it resets on every successful provider refresh. It does not measure how old the session is. A continuously connected user therefore never reaches it, for months or for years, and a user the provider has deactivated is cut off at their next reconnect, sooner than any fixed deadline would manage.
+
+What counts as a check, and what a failure means. A successful provider refresh resets the clock. A failure does not end the session and does not touch local data. It means the provider's answer is unknown, and the clock simply keeps running until the bound is reached, at which point an interactive login is required. That login is where the answer becomes unambiguous, because a genuinely removed user fails it and everyone else succeeds and resets the clock. This is forced by the protocol rather than chosen. RFC 6749 defines a single `invalid_grant` code covering a token that is "invalid, expired, revoked, does not match the redirection URI... or was issued to another client", and Google documents its own causes as including a password change, six months of disuse, and exceeding a cap on live tokens. Most are benign, none are distinguishable from the error, so no destructive action may depend on that signal.
+
+Long-lived access is always requested, so the check always exists. Without a retained provider refresh token there is no probe, and the staleness bound silently degenerates into the session-age ceiling it replaced. connetto therefore requests offline access at login even when the application never calls provider APIs, and treats the probe as part of the session mechanism rather than a side effect of whatever scopes were configured. The cost is not uniform. Microsoft lists `offline_access` among the scopes a user consents to, while Google grants the refresh token through a request parameter with no separate consent line.
+
+A failed provider refresh means unknown, never revoked. It ends nothing and destroys nothing, it only stops resetting the clock, because `invalid_grant` cannot distinguish revocation from a password change or six months of disuse. The interactive login at the bound is where the answer becomes unambiguous.
+
+### Open points
+
+1. **The default bound**, asked of the maintainer when the phase starts.
+
+### Steps
+
+1. Every login requests offline access, and the session record keeps the time the provider last confirmed the user.
+2. A refresh past the bound refreshes against the provider. A success resets the clock, and a failure leaves it running until the bound, past which the session requires an interactive login.
+3. The fixed idle window and absolute ceiling of `RefreshLifetimes` go.
+
+### Proof
+
+Docker-gated, against the mock identity provider. A session the provider keeps confirming outlives the old ceiling. A user the provider deactivates is refused at the next refresh past the bound. A provider outage alone ends no session before the bound.
+
+### Done when
+
+A session ends when the provider has not confirmed the user within the bound, and at no fixed age.
+
+---
+
+## R111: a durable replica where OPFS is refused
+
+**Blocked on** a durable IndexedDB VFS for `sqlite-wasm-rs`, built in Luca's fork for an upstream pull request that answers Spxg/sqlite-wasm-rs #193. Its xSync suspends through JSPI until an IndexedDB transaction opened with `durability: "strict"` completes.
+
+**Changes state.** Client tables, none. Server tables, none. Wire messages, none. Archive format, none. The browser replica gains a second storage backend.
+
+### Purpose
+
+A browser that refuses OPFS, Firefox private windows among them, runs the replica in memory, [G4](#g4), so a reload loses every unsent write. Firefox private windows keep IndexedDB for the life of the private session. A synchronous VFS over IndexedDB loses commits, which for connetto means a reused writer sequence the server refuses as forked, and `sqlite-wasm-vfs` removed the one it had for that reason. JSPI, in Chrome 137 and Firefox 153, lets a VFS wait for IndexedDB before SQLite's commit returns.
+
+### Decisions, taken with the maintainer
+
+1. **The VFS is built upstream first.** It is proven in Luca's `sqlite-wasm-rs` fork before any issue or pull request, and it depends on `rsqlite-vfs` alone so it can become a standalone crate if upstream declines it.
+2. **The storage order is OPFS, then the IndexedDB VFS where JSPI is present, then memory**, and the boot report says which one the replica runs on.
+
+### Steps
+
+1. The DB worker builds with JSPI and opens the replica on the IndexedDB VFS when OPFS is refused and JSPI is present.
+2. The boot report names the backend, and the memory case keeps its warning.
+
+### Proof
+
+A browser suite in a Firefox private window writes, reloads and finds every acknowledged write and the writer chain intact, and a killed worker after a commit loses nothing the client reported committed.
+
+### Done when
+
+A browser that refuses OPFS but runs JSPI keeps the replica and its queued writes across reloads.
+
+---
 
 # Cross-cutting checklist
 

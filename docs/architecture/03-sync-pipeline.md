@@ -34,7 +34,7 @@ On receiving a `MutationHeader` and its `MutationPatch`:
 4. Apply the changeset. A row-level-security refusal, a `WITH CHECK` violation or an `UPDATE`/`DELETE` finding no visible row, rolls back and replies `MutationReject` with `Unauthorized`. A constraint violation replies `Constraint`
 5. On commit, `MutationApplied` with the sequence, which is what retires the client's pending record
 
-The patchset settles as a whole. One outcome per sequence, so one failing operation fails the whole patchset and the client rolls back all of it. Per-operation results do not exist. [G13](../../plans/master-implementation-plan.md#g13)
+The patchset settles as a whole. One outcome per sequence, so one failing operation fails the whole patchset and the client rolls back all of it. Per-operation results do not exist.
 
 ### 5. Conflict handling
 
