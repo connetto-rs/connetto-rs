@@ -61,7 +61,7 @@ rm -rf /usr/local/share/chromedriver-linux64
 unzip -q /tmp/chromedriver.zip -d /usr/local/share
 ln -sf /usr/local/share/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver
 
-echo "== Android SDK at the hosted image's path, API 35 emulator image, NDK $NDK_DEFAULT and $NDK_LATEST"
+echo "== Android SDK at the hosted image's path, API 35 emulator image, what the demo's Gradle build asks for, NDK $NDK_DEFAULT and $NDK_LATEST"
 mkdir -p "$SDK/cmdline-tools"
 curl -fsSL "https://dl.google.com/android/repository/$CMDLINE_TOOLS" -o /tmp/cmdline-tools.zip
 rm -rf "$SDK/cmdline-tools/latest"
@@ -69,8 +69,10 @@ unzip -q /tmp/cmdline-tools.zip -d "$SDK/cmdline-tools"
 mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
 # A process substitution, because `yes | sdkmanager` ends `yes` with SIGPIPE, which pipefail turns into a failure.
 "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" --licenses < <(yes) >/dev/null
+# The Gradle build of the demo's APK installs any build tools and platform it misses, a download per run.
 "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" \
   "platform-tools" "emulator" "platforms;android-35" "build-tools;35.0.0" \
+  "platforms;android-36" "platforms;android-37.0" "build-tools;36.0.0" \
   "system-images;android-35;google_apis;x86_64" "ndk;$NDK_DEFAULT" "ndk;$NDK_LATEST" >/dev/null
 chown -R "$RUNNER:$RUNNER" "$SDK"
 
@@ -87,10 +89,14 @@ source ~/.cargo/env
 rustup toolchain install nightly --profile minimal -c clippy -t wasm32-unknown-unknown
 curl -fsSL https://get.nexte.st/latest/linux | tar xz -C ~/.cargo/bin
 cargo install wasm-pack --locked --version $WASM_PACK_VERSION
-# The registry lives on the host, shared by every VM. Git checkouts stay local, because
-# libgit2 needs shared mmap, which virtiofs refuses here.
+# Downloads live on the host, shared by every VM. Unpacked sources stay local, because builds write
+# into them, the Gradle builds of Tauri's Android plugins among them, and two VMs sharing one tree
+# clobber each other's build directories. Git checkouts stay local too, because libgit2 needs
+# shared mmap, which virtiofs refuses here.
 rm -rf ~/.cargo/registry
-ln -s $CACHE/cargo-registry ~/.cargo/registry
+mkdir -p ~/.cargo/registry $CACHE/cargo-registry/index $CACHE/cargo-registry/cache
+ln -s $CACHE/cargo-registry/index ~/.cargo/registry/index
+ln -s $CACHE/cargo-registry/cache ~/.cargo/registry/cache
 # Every git dependency main locks, fetched into the image, so a job fetches only what moved since.
 git clone -q --depth 1 https://github.com/connetto-rs/connetto-rs /tmp/connetto-rs
 for lock in /tmp/connetto-rs/Cargo.lock /tmp/connetto-rs/crates/*/Cargo.lock /tmp/connetto-rs/examples/*/Cargo.lock; do

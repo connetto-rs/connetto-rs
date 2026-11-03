@@ -609,9 +609,17 @@ pub struct Unlock<'a> {
     pub pin: Option<&'a str>,
 }
 
+/// How many times the driver types the PIN at a keyguard, below the five wrong
+/// entries after which Android locks the keyguard for 30 seconds.
+const KEYGUARD_ATTEMPTS: u32 = 4;
+
 impl Unlock<'_> {
     /// Clear a PIN keyguard, which waking the device leaves up and which hides
     /// every app and browser tab behind it.
+    ///
+    /// A freshly booted emulator's System UI can stall for seconds or restart,
+    /// and a PIN typed meanwhile is lost, so an entry that leaves the keyguard
+    /// up is typed again on a cleared pad.
     ///
     /// # Errors
     ///
@@ -620,22 +628,33 @@ impl Unlock<'_> {
         let Some(pin) = self.pin else {
             return Ok(());
         };
-        if !device.keyguard_showing().await? {
-            return Ok(());
-        }
-        device.adb(&["shell", "wm", "dismiss-keyguard"]).await?;
-        // The PIN pad needs a moment to take focus.
-        sleep(Duration::from_secs(1)).await;
-        device.adb(&["shell", "input", "text", pin]).await?;
-        device
-            .adb(&["shell", "input", "keyevent", "KEYCODE_ENTER"])
-            .await?;
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while device.keyguard_showing().await? {
-            if Instant::now() >= deadline {
-                bail!("the keyguard stayed up after the PIN");
+        let clear: Vec<&str> = ["shell", "input", "keyevent"]
+            .into_iter()
+            .chain(std::iter::repeat_n("KEYCODE_DEL", pin.len()))
+            .collect();
+        for _ in 0..KEYGUARD_ATTEMPTS {
+            if !device.keyguard_showing().await? {
+                return Ok(());
             }
-            sleep(Duration::from_millis(500)).await;
+            device.adb(&["shell", "wm", "dismiss-keyguard"]).await?;
+            // The PIN pad needs a moment to take focus.
+            sleep(Duration::from_secs(1)).await;
+            // Digits a stalled pad took from an earlier entry would prefix this one.
+            device.adb(&clear).await?;
+            device.adb(&["shell", "input", "text", pin]).await?;
+            device
+                .adb(&["shell", "input", "keyevent", "KEYCODE_ENTER"])
+                .await?;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while device.keyguard_showing().await? {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                sleep(Duration::from_millis(500)).await;
+            }
+        }
+        if device.keyguard_showing().await? {
+            bail!("the keyguard stayed up after {KEYGUARD_ATTEMPTS} entries of the PIN");
         }
         Ok(())
     }
