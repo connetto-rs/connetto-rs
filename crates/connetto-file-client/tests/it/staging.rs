@@ -203,6 +203,10 @@ async fn the_boot_pass_retires_an_unsent_file_whose_bytes_are_gone() {
     for path in walk_files(&chunks) {
         std::fs::remove_file(&path).expect("remove a chunk file");
     }
+    assert!(
+        matches!(content.resolve(file_id).await, Ok(Resolved::Unavailable)),
+        "an unsent file whose bytes are gone has nothing to answer, even before the pass"
+    );
 
     assert_eq!(
         content.verify_unsent().await.expect("the boot pass runs"),
