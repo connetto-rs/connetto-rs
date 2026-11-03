@@ -1,13 +1,15 @@
 //! The media driver: one loop over the peer links' media traffic that serves
-//! this device's files to linked peers and fetches files from them (R79).
+//! this device's files to linked peers and fetches files from them, and the
+//! files the retention pass spares for provisional rows (R79).
 
 mod fetch;
 mod serve;
 
 use core::fmt::Display;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use connetto_client::ConnettoConnection;
 use connetto_client::media::{MediaEvent, MediaPort, MediaSender};
 use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::traits::Transport;
@@ -31,6 +33,33 @@ use crate::resolve::Resolved;
 
 /// What the links ask the driver, each fetch tagged by its own number.
 type Action = MediaAction<DeviceIdentity, u64>;
+
+/// The files a declared column of a row whose peer apply still awaits a
+/// verdict names, which the retention pass keeps (R79 decision 6).
+///
+/// # Errors
+///
+/// [`ContentError::Client`] when the provisional records or a declared
+/// column cannot be read, so the pass evicts nothing rather than a file it
+/// should keep.
+pub(super) fn provisionally_named<T>(
+    conn: &mut ConnettoConnection<T>,
+    declared: &[(String, String)],
+) -> Result<HashSet<FileId>, ContentError>
+where
+    T: Transport,
+    T::Error: Display,
+{
+    let mut named = HashSet::new();
+    for (table, column) in declared {
+        for blob in conn.provisional_blobs(table, column)? {
+            if let Ok(id) = <[u8; 32]>::try_from(blob.value.as_slice()) {
+                named.insert(FileId::from_bytes(id));
+            }
+        }
+    }
+    Ok(named)
+}
 
 /// Work the driver runs beside its loop.
 enum Job {

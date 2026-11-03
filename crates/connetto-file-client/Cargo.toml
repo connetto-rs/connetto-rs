@@ -102,6 +102,9 @@ connetto-client = { path = "../connetto-client", default-features = false, featu
 # certificates minted in memory, under a translated policy schema.
 connetto-peer = { path = "../connetto-peer", features = ["test-support"] }
 connetto-schema.workspace = true
+# The retention proofs apply a captured peer entry, whose manifest row names
+# the SHA-256 of its body.
+sha2 = "0.10"
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "time"] }
 tempfile = "3"
 axum = { workspace = true }

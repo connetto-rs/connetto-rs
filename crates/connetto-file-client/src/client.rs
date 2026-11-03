@@ -1022,7 +1022,11 @@ where
 {
     /// The outbox driver: the boot integrity pass, then a walk whenever one
     /// could get further than the last, then [`tidy_content`](Self::tidy_content)
-    /// after each walk that sent a file.
+    /// after each walk that sent a file. With the `peer` feature it also
+    /// tidies once at its start and on every
+    /// [`ClientEvent::ProvisionalRetracted`], so the bytes of a write the
+    /// server or its author refused leave the device at once, and a
+    /// retraction the event stream dropped is caught at the next start.
     ///
     /// Returned as a future rather than spawned, the same shape
     /// [`ConnettoClient::with_pump`] uses, so the caller decides which
@@ -1040,6 +1044,8 @@ where
     pub async fn drive_outbox<S: Sleeper>(&self, mut sleeper: S) {
         let policy = ReconnectPolicy::default();
         let mut events = self.client.events();
+        #[cfg(feature = "peer")]
+        let _ = self.tidy_content().await;
         if let Err(err) = self.verify_unsent().await {
             let _ = self.events.send(ContentEvent::IntegrityPassFailed {
                 detail: err.to_string(),
@@ -1091,6 +1097,10 @@ where
                             | ClientEvent::SnapshotEnd { .. }
                             | ClientEvent::FullResync { .. },
                         ) if !self.heal_queries.is_empty() => break,
+                        #[cfg(feature = "peer")]
+                        Ok(ClientEvent::ProvisionalRetracted { .. }) => {
+                            let _ = self.tidy_content().await;
+                        }
                         Ok(ClientEvent::Closed) | Err(broadcast::error::RecvError::Closed) => {
                             return;
                         }
@@ -1133,7 +1143,11 @@ where
     /// The byte-level mirror of R15's `tidy`, and application-callable for the
     /// same reason: only the application knows why it holds data. A manifest
     /// survives when the file is unsent, because those bytes cannot be fetched
-    /// again, or when a pin names it. Everything else is cache and goes.
+    /// again, or when a pin names it. With the `peer` feature it also
+    /// survives while a row whose peer apply still awaits a verdict names it
+    /// in a column [`with_peer_content`](Self::with_peer_content) declared,
+    /// since a file fetched in camp may not be on the server yet. Everything
+    /// else is cache and goes.
     ///
     /// Then every chunk file the store holds that no surviving manifest names
     /// is deleted. Enumerating the store rather than the hashes an eviction
@@ -1158,14 +1172,22 @@ where
     /// [`ContentError::Store`] when the store cannot be listed or a chunk file
     /// cannot be removed.
     pub async fn tidy_content(&self) -> Result<usize, ContentError> {
-        let pinned = self.pinned().await?;
+        #[cfg_attr(
+            not(feature = "peer"),
+            expect(unused_mut, reason = "only the peer build adds to the kept set")
+        )]
+        let mut kept = self.pinned().await?;
         let _writing = self.content_writes.lock().await;
         let (evicted, referenced) = self
             .client
             .with_conn(|conn| {
+                // Read with the eviction under one hold of the connection,
+                // so a peer apply cannot land a provisional row between them.
+                #[cfg(feature = "peer")]
+                kept.extend(peer::provisionally_named(conn, &self.peer_content)?);
                 conn.transact_with_bookkeeping(
                     |c| {
-                        let evicted = crate::retain::evict_uncovered(c, &pinned)?;
+                        let evicted = crate::retain::evict_uncovered(c, &kept)?;
                         Ok((evicted, db::referenced_hashes(c)?))
                     },
                     |_| Ok::<(), ContentError>(()),
