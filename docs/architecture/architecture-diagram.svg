@@ -485,9 +485,9 @@
       <text x="150" y="46" text-anchor="middle" font-size="8.5" fill="#555">manifests, outbox and pins in the replica, committed with the row</text>
       <text x="150" y="59" text-anchor="middle" font-size="8.5" fill="#555">encrypted store on std::fs, bytes over HTTP under one ticket</text>
       <text x="150" y="72" text-anchor="middle" font-size="8.5" fill="#555">outbox walk with a boot pass, a server refusal stays queued</text>
-      <text x="150" y="85" text-anchor="middle" font-size="8.5" fill="#555">resolver: a signed URL by default, local bytes when unsent or pinned</text>
+      <text x="150" y="85" text-anchor="middle" font-size="8.5" fill="#555">resolver: local bytes when held, a signed URL otherwise</text>
       <text x="150" y="98" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: the demos drive the content surface end to end, R69</text>
-      <text x="150" y="111" text-anchor="middle" font-size="8.5" fill="#C62828">R79: peer fetch, holder gate, the provisional spare</text>
+      <text x="150" y="111" text-anchor="middle" font-size="8.5" fill="#4CAF50">peer fetch, holder gate, the provisional spare, R79</text>
     </g>
 
     <!-- Device-to-device sync (R74 to R80) -->
@@ -500,7 +500,7 @@
       <text x="150" y="63" text-anchor="middle" font-size="8.5" fill="#4CAF50">Android, iPhone, Linux host, the iPad and Mac join</text>
       <text x="150" y="77" text-anchor="middle" font-size="8.5" fill="#4CAF50">R75 frontiers, R77 slices 1 to 5, R79 media frames and port</text>
       <text x="150" y="91" text-anchor="middle" font-size="8.5" fill="#C62828">R76 slices 9d and 9e, R74's Windows record</text>
-      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#C62828">R77 slices 6 to 8, R78, R79 slices 4 to 8, R80 (chapter 19)</text>
+      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#C62828">R77 slices 6 to 8, R78, R79 slices 7 and 8, R80 (chapter 19)</text>
     </g>
   </g>
 

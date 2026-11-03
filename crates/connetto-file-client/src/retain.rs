@@ -52,18 +52,19 @@ pub(crate) struct PinnedId {
     file_id: Vec<u8>,
 }
 
-/// Drops every manifest nothing covers and answers how many went.
+/// Drops every manifest that is neither unsent nor in `kept` and answers how
+/// many went.
 ///
 /// The chunk files are not touched here. The rows have to commit before any
 /// file goes, because the reverse order leaves a manifest pointing at bytes
 /// that are gone.
 pub(crate) fn evict_uncovered(
     conn: &mut SqliteConnection,
-    pinned: &HashSet<FileId>,
+    kept: &HashSet<FileId>,
 ) -> Result<usize, ContentError> {
     let mut evicted = 0;
     for file_id in db::all_manifests(conn)? {
-        if evictable(conn, pinned, file_id)?.is_none() {
+        if evictable(conn, kept, file_id)?.is_none() {
             continue;
         }
         db::drop_manifest(conn, file_id)?;
@@ -75,10 +76,10 @@ pub(crate) fn evict_uncovered(
 /// The manifest to evict, or `None` when something still wants this file.
 fn evictable(
     conn: &mut SqliteConnection,
-    pinned: &HashSet<FileId>,
+    kept: &HashSet<FileId>,
     file_id: FileId,
 ) -> Result<Option<Manifest>, ContentError> {
-    if pinned.contains(&file_id) || db::is_unsent(conn, file_id)? {
+    if kept.contains(&file_id) || db::is_unsent(conn, file_id)? {
         return Ok(None);
     }
     db::load_manifest(conn, file_id)
