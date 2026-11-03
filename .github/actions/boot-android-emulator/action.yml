@@ -1,0 +1,17 @@
+name: Boot the Android emulator
+description: >-
+  Boots an API 35 Google APIs x86_64 emulator as emulator-5554 from the
+  runner's own Android SDK, downloading only the packages the SDK lacks, and
+  returns once Android reports its boot complete. The emulator keeps running
+  for the steps after it, writing its device log to the given file.
+inputs:
+  logcat:
+    description: The file the emulator writes its device log to.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        LOGCAT: ${{ inputs.logcat }}
+      run: bash "${{ github.action_path }}/boot.sh" "$LOGCAT"

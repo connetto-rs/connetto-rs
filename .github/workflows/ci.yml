@@ -950,21 +950,23 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Walk the proof on an emulator
-        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+      # The emulator writes the device log itself, which outlives the adb
+      # server restarts the proof makes.
+      - uses: $/.github/actions/boot-android-emulator
+        with:
+          logcat: ${{ runner.temp }}/emulator-logcat.txt
+
+      # The Keystore gate (R52) needs a secure lock screen, so the run sets a throwaway PIN and types it.
+      - name: Walk the proof on the emulator
         env:
           CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/connetto-server
-        with:
-          api-level: 35
-          target: google_apis
-          arch: x86_64
-          # The action's defaults, plus the device log written by the emulator
-          # itself, which outlives the adb server restarts the proof makes.
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -logcat *:v -logcat-output ${{ runner.temp }}/emulator-logcat.txt
-          # The Keystore gate (R52) needs a secure lock screen, so the run sets a throwaway PIN and types it.
-          script: |
-            adb -s emulator-5554 shell locksettings set-pin 2580
-            android-bins/connetto-demo-stack android-bins/connetto-android-proof --serial emulator-5554 --unlock-pin 2580 --app tauri --apk examples/tauri-leptos-demo/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+        run: |
+          adb -s emulator-5554 shell locksettings set-pin 2580
+          android-bins/connetto-demo-stack android-bins/connetto-android-proof --serial emulator-5554 --unlock-pin 2580 --app tauri --apk examples/tauri-leptos-demo/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+
+      - name: Stop the emulator
+        if: always()
+        run: timeout 60 adb -s emulator-5554 emu kill || true
 
       # The adb server's own log records every change of the device's
       # transport, such as it going offline.
@@ -975,6 +977,7 @@ jobs:
           path: |
             target/android-proof
             ${{ runner.temp }}/emulator-logcat.txt
+            ${{ runner.temp }}/emulator.log
             /tmp/adb.*.log
           retention-days: 7
 
