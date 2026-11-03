@@ -1,5 +1,5 @@
-//! The receiver's side: the candidate order, the verified chunk writes and
-//! the commit (R79 decisions 3, 4, 5 and 10).
+//! The receiver's side: the candidate order, the prefetch reading, the
+//! verified chunk writes and the commit (R79 decisions 3, 4, 5, 8 and 10).
 
 use core::fmt::Display;
 use std::collections::VecDeque;
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::traits::Transport;
+use connetto_exchange::media::Priority;
 use connetto_file_core::{
     ChunkHash, ChunkMeta, ChunkStore, FileId, Manifest, MaybeSend, decode_range, outboard_of,
 };
@@ -28,6 +29,10 @@ pub(super) const FIRST_BACKOFF: Duration = Duration::from_secs(5);
 
 /// The longest wait before asking busy holders again.
 pub(super) const LAST_BACKOFF: Duration = Duration::from_mins(5);
+
+/// The largest file a prefetch fetches, so a misdeclared column never pulls
+/// a video unasked (R79 decision 8).
+pub(super) const MAX_PREFETCH_BYTES: u64 = 1024 * 1024;
 
 /// A file `resolve` hands the media driver, with where to answer whether its
 /// bytes arrived.
@@ -61,10 +66,13 @@ pub(super) struct Fetch {
     pub(super) retry_at: Option<Instant>,
     /// The fetch's start, or its last verified chunk.
     pub(super) progress: Instant,
+    /// Whether nothing waits on the fetch, a thumbnail asked of its author
+    /// alone, behind every on-demand ask and dropped rather than retried.
+    pub(super) prefetch: bool,
 }
 
 impl Fetch {
-    /// A fetch of `file_id` started at `now`.
+    /// An on-demand fetch of `file_id` started at `now`.
     pub(super) fn new(file_id: FileId, now: Instant) -> Self {
         Self {
             file_id,
@@ -77,6 +85,16 @@ impl Fetch {
             backoff: FIRST_BACKOFF,
             retry_at: None,
             progress: now,
+            prefetch: false,
+        }
+    }
+
+    /// The priority its asks queue at.
+    pub(super) fn priority(&self) -> Priority {
+        if self.prefetch {
+            Priority::Prefetch
+        } else {
+            Priority::OnDemand
         }
     }
 
@@ -174,8 +192,11 @@ where
         self.client
             .with_conn(|conn| {
                 let mut authors = Vec::new();
-                for (table, column) in declared {
-                    for blob in conn.provisional_blobs(table, column).unwrap_or_default() {
+                for declared in declared {
+                    for blob in conn
+                        .provisional_blobs(&declared.table, &declared.column)
+                        .unwrap_or_default()
+                    {
                         if blob.value.as_slice() == file_id.as_bytes().as_slice()
                             && !authors.contains(&blob.author)
                         {
@@ -187,6 +208,40 @@ where
             })
             .await
             .unwrap_or_default()
+    }
+
+    /// The files the prefetch columns of `author`'s provisional rows name, in
+    /// row order, skipping those the device already holds.
+    pub(super) async fn prefetches_of(&self, author: &[u8]) -> Vec<FileId> {
+        let declared = &self.peer_content;
+        let named: Vec<FileId> = self
+            .client
+            .with_conn(|conn| {
+                let mut named = Vec::new();
+                for declared in declared.iter().filter(|declared| declared.prefetch) {
+                    for blob in conn
+                        .provisional_blobs(&declared.table, &declared.column)
+                        .unwrap_or_default()
+                    {
+                        if blob.author == author
+                            && let Ok(id) = <[u8; 32]>::try_from(blob.value.as_slice())
+                            && !named.contains(&FileId::from_bytes(id))
+                        {
+                            named.push(FileId::from_bytes(id));
+                        }
+                    }
+                }
+                named
+            })
+            .await
+            .unwrap_or_default();
+        let mut lacking = Vec::with_capacity(named.len());
+        for file_id in named {
+            if !matches!(self.local_answer(file_id).await, Ok(Some(_))) {
+                lacking.push(file_id);
+            }
+        }
+        lacking
     }
 
     /// The first chunk of `manifest` from `from` the store lacks, with its

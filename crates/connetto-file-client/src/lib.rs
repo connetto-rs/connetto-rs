@@ -20,6 +20,8 @@ mod worker;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub use browser_store::{BrowserStore, BrowserStoreError};
 
+#[cfg(feature = "peer")]
+pub use client::PeerContent;
 pub use client::{ContentClient, ContentEvent};
 pub use connetto_file_core::{ChunkHash, FileId, FileIdHasher, MimeClass};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]

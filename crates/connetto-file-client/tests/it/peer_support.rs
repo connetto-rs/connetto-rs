@@ -2,24 +2,33 @@
 //! client over, minted devices on loopback nodes, and a media port over a
 //! bare node.
 
+use std::sync::Arc;
+
 use connetto_client::SyncSchema;
 use connetto_client::live::ConnettoClient;
 use connetto_client::media::{MediaEvent, MediaPort};
+use connetto_client::peer::PeerAuthor;
+use connetto_core::Major;
 use connetto_core::device_cert::AttestationLevel;
+use connetto_core::exchange::ManifestRow;
+use connetto_core::schema::SchemaBundle;
+use connetto_exchange::media::{MAX_PIECE_BYTES, Media};
 use connetto_file_client::{ContentClient, FsStore, MimeClass};
-use connetto_file_core::FileId;
+use connetto_file_core::{FileId, MemStore, encode_range, process_file_with_outboard};
 use connetto_peer::test_support::{DAY, Deployment, Issuer, Peer, node, serve, whole_second};
-use connetto_peer::{Node, PeerEvent};
+use connetto_peer::{CloseReason, Node, PeerEvent};
 use diesel::prelude::*;
+use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::support::{RecordingHttp, Scripted, attach_content, cold_over, started};
 
-/// A photo table each person reads only their own rows of, which the
-/// device, signed in as the suite's tester, curates whole.
+/// A photo table with a thumbnail column, each person reading only their own
+/// rows, which the device, signed in as the suite's tester, curates whole.
 const PHOTO_SCHEMA: &str = "-- connetto:major 1\n \
                             CREATE TABLE photos (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
-                            content_id BYTEA NOT NULL); \
+                            content_id BYTEA NOT NULL, thumb_id BYTEA); \
                             ALTER TABLE photos ENABLE ROW LEVEL SECURITY;";
 
 const PHOTO_POLICIES: &str = "CREATE POLICY photos_read ON photos FOR SELECT \
@@ -39,6 +48,8 @@ diesel::table! {
         owner -> Text,
         /// The file the row names.
         content_id -> Binary,
+        /// The photo's thumbnail, a file of its own.
+        thumb_id -> Nullable<Binary>,
     }
 }
 
@@ -222,4 +233,221 @@ pub async fn beside_both(
         () = second.drive_media(second_port) => panic!("the second port ended under the proof"),
         () = proof => {}
     }
+}
+
+/// How a bare holder misbehaves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// It serves the file as it is.
+    None,
+    /// It flips a byte in the middle of every encoded range.
+    ForgePiece,
+    /// It names every chunk by a hash the chunk does not have.
+    LieInManifest,
+    /// It closes every link at its second `Fetch`.
+    DropAtSecondFetch,
+    /// It answers every request `Busy`.
+    AlwaysBusy,
+    /// It answers nothing.
+    Silent,
+    /// It names a chunk of no bytes.
+    EmptyChunk,
+    /// It sends more manifest rows than a manifest may hold, in two runs.
+    TooManyRows,
+}
+
+/// A bare node serving `bytes` as a holder would, chunked as the generic
+/// class chunks it, with `fault`, answering the requests it records.
+pub fn bare_holder(
+    node: Node,
+    mut events: mpsc::UnboundedReceiver<PeerEvent>,
+    bytes: Vec<u8>,
+    fault: Fault,
+) -> Arc<Mutex<Vec<Media>>> {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&asked);
+    tokio::spawn(async move {
+        let store = MemStore::new();
+        let (manifest, outboard) =
+            process_file_with_outboard(bytes.as_slice(), MimeClass::Generic, &store)
+                .await
+                .expect("chunk the file");
+        let mut fetches = 0;
+        while let Some(event) = events.recv().await {
+            let PeerEvent::Media { peer, message } = event else {
+                continue;
+            };
+            record.lock().push(message.clone());
+            let request_id = message.request_id();
+            match (fault, message) {
+                (Fault::Silent, _) => {}
+                (Fault::AlwaysBusy, _) => {
+                    let _ = node.send_media(&peer, Media::Busy { request_id }).await;
+                }
+                (Fault::TooManyRows, Media::Want { .. }) => {
+                    for last in [false, true] {
+                        let run = Media::Manifest {
+                            request_id,
+                            chunks: vec![([7; 32], 1); 5_000],
+                            last,
+                        };
+                        let _ = node.send_media(&peer, run).await;
+                    }
+                }
+                (_, Media::Want { .. }) => {
+                    let chunks = manifest
+                        .chunks()
+                        .iter()
+                        .map(|chunk| {
+                            let mut hash = *chunk.hash.as_bytes();
+                            if fault == Fault::LieInManifest {
+                                hash[0] ^= 1;
+                            }
+                            let len = if fault == Fault::EmptyChunk {
+                                0
+                            } else {
+                                chunk.len
+                            };
+                            (hash, len)
+                        })
+                        .collect();
+                    let run = Media::Manifest {
+                        request_id,
+                        chunks,
+                        last: true,
+                    };
+                    let _ = node.send_media(&peer, run).await;
+                }
+                (
+                    _,
+                    Media::Fetch {
+                        request_id,
+                        start,
+                        len,
+                        ..
+                    },
+                ) => {
+                    fetches += 1;
+                    if fault == Fault::DropAtSecondFetch && fetches == 2 {
+                        node.stop(CloseReason::Closed);
+                        return;
+                    }
+                    let mut encoded = Vec::new();
+                    encode_range(&manifest, &store, &outboard, start, len, &mut encoded)
+                        .await
+                        .expect("encode the range");
+                    if fault == Fault::ForgePiece {
+                        let middle = encoded.len() / 2;
+                        encoded[middle] ^= 1;
+                    }
+                    let pieces: Vec<&[u8]> = encoded.chunks(MAX_PIECE_BYTES).collect();
+                    let last = pieces.len() - 1;
+                    for (index, piece) in pieces.into_iter().enumerate() {
+                        let piece = Media::Piece {
+                            request_id,
+                            encoded: piece.to_vec(),
+                            last: index == last,
+                        };
+                        let _ = node.send_media(&peer, piece).await;
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    asked
+}
+
+/// How many `Want` requests a bare holder saw.
+pub fn wants(asked: &Mutex<Vec<Media>>) -> usize {
+    asked
+        .lock()
+        .iter()
+        .filter(|message| matches!(message, Media::Want { .. }))
+        .count()
+}
+
+/// The `Fetch` requests a bare holder saw, as `(start, len)`.
+pub fn fetches(asked: &Mutex<Vec<Media>>) -> Vec<(u64, u64)> {
+    asked
+        .lock()
+        .iter()
+        .filter_map(|message| match message {
+            Media::Fetch { start, len, .. } => Some((*start, *len)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The photo table on an author's plain replica, the columns the policy
+/// table has.
+const PLAIN_PHOTOS: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
+                            content_id BLOB NOT NULL, thumb_id BLOB)";
+
+/// One captured queue entry's body.
+#[derive(QueryableByName)]
+struct Body {
+    #[diesel(sql_type = diesel::sql_types::Binary)]
+    changeset: Vec<u8>,
+}
+
+/// The changeset an author's replica in `dir` captures for inserting anna's
+/// photo `id` naming `content` and `thumb`, the author's next entry.
+pub async fn captured_photo(
+    dir: &std::path::Path,
+    id: i64,
+    content: Vec<u8>,
+    thumb: Option<Vec<u8>>,
+) -> Vec<u8> {
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            "-- connetto:major 1",
+            "",
+            PLAIN_PHOTOS,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    );
+    let mut author = cold_over::<Scripted>(&dir.join("author.sqlite"), schema).await;
+    author
+        .attach(Scripted::new([]))
+        .await
+        .expect("attach the transport");
+    diesel::insert_into(photos::table)
+        .values((
+            photos::id.eq(id),
+            photos::owner.eq("anna"),
+            photos::content_id.eq(content),
+            photos::thumb_id.eq(thumb),
+        ))
+        .execute(author.conn())
+        .expect("insert the author's photo");
+    author.flush().await.expect("flush the author's write");
+    diesel::sql_query("SELECT changeset FROM _connetto_pending ORDER BY position DESC LIMIT 1")
+        .get_result::<Body>(author.conn())
+        .expect("capture the author's photo")
+        .changeset
+}
+
+/// Applies `body` as `author`'s entry `seq` on `client`.
+pub async fn apply_entry(
+    client: &ConnettoClient<Scripted>,
+    author: &PeerAuthor,
+    seq: u64,
+    body: Vec<u8>,
+) {
+    let row = ManifestRow {
+        seq,
+        major: Major::new(1).expect("major 1"),
+        origin: None,
+        digest: Sha256::digest(&body).into(),
+    };
+    let author = author.clone();
+    client
+        .with_conn(move |conn| conn.apply_peer_entry(&author, &row, &body))
+        .await
+        .expect("the replica is open")
+        .expect("apply the author's entry");
 }
