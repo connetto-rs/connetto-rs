@@ -11501,6 +11501,53 @@ mod tests {
         assert_eq!(armed, vec![2], "the run past the frontier is armed");
     }
 
+    /// R78 decision 17 on R77 decision 9: a device's entry applied before the
+    /// restore and refused by the restored server enters the retraction log
+    /// peers read, and keeps the refusal for a later restore.
+    #[cfg(all(feature = "device-identity", feature = "peer"))]
+    #[tokio::test]
+    async fn a_device_entry_refused_after_a_restore_enters_the_retraction_log() {
+        let (mut conn, key, device) = device_settled_two_of_three(SyncTuning::default()).await;
+        conn.answer_bind(
+            key,
+            "below".to_owned(),
+            WriterOutcome::Bound { frontier: 1 },
+        )
+        .await
+        .expect("the bind is answered");
+        let event = conn
+            .handle_control(ControlMessage::MutationReject(
+                connetto_core::messages::MutationReject {
+                    client_seq: 2,
+                    reason: MutationRejectReason::Unauthorized,
+                },
+            ))
+            .await
+            .expect("the answer settles");
+        let refused = PriorRefusal::Rejected(MutationRejectReason::Unauthorized);
+        assert_eq!(
+            event,
+            ClientEvent::WriteRestored {
+                client_seq: 2,
+                refused: Some(refused.clone()),
+            }
+        );
+        let logged: Vec<i64> = author::_connetto_retraction::table
+            .filter(author::_connetto_retraction::writer.eq(writer_id(&device)))
+            .select(author::_connetto_retraction::seq)
+            .load(&mut conn.db)
+            .expect("read the retraction log");
+        assert_eq!(logged, vec![2], "peers learn the refusal");
+        let run = acked::run(&mut conn.db, &device, 2, 2, conn.config.schema_major)
+            .expect("read the retained entry")
+            .expect("the entry stays retained");
+        assert_eq!(
+            run[0].1.refused,
+            Some(refused),
+            "a later restore declares it"
+        );
+    }
+
     /// Decision 21's device rows, with no retained run: a `Bound` whose
     /// frontier stands at what the replica saw settled keeps the device, and
     /// one below it can only come from a restore, so the key is retired and
