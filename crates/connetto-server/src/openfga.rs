@@ -44,7 +44,10 @@ use openfga_client::tonic::codegen::{Body as ResponseBody, Bytes, StdError, http
 use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::generator::tuple_generator::{TupleCondition, TupleRow};
 use rls2fga::translator::Translator;
-use rls2fga::types::{Record, RecordContextValue, RelationShapes, ReplayScope, RowDecision};
+use rls2fga::types::{
+    NoteSeverity, Record, RecordContextValue, RelationShapes, ReplayScope, RowDecision,
+    TranslationNote,
+};
 use subql::ParserDB;
 use subql::backend::{Postgres, Value};
 use subql::visibility::openfga::{OpenFgaError, OpenFgaPolicy, Reconciled, WithdrawnFact};
@@ -558,6 +561,21 @@ pub enum SetupError {
          will narrow this refusal: {0}"
     )]
     Unwithdrawable(String),
+    /// A policy applies to named roles, and connetto runs every caller as its
+    /// reader role, so neither translation can settle who the policy serves.
+    #[error(
+        "policy {policy} on table {table} applies only to {roles}, and connetto runs every \
+         caller as its reader role, so it cannot tell which callers the policy serves. Write \
+         the policy without a TO clause, or TO PUBLIC"
+    )]
+    RoleScopedPolicy {
+        /// The policy's name.
+        policy: String,
+        /// The table it is defined on, as written.
+        table: String,
+        /// The roles its `TO` clause names, as written.
+        roles: String,
+    },
 }
 
 /// The pool the authorization store's facts are read from, whose role sees
@@ -652,6 +670,7 @@ impl Translated {
         }
         let catalog = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&sql)
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
+        refuse_role_scoped(&catalog)?;
         let translator = rls2fga::translator::TranslatorBuilder::new()
             .with_min_confidence(rls2fga::types::ConfidenceLevel::B)
             .with_session_attributes([
@@ -699,6 +718,7 @@ impl Translated {
         if !diverging.is_empty() {
             return Err(SetupError::Untranslated(diverging.join("; ")));
         }
+        warn_operator_notes(&notes);
         let outputs = translator
             .translate(&catalog)
             .map_err(|err| SetupError::Unplannable(err.to_string()))?
@@ -803,6 +823,13 @@ impl Translated {
     #[must_use]
     pub fn shapes_arc(&self) -> Arc<Shapes<ParserDB>> {
         Arc::clone(&self.shapes)
+    }
+
+    /// The translator the materializer's engine classifies membership with,
+    /// the one `into_parts` later hands to the upkeep.
+    #[must_use]
+    pub const fn translator(&self) -> &Translator {
+        &self.translator
     }
 
     /// Put this translation's rule description on the service, adopting the
@@ -1166,6 +1193,69 @@ struct PlainRow {
     relation: String,
     #[diesel(sql_type = Text)]
     subject: String,
+}
+
+/// Log at `warn` every note that leaves the boot running and still asks
+/// something of the operator or says whom the rules do not reach.
+///
+/// The note asking every check to carry a parameter is left out, since
+/// connetto supplies that parameter itself and the operator has nothing to
+/// act on.
+fn warn_operator_notes(notes: &[TranslationNote]) {
+    for note in notes.iter().filter(|note| {
+        matches!(
+            note.severity(),
+            NoteSeverity::ActionRequired | NoteSeverity::Exempt
+        ) && !matches!(
+            note,
+            TranslationNote::CallerSuppliesConditionParameter { .. }
+        )
+    }) {
+        tracing::warn!(
+            subject = %note.subject(),
+            severity = %note.severity(),
+            "{note}"
+        );
+    }
+}
+
+/// Refuse the first policy whose `TO` clause names a role other than
+/// `PUBLIC`, naming the policy, its table and the roles as written.
+///
+/// Every caller runs as the reader role, so neither the model nor the
+/// replica can tell which callers such a policy serves. `CURRENT_USER`,
+/// `CURRENT_ROLE` and `SESSION_USER` count as named, since each resolves to
+/// a role at run time.
+///
+/// # Errors
+///
+/// [`SetupError::RoleScopedPolicy`] for the first such policy in document
+/// order.
+fn refuse_role_scoped(catalog: &ParserDB) -> Result<(), SetupError> {
+    use sql_traits::prelude::DatabaseLike as _;
+    use sqlparser::ast::Owner;
+
+    let is_public = |owner: &Owner| {
+        matches!(owner, Owner::Ident(ident)
+            if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("public"))
+    };
+    for policy in catalog.policies() {
+        let Some(roles) = &policy.to else { continue };
+        if roles.iter().all(is_public) {
+            continue;
+        }
+        return Err(SetupError::RoleScopedPolicy {
+            policy: policy.name.value.clone(),
+            table: policy.table_name.to_string(),
+            roles: roles
+                .iter()
+                .filter(|owner| !is_public(owner))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        });
+    }
+    Ok(())
 }
 
 /// Every table a policy expression reads, deduplicated and sorted.
