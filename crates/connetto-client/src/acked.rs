@@ -9,8 +9,8 @@
 //! table stays apart from `_connetto_pending`, whose readers take it for the
 //! unsent writes alone.
 
-use connetto_core::Major;
 use connetto_core::messages::{PriorRefusal, Provenance, WriterRef};
+use connetto_core::{Major, SchemaVersion};
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
@@ -20,7 +20,12 @@ use crate::{ClientError, PendingEntry, seq_storage, stored_provenance, writer_id
 pub(crate) const ACKED_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_acked \
      (writer TEXT NOT NULL, seq INTEGER NOT NULL, changeset BLOB NOT NULL, \
       entry_hash BLOB NOT NULL, prov_writer TEXT, prov_seq INTEGER, prov_secret BLOB, \
-      major INTEGER, refused BLOB, acked_at INTEGER NOT NULL, PRIMARY KEY (writer, seq))";
+      major INTEGER, refused BLOB, acked_at INTEGER NOT NULL, version BLOB, \
+      PRIMARY KEY (writer, seq))";
+
+/// The bundle hash column a table made before it holds none of (R78
+/// decision 26).
+pub(crate) const VERSION_COLUMN: &str = "ALTER TABLE _connetto_acked ADD COLUMN version BLOB";
 
 diesel::table! {
     /// The entries the server answered for good, kept for a restore.
@@ -45,6 +50,9 @@ diesel::table! {
         refused -> Nullable<Binary>,
         /// When the server answered it, in seconds of the replica's clock.
         acked_at -> BigInt,
+        /// The bundle hash of the build that captured it, which an older
+        /// major's server is presented with.
+        version -> Nullable<Binary>,
     }
 }
 
@@ -57,19 +65,22 @@ pub(crate) struct AckedEntry {
     pub(crate) provenance: Option<Provenance>,
     /// The refusal the entry settled with.
     pub(crate) refused: Option<PriorRefusal>,
+    /// The application schema major that captured it.
+    pub(crate) major: Option<Major>,
+    /// That build's bundle hash.
+    pub(crate) version: Option<SchemaVersion>,
 }
 
-/// Keep `writer`'s entry `seq`, answered with `refused` or applied, at
-/// `now`, then drop every retained entry older than `retention`. Runs in the
+/// Keep `writer`'s entry `seq`, answered as `settled` says, at `now`, then
+/// drop every retained entry older than the build's retention. Runs in the
 /// transaction that retires the entry from `_connetto_pending`.
 pub(crate) fn retain(
     db: &mut SqliteConnection,
     writer: &WriterRef,
     seq: u64,
     entry: &PendingEntry,
-    refused: Option<&PriorRefusal>,
+    settled: &crate::Settled<'_>,
     now: i64,
-    retention: core::time::Duration,
 ) -> Result<(), ClientError> {
     let (prov_writer, prov_seq, prov_secret) = match &entry.provenance {
         Some(prov) => (
@@ -79,7 +90,8 @@ pub(crate) fn retain(
         ),
         None => (None, None, None),
     };
-    let refused = refused
+    let refused = settled
+        .refused
         .map(serde_json::to_vec)
         .transpose()
         .map_err(|err| ClientError::Session(format!("a refusal does not encode: {err}")))?;
@@ -95,9 +107,10 @@ pub(crate) fn retain(
             _connetto_acked::major.eq(entry.major.map(|major| i64::from(major.get()))),
             _connetto_acked::refused.eq(refused),
             _connetto_acked::acked_at.eq(now),
+            _connetto_acked::version.eq(settled.version.map(SchemaVersion::hash)),
         ))
         .execute(db)?;
-    prune(db, now, retention)
+    prune(db, now, settled.retention)
 }
 
 /// Drop every retained entry answered `retention` or longer before `now`.
@@ -168,15 +181,37 @@ pub(crate) fn rewrite_major(
     Ok(())
 }
 
+/// Give every retained entry `major` captured without a bundle hash the
+/// hash `version`, the build R31's rebuild leaves behind. The rebuild runs
+/// before the metadata install, so the column is added here when missing.
+pub(crate) fn fill_version(
+    db: &mut SqliteConnection,
+    major: i64,
+    version: &SchemaVersion,
+) -> Result<(), ClientError> {
+    match diesel::connection::SimpleConnection::batch_execute(db, VERSION_COLUMN) {
+        Ok(()) => {}
+        Err(diesel::result::Error::DatabaseError(_, info))
+            if info.message().contains("duplicate column name") => {}
+        Err(error) => return Err(error.into()),
+    }
+    diesel::update(
+        _connetto_acked::table
+            .filter(_connetto_acked::major.eq(major))
+            .filter(_connetto_acked::version.is_null()),
+    )
+    .set(_connetto_acked::version.eq(version.hash()))
+    .execute(db)?;
+    Ok(())
+}
+
 /// `writer`'s retained entries from `from` through `to` in sequence order,
-/// when the replica retains every one of them under `major`, the capture
-/// major this connection's wire carries.
+/// when the replica retains every one of them.
 pub(crate) fn run(
     db: &mut SqliteConnection,
     writer: &WriterRef,
     from: u64,
     to: u64,
-    major: Option<Major>,
 ) -> Result<Option<Vec<(u64, AckedEntry)>>, ClientError> {
     #[derive(diesel::Queryable)]
     struct Row {
@@ -187,6 +222,7 @@ pub(crate) fn run(
         prov_secret: Option<Vec<u8>>,
         major: Option<i64>,
         refused: Option<Vec<u8>>,
+        version: Option<Vec<u8>>,
     }
     if from > to {
         return Ok(None);
@@ -204,19 +240,19 @@ pub(crate) fn run(
             _connetto_acked::prov_secret,
             _connetto_acked::major,
             _connetto_acked::refused,
+            _connetto_acked::version,
         ))
         .load(db)?;
     let mut entries = Vec::with_capacity(rows.len());
     for (expected, row) in (from..=to).zip(rows) {
+        // A gap leaves the run to the writer's retirement.
+        if u64::try_from(row.seq).ok() != Some(expected) {
+            return Ok(None);
+        }
         let captured = row
             .major
             .and_then(|major| u32::try_from(major).ok())
             .and_then(Major::new);
-        // A gap, or an entry only another major's wire carries, leaves the
-        // run to the writer's retirement.
-        if u64::try_from(row.seq).ok() != Some(expected) || captured != major {
-            return Ok(None);
-        }
         let refused = row
             .refused
             .map(|bytes| serde_json::from_slice::<PriorRefusal>(&bytes))
@@ -234,6 +270,8 @@ pub(crate) fn run(
                     row.prov_secret,
                 ),
                 refused,
+                major: captured,
+                version: row.version.map(SchemaVersion::from_hash),
             },
         ));
     }

@@ -417,3 +417,147 @@ async fn a_drain_wire_whose_receive_fails_redials_after_a_backoff() {
     );
     assert_eq!(conn.unsynced().len(), 1);
 }
+
+/// Queue rows `ids` under number 7 as major 1 captured them, drain them to
+/// major 1's server and pump until the batch drained, so the replica
+/// retains them with major 1's bundle hash. Returns their sequences.
+async fn drain_major_one_writes(conn: &mut Conn, ids: &[i32]) -> Vec<u64> {
+    let seqs: Vec<u64> = ids
+        .iter()
+        .map(|id| queue(conn, WriterRef::Number(7), *id, major(1)))
+        .collect();
+    hold_major_one(conn);
+    let (_asked, mut old, _broken) = dial(conn, vec![granting(7)], Then::Stay).await;
+    for seq in &seqs {
+        assert_eq!(apply_next(&mut old).await, *seq);
+    }
+    while pump(conn).await != ClientEvent::Held(HeldWork::Drained { major: major(1) }) {}
+    seqs
+}
+
+/// The old major's acknowledgement binding number 7 at `frontier`.
+fn binding_seven_at(frontier: u64) -> ControlMessage {
+    ack(Some(WriterGrant {
+        number: 7,
+        frontier,
+    }))
+}
+
+/// The sequences number 7's armed run still holds.
+fn armed(conn: &Conn) -> Vec<u64> {
+    conn.restore
+        .as_ref()
+        .map(|restore| restore.entries.keys().copied().collect())
+        .unwrap_or_default()
+}
+
+/// R78 decision 27: a run reaching into an older major opens a drain for it
+/// although its batch drained long ago, presents it with the bundle hash its
+/// rows carry, and re-sends that prefix, while the main wire holds the run's
+/// current-major part until the prefix settles.
+#[tokio::test]
+async fn a_run_reaching_into_an_older_major_drains_its_prefix_first() {
+    let mut conn = replica();
+    let prefix = drain_major_one_writes(&mut conn, &[1, 2]).await;
+    let current = queue(&mut conn, WriterRef::Number(7), 3, major(2));
+    conn.bound_writer = Some(WriterRef::Number(7));
+    conn.handle_control(ControlMessage::MutationApplied(MutationApplied {
+        client_seq: current,
+    }))
+    .await
+    .expect("the major 2 write settles");
+    conn.bound_writer = None;
+    assert_eq!(conn.drain_timer(), None, "nothing is held any more");
+
+    assert!(
+        conn.arm_restore(WriterRef::Number(7), 0)
+            .expect("arm the run"),
+        "the whole run is retained"
+    );
+    assert_eq!(armed(&conn), vec![prefix[0], prefix[1], current]);
+    assert!(conn.run_holds_older_major(WriterRef::Number(7)));
+    assert_eq!(
+        conn.drain_timer().map(|timer| timer.wait()),
+        Some(Duration::ZERO),
+        "the run's older major owes a dial at once"
+    );
+
+    let (asked, mut old, _broken) = dial(&mut conn, vec![binding_seven_at(0)], Then::Stay).await;
+    assert_eq!(asked, number_request(7));
+    assert_eq!(apply_next(&mut old).await, prefix[0]);
+    assert_eq!(apply_next(&mut old).await, prefix[1]);
+    let mut events = Vec::new();
+    while !events.contains(&ClientEvent::Held(HeldWork::Drained { major: major(1) })) {
+        events.push(pump(&mut conn).await);
+    }
+    assert!(
+        events.contains(&ClientEvent::WriteRestored {
+            client_seq: prefix[1],
+            refused: None,
+        }),
+        "the re-sent entries settle as restored, saw {events:?}"
+    );
+    assert_eq!(armed(&conn), vec![current], "the main wire's part is left");
+    assert!(!conn.run_holds_older_major(WriterRef::Number(7)));
+}
+
+/// R78 decision 27: a restore met first on the drain wire arms the retained
+/// run there, re-sending it ahead of the writer's held entry, instead of
+/// sending the held entry into a gap.
+#[tokio::test]
+async fn a_restore_met_first_on_the_drain_wire_resends_the_run_ahead_of_the_held_write() {
+    let mut conn = replica();
+    let prefix = drain_major_one_writes(&mut conn, &[1, 2]).await;
+    let held = queue(&mut conn, WriterRef::Number(7), 3, major(1));
+    hold_major_one(&mut conn);
+
+    let (_asked, mut old, _broken) = dial(&mut conn, vec![binding_seven_at(0)], Then::Stay).await;
+    assert_eq!(apply_next(&mut old).await, prefix[0]);
+    assert_eq!(apply_next(&mut old).await, prefix[1]);
+    assert_eq!(apply_next(&mut old).await, held);
+    while pump(&mut conn).await != ClientEvent::Held(HeldWork::Drained { major: major(1) }) {}
+    assert_eq!(armed(&conn), Vec::<u64>::new());
+    assert_eq!(conn.unsynced(), [] as [crate::UnsyncedWrite; 0]);
+}
+
+/// R78 decision 27: a run whose older major no server serves any more cannot
+/// complete, so the writer moves on and the run's entries are reported lost.
+#[tokio::test]
+async fn a_run_whose_older_major_is_gone_is_lost_and_the_writer_moves_on() {
+    let mut conn = replica();
+    let prefix = drain_major_one_writes(&mut conn, &[1, 2]).await;
+    assert!(
+        conn.arm_restore(WriterRef::Number(7), 0)
+            .expect("arm the run")
+    );
+
+    let (_asked, _old, _broken) = dial(&mut conn, vec![major_one_gone()], Then::Stay).await;
+    let mut events = Vec::new();
+    loop {
+        let event = pump(&mut conn).await;
+        let lost = matches!(event, ClientEvent::Held(HeldWork::Lost { .. }));
+        events.push(event);
+        if lost {
+            break;
+        }
+    }
+    assert_eq!(
+        events.last(),
+        Some(&ClientEvent::Held(HeldWork::Lost {
+            major: major(1),
+            writes: prefix
+                .iter()
+                .map(|seq| HeldWrite {
+                    writer: WriterRef::Number(7),
+                    seq: *seq,
+                })
+                .collect(),
+            files: 0,
+        }))
+    );
+    assert_eq!(armed(&conn), Vec::<u64>::new());
+    assert!(
+        !conn.writers.contains_key(&WriterRef::Number(7)),
+        "the rewound number is abandoned"
+    );
+}

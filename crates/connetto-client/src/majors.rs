@@ -280,6 +280,10 @@ pub(crate) fn prepare_rebuild(
             }
         }
     }
+    // A replica older than the retained entries has no table to fill.
+    if has_table(db, "_connetto_acked")? {
+        crate::acked::fill_version(db, old_major, &from.version)?;
+    }
     let held_content = (content.hold)(db, from.major)?;
     if held_writes || held_content {
         diesel::insert_into(held_batch::table)
