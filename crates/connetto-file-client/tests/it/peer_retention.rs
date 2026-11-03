@@ -52,9 +52,9 @@ struct Body {
     changeset: Vec<u8>,
 }
 
-/// The changeset an author's replica captures for inserting photo `id`
-/// naming `file_id`.
-async fn captured_photo(dir: &std::path::Path, id: i64, file_id: FileId) -> Vec<u8> {
+/// The changeset anna's replica in `dir` captures for inserting photo `id`
+/// naming `value`, her next entry.
+async fn captured_photo(dir: &std::path::Path, id: i64, value: Vec<u8>) -> Vec<u8> {
     let schema = SyncSchema::new(
         SchemaBundle::new(
             "-- connetto:major 1",
@@ -75,7 +75,7 @@ async fn captured_photo(dir: &std::path::Path, id: i64, file_id: FileId) -> Vec<
         .values((
             photos::id.eq(id),
             photos::owner.eq("anna"),
-            photos::content_id.eq(file_id.as_bytes().to_vec()),
+            photos::content_id.eq(value),
         ))
         .execute(author.conn())
         .expect("insert the author's photo");
@@ -86,10 +86,10 @@ async fn captured_photo(dir: &std::path::Path, id: i64, file_id: FileId) -> Vec<
         .changeset
 }
 
-/// Applies `body` as anna's entry 1 on `client`.
-async fn apply(client: &ConnettoClient<Scripted>, body: Vec<u8>) {
+/// Applies `body` as anna's entry `seq` on `client`.
+async fn apply(client: &ConnettoClient<Scripted>, seq: u64, body: Vec<u8>) {
     let row = ManifestRow {
-        seq: 1,
+        seq,
         major: Major::new(1).expect("major 1"),
         origin: None,
         digest: Sha256::digest(&body).into(),
@@ -130,7 +130,7 @@ async fn held(device: &Device, file_id: FileId) -> bool {
 /// A receiver that applied anna's provisional photo row and fetched its file
 /// from a linked holder, as cache.
 struct Camp {
-    _dirs: [tempfile::TempDir; 3],
+    dirs: [tempfile::TempDir; 3],
     client: ConnettoClient<Scripted>,
     receiver: Device,
     file_id: FileId,
@@ -147,7 +147,12 @@ impl Camp {
         let bytes = pseudorandom(60, 300_000);
         let file_id = stage(&holder, 1, "anna", &bytes).await;
         let (client, receiver) = declared(dirs[1].path()).await;
-        apply(&client, captured_photo(dirs[2].path(), 7, file_id).await).await;
+        apply(
+            &client,
+            1,
+            captured_photo(dirs[2].path(), 7, file_id.as_bytes().to_vec()).await,
+        )
+        .await;
 
         let devices = Devices::new();
         let (holder_node, holder_addr, holder_events) = devices.node(&devices.device("r77", 2));
@@ -171,7 +176,7 @@ impl Camp {
         )
         .await;
         Self {
-            _dirs: dirs,
+            dirs,
             client,
             receiver,
             file_id,
@@ -216,6 +221,29 @@ async fn a_file_a_provisional_row_names_survives_a_tidy_until_the_row_is_settled
         !held(&camp.receiver, camp.file_id).await,
         "a settled row's file is ordinary cache, which the tidy removes"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_provisional_value_that_is_no_file_id_spares_nothing_and_stops_nothing() {
+    let camp = Camp::new().await;
+    apply(
+        &camp.client,
+        2,
+        captured_photo(camp.dirs[2].path(), 8, b"short".to_vec()).await,
+    )
+    .await;
+    camp.receiver.tidy_content().await.expect("tidy");
+    assert!(
+        held(&camp.receiver, camp.file_id).await,
+        "the first row still names the file"
+    );
+
+    camp.client
+        .with_conn(|conn| conn.adjudicate_peer_frontier(&anna().key_id, 2))
+        .await
+        .expect("the replica is open")
+        .expect("adjudicate anna's frontier");
+    assert_eq!(camp.receiver.tidy_content().await.expect("tidy"), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
