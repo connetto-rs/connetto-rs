@@ -54,6 +54,10 @@ pub struct KeyRecord<Id> {
     pub revoked: bool,
     /// Whether the key holds a certificate not expired at the read.
     pub certificate_live: bool,
+    /// Whether the key's certificate is not expired past the tolerance a
+    /// peer still accepts it within, the read minus `DEVICE_SKEW` (R77
+    /// decision 11).
+    pub certificate_live_past_skew: bool,
     /// The device key's `SubjectPublicKeyInfo`.
     pub public_key: Vec<u8>,
 }
@@ -368,6 +372,11 @@ impl<Id: Clone + PartialEq + Send + Sync + 'static> EnrolmentStore<Id> for Memor
     ) -> EnrolmentFuture<'a, Option<KeyRecord<Id>>> {
         let record = {
             let state = self.state.lock();
+            let now = SystemTime::now();
+            // The tolerance window a peer still accepts within (R77 decision 11).
+            let past_skew = now
+                .checked_sub(connetto_core::clock::DEVICE_SKEW)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
             state
                 .rows
                 .get(&key)
@@ -385,7 +394,11 @@ impl<Id: Clone + PartialEq + Send + Sync + 'static> EnrolmentStore<Id> for Memor
                         certificate_live: state
                             .grants
                             .iter()
-                            .any(|grant| grant.key == key && grant.expires_at > SystemTime::now()),
+                            .any(|grant| grant.key == key && grant.expires_at > now),
+                        certificate_live_past_skew: state
+                            .grants
+                            .iter()
+                            .any(|grant| grant.key == key && grant.expires_at > past_skew),
                         public_key,
                     }
                 })

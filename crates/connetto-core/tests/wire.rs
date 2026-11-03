@@ -12,6 +12,7 @@ use connetto_core::{
         decode_control_framed, encode_bulk, encode_bulk_framed, encode_control,
         encode_control_framed,
     },
+    exchange::{Frontier, Offer, RetractCause, Retraction, SignedOffer},
     messages::{
         AckCredits, AggregateUpdate, BindDevice, BotListEntry, BotRegistered, BulkMessage,
         Challenge, ConflictRow, ControlMessage, DeviceAttestation, DeviceRevokedAck, DeviceSummary,
@@ -19,11 +20,11 @@ use connetto_core::{
         EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
         FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MutationConflict,
         MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError,
-        PauseCause, Ping, Pong, Provenance, RateLimited, RegisterBot, ReplaceShareKeys,
-        RetireWriter, RevocationUpdate, RevokeDeviceRequest, ShareKeysReplaced, SignedList,
-        SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority,
-        SubscriptionSpec, Unsubscribe, WriterAnswer, WriterGrant, WriterOutcome, WriterRef,
-        WriterRequest, WriterSecret,
+        PauseCause, Ping, Pong, Provenance, ProvisionalStatus, ProvisionalVerdicts, RateLimited,
+        RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate, RevokeDeviceRequest,
+        ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
+        SubscriptionPriority, SubscriptionSpec, Unsubscribe, Verdict, WriterAnswer, WriterGrant,
+        WriterOutcome, WriterRef, WriterRequest, WriterSecret,
     },
     version::PROTOCOL_VERSION,
 };
@@ -650,4 +651,57 @@ fn every_enrol_refusal() -> Vec<EnrolRefusal> {
         }
     }
     all
+}
+
+#[test]
+fn provisional_frames_round_trip() {
+    // The offer travels as the cursor's stored MessagePack bytes.
+    let signed = SignedOffer {
+        offer: Offer {
+            builds: vec![(
+                Major::new(3).expect("a major"),
+                SchemaVersion::from_hash(vec![1]),
+            )],
+            settled: Some(Frontier {
+                seq: 2,
+                head: [7; 32],
+            }),
+            newest: Some(Frontier {
+                seq: 3,
+                head: [8; 32],
+            }),
+            retractions: vec![Retraction {
+                seq: 2,
+                cause: RetractCause::Rejected(MutationRejectReason::Unauthorized),
+            }],
+        },
+        signature: vec![0x30, 0x44, 0x02],
+    };
+    let offer = rmp_serde::to_vec_named(&signed).expect("a signed offer encodes");
+    round_trip_control(&ControlMessage::ProvisionalStatus(ProvisionalStatus {
+        request_id: "ask-1".into(),
+        author: [9; 32],
+        offer,
+        seqs: vec![1, 2, 3],
+    }));
+    for verdict in [
+        Verdict::Applied,
+        Verdict::Settled,
+        Verdict::Refused(RetractCause::Rejected(MutationRejectReason::Unauthorized)),
+        Verdict::Refused(RetractCause::Conflict),
+        Verdict::Refused(RetractCause::Abandoned),
+        Verdict::Pending,
+    ] {
+        round_trip_control(&ControlMessage::ProvisionalVerdicts(ProvisionalVerdicts {
+            request_id: "ask-1".into(),
+            verdicts: vec![(3, verdict)],
+        }));
+    }
+    // An ask with no sequences round-trips the same way.
+    round_trip_control(&ControlMessage::ProvisionalStatus(ProvisionalStatus {
+        request_id: "ask-2".into(),
+        author: [10; 32],
+        offer: rmp_serde::to_vec_named(&signed).expect("a signed offer encodes"),
+        seqs: vec![],
+    }));
 }

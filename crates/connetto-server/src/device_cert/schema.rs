@@ -832,6 +832,24 @@ macro_rules! connetto_enrolment_tables {
                     )))
                     .get_result(conn)
                     .await?;
+                    // The tolerance window a peer still accepts within (R77 decision 11).
+                    let live_past_skew: bool = diesel::select(diesel::dsl::exists(QueryDsl::filter(
+                        QueryDsl::filter(
+                            connetto_device_certificates::table,
+                            connetto_device_certificates::key_id.eq(key.as_bytes().to_vec()),
+                        ),
+                        connetto_device_certificates::expires_at.gt(diesel::dsl::sql::<
+                            diesel::sql_types::Timestamptz,
+                        >(
+                            "now() - make_interval(secs => ",
+                        )
+                        .bind::<diesel::sql_types::Double, _>(
+                            $crate::db_clock::DEVICE_SKEW_SECS,
+                        )
+                        .sql(")")),
+                    )))
+                    .get_result(conn)
+                    .await?;
                     let found: Option<($id, bool, Vec<u8>)> = match user {
                         Some(user) => RunQueryDsl::first(
                             QueryDsl::filter(
@@ -874,6 +892,7 @@ macro_rules! connetto_enrolment_tables {
                             user,
                             revoked,
                             certificate_live: live,
+                            certificate_live_past_skew: live_past_skew,
                             public_key,
                         },
                     ))

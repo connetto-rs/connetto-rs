@@ -111,3 +111,27 @@ pub struct SignedOffer {
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
+
+/// The rows one manifest frame carries, the bound a manifest over is refused
+/// on both ends of the link and the sequences one provisional ask carries.
+pub const MAX_MANIFEST_ROWS: usize = 8192;
+
+/// How the server ruled on one asked sequence of a verified provisional ask
+/// (R77 decision 11), the writer row's `frontier` being `f`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Verdict {
+    /// A record of the sequence stands with outcome `Applied`.
+    Applied,
+    /// No record of the sequence stands at or below the frontier.
+    Settled,
+    /// A record of the sequence stands with a refusal, the cause the
+    /// receiver retracts on.
+    Refused(RetractCause),
+    /// No record of the sequence stands above the frontier of a writer that
+    /// can no longer deliver, a retired one or one whose enrolment is
+    /// revoked, absent or past its expiry plus tolerance.
+    Abandoned,
+    /// No record of the sequence stands above the frontier of a writer that
+    /// can still deliver, so the receiver waits for the next connection.
+    Pending,
+}

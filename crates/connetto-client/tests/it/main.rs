@@ -97,6 +97,8 @@ mod pump_fault;
 
 #[cfg(feature = "peer")]
 mod provisional;
+#[cfg(feature = "peer")]
+mod provisional_adjudication;
 mod reconnect_live;
 
 mod references;

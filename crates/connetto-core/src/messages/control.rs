@@ -92,6 +92,7 @@ use super::{
     flow::{AckCredits, Ping, Pong},
     handshake::{Handshake, HandshakeAck},
     mutation::{HeldWork, MutationApplied, MutationConflict, MutationHeader, MutationReject},
+    provisional::{ProvisionalStatus, ProvisionalVerdicts},
     reconnect::FullResyncRequired,
     registration::{BotRegistered, Challenge, RegisterBot},
     share_keys::{ReplaceShareKeys, ShareKeysReplaced, TabShareKeyAnswer, TabShareKeyChange},
@@ -188,6 +189,12 @@ pub enum ControlMessage {
     RetireWriter(RetireWriter),
     /// Server answers a bind or a retirement.
     WriterAnswer(WriterAnswer),
+
+    /// Client asks how the server stood to one author's sequences, the
+    /// ruling of its provisional rows (R77).
+    ProvisionalStatus(ProvisionalStatus),
+    /// Server answers the ask, one ruling per sequence.
+    ProvisionalVerdicts(ProvisionalVerdicts),
 
     /// Client heartbeat probe.
     Ping(Ping),

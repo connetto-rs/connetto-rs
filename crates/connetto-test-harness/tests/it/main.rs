@@ -8,6 +8,8 @@ mod cap_policies;
 
 mod catchup_cost;
 
+mod demo;
+
 mod fanout_counters;
 
 mod fanout_delegated;
@@ -24,6 +26,8 @@ mod outage;
 mod parity;
 
 mod peer_exchange;
+
+mod provisional_adjudication;
 
 mod read_rule_fold;
 

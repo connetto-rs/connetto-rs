@@ -35,7 +35,7 @@ use std::time::{Duration, Instant, SystemTime};
 use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
 use connetto_core::chain::{self, GENESIS};
 use connetto_core::device_cert::{KeyId, spki_point};
-use connetto_core::exchange::Origin;
+use connetto_core::exchange::{Origin, SignedOffer};
 use connetto_core::messages::{
     AggregateUpdate, BindDevice, BindValue, BotRegistered, BulkMessage, CONTENT_TICKET_REFUSED,
     CONTENT_TICKET_SIGNER_ERROR, Challenge, ConflictRow, ContentTicketGrant, ContentTicketRequest,
@@ -43,11 +43,12 @@ use connetto_core::messages::{
     EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
     FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MembershipOpened,
     MutationApplied, MutationConflict, MutationHeader, MutationPatch, MutationReject,
-    MutationRejectReason, NonFatalError, PauseCause, Pong, Provenance, RateLimited, RegisterBot,
-    ReplaceShareKeys, RetireWriter, RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED,
-    ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
-    SubscriptionSpec, WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest,
-    WriterSecret, bot_registration_message, writer_bind_message,
+    MutationRejectReason, NonFatalError, PROVISIONAL_ASK_REFUSED, PauseCause, Pong, Provenance,
+    ProvisionalStatus, ProvisionalVerdicts, RateLimited, RegisterBot, ReplaceShareKeys,
+    RetireWriter, RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED, ShareKeysReplaced,
+    SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
+    WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
+    bot_registration_message, writer_bind_message,
 };
 use connetto_core::traits::{
     CheckedGrant, ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport,
@@ -5984,6 +5985,9 @@ where
             ControlMessage::RetireWriter(retire) => {
                 self.handle_retire_writer(transport, retire, state).await
             }
+            ControlMessage::ProvisionalStatus(ask) => {
+                self.handle_provisional_status(transport, ask).await
+            }
             // Server-origin frames received from a client are ignored.
             _ => Ok(()),
         }
@@ -6146,6 +6150,138 @@ where
             .send_control(ControlMessage::WriterAnswer(WriterAnswer {
                 request_id: retire.request_id,
                 outcome,
+            }))
+            .await
+            .map_err(transport_err)
+    }
+
+    /// Answer the ask about one author's provisional rows, each sequence
+    /// ruled from the writer's settled records (R77 decision 11).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one ask walks the verifications and the ruling in order and a split would hide the sequence"
+    )]
+    async fn handle_provisional_status<T: Transport>(
+        &self,
+        transport: &mut T,
+        ask: ProvisionalStatus,
+    ) -> Result<(), SessionError> {
+        let refused = || {
+            ControlMessage::NonFatalError(NonFatalError {
+                related_to: Some(ask.request_id.clone()),
+                detail: PROVISIONAL_ASK_REFUSED.to_owned(),
+            })
+        };
+        // The offer is the cursor's stored MessagePack.
+        let Ok(signed) = rmp_serde::from_slice::<SignedOffer>(&ask.offer) else {
+            return transport
+                .send_control(refused())
+                .await
+                .map_err(transport_err);
+        };
+        // One ask carries at most the manifest frame's bound, and no sequence
+        // past the offer's signed head.
+        if ask.seqs.len() > connetto_core::exchange::MAX_MANIFEST_ROWS
+            || ask.seqs.iter().any(|seq| {
+                signed
+                    .offer
+                    .newest
+                    .as_ref()
+                    .is_none_or(|newest| *seq > newest.seq)
+            })
+        {
+            return transport
+                .send_control(refused())
+                .await
+                .map_err(transport_err);
+        }
+        let record = match self.device_enrolment.get() {
+            Some(enrolment) => enrolment
+                .key_record(None, KeyId::from_bytes(ask.author))
+                .await
+                .map_err(|_| SessionError::Protocol("the enrolment store did not answer".into()))?,
+            None => None,
+        };
+        // A key the store has no record of counts as revoked, its sequences
+        // above the frontier abandoned (R77 decision 11).
+        let abandoned = record
+            .as_ref()
+            .is_none_or(|record| record.revoked || !record.certificate_live_past_skew);
+        if let Some(record) = &record
+            && !chain::verify_offer(&record.public_key, &ask.author, &signed)
+        {
+            return transport
+                .send_control(refused())
+                .await
+                .map_err(transport_err);
+        }
+        // The ask reads the writer's row, never creating one.
+        let key: Vec<u8> = ask.author.to_vec();
+        let writer_row = self
+            .target
+            .writer_by_key(&key)
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        let writer = writer_row.as_ref().map(|row| row.writer);
+        let (frontier, retired) = writer_row.as_ref().map_or((0, false), |row| {
+            (
+                u64::try_from(row.frontier).unwrap_or(0),
+                row.retired_at.is_some(),
+            )
+        });
+        // A record never stands above the frontier, so the one read covers
+        // the asked sequences at or below it alone.
+        let low = ask
+            .seqs
+            .iter()
+            .filter(|seq| **seq <= frontier)
+            .copied()
+            .min();
+        let mut records: HashMap<i64, SettledOutcome> = HashMap::new();
+        if let (Some(low), Some(writer)) = (low, writer) {
+            for (seq, settled) in self
+                .target
+                .settled_range(
+                    writer,
+                    i64::try_from(low).unwrap_or(0),
+                    i64::try_from(frontier).unwrap_or(i64::MAX),
+                )
+                .await
+                .map_err(|err| SessionError::WriteTarget(err.detail()))?
+            {
+                records.insert(
+                    seq,
+                    SettledOutcome::from_json(&settled.outcome).map_err(|err| {
+                        SessionError::Protocol(format!(
+                            "a settled record holds no outcome the table defines: {err}"
+                        ))
+                    })?,
+                );
+            }
+        }
+        let facts = crate::provisional::AskFacts {
+            frontier,
+            retired,
+            abandoned,
+        };
+        let verdicts = ask
+            .seqs
+            .iter()
+            .map(|seq| {
+                (
+                    *seq,
+                    crate::provisional::verdict_of(
+                        &facts,
+                        *seq,
+                        records.get(&i64::try_from(*seq).unwrap_or(i64::MAX)),
+                    ),
+                )
+            })
+            .collect();
+        transport
+            .send_control(ControlMessage::ProvisionalVerdicts(ProvisionalVerdicts {
+                request_id: ask.request_id,
+                verdicts,
             }))
             .await
             .map_err(transport_err)

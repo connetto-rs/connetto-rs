@@ -28,25 +28,27 @@ use connetto_core::messages::{
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
-    ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, SessionConfig, SessionManager,
+    SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{
     Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID, number_writer,
 };
-use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
+use diesel::{QueryDsl, SelectableHelper};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
-use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, Insert, SimpleTable, Update, Value};
+use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, SimpleTable, Update, Value};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use subql::backend::Postgres;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 
-const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
+use super::writer_shared::{
+    PG_DDL, insert_changeset, note_table, notes, seed_notes, writable_catalog,
+};
 
 fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
     std::sync::Arc::new(TestGrantChecker)
@@ -137,18 +139,6 @@ impl VisibilityPolicy for DenyAuth {
     }
 }
 
-diesel::table! {
-    /// Row from the notes test fixture.
-    notes (id) {
-        /// Note identifier, the primary key.
-        id -> diesel::sql_types::Integer,
-        /// Note text.
-        body -> diesel::sql_types::Text,
-        /// Timestamp of the last edit.
-        edited_at -> diesel::sql_types::Text,
-    }
-}
-
 #[derive(diesel::Queryable, diesel::Selectable, Debug, PartialEq)]
 #[diesel(table_name = notes)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -176,58 +166,6 @@ async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
         .load(&mut *conn)
         .await
         .expect("read notes")
-}
-
-/// Reset the fixture to a fresh `notes` table seeded with one versioned row and
-/// the writer tables provisioned by the admin.
-async fn seed_notes(fixture: &Fixture) {
-    fixture
-        .setup(&[
-            "DROP TABLE IF EXISTS notes CASCADE",
-            "DROP TABLE IF EXISTS _connetto_settled",
-            "DROP TABLE IF EXISTS _connetto_writers",
-            "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
-        ])
-        .await;
-    connetto_test_harness::provision_writers(fixture.admin()).await;
-    let mut conn = fixture.admin().get().await.expect("admin connection");
-    diesel::insert_into(notes::table)
-        .values((
-            notes::id.eq(1_i32),
-            notes::body.eq("hello"),
-            notes::edited_at.eq("t0"),
-        ))
-        .execute(&mut *conn)
-        .await
-        .expect("seed row");
-}
-
-fn writable_catalog() -> RuntimeWritableCatalog {
-    RuntimeWritableCatalog::builder()
-        .versioned("notes", "edited_at")
-        .build()
-}
-
-fn note_table() -> SimpleTable {
-    SimpleTable::new(
-        "notes",
-        &[("id", ""), ("body", ""), ("edited_at", "")],
-        &[0],
-    )
-}
-
-/// A changeset that inserts one full row.
-fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(note_table())
-        .set(0, Value::Integer(id))
-        .expect("set id")
-        .set(1, Value::Text(body.to_owned()))
-        .expect("set body")
-        .set(2, Value::Text(edited_at.to_owned()))
-        .expect("set edited_at");
-    ChangeSet::<SimpleTable, String, Vec<u8>>::new()
-        .insert(insert)
-        .build()
 }
 
 /// A changeset that updates one row, carrying the old image (the version basis).

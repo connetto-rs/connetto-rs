@@ -389,6 +389,20 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         Ok(())
     }
 
+    /// The settled rows of `writer` with sequences in `from..=to`, in
+    /// sequence order, the ask's one read of the records its sequences name.
+    pub(crate) async fn settled_range(
+        &self,
+        writer: i64,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<(i64, crate::writer_schema::SettledRow)>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::settled_range(&mut conn, writer, from, to)
+            .await
+            .map_err(WriteError::from)
+    }
+
     /// Drop every settled row of `writer`.
     pub(crate) async fn prune_writer(&self, writer: i64) -> Result<(), WriteError> {
         let mut conn = self.pool.get().await.map_err(pool_failure)?;

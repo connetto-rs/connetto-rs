@@ -95,12 +95,30 @@ pub(crate) fn cursor_of(
     }))
 }
 
+/// The author's last verified signed offer, its cursor's stored `MessagePack`
+/// bytes, `None` when nothing of the author was ever verified (R77).
+///
+/// # Errors
+///
+/// [`ClientError`] when the cursor cannot be read.
+pub(crate) fn offer_of(
+    db: &mut SqliteConnection,
+    author: &[u8],
+) -> Result<Option<Vec<u8>>, ClientError> {
+    let offer: Option<Vec<u8>> = dsl::_connetto_peer_cursor
+        .filter(dsl::author.eq(author))
+        .select(dsl::offer)
+        .first(db)
+        .optional()?;
+    Ok(offer)
+}
+
 /// Every stored cursor, author order, the archive's copy of the peer state
 /// (R77 decision 16).
 ///
 /// # Errors
 ///
-/// [`ClientError`] when a cursor cannot be read or its head is corrupt.
+/// When a cursor cannot be read or its head is corrupt.
 pub(crate) fn all_cursors(
     db: &mut SqliteConnection,
 ) -> Result<Vec<crate::archive::ArchivedPeerCursor>, ClientError> {

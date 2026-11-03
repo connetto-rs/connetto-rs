@@ -22,6 +22,9 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use super::writer_shared::{
+    Enrolments, PG_DDL, insert_changeset, notes, seed_notes, writable_catalog, writer_for_key,
+};
 use connetto_core::Major;
 use connetto_core::SessionId;
 use connetto_core::auth::Principal;
@@ -35,14 +38,12 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
 use connetto_server::courier::{CourierDelivery, CourierEntry, CourierRefusal};
 use connetto_server::defaults::{_connetto_settled, _connetto_writers};
-use connetto_server::device_cert::{
-    DeviceCertConfig, DeviceEnrolment, Enrolment, EnrolmentStore, MemoryEnrolments,
-};
+use connetto_server::device_cert::{DeviceEnrolment, Enrolment, EnrolmentStore};
 use connetto_server::writer_schema::{SettlePath, SettledOutcome};
 use connetto_server::{
-    AbuseConfig, ManagerBuilder, Materializer, NoConnector, PageSpec, RequestGuard,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, ThrottleConfig, pg_write_target,
+    AbuseConfig, ManagerBuilder, Materializer, NoConnector, PageSpec, RequestGuard, SessionConfig,
+    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, ThrottleConfig,
+    pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
@@ -50,12 +51,6 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use parking_lot::Mutex;
 use rcgen::{KeyPair, PublicKeyData as _, SigningKey as _};
-use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
-
-use super::enrolment::device_key;
-
-/// The notes table these tests sync.
-const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
 
 /// The handshake authority every test manager takes.
 fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
@@ -109,18 +104,6 @@ impl SnapshotSource for NoSnapshot {
 }
 
 diesel::table! {
-    /// Row from the notes test fixture.
-    notes (id) {
-        /// Note identifier, the primary key.
-        id -> diesel::sql_types::Integer,
-        /// Note text.
-        body -> diesel::sql_types::Text,
-        /// Timestamp of the last edit.
-        edited_at -> diesel::sql_types::Text,
-    }
-}
-
-diesel::table! {
     /// Backends waiting for database locks.
     pg_stat_activity (pid) {
         /// Backend identifier.
@@ -158,58 +141,6 @@ async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
         .expect("read notes")
 }
 
-/// Reset the fixture to a fresh `notes` table seeded with one versioned row
-/// and the writer tables provisioned by the admin.
-async fn seed_notes(fixture: &Fixture) {
-    fixture
-        .setup(&[
-            "DROP TABLE IF EXISTS notes CASCADE",
-            "DROP TABLE IF EXISTS _connetto_settled",
-            "DROP TABLE IF EXISTS _connetto_writers",
-            "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
-        ])
-        .await;
-    connetto_test_harness::provision_writers(fixture.admin()).await;
-    let mut conn = fixture.admin().get().await.expect("admin connection");
-    diesel::insert_into(notes::table)
-        .values((
-            notes::id.eq(1_i32),
-            notes::body.eq("hello"),
-            notes::edited_at.eq("t0"),
-        ))
-        .execute(&mut *conn)
-        .await
-        .expect("seed row");
-}
-
-fn writable_catalog() -> RuntimeWritableCatalog {
-    RuntimeWritableCatalog::builder()
-        .versioned("notes", "edited_at")
-        .build()
-}
-
-fn note_table() -> SimpleTable {
-    SimpleTable::new(
-        "notes",
-        &[("id", ""), ("body", ""), ("edited_at", "")],
-        &[0],
-    )
-}
-
-/// A changeset that inserts one full row.
-fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(note_table())
-        .set(0, Value::Integer(id))
-        .expect("set id")
-        .set(1, Value::Text(body.to_owned()))
-        .expect("set body")
-        .set(2, Value::Text(edited_at.to_owned()))
-        .expect("set edited_at");
-    ChangeSet::<SimpleTable, String, Vec<u8>>::new()
-        .insert(insert)
-        .build()
-}
-
 /// The writer's account, frontier, head and retirement state, read as admin.
 struct WriterFacts {
     user: Option<String>,
@@ -237,17 +168,6 @@ async fn writer_facts(pool: &Pool<AsyncPgConnection>, writer: i64) -> WriterFact
         head,
         retired,
     }
-}
-
-/// The writer number a device key bound to.
-async fn writer_for_key(pool: &Pool<AsyncPgConnection>, key_id: [u8; 32]) -> i64 {
-    let mut conn = pool.get().await.expect("admin connection");
-    _connetto_writers::table
-        .filter(_connetto_writers::device_key.eq(key_id.to_vec()))
-        .select(_connetto_writers::writer)
-        .get_result(&mut *conn)
-        .await
-        .expect("read the device writer")
 }
 
 /// One settled entry, read as admin, ordered by sequence.
@@ -306,48 +226,7 @@ impl Captured {
     }
 }
 
-/// The device key enrolments the test installs on the manager, in memory.
-struct Enrolments {
-    store: Arc<MemoryEnrolments<String>>,
-}
-
 impl Enrolments {
-    /// An empty store, fresh per test.
-    fn new() -> Self {
-        Self {
-            store: Arc::new(MemoryEnrolments::default()),
-        }
-    }
-
-    /// Enrol `user`'s fresh key with a certificate that stands until
-    /// `expires_at`, and hand back the key and its id.
-    async fn enrol(&self, user: &str, expires_at: SystemTime) -> (KeyPair, [u8; 32]) {
-        let key = device_key();
-        let key_id = *KeyId::of_public_key(&key.subject_public_key_info()).as_bytes();
-        let record = Enrolment {
-            user: user.to_owned(),
-            key: KeyId::from_bytes(key_id),
-            serial: [7; 16],
-            issuer: KeyId::from_bytes([9; 32]),
-            issued_at: SystemTime::now(),
-            expires_at,
-            session: SessionId::from_uuid(uuid::Uuid::new_v4()),
-            public_key: key.subject_public_key_info().clone(),
-            descriptor: vec![0x91, 0x01],
-            attestation: AttestationLevel::Unproven,
-        };
-        self.store
-            .record(record)
-            .await
-            .expect("record the certificate");
-        (key, key_id)
-    }
-
-    /// Revoke `key_id` whoever enrolled it, as an operator would.
-    fn revoke(&self, key_id: [u8; 32]) {
-        self.store.revoke_key(KeyId::from_bytes(key_id));
-    }
-
     /// Renew the same key with a certificate that stands until `expires_at`.
     async fn renew(&self, key: &KeyPair, user: &str, expires_at: SystemTime) {
         let key_id = *KeyId::of_public_key(&key.subject_public_key_info()).as_bytes();
@@ -364,14 +243,6 @@ impl Enrolments {
             attestation: AttestationLevel::Unproven,
         };
         self.store.record(record).await.expect("record the renewal");
-    }
-
-    /// The enrolment the manager takes, over this store and a fresh issuer.
-    fn installable(&self) -> DeviceEnrolment<String> {
-        let (_, _, issuer) = rooted_issuer();
-        let store = Arc::clone(&self.store);
-        let store: Arc<dyn EnrolmentStore<String>> = store;
-        DeviceEnrolment::new(DeviceCertConfig::new(issuer), store)
     }
 }
 
@@ -425,9 +296,6 @@ async fn expect_applied(client: &mut Client, client_seq: u64) {
     };
     assert_eq!(applied.client_seq, client_seq);
 }
-
-/// The enrolment test helpers shared by every suite in this crate.
-use super::enrolment::rooted_issuer;
 
 /// A courier range over a fresh author's chain settles every entry in order
 /// as the `Courier` path, under the author's account identity, and stands

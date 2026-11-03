@@ -18,6 +18,7 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use super::writer_shared::{PG_DDL, insert_changeset, notes, seed_notes, writable_catalog};
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{
     ControlMessage, FatalError, FatalErrorReason, Handshake, Provenance, WriterRef, WriterRequest,
@@ -27,9 +28,9 @@ use connetto_core::traits::{IncomingFrame, Transport as _};
 use connetto_server::defaults::{_connetto_settled, _connetto_writers};
 use connetto_server::writer_schema::SettlePath;
 use connetto_server::{
-    AbuseConfig, ManagerBuilder, Materializer, NoConnector, PageSpec, RequestGuard,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, ThrottleConfig, loopback, pg_write_target,
+    AbuseConfig, ManagerBuilder, Materializer, NoConnector, PageSpec, RequestGuard, SessionConfig,
+    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, ThrottleConfig, loopback,
+    pg_write_target,
 };
 use connetto_test_harness::{
     Client, ConnettoDefaults, Fixture, RosterAuth, number_writer, writer_secret,
@@ -37,10 +38,6 @@ use connetto_test_harness::{
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
-
-/// The notes table these tests sync.
-const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
 
 /// The handshake authority every test manager takes.
 fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
@@ -93,18 +90,6 @@ impl SnapshotSource for NoSnapshot {
     }
 }
 
-diesel::table! {
-    /// Row from the notes test fixture.
-    notes (id) {
-        /// Note identifier, the primary key.
-        id -> diesel::sql_types::Integer,
-        /// Note text.
-        body -> diesel::sql_types::Text,
-        /// Timestamp of the last edit.
-        edited_at -> diesel::sql_types::Text,
-    }
-}
-
 #[derive(diesel::Queryable, diesel::Selectable, Debug, PartialEq)]
 #[diesel(table_name = notes)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -123,58 +108,6 @@ async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
         .load(&mut *conn)
         .await
         .expect("read notes")
-}
-
-/// Reset the fixture to a fresh `notes` table seeded with one row and the
-/// writer tables provisioned by the admin.
-async fn seed_notes(fixture: &Fixture) {
-    fixture
-        .setup(&[
-            "DROP TABLE IF EXISTS notes CASCADE",
-            "DROP TABLE IF EXISTS _connetto_settled",
-            "DROP TABLE IF EXISTS _connetto_writers",
-            "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
-        ])
-        .await;
-    connetto_test_harness::provision_writers(fixture.admin()).await;
-    let mut conn = fixture.admin().get().await.expect("admin connection");
-    diesel::insert_into(notes::table)
-        .values((
-            notes::id.eq(1_i32),
-            notes::body.eq("hello"),
-            notes::edited_at.eq("t0"),
-        ))
-        .execute(&mut *conn)
-        .await
-        .expect("seed row");
-}
-
-fn writable_catalog() -> RuntimeWritableCatalog {
-    RuntimeWritableCatalog::builder()
-        .versioned("notes", "edited_at")
-        .build()
-}
-
-fn note_table() -> SimpleTable {
-    SimpleTable::new(
-        "notes",
-        &[("id", ""), ("body", ""), ("edited_at", "")],
-        &[0],
-    )
-}
-
-/// A changeset that inserts one full row.
-fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(note_table())
-        .set(0, Value::Integer(id))
-        .expect("set id")
-        .set(1, Value::Text(body.to_owned()))
-        .expect("set body")
-        .set(2, Value::Text(edited_at.to_owned()))
-        .expect("set edited_at");
-    ChangeSet::<SimpleTable, String, Vec<u8>>::new()
-        .insert(insert)
-        .build()
 }
 
 /// The writer's frontier, head and retirement state, read as admin.

@@ -84,6 +84,9 @@ mod app {
         Option<Instant>,
     );
 
+    /// The `app_settled` row as the columns the range query selects.
+    type SettledRangeTuple = (i64, Vec<u8>, Vec<u8>, String, SettlePath);
+
     /// The deployment's own writer tables and the reader's grant on them.
     pub const WRITERS_DDL: [&str; 5] = [
         "CREATE TABLE app_writers (\
@@ -318,6 +321,45 @@ mod app {
                         path,
                     }),
                 )
+            })
+        }
+
+        fn settled_range(
+            conn: &mut AsyncPgConnection,
+            writer: i64,
+            from: i64,
+            to: i64,
+        ) -> Statement<'_, Vec<(i64, SettledRow)>> {
+            Box::pin(async move {
+                use diesel::{ExpressionMethods, QueryDsl};
+                use diesel_async::RunQueryDsl;
+                let query = app_settled::table
+                    .filter(app_settled::writer.eq(writer))
+                    .filter(app_settled::seq.ge(from))
+                    .filter(app_settled::seq.le(to))
+                    .order(app_settled::seq.asc())
+                    .select((
+                        app_settled::seq,
+                        app_settled::entry_hash,
+                        app_settled::previous_hash,
+                        app_settled::outcome,
+                        app_settled::path,
+                    ));
+                let rows: Vec<SettledRangeTuple> = RunQueryDsl::load(query, &mut *conn).await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|(seq, entry_hash, previous_hash, outcome, path)| {
+                        (
+                            seq,
+                            SettledRow {
+                                entry_hash,
+                                previous_hash,
+                                outcome: outcome.into_bytes(),
+                                path,
+                            },
+                        )
+                    })
+                    .collect())
             })
         }
 
