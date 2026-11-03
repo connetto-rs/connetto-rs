@@ -966,13 +966,16 @@ fn no_browser() -> BrowserOpener {
 /// Sign in as `subject` through a fresh login and return the account the
 /// store holds it under.
 async fn builder_login(base: &str, store: &SharedRefreshStore, subject: &str) -> String {
-    let client = offline_builder()
-        .signed_in(
-            provider(base, store, AccountChoice::New).with_browser_opener(fake_browser(subject)),
-        )
-        .connect()
-        .await
-        .expect("the provider build signs in");
+    let client = Box::pin(
+        offline_builder()
+            .signed_in(
+                provider(base, store, AccountChoice::New)
+                    .with_browser_opener(fake_browser(subject)),
+            )
+            .connect(),
+    )
+    .await
+    .expect("the provider build signs in");
     let account = client
         .session()
         .expect("a provider build reports its session")
@@ -1074,15 +1077,17 @@ async fn a_last_used_build_signs_back_in_without_a_browser() {
     let store = SharedRefreshStore::default();
     let account = Box::pin(builder_login(&base, &store, "returning-user")).await;
 
-    let client = offline_builder()
-        .signed_in(
-            Auth::new(&base, MOCK_OAUTH_PROVIDER)
-                .refresh_store(store.clone())
-                .with_browser_opener(no_browser()),
-        )
-        .connect()
-        .await
-        .expect("the silent sign-in");
+    let client = Box::pin(
+        offline_builder()
+            .signed_in(
+                Auth::new(&base, MOCK_OAUTH_PROVIDER)
+                    .refresh_store(store.clone())
+                    .with_browser_opener(no_browser()),
+            )
+            .connect(),
+    )
+    .await
+    .expect("the silent sign-in");
     assert_eq!(
         client.session().expect("a session").account(),
         account,
@@ -1100,15 +1105,20 @@ async fn an_ask_build_signs_in_as_the_account_the_chooser_picks() {
     let store = SharedRefreshStore::default();
     let first = Box::pin(builder_login(&base, &store, "first-user")).await;
 
-    let client = offline_builder()
-        .signed_in(
-            provider(&base, &store, AccountChoice::New)
-                .with_browser_opener(no_browser())
-                .with_claimed_redirect(APP_REDIRECT, Arc::new(ScriptedSession::new("second-user"))),
-        )
-        .connect()
-        .await
-        .expect("the claimed-redirect sign-in");
+    let client = Box::pin(
+        offline_builder()
+            .signed_in(
+                provider(&base, &store, AccountChoice::New)
+                    .with_browser_opener(no_browser())
+                    .with_claimed_redirect(
+                        APP_REDIRECT,
+                        Arc::new(ScriptedSession::new("second-user")),
+                    ),
+            )
+            .connect(),
+    )
+    .await
+    .expect("the claimed-redirect sign-in");
     let second = client.session().expect("a session").account().to_owned();
     client.close().await;
     assert_ne!(first, second, "two distinct accounts are stored");
@@ -1123,15 +1133,17 @@ async fn an_ask_build_signs_in_as_the_account_the_chooser_picks() {
             Box::pin(async move { AccountChoice::Account(pick) })
         })
     };
-    let client = offline_builder()
-        .signed_in(
-            provider(&base, &store, AccountChoice::Ask)
-                .with_browser_opener(no_browser())
-                .with_account_chooser(chooser),
-        )
-        .connect()
-        .await
-        .expect("the chosen account signs in silently");
+    let client = Box::pin(
+        offline_builder()
+            .signed_in(
+                provider(&base, &store, AccountChoice::Ask)
+                    .with_browser_opener(no_browser())
+                    .with_account_chooser(chooser),
+            )
+            .connect(),
+    )
+    .await
+    .expect("the chosen account signs in silently");
     let mut listed = offered.lock().expect("offered").clone();
     listed.sort();
     let mut stored = vec![first.clone(), second];
@@ -1152,13 +1164,15 @@ async fn an_ask_build_signs_in_as_the_account_the_chooser_picks() {
 #[tokio::test]
 async fn an_ask_build_without_an_answer_is_refused() {
     let store = SharedRefreshStore::default();
-    let refused = offline_builder()
-        .signed_in(
-            provider("http://127.0.0.1:1", &store, AccountChoice::Ask)
-                .with_browser_opener(no_browser()),
-        )
-        .connect()
-        .await;
+    let refused = Box::pin(
+        offline_builder()
+            .signed_in(
+                provider("http://127.0.0.1:1", &store, AccountChoice::Ask)
+                    .with_browser_opener(no_browser()),
+            )
+            .connect(),
+    )
+    .await;
     assert!(
         matches!(refused, Err(ClientError::Auth(_))),
         "an Ask with no chooser is refused"
@@ -1166,14 +1180,16 @@ async fn an_ask_build_without_an_answer_is_refused() {
 
     let evasive: AccountChooser =
         Arc::new(|_accounts: Vec<String>| Box::pin(async { AccountChoice::Ask }));
-    let refused = offline_builder()
-        .signed_in(
-            provider("http://127.0.0.1:1", &store, AccountChoice::Ask)
-                .with_browser_opener(no_browser())
-                .with_account_chooser(evasive),
-        )
-        .connect()
-        .await;
+    let refused = Box::pin(
+        offline_builder()
+            .signed_in(
+                provider("http://127.0.0.1:1", &store, AccountChoice::Ask)
+                    .with_browser_opener(no_browser())
+                    .with_account_chooser(evasive),
+            )
+            .connect(),
+    )
+    .await;
     assert!(
         matches!(refused, Err(ClientError::Auth(_))),
         "a chooser answering Ask is refused"
