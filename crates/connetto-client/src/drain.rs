@@ -22,10 +22,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use connetto_core::exchange::{Origin, RetractCause};
+use connetto_core::exchange::Origin;
 use connetto_core::messages::{
     ContentTicketRequest, ContentVerb, ControlMessage, FatalErrorReason, HeldWork, HeldWrite,
-    MutationRejectReason, Provenance, ReplaceShareKeys, WriterRef, WriterRequest,
+    MutationRejectReason, PriorRefusal, Provenance, ReplaceShareKeys, WriterRef, WriterRequest,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{WriterAnswer, WriterOutcome};
@@ -39,10 +39,10 @@ use crate::away::Clock as _;
 use crate::majors::held_batch;
 use crate::{
     ClientError, ClientEvent, ConnettoConnection, EntryRecord, ExemptWrites, HandshakeInput,
-    HandshakeOk, PendingEntry, SHARE_KEY_REQUEST_WAIT, ShareKeyRequest, WriterQueue, clock,
-    delete_pending, delete_writer_pending, exchange_handshake, is_real_writer, live_share_grants,
-    persist_pending, persist_retire, persist_writer_state, settle_pending, share_key_request_id,
-    unissued,
+    HandshakeOk, PendingEntry, SHARE_KEY_REQUEST_WAIT, Settled, ShareKeyRequest, WriterQueue,
+    clock, delete_pending, delete_writer_pending, exchange_handshake, is_real_writer,
+    live_share_grants, persist_pending, persist_retire, persist_writer_state, settle_pending,
+    share_key_request_id, unissued,
 };
 
 /// How a drain dial backs off, the reconnect loop's own shape: 200 ms first,
@@ -700,7 +700,7 @@ where
                 return Ok(());
             };
             if let Err(err) =
-                crate::send_wire_changeset(wire, seq, &changeset, provenance.as_ref()).await
+                crate::send_wire_changeset(wire, seq, &changeset, provenance.as_ref(), None).await
             {
                 tracing::warn!(error = %err, "the drain wire failed while sending held writes");
                 self.drop_drain_wire().await;
@@ -717,13 +717,17 @@ where
         &mut self,
         writer: WriterRef,
         seq: u64,
-        cause: Option<&RetractCause>,
+        refused: Option<&PriorRefusal>,
     ) -> Result<(), ClientError> {
         if let Some(entry) = self.take_entry(writer, seq) {
+            let settled = Settled {
+                refused,
+                retention: self.config.tuning.acked_retention(),
+            };
             {
                 let _suspended = ExemptWrites::raise(&self.write_flags);
                 self.db.transaction::<_, ClientError, _>(|db| {
-                    settle_pending(db, &writer, seq, &entry.hash, cause)
+                    settle_pending(db, &writer, seq, &entry, &settled)
                 })?;
             }
             self.offer_changed(&writer);
@@ -1001,8 +1005,8 @@ where
                 return Ok(());
             }
             Some(IncomingFrame::Control(ControlMessage::MutationReject(reject))) => {
-                let cause = RetractCause::Rejected(reject.reason.clone());
-                if let Some(write) = self.settle_held(reject.client_seq, Some(&cause))? {
+                let refused = PriorRefusal::Rejected(reject.reason.clone());
+                if let Some(write) = self.settle_held(reject.client_seq, Some(&refused))? {
                     self.notices
                         .push_back(ClientEvent::Held(HeldWork::Rejected {
                             major,
@@ -1012,9 +1016,10 @@ where
                 }
             }
             Some(IncomingFrame::Control(ControlMessage::MutationConflict(conflict))) => {
-                if let Some(write) =
-                    self.settle_held(conflict.client_seq, Some(&RetractCause::Conflict))?
-                {
+                let refused = PriorRefusal::Conflict {
+                    table: conflict.table.clone(),
+                };
+                if let Some(write) = self.settle_held(conflict.client_seq, Some(&refused))? {
                     self.notices
                         .push_back(ClientEvent::Held(HeldWork::Rejected {
                             major,
@@ -1108,12 +1113,12 @@ where
     fn settle_held(
         &mut self,
         seq: u64,
-        cause: Option<&RetractCause>,
+        refused: Option<&PriorRefusal>,
     ) -> Result<Option<HeldWrite>, ClientError> {
         let Some(writer) = self.drain.writer else {
             return Ok(None);
         };
-        self.settle_entry(writer, seq, cause)?;
+        self.settle_entry(writer, seq, refused)?;
         Ok(Some(HeldWrite { writer, seq }))
     }
 

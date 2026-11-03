@@ -35,8 +35,8 @@ use connetto_core::device_cert::{AttestationLevel, KeyId};
 use connetto_core::exchange::Origin;
 use connetto_core::messages::{
     BindDevice, ConflictRow, ControlMessage, FatalError, FatalErrorReason, Grant, Handshake,
-    MutationRejectReason, Provenance, WriterGrant, WriterOutcome, WriterRef, WriterRequest,
-    WriterSecret, writer_bind_message,
+    MutationRejectReason, PriorRefusal, Provenance, WriterGrant, WriterOutcome, WriterRef,
+    WriterRequest, WriterSecret, writer_bind_message,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::TestGrantChecker;
@@ -2949,6 +2949,90 @@ async fn a_patch_over_the_byte_window_is_refused_and_settled() {
         vec![note(1, "hello", "t0")],
         "the oversize patch never applied"
     );
+    client.close().await;
+    server.await.expect("join server").expect("session ok");
+}
+
+/// R78 decision 17: an entry its author re-sends after a restore declaring
+/// the refusal it settled with before settles that refusal and applies
+/// nothing, a declared conflict keeping its table and no key, and the
+/// redelivery re-answers each from the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_refusal_settles_without_applying_and_redelivers_from_the_record() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (_captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::new(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, None, SessionConfig::default());
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("declared-1", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+    let writer = i64::try_from(number).expect("number fits");
+
+    let rejected = insert_changeset(2, "two", "t1");
+    let declared = PriorRefusal::Rejected(MutationRejectReason::Unauthorized);
+    client
+        .upload_declared(1, rejected.clone(), declared.clone())
+        .await;
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("expected the declared rejection");
+    };
+    assert_eq!(reject.client_seq, 1);
+    assert_eq!(reject.reason, MutationRejectReason::Unauthorized);
+
+    let conflicted = insert_changeset(3, "three", "t1");
+    client
+        .upload_declared(
+            2,
+            conflicted.clone(),
+            PriorRefusal::Conflict {
+                table: "notes".to_owned(),
+            },
+        )
+        .await;
+    let ControlMessage::MutationConflict(conflict) = client.next_control().await else {
+        panic!("expected the declared conflict");
+    };
+    assert_eq!(conflict.client_seq, 2);
+    assert_eq!(conflict.table, "notes");
+    assert_eq!(
+        conflict.server_row, None,
+        "a declared conflict names no row"
+    );
+
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0")],
+        "neither declared entry applied"
+    );
+    let rows = settled_rows(fixture.admin(), writer).await;
+    assert_eq!(rows.len(), 2, "both declared entries settled");
+    assert!(
+        rows[0].outcome.contains("Unauthorized"),
+        "got {}",
+        rows[0].outcome
+    );
+    assert!(rows[1].outcome.contains("notes"), "got {}", rows[1].outcome);
+    assert_eq!(writer_facts(fixture.admin(), writer).await.frontier, 2);
+
+    // A plain redelivery of the same bytes is answered from the record.
+    client.upload(1, rejected).await;
+    let ControlMessage::MutationReject(again) = client.next_control().await else {
+        panic!("expected the recorded rejection");
+    };
+    assert_eq!(again.reason, MutationRejectReason::Unauthorized);
+    client.upload(2, conflicted).await;
+    let ControlMessage::MutationConflict(again) = client.next_control().await else {
+        panic!("expected the recorded conflict");
+    };
+    assert_eq!(again.server_row, None);
     client.close().await;
     server.await.expect("join server").expect("session ok");
 }

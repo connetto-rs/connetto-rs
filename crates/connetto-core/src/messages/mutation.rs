@@ -36,6 +36,29 @@ pub struct MutationHeader {
     /// entry an import restored or a retired writer's device carried forward.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Provenance>,
+    /// How the server refused this entry before a restore rewound its
+    /// writer, for an entry the author re-sends from what it retained (R78
+    /// decision 17). The server settles the sequence with this refusal and
+    /// applies nothing, so the restored server keeps the record it had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<Box<PriorRefusal>>,
+}
+
+/// The refusal an entry settled with before a restore, re-declared by its
+/// author when it re-sends the entry.
+///
+/// Only the writer's own entry can carry it, and a writer may always refuse
+/// its own write, so the declaration drops nobody else's work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PriorRefusal {
+    /// The server rejected the entry for this reason.
+    Rejected(MutationRejectReason),
+    /// The entry conflicted with a row of `table`, the table the conflict
+    /// answer named.
+    Conflict {
+        /// The table the conflict answer named.
+        table: String,
+    },
 }
 
 impl MutationHeader {
@@ -45,6 +68,7 @@ impl MutationHeader {
             client_seq,
             op_count,
             provenance: None,
+            refused: None,
         }
     }
 
@@ -52,6 +76,13 @@ impl MutationHeader {
     #[must_use]
     pub fn with_provenance(mut self, provenance: Provenance) -> Self {
         self.provenance = Some(provenance);
+        self
+    }
+
+    /// Re-declare the refusal this entry settled with before a restore.
+    #[must_use]
+    pub fn with_refused(mut self, refused: PriorRefusal) -> Self {
+        self.refused = Some(Box::new(refused));
         self
     }
 }

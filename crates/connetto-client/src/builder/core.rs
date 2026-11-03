@@ -1503,7 +1503,8 @@ where
     // A browser worker names the holder before its hub installs content.
     let held_content = held_content.or_else(|| content.is_some().then(C::held_content));
     let config = fold_config_aspects(config, share_keys).with_optional_held_content(held_content);
-    let conn = offline_connect_core(
+    // Boxed, so the open's frames never sit beside the pump in this future.
+    let conn = Box::pin(offline_connect_core(
         replica,
         &schema,
         &config,
@@ -1512,7 +1513,7 @@ where
         &mut dialer,
         FirstDial::MayFail,
         inputs.share_key_store,
-    )
+    ))
     .await?;
     let sleeper = sleeper.unwrap_or_else(default_sleeper);
     let (client, pump) = ConnettoClient::with_reconnect(conn, dialer, sleeper, policy);

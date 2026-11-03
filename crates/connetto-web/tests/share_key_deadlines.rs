@@ -484,6 +484,7 @@ async fn send_mutation(tab: &mut MessageTransport<MessagePort>, seq: u64, change
         client_seq: seq,
         op_count: 1,
         provenance: None,
+        refused: None,
     }))
     .await
     .expect("post header");

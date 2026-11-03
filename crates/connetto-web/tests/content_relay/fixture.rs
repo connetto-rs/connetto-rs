@@ -294,6 +294,7 @@ pub(super) async fn send_mutation(
         client_seq: seq,
         op_count: 1,
         provenance: None,
+        refused: None,
     }))
     .await
     .expect("post header");

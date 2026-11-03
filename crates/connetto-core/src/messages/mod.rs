@@ -40,7 +40,7 @@ pub use flow::{AckCredits, Ping, Pong};
 pub use handshake::{Grant, Handshake, HandshakeAck};
 pub use mutation::{
     ConflictRow, HeldWork, HeldWrite, MutationApplied, MutationConflict, MutationHeader,
-    MutationReject, MutationRejectReason,
+    MutationReject, MutationRejectReason, PriorRefusal,
 };
 pub use provisional::{PROVISIONAL_ASK_REFUSED, ProvisionalStatus, ProvisionalVerdicts};
 pub use reconnect::{FullResyncReason, FullResyncRequired};

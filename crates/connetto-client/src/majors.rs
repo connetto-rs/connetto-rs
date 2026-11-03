@@ -93,9 +93,10 @@ diesel::table! {
 
 /// Connetto's own tables a rebuild keeps beside the held batches: the build
 /// record, the device's enrolment, the writer queues with their retirement
-/// bookkeeping, whose frontiers the server keeps across majors, and the peer
-/// cursors and retraction log, whose owners settle across majors (R77).
-const KEPT: [&str; 10] = [
+/// bookkeeping and the entries kept for a restore, whose frontiers the server
+/// keeps across majors, and the peer cursors and retraction log, whose owners
+/// settle across majors (R77, R78).
+const KEPT: [&str; 11] = [
     "_connetto_build",
     "_connetto_build_renames",
     "_connetto_device_certificate",
@@ -104,6 +105,7 @@ const KEPT: [&str; 10] = [
     "_connetto_retraction",
     "_connetto_writers",
     "_connetto_pending",
+    "_connetto_acked",
     "_connetto_retire",
     "_connetto_retired_keys",
 ];
@@ -243,31 +245,38 @@ pub(crate) fn prepare_rebuild(
         _connetto_pending::table.filter(_connetto_pending::major.eq(old_major)),
     ))
     .get_result::<bool>(db)?;
-    if held_writes && has_table(db, "_connetto_build_renames")? {
+    if has_table(db, "_connetto_build_renames")? {
         let renames: HashMap<String, String> = build_renames::table
             .select((build_renames::physical, build_renames::logical))
             .load::<(String, String)>(db)?
             .into_iter()
             .collect();
         if !renames.is_empty() {
-            let writes: Vec<(String, i64, Vec<u8>)> = _connetto_pending::table
-                .filter(_connetto_pending::major.eq(old_major))
-                .select((
-                    _connetto_pending::writer,
-                    _connetto_pending::seq,
-                    _connetto_pending::changeset,
-                ))
-                .load(db)?;
-            for (writer, seq, changeset) in writes {
-                let wire =
-                    rename_diffset(changeset, |name| renames.get(&name.to_lowercase()).cloned())?;
-                diesel::update(
-                    _connetto_pending::table
-                        .filter(_connetto_pending::writer.eq(&writer))
-                        .filter(_connetto_pending::seq.eq(seq)),
-                )
-                .set(_connetto_pending::changeset.eq(wire))
-                .execute(db)?;
+            let rewrite = |changeset: Vec<u8>| {
+                rename_diffset(changeset, |name| renames.get(&name.to_lowercase()).cloned())
+            };
+            if held_writes {
+                let writes: Vec<(String, i64, Vec<u8>)> = _connetto_pending::table
+                    .filter(_connetto_pending::major.eq(old_major))
+                    .select((
+                        _connetto_pending::writer,
+                        _connetto_pending::seq,
+                        _connetto_pending::changeset,
+                    ))
+                    .load(db)?;
+                for (writer, seq, changeset) in writes {
+                    diesel::update(
+                        _connetto_pending::table
+                            .filter(_connetto_pending::writer.eq(&writer))
+                            .filter(_connetto_pending::seq.eq(seq)),
+                    )
+                    .set(_connetto_pending::changeset.eq(rewrite(changeset)?))
+                    .execute(db)?;
+                }
+            }
+            // A replica older than the retained entries has no table to rewrite.
+            if has_table(db, "_connetto_acked")? {
+                crate::acked::rewrite_major(db, old_major, rewrite)?;
             }
         }
     }

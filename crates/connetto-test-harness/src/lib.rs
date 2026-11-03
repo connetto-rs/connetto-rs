@@ -2167,6 +2167,33 @@ impl Client {
             .expect("send mutation patch");
     }
 
+    /// Upload one mutation re-declaring `refused`, the refusal an author's
+    /// entry settled with before a restore (R78 decision 17).
+    ///
+    /// # Panics
+    ///
+    /// Panics when zstd compression of `changeset` fails, or when sending the mutation header or patch frame fails on the transport.
+    pub async fn upload_declared(
+        &mut self,
+        client_seq: u64,
+        changeset: Vec<u8>,
+        refused: connetto_core::messages::PriorRefusal,
+    ) {
+        let payload = zstd::encode_all(changeset.as_slice(), 3).expect("compress");
+        self.transport
+            .send_control(ControlMessage::MutationHeader(
+                MutationHeader::new(client_seq, 1).with_refused(refused),
+            ))
+            .await
+            .expect("send mutation header");
+        self.transport
+            .send_bulk(BulkMessage::MutationPatch(MutationPatch::new(
+                client_seq, payload,
+            )))
+            .await
+            .expect("send mutation patch");
+    }
+
     /// Upload one mutation whose patch carries `payload` verbatim, no
     /// compression, so a test can hand the server bytes that do not
     /// decompress.

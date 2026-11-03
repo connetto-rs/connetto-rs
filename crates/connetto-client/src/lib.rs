@@ -22,10 +22,10 @@ use connetto_core::exchange::Origin;
 use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
     ControlMessage, FatalErrorReason, GateState, Handshake, HeldWork, MutationHeader,
-    MutationPatch, MutationReject, MutationRejectReason, Ping, Provenance, ReplaceShareKeys,
-    RetireWriter, SUBSCRIPTION_REFUSED, ShareKeyChange, Subscribe, SubscriptionSpec, TabIdentity,
-    TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome,
-    TabStorageUse, Unsubscribe, WriterAnswer,
+    MutationPatch, MutationReject, MutationRejectReason, Ping, PriorRefusal, Provenance,
+    ReplaceShareKeys, RetireWriter, SUBSCRIPTION_REFUSED, ShareKeyChange, Subscribe,
+    SubscriptionSpec, TabIdentity, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome,
+    TabStorageAnswer, TabStorageOutcome, TabStorageUse, Unsubscribe, WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -61,6 +61,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+mod acked;
 mod aggregates;
 pub mod archive;
 #[cfg(feature = "native-auth")]
@@ -1410,6 +1411,16 @@ pub enum ClientEvent {
         /// The applied mutation's sequence number.
         client_seq: u64,
     },
+    /// A server restored to an earlier point answered an entry the writer
+    /// re-sent from what it retained (R78 decision 17). The write was
+    /// answered before the restore, so nothing rolls back and no
+    /// application is raised again.
+    WriteRestored {
+        /// The re-sent entry's sequence number.
+        client_seq: u64,
+        /// The restored server's refusal, absent when it applied the entry.
+        refused: Option<PriorRefusal>,
+    },
     /// Work held from an older application schema major settled while it
     /// drained to that major's server (R31). A browser tab receives it from
     /// the relay hub, whose worker owns the drain.
@@ -1793,6 +1804,11 @@ pub const DEFAULT_PROBE_AFTER: Duration = Duration::from_secs(15);
 /// The time a probe (and the opening handshake) waits for an answer.
 pub const DEFAULT_ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
+/// How long a writer keeps the entries the server answered, so a server
+/// restored to an earlier point gets them back (R78 decision 22), the
+/// default of the device certificate lifetime ceiling.
+pub const DEFAULT_ACKED_RETENTION: Duration = Duration::from_hours(30 * 24);
+
 /// The schedule a deferred write is sent again on. Uncapped, because a write
 /// the server could not settle is kept like an offline one.
 static RESEND_POLICY: std::sync::LazyLock<RetryPolicy> = std::sync::LazyLock::new(RetryPolicy::new);
@@ -1803,6 +1819,15 @@ enum Arrived<F> {
     Main(F),
     /// The wire draining an older major's held work (R31).
     Drain(F),
+}
+
+/// The run a restore rewound a writer below, re-sent from what the replica
+/// retained (R78 decision 17).
+struct Restore {
+    /// The writer the run belongs to, the bound one.
+    writer: WriterRef,
+    /// The entries not answered yet, by sequence.
+    entries: BTreeMap<u64, acked::AckedEntry>,
 }
 
 /// Where sending the deferred writes again stands.
@@ -2108,6 +2133,7 @@ pub(crate) async fn send_wire_changeset<T: Transport>(
     seq: u64,
     changeset: &[u8],
     provenance: Option<&Provenance>,
+    refused: Option<Box<PriorRefusal>>,
 ) -> Result<(), ClientError>
 where
     T::Error: core::fmt::Display,
@@ -2118,6 +2144,7 @@ where
     if let Some(provenance) = provenance {
         header = header.with_provenance(*provenance);
     }
+    header.refused = refused;
     transport
         .send_control(ControlMessage::MutationHeader(header))
         .await
@@ -3663,6 +3690,7 @@ fn drop_writer_state(db: &mut SqliteConnection, writer: &WriterRef) -> Result<()
     let id = writer_id(writer);
     diesel::delete(_connetto_writers::table.filter(_connetto_writers::id.eq(&id))).execute(db)?;
     delete_writer_pending(db, writer)?;
+    acked::forget(db, writer)?;
     #[cfg(feature = "peer")]
     author::forget(db, writer)?;
     Ok(())
@@ -3775,27 +3803,72 @@ fn delete_pending(
     Ok(())
 }
 
-/// Retire one queued entry the server answered for good, the peer build
-/// keeping its hash as the settled frontier and a refusal's `cause` in the
-/// device writer's retraction log (R77 decision 9).
-#[cfg_attr(
-    not(feature = "peer"),
-    expect(
-        unused_variables,
-        reason = "only a peer build keeps the settled frontier and the retraction log"
-    )
-)]
+/// How one queued entry settled for good, applied or refused.
+struct Settled<'a> {
+    /// The refusal the server answered, absent when it applied the entry.
+    refused: Option<&'a PriorRefusal>,
+    /// How long the build keeps an answered entry for a restore.
+    retention: Duration,
+}
+
+/// Retire one queued entry the server answered for good into the entries
+/// kept for a restore (R78 decision 21), the peer build also keeping its
+/// hash as the settled frontier and a refusal's cause in the device
+/// writer's retraction log (R77 decision 9).
 fn settle_pending(
     db: &mut SqliteConnection,
     writer: &WriterRef,
     seq: u64,
-    hash: &[u8; 32],
-    cause: Option<&connetto_core::exchange::RetractCause>,
+    entry: &PendingEntry,
+    settled: &Settled<'_>,
 ) -> Result<(), ClientError> {
     delete_pending(db, writer, seq)?;
+    let now = clock::now_secs(db)?;
+    acked::retain(
+        db,
+        writer,
+        seq,
+        entry,
+        settled.refused,
+        now,
+        settled.retention,
+    )?;
     #[cfg(feature = "peer")]
-    author::settle(db, writer, seq, hash, cause)?;
+    author::settle(
+        db,
+        writer,
+        seq,
+        &entry.hash,
+        settled.refused.map(retract_cause).as_ref(),
+    )?;
     Ok(())
+}
+
+/// The cause a peer reads from a refusal (R77 decision 9).
+#[cfg(feature = "peer")]
+fn retract_cause(refused: &PriorRefusal) -> connetto_core::exchange::RetractCause {
+    match refused {
+        PriorRefusal::Rejected(reason) => {
+            connetto_core::exchange::RetractCause::Rejected(reason.clone())
+        }
+        PriorRefusal::Conflict { .. } => connetto_core::exchange::RetractCause::Conflict,
+    }
+}
+
+/// A stored provenance, absent when its writer or sequence is missing or does
+/// not parse.
+fn stored_provenance(
+    writer: Option<&str>,
+    seq: Option<i64>,
+    secret: Option<Vec<u8>>,
+) -> Option<Provenance> {
+    let writer = writer_from_id(writer?)?;
+    let seq = u64::try_from(seq?).ok()?;
+    Some(Provenance {
+        writer,
+        seq,
+        secret: stored_secret(secret),
+    })
 }
 
 /// Retire every queued entry of one writer, it moving to a fresh writer.
@@ -3883,17 +3956,8 @@ fn load_pending(
         let Ok(position) = u64::try_from(row.position) else {
             continue;
         };
-        let secret = stored_secret(row.prov_secret);
-        let provenance = row
-            .prov_writer
-            .as_deref()
-            .zip(row.prov_seq)
-            .and_then(|(writer, seq)| Some((writer_from_id(writer)?, u64::try_from(seq).ok()?)))
-            .map(|(writer, seq)| Provenance {
-                writer,
-                seq,
-                secret,
-            });
+        let provenance =
+            stored_provenance(row.prov_writer.as_deref(), row.prov_seq, row.prov_secret);
         let major = row
             .major
             .and_then(|major| u32::try_from(major).ok())
@@ -4624,6 +4688,10 @@ pub struct ConnettoConnection<T: Transport> {
     transaction_state: AnsiTransactionManager,
     /// Where sending the writes the server deferred again stands.
     resend: Resend,
+    /// The run a restore rewound the bound writer below, re-sent ahead of its
+    /// queue from what this replica retained, until each entry is answered
+    /// (R78 decision 17).
+    restore: Option<Box<Restore>>,
     /// How many resends were ever armed, so a pump tells a fresh timer from the one it sleeps on.
     resends_armed: u64,
     /// Where the keepalive stands, the silence since the last inbound frame
@@ -4800,6 +4868,7 @@ fn install_replica_metadata(
             Err(error) => return Err(error.into()),
         }
     }
+    db.batch_execute(acked::ACKED_DDL)?;
     db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
     db.batch_execute(holdings::HOLDING_DDL)?;
     // After the subscription tables, since it references `_connetto_query`.
@@ -5128,6 +5197,7 @@ where
             residual_warned: false,
             transaction_state: AnsiTransactionManager::default(),
             resend: Resend::Idle,
+            restore: None,
             resends_armed: 0,
             keepalive: KeepalivePhase::Idle {
                 last_inbound: Moment::now(&SystemClock),
@@ -5366,6 +5436,8 @@ where
         let now = clock::now_secs(&mut self.db)?;
         // Durable authorization is loaded before the first handshake.
         self.prepare_share_keys().await?;
+        // A run armed on an earlier transport is judged again against this grant.
+        self.restore = None;
         let (writer, settled_through) = self.writer_handshake()?;
         let ack = match exchange_handshake(
             &mut transport,
@@ -5404,6 +5476,7 @@ where
         };
         if let (Some(rewound), Some(frontier)) = (bound, frontier)
             && self.rewound(&rewound, frontier)
+            && !self.arm_restore(rewound, frontier)?
         {
             self.abandon_rewound(rewound)?;
             return Err(ClientError::WriterRewound { writer: rewound });
@@ -5476,7 +5549,8 @@ where
         let AttachReplay::Pending { frontier } = self.attach_replay else {
             return Ok(());
         };
-        self.reconcile_pending(frontier).await?;
+        // Boxed, so every caller's future stays clear of the send path's frames.
+        Box::pin(self.reconcile_pending(frontier)).await?;
         self.replay_subscriptions().await?;
         self.attach_replay = AttachReplay::Idle;
         Ok(())
@@ -5542,16 +5616,23 @@ where
         let writer = self.bound_writer.filter(|_| self.is_connected())?;
         let queue = self.writers.get(&writer)?;
         let held_from = self.held_from();
-        let sends = queue
+        // A restore's run goes first, since its sequences precede the queue's.
+        let restored = self
+            .restore
+            .as_ref()
+            .filter(|restore| restore.writer == writer)
+            .into_iter()
+            .flat_map(|restore| restore.entries.range(after.saturating_add(1)..))
+            .map(|(seq, entry)| (*seq, entry.changeset.clone(), entry.provenance));
+        let queued = queue
             .pending
             .range(after.saturating_add(1)..)
             .take_while(|(_, entry)| {
                 !self.held_major(entry.major)
                     && held_from.is_none_or(|position| entry.position < position)
             })
-            .map(|(seq, entry)| (*seq, entry.changeset.clone(), entry.provenance))
-            .collect();
-        Some((writer, sends))
+            .map(|(seq, entry)| (*seq, entry.changeset.clone(), entry.provenance));
+        Some((writer, restored.chain(queued).collect()))
     }
 
     /// The lowest append position among the queued entries another major
@@ -6178,10 +6259,8 @@ where
                         detail: "a stale bind answer for a retired key dropped".to_owned(),
                     });
                 }
-                // A frontier below what this replica saw settled can only be
-                // a restore, so the key retires and its queue travels on
-                // naming nothing past the restored frontier (R70 decision 21).
-                if self.rewound(&writer, frontier) {
+                // Only a restore lowers a frontier, and an unretained run retires the key (R70 decision 21).
+                if self.rewound(&writer, frontier) && !self.arm_restore(writer, frontier)? {
                     return self.retire_device(Carry::Abandoned);
                 }
                 let queue = self
@@ -9431,7 +9510,22 @@ where
             ));
         }
         let logical = self.to_logical(changeset.to_vec())?;
-        send_wire_changeset(&mut self.wire()?.transport, seq, &logical, provenance).await?;
+        // An entry a restore re-sends declares the refusal it settled with before.
+        let refused = self
+            .restore
+            .as_ref()
+            .filter(|restore| restore.writer == writer)
+            .and_then(|restore| restore.entries.get(&seq))
+            .and_then(|entry| entry.refused.clone())
+            .map(Box::new);
+        send_wire_changeset(
+            &mut self.wire()?.transport,
+            seq,
+            &logical,
+            provenance,
+            refused,
+        )
+        .await?;
         if let Some(queue) = self.writers.get_mut(&writer) {
             queue.sent_through = queue.sent_through.max(seq);
         }
@@ -9440,12 +9534,12 @@ where
 
     /// Undo `writer`'s refused `client_seq` in both schemas under the write
     /// exemption, leaving a row a later change touched, settle it with
-    /// `cause`, and return its rows.
+    /// `refused`, and return its rows.
     fn rollback(
         &mut self,
         writer: WriterRef,
         client_seq: u64,
-        cause: &connetto_core::exchange::RetractCause,
+        refused: &PriorRefusal,
     ) -> Result<Vec<AffectedRow>, ClientError> {
         let Some(queue) = self.writers.get_mut(&writer) else {
             return Ok(Vec::new());
@@ -9453,15 +9547,18 @@ where
         let Some(entry) = queue.pending.remove(&client_seq) else {
             return Ok(Vec::new());
         };
-        let (changeset, hash) = (entry.changeset, entry.hash);
-        let rows = affected_rows(&changeset, &self.config.policy_tables)?;
-        let inverse = invert_changeset(&changeset)
+        let rows = affected_rows(&entry.changeset, &self.config.policy_tables)?;
+        let inverse = invert_changeset(&entry.changeset)
             .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?;
         let shared = &self.config.shared_tables;
+        let settled = Settled {
+            refused: Some(refused),
+            retention: self.config.tuning.acked_retention(),
+        };
         {
             let _suspended = ExemptWrites::raise(&self.write_flags);
             self.db.transaction::<_, ClientError, _>(|db| {
-                settle_pending(db, &writer, client_seq, &hash, Some(cause))?;
+                settle_pending(db, &writer, client_seq, &entry, &settled)?;
                 db.apply_changeset(&inverse, rollback_omit)
                     .map_err(|err| ClientError::Apply(err.to_string()))?;
                 if !shared.is_empty() {
@@ -9729,15 +9826,17 @@ where
             ControlMessage::MutationApplied(ack) => self.mutation_applied(ack.client_seq).await,
             ControlMessage::MutationReject(reject) => self.mutation_rejected(&reject).await,
             ControlMessage::MutationConflict(conflict) => {
+                let refused = PriorRefusal::Conflict {
+                    table: conflict.table.clone(),
+                };
+                if let Some(event) = self.restore_answered(conflict.client_seq, Some(&refused))? {
+                    return Ok(event);
+                }
                 self.settle_resend();
                 let writer = self
                     .bound_writer
                     .expect("a conflict arrives for the bound writer");
-                let rows = self.rollback(
-                    writer,
-                    conflict.client_seq,
-                    &connetto_core::exchange::RetractCause::Conflict,
-                )?;
+                let rows = self.rollback(writer, conflict.client_seq, &refused)?;
                 #[cfg(feature = "device-identity")]
                 self.finish_number_tail().await?;
                 Ok(ClientEvent::MutationConflict {
@@ -9874,11 +9973,12 @@ where
                 }
             }
             FatalErrorReason::SequenceGap { expected, .. } => {
-                // A server frontier below what this replica saw settled can
-                // only be a restore, so the writer is abandoned before the
-                // redial. A gap at the settled prefix is left to the redial.
+                // Only a restore lowers a frontier, and the redial re-sends a retained run (R78 decision 17).
                 if let Some(writer) = self.bound_writer
                     && self.rewound(&writer, expected.saturating_sub(1))
+                    && self
+                        .retained_run(&writer, expected.saturating_sub(1))?
+                        .is_none()
                 {
                     self.abandon_rewound(writer)?;
                 }
@@ -9901,6 +10001,9 @@ where
         )
     )]
     async fn mutation_applied(&mut self, client_seq: u64) -> Result<ClientEvent, ClientError> {
+        if let Some(event) = self.restore_answered(client_seq, None)? {
+            return Ok(event);
+        }
         let writer = self.bound_writer;
         if let Some(writer) = writer {
             let removed = self
@@ -9908,10 +10011,14 @@ where
                 .get_mut(&writer)
                 .and_then(|queue| queue.pending.remove(&client_seq));
             if let Some(entry) = removed {
+                let settled = Settled {
+                    refused: None,
+                    retention: self.config.tuning.acked_retention(),
+                };
                 {
                     let _suspended = ExemptWrites::raise(&self.write_flags);
                     self.db.transaction::<_, ClientError, _>(|db| {
-                        settle_pending(db, &writer, client_seq, &entry.hash, None)
+                        settle_pending(db, &writer, client_seq, &entry, &settled)
                     })?;
                 }
                 self.offer_changed(&writer);
@@ -9948,19 +10055,33 @@ where
                         .get(&writer)
                         .map(|queue| queue.pending.contains_key(&client_seq))
                 })
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || self.restoring(client_seq);
             if held {
                 self.defer_pending(None);
             }
             return Ok(ClientEvent::MutationDeferred { client_seq });
         }
+        // Another entry stands at a sequence the restore re-sent, so the run
+        // is not this writer's history any more and the writer moves on.
+        if reject.reason == MutationRejectReason::Forked
+            && self.restoring(client_seq)
+            && let Some(writer) = writer
+        {
+            self.restore = None;
+            self.abandon_rewound(writer)?;
+            return Ok(ClientEvent::WriteRestored {
+                client_seq,
+                refused: Some(PriorRefusal::Rejected(MutationRejectReason::Forked)),
+            });
+        }
+        let refused = PriorRefusal::Rejected(reject.reason.clone());
+        if let Some(event) = self.restore_answered(client_seq, Some(&refused))? {
+            return Ok(event);
+        }
         self.settle_resend();
         let rows = match writer {
-            Some(writer) => self.rollback(
-                writer,
-                client_seq,
-                &connetto_core::exchange::RetractCause::Rejected(reject.reason.clone()),
-            )?,
+            Some(writer) => self.rollback(writer, client_seq, &refused)?,
             None => Vec::new(),
         };
         #[cfg(feature = "device-identity")]
@@ -9970,6 +10091,89 @@ where
             reason: reject.reason.clone(),
             rows,
         })
+    }
+
+    /// Whether `client_seq` is an unanswered entry of the bound writer's
+    /// restore run.
+    fn restoring(&self, client_seq: u64) -> bool {
+        self.restore.as_ref().is_some_and(|restore| {
+            Some(restore.writer) == self.bound_writer && restore.entries.contains_key(&client_seq)
+        })
+    }
+
+    /// Settle the restored server's answer to an entry the restore re-sent,
+    /// `refused` naming its refusal and absent for an application, `None`
+    /// when `client_seq` is no such entry. Nothing rolls back, since the write
+    /// was answered before the restore. An entry applied before and refused
+    /// now keeps the refusal, so a later restore re-sends it declared, and
+    /// enters the device writer's retraction log (R77 decision 9).
+    fn restore_answered(
+        &mut self,
+        client_seq: u64,
+        refused: Option<&PriorRefusal>,
+    ) -> Result<Option<ClientEvent>, ClientError> {
+        if !self.restoring(client_seq) {
+            return Ok(None);
+        }
+        let Some(restore) = self.restore.as_mut() else {
+            return Ok(None);
+        };
+        let writer = restore.writer;
+        let entry = restore.entries.remove(&client_seq);
+        if restore.entries.is_empty() {
+            self.restore = None;
+        }
+        self.settle_resend();
+        if let (Some(refused), Some(entry)) = (refused, entry)
+            && entry.refused.is_none()
+        {
+            let _suspended = ExemptWrites::raise(&self.write_flags);
+            self.db.transaction::<_, ClientError, _>(|db| {
+                acked::refuse(db, &writer, client_seq, refused)?;
+                #[cfg(feature = "peer")]
+                author::retract(db, &writer, client_seq, &retract_cause(refused))?;
+                Ok(())
+            })?;
+            self.offer_changed(&writer);
+        }
+        Ok(Some(ClientEvent::WriteRestored {
+            client_seq,
+            refused: refused.cloned(),
+        }))
+    }
+
+    /// Arm the re-send of the run a restore rewound `writer` below, from
+    /// `frontier + 1` through what this replica saw settled, when it retains
+    /// every entry of it under this connection's major (R78 decision 17).
+    /// Returns whether it did, the writer retiring otherwise.
+    fn arm_restore(&mut self, writer: WriterRef, frontier: u64) -> Result<bool, ClientError> {
+        match self.retained_run(&writer, frontier)? {
+            Some(entries) => {
+                self.restore = Some(Box::new(Restore {
+                    writer,
+                    entries: entries.into_iter().collect(),
+                }));
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// The retained run from `frontier + 1` through what this replica saw
+    /// settled for `writer`, when it holds every entry of it.
+    fn retained_run(
+        &mut self,
+        writer: &WriterRef,
+        frontier: u64,
+    ) -> Result<Option<Vec<(u64, acked::AckedEntry)>>, ClientError> {
+        let through = self.settled_through(writer);
+        acked::run(
+            &mut self.db,
+            writer,
+            frontier.saturating_add(1),
+            through,
+            self.config.schema_major,
+        )
     }
 
     /// The server gave a resent write a final answer, so whatever deferred it has passed and the next deferral starts its schedule afresh.
@@ -11239,14 +11443,14 @@ mod tests {
         assert_eq!(version.user_version, 0, "a planless create stamps nothing");
     }
 
-    /// Decision 21's device rows: a `Bound` whose frontier stands at what the
-    /// replica saw settled keeps the device, and one below it can only come
-    /// from a restore, so the key is retired and its queue moves to a number
-    /// without naming the key.
+    /// A device-writer connection whose key `[7; 32]` queued three writes and
+    /// settled the first two, built with `tuning`.
     #[cfg(feature = "device-identity")]
-    #[tokio::test]
-    async fn a_bind_below_the_settled_prefix_retires_the_key_and_names_nothing() {
-        let config = ClientConfig::new("rebase-test");
+    async fn device_settled_two_of_three(
+        tuning: SyncTuning,
+    ) -> (ConnettoConnection<FakeTransport>, [u8; 32], WriterRef) {
+        let mut config = ClientConfig::new("rebase-test");
+        config.tuning = tuning;
         let mut conn =
             ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
                 .expect("open in-memory replica");
@@ -11271,7 +11475,89 @@ mod tests {
             .expect("the write settles");
         }
         conn.bound_writer = None;
+        (conn, key, device)
+    }
 
+    /// R78 decision 17's device row: a `Bound` below the settled prefix whose
+    /// run the replica retains binds the key and arms that run's re-send.
+    #[cfg(feature = "device-identity")]
+    #[tokio::test]
+    async fn a_bind_below_a_retained_run_binds_the_key_and_arms_the_resend() {
+        let (mut conn, key, device) = device_settled_two_of_three(SyncTuning::default()).await;
+        conn.answer_bind(
+            key,
+            "below".to_owned(),
+            WriterOutcome::Bound { frontier: 1 },
+        )
+        .await
+        .expect("the bind is answered");
+        assert_eq!(conn.bound_writer, Some(device), "the key binds");
+        assert!(!conn.retired_keys.contains(&key), "the key stays");
+        let armed: Vec<u64> = conn
+            .restore
+            .as_ref()
+            .map(|restore| restore.entries.keys().copied().collect())
+            .unwrap_or_default();
+        assert_eq!(armed, vec![2], "the run past the frontier is armed");
+    }
+
+    /// R78 decision 17 on R77 decision 9: a device's entry applied before the
+    /// restore and refused by the restored server enters the retraction log
+    /// peers read, and keeps the refusal for a later restore.
+    #[cfg(all(feature = "device-identity", feature = "peer"))]
+    #[tokio::test]
+    async fn a_device_entry_refused_after_a_restore_enters_the_retraction_log() {
+        let (mut conn, key, device) = device_settled_two_of_three(SyncTuning::default()).await;
+        conn.answer_bind(
+            key,
+            "below".to_owned(),
+            WriterOutcome::Bound { frontier: 1 },
+        )
+        .await
+        .expect("the bind is answered");
+        let event = conn
+            .handle_control(ControlMessage::MutationReject(
+                connetto_core::messages::MutationReject {
+                    client_seq: 2,
+                    reason: MutationRejectReason::Unauthorized,
+                },
+            ))
+            .await
+            .expect("the answer settles");
+        let refused = PriorRefusal::Rejected(MutationRejectReason::Unauthorized);
+        assert_eq!(
+            event,
+            ClientEvent::WriteRestored {
+                client_seq: 2,
+                refused: Some(refused.clone()),
+            }
+        );
+        let logged: Vec<i64> = author::_connetto_retraction::table
+            .filter(author::_connetto_retraction::writer.eq(writer_id(&device)))
+            .select(author::_connetto_retraction::seq)
+            .load(&mut conn.db)
+            .expect("read the retraction log");
+        assert_eq!(logged, vec![2], "peers learn the refusal");
+        let run = acked::run(&mut conn.db, &device, 2, 2, conn.config.schema_major)
+            .expect("read the retained entry")
+            .expect("the entry stays retained");
+        assert_eq!(
+            run[0].1.refused,
+            Some(refused),
+            "a later restore declares it"
+        );
+    }
+
+    /// Decision 21's device rows, with no retained run: a `Bound` whose
+    /// frontier stands at what the replica saw settled keeps the device, and
+    /// one below it can only come from a restore, so the key is retired and
+    /// its queue moves to a number without naming the key.
+    #[cfg(feature = "device-identity")]
+    #[tokio::test]
+    async fn a_bind_below_the_settled_prefix_without_a_retained_run_retires_the_key() {
+        let (mut conn, key, device) =
+            device_settled_two_of_three(SyncTuning::default().with_acked_retention(Duration::ZERO))
+                .await;
         conn.answer_bind(
             key,
             "at-prefix".to_owned(),

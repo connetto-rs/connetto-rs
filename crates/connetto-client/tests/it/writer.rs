@@ -20,8 +20,8 @@ use connetto_client::{
 use connetto_core::chain::{GENESIS, entry_hash};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, MutationApplied,
-    MutationReject, MutationRejectReason, WriterAnswer, WriterGrant, WriterOutcome, WriterRef,
-    WriterRequest,
+    MutationConflict, MutationReject, MutationRejectReason, PriorRefusal, WriterAnswer,
+    WriterGrant, WriterOutcome, WriterRef, WriterRequest,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -71,6 +71,17 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// The client's private table of entries the server answered, kept for a
+    /// restore's re-send (R78), read by the assertions.
+    _connetto_acked (writer, seq) {
+        writer -> Text,
+        seq -> BigInt,
+        changeset -> Binary,
+        entry_hash -> Binary,
+    }
+}
+
 /// One row of the durable pending queue, the bookkeeping columns the
 /// assertions read.
 #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
@@ -87,6 +98,9 @@ enum Answer {
     #[default]
     Applied,
     Reject,
+    Conflict,
+    Indeterminate,
+    Forked,
     Silent,
 }
 
@@ -124,9 +138,12 @@ fn asked(requests: &[WriterRequest]) -> Vec<Asked> {
 struct Log {
     handshakes: Vec<WriterRequest>,
     mutations: Vec<u64>,
+    refused: Vec<Option<PriorRefusal>>,
     bulks: Vec<Vec<u8>>,
     retires: Vec<connetto_core::messages::RetireWriter>,
     outbox: VecDeque<IncomingFrame>,
+    /// Answers for the next headers, in order, ahead of the fake's default.
+    script: VecDeque<Answer>,
 }
 
 /// A transport that plays a fresh server: it grants a writer number at the
@@ -173,9 +190,22 @@ impl Wire {
         self
     }
 
+    /// Answer every mutation header with a conflict on table `t`.
+    fn conflicting(mut self) -> Self {
+        self.answer = Answer::Conflict;
+        self
+    }
+
     /// Answer nothing at all.
     fn silent(mut self) -> Self {
         self.answer = Answer::Silent;
+        self
+    }
+
+    /// Answer the next headers with `answers`, in order, and the rest as
+    /// this fake otherwise would.
+    fn scripted(self, answers: impl IntoIterator<Item = Answer>) -> Self {
+        self.log.lock().script.extend(answers);
         self
     }
 
@@ -261,23 +291,35 @@ impl Transport for Wire {
             ControlMessage::MutationHeader(header) => {
                 // The silent arm still records what went up, so a test can
                 // prove the resend happened.
-                self.log.lock().mutations.push(header.client_seq);
-                if matches!(self.answer, Answer::Silent) {
-                    return ready(Ok(()));
-                }
-                let frame = match self.answer {
+                let answer = {
+                    let mut log = self.log.lock();
+                    log.mutations.push(header.client_seq);
+                    log.refused.push(header.refused.map(|refused| *refused));
+                    log.script.pop_front().unwrap_or(self.answer)
+                };
+                let reject = |reason| {
+                    IncomingFrame::Control(ControlMessage::MutationReject(MutationReject {
+                        client_seq: header.client_seq,
+                        reason,
+                    }))
+                };
+                let frame = match answer {
+                    Answer::Silent => return ready(Ok(())),
                     Answer::Applied => {
                         IncomingFrame::Control(ControlMessage::MutationApplied(MutationApplied {
                             client_seq: header.client_seq,
                         }))
                     }
-                    Answer::Reject => {
-                        IncomingFrame::Control(ControlMessage::MutationReject(MutationReject {
+                    Answer::Reject => reject(MutationRejectReason::Unauthorized),
+                    Answer::Indeterminate => reject(MutationRejectReason::Indeterminate),
+                    Answer::Forked => reject(MutationRejectReason::Forked),
+                    Answer::Conflict => {
+                        IncomingFrame::Control(ControlMessage::MutationConflict(MutationConflict {
                             client_seq: header.client_seq,
-                            reason: MutationRejectReason::Unauthorized,
+                            table: "t".to_owned(),
+                            server_row: None,
                         }))
                     }
-                    Answer::Silent => unreachable!("the silent arm answered above"),
                 };
                 self.log.lock().outbox.push_back(frame);
             }
@@ -316,12 +358,21 @@ impl Transport for Wire {
 
 /// A replica in its own directory, opened offline under the suite's identity.
 async fn open(dir: &tempfile::TempDir) -> ConnettoConnection<Wire> {
+    open_tuned(dir, connetto_client::SyncTuning::default()).await
+}
+
+/// [`open`] with the build's `tuning`.
+async fn open_tuned(
+    dir: &tempfile::TempDir,
+    tuning: connetto_client::SyncTuning,
+) -> ConnettoConnection<Wire> {
     let credential = super::support::held("tester");
     let store = super::support::key_store(&credential).await;
     ClientBuilder::new(
         super::support::bundle(DDL),
         super::support::NeverDial::<Wire>::default(),
     )
+    .with_tuning(tuning)
     .signed_in(credential)
     .durable(
         DataDir::new(dir.path().to_path_buf()),
@@ -331,6 +382,24 @@ async fn open(dir: &tempfile::TempDir) -> ConnettoConnection<Wire> {
     .open_driven()
     .await
     .expect("open with no server")
+}
+
+/// The writers and sequences the replica keeps for a restore's re-send.
+fn retained(conn: &mut ConnettoConnection<Wire>) -> Vec<(String, i64)> {
+    _connetto_acked::table
+        .select((_connetto_acked::writer, _connetto_acked::seq))
+        .order((_connetto_acked::writer, _connetto_acked::seq))
+        .load(conn.conn())
+        .expect("read the retained entries")
+}
+
+/// The ids the replica's table holds.
+fn ids(conn: &mut ConnettoConnection<Wire>) -> Vec<i32> {
+    t::table
+        .select(t::id)
+        .order(t::id)
+        .load(conn.conn())
+        .expect("read the table")
 }
 
 fn writers(conn: &mut ConnettoConnection<Wire>) -> Vec<String> {
@@ -1278,13 +1347,19 @@ async fn a_number_held_without_a_secret_asks_for_a_fresh_one() {
 
 /// Write `ids` offline, then settle them on a first connection, so the number
 /// stands with `ids.len()` sequences acknowledged, and queue one more write
-/// the next connection never answers.
-async fn settle_then_queue(conn: &mut ConnettoConnection<Wire>, ids: &[i32], queued: i32) {
+/// the next connection never answers. Returns the patch bytes the first
+/// connection uploaded, in sequence order.
+async fn settle_then_queue(
+    conn: &mut ConnettoConnection<Wire>,
+    ids: &[i32],
+    queued: i32,
+) -> Vec<Vec<u8>> {
     for (seq, id) in (1..).zip(ids) {
         write(conn, *id);
         assert_eq!(conn.push().await.expect("queue"), Some(seq));
     }
-    conn.attach(Wire::default()).await.expect("attach");
+    let first = Wire::default();
+    conn.attach(first.clone()).await.expect("attach");
     drain(conn).await;
     assert!(conn.unsynced().is_empty(), "the first writes settled");
     let settled = u64::try_from(ids.len()).expect("a short list");
@@ -1303,16 +1378,289 @@ async fn settle_then_queue(conn: &mut ConnettoConnection<Wire>, ids: &[i32], que
         }],
         "the queued write waits under the number"
     );
+    first.log.lock().bulks.clone()
 }
 
-/// Decision 21's restored-number row: a grant whose frontier stands below
-/// what this replica saw settled can only come from a restore, so the queue
-/// moves to the unissued writer without naming the abandoned number, the
-/// attach fails, and the redial asks for a fresh number.
+/// A build that keeps nothing it settled, so a restore finds no run to re-send.
+fn retaining_nothing() -> connetto_client::SyncTuning {
+    connetto_client::SyncTuning::default().with_acked_retention(core::time::Duration::ZERO)
+}
+
+/// R78 decision 17: a grant below the settled prefix whose whole run the
+/// replica retains keeps the number, re-sends that run byte for byte from
+/// the server's frontier, and then the queue, so a restore loses nothing the
+/// server acknowledged.
 #[tokio::test]
-async fn a_grant_below_the_settled_prefix_moves_the_queue_to_a_fresh_number() {
+async fn a_grant_below_the_settled_prefix_resends_the_retained_run() {
     let dir = tempdir().expect("temp dir");
     let mut conn = open(&dir).await;
+    let uploaded = settle_then_queue(&mut conn, &[1, 2], 3).await;
+    assert_eq!(
+        retained(&mut conn),
+        vec![("number:1".to_owned(), 1), ("number:1".to_owned(), 2)],
+        "both settled entries are retained"
+    );
+
+    let wire = Wire::default().grant(1, 1);
+    conn.attach(wire.clone())
+        .await
+        .expect("a retained run keeps the number");
+    let seen = drain(&mut conn).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(
+            log.mutations,
+            vec![2, 3],
+            "the run past the frontier goes first, then the queue"
+        );
+        assert_eq!(log.refused, vec![None, None], "nothing was refused");
+        assert_eq!(
+            log.bulks.first(),
+            uploaded.get(1),
+            "the retained entry goes up byte for byte"
+        );
+    }
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, ClientEvent::MutationApplied { client_seq: 2 })),
+        "the re-sent entry raises no new application, saw {seen:?}"
+    );
+    assert_eq!(writers(&mut conn), vec!["number:1".to_owned()]);
+    assert!(conn.unsynced().is_empty(), "the queue settled too");
+    assert_eq!(ids(&mut conn), vec![1, 2, 3]);
+}
+
+/// R78 decision 17: an entry the server refused before the restore is
+/// re-sent declaring that refusal, so the restored server settles it refused
+/// again, and its answer rolls nothing back a second time.
+#[tokio::test]
+async fn a_retained_refusal_is_resent_declared_and_rolls_nothing_back() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    write(&mut conn, 1);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    conn.attach(Wire::default().rejecting())
+        .await
+        .expect("attach");
+    drain(&mut conn).await;
+    write(&mut conn, 2);
+    assert_eq!(conn.push().await.expect("queue"), Some(2));
+    conn.attach(Wire::default().conflicting().grant(1, 1))
+        .await
+        .expect("attach");
+    drain(&mut conn).await;
+    write(&mut conn, 3);
+    assert_eq!(conn.push().await.expect("queue"), Some(3));
+    conn.attach(Wire::default().grant(1, 2))
+        .await
+        .expect("attach");
+    drain(&mut conn).await;
+    assert_eq!(ids(&mut conn), vec![3], "both refusals rolled back");
+
+    let wire = Wire::default().rejecting().grant(1, 0);
+    conn.attach(wire.clone())
+        .await
+        .expect("a retained run keeps the number");
+    let seen = drain(&mut conn).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(log.mutations, vec![1, 2, 3]);
+        assert_eq!(
+            log.refused,
+            vec![
+                Some(PriorRefusal::Rejected(MutationRejectReason::Unauthorized)),
+                Some(PriorRefusal::Conflict {
+                    table: "t".to_owned()
+                }),
+                None,
+            ],
+            "each refusal is declared, the applied entry is not"
+        );
+    }
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, ClientEvent::MutationRejected { .. })),
+        "a re-sent entry's answer raises no rejection, saw {seen:?}"
+    );
+    assert_eq!(
+        ids(&mut conn),
+        vec![3],
+        "the applied row stands, nothing rolls back again"
+    );
+    assert_eq!(writers(&mut conn), vec!["number:1".to_owned()]);
+}
+
+/// R78 decision 22: a build retaining nothing keeps no settled entry.
+#[tokio::test]
+async fn a_zero_retention_keeps_no_settled_entry() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open_tuned(&dir, retaining_nothing()).await;
+    settle_then_queue(&mut conn, &[1, 2], 3).await;
+    assert_eq!(retained(&mut conn), Vec::<(String, i64)>::new());
+}
+
+/// R78 decision 17: a re-sent entry the restored server could not settle
+/// arms the deferred-write resend, which sends it again on the same wire.
+#[tokio::test]
+async fn a_resent_entry_answered_indeterminate_is_sent_again_on_the_resend() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    for (seq, id) in [(1, 1), (2, 2)] {
+        write(&mut conn, id);
+        assert_eq!(conn.push().await.expect("queue"), Some(seq));
+    }
+    conn.attach(Wire::default()).await.expect("attach");
+    drain(&mut conn).await;
+    assert_eq!(conn.unsynced(), Vec::new(), "both writes settled");
+
+    let wire = Wire::default()
+        .grant(1, 1)
+        .scripted([Answer::Indeterminate]);
+    conn.attach(wire.clone())
+        .await
+        .expect("a retained run keeps the number");
+    let mut deferred = false;
+    for _ in 0..16 {
+        if matches!(
+            conn.pump_one().await.expect("pump"),
+            ClientEvent::MutationDeferred { client_seq: 2 }
+        ) {
+            deferred = true;
+            break;
+        }
+    }
+    assert!(deferred, "the re-sent entry is deferred");
+    let timer = conn
+        .resend_timer()
+        .expect("the deferred re-send arms a resend");
+    conn.resend_deferred(timer).await.expect("resend");
+    let seen = drain(&mut conn).await;
+    assert_eq!(
+        wire.log.lock().mutations,
+        vec![2, 2],
+        "the entry went up again"
+    );
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            ClientEvent::WriteRestored {
+                client_seq: 2,
+                refused: None
+            }
+        )),
+        "the second answer settles it, saw {seen:?}"
+    );
+}
+
+/// R78 decision 17: a re-sent entry answered `Forked` finds another entry
+/// standing where the run was, so the writer moves on as for a run it does
+/// not retain.
+#[tokio::test]
+async fn a_resent_entry_answered_forked_moves_the_queue_to_a_fresh_number() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    settle_then_queue(&mut conn, &[1, 2], 3).await;
+
+    let wire = Wire::default()
+        .silent()
+        .grant(1, 1)
+        .scripted([Answer::Forked]);
+    conn.attach(wire)
+        .await
+        .expect("a retained run keeps the number");
+    let seen = drain(&mut conn).await;
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            ClientEvent::WriteRestored {
+                client_seq: 2,
+                refused: Some(PriorRefusal::Rejected(MutationRejectReason::Forked)),
+            }
+        )),
+        "the fork is reported, saw {seen:?}"
+    );
+    assert_eq!(writers(&mut conn), vec!["number:0".to_owned()]);
+    assert_eq!(
+        pending(&mut conn),
+        vec![PendingRow {
+            writer: "number:0".to_owned(),
+            seq: 1,
+            prov_writer: None,
+            prov_seq: None,
+        }],
+        "the queue waits for a fresh number, naming nothing past the restored frontier"
+    );
+}
+
+/// R78 decision 17: an entry applied before the restore and refused by the
+/// restored server keeps that refusal, rolls nothing back, and a later
+/// restore re-sends it declared.
+#[tokio::test]
+async fn a_resent_entry_refused_now_is_declared_at_the_next_restore() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    settle_then_queue(&mut conn, &[1, 2], 3).await;
+
+    let first = Wire::default().grant(1, 1).scripted([Answer::Conflict]);
+    conn.attach(first)
+        .await
+        .expect("a retained run keeps the number");
+    drain(&mut conn).await;
+    assert_eq!(ids(&mut conn), vec![1, 2, 3], "nothing rolls back");
+
+    let second = Wire::default().grant(1, 1);
+    conn.attach(second.clone())
+        .await
+        .expect("a retained run keeps the number");
+    drain(&mut conn).await;
+    assert_eq!(
+        second.log.lock().refused,
+        vec![
+            Some(PriorRefusal::Conflict {
+                table: "t".to_owned()
+            }),
+            None,
+        ]
+    );
+}
+
+/// R78 decision 17: a run missing an entry in its middle cannot be re-sent
+/// byte for byte, so the writer moves on.
+#[tokio::test]
+async fn a_run_missing_a_middle_entry_moves_the_queue_to_a_fresh_number() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    settle_then_queue(&mut conn, &[1, 2, 3], 4).await;
+    diesel::delete(_connetto_acked::table.filter(_connetto_acked::seq.eq(2)))
+        .execute(conn.conn())
+        .expect("drop the middle entry");
+
+    let error = conn
+        .attach(Wire::default().silent().grant(1, 0))
+        .await
+        .expect_err("an unretained run fails the attach");
+    assert!(
+        matches!(
+            error,
+            ClientError::WriterRewound {
+                writer: WriterRef::Number(1)
+            }
+        ),
+        "the rewound writer is named, saw {error:?}"
+    );
+    assert_eq!(writers(&mut conn), vec!["number:0".to_owned()]);
+}
+
+/// Decision 21's restored-number row, with no retained run: a grant whose
+/// frontier stands below what this replica saw settled can only come from a
+/// restore, so the queue moves to the unissued writer without naming the
+/// abandoned number, the attach fails, and the redial asks for a fresh number.
+#[tokio::test]
+async fn a_grant_below_the_settled_prefix_without_a_retained_run_moves_the_queue() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open_tuned(&dir, retaining_nothing()).await;
     settle_then_queue(&mut conn, &[1, 2], 3).await;
 
     let error = conn
@@ -1363,14 +1711,50 @@ async fn a_grant_below_the_settled_prefix_moves_the_queue_to_a_fresh_number() {
     assert_eq!(writers(&mut conn), vec!["number:2".to_owned()]);
 }
 
-/// Decision 21's live gap rows: a `SequenceGap` whose server frontier stands
-/// below what this replica saw settled moves the queue as a rewound grant
-/// does, while one at the settled prefix is a gap the client cannot have made
-/// and leaves the queue to the redial.
+/// R78 decision 17's live gap: a `SequenceGap` whose server frontier stands
+/// below a run the replica retains keeps the number, and the redial's grant
+/// at that frontier re-sends the run and then the queue.
 #[tokio::test]
-async fn a_live_sequence_gap_below_the_settled_prefix_moves_the_queue() {
+async fn a_live_sequence_gap_below_a_retained_run_keeps_the_number_for_the_redial() {
     let dir = tempdir().expect("temp dir");
     let mut conn = open(&dir).await;
+    settle_then_queue(&mut conn, &[1, 2], 3).await;
+
+    let below = Wire::default()
+        .silent()
+        .grant(1, 2)
+        .closing(FatalErrorReason::SequenceGap {
+            expected: 2,
+            got: 3,
+        });
+    conn.attach(below).await.expect("attach");
+    drain(&mut conn).await;
+    assert_eq!(writers(&mut conn), vec!["number:1".to_owned()]);
+    assert_eq!(
+        conn.unsynced(),
+        vec![UnsyncedWrite {
+            writer: WriterRef::Number(1),
+            seq: 3,
+            major: Major::new(1),
+        }],
+        "the queue waits under the number"
+    );
+
+    let redial = Wire::default().grant(1, 1);
+    conn.attach(redial.clone()).await.expect("redial");
+    drain(&mut conn).await;
+    assert_eq!(redial.log.lock().mutations, vec![2, 3]);
+    assert_eq!(conn.unsynced(), Vec::new());
+}
+
+/// Decision 21's live gap rows, with no retained run: a `SequenceGap` whose
+/// server frontier stands below what this replica saw settled moves the
+/// queue as a rewound grant does, while one at the settled prefix is a gap
+/// the client cannot have made and leaves the queue to the redial.
+#[tokio::test]
+async fn a_live_sequence_gap_below_the_settled_prefix_without_a_retained_run_moves_the_queue() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open_tuned(&dir, retaining_nothing()).await;
     settle_then_queue(&mut conn, &[1, 2], 3).await;
 
     let at_prefix = Wire::default()
@@ -1531,19 +1915,10 @@ async fn an_older_majors_entry_holds_the_newer_majors_writes_off_the_wire() {
     );
 }
 
-#[tokio::test]
-async fn a_refused_writer_carries_held_bytes_without_the_active_builds_renames() {
-    let dir = tempdir().expect("temp dir");
-    {
-        let mut conn = split_open(&dir).await;
-        conn.attach(Wire::default().silent()).await.expect("attach");
-        conn.conn()
-            .batch_execute("INSERT INTO t (id) VALUES (1)")
-            .expect("write through the view");
-        assert_eq!(conn.push().await.expect("queue"), Some(1));
-        drain(&mut conn).await;
-    }
-    let active = SyncSchema::new(
+/// Major 2 of the split schema, whose view names the old physical table and
+/// whose renames differ from major 1's.
+fn renamed_major_two() -> SyncSchema {
+    SyncSchema::new(
         SchemaBundle::new(
             "-- connetto:major 2",
             "",
@@ -1556,7 +1931,50 @@ async fn a_refused_writer_carries_held_bytes_without_the_active_builds_renames()
             None::<&str>,
         )
         .expect("the source declares major 2"),
+    )
+}
+
+/// R78 decision 21: R31's rebuild keeps the retained entries and rewrites an
+/// old major's into the wire form its server reads, so a re-send carries the
+/// bytes its chain hash covers.
+#[tokio::test]
+async fn a_rebuild_rewrites_retained_entries_into_their_majors_wire_form() {
+    let dir = tempdir().expect("temp dir");
+    {
+        let mut conn = split_open(&dir).await;
+        conn.attach(Wire::default()).await.expect("attach");
+        conn.conn()
+            .batch_execute("INSERT INTO t (id) VALUES (1)")
+            .expect("write through the view");
+        assert_eq!(conn.push().await.expect("queue"), Some(1));
+        drain(&mut conn).await;
+        assert!(conn.unsynced().is_empty(), "the write settled");
+    }
+    let mut conn = open_with(&dir, renamed_major_two()).await;
+    let (changeset, hash): (Vec<u8>, Vec<u8>) = _connetto_acked::table
+        .select((_connetto_acked::changeset, _connetto_acked::entry_hash))
+        .first(conn.conn())
+        .expect("the rebuild keeps the retained entry");
+    assert_eq!(
+        hash.as_slice(),
+        entry_hash(&GENESIS, 1, Major::new(1), None, &changeset),
+        "the retained bytes are the logical ones the chain hash covers"
     );
+}
+
+#[tokio::test]
+async fn a_refused_writer_carries_held_bytes_without_the_active_builds_renames() {
+    let dir = tempdir().expect("temp dir");
+    {
+        let mut conn = split_open(&dir).await;
+        conn.attach(Wire::default().silent()).await.expect("attach");
+        conn.conn()
+            .batch_execute("INSERT INTO t (id) VALUES (1)")
+            .expect("write through the view");
+        assert_eq!(conn.push().await.expect("queue"), Some(1));
+        drain(&mut conn).await;
+    }
+    let active = renamed_major_two();
     let mut conn = open_with(&dir, active.clone()).await;
     let held: Vec<u8> = _connetto_pending::table
         .select(_connetto_pending::changeset)
