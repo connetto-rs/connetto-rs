@@ -232,7 +232,9 @@ async fn a_thumbnail_above_one_mebibyte_is_left_for_an_on_demand_fetch() {
                 "the prefetch reads the manifest and asks for no range"
             );
             match receiver.resolve(thumb).await.expect("resolve") {
-                Resolved::Local { bytes: held, .. } => assert!(held == bytes),
+                Resolved::Local { bytes: held, .. } => {
+                    assert!(held == bytes, "the on-demand fetch brings the bytes");
+                }
                 other => panic!("an on-demand fetch still brings it, not {other:?}"),
             }
         },
@@ -276,6 +278,56 @@ async fn a_prefetch_asks_its_author_alone_and_drops_on_busy() {
             tokio::time::sleep(Duration::from_secs(6)).await;
             assert_eq!(wants(&author), 1, "a busy author is not asked again");
             assert_eq!(wants(&other), 0, "a prefetch asks the author alone");
+        },
+    ))
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resolve_joining_a_prefetch_widens_it_to_every_linked_holder() {
+    let dirs = [
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+    ];
+    let (client, receiver) = receiver(dirs[0].path()).await;
+    let bytes = pseudorandom(73, 50_000);
+    let thumb = learn_file_id(&bytes).await;
+    let devices = Devices::new();
+    let (author_device, other_device) = (devices.device("anna", 2), devices.device("anna", 4));
+    let (author_node, author_addr, author_events) = devices.node(&author_device);
+    let (other_node, other_addr, other_events) = devices.node(&other_device);
+    let author = bare_holder(author_node, author_events, bytes.clone(), Fault::Silent);
+    let other = bare_holder(other_node, other_events, bytes.clone(), Fault::None);
+    let (receiver_node, _, receiver_events) = devices.node(&devices.device("anna", 3));
+    for addr in [author_addr, other_addr] {
+        receiver_node.link(addr).await.expect("the link completes");
+    }
+
+    Box::pin(beside(
+        &receiver,
+        port(receiver_node, receiver_events),
+        async {
+            apply_photo(
+                &client,
+                dirs[1].path(),
+                &author_of(&author_device),
+                FileId::from_bytes([9; 32]),
+                thumb,
+            )
+            .await;
+            while wants(&author) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // The silent author lapses after the frame bound, and the joined
+            // fetch moves on to the other holder rather than dropping.
+            match receiver.resolve(thumb).await.expect("resolve") {
+                Resolved::Local { bytes: held, .. } => {
+                    assert!(held == bytes, "the joined fetch brings the bytes");
+                }
+                other => panic!("the joined fetch reaches the other holder, not {other:?}"),
+            }
+            assert_eq!(wants(&author), 1);
+            assert_eq!(wants(&other), 1);
         },
     ))
     .await;
