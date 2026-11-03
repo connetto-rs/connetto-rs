@@ -190,14 +190,13 @@ where
         &self,
         file_id: FileId,
     ) -> Result<Option<Resolved>, ContentError> {
-        let orders = self.peer_orders.lock().clone();
-        let Some(orders) = orders else {
+        let Some(orders) = self.peer_orders.lock().clone() else {
             return Ok(None);
         };
         let (answer, answered) = oneshot::channel();
-        if orders.send(Order { file_id, answer }).is_err() {
-            return Ok(None);
-        }
+        // A driver stopping now drops the order and its answer, which reads
+        // as unavailable below.
+        let _ = orders.send(Order { file_id, answer });
         let Ok(fetched) = answered.await else {
             return Ok(Some(Resolved::Unavailable));
         };
@@ -411,36 +410,33 @@ where
         fetch.answers.push(order.answer);
         self.fetches.insert(tag, fetch);
         self.tags.insert(order.file_id, tag);
-        self.start_round(tag, now).await
+        self.start_round(tag, order.file_id, now).await
     }
 
-    /// Lines up every linked holder for the fetch `tag` and asks the first.
-    async fn start_round(&mut self, tag: u64, now: Instant) -> Vec<Action> {
-        let Some(file_id) = self.fetches.get(&tag).map(|fetch| fetch.file_id) else {
-            return Vec::new();
-        };
+    /// Lines up every linked holder for the fetch `tag` of `file_id` and asks
+    /// the first.
+    async fn start_round(&mut self, tag: u64, file_id: FileId, now: Instant) -> Vec<Action> {
         let authors = self.content.provisional_authors(file_id).await;
         let candidates = candidate_order(self.links.linked_peers(), &authors);
-        let Some(fetch) = self.fetches.get_mut(&tag) else {
-            return Vec::new();
-        };
-        fetch.candidates = candidates;
-        fetch.round_busy = None;
-        fetch.retry_at = None;
+        if let Some(fetch) = self.fetches.get_mut(&tag) {
+            fetch.candidates = candidates;
+            fetch.round_busy = None;
+            fetch.retry_at = None;
+        }
         self.next_holder(tag, now)
     }
 
     /// Every fetch whose busy holders are due again starts a new round.
     async fn retry_due(&mut self, now: Instant) -> Vec<Action> {
-        let due: Vec<u64> = self
+        let due: Vec<(u64, FileId)> = self
             .fetches
             .iter()
             .filter(|(_, fetch)| fetch.retry_at.is_some_and(|at| at <= now))
-            .map(|(tag, _)| *tag)
+            .map(|(tag, fetch)| (*tag, fetch.file_id))
             .collect();
         let mut actions = Vec::new();
-        for tag in due {
-            actions.extend(self.start_round(tag, now).await);
+        for (tag, file_id) in due {
+            actions.extend(self.start_round(tag, file_id, now).await);
         }
         actions
     }

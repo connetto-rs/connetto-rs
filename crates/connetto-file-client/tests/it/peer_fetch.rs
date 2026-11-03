@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use connetto_client::media::MediaPort;
+use connetto_client::media::{MediaEvent, MediaPort};
 use connetto_exchange::media::{MAX_PIECE_BYTES, Media};
 use connetto_file_client::{ContentEvent, FileId, Resolved};
 use connetto_file_core::{MemStore, MimeClass, encode_range, process_file_with_outboard};
@@ -561,6 +561,32 @@ async fn a_manifest_no_file_can_have_is_refused_before_any_fetch() {
         })
         .await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fetch_waiting_when_the_client_ends_answers_unavailable_and_the_driver_returns() {
+    let mut camp = Camp::new(pseudorandom(16, 100_000)).await;
+    let silent = camp.linked_holder(Fault::Silent).await;
+    // A port whose events the proof feeds, so dropping the feed ends it as
+    // the client's end does. The driver reads the links at its start.
+    let (feed, events) = mpsc::unbounded_channel::<MediaEvent>();
+    let port = MediaPort::over(camp.anna.clone(), events);
+    let ending = async {
+        while wants(&silent) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(feed);
+    };
+    let (resolved, (), ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            camp.receiver.resolve(camp.file_id),
+            camp.receiver.drive_media(port),
+            ending
+        )
+    })
+    .await
+    .expect("the driver returns once its port ends");
+    assert_eq!(resolved.expect("resolve"), Resolved::Unavailable);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

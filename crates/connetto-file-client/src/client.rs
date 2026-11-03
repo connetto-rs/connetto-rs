@@ -759,24 +759,20 @@ where
             }
             return Ok(Resolved::Unavailable);
         }
-        match ticket::request(
+        let ticket = ticket::request(
             &self.client,
             file_id,
             ContentVerb::Read,
             ticket::TicketWire::Main,
         )
-        .await
+        .await;
+        #[cfg(feature = "peer")]
+        if let Err(ContentError::TicketRefused { .. }) = &ticket
+            && let Some(answer) = self.peer_stage(file_id).await?
         {
-            Ok(url) => Ok(Resolved::Remote { url }),
-            Err(refused @ ContentError::TicketRefused { .. }) => {
-                #[cfg(feature = "peer")]
-                if let Some(answer) = self.peer_stage(file_id).await? {
-                    return Ok(answer);
-                }
-                Err(refused)
-            }
-            Err(err) => Err(err),
+            return Ok(answer);
         }
+        ticket.map(|url| Resolved::Remote { url })
     }
 
     /// The answer the device can give on its own, or `None` to ask a server.

@@ -11,7 +11,7 @@ use connetto_file_core::decode_range;
 use connetto_peer::{Node, PeerEvent};
 use tokio::sync::mpsc;
 
-use crate::peer_support::{Devices, beside, declared, hand_over, port, replica, stage};
+use crate::peer_support::{Devices, beside, declared, hand_over, name_file, port, replica, stage};
 use crate::retention::pseudorandom;
 
 /// The replies to `request` from `holder`, up to the last one, bounded.
@@ -306,6 +306,43 @@ async fn a_stream_whose_link_falls_stops_and_the_holder_serves_on() {
             matches!(replies.last(), Some(Media::Manifest { last: true, .. })),
             "the holder serves the next requester, got {replies:?}"
         );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_a_readable_row_names_but_the_holder_lacks_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (client, content) = declared(dir.path()).await;
+    name_file(&client, 1, "anna", [5; 32]).await;
+
+    let devices = Devices::new();
+    let (holder_device, anna_device) = (devices.device("r77", 2), devices.device("anna", 3));
+    let (holder_node, holder_addr, holder_events) = devices.node(&holder_device);
+    let (anna, _, mut anna_events) = devices.node(&anna_device);
+    let port = port(holder_node, holder_events);
+
+    beside(&content, port, async {
+        let holder = anna.link(holder_addr).await.expect("the link completes");
+        for request in [
+            Media::Want {
+                request_id: 1,
+                file_id: [5; 32],
+            },
+            Media::Fetch {
+                request_id: 2,
+                file_id: [5; 32],
+                start: 0,
+                len: 100,
+            },
+        ] {
+            let request_id = request.request_id();
+            assert_eq!(
+                ask(&anna, &mut anna_events, &holder, request).await,
+                vec![Media::Refused { request_id }],
+                "the gate admits anna, and the holder has no bytes to give"
+            );
+        }
     })
     .await;
 }

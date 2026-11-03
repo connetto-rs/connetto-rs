@@ -167,6 +167,24 @@ pub async fn stage(content: &Device, id: i64, owner: &str, bytes: &[u8]) -> File
     file_id
 }
 
+/// Inserts photo `id` owned by `owner` naming `file_id`, whose bytes the
+/// device never held.
+pub async fn name_file(client: &ConnettoClient<Scripted>, id: i64, owner: &str, file_id: [u8; 32]) {
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(photos::table)
+                .values((
+                    photos::id.eq(id),
+                    photos::owner.eq(owner),
+                    photos::content_id.eq(file_id.to_vec()),
+                ))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("name the file");
+}
+
 /// Hands photo `id` to `owner`.
 pub async fn hand_over(client: &ConnettoClient<Scripted>, id: i64, owner: &str) {
     let now = client
