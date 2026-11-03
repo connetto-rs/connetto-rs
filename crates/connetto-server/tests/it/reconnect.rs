@@ -2342,7 +2342,7 @@ async fn a_fenced_cursor_catches_up_what_its_snapshot_missed_and_nothing_it_held
     expect_idle(&mut client).await;
 }
 
-/// A fenced replay that runs out of room partway through what its snapshot missed, and again in the gap after its cursor, picks up each time where it stopped, so every row arrives once.
+/// A fenced replay that runs out of room twice partway through what its snapshot missed, and again in the gap after its cursor, picks up each time where it stopped, so every row arrives once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fenced_replay_out_of_room_resumes_where_it_stopped() {
     let fixture = Fixture::acquire().await;
@@ -2358,32 +2358,39 @@ async fn a_fenced_replay_out_of_room_resumes_where_it_stopped() {
     );
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     let mut events = Vec::new();
-    for id in 1..=5 {
+    for id in 1..=6 {
         events.push(insert(&mut source, id).await);
     }
     for event in &events {
         manager.dispatch_event(event).await.expect("dispatch");
     }
-    let [held_below, missed_a, missed_b, _held_above, beyond] =
-        <[PgChangeEvent; 5]>::try_from(events).expect("five inserts");
+    let [
+        held_below,
+        missed_a,
+        missed_b,
+        missed_c,
+        _held_above,
+        beyond,
+    ] = <[PgChangeEvent; 6]>::try_from(events).expect("six inserts");
 
-    // The read ran after the third commit while the second and third were still in progress, so both sit below the cursor unseen.
+    // The read ran after the fourth commit while the second to fourth were still in progress, so all three sit below the cursor unseen.
     let xid = |event: &PgChangeEvent| event.position().xid().0;
-    let read = PgCommitPosition::before_commit(PgLsn(missed_b.position().commit_lsn().0 + 1));
+    let read = PgCommitPosition::before_commit(PgLsn(missed_c.position().commit_lsn().0 + 1));
     let fence = ReadFence::parse(
         &format!(
-            "{}:{}:{},{}",
+            "{}:{}:{},{},{}",
             xid(&held_below),
             xid(&beyond) + 1,
             xid(&missed_a),
-            xid(&missed_b)
+            xid(&missed_b),
+            xid(&missed_c)
         ),
         beyond.position().commit_lsn(),
     )
     .expect("fence");
     let mut client = open_fenced_session(&manager, Some(fenced_cursor(read, Some(&fence)))).await;
     subscribe(&mut client).await;
-    for event in [&missed_a, &missed_b, &beyond] {
+    for event in [&missed_a, &missed_b, &missed_c, &beyond] {
         client
             .send_control(ControlMessage::AckCredits(AckCredits { credits: 1 }))
             .await
