@@ -64,6 +64,10 @@ impl DrainTimer {
     }
 }
 
+/// One write the drain sends: its sequence, changeset and provenance, and
+/// the refusal a restore's re-sent entry declares.
+type DrainSend = (u64, Vec<u8>, Option<Provenance>, Option<Box<PriorRefusal>>);
+
 /// The older major whose work is draining, with the bundle hash its server
 /// was built from.
 struct HeldBatch {
@@ -128,6 +132,11 @@ impl<T> Drain<T> {
         }
     }
 
+    /// Whether no batch is draining.
+    pub(crate) const fn batch_idle(&self) -> bool {
+        self.batch.is_none()
+    }
+
     /// The live drain wire, if any.
     pub(crate) fn wire_mut(&mut self) -> Option<&mut T> {
         self.wire.as_mut()
@@ -170,11 +179,16 @@ impl<T> Drain<T> {
     }
 }
 
-/// The oldest major a rebuild left work for.
-fn oldest_batch(db: &mut SqliteConnection) -> Result<Option<HeldBatch>, ClientError> {
+/// The oldest major a rebuild left work for, or an armed run's older major
+/// presented with the hash its rows carry (R78 decision 27).
+fn oldest_batch(
+    db: &mut SqliteConnection,
+    run: impl IntoIterator<Item = (Major, SchemaVersion)>,
+) -> Result<Option<HeldBatch>, ClientError> {
     Ok(crate::majors::held_builds(db)?
         .into_iter()
-        .next()
+        .chain(run)
+        .min_by_key(|(major, _)| *major)
         .map(|(major, version)| HeldBatch { major, version }))
 }
 
@@ -185,7 +199,15 @@ where
 {
     /// Load the oldest held batch and owe a dial for it at once.
     pub(crate) fn load_drain(&mut self) -> Result<(), ClientError> {
-        self.drain.batch = oldest_batch(&mut self.db)?;
+        let build = self.config.schema_major;
+        let run: Vec<(Major, SchemaVersion)> = self
+            .restore
+            .iter()
+            .flat_map(|restore| restore.entries.values())
+            .filter(|entry| entry.major != build)
+            .filter_map(|entry| Some((entry.major?, entry.version.clone()?)))
+            .collect();
+        self.drain.batch = oldest_batch(&mut self.db, run)?;
         self.drain.timer = None;
         if self.drain.batch.is_some() {
             self.drain.episode = DRAIN_POLICY.start();
@@ -226,6 +248,15 @@ where
     /// The writer the draining major's next write is queued under: the one
     /// holding its entry of the lowest append position.
     fn drain_writer(&self, major: Major) -> Option<WriterRef> {
+        // A run's entries of the major precede its writer's pending ones.
+        if let Some(restore) = self.restore.as_ref()
+            && restore
+                .entries
+                .values()
+                .any(|entry| entry.major == Some(major))
+        {
+            return Some(restore.writer);
+        }
         self.writers
             .iter()
             .flat_map(|(writer, queue)| {
@@ -241,12 +272,28 @@ where
 
     /// Whether any writer still queues an entry `major` captured.
     fn holds_major(&self, major: Major) -> bool {
-        self.writers.values().any(|queue| {
-            queue
-                .pending
-                .values()
-                .any(|entry| entry.major == Some(major))
-        })
+        self.run_entries_of(None, major).next().is_some()
+            || self.writers.values().any(|queue| {
+                queue
+                    .pending
+                    .values()
+                    .any(|entry| entry.major == Some(major))
+            })
+    }
+
+    /// The armed run's unanswered sequences `major` captured, of `writer`
+    /// when one is named.
+    fn run_entries_of(
+        &self,
+        writer: Option<WriterRef>,
+        major: Major,
+    ) -> impl Iterator<Item = u64> + '_ {
+        self.restore
+            .iter()
+            .filter(move |restore| writer.is_none_or(|writer| restore.writer == writer))
+            .flat_map(|restore| restore.entries.iter())
+            .filter(move |(_, entry)| entry.major == Some(major))
+            .map(|(seq, _)| *seq)
     }
 
     /// The lowest append position among the queued entries captured under a
@@ -632,6 +679,19 @@ where
         frontier: u64,
     ) -> Result<(), ClientError> {
         self.drain.writer = Some(writer);
+        // Only a restore lowers a frontier, and a run retained whole is re-sent (R78 decision 27).
+        let armed = self
+            .restore
+            .as_ref()
+            .is_some_and(|restore| restore.writer == writer);
+        if self.rewound(&writer, frontier) && !armed && !self.arm_restore(writer, frontier)? {
+            // The next dial takes a fresh number naming nothing past the restored frontier.
+            self.drain.dead.insert(writer, crate::Carry::Abandoned);
+            self.drop_drain_wire().await;
+            self.drain.arm(Duration::ZERO);
+            return Ok(());
+        }
+        self.drop_run_through(writer, frontier);
         let settled: Vec<(u64, Option<Major>)> = self
             .writers
             .get(&writer)
@@ -678,11 +738,27 @@ where
         let Some(writer) = self.drain.writer else {
             return self.after_drain_settle(major).await;
         };
+        // The run's entries of the major go first, since its sequences precede the queue's.
+        let mut sends: Vec<DrainSend> = self
+            .restore
+            .iter()
+            .filter(|restore| restore.writer == writer)
+            .flat_map(|restore| restore.entries.iter())
+            .filter(|(seq, entry)| {
+                entry.major == Some(major) && !self.drain.in_flight.contains(seq)
+            })
+            .map(|(seq, entry)| {
+                (
+                    *seq,
+                    entry.changeset.clone(),
+                    entry.provenance,
+                    entry.refused.clone().map(Box::new),
+                )
+            })
+            .collect();
         let limit = self.lowest_position_outside(Some(major));
-        let sends: Vec<(u64, Vec<u8>, Option<Provenance>)> = self
-            .writers
-            .get(&writer)
-            .map(|queue| {
+        if let Some(queue) = self.writers.get(&writer) {
+            sends.extend(
                 queue
                     .pending
                     .iter()
@@ -691,16 +767,16 @@ where
                             && limit.is_none_or(|position| entry.position < position)
                     })
                     .filter(|(seq, _)| !self.drain.in_flight.contains(seq))
-                    .map(|(seq, entry)| (*seq, entry.changeset.clone(), entry.provenance))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for (seq, changeset, provenance) in sends {
+                    .map(|(seq, entry)| (*seq, entry.changeset.clone(), entry.provenance, None)),
+            );
+        }
+        for (seq, changeset, provenance, refused) in sends {
             let Some(wire) = self.drain.wire.as_mut() else {
                 return Ok(());
             };
             if let Err(err) =
-                crate::send_wire_changeset(wire, seq, &changeset, provenance.as_ref(), None).await
+                crate::send_wire_changeset(wire, seq, &changeset, provenance.as_ref(), refused)
+                    .await
             {
                 tracing::warn!(error = %err, "the drain wire failed while sending held writes");
                 self.drop_drain_wire().await;
@@ -723,6 +799,7 @@ where
             let settled = Settled {
                 refused,
                 retention: self.config.tuning.acked_retention(),
+                version: self.drain.batch.as_ref().map(|batch| &batch.version),
             };
             {
                 let _suspended = ExemptWrites::raise(&self.write_flags);
@@ -773,12 +850,13 @@ where
         if self.drain.bind.is_some() {
             return Ok(());
         }
-        let left_here = self.writers.get(&writer).is_some_and(|queue| {
-            queue
-                .pending
-                .values()
-                .any(|entry| entry.major == Some(major))
-        });
+        let left_here = self.run_entries_of(Some(writer), major).next().is_some()
+            || self.writers.get(&writer).is_some_and(|queue| {
+                queue
+                    .pending
+                    .values()
+                    .any(|entry| entry.major == Some(major))
+            });
         if !left_here {
             // Another writer holds the major's next write, so the next dial binds it.
             self.drop_drain_wire().await;
@@ -810,9 +888,21 @@ where
                     })
             })
             .collect();
-        let hit: BTreeSet<WriterRef> = lost.iter().map(|write| write.writer).collect();
         for write in &lost {
             self.lose_entry(write.writer, write.seq)?;
+        }
+        // A run's entries of the gone major leave a gap no wire can fill (R78 decision 27).
+        let mut lost = lost;
+        let mut hit: BTreeSet<WriterRef> = lost.iter().map(|write| write.writer).collect();
+        let mut rewound = None;
+        if let Some(writer) = self.restore.as_ref().map(|restore| restore.writer) {
+            let run: Vec<u64> = self.run_entries_of(Some(writer), major).collect();
+            if !run.is_empty() {
+                self.restore = None;
+                hit.remove(&writer);
+                rewound = Some(writer);
+                lost.extend(run.into_iter().map(|seq| HeldWrite { writer, seq }));
+            }
         }
         let files = {
             let _suspended = ExemptWrites::raise(&self.write_flags);
@@ -836,6 +926,10 @@ where
                     self.drain.dead.insert(number, crate::Carry::Named);
                 }
             }
+        }
+        // The restored frontier stands below the lost run, so nothing past it is named.
+        if let Some(writer) = rewound {
+            self.move_rewound_writer_on(writer)?;
         }
         self.notices.push_back(ClientEvent::Held(HeldWork::Lost {
             major,
@@ -1004,6 +1098,21 @@ where
                 self.drop_drain_wire().await;
                 return Ok(());
             }
+            // Another entry stands where the run re-sent one, so the writer moves on.
+            Some(IncomingFrame::Control(ControlMessage::MutationReject(reject)))
+                if reject.reason == MutationRejectReason::Forked
+                    && self
+                        .drain
+                        .writer
+                        .is_some_and(|writer| self.restoring_for(writer, reject.client_seq)) =>
+            {
+                if let Some(writer) = self.drain.writer {
+                    self.move_rewound_writer_on(writer)?;
+                }
+                self.drop_drain_wire().await;
+                self.drain.arm(Duration::ZERO);
+                return Ok(());
+            }
             Some(IncomingFrame::Control(ControlMessage::MutationReject(reject))) => {
                 let refused = PriorRefusal::Rejected(reject.reason.clone());
                 if let Some(write) = self.settle_held(reject.client_seq, Some(&refused))? {
@@ -1118,8 +1227,46 @@ where
         let Some(writer) = self.drain.writer else {
             return Ok(None);
         };
+        if self.restoring_for(writer, seq) {
+            self.drain.in_flight.remove(&seq);
+            if let Some(event) = self.restore_answered_for(writer, seq, refused)? {
+                self.notices.push_back(event);
+            }
+            return Ok(None);
+        }
         self.settle_entry(writer, seq, refused)?;
         Ok(Some(HeldWrite { writer, seq }))
+    }
+
+    /// Move a rewound `writer` on when its run can never complete, a re-sent
+    /// entry answered `Forked` or an older major with no server: its run and
+    /// retained entries go, so nothing re-arms it, its current-major queue
+    /// moves as an unretained run's does, and the drain's next dial takes a
+    /// fresh number for its older-major entries.
+    pub(crate) fn move_rewound_writer_on(&mut self, writer: WriterRef) -> Result<(), ClientError> {
+        self.restore = None;
+        {
+            let _suspended = ExemptWrites::raise(&self.write_flags);
+            crate::acked::forget(&mut self.db, &writer)?;
+        }
+        self.drain.dead.insert(writer, crate::Carry::Abandoned);
+        self.abandon_rewound(writer)
+    }
+
+    /// Drop `writer`'s run entries at or below `frontier`, which the server
+    /// already holds.
+    fn drop_run_through(&mut self, writer: WriterRef, frontier: u64) {
+        let Some(restore) = self
+            .restore
+            .as_mut()
+            .filter(|restore| restore.writer == writer)
+        else {
+            return;
+        };
+        restore.entries = restore.entries.split_off(&frontier.saturating_add(1));
+        if restore.entries.is_empty() {
+            self.restore = None;
+        }
     }
 
     /// The old major's answer to the drain's device bind.

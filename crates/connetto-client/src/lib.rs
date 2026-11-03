@@ -3809,6 +3809,8 @@ struct Settled<'a> {
     refused: Option<&'a PriorRefusal>,
     /// How long the build keeps an answered entry for a restore.
     retention: Duration,
+    /// The bundle hash of the build whose wire answered it (R78 decision 26).
+    version: Option<&'a SchemaVersion>,
 }
 
 /// Retire one queued entry the server answered for good into the entries
@@ -3824,15 +3826,7 @@ fn settle_pending(
 ) -> Result<(), ClientError> {
     delete_pending(db, writer, seq)?;
     let now = clock::now_secs(db)?;
-    acked::retain(
-        db,
-        writer,
-        seq,
-        entry,
-        settled.refused,
-        now,
-        settled.retention,
-    )?;
+    acked::retain(db, writer, seq, entry, settled, now)?;
     #[cfg(feature = "peer")]
     author::settle(
         db,
@@ -4853,9 +4847,11 @@ fn install_replica_metadata(
     check_recorded_tables(db, "main", &config.unrecorded_tables)?;
     db.batch_execute(META_DDL)?;
     db.batch_execute(outbox::OUTBOX_DDL)?;
+    db.batch_execute(acked::ACKED_DDL)?;
     let added = [
         "ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB",
         "ALTER TABLE _connetto_pending ADD COLUMN major INTEGER",
+        acked::VERSION_COLUMN,
     ]
     .into_iter();
     #[cfg(feature = "peer")]
@@ -4868,7 +4864,6 @@ fn install_replica_metadata(
             Err(error) => return Err(error.into()),
         }
     }
-    db.batch_execute(acked::ACKED_DDL)?;
     db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
     db.batch_execute(holdings::HOLDING_DDL)?;
     // After the subscription tables, since it references `_connetto_query`.
@@ -5615,6 +5610,10 @@ where
     fn queued_sends(&self, after: u64) -> Option<(WriterRef, Vec<QueuedSend>)> {
         let writer = self.bound_writer.filter(|_| self.is_connected())?;
         let queue = self.writers.get(&writer)?;
+        // The drain re-sends a run's older-major prefix first (R78 decision 27).
+        if self.run_holds_older_major(writer) {
+            return Some((writer, Vec::new()));
+        }
         let held_from = self.held_from();
         // A restore's run goes first, since its sequences precede the queue's.
         let restored = self
@@ -9554,6 +9553,7 @@ where
         let settled = Settled {
             refused: Some(refused),
             retention: self.config.tuning.acked_retention(),
+            version: self.config.schema_version.as_ref(),
         };
         {
             let _suspended = ExemptWrites::raise(&self.write_flags);
@@ -10014,6 +10014,7 @@ where
                 let settled = Settled {
                     refused: None,
                     retention: self.config.tuning.acked_retention(),
+                    version: self.config.schema_version.as_ref(),
                 };
                 {
                     let _suspended = ExemptWrites::raise(&self.write_flags);
@@ -10068,8 +10069,7 @@ where
             && self.restoring(client_seq)
             && let Some(writer) = writer
         {
-            self.restore = None;
-            self.abandon_rewound(writer)?;
+            self.move_rewound_writer_on(writer)?;
             return Ok(ClientEvent::WriteRestored {
                 client_seq,
                 refused: Some(PriorRefusal::Rejected(MutationRejectReason::Forked)),
@@ -10096,29 +10096,48 @@ where
     /// Whether `client_seq` is an unanswered entry of the bound writer's
     /// restore run.
     fn restoring(&self, client_seq: u64) -> bool {
+        self.bound_writer
+            .is_some_and(|writer| self.restoring_for(writer, client_seq))
+    }
+
+    /// Whether `client_seq` is an unanswered entry of `writer`'s restore run.
+    fn restoring_for(&self, writer: WriterRef, client_seq: u64) -> bool {
         self.restore.as_ref().is_some_and(|restore| {
-            Some(restore.writer) == self.bound_writer && restore.entries.contains_key(&client_seq)
+            restore.writer == writer && restore.entries.contains_key(&client_seq)
         })
     }
 
-    /// Settle the restored server's answer to an entry the restore re-sent,
-    /// `refused` naming its refusal and absent for an application, `None`
-    /// when `client_seq` is no such entry. Nothing rolls back, since the write
-    /// was answered before the restore. An entry applied before and refused
-    /// now keeps the refusal, so a later restore re-sends it declared, and
-    /// enters the device writer's retraction log (R77 decision 9).
+    /// Settle the restored server's answer on the main wire to an entry the
+    /// restore re-sent, as [`restore_answered_for`](Self::restore_answered_for) does.
     fn restore_answered(
         &mut self,
         client_seq: u64,
         refused: Option<&PriorRefusal>,
     ) -> Result<Option<ClientEvent>, ClientError> {
-        if !self.restoring(client_seq) {
+        match self.bound_writer {
+            Some(writer) => self.restore_answered_for(writer, client_seq, refused),
+            None => Ok(None),
+        }
+    }
+
+    /// Settle the restored server's answer to `writer`'s entry the restore
+    /// re-sent, `refused` naming its refusal and absent for an application,
+    /// `None` when `client_seq` is no such entry. Nothing rolls back, since
+    /// the write was answered before the restore. An entry applied before and
+    /// refused now keeps the refusal, so a later restore re-sends it declared,
+    /// and enters the device writer's retraction log (R77 decision 9).
+    fn restore_answered_for(
+        &mut self,
+        writer: WriterRef,
+        client_seq: u64,
+        refused: Option<&PriorRefusal>,
+    ) -> Result<Option<ClientEvent>, ClientError> {
+        if !self.restoring_for(writer, client_seq) {
             return Ok(None);
         }
         let Some(restore) = self.restore.as_mut() else {
             return Ok(None);
         };
-        let writer = restore.writer;
         let entry = restore.entries.remove(&client_seq);
         if restore.entries.is_empty() {
             self.restore = None;
@@ -10144,36 +10163,58 @@ where
 
     /// Arm the re-send of the run a restore rewound `writer` below, from
     /// `frontier + 1` through what this replica saw settled, when it retains
-    /// every entry of it under this connection's major (R78 decision 17).
+    /// every entry of it (R78 decisions 17 and 27). A run reaching into an
+    /// older major opens the drain's batch for it when the drain is idle.
     /// Returns whether it did, the writer retiring otherwise.
     fn arm_restore(&mut self, writer: WriterRef, frontier: u64) -> Result<bool, ClientError> {
-        match self.retained_run(&writer, frontier)? {
-            Some(entries) => {
-                self.restore = Some(Box::new(Restore {
-                    writer,
-                    entries: entries.into_iter().collect(),
-                }));
-                Ok(true)
-            }
-            None => Ok(false),
+        let Some(entries) = self.retained_run(&writer, frontier)? else {
+            return Ok(false);
+        };
+        self.restore = Some(Box::new(Restore {
+            writer,
+            entries: entries.into_iter().collect(),
+        }));
+        if self.run_holds_older_major(writer) && self.drain.batch_idle() {
+            self.load_drain()?;
         }
+        Ok(true)
+    }
+
+    /// Whether `writer`'s armed run still holds an entry an older major
+    /// captured, which the main wire waits behind (R78 decision 27).
+    fn run_holds_older_major(&self, writer: WriterRef) -> bool {
+        self.restore.as_ref().is_some_and(|restore| {
+            restore.writer == writer
+                && restore
+                    .entries
+                    .values()
+                    .any(|entry| entry.major != self.config.schema_major)
+        })
     }
 
     /// The retained run from `frontier + 1` through what this replica saw
-    /// settled for `writer`, when it holds every entry of it.
+    /// settled for `writer`, when it holds every entry of it and each one a
+    /// wire can present, this build's major or an older one with its bundle
+    /// hash (R78 decision 26).
     fn retained_run(
         &mut self,
         writer: &WriterRef,
         frontier: u64,
     ) -> Result<Option<Vec<(u64, acked::AckedEntry)>>, ClientError> {
         let through = self.settled_through(writer);
-        acked::run(
-            &mut self.db,
-            writer,
-            frontier.saturating_add(1),
-            through,
-            self.config.schema_major,
-        )
+        let Some(run) = acked::run(&mut self.db, writer, frontier.saturating_add(1), through)?
+        else {
+            return Ok(None);
+        };
+        let build = self.config.schema_major;
+        let presentable = run.iter().all(|(_, entry)| {
+            entry.major == build
+                || matches!(
+                    (entry.major, build, &entry.version),
+                    (Some(major), Some(build), Some(_)) if major < build
+                )
+        });
+        Ok(presentable.then_some(run))
     }
 
     /// The server gave a resent write a final answer, so whatever deferred it has passed and the next deferral starts its schedule afresh.
@@ -11538,7 +11579,7 @@ mod tests {
             .load(&mut conn.db)
             .expect("read the retraction log");
         assert_eq!(logged, vec![2], "peers learn the refusal");
-        let run = acked::run(&mut conn.db, &device, 2, 2, conn.config.schema_major)
+        let run = acked::run(&mut conn.db, &device, 2, 2)
             .expect("read the retained entry")
             .expect("the entry stays retained");
         assert_eq!(
