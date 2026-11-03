@@ -605,6 +605,48 @@ async fn a_credit_starved_catchup_holds_its_completion_behind_its_rows() {
     expect_idle(&mut client).await;
 }
 
+/// A replay larger than its share of the send budget leaves the walk as credits release room for it, and the client still receives every missed row once, in log order, before the completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_past_its_send_budget_waits_for_room_and_arrives_whole() {
+    let fixture = Fixture::acquire().await;
+    // Under this budget the replay may queue one row at a time.
+    let config = SessionConfig::new()
+        .with_initial_credits(0)
+        .with_send_queue_bytes(1);
+    let (manager, script, events, _source) = scripted(&fixture, config).await;
+    arm(&script, &[], true, None);
+    let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
+    subscribe(&mut client).await;
+    for event in &events[1..] {
+        client
+            .send_control(ControlMessage::AckCredits(AckCredits { credits: 1 }))
+            .await
+            .expect("credit one row");
+        let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+            panic!("expected a replayed row");
+        };
+        assert_eq!(
+            live.cursor,
+            cursor_of(event),
+            "the missed rows in log order"
+        );
+    }
+    expect_catchup_end(&mut client, "orders").await;
+    expect_idle(&mut client).await;
+    let walks = {
+        let script = script.lock().expect("script");
+        script
+            .reads
+            .iter()
+            .filter(|read| **read == "entries_since")
+            .count()
+    };
+    assert_eq!(
+        walks, 2,
+        "the second row found no room behind the first and was read again once the first left"
+    );
+}
+
 /// Resuming at the ceiling replays no rows, but the catchup still completes, and the completion carries the cursor the resume presented.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_empty_catchup_still_sends_its_completion() {
@@ -1679,6 +1721,17 @@ fn fenced_manager(
     ddl: &str,
     auth: RosterAuth,
 ) -> Arc<FencedManager> {
+    fenced_manager_with(fixture, seed, ddl, auth, SessionConfig::default())
+}
+
+/// [`fenced_manager`] with sessions under `config`.
+fn fenced_manager_with(
+    fixture: &Fixture,
+    seed: FencedSeed,
+    ddl: &str,
+    auth: RosterAuth,
+    config: SessionConfig,
+) -> Arc<FencedManager> {
     ManagerBuilder::new(
         Materializer::builder(ddl)
             .build()
@@ -1690,6 +1743,7 @@ fn fenced_manager(
         pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), ddl)
             .expect("build write target"),
     )
+    .with_session(config)
     .build()
 }
 
@@ -2285,6 +2339,75 @@ async fn a_fenced_cursor_catches_up_what_its_snapshot_missed_and_nothing_it_held
         .dispatch_event(&held_above)
         .await
         .expect("re-deliver a held transaction");
+    expect_idle(&mut client).await;
+}
+
+/// A fenced replay that runs out of room twice partway through what its snapshot missed, and again in the gap after its cursor, picks up each time where it stopped, so every row arrives once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fenced_replay_out_of_room_resumes_where_it_stopped() {
+    let fixture = Fixture::acquire().await;
+    // Under this budget the replay may queue one row at a time.
+    let manager = fenced_manager_with(
+        &fixture,
+        FencedSeed::default(),
+        PG_DDL,
+        RosterAuth::granting("client-a"),
+        SessionConfig::new()
+            .with_initial_credits(0)
+            .with_send_queue_bytes(1),
+    );
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    let mut events = Vec::new();
+    for id in 1..=6 {
+        events.push(insert(&mut source, id).await);
+    }
+    for event in &events {
+        manager.dispatch_event(event).await.expect("dispatch");
+    }
+    let [
+        held_below,
+        missed_a,
+        missed_b,
+        missed_c,
+        _held_above,
+        beyond,
+    ] = <[PgChangeEvent; 6]>::try_from(events).expect("six inserts");
+
+    // The read ran after the fourth commit while the second to fourth were still in progress, so all three sit below the cursor unseen.
+    let xid = |event: &PgChangeEvent| event.position().xid().0;
+    let read = PgCommitPosition::before_commit(PgLsn(missed_c.position().commit_lsn().0 + 1));
+    let fence = ReadFence::parse(
+        &format!(
+            "{}:{}:{},{},{}",
+            xid(&held_below),
+            xid(&beyond) + 1,
+            xid(&missed_a),
+            xid(&missed_b),
+            xid(&missed_c)
+        ),
+        beyond.position().commit_lsn(),
+    )
+    .expect("fence");
+    let mut client = open_fenced_session(&manager, Some(fenced_cursor(read, Some(&fence)))).await;
+    subscribe(&mut client).await;
+    for event in [&missed_a, &missed_b, &missed_c, &beyond] {
+        client
+            .send_control(ControlMessage::AckCredits(AckCredits { credits: 1 }))
+            .await
+            .expect("credit one row");
+        let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+            panic!("expected a replayed row");
+        };
+        assert_eq!(
+            live.cursor,
+            cursor_of(event),
+            "each missed row once, then the gap past what the snapshot held"
+        );
+    }
+    let ControlMessage::SnapshotEnd(end) = next_control_bounded(&mut client).await else {
+        panic!("expected catchup completion");
+    };
+    assert_eq!(end.cursor, cursor_of(&beyond));
     expect_idle(&mut client).await;
 }
 

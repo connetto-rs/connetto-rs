@@ -247,10 +247,6 @@ Fixed in one pull request, by stating the rule on `SnapshotSource::snapshot_page
 
 Fixed in one pull request, by a browser CI shard with its own restartable stack and a suite that restarts the server mid-run.
 
-### G19
-
-**Catchup replay is paced by nothing.** A reconnecting client's catchup walks the reconnect log from its cursor to the ceiling, and the walker pushes every patch into an unbounded per-member channel while `drain_catchup` in [session.rs](../crates/connetto-server/src/session.rs) moves each one into the credit queue whether or not the client has granted a credit. Acknowledgements arriving during catchup are held with the rest of the input, so the replay never waits for them. A client resuming from an old cursor therefore has its whole replay window, bounded only by the log's retention, in server memory at once, outside the connection's send budget. Pacing it needs the walker to apply backpressure per member and the session to honour credits during catchup, without one slow member stalling the others in its wave.
-
 ## Upstream dependencies
 
 **No phase waits on an upstream merge.** A phase that needs a change in a dependency requests it upstream, then builds against the fork through a `[patch.crates-io]` entry pinned to a revision, and drops the entry once a release carries the change. A review that takes months therefore holds nothing, and an upstream finding lists no phase in its blockers. What follows holds only the requests still open, each checked against its upstream.
