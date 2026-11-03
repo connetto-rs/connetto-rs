@@ -500,15 +500,17 @@ fn number_of(db: &Path) -> u64 {
         .expect("the replica holds an issued number")
 }
 
-/// R70 step 2's frontier leg (decisions 21 and 22): a server restored to an
-/// earlier point holds one client's number below what that client saw
-/// settled, and issues another client's number again to a third. Both
-/// returning clients move their queues to fresh numbers and their new writes
-/// settle, while the writes acknowledged after the backup are lost, R78's
-/// courier being their recovery (decision 20).
+/// R70 step 2's frontier leg (decisions 21 and 22) with R78's re-send
+/// (decisions 17 and 22): a server restored to an earlier point holds one
+/// client's number below what that client saw settled, and issues another
+/// client's number again to a third. The client whose number stands re-sends
+/// the run it retained, so its write acknowledged after the backup comes
+/// back and it keeps its number. The client whose number the restore never
+/// knew moves its queue to a fresh number and its write acknowledged after
+/// the backup stays lost.
 #[tokio::test]
 #[ignore = "needs Docker and the release connetto-server and connetto-client binaries"]
-async fn a_restore_moves_rewound_writers_to_fresh_numbers() {
+async fn a_restore_takes_a_retained_run_back_and_moves_unknown_numbers() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     assert!(client_bin().exists(), "build the client binary first");
     let _serial = PG_SERIAL.lock().await;
@@ -586,43 +588,42 @@ async fn a_restore_moves_rewound_writers_to_fresh_numbers() {
     );
 
     // Both log in again, as a restore revoked every session. A finds its
-    // number held below what it saw settled and B finds its number unknown
-    // under its own secret, so each moves its queue to a fresh writer and its
-    // first attach fails, a driven client having no redial of its own.
+    // number held below what it saw settled and re-sends the run it retained.
+    // B finds its number unknown under its own secret, so it moves its queue
+    // to a fresh number and its first attach fails, a driven client having no
+    // redial of its own.
     let (token_a, _) = mint_token(&auth_base).await;
     let (token_b, _) = mint_token(&auth_base).await;
     let mut a = launch_writing(&ws, &early, &token_a, &local_order(12));
     let mut b = launch_writing(&ws, &late, &token_b, &local_order(21));
-    eventually("A and B end on their first attach", || {
-        a.exited().is_some() && b.exited().is_some()
-    })
-    .await;
+    wait_for_server(&restored, &[11, 12]).await;
+    eventually("B ends on its first attach", || b.exited().is_some()).await;
 
-    // The relaunch is the redial, each asking for a fresh number and writing.
-    let mut a = launch_writing(&ws, &early, &token_a, &local_order(12));
+    // The relaunch is B's redial, asking for a fresh number and writing.
     let mut b = launch_writing(&ws, &late, &token_b, &local_order(21));
-    wait_for_server(&restored, &[12, 21]).await;
-    eventually("A and B settle under fresh numbers", || {
-        settled(&early) && settled(&late)
-    })
-    .await;
+    wait_for_server(&restored, &[21]).await;
+    eventually("A and B settle", || settled(&early) && settled(&late)).await;
     assert!(a.exited().is_none(), "A keeps running");
     assert!(b.exited().is_none(), "B keeps running");
     let (a_after, b_after) = (number_of(&early), number_of(&late));
-    assert_ne!(a_after, a_before, "A moved off its rewound number");
+    assert_eq!(a_after, a_before, "A keeps the number the restore rewound");
     assert_ne!(b_after, b_before, "B moved off its reissued number");
     assert!(
-        a_after != b_after && a_after != c_number && b_after != c_number,
-        "every replica writes under its own number, A {a_after}, B {b_after}, C {c_number}"
+        b_after != a_after && b_after != c_number,
+        "B writes under a number of its own, A {a_after}, B {b_after}, C {c_number}"
     );
 
     let held = server_ids(&restored).await;
     assert!(
-        !held.contains(&11) && !held.contains(&20),
-        "the writes acknowledged after the backup are lost, the server holds {held:?}"
+        held.contains(&11),
+        "A's write acknowledged after the backup came back, the server holds {held:?}"
     );
-    eventually("A resyncs to the restored server", || {
-        !client_ids(&early).contains(&11)
+    assert!(
+        !held.contains(&20),
+        "B's write under a number the backup never knew stays lost, the server holds {held:?}"
+    );
+    eventually("A holds its restored write", || {
+        client_ids(&early).contains(&11)
     })
     .await;
 }

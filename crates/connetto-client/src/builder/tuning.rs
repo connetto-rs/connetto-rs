@@ -3,9 +3,9 @@
 use core::time::Duration;
 
 use crate::{
-    DEFAULT_ANSWER_WITHIN, DEFAULT_GRACE, DEFAULT_PROBE_AFTER, DEFAULT_RESIDUAL_THRESHOLD,
-    DEFAULT_RESTED_STATISTICS_CAP, DEFAULT_TRIM_BUDGET, DEFAULT_TRIM_THRESHOLD, MAX_GRACE,
-    ResidualPass,
+    DEFAULT_ACKED_RETENTION, DEFAULT_ANSWER_WITHIN, DEFAULT_GRACE, DEFAULT_PROBE_AFTER,
+    DEFAULT_RESIDUAL_THRESHOLD, DEFAULT_RESTED_STATISTICS_CAP, DEFAULT_TRIM_BUDGET,
+    DEFAULT_TRIM_THRESHOLD, MAX_GRACE, ResidualPass,
 };
 
 /// The tuning levers a build carries, with their safe bounds applied at the
@@ -24,6 +24,7 @@ pub struct SyncTuning {
     watch_grace: Duration,
     probe_after: Duration,
     answer_within: Duration,
+    acked_retention: Duration,
 }
 
 impl Default for SyncTuning {
@@ -37,6 +38,7 @@ impl Default for SyncTuning {
             watch_grace: DEFAULT_GRACE,
             probe_after: DEFAULT_PROBE_AFTER,
             answer_within: DEFAULT_ANSWER_WITHIN,
+            acked_retention: DEFAULT_ACKED_RETENTION,
         }
     }
 }
@@ -148,6 +150,20 @@ impl SyncTuning {
     #[must_use]
     pub const fn answer_within(&self) -> Duration {
         self.answer_within
+    }
+
+    /// How long a writer keeps each entry the server answered, so a server
+    /// restored to an earlier point gets it back (R78 decision 22).
+    #[must_use]
+    pub const fn with_acked_retention(mut self, retention: Duration) -> Self {
+        self.acked_retention = retention;
+        self
+    }
+
+    /// How long a writer keeps each entry the server answered.
+    #[must_use]
+    pub const fn acked_retention(&self) -> Duration {
+        self.acked_retention
     }
 }
 

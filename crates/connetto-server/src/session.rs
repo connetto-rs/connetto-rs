@@ -43,8 +43,8 @@ use connetto_core::messages::{
     EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
     FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MembershipOpened,
     MutationApplied, MutationConflict, MutationHeader, MutationPatch, MutationReject,
-    MutationRejectReason, NonFatalError, PROVISIONAL_ASK_REFUSED, PauseCause, Pong, Provenance,
-    ProvisionalStatus, ProvisionalVerdicts, RateLimited, RegisterBot, ReplaceShareKeys,
+    MutationRejectReason, NonFatalError, PROVISIONAL_ASK_REFUSED, PauseCause, Pong, PriorRefusal,
+    Provenance, ProvisionalStatus, ProvisionalVerdicts, RateLimited, RegisterBot, ReplaceShareKeys,
     RetireWriter, RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED, ShareKeysReplaced,
     SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
     WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
@@ -7175,21 +7175,25 @@ where
                 pk_columns,
                 pk_values,
             } => {
-                let server_row = self
-                    .target
-                    .settled_conflict_row(
-                        &state.principal,
-                        table,
-                        version_column,
-                        pk_columns,
-                        pk_values,
-                    )
-                    .await
-                    .map_err(|err| SessionError::WriteTarget(err.detail()))?
-                    .map(|row| ConflictRow {
-                        updated_at: row.version,
-                        row_json: row.row_json,
-                    });
+                // A conflict an author re-declared after a restore names no key to read.
+                let server_row = if pk_columns.is_empty() {
+                    None
+                } else {
+                    self.target
+                        .settled_conflict_row(
+                            &state.principal,
+                            table,
+                            version_column,
+                            pk_columns,
+                            pk_values,
+                        )
+                        .await
+                        .map_err(|err| SessionError::WriteTarget(err.detail()))?
+                        .map(|row| ConflictRow {
+                            updated_at: row.version,
+                            row_json: row.row_json,
+                        })
+                };
                 transport
                     .send_control(ControlMessage::MutationConflict(MutationConflict {
                         client_seq: seq,
@@ -7318,6 +7322,11 @@ where
                 // The original is not a writer of this account, so the entry applies plainly.
                 None => {}
             }
+        }
+        if let Some(refused) = &header.refused {
+            return self
+                .settle_prior_refusal(transport, &settle, refused, state)
+                .await;
         }
         let plan = match self
             .materializer
@@ -7562,9 +7571,44 @@ where
         reason: MutationRejectReason,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
+        self.settle_refused(transport, settle, &SettledOutcome::Rejected(reason), state)
+            .await
+    }
+
+    /// Settle the refusal an author re-declares for an entry it re-sends
+    /// after a restore, applying nothing (R78 decision 17). A conflict keeps
+    /// the table its answer named and no key, since the author never saw one.
+    async fn settle_prior_refusal<T: Transport>(
+        &self,
+        transport: &mut T,
+        settle: &SettleSpec,
+        refused: &PriorRefusal,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let outcome = match refused {
+            PriorRefusal::Rejected(reason) => SettledOutcome::Rejected(reason.clone()),
+            PriorRefusal::Conflict { table } => SettledOutcome::Conflict {
+                table: table.clone(),
+                version_column: String::new(),
+                pk_columns: Vec::new(),
+                pk_values: Vec::new(),
+            },
+        };
+        self.settle_refused(transport, settle, &outcome, state)
+            .await
+    }
+
+    /// Settle `outcome`, a refusal, under the entry and answer what stands.
+    async fn settle_refused<T: Transport>(
+        &self,
+        transport: &mut T,
+        settle: &SettleSpec,
+        outcome: &SettledOutcome,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
         let settlement = self
             .target
-            .settle_refusal(settle, &SettledOutcome::Rejected(reason))
+            .settle_refusal(settle, outcome)
             .await
             .map_err(|err| SessionError::WriteTarget(err.detail()))?;
         let outcome = self.recorded_outcome(&state.principal, settle, &settlement)?;

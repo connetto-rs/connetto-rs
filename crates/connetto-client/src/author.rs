@@ -78,6 +78,30 @@ pub(crate) fn settle(
     Ok(())
 }
 
+/// Log `cause` for `writer`'s entry `seq`, a device writer's entry a restored
+/// server refused after it applied it before the restore (R78 decision 17),
+/// keeping a cause the log already holds.
+pub(crate) fn retract(
+    db: &mut SqliteConnection,
+    writer: &WriterRef,
+    seq: u64,
+    cause: &RetractCause,
+) -> Result<(), ClientError> {
+    if !matches!(writer, WriterRef::Device(_)) {
+        return Ok(());
+    }
+    let cause = serde_json::to_vec(cause).expect("a retraction cause encodes as JSON");
+    diesel::insert_into(_connetto_retraction::table)
+        .values((
+            _connetto_retraction::writer.eq(writer_id(writer)),
+            _connetto_retraction::seq.eq(seq_storage(seq)?),
+            _connetto_retraction::cause.eq(cause),
+        ))
+        .on_conflict_do_nothing()
+        .execute(db)?;
+    Ok(())
+}
+
 /// Forget the retraction log of a writer whose state goes with it.
 pub(crate) fn forget(db: &mut SqliteConnection, writer: &WriterRef) -> Result<(), ClientError> {
     diesel::delete(
