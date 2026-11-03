@@ -52,7 +52,10 @@ impl MediaSlot {
         }
         let (sender, events) = mpsc::unbounded_channel();
         *slot = Some(sender);
-        Some(MediaPort { node, events })
+        Some(MediaPort {
+            sender: MediaSender { node },
+            events,
+        })
     }
 
     /// Hand `event` to the live port, answering it back when none lives.
@@ -70,16 +73,42 @@ impl MediaSlot {
 
 /// One consumer's view of the peer links' media traffic.
 pub struct MediaPort {
-    node: connetto_peer::Node,
+    sender: MediaSender,
     events: mpsc::UnboundedReceiver<MediaEvent>,
 }
 
 impl MediaPort {
+    /// A port over a bare `node`, its events fed by the caller, for proofs
+    /// that run a consumer without an enrolled client.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn over(node: connetto_peer::Node, events: mpsc::UnboundedReceiver<MediaEvent>) -> Self {
+        Self {
+            sender: MediaSender { node },
+            events,
+        }
+    }
+
     /// The next event, `None` once the client ends.
     pub async fn recv(&mut self) -> Option<MediaEvent> {
         self.events.recv().await
     }
 
+    /// The sending half, which a consumer clones to send while it waits on
+    /// [`recv`](Self::recv).
+    #[must_use]
+    pub fn sender(&self) -> &MediaSender {
+        &self.sender
+    }
+}
+
+/// The sending half of a [`MediaPort`].
+#[derive(Clone)]
+pub struct MediaSender {
+    node: connetto_peer::Node,
+}
+
+impl MediaSender {
     /// Queue `message` on the media queue of the link to `peer`.
     ///
     /// # Errors

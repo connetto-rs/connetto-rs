@@ -31,6 +31,9 @@ use crate::resolve::{BoxedSource, ChunkStoreSource, Resolved};
 use crate::worker::{outbox_manifests, retire, unreadable_chunk_count, write_content_entries};
 use crate::{ticket, upload};
 
+#[cfg(feature = "peer")]
+mod peer;
+
 /// How many content events are held for a slow observer.
 const EVENT_CAPACITY: usize = 64;
 
@@ -126,6 +129,10 @@ pub struct ContentClient<T: Transport, B: ChunkStore + Clone, H: ContentHttp> {
     outbox_wake: tokio::sync::Notify,
     /// The application's `(query, file_id_column)` pairs naming files the server marked lost.
     heal_queries: Vec<(String, String)>,
+    /// The `(table, column)` pairs holding file ids a linked peer may be
+    /// served through, judged by the requester's read of a row naming the file.
+    #[cfg(feature = "peer")]
+    peer_content: Vec<(String, String)>,
 }
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -172,6 +179,8 @@ where
             content_writes: tokio::sync::Mutex::new(()),
             outbox_wake: tokio::sync::Notify::new(),
             heal_queries: Vec::new(),
+            #[cfg(feature = "peer")]
+            peer_content: Vec::new(),
         })
     }
 

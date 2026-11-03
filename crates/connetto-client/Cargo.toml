@@ -77,6 +77,9 @@ native-auth = [
   "dep:getrandom",
   "tokio/signal",
 ]
+# A media port over a bare peer node, for the proofs of a media consumer
+# that runs without an enrolled client. Test builds only.
+test-support = ["peer"]
 
 [[bin]]
 name = "connetto-client"

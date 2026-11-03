@@ -118,6 +118,15 @@ pub enum ContentError {
         /// The column the query named.
         column: String,
     },
+    /// A peer content declaration named a table or column the replica lacks.
+    #[cfg(feature = "peer")]
+    #[error("peer content declaration names {table}.{column}, which the replica does not hold")]
+    PeerContentColumnMissing {
+        /// The table the declaration named.
+        table: String,
+        /// The column the declaration named.
+        column: String,
+    },
 }
 
 /// Why a staged commit did not land, keeping the row's refusal distinguishable
@@ -170,6 +179,8 @@ impl ContentError {
             | Self::Archive(_)
             | Self::PinColumnMissing { .. }
             | Self::HealColumnMissing { .. } => AttemptOutcome::Refused,
+            #[cfg(feature = "peer")]
+            Self::PeerContentColumnMissing { .. } => AttemptOutcome::Refused,
             Self::Http { .. }
             | Self::Replica(_)
             | Self::Client(_)

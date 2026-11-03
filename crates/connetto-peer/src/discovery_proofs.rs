@@ -20,8 +20,9 @@ use crate::DiscoveryEvent;
 use crate::Fingerprint;
 use crate::PeerEvent;
 use crate::discovery::{DnsSd, DnsSdEvent, DnsSdSession, DnsSdSink};
-use crate::test_support::loopback_multicast;
-use crate::tests::{Deployment, Peer, events, node, serve, whole_second};
+use crate::test_support::{
+    Deployment, Peer, events, loopback_multicast, node, serve, whole_second,
+};
 
 /// A loopback port the proof's mDNS daemons bind, clear of the system
 /// daemon's and of every other proof's.
@@ -110,7 +111,7 @@ fn pair(now: std::time::SystemTime) -> (Deployment, Peer, Peer) {
 /// A node and its discovery, served on loopback, the events teed out.
 fn standing(
     deployment: &Deployment,
-    peer: &crate::tests::Peer,
+    peer: &Peer,
     autolink: bool,
     port: u16,
 ) -> (
