@@ -5,36 +5,16 @@
 
 use std::time::Duration;
 
-use connetto_client::SyncSchema;
 use connetto_client::live::ConnettoClient;
 use connetto_client::peer::PeerAuthor;
-use connetto_core::Major;
-use connetto_core::exchange::{ManifestRow, RetractCause, Retraction};
-use connetto_core::schema::SchemaBundle;
+use connetto_core::exchange::{RetractCause, Retraction};
 use connetto_file_client::{FileId, Resolved};
-use diesel::prelude::*;
-use sha2::{Digest, Sha256};
 
-use crate::peer_support::{Device, Devices, beside_both, declared, port, stage};
+use crate::peer_support::{
+    Device, Devices, apply_entry, beside_both, captured_photo, declared, port, stage,
+};
 use crate::retention::pseudorandom;
-use crate::support::{Scripted, cold_over};
-
-/// The photo table on the author's plain replica, the columns the receiver's
-/// policy table has.
-const PLAIN_PHOTOS: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
-                            content_id BLOB NOT NULL)";
-
-diesel::table! {
-    /// The author's photos.
-    photos (id) {
-        /// Primary key.
-        id -> BigInt,
-        /// The row's owner.
-        owner -> Text,
-        /// The file the row names.
-        content_id -> Binary,
-    }
-}
+use crate::support::Scripted;
 
 /// The author whose entry the receiver applies.
 fn anna() -> PeerAuthor {
@@ -45,60 +25,9 @@ fn anna() -> PeerAuthor {
     }
 }
 
-/// One captured queue entry's body.
-#[derive(QueryableByName)]
-struct Body {
-    #[diesel(sql_type = diesel::sql_types::Binary)]
-    changeset: Vec<u8>,
-}
-
-/// The changeset anna's replica in `dir` captures for inserting photo `id`
-/// naming `value`, her next entry.
-async fn captured_photo(dir: &std::path::Path, id: i64, value: Vec<u8>) -> Vec<u8> {
-    let schema = SyncSchema::new(
-        SchemaBundle::new(
-            "-- connetto:major 1",
-            "",
-            PLAIN_PHOTOS,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
-            None::<&str>,
-        )
-        .expect("the source declares major 1"),
-    );
-    let mut author = cold_over::<Scripted>(&dir.join("author.sqlite"), schema).await;
-    author
-        .attach(Scripted::new([]))
-        .await
-        .expect("attach the transport");
-    diesel::insert_into(photos::table)
-        .values((
-            photos::id.eq(id),
-            photos::owner.eq("anna"),
-            photos::content_id.eq(value),
-        ))
-        .execute(author.conn())
-        .expect("insert the author's photo");
-    author.flush().await.expect("flush the author's write");
-    diesel::sql_query("SELECT changeset FROM _connetto_pending ORDER BY position DESC LIMIT 1")
-        .get_result::<Body>(author.conn())
-        .expect("capture the author's photo")
-        .changeset
-}
-
 /// Applies `body` as anna's entry `seq` on `client`.
 async fn apply(client: &ConnettoClient<Scripted>, seq: u64, body: Vec<u8>) {
-    let row = ManifestRow {
-        seq,
-        major: Major::new(1).expect("major 1"),
-        origin: None,
-        digest: Sha256::digest(&body).into(),
-    };
-    client
-        .with_conn(move |conn| conn.apply_peer_entry(&anna(), &row, &body))
-        .await
-        .expect("the replica is open")
-        .expect("apply anna's photo");
+    apply_entry(client, &anna(), seq, body).await;
 }
 
 /// Retracts anna's entry 1 on `client`.
@@ -150,7 +79,7 @@ impl Camp {
         apply(
             &client,
             1,
-            captured_photo(dirs[2].path(), 7, file_id.as_bytes().to_vec()).await,
+            captured_photo(dirs[2].path(), 7, file_id.as_bytes().to_vec(), None).await,
         )
         .await;
 
@@ -229,7 +158,7 @@ async fn a_provisional_value_that_is_no_file_id_spares_nothing_and_stops_nothing
     apply(
         &camp.client,
         2,
-        captured_photo(camp.dirs[2].path(), 8, b"short".to_vec()).await,
+        captured_photo(camp.dirs[2].path(), 8, b"short".to_vec(), None).await,
     )
     .await;
     camp.receiver.tidy_content().await.expect("tidy");

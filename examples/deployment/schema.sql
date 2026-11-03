@@ -35,8 +35,10 @@ CREATE TABLE order_lines (order_id UUID NOT NULL REFERENCES orders(id), line_no 
 -- `available`, so the placeholder condition is "not available" and the
 -- availability flip arrives as an ordinary synced column change. owner_id
 -- repeats from the parent order as it does on order_lines, so the visibility
--- policy settles from the row itself.
-CREATE TABLE photos (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), order_id UUID NOT NULL REFERENCES orders(id), owner_id TEXT NOT NULL, content_id BYTEA NOT NULL, content_state TEXT);
+-- policy settles from the row itself. thumb_id names the photo's thumbnail,
+-- an ordinary file of its own that a device in camp fetches from the author
+-- unasked, and stays null for a photo staged without one.
+CREATE TABLE photos (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), order_id UUID NOT NULL REFERENCES orders(id), owner_id TEXT NOT NULL, content_id BYTEA NOT NULL, content_state TEXT, thumb_id BYTEA);
 
 -- The catalogue the demo sells from. It has no policy of its own, so every
 -- account reads every row, and it is read-only, since no grant on it admits a

@@ -161,8 +161,8 @@ where
         let declared = &self.peer_content;
         self.client
             .with_conn(|conn| {
-                declared.iter().any(|(table, column)| {
-                    conn.peer_may_read(&requester, table, column, file_id)
+                declared.iter().any(|declared| {
+                    conn.peer_may_read(&requester, &declared.table, &declared.column, file_id)
                         .unwrap_or(false)
                 })
             })

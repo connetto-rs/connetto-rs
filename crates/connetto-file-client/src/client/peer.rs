@@ -9,8 +9,8 @@ use core::fmt::Display;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use connetto_client::ConnettoConnection;
 use connetto_client::media::{MediaEvent, MediaPort, MediaSender};
+use connetto_client::{ClientEvent, ConnettoConnection};
 use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::traits::Transport;
 use connetto_exchange::MAX_MANIFEST_ROWS;
@@ -19,11 +19,12 @@ use connetto_file_core::{ChunkHash, ChunkMeta, ChunkStore, FileId, Manifest, May
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 pub(super) use fetch::Order;
 use fetch::{
-    ChunkOutcome, Fetch, LAST_BACKOFF, ON_DEMAND_BOUND, Stage, candidate_order, holders_manifest,
+    ChunkOutcome, Fetch, LAST_BACKOFF, MAX_PREFETCH_BYTES, ON_DEMAND_BOUND, Stage, candidate_order,
+    holders_manifest,
 };
 
 use super::ContentClient;
@@ -33,6 +34,52 @@ use crate::resolve::Resolved;
 
 /// What the links ask the driver, each fetch tagged by its own number.
 type Action = MediaAction<DeviceIdentity, u64>;
+
+/// One column declared to hold file ids for the peer links.
+pub(in crate::client) struct PeerColumn {
+    /// The table.
+    pub(super) table: String,
+    /// The column.
+    pub(super) column: String,
+    /// Whether a receiver fetches the files it names unasked, a thumbnail
+    /// column.
+    pub(super) prefetch: bool,
+}
+
+/// A column declaration [`ContentClient::with_peer_content`] starts, recorded
+/// once awaited.
+#[must_use = "a declaration is recorded only once awaited"]
+pub struct PeerContent<T: Transport, B: ChunkStore + Clone, H: ContentHttp> {
+    content: ContentClient<T, B, H>,
+    column: PeerColumn,
+}
+
+impl<T: Transport, B: ChunkStore + Clone, H: ContentHttp> PeerContent<T, B, H> {
+    /// Marks the column as a thumbnail column. A receiver then fetches each
+    /// file it names on an author's provisional row from that author unasked,
+    /// when the author's entry applies and when the author's link comes up,
+    /// behind every fetch the application waits on and only when the file is
+    /// at most 1 MiB (R79 decision 8).
+    pub fn prefetch(mut self) -> Self {
+        self.column.prefetch = true;
+        self
+    }
+}
+
+impl<T, B, H> IntoFuture for PeerContent<T, B, H>
+where
+    T: Transport + MaybeSend + Send + 'static,
+    T::Error: Display,
+    B: ChunkStore + Clone + Sync + MaybeSend + 'static,
+    H: ContentHttp + Send + 'static,
+{
+    type Output = Result<ContentClient<T, B, H>, ContentError>;
+    type IntoFuture = core::pin::Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.content.declare(self.column))
+    }
+}
 
 /// The files a declared column of a row whose peer apply still awaits a
 /// verdict names, which the retention pass keeps (R79 decision 6).
@@ -44,15 +91,15 @@ type Action = MediaAction<DeviceIdentity, u64>;
 /// should keep.
 pub(super) fn provisionally_named<T>(
     conn: &mut ConnettoConnection<T>,
-    declared: &[(String, String)],
+    declared: &[PeerColumn],
 ) -> Result<HashSet<FileId>, ContentError>
 where
     T: Transport,
     T::Error: Display,
 {
     let mut named = HashSet::new();
-    for (table, column) in declared {
-        for blob in conn.provisional_blobs(table, column)? {
+    for declared in declared {
+        for blob in conn.provisional_blobs(&declared.table, &declared.column)? {
             if let Ok(id) = <[u8; 32]>::try_from(blob.value.as_slice()) {
                 named.insert(FileId::from_bytes(id));
             }
@@ -117,37 +164,46 @@ where
     H: ContentHttp,
 {
     /// Declares `column` of `table` as holding file ids a linked peer may be
-    /// served and fetched from.
+    /// served and fetched from, recorded once the returned declaration is
+    /// awaited.
     ///
     /// A peer asking for a file is served when the policy views, under the
     /// requester's certificate, show it a row of a declared column naming the
     /// file. With nothing declared every request is refused. A fetch asks the
     /// authors of the provisional rows whose declared columns name the file
     /// first. Every build of the application declares the same columns.
+    /// [`PeerContent::prefetch`] marks a thumbnail column.
     ///
     /// # Errors
     ///
-    /// [`ContentError::PeerContentColumnMissing`] when the replica holds no
-    /// such table or column.
-    pub async fn with_peer_content(
-        mut self,
-        table: &str,
-        column: &str,
-    ) -> Result<Self, ContentError> {
-        let query = format!("SELECT * FROM \"{}\"", table.replace('"', "\"\""));
-        let probe = column.to_owned();
+    /// Awaiting answers [`ContentError::PeerContentColumnMissing`] when the
+    /// replica holds no such table or column.
+    pub fn with_peer_content(self, table: &str, column: &str) -> PeerContent<T, B, H> {
+        PeerContent {
+            content: self,
+            column: PeerColumn {
+                table: table.to_owned(),
+                column: column.to_owned(),
+                prefetch: false,
+            },
+        }
+    }
+
+    /// Records `declared` once the replica is shown to hold it.
+    async fn declare(mut self, declared: PeerColumn) -> Result<Self, ContentError> {
+        let query = format!("SELECT * FROM \"{}\"", declared.table.replace('"', "\"\""));
+        let probe = declared.column.clone();
         if !self
             .client
             .with_conn(move |conn| crate::retain::answers_column(conn.conn(), &query, &probe))
             .await?
         {
             return Err(ContentError::PeerContentColumnMissing {
-                table: table.to_owned(),
-                column: column.to_owned(),
+                table: declared.table,
+                column: declared.column,
             });
         }
-        self.peer_content
-            .push((table.to_owned(), column.to_owned()));
+        self.peer_content.push(declared);
         Ok(self)
     }
 
@@ -155,7 +211,10 @@ where
     /// manifest and every `Fetch` with the verified encoding of the range,
     /// each after the gate admits the requester, and `Refused` otherwise. It
     /// also fetches the files [`resolve`](Self::resolve) hands it from linked
-    /// holders, verifying every piece against the file id.
+    /// holders, verifying every piece against the file id, and prefetches the
+    /// files a [`prefetch`](PeerContent::prefetch) column names on an author's
+    /// provisional rows from that author, when its entry applies and when its
+    /// link comes up.
     ///
     /// A peer is served one request at a time and at most two peers at once,
     /// and a request beyond that is answered `Busy`. A stream stops when its
@@ -169,10 +228,15 @@ where
         let sender = port.sender().clone();
         let (orders_tx, mut orders) = mpsc::unbounded_channel();
         let _orders = OrdersOpen::open(&self.peer_orders, orders_tx);
+        let mut applied = self.client.events();
+        let mut applies_open = true;
         let mut driver = Driver::new(self);
+        let mut actions = Vec::new();
         for (peer, _) in sender.linked() {
             driver.links.linked(&peer);
+            actions.extend(driver.prefetch(peer.key().as_bytes(), Instant::now()).await);
         }
+        driver.act(actions, Instant::now()).await;
         let mut jobs = FuturesUnordered::new();
         loop {
             let wake = driver.next_wake();
@@ -189,7 +253,7 @@ where
                         }
                         Some(MediaEvent::Linked { peer, .. }) => {
                             driver.linked(&peer, now);
-                            Vec::new()
+                            driver.prefetch(peer.key().as_bytes(), now).await
                         }
                         Some(MediaEvent::Unlinked { peer }) => driver.links.unlinked(&peer),
                         Some(MediaEvent::Message { peer, message }) => {
@@ -198,6 +262,18 @@ where
                     }
                 }
                 Some(order) = orders.recv() => driver.order(order, Instant::now()).await,
+                event = applied.recv(), if applies_open => match event {
+                    Ok(ClientEvent::ProvisionalApplied { author, .. }) => {
+                        driver.prefetch(&author, Instant::now()).await
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        applies_open = false;
+                        Vec::new()
+                    }
+                    // A dropped apply is caught when the author's link comes
+                    // up again.
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => Vec::new(),
+                },
                 Some(done) = jobs.next() => driver.done(done, Instant::now()).await,
                 () = sleep, if wake.is_some() => {
                     let now = Instant::now();
@@ -424,13 +500,22 @@ where
     }
 
     /// `resolve` asked for a file, which joins a fetch of it already running.
+    /// A prefetch it joins turns on demand, asking every linked holder once
+    /// its author is done.
     async fn order(&mut self, order: Order, now: Instant) -> Vec<Action> {
-        if let Some(fetch) = self
-            .tags
-            .get(&order.file_id)
-            .and_then(|tag| self.fetches.get_mut(tag))
-        {
-            fetch.answers.push(order.answer);
+        if let Some(&tag) = self.tags.get(&order.file_id) {
+            let authors = self.content.provisional_authors(order.file_id).await;
+            let linked = candidate_order(self.links.linked_peers(), &authors);
+            if let Some(fetch) = self.fetches.get_mut(&tag) {
+                fetch.answers.push(order.answer);
+                if fetch.prefetch {
+                    fetch.prefetch = false;
+                    fetch.candidates = linked
+                        .into_iter()
+                        .filter(|peer| fetch.holder.as_ref() != Some(peer))
+                        .collect();
+                }
+            }
             return Vec::new();
         }
         let tag = self.next_tag;
@@ -440,6 +525,35 @@ where
         self.fetches.insert(tag, fetch);
         self.tags.insert(order.file_id, tag);
         self.start_round(tag, order.file_id, now).await
+    }
+
+    /// Queues a prefetch from `author`, when linked, of every file a
+    /// prefetch column names on its provisional rows that the device lacks
+    /// and fetches nothing of yet.
+    async fn prefetch(&mut self, author: &[u8], now: Instant) -> Vec<Action> {
+        let Some(peer) = self
+            .links
+            .linked_peers()
+            .find(|peer| peer.key().as_bytes().as_slice() == author)
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        for file_id in self.content.prefetches_of(author).await {
+            if self.tags.contains_key(&file_id) {
+                continue;
+            }
+            let tag = self.next_tag;
+            self.next_tag += 1;
+            let mut fetch = Fetch::new(file_id, now);
+            fetch.prefetch = true;
+            fetch.candidates = VecDeque::from([peer.clone()]);
+            self.fetches.insert(tag, fetch);
+            self.tags.insert(file_id, tag);
+            actions.extend(self.next_holder(tag, now));
+        }
+        actions
     }
 
     /// Lines up every linked holder for the fetch `tag` of `file_id` and asks
@@ -471,9 +585,9 @@ where
     }
 
     /// Drops the fetch `tag`'s holder and asks the next linked one from
-    /// `Want`. With none left, a round every holder answered `Busy` is tried
-    /// again later within the on-demand bound, and the fetch is otherwise
-    /// unavailable.
+    /// `Want`. With none left, an on-demand round every holder answered
+    /// `Busy` is tried again later within the on-demand bound, and the fetch
+    /// is otherwise unavailable, a prefetch dropped until its next trigger.
     fn next_holder(&mut self, tag: u64, now: Instant) -> Vec<Action> {
         let Some(fetch) = self.fetches.get_mut(&tag) else {
             return Vec::new();
@@ -489,10 +603,13 @@ where
                 let want = Ask::Want {
                     file_id: *fetch.file_id.as_bytes(),
                 };
-                return self.links.ask(&peer, want, tag, Priority::OnDemand, now);
+                let priority = fetch.priority();
+                return self.links.ask(&peer, want, tag, priority, now);
             }
         }
-        if fetch.round_busy == Some(true) && now + fetch.backoff <= fetch.progress + ON_DEMAND_BOUND
+        if !fetch.prefetch
+            && fetch.round_busy == Some(true)
+            && now + fetch.backoff <= fetch.progress + ON_DEMAND_BOUND
         {
             fetch.retry_at = Some(now + fetch.backoff);
             fetch.backoff = (fetch.backoff * 2).min(LAST_BACKOFF);
@@ -597,8 +714,23 @@ where
             more.extend(self.next_holder(tag, now));
             return more;
         };
+        let prefetch = fetch.prefetch;
+        if prefetch
+            && manifest.chunks().iter().map(|chunk| chunk.len).sum::<u64>() > MAX_PREFETCH_BYTES
+        {
+            self.finish(tag, Ok(false));
+            return self.release(&peer, done, now);
+        }
         let next = self.chunk_or_commit(tag, manifest, 0).await;
-        self.links.proceed(&peer, next.map(|ask| (ask, tag)), now)
+        if !prefetch {
+            return self.links.proceed(&peer, next.map(|ask| (ask, tag)), now);
+        }
+        // A prefetch's next ask queues behind every on-demand one.
+        let mut more = self.links.proceed(&peer, None, now);
+        if let Some(ask) = next {
+            more.extend(self.links.ask(&peer, ask, tag, Priority::Prefetch, now));
+        }
+        more
     }
 
     /// Asks for the first chunk of `manifest` from `from` the store lacks,
@@ -730,13 +862,13 @@ where
         let Some(ask) = self.chunk_or_commit(tag, manifest, from).await else {
             return Vec::new();
         };
-        match self
+        let Some((holder, priority)) = self
             .fetches
             .get(&tag)
-            .and_then(|fetch| fetch.holder.clone())
-        {
-            Some(holder) => self.links.ask(&holder, ask, tag, Priority::OnDemand, now),
-            None => Vec::new(),
-        }
+            .and_then(|fetch| Some((fetch.holder.clone()?, fetch.priority())))
+        else {
+            return Vec::new();
+        };
+        self.links.ask(&holder, ask, tag, priority, now)
     }
 }

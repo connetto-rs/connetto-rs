@@ -7,12 +7,15 @@
 --
 -- connetto_visible_files is SECURITY INVOKER with a pinned search_path so row
 -- level security answers from the caller's own identity, which is what both
--- the mint and the serving check consult. connetto_set_content_state is
--- SECURITY DEFINER with a pinned search_path so the file server's commit can
--- write content_state without owning the photos table. The writer grants on
+-- the mint and the serving check consult. It admits a file that either the
+-- photo column or the thumbnail column of a readable row names.
+-- connetto_set_content_state is SECURITY DEFINER with a pinned search_path
+-- so the file server's commit can write content_state without owning the
+-- photos table. It marks the row whose photo column names the file, so a
+-- thumbnail's upload leaves the photo's state alone. The writer grants on
 -- photos live in roles.sql beside the other tables, because the demo's own
 -- write path applies client mutations as connetto_reader.
-CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[]) RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ SELECT ARRAY(SELECT f FROM UNNEST(p_file_ids) AS f WHERE EXISTS (SELECT 1 FROM public.photos p WHERE p.content_id = f)) $$;
+CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[]) RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ SELECT ARRAY(SELECT f FROM UNNEST(p_file_ids) AS f WHERE EXISTS (SELECT 1 FROM public.photos p WHERE p.content_id = f OR p.thumb_id = f)) $$;
 CREATE OR REPLACE FUNCTION connetto_set_content_state(p_file_id BYTEA, p_new_state TEXT, p_caller TEXT) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' AS $$ BEGIN UPDATE public.photos SET content_state = p_new_state WHERE content_id = p_file_id; RETURN p_file_id; END; $$;
 GRANT SELECT ON _cfs_manifests TO connetto_reader;
 GRANT SELECT ON _cfs_manifest_chunks TO connetto_reader;

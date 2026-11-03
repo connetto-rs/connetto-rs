@@ -33,6 +33,8 @@ use crate::{ticket, upload};
 
 #[cfg(feature = "peer")]
 mod peer;
+#[cfg(feature = "peer")]
+pub use peer::PeerContent;
 
 /// How many content events are held for a slow observer.
 const EVENT_CAPACITY: usize = 64;
@@ -133,7 +135,7 @@ pub struct ContentClient<T: Transport, B: ChunkStore + Clone, H: ContentHttp> {
     /// The `(table, column)` pairs holding file ids a linked peer may be
     /// served through, judged by the requester's read of a row naming the file.
     #[cfg(feature = "peer")]
-    peer_content: Vec<(String, String)>,
+    peer_content: Vec<peer::PeerColumn>,
     /// Where `resolve` hands a peer fetch to the running media driver, `None`
     /// while none runs.
     #[cfg(feature = "peer")]

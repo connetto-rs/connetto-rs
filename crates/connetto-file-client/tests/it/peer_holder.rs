@@ -380,7 +380,7 @@ async fn a_holder_with_no_declared_column_refuses_every_request() {
 
 #[tokio::test]
 async fn a_declaration_naming_a_column_the_replica_lacks_is_refused() {
-    for (table, column) in [("photos", "thumb_id"), ("albums", "content_id")] {
+    for (table, column) in [("photos", "banner_id"), ("albums", "content_id")] {
         let dir = tempfile::tempdir().expect("temp dir");
         let refused = replica(dir.path(), None)
             .await

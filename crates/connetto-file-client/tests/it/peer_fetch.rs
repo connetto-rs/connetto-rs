@@ -7,162 +7,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_client::media::{MediaEvent, MediaPort};
-use connetto_exchange::media::{MAX_PIECE_BYTES, Media};
+use connetto_exchange::media::Media;
 use connetto_file_client::{ContentEvent, FileId, Resolved};
-use connetto_file_core::{MemStore, MimeClass, encode_range, process_file_with_outboard};
-use connetto_peer::{CloseReason, Node, PeerEvent};
+use connetto_peer::Node;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::peer_support::{
-    Device, Devices, beside, beside_both, declare, declared, port, replica, stage,
+    Device, Devices, Fault, bare_holder, beside, beside_both, declare, declared, fetches, port,
+    replica, stage, wants,
 };
 use crate::retention::pseudorandom;
 use crate::support::Scripted;
-
-/// How a bare holder misbehaves.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Fault {
-    /// It serves the file as it is.
-    None,
-    /// It flips a byte in the middle of every encoded range.
-    ForgePiece,
-    /// It names every chunk by a hash the chunk does not have.
-    LieInManifest,
-    /// It closes every link at its second `Fetch`.
-    DropAtSecondFetch,
-    /// It answers every request `Busy`.
-    AlwaysBusy,
-    /// It answers nothing.
-    Silent,
-    /// It names a chunk of no bytes.
-    EmptyChunk,
-    /// It sends more manifest rows than a manifest may hold, in two runs.
-    TooManyRows,
-}
-
-/// A bare node serving `bytes` as a holder would, chunked as the generic
-/// class chunks it, with `fault`, answering the requests it records.
-fn bare_holder(
-    node: Node,
-    mut events: mpsc::UnboundedReceiver<PeerEvent>,
-    bytes: Vec<u8>,
-    fault: Fault,
-) -> Arc<Mutex<Vec<Media>>> {
-    let asked = Arc::new(Mutex::new(Vec::new()));
-    let record = Arc::clone(&asked);
-    tokio::spawn(async move {
-        let store = MemStore::new();
-        let (manifest, outboard) =
-            process_file_with_outboard(bytes.as_slice(), MimeClass::Generic, &store)
-                .await
-                .expect("chunk the file");
-        let mut fetches = 0;
-        while let Some(event) = events.recv().await {
-            let PeerEvent::Media { peer, message } = event else {
-                continue;
-            };
-            record.lock().push(message.clone());
-            let request_id = message.request_id();
-            match (fault, message) {
-                (Fault::Silent, _) => {}
-                (Fault::AlwaysBusy, _) => {
-                    let _ = node.send_media(&peer, Media::Busy { request_id }).await;
-                }
-                (Fault::TooManyRows, Media::Want { .. }) => {
-                    for last in [false, true] {
-                        let run = Media::Manifest {
-                            request_id,
-                            chunks: vec![([7; 32], 1); 5_000],
-                            last,
-                        };
-                        let _ = node.send_media(&peer, run).await;
-                    }
-                }
-                (_, Media::Want { .. }) => {
-                    let chunks = manifest
-                        .chunks()
-                        .iter()
-                        .map(|chunk| {
-                            let mut hash = *chunk.hash.as_bytes();
-                            if fault == Fault::LieInManifest {
-                                hash[0] ^= 1;
-                            }
-                            let len = if fault == Fault::EmptyChunk {
-                                0
-                            } else {
-                                chunk.len
-                            };
-                            (hash, len)
-                        })
-                        .collect();
-                    let run = Media::Manifest {
-                        request_id,
-                        chunks,
-                        last: true,
-                    };
-                    let _ = node.send_media(&peer, run).await;
-                }
-                (
-                    _,
-                    Media::Fetch {
-                        request_id,
-                        start,
-                        len,
-                        ..
-                    },
-                ) => {
-                    fetches += 1;
-                    if fault == Fault::DropAtSecondFetch && fetches == 2 {
-                        node.stop(CloseReason::Closed);
-                        return;
-                    }
-                    let mut encoded = Vec::new();
-                    encode_range(&manifest, &store, &outboard, start, len, &mut encoded)
-                        .await
-                        .expect("encode the range");
-                    if fault == Fault::ForgePiece {
-                        let middle = encoded.len() / 2;
-                        encoded[middle] ^= 1;
-                    }
-                    let pieces: Vec<&[u8]> = encoded.chunks(MAX_PIECE_BYTES).collect();
-                    let last = pieces.len() - 1;
-                    for (index, piece) in pieces.into_iter().enumerate() {
-                        let piece = Media::Piece {
-                            request_id,
-                            encoded: piece.to_vec(),
-                            last: index == last,
-                        };
-                        let _ = node.send_media(&peer, piece).await;
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
-    asked
-}
-
-/// How many `Want` requests a bare holder saw.
-fn wants(asked: &Mutex<Vec<Media>>) -> usize {
-    asked
-        .lock()
-        .iter()
-        .filter(|message| matches!(message, Media::Want { .. }))
-        .count()
-}
-
-/// The `Fetch` requests a bare holder saw, as `(start, len)`.
-fn fetches(asked: &Mutex<Vec<Media>>) -> Vec<(u64, u64)> {
-    asked
-        .lock()
-        .iter()
-        .filter_map(|message| match message {
-            Media::Fetch { start, len, .. } => Some((*start, *len)),
-            _ => None,
-        })
-        .collect()
-}
 
 /// Asserts `device` resolves `file_id` to `bytes` from its own store.
 fn assert_local(resolved: &Resolved, bytes: &[u8]) {
