@@ -2,6 +2,8 @@
 
 use std::collections::VecDeque;
 
+use connetto_core::messages::ControlMessage;
+use connetto_core::messages::flow::AckCredits;
 use connetto_core::traits::{IncomingFrame, Transport};
 
 use super::SessionError;
@@ -27,6 +29,25 @@ impl HeldInput {
             return Ok(Some(frame));
         }
         transport.recv().await
+    }
+
+    /// Hold the paging an acknowledgement drives, whose credits were already applied, as an acknowledgement granting none.
+    ///
+    /// Paging runs one page per acknowledgement only while nothing is queued, so a run of them held back to back needs one.
+    pub(super) fn hold_paging(&mut self, limit: usize) -> Result<(), SessionError> {
+        if matches!(
+            self.queue.back(),
+            Some((
+                IncomingFrame::Control(ControlMessage::AckCredits(AckCredits { credits: 0 })),
+                _
+            ))
+        ) {
+            return Ok(());
+        }
+        self.push(
+            IncomingFrame::Control(ControlMessage::AckCredits(AckCredits { credits: 0 })),
+            limit,
+        )
     }
 
     pub(super) fn push(&mut self, frame: IncomingFrame, limit: usize) -> Result<(), SessionError> {
