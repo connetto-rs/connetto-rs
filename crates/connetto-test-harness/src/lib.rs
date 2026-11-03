@@ -1905,6 +1905,9 @@ pub struct Client {
     /// commit, and an assertion about what was delivered has to weigh that
     /// patch rather than never meet it.
     live_backlog: VecDeque<LivePatch>,
+    /// The schema major every handshake declares, the capture major of the
+    /// entries the connection settles.
+    schema_major: Option<connetto_core::Major>,
 }
 
 impl Client {
@@ -1916,7 +1919,15 @@ impl Client {
         Self {
             transport,
             live_backlog: VecDeque::new(),
+            schema_major: None,
         }
+    }
+
+    /// Declare `major` in every handshake this client sends.
+    #[must_use]
+    pub fn declaring(mut self, major: connetto_core::Major) -> Self {
+        self.schema_major = Some(major);
+        self
     }
 
     /// Send the handshake as `client_id` and wait for its ack. The client id
@@ -1958,6 +1969,7 @@ impl Client {
         let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
             .with_grants(grants.iter().map(|grant| Grant::new(*grant)))
             .with_writer(writer);
+        handshake.schema_major = self.schema_major;
         if let Some(token) = resume_token {
             handshake = handshake.with_resume_token(token);
         }
@@ -2011,6 +2023,7 @@ impl Client {
         let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
             .with_grant(Grant::new(grant))
             .with_cursor(cursor);
+        handshake.schema_major = self.schema_major;
         if let Some(subjects) = cursor_subjects {
             handshake = handshake.with_cursor_subjects(subjects.iter().copied());
         }
@@ -2039,6 +2052,7 @@ impl Client {
         let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
             .with_grants(grants.iter().map(|grant| Grant::new(*grant)))
             .with_writer(writer);
+        handshake.schema_major = self.schema_major;
         if let Some(token) = resume_token {
             handshake = handshake.with_resume_token(token);
         }

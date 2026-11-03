@@ -135,3 +135,64 @@ pub enum Verdict {
     /// can still deliver, so the receiver waits for the next connection.
     Pending,
 }
+
+/// Why the server refused a courier range before settling any of it (R78).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CourierRefusal {
+    /// The offer does not decode, the rows exceed [`MAX_MANIFEST_ROWS`],
+    /// skip a sequence or run past the offer's newest, or a body names no
+    /// row, arrives out of order or disagrees with its row's digest.
+    Malformed,
+    /// The author's enrolment is absent, revoked, or past its certificate's
+    /// expiry plus `DEVICE_SKEW`.
+    NotEnrolled,
+    /// The author's account is banned, so the entries stay deliverable once
+    /// the ban lifts.
+    AuthorBanned,
+    /// The author's writer is retired.
+    WriterRetired,
+    /// The offer's signature does not verify against the author's key, or
+    /// the rows above the writer's frontier do not chain from its head to
+    /// the offer's newest.
+    Unverified,
+    /// The rows above the writer's frontier do not start right after it.
+    SequenceGap {
+        /// The sequence after the writer's frontier.
+        expected: u64,
+        /// The first sequence the range carries above the frontier.
+        got: u64,
+    },
+}
+
+/// How the server answered one row of a courier range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CourierEntryOutcome {
+    /// The sequence is settled, by an earlier path or by this range, with
+    /// the verdict a provisional ask would answer, never
+    /// [`Verdict::Pending`] or [`Verdict::Abandoned`].
+    Ruled(Verdict),
+    /// The row carries no body, or an original only its number writer can
+    /// settle, so it and every row after it wait for the author's own
+    /// device.
+    NotCouriered,
+    /// Nothing settled at the row, so the range is offered again from it
+    /// after the wait.
+    Retry {
+        /// How long to wait before offering again, 0 when the server names
+        /// no wait.
+        retry_after_ms: u64,
+    },
+}
+
+/// The server's answer to one courier range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CourierOutcome {
+    /// Nothing settled.
+    Refused(CourierRefusal),
+    /// One outcome per row answered, in sequence order. The list stops after
+    /// a [`CourierEntryOutcome::NotCouriered`] or a
+    /// [`CourierEntryOutcome::Retry`], and after a sequence the server holds
+    /// under another entry, ruled refused `Forked`, whose chain the rest of
+    /// the range no longer continues.
+    Entries(Vec<(u64, CourierEntryOutcome)>),
+}

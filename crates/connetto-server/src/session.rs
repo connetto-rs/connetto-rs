@@ -35,7 +35,9 @@ use std::time::{Duration, Instant, SystemTime};
 use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
 use connetto_core::chain::{self, GENESIS};
 use connetto_core::device_cert::{KeyId, spki_point};
-use connetto_core::exchange::{Origin, SignedOffer};
+use connetto_core::exchange::{
+    CourierEntryOutcome, CourierOutcome, CourierRefusal, ManifestRow, Origin, SignedOffer,
+};
 use connetto_core::messages::{
     AggregateUpdate, BindDevice, BindValue, BotRegistered, BulkMessage, CONTENT_TICKET_REFUSED,
     CONTENT_TICKET_SIGNER_ERROR, Challenge, ConflictRow, ContentTicketGrant, ContentTicketRequest,
@@ -84,7 +86,7 @@ use crate::bots::schema::{ListEntry, PgBotRegistry, RegistryError, Verb};
 
 use crate::audit::{AuthEvent, AuthOp};
 use crate::counters;
-use crate::courier::{CourierDelivery, CourierEntry, CourierRefusal};
+use crate::courier::{CourierAuthor, CourierEntry};
 use crate::fence::{ReadFence, split_snapshot_cursor};
 use crate::guard::RequestGuard;
 use crate::materializer::{
@@ -6293,10 +6295,6 @@ where
 
     /// Answer the ask about one author's provisional rows, each sequence
     /// ruled from the writer's settled records (R77 decision 11).
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one ask walks the verifications and the ruling in order and a split would hide the sequence"
-    )]
     async fn handle_provisional_status<T: Transport>(
         &self,
         transport: &mut T,
@@ -6373,28 +6371,10 @@ where
             .filter(|seq| **seq <= frontier)
             .copied()
             .min();
-        let mut records: HashMap<i64, SettledOutcome> = HashMap::new();
-        if let (Some(low), Some(writer)) = (low, writer) {
-            for (seq, settled) in self
-                .target
-                .settled_range(
-                    writer,
-                    i64::try_from(low).unwrap_or(0),
-                    i64::try_from(frontier).unwrap_or(i64::MAX),
-                )
-                .await
-                .map_err(|err| SessionError::WriteTarget(err.detail()))?
-            {
-                records.insert(
-                    seq,
-                    SettledOutcome::from_json(&settled.outcome).map_err(|err| {
-                        SessionError::Protocol(format!(
-                            "a settled record holds no outcome the table defines: {err}"
-                        ))
-                    })?,
-                );
-            }
-        }
+        let records = match (low, writer) {
+            (Some(low), Some(writer)) => self.settled_records(writer, low, frontier).await?,
+            _ => HashMap::new(),
+        };
         let facts = crate::provisional::AskFacts {
             frontier,
             retired,
@@ -6406,11 +6386,7 @@ where
             .map(|seq| {
                 (
                     *seq,
-                    crate::provisional::verdict_of(
-                        &facts,
-                        *seq,
-                        records.get(&i64::try_from(*seq).unwrap_or(i64::MAX)),
-                    ),
+                    crate::provisional::verdict_of(&facts, *seq, records.get(seq)),
                 )
             })
             .collect();
@@ -6536,40 +6512,90 @@ where
             .map_err(|err| SessionError::WriteTarget(err.detail()))
     }
 
-    /// Settle a range the courier carried from the author's device (R75),
-    /// with `major` the application schema major the delivering connection
-    /// declared, the capture major of every entry the range settles.
+    /// Settle a range a courier carried for its author (R75, R78 decisions 2
+    /// to 4, 6, 8, 9 and 13 to 15), with `major` the schema major the
+    /// delivering connection declared, the capture major of every body the
+    /// range settles.
     ///
-    /// The author's signature verifies against the author's live enrolment
-    /// over the range's chain, whose head binds every entry's major and
-    /// provenance original, the entries continue the author's settled chain
-    /// from the writer's frontier, and each entry settles at the frontier
-    /// plus one, in order, under the author's identity, so an entry another
-    /// path settled is answered from the record and never applied twice. A
-    /// carried entry settles its provenance original the way the direct
-    /// upload does.
+    /// `offer` is the author's stored [`SignedOffer`] in MessagePack, `rows`
+    /// the manifest rows the courier holds up to the offer's newest entry, in
+    /// sequence order, and `bodies` the bodies it holds of them, in the same
+    /// order. The range is refused unsettled when it is malformed, the
+    /// author's enrolment is absent, revoked or past its expiry plus
+    /// `DEVICE_SKEW`, the author's account is banned, its writer is retired,
+    /// the offer's signature fails, the rows above the writer's frontier do
+    /// not start right after it, or they do not chain from the writer's head
+    /// to the offer's newest head. Rows at or below the frontier are answered
+    /// with the verdict their records give and touch nothing. The rows above
+    /// it settle in order under the author's account, the bot list its
+    /// certificate carries and no subjects, so an entry another path settled
+    /// is answered from the record and never applied twice. The range stops
+    /// at a row with no body, of another major or with a number original,
+    /// and at a row that settles nothing. A carried entry settles its
+    /// provenance original the way the direct upload does.
     ///
     /// # Errors
     ///
     /// [`SessionError::Protocol`] when no enrolment is installed, the store
-    /// does not answer, or the writer row does not stand.
+    /// does not answer, the writer row does not stand, or a provenance
+    /// sequence is past its original's frontier.
+    /// [`SessionError::BanList`] when the ban list cannot be read.
     /// [`SessionError::WriteTarget`] when the writer tables or the apply
     /// database fail.
-    ///
-    /// # Panics
-    ///
-    /// When one identity cannot settle one run, a guarantee `accept` upholds.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the author's signature verifies the whole range and each entry settles in order under its identity, so the range settles as one unit"
-    )]
     pub async fn courier_deliver(
         &self,
         author: KeyId,
         major: Option<Major>,
-        entries: &[CourierEntry],
-        signature: &[u8],
-    ) -> Result<CourierDelivery, SessionError> {
+        offer: &[u8],
+        rows: &[ManifestRow],
+        bodies: &[CourierEntry],
+    ) -> Result<CourierOutcome, SessionError> {
+        let author = match self.courier_checks(author, offer, rows, bodies).await? {
+            Ok(author) => author,
+            Err(refusal) => return Ok(CourierOutcome::Refused(refusal)),
+        };
+        let (settled, unsettled) =
+            rows.split_at(rows.partition_point(|row| row.seq <= author.frontier));
+        let mut answers = Vec::with_capacity(rows.len());
+        if let (Some(first), Some(writer)) = (settled.first(), author.writer) {
+            let records = self
+                .settled_records(writer, first.seq, author.frontier)
+                .await?;
+            let facts = author.facts();
+            answers.extend(settled.iter().map(|row| {
+                (
+                    row.seq,
+                    CourierEntryOutcome::Ruled(crate::provisional::verdict_of(
+                        &facts,
+                        row.seq,
+                        records.get(&row.seq),
+                    )),
+                )
+            }));
+        }
+        if !unsettled.is_empty() {
+            self.courier_settle(&author, major, unsettled, bodies, &mut answers)
+                .await?;
+        }
+        Ok(CourierOutcome::Entries(answers))
+    }
+
+    /// R78's checks of one courier range in their order, the first that
+    /// fails naming the refusal, else the author's standing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::courier_deliver`].
+    async fn courier_checks(
+        &self,
+        author: KeyId,
+        offer: &[u8],
+        rows: &[ManifestRow],
+        bodies: &[CourierEntry],
+    ) -> Result<Result<CourierAuthor<Id>, CourierRefusal>, SessionError> {
+        let Some(signed) = crate::courier::well_formed(offer, rows, bodies) else {
+            return Ok(Err(CourierRefusal::Malformed));
+        };
         let enrolment = self
             .device_enrolment
             .get()
@@ -6578,117 +6604,235 @@ where
             .key_record(None, author)
             .await
             .map_err(|_| SessionError::Protocol("the enrolment store did not answer".into()))?
+            .filter(|record| !record.revoked && record.certificate_live_past_skew)
         else {
-            return Ok(CourierDelivery::Refused(CourierRefusal::NotEnrolled));
+            return Ok(Err(CourierRefusal::NotEnrolled));
         };
-        if record.revoked || !record.certificate_live {
-            return Ok(CourierDelivery::Refused(CourierRefusal::NotEnrolled));
+        if self
+            .guard
+            .banned(&record.user)
+            .await
+            .map_err(|err| SessionError::BanList(err.detail().to_owned()))?
+            .is_some()
+        {
+            return Ok(Err(CourierRefusal::AuthorBanned));
         }
         let key: Vec<u8> = author.as_bytes().to_vec();
-        let writer_row = match self
+        let writer_row = self
             .target
             .writer_by_key(&key)
             .await
-            .map_err(|err| SessionError::WriteTarget(err.detail()))?
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        if writer_row
+            .as_ref()
+            .is_some_and(|row| row.retired_at.is_some())
         {
-            Some(row) if row.retired_at.is_some() => {
-                return Ok(CourierDelivery::Refused(CourierRefusal::WriterRetired));
-            }
-            Some(row) => row,
-            // A live enrolment that never bound takes its row at frontier 0.
-            None => {
-                self.target
-                    .insert_device_writer(Some(record.user.clone()), &key)
-                    .await
-                    .map_err(|err| SessionError::WriteTarget(err.detail()))?;
-                self.target
-                    .writer_by_key(&key)
-                    .await
-                    .map_err(|err| SessionError::WriteTarget(err.detail()))?
-                    .ok_or_else(|| {
-                        SessionError::Protocol("the device writer row did not stand".into())
-                    })?
-            }
-        };
-        // The entries continue the author's settled chain.
-        let frontier = u64::try_from(writer_row.frontier).unwrap_or(0);
-        let head = writer_row.head.as_deref().map_or(GENESIS, |head| {
-            <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
-        });
-        let mut previous = head;
-        let mut hashes = Vec::with_capacity(entries.len());
-        let mut expected = frontier.saturating_add(1);
-        for entry in entries {
-            if entry.seq != expected {
-                return Ok(CourierDelivery::Refused(CourierRefusal::SequenceGap {
+            return Ok(Err(CourierRefusal::WriterRetired));
+        }
+        if !chain::verify_offer(&record.public_key, author.as_bytes(), &signed) {
+            return Ok(Err(CourierRefusal::Unverified));
+        }
+        let frontier = writer_row
+            .as_ref()
+            .map_or(0, |row| u64::try_from(row.frontier).unwrap_or(0));
+        let head = writer_row
+            .as_ref()
+            .and_then(|row| row.head.as_deref())
+            .map_or(GENESIS, |head| {
+                <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
+            });
+        let unsettled = &rows[rows.partition_point(|row| row.seq <= frontier)..];
+        if let Some(first) = unsettled.first() {
+            let expected = frontier.saturating_add(1);
+            if first.seq != expected {
+                return Ok(Err(CourierRefusal::SequenceGap {
                     expected,
-                    got: entry.seq,
+                    got: first.seq,
                 }));
             }
-            let hash = chain::entry_hash(
-                &previous,
-                entry.seq,
-                major,
-                entry.provenance.map(Origin::from),
-                &entry.changeset,
-            );
-            previous = hash;
-            expected = entry.seq.saturating_add(1);
-            hashes.push(hash);
+            // The rows above the frontier run to the signed newest entry and
+            // continue the writer's own head to its hash.
+            let reached = signed.offer.newest.as_ref().is_some_and(|newest| {
+                unsettled.last().is_some_and(|last| last.seq == newest.seq)
+                    && chain::chain_walk(
+                        &head,
+                        unsettled
+                            .iter()
+                            .map(|row| (row.seq, Some(row.major), row.origin, row.digest)),
+                    ) == newest.head
+            });
+            if !reached {
+                return Ok(Err(CourierRefusal::Unverified));
+            }
         }
-        // The author vouches the range's chain up to its last entry, or its
-        // own head when the range carries none.
-        let (vouch_seq, vouch_head) = match entries.last() {
-            Some(last) => (last.seq, previous),
-            None => (frontier, head),
+        Ok(Ok(CourierAuthor {
+            user: record.user,
+            bot_list: record.bot_list,
+            key,
+            writer: writer_row.map(|row| row.writer),
+            frontier,
+            head,
+        }))
+    }
+
+    /// Settle a courier range's rows above the writer's frontier in order
+    /// (R78), answering each into `answers` and stopping at a row the range
+    /// cannot settle on this connection or one that settles nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::courier_deliver`].
+    ///
+    /// # Panics
+    ///
+    /// When one identity cannot settle one run, a guarantee `accept` upholds.
+    async fn courier_settle(
+        &self,
+        author: &CourierAuthor<Id>,
+        major: Option<Major>,
+        rows: &[ManifestRow],
+        bodies: &[CourierEntry],
+        answers: &mut Vec<(u64, CourierEntryOutcome)>,
+    ) -> Result<(), SessionError> {
+        let writer = match author.writer {
+            Some(writer) => writer,
+            // A live enrolment that never bound takes its row at frontier 0.
+            None => self.courier_writer(author).await?,
         };
-        if !chain::verify_range(
-            &record.public_key,
-            author.as_bytes(),
-            vouch_seq,
-            &vouch_head,
-            signature,
-        ) {
-            return Ok(CourierDelivery::Refused(CourierRefusal::NotEnrolled));
-        }
-        // The author's identity every entry applies under.
         let session = SessionId::from_uuid(Uuid::new_v4());
         let session_uuid = *session.as_uuid();
-        let mut author_principal = Principal::unidentified(session);
-        author_principal
+        let mut principal = Principal::unidentified(session);
+        principal
             .accept(Subject::Identity(VerifiedSession {
-                context: AuthContext::new(record.user),
+                context: AuthContext::new(author.user.clone()),
                 session_id: session,
-                bot_list: None,
+                bot_list: crate::courier::author_bot_list(author.bot_list.as_deref()),
             }))
             .expect("one identity settles one run");
-        let author: Arc<Principal<Id, Key>> = Arc::new(author_principal);
-        let mut outcomes: Vec<SettledOutcome> = Vec::with_capacity(entries.len());
-        let mut previous = head;
-        for (entry, hash) in entries.iter().zip(hashes.iter()) {
+        let principal: Arc<Principal<Id, Key>> = Arc::new(principal);
+        let facts = author.facts();
+        // The bodies are in sequence order, so one index walks them beside the
+        // rows, past the bodies of rows at or below the frontier.
+        let mut next_body = bodies.partition_point(|body| body.seq < rows[0].seq);
+        let mut previous = author.head;
+        for row in rows {
+            let body = bodies.get(next_body).filter(|body| body.seq == row.seq);
+            if body.is_some() {
+                next_body += 1;
+            }
+            let number_original = row
+                .origin
+                .is_some_and(|origin| matches!(origin.writer, WriterRef::Number(_)));
+            let Some(body) = body.filter(|_| major == Some(row.major) && !number_original) else {
+                answers.push((row.seq, CourierEntryOutcome::NotCouriered));
+                break;
+            };
+            let hash = chain::chain_walk(
+                &previous,
+                [(row.seq, Some(row.major), row.origin, row.digest)],
+            );
             let outcome = self
                 .courier_entry(
-                    &author,
+                    &principal,
                     session_uuid,
                     major,
-                    writer_row.writer,
-                    entry,
-                    *hash,
+                    writer,
+                    row,
+                    &body.changeset,
+                    hash,
                     previous,
                 )
                 .await?;
-            previous = *hash;
-            // A refusal stops the range.
-            let stops = matches!(outcome, SettledOutcome::Rejected(_));
-            outcomes.push(outcome);
-            if stops {
-                break;
+            previous = hash;
+            match outcome {
+                // Settles nothing, so the range is offered again from here.
+                SettledOutcome::Rejected(MutationRejectReason::Indeterminate) => {
+                    answers.push((row.seq, CourierEntryOutcome::Retry { retry_after_ms: 0 }));
+                    break;
+                }
+                outcome => {
+                    // Another entry stands at the sequence, so the rest of the
+                    // range no longer continues the server's chain.
+                    let forked = matches!(
+                        outcome,
+                        SettledOutcome::Rejected(MutationRejectReason::Forked)
+                    );
+                    answers.push((
+                        row.seq,
+                        CourierEntryOutcome::Ruled(crate::provisional::verdict_of(
+                            &facts,
+                            row.seq,
+                            Some(&outcome),
+                        )),
+                    ));
+                    if forked {
+                        break;
+                    }
+                }
             }
         }
-        Ok(CourierDelivery::Entries(outcomes))
+        Ok(())
     }
 
-    /// Settle one courier entry at the frontier as [`SettlePath::Courier`].
+    /// The writer row a courier range creates for an author whose live
+    /// enrolment never bound, at frontier 0.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::WriteTarget`] when the writer tables fail,
+    /// [`SessionError::Protocol`] when the row does not stand.
+    async fn courier_writer(&self, author: &CourierAuthor<Id>) -> Result<i64, SessionError> {
+        self.target
+            .insert_device_writer(Some(author.user.clone()), &author.key)
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        self.target
+            .writer_by_key(&author.key)
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?
+            .map(|row| row.writer)
+            .ok_or_else(|| SessionError::Protocol("the device writer row did not stand".into()))
+    }
+
+    /// The settled records of `writer` from `low` through `frontier`, by
+    /// sequence, the one read a provisional ask and a courier range's
+    /// settled prefix take (R77 decision 11).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::WriteTarget`] when the writer tables fail,
+    /// [`SessionError::Protocol`] when a record holds no outcome the table
+    /// defines.
+    async fn settled_records(
+        &self,
+        writer: i64,
+        low: u64,
+        frontier: u64,
+    ) -> Result<HashMap<u64, SettledOutcome>, SessionError> {
+        let mut records = HashMap::new();
+        for (seq, settled) in self
+            .target
+            .settled_range(
+                writer,
+                i64::try_from(low).unwrap_or(i64::MAX),
+                i64::try_from(frontier).unwrap_or(i64::MAX),
+            )
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?
+        {
+            records.insert(
+                u64::try_from(seq).unwrap_or(0),
+                SettledOutcome::from_json(&settled.outcome).map_err(|err| {
+                    SessionError::Protocol(format!(
+                        "a settled record holds no outcome the table defines: {err}"
+                    ))
+                })?,
+            );
+        }
+        Ok(records)
+    }
+
+    /// Settle one courier row at the frontier as [`SettlePath::Courier`].
     ///
     /// # Errors
     ///
@@ -6698,7 +6842,7 @@ where
     /// the provenance sequence is past the original's frontier.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the author, its declared major and the entry's hash and predecessor are the range's per-entry identity, and the range hands each over as it settles"
+        reason = "the author, its declared major and the entry's row, body, hash and predecessor are the range's per-entry identity, and the range hands each over as it settles"
     )]
     async fn courier_entry(
         &self,
@@ -6706,21 +6850,28 @@ where
         session_id: uuid::Uuid,
         major: Option<Major>,
         writer: i64,
-        entry: &CourierEntry,
+        row: &ManifestRow,
+        changeset: &[u8],
         entry_hash: [u8; 32],
         previous_hash: [u8; 32],
     ) -> Result<SettledOutcome, SessionError> {
-        let changeset = entry.changeset.as_slice();
         let mut settle = SettleSpec {
             writer,
-            seq: entry.seq,
+            seq: row.seq,
             entry_hash,
             previous_hash,
             path: SettlePath::Courier,
             original: None,
         };
         if let Some(outcome) = self
-            .courier_original(author, session_id, major, entry, &mut settle)
+            .courier_original(
+                author,
+                session_id,
+                major,
+                row.origin,
+                changeset,
+                &mut settle,
+            )
             .await?
         {
             return Ok(outcome);
@@ -6800,14 +6951,21 @@ where
         author: &Arc<Principal<Id, Key>>,
         session_id: uuid::Uuid,
         major: Option<Major>,
-        entry: &CourierEntry,
+        origin: Option<Origin>,
+        changeset: &[u8],
         settle: &mut SettleSpec,
     ) -> Result<Option<SettledOutcome>, SessionError> {
-        let Some(provenance) = entry.provenance else {
+        // A courier never holds a number's secret, so only a device original
+        // reaches here and it names its writer alone.
+        let Some(provenance) = origin.map(|origin| Provenance {
+            writer: origin.writer,
+            seq: origin.seq,
+            secret: None,
+        }) else {
             return Ok(None);
         };
         match self
-            .provenance_original(&provenance, major, &entry.changeset, author, session_id)
+            .provenance_original(&provenance, major, changeset, author, session_id)
             .await?
         {
             Some((writer, frontier, _, _)) if provenance.seq <= frontier => {

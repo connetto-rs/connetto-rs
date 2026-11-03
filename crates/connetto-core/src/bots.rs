@@ -178,6 +178,23 @@ impl BotList {
         }
         text
     }
+
+    /// The list [`Self::text`] rendered as `text`, `None` when an entry is
+    /// no `table:verb` pair naming a table and one of the four verbs.
+    #[must_use]
+    pub fn from_text(text: &str) -> Option<Self> {
+        if text.is_empty() {
+            return Some(Self::new([]));
+        }
+        text.split(crate::schema::BOT_LIST_SEPARATOR)
+            .map(|entry| {
+                let (table, verb) = entry.rsplit_once(':')?;
+                (!table.is_empty()).then_some(())?;
+                Some((table.to_owned(), Verb::parse(verb)?))
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Self::new)
+    }
 }
 
 #[cfg(feature = "diesel-pg")]
@@ -415,5 +432,27 @@ mod tests {
         let empty = BotList::new([]);
         assert!(empty.is_empty());
         assert_eq!(empty.text(), "");
+    }
+
+    /// A list's text parses back to the same entries, an empty text to the
+    /// empty list, and a text with an entry that is no `table:verb` pair of
+    /// a known verb to nothing, the wildcard included.
+    #[test]
+    fn the_text_parses_back_to_its_list() {
+        let list = BotList::new([
+            ("orders".to_owned(), Verb::Read),
+            ("invoices".to_owned(), Verb::Delete),
+        ]);
+        assert_eq!(BotList::from_text(&list.text()), Some(list));
+        assert_eq!(BotList::from_text(""), Some(BotList::new([])));
+        for foreign in [
+            crate::BOT_LIST_WILDCARD,
+            "orders",
+            "orders:drop",
+            "orders:read,",
+            ":read",
+        ] {
+            assert_eq!(BotList::from_text(foreign), None, "{foreign:?}");
+        }
     }
 }

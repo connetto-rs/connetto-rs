@@ -41,6 +41,9 @@ pub struct Enrolment<Id> {
     pub descriptor: Vec<u8>,
     /// The attestation level the first enrolment recorded, which renewals keep.
     pub attestation: AttestationLevel,
+    /// The bot list the certificate carries, the one the enrolling session's
+    /// connection binds (R77 decision 12), which a renewal replaces.
+    pub bot_list: String,
 }
 
 /// One key's enrolment record, what a writer decision needs (R75): the account
@@ -60,6 +63,10 @@ pub struct KeyRecord<Id> {
     pub certificate_live_past_skew: bool,
     /// The device key's `SubjectPublicKeyInfo`.
     pub public_key: Vec<u8>,
+    /// The bot list the key's last certificate carries, `None` for an
+    /// enrolment recorded before the column held one, which binds nothing
+    /// (R78 decision 9).
+    pub bot_list: Option<String>,
 }
 
 /// What recording an enrolment found.
@@ -193,6 +200,7 @@ struct Row<Id> {
     session: SessionId,
     descriptor: Vec<u8>,
     attestation: AttestationLevel,
+    bot_list: String,
 }
 
 #[derive(Debug)]
@@ -249,6 +257,7 @@ impl<Id: Clone + PartialEq + Send + 'static> MemoryEnrolments<Id> {
             row.last_seen = enrolment.issued_at;
             row.session = enrolment.session;
             row.descriptor.clone_from(&enrolment.descriptor);
+            row.bot_list.clone_from(&enrolment.bot_list);
         } else {
             state.rows.insert(
                 enrolment.key,
@@ -260,6 +269,7 @@ impl<Id: Clone + PartialEq + Send + 'static> MemoryEnrolments<Id> {
                     session: enrolment.session,
                     descriptor: enrolment.descriptor.clone(),
                     attestation: enrolment.attestation,
+                    bot_list: enrolment.bot_list.clone(),
                 },
             );
         }
@@ -400,10 +410,23 @@ impl<Id: Clone + PartialEq + Send + Sync + 'static> EnrolmentStore<Id> for Memor
                             .iter()
                             .any(|grant| grant.key == key && grant.expires_at > past_skew),
                         public_key,
+                        bot_list: Some(row.bot_list.clone()),
                     }
                 })
         };
         Box::pin(core::future::ready(Ok(record)))
+    }
+}
+
+/// The refusal an enrolment answers when the issuer would not sign its
+/// certificate, logging the failures that are the server's.
+fn issue_refusal(err: &IssueError) -> EnrolRefusal {
+    match err {
+        IssueError::Identity(_) => EnrolRefusal::Unidentified,
+        IssueError::OutlivesIssuer | IssueError::Validity | IssueError::Sign(_) => {
+            tracing::warn!(error = %err, "device certificate not issued");
+            EnrolRefusal::IssuerUnavailable
+        }
     }
 }
 
@@ -648,13 +671,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
                 level,
                 bot_list,
             )
-            .map_err(|err| match err {
-                IssueError::Identity(_) => EnrolRefusal::Unidentified,
-                IssueError::OutlivesIssuer | IssueError::Validity | IssueError::Sign(_) => {
-                    tracing::warn!(error = %err, "device certificate not issued");
-                    EnrolRefusal::IssuerUnavailable
-                }
-            })?;
+            .map_err(|err| issue_refusal(&err))?;
         let enrolment = Enrolment {
             user: user.clone(),
             key,
@@ -666,6 +683,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
             public_key: csr.public_key().to_vec(),
             descriptor: request.descriptor,
             attestation: level,
+            bot_list: bot_list.to_owned(),
         };
         let told = first.then(|| self.told(&enrolment)).flatten();
         match self.store.record(enrolment).await {
