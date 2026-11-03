@@ -685,7 +685,8 @@ where
             .as_ref()
             .is_some_and(|restore| restore.writer == writer);
         if self.rewound(&writer, frontier) && !armed && !self.arm_restore(writer, frontier)? {
-            self.abandon_rewound(writer)?;
+            // The next dial takes a fresh number naming nothing past the restored frontier.
+            self.drain.dead.insert(writer, crate::Carry::Abandoned);
             self.drop_drain_wire().await;
             self.drain.arm(Duration::ZERO);
             return Ok(());
@@ -928,7 +929,7 @@ where
         }
         // The restored frontier stands below the lost run, so nothing past it is named.
         if let Some(writer) = rewound {
-            self.abandon_rewound(writer)?;
+            self.move_rewound_writer_on(writer)?;
         }
         self.notices.push_back(ClientEvent::Held(HeldWork::Lost {
             major,
@@ -1106,8 +1107,7 @@ where
                         .is_some_and(|writer| self.restoring_for(writer, reject.client_seq)) =>
             {
                 if let Some(writer) = self.drain.writer {
-                    self.restore = None;
-                    self.abandon_rewound(writer)?;
+                    self.move_rewound_writer_on(writer)?;
                 }
                 self.drop_drain_wire().await;
                 self.drain.arm(Duration::ZERO);
@@ -1236,6 +1236,21 @@ where
         }
         self.settle_entry(writer, seq, refused)?;
         Ok(Some(HeldWrite { writer, seq }))
+    }
+
+    /// Move a rewound `writer` on when its run can never complete, a re-sent
+    /// entry answered `Forked` or an older major with no server: its run and
+    /// retained entries go, so nothing re-arms it, its current-major queue
+    /// moves as an unretained run's does, and the drain's next dial takes a
+    /// fresh number for its older-major entries.
+    pub(crate) fn move_rewound_writer_on(&mut self, writer: WriterRef) -> Result<(), ClientError> {
+        self.restore = None;
+        {
+            let _suspended = ExemptWrites::raise(&self.write_flags);
+            crate::acked::forget(&mut self.db, &writer)?;
+        }
+        self.drain.dead.insert(writer, crate::Carry::Abandoned);
+        self.abandon_rewound(writer)
     }
 
     /// Drop `writer`'s run entries at or below `frontier`, which the server

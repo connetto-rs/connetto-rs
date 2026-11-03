@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, HeldWork, HeldWrite,
-    MutationApplied, WriterGrant, WriterRef, WriterRequest, WriterSecret,
+    MutationApplied, MutationReject, MutationRejectReason, WriterGrant, WriterRef, WriterRequest,
+    WriterSecret,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, Major, SchemaVersion, loopback};
@@ -57,11 +58,17 @@ pub(crate) fn old_version() -> SchemaVersion {
 
 /// A major 2 replica with no wire and nothing queued.
 pub(crate) fn replica() -> Conn {
-    let config = ClientConfig::new("drain")
+    replica_tuned(crate::SyncTuning::default())
+}
+
+/// [`replica`] with the build's `tuning`.
+pub(crate) fn replica_tuned(tuning: crate::SyncTuning) -> Conn {
+    let mut config = ClientConfig::new("drain")
         .with_schema_major(Some(major(2)))
         .with_schema_version(Some(SchemaVersion::from_hash(
             b"the major 2 bundle".to_vec(),
         )));
+    config.tuning = tuning;
     let mut conn = ConnettoConnection::open(
         &Replica::in_memory(),
         "CREATE TABLE items (id INTEGER PRIMARY KEY)",
@@ -559,5 +566,166 @@ async fn a_run_whose_older_major_is_gone_is_lost_and_the_writer_moves_on() {
     assert!(
         !conn.writers.contains_key(&WriterRef::Number(7)),
         "the rewound number is abandoned"
+    );
+}
+
+/// Settle number 7's write `id`, captured under major 2, on the main wire,
+/// so the replica retains it with major 2's bundle hash. Returns its
+/// sequence.
+async fn settle_major_two_write(conn: &mut Conn, id: i32) -> u64 {
+    let seq = queue(conn, WriterRef::Number(7), id, major(2));
+    conn.bound_writer = Some(WriterRef::Number(7));
+    conn.handle_control(ControlMessage::MutationApplied(MutationApplied {
+        client_seq: seq,
+    }))
+    .await
+    .expect("the major 2 write settles");
+    conn.bound_writer = None;
+    seq
+}
+
+/// R78 decision 27: while the run holds an older major's entry the main wire
+/// sends nothing of its writer, and it sends the run's current-major part
+/// once the drain settled the prefix.
+#[tokio::test]
+async fn the_main_wire_waits_for_the_drain_to_settle_the_older_prefix() {
+    let mut conn = replica();
+    let prefix = drain_major_one_writes(&mut conn, &[1, 2]).await;
+    let current = settle_major_two_write(&mut conn, 3).await;
+    let (end, mut server, _broken) = wire();
+    conn.wire = Some(crate::Wire {
+        transport: end,
+        connection_id: "main".to_owned(),
+        #[cfg(feature = "device-identity")]
+        challenge: None,
+        #[cfg(feature = "device-identity")]
+        number: crate::ConnectionNumber(1),
+    });
+    conn.bound_writer = Some(WriterRef::Number(7));
+    assert!(
+        conn.arm_restore(WriterRef::Number(7), 0)
+            .expect("arm the run")
+    );
+
+    conn.replay_pending().await.expect("replay");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), server.recv())
+            .await
+            .is_err(),
+        "the main wire sends nothing while the older prefix is outstanding"
+    );
+
+    let (_asked, mut old, _broken) = dial(&mut conn, vec![binding_seven_at(0)], Then::Stay).await;
+    assert_eq!(apply_next(&mut old).await, prefix[0]);
+    assert_eq!(apply_next(&mut old).await, prefix[1]);
+    while pump(&mut conn).await != ClientEvent::Held(HeldWork::Drained { major: major(1) }) {}
+    let Some(ControlMessage::MutationHeader(header)) = sent(&mut server).await else {
+        panic!("the main wire sends the run's current-major part");
+    };
+    assert_eq!(header.client_seq, current);
+}
+
+/// R70 decision 21 on the drain: a writer the old major holds below what
+/// this replica saw settled, with no retained run, moves its held entry to a
+/// fresh number naming nothing past the restored frontier, as the main wire
+/// moves its queue, instead of sending it into a gap.
+#[tokio::test]
+async fn a_rewound_writer_on_the_drain_without_a_retained_run_moves_on() {
+    let mut conn = replica_tuned(crate::SyncTuning::default().with_acked_retention(Duration::ZERO));
+    drain_major_one_writes(&mut conn, &[1, 2]).await;
+    queue(&mut conn, WriterRef::Number(7), 3, major(1));
+    hold_major_one(&mut conn);
+
+    let (_asked, mut old, _broken) = dial(&mut conn, vec![binding_seven_at(0)], Then::Stay).await;
+    assert_eq!(sent(&mut old).await, None, "nothing goes into the gap");
+
+    let (asked, mut old, _broken) = dial(&mut conn, vec![granting(9)], Then::Stay).await;
+    assert!(
+        matches!(asked, WriterRequest::Issue { .. }),
+        "the rewound number is never presented again"
+    );
+    let Some(ControlMessage::MutationHeader(header)) = sent(&mut old).await else {
+        panic!("the fresh number sends the held write");
+    };
+    assert_eq!(header.client_seq, 1);
+    assert_eq!(
+        header.provenance, None,
+        "nothing past the restored frontier is named"
+    );
+}
+
+/// R78 decision 27: a re-sent entry the old major answers `Forked` finds
+/// another entry standing where the run was, so the run goes for good and
+/// the writer's held entry moves to a fresh number on the next dial.
+#[tokio::test]
+async fn a_forked_answer_on_the_drain_moves_the_rewound_writer_on() {
+    let mut conn = replica();
+    let prefix = drain_major_one_writes(&mut conn, &[1, 2]).await;
+    queue(&mut conn, WriterRef::Number(7), 3, major(1));
+    hold_major_one(&mut conn);
+    assert!(
+        conn.arm_restore(WriterRef::Number(7), 0)
+            .expect("arm the run")
+    );
+    let (_asked, mut old, _broken) = dial(&mut conn, vec![binding_seven_at(0)], Then::Stay).await;
+    let Some(ControlMessage::MutationHeader(header)) = sent(&mut old).await else {
+        panic!("the run goes up");
+    };
+    assert_eq!(header.client_seq, prefix[0]);
+    conn.handle_drain_frame(Some(IncomingFrame::Control(
+        ControlMessage::MutationReject(MutationReject {
+            client_seq: prefix[0],
+            reason: MutationRejectReason::Forked,
+        }),
+    )))
+    .await
+    .expect("the fork settles");
+    assert_eq!(armed(&conn), Vec::<u64>::new());
+
+    let (asked, mut old, _broken) = dial(&mut conn, vec![granting(9)], Then::Stay).await;
+    assert!(
+        matches!(asked, WriterRequest::Issue { .. }),
+        "the forked number is never presented again"
+    );
+    let Some(ControlMessage::MutationHeader(header)) = sent(&mut old).await else {
+        panic!("the fresh number sends the held write");
+    };
+    assert_eq!(header.client_seq, 1);
+    assert_eq!(header.provenance, None);
+}
+
+/// R78 decision 27: a drain bound at or past the run's end finds the server
+/// already holds it, so the run goes and the batch drains.
+#[tokio::test]
+async fn a_drain_bound_past_the_run_drops_it_and_drains() {
+    let mut conn = replica();
+    drain_major_one_writes(&mut conn, &[1, 2]).await;
+    assert!(
+        conn.arm_restore(WriterRef::Number(7), 0)
+            .expect("arm the run")
+    );
+    let (_asked, _old, _broken) = dial(&mut conn, vec![binding_seven_at(2)], Then::Stay).await;
+    assert_eq!(armed(&conn), Vec::<u64>::new());
+    assert_eq!(
+        pump(&mut conn).await,
+        ClientEvent::Held(HeldWork::Drained { major: major(1) })
+    );
+}
+
+/// R78 decision 26: an older-major row with no bundle hash cannot be
+/// presented to that major's server, so the run is not armed.
+#[tokio::test]
+async fn a_run_whose_older_rows_carry_no_bundle_hash_is_not_armed() {
+    let mut conn = replica();
+    drain_major_one_writes(&mut conn, &[1, 2]).await;
+    diesel::update(crate::acked::_connetto_acked::table)
+        .set(crate::acked::_connetto_acked::version.eq(None::<Vec<u8>>))
+        .execute(&mut conn.db)
+        .expect("forget the bundle hashes");
+    assert!(
+        !conn
+            .arm_restore(WriterRef::Number(7), 0)
+            .expect("read the run"),
+        "the run is left to the writer's retirement"
     );
 }

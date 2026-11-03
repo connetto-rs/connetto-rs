@@ -10069,8 +10069,7 @@ where
             && self.restoring(client_seq)
             && let Some(writer) = writer
         {
-            self.restore = None;
-            self.abandon_rewound(writer)?;
+            self.move_rewound_writer_on(writer)?;
             return Ok(ClientEvent::WriteRestored {
                 client_seq,
                 refused: Some(PriorRefusal::Rejected(MutationRejectReason::Forked)),
@@ -11580,7 +11579,7 @@ mod tests {
             .load(&mut conn.db)
             .expect("read the retraction log");
         assert_eq!(logged, vec![2], "peers learn the refusal");
-        let run = acked::run(&mut conn.db, &device, 2, 2, conn.config.schema_major)
+        let run = acked::run(&mut conn.db, &device, 2, 2)
             .expect("read the retained entry")
             .expect("the entry stays retained");
         assert_eq!(
