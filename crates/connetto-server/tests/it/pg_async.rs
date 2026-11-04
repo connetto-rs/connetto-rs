@@ -735,18 +735,48 @@ async fn pg_oplog_drops_the_oldest_rows_past_its_byte_budget() {
     }
 }
 
-/// The log line naming the bound that pruned is what tells an operator that extra full resyncs come from a retention setting, so the byte bound names itself once it starts pruning, and once only while it keeps pruning.
+/// The log line naming the bound that pruned is what tells an operator that extra full resyncs come from a retention setting, so each bound names itself when it takes over from another, and only then.
 #[tokio::test]
-async fn the_byte_bound_names_itself_when_it_starts_pruning() {
+async fn each_bound_names_itself_when_it_takes_over_pruning() {
     let capture = super::logging::with_capture(
-        "the_byte_bound_names_itself_when_it_starts_pruning",
+        "each_bound_names_itself_when_it_takes_over_pruning",
         |capture| async move {
-            let rows: Vec<ChangeRecord> = (1..=4).map(|n| single_row(n).0).collect();
-            let oplog =
-                InMemoryOplog::new(OplogConfig::default().with_max_bytes(rows[0].stored_bytes()));
-            for record in &rows {
-                oplog.append(record).await.expect("append");
+            let small = |n| single_row(n).0;
+            let big = {
+                let row = small(7);
+                ChangeRecord::new(
+                    "orders",
+                    row.pk().to_vec(),
+                    row.event().clone(),
+                    vec![0; 4096],
+                )
+            };
+            let clock = Arc::new(subql::ManualClock::new(0));
+            let handle: subql::ClockHandle = clock.clone();
+            let oplog = InMemoryOplog::with_clock(
+                OplogConfig::default()
+                    .with_max_entries(3)
+                    .with_max_age(std::time::Duration::from_secs(10))
+                    .with_max_bytes(big.stored_bytes() + small(1).stored_bytes() / 2),
+                handle,
+            );
+            for n in 1..=2 {
+                oplog.append(&small(n)).await.expect("append");
             }
+            clock.advance(std::time::Duration::from_secs(11));
+            // Rows 1 and 2 age out.
+            oplog.append(&small(3)).await.expect("append");
+            // Row 3 is the fourth of three.
+            for n in 4..=6 {
+                oplog.append(&small(n)).await.expect("append");
+            }
+            oplog
+                .forget_through(small(5).position())
+                .await
+                .expect("forget");
+            // Row 6 no longer fits beside the wide row 7, and row 8 keeps the byte bound pruning.
+            oplog.append(&big).await.expect("append");
+            oplog.append(&small(8)).await.expect("append");
             capture
         },
     )
@@ -755,13 +785,9 @@ async fn the_byte_bound_names_itself_when_it_starts_pruning() {
         .lines()
         .into_iter()
         .filter(|line| line["message"] == "the oplog started pruning by another bound")
+        .map(|line| line["bound"].clone())
         .collect();
-    assert_eq!(
-        named.len(),
-        1,
-        "one line for the bound taking over, {named:?}"
-    );
-    assert_eq!(named[0]["bound"], "bytes");
+    assert_eq!(named, ["age", "entries", "bytes"]);
 }
 
 /// Two transactions as the emulator stamps them, the first of two rows and the second of one, with their records and commits.
