@@ -293,16 +293,33 @@ const DEMO_CA_PASSPHRASE: &str = "connetto demo stack";
 ///
 /// When the root or the issuer cannot be created, read or signed.
 pub fn demo_device_ca(now: SystemTime) -> Result<DemoDeviceCa> {
+    demo_device_ca_in(&target_dir()?.join("demo-device-ca"), now)
+}
+
+/// [`demo_device_ca`] kept in `dir`.
+///
+/// Test processes run side by side, so the root and the issuer are created
+/// under an exclusive lock on a file beside `dir`, which the first process to
+/// arrive holds while it writes them and the rest then find written.
+fn demo_device_ca_in(dir: &Path, now: SystemTime) -> Result<DemoDeviceCa> {
     use connetto_core::device_cert::DeviceIssuer;
     use connetto_core::device_cert::layout::{ISSUER_CERTIFICATE, ISSUER_KEY, ROOT_CERTIFICATE};
     use connetto_server::device_cert::DeviceCertConfig;
 
-    let dir = target_dir()?.join("demo-device-ca");
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent).context("creating the demo CA's parent directory")?;
+    }
+    let lock_path = dir.with_extension("lock");
+    let lock =
+        fs::File::create(&lock_path).with_context(|| format!("opening {}", lock_path.display()))?;
+    lock.lock()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+
     let root = dir.join(ROOT_CERTIFICATE);
     let issuer = dir.join("issuer");
     if !root.exists() {
-        fs::create_dir_all(&dir).context("creating the demo CA directory")?;
-        connetto_ca::init(&dir, DEMO_CA_PASSPHRASE, now).context("creating the demo root")?;
+        fs::create_dir_all(dir).context("creating the demo CA directory")?;
+        connetto_ca::init(dir, DEMO_CA_PASSPHRASE, now).context("creating the demo root")?;
     }
     let current = || -> Result<bool> {
         let read =
@@ -319,7 +336,7 @@ pub fn demo_device_ca(now: SystemTime) -> Result<DemoDeviceCa> {
             fs::remove_dir_all(&issuer).context("removing the expiring demo issuer")?;
         }
         fs::create_dir_all(&issuer).context("creating the demo issuer directory")?;
-        connetto_ca::sign_issuer(&dir, DEMO_CA_PASSPHRASE, &issuer, now)
+        connetto_ca::sign_issuer(dir, DEMO_CA_PASSPHRASE, &issuer, now)
             .context("signing the demo issuer")?;
     }
     Ok(DemoDeviceCa { root, issuer })
@@ -707,7 +724,9 @@ pub fn now_millis() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ISSUER_VAR, OPENFGA_URL_VAR, POSTGRES_URL_VAR, RunningServices, TempDir};
+    use super::{
+        ISSUER_VAR, OPENFGA_URL_VAR, POSTGRES_URL_VAR, RunningServices, TempDir, demo_device_ca_in,
+    };
 
     fn lookup(set: &[&str]) -> impl Fn(&str) -> Option<String> {
         let set: Vec<String> = set.iter().map(|name| (*name).to_owned()).collect();
@@ -761,5 +780,30 @@ mod tests {
                 "{set:?} was accepted"
             );
         }
+    }
+
+    /// Test processes run side by side, so several reach the demo CA before
+    /// any has created it, and each must get the one root they all share.
+    #[tokio::test]
+    async fn processes_reaching_the_demo_ca_at_once_share_one_root() {
+        let scratch = TempDir::create("demo-ca-race").await.unwrap();
+        let dir = scratch.path.join("demo-device-ca");
+        let now = std::time::SystemTime::now();
+        let start = std::sync::Barrier::new(8);
+        let roots: Vec<Vec<u8>> = std::thread::scope(|scope| {
+            let racers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        demo_device_ca_in(&dir, now).map(|ca| std::fs::read(ca.root).unwrap())
+                    })
+                })
+                .collect();
+            racers
+                .into_iter()
+                .map(|racer| racer.join().unwrap().expect("every racer gets the CA"))
+                .collect()
+        });
+        assert!(roots.windows(2).all(|pair| pair[0] == pair[1]), "one root");
     }
 }
