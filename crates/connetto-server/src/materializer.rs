@@ -62,10 +62,9 @@ use subql::reexec::{
 };
 use subql::{
     AggValue, AggregateBootstrap, AggregateResultValue, AggregateValueChange, AggregateValueUpdate,
-    AsyncSubscriptionDispatch, Checkpoint, ColumnId, DatabaseLike, DefaultIds,
-    MaintenanceTransition, NumericValue, OpaqueCheckpoint, ParserDB, PgChangeEvent,
-    SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableId, TableLike, Tier,
-    catalog_helpers,
+    AsyncSubscriptionDispatch, Checkpoint, DatabaseLike, DefaultIds, MaintenanceTransition,
+    NumericValue, OpaqueCheckpoint, ParserDB, PgChangeEvent, SubscriptionEngine, SubscriptionId,
+    SubscriptionRequest, TableId, TableLike, Tier, catalog_helpers,
 };
 
 use crate::reexec::ReadBudget;
@@ -1817,13 +1816,11 @@ where
         table_id: TableId,
         schema: &TableSchema<String>,
     ) -> Result<(), MaterializerError> {
-        let arity = catalog_helpers::table_arity(&self.catalog, table_id)
-            .map_err(|err| MaterializerError::Catalog(err.to_string()))?;
-        let key = catalog_helpers::primary_key_columns(&self.catalog, table_id)
+        let shape = catalog_helpers::simple_table(&self.catalog, table_id)
             .map_err(|err| MaterializerError::Catalog(err.to_string()))?;
         let uploaded: Vec<usize> = schema.primary_key_columns().collect();
-        let expected: Vec<usize> = key.iter().map(|column| usize::from(*column)).collect();
-        if schema.number_of_columns() != arity || uploaded != expected {
+        let expected: Vec<usize> = shape.inner().primary_key_columns().collect();
+        if schema.number_of_columns() != shape.inner().number_of_columns() || uploaded != expected {
             return Err(MaterializerError::SchemaMismatch(table.to_owned()));
         }
         Ok(())
@@ -2361,19 +2358,14 @@ fn catalog_columns(catalog: &ParserDB, select: &Select) -> Option<Vec<SelectItem
     };
     let ident = name.0.last()?.as_ident()?;
     let table_id = catalog_helpers::table_id::<Postgres, _>(catalog, &ident.value)?;
-    let arity = catalog_helpers::table_arity(catalog, table_id).ok()?;
-    let names = (0..arity)
-        .map(|ordinal| {
-            let Ok(column) = ColumnId::try_from(ordinal) else {
-                return None;
-            };
-            catalog_helpers::column_name(catalog, table_id, column)
-        })
-        .collect::<Option<Vec<_>>>()?;
+    let shape = catalog_helpers::simple_table(catalog, table_id).ok()?;
     Some(
-        names
-            .into_iter()
-            .map(|name| SelectItem::UnnamedExpr(Expr::Identifier(Ident::with_quote('"', name))))
+        shape
+            .column_names()
+            .iter()
+            .map(|name| {
+                SelectItem::UnnamedExpr(Expr::Identifier(Ident::with_quote('"', name.as_str())))
+            })
             .collect(),
     )
 }
@@ -2534,28 +2526,27 @@ async fn read_current_row_pg(
     .await
 }
 
-/// The catalog's columns of `table_id`, quoted for a `SELECT` list, in
-/// catalog order.
+/// The catalog's columns of `table`, quoted for a `SELECT` list, in catalog
+/// order.
 ///
 /// # Errors
 ///
-/// [`MaterializerError::Catalog`] when the catalog cannot name the table's
-/// columns.
+/// [`MaterializerError::SchemaMismatch`] when the catalog does not know the
+/// table, [`MaterializerError::Catalog`] when the catalog cannot name the
+/// table's columns.
 pub(crate) fn quoted_table_columns<DB: DatabaseLike>(
     catalog: &DB,
-    table_id: TableId,
+    table: &str,
 ) -> Result<Vec<String>, MaterializerError> {
-    let arity = catalog_helpers::table_arity(catalog, table_id)
+    let table_id = catalog_helpers::table_id::<Postgres, _>(catalog, table)
+        .ok_or_else(|| MaterializerError::SchemaMismatch(table.to_owned()))?;
+    let shape = catalog_helpers::simple_table(catalog, table_id)
         .map_err(|err| MaterializerError::Catalog(err.to_string()))?;
-    let mut columns = Vec::with_capacity(arity);
-    for ordinal in 0..arity {
-        let column = ColumnId::try_from(ordinal)
-            .map_err(|err| MaterializerError::Catalog(err.to_string()))?;
-        let name = catalog_helpers::column_name(catalog, table_id, column)
-            .ok_or_else(|| MaterializerError::Catalog(ordinal.to_string()))?;
-        columns.push(quote_ident(&name));
-    }
-    Ok(columns)
+    Ok(shape
+        .column_names()
+        .iter()
+        .map(|name| quote_ident(name.as_str()))
+        .collect())
 }
 
 /// Read the row named by a primary key from Postgres, as a JSON object, the
@@ -2579,9 +2570,7 @@ async fn read_row_by_pk(
     pk_columns: &[String],
     pk_values: &[WireValue],
 ) -> Result<Option<ServerRow>, MaterializerError> {
-    let table_id = catalog_helpers::table_id::<Postgres, _>(catalog, table)
-        .ok_or_else(|| MaterializerError::SchemaMismatch(table.to_owned()))?;
-    let columns = quoted_table_columns(catalog, table_id)?;
+    let columns = quoted_table_columns(catalog, table)?;
     let predicate: Vec<String> = pk_columns
         .iter()
         .enumerate()
@@ -2805,6 +2794,16 @@ mod widen_tests {
         assert_eq!(
             widened("SELECT id FROM docs JOIN pages ON docs.id = pages.id"),
             "SELECT * FROM docs JOIN pages ON docs.id = pages.id"
+        );
+        // A from clause of more than one table names no single entry.
+        assert_eq!(
+            widened("SELECT id FROM docs, pages"),
+            "SELECT * FROM docs, pages"
+        );
+        // A table the select reads through a subquery is not a plain table.
+        assert_eq!(
+            widened("SELECT n FROM (SELECT id AS n FROM docs) d"),
+            "SELECT * FROM (SELECT id AS n FROM docs) d"
         );
     }
 

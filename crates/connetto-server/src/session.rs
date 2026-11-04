@@ -3729,7 +3729,7 @@ where
         // Project the catalog's columns so a column the live table gained
         // under the running server stays out of the move-out read.
         let Ok(columns) =
-            crate::materializer::quoted_table_columns(self.catalog.as_ref(), table_id)
+            crate::materializer::quoted_table_columns(self.catalog.as_ref(), &term_move.table)
         else {
             return false;
         };
@@ -8435,13 +8435,9 @@ where
         let table = connetto_core::quote_ident(&member.table);
         // Project the catalog's columns so a column the live table gained
         // under the running server stays out of the mirror read.
-        let table_id =
-            subql::catalog_helpers::table_id::<Postgres, _>(self.catalog.as_ref(), &member.table)
-                .ok_or_else(|| {
-                SessionError::Snapshot(format!("the catalog does not know table {}", member.table))
-            })?;
-        let columns = crate::materializer::quoted_table_columns(self.catalog.as_ref(), table_id)
-            .map_err(|err| SessionError::Snapshot(err.to_string()))?;
+        let columns =
+            crate::materializer::quoted_table_columns(self.catalog.as_ref(), &member.table)
+                .map_err(|err| SessionError::Snapshot(err.to_string()))?;
         let predicate = mirror_predicate(
             member,
             identity_function.as_deref(),

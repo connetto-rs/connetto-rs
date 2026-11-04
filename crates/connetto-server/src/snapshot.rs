@@ -614,10 +614,8 @@ mod pg {
             let Some(filter) = filter else {
                 return Ok(None);
             };
-            let columns = match crate::materializer::quoted_table_columns(&self.catalog, table_id) {
-                Ok(columns) if !columns.is_empty() => columns,
-                _ => return Ok(None),
-            };
+            let columns = crate::materializer::quoted_table_columns(&self.catalog, table)
+                .map_err(|err| SnapshotError::Backend(err.to_string()))?;
             // Raw SQL for the same reason the read filter is: the table and its
             // columns come from the deployment's runtime DDL, so no `table!`
             // schema names them.
