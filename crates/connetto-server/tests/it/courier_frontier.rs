@@ -41,15 +41,15 @@ use connetto_core::messages::{
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
-use connetto_server::ban::{Ban, BanFuture, BanStore, NewBan};
+use connetto_server::ban::{Ban, BanError, BanFuture, BanStore, NewBan};
 use connetto_server::courier::CourierEntry;
 use connetto_server::defaults::{_connetto_settled, _connetto_writers};
 use connetto_server::device_cert::{DeviceEnrolment, Enrolment, EnrolmentStore};
 use connetto_server::writer_schema::{SettlePath, SettledOutcome};
 use connetto_server::{
-    AbuseConfig, ManagerBuilder, Materializer, NoConnector, PageSpec, RequestGuard, SessionConfig,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, ThrottleConfig,
-    pg_write_target,
+    AbuseConfig, FailedAuthorization, ManagerBuilder, Materializer, NoConnector, PageSpec,
+    RequestGuard, SessionConfig, SessionError, SessionManager, SnapshotEstimate, SnapshotPage,
+    SnapshotSource, ThrottleConfig, pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::{ExpressionMethods, OptionalExtension as _, QueryDsl, SelectableHelper};
@@ -58,6 +58,8 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use parking_lot::Mutex;
 use rcgen::{KeyPair, PublicKeyData as _, SigningKey as _};
 use sha2::{Digest as _, Sha256};
+use subql::backend::{Postgres as PgBackend, Value};
+use subql::visibility::{RowView, RowWrite, Verdict as PolicyVerdict, VisibilityPolicy};
 
 /// The handshake authority every test manager takes.
 fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
@@ -437,21 +439,41 @@ async fn settled_count(pool: &Pool<AsyncPgConnection>) -> i64 {
         .expect("count the settled rows")
 }
 
+/// The roster every test grants, the two accounts the tests sign in as.
+fn roster() -> RosterAuth {
+    RosterAuth::granting("alice")
+        .and("bob")
+        .withholding(WITHHELD_ID)
+}
+
 fn writing_manager(
     pool: &Pool<AsyncPgConnection>,
     guard: Arc<RequestGuard<String>>,
     enrolment: Option<DeviceEnrolment<String>>,
     session: SessionConfig,
 ) -> Manager {
+    manager_over(pool, guard, enrolment, session, roster())
+}
+
+/// A manager asking `auth` whether each write may land.
+fn manager_over<A>(
+    pool: &Pool<AsyncPgConnection>,
+    guard: Arc<RequestGuard<String>>,
+    enrolment: Option<DeviceEnrolment<String>>,
+    session: SessionConfig,
+    auth: A,
+) -> Arc<SessionManager<NoSnapshot, A, ConnettoDefaults>>
+where
+    A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
+    A::Error: core::fmt::Display + FailedAuthorization,
+{
     let manager = ManagerBuilder::new(
         Materializer::builder(PG_DDL)
             .with_write_catalog(writable_catalog())
             .build()
             .expect("build materializer"),
         NoSnapshot,
-        RosterAuth::granting("alice")
-            .and("bob")
-            .withholding(WITHHELD_ID),
+        auth,
         test_verifier(),
         NoConnector,
         pg_write_target::<ConnettoDefaults>(pool.clone(), PG_DDL).expect("build write target"),
@@ -584,19 +606,25 @@ async fn seed_direct_refusal(pool: &Pool<AsyncPgConnection>, writer: i64, head: 
         .expect("frontier");
 }
 
-/// A ban list refusing one account.
-struct Banning(&'static str);
+/// A ban list that bans one account, or one that cannot be read.
+enum Bans {
+    Refusing(&'static str),
+    Unreachable,
+}
 
-impl BanStore<String> for Banning {
+impl BanStore<String> for Bans {
     fn check<'a>(&'a self, user_id: &'a String) -> BanFuture<'a, Option<Ban>> {
-        let ban = (user_id == self.0).then(|| Ban {
-            session: SessionId::from_uuid(uuid::Uuid::nil()),
-            reason: "test".to_owned(),
-            banned_at: SystemTime::now().into(),
-            expires_at: None,
-            applies: true,
-        });
-        Box::pin(core::future::ready(Ok(ban)))
+        let answer = match self {
+            Self::Refusing(banned) => Ok((user_id == banned).then(|| Ban {
+                session: SessionId::from_uuid(uuid::Uuid::nil()),
+                reason: "test".to_owned(),
+                banned_at: SystemTime::now().into(),
+                expires_at: None,
+                applies: true,
+            })),
+            Self::Unreachable => Err(BanError::new("the ban table is unreachable")),
+        };
+        Box::pin(core::future::ready(answer))
     }
 
     fn impose(&self, _ban: NewBan<String>) -> BanFuture<'_, ()> {
@@ -605,6 +633,53 @@ impl BanStore<String> for Banning {
 
     fn lift<'a>(&'a self, _user_id: &'a String) -> BanFuture<'a, bool> {
         Box::pin(core::future::ready(Ok(false)))
+    }
+}
+
+/// The note id whose insert the [`Faulting`] policy cannot judge.
+const FAULTED: i64 = 900;
+
+/// The suite's roster, except that whether the note [`FAULTED`] may be
+/// inserted it cannot answer, as a policy store that stopped answering.
+struct Faulting(RosterAuth);
+
+impl VisibilityPolicy for Faulting {
+    type Watcher = Arc<Principal>;
+    type Error = std::io::Error;
+    type Backend = PgBackend;
+
+    async fn may_see<R>(
+        &self,
+        row: &R,
+        watchers: &[Self::Watcher],
+        verdicts: &mut [PolicyVerdict],
+    ) -> Result<(), Self::Error>
+    where
+        R: RowView<Backend = PgBackend> + Sync + ?Sized,
+    {
+        match self.0.may_see(row, watchers, verdicts).await {
+            Ok(()) => Ok(()),
+            Err(never) => match never {},
+        }
+    }
+
+    async fn may_write<R>(
+        &self,
+        write: RowWrite<'_, R>,
+        watcher: &Self::Watcher,
+    ) -> Result<PolicyVerdict, Self::Error>
+    where
+        R: RowView<Backend = PgBackend> + Sync + ?Sized,
+    {
+        if let RowWrite::Insert { new } = &write
+            && matches!(new.value_at(0), Ok(Value::Int(FAULTED)))
+        {
+            return Err(std::io::Error::other("the policy store did not answer"));
+        }
+        match self.0.may_write(write, watcher).await {
+            Ok(verdict) => Ok(verdict),
+            Err(never) => match never {},
+        }
     }
 }
 
@@ -1034,7 +1109,7 @@ async fn a_banned_authors_range_is_refused_unsettled() {
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let guard = Arc::new(
         RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
-            .with_bans(Arc::new(Banning("alice"))),
+            .with_bans(Arc::new(Bans::Refusing("alice"))),
     );
     let manager = writing_manager(
         fixture.admin(),
@@ -1791,8 +1866,7 @@ async fn concurrent_courier_restores_reserve_the_original_before_applying() {
             for (key, id) in authors {
                 let manager = Arc::clone(&manager);
                 let signed = offer(&key, id, restored.newest());
-                let rows = restored.rows.clone();
-                let bodies = restored.bodies.clone();
+                let restored = Arc::clone(&restored);
                 jobs.push(tokio::spawn(async move {
                     let delivery = tokio::time::timeout(
                         Duration::from_secs(30),
@@ -1800,8 +1874,8 @@ async fn concurrent_courier_restores_reserve_the_original_before_applying() {
                             KeyId::from_bytes(id),
                             Some(major()),
                             &signed,
-                            &rows,
-                            &bodies,
+                            &restored.rows,
+                            &restored.bodies,
                         ),
                     )
                     .await
@@ -1844,4 +1918,318 @@ async fn concurrent_courier_restores_reserve_the_original_before_applying() {
         "the losing restore audits its original replay"
     );
     assert_eq!(events[0].op, AuthOp::WriteRedelivered);
+}
+
+/// A row the policy cannot judge settles nothing and is answered `Retry`,
+/// nothing past it settles, and the range offered again once the policy
+/// answers settles from that row on, the earlier rows answered from their
+/// records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_that_settles_nothing_is_offered_again_from_it() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, guard) = audited_guard();
+    let faulting = manager_over(
+        fixture.admin(),
+        Arc::clone(&guard),
+        Some(store.installable()),
+        SessionConfig::default(),
+        Faulting(roster()),
+    );
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(FAULTED, "faulted", "t2")),
+        plain(insert_changeset(4, "four", "t3")),
+    ]);
+    let answer = faulting
+        .courier_deliver(
+            KeyId::from_bytes(key_id),
+            Some(major()),
+            &offer(&key, key_id, range.newest()),
+            &range.rows,
+            &range.bodies,
+        )
+        .await
+        .expect("deliver the range");
+    assert_eq!(
+        entries(answer),
+        vec![
+            applied(1),
+            (2, CourierEntryOutcome::Retry { retry_after_ms: 0 })
+        ]
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    assert_eq!(writer_facts(fixture.admin(), writer).await.frontier, 1);
+    assert_eq!(settled_rows(fixture.admin(), writer).await.len(), 1);
+
+    let answering = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(store.installable()),
+        SessionConfig::default(),
+    );
+    assert_eq!(
+        entries(deliver(&answering, &key, key_id, &range, 1).await),
+        vec![applied(1), applied(2), applied(3)]
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "two", "t1"),
+            note(4, "four", "t3"),
+            note(900, "faulted", "t2"),
+        ]
+    );
+}
+
+/// A sequence another path settled under a different entry after the range
+/// read the writer's frontier answers refused `Forked`, audited as a fork,
+/// and the range stops there, since the rest of it no longer continues the
+/// server's chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_range_stops_at_a_sequence_settled_under_another_entry() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (captured, manager) = courier_manager(&fixture, &store);
+    settle_directly(&manager, "alice", &key, key_id, Vec::new()).await;
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    // The record the other path's transaction left, its frontier not yet
+    // read by the range.
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    diesel::insert_into(_connetto_settled::table)
+        .values((
+            _connetto_settled::writer.eq(writer),
+            _connetto_settled::seq.eq(1_i64),
+            _connetto_settled::entry_hash.eq([7_u8; 32].as_slice()),
+            _connetto_settled::previous_hash.eq(GENESIS),
+            _connetto_settled::outcome.eq(SettledOutcome::Applied.json()),
+            _connetto_settled::path.eq(SettlePath::Direct),
+        ))
+        .execute(&mut *conn)
+        .await
+        .expect("the other entry's record");
+
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+    ]);
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![ruled(
+            1,
+            Verdict::Refused(RetractCause::Rejected(MutationRejectReason::Forked))
+        )]
+    );
+    let events = captured.write_events();
+    let [event] = events.as_slice() else {
+        panic!("the fork audits once, got {}", events.len());
+    };
+    assert_eq!(event.op, AuthOp::WriteForked);
+    assert_eq!(event.seq, Some(1));
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+    assert_eq!(settled_rows(fixture.admin(), writer).await.len(), 1);
+}
+
+/// A settled record holding no outcome the table defines fails the range
+/// rather than answering the row settled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_settled_record_fails_the_range() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+    ]);
+    settle_directly(
+        &manager,
+        "alice",
+        &key,
+        key_id,
+        vec![range.bodies[0].changeset.clone()],
+    )
+    .await;
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    diesel::update(_connetto_settled::table)
+        .set(_connetto_settled::outcome.eq(r#""bogus""#))
+        .execute(&mut *conn)
+        .await
+        .expect("spoil the record");
+
+    let error = manager
+        .courier_deliver(
+            KeyId::from_bytes(key_id),
+            Some(major()),
+            &offer(&key, key_id, range.newest()),
+            &range.rows,
+            &range.bodies,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, SessionError::Protocol(_)),
+        "an unreadable record is a protocol failure, got {error:?}"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "nothing past the record settles"
+    );
+}
+
+/// A ban list that cannot be read fails the range closed, so an outage
+/// never lets a banned author's writes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_ban_list_fails_the_range_closed() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let guard = Arc::new(
+        RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
+            .with_bans(Arc::new(Bans::Unreachable)),
+    );
+    let manager = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(store.installable()),
+        SessionConfig::default(),
+    );
+
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    let error = manager
+        .courier_deliver(
+            KeyId::from_bytes(key_id),
+            Some(major()),
+            &offer(&key, key_id, range.newest()),
+            &range.rows,
+            &range.bodies,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SessionError::BanList(_)), "got {error:?}");
+    assert_eq!(settled_count(fixture.admin()).await, 0, "nothing settled");
+    assert_eq!(writer_row(fixture.admin(), key_id).await, None);
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+}
+
+/// Writer tables that fail a read fail the range rather than reading as an
+/// author with no writer row or no records, which would apply its entries
+/// again from the start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_writer_table_failure_fails_the_range() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+    ]);
+    settle_directly(
+        &manager,
+        "alice",
+        &key,
+        key_id,
+        vec![range.bodies[0].changeset.clone()],
+    )
+    .await;
+    let attempt = async || {
+        manager
+            .courier_deliver(
+                KeyId::from_bytes(key_id),
+                Some(major()),
+                &offer(&key, key_id, range.newest()),
+                &range.rows,
+                &range.bodies,
+            )
+            .await
+            .unwrap_err()
+    };
+
+    // The settled prefix's records cannot be read.
+    fixture
+        .setup(&["DROP TABLE _connetto_settled CASCADE"])
+        .await;
+    let error = attempt().await;
+    assert!(
+        matches!(error, SessionError::WriteTarget(_)),
+        "got {error:?}"
+    );
+
+    // The writer row cannot be read.
+    fixture
+        .setup(&["DROP TABLE _connetto_writers CASCADE"])
+        .await;
+    let error = attempt().await;
+    assert!(
+        matches!(error, SessionError::WriteTarget(_)),
+        "got {error:?}"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")]
+    );
+}
+
+/// The writer row a range creates for an author that never bound fails the
+/// range when its insert fails or the row does not stand after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_writer_row_that_will_not_stand_fails_the_range() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    let attempt = async || {
+        manager
+            .courier_deliver(
+                KeyId::from_bytes(key_id),
+                Some(major()),
+                &offer(&key, key_id, range.newest()),
+                &range.rows,
+                &range.bodies,
+            )
+            .await
+            .unwrap_err()
+    };
+
+    // The insert reports success and leaves no row.
+    fixture
+        .setup(&[
+            "CREATE OR REPLACE FUNCTION drop_writer_rows() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$",
+            "CREATE TRIGGER drop_writer_rows BEFORE INSERT ON _connetto_writers \
+             FOR EACH ROW EXECUTE FUNCTION drop_writer_rows()",
+        ])
+        .await;
+    let error = attempt().await;
+    assert!(matches!(error, SessionError::Protocol(_)), "got {error:?}");
+
+    // The insert fails.
+    fixture
+        .setup(&[
+            "CREATE OR REPLACE FUNCTION drop_writer_rows() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'no writer rows'; END $$",
+        ])
+        .await;
+    let error = attempt().await;
+    assert!(
+        matches!(error, SessionError::WriteTarget(_)),
+        "got {error:?}"
+    );
+    assert_eq!(settled_count(fixture.admin()).await, 0, "nothing settled");
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+    fixture
+        .setup(&["DROP FUNCTION drop_writer_rows() CASCADE"])
+        .await;
 }
