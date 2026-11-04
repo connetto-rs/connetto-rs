@@ -172,8 +172,8 @@ pub trait ConnettoStoreSchema: Send + Sync + 'static {
         keep: Option<SessionId>,
     ) -> Statement<'_, Vec<SessionId>>;
 
-    /// The `revoked` flag of a session whose absolute deadline has not passed
-    /// by the database's clock, absent when the id names no such row.
+    /// The `revoked` flag of a session whose idle and absolute deadlines have
+    /// not passed by the database's clock, absent when the id names no such row.
     fn live_session(
         conn: &mut AsyncPgConnection,
         session_id: SessionId,
@@ -587,6 +587,7 @@ macro_rules! connetto_auth_tables {
                 session_id: $crate::SessionId,
             ) -> $crate::authn::schema::Statement<'_, Option<bool>> {
                 Box::pin(async move {
+                    use diesel::BoolExpressionMethods as _;
                     use diesel::ExpressionMethods as _;
                     use diesel::OptionalExtension as _;
                     // Qualified calls, so a caller's own named diesel imports
@@ -598,7 +599,12 @@ macro_rules! connetto_auth_tables {
                                     connetto_sessions::table,
                                     connetto_sessions::session_id.eq(session_id),
                                 ),
-                                connetto_sessions::absolute_deadline.ge($crate::db_clock::now()),
+                                connetto_sessions::idle_deadline
+                                    .ge($crate::db_clock::now())
+                                    .and(
+                                        connetto_sessions::absolute_deadline
+                                            .ge($crate::db_clock::now()),
+                                    ),
                             ),
                             connetto_sessions::revoked,
                         ),

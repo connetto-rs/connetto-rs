@@ -233,9 +233,9 @@ pub trait AuthStore: Send + Sync {
         keep: Option<SessionId>,
     ) -> impl Future<Output = Result<Vec<SessionId>, AuthStoreError>> + Send;
 
-    /// Whether the session still exists, is not revoked, and is within its
-    /// absolute ceiling. This is the handshake liveness check that makes
-    /// revocation authoritative.
+    /// Whether the session still exists, is not revoked, and is within both
+    /// its idle window and its absolute ceiling. This is the handshake
+    /// liveness check that makes revocation authoritative.
     fn session_is_live(
         &self,
         session_id: SessionId,
@@ -565,7 +565,7 @@ impl<
         let sessions = self.sessions.lock().expect("auth store lock");
         Ok(sessions
             .get(&session_id)
-            .is_some_and(|record| !record.revoked && now <= record.absolute_deadline))
+            .is_some_and(|record| record.live_at(now)))
     }
 
     #[expect(
