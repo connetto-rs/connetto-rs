@@ -4414,8 +4414,22 @@ where
         let Some(source) = self.withdrawal_source.get() else {
             return false;
         };
+        let Some(table_id) = subql::catalog_helpers::table_id::<Postgres, _>(
+            self.catalog.as_ref(),
+            &term_move.table,
+        ) else {
+            return false;
+        };
+        // Project the catalog's columns so a column the live table gained
+        // under the running server stays out of the move-out read.
+        let Ok(columns) =
+            crate::materializer::quoted_table_columns(self.catalog.as_ref(), table_id)
+        else {
+            return false;
+        };
         let base = format!(
-            "SELECT * FROM {}",
+            "SELECT {} FROM {}",
+            columns.join(", "),
             connetto_core::quote_ident(&term_move.table)
         );
         let Some(sql) = narrowed_sql(&base, &term_move.pairs) else {
@@ -4425,12 +4439,6 @@ where
             return false;
         };
         let Ok(ParsedDiffSet::Patchset(set)) = ParsedDiffSet::parse(&snapshot.patchset) else {
-            return false;
-        };
-        let Some(table_id) = subql::catalog_helpers::table_id::<Postgres, _>(
-            self.catalog.as_ref(),
-            &term_move.table,
-        ) else {
             return false;
         };
         let mut deletes = PatchSet::<TableSchema<String>, String, Vec<u8>>::new();
@@ -9791,6 +9799,15 @@ where
             )
         };
         let table = connetto_core::quote_ident(&member.table);
+        // Project the catalog's columns so a column the live table gained
+        // under the running server stays out of the mirror read.
+        let table_id =
+            subql::catalog_helpers::table_id::<Postgres, _>(self.catalog.as_ref(), &member.table)
+                .ok_or_else(|| {
+                SessionError::Snapshot(format!("the catalog does not know table {}", member.table))
+            })?;
+        let columns = crate::materializer::quoted_table_columns(self.catalog.as_ref(), table_id)
+            .map_err(|err| SessionError::Snapshot(err.to_string()))?;
         let predicate = mirror_predicate(
             member,
             identity_function.as_deref(),
@@ -9807,7 +9824,10 @@ where
                     .to_owned(),
             })
         })?;
-        let query = format!("SELECT * FROM {table} WHERE {predicate}");
+        let query = format!(
+            "SELECT {} FROM {table} WHERE {predicate}",
+            columns.join(", ")
+        );
         let hidden = Subscribe {
             sub_id: label.clone(),
             spec: SubscriptionSpec::new(query),
