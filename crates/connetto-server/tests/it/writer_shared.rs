@@ -15,7 +15,7 @@ use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use rcgen::{KeyPair, PublicKeyData as _};
-use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
+use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, Insert, SimpleTable, Update, Value};
 
 use super::enrolment::{device_key, rooted_issuer};
 
@@ -87,6 +87,34 @@ pub(super) fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> 
         .expect("set edited_at");
     ChangeSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(insert)
+        .build()
+}
+
+/// A changeset that updates one row, carrying the old image (the version basis).
+pub(super) fn update_changeset(
+    id: i64,
+    old_body: &str,
+    new_body: &str,
+    old_edited_at: &str,
+    new_edited_at: &str,
+) -> Vec<u8> {
+    let update = Update::<_, ChangesetFormat, String, Vec<u8>>::from(note_table())
+        .set(0, Value::Integer(id), Value::Integer(id))
+        .expect("set id")
+        .set(
+            1,
+            Value::Text(old_body.to_owned()),
+            Value::Text(new_body.to_owned()),
+        )
+        .expect("set body")
+        .set(
+            2,
+            Value::Text(old_edited_at.to_owned()),
+            Value::Text(new_edited_at.to_owned()),
+        )
+        .expect("set edited_at");
+    ChangeSet::<SimpleTable, String, Vec<u8>>::new()
+        .update(update)
         .build()
 }
 

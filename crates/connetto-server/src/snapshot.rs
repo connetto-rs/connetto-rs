@@ -614,21 +614,8 @@ mod pg {
             let Some(filter) = filter else {
                 return Ok(None);
             };
-            let arity = catalog_helpers::table_arity(&self.catalog, table_id).unwrap_or_default();
-            let mut columns = Vec::with_capacity(arity);
-            for ordinal in 0..arity {
-                let Ok(column) = ColumnId::try_from(ordinal) else {
-                    return Ok(None);
-                };
-                let Some(name) = catalog_helpers::column_name(&self.catalog, table_id, column)
-                else {
-                    return Ok(None);
-                };
-                columns.push(quote_ident(&name));
-            }
-            if columns.is_empty() {
-                return Ok(None);
-            }
+            let columns = crate::materializer::quoted_table_columns(&self.catalog, table)
+                .map_err(|err| SnapshotError::Backend(err.to_string()))?;
             // Raw SQL for the same reason the read filter is: the table and its
             // columns come from the deployment's runtime DDL, so no `table!`
             // schema names them.
