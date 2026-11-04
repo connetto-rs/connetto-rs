@@ -98,17 +98,13 @@ impl PageSession {
     }
 
     /// A session on the first of `urls` whose page attaches through
-    /// [`webkit`](Self::webkit), or [`None`] when none does.
+    /// [`webkit`](Self::webkit) within `bound`, or [`None`] when none does.
     ///
     /// The proxy keeps listing a page after iOS suspended its process, as the
     /// login view of a sign-in that finished, and such a page accepts the
     /// connection and announces nothing, so a page that does not attach is
     /// skipped rather than ending the caller's wait.
-    pub async fn webkit_first(urls: &[String]) -> Option<Self> {
-        Self::webkit_first_within(urls, REPLY_BOUND).await
-    }
-
-    async fn webkit_first_within(urls: &[String], bound: Duration) -> Option<Self> {
+    pub async fn webkit_first(urls: &[String], bound: Duration) -> Option<Self> {
         for url in urls {
             match Self::webkit_within(url, bound).await {
                 Ok(page) => return Some(page),
@@ -862,28 +858,28 @@ mod tests {
     async fn a_listed_page_that_never_announces_itself_is_skipped() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let suspended = format!("ws://{}", listener.local_addr().unwrap());
+        // The two attaches the test makes, held open and silent by the receiver.
+        let (accepted, _held) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((stream, _)) = listener.accept().await {
-                held.push(tokio_tungstenite::accept_async(stream).await.unwrap());
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let _ = accepted.send(tokio_tungstenite::accept_async(stream).await.unwrap());
             }
         });
         let (seen, mut expressions) = tokio::sync::mpsc::unbounded_channel();
         let live = webkit_endpoint(seen).await;
 
-        let mut page = PageSession::webkit_first_within(
-            &[suspended.clone(), live],
-            Duration::from_millis(200),
-        )
-        .await
-        .expect("the live page attaches");
+        let mut page =
+            PageSession::webkit_first(&[suspended.clone(), live], Duration::from_millis(200))
+                .await
+                .expect("the live page attaches");
         page.set_input("user", "second").await.unwrap();
         assert!(
             expressions.try_recv().is_ok(),
             "the session reached the live page"
         );
 
-        let none = PageSession::webkit_first_within(&[suspended], Duration::from_millis(200)).await;
+        let none = PageSession::webkit_first(&[suspended], Duration::from_millis(200)).await;
         assert!(none.is_none(), "no listed page attached");
     }
 }

@@ -68,7 +68,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_client::BluetoothState;
 use connetto_test_harness::android_phone;
 use connetto_test_harness::demo::{order_count, wait_for_count};
-use connetto_test_harness::inspector::{PageSession, list_pages};
+use connetto_test_harness::inspector::{PageSession, REPLY_BOUND, list_pages};
 use connetto_test_harness::ios_signing;
 use connetto_test_harness::leg::LegClient;
 use connetto_test_harness::leg_wire::parse_default_gateway;
@@ -2720,7 +2720,7 @@ impl Inspector {
     /// A session on a page whose URL `wanted` accepts, if one listed now attaches.
     async fn try_page(&mut self, wanted: impl Fn(&str) -> bool) -> Option<PageSession> {
         let urls = self.find(&wanted).await;
-        let page = PageSession::webkit_first(&urls).await;
+        let page = PageSession::webkit_first(&urls, REPLY_BOUND).await;
         if page.is_some() {
             self.restart_at = Instant::now() + PROXY_RESTART;
         } else if !urls.is_empty() {
