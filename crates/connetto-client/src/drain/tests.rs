@@ -209,6 +209,7 @@ pub(crate) fn ack(grant: Option<WriterGrant>) -> ControlMessage {
         current_cursor: Cursor::new(Vec::new()),
         schema_version: Some(old_version()),
         sunset_at_secs: None,
+        courier: false,
         initial_credits: 64,
         writer: grant,
     })

@@ -3400,6 +3400,7 @@ where
                     // the tab's client raises the event from its own ack and
                     // prompts its application to update (R107).
                     sunset_at_secs: state.sunset,
+                    courier: false,
                     initial_credits: INITIAL_CREDITS,
                     writer: Some(WriterGrant {
                         number,
@@ -5937,6 +5938,7 @@ mod tests {
                     current_cursor: Cursor::new(Vec::new()),
                     schema_version: Some(version),
                     sunset_at_secs: None,
+                    courier: false,
                     initial_credits: 64,
                     writer: Some(WriterGrant {
                         number: 7,

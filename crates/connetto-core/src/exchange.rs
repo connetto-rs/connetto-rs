@@ -139,9 +139,13 @@ pub enum Verdict {
 /// Why the server refused a courier range before settling any of it (R78).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CourierRefusal {
+    /// The deployment does not accept courier ranges.
+    Disabled,
+    /// The connection bound no device writer, so it is no certified bearer.
+    Uncertified,
     /// The offer does not decode, the rows exceed [`MAX_MANIFEST_ROWS`],
-    /// skip a sequence or run past the offer's newest, or a body names no
-    /// row, arrives out of order or disagrees with its row's digest.
+    /// start at sequence 0, skip or repeat a sequence or run past the offer's
+    /// newest, or the range declares more bodies than rows.
     Malformed,
     /// The author's enrolment is absent, revoked, or past its certificate's
     /// expiry plus `DEVICE_SKEW`.

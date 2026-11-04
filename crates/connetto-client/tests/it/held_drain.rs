@@ -140,6 +140,7 @@ fn ack(version: SchemaVersion, grant: Option<WriterGrant>) -> ControlMessage {
         current_cursor: Cursor::new(Vec::new()),
         schema_version: Some(version),
         sunset_at_secs: None,
+        courier: false,
         initial_credits: 64,
         writer: grant,
     })

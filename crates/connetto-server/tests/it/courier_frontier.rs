@@ -68,7 +68,7 @@ fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
 
 /// No subscriptions are made in these tests, so the snapshot source is never
 /// invoked.
-struct NoSnapshot;
+pub(super) struct NoSnapshot;
 
 impl SnapshotSource for NoSnapshot {
     type Error = Infallible;
@@ -125,13 +125,13 @@ diesel::table! {
 #[derive(diesel::Queryable, diesel::Selectable, Debug, PartialEq)]
 #[diesel(table_name = notes)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
-struct Note {
+pub(super) struct Note {
     id: i32,
     body: String,
     edited_at: String,
 }
 
-fn note(id: i32, body: &str, edited_at: &str) -> Note {
+pub(super) fn note(id: i32, body: &str, edited_at: &str) -> Note {
     Note {
         id,
         body: body.to_owned(),
@@ -140,7 +140,7 @@ fn note(id: i32, body: &str, edited_at: &str) -> Note {
 }
 
 /// The `notes` rows, read through the admin pool.
-async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
+pub(super) async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
     let mut conn = pool.get().await.expect("admin connection");
     notes::table
         .order(notes::id)
@@ -151,14 +151,14 @@ async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
 }
 
 /// The writer's account, frontier, head and retirement state, read as admin.
-struct WriterFacts {
+pub(super) struct WriterFacts {
     user: Option<String>,
     frontier: i64,
     head: Option<Vec<u8>>,
     retired: bool,
 }
 
-async fn writer_facts(pool: &Pool<AsyncPgConnection>, writer: i64) -> WriterFacts {
+pub(super) async fn writer_facts(pool: &Pool<AsyncPgConnection>, writer: i64) -> WriterFacts {
     let mut conn = pool.get().await.expect("admin connection");
     let (user, frontier, head, retired) = _connetto_writers::table
         .filter(_connetto_writers::writer.eq(writer))
@@ -180,14 +180,14 @@ async fn writer_facts(pool: &Pool<AsyncPgConnection>, writer: i64) -> WriterFact
 }
 
 /// One settled entry, read as admin, ordered by sequence.
-struct SettledFacts {
+pub(super) struct SettledFacts {
     seq: i64,
     entry_hash: Vec<u8>,
     outcome: String,
     path: SettlePath,
 }
 
-async fn settled_rows(pool: &Pool<AsyncPgConnection>, writer: i64) -> Vec<SettledFacts> {
+pub(super) async fn settled_rows(pool: &Pool<AsyncPgConnection>, writer: i64) -> Vec<SettledFacts> {
     let mut conn = pool.get().await.expect("admin connection");
     _connetto_settled::table
         .filter(_connetto_settled::writer.eq(writer))
@@ -213,7 +213,7 @@ async fn settled_rows(pool: &Pool<AsyncPgConnection>, writer: i64) -> Vec<Settle
 
 /// Collects the audit events the guard emits, in order.
 #[derive(Default)]
-struct Captured(Arc<Mutex<Vec<AuthEvent<String>>>>);
+pub(super) struct Captured(Arc<Mutex<Vec<AuthEvent<String>>>>);
 
 impl Captured {
     /// A fresh sink with its audit hook.
@@ -236,7 +236,7 @@ impl Captured {
 }
 
 /// The manager every test drives.
-type Manager = Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>>;
+pub(super) type Manager = Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>>;
 
 impl Enrolments {
     /// Renew the same key with a certificate that stands until `expires_at`.
@@ -260,24 +260,24 @@ impl Enrolments {
 }
 
 /// The ECDSA P-256 SHA-256 signature of `key` over `message`.
-fn sign(key: &KeyPair, message: &[u8]) -> Vec<u8> {
+pub(super) fn sign(key: &KeyPair, message: &[u8]) -> Vec<u8> {
     key.sign(message).expect("sign the message").clone()
 }
 
 /// The schema major every test range and connection declares.
-fn major() -> Major {
+pub(super) fn major() -> Major {
     Major::new(1).expect("a positive major")
 }
 
 /// One entry of an author's chain, its changeset and the original it was
 /// first written under.
-struct Link {
+pub(super) struct Link {
     changeset: Vec<u8>,
     origin: Option<Origin>,
 }
 
 /// An entry the author's writer started itself.
-fn plain(changeset: Vec<u8>) -> Link {
+pub(super) fn plain(changeset: Vec<u8>) -> Link {
     Link {
         changeset,
         origin: None,
@@ -302,12 +302,12 @@ fn device_origin(key: [u8; 32], seq: u64) -> Origin {
 
 /// An author's chain from genesis, one manifest row and one body per link
 /// from sequence 1, every entry captured under [`major`].
-struct Chain {
-    rows: Vec<ManifestRow>,
-    bodies: Vec<CourierEntry>,
+pub(super) struct Chain {
+    pub(super) rows: Vec<ManifestRow>,
+    pub(super) bodies: Vec<CourierEntry>,
 }
 
-fn chain(links: Vec<Link>) -> Chain {
+pub(super) fn chain(links: Vec<Link>) -> Chain {
     let mut rows = Vec::with_capacity(links.len());
     let mut bodies = Vec::with_capacity(links.len());
     for (seq, link) in (1..).zip(links) {
@@ -327,7 +327,7 @@ fn chain(links: Vec<Link>) -> Chain {
 
 impl Chain {
     /// The chain's hash at `seq`.
-    fn head(&self, seq: u64) -> [u8; 32] {
+    pub(super) fn head(&self, seq: u64) -> [u8; 32] {
         chain_walk(
             &GENESIS,
             self.rows
@@ -338,7 +338,7 @@ impl Chain {
     }
 
     /// The chain's newest frontier.
-    fn newest(&self) -> Frontier {
+    pub(super) fn newest(&self) -> Frontier {
         let seq = self.rows.last().map_or(0, |row| row.seq);
         Frontier {
             seq,
@@ -367,7 +367,7 @@ impl Chain {
 
 /// The offer naming `newest` that `key` signs, encoded as the exchange
 /// stores it.
-fn offer(key: &KeyPair, key_id: [u8; 32], newest: Frontier) -> Vec<u8> {
+pub(super) fn offer(key: &KeyPair, key_id: [u8; 32], newest: Frontier) -> Vec<u8> {
     let offer = Offer {
         builds: Vec::new(),
         settled: None,
@@ -400,17 +400,17 @@ async fn deliver(
 }
 
 /// The answer of a row the range settled or found settled under `verdict`.
-fn ruled(seq: u64, verdict: Verdict) -> (u64, CourierEntryOutcome) {
+pub(super) fn ruled(seq: u64, verdict: Verdict) -> (u64, CourierEntryOutcome) {
     (seq, CourierEntryOutcome::Ruled(verdict))
 }
 
 /// The answer of a row that stands applied.
-fn applied(seq: u64) -> (u64, CourierEntryOutcome) {
+pub(super) fn applied(seq: u64) -> (u64, CourierEntryOutcome) {
     ruled(seq, Verdict::Applied)
 }
 
 /// The rows the range answered, failing the test on a refusal.
-fn entries(outcome: CourierOutcome) -> Vec<(u64, CourierEntryOutcome)> {
+pub(super) fn entries(outcome: CourierOutcome) -> Vec<(u64, CourierEntryOutcome)> {
     match outcome {
         CourierOutcome::Entries(entries) => entries,
         CourierOutcome::Refused(refusal) => panic!("expected answered rows, got {refusal:?}"),
@@ -418,7 +418,7 @@ fn entries(outcome: CourierOutcome) -> Vec<(u64, CourierEntryOutcome)> {
 }
 
 /// The writer row of `key_id`, `None` when the key holds none.
-async fn writer_row(pool: &Pool<AsyncPgConnection>, key_id: [u8; 32]) -> Option<i64> {
+pub(super) async fn writer_row(pool: &Pool<AsyncPgConnection>, key_id: [u8; 32]) -> Option<i64> {
     let mut conn = pool.get().await.expect("admin connection");
     _connetto_writers::table
         .filter(_connetto_writers::device_key.eq(key_id.to_vec()))
@@ -430,7 +430,7 @@ async fn writer_row(pool: &Pool<AsyncPgConnection>, key_id: [u8; 32]) -> Option<
 }
 
 /// How many settled records stand across every writer.
-async fn settled_count(pool: &Pool<AsyncPgConnection>) -> i64 {
+pub(super) async fn settled_count(pool: &Pool<AsyncPgConnection>) -> i64 {
     let mut conn = pool.get().await.expect("admin connection");
     _connetto_settled::table
         .count()
@@ -440,13 +440,13 @@ async fn settled_count(pool: &Pool<AsyncPgConnection>) -> i64 {
 }
 
 /// The roster every test grants, the two accounts the tests sign in as.
-fn roster() -> RosterAuth {
+pub(super) fn roster() -> RosterAuth {
     RosterAuth::granting("alice")
         .and("bob")
         .withholding(WITHHELD_ID)
 }
 
-fn writing_manager(
+pub(super) fn writing_manager(
     pool: &Pool<AsyncPgConnection>,
     guard: Arc<RequestGuard<String>>,
     enrolment: Option<DeviceEnrolment<String>>,
@@ -456,7 +456,7 @@ fn writing_manager(
 }
 
 /// A manager asking `auth` whether each write may land.
-fn manager_over<A>(
+pub(super) fn manager_over<A>(
     pool: &Pool<AsyncPgConnection>,
     guard: Arc<RequestGuard<String>>,
     enrolment: Option<DeviceEnrolment<String>>,
@@ -492,7 +492,7 @@ where
 }
 
 /// A guard auditing into a fresh sink.
-fn audited_guard() -> (Captured, Arc<RequestGuard<String>>) {
+pub(super) fn audited_guard() -> (Captured, Arc<RequestGuard<String>>) {
     let (captured, hook) = Captured::new();
     let guard = Arc::new(RequestGuard::new(
         ThrottleConfig::default(),
@@ -503,7 +503,7 @@ fn audited_guard() -> (Captured, Arc<RequestGuard<String>>) {
 }
 
 /// A manager over a fresh store with an audited guard.
-fn courier_manager(fixture: &Fixture, store: &Enrolments) -> (Captured, Manager) {
+pub(super) fn courier_manager(fixture: &Fixture, store: &Enrolments) -> (Captured, Manager) {
     let (captured, guard) = audited_guard();
     let manager = writing_manager(
         fixture.admin(),
@@ -515,7 +515,7 @@ fn courier_manager(fixture: &Fixture, store: &Enrolments) -> (Captured, Manager)
 }
 
 /// A day from now, a certificate's expiry in most tests.
-fn tomorrow() -> SystemTime {
+pub(super) fn tomorrow() -> SystemTime {
     SystemTime::now() + Duration::from_hours(24)
 }
 
@@ -528,25 +528,29 @@ async fn expect_applied(client: &mut Client, client_seq: u64) {
 }
 
 /// A loopback connection driven as a harness `Client` declaring [`major`].
-fn loopback_client(
-    manager: &Manager,
+pub(super) fn loopback_client<A>(
+    manager: &Arc<SessionManager<NoSnapshot, A, ConnettoDefaults>>,
 ) -> (
     Client,
     tokio::task::JoinHandle<Result<(), connetto_server::SessionError>>,
-) {
+)
+where
+    A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
+    A::Error: core::fmt::Display + FailedAuthorization,
+{
     let (server_transport, client) = connetto_server::loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
     (Client::new(client).declaring(major()), server)
 }
 
 /// The message a device key signs to bind to a connection's challenge.
-fn bind_nonce_message(nonce: &[u8; 32]) -> Vec<u8> {
+pub(super) fn bind_nonce_message(nonce: &[u8; 32]) -> Vec<u8> {
     connetto_core::messages::writer_bind_message(nonce)
 }
 
 /// Bind `key` as `user`'s device writer and upload `changesets` from
 /// sequence 1, each acknowledged applied, then close.
-async fn settle_directly(
+pub(super) async fn settle_directly(
     manager: &Manager,
     user: &str,
     key: &KeyPair,
@@ -637,11 +641,11 @@ impl BanStore<String> for Bans {
 }
 
 /// The note id whose insert the [`Faulting`] policy cannot judge.
-const FAULTED: i64 = 900;
+pub(super) const FAULTED: i64 = 900;
 
 /// The suite's roster, except that whether the note [`FAULTED`] may be
 /// inserted it cannot answer, as a policy store that stopped answering.
-struct Faulting(RosterAuth);
+pub(super) struct Faulting(pub(super) RosterAuth);
 
 impl VisibilityPolicy for Faulting {
     type Watcher = Arc<Principal>;
@@ -810,8 +814,7 @@ async fn a_forged_offer_is_refused_before_anything_settles() {
 
 /// A range that does not hold together is refused malformed before anything
 /// settles: an offer that does not decode, rows that skip a sequence or run
-/// past the offer's newest, and a body that names no row, arrives out of
-/// order or disagrees with its row's digest.
+/// past the offer's newest, and more bodies than rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_malformed_range_is_refused_before_anything_settles() {
     let fixture = Fixture::acquire().await;
@@ -870,37 +873,69 @@ async fn a_malformed_range_is_refused_before_anything_settles() {
             .expect("deliver"),
         "rows past the offer's newest",
     );
-    let stray = vec![CourierEntry {
-        seq: 9,
-        changeset: insert_changeset(9, "nine", "t9"),
-    }];
+    let mut surplus = range.bodies.clone();
+    surplus.push(range.bodies[0].clone());
     refused(
         manager
-            .courier_deliver(author, Some(major()), &signed, &range.rows, &stray)
+            .courier_deliver(author, Some(major()), &signed, &range.rows, &surplus)
             .await
             .expect("deliver"),
-        "a body that names no row",
-    );
-    let reversed = vec![range.bodies[1].clone(), range.bodies[0].clone()];
-    refused(
-        manager
-            .courier_deliver(author, Some(major()), &signed, &range.rows, &reversed)
-            .await
-            .expect("deliver"),
-        "bodies out of order",
-    );
-    let mut swapped = range.bodies.clone();
-    swapped[1].changeset = insert_changeset(3, "swapped", "t2");
-    refused(
-        manager
-            .courier_deliver(author, Some(major()), &signed, &range.rows, &swapped)
-            .await
-            .expect("deliver"),
-        "a body that disagrees with its row's digest",
+        "more bodies than rows",
     );
 
     assert_eq!(settled_count(fixture.admin()).await, 0, "nothing settled");
     assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+}
+
+/// A body that names no row, comes out of order or disagrees with its row's
+/// digest fails the range as the connection it would close, and the entries
+/// settled before it stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_body_fails_the_range_and_what_settled_stands() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+        plain(insert_changeset(4, "four", "t3")),
+    ]);
+    let signed = offer(&key, key_id, range.newest());
+    let author = KeyId::from_bytes(key_id);
+    let stray = vec![CourierEntry {
+        seq: 9,
+        changeset: insert_changeset(9, "nine", "t9"),
+    }];
+    let reversed = vec![range.bodies[1].clone(), range.bodies[0].clone()];
+    let mut swapped = range.bodies.clone();
+    swapped[1].changeset = insert_changeset(3, "swapped", "t2");
+    for (bodies, detail) in [
+        (
+            stray,
+            "a courier body naming sequence 9, no row of the range",
+        ),
+        (reversed, "a courier body for sequence 1 out of order"),
+        (
+            swapped,
+            "a courier body for sequence 2 disagrees with its row's digest",
+        ),
+    ] {
+        let error = manager
+            .courier_deliver(author, Some(major()), &signed, &range.rows, &bodies)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, SessionError::Protocol(told) if told == detail),
+            "got {error:?}"
+        );
+    }
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "the entry settled before the broken body stands"
+    );
 }
 
 /// A range whose rows above the writer's frontier start past it is refused

@@ -156,6 +156,7 @@ impl Upstream {
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
             sunset_at_secs: None,
+            courier: false,
             initial_credits: 64,
             writer: Some(WriterGrant {
                 number: 1,
@@ -246,6 +247,7 @@ impl Transport for Upstream {
                                     held_schema(if old { 1 } else { 2 }).version(),
                                 ),
                                 sunset_at_secs: None,
+                                courier: false,
                                 initial_credits: 64,
                                 writer: (!old).then_some(WriterGrant {
                                     number: 1,

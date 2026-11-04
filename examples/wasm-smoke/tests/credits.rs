@@ -127,6 +127,7 @@ async fn fake_upstream(mut server: LoopbackTransport, trigger: oneshot::Receiver
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
             sunset_at_secs: None,
+            courier: false,
             initial_credits: INITIAL_CREDITS,
             writer: Some(WriterGrant {
                 number: 1,

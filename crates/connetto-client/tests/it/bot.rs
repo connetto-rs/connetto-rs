@@ -107,6 +107,7 @@ fn challenged_server() -> LoopbackTransport {
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: None,
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: Some(connetto_core::messages::WriterGrant {
                     number: 1,
@@ -434,6 +435,7 @@ async fn register_with_a_wrong_control_first_frame_is_a_protocol_error() {
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: None,
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: Some(connetto_core::messages::WriterGrant {
                     number: 1,
