@@ -370,6 +370,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
             .map_err(WriteError::from)?;
         crate::materializer::read_settled_conflict_row(
             &mut conn,
+            &self.catalog,
             table,
             version_column,
             pk_columns,
@@ -493,7 +494,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                     let Some(conflict) = &op.conflict else {
                         continue;
                     };
-                    if let ConflictProbe::Stale(row) = probe_conflict_pg(conflict, c)
+                    if let ConflictProbe::Stale(row) = probe_conflict_pg(conflict, c, catalog)
                         .await
                         .map_err(CommitError::Probe)?
                     {

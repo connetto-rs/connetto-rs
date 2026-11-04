@@ -40,12 +40,12 @@ use pg2sqlite::prelude::ReverseTranslator;
 use pg2sqlite::prelude::SessionVariableMapping;
 use rls2fga::translator::Translator;
 use sqlite_diff_rs::{
-    ChangesetOp, DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK,
-    TableSchema, Value,
+    ChangesetOp, DiffOps, DynTable, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp,
+    SchemaWithPK, TableSchema, Value,
 };
 use sqlparser::ast::{
-    BinaryOperator, Distinct, Expr, GroupByExpr, SelectItem, SetExpr, Statement,
-    WildcardAdditionalOptions,
+    BinaryOperator, Distinct, Expr, GroupByExpr, Ident, Select, SelectItem, SetExpr, Statement,
+    TableFactor, TableWithJoins, WildcardAdditionalOptions,
 };
 use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
@@ -62,9 +62,10 @@ use subql::reexec::{
 };
 use subql::{
     AggValue, AggregateBootstrap, AggregateResultValue, AggregateValueChange, AggregateValueUpdate,
-    AsyncSubscriptionDispatch, Checkpoint, DatabaseLike, DefaultIds, MaintenanceTransition,
-    NumericValue, OpaqueCheckpoint, ParserDB, PgChangeEvent, SubscriptionEngine, SubscriptionId,
-    SubscriptionRequest, TableId, TableLike, Tier, catalog_helpers,
+    AsyncSubscriptionDispatch, Checkpoint, ColumnId, DatabaseLike, DefaultIds,
+    MaintenanceTransition, NumericValue, OpaqueCheckpoint, ParserDB, PgChangeEvent,
+    SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableId, TableLike, Tier,
+    catalog_helpers,
 };
 
 use crate::reexec::ReadBudget;
@@ -655,7 +656,7 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
         sqlite_sql: &str,
     ) -> Result<String, MaterializerError> {
         let mut pg = translate_select(&self.catalog, self.caller.as_ref(), sqlite_sql)?;
-        widen_column_subset(&mut pg);
+        widen_column_subset(&self.catalog, &mut pg);
         Ok(pg.to_string())
     }
 
@@ -1769,9 +1770,10 @@ where
     ///
     /// Classifies each op, extracts its primary key and, for version-bearing
     /// updates and deletes, the read that detects a stale-version conflict.
-    /// Rejects a mutation whose target table is not writable, or an update or
-    /// delete uploaded as a patchset (patchsets carry no prior image, so a
-    /// conflict cannot be detected).
+    /// Rejects a mutation whose target table is not writable, whose table
+    /// shape disagrees with the catalog's, or an update or delete uploaded as
+    /// a patchset (patchsets carry no prior image, so a conflict cannot be
+    /// detected).
     ///
     /// # Errors
     ///
@@ -1805,6 +1807,28 @@ where
             .ok_or_else(|| MaterializerError::SchemaMismatch(table.to_owned()))
     }
 
+    /// The upload's table shape against the catalog's, one arity and one key
+    /// each. A column the live table gained after the catalog was built is a
+    /// shape the catalog does not know, and it is refused as a schema
+    /// mismatch rather than an out-of-range apply failure.
+    fn require_upload_shape(
+        &self,
+        table: &str,
+        table_id: TableId,
+        schema: &TableSchema<String>,
+    ) -> Result<(), MaterializerError> {
+        let arity = catalog_helpers::table_arity(&self.catalog, table_id)
+            .map_err(|err| MaterializerError::Catalog(err.to_string()))?;
+        let key = catalog_helpers::primary_key_columns(&self.catalog, table_id)
+            .map_err(|err| MaterializerError::Catalog(err.to_string()))?;
+        let uploaded: Vec<usize> = schema.primary_key_columns().collect();
+        let expected: Vec<usize> = key.iter().map(|column| usize::from(*column)).collect();
+        if schema.number_of_columns() != arity || uploaded != expected {
+            return Err(MaterializerError::SchemaMismatch(table.to_owned()));
+        }
+        Ok(())
+    }
+
     fn plan_changeset_op(
         &self,
         op: &ChangesetOp<'_, TableSchema<String>, String, Vec<u8>>,
@@ -1815,6 +1839,7 @@ where
             return Err(MaterializerError::NotWritable(table));
         }
         let table_id = self.table_id(&table)?;
+        self.require_upload_shape(&table, table_id, schema)?;
         let db = self.catalog();
         let pk_values = op.primary_key();
         let (write, conflict) = match op {
@@ -1888,6 +1913,7 @@ where
         match op {
             PatchsetOp::Insert { values, .. } => {
                 let table_id = self.table_id(&table)?;
+                self.require_upload_shape(&table, table_id, op.table())?;
                 Ok(PlannedOp {
                     table_id,
                     write: PlannedWrite::Insert {
@@ -2276,14 +2302,20 @@ pub(crate) fn translate_select(
         .map_err(|err| MaterializerError::Translate(format!("{err}")))
 }
 
-/// Rewrite a select list naming only plain columns to `*`.
+/// Rewrite a select list naming only plain columns to the catalog's
+/// columns of the table it reads.
 ///
 /// The replica holds the application's whole table, so a subscription naming
 /// fewer columns still has to bring whole rows, or the left-out columns land
-/// empty and the changes to them alone never arrive. The client runs the query
-/// as written against its replica, which keeps the columns the caller asked for.
-/// Aggregates, groupings, `DISTINCT` and expressions keep their own list.
-fn widen_column_subset(statement: &mut Statement) {
+/// empty and the changes to them alone never arrive. The client runs the
+/// query as written against its replica, which keeps the columns the caller
+/// asked for. Naming the catalog's columns keeps the stored `SELECT` at the
+/// catalog's shape when the live table gains a column, so the snapshot's
+/// inner query and the engine's re-execution carry the catalog's column
+/// list. Aggregates, groupings, `DISTINCT` and expressions keep their own
+/// list, and a table the catalog cannot hold to one catalog entry keeps the
+/// wildcard.
+fn widen_column_subset(catalog: &ParserDB, statement: &mut Statement) {
     let Statement::Query(query) = statement else {
         return;
     };
@@ -2304,9 +2336,46 @@ fn widen_column_subset(statement: &mut Statement) {
             | SelectItem::QualifiedWildcard(..)
             | SelectItem::ExprWithAliases { .. } => false,
         });
-    if all_plain {
-        select.projection = vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())];
+    if !all_plain {
+        return;
     }
+    let projection = match catalog_columns(catalog, select) {
+        Some(columns) if !columns.is_empty() => columns,
+        _ => vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())],
+    };
+    select.projection = projection;
+}
+
+/// The catalog's columns of the one table a select reads, as projection
+/// items in catalog order, or `None` when the select reads no single table
+/// the catalog knows.
+fn catalog_columns(catalog: &ParserDB, select: &Select) -> Option<Vec<SelectItem>> {
+    let [TableWithJoins { relation, joins }] = select.from.as_slice() else {
+        return None;
+    };
+    if !joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, .. } = relation else {
+        return None;
+    };
+    let ident = name.0.last()?.as_ident()?;
+    let table_id = catalog_helpers::table_id::<Postgres, _>(catalog, &ident.value)?;
+    let arity = catalog_helpers::table_arity(catalog, table_id).ok()?;
+    let names = (0..arity)
+        .map(|ordinal| {
+            let Ok(column) = ColumnId::try_from(ordinal) else {
+                return None;
+            };
+            catalog_helpers::column_name(catalog, table_id, column)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(
+        names
+            .into_iter()
+            .map(|name| SelectItem::UnnamedExpr(Expr::Identifier(Ident::with_quote('"', name))))
+            .collect(),
+    )
 }
 
 /// Decoded group values as a JSON array string, in `GROUP BY` order (R84).
@@ -2416,6 +2485,7 @@ struct PresentBool {
 pub(crate) async fn probe_conflict_pg(
     conflict: &PlannedConflict,
     conn: &mut AsyncPgConnection,
+    catalog: &ParserDB,
 ) -> Result<ConflictProbe, MaterializerError> {
     let mut predicate: Vec<String> = conflict
         .pk_columns
@@ -2443,7 +2513,7 @@ pub(crate) async fn probe_conflict_pg(
         return Ok(ConflictProbe::Clear);
     }
     Ok(ConflictProbe::Stale(
-        read_current_row_pg(conflict, conn).await?,
+        read_current_row_pg(conflict, conn, catalog).await?,
     ))
 }
 
@@ -2451,9 +2521,11 @@ pub(crate) async fn probe_conflict_pg(
 async fn read_current_row_pg(
     conflict: &PlannedConflict,
     conn: &mut AsyncPgConnection,
+    catalog: &ParserDB,
 ) -> Result<Option<ServerRow>, MaterializerError> {
     read_row_by_pk(
         conn,
+        catalog,
         &conflict.table,
         &conflict.version_column,
         &conflict.pk_columns,
@@ -2462,23 +2534,62 @@ async fn read_current_row_pg(
     .await
 }
 
+/// The catalog's columns of `table_id`, quoted for a `SELECT` list, in
+/// catalog order.
+///
+/// # Errors
+///
+/// [`MaterializerError::Catalog`] when the catalog cannot name the table's
+/// columns.
+pub(crate) fn quoted_table_columns<DB: DatabaseLike>(
+    catalog: &DB,
+    table_id: TableId,
+) -> Result<Vec<String>, MaterializerError> {
+    let arity = catalog_helpers::table_arity(catalog, table_id)
+        .map_err(|err| MaterializerError::Catalog(err.to_string()))?;
+    let mut columns = Vec::with_capacity(arity);
+    for ordinal in 0..arity {
+        let column = ColumnId::try_from(ordinal)
+            .map_err(|err| MaterializerError::Catalog(err.to_string()))?;
+        let name = catalog_helpers::column_name(catalog, table_id, column)
+            .ok_or_else(|| MaterializerError::Catalog(ordinal.to_string()))?;
+        columns.push(quote_ident(&name));
+    }
+    Ok(columns)
+}
+
 /// Read the row named by a primary key from Postgres, as a JSON object, the
-/// current version rendered from the row itself. Raw SQL because the table is
-/// the application's own and only known at runtime.
+/// current version rendered from the row itself. Projects the catalog's
+/// columns, so a column the live table gained under the running server never
+/// reaches the client. Raw SQL because the table is the application's own and
+/// only known at runtime.
+///
+/// # Errors
+///
+/// [`MaterializerError::Apply`] on a query failure,
+/// [`MaterializerError::Catalog`] when the catalog cannot name the table's
+/// columns, [`MaterializerError::Parse`] when the read-back row is not valid
+/// JSON, and [`MaterializerError::SchemaMismatch`] when the table is absent
+/// from the catalog.
 async fn read_row_by_pk(
     conn: &mut AsyncPgConnection,
+    catalog: &ParserDB,
     table: &str,
     version_column: &str,
     pk_columns: &[String],
     pk_values: &[WireValue],
 ) -> Result<Option<ServerRow>, MaterializerError> {
+    let table_id = catalog_helpers::table_id::<Postgres, _>(catalog, table)
+        .ok_or_else(|| MaterializerError::SchemaMismatch(table.to_owned()))?;
+    let columns = quoted_table_columns(catalog, table_id)?;
     let predicate: Vec<String> = pk_columns
         .iter()
         .enumerate()
         .map(|(index, col)| format!("{} = ${}", quote_ident(col), index + 1))
         .collect();
     let sql = format!(
-        "SELECT row_to_json(t)::text AS row_json FROM {} t WHERE {} LIMIT 1",
+        "SELECT row_to_json(r)::text AS row_json FROM (SELECT {} FROM {} t WHERE {}) r LIMIT 1",
+        columns.join(", "),
         quote_ident(table),
         predicate.join(" AND "),
     );
@@ -2530,13 +2641,14 @@ pub(crate) fn wire_value(value: &crate::writer_schema::StoredValue) -> WireValue
 /// Postgres, under the RLS context the caller set on `conn`.
 pub(crate) async fn read_settled_conflict_row(
     conn: &mut AsyncPgConnection,
+    catalog: &ParserDB,
     table: &str,
     version_column: &str,
     pk_columns: &[String],
     pk_values: &[crate::writer_schema::StoredValue],
 ) -> Result<Option<ServerRow>, MaterializerError> {
     let values: Vec<WireValue> = pk_values.iter().map(wire_value).collect();
-    read_row_by_pk(conn, table, version_column, pk_columns, &values).await
+    read_row_by_pk(conn, catalog, table, version_column, pk_columns, &values).await
 }
 
 /// Bind one wire value with the Postgres SQL type matching its variant.
@@ -2649,7 +2761,9 @@ mod registry_write_tests {
 
 #[cfg(test)]
 mod widen_tests {
-    //! Which subscription shapes the server widens to whole rows.
+    //! Which subscription shapes the server widens to the catalog's columns.
+
+    use subql::ParserDB;
 
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
@@ -2657,23 +2771,40 @@ mod widen_tests {
     use super::widen_column_subset;
 
     fn widened(sql: &str) -> String {
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE docs (id INT PRIMARY KEY, title TEXT, owner TEXT); \
+             CREATE TABLE pages (id INT PRIMARY KEY, label TEXT);",
+        )
+        .expect("the test catalog parses");
         let mut statement = Parser::parse_sql(&PostgreSqlDialect {}, sql)
             .expect("the test SQL parses")
             .remove(0);
-        widen_column_subset(&mut statement);
+        widen_column_subset(&catalog, &mut statement);
         statement.to_string()
     }
 
-    /// Plain columns, aliased or qualified by the table read, widen to `*`.
+    /// Plain columns, aliased or qualified by the table read, widen to the
+    /// catalog's columns of the table read, in catalog order.
     #[test]
-    fn a_plain_column_list_widens_to_whole_rows() {
+    fn a_plain_column_list_widens_to_the_catalogs_columns() {
         assert_eq!(
             widened("SELECT id, title FROM docs WHERE owner = $1"),
-            "SELECT * FROM docs WHERE owner = $1"
+            "SELECT \"id\", \"title\", \"owner\" FROM docs WHERE owner = $1"
         );
         assert_eq!(
             widened("SELECT d.id AS i, d.title FROM docs AS d"),
-            "SELECT * FROM docs AS d"
+            "SELECT \"id\", \"title\", \"owner\" FROM docs AS d"
+        );
+    }
+
+    /// A select the catalog cannot hold to one catalog entry keeps the
+    /// wildcard, since a partial list would drop columns from the rows.
+    #[test]
+    fn a_shape_the_catalog_cannot_hold_keeps_the_wildcard() {
+        assert_eq!(widened("SELECT id FROM ghosts"), "SELECT * FROM ghosts");
+        assert_eq!(
+            widened("SELECT id FROM docs JOIN pages ON docs.id = pages.id"),
+            "SELECT * FROM docs JOIN pages ON docs.id = pages.id"
         );
     }
 
