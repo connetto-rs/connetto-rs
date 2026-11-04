@@ -1212,7 +1212,7 @@ Two devices of different accounts exchange offline and reconcile online with not
 
 ## R78: courier recovery
 
-**Status.** IN PROGRESS. Designed with the maintainer on 2026-11-02, decisions 1 to 27 below, in nine pull requests, of which slice 5 is merged as [#387](https://github.com/connetto-rs/connetto-rs/pull/387) and slice 5b as [#391](https://github.com/connetto-rs/connetto-rs/pull/391).
+**Status.** IN PROGRESS. Designed with the maintainer on 2026-11-02, decisions 1 to 33 below, in nine pull requests, of which slice 5 is merged as [#387](https://github.com/connetto-rs/connetto-rs/pull/387) and slice 5b as [#391](https://github.com/connetto-rs/connetto-rs/pull/391).
 
 **Blocked on** nothing. R77 slice 7 merged as [#377](https://github.com/connetto-rs/connetto-rs/pull/377), which slices 1a, 3a, 4 and 6 build on. Slice 1a reads #377's `settled_range`, its `verdict_of` ruling, its pruning that keeps refused records and its `certificate_live_past_skew`. Slice 3a changes the adjudication code #377 adds to the client (`settle_provisional_ask`, `adjudicate_peer_seq`). Slice 4 builds its candidates on #377's `ProvisionalStatus` asks and settles a courier answer the way #377 settles `ProvisionalVerdicts`. Slices 1b, 2 and 3b wait only for the slices before them. R75 and R31 are merged.
 
@@ -1258,17 +1258,23 @@ Field survivability, a lost device's work is recoverable from the camp. The serv
 25. **An older major's retained run is re-sent on the drain wire in a slice of its own, 5b** (decided with the maintainer during slice 5). The drain dials only while a held batch with pending entries exists and never checks for a rewound frontier, so 5b adds a batch the armed run alone opens, the drain's rewind check and its re-send. Until 5b lands, a run holding an older major's entry retires the writer.
 26. **A retained row carries its bundle hash** (decided with the maintainer during slice 5b). `_connetto_acked` gains `version`, written at retention from the build's hash, or from the held batch's for an entry the drain settled, and filled from the batch's hash by R31's rewrite for a row retained before the column, so a restore can present an older major whose batch is long gone. `_connetto_held_batch`, `load_drain` and the offer's build list stay as they are. Rejected: keeping the batch row while retained rows need it, which lists a build the offer holds nothing of and dials it at every open.
 27. **The armed run opens an in-memory batch** (decided with the maintainer during slice 5b). Whichever wire meets the rewound frontier first arms the run, and the drain takes the oldest major among the held batches and the run's older majors, presenting a run major with the hash its rows carry. A restart re-arms the run at the next handshake or bind, so nothing new is durable. While the run holds an older major's entry, the main wire holds that writer's current-major part and its queue, and the drain sends a writer's run entries of its major ahead of that writer's pending entries of it. No server serving the older major retires the writer as an uncovered run does and reports the run's entries of that major as `HeldWork::Lost`. Rejected: a durable held batch row, which `PendingWork` and the offer would count as held work.
+28. **A courier range declares its body count** (decided with the maintainer during slice 1b). `CourierRange` gains `bodies: u32`, the number of `CourierBody` frames that follow it, so the server knows when the range ends whatever rows are digest-only or held without a body, and a range of digest-only rows needs no body frame at all. A count above the row count is refused `Malformed`. Rejected: a `last` flag on `CourierBody`, which cannot send a range without bodies. Rejected: a closing `CourierEnd` frame, one more frame type ordered across the two planes.
+29. **The server settles each body as it lands** (decided with the maintainer during slice 1b). The range checks of the table below run when `CourierRange` arrives, and each body settles as its frame arrives, so one body at a time is held in memory. A body that names no row of the range, arrives out of sequence order, does not decompress or disagrees with its row's digest is a protocol violation that ends the connection, as an unreadable mutation envelope does, and the entries settled before it stay settled, the author's signed entries. `Malformed` stays a refusal of the offer, the rows and the body count. Rejected: holding every body until the last one and settling the range whole, which buffers up to a whole range per connection.
+30. **One courier range is open per connection** (decided with the maintainer during slice 1b). A `CourierRange` before the previous range's answer is a protocol violation that ends the connection, and the client queues a range for another author behind the outstanding answer, `CourierBusy` staying the answer to a second call for the same author. Rejected: one open range per author capped per connection, whose interleaved bodies hold up to the cap's rows on the server.
+31. **The courier is a certified bearer, a session with its device writer bound** (decided with the maintainer during slice 1b). A `CourierRange` on a connection that bound no device writer is refused `CourierRefusal::Uncertified`, nothing read, so the audit row and the notice of slice 2 always name the courier's account and device. Rejected: any identified session, a browser included. Rejected: any session, which leaves the courier unnamed on the audit row and the notice.
+32. **The range answers once, after its last counted body** (decided with the maintainer during slice 1b). A range ends when its declared bodies have arrived, or at once with none. Bodies after a refusal or a stop are read, checked for their range and order, and dropped, then the one `CourierAnswer` goes out, so the client always sends exactly the count it declared. Rejected: a refusal answered on `CourierRange` with the bodies drained after it, which saves the client nothing since its bodies are already on the wire.
+33. **A courier whose 30 s wait ran out holds further ranges until the late answer or the session ends** (decided with the maintainer during slice 1b). The server may still be settling the range, so a new `CourierRange` on the connection would end it. The late answer settles as any answer does, and the ranges queued behind it go out after it. Rejected: closing the connection on the timeout, which costs a reconnect and a handshake for a slow server.
 
 ### Design
 
 ```text
 the server wire, control plane unless marked
-  CourierRange      { request_id, author: [u8; 32], offer: Vec<u8>, rows: Vec<ManifestRow> }
+  CourierRange      { request_id, author: [u8; 32], offer: Vec<u8>, rows: Vec<ManifestRow>, bodies: u32 }
   CourierBody       { request_id, seq, changeset_zstd }                    bulk plane
   CourierAnswer     { request_id, outcome: CourierOutcome }
   CourierOutcome    = Refused(CourierRefusal) | Entries(Vec<(u64, CourierEntryOutcome)>)
-  CourierRefusal    = Disabled | Malformed | NotEnrolled | AuthorBanned | WriterRetired
-                    | Unverified | SequenceGap { expected, got }
+  CourierRefusal    = Disabled | Uncertified | Malformed | NotEnrolled | AuthorBanned
+                    | WriterRetired | Unverified | SequenceGap { expected, got }
   CourierEntryOutcome = Ruled(Verdict) | NotCouriered | Retry { retry_after_ms }
   CourierNotice     { notice_id, notices: Vec<CourierNoticeRow> }
   CourierNoticeRow  { courier, writer: WriterRef, seq, verdict: Verdict }
@@ -1276,7 +1282,7 @@ the server wire, control plane unless marked
   HandshakeAck      gains courier: bool
 ```
 
-`ManifestRow` and `Verdict` are R77's types in `connetto-core::exchange`, and `Verdict::Pending` never answers a couriered row. The client waits at most 30 s for `CourierAnswer` on a monotonic clock, R77 decision 10's bound, and holds one range per author open at a time.
+`ManifestRow` and `Verdict` are R77's types in `connetto-core::exchange`, and `Verdict::Pending` never answers a couriered row. The client waits at most 30 s for `CourierAnswer` on a monotonic clock, R77 decision 10's bound, and has one range open per connection at a time (decision 30).
 
 ```sql
 -- client, in main, the two R77 tables as they become
@@ -1290,12 +1296,13 @@ ALTER TYPE connetto_auth_op ADD VALUE 'write_couriered';
 -- and one notice row per couriered entry that settled, in a table of the Writers member
 ```
 
-**One courier range on the server.** The checks run in this order, and the first that answers ends the range. `f` is the writer row's frontier and `h` its head, `GENESIS` and 0 for a writer the courier path creates, as `courier_deliver` creates one today.
+**One courier range on the server.** The checks run in this order when `CourierRange` arrives, and the first that answers ends the range. `f` is the writer row's frontier and `h` its head, `GENESIS` and 0 for a writer the courier path creates, as `courier_deliver` creates one today. The rows from the first above `f` settle as their bodies land (decision 29).
 
 | Situation | Answer |
 |---|---|
 | The courier switch is off | `Refused(Disabled)`, nothing read |
-| The offer does not decode, rows exceed the bound or skip a sequence, a body names no row, arrives out of order, or disagrees with its row's digest | `Refused(Malformed)` |
+| The connection bound no device writer | `Refused(Uncertified)`, nothing read |
+| The offer does not decode, the rows exceed the bound, start at 0, skip or repeat a sequence or run past the offer's newest, or `bodies` exceeds the rows | `Refused(Malformed)` |
 | The enrolment is absent, revoked, or past its expiry plus `DEVICE_SKEW` | `Refused(NotEnrolled)` |
 | The author's account is banned | `Refused(AuthorBanned)` |
 | The writer is retired | `Refused(WriterRetired)` |
@@ -1303,10 +1310,26 @@ ALTER TYPE connetto_auth_op ADD VALUE 'write_couriered';
 | The first row is above `f + 1` | `Refused(SequenceGap { expected: f + 1, got })` |
 | A row at or below `f` | `Ruled` with #377's verdict for it, nothing applied or audited |
 | A row above `f` with a body and no number origin | applied under the author's account, the enrolment row's bot list and no subjects, settled `Applied`, `Rejected` or `Conflict`, one audit row and one notice row, answered `Ruled` |
-| A digest-only row or a number origin above `f` | `NotCouriered`, nothing past it settles |
+| A row above `f` with no body, of another major than the connection's, or with a number origin | `NotCouriered`, nothing past it settles |
 | An entry settles `Indeterminate`, or the courier bucket runs dry | `Retry`, nothing past it settles |
+| Another path settled the row's sequence under a different entry after the range read `f` | `Ruled(Refused(Rejected(Forked)))`, audited `write_forked`, nothing past it settles |
 
-**The courier on the client.** `courier(author)` sends the rows held for the author from the lowest one not known settled to the offer's newest, with every body it holds, and settles the answer row by row in one transaction each, `Applied` and `Settled` adjudicating as a verdict does, `Refused` retracting with its cause, `NotCouriered` and `Retry` keeping the row.
+**One connection's courier stream.** Per connection, **K0** no range open, **K1** a range open whose rows above `f` are still settling, **K2** a range open that was refused or stopped, its remaining bodies draining. A protocol violation sends `FatalError(ProtocolViolation)` and ends the connection.
+
+| Event | K0 | K1 | K2 |
+|---|---|---|---|
+| `CourierRange` | run the checks above, rule the rows at or below `f`, enter K1 when one passes and K2 on a refusal, answering at once and staying K0 when `bodies` is 0 | protocol violation | protocol violation |
+| `CourierBody` | protocol violation, no range is open | as the rows below | as the rows below |
+| `CourierBody` of another `request_id`, naming no row of the range, or not after the previous body | n/a | protocol violation | protocol violation |
+| `CourierBody` that does not decompress or disagrees with its row's digest | n/a | protocol violation | dropped, as every body in K2 |
+| `CourierBody` for a row at or below `f` | n/a | consumed, nothing applied | dropped |
+| `CourierBody` for the next row above `f` | n/a | settle it, entering K2 on `Retry` or `Forked` | dropped |
+| `CourierBody` for a later row, past one with no body | n/a | answer the skipped row `NotCouriered`, drop this body, enter K2 | dropped |
+| The last counted body arrives | n/a | answer `NotCouriered` for the next row above `f` left without a body, if any, send `CourierAnswer`, enter K0 | send `CourierAnswer`, enter K0 |
+| Mutations, subscriptions and other frames | handled as ever | handled as ever, between bodies | handled as ever |
+| The connection ends | nothing | no answer, the entries settled stay | no answer |
+
+**The courier on the client.** `courier(author)` sends the rows held for the author from the lowest one not known settled to the offer's newest, with every body it holds and exactly that count declared, and settles the answer row by row in one transaction each, `Applied` and `Settled` adjudicating as a verdict does, `Refused` retracting with its cause, `NotCouriered` and `Retry` keeping the row. A range for another author waits until the open range is answered or the session ends.
 
 **The author's re-send.** At the handshake for a number and the bind for a device the client compares the frontier the server answers, `f`, with the writer's `settled_seq`, `s`. Below `s` it re-sends `f + 1` to `s` from `_connetto_acked` in order through the direct path when every one is retained, then replays its pending entries, and otherwise retires the writer as chapter 20 states.
 
@@ -1321,17 +1344,19 @@ For one author as the courier sees it, **C0** no server session, or the session'
 | Full resync ends | ask about retained rows too | same | same | same, after the answer |
 | `ProvisionalVerdicts` answers a held row | settle it as #377 does | same, enter C2 on a `Pending` row | same, enter C1 when no candidate row is left | same |
 | A verified offer over a link adds rows | nothing | enter C2 | stay | stay, the next call sends them |
-| `courier(author)` | answer `CourierUnavailable` | answer that nothing is held | send the range and its bodies, enter C3 | answer `CourierBusy` |
+| `courier(author)` | answer `CourierUnavailable` | answer that nothing is held | send the range and its declared bodies, enter C3, or when another author's range holds the connection queue it behind that answer (decision 30) | answer `CourierBusy` |
 | `Ruled(Applied)` or `Ruled(Settled)` for a row | n/a | n/a | n/a | the row becomes retained, a provisional record adjudicated |
 | `Ruled(Refused(cause))` for a row | n/a | n/a | n/a | a provisional row retracted with the cause, a courier-only or digest-only row deleted |
 | `NotCouriered` | n/a | n/a | n/a | the rows from it stay, enter C1 until a new offer adds rows |
 | `Retry` | n/a | n/a | n/a | the rows from it stay, enter C2, the call answers the wait |
 | `Refused(Disabled)` | n/a | n/a | n/a | enter C0 |
+| `Refused(Uncertified)` | n/a | n/a | n/a | log it, keep every row, enter C1 until the next session |
 | `Refused(Malformed)` | n/a | n/a | n/a | log it, enter C2 |
 | `Refused(NotEnrolled)`, `Refused(WriterRetired)` or `Refused(Unverified)` | n/a | n/a | n/a | delete the author's courier-only, digest-only and retained rows, provisional rows wait for their verdict, raise `PeerChainInvalid` on `Unverified`, enter C1 |
 | `Refused(AuthorBanned)` | n/a | n/a | n/a | keep every row, enter C1 until the next session |
 | `Refused(SequenceGap)` | n/a | n/a | n/a | keep every row, enter C1 until a new offer adds rows |
-| 30 s without `CourierAnswer` | n/a | n/a | n/a | drop the wait, keep every row, enter C2 |
+| 30 s without `CourierAnswer` | n/a | n/a | n/a | drop the wait, keep every row, enter C2, the connection holding further ranges until the late answer or the session ends (decision 33) |
+| The late answer of a range whose wait was dropped | n/a | settle it row by row as in C3, then send the next queued range | same | n/a |
 | Session lost | stay | enter C0 | enter C0 | enter C0, the unanswered rows kept |
 | Retention of a retained row runs out | delete it | same | same, enter C1 when no candidate is left | same, after the answer |
 | R31 rebuild at a newer major | rows kept under their major (decision 7) | links and session close first, as C0 | same | same |
@@ -1388,11 +1413,11 @@ For one restored writer whose armed run reaches into older majors (decisions 25 
 One pull request each, in this order, each green and useful on its own (decided with the maintainer).
 
 - **1a, the server's courier rules** (decisions 2 to 4, 6, 8, 9, 13 to 15). `courier_deliver` checks the `SignedOffer` with digest rows to the signed head, skips the settled prefix with #377's verdicts, stops at a digest-only row or a number origin, binds the enrolment row's bot list and refuses a banned author, a key past expiry plus `DEVICE_SKEW` and a revoked key, `range_message` and `verify_range` go, and R77 decision 1 is corrected. Proven Docker-gated by calling `courier_deliver` as `courier_frontier.rs` does, for a forged offer, a gap, a revoked key, a banned author, a bot author's list and the author's own later replay answered once.
-- **1b, the courier wire** (decisions 1 and 5). `CourierRange`, `CourierBody` and `CourierAnswer`, the switch and `CONNETTO_COURIER`, and `HandshakeAck.courier`. Proven Docker-gated over a socket with the switch on and off.
+- **1b, the courier wire** (decisions 1, 5 and 28 to 32). `CourierRange` with its body count, `CourierBody` and `CourierAnswer`, the switch and `CONNETTO_COURIER`, `HandshakeAck.courier`, `Uncertified`, and the server's courier stream settling each body as it lands, one range per connection answered after its last counted body, every row of the stream table. Proven Docker-gated over a socket with the switch on and off.
 - **2, audit, meter and notice** (decisions 10 to 12). `write_couriered` with `courier_user_id`, the courier bucket, the notice table, `CourierNotice` and its ack. Proven Docker-gated, every settled couriered entry audited naming both accounts, a range past the budget answered `Retry`, and the author's next session receiving its notices once.
 - **3a, the courier hold** (decisions 3, 17 and 19). The state column, manifest rows, courier-only bodies, retained rows with `expires_at`, and the re-apply and every R77 reader taking provisional rows alone. Proven in process for each row of the held-row table.
 - **3b, the rebuild and the archive** (decisions 7 and 20). R31's rebuild keeping the rows under their major, and the archive carrying them with the format version moved. Proven in process.
-- **4, the offer** (decisions 7 and 16). `courier_candidates`, `CourierCandidates`, `courier(author)`, the answer settling the courier's rows, and older-major rows on the drain wire. Proven Docker-gated in `connetto-test-harness`, a device's writes reaching the server through a different account's session.
+- **4, the offer** (decisions 7, 16, 30 and 33). `courier_candidates`, `CourierCandidates`, `courier(author)`, the answer settling the courier's rows, and older-major rows on the drain wire. Proven Docker-gated in `connetto-test-harness`, a device's writes reaching the server through a different account's session.
 - **5, the author's re-send** (decisions 17 and 21 to 24). `_connetto_acked`, `SyncTuning::with_acked_retention`, `MutationHeader.refused` and its server settlement, and the re-send on a rewound frontier for a device and a number writer on the main wire. Proven Docker-gated by `a_restore_takes_a_retained_run_back_and_moves_unknown_numbers`, a same-cluster dump restore, and `a_declared_refusal_settles_without_applying_and_redelivers_from_the_record`.
 - **5b, the older major's re-send** (decisions 25 to 27). `_connetto_acked.version`, the in-memory batch the armed run opens, the drain's rewind check, its re-send ahead of pending entries, and the main wire holding behind an older prefix. Proven in process against the drain's fake old-major server, for a run spanning an older major and the current one, a restore met first on the drain wire, and an older major with no server.
 - **6, the harness proof** (decisions 17 and 18). The Done when end to end, a courier's re-delivery to a restored server and a courier refused after the author retired, with chapters 19 and 20 and the diagram brought to what is built. Waits for every slice before it.
