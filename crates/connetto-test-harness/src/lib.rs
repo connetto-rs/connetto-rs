@@ -1923,8 +1923,12 @@ impl Client {
         }
     }
 
-    /// Declare `major` in every handshake this client sends.
+    /// Declare `major` in every handshake this client sends, the capture
+    /// major of the entries the connection settles.
+    // Out of line, since rustc otherwise copies so small a function into each
+    // calling crate of a non-incremental build, where coverage never counts it.
     #[must_use]
+    #[inline(never)]
     pub fn declaring(mut self, major: connetto_core::Major) -> Self {
         self.schema_major = Some(major);
         self
