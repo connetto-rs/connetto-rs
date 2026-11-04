@@ -1212,7 +1212,7 @@ Two devices of different accounts exchange offline and reconcile online with not
 
 ## R78: courier recovery
 
-**Status.** IN PROGRESS. Designed with the maintainer on 2026-11-02, decisions 1 to 33 below, in nine pull requests, of which slice 5 is merged as [#387](https://github.com/connetto-rs/connetto-rs/pull/387) and slice 5b as [#391](https://github.com/connetto-rs/connetto-rs/pull/391).
+**Status.** IN PROGRESS. Designed with the maintainer on 2026-11-02, decisions 1 to 41 below, in nine pull requests, of which slice 5 is merged as [#387](https://github.com/connetto-rs/connetto-rs/pull/387) and slice 5b as [#391](https://github.com/connetto-rs/connetto-rs/pull/391).
 
 **Blocked on** nothing. R77 slice 7 merged as [#377](https://github.com/connetto-rs/connetto-rs/pull/377), which slices 1a, 3a, 4 and 6 build on. Slice 1a reads #377's `settled_range`, its `verdict_of` ruling, its pruning that keeps refused records and its `certificate_live_past_skew`. Slice 3a changes the adjudication code #377 adds to the client (`settle_provisional_ask`, `adjudicate_peer_seq`). Slice 4 builds its candidates on #377's `ProvisionalStatus` asks and settles a courier answer the way #377 settles `ProvisionalVerdicts`. Slices 1b, 2 and 3b wait only for the slices before them. R75 and R31 are merged.
 
@@ -1264,6 +1264,14 @@ Field survivability, a lost device's work is recoverable from the camp. The serv
 31. **The courier is a certified bearer, a session with its device writer bound** (decided with the maintainer during slice 1b). A `CourierRange` on a connection that bound no device writer is refused `CourierRefusal::Uncertified`, nothing read, so the audit row and the notice of slice 2 always name the courier's account and device. Rejected: any identified session, a browser included. Rejected: any session, which leaves the courier unnamed on the audit row and the notice.
 32. **The range answers once, after its last counted body** (decided with the maintainer during slice 1b). A range ends when its declared bodies have arrived, or at once with none. Bodies after a refusal or a stop are read, checked for their range and order, and dropped, then the one `CourierAnswer` goes out, so the client always sends exactly the count it declared. Rejected: a refusal answered on `CourierRange` with the bodies drained after it, which saves the client nothing since its bodies are already on the wire.
 33. **A courier whose 30 s wait ran out holds further ranges until the late answer or the session ends** (decided with the maintainer during slice 1b). The server may still be settling the range, so a new `CourierRange` on the connection would end it. The late answer settles as any answer does, and the ranges queued behind it go out after it. Rejected: closing the connection on the timeout, which costs a reconnect and a handshake for a slow server.
+34. **Every new session of the author hears the notices after its handshake, the first ack deleting them** (decided with the maintainer during slice 2). Two sessions connecting at once can both receive the same rows, and a session already connected when a courier settles hears at its next handshake. Rejected: pushing a notice live to the author's connected sessions, a fan-out per settled entry across connections. Rejected: leasing the rows to the first session until it acks.
+35. **Slice 2 builds the server and both clients** (decided with the maintainer during slice 2). The native `ConnettoConnection` and the browser hub raise `ClientEvent::WritesCouriered` and ack, so no deployed client leaves notices unacked to come again at every login. Rejected: the native client alone, and the server alone with the clients in slice 4.
+36. **A body larger than the whole courier bucket is answered `NotCouriered`** (decided with the maintainer during slice 2). It can never fit the bucket, so the courier keeps the row and the author's own device delivers it, judged by the mutation bucket. Rejected: `Retry` with the window's length, which never settles. Rejected: settling it refused, which loses the entry for the author too.
+37. **The notice row is written in the transaction that settles the couriered entry** (decided with the maintainer during slice 2), so a settled couriered entry always has its notice. A sequence another path already settled writes neither a notice nor a `write_couriered` audit row. Rejected: a second statement after the settle, which a crash between leaves without the notice.
+38. **Every body draws its compressed bytes on the courier bucket as it arrives** (decided with the maintainer during slice 2), the bodies a refused or stopped range drains included, so a courier cannot send unmetered bytes that are thrown away. A body past the budget answers the next unsettled row `Retry` with the wait and stops the range. Rejected: metering only the bodies that settle.
+39. **The server sends every pending notice right after the handshake** (decided with the maintainer during slice 2), in frames of at most `MAX_MANIFEST_ROWS` rows, each with its own `notice_id`, and each ack deletes its frame's rows. An ack naming no frame of the connection, a repeat among them, is ignored. Rejected: one frame at a time behind each ack, slower for a backlog and a position the server tracks per session.
+40. **Erasing a person deletes every notice naming them as author or courier** (decided with the maintainer during slice 2), so nothing of the person stays, at the cost of the author never hearing of entries an erased courier delivered. Rejected: keeping the author's notices with the courier blanked, which needs a nullable courier and an event allowing an unknown one.
+41. **A client raises one `ClientEvent::WritesCouriered` per frame and acks it at once** (decided with the maintainer during slice 2). A connection lost before the ack receives the same rows at the next handshake, so the application may see them twice. Rejected: one event per row. Rejected: acking only after the application confirms it showed them.
 
 ### Design
 
@@ -1277,7 +1285,7 @@ the server wire, control plane unless marked
                     | WriterRetired | Unverified | SequenceGap { expected, got }
   CourierEntryOutcome = Ruled(Verdict) | NotCouriered | Retry { retry_after_ms }
   CourierNotice     { notice_id, notices: Vec<CourierNoticeRow> }
-  CourierNoticeRow  { courier, writer: WriterRef, seq, verdict: Verdict }
+  CourierNoticeRow  { courier: String, writer: WriterRef, seq, verdict: Verdict }
   CourierNoticeAck  { notice_id }
   HandshakeAck      gains courier: bool
 ```
@@ -1293,7 +1301,8 @@ CREATE TABLE _connetto_acked (writer BLOB, seq INTEGER, major INTEGER NOT NULL, 
 ALTER TABLE connetto_device_enrolments ADD COLUMN bot_list TEXT;
 ALTER TABLE auth_events ADD COLUMN courier_user_id TEXT;
 ALTER TYPE connetto_auth_op ADD VALUE 'write_couriered';
--- and one notice row per couriered entry that settled, in a table of the Writers member
+-- one notice row per couriered entry that settled, a table of the Writers member
+CREATE TABLE _connetto_courier_notices (id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL, courier_user_id TEXT NOT NULL, device_key BYTEA NOT NULL, seq BIGINT NOT NULL, outcome TEXT NOT NULL);
 ```
 
 **One courier range on the server.** The checks run in this order when `CourierRange` arrives, and the first that answers ends the range. `f` is the writer row's frontier and `h` its head, `GENESIS` and 0 for a writer the courier path creates, as `courier_deliver` creates one today. The rows from the first above `f` settle as their bodies land (decision 29).
@@ -1309,9 +1318,10 @@ ALTER TYPE connetto_auth_op ADD VALUE 'write_couriered';
 | The offer's signature does not verify, or the chain from `h` through rows `f + 1` to the offer's newest misses `newest.head` | `Refused(Unverified)` |
 | The first row is above `f + 1` | `Refused(SequenceGap { expected: f + 1, got })` |
 | A row at or below `f` | `Ruled` with #377's verdict for it, nothing applied or audited |
-| A row above `f` with a body and no number origin | applied under the author's account, the enrolment row's bot list and no subjects, settled `Applied`, `Rejected` or `Conflict`, one audit row and one notice row, answered `Ruled` |
+| A row above `f` with a body and no number origin | applied under the author's account, the enrolment row's bot list and no subjects, settled `Applied`, `Rejected` or `Conflict` with its notice row in the same transaction (decision 37), one `write_couriered` audit row, answered `Ruled` |
 | A row above `f` with no body, of another major than the connection's, or with a number origin | `NotCouriered`, nothing past it settles |
-| An entry settles `Indeterminate`, or the courier bucket runs dry | `Retry`, nothing past it settles |
+| An entry settles `Indeterminate`, or a body arrives past the courier budget | `Retry`, carrying the budget's wait, nothing past it settles |
+| A body larger than the whole courier bucket | `NotCouriered`, nothing past it settles (decision 36) |
 | Another path settled the row's sequence under a different entry after the range read `f` | `Ruled(Refused(Rejected(Forked)))`, audited `write_forked`, nothing past it settles |
 
 **One connection's courier stream.** Per connection, **K0** no range open, **K1** a range open whose rows above `f` are still settling, **K2** a range open that was refused or stopped, its remaining bodies draining. A protocol violation sends `FatalError(ProtocolViolation)` and ends the connection.
@@ -1319,15 +1329,36 @@ ALTER TYPE connetto_auth_op ADD VALUE 'write_couriered';
 | Event | K0 | K1 | K2 |
 |---|---|---|---|
 | `CourierRange` | run the checks above, rule the rows at or below `f`, enter K1 when one passes and K2 on a refusal, answering at once and staying K0 when `bodies` is 0 | protocol violation | protocol violation |
-| `CourierBody` | protocol violation, no range is open | as the rows below | as the rows below |
+| `CourierBody` | protocol violation, no range is open | drawn on the courier bucket, then as the rows below | drawn on the courier bucket, then as the rows below |
 | `CourierBody` of another `request_id`, naming no row of the range, or not after the previous body | n/a | protocol violation | protocol violation |
 | `CourierBody` that does not decompress or disagrees with its row's digest | n/a | protocol violation | dropped, as every body in K2 |
 | `CourierBody` for a row at or below `f` | n/a | consumed, nothing applied | dropped |
 | `CourierBody` for the next row above `f` | n/a | settle it, entering K2 on `Retry` or `Forked` | dropped |
+| `CourierBody` past the courier budget, or larger than the whole bucket | n/a | answer the next unsettled row `Retry` with the wait, or `NotCouriered` for the oversized body, drop this body, enter K2 | dropped |
 | `CourierBody` for a later row, past one with no body | n/a | answer the skipped row `NotCouriered`, drop this body, enter K2 | dropped |
 | The last counted body arrives | n/a | answer `NotCouriered` for the next row above `f` left without a body, if any, send `CourierAnswer`, enter K0 | send `CourierAnswer`, enter K0 |
 | Mutations, subscriptions and other frames | handled as ever | handled as ever, between bodies | handled as ever |
 | The connection ends | nothing | no answer, the entries settled stay | no answer |
+
+**The author's notices on the server.** Per connection, **N0** no notice frame unanswered, **N1** notice frames sent and not yet acked.
+
+| Event | N0 | N1 |
+|---|---|---|
+| Handshake of an identified session whose account has notice rows | send them all at once in `CourierNotice` frames of at most `MAX_MANIFEST_ROWS` rows, each with its own `notice_id`, enter N1 (decisions 34 and 39) | n/a |
+| Handshake of an anonymous session, or of an account with no notice rows | stay | n/a |
+| `CourierNoticeAck` naming a frame of this connection | n/a | delete that frame's rows, enter N0 when no frame is left |
+| `CourierNoticeAck` naming no frame of this connection, a repeat among them | ignored | ignored |
+| A courier settles an entry of this account meanwhile | its row is written, sent at the next handshake | same |
+| Another session of the account acks the same rows first | nothing | the ack here deletes nothing more |
+| The connection ends | nothing | the unacked rows stay, sent at the next handshake |
+| The erasure recipe for a person | the rows naming the person as author or courier go (decision 40) | same |
+
+**The author's notices on a client.** The native `ConnettoConnection` and the browser hub alike (decision 35).
+
+| Event | Any state |
+|---|---|
+| `CourierNotice` arrives | raise one `ClientEvent::WritesCouriered` with its rows, the hub relaying it to every tab as it relays other events, and send `CourierNoticeAck` at once (decision 41) |
+| The connection drops before the ack is sent | nothing, the same rows come again at the next handshake and raise the event again |
 
 **The courier on the client.** `courier(author)` sends the rows held for the author from the lowest one not known settled to the offer's newest, with every body it holds and exactly that count declared, and settles the answer row by row in one transaction each, `Applied` and `Settled` adjudicating as a verdict does, `Refused` retracting with its cause, `NotCouriered` and `Retry` keeping the row. A range for another author waits until the open range is answered or the session ends.
 
@@ -1414,7 +1445,7 @@ One pull request each, in this order, each green and useful on its own (decided 
 
 - **1a, the server's courier rules** (decisions 2 to 4, 6, 8, 9, 13 to 15). `courier_deliver` checks the `SignedOffer` with digest rows to the signed head, skips the settled prefix with #377's verdicts, stops at a digest-only row or a number origin, binds the enrolment row's bot list and refuses a banned author, a key past expiry plus `DEVICE_SKEW` and a revoked key, `range_message` and `verify_range` go, and R77 decision 1 is corrected. Proven Docker-gated by calling `courier_deliver` as `courier_frontier.rs` does, for a forged offer, a gap, a revoked key, a banned author, a bot author's list and the author's own later replay answered once.
 - **1b, the courier wire** (decisions 1, 5 and 28 to 32). `CourierRange` with its body count, `CourierBody` and `CourierAnswer`, the switch and `CONNETTO_COURIER`, `HandshakeAck.courier`, `Uncertified`, and the server's courier stream settling each body as it lands, one range per connection answered after its last counted body, every row of the stream table. Proven Docker-gated over a socket with the switch on and off.
-- **2, audit, meter and notice** (decisions 10 to 12). `write_couriered` with `courier_user_id`, the courier bucket, the notice table, `CourierNotice` and its ack. Proven Docker-gated, every settled couriered entry audited naming both accounts, a range past the budget answered `Retry`, and the author's next session receiving its notices once.
+- **2, audit, meter and notice** (decisions 10 to 12 and 34 to 41). `write_couriered` with `courier_user_id`, the courier bucket, the notice table written with the settle, `CourierNotice` and its ack on the server, and `ClientEvent::WritesCouriered` with the ack in `ConnettoConnection` and the browser hub. Proven Docker-gated, every settled couriered entry audited naming both accounts, a range past the budget answered `Retry` and an oversized body `NotCouriered`, and the author's next session receiving its notices once, through a real `ConnettoConnection`, every row of the two notice tables.
 - **3a, the courier hold** (decisions 3, 17 and 19). The state column, manifest rows, courier-only bodies, retained rows with `expires_at`, and the re-apply and every R77 reader taking provisional rows alone. Proven in process for each row of the held-row table.
 - **3b, the rebuild and the archive** (decisions 7 and 20). R31's rebuild keeping the rows under their major, and the archive carrying them with the format version moved. Proven in process.
 - **4, the offer** (decisions 7, 16, 30 and 33). `courier_candidates`, `CourierCandidates`, `courier(author)`, the answer settling the courier's rows, and older-major rows on the drain wire. Proven Docker-gated in `connetto-test-harness`, a device's writes reaching the server through a different account's session.
