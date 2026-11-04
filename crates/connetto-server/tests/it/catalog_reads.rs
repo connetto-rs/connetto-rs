@@ -21,11 +21,11 @@ use connetto_test_harness::{
 use diesel::QueryDsl;
 use diesel_async::RunQueryDsl;
 use sqlite_diff_rs::{
-    ChangeSet, ChangesetFormat, DiffOps, DynTable as _, ParsedDiffSet, PatchsetOp, SimpleTable,
-    TableSchema, Update, Value,
+    ChangeSet, ChangesetFormat, DiffOps, DynTable as _, Insert, ParsedDiffSet, PatchSet,
+    PatchsetOp, SimpleTable, TableSchema, Update, Value,
 };
 
-use super::writer_shared::{note_table, seed_notes, writable_catalog};
+use super::writer_shared::{note_table, seed_notes, update_changeset, writable_catalog};
 
 /// The old major's DDL the server is built from.
 const PG_DDL: &str = "-- connetto:major 1\n\
@@ -92,35 +92,6 @@ async fn extras(fixture: &Fixture) -> Vec<Option<String>> {
         .expect("read the added column")
 }
 
-/// A changeset that updates one row, carrying the old image as the version
-/// basis, in the old major's shape.
-fn update_changeset(
-    id: i64,
-    old_body: &str,
-    new_body: &str,
-    old_edited_at: &str,
-    new_edited_at: &str,
-) -> Vec<u8> {
-    let update = Update::<_, ChangesetFormat, String, Vec<u8>>::from(note_table())
-        .set(0, Value::Integer(id), Value::Integer(id))
-        .expect("set id")
-        .set(
-            1,
-            Value::Text(old_body.to_owned()),
-            Value::Text(new_body.to_owned()),
-        )
-        .expect("set body")
-        .set(
-            2,
-            Value::Text(old_edited_at.to_owned()),
-            Value::Text(new_edited_at.to_owned()),
-        )
-        .expect("set edited_at");
-    ChangeSet::<SimpleTable, String, Vec<u8>>::new()
-        .update(update)
-        .build()
-}
-
 /// The table as a post-expand client spells it, naming the added column.
 fn expanded_table() -> SimpleTable {
     SimpleTable::new(
@@ -167,6 +138,21 @@ fn expanded_update_changeset() -> Vec<u8> {
         .expect("set extra");
     ChangeSet::<SimpleTable, String, Vec<u8>>::new()
         .update(update)
+        .build()
+}
+
+/// A patchset that inserts one full row. A patchset carries no prior image,
+/// so no conflict is planned for it.
+fn patchset_insert(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
+    let insert = Insert::<_, String, Vec<u8>>::from(note_table())
+        .set(0, Value::Integer(id))
+        .expect("set id")
+        .set(1, Value::Text(body.to_owned()))
+        .expect("set body")
+        .set(2, Value::Text(edited_at.to_owned()))
+        .expect("set edited_at");
+    PatchSet::<SimpleTable, String, Vec<u8>>::new()
+        .insert(insert)
         .build()
 }
 
@@ -379,6 +365,77 @@ async fn an_upload_naming_the_added_column_is_refused_as_a_schema_mismatch() {
         panic!("the write applies");
     };
     assert_eq!(ack.client_seq, 3);
+    client.close().await;
+    drop_slot(fixture.admin()).await;
+}
+
+/// A patchset's insert carries no prior image, so no conflict is planned,
+/// and it lands in the catalog's shape the way a changeset's insert does.
+#[tokio::test]
+async fn a_patchset_insert_lands_in_the_catalog_shape() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    fixture.setup(&[EXPAND]).await;
+
+    let server = stack(&fixture).await;
+    let mut client = server.connect();
+    client.handshake_with("alice", "user:alice").await;
+
+    client.upload(1, patchset_insert(2, "new", "t1")).await;
+    let ControlMessage::MutationApplied(ack) = client.next_control().await else {
+        panic!("the patchset's insert applies");
+    };
+    assert_eq!(ack.client_seq, 1);
+    assert_eq!(
+        extras(&fixture).await,
+        vec![None, None],
+        "the insert leaves the added column at its default"
+    );
+    client.close().await;
+    drop_slot(fixture.admin()).await;
+}
+
+/// A column the live table loses under the running server breaks the
+/// catalog-shaped re-read. The presence probe still answers on the surviving
+/// key and version, and the row read fails on the column the catalog names,
+/// so the write is refused and the server keeps serving.
+#[tokio::test]
+async fn a_write_past_a_lost_column_is_refused_with_a_constraint_error() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+
+    let server = stack(&fixture).await;
+    let mut client = server.connect();
+    client.handshake_with("alice", "user:alice").await;
+
+    // The live table loses a column the catalog still names.
+    fixture.exec("ALTER TABLE notes DROP COLUMN body").await;
+
+    // The basis matches no row, so the probe re-reads the current one.
+    client
+        .upload(1, update_changeset(1, "stale", "stale", "t9", "t2"))
+        .await;
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("expected the refusal of the write past the lost column");
+    };
+    assert_eq!(reject.client_seq, 1);
+    assert!(
+        matches!(reject.reason, MutationRejectReason::Constraint { .. }),
+        "a failed re-read is a constraint error: {reject:?}"
+    );
+
+    // The refusal is graceful and repeatable, not a wedged server.
+    client
+        .upload(2, update_changeset(1, "stale", "stale", "t9", "t2"))
+        .await;
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("expected the repeatable refusal of the write past the lost column");
+    };
+    assert_eq!(reject.client_seq, 2);
+    assert!(
+        matches!(reject.reason, MutationRejectReason::Constraint { .. }),
+        "the repeatable refusal is a constraint error: {reject:?}"
+    );
     client.close().await;
     drop_slot(fixture.admin()).await;
 }
