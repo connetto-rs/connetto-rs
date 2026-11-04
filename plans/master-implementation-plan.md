@@ -1189,7 +1189,7 @@ Both roles run on every link at once. For one author as the receiver sees it, **
 
 Slices 1 to 5, 9 and 10 are merged, each one pull request, and slices 6 to 8 remain.
 
-1. **The chain at version 2 and the signed offer** (decisions 1 and 7), `connetto-core` with the server's chain recomputation and `courier_deliver` moved to version 2, and a public `verify_range` a peer and the server call. Needs R31's per-entry major. Merged.
+1. **The chain at version 2 and the signed offer** (decisions 1 and 7), `connetto-core` with the server's chain recomputation and `courier_deliver` moved to version 2, and a public `verify_offer` a peer and the server call. Needs R31's per-entry major. Merged.
 2. **The provisional bookkeeping** (decision 2, step 5), `connetto-client` with no wire, `_connetto_provisional`, the eviction keep for provisional rows, the server-write clearing with `ProvisionalConfirmed`, and the reads, proven by tests that write provenance directly and then evict and patch. The other three tables arrive with the slices that write them. Needs nothing from R31. Merged.
 3. **The bot list in the certificate** (decision 12), `connetto-core`'s certificate profile, the server's enrolment and renewal filling the extension from `bot_list_for`, and its reading on the client and on a linked peer. Needs nothing from R31. Merged.
 4. **The peer link frames** (the wire above), `connetto-peer` at protocol version 2, the frames, a bounded request path through `LinkCommand` and a `PeerEvent` for exchange traffic, proven between two nodes on loopback. Needs R31's `Major`. Merged.
