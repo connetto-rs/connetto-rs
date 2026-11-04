@@ -469,11 +469,13 @@ async fn the_binary_turns_device_identity_on_from_the_issuer_directory() {
     let mut on = base;
     on.push(("CONNETTO_DEVICE_ROOT", &root));
     on.push(("CONNETTO_DEVICE_ISSUER_DIR", &issuer_dir));
+    // The publication setup creates the enrolment base table, so the first
+    // enrolment table the boot names is the certificate one (R77 decision 11).
     let output = run_server_exit_output(&url, Some(&reader_url), &on).await;
     assert!(!output.status.success(), "no enrolment tables refuses");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("table connetto_device_enrolments does not exist"),
+        stderr.contains("table connetto_device_certificates does not exist"),
         "{stderr}"
     );
 }

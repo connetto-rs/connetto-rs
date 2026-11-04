@@ -78,6 +78,7 @@ async fn term_manager(
             &ddl,
             POLICIES,
             "app.user_id",
+            true,
         )
         .expect("membership classifier")
         .into_parts()

@@ -230,9 +230,11 @@ pub async fn provision_auth_tables(fixture: &Fixture) {
 }
 
 /// The default deployment's enrolment tables, whose descriptor is `()` and so
-/// has no columns of its own (R74).
+/// has no columns of its own (R74). The statements are idempotent, since
+/// `start_replication_on` already creates the base table before the demo
+/// stack provisions the rest.
 pub const ENROLMENT_DDL: [&str; 3] = [
-    "CREATE TABLE connetto_device_enrolments (\
+    "CREATE TABLE IF NOT EXISTS connetto_device_enrolments (\
      key_id BYTEA PRIMARY KEY, user_id TEXT NOT NULL, session_id UUID NOT NULL, \
      enrolled_at TIMESTAMPTZ NOT NULL, last_seen TIMESTAMPTZ NOT NULL, \
      revoked_at TIMESTAMPTZ, public_key BYTEA NOT NULL, attestation TEXT NOT NULL)",

@@ -314,6 +314,100 @@ pub fn with_registry<Id: BotRegistryIdSql>(schema_sql: &str) -> String {
     out
 }
 
+/// Append the bookkeeping tables to a schema document the way [`with_registry`]
+/// appends the bot registry, the writer and settled records always and the
+/// device enrolment only with device identity (R77 decision 11).
+///
+/// A publication row for a table outside the catalog wedges the change stream,
+/// so the server's catalog carries them, and the deployment adds them to its
+/// publication with `REPLICA IDENTITY FULL`, which preflight already requires
+/// of every published table. The enrolment table stands only with device
+/// identity, so a deployment without it would otherwise carry the table in the
+/// catalog and be refused at preflight, where the read-in-full probe finds it
+/// absent.
+///
+/// The shapes match the reference DDL the test harness provisions, the writer
+/// tables' and the enrolment base table's. The `user_id` column follows the
+/// deployment's id type `Id` the way the registry's id columns do, so the
+/// catalog decodes a non-text deployment's writer and enrolment rows as the
+/// deployment stores them. The settle-path column's enum type is declared by
+/// the deployment, and the catalog maps a column of an undeclared type to
+/// text, so the DDL here names the type without the `CREATE TYPE` that would
+/// redeclare it.
+#[must_use]
+pub fn with_bookkeeping<Id: BotRegistryIdSql>(schema_sql: &str, devices: bool) -> String {
+    let mut out = schema_sql.trim_end().to_owned();
+    if !out.ends_with(';') {
+        out.push(';');
+    }
+    out.push('\n');
+    out.push_str(&bookkeeping_ddl::<Id>());
+    if devices {
+        out.push_str(";\n");
+        out.push_str(&enrolment_ddl::<Id>());
+    }
+    // The enrolment and settled statements carry no terminator of their own,
+    // so end the document with one; a caller that appends a policy document
+    // after this needs the boundary.
+    if !out.ends_with(';') {
+        out.push(';');
+    }
+    out
+}
+
+/// The writer and settled tables' DDL over the deployment's id type `Id`,
+/// `;`-terminated, the tables that stand with or without device identity.
+#[must_use]
+pub fn bookkeeping_ddl<Id: BotRegistryIdSql>() -> String {
+    format!(
+        "CREATE TABLE _connetto_writers \
+         (writer BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY, \
+          user_id {}, \
+          session_id UUID, \
+          device_key BYTEA UNIQUE, \
+          frontier BIGINT NOT NULL DEFAULT 0, \
+          head BYTEA, \
+          retired_at TIMESTAMPTZ, \
+          secret_hash BYTEA); \
+         CREATE TABLE _connetto_settled \
+         (writer BIGINT NOT NULL, \
+          seq BIGINT NOT NULL, \
+          entry_hash BYTEA NOT NULL, \
+          previous_hash BYTEA NOT NULL, \
+          outcome TEXT NOT NULL, \
+          path connetto_settle_path NOT NULL, \
+          settled_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+          PRIMARY KEY (writer, seq))",
+        Id::ID_SQL_TYPE
+    )
+}
+
+/// The device enrolment table's DDL over the deployment's id type `Id`,
+/// present only with device identity.
+#[must_use]
+pub fn enrolment_ddl<Id: BotRegistryIdSql>() -> String {
+    format!(
+        "CREATE TABLE connetto_device_enrolments \
+         (key_id BYTEA PRIMARY KEY, \
+          user_id {} NOT NULL, \
+          session_id UUID NOT NULL, \
+          enrolled_at TIMESTAMPTZ NOT NULL, \
+          last_seen TIMESTAMPTZ NOT NULL, \
+          revoked_at TIMESTAMPTZ, \
+          public_key BYTEA NOT NULL, \
+          attestation TEXT NOT NULL)",
+        Id::ID_SQL_TYPE
+    )
+}
+
+/// The bookkeeping tables' names, in the order [`bookkeeping_ddl`] creates
+/// them.
+pub const BOOKKEEPING_TABLES: &[&str] = &[
+    "_connetto_writers",
+    "_connetto_settled",
+    "connetto_device_enrolments",
+];
+
 /// The listed tables, as the schema declares them, that a device may store
 /// once for every account.
 ///
@@ -2296,5 +2390,23 @@ mod tests {
             ),
             Err(SchemaError::Major(connetto_core::MajorError::Missing))
         ));
+    }
+
+    /// The bookkeeping `user_id` columns follow the deployment's id type the
+    /// way the registry's do, so a non-text deployment's writer and enrolment
+    /// rows decode as the deployment stores them (R77 decision 11).
+    #[test]
+    fn bookkeeping_ddl_follows_the_deployment_id_type() {
+        let text = bookkeeping_ddl::<connetto_core::bots::TextIds>();
+        assert!(text.contains("user_id TEXT"));
+        let uuid = bookkeeping_ddl::<connetto_core::bots::UuidIds>();
+        assert!(uuid.contains("user_id UUID"));
+        assert!(!uuid.contains("user_id TEXT"));
+
+        let text_enrol = enrolment_ddl::<connetto_core::bots::TextIds>();
+        assert!(text_enrol.contains("user_id TEXT NOT NULL"));
+        let uuid_enrol = enrolment_ddl::<connetto_core::bots::UuidIds>();
+        assert!(uuid_enrol.contains("user_id UUID NOT NULL"));
+        assert!(!uuid_enrol.contains("user_id TEXT"));
     }
 }

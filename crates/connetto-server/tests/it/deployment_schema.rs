@@ -621,9 +621,10 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
     let fixture = Fixture::acquire().await;
     let pool = admin_pool(&fixture).await;
     reset_fixture(&pool, &fixture).await;
+    // The default bookkeeping tables stand beside the deployment's own
+    // writer tables, since the publication must carry the settled table the
+    // pending verdicts push on (R77 decision 11).
     for stmt in [
-        "DROP TABLE _connetto_settled",
-        "DROP TABLE _connetto_writers",
         "CREATE TABLE connetto_sessions (\
          session_id UUID PRIMARY KEY, user_id UUID NOT NULL, \
          current_refresh_hash BYTEA NOT NULL, idle_deadline TIMESTAMPTZ NOT NULL, \
