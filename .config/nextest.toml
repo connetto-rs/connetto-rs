@@ -2,6 +2,7 @@
 #
 # Local iteration: cargo nextest run --cargo-profile testfast
 # One old file's tests: cargo nextest run --cargo-profile testfast -E 'test(retention::)'
+# Postgres without Docker: eval "$(scripts/native-postgres.sh DIR)", then add --profile native
 # The pre-push gate archives with --release instead, matching CI.
 
 [profile.default]
@@ -97,3 +98,20 @@ test(two_nodes_discover_each_other_and_autolink)
 | test(clients_without_autolink_report_and_link_only_on_the_call)
 '''
 test-group = 'discovery'
+
+# Native clusters start without Docker, so only the serialized groups above stay in force.
+# This filter repeats the keyring and discovery filters, so it changes with them.
+[profile.native]
+
+[[profile.native.overrides]]
+filter = '''
+not (
+  test(secret_stores::) | test(teardown::) | test(e2e::) | test(revocation::)
+  | test(two_nodes_discover_each_other_and_autolink)
+  | test(a_renewal_re_registers_under_a_new_fingerprint)
+  | test(a_stopped_discovery_serves_again)
+  | test(two_clients_discover_each_other_and_autolink)
+  | test(clients_without_autolink_report_and_link_only_on_the_call)
+)
+'''
+test-group = '@global'
