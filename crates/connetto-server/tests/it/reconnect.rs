@@ -239,9 +239,10 @@ async fn drive<A, O>(
     sql: &str,
 ) -> Vec<PgChangeEvent>
 where
-    A: VisibilityPolicy<Watcher = Arc<connetto_core::auth::Principal>, Backend = Postgres>,
+    A: VisibilityPolicy<Watcher = Arc<connetto_core::auth::Principal>, Backend = Postgres>
+        + 'static,
     A::Error: core::fmt::Display + connetto_server::FailedAuthorization,
-    O: Oplog,
+    O: Oplog + 'static,
 {
     source.execute_sql(sql).expect("execute dml");
     let mut events = Vec::new();

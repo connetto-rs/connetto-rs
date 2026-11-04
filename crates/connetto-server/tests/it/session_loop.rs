@@ -178,8 +178,9 @@ async fn drive_cdc<S, A>(
     manager: &SessionManager<S, A, ConnettoDefaults>,
     sql: &str,
 ) where
-    S: SnapshotSource,
-    A: VisibilityPolicy<Watcher = std::sync::Arc<connetto_core::Principal>, Backend = Postgres>,
+    S: SnapshotSource + 'static,
+    A: VisibilityPolicy<Watcher = std::sync::Arc<connetto_core::Principal>, Backend = Postgres>
+        + 'static,
     A::Error: core::fmt::Display + connetto_server::FailedAuthorization,
 {
     source.execute_sql(sql).expect("execute dml");
