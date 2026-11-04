@@ -10,8 +10,10 @@
 //!
 //! Needs Docker: the fixture starts its own Postgres.
 
+use std::sync::Arc;
+
 use super::courier_frontier::{
-    Chain, FAULTED, Faulting, Manager, applied, audited_guard, bind_nonce_message, chain,
+    Bans, Chain, FAULTED, Faulting, Manager, applied, audited_guard, bind_nonce_message, chain,
     courier_manager, manager_over, note, notes, offer, plain, roster, ruled, settle_directly,
     settled_count, sign, tomorrow, writing_manager,
 };
@@ -28,7 +30,9 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::Transport;
 use connetto_server::device_cert::DeviceCertConfig;
-use connetto_server::{SessionConfig, SessionError, WebSocketTransport};
+use connetto_server::{
+    AbuseConfig, RequestGuard, SessionConfig, SessionError, ThrottleConfig, WebSocketTransport,
+};
 use connetto_test_harness::{Client, Fixture, RowValue, isolated_session_keyring};
 use diesel_async::RunQueryDsl as _;
 use rcgen::{KeyPair, PublicKeyData as _};
@@ -851,4 +855,90 @@ async fn a_built_server_with_the_path_off_refuses_a_range_over_a_socket() {
         CourierOutcome::Refused(CourierRefusal::Disabled)
     );
     assert_eq!(landed, 0, "nothing landed");
+}
+
+/// A store that fails while a range opens or a body settles ends the
+/// connection with the failure, the range unanswered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_failure_in_a_range_ends_the_connection() {
+    // The ban list cannot be read when the range opens.
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (author, author_id) = store.enrol("alice", tomorrow()).await;
+    let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
+    let unreadable_bans = writing_manager(
+        fixture.admin(),
+        Arc::new(
+            RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
+                .with_bans(Arc::new(Bans::Unreachable("alice"))),
+        ),
+        Some(store.installable()),
+        SessionConfig::default().with_courier(true),
+    );
+    let range = three();
+    let (mut client, server) = courier_session(&unreadable_bans, "bob", &courier, courier_id).await;
+    client
+        .courier_range(range_frame("c1", &author, author_id, &range, 1, 1))
+        .await;
+    let ended = server.await.expect("join the session");
+    assert!(
+        matches!(ended, Err(SessionError::BanList(_))),
+        "got {ended:?}"
+    );
+
+    // The author's writer row cannot be made when the first body settles.
+    let manager = courier_on(&fixture, &store);
+    let (mut client, server) = courier_session(&manager, "bob", &courier, courier_id).await;
+    fixture
+        .setup(&[
+            "CREATE OR REPLACE FUNCTION refuse_writer_rows() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'no writer rows'; END $$",
+            "CREATE TRIGGER refuse_writer_rows BEFORE INSERT ON _connetto_writers \
+             FOR EACH ROW EXECUTE FUNCTION refuse_writer_rows()",
+        ])
+        .await;
+    client
+        .courier_range(range_frame("c1", &author, author_id, &range, 1, 1))
+        .await;
+    client.courier_body(body_frame("c1", &range, 1)).await;
+    let ended = server.await.expect("join the session");
+    assert!(
+        matches!(ended, Err(SessionError::WriteTarget(_))),
+        "got {ended:?}"
+    );
+    assert_eq!(settled_count(fixture.admin()).await, 0, "nothing settled");
+    fixture
+        .setup(&["DROP FUNCTION refuse_writer_rows() CASCADE"])
+        .await;
+}
+
+/// The binary refuses to boot on a `CONNETTO_COURIER` that is neither `on`
+/// nor `off`, naming it.
+#[tokio::test]
+async fn the_binary_refuses_an_unknown_courier_switch() {
+    use super::e2e::{build_auth_stack, run_server_exit_output, with_user_url};
+
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let auth_stack = build_auth_stack().await;
+    let auth_env = auth_stack.env_pairs("http://127.0.0.1:0");
+    let mut envs: Vec<(&str, &str)> = auth_env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    envs.push(("CONNETTO_COURIER", "yes"));
+    let output = run_server_exit_output(&url, Some(&reader_url), &envs).await;
+    assert!(
+        !output.status.success(),
+        "the unknown switch refuses the boot"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown CONNETTO_COURIER \"yes\""),
+        "the refusal names the value, got: {stderr}"
+    );
 }

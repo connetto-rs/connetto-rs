@@ -88,7 +88,7 @@ use crate::bots::schema::{ListEntry, PgBotRegistry, RegistryError, Verb};
 use crate::audit::{AuthEvent, AuthOp};
 use crate::counters;
 use crate::courier::{
-    Admitted, Applier, CourierAuthor, CourierEntry, CourierRun, CourierViolation, Settling,
+    Admitted, Applier, CourierAuthor, CourierEntry, CourierRun, CourierViolation, Settling, Slot,
 };
 use crate::fence::{ReadFence, split_snapshot_cursor};
 use crate::guard::RequestGuard;
@@ -6651,15 +6651,15 @@ where
         match run.admit(&body.request_id, body.seq) {
             Err(violation) => return courier_violation(transport, &violation).await,
             Ok(Admitted::Dropped) => {}
-            Ok(Admitted::Row(index)) => {
+            Ok(Admitted::Row(slot)) => {
                 let Ok(changeset) = crate::materializer::decompress(&body.changeset_zstd) else {
                     return courier_violation(transport, &CourierViolation::Envelope(body.seq))
                         .await;
                 };
-                if let Err(violation) = run.check_digest(index, &changeset) {
+                if let Err(violation) = slot.check_digest(&changeset) {
                     return courier_violation(transport, &violation).await;
                 }
-                self.courier_settle_row(run, index, &changeset, &body.changeset_zstd)
+                self.courier_settle_row(slot, &changeset, &body.changeset_zstd)
                     .await?;
             }
         }
@@ -6724,13 +6724,12 @@ where
         }
         for body in bodies {
             let violation = |err: CourierViolation| SessionError::Protocol(err.to_string());
-            if let Admitted::Row(index) = run.admit("", body.seq).map_err(violation)? {
-                run.check_digest(index, &body.changeset)
-                    .map_err(violation)?;
+            if let Admitted::Row(slot) = run.admit("", body.seq).map_err(violation)? {
+                slot.check_digest(&body.changeset).map_err(violation)?;
                 let payload = compress(&body.changeset).map_err(|err| {
                     SessionError::Protocol(format!("the changeset will not compress, {err}"))
                 })?;
-                self.courier_settle_row(&mut run, index, &body.changeset, &payload)
+                self.courier_settle_row(slot, &body.changeset, &payload)
                     .await?;
             }
         }
@@ -6780,13 +6779,7 @@ where
             rows,
             bodies,
             answers,
-            Settling {
-                author,
-                major,
-                next,
-                previous,
-                applier: None,
-            },
+            Settling::new(author, major, next, previous),
         ))
     }
 
@@ -6885,7 +6878,7 @@ where
         }))
     }
 
-    /// Settle the body of the row at `index`, already checked against its
+    /// Settle the body `slot` admitted, already checked against its row's
     /// digest, as the stream table says: a row at or below the frontier is
     /// consumed, the next row above it settles, and a later row stops the
     /// range at the one skipped.
@@ -6899,26 +6892,23 @@ where
     /// When one identity cannot settle one run, a guarantee `accept` upholds.
     async fn courier_settle_row(
         &self,
-        run: &mut CourierRun<Id, Key>,
-        index: usize,
+        mut slot: Slot<'_, Id, Key>,
         changeset: &[u8],
         payload: &[u8],
     ) -> Result<(), SessionError> {
-        let Some((rows, settling)) = run.settling_parts() else {
-            return Ok(());
-        };
-        if index < settling.next {
+        let next = slot.settling.next;
+        if slot.index < next {
             return Ok(());
         }
-        let next = settling.next;
-        let row = &rows[next];
+        let row = &slot.rows[next];
         let number_original = row
             .origin
             .is_some_and(|origin| matches!(origin.writer, WriterRef::Number(_)));
-        if index > next || settling.major != Some(row.major) || number_original {
-            run.answer(next, CourierEntryOutcome::NotCouriered, true);
+        if slot.index > next || slot.settling.major != Some(row.major) || number_original {
+            slot.answer(next, CourierEntryOutcome::NotCouriered, true);
             return Ok(());
         }
+        let settling = &mut *slot.settling;
         let applier = match settling.applier.take() {
             Some(applier) => applier,
             None => self.courier_applier(&settling.author).await?,
@@ -6949,7 +6939,7 @@ where
         match outcome {
             // Settles nothing, so the range is offered again from here.
             SettledOutcome::Rejected(MutationRejectReason::Indeterminate) => {
-                run.answer(next, CourierEntryOutcome::Retry { retry_after_ms: 0 }, true);
+                slot.answer(next, CourierEntryOutcome::Retry { retry_after_ms: 0 }, true);
             }
             outcome => {
                 // Another entry stands at the sequence, so the rest of the
@@ -6959,7 +6949,7 @@ where
                     SettledOutcome::Rejected(MutationRejectReason::Forked)
                 );
                 let verdict = crate::provisional::verdict_of(&facts, seq, Some(&outcome));
-                run.answer(next, CourierEntryOutcome::Ruled(verdict), forked);
+                slot.answer(next, CourierEntryOutcome::Ruled(verdict), forked);
             }
         }
         Ok(())

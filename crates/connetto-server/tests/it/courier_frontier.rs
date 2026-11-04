@@ -610,10 +610,10 @@ async fn seed_direct_refusal(pool: &Pool<AsyncPgConnection>, writer: i64, head: 
         .expect("frontier");
 }
 
-/// A ban list that bans one account, or one that cannot be read.
-enum Bans {
+/// A ban list that bans one account, or one that cannot be read for one.
+pub(super) enum Bans {
     Refusing(&'static str),
-    Unreachable,
+    Unreachable(&'static str),
 }
 
 impl BanStore<String> for Bans {
@@ -626,7 +626,10 @@ impl BanStore<String> for Bans {
                 expires_at: None,
                 applies: true,
             })),
-            Self::Unreachable => Err(BanError::new("the ban table is unreachable")),
+            Self::Unreachable(unread) if user_id == unread => {
+                Err(BanError::new("the ban table is unreachable"))
+            }
+            Self::Unreachable(_) => Ok(None),
         };
         Box::pin(core::future::ready(answer))
     }
@@ -2129,7 +2132,7 @@ async fn an_unreadable_ban_list_fails_the_range_closed() {
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let guard = Arc::new(
         RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
-            .with_bans(Arc::new(Bans::Unreachable)),
+            .with_bans(Arc::new(Bans::Unreachable("alice"))),
     );
     let manager = writing_manager(
         fixture.admin(),

@@ -142,25 +142,75 @@ pub(crate) struct Settling<Id, Key> {
     pub previous: [u8; 32],
     /// The identity and writer, once a body applied.
     pub applier: Option<Applier<Id, Key>>,
+    /// Whether the range stopped at a row, its remaining bodies draining.
+    stopped: bool,
+}
+
+impl<Id, Key> Settling<Id, Key> {
+    /// The settling state of a range whose next row to settle is `next`,
+    /// chained from `previous`.
+    pub(crate) fn new(
+        author: CourierAuthor<Id>,
+        major: Option<Major>,
+        next: usize,
+        previous: [u8; 32],
+    ) -> Self {
+        Self {
+            author,
+            major,
+            next,
+            previous,
+            applier: None,
+            stopped: false,
+        }
+    }
 }
 
 /// Where a range stands.
-pub(crate) enum Stage<Id, Key> {
+enum Stage<Id, Key> {
     /// Refused before anything settled, its bodies draining.
     Refused(CourierRefusal),
-    /// Settling its rows above the frontier.
+    /// Settling its rows above the frontier, or stopped at one.
     Settling(Settling<Id, Key>),
-    /// Stopped at a row, its remaining bodies draining.
-    Stopped,
 }
 
 /// What a body that passed the range and order checks asks of the caller.
-pub(crate) enum Admitted {
+pub(crate) enum Admitted<'a, Id, Key> {
     /// The range is refused or stopped, so the body is dropped unread.
     Dropped,
-    /// The body belongs to the row at this index and must decompress and
-    /// match the row's digest before it settles.
-    Row(usize),
+    /// The body belongs to a row of a settling range and must decompress
+    /// and match the row's digest before it settles.
+    Row(Slot<'a, Id, Key>),
+}
+
+/// A settling range's state beside the row an admitted body belongs to.
+pub(crate) struct Slot<'a, Id, Key> {
+    /// The index of the body's row.
+    pub index: usize,
+    /// The range's rows.
+    pub rows: &'a [ManifestRow],
+    /// The range's settling state.
+    pub settling: &'a mut Settling<Id, Key>,
+    /// The rows answered so far.
+    answers: &'a mut Vec<(u64, CourierEntryOutcome)>,
+}
+
+impl<Id, Key> Slot<'_, Id, Key> {
+    /// Check the body's changeset against its row's digest.
+    pub(crate) fn check_digest(&self, changeset: &[u8]) -> Result<(), CourierViolation> {
+        let row = &self.rows[self.index];
+        if <[u8; 32]>::from(Sha256::digest(changeset)) == row.digest {
+            Ok(())
+        } else {
+            Err(CourierViolation::Digest(row.seq))
+        }
+    }
+
+    /// Answer the row at `index` and, when `stops`, stop the range.
+    pub(crate) fn answer(&mut self, index: usize, outcome: CourierEntryOutcome, stops: bool) {
+        self.answers.push((self.rows[index].seq, outcome));
+        self.settling.stopped |= stops;
+    }
 }
 
 /// One courier range open on a connection (R78 decisions 28 to 32).
@@ -216,20 +266,11 @@ impl<Id, Key> CourierRun<Id, Key> {
         }
     }
 
-    /// The rows beside the settling state, `None` once the range is refused
-    /// or stopped.
-    pub(crate) fn settling_parts(&mut self) -> Option<(&[ManifestRow], &mut Settling<Id, Key>)> {
-        match &mut self.stage {
-            Stage::Settling(settling) => Some((&self.rows, settling)),
-            Stage::Refused(_) | Stage::Stopped => None,
-        }
-    }
-
     /// The refusal of a range refused before anything settled.
     pub(crate) fn refusal(&self) -> Option<CourierRefusal> {
         match self.stage {
             Stage::Refused(refusal) => Some(refusal),
-            Stage::Settling(_) | Stage::Stopped => None,
+            Stage::Settling(_) => None,
         }
     }
 
@@ -244,7 +285,7 @@ impl<Id, Key> CourierRun<Id, Key> {
         &mut self,
         request_id: &str,
         seq: u64,
-    ) -> Result<Admitted, CourierViolation> {
+    ) -> Result<Admitted<'_, Id, Key>, CourierViolation> {
         if request_id != self.request_id {
             return Err(CourierViolation::OtherRange);
         }
@@ -262,47 +303,29 @@ impl<Id, Key> CourierRun<Id, Key> {
         }
         self.last_body = Some(seq);
         self.bodies_left = self.bodies_left.saturating_sub(1);
-        Ok(match self.stage {
-            Stage::Settling(_) => Admitted::Row(index),
-            Stage::Refused(_) | Stage::Stopped => Admitted::Dropped,
+        Ok(match &mut self.stage {
+            Stage::Settling(settling) if !settling.stopped => Admitted::Row(Slot {
+                index,
+                rows: &self.rows,
+                settling,
+                answers: &mut self.answers,
+            }),
+            Stage::Settling(_) | Stage::Refused(_) => Admitted::Dropped,
         })
     }
 
-    /// Check a read body's changeset against its row's digest.
-    pub(crate) fn check_digest(
-        &self,
-        index: usize,
-        changeset: &[u8],
-    ) -> Result<(), CourierViolation> {
-        let row = &self.rows[index];
-        if <[u8; 32]>::from(Sha256::digest(changeset)) == row.digest {
-            Ok(())
-        } else {
-            Err(CourierViolation::Digest(row.seq))
-        }
-    }
-
-    /// Answer the row at `index` and, when `stops`, stop the range.
-    pub(crate) fn answer(&mut self, index: usize, outcome: CourierEntryOutcome, stops: bool) {
-        self.answers.push((self.rows[index].seq, outcome));
-        if stops {
-            self.stage = Stage::Stopped;
-        }
-    }
-
     /// The range's one answer, the next row above the frontier left without
-    /// a body answered `NotCouriered`.
+    /// a body answered `NotCouriered` unless the range stopped.
     pub(crate) fn finish(mut self) -> (String, CourierOutcome) {
         let outcome = match self.stage {
             Stage::Refused(refusal) => CourierOutcome::Refused(refusal),
-            Stage::Settling(Settling { next, .. }) => {
-                if let Some(row) = self.rows.get(next) {
+            Stage::Settling(Settling { next, stopped, .. }) => {
+                if let Some(row) = self.rows.get(next).filter(|_| !stopped) {
                     self.answers
                         .push((row.seq, CourierEntryOutcome::NotCouriered));
                 }
                 CourierOutcome::Entries(self.answers)
             }
-            Stage::Stopped => CourierOutcome::Entries(self.answers),
         };
         (self.request_id, outcome)
     }
@@ -459,14 +482,59 @@ mod tests {
         assert!(refused(0).done());
     }
 
-    /// A read body is checked against its own row's digest.
+    fn settling(bodies: u32) -> CourierRun<String, String> {
+        CourierRun::settling(
+            "c1".to_owned(),
+            vec![row(4, b"four"), row(5, b"five"), row(6, b"six")],
+            bodies,
+            Vec::new(),
+            Settling::new(
+                CourierAuthor {
+                    user: "alice".to_owned(),
+                    bot_list: None,
+                    key: Vec::new(),
+                    writer: None,
+                    frontier: 3,
+                    head: [0; 32],
+                },
+                None,
+                0,
+                [0; 32],
+            ),
+        )
+    }
+
+    /// A settling range reads its bodies, checking each against its own
+    /// row's digest, until a stop, after which it drops them and answers no
+    /// row it did not reach.
     #[test]
-    fn a_body_is_checked_against_its_rows_digest() {
-        let run = refused(0);
-        assert_eq!(run.check_digest(1, b"five"), Ok(()));
+    fn a_settling_range_reads_its_bodies_until_it_stops() {
+        let mut run = settling(3);
+        let Ok(Admitted::Row(mut slot)) = run.admit("c1", 4) else {
+            panic!("a settling range reads its body");
+        };
+        assert_eq!(slot.index, 0);
+        assert_eq!(slot.check_digest(b"four"), Ok(()));
+        assert_eq!(slot.check_digest(b"five"), Err(CourierViolation::Digest(4)));
+        slot.answer(0, CourierEntryOutcome::Retry { retry_after_ms: 0 }, true);
+        assert!(matches!(run.admit("c1", 5), Ok(Admitted::Dropped)));
+        assert!(matches!(run.admit("c1", 6), Ok(Admitted::Dropped)));
+        assert!(run.done());
         assert_eq!(
-            run.check_digest(1, b"four"),
-            Err(CourierViolation::Digest(5))
+            run.finish().1,
+            CourierOutcome::Entries(vec![(4, CourierEntryOutcome::Retry { retry_after_ms: 0 })]),
+            "a stopped range answers no row past the stop"
+        );
+    }
+
+    /// A range whose last body leaves rows unreached answers the next one
+    /// `NotCouriered`.
+    #[test]
+    fn a_range_short_of_bodies_answers_its_next_row_not_couriered() {
+        let run = settling(0);
+        assert_eq!(
+            run.finish().1,
+            CourierOutcome::Entries(vec![(4, CourierEntryOutcome::NotCouriered)])
         );
     }
 
