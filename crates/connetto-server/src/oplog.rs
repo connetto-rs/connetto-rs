@@ -1706,6 +1706,35 @@ mod tests {
         assert_eq!(kept, newest, "the three newest fit the budget exactly");
     }
 
+    /// An entry older than the age bound is dropped at the next append, and one exactly at the bound stays.
+    #[tokio::test]
+    async fn the_age_bound_drops_entries_past_it_at_the_next_append() {
+        let clock = Arc::new(subql::ManualClock::new(0));
+        let handle: ClockHandle = clock.clone();
+        let log = InMemoryOplog::with_clock(
+            OplogConfig::default().with_max_age(Duration::from_secs(10)),
+            handle,
+        );
+        let at = |n: u32| PgCommitPosition::new(PgLsn(0x100 * u64::from(n)), PgXid(n), 1);
+        log.append(&row(1, at(1))).await.expect("append");
+        clock.advance(Duration::from_secs(5));
+        log.append(&row(2, at(2))).await.expect("append");
+        clock.advance(Duration::from_secs(5));
+        log.append(&row(3, at(3))).await.expect("append");
+        assert_eq!(
+            log.min_position().await.expect("min"),
+            Some(at(1)),
+            "ten seconds old stays"
+        );
+        clock.advance(Duration::from_secs(1));
+        log.append(&row(4, at(4))).await.expect("append");
+        assert_eq!(
+            log.min_position().await.expect("min"),
+            Some(at(2)),
+            "eleven seconds old goes"
+        );
+    }
+
     /// A row delivered again after a failed dispatch is kept once.
     #[tokio::test]
     async fn a_row_appended_again_is_kept_once() {
