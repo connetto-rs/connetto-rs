@@ -19,10 +19,10 @@ use connetto_core::messages::{ControlMessage, Handshake, Subscribe, Subscription
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, ChangeRecord, ManagerBuilder, Materializer, Oplog,
-    OplogConfig, PageSpec, PgOplog, PgReadConnector, PgSnapshotSource, ReadBudget,
-    RuntimeWritableCatalog, SnapshotEstimate, SnapshotPage, SnapshotSource, UnseenIds, loopback,
-    pg_write_target, split_snapshot_cursor,
+    CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, ChangeRecord, InMemoryOplog, ManagerBuilder,
+    Materializer, Oplog, OplogConfig, PageSpec, PgOplog, PgReadConnector, PgSnapshotSource,
+    ReadBudget, RuntimeWritableCatalog, SnapshotEstimate, SnapshotPage, SnapshotSource, UnseenIds,
+    loopback, pg_write_target, split_snapshot_cursor,
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
@@ -702,6 +702,68 @@ async fn pg_oplog_round_trips_a_composite_key() {
         .expect("drop oplog table");
 }
 
+/// Postgres counts an entry's bytes exactly as `ChangeRecord::stored_bytes` does, so a budget of the two newest rows keeps both and one byte less keeps only the newest, as the in-memory log would.
+#[tokio::test]
+async fn pg_oplog_drops_the_oldest_rows_past_its_byte_budget() {
+    let fixture = Fixture::acquire().await;
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(fixture.admin_url());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    let (records, _) = two_transactions();
+    let two_newest: u64 = records[1..].iter().map(ChangeRecord::stored_bytes).sum();
+    for (budget, kept_from) in [(two_newest, 1), (two_newest - 1, 2)] {
+        let oplog = fresh_oplog(
+            &pool,
+            "connetto_oplog_bytes",
+            OplogConfig::default().with_max_bytes(budget),
+        )
+        .await;
+        for record in &records {
+            oplog.append(record).await.expect("append");
+        }
+        let kept: Vec<PgCommitPosition> = oplog
+            .entries_since(PgCommitPosition::before_commit(PgLsn(0)))
+            .await
+            .expect("read")
+            .iter()
+            .map(ChangeRecord::position)
+            .collect();
+        let newest: Vec<PgCommitPosition> = records[kept_from..]
+            .iter()
+            .map(ChangeRecord::position)
+            .collect();
+        assert_eq!(kept, newest, "a budget of {budget} bytes");
+    }
+}
+
+/// The log line naming the bound that pruned is what tells an operator that extra full resyncs come from a retention setting, so the byte bound names itself once it starts pruning, and once only while it keeps pruning.
+#[tokio::test]
+async fn the_byte_bound_names_itself_when_it_starts_pruning() {
+    let capture = super::logging::with_capture(
+        "the_byte_bound_names_itself_when_it_starts_pruning",
+        |capture| async move {
+            let rows: Vec<ChangeRecord> = (1..=4).map(|n| single_row(n).0).collect();
+            let oplog =
+                InMemoryOplog::new(OplogConfig::default().with_max_bytes(rows[0].stored_bytes()));
+            for record in &rows {
+                oplog.append(record).await.expect("append");
+            }
+            capture
+        },
+    )
+    .await;
+    let named: Vec<serde_json::Value> = capture
+        .lines()
+        .into_iter()
+        .filter(|line| line["message"] == "the oplog started pruning by another bound")
+        .collect();
+    assert_eq!(
+        named.len(),
+        1,
+        "one line for the bound taking over, {named:?}"
+    );
+    assert_eq!(named[0]["bound"], "bytes");
+}
+
 /// Two transactions as the emulator stamps them, the first of two rows and the second of one, with their records and commits.
 fn two_transactions() -> (Vec<ChangeRecord>, Vec<PgCommit>) {
     let mat = Materializer::builder(ORDERS_PG_DDL)
@@ -743,8 +805,8 @@ fn two_transactions() -> (Vec<ChangeRecord>, Vec<PgCommit>) {
     (records, commits)
 }
 
-/// A fresh `PgOplog` over `table`, whose window keeps at most `max_entries` rows.
-async fn fresh_oplog(pool: &Pool<AsyncPgConnection>, table: &str, max_entries: usize) -> PgOplog {
+/// A fresh `PgOplog` over `table`, retaining what `config` allows.
+async fn fresh_oplog(pool: &Pool<AsyncPgConnection>, table: &str, config: OplogConfig) -> PgOplog {
     let mut conn = pool.get().await.expect("get connection");
     for drop in [
         table.to_owned(),
@@ -756,11 +818,7 @@ async fn fresh_oplog(pool: &Pool<AsyncPgConnection>, table: &str, max_entries: u
             .await
             .expect("drop oplog table");
     }
-    let oplog = PgOplog::new(
-        pool.clone(),
-        table,
-        OplogConfig::default().with_max_entries(max_entries),
-    );
+    let oplog = PgOplog::new(pool.clone(), table, config);
     oplog.ensure_schema().await.expect("ensure schema");
     oplog
 }
@@ -777,7 +835,12 @@ async fn pg_oplog_orders_the_rows_of_one_transaction_by_their_ordinal() {
         entries.iter().map(ChangeRecord::position).collect()
     };
 
-    let oplog = fresh_oplog(&pool, "connetto_oplog_ordinals", 100).await;
+    let oplog = fresh_oplog(
+        &pool,
+        "connetto_oplog_ordinals",
+        OplogConfig::default().with_max_entries(100),
+    )
+    .await;
     for record in &records {
         oplog.append(record).await.expect("append");
     }
@@ -827,7 +890,12 @@ async fn pg_oplog_orders_the_rows_of_one_transaction_by_their_ordinal() {
         "trimming through a transaction's first row keeps its second"
     );
 
-    let pruned = fresh_oplog(&pool, "connetto_oplog_pruned", 2).await;
+    let pruned = fresh_oplog(
+        &pool,
+        "connetto_oplog_pruned",
+        OplogConfig::default().with_max_entries(2),
+    )
+    .await;
     for record in &records {
         pruned.append(record).await.expect("append");
     }
@@ -863,7 +931,12 @@ async fn pg_oplog_keeps_the_later_of_two_recorded_commits() {
     let (earlier, later) = (commits[0], commits[1]);
     assert!(earlier.end_lsn() < later.end_lsn());
 
-    let oplog = fresh_oplog(&pool, "connetto_oplog_commits", 100).await;
+    let oplog = fresh_oplog(
+        &pool,
+        "connetto_oplog_commits",
+        OplogConfig::default().with_max_entries(100),
+    )
+    .await;
     assert_eq!(oplog.last_commit().await.expect("read"), None);
     oplog.record_commit(earlier).await.expect("record");
     assert_eq!(oplog.last_commit().await.expect("read"), Some(earlier));
@@ -942,7 +1015,12 @@ async fn pg_oplog_tells_a_pruned_missed_transaction_from_a_retained_one() {
     let fixture = Fixture::acquire().await;
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(fixture.admin_url());
     let pool = Pool::builder().build(manager).await.expect("build pool");
-    let oplog = fresh_oplog(&pool, "connetto_oplog_xids", 10).await;
+    let oplog = fresh_oplog(
+        &pool,
+        "connetto_oplog_xids",
+        OplogConfig::default().with_max_entries(10),
+    )
+    .await;
     for n in 1..=20 {
         let (record, commit) = single_row(n);
         oplog.append(&record).await.expect("append");

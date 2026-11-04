@@ -211,12 +211,6 @@ Taken by [R108](#r108-caller-kinds-as-database-roles), whose decision 4 settles 
 
 Taken by [R108](#r108-caller-kinds-as-database-roles), which has both translators adopt one set of sql-traits answers and whose proof includes the differential harness.
 
-### G9
-
-**The oplog has no byte bound.** `OplogConfig` bounds entries (1M) and age (72 h). Each entry stores the compressed patch, so wide rows reach gigabytes before either bound prunes, on the heap for `InMemoryOplog`.
-
-Decided. The byte bound ships ahead of the rest of the shared-frame design, in one pull request, with a default budget of 1 GiB and pruning that logs which bound fired.
-
 ### G11
 
 **Over-restriction is noted only as faithful.** At the pinned `rls2fga`, a policy translated to no access, a self-referential read policy for one, hides every row and is noted at the `Faithful` severity, which connetto does not log. connetto logs as a warning every note that leaves the boot running and asks something of the operator or names whom the rules do not reach. Postgres answers a self-referential policy with `42P17` and `pg2sqlite` refuses it, so a deployment carrying one is refused at startup before anything reaches OpenFGA.
@@ -267,9 +261,9 @@ Fixed in one pull request, by a browser CI shard with its own restartable stack 
 
 Decided designs no phase builds yet. A phase that takes one moves it into its section.
 
-## Shared frames and the oplog byte bound
+## Shared frames
 
-Decided in R16 part B, which wrote no implementation phase. [G9](#g9) is the defect it answers, and the shared frame cuts the per-subscriber copies the send budget bounds.
+Decided in R16 part B, which wrote no implementation phase. The shared frame cuts the per-subscriber copies the send budget bounds.
 
 **The unit is one change event, not one subscriber and not one subscription.** Every computation a change requires happens once per event. What remains per subscriber is a route lookup, a verdict entry and a socket write, and none of the three recomputes anything the event already produced. The reason the unit is the event rather than the subscriber is that a change event is the only thing in the system that happens once. A subscriber is a destination, not a computation.
 
@@ -333,10 +327,6 @@ Sending the header and the body as separate WebSocket continuation fragments wou
 
 It does not foreclose the zero-copy send. `bytes::Bytes::from_owner` accepts any `AsRef<[u8]> + Send + 'static` owner and takes ownership without copying, and `Arc<[u8]>` satisfies that bound. So after the transport bump the frame is converted once per event and cloned per socket, and `connetto-core`'s public types never grow a `bytes` dependency.
 
-### The byte bound
-
-`OplogConfig` gains a byte bound, on by default, and connetto logs which bound pruned. The window is bounded today by entry count and age alone (one million entries or seventy-two hours, [06-reconnect.md](../docs/architecture/06-reconnect.md#retention-window)), and neither notices row width. At the thirty-nine bytes R0 measured for a two-column row a full window of patches is tens of megabytes, and at a few kilobytes per row it is gigabytes. The failure mode of a bound set too small is extra full snapshots rather than lost data, because a resume point that has fallen off the front of the log already draws `FullResyncRequired`, which is a working path. That is precisely why the log line is part of the decision and not a nicety. Extra snapshots look like a client defect and are actually a retention setting. The default value has no measurement behind it and is a starting point, not a finding.
-
 ### The cost
 
 | Change | Where |
@@ -350,7 +340,6 @@ It does not foreclose the zero-copy send. `bytes::Bytes::from_owner` accepts any
 | Server handle derived from `predicate_hash`, returned on the subscribe reply, carried in the header | `materializer.rs`, `session.rs`, `messages` |
 | One frame built per handle per event, cloned per socket | `session.rs` |
 | `tokio-tungstenite` from 0.24, and the frame handed over as `Bytes` | `connetto-core/Cargo.toml`, `transport.rs` |
-| `OplogConfig` gains a byte bound, and pruning names the bound that fired | `oplog.rs` |
 
 Nothing goes upstream. The frame split is a breaking framing change, and `PROTOCOL_VERSION` (currently 2, `crates/connetto-core/src/version.rs`) bumps on breaking changes to `ControlMessage`, `BulkMessage`, framing or compression, so the new wire takes a version bump rather than riding on a frozen one.
 
