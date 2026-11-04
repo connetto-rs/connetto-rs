@@ -10,13 +10,16 @@
 //!
 //! Needs Docker: the fixture starts its own Postgres.
 
+use core::fmt::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::courier_frontier::{
     Bans, Chain, FAULTED, Faulting, Manager, applied, audited_guard, bind_nonce_message, chain,
     courier_manager, manager_over, note, notes, offer, plain, roster, ruled, settle_directly,
     settled_count, sign, tomorrow, writing_manager,
 };
+use super::writer_frontier::{accept_manager, pump_until, signed_in_alice};
 use super::writer_shared::{Enrolments, insert_changeset, seed_notes, writer_for_key};
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::device_cert::KeyId;
@@ -166,6 +169,71 @@ async fn violated(
         matches!(&ended, Err(SessionError::Protocol(told)) if told == detail),
         "the connection ends on the violation, got {ended:?}"
     );
+}
+
+/// The hex form of a device key, for a seed statement.
+fn key_hex(key_id: [u8; 32]) -> String {
+    let mut hex = String::with_capacity(key_id.len() * 2);
+    for byte in key_id {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Seed `count` standing notice rows for `author`, naming `courier` and the
+/// author's device key, the stored outcome applied.
+async fn seed_notices(
+    fixture: &Fixture,
+    author: &str,
+    key_id: [u8; 32],
+    courier: &str,
+    count: i64,
+) {
+    fixture
+        .setup(&[&format!(
+            "INSERT INTO _connetto_courier_notices (user_id, courier_user_id, device_key, seq, outcome) \
+             SELECT '{author}', '{courier}', '\\x{hex}', s, '{outcome}' FROM generate_series(1, {count}) s",
+            hex = key_hex(key_id),
+            outcome = connetto_server::writer_schema::SettledOutcome::Applied.json(),
+        )])
+        .await;
+}
+
+/// How many notice rows stand across every account.
+async fn notice_count(
+    pool: &diesel_async::pooled_connection::bb8::Pool<diesel_async::AsyncPgConnection>,
+) -> i64 {
+    use diesel::QueryDsl;
+    let mut conn = pool.get().await.expect("admin connection");
+    connetto_server::defaults::_connetto_courier_notices::table
+        .count()
+        .get_result(&mut *conn)
+        .await
+        .expect("count the notices")
+}
+
+/// Wait until the notice count reaches `expected`, the ack's delete landing
+/// in its own connection and answering nothing.
+async fn wait_notice_count(
+    pool: &diesel_async::pooled_connection::bb8::Pool<diesel_async::AsyncPgConnection>,
+    expected: i64,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while notice_count(pool).await != expected {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the notice count did not reach {expected}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The notice frame the session carries, failing on any other control.
+async fn notice(client: &mut Client) -> connetto_core::messages::CourierNotice {
+    match client.next_control().await {
+        ControlMessage::CourierNotice(notice) => notice,
+        other => panic!("expected a courier notice, got {other:?}"),
+    }
 }
 
 /// Three notes of an author's chain from sequence 1.
@@ -940,5 +1008,424 @@ async fn the_binary_refuses_an_unknown_courier_switch() {
     assert!(
         stderr.contains("unknown CONNETTO_COURIER \"yes\""),
         "the refusal names the value, got: {stderr}"
+    );
+}
+
+/// A manager whose courier bucket holds `limit` bytes a minute.
+fn budget_manager(fixture: &Fixture, store: &Enrolments, limit: u64) -> Manager {
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default().with_courier_bytes(limit, std::time::Duration::from_secs(60)),
+        AbuseConfig::default(),
+    ));
+    manager_over(
+        fixture.admin(),
+        guard,
+        Some(store.installable()),
+        SessionConfig::default().with_courier(true),
+        roster(),
+    )
+}
+
+/// A body that draws past its courier bucket earns `Retry` with a nonzero
+/// wait, the range drains its rest, and the next range's body retries too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_past_its_courier_bucket_earns_retries() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (author, author_id) = store.enrol("alice", tomorrow()).await;
+    let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
+    let range = three();
+    // The bucket holds the first two bodies exactly, so the third draws none.
+    let budget = (1..=2)
+        .map(|seq| {
+            u64::try_from(body_frame("s", &range, seq).changeset_zstd.len()).expect("length")
+        })
+        .sum();
+    let manager = budget_manager(&fixture, &store, budget);
+    let (mut client, server) = courier_session(&manager, "bob", &courier, courier_id).await;
+
+    client
+        .courier_range(range_frame("c1", &author, author_id, &range, 1, 3))
+        .await;
+    client.courier_body(body_frame("c1", &range, 1)).await;
+    client.courier_body(body_frame("c1", &range, 2)).await;
+    client.courier_body(body_frame("c1", &range, 3)).await;
+    let entries = answered(answer(&mut client).await);
+    assert_eq!(entries[0], applied(1));
+    assert_eq!(entries[1], applied(2));
+    let third = &entries[2];
+    assert_eq!(third.0, 3);
+    let CourierEntryOutcome::Retry { retry_after_ms } = &third.1 else {
+        panic!("the third body drew nothing, got {:?}", third.1);
+    };
+    assert!(*retry_after_ms > 0, "the retry names a wait");
+
+    // The bucket stays empty, so the next range's body retries too.
+    client
+        .courier_range(range_frame("c2", &author, author_id, &range, 3, 1))
+        .await;
+    client.courier_body(body_frame("c2", &range, 3)).await;
+    let again = answered(answer(&mut client).await);
+    assert!(
+        matches!(again[0].1, CourierEntryOutcome::Retry { retry_after_ms } if retry_after_ms > 0),
+        "the retry stands, got {:?}",
+        again[0].1
+    );
+    client.close().await;
+    server.await.expect("join").expect("session ok");
+}
+
+/// The bodies a refused range drains draw on the courier bucket too, so
+/// the next range's first body finds it spent and is answered `Retry`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drained_bodies_draw_on_the_courier_bucket() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (author, author_id) = store.enrol("alice", tomorrow()).await;
+    let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
+    let range = three();
+    let budget = (1..=2)
+        .map(|seq| {
+            u64::try_from(body_frame("s", &range, seq).changeset_zstd.len()).expect("length")
+        })
+        .sum();
+    let manager = budget_manager(&fixture, &store, budget);
+    let (mut client, server) = courier_session(&manager, "bob", &courier, courier_id).await;
+
+    // Bob signs Anna's offer, so the range is refused and its bodies drain.
+    client
+        .courier_range(range_frame("c1", &courier, author_id, &range, 1, 2))
+        .await;
+    client.courier_body(body_frame("c1", &range, 1)).await;
+    client.courier_body(body_frame("c1", &range, 2)).await;
+    assert_eq!(
+        answer(&mut client).await.outcome,
+        CourierOutcome::Refused(CourierRefusal::Unverified)
+    );
+
+    client
+        .courier_range(range_frame("c2", &author, author_id, &range, 1, 1))
+        .await;
+    client.courier_body(body_frame("c2", &range, 1)).await;
+    let again = answered(answer(&mut client).await);
+    assert!(
+        matches!(again.as_slice(), [(1, CourierEntryOutcome::Retry { retry_after_ms })] if *retry_after_ms > 0),
+        "the drained bodies spent the bucket, got {again:?}"
+    );
+    assert_eq!(settled_count(fixture.admin()).await, 0);
+    client.close().await;
+    server.await.expect("join").expect("session ok");
+}
+
+/// A body wider than the whole courier bucket is answered `NotCouriered`,
+/// the range stopping there and its remaining bodies draining.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_wider_than_its_courier_bucket_settles_nothing() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (author, author_id) = store.enrol("alice", tomorrow()).await;
+    let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
+    let manager = budget_manager(&fixture, &store, 8);
+    let (mut client, server) = courier_session(&manager, "bob", &courier, courier_id).await;
+    let range = three();
+
+    client
+        .courier_range(range_frame("c1", &author, author_id, &range, 1, 3))
+        .await;
+    client.courier_body(body_frame("c1", &range, 1)).await;
+    client.courier_body(body_frame("c1", &range, 2)).await;
+    client.courier_body(body_frame("c1", &range, 3)).await;
+    assert_eq!(
+        answered(answer(&mut client).await),
+        vec![(1, CourierEntryOutcome::NotCouriered)]
+    );
+    assert_eq!(settled_count(fixture.admin()).await, 0);
+    client.close().await;
+    server.await.expect("join").expect("session ok");
+}
+
+/// An identified handshake carries the author's standing notices, chunked at
+/// the manifest cap, one fresh id per frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_identified_handshake_carries_the_standing_courier_notices() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (_author, author_id) = store.enrol("alice", tomorrow()).await;
+    let manager = courier_on(&fixture, &store);
+    let cap = connetto_core::exchange::MAX_MANIFEST_ROWS;
+    let total = i64::try_from(cap + 2).expect("the cap fits i64");
+    seed_notices(&fixture, "alice", author_id, "bob", total).await;
+
+    let (mut client, server) = super::courier_frontier::loopback_client(&manager);
+    client.handshake("alice").await;
+    let first = notice(&mut client).await;
+    assert_eq!(first.notices.len(), cap);
+    assert_eq!(first.notices[0].courier, "bob");
+    assert_eq!(
+        first.notices[0].writer,
+        connetto_core::messages::WriterRef::Device(author_id)
+    );
+    assert_eq!(first.notices[0].seq, 1);
+    assert_eq!(first.notices[0].verdict, Verdict::Applied);
+    assert_eq!(
+        first.notices[cap - 1].seq,
+        u64::try_from(cap).expect("the cap fits u64")
+    );
+    let second = notice(&mut client).await;
+    assert_ne!(first.notice_id, second.notice_id);
+    assert_eq!(second.notices.len(), 2);
+    assert_eq!(
+        second.notices[0].seq,
+        u64::try_from(cap + 1).expect("the cap fits u64")
+    );
+    client.close().await;
+    server.await.expect("join").expect("session ok");
+}
+
+/// An anonymous session carries no notices at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_anonymous_session_carries_no_courier_notices() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (_author, author_id) = store.enrol("alice", tomorrow()).await;
+    let manager = courier_on(&fixture, &store);
+    seed_notices(&fixture, "alice", author_id, "bob", 2).await;
+
+    let (mut client, server) = super::courier_frontier::loopback_client(&manager);
+    client.handshake_unidentified("anon").await;
+    assert!(
+        matches!(client.barrier(99).await, ControlMessage::Pong(_)),
+        "no notice frame reaches the anonymous session"
+    );
+    client.close().await;
+    server.await.expect("join").expect("session ok");
+}
+
+/// A notice ack deletes the rows its frame carried, the rows of the other
+/// frame stand, and unknown or repeat acks change nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_courier_notice_ack_deletes_only_its_frames_rows() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (_author, author_id) = store.enrol("alice", tomorrow()).await;
+    let manager = courier_on(&fixture, &store);
+    let cap = connetto_core::exchange::MAX_MANIFEST_ROWS;
+    let total = i64::try_from(cap + 2).expect("the cap fits i64");
+    seed_notices(&fixture, "alice", author_id, "bob", total).await;
+
+    let (mut client, server) = super::courier_frontier::loopback_client(&manager);
+    client.handshake("alice").await;
+    let first = notice(&mut client).await;
+    let second = notice(&mut client).await;
+    client.courier_notice_ack(&first.notice_id).await;
+    wait_notice_count(fixture.admin(), 2).await;
+    client.courier_notice_ack(&second.notice_id).await;
+    wait_notice_count(fixture.admin(), 0).await;
+    client.courier_notice_ack("no such notice").await;
+    client.courier_notice_ack(&first.notice_id).await;
+    assert_eq!(
+        notice_count(fixture.admin()).await,
+        0,
+        "the unknown and repeat acks changed nothing"
+    );
+    assert!(
+        matches!(client.barrier(98).await, ControlMessage::Pong(_)),
+        "the session outlives the acks"
+    );
+    client.close().await;
+    server.await.expect("join").expect("session ok");
+}
+
+/// A notice the session never acked stands until its next handshake, which
+/// carries it again under a fresh id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unacked_courier_notice_outlives_a_close() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (_author, author_id) = store.enrol("alice", tomorrow()).await;
+    let manager = courier_on(&fixture, &store);
+    seed_notices(&fixture, "alice", author_id, "bob", 2).await;
+
+    let (mut first, first_server) = super::courier_frontier::loopback_client(&manager);
+    first.handshake("alice").await;
+    let frame = notice(&mut first).await;
+    first.close().await;
+    first_server.await.expect("join").expect("session ok");
+
+    let (mut second, second_server) = super::courier_frontier::loopback_client(&manager);
+    second.handshake("alice").await;
+    let again = notice(&mut second).await;
+    assert_ne!(frame.notice_id, again.notice_id);
+    assert_eq!(again.notices.len(), 2);
+    second.close().await;
+    second_server.await.expect("join").expect("session ok");
+}
+
+/// Two sessions of one author both carry a standing notice, and the ack the
+/// second one sends deletes nothing the first one already took.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_sessions_both_receive_a_courier_notice() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (_author, author_id) = store.enrol("alice", tomorrow()).await;
+    let manager = courier_on(&fixture, &store);
+    seed_notices(&fixture, "alice", author_id, "bob", 2).await;
+
+    // Two live logins of one person carry the identity `alice` under two
+    // distinct handles, since the `#run` suffix mints a fresh handle per login.
+    let (mut first, first_server) = super::courier_frontier::loopback_client(&manager);
+    first.handshake_with("alice-1", "user:alice#r1").await;
+    let a = notice(&mut first).await;
+    let (mut second, second_server) = super::courier_frontier::loopback_client(&manager);
+    second.handshake_with("alice-2", "user:alice#r2").await;
+    let b = notice(&mut second).await;
+    assert_eq!(a.notices.len(), 2);
+    assert_eq!(b.notices.len(), 2, "the rows stand until an ack");
+    first.courier_notice_ack(&a.notice_id).await;
+    wait_notice_count(fixture.admin(), 0).await;
+    second.courier_notice_ack(&b.notice_id).await;
+    assert_eq!(
+        notice_count(fixture.admin()).await,
+        0,
+        "the later ack deletes nothing"
+    );
+    first.close().await;
+    second.close().await;
+    first_server.await.expect("join").expect("session ok");
+    second_server.await.expect("join").expect("session ok");
+}
+
+/// A courier settle while the author is connected writes its notice row but
+/// pushes no live frame, and the author's next handshake carries it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_courier_settle_pushes_no_live_notice_to_the_author() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (author, author_id) = store.enrol("alice", tomorrow()).await;
+    let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
+    let manager = courier_on(&fixture, &store);
+
+    let (mut author_session, author_server) = super::courier_frontier::loopback_client(&manager);
+    author_session.handshake("alice").await;
+    assert!(
+        matches!(author_session.barrier(77).await, ControlMessage::Pong(_)),
+        "no notice stands before the settle"
+    );
+    let (mut courier_session, courier_server) =
+        courier_session(&manager, "bob", &courier, courier_id).await;
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    courier_session
+        .courier_range(range_frame("c1", &author, author_id, &range, 1, 1))
+        .await;
+    courier_session
+        .courier_body(body_frame("c1", &range, 1))
+        .await;
+    assert_eq!(
+        answered(answer(&mut courier_session).await),
+        vec![applied(1)]
+    );
+    assert_eq!(
+        notice_count(fixture.admin()).await,
+        1,
+        "the settle wrote its row"
+    );
+
+    // The author's live session sees no frame for it.
+    assert!(
+        matches!(author_session.barrier(78).await, ControlMessage::Pong(_)),
+        "no live notice frame reaches the connected author"
+    );
+    author_session.close().await;
+    author_server.await.expect("join").expect("session ok");
+
+    // The author's next handshake carries the row.
+    let (mut reconnect, reconnect_server) = super::courier_frontier::loopback_client(&manager);
+    reconnect.handshake("alice").await;
+    let frame = notice(&mut reconnect).await;
+    let [row] = frame.notices.as_slice() else {
+        panic!("one row stands, got {}", frame.notices.len());
+    };
+    assert_eq!(row.courier, "bob");
+    assert_eq!(
+        row.writer,
+        connetto_core::messages::WriterRef::Device(author_id)
+    );
+    assert_eq!(row.seq, 1);
+    assert_eq!(row.verdict, Verdict::Applied);
+    reconnect.courier_notice_ack(&frame.notice_id).await;
+    wait_notice_count(fixture.admin(), 0).await;
+    reconnect.close().await;
+    reconnect_server.await.expect("join").expect("session ok");
+    courier_session.close().await;
+    courier_server.await.expect("join").expect("session ok");
+}
+
+/// The author's next session on the real client raises the notices Bruno
+/// left for her as one event, its receipt deletes them, and her session
+/// after that raises none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_real_client_raises_courier_notices_once() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let manager = accept_manager(fixture.admin(), guard);
+    let key_id = [7; 32];
+    seed_notices(&fixture, "alice", key_id, "bruno", 2).await;
+
+    let mut first = signed_in_alice(&manager).await;
+    let event = pump_until(&mut first, |event| {
+        matches!(event, connetto_client::ClientEvent::WritesCouriered { .. })
+    })
+    .await;
+    let connetto_client::ClientEvent::WritesCouriered { notices } = event else {
+        unreachable!("pump_until returns the matching event");
+    };
+    assert_eq!(
+        notices
+            .iter()
+            .map(|row| (row.courier.as_str(), row.seq, row.verdict.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("bruno", 1, Verdict::Applied),
+            ("bruno", 2, Verdict::Applied)
+        ]
+    );
+    assert!(
+        notices
+            .iter()
+            .all(|row| row.writer == connetto_core::messages::WriterRef::Device(key_id))
+    );
+    wait_notice_count(fixture.admin(), 0).await;
+    drop(first);
+
+    // The next session subscribes and reaches its snapshot with no notice.
+    let mut second = signed_in_alice(&manager).await;
+    second
+        .subscribe("notes", "SELECT * FROM notes")
+        .await
+        .expect("subscribe");
+    let seen = std::sync::Mutex::new(false);
+    pump_until(&mut second, |event| {
+        if matches!(event, connetto_client::ClientEvent::WritesCouriered { .. }) {
+            *seen.lock().expect("the flag") = true;
+        }
+        matches!(event, connetto_client::ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    assert!(
+        !*seen.lock().expect("the flag"),
+        "the acked notices never raise again"
     );
 }

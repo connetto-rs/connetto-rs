@@ -2,20 +2,22 @@
 //! factory serves, the dials and waits they count, and the bounded reads
 //! they put on a tab's channel.
 
-// Each fake's consumers are the two hub test targets, and each target
-// compiles this module alone, so whichever half of the fakes a target does
-// not use is dead code from its side.
+// Each fake's consumers are the hub test targets, and each target compiles
+// this module alone, so whichever half of the fakes a target does not use
+// is dead code from its side.
 #![expect(
     dead_code,
-    reason = "shared by the two hub test targets, each of which compiles this module alone and uses its own subset"
+    reason = "shared by the hub test targets, each of which compiles this module alone and uses its own subset"
 )]
 
 use core::future::ready;
 use core::time::Duration;
 
+use parking_lot::Mutex;
+
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use connetto_client::{ClientBuilder, FirstThen, ReconnectPolicy, SyncSchema};
 use connetto_core::messages::{
@@ -93,12 +95,20 @@ impl Script {
     }
 }
 
+/// The record of the control frames a scripted upstream's client sent.
+pub type SentControls = Arc<Mutex<Vec<ControlMessage>>>;
+
 /// A fake upstream that answers the handshake from its script and then ends
 /// its stream, or stays open until the test hands it a close reason, as a
 /// server that closes a live session with a reason does.
 pub struct FakeUpstream {
     script: Script,
     close: tokio::sync::mpsc::UnboundedReceiver<FatalErrorReason>,
+    /// Frames a test hands the upstream after the handshake, held by
+    /// [`scripted_live`](Self::scripted_live) alone.
+    late: Option<tokio::sync::mpsc::UnboundedReceiver<IncomingFrame>>,
+    /// The control frames the upstream's client sent, for a test to read.
+    sent: SentControls,
     inbox: Mutex<VecDeque<IncomingFrame>>,
 }
 
@@ -111,9 +121,39 @@ impl FakeUpstream {
             Self {
                 script,
                 close: rx,
+                late: None,
+                sent: Arc::new(Mutex::new(Vec::new())),
                 inbox: Mutex::new(VecDeque::new()),
             },
             close,
+        )
+    }
+
+    /// The same, keeping the late-frame sender a test uses to hand the
+    /// upstream a frame after the handshake, and the record of the control
+    /// frames the upstream's client answers with.
+    pub fn scripted_live(
+        script: Script,
+    ) -> (
+        Self,
+        tokio::sync::mpsc::UnboundedSender<FatalErrorReason>,
+        tokio::sync::mpsc::UnboundedSender<IncomingFrame>,
+        SentControls,
+    ) {
+        let (close, close_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (late, late_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                script,
+                close: close_rx,
+                late: Some(late_rx),
+                sent: Arc::clone(&sent),
+                inbox: Mutex::new(VecDeque::new()),
+            },
+            close,
+            late,
+            sent,
         )
     }
 
@@ -141,12 +181,13 @@ impl FakeUpstream {
 
 #[expect(
     clippy::unused_async_trait_impl,
-    reason = "the trait methods are async and the bodies finish without awaiting"
+    reason = "the trait methods are async and most bodies finish without awaiting"
 )]
 impl Transport for FakeUpstream {
     type Error = FakeTransportError;
 
     async fn send_control(&mut self, message: ControlMessage) -> Result<(), FakeTransportError> {
+        self.sent.lock().push(message.clone());
         if let ControlMessage::Handshake(handshake) = &message {
             let writer = match &handshake.writer {
                 WriterRequest::Device => None,
@@ -155,7 +196,7 @@ impl Transport for FakeUpstream {
                     frontier: 0,
                 }),
             };
-            self.inbox.lock().unwrap().push_back(self.answer(writer));
+            self.inbox.lock().push_back(self.answer(writer));
         }
         Ok(())
     }
@@ -167,7 +208,7 @@ impl Transport for FakeUpstream {
     async fn recv(&mut self) -> Result<Option<IncomingFrame>, FakeTransportError> {
         loop {
             let pending = {
-                let mut inbox = self.inbox.lock().unwrap();
+                let mut inbox = self.inbox.lock();
                 inbox.pop_front()
             };
             if let Some(frame) = pending {
@@ -176,12 +217,36 @@ impl Transport for FakeUpstream {
             if !self.script.silent {
                 return Ok(None);
             }
-            let Some(reason) = self.close.recv().await else {
-                return Ok(None);
-            };
-            self.inbox.lock().unwrap().push_back(IncomingFrame::Control(
-                ControlMessage::FatalError(FatalError::new(reason)),
-            ));
+            // A silent upstream serves its late frames beside the close the
+            // test hands it, and neither arrives more than once.
+            match self.late.as_mut() {
+                None => {
+                    let Some(reason) = self.close.recv().await else {
+                        return Ok(None);
+                    };
+                    self.inbox.lock().push_back(IncomingFrame::Control(
+                        ControlMessage::FatalError(FatalError::new(reason)),
+                    ));
+                }
+                Some(late) => {
+                    tokio::select! {
+                        reason = self.close.recv() => {
+                            let Some(reason) = reason else {
+                                return Ok(None);
+                            };
+                            self.inbox.lock().push_back(IncomingFrame::Control(
+                                ControlMessage::FatalError(FatalError::new(reason)),
+                            ));
+                        }
+                        frame = late.recv() => {
+                            let Some(frame) = frame else {
+                                return Ok(None);
+                            };
+                            self.inbox.lock().push_back(frame);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -215,19 +280,15 @@ impl Plan {
         let script = self
             .scripts
             .lock()
-            .unwrap()
             .pop_front()
             .unwrap_or_else(|| Script::accepting(false));
-        self.dialed
-            .lock()
-            .unwrap()
-            .push(if script.refuse.is_some() {
-                "refusing"
-            } else {
-                "accepting"
-            });
+        self.dialed.lock().push(if script.refuse.is_some() {
+            "refusing"
+        } else {
+            "accepting"
+        });
         let (upstream, close) = FakeUpstream::scripted(script);
-        self.closers.lock().unwrap().push(close);
+        self.closers.lock().push(close);
         upstream
     }
 
@@ -236,7 +297,7 @@ impl Plan {
     }
 
     pub fn dialed(&self) -> Vec<&'static str> {
-        self.dialed.lock().unwrap().clone()
+        self.dialed.lock().clone()
     }
 }
 
@@ -253,11 +314,11 @@ impl Waits {
     }
 
     fn record(&self, wait: Duration) {
-        self.waits.lock().unwrap().push(wait);
+        self.waits.lock().push(wait);
     }
 
     pub fn take(&self) -> Vec<Duration> {
-        self.waits.lock().unwrap().to_vec()
+        self.waits.lock().to_vec()
     }
 }
 
@@ -268,18 +329,14 @@ pub fn once<T: Transport + 'static>(
     FirstThen::new(transport, || ready(Err(FakeTransportError::Closed)))
 }
 
-/// A hub over a scripted upstream with the test's reconnect wiring, and the
-/// tab end of a real message channel attached before the pump starts, so the
-/// tab is registered before any upstream outcome can end the hub.
-pub async fn hub_with_tab(
-    worker_script: Script,
+/// The hub pump wiring over one worker upstream, its tab end attached before
+/// the pump starts, so the tab is registered before any upstream outcome can
+/// end the hub.
+async fn hub_over(
+    worker: FakeUpstream,
     plan: Arc<Plan>,
     waits: Arc<Waits>,
-) -> (
-    MessageTransport<MessagePort>,
-    tokio::sync::mpsc::UnboundedSender<FatalErrorReason>,
-) {
-    let (worker, worker_close) = FakeUpstream::scripted(worker_script);
+) -> MessageTransport<MessagePort> {
     let client = ClientBuilder::new(schema(), once(worker))
         .with_client_id("hub-fake-worker")
         .connect_driven()
@@ -309,10 +366,43 @@ pub async fn hub_with_tab(
     spawn_local(async move {
         pump.await.expect("hub pump");
     });
-    (
-        MessageTransport::<MessagePort>::new(channel.port2()),
-        worker_close,
-    )
+    MessageTransport::<MessagePort>::new(channel.port2())
+}
+
+/// A hub over a scripted upstream with the test's reconnect wiring, and the
+/// tab end of a real message channel attached before the pump starts, so the
+/// tab is registered before any upstream outcome can end the hub.
+pub async fn hub_with_tab(
+    worker_script: Script,
+    plan: Arc<Plan>,
+    waits: Arc<Waits>,
+) -> (
+    MessageTransport<MessagePort>,
+    tokio::sync::mpsc::UnboundedSender<FatalErrorReason>,
+) {
+    let (worker, worker_close) = FakeUpstream::scripted(worker_script);
+    let tab = hub_over(worker, plan, waits).await;
+    (tab, worker_close)
+}
+
+/// The same, over a [`scripted_live`](FakeUpstream::scripted_live) upstream,
+/// keeping the late-frame sender a test uses to hand the worker's connection
+/// a frame after the handshake, and the record of the control frames that
+/// connection answers with.
+pub async fn hub_with_tab_live(
+    worker_script: Script,
+    plan: Arc<Plan>,
+    waits: Arc<Waits>,
+) -> (
+    MessageTransport<MessagePort>,
+    tokio::sync::mpsc::UnboundedSender<FatalErrorReason>,
+    tokio::sync::mpsc::UnboundedSender<IncomingFrame>,
+    SentControls,
+) {
+    let (worker, worker_close, worker_late, worker_sent) =
+        FakeUpstream::scripted_live(worker_script);
+    let tab = hub_over(worker, plan, waits).await;
+    (tab, worker_close, worker_late, worker_sent)
 }
 
 /// One frame from the tab, or a deadline failure when the hub goes quiet.

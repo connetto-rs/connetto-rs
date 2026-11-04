@@ -730,11 +730,19 @@ pub const WRITERS_DDL: &str = "DO $$ BEGIN \
      writer BIGINT NOT NULL, \
      first_seq BIGINT NOT NULL, \
      bound_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-     PRIMARY KEY (session_id, writer))";
+     PRIMARY KEY (session_id, writer)); \
+    CREATE TABLE IF NOT EXISTS _connetto_courier_notices \
+    (id BIGSERIAL PRIMARY KEY, \
+     user_id TEXT NOT NULL, \
+     courier_user_id TEXT NOT NULL, \
+     device_key BYTEA NOT NULL, \
+     seq BIGINT NOT NULL, \
+     outcome TEXT NOT NULL)";
 
 /// Create the reference settle-path enum and writer tables if missing, as
 /// admin. A restricted writer role needs `SELECT, INSERT, UPDATE, DELETE` on
-/// all three tables, granted separately.
+/// all four tables and `USAGE` on the notices table's id sequence, granted
+/// separately.
 pub async fn provision_writers(pool: &Pool<AsyncPgConnection>) {
     exec(pool, WRITERS_DDL).await;
 }
@@ -749,7 +757,7 @@ pub const AUDIT_DDL: &str = "DO $$ BEGIN \
     'ended_by_owner', 'ended_all', 'ended_others', 'ended_by_ban', \
     'capability_minted', 'permission_change', 'model_change', \
     'banned', 'ban_lifted', 'write_forked', 'write_redelivered', \
-    'data_downloaded', 'data_erased'); \
+    'write_couriered', 'data_downloaded', 'data_erased'); \
     EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
     CREATE TABLE IF NOT EXISTS auth_events \
     (at TIMESTAMPTZ NOT NULL DEFAULT now(), \
@@ -763,6 +771,7 @@ pub const AUDIT_DDL: &str = "DO $$ BEGIN \
      seq BIGINT, \
      path connetto_settle_path, \
      other_path connetto_settle_path, \
+     courier_user_id TEXT, \
      provider TEXT, \
      issuer TEXT, \
      query_list_hash TEXT, \
@@ -2256,6 +2265,22 @@ impl Client {
             .send_bulk(BulkMessage::CourierBody(body))
             .await
             .expect("send courier body");
+    }
+
+    /// Ack the courier notice frame a connection received (R78).
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `CourierNoticeAck` frame fails on the transport.
+    pub async fn courier_notice_ack(&mut self, notice_id: &str) {
+        self.transport
+            .send_control(ControlMessage::CourierNoticeAck(
+                connetto_core::messages::CourierNoticeAck {
+                    notice_id: notice_id.to_owned(),
+                },
+            ))
+            .await
+            .expect("send courier notice ack");
     }
 
     /// Prove the connection's device key with a signature over the

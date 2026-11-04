@@ -92,6 +92,7 @@ fn state() -> State {
         closing: false,
         enrol_challenge: None,
         courier: None,
+        notices: HashMap::new(),
     }
 }
 

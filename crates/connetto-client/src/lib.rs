@@ -21,11 +21,12 @@ use connetto_core::device_cert::DeviceKey;
 use connetto_core::exchange::Origin;
 use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
-    ControlMessage, FatalErrorReason, GateState, Handshake, HeldWork, MutationHeader,
-    MutationPatch, MutationReject, MutationRejectReason, Ping, PriorRefusal, Provenance,
-    ReplaceShareKeys, RetireWriter, SUBSCRIPTION_REFUSED, ShareKeyChange, Subscribe,
-    SubscriptionSpec, TabIdentity, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome,
-    TabStorageAnswer, TabStorageOutcome, TabStorageUse, Unsubscribe, WriterAnswer,
+    ControlMessage, CourierNoticeAck, CourierNoticeRow, FatalErrorReason, GateState, Handshake,
+    HeldWork, MutationHeader, MutationPatch, MutationReject, MutationRejectReason, Ping,
+    PriorRefusal, Provenance, ReplaceShareKeys, RetireWriter, SUBSCRIPTION_REFUSED, ShareKeyChange,
+    Subscribe, SubscriptionSpec, TabIdentity, TabShareKeyAnswer, TabShareKeyChange,
+    TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse, Unsubscribe,
+    WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -1737,6 +1738,15 @@ pub enum ClientEvent {
     ShareKeysReplaced {
         /// The correlation token the swap it answers carried.
         request_id: String,
+    },
+    /// The entries a courier settled for the session's account, sent after
+    /// the handshake and deleted by the receipt the connection answers at
+    /// once (R78 decisions 12, 34 and 41). Raised once per frame, and the
+    /// same rows raise again on a later connection when the receipt did not
+    /// reach the server, so an application may see them twice.
+    WritesCouriered {
+        /// The settled entries, one row each, naming the courier's account.
+        notices: Vec<CourierNoticeRow>,
     },
 }
 
@@ -9939,6 +9949,21 @@ where
                 self.settle_share_key_replacement(&ack.request_id)?;
                 Ok(ClientEvent::ShareKeysReplaced {
                     request_id: ack.request_id,
+                })
+            }
+            // The receipt goes ahead of the event, so the rows are deleted
+            // while the connection still stands to carry the event (R78
+            // decision 41).
+            ControlMessage::CourierNotice(notice) => {
+                self.wire()?
+                    .transport
+                    .send_control(ControlMessage::CourierNoticeAck(CourierNoticeAck {
+                        notice_id: notice.notice_id,
+                    }))
+                    .await
+                    .map_err(|e| ClientError::Transport(e.to_string()))?;
+                Ok(ClientEvent::WritesCouriered {
+                    notices: notice.notices,
                 })
             }
             other => Err(ClientError::Protocol(format!(

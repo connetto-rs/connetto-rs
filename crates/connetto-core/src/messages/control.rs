@@ -84,7 +84,7 @@ pub struct TabIdentity {
 use super::{
     aggregate::AggregateUpdate,
     content::{ContentTicketGrant, ContentTicketRequest},
-    courier::{CourierAnswer, CourierRange},
+    courier::{CourierAnswer, CourierNotice, CourierNoticeAck, CourierRange},
     enrolment::{
         DeviceRevokedAck, DevicesList, DevicesRequest, EnrolChallenge, EnrolChallengeRequest,
         EnrolGrant, EnrolRefused, EnrolRequest, RevocationUpdate, RevokeDeviceRequest,
@@ -202,6 +202,10 @@ pub enum ControlMessage {
     CourierRange(CourierRange),
     /// Server answers the range once, after its last counted body.
     CourierAnswer(CourierAnswer),
+    /// Server tells the session's account what couriers settled for it.
+    CourierNotice(CourierNotice),
+    /// Client receipt of a notice, which deletes its rows.
+    CourierNoticeAck(CourierNoticeAck),
 
     /// Client heartbeat probe.
     Ping(Ping),
