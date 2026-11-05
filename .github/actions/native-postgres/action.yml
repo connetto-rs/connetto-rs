@@ -1,0 +1,21 @@
+name: Select native Postgres for the test fixtures
+description: >-
+  Makes the stopped PostgreSQL 16 template each test fixture copies and starts
+  in place of a Postgres container, and exports the variables selecting it.
+  Run the suite with nextest's native profile, which lifts the docker group's bound.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        bin=/usr/lib/postgresql/16/bin
+        # The emi image carries Ubuntu 24.04's 16, GitHub's ubuntu-26.04 image a newer major.
+        if [ ! -x "$bin/pg_ctl" ]; then
+          sudo apt-get update
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          # Only the programs, no cluster of its own running beside the fixtures.
+          echo 'create_main_cluster = false' | sudo tee -a /etc/postgresql-common/createcluster.conf > /dev/null
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends postgresql-16
+        fi
+        "$GITHUB_WORKSPACE/scripts/native-postgres.sh" "$RUNNER_TEMP/connetto-pg16" "$bin"

@@ -37,7 +37,7 @@ cargo +stable test --profile testfast --all-features -p connetto-server --test i
 
 `.config/nextest.toml` bounds the `docker` group to four threads and serializes the `keyring` and `discovery` groups, and a wedged test is killed at five slow periods instead of hanging the invocation. The `keyctl session` wrapper is optional locally, since every OS-keyring test joins its own fresh session keyring in-process through `connetto_test_harness::isolated_session_keyring`, called first in each such test, and CI still wraps its runs in one out of caution. The gate commands above still run `--release`, unchanged, so the proof profile is untouched.
 
-Locally, fixtures can start a native PostgreSQL 16 cluster copied from a stopped template in place of a container, keeping one cluster per test without Docker. On the `connetto-server` suite that took 100 s against 854 s with containers. `scripts/native-postgres.sh` makes the template once and prints the two variables that select it, and the `native` nextest profile lifts the `docker` group's bound. OpenFGA and MySQL stay containers, and CI keeps Docker.
+Fixtures can start a native PostgreSQL 16 cluster copied from a stopped template in place of a container, keeping one cluster per test without Docker. On the `connetto-server` suite that took 100 s against 854 s with containers. `scripts/native-postgres.sh` makes the template once and prints the two variables that select it, and the `native` nextest profile lifts the `docker` group's bound. The Linux test and coverage jobs run this way through the `native-postgres` action. OpenFGA and MySQL stay containers.
 
 ```sh
 eval "$(scripts/native-postgres.sh /mnt/nvme/scratch/$USER/connetto-pg16)"
