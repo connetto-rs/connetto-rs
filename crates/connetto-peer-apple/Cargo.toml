@@ -48,10 +48,10 @@ libc = "0.2"
 # The beacon's UUIDs, the peer's own constants, read by the Apple bridge (R76).
 connetto-peer = { path = "../connetto-peer", features = ["bluetooth"] }
 parking_lot = "0.12"
-dispatch2 = "0.3.1"
-block2 = { version = "0.6", default-features = false, features = ["alloc"] }
-objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = [
+dispatch2.workspace = true
+block2 = { workspace = true, features = ["alloc"] }
+objc2 = { workspace = true, features = ["std"] }
+objc2-foundation = { workspace = true, features = [
   "std",
   "block2",
   "NSArray",
@@ -62,7 +62,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
   "NSString",
   "NSUUID",
 ] }
-objc2-core-bluetooth = { version = "0.3.2", default-features = false, features = [
+objc2-core-bluetooth = { workspace = true, features = [
   "std",
   "dispatch2",
   "CBAdvertisementData",
@@ -85,11 +85,11 @@ if-addrs = "0.15"
 # The Network Extension join the joiner's device asks iOS for, and the
 # device's name the user set on it.
 [target.'cfg(target_os = "ios")'.dependencies]
-objc2-network-extension = { version = "0.3.2", default-features = false, features = [
+objc2-network-extension = { workspace = true, features = [
   "std",
   "block2",
 ] }
-objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
+objc2-ui-kit = { workspace = true, features = [
   "std",
   "UIDevice",
 ] }
@@ -98,11 +98,11 @@ objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
 # association.
 [target.'cfg(target_os = "macos")'.dependencies]
 # The Location Services access a join by name needs on macOS.
-objc2-core-location = { version = "0.3.2", default-features = false, features = [
+objc2-core-location = { workspace = true, features = [
   "std",
   "CLLocationManager",
 ] }
-objc2-core-wlan = { version = "0.3.2", default-features = false, features = [
+objc2-core-wlan = { workspace = true, features = [
   "std",
   "CWInterface",
   "CWNetwork",

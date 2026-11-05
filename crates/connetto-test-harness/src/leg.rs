@@ -249,7 +249,7 @@ pub async fn run_leg() -> Result<()> {
 /// Run the leg as a process of its own, the sign in, the enrolment and the
 /// command protocol on the process's standard streams.
 ///
-/// On macos the main thread stands the platform's main queue draining,
+/// On macos the main thread runs its run loop, serving the platform's main queue,
 /// which the Location Services prompt and its reads stand on, and the leg
 /// itself runs on a worker thread's runtime, which ends the process when
 /// it answers.
@@ -268,7 +268,10 @@ pub fn leg_process() -> Result<()> {
                 std::process::exit(1);
             }
         });
-        dispatch2::dispatch_main();
+        // The run loop serves the main queue on the main thread itself, where the Location
+        // Services manager is made.
+        objc2_core_foundation::CFRunLoop::run();
+        bail!("the main run loop stopped while the leg ran");
     }
     #[cfg(not(target_os = "macos"))]
     runtime.block_on(run_leg())

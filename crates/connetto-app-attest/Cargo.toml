@@ -43,6 +43,6 @@ thiserror.workspace = true
 [target.'cfg(target_os = "ios")'.dependencies]
 parking_lot = "0.12"
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
-block2 = { version = "0.6", default-features = false, features = ["alloc"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSError", "NSString"] }
-objc2-device-check = { version = "0.3.2", default-features = false, features = ["std", "DCAppAttestService", "DCError", "block2"] }
+block2 = { workspace = true, features = ["alloc"] }
+objc2-foundation = { workspace = true, features = ["std", "NSData", "NSError", "NSString"] }
+objc2-device-check = { workspace = true, features = ["std", "DCAppAttestService", "DCError", "block2"] }

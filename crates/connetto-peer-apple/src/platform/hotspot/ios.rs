@@ -30,7 +30,7 @@ pub(crate) fn join(ssid: &str, passphrase: &str, security: Security) -> Result<(
     // The answer is cleared before the join, since the system may answer
     // before the call returns.
     STANDING.lock().completion = None;
-    let handler: RcBlock<dyn Fn(*mut NSError)> = RcBlock::new(move |error: *mut NSError| {
+    let handler = RcBlock::<_, dyn Send + Sync>::new(move |error: *mut NSError| {
         // SAFETY: the system passes either null or an error it owns for the
         // duration of this call, and the error is copied before the call
         // returns.
