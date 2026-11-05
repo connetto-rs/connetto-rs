@@ -17,8 +17,8 @@ pub const ADAPTER_OFF_BOUND: Duration = Duration::from_secs(30);
 pub struct NearbyHost {
     /// The host's device, the key the scan stands on.
     pub host: u64,
-    /// The beacon's prefix as 16 hex digits, where the beacon carries one.
-    pub prefix: Option<String>,
+    /// The beacon's prefix as 16 hex digits.
+    pub prefix: String,
     /// The signal the beacon carried.
     pub rssi: Option<i16>,
 }
@@ -91,11 +91,10 @@ pub fn ss_remote_address(line: &str) -> Option<IpAddr> {
 
 /// The host to join, where exactly one host stands in sight and its beacon
 /// carries `prefix`, and none while another host stands or the prefix does
-/// not show. A `None` prefix names an Apple host, whose beacon carries none
-/// (R76 decision 25), so the lone host then stands by its address.
-pub fn single_nearby(hosts: &[NearbyHost], prefix: Option<&str>) -> Option<u64> {
+/// not show.
+pub fn single_nearby(hosts: &[NearbyHost], prefix: &str) -> Option<u64> {
     match hosts {
-        [host] if host.prefix.as_deref() == prefix => Some(host.host),
+        [host] if host.prefix == prefix => Some(host.host),
         _ => None,
     }
 }
@@ -207,36 +206,21 @@ wlp39s0          wifi      disconnected           --
     fn single_host_carries_the_prefix() {
         let hosts = vec![NearbyHost {
             host: 7,
-            prefix: Some("a1b2c3d4e5f6a7b8".to_owned()),
+            prefix: "a1b2c3d4e5f6a7b8".to_owned(),
             rssi: Some(-40),
         }];
-        assert_eq!(single_nearby(&hosts, Some("a1b2c3d4e5f6a7b8")), Some(7));
+        assert_eq!(single_nearby(&hosts, "a1b2c3d4e5f6a7b8"), Some(7));
     }
 
     #[test]
     fn single_host_refuses_a_wrong_prefix() {
         let hosts = vec![NearbyHost {
             host: 7,
-            prefix: Some("a1b2c3d4e5f6a7b8".to_owned()),
+            prefix: "a1b2c3d4e5f6a7b8".to_owned(),
             rssi: None,
         }];
-        assert_eq!(single_nearby(&hosts, Some("ffffffffffffffff")), None);
-        assert_eq!(single_nearby(&[], Some("a1b2c3d4e5f6a7b8")), None);
-    }
-
-    /// An Apple host's beacon carries no prefix (R76 decision 25), so the
-    /// lone host stands by its address, and a prefix where none was asked
-    /// for is another host.
-    #[test]
-    fn single_host_stands_without_a_prefix_where_none_is_carried() {
-        let host = |prefix: Option<&str>| NearbyHost {
-            host: 7,
-            prefix: prefix.map(str::to_owned),
-            rssi: Some(-64),
-        };
-        assert_eq!(single_nearby(&[host(None)], None), Some(7));
-        assert_eq!(single_nearby(&[host(Some("a1b2c3d4e5f6a7b8"))], None), None);
-        assert_eq!(single_nearby(&[host(None)], Some("a1b2c3d4e5f6a7b8")), None);
+        assert_eq!(single_nearby(&hosts, "ffffffffffffffff"), None);
+        assert_eq!(single_nearby(&[], "a1b2c3d4e5f6a7b8"), None);
     }
 
     #[test]
@@ -244,16 +228,16 @@ wlp39s0          wifi      disconnected           --
         let hosts = vec![
             NearbyHost {
                 host: 7,
-                prefix: Some("a1b2c3d4e5f6a7b8".to_owned()),
+                prefix: "a1b2c3d4e5f6a7b8".to_owned(),
                 rssi: None,
             },
             NearbyHost {
                 host: 8,
-                prefix: None,
+                prefix: "ffffffffffffffff".to_owned(),
                 rssi: None,
             },
         ];
-        assert_eq!(single_nearby(&hosts, Some("a1b2c3d4e5f6a7b8")), None);
+        assert_eq!(single_nearby(&hosts, "a1b2c3d4e5f6a7b8"), None);
     }
 
     #[test]

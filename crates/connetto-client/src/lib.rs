@@ -1648,10 +1648,6 @@ pub enum ClientEvent {
     /// The hotspot stopped, on a system stop (R76).
     #[cfg(feature = "peer")]
     HotspotStopped,
-    /// The personal hotspot's offer was handed out but no device landed on
-    /// the network within its bound (R76 decision 26).
-    #[cfg(feature = "peer")]
-    HotspotUnreached,
     /// The joined network was left (R76).
     #[cfg(feature = "peer")]
     HotspotLeft,
@@ -1676,9 +1672,8 @@ pub enum ClientEvent {
     HostNearby {
         /// The host's device.
         host: crate::bluetooth::HostId,
-        /// The beacon's prefix, where the beacon carries one (R76 decision
-        /// 25).
-        prefix: Option<[u8; 8]>,
+        /// The beacon's prefix (R76 decision 18).
+        prefix: [u8; 8],
         /// The signal the beacon carried.
         rssi: Option<i16>,
     },

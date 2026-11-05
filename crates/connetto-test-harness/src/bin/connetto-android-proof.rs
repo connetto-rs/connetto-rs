@@ -1778,7 +1778,7 @@ async fn phone_hosts_walk(
                 .context("the beacon line carries no prefix")?
                 .to_owned();
             step("find the beacon on linux");
-            let host = leg.wait_nearby(Some(&prefix)).await?;
+            let host = leg.wait_nearby(&prefix).await?;
             leg.join_nearby(&host).await?.1
         }
     };

@@ -777,6 +777,7 @@ pub async fn sign_in_phone(
 ) -> Result<PageSession> {
     crate::step(&format!("sign in on {}", phone.serial));
     phone.launch().await?;
+    phone.click_sign_in().await?;
     let mut tab = phone.login_tab(issuer).await?;
     phone
         .screenshot(evidence, &format!("{shot}-login-page"))
@@ -787,7 +788,10 @@ pub async fn sign_in_phone(
         .approve(phone, evidence, &format!("{shot}-launch-unlock"))
         .await?;
     let mut app = phone.app().await?;
-    app.wait_for_text("status: connected", Duration::from_secs(90))
+    // The status line can carry a non-fatal message, such as the retirement
+    // of the writer a cleared app left behind, so the banner stands for the
+    // connection.
+    app.wait_for_text("Signed in as ", Duration::from_secs(90))
         .await?;
     app.wait_for_text("device: certified until", Duration::from_secs(60))
         .await?;

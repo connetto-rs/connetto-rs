@@ -1,5 +1,5 @@
 //! The parts of the handheld star run (R76 slice 9f) that stand without a
-//! device: the two rounds' plan, the three-way link's matrix off the pages'
+//! device: the round's plan, the three-way link's matrix off the pages'
 //! linked lines, and the run's summary. The walk that drives the iPhone, the
 //! iPad and the Android phone lives in the `connetto-ios-proof` runner.
 
@@ -9,11 +9,11 @@ use std::time::Duration;
 /// The three handhelds of the star.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Device {
-    /// The phone the run proves first, which hosts the second round.
+    /// The phone the run proves first, which joins the round.
     IPhone,
-    /// The tablet, which joins both rounds.
+    /// The tablet, which joins the round.
     IPad,
-    /// The phone the runner drives over `adb`, which hosts the first round.
+    /// The phone the runner drives over `adb`, which hosts the round.
     Android,
 }
 
@@ -49,49 +49,33 @@ impl Device {
     }
 }
 
-/// The star's two rounds (R76 slice 9f): the Android phone hosts while the
-/// iPhone and the iPad join, then the iPhone hosts while the Android phone
-/// and the iPad join.
+/// The star's one round (R76 slice 9f): the Android phone hosts its
+/// local-only hotspot while the iPhone and the iPad join.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Round {
     /// The Android phone hosts the local-only hotspot.
     AndroidHosts,
-    /// The iPhone hosts its Personal Hotspot.
-    IPhoneHosts,
 }
 
 impl Round {
     /// The star's rounds, in the order the run walks them.
-    pub const ALL: [Round; 2] = [Self::AndroidHosts, Self::IPhoneHosts];
+    pub const ALL: [Round; 1] = [Self::AndroidHosts];
 
     /// The round's host.
     pub const fn host(self) -> Device {
-        match self {
-            Self::AndroidHosts => Device::Android,
-            Self::IPhoneHosts => Device::IPhone,
-        }
+        Device::Android
     }
 
     /// The round's joiners, in the order they join, the first linked before
-    /// the second.
+    /// the second, the tablet last so the phone's page stands ready when
+    /// the tablet's link to it is the one still to wait on.
     pub const fn joiners(self) -> [Device; 2] {
-        match self {
-            // The tablet joins last, so the phone's page stands ready when
-            // the tablet's link to it is the one still to wait on.
-            Self::AndroidHosts => [Device::IPhone, Device::IPad],
-            // The Android phone's join is the slower of the two, so it goes
-            // first and the tablet's link to it stands while the tablet
-            // joins.
-            Self::IPhoneHosts => [Device::Android, Device::IPad],
-        }
+        [Device::IPhone, Device::IPad]
     }
 
     /// The round's name in the summary and the evidence.
     pub const fn name(self) -> &'static str {
-        match self {
-            Self::AndroidHosts => "android-hosts",
-            Self::IPhoneHosts => "iphone-hosts",
-        }
+        "android-hosts"
     }
 }
 
@@ -181,8 +165,8 @@ pub struct RoundPlan {
     pub join: Join,
 }
 
-/// The two rounds in their order, with the join the joiners take.
-pub fn plan(join: Join) -> [RoundPlan; 2] {
+/// The one round, with the join the joiners take.
+pub fn plan(join: Join) -> [RoundPlan; 1] {
     Round::ALL.map(|round| RoundPlan {
         round,
         host: round.host(),
@@ -367,12 +351,12 @@ mod tests {
         assert!(!text.contains("WIFI:"));
     }
 
-    /// The plan hosts each round by its own device, joins with the other two
-    /// and carries the join through.
+    /// The plan hosts the round by the Android phone, joins with the other
+    /// two and carries the join through.
     #[test]
-    fn the_plan_covers_every_round_with_all_three_devices() {
+    fn the_plan_covers_the_round_with_all_three_devices() {
         let plans = plan(Join::Payload);
-        assert_eq!(plans.len(), 2);
+        assert_eq!(plans.len(), 1);
         for plan in &plans {
             let devices = [plan.host, plan.joiners[0], plan.joiners[1]];
             for device in Device::ALL {
@@ -386,9 +370,6 @@ mod tests {
         assert_eq!(plans[0].round, Round::AndroidHosts);
         assert_eq!(plans[0].host, Device::Android);
         assert_eq!(plans[0].joiners, [Device::IPhone, Device::IPad]);
-        assert_eq!(plans[1].round, Round::IPhoneHosts);
-        assert_eq!(plans[1].host, Device::IPhone);
-        assert_eq!(plans[1].joiners, [Device::Android, Device::IPad]);
     }
 
     const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 42, 0, 1);
@@ -496,16 +477,10 @@ mod tests {
     }
 
     fn round(round: Round) -> RoundReport {
-        let (first, second) = match round {
-            Round::AndroidHosts => (
-                "the iphone joins by the beacon",
-                "the ipad joins by the beacon",
-            ),
-            Round::IPhoneHosts => (
-                "the android joins by the beacon",
-                "the ipad joins by the beacon",
-            ),
-        };
+        let (first, second) = (
+            "the iphone joins by the beacon",
+            "the ipad joins by the beacon",
+        );
         let fail = Err("the ipad never named the android as linked".to_owned());
         RoundReport {
             round,
@@ -522,7 +497,7 @@ mod tests {
     /// their time and, where one failed, why.
     #[test]
     fn the_summary_names_every_step_and_why_a_step_failed() {
-        let rounds = [round(Round::AndroidHosts), round(Round::IPhoneHosts)];
+        let rounds = [round(Round::AndroidHosts)];
         let text = summary("abc123", &(Duration::from_secs(60), Ok(())), &rounds);
         for line in [
             "commit: abc123",
@@ -531,8 +506,6 @@ mod tests {
             "android-hosts round, the ipad joins by the beacon: failed in 7s: the ipad never named the android as linked",
             "android-hosts round, the three-way link: failed in 7s: the ipad never named the android as linked",
             "android-hosts round, the restore: passed in 7s",
-            "iphone-hosts round, the android joins by the beacon: passed in 7s",
-            "iphone-hosts round, the restore: passed in 7s",
         ] {
             assert!(text.contains(line), "the summary lacks {line}:\n{text}");
         }

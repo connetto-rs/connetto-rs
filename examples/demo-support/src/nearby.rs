@@ -15,10 +15,6 @@ use crate::view::OfferView;
 /// The line a VPN refusing the joined hotspot's dial shows.
 pub const VPN_LINE: &str = "link: a VPN on this device blocks its own connections over the joined hotspot, only peers that connect to it can link";
 
-/// The iPhone's note on hosting, since the app cannot read the Personal
-/// Hotspot switch.
-pub const PERSONAL_NOTE: &str = "connetto cannot see whether Personal Hotspot is on";
-
 /// The outcome a nearby join shows while it runs, the guard against a
 /// second one.
 pub const JOINING_NEARBY: &str = "joining the nearby host";
@@ -163,18 +159,12 @@ pub fn nearby_permission(err: &JoinNearbyError) -> Option<&str> {
     }
 }
 
-/// A nearby host's line, `nearby: <prefix>` or `nearby: no beacon prefix`
-/// where the beacon carries none, with the signal where known.
+/// A nearby host's line, `nearby: <prefix>`, with the signal where known.
 #[must_use]
 pub fn nearby_line(host: &NearbyHost) -> String {
     let mut line = String::from("nearby: ");
-    match host.prefix {
-        Some(prefix) => {
-            for byte in prefix {
-                let _ = write!(line, "{byte:02x}");
-            }
-        }
-        None => line.push_str("no beacon prefix"),
+    for byte in host.prefix {
+        let _ = write!(line, "{byte:02x}");
     }
     if let Some(rssi) = host.rssi {
         let _ = write!(line, " at {rssi} dBm");
@@ -242,7 +232,7 @@ mod tests {
     fn the_nearby_join_takes_the_strongest_beacon() {
         let host = |host: u64, rssi: Option<i16>| NearbyHost {
             host,
-            prefix: None,
+            prefix: [0; 8],
             rssi,
         };
         let hosts = [host(1, Some(-80)), host(2, Some(-50)), host(3, None)];
@@ -250,21 +240,21 @@ mod tests {
         assert_eq!(strongest(&[]), None);
     }
 
-    /// A beacon with a prefix names it in hex with its signal, and one
-    /// without says so, the two forms the runners match.
+    /// A beacon's line names its prefix in hex with its signal, the form the
+    /// runners match.
     #[test]
-    fn a_nearby_line_names_the_prefix_or_its_absence() {
+    fn a_nearby_line_names_the_prefix_and_signal() {
         let with = NearbyHost {
             host: 1,
-            prefix: Some([0x6d, 0x57, 0xb8, 0xa7, 0x88, 0x74, 0x78, 0x36]),
+            prefix: [0x6d, 0x57, 0xb8, 0xa7, 0x88, 0x74, 0x78, 0x36],
             rssi: Some(-66),
         };
         assert_eq!(nearby_line(&with), "nearby: 6d57b8a788747836 at -66 dBm");
-        let without = NearbyHost {
+        let without_signal = NearbyHost {
             host: 2,
-            prefix: None,
+            prefix: [0xab; 8],
             rssi: None,
         };
-        assert_eq!(nearby_line(&without), "nearby: no beacon prefix");
+        assert_eq!(nearby_line(&without_signal), "nearby: abababababababab");
     }
 }
