@@ -466,9 +466,9 @@ impl<L: Link> Run<L> {
         }
     }
 
-    /// The author `peer`'s link proved. The machine acts only for linked
-    /// peers, and a link's author is kept from its link up to its unlink.
-    /// The author `peer`'s link proved and the end of its certificate.
+    /// The author `peer`'s link proved and the end of its certificate. The
+    /// machine acts only for linked peers, and a link's author is kept from
+    /// its link up to its unlink.
     fn linked_author(&self, peer: &DeviceIdentity) -> (PeerAuthor, std::time::SystemTime) {
         let linked = self
             .exchange
