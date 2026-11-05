@@ -1432,12 +1432,13 @@ impl Machine {
                         central.disconnect(host);
                     }
                 }
-                // A chunk the host notified, to the exchange's stream.
+                // A chunk the host notified, to the exchange's stream, and a
+                // stream 64 chunks behind ends the exchange.
                 CentralEvent::Chunk { host, bytes } => {
                     if matches!(&self.joiner, JoinerState::Exchanging { host: h, .. } if *h == host)
                         && !self.send_join_chunk(host, bytes)
                     {
-                        end = Some(channel_error("the stream's reader is gone"));
+                        end = Some(channel_error("the stream's reader is 64 chunks behind"));
                     }
                 }
                 // The host disconnected, so the exchange's stream ends by its
@@ -1590,7 +1591,10 @@ impl Machine {
         }
     }
 
-    /// A chunk to the exchange's stream, `false` where its reader is gone.
+    /// A chunk to the exchange's stream, `false` where its reader is 64
+    /// chunks behind. A reader that has closed belongs to a task with its
+    /// answer, such as the offer before the host's TLS close, so the chunk
+    /// is dropped and the answer decides the exchange.
     fn send_join_chunk(&mut self, host: HostId, bytes: Vec<u8>) -> bool {
         let JoinerState::Exchanging {
             host: target,
@@ -1603,9 +1607,12 @@ impl Machine {
         if *target != host {
             return true;
         }
-        match inbound {
-            Some(sender) => sender.try_send(bytes).is_ok(),
-            None => false,
+        let Some(sender) = inbound else {
+            return true;
+        };
+        match sender.try_send(bytes) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => false,
         }
     }
 
@@ -1660,7 +1667,11 @@ impl Machine {
             // The host's chain is refused, the exchange times out, or
             // Bluetooth fails, so the host is marked tried.
             Err(err) => {
-                tracing::debug!(?err, "the join's exchange ended without its offer");
+                tracing::warn!(
+                    error = %err,
+                    source = ?std::error::Error::source(&err),
+                    "the join's exchange ended without its offer"
+                );
                 if let Some(record) = self.hosts.get_mut(&host) {
                     record.tried = true;
                 }
@@ -2794,6 +2805,15 @@ mod tests {
                 self.joiner.tick(None, false);
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
+        }
+
+        /// Whether the joiner's exchange task has ended and dropped its
+        /// stream's reader, its answer not yet taken.
+        fn joiner_reader_closed(&self) -> bool {
+            matches!(
+                &self.joiner.joiner,
+                JoinerState::Exchanging { inbound: Some(inbound), .. } if inbound.is_closed()
+            )
         }
     }
 
@@ -3933,6 +3953,52 @@ mod tests {
         assert_eq!(identity, pair.host_identity);
         assert_eq!(offer.ssid, "hotspot");
         assert_eq!(offer.passphrase, "secret");
+    }
+
+    /// The joiner's row `a host chunk arrives once the exchange's task has
+    /// its answer`. The host's TLS close follows its offer, so the chunk is
+    /// dropped and the task's answer stands.
+    #[tokio::test]
+    async fn a_host_chunk_after_the_offer_leaves_the_fetch_its_offer() {
+        let mut pair = ExchangePair::new().await;
+        let device: HostId = 1;
+        let (fetch_tx, mut fetch_rx) = oneshot::channel();
+        pair.joiner.handle(Command::Fetch {
+            host: device,
+            reply: fetch_tx,
+        });
+        pair.joiner_central.push(CentralEvent::Connected {
+            host: device,
+            mtu: 517,
+        });
+        pair.host_peripheral
+            .push(PeripheralEvent::Connected { device, mtu: 517 });
+        pair.host.tick(Some(&offer()), false);
+        let mut late = false;
+        let mut p = 0;
+        let answer = loop {
+            if let Ok(answer) = fetch_rx.try_recv() {
+                break answer;
+            }
+            p += 1;
+            assert!(p < 2000, "the fetch did not answer in time");
+            pair.host.tick(Some(&offer()), false);
+            if !late && pair.joiner_reader_closed() {
+                pair.joiner_central.push(CentralEvent::Chunk {
+                    host: device,
+                    bytes: vec![0; 24],
+                });
+                late = true;
+            }
+            pair.joiner.tick(None, false);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        assert!(late, "the exchange's task answered with its reader open");
+        let Ok((identity, offer)) = answer else {
+            panic!("the fetch answers its offer, got {answer:?}");
+        };
+        assert_eq!(identity, pair.host_identity);
+        assert_eq!(offer.ssid, "hotspot");
     }
 
     // --- The unified runner ---
