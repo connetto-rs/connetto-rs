@@ -777,6 +777,15 @@ impl Platform {
             Action::FreeUpSpace => self.free_up_space(),
             Action::Export => self.export(),
             Action::Import { bytes, .. } => self.import(bytes),
+            // The web's view carries no peer link, so the nearby pane's
+            // controls have nothing to act on.
+            Action::EnableBluetooth
+            | Action::HostHotspot
+            | Action::StopHotspot
+            | Action::JoinHotspot { .. }
+            | Action::JoinPayload { .. }
+            | Action::JoinNearby
+            | Action::LeaveHotspot => {}
         }
     }
 

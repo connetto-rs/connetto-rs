@@ -411,6 +411,15 @@ pub enum ClientError {
     #[cfg(all(feature = "device-identity", target_os = "android"))]
     #[error("the device key needs JNI access: call NativeDurable::with_java_access")]
     MissingJavaAccess,
+    /// A platform prompt needs the application's screen in front, and the
+    /// application shows none, a backgrounded one or one not started yet.
+    #[cfg(all(feature = "device-identity", target_os = "android"))]
+    #[error("no screen of the application is in front for the prompt")]
+    NoAndroidScreen,
+    /// A call into the application's Java code failed, kept as its text.
+    #[cfg(all(feature = "device-identity", target_os = "android"))]
+    #[error("the application's Java code refused: {0}")]
+    AndroidJava(String),
     /// A build with a device identity connected without naming the roots its
     /// certificates and revocation lists are checked against (R74 decision 23).
     #[cfg(feature = "device-identity")]

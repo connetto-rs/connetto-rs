@@ -289,10 +289,13 @@ impl Device {
                 return Ok(());
             }
             settings_opened = true;
+            // Settings left open on another screen takes the intent into its
+            // running task without showing the Wi-Fi list, so the task clears.
             self.adb(&[
                 "shell",
                 "am",
                 "start",
+                "--activity-clear-task",
                 "-a",
                 "android.settings.WIFI_SETTINGS",
             ])
@@ -558,6 +561,38 @@ impl Device {
         ])
         .await
         .map(drop)
+    }
+
+    /// The demo's page once its `WebView` answers, retried for a minute while
+    /// the app starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last error when the page does not answer within the minute.
+    pub async fn ready_app(&self) -> Result<PageSession> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match self.app().await {
+                Ok(app) => return Ok(app),
+                Err(err) if Instant::now() >= deadline => return Err(err),
+                Err(_) => sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
+
+    /// Click the demo's Sign in once its setup has parked the login, since
+    /// both demos open the login tab on that click.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the banner or an enabled button does not appear
+    /// within its bound.
+    pub async fn click_sign_in(&self) -> Result<()> {
+        let mut app = self.ready_app().await?;
+        app.wait_for_text("Sign in to begin.", Duration::from_secs(90))
+            .await?;
+        app.click_when_enabled("Sign in", Duration::from_secs(90))
+            .await
     }
 
     /// A `DevTools` session on the demo's `WebView`, over a forward that lives

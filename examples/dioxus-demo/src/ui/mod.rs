@@ -26,11 +26,23 @@ use connetto_demo_support as support;
 use dioxus::prelude::*;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaArrowRightArrowLeft, FaCheck, FaCircleUser, FaFingerprint, FaRightFromBracket,
+    FaArrowRightArrowLeft, FaCheck, FaCircleInfo, FaCircleUser, FaFingerprint, FaRightFromBracket,
     FaRightToBracket, FaTrashCan, FaUserPlus, FaXmark,
 };
 
 use crate::platform::{Client, DemoContent, Ops};
+
+/// The small grey line at a panel's foot saying what the panel is for and
+/// what it tests.
+#[component]
+pub fn PaneInfo(text: &'static str) -> Element {
+    rsx! {
+        p { class: "pane-info",
+            Icon { icon: FaCircleInfo, width: 12, height: 12 }
+            span { {text} }
+        }
+    }
+}
 
 /// The app's own status line, set by the platform's event loop.
 #[derive(Clone, Copy)]

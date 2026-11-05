@@ -1,12 +1,94 @@
-//! Where `connetto-ios-signing` keeps the iOS signing identity on a Mac, so
-//! the proof driver finds and unlocks the same one.
+//! Where `connetto-ios-signing` keeps the iOS signing identity and
+//! development profiles on a Mac, so the proof drivers find and unlock the
+//! same ones.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 
 /// The keychain holding the signing identity, in `~/Library/Keychains`.
 pub const KEYCHAIN: &str = "connetto-signing.keychain-db";
+/// The development profile of the dioxus demo's iOS builds.
+pub const DIOXUS_PROFILE: &str = "connetto dioxus demo development";
+/// The development profile of the dioxus demo's macOS build.
+pub const DIOXUS_MACOS_PROFILE: &str = "connetto dioxus demo macos development";
+/// The development profile of the Tauri demo's iOS builds.
+pub const TAURI_PROFILE: &str = "connetto tauri demo development";
+/// The development profile of the tapper's test runner.
+pub const TAPPER_PROFILE: &str = "connetto tapper development";
+
+/// The folder `xcodebuild` and `dx` read the development profiles from.
+///
+/// # Errors
+///
+/// When `HOME` is unset.
+pub fn profile_folder() -> Result<PathBuf> {
+    Ok(home()?.join("Library/Developer/Xcode/UserData/Provisioning Profiles"))
+}
+
+/// The profile's content decoded with `security`, the plist its name and
+/// entitlements stand in.
+///
+/// # Errors
+///
+/// When `security` cannot decode the profile.
+pub async fn decode_profile(profile: &Path) -> Result<String> {
+    let output = tokio::process::Command::new("security")
+        .args(["cms", "-D", "-i"])
+        .arg(profile)
+        .output()
+        .await
+        .context("starting security")?;
+    if !output.status.success() {
+        bail!(
+            "decoding the profile {} failed: {}",
+            profile.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The path of the profile named `name`, decoded one file at a time from the
+/// folder Xcode reads.
+///
+/// # Errors
+///
+/// When the folder holds no profile of that name, naming the ones it does.
+pub async fn profile_named(name: &str) -> Result<PathBuf> {
+    let folder = profile_folder()?;
+    let mut entries = tokio::fs::read_dir(&folder)
+        .await
+        .with_context(|| format!("listing {}", folder.display()))?;
+    let mut held = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let Ok(plist) = decode_profile(&path).await else {
+            continue;
+        };
+        match profile_name(&plist) {
+            Some(actual) if actual == name => return Ok(path),
+            Some(actual) => held.push(actual.to_owned()),
+            None => {}
+        }
+    }
+    let seen = if held.is_empty() {
+        String::from("nothing of a profile's shape")
+    } else {
+        format!("the profiles {held:?}")
+    };
+    bail!(
+        "no profile named {name} in {}, the folder holds {seen}",
+        folder.display()
+    )
+}
+
+/// The `Name` of a decoded profile's property list.
+pub fn profile_name(plist: &str) -> Option<&str> {
+    let (_, after) = plist.split_once("<key>Name</key>")?;
+    let (_, value) = after.split_once("<string>")?;
+    value.split_once("</string>").map(|(name, _)| name)
+}
 
 /// The folder holding the signing key, the certificate and the keychain's
 /// password.

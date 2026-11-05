@@ -13,6 +13,9 @@ pub use data::*;
 
 pub mod view;
 
+#[cfg(feature = "peer")]
+pub mod nearby;
+
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
 pub mod web;
 
@@ -88,6 +91,24 @@ input[type=file] { border: none; padding: 0; }
 .warn { color: #7d4e00; background: #fff8c5; border: 1px solid #d4a72c; border-radius: 6px; padding: 4px 8px; margin: 4px 0; }
 .error { color: var(--danger); }
 .peer { border: 1px solid var(--border); border-radius: 10px; padding: 8px 14px; margin-bottom: 12px; }
+.panel { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; background: #fff; }
+.panel h2 { margin: 0 0 8px; font-size: 1.05em; }
+.panel h3 { display: flex; align-items: center; gap: 6px; margin: 10px 0 4px; font-size: 0.95em; }
+.panel p { margin: 4px 0; }
+.panel input[type=text] { width: 100%; max-width: 28em; box-sizing: border-box; }
+.panel .lines { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }
+.toned { border-top: 4px solid var(--tone); background: #fff; background: color-mix(in srgb, var(--tone) 5%, #fff); }
+.toned h2 svg { fill: var(--tone); }
+.tone-orders { --tone: #2f6feb; }
+.tone-photos { --tone: #0f8b8d; }
+.tone-notes { --tone: #cf222e; }
+.tone-retention { --tone: #1a7f37; }
+.tone-your-data { --tone: #d1660f; }
+.tone-catalogue { --tone: #8250df; }
+.tone-nearby { --tone: #4c51bf; }
+.peering { background: #eef0ff; color: #2f3480; }
+.pane-info { display: flex; align-items: flex-start; gap: 6px; margin: 12px 0 0; font-size: 0.75em; line-height: 1.4; color: var(--muted); }
+.pane-info svg { flex: none; margin-top: 2px; fill: currentColor; }
 img.thumb { max-height: 60px; border-radius: 4px; }
 "#;
 
@@ -111,6 +132,9 @@ pub const RETENTION_BADGE: &str = "trim";
 pub const YOUR_DATA_PANE_TITLE: &str = "your data";
 /// The your-data pane's badge.
 pub const YOUR_DATA_BADGE: &str = "device-only";
+
+/// What the nearby panel is for and what it tests.
+pub const NEARBY_INFO: &str = "Links this phone directly to nearby phones over Bluetooth and a local Wi-Fi hotspot, with no server involved. Tests discovery, hosting and joining a hotspot, and the peer link the team notes travel on.";
 
 /// The orders pane's readout line.
 #[must_use]

@@ -20,6 +20,7 @@ pub fn App(view: RwSignal<View>) -> impl IntoView {
         <div class="wrap">
             <Header view=view />
             <AccountBar view=view />
+            {move || view.with(|v| v.nearby.is_some()).then(|| view! { <NearbyPane view=view /> })}
             <Dashboard view=view />
         </div>
     }
@@ -319,6 +320,17 @@ fn pane_heading(
             " "
             <span class=badge_class>{badge}</span>
         </h2>
+    }
+}
+
+/// A pane footer with the info icon and the pane's purpose line.
+#[component]
+fn PaneInfo(text: &'static str) -> impl IntoView {
+    view! {
+        <p class="pane-info">
+            <Fa icon=Icon::CircleInfo size=12 />
+            <span>{text}</span>
+        </p>
     }
 }
 
@@ -738,6 +750,207 @@ fn YourDataPane(view: RwSignal<View>) -> impl IntoView {
                 />
             </div>
             {move || status_line(view.with(|v| v.import_line.clone()))}
+        </div>
+    }
+}
+
+/// The scoped style for the nearby panel, its sections and their forms.
+const PEER_PANEL_STYLE: &str = r#".peer section + section { border-top: 1px solid var(--border); }
+.peer section { padding: 6px 0; }
+.peer h4 { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-size: 0.95em; }
+.peer p { margin: 2px 0; font-size: 0.9em; }
+.peer input { display: block; width: 100%; max-width: 28em; box-sizing: border-box; margin: 4px 0; }"#;
+
+/// The nearby panel (R76): the peer link, the hotspot this device hosts with
+/// its offer as plain lines, and the forms that join a hotspot another
+/// device hosted. It stands beside the panes while the build carries the
+/// peer link.
+#[component]
+fn NearbyPane(view: RwSignal<View>) -> impl IntoView {
+    // The join forms, the typed values the controls keep locally and send
+    // with their actions.
+    let join_ssid = RwSignal::new(String::new());
+    let join_passphrase = RwSignal::new(String::new());
+    let join_port = RwSignal::new(String::new());
+    let join_payload = RwSignal::new(String::new());
+
+    view! {
+        <div class="peer panel toned tone-nearby">
+            <style>{PEER_PANEL_STYLE}</style>
+            <h2>
+                <Fa icon=Icon::SatelliteDish />
+                "nearby "
+                <span class="badge peering">"peer"</span>
+            </h2>
+            {move || {
+                let near = view.with(|v| v.nearby.clone().unwrap_or_default());
+                let support::view::NearbyView {
+                    peer_line,
+                    bluetooth_line,
+                    beacon_line,
+                    linked,
+                    nearby: nearby_lines,
+                    offer,
+                    outcome,
+                    vpn_line,
+                    joined,
+                    can_host,
+                } = near;
+                let hosting = offer.is_some();
+                view! {
+                    <section>
+                        <h4>
+                            <Fa icon=Icon::CircleInfo />
+                            "Status"
+                        </h4>
+                        <p>{peer_line}</p>
+                        <p>{bluetooth_line.clone()}</p>
+                        <p>{beacon_line}</p>
+                        {linked.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
+                        {nearby_lines.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
+                        {offer.map(|offer| {
+                            view! {
+                                <p>"hotspot ssid: " {offer.ssid}</p>
+                                <p>"hotspot passphrase: " {offer.passphrase}</p>
+                                <p>"hotspot port: " {offer.port}</p>
+                                <p>"hotspot payload: " {offer.payload}</p>
+                                {offer.qr_svg.map(|svg| view! { <div inner_html=svg /> })}
+                            }
+                        })}
+                        <p>"hotspot: " {outcome}</p>
+                        {vpn_line.map(|line| view! { <p>{line}</p> })}
+                        <div class="row">
+                            {support::view::offers_bluetooth_on(&bluetooth_line).then(|| view! {
+                                <button on:click=move |_| act(Action::EnableBluetooth)>
+                                    <Fa icon=Icon::PowerOff />
+                                    "Turn on Bluetooth"
+                                </button>
+                            })}
+                        </div>
+                    </section>
+                    {(can_host && !joined).then(|| {
+                        view! {
+                            <section>
+                                <h4>
+                                    <Fa icon=Icon::TowerBroadcast />
+                                    "Host"
+                                </h4>
+                                <div class="row">
+                                    {(!hosting).then(|| {
+                                        view! {
+                                            <button on:click=move |_| act(Action::HostHotspot)>
+                                                <Fa icon=Icon::TowerBroadcast />
+                                                "Host a hotspot"
+                                            </button>
+                                        }
+                                    })}
+                                    {hosting.then(|| {
+                                        view! {
+                                            <button on:click=move |_| act(Action::StopHotspot)>
+                                                <Fa icon=Icon::Stop />
+                                                "Stop the hotspot"
+                                            </button>
+                                        }
+                                    })}
+                                </div>
+                            </section>
+                        }
+                    })}
+                    {(!hosting && !joined).then(|| {
+                        view! {
+                            <section>
+                                <h4>
+                                    <Fa icon=Icon::Wifi />
+                                    "Join by the offer"
+                                </h4>
+                                <input
+                                    type="text"
+                                    name="ssid"
+                                    placeholder="the offer's ssid"
+                                    style="font-family: monospace;"
+                                    prop:value=move || join_ssid.get()
+                                    on:input=move |ev| join_ssid.set(event_target_value(&ev))
+                                />
+                                <input
+                                    type="text"
+                                    name="passphrase"
+                                    placeholder="the offer's passphrase"
+                                    style="font-family: monospace;"
+                                    prop:value=move || join_passphrase.get()
+                                    on:input=move |ev| join_passphrase.set(event_target_value(&ev))
+                                />
+                                <input
+                                    type="text"
+                                    name="port"
+                                    placeholder="the offer's port"
+                                    style="font-family: monospace;"
+                                    prop:value=move || join_port.get()
+                                    on:input=move |ev| join_port.set(event_target_value(&ev))
+                                />
+                                <button on:click=move |_| {
+                                    let ssid = join_ssid.get_untracked().trim().to_owned();
+                                    let passphrase = join_passphrase.get_untracked().clone();
+                                    let port = join_port.get_untracked().trim().to_owned();
+                                    act(Action::JoinHotspot { ssid, passphrase, port });
+                                }>
+                                    <Fa icon=Icon::Wifi />
+                                    "Join the hotspot"
+                                </button>
+                            </section>
+                            <section>
+                                <h4>
+                                    <Fa icon=Icon::Qrcode />
+                                    "Join by the payload"
+                                </h4>
+                                <input
+                                    type="text"
+                                    name="payload"
+                                    placeholder="WIFI: payload"
+                                    style="font-family: monospace;"
+                                    prop:value=move || join_payload.get()
+                                    on:input=move |ev| join_payload.set(event_target_value(&ev))
+                                />
+                                <button on:click=move |_| {
+                                    let payload = join_payload.get_untracked().trim().to_owned();
+                                    act(Action::JoinPayload { payload });
+                                }>
+                                    <Fa icon=Icon::Qrcode />
+                                    "Join from the payload"
+                                </button>
+                            </section>
+                        }
+                    })}
+                    {(!hosting).then(|| {
+                        view! {
+                            <section>
+                                <h4>
+                                    <Fa icon=Icon::SatelliteDish />
+                                    "Join nearby, or leave"
+                                </h4>
+                                <div class="row">
+                                    {joined.then(|| {
+                                        view! {
+                                            <button on:click=move |_| act(Action::LeaveHotspot)>
+                                                <Fa icon=Icon::RightFromBracket />
+                                                "Leave the hotspot"
+                                            </button>
+                                        }
+                                    })}
+                                    {(!joined).then(|| {
+                                        view! {
+                                            <button on:click=move |_| act(Action::JoinNearby)>
+                                                <Fa icon=Icon::SatelliteDish />
+                                                "Join the nearby host"
+                                            </button>
+                                        }
+                                    })}
+                                </div>
+                            </section>
+                        }
+                    })}
+                }
+            }}
+            <PaneInfo text=support::NEARBY_INFO />
         </div>
     }
 }

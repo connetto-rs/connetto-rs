@@ -86,6 +86,58 @@ impl AccountEntry {
     }
 }
 
+/// The hotspot this device hosts, as the nearby panel shows its offer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfferView {
+    /// The hotspot's network name.
+    pub ssid: String,
+    /// The hotspot's passphrase.
+    pub passphrase: String,
+    /// The device's peer port, `none` while it serves none.
+    pub port: String,
+    /// The offer as one `WIFI:` payload (R76 decision 23).
+    pub payload: String,
+    /// The payload drawn as an SVG QR code, absent where it fits none.
+    pub qr_svg: Option<String>,
+}
+
+/// The nearby panel's standing, the peer link and the hotspot (R76).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NearbyView {
+    /// `peer: listening on <port> as <identity>` or `peer: not serving`.
+    pub peer_line: String,
+    /// `bluetooth: <state>`.
+    pub bluetooth_line: String,
+    /// `beacon: advertising <prefix>` or `beacon: off (<reason>)`.
+    pub beacon_line: String,
+    /// One `linked: <identity> via <address>` line per linked peer, sorted.
+    pub linked: Vec<String>,
+    /// One `nearby: <prefix> at <rssi> dBm` line per host whose beacon shows.
+    pub nearby: Vec<String>,
+    /// The offer this device hosts, until the hotspot stops.
+    pub offer: Option<OfferView>,
+    /// The last hotspot or join outcome, `idle` before the first.
+    pub outcome: String,
+    /// The line a VPN refusing the joined hotspot's dial shows.
+    pub vpn_line: Option<String>,
+    /// Whether this device stands joined to another's hotspot.
+    pub joined: bool,
+    /// Whether this system hosts a hotspot from the app, never on the
+    /// Apple devices, which only join (R77 decision 23).
+    pub can_host: bool,
+}
+
+/// Whether the nearby panel offers its Bluetooth button for the panel's
+/// `bluetooth: <state>` line, only while the user can turn the radio on or
+/// grant its permission, so a ready or absent Bluetooth shows no button.
+#[must_use]
+pub fn offers_bluetooth_on(bluetooth_line: &str) -> bool {
+    matches!(
+        bluetooth_line,
+        "bluetooth: off" | "bluetooth: not permitted"
+    )
+}
+
 /// Every line the screen shows.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct View {
@@ -175,6 +227,9 @@ pub struct View {
     pub export_line: Option<String>,
     /// The last import line.
     pub import_line: Option<String>,
+
+    /// The nearby panel, absent in a build without the peer link.
+    pub nearby: Option<NearbyView>,
 
     /// Whether this window's tab client attached, the dashboard's gate.
     pub attached: bool,
@@ -269,4 +324,43 @@ pub enum Action {
         /// The archive's bytes.
         bytes: Vec<u8>,
     },
+    /// Turn Bluetooth on, through the system's prompt where it asks.
+    EnableBluetooth,
+    /// Host a hotspot from the app.
+    HostHotspot,
+    /// Stop the hotspot this device hosts.
+    StopHotspot,
+    /// Join a hotspot by its offer's typed lines.
+    JoinHotspot {
+        /// The offer's network name.
+        ssid: String,
+        /// The offer's passphrase.
+        passphrase: String,
+        /// The offer's peer port, empty where it names none.
+        port: String,
+    },
+    /// Join a hotspot by its `WIFI:` payload.
+    JoinPayload {
+        /// The pasted or scanned payload.
+        payload: String,
+    },
+    /// Join the strongest host whose beacon shows.
+    JoinNearby,
+    /// Leave the joined hotspot.
+    LeaveHotspot,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::offers_bluetooth_on;
+
+    /// The Bluetooth button stands only while the user can turn the radio on
+    /// or grant its permission, and goes once Bluetooth is ready.
+    #[test]
+    fn the_bluetooth_button_stands_only_while_bluetooth_is_not_ready() {
+        assert!(offers_bluetooth_on("bluetooth: off"));
+        assert!(offers_bluetooth_on("bluetooth: not permitted"));
+        assert!(!offers_bluetooth_on("bluetooth: ready"));
+        assert!(!offers_bluetooth_on("bluetooth: unsupported"));
+    }
 }

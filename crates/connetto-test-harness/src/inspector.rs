@@ -351,6 +351,25 @@ impl PageSession {
         }
     }
 
+    /// Switch the account bar back to the account `signed_in_line` named,
+    /// the page's `Signed in as <short identity>` line. Each switch button
+    /// names its account by the full identity, which starts with the short
+    /// one, so the button is found among any others a kept keychain still
+    /// holds.
+    ///
+    /// # Errors
+    ///
+    /// When the line names no identity, when no single button switches to it,
+    /// or as [`PageSession::call`].
+    pub async fn switch_to_account(&mut self, signed_in_line: &str) -> Result<()> {
+        let identity = signed_in_line
+            .strip_prefix("Signed in as ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .ok_or_else(|| anyhow!("the signed-in line {signed_in_line:?} names no identity"))?;
+        self.click_starting_with(&format!("Switch to {identity}"))
+            .await
+    }
+
     /// The first line of the page's text that starts with `prefix`.
     ///
     /// # Errors
