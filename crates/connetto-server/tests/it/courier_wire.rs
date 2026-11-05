@@ -1186,6 +1186,93 @@ async fn an_identified_handshake_carries_the_standing_courier_notices() {
     server.await.expect("join").expect("session ok");
 }
 
+/// Notice rows the deployment's table holds in a shape no frame can carry
+/// (a key that is no device key, a sequence below zero, an outcome no
+/// settle wrote) are never sent and stand, and a well formed row beside
+/// them still goes out alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_courier_notices_stand_and_the_rest_go_out() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (_author, author_id) = store.enrol("alice", tomorrow()).await;
+    let manager = courier_on(&fixture, &store);
+    let applied = connetto_server::writer_schema::SettledOutcome::Applied.json();
+    let key = key_hex(author_id);
+    fixture
+        .setup(&[&format!(
+            "INSERT INTO _connetto_courier_notices (user_id, courier_user_id, device_key, seq, outcome) VALUES \
+             ('alice', 'bob', '\\x010203', 1, '{applied}'), \
+             ('alice', 'bob', '\\x{key}', -1, '{applied}'), \
+             ('alice', 'bob', '\\x{key}', 2, 'not an outcome')"
+        )])
+        .await;
+
+    // A frame of nothing but malformed rows is never sent.
+    let (mut client, server) = super::courier_frontier::loopback_client(&manager);
+    client.handshake("alice").await;
+    assert!(
+        matches!(client.barrier(97).await, ControlMessage::Pong(_)),
+        "no notice frame carries only malformed rows"
+    );
+    client.close().await;
+    server.await.expect("join").expect("session ok");
+    assert_eq!(notice_count(fixture.admin()).await, 3);
+
+    seed_notices(&fixture, "alice", author_id, "bob", 1).await;
+    let (mut client, server) = super::courier_frontier::loopback_client(&manager);
+    client.handshake("alice").await;
+    let only = notice(&mut client).await;
+    assert_eq!(only.notices.len(), 1, "the well formed row goes out alone");
+    assert_eq!(only.notices[0].seq, 1);
+    client.courier_notice_ack(&only.notice_id).await;
+    wait_notice_count(fixture.admin(), 3).await;
+    client.close().await;
+    server.await.expect("join").expect("session ok");
+}
+
+/// An ack whose delete fails leaves the session standing and the rows in
+/// place, so the author's next handshake carries them again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_notice_delete_keeps_the_rows_for_the_next_handshake() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (_author, author_id) = store.enrol("alice", tomorrow()).await;
+    let manager = courier_on(&fixture, &store);
+    seed_notices(&fixture, "alice", author_id, "bob", 2).await;
+    fixture
+        .setup(&[
+            "CREATE OR REPLACE FUNCTION no_notice_delete() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RAISE EXCEPTION 'no notice delete'; END $$",
+            "CREATE TRIGGER no_notice_delete BEFORE DELETE ON _connetto_courier_notices \
+             FOR EACH ROW EXECUTE FUNCTION no_notice_delete()",
+        ])
+        .await;
+
+    let (mut client, server) = super::courier_frontier::loopback_client(&manager);
+    client.handshake("alice").await;
+    let first = notice(&mut client).await;
+    client.courier_notice_ack(&first.notice_id).await;
+    assert!(
+        matches!(client.barrier(96).await, ControlMessage::Pong(_)),
+        "the session outlives the failed delete"
+    );
+    assert_eq!(notice_count(fixture.admin()).await, 2);
+    client.close().await;
+    server.await.expect("join").expect("session ok");
+
+    let (mut client, server) = super::courier_frontier::loopback_client(&manager);
+    client.handshake("alice").await;
+    let again = notice(&mut client).await;
+    assert_eq!(
+        again.notices.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        first.notices.iter().map(|row| row.seq).collect::<Vec<_>>()
+    );
+    client.close().await;
+    server.await.expect("join").expect("session ok");
+}
+
 /// An anonymous session carries no notices at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_anonymous_session_carries_no_courier_notices() {
