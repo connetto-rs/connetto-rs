@@ -28,6 +28,17 @@ use crate::one_event::OneEvent;
 
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);";
 
+/// The first row change `source` produces. The table's relation message leads
+/// the stream and the commit ends it, so both are skipped over.
+async fn first_event(source: &mut PgSqliteEmuSource) -> PgChangeEvent {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        if let subql::SourceItem::Event(event) = item {
+            return event;
+        }
+    }
+    panic!("the stream ended without a row change");
+}
+
 /// Upkeep that counts how many times it is consulted.
 struct CountingUpkeep(Arc<AtomicU64>);
 
@@ -120,12 +131,7 @@ async fn store_upkeep_passed_at_construction_is_called_on_cdc_event() {
     source
         .execute_sql("INSERT INTO notes (id, body) VALUES (1, 'hello')")
         .expect("execute dml");
-    let event = source
-        .next_item()
-        .await
-        .expect("poll source")
-        .and_then(subql::SourceItem::into_event)
-        .expect("one event");
+    let event = first_event(&mut source).await;
 
     manager
         .ingest(&mut OneEvent(Some(event)), &mut |_| {})
@@ -177,12 +183,7 @@ async fn a_failed_store_write_holds_the_event() {
     source
         .execute_sql("INSERT INTO notes (id, body) VALUES (1, 'hello')")
         .expect("execute dml");
-    let event = source
-        .next_item()
-        .await
-        .expect("poll source")
-        .and_then(subql::SourceItem::into_event)
-        .expect("one event");
+    let event = first_event(&mut source).await;
 
     let retries = AtomicU64::new(0);
     let ended = tokio::time::timeout(
@@ -252,12 +253,7 @@ async fn a_store_refusal_that_cannot_clear_ends_ingest() {
     source
         .execute_sql("INSERT INTO notes (id, body) VALUES (1, 'refused')")
         .expect("execute dml");
-    let event = source
-        .next_item()
-        .await
-        .expect("poll source")
-        .and_then(subql::SourceItem::into_event)
-        .expect("one event");
+    let event = first_event(&mut source).await;
 
     let retries = AtomicU32::new(0);
     let ended = tokio::time::timeout(

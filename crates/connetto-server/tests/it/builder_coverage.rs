@@ -2226,9 +2226,9 @@ async fn a_missing_schema_table_refuses_naming_it() {
         "{bans}"
     );
     let (_, _, issuer) = super::enrolment::rooted_issuer();
-    let devices = missing(&fixture, move |builder| {
+    let devices = Box::pin(missing(&fixture, move |builder| {
         builder.device_identity(Some(DeviceCertConfig::new(issuer)))
-    })
+    }))
     .await;
     assert!(
         devices.starts_with("table connetto_device_enrolments does not exist"),
