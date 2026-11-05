@@ -3732,6 +3732,87 @@ mod tests {
         assert!(h.strongest_untried().is_none());
     }
 
+    /// The joiner's row `the exchange's stream is 64 chunks behind`. The
+    /// 65th chunk has nowhere to go, so the exchange ends at once.
+    #[tokio::test]
+    async fn a_stream_64_chunks_behind_ends_its_exchange() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.settle().await;
+        h.host_seen(1, &fp(9), -50);
+        h.tick(None);
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        h.machine.handle(Command::Fetch {
+            host: 1,
+            reply: reply_tx,
+        });
+        h.tick(None);
+        h.central
+            .push(CentralEvent::Connected { host: 1, mtu: 517 });
+        for _ in 0..64 {
+            h.central.push(CentralEvent::Chunk {
+                host: 1,
+                bytes: vec![0; 24],
+            });
+        }
+        h.tick(None);
+        assert!(
+            reply_rx.try_recv().is_err(),
+            "64 chunks fit the stream, so the exchange runs on"
+        );
+        h.central.push(CentralEvent::Chunk {
+            host: 1,
+            bytes: vec![0; 24],
+        });
+        h.tick(None);
+        let answer = reply_rx.try_recv();
+        let Ok(Err(BluetoothError::Exchange(ExchangeError::Io(err)))) = answer else {
+            panic!("the 65th chunk ends the exchange, got {answer:?}");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert!(h.strongest_untried().is_none());
+    }
+
+    /// The joiner's row `a host chunk arrives after the host disconnected
+    /// a running exchange`. The chunk is dropped, so the exchange's own end
+    /// decides it on a later look.
+    #[tokio::test]
+    async fn a_chunk_after_the_host_disconnected_leaves_the_exchange_to_its_task() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.settle().await;
+        h.host_seen(1, &fp(9), -50);
+        h.tick(None);
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        h.machine.handle(Command::Fetch {
+            host: 1,
+            reply: reply_tx,
+        });
+        h.tick(None);
+        h.central
+            .push(CentralEvent::Connected { host: 1, mtu: 517 });
+        h.central.push(CentralEvent::Disconnected { host: 1 });
+        h.central.push(CentralEvent::Chunk {
+            host: 1,
+            bytes: vec![0; 24],
+        });
+        h.tick(None);
+        assert!(
+            reply_rx.try_recv().is_err(),
+            "the chunk ended the exchange before its task did"
+        );
+        let mut p = 0;
+        let answer = loop {
+            if let Ok(answer) = reply_rx.try_recv() {
+                break answer;
+            }
+            p += 1;
+            assert!(p < 2000, "the exchange's task never ended");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            h.tick(None);
+        };
+        assert!(answer.is_err(), "the stream ended, so no offer comes");
+        assert!(h.strongest_untried().is_none());
+    }
+
     /// The joiner's row `the autojoin's exchange ends without an offer |
     /// the host stands tried, and the answer goes to no one` (R76
     /// decision 19).
