@@ -512,9 +512,21 @@ fn count(conn: &mut ConnettoConnection<FakeTransport>, table: &str) -> i64 {
 /// log, so the exchange resumes where it stopped and peers still learn the
 /// refusals, while the stored peer entries and their records go with the
 /// synced rows they named (R77 decision 16).
+/// One held peer entry's state, major and body, read raw.
+#[cfg(feature = "peer")]
+#[derive(diesel::QueryableByName)]
+struct HeldRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    state: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    major: i64,
+    #[diesel(sql_type = diesel::sql_types::Binary)]
+    changeset: Vec<u8>,
+}
+
 #[cfg(feature = "peer")]
 #[tokio::test]
-async fn a_rebuild_keeps_the_peer_cursors_and_retractions_and_drops_the_entries() {
+async fn a_rebuild_keeps_the_peer_state_and_holds_applied_entries_courier_only() {
     let dir = tempdir().expect("temp dir");
     {
         let mut conn = open(&dir, schema(1, V1_DDL)).await.expect("fresh open");
@@ -545,10 +557,19 @@ async fn a_rebuild_keeps_the_peer_cursors_and_retractions_and_drops_the_entries(
         1,
         "the retraction log stays"
     );
+    // The entry stays under its major, courier-only, since the record that
+    // made it provisional goes with the synced tables (R78 decision 7).
+    let entries: Vec<(i64, i64, Vec<u8>)> =
+        diesel::sql_query("SELECT state, major, changeset FROM _connetto_peer_entry")
+            .load::<HeldRow>(conn.conn())
+            .expect("read the entries")
+            .into_iter()
+            .map(|row| (row.state, row.major, row.changeset))
+            .collect();
     assert_eq!(
-        count(&mut conn, "_connetto_peer_entry"),
-        0,
-        "the entries go"
+        entries,
+        vec![(1, 1, vec![0])],
+        "the entry stays courier-only"
     );
     assert_eq!(
         count(&mut conn, "_connetto_provisional"),

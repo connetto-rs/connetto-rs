@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use connetto_client::peer::{PeerApplyOutcome, PeerAuthor};
+use connetto_client::peer::{HeldState, PeerApplyOutcome, PeerAuthor};
 use connetto_client::provisional::ProvisionalState;
 use connetto_client::{
     ClientEvent, ConnettoConnection, ExportScope, ImportChoices, ImportOutcome, KeyValue,
@@ -15,8 +15,8 @@ use connetto_client::{
 use diesel::prelude::*;
 
 use super::peer_support::{
-    author, board_rows, captured, insert_order, manifest, order_rows, provenance_of, receiver,
-    stored_entries, write_board,
+    author, board_rows, captured, held_entries, insert_order, manifest, order_rows, provenance_of,
+    receiver, stored_entries, write_board,
 };
 use super::support::Script;
 
@@ -572,11 +572,11 @@ fn store_raw_entry<T>(
     .expect("store the entry");
 }
 
-/// An archived entry the importing replica's policies refuse lands nothing,
-/// and the import says so with `PeerWriteRefused`, while the plan of a build
-/// that exchanges with peers leaves no entry out.
+/// An archived entry the importing replica's policies refuse lands nothing
+/// and is held courier-only, and the import says so with `PeerWriteRefused`,
+/// while the plan of a build that exchanges with peers leaves no entry out.
 #[tokio::test]
-async fn an_archived_entry_the_policies_refuse_is_reported_and_left_out() {
+async fn an_archived_entry_the_policies_refuse_is_reported_and_held_courier_only() {
     let [foreign] = captured(PLAIN_DDL, [&|conn| insert_order(conn, 3, "peer-bob", "x")]).await;
     let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     let anna = author("author-a", "peer-anna", Some("*"));
@@ -592,7 +592,11 @@ async fn an_archived_entry_the_policies_refuse_is_reported_and_left_out() {
         .expect("apply the import");
 
     assert_eq!(order_rows(&mut r2), Vec::new());
-    assert_eq!(stored_entries(&mut r2), Vec::new());
+    assert_eq!(
+        held_entries(&mut r2),
+        vec![(b"author-a".to_vec(), 1, HeldState::CourierOnly)],
+        "the refused body is kept for a courier (R78 decision 3)"
+    );
     let events = drain_events(&mut r2).await;
     assert!(
         events.iter().any(|event| matches!(
@@ -691,4 +695,178 @@ async fn a_cursor_with_a_corrupt_head_refuses_the_export() {
         r1.export_local_data(ExportScope::Unsynced, Vec::new()),
         Err(connetto_client::ClientError::Session(_))
     ));
+}
+
+/// Set the certificate end `conn` keeps for `author_id`.
+fn set_expiry<T>(conn: &mut ConnettoConnection<T>, author_id: &[u8], expires_at: i64)
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    diesel::update(
+        _connetto_peer_cursor::table.filter(_connetto_peer_cursor::author.eq(author_id)),
+    )
+    .set(_connetto_peer_cursor::expires_at.eq(expires_at))
+    .execute(conn.conn())
+    .expect("set the certificate end");
+}
+
+/// The certificate end `conn` keeps for `author_id`.
+fn expiry_of<T>(conn: &mut ConnettoConnection<T>, author_id: &[u8]) -> i64
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    _connetto_peer_cursor::table
+        .filter(_connetto_peer_cursor::author.eq(author_id))
+        .select(_connetto_peer_cursor::expires_at)
+        .first(conn.conn())
+        .expect("read the certificate end")
+}
+
+/// The body and digest `conn` holds of `author-a`'s entry `seq`.
+fn body_and_digest<T>(conn: &mut ConnettoConnection<T>, seq: i64) -> (Option<Vec<u8>>, Vec<u8>)
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    #[derive(diesel::QueryableByName)]
+    struct Held {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Binary>)]
+        changeset: Option<Vec<u8>>,
+        #[diesel(sql_type = diesel::sql_types::Binary)]
+        digest: Vec<u8>,
+    }
+    let row: Held = diesel::sql_query(
+        "SELECT changeset, digest FROM _connetto_peer_entry WHERE author = ? AND seq = ?",
+    )
+    .bind::<diesel::sql_types::Binary, _>(b"author-a".as_slice())
+    .bind::<diesel::sql_types::BigInt, _>(seq)
+    .get_result(conn.conn())
+    .expect("read the held entry");
+    (row.changeset, row.digest)
+}
+
+/// R78 decision 20: the archive carries every held entry with its state,
+/// body and digest, and the cursor with its certificate end. The import
+/// re-applies the provisional entry and restores the courier-only,
+/// digest-only and retained ones as they are, the retained entry's row being
+/// the server's to send.
+#[tokio::test]
+async fn every_held_entry_and_the_certificate_end_survive_the_archive() {
+    let [t1, p2, o3, d4] = captured(
+        PLAIN_DDL,
+        [
+            &|conn| insert_order(conn, 1, "peer-anna", "a"),
+            &|conn| insert_order(conn, 2, "peer-anna", "b"),
+            &|conn| insert_order(conn, 3, "peer-bob", "c"),
+            &|conn| insert_order(conn, 4, "peer-anna", "d"),
+        ],
+    )
+    .await;
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    seed_cursor(&mut r1, b"author-a", "peer-anna", 4, &HEAD3, b"offer-four");
+    set_expiry(&mut r1, b"author-a", 4_000_000_000);
+    r1.apply_peer_entry(&a, &manifest(1, &t1), &t1)
+        .expect("apply sequence 1");
+    r1.adjudicate_peer_frontier(b"author-a", 1)
+        .expect("retain sequence 1");
+    r1.apply_peer_entry(&a, &manifest(2, &p2), &p2)
+        .expect("apply sequence 2");
+    r1.apply_peer_entry(&a, &manifest(3, &o3), &o3)
+        .expect("hold sequence 3 courier-only");
+    let other_build = connetto_core::exchange::ManifestRow {
+        major: connetto_core::Major::new(2).expect("major 2"),
+        ..manifest(4, &d4)
+    };
+    r1.apply_peer_entry(&a, &other_build, &d4)
+        .expect("hold sequence 4 digest-only");
+    let held = vec![
+        (b"author-a".to_vec(), 1, HeldState::Retained),
+        (b"author-a".to_vec(), 2, HeldState::Provisional),
+        (b"author-a".to_vec(), 3, HeldState::CourierOnly),
+        (b"author-a".to_vec(), 4, HeldState::DigestOnly),
+    ];
+    assert_eq!(held_entries(&mut r1), held);
+
+    let (mut r2, _) = restore(&export(&mut r1, ExportScope::Unsynced)).await;
+    assert_eq!(held_entries(&mut r2), held);
+    assert_eq!(
+        body_and_digest(&mut r2, 1),
+        (Some(t1.clone()), manifest(1, &t1).digest.to_vec())
+    );
+    assert_eq!(
+        body_and_digest(&mut r2, 3),
+        (Some(o3.clone()), manifest(3, &o3).digest.to_vec())
+    );
+    assert_eq!(
+        body_and_digest(&mut r2, 4),
+        (None, manifest(4, &d4).digest.to_vec())
+    );
+    assert_eq!(expiry_of(&mut r2, b"author-a"), 4_000_000_000);
+    assert_eq!(
+        order_rows(&mut r2),
+        vec![(2, "peer-anna".to_owned(), "b".to_owned())],
+        "only the provisional entry applies"
+    );
+}
+
+/// R78 decision 43: an archived provisional entry of another major is held
+/// courier-only under its major, its body kept for a courier.
+#[tokio::test]
+async fn an_archived_provisional_entry_of_another_major_is_held_courier_only() {
+    let [body] = captured(PLAIN_DDL, [&|conn| insert_order(conn, 1, "peer-anna", "a")]).await;
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
+    let anna = author("author-a", "peer-anna", Some("*"));
+    store_raw_entry(&mut r1, &anna, 1, 2, &body);
+    let (mut r2, _) = restore(&export(&mut r1, ExportScope::Unsynced)).await;
+    assert_eq!(
+        held_entries(&mut r2),
+        vec![(b"author-a".to_vec(), 1, HeldState::CourierOnly)]
+    );
+    assert_eq!(body_and_digest(&mut r2, 1).0, Some(body));
+    assert_eq!(order_rows(&mut r2), Vec::new(), "nothing applied");
+}
+
+/// R78 held-row table: an import keeps the later of the receiver's and the
+/// archive's certificate end for an author, whichever cursor it keeps.
+#[tokio::test]
+async fn an_import_keeps_the_later_certificate_end() {
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
+    seed_cursor(&mut r1, b"author-a", "peer-anna", 2, &HEAD2, b"offer-two");
+    set_expiry(&mut r1, b"author-a", 4_000_000_000);
+    let bytes = export(&mut r1, ExportScope::Unsynced);
+
+    // The receiver's cursor is behind, so the archive's comes over, and the
+    // receiver's later end stays.
+    let (mut r2, _) = receiver(POLICY_SCHEMA, POLICIES).await;
+    seed_cursor(&mut r2, b"author-a", "peer-anna", 1, &HEAD1, b"offer-one");
+    set_expiry(&mut r2, b"author-a", 4_100_000_000);
+    let plan = r2
+        .import_local_data(std::io::Cursor::new(&bytes))
+        .expect("plan the import");
+    r2.apply_import(&plan, &ImportChoices::keeping_the_file())
+        .expect("apply the import");
+    assert_eq!(
+        cursor_row(&mut r2, b"author-a"),
+        Some((2, HEAD2.to_vec(), b"offer-two".to_vec()))
+    );
+    assert_eq!(expiry_of(&mut r2, b"author-a"), 4_100_000_000);
+
+    // The receiver's cursor is ahead and keeps itself, and the archive's
+    // later end comes over.
+    let (mut r3, _) = receiver(POLICY_SCHEMA, POLICIES).await;
+    seed_cursor(&mut r3, b"author-a", "peer-anna", 3, &HEAD3, b"offer-three");
+    set_expiry(&mut r3, b"author-a", 3_900_000_000);
+    let plan = r3
+        .import_local_data(std::io::Cursor::new(&bytes))
+        .expect("plan the import");
+    r3.apply_import(&plan, &ImportChoices::keeping_the_file())
+        .expect("apply the import");
+    assert_eq!(
+        cursor_row(&mut r3, b"author-a"),
+        Some((3, HEAD3.to_vec(), b"offer-three".to_vec()))
+    );
+    assert_eq!(expiry_of(&mut r3, b"author-a"), 4_000_000_000);
 }
