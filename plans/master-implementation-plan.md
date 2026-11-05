@@ -37,6 +37,13 @@ cargo +stable test --profile testfast --all-features -p connetto-server --test i
 
 `.config/nextest.toml` bounds the `docker` group to four threads and serializes the `keyring` and `discovery` groups, and a wedged test is killed at five slow periods instead of hanging the invocation. The `keyctl session` wrapper is optional locally, since every OS-keyring test joins its own fresh session keyring in-process through `connetto_test_harness::isolated_session_keyring`, called first in each such test, and CI still wraps its runs in one out of caution. The gate commands above still run `--release`, unchanged, so the proof profile is untouched.
 
+Locally, fixtures can start a native PostgreSQL 16 cluster copied from a stopped template in place of a container, keeping one cluster per test without Docker. On the `connetto-server` suite that took 100 s against 854 s with containers. `scripts/native-postgres.sh` makes the template once and prints the two variables that select it, and the `native` nextest profile lifts the `docker` group's bound. OpenFGA and MySQL stay containers, and CI keeps Docker.
+
+```sh
+eval "$(scripts/native-postgres.sh /mnt/nvme/scratch/$USER/connetto-pg16)"
+cargo nextest run --profile native --cargo-profile testfast --all-features
+```
+
 The browser suites run per suite through `connetto-browser-stack`, a binary of `connetto-test-harness`. It starts the stack and drives one `wasm-pack test --headless --chrome` invocation per suite, and the suite list covers the `tests` targets of `crates/connetto-web`, `examples/wasm-smoke`, `examples/yew-web-demo` and `examples/leptos-demo`, the lib suites of `connetto-web` and `connetto-file-client`, and the dioxus demo's `web` feature. Bare, the binary runs the verified-topology step and then the default suites in series, and `--shard I/N` runs the suites whose position lands on `I`, which is how CI quarters them.
 
 Docker-gated Postgres tests and headless Chrome may both be run freely.
