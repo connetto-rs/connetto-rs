@@ -15,6 +15,7 @@ use connetto_core::messages::{
     SnapshotPatch, SubscriptionPriority,
 };
 use connetto_core::traits::IncomingFrame;
+use diesel::connection::SimpleConnection as _;
 use diesel::prelude::*;
 use sqlite_diff_rs::{PatchSet, SimpleTable};
 
@@ -121,6 +122,31 @@ async fn a_refused_entry_is_held_courier_only_with_its_body() {
         held_entries(&mut recv),
         vec![(anna(), 7, HeldState::CourierOnly)]
     );
+}
+
+/// A courier-only hold the replica cannot store fails the apply, so the
+/// exchange retries the entry rather than losing it.
+#[tokio::test]
+async fn a_courier_only_hold_the_replica_refuses_fails_the_apply() {
+    let [body] = captured(
+        PLAIN_DDL,
+        [&|conn| insert_order(conn, 1, "mallory", "open")],
+    )
+    .await;
+    let (mut recv, _) = receiver(POLICY_SCHEMA, POLICIES).await;
+    recv.conn()
+        .batch_execute(
+            "CREATE TEMP TRIGGER refuse BEFORE INSERT ON _connetto_peer_entry \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .expect("install the refusal");
+    let a = author("author-a", "peer-anna", Some("*"));
+    assert!(
+        recv.apply_peer_entry(&a, &manifest(7, &body), &body)
+            .is_err(),
+        "the refused hold fails the apply"
+    );
+    assert_eq!(held_entries(&mut recv), Vec::new());
 }
 
 /// An entry of another build stays held digest-only, its manifest row kept

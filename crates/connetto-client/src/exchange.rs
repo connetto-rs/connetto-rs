@@ -442,8 +442,7 @@ where
                 dsl::expires_at.eq(expires_at),
             ))
             .execute(&mut self.db)?;
-        let now = crate::clock::now_secs(&mut self.db)?;
-        crate::peer::prune_retained(&mut self.db, now)
+        crate::peer::prune_retained(&mut self.db)
     }
 
     /// Move `author`'s certificate end to `expires_at`, in Unix seconds, as a
@@ -464,8 +463,7 @@ where
         diesel::update(dsl::_connetto_peer_cursor.filter(dsl::author.eq(author)))
             .set(dsl::expires_at.eq(expires_at))
             .execute(&mut self.db)?;
-        let now = crate::clock::now_secs(&mut self.db)?;
-        crate::peer::prune_retained(&mut self.db, now)
+        crate::peer::prune_retained(&mut self.db)
     }
 
     /// Take `author`'s entry `row` with the cursor at it (R77 state table,

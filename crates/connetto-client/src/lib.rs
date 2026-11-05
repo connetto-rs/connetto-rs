@@ -4910,7 +4910,7 @@ fn install_replica_metadata(
         db.batch_execute(author::RETRACTION_DDL)?;
         exchange::upgrade_cursors(db, now)?;
         db.batch_execute(exchange::PEER_CURSOR_DDL)?;
-        peer::prune_retained(db, now)?;
+        peer::prune_retained(db)?;
     }
     // A watch the previous run died still holding counts down from now.
     subscriptions::anchor_launch(db)?;
@@ -6225,7 +6225,6 @@ where
     #[cfg(feature = "peer")]
     fn adjudicate_peer_seq(&mut self, author: &[u8], seq: u64) -> Result<(), ClientError> {
         let seq = i64::try_from(seq).unwrap_or(i64::MAX);
-        let now = crate::clock::now_secs(&mut self.db)?;
         let _exempt = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
         self.db.transaction::<_, ClientError, _>(|db| {
@@ -6238,7 +6237,7 @@ where
                 Some(peer::HeldState::Retained) => return Ok(()),
             }
             peer::retain(db, author, seq)?;
-            peer::prune_retained(db, now)
+            peer::prune_retained(db)
         })
     }
 
@@ -8251,7 +8250,6 @@ where
         frontier: u64,
     ) -> Result<(), ClientError> {
         let frontier = i64::try_from(frontier).unwrap_or(i64::MAX);
-        let now = crate::clock::now_secs(&mut self.db)?;
         let _exempt = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
         self.db.transaction::<_, ClientError, _>(|db| {
@@ -8261,7 +8259,7 @@ where
                 }
                 peer::retain(db, &held.author, held.seq)?;
             }
-            peer::prune_retained(db, now)
+            peer::prune_retained(db)
         })
     }
 

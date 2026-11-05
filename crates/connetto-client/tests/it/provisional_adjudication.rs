@@ -506,6 +506,38 @@ async fn a_ruling_retains_or_drops_the_unapplied_entries() {
     assert_eq!(order_ids(&mut conn), Vec::<i64>::new());
 }
 
+/// A ruling that reaches an entry the author's frontier retained while the
+/// ask was out changes nothing of it, a refusal included, since a retained
+/// entry settled for good (R78 held-row table).
+#[tokio::test]
+async fn a_ruling_for_a_retained_entry_changes_nothing() {
+    let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
+    let w2 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 2);
+    let bodies = captured(PLAIN_DDL, [&w1, &w2]).await;
+    let mut conn = provisioned(&bodies).await;
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [ask] = asks(&script).try_into().expect("one ask");
+    assert_eq!(ask.seqs, vec![1, 2]);
+    conn.adjudicate_peer_frontier(&AUTHOR_A, 1)
+        .expect("the frontier retains sequence 1");
+
+    rule(
+        &script,
+        &ask.request_id,
+        vec![
+            (1, Verdict::Refused(RetractCause::Conflict)),
+            (2, Verdict::Applied),
+        ],
+    );
+    pump_to(&mut conn, applied).await;
+    assert_eq!(
+        entry_states(&mut conn, &AUTHOR_A),
+        vec![(1, HeldState::Retained.db()), (2, HeldState::Retained.db()),]
+    );
+    assert_eq!(order_ids(&mut conn), vec![1, 2], "no row rolled back");
+}
+
 /// `Refused` and `Abandoned` retract the entry through the retraction, with
 /// the cause, the rows rolling back.
 #[tokio::test]

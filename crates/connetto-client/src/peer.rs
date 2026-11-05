@@ -426,18 +426,20 @@ pub(crate) fn delete_entry(
 }
 
 /// Delete every retained entry whose author's certificate ended
-/// [`DEVICE_SKEW`](connetto_core::clock::DEVICE_SKEW) or more before `now`,
-/// or whose author's cursor is gone, since a courier delivers nothing without
-/// the author's offer (R78 decision 17).
-pub(crate) fn prune_retained(db: &mut SqliteConnection, now: i64) -> Result<(), ClientError> {
+/// [`DEVICE_SKEW`](connetto_core::clock::DEVICE_SKEW) or more before now, by
+/// the wall clock the replica keeps its times in, or whose author's cursor is
+/// gone, since a courier delivers nothing without the author's offer (R78
+/// decision 17).
+pub(crate) fn prune_retained(db: &mut SqliteConnection) -> Result<(), ClientError> {
     let skew = i64::try_from(connetto_core::clock::DEVICE_SKEW.as_secs()).unwrap_or(i64::MAX);
     diesel::sql_query(
         "DELETE FROM _connetto_peer_entry WHERE state = ? AND NOT EXISTS \
          (SELECT 1 FROM _connetto_peer_cursor AS cursor \
-          WHERE cursor.author = _connetto_peer_entry.author AND cursor.expires_at > ?)",
+          WHERE cursor.author = _connetto_peer_entry.author \
+          AND cursor.expires_at + ? > CAST(strftime('%s', 'now') AS INTEGER))",
     )
     .bind::<diesel::sql_types::BigInt, _>(HeldState::Retained.db())
-    .bind::<diesel::sql_types::BigInt, _>(now.saturating_sub(skew))
+    .bind::<diesel::sql_types::BigInt, _>(skew)
     .execute(db)?;
     Ok(())
 }
