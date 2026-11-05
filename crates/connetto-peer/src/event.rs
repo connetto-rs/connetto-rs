@@ -1,5 +1,7 @@
 //! What the node tells the device about its links.
 
+use std::time::SystemTime;
+
 use connetto_core::device_cert::DeviceIdentity;
 use connetto_exchange::Message;
 use connetto_exchange::media::Media;
@@ -20,6 +22,17 @@ pub enum PeerEvent {
         /// certificate without the extension, which readers bind as `NULL`
         /// (R77 decision 12).
         bot_list: Option<String>,
+        /// The end of the peer's certificate, which a receiver keeps the
+        /// peer's retained entries until (R78 decision 17).
+        expires_at: SystemTime,
+    },
+    /// A linked peer presented a renewed certificate on its link, on the
+    /// same key (R78 slice 3a).
+    Renewed {
+        /// The peer that renewed.
+        peer: DeviceIdentity,
+        /// The end of the renewed certificate.
+        expires_at: SystemTime,
     },
     /// A peer key lost its last link.
     Unlinked {

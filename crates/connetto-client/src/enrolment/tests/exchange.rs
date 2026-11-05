@@ -119,12 +119,26 @@ impl Link for ReplicaLink {
         author: crate::peer::PeerAuthor,
         offer: SignedOffer,
         cursor: Frontier,
+        expires_at: std::time::SystemTime,
     ) -> Result<(), ClientError> {
         refused(&mut self.refusals.lock().0)?;
+        self.conn.lock().await.adopt_peer_offer(
+            &author,
+            &offer,
+            &cursor,
+            crate::exchange::unix_secs(expires_at),
+        )
+    }
+
+    async fn renew(
+        &self,
+        author: Vec<u8>,
+        expires_at: std::time::SystemTime,
+    ) -> Result<(), ClientError> {
         self.conn
             .lock()
             .await
-            .adopt_peer_offer(&author, &offer, &cursor)
+            .renew_peer_expiry(&author, crate::exchange::unix_secs(expires_at))
     }
 
     async fn take_row(
@@ -150,6 +164,8 @@ struct Device {
     handle: EnrolHandle,
     node: connetto_peer::Node,
     key_id: [u8; 32],
+    /// The end of the device's certificate.
+    certificate_end: std::time::SystemTime,
     run: tokio::task::JoinHandle<()>,
     end: watch::Sender<()>,
 }
@@ -168,6 +184,7 @@ impl Device {
             12 * HOUR,
             positive_serial(serial),
         );
+        let certificate_end = held.leaf.not_after();
         let mut conn = replica();
         for (id, captured) in (1..).zip(majors) {
             queue(&mut conn, WriterRef::Device(key_id), id, major(*captured));
@@ -208,6 +225,7 @@ impl Device {
             handle,
             node,
             key_id,
+            certificate_end,
             run,
             end,
         }
@@ -235,11 +253,12 @@ fn items(conn: &tokio::sync::Mutex<Conn>) -> Option<String> {
     .ok()
 }
 
-/// The stored peer entries of the replica.
+/// The stored peer entries of the replica a verdict can still reach, every
+/// one but the retained.
 fn stored_entries(conn: &tokio::sync::Mutex<Conn>) -> Option<i64> {
     let mut conn = conn.try_lock().ok()?;
     diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
-        "(SELECT count(*) FROM _connetto_peer_entry)",
+        "(SELECT count(*) FROM _connetto_peer_entry WHERE state != 3)",
     ))
     .get_result(&mut conn.db)
     .ok()
@@ -274,6 +293,14 @@ async fn two_linked_devices_exchange_their_writers_entries() {
         },
         "the cursor stands at the verified head"
     );
+    // The adopt kept the end of the certificate the link proved (R78
+    // decision 17).
+    let expires_at: i64 = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+        "(SELECT expires_at FROM _connetto_peer_cursor)",
+    ))
+    .get_result(&mut ben.conn.lock().await.db)
+    .expect("read the certificate end");
+    assert_eq!(expires_at, crate::exchange::unix_secs(anna.certificate_end));
 
     // Anna's next write reaches Ben through her fresh offer.
     queue(
@@ -297,6 +324,12 @@ async fn two_linked_devices_exchange_their_writers_entries() {
             .expect("the ack lands");
     }
     poll_until(|| stored_entries(&ben.conn) == Some(0)).await;
+    let retained: i64 = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+        "(SELECT count(*) FROM _connetto_peer_entry WHERE state = 3)",
+    ))
+    .get_result(&mut ben.conn.lock().await.db)
+    .expect("count the retained entries");
+    assert_eq!(retained, 4, "every adjudicated entry is retained");
     assert!(
         ben.conn
             .lock()

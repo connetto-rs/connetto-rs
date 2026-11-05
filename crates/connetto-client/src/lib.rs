@@ -2847,8 +2847,8 @@ struct PeerApplyFrame {
 /// How a landed entry is stored when the receiver does not hold it yet.
 #[cfg(feature = "peer")]
 struct EntryToStore<'a> {
-    /// The application schema major the entry was captured under.
-    major: i64,
+    /// The entry's manifest row.
+    row: &'a connetto_core::exchange::ManifestRow,
     /// The entry's captured changeset.
     body: &'a [u8],
     /// When the entry was first received, in seconds.
@@ -2893,11 +2893,13 @@ fn land_peer_entry(
                 peer::store_entry(
                     db,
                     cx.author,
-                    cx.seq,
-                    store.major,
-                    store.body,
-                    store.received_at,
-                    store.position,
+                    &peer::NewEntry {
+                        row: store.row,
+                        state: peer::HeldState::Provisional,
+                        body: Some(store.body),
+                        received_at: store.received_at,
+                        position: store.position,
+                    },
                 )?;
                 store.position
             };
@@ -2912,6 +2914,28 @@ fn land_peer_entry(
         (Err(_), Some(cause)) => Ok(Err(cause)),
         (Err(err), None) => Err(err),
     }
+}
+
+/// Move one provisional entry's records to adjudicated and release their
+/// holdings, the rows handing to ordinary coverage (R77).
+///
+/// # Errors
+///
+/// [`ClientError`] when the records or holdings cannot be read or written.
+#[cfg(feature = "peer")]
+fn adjudicate_provisional(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+    author: &[u8],
+    seq: i64,
+) -> Result<(), ClientError> {
+    let settled: Vec<(String, Vec<KeyValue>)> = provisional::records_of_entry(db, author, seq)?
+        .into_iter()
+        .filter(|record| record.state == provisional::ProvisionalState::Provisional)
+        .map(|record| (record.table, record.key))
+        .collect();
+    provisional::adjudicate_entry(db, author, seq)?;
+    holdings::release_provisional(db, config, &settled)
 }
 
 /// One re-applied entry's author, its sequence and the rows it lands, which
@@ -3061,8 +3085,14 @@ fn reapply_archived_entry(
         receiver: &frame.receiver,
         now: entry.received_at,
     };
+    let row = connetto_core::exchange::ManifestRow {
+        seq: u64::try_from(entry.seq).unwrap_or(u64::MAX),
+        major,
+        origin: None,
+        digest: Sha256::digest(&entry.changeset).into(),
+    };
     let store = EntryToStore {
-        major: entry.major,
+        row: &row,
         body: &entry.changeset,
         received_at: entry.received_at,
         position: *next_position,
@@ -4873,11 +4903,15 @@ fn install_replica_metadata(
     #[cfg(feature = "peer")]
     db.batch_execute(provisional::PROVISIONAL_DDL)?;
     #[cfg(feature = "peer")]
-    db.batch_execute(peer::PEER_ENTRY_DDL)?;
-    #[cfg(feature = "peer")]
-    db.batch_execute(author::RETRACTION_DDL)?;
-    #[cfg(feature = "peer")]
-    db.batch_execute(exchange::PEER_CURSOR_DDL)?;
+    {
+        let now = crate::clock::now_secs(db)?;
+        peer::upgrade_entries(db)?;
+        db.batch_execute(peer::PEER_ENTRY_DDL)?;
+        db.batch_execute(author::RETRACTION_DDL)?;
+        exchange::upgrade_cursors(db, now)?;
+        db.batch_execute(exchange::PEER_CURSOR_DDL)?;
+        peer::prune_retained(db, now)?;
+    }
     // A watch the previous run died still holding counts down from now.
     subscriptions::anchor_launch(db)?;
     Ok(())
@@ -6001,6 +6035,11 @@ where
                     .push(row.seq);
             }
         }
+        // The courier-only and digest-only entries await the same ruling
+        // (R78 held-row table), and a retained one is settled.
+        for (author, seq) in peer::unapplied(&mut self.db)? {
+            by_author.entry(author).or_default().push(seq);
+        }
         for (author, mut seqs) in by_author {
             let Ok(key) = <[u8; 32]>::try_from(author.as_slice()) else {
                 continue;
@@ -6174,9 +6213,10 @@ where
         })
     }
 
-    /// Adjudicate one stored peer entry on a verdict (R77): its records move
-    /// to adjudicated and the entry goes, the rows handing to ordinary
-    /// coverage.
+    /// Adjudicate one held peer entry on a verdict (R77): a provisional
+    /// entry's records move to adjudicated, the rows handing to ordinary
+    /// coverage, and the entry is retained until its author's certificate
+    /// ends (R78 decision 17).
     ///
     /// # Errors
     ///
@@ -6185,19 +6225,21 @@ where
     #[cfg(feature = "peer")]
     fn adjudicate_peer_seq(&mut self, author: &[u8], seq: u64) -> Result<(), ClientError> {
         let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        let now = crate::clock::now_secs(&mut self.db)?;
         let _exempt = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
         self.db.transaction::<_, ClientError, _>(|db| {
-            let settled: Vec<(String, Vec<KeyValue>)> =
-                provisional::records_of_entry(db, author, seq)?
-                    .into_iter()
-                    .filter(|record| record.state == provisional::ProvisionalState::Provisional)
-                    .map(|record| (record.table, record.key))
-                    .collect();
-            provisional::adjudicate_entry(db, author, seq)?;
-            holdings::release_provisional(db, config, &settled)?;
-            peer::delete_entry(db, author, seq)?;
-            Ok(())
+            match peer::state_of(db, author, seq)? {
+                Some(peer::HeldState::Provisional) => {
+                    adjudicate_provisional(db, config, author, seq)?;
+                }
+                Some(peer::HeldState::CourierOnly | peer::HeldState::DigestOnly) => {}
+                // A record with no stored entry still moves, as R77 left it.
+                None => adjudicate_provisional(db, config, author, seq)?,
+                Some(peer::HeldState::Retained) => return Ok(()),
+            }
+            peer::retain(db, author, seq)?;
+            peer::prune_retained(db, now)
         })
     }
 
@@ -7918,8 +7960,10 @@ where
         cursor: Option<&connetto_core::exchange::Frontier>,
     ) -> Result<peer::PeerApplyOutcome, ClientError> {
         // An entry another build captured crosses as its manifest row only,
-        // the version half of the test being the offer's (R77 slice 6).
+        // the version half of the test being the offer's (R77 slice 6), and
+        // is kept digest-only (R78 decision 3).
         if Some(row.major) != self.config.schema_major {
+            self.hold_peer_entry(author, row, peer::HeldState::DigestOnly, None, cursor)?;
             return Ok(peer::PeerApplyOutcome::Skipped);
         }
         let mut hasher = Sha256::new();
@@ -7943,7 +7987,7 @@ where
             now: frame.now,
         };
         let store = EntryToStore {
-            major: i64::from(row.major.get()),
+            row,
             body,
             received_at: frame.now,
             position: i64::try_from(self.peer_next_position).unwrap_or(i64::MAX),
@@ -7974,6 +8018,15 @@ where
                 Ok(peer::PeerApplyOutcome::Applied { rows })
             }
             Err(cause) => {
+                // The refused body is still the author's signed entry, kept
+                // courier-only for a courier to carry (R78 decision 3).
+                self.hold_peer_entry(
+                    author,
+                    row,
+                    peer::HeldState::CourierOnly,
+                    Some(body),
+                    cursor,
+                )?;
                 let rows = peer::entry_rows(diff.iter());
                 self.notices.push_back(ClientEvent::PeerWriteRefused {
                     author: author.key_id.clone(),
@@ -7983,6 +8036,49 @@ where
                 Ok(peer::PeerApplyOutcome::Refused { cause, rows })
             }
         }
+    }
+
+    /// Keep `author`'s entry `row` unapplied as `state`, with `body` when one
+    /// crossed, unless the receiver holds its sequence already, and store
+    /// `cursor` as the author's in the same transaction (R78 decision 3).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the clock cannot be read or the entry or the
+    /// cursor cannot be written.
+    #[cfg(feature = "peer")]
+    fn hold_peer_entry(
+        &mut self,
+        author: &peer::PeerAuthor,
+        row: &connetto_core::exchange::ManifestRow,
+        state: peer::HeldState,
+        body: Option<&[u8]>,
+        cursor: Option<&connetto_core::exchange::Frontier>,
+    ) -> Result<(), ClientError> {
+        let received_at = crate::clock::now_secs(&mut self.db)?;
+        let position = i64::try_from(self.peer_next_position).unwrap_or(i64::MAX);
+        let _exempt = ExemptWrites::raise(&self.write_flags);
+        let written = self.db.transaction::<_, ClientError, _>(|db| {
+            let written = peer::store_entry(
+                db,
+                author,
+                &peer::NewEntry {
+                    row,
+                    state,
+                    body,
+                    received_at,
+                    position,
+                },
+            )?;
+            if let Some(cursor) = cursor {
+                exchange::store_cursor(db, &author.key_id, cursor)?;
+            }
+            Ok(written)
+        })?;
+        if written {
+            self.peer_next_position += 1;
+        }
+        Ok(())
     }
 
     /// The frame a peer apply judges its ops against. The receiver's own
@@ -8029,6 +8125,17 @@ where
         retraction: &connetto_core::exchange::Retraction,
     ) -> Result<(), ClientError> {
         let seq = i64::try_from(retraction.seq).unwrap_or(i64::MAX);
+        match peer::state_of(&mut self.db, &author.key_id, seq)? {
+            // Nothing of the entry applied, so it goes with nothing to invert
+            // (R78 held-row table).
+            Some(peer::HeldState::CourierOnly | peer::HeldState::DigestOnly) => {
+                let _exempt = ExemptWrites::raise(&self.write_flags);
+                return peer::delete_entry(&mut self.db, &author.key_id, seq);
+            }
+            // An adjudicated entry settled for good, so no retraction reaches it.
+            None | Some(peer::HeldState::Retained) => return Ok(()),
+            Some(peer::HeldState::Provisional) => {}
+        }
         let Some(entry) = peer::entry_of(&mut self.db, &author.key_id, seq)? else {
             return Ok(());
         };
@@ -8129,9 +8236,10 @@ where
         Ok(())
     }
 
-    /// Adjudicate the author's stored entries at or below a frontier (R77):
-    /// their records move to adjudicated and the entries go, the rows
-    /// handing to ordinary coverage.
+    /// Adjudicate the author's held entries at or below a frontier (R77): a
+    /// provisional entry's records move to adjudicated, the rows handing to
+    /// ordinary coverage, and every entry is retained until its author's
+    /// certificate ends (R78 decision 17).
     ///
     /// # Errors
     ///
@@ -8144,21 +8252,17 @@ where
         frontier: u64,
     ) -> Result<(), ClientError> {
         let frontier = i64::try_from(frontier).unwrap_or(i64::MAX);
+        let now = crate::clock::now_secs(&mut self.db)?;
         let _exempt = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
         self.db.transaction::<_, ClientError, _>(|db| {
-            for entry in peer::entries_at_or_below(db, author, frontier)? {
-                let settled: Vec<(String, Vec<KeyValue>)> =
-                    provisional::records_of_entry(db, &entry.author, entry.seq)?
-                        .into_iter()
-                        .filter(|record| record.state == provisional::ProvisionalState::Provisional)
-                        .map(|record| (record.table, record.key))
-                        .collect();
-                provisional::adjudicate_entry(db, &entry.author, entry.seq)?;
-                holdings::release_provisional(db, config, &settled)?;
-                peer::delete_entry(db, &entry.author, entry.seq)?;
+            for held in peer::unsettled_at_or_below(db, author, frontier)? {
+                if held.state == peer::HeldState::Provisional {
+                    adjudicate_provisional(db, config, &held.author, held.seq)?;
+                }
+                peer::retain(db, &held.author, held.seq)?;
             }
-            Ok(())
+            peer::prune_retained(db, now)
         })
     }
 
@@ -8186,13 +8290,11 @@ where
                         "a stored peer entry holds a major the build cannot express".to_owned(),
                     )
                 })?;
-            let mut hasher = Sha256::new();
-            hasher.update(&entry.changeset);
             let row = connetto_core::exchange::ManifestRow {
                 seq: u64::try_from(entry.seq).unwrap_or(u64::MAX),
                 major,
-                origin: None,
-                digest: hasher.finalize().into(),
+                origin: entry.origin,
+                digest: entry.digest,
             };
             let _ = self.apply_peer_entry(&author, &row, &entry.changeset)?;
         }

@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use connetto_client::peer::{PeerApplyOutcome, PeerRefusal};
+use connetto_client::peer::{HeldState, PeerApplyOutcome, PeerRefusal};
 use connetto_client::provisional::ProvisionalState;
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, KeyValue, SyncSchema};
 use connetto_core::Major;
@@ -23,9 +23,9 @@ use diesel::prelude::*;
 use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 use super::peer_support::{
-    _connetto_peer_entry, author, board_rows, captured, cursor_byte, drain_quiet, insert_order,
-    manifest, order_rows, orders, provenance_of, pump_to, receiver, receiver_holding,
-    stored_entries, write_board,
+    _connetto_peer_entry, author, board_rows, captured, cursor_byte, drain_quiet, held_entries,
+    hold_cursor, insert_order, manifest, order_rows, orders, provenance_of, pump_to, receiver,
+    receiver_holding, stored_entries, write_board,
 };
 use super::support::{self, Script};
 
@@ -649,9 +649,9 @@ async fn a_peer_write_never_enters_the_receiver_queue() {
 }
 
 /// Adjudication at a frontier moves the frontier's records to adjudicated
-/// and deletes the entries at or below it, leaving a newer entry alone.
+/// and retains the entries at or below it, leaving a newer entry alone.
 #[tokio::test]
-async fn adjudication_at_a_frontier_moves_records_and_drops_entries() {
+async fn adjudication_at_a_frontier_moves_records_and_retains_entries() {
     let [first, second] = captured(
         PLAIN_DDL,
         [
@@ -663,6 +663,7 @@ async fn adjudication_at_a_frontier_moves_records_and_drops_entries() {
 
     let (mut recv, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     let a = author("author-a", "peer-anna", Some("*"));
+    hold_cursor(&mut recv, &a.key_id);
     recv.apply_peer_entry(&a, &manifest(7, &first), &first)
         .expect("apply the first entry");
     recv.apply_peer_entry(&a, &manifest(8, &second), &second)
@@ -687,8 +688,13 @@ async fn adjudication_at_a_frontier_moves_records_and_drops_entries() {
     let rows = recv.provisional_rows().expect("read the records");
     let record = provenance_of(&rows, "orders", &[KeyValue::Int(1)]).expect("the record");
     assert_eq!(record.state, ProvisionalState::Adjudicated);
-    let entries = stored_entries(&mut recv);
-    assert_eq!(entries, Vec::new());
+    assert_eq!(
+        held_entries(&mut recv),
+        vec![
+            ("author-a".as_bytes().to_vec(), 7, HeldState::Retained),
+            ("author-a".as_bytes().to_vec(), 8, HeldState::Retained),
+        ]
+    );
     // The rows stay: adjudication hands them to ordinary coverage.
     assert_eq!(
         order_rows(&mut recv),

@@ -349,6 +349,7 @@ impl Discovery {
                 reason: Some(*reason),
             },
             PeerEvent::ListReceived { .. }
+            | PeerEvent::Renewed { .. }
             | PeerEvent::Exchange { .. }
             | PeerEvent::Media { .. } => return,
         };

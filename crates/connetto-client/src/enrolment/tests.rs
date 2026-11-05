@@ -708,6 +708,15 @@ impl Link for FakeLink {
         _author: crate::peer::PeerAuthor,
         _offer: connetto_core::exchange::SignedOffer,
         _cursor: connetto_core::exchange::Frontier,
+        _expires_at: std::time::SystemTime,
+    ) -> impl Future<Output = Result<(), ClientError>> + Send {
+        core::future::ready(Ok(()))
+    }
+
+    fn renew(
+        &self,
+        _author: Vec<u8>,
+        _expires_at: std::time::SystemTime,
     ) -> impl Future<Output = Result<(), ClientError>> + Send {
         core::future::ready(Ok(()))
     }

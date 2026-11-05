@@ -1,32 +1,48 @@
-//! The stored peer entries and the author's binding (R77 decisions 3 to 6).
+//! The stored peer entries and the author's binding (R77 decisions 3 to 6,
+//! R78 decision 19).
 //!
-//! An applied entry is kept until a verdict takes it, so a retraction can
-//! invert it and a resync can re-apply it. The entry's position is the
-//! replica's append order across every author, which the resync's re-apply
-//! runs in.
+//! Every entry a verified range carried is kept until a verdict takes it, in
+//! one of four states. A provisional entry applied, so a retraction can invert
+//! it and a resync can re-apply it. A courier-only entry is an own-build body
+//! the receiver's policies refused, never applied, kept for a courier. A
+//! digest-only entry is another build's, its manifest row alone. A retained
+//! entry was adjudicated and is kept, body and row, until its author's
+//! certificate ends, so a courier can bring it back to a restored server. The
+//! entry's position is the replica's append order across every author, which
+//! the resync's re-apply runs in.
 
+use diesel::connection::SimpleConnection as _;
 use diesel::prelude::*;
+use sha2::{Digest as _, Sha256};
 
 use crate::provisional::{ProvisionalRow, ProvisionalState};
 use crate::{ClientError, KeyValue};
 
 /// Creates the entry table beside the replica's other bookkeeping.
 pub(crate) const PEER_ENTRY_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_peer_entry \
-     (author BLOB, seq INTEGER, major INTEGER NOT NULL, changeset BLOB NOT NULL, \
-      account TEXT NOT NULL, bot_list TEXT, received_at INTEGER NOT NULL, \
-      position INTEGER NOT NULL, PRIMARY KEY (author, seq))";
+     (author BLOB, seq INTEGER, state INTEGER NOT NULL, major INTEGER NOT NULL, origin BLOB, \
+      digest BLOB NOT NULL, changeset BLOB, account TEXT NOT NULL, bot_list TEXT, \
+      received_at INTEGER NOT NULL, position INTEGER NOT NULL, PRIMARY KEY (author, seq))";
 
 diesel::table! {
-    /// The applied peer entries held until a verdict takes them (R77).
+    /// Every peer entry the receiver holds until a verdict takes it (R77,
+    /// R78 decision 19).
     _connetto_peer_entry (author, seq) {
         /// The author's key id.
         author -> Binary,
         /// The author's queue sequence.
         seq -> BigInt,
+        /// What the entry is held as, a [`HeldState`](crate::peer::HeldState).
+        state -> BigInt,
         /// The major the entry was captured under.
         major -> BigInt,
-        /// The entry's body, as received.
-        changeset -> Binary,
+        /// The entry's original writer and sequence as `MessagePack`, absent
+        /// for an entry with no provenance or one stored before the column.
+        origin -> Nullable<Binary>,
+        /// The hash of the entry's body, its manifest row's digest.
+        digest -> Binary,
+        /// The entry's body, as received, absent for a digest-only entry.
+        changeset -> Nullable<Binary>,
         /// The author's certificate account.
         account -> Text,
         /// The author's certificate bot list, absent when it carried none.
@@ -39,6 +55,50 @@ diesel::table! {
 }
 
 use _connetto_peer_entry::dsl;
+
+/// What one stored peer entry is held as (R78 decision 19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldState {
+    /// Applied with its records, awaiting a verdict.
+    Provisional,
+    /// An own-build body the receiver's policies refused, never applied,
+    /// awaiting a verdict.
+    CourierOnly,
+    /// Another build's entry, its manifest row alone, awaiting a verdict.
+    DigestOnly,
+    /// Adjudicated, kept until the author's certificate ends.
+    Retained,
+}
+
+impl HeldState {
+    /// The stored value.
+    #[must_use]
+    pub const fn db(self) -> i64 {
+        match self {
+            Self::Provisional => 0,
+            Self::CourierOnly => 1,
+            Self::DigestOnly => 2,
+            Self::Retained => 3,
+        }
+    }
+
+    /// The state a stored value names.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] for a value no state stores.
+    fn from_db(value: i64) -> Result<Self, ClientError> {
+        match value {
+            0 => Ok(Self::Provisional),
+            1 => Ok(Self::CourierOnly),
+            2 => Ok(Self::DigestOnly),
+            3 => Ok(Self::Retained),
+            other => Err(ClientError::Session(format!(
+                "a stored peer entry holds the unknown state {other}"
+            ))),
+        }
+    }
+}
 
 /// One author a peer entry applies under.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,7 +132,8 @@ pub enum PeerApplyOutcome {
         /// keys it displaced.
         rows: Vec<crate::provisional::ProvisionalRow>,
     },
-    /// Nothing of the entry's rows landed.
+    /// Nothing of the entry's rows landed. A policy or key refusal keeps the
+    /// body courier-only.
     Refused {
         /// Why.
         cause: PeerRefusal,
@@ -80,11 +141,11 @@ pub enum PeerApplyOutcome {
         rows: Vec<(String, Vec<KeyValue>)>,
     },
     /// The entry crosses as its manifest row only, its build's apply not
-    /// this receiver's.
+    /// this receiver's, and is kept digest-only.
     Skipped,
 }
 
-/// One stored entry, as the re-apply and the retraction stand it.
+/// One provisional entry, as the re-apply and the retraction stand it.
 pub(crate) struct Entry {
     /// The author's key id.
     pub(crate) author: Vec<u8>,
@@ -92,6 +153,10 @@ pub(crate) struct Entry {
     pub(crate) seq: i64,
     /// The major the entry was captured under.
     pub(crate) major: i64,
+    /// The entry's original writer, when it carries one.
+    pub(crate) origin: Option<connetto_core::exchange::Origin>,
+    /// The hash of the entry's body.
+    pub(crate) digest: [u8; 32],
     /// The entry's body, as stored.
     pub(crate) changeset: Vec<u8>,
     /// The author's certificate account.
@@ -102,12 +167,25 @@ pub(crate) struct Entry {
     pub(crate) received_at: i64,
 }
 
+/// One held entry a verdict can still reach, its author, sequence and
+/// state, which is never [`HeldState::Retained`].
+pub(crate) struct Held {
+    /// The author's key id.
+    pub(crate) author: Vec<u8>,
+    /// The author's queue sequence.
+    pub(crate) seq: i64,
+    /// What the entry is held as.
+    pub(crate) state: HeldState,
+}
+
 #[derive(diesel::Queryable)]
 struct StoredEntry {
     author: Vec<u8>,
     seq: i64,
     major: i64,
-    changeset: Vec<u8>,
+    origin: Option<Vec<u8>>,
+    digest: Vec<u8>,
+    changeset: Option<Vec<u8>>,
     account: String,
     bot_list: Option<String>,
     received_at: i64,
@@ -119,6 +197,8 @@ const ENTRY_SELECT: (
     dsl::author,
     dsl::seq,
     dsl::major,
+    dsl::origin,
+    dsl::digest,
     dsl::changeset,
     dsl::account,
     dsl::bot_list,
@@ -127,22 +207,46 @@ const ENTRY_SELECT: (
     dsl::author,
     dsl::seq,
     dsl::major,
+    dsl::origin,
+    dsl::digest,
     dsl::changeset,
     dsl::account,
     dsl::bot_list,
     dsl::received_at,
 );
 
-fn into_entry(row: StoredEntry) -> Entry {
-    Entry {
+/// A provisional row as the reads stand it.
+///
+/// # Errors
+///
+/// [`ClientError::Session`] when the row holds no body, a digest of another
+/// length or an origin that does not decode.
+fn into_entry(row: StoredEntry) -> Result<Entry, ClientError> {
+    let corrupt = |what: &str| {
+        ClientError::Session(format!(
+            "the provisional peer entry at sequence {} holds {what}",
+            row.seq
+        ))
+    };
+    let digest = <[u8; 32]>::try_from(row.digest.as_slice()).map_err(|_| corrupt("no digest"))?;
+    let origin = row
+        .origin
+        .as_deref()
+        .map(rmp_serde::from_slice)
+        .transpose()
+        .map_err(|_| corrupt("an unreadable origin"))?;
+    let changeset = row.changeset.ok_or_else(|| corrupt("no body"))?;
+    Ok(Entry {
         author: row.author,
         seq: row.seq,
         major: row.major,
-        changeset: row.changeset,
+        origin,
+        digest,
+        changeset,
         account: row.account,
         bot_list: row.bot_list,
         received_at: row.received_at,
-    }
+    })
 }
 
 /// The position the next stored entry takes, rebuilt from the stored ones
@@ -156,7 +260,8 @@ pub(crate) fn load_next_position(db: &mut SqliteConnection) -> Result<u64, Clien
         .unwrap_or(1))
 }
 
-/// The stored entry of one author's sequence, if the receiver holds it.
+/// The provisional entry of one author's sequence, if the receiver holds it
+/// provisionally.
 pub(crate) fn entry_of(
     db: &mut SqliteConnection,
     author: &[u8],
@@ -166,33 +271,71 @@ pub(crate) fn entry_of(
         .select(ENTRY_SELECT)
         .filter(dsl::author.eq(author))
         .filter(dsl::seq.eq(seq))
+        .filter(dsl::state.eq(HeldState::Provisional.db()))
         .first(db)
         .optional()?;
-    Ok(row.map(into_entry))
+    row.map(into_entry).transpose()
 }
 
-/// The author's stored entries at or below a frontier, position order.
-pub(crate) fn entries_at_or_below(
+/// What one author's sequence is held as, `None` when the receiver holds
+/// nothing of it.
+pub(crate) fn state_of(
     db: &mut SqliteConnection,
     author: &[u8],
     seq: i64,
-) -> Result<Vec<Entry>, ClientError> {
-    let rows: Vec<StoredEntry> = dsl::_connetto_peer_entry
-        .select(ENTRY_SELECT)
+) -> Result<Option<HeldState>, ClientError> {
+    let row: Option<i64> = dsl::_connetto_peer_entry
+        .select(dsl::state)
         .filter(dsl::author.eq(author))
-        .filter(dsl::seq.le(seq))
-        .order(dsl::position.asc())
-        .load(db)?;
-    Ok(rows.into_iter().map(into_entry).collect())
+        .filter(dsl::seq.eq(seq))
+        .first(db)
+        .optional()?;
+    row.map(HeldState::from_db).transpose()
 }
 
-/// Every stored entry, position order, the resync's re-apply running in.
+/// The author's held entries at or below a frontier that a verdict can
+/// still reach, position order.
+pub(crate) fn unsettled_at_or_below(
+    db: &mut SqliteConnection,
+    author: &[u8],
+    seq: i64,
+) -> Result<Vec<Held>, ClientError> {
+    let rows: Vec<(Vec<u8>, i64, i64)> = dsl::_connetto_peer_entry
+        .select((dsl::author, dsl::seq, dsl::state))
+        .filter(dsl::author.eq(author))
+        .filter(dsl::seq.le(seq))
+        .filter(dsl::state.ne(HeldState::Retained.db()))
+        .order(dsl::position.asc())
+        .load(db)?;
+    rows.into_iter()
+        .map(|(author, seq, state)| {
+            Ok(Held {
+                author,
+                seq,
+                state: HeldState::from_db(state)?,
+            })
+        })
+        .collect()
+}
+
+/// Every courier-only and digest-only entry, author and sequence, which the
+/// session's asks cover beside the provisional records (R78 slice 3a).
+pub(crate) fn unapplied(db: &mut SqliteConnection) -> Result<Vec<(Vec<u8>, i64)>, ClientError> {
+    Ok(dsl::_connetto_peer_entry
+        .select((dsl::author, dsl::seq))
+        .filter(dsl::state.eq_any([HeldState::CourierOnly.db(), HeldState::DigestOnly.db()]))
+        .load(db)?)
+}
+
+/// Every provisional entry, position order, the resync's re-apply and the
+/// archive export running in.
 pub(crate) fn all_entries(db: &mut SqliteConnection) -> Result<Vec<Entry>, ClientError> {
     let rows: Vec<StoredEntry> = dsl::_connetto_peer_entry
         .select(ENTRY_SELECT)
+        .filter(dsl::state.eq(HeldState::Provisional.db()))
         .order(dsl::position.asc())
         .load(db)?;
-    Ok(rows.into_iter().map(into_entry).collect())
+    rows.into_iter().map(into_entry).collect()
 }
 
 /// The position a stored entry already took, `None` when the entry is not
@@ -210,32 +353,66 @@ pub(crate) fn existing_position(
         .optional()?)
 }
 
-/// Store an entry of `author` at the position its apply took.
+/// One entry to store, beside the author it names.
+pub(crate) struct NewEntry<'a> {
+    /// The entry's manifest row.
+    pub(crate) row: &'a connetto_core::exchange::ManifestRow,
+    /// What the entry is held as.
+    pub(crate) state: HeldState,
+    /// The entry's body, absent for a digest-only entry.
+    pub(crate) body: Option<&'a [u8]>,
+    /// The wall clock the entry was received at, in seconds.
+    pub(crate) received_at: i64,
+    /// The replica-wide append position it takes.
+    pub(crate) position: i64,
+}
+
+/// Store an entry of `author` unless the receiver holds its sequence
+/// already, reporting whether it was written.
 pub(crate) fn store_entry(
     db: &mut SqliteConnection,
     author: &PeerAuthor,
-    seq: i64,
-    major: i64,
-    changeset: &[u8],
-    received_at: i64,
-    position: i64,
-) -> Result<(), ClientError> {
-    diesel::insert_into(dsl::_connetto_peer_entry)
+    entry: &NewEntry<'_>,
+) -> Result<bool, ClientError> {
+    let origin = entry
+        .row
+        .origin
+        .map(|origin| rmp_serde::to_vec_named(&origin).expect("an origin encodes"));
+    let written = diesel::insert_into(dsl::_connetto_peer_entry)
         .values((
             dsl::author.eq(&author.key_id),
-            dsl::seq.eq(seq),
-            dsl::major.eq(major),
-            dsl::changeset.eq(changeset),
+            dsl::seq.eq(i64::try_from(entry.row.seq).unwrap_or(i64::MAX)),
+            dsl::state.eq(entry.state.db()),
+            dsl::major.eq(i64::from(entry.row.major.get())),
+            dsl::origin.eq(origin),
+            dsl::digest.eq(entry.row.digest.as_slice()),
+            dsl::changeset.eq(entry.body),
             dsl::account.eq(&author.account),
             dsl::bot_list.eq(author.bot_list.as_deref()),
-            dsl::received_at.eq(received_at),
-            dsl::position.eq(position),
+            dsl::received_at.eq(entry.received_at),
+            dsl::position.eq(entry.position),
         ))
+        .on_conflict_do_nothing()
+        .execute(db)?;
+    Ok(written == 1)
+}
+
+/// Retain one held entry, the adjudication keeping it for a restore (R78
+/// decision 17).
+pub(crate) fn retain(
+    db: &mut SqliteConnection,
+    author: &[u8],
+    seq: i64,
+) -> Result<(), ClientError> {
+    diesel::update(dsl::_connetto_peer_entry)
+        .filter(dsl::author.eq(author))
+        .filter(dsl::seq.eq(seq))
+        .set(dsl::state.eq(HeldState::Retained.db()))
         .execute(db)?;
     Ok(())
 }
 
-/// Delete one stored entry, the retraction and the adjudication taking it.
+/// Delete one stored entry, the retraction taking it.
 pub(crate) fn delete_entry(
     db: &mut SqliteConnection,
     author: &[u8],
@@ -246,6 +423,91 @@ pub(crate) fn delete_entry(
         .filter(dsl::seq.eq(seq))
         .execute(db)?;
     Ok(())
+}
+
+/// Delete every retained entry whose author's certificate ended
+/// [`DEVICE_SKEW`](connetto_core::clock::DEVICE_SKEW) or more before `now`,
+/// or whose author's cursor is gone, since a courier delivers nothing without
+/// the author's offer (R78 decision 17).
+pub(crate) fn prune_retained(db: &mut SqliteConnection, now: i64) -> Result<(), ClientError> {
+    let skew = i64::try_from(connetto_core::clock::DEVICE_SKEW.as_secs()).unwrap_or(i64::MAX);
+    diesel::sql_query(
+        "DELETE FROM _connetto_peer_entry WHERE state = ? AND NOT EXISTS \
+         (SELECT 1 FROM _connetto_peer_cursor AS cursor \
+          WHERE cursor.author = _connetto_peer_entry.author AND cursor.expires_at > ?)",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(HeldState::Retained.db())
+    .bind::<diesel::sql_types::BigInt, _>(now.saturating_sub(skew))
+    .execute(db)?;
+    Ok(())
+}
+
+/// The columns `table` holds, empty when the replica holds no such table.
+///
+/// # Errors
+///
+/// [`ClientError`] when the table's columns cannot be read.
+pub(crate) fn columns_of(
+    db: &mut SqliteConnection,
+    table: &str,
+) -> Result<Vec<String>, ClientError> {
+    #[derive(diesel::QueryableByName)]
+    struct Column {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+    }
+    let columns: Vec<Column> = diesel::sql_query("SELECT name FROM pragma_table_info(?)")
+        .bind::<diesel::sql_types::Text, _>(table)
+        .load(db)?;
+    Ok(columns.into_iter().map(|column| column.name).collect())
+}
+
+/// Bring an entry table of an earlier build to the held shape (R78 slice
+/// 3a): every row it holds stays provisional, its digest recomputed from
+/// its body and its origin left empty, since the earlier build kept none.
+///
+/// # Errors
+///
+/// [`ClientError`] when the table cannot be read or rewritten.
+pub(crate) fn upgrade_entries(db: &mut SqliteConnection) -> Result<(), ClientError> {
+    #[derive(diesel::QueryableByName)]
+    struct Earlier {
+        #[diesel(sql_type = diesel::sql_types::Binary)]
+        author: Vec<u8>,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        seq: i64,
+        #[diesel(sql_type = diesel::sql_types::Binary)]
+        changeset: Vec<u8>,
+    }
+    let columns = columns_of(db, "_connetto_peer_entry")?;
+    if columns.is_empty() || columns.iter().any(|column| column == "state") {
+        return Ok(());
+    }
+    db.transaction::<_, ClientError, _>(|db| {
+        let earlier: Vec<Earlier> =
+            diesel::sql_query("SELECT author, seq, changeset FROM _connetto_peer_entry")
+                .load(db)?;
+        db.batch_execute(
+            "ALTER TABLE _connetto_peer_entry RENAME TO _connetto_peer_entry_earlier",
+        )?;
+        db.batch_execute(PEER_ENTRY_DDL)?;
+        db.batch_execute(
+            "INSERT INTO _connetto_peer_entry (author, seq, state, major, digest, changeset, \
+             account, bot_list, received_at, position) \
+             SELECT author, seq, 0, major, X'', changeset, account, bot_list, received_at, \
+             position FROM _connetto_peer_entry_earlier; \
+             DROP TABLE _connetto_peer_entry_earlier",
+        )?;
+        for row in earlier {
+            let digest: [u8; 32] = Sha256::digest(&row.changeset).into();
+            diesel::update(dsl::_connetto_peer_entry)
+                .filter(dsl::author.eq(&row.author))
+                .filter(dsl::seq.eq(row.seq))
+                .set(dsl::digest.eq(digest.as_slice()))
+                .execute(db)?;
+        }
+        Ok(())
+    })
 }
 
 /// The receiver's side of one peer apply, what its ops are judged against.

@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use connetto_client::peer::PeerAuthor;
+use connetto_client::peer::{HeldState, PeerAuthor};
 use connetto_client::provisional::{ProvisionalState, encode_key};
 use connetto_client::{ClientEvent, ConnettoConnection, KeyValue};
 use connetto_core::exchange::{RetractCause, Verdict};
@@ -70,10 +70,12 @@ diesel::table! {
         author -> Binary,
         /// The author's queue sequence.
         seq -> BigInt,
+        /// What the entry is held as, a `HeldState`.
+        state -> BigInt,
         /// The major the entry was captured under.
         major -> BigInt,
-        /// The entry's body, as received.
-        changeset -> Binary,
+        /// The entry's body, absent for a digest-only entry.
+        changeset -> Nullable<Binary>,
         /// The author's certificate account.
         account -> Text,
         /// The author's bot list, when the author carries one.
@@ -98,6 +100,8 @@ diesel::table! {
         head -> Binary,
         /// The author's last verified signed offer, as `MessagePack`.
         offer -> Binary,
+        /// When the author's certificate ends, in Unix seconds.
+        expires_at -> BigInt,
     }
 }
 
@@ -159,6 +163,7 @@ where
             _connetto_peer_cursor::seq.eq(seq),
             _connetto_peer_cursor::head.eq(vec![0u8; 32]),
             _connetto_peer_cursor::offer.eq(offer.to_vec()),
+            _connetto_peer_cursor::expires_at.eq(4_102_444_800_i64),
         ))
         .execute(conn.conn())
         .expect("seed the cursor");
@@ -208,9 +213,21 @@ where
     T: connetto_core::traits::Transport,
     T::Error: core::fmt::Display,
 {
+    entry_states(conn, author)
+        .into_iter()
+        .map(|(seq, _)| seq)
+        .collect()
+}
+
+/// The stored entries of `author`, sequence and state, seq order.
+fn entry_states<T>(conn: &mut ConnettoConnection<T>, author: &[u8; 32]) -> Vec<(i64, i64)>
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
     _connetto_peer_entry::table
         .filter(_connetto_peer_entry::author.eq(author.to_vec()))
-        .select(_connetto_peer_entry::seq)
+        .select((_connetto_peer_entry::seq, _connetto_peer_entry::state))
         .order(_connetto_peer_entry::seq.asc())
         .load(conn.conn())
         .expect("read the entries")
@@ -342,7 +359,8 @@ async fn attach_asks_each_author_it_holds_an_offer_from() {
 }
 
 /// `Applied` and `Settled` adjudicate the entry the way the frontier does,
-/// the records move and the entries go, the rows standing. `Pending` keeps.
+/// the records move and the entries are retained, the rows standing.
+/// `Pending` keeps.
 #[tokio::test]
 async fn an_applied_ruling_adjudicates_the_entry_and_keeps_its_rows() {
     let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
@@ -373,8 +391,119 @@ async fn an_applied_ruling_adjudicates_the_entry_and_keeps_its_rows() {
             (3, ProvisionalState::Provisional.db()),
         ]
     );
-    assert_eq!(entry_seqs(&mut conn, &AUTHOR_A), vec![3]);
+    assert_eq!(
+        entry_states(&mut conn, &AUTHOR_A),
+        vec![
+            (1, HeldState::Retained.db()),
+            (2, HeldState::Retained.db()),
+            (3, HeldState::Provisional.db()),
+        ]
+    );
     assert_eq!(order_ids(&mut conn), vec![1, 2, 3]);
+}
+
+/// Insert one order another person owns, which the receiver's policies
+/// refuse from the author.
+fn insert_foreign(conn: &mut ConnettoConnection<Script>, id: i64) {
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(id),
+            orders::owner.eq("mallory"),
+            orders::status.eq("open"),
+        ))
+        .execute(conn.conn())
+        .expect("insert the order");
+}
+
+/// The row of `body` at `seq` captured under the major 2 another build
+/// declares.
+fn other_build(seq: u64, body: &[u8]) -> connetto_core::exchange::ManifestRow {
+    connetto_core::exchange::ManifestRow {
+        major: connetto_core::Major::new(2).expect("major 2"),
+        ..manifest(seq, body)
+    }
+}
+
+/// An ask covers the courier-only and digest-only entries beside the
+/// provisional ones, and never a retained one (R78 held-row table).
+#[tokio::test]
+async fn an_ask_covers_every_held_entry_but_the_retained() {
+    let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
+    let w2 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 2);
+    let m3 = |conn: &mut ConnettoConnection<Script>| insert_foreign(conn, 3);
+    let w4 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 4);
+    let [b1, b2, b3, b4] = captured(PLAIN_DDL, [&w1, &w2, &m3, &w4]).await;
+    let (mut conn, _) = receiver(DDL, POLICIES).await;
+    let author = author_of(AUTHOR_A);
+    seed_cursor(&mut conn, &AUTHOR_A, 4, OFFER_A);
+    conn.apply_peer_entry(&author, &manifest(1, &b1), &b1)
+        .expect("apply sequence 1");
+    conn.adjudicate_peer_frontier(&AUTHOR_A, 1)
+        .expect("retain sequence 1");
+    conn.apply_peer_entry(&author, &manifest(2, &b2), &b2)
+        .expect("apply sequence 2");
+    conn.apply_peer_entry(&author, &manifest(3, &b3), &b3)
+        .expect("hold sequence 3 courier-only");
+    conn.apply_peer_entry(&author, &other_build(4, &b4), &b4)
+        .expect("hold sequence 4 digest-only");
+    assert_eq!(
+        entry_states(&mut conn, &AUTHOR_A),
+        vec![
+            (1, HeldState::Retained.db()),
+            (2, HeldState::Provisional.db()),
+            (3, HeldState::CourierOnly.db()),
+            (4, HeldState::DigestOnly.db()),
+        ]
+    );
+
+    conn.disconnect();
+    let (_conn, script) = attach(conn).await;
+    let [ask] = asks(&script).try_into().expect("one ask");
+    assert_eq!(ask.author, AUTHOR_A);
+    assert_eq!(ask.seqs, vec![2, 3, 4]);
+}
+
+/// A ruling retains a courier-only or digest-only entry it settles and
+/// drops one it refuses or abandons, with nothing to roll back.
+#[tokio::test]
+async fn a_ruling_retains_or_drops_the_unapplied_entries() {
+    let m1 = |conn: &mut ConnettoConnection<Script>| insert_foreign(conn, 1);
+    let w2 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 2);
+    let m3 = |conn: &mut ConnettoConnection<Script>| insert_foreign(conn, 3);
+    let w4 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 4);
+    let [b1, b2, b3, b4] = captured(PLAIN_DDL, [&m1, &w2, &m3, &w4]).await;
+    let (mut conn, _) = receiver(DDL, POLICIES).await;
+    let author = author_of(AUTHOR_A);
+    conn.apply_peer_entry(&author, &manifest(1, &b1), &b1)
+        .expect("hold sequence 1 courier-only");
+    conn.apply_peer_entry(&author, &other_build(2, &b2), &b2)
+        .expect("hold sequence 2 digest-only");
+    conn.apply_peer_entry(&author, &manifest(3, &b3), &b3)
+        .expect("hold sequence 3 courier-only");
+    conn.apply_peer_entry(&author, &other_build(4, &b4), &b4)
+        .expect("hold sequence 4 digest-only");
+    seed_cursor(&mut conn, &AUTHOR_A, 4, OFFER_A);
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [ask] = asks(&script).try_into().expect("one ask");
+    assert_eq!(ask.seqs, vec![1, 2, 3, 4]);
+
+    rule(
+        &script,
+        &ask.request_id,
+        vec![
+            (1, Verdict::Applied),
+            (2, Verdict::Settled),
+            (3, Verdict::Refused(RetractCause::Conflict)),
+            (4, Verdict::Abandoned),
+        ],
+    );
+    pump_to(&mut conn, applied).await;
+    assert_eq!(
+        entry_states(&mut conn, &AUTHOR_A),
+        vec![(1, HeldState::Retained.db()), (2, HeldState::Retained.db()),]
+    );
+    assert_eq!(order_ids(&mut conn), Vec::<i64>::new());
 }
 
 /// `Refused` and `Abandoned` retract the entry through the retraction, with

@@ -8,11 +8,14 @@ use diesel::connection::SimpleConnection as _;
 use diesel::prelude::*;
 use sha2::Digest as _;
 
+use super::_connetto_peer_cursor::dsl;
 use crate::peer::PeerAuthor;
 
 use crate::drain::tests::{Conn, major, queue, replica};
 
 const KEY: [u8; 32] = [4; 32];
+/// The end of the author's certificate the tests' links prove, far ahead.
+const CERT_END: i64 = 4_102_444_800;
 const WRITER: WriterRef = WriterRef::Device(KEY);
 
 /// A major 2 replica whose bound device writer queued rows 1 to `count`.
@@ -190,7 +193,7 @@ fn a_cursor_starts_fresh_and_moves_with_a_skipped_row() {
         },
         signature: vec![1, 2, 3],
     };
-    conn.adopt_peer_offer(&author, &offer, &super::FRESH_CURSOR)
+    conn.adopt_peer_offer(&author, &offer, &super::FRESH_CURSOR, CERT_END)
         .expect("adopt the offer");
     let row = ManifestRow {
         seq: 1,
@@ -255,6 +258,7 @@ fn receiver_of(anna: &mut Conn, seqs: &[u64]) -> (Conn, Vec<Frontier>) {
         &writer_author(),
         &signed(None, Some(newest), &[]),
         &super::FRESH_CURSOR,
+        CERT_END,
     )
     .expect("adopt the offer");
     let mut frontiers = Vec::new();
@@ -283,6 +287,16 @@ fn items(conn: &mut Conn) -> String {
     .expect("read the items")
 }
 
+/// The replica's held peer entries, sequence and stored state, seq order.
+fn states(conn: &mut Conn) -> Vec<(i64, i64)> {
+    use crate::peer::_connetto_peer_entry::dsl;
+    dsl::_connetto_peer_entry
+        .select((dsl::seq, dsl::state))
+        .order(dsl::seq.asc())
+        .load(&mut conn.db)
+        .expect("read the entries")
+}
+
 /// The stored peer entries of the replica.
 fn stored(conn: &mut Conn) -> i64 {
     diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
@@ -306,13 +320,162 @@ fn an_adopted_offer_retracts_and_adjudicates_applied_entries() {
         &writer_author(),
         &signed(Some(frontiers[1].clone()), None, &[seqs[0]]),
         &frontiers[1],
+        CERT_END,
     )
     .expect("adopt the settling offer");
     assert_eq!(items(&mut ben), "2", "the retracted entry is taken back");
-    assert_eq!(stored(&mut ben), 0, "the settled entry is adjudicated");
+    assert_eq!(
+        states(&mut ben),
+        vec![(2, crate::peer::HeldState::Retained.db())],
+        "the settled entry is adjudicated and retained"
+    );
     assert_eq!(
         ben.peer_cursor(&KEY).expect("read the cursor"),
         frontiers[1]
+    );
+}
+
+/// The end of `KEY`'s certificate the replica keeps, in Unix seconds.
+fn certificate_end(conn: &mut Conn) -> i64 {
+    dsl::_connetto_peer_cursor
+        .filter(dsl::author.eq(KEY.as_slice()))
+        .select(dsl::expires_at)
+        .first(&mut conn.db)
+        .expect("read the certificate end")
+}
+
+/// R78 decision 17: the adopt keeps the end of the certificate the link
+/// proved, a renewal moves it, and the retained entries go once it passed
+/// by more than `DEVICE_SKEW`, an entry awaiting its verdict staying.
+#[test]
+fn retained_entries_go_once_their_authors_certificate_ends() {
+    let (mut anna, seqs) = author(3);
+    let (mut ben, frontiers) = receiver_of(&mut anna, &seqs);
+    assert_eq!(certificate_end(&mut ben), CERT_END);
+    ben.adopt_peer_offer(
+        &writer_author(),
+        &signed(Some(frontiers[1].clone()), None, &[]),
+        &frontiers[2],
+        CERT_END,
+    )
+    .expect("adopt the settling offer");
+    let retained = crate::peer::HeldState::Retained.db();
+    let provisional = crate::peer::HeldState::Provisional.db();
+    assert_eq!(
+        states(&mut ben),
+        vec![(1, retained), (2, retained), (3, provisional)]
+    );
+
+    let now = crate::clock::now_secs(&mut ben.db).expect("read the clock");
+    let skew = i64::try_from(connetto_core::clock::DEVICE_SKEW.as_secs()).expect("the skew fits");
+    ben.renew_peer_expiry(&KEY, now - skew + 60)
+        .expect("renew inside the tolerance");
+    assert_eq!(certificate_end(&mut ben), now - skew + 60);
+    assert_eq!(
+        states(&mut ben),
+        vec![(1, retained), (2, retained), (3, provisional)],
+        "inside the tolerance the retained entries stay"
+    );
+    ben.renew_peer_expiry(&KEY, now - skew - 60)
+        .expect("renew past the tolerance");
+    assert_eq!(
+        states(&mut ben),
+        vec![(3, provisional)],
+        "past the tolerance the retained entries go"
+    );
+}
+
+/// R78 decision 17: a retained entry whose author's cursor is gone has no
+/// offer a courier could present, so the next prune takes it.
+#[test]
+fn a_retained_entry_without_its_authors_cursor_goes() {
+    let (mut anna, seqs) = author(2);
+    let (mut ben, frontiers) = receiver_of(&mut anna, &seqs);
+    ben.adopt_peer_offer(
+        &writer_author(),
+        &signed(Some(frontiers[0].clone()), None, &[]),
+        &frontiers[1],
+        CERT_END,
+    )
+    .expect("adopt the settling offer");
+    ben.db
+        .batch_execute("DELETE FROM _connetto_peer_cursor")
+        .expect("drop the cursor");
+    ben.renew_peer_expiry(&KEY, CERT_END)
+        .expect("a renewal with no cursor prunes");
+    assert_eq!(
+        states(&mut ben),
+        vec![(2, crate::peer::HeldState::Provisional.db())]
+    );
+}
+
+/// R78 slice 3a and decision 42: an entry table and a cursor table an
+/// earlier build wrote come to the held shape, every entry provisional with
+/// its body kept and its digest recomputed, every cursor counting its
+/// author's certificate as ending 30 days on, and a second upgrade changes
+/// nothing.
+#[test]
+fn an_earlier_builds_peer_tables_come_to_the_held_shape() {
+    use crate::peer::_connetto_peer_entry::dsl as entry;
+    /// One upgraded entry's sequence, state, origin, digest and body.
+    type Upgraded = (i64, i64, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>);
+    let (anna, seqs) = author(1);
+    let body = anna
+        .serve_body(KEY, seqs[0])
+        .expect("read the body")
+        .expect("the entry is queued");
+    let mut ben = replica();
+    ben.db
+        .batch_execute(
+            "DROP TABLE _connetto_peer_entry; DROP TABLE _connetto_peer_cursor; \
+             CREATE TABLE _connetto_peer_entry (author BLOB, seq INTEGER, \
+             major INTEGER NOT NULL, changeset BLOB NOT NULL, account TEXT NOT NULL, \
+             bot_list TEXT, received_at INTEGER NOT NULL, position INTEGER NOT NULL, \
+             PRIMARY KEY (author, seq)); \
+             CREATE TABLE _connetto_peer_cursor (author BLOB PRIMARY KEY, \
+             account TEXT NOT NULL, seq INTEGER NOT NULL, head BLOB NOT NULL, \
+             offer BLOB NOT NULL)",
+        )
+        .expect("lay out the earlier tables");
+    diesel::sql_query("INSERT INTO _connetto_peer_entry VALUES (?, 1, 2, ?, 'anna', NULL, 10, 1)")
+        .bind::<diesel::sql_types::Binary, _>(KEY.as_slice())
+        .bind::<diesel::sql_types::Binary, _>(body.as_slice())
+        .execute(&mut ben.db)
+        .expect("store the earlier entry");
+    diesel::sql_query("INSERT INTO _connetto_peer_cursor VALUES (?, 'anna', 1, zeroblob(32), x'')")
+        .bind::<diesel::sql_types::Binary, _>(KEY.as_slice())
+        .execute(&mut ben.db)
+        .expect("store the earlier cursor");
+
+    let now = 1_800_000_000;
+    for _ in 0..2 {
+        crate::peer::upgrade_entries(&mut ben.db).expect("upgrade the entries");
+        super::upgrade_cursors(&mut ben.db, now).expect("upgrade the cursors");
+    }
+    let stored: Vec<Upgraded> = entry::_connetto_peer_entry
+        .select((
+            entry::seq,
+            entry::state,
+            entry::origin,
+            entry::digest,
+            entry::changeset,
+        ))
+        .load(&mut ben.db)
+        .expect("read the upgraded entries");
+    let digest: [u8; 32] = sha2::Sha256::digest(&body).into();
+    assert_eq!(
+        stored,
+        vec![(
+            1,
+            crate::peer::HeldState::Provisional.db(),
+            None,
+            digest.to_vec(),
+            Some(body)
+        )]
+    );
+    assert_eq!(
+        certificate_end(&mut ben),
+        now + i64::try_from(super::UNLEARNED_EXPIRY.as_secs()).expect("the window fits")
     );
 }
 
@@ -338,7 +501,7 @@ fn exchange_writes_the_replica_refuses_are_errors() {
         head: [0; 32],
     };
     assert!(
-        ben.adopt_peer_offer(&writer_author(), &signed(None, None, &[]), &past)
+        ben.adopt_peer_offer(&writer_author(), &signed(None, None, &[]), &past, CERT_END)
             .is_err()
     );
     let row = ManifestRow {
@@ -357,19 +520,25 @@ fn exchange_writes_the_replica_refuses_are_errors() {
         ben.adopt_peer_offer(
             &writer_author(),
             &signed(None, None, &[seqs[0]]),
-            &frontiers[1]
+            &frontiers[1],
+            CERT_END
         )
         .is_err(),
         "a retraction that cannot delete its entry fails"
     );
+    ben.db
+        .batch_execute("DROP TRIGGER refuse")
+        .expect("lift the delete refusal");
+    refuse(&mut ben, "BEFORE UPDATE ON _connetto_peer_entry");
     assert!(
         ben.adopt_peer_offer(
             &writer_author(),
             &signed(Some(frontiers[0].clone()), None, &[]),
-            &frontiers[1]
+            &frontiers[1],
+            CERT_END
         )
         .is_err(),
-        "an adjudication that cannot delete its entry fails"
+        "an adjudication that cannot retain its entry fails"
     );
 
     let mut fresh = replica();
@@ -379,7 +548,8 @@ fn exchange_writes_the_replica_refuses_are_errors() {
             .adopt_peer_offer(
                 &writer_author(),
                 &signed(None, None, &[]),
-                &super::FRESH_CURSOR
+                &super::FRESH_CURSOR,
+                CERT_END
             )
             .is_err(),
         "an offer whose cursor cannot be stored fails"
@@ -390,6 +560,7 @@ fn exchange_writes_the_replica_refuses_are_errors() {
             &writer_author(),
             &signed(None, None, &[]),
             &super::FRESH_CURSOR,
+            CERT_END,
         )
         .expect("adopt the offer");
     refuse(&mut stale, "BEFORE UPDATE ON _connetto_peer_cursor");
@@ -408,12 +579,12 @@ fn corrupt_exchange_bookkeeping_is_an_error() {
     let key = format!("x'{}'", "04".repeat(32));
     for corruption in [
         format!(
-            "INSERT INTO _connetto_peer_cursor (author, account, seq, head, offer) \
-             VALUES ({key}, 'anna', -1, zeroblob(32), x'')"
+            "INSERT INTO _connetto_peer_cursor (author, account, seq, head, offer, expires_at) \
+             VALUES ({key}, 'anna', -1, zeroblob(32), x'', 0)"
         ),
         format!(
-            "INSERT INTO _connetto_peer_cursor (author, account, seq, head, offer) \
-             VALUES ({key}, 'anna', 1, zeroblob(31), x'')"
+            "INSERT INTO _connetto_peer_cursor (author, account, seq, head, offer, expires_at) \
+             VALUES ({key}, 'anna', 1, zeroblob(31), x'', 0)"
         ),
         "DROP TABLE _connetto_peer_cursor".to_owned(),
     ] {
