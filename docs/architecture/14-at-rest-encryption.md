@@ -193,7 +193,7 @@ Call `provision_replica_key` only for a replica that does not yet exist. For one
 
 ## The page codec
 
-connetto does not implement encryption. At each connect it states whether the database holds encrypted pages and hands the key to an off-the-shelf codec. Natively the codec is SQLCipher, vendored by `libsqlite3-sys` under `bundled-sqlcipher`. In the browser it is SQLite3 Multiple Ciphers, vendored by `sqlite-wasm-rs` under `sqlite3mc`. The two are not the same codebase, which forces an explicit pin.
+connetto does not implement encryption. At each connect it states whether the database holds encrypted pages and hands the key to an off-the-shelf codec. Natively the codec is SQLCipher 4.19.0 on SQLite 3.53.4, which `libsqlite3-sys` builds under `bundled-sqlcipher` from the `sqlcipher-src` crate. In the browser it is SQLite3 Multiple Ciphers, vendored by `sqlite-wasm-rs` under `sqlite3mc`. The two are not the same codebase, which forces an explicit pin.
 
 The construction on both sides is SQLCipher version 4. AES-256-CBC per page, with a fresh 16-byte random IV on every page write, plus a 64-byte HMAC-SHA512 over the ciphertext, the IV, and the page number. Both live in the 80 reserved bytes at the end of every page that SQLite accounts for through its page-reserve field. Page 1 carries a 16-byte random per-database salt in the clear. Rewriting a page in place never reuses an IV.
 
@@ -207,7 +207,7 @@ PRAGMA cipher = 'sqlcipher'; PRAGMA legacy = 4;
 
 The native codec is SQLCipher itself and needs no pinning, so `cipher::unlock` applies them only on wasm.
 
-Planned in [R21](../../plans/master-implementation-plan.md#r21-one-page-codec-on-both-backends), the native side moves to the browser's page codec and the format becomes ChaCha20-Poly1305.
+Planned in [R21](../../plans/master-implementation-plan.md#r21-one-page-codec-on-both-backends), the browser moves to SQLCipher from the same `sqlcipher-src` release, every encrypted open declares the SQLCipher 4 settings, and the pin goes.
 
 `sqlcipher_export` exists in the SQLCipher amalgamation and not in the sqlite3mc amalgamation, so no plaintext-to-encrypted transform works on both backends.
 
