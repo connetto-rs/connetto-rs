@@ -497,10 +497,10 @@
       <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Device-to-device sync</text>
       <text x="150" y="34" text-anchor="middle" font-size="8.5" fill="#4CAF50">R74: chip key, certificates, attestation under PEN 67105</text>
       <text x="150" y="49" text-anchor="middle" font-size="8.5" fill="#4CAF50">R76 slices 1 to 9c: the link, mDNS, hotspots, beacon</text>
-      <text x="150" y="63" text-anchor="middle" font-size="8.5" fill="#4CAF50">Android, iPhone, Linux host, the iPad and Mac join</text>
+      <text x="150" y="63" text-anchor="middle" font-size="8.5" fill="#4CAF50">Android and Linux host offline, Apple devices join</text>
       <text x="150" y="77" text-anchor="middle" font-size="8.5" fill="#4CAF50">R75 frontiers, R77 slices 1 to 5, R79 media frames and port</text>
       <text x="150" y="91" text-anchor="middle" font-size="8.5" fill="#C62828">R76 slices 9d and 9e, R74's Windows record</text>
-      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#C62828">R77 slices 6 to 8, R78, R79 slice 8, R80 (chapter 19)</text>
+      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#C62828">R77 slices 6 to 8 and 12, R78, R79 slice 8, R80, R112 (chapter 19)</text>
     </g>
   </g>
 
