@@ -42,7 +42,7 @@ COMMONS_MEMORY_GIB=200
 COMMONS_VMS=16
 COMMONS_CPUS=64
 # The largest flavor, which a VM still being created is counted as.
-LARGEST_GIB=22
+LARGEST_GIB=32
 LARGEST_CPUS=8
 
 case "$MEMBER" in
@@ -378,7 +378,7 @@ if [ "$MEMBER" = emi ]; then
     incus profile device show "$name" --project "$PROJECT" | grep -q "^actions:" \
       || incus profile device add "$name" actions disk source="$CACHE_ROOT/actions" path=/srv/cache/actions readonly=true --project "$PROJECT"
   }
-  # The largest measured peaks are 9.3 GiB light and 19.1 GiB heavy.
+  # The largest measured peaks are 9.3 GiB light and 21.8 GiB heavy.
   make_profile ci-light 4 12GiB
   make_profile ci-heavy "$LARGEST_CPUS" "${LARGEST_GIB}GiB"
 
