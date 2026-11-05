@@ -6230,12 +6230,11 @@ where
         let config = &self.config;
         self.db.transaction::<_, ClientError, _>(|db| {
             match peer::state_of(db, author, seq)? {
-                Some(peer::HeldState::Provisional) => {
+                // A record with no stored entry still moves, as R77 left it.
+                Some(peer::HeldState::Provisional) | None => {
                     adjudicate_provisional(db, config, author, seq)?;
                 }
                 Some(peer::HeldState::CourierOnly | peer::HeldState::DigestOnly) => {}
-                // A record with no stored entry still moves, as R77 left it.
-                None => adjudicate_provisional(db, config, author, seq)?,
                 Some(peer::HeldState::Retained) => return Ok(()),
             }
             peer::retain(db, author, seq)?;

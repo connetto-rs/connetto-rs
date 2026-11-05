@@ -23,13 +23,12 @@ pub(crate) const PEER_CURSOR_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_p
 /// lifetime ceiling (R78 decision 42).
 pub(crate) const UNLEARNED_EXPIRY: core::time::Duration = core::time::Duration::from_hours(30 * 24);
 
-/// `at` in whole Unix seconds, the instant the cursor stores, saturating at
-/// both ends of storage.
+/// `at` in whole Unix seconds, the instant the cursor stores, an instant
+/// before the epoch counting as the epoch, long ended.
 pub(crate) fn unix_secs(at: std::time::SystemTime) -> i64 {
-    match at.duration_since(std::time::UNIX_EPOCH) {
-        Ok(after) => i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
-        Err(before) => i64::try_from(before.duration().as_secs()).map_or(i64::MIN, |secs| -secs),
-    }
+    at.duration_since(std::time::UNIX_EPOCH).map_or(0, |after| {
+        i64::try_from(after.as_secs()).unwrap_or(i64::MAX)
+    })
 }
 
 /// The end an author's certificate counts as having when the receiver never

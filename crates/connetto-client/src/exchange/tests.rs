@@ -385,6 +385,94 @@ fn retained_entries_go_once_their_authors_certificate_ends() {
     );
 }
 
+/// R78 held-row table: a body its row does not digest is no entry of the
+/// author's, so the cursor moves past it and nothing of it is held.
+#[test]
+fn a_body_its_row_does_not_digest_moves_the_cursor_alone() {
+    let (mut anna, seqs) = author(2);
+    let (mut ben, _) = receiver_of(&mut anna, &seqs[..1]);
+    let row = ManifestRow {
+        seq: 2,
+        major: major(2),
+        origin: None,
+        digest: [9; 32],
+    };
+    let cursor = Frontier {
+        seq: 2,
+        head: [7; 32],
+    };
+    ben.take_peer_row(&writer_author(), &row, Some(b"not the body"), &cursor)
+        .expect("take the row");
+    assert_eq!(ben.peer_cursor(&KEY).expect("read the cursor"), cursor);
+    assert_eq!(
+        states(&mut ben),
+        vec![(1, crate::peer::HeldState::Provisional.db())]
+    );
+}
+
+/// R78 held-row table: a digest-only entry the replica cannot store fails
+/// the row and leaves the cursor where it stood, so the driver retries it.
+#[test]
+fn a_hold_the_replica_refuses_fails_the_row() {
+    let (mut anna, seqs) = author(2);
+    let (mut ben, frontiers) = receiver_of(&mut anna, &seqs[..1]);
+    refuse(&mut ben, "BEFORE INSERT ON _connetto_peer_entry");
+    let row = ManifestRow {
+        seq: 2,
+        major: major(1),
+        origin: None,
+        digest: [9; 32],
+    };
+    let cursor = Frontier {
+        seq: 2,
+        head: [7; 32],
+    };
+    assert!(
+        ben.take_peer_row(&writer_author(), &row, None, &cursor)
+            .is_err()
+    );
+    assert_eq!(
+        ben.peer_cursor(&KEY).expect("read the cursor"),
+        frontiers[0],
+        "the cursor stays with the refused hold"
+    );
+}
+
+/// R78 decision 19: a held entry in a state no build stores, or a
+/// provisional one without its body, is an error, never a row misread.
+#[test]
+fn a_corrupt_held_entry_is_an_error() {
+    let (mut anna, seqs) = author(1);
+    let (mut ben, frontiers) = receiver_of(&mut anna, &seqs);
+    ben.db
+        .batch_execute("UPDATE _connetto_peer_entry SET state = 9")
+        .expect("corrupt the state");
+    assert!(
+        ben.adopt_peer_offer(
+            &writer_author(),
+            &signed(Some(frontiers[0].clone()), None, &[]),
+            &frontiers[0],
+            CERT_END,
+        )
+        .is_err(),
+        "an unknown state refuses the adjudication"
+    );
+    ben.db
+        .batch_execute("UPDATE _connetto_peer_entry SET state = 0, changeset = NULL")
+        .expect("drop the body");
+    assert!(
+        ben.retract_peer_entry(
+            &writer_author(),
+            &Retraction {
+                seq: 1,
+                cause: RetractCause::Conflict,
+            },
+        )
+        .is_err(),
+        "a provisional entry without its body refuses the retraction"
+    );
+}
+
 /// R78 decision 17: a retained entry whose author's cursor is gone has no
 /// offer a courier could present, so the next prune takes it.
 #[test]

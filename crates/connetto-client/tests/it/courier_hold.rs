@@ -113,6 +113,14 @@ async fn a_refused_entry_is_held_courier_only_with_its_body() {
             .is_empty(),
         "a refused entry writes no record"
     );
+
+    // The same entry arriving again is held once, where it first landed.
+    recv.apply_peer_entry(&a, &manifest(7, &body), &body)
+        .expect("apply the entry again");
+    assert_eq!(
+        held_entries(&mut recv),
+        vec![(anna(), 7, HeldState::CourierOnly)]
+    );
 }
 
 /// An entry of another build stays held digest-only, its manifest row kept
