@@ -513,7 +513,7 @@
 
   <!-- ==================== BROWSER / WASM CLIENT ZONE ==================== -->
   <g id="wasm-client-zone" transform="translate(0, 290)">
-    <rect x="980" y="680" width="660" height="812" rx="10" fill="#F5F5F5" stroke="#BDBDBD" stroke-width="1.5" />
+    <rect x="980" y="680" width="660" height="825" rx="10" fill="#F5F5F5" stroke="#BDBDBD" stroke-width="1.5" />
     <text x="1310" y="706" text-anchor="middle" font-size="15" font-weight="700" fill="#555">Browser / WASM client</text>
     <text x="1310" y="722" text-anchor="middle" font-size="10" fill="#4CAF50">connetto-web, in this repo, built and browser-verified</text>
 
@@ -548,14 +548,14 @@
     <text x="1322" y="902" font-size="9" font-weight="600" fill="#4CAF50">(7) BroadcastChannel</text>
 
     <!-- DB worker sub-zone -->
-    <rect x="995" y="916" width="630" height="564" rx="8" fill="#EDE7F6" stroke="#7E57C2" stroke-width="1" />
-    <rect x="995" y="916" width="5" height="564" rx="2" fill="#4CAF50" />
+    <rect x="995" y="916" width="630" height="577" rx="8" fill="#EDE7F6" stroke="#7E57C2" stroke-width="1" />
+    <rect x="995" y="916" width="5" height="577" rx="2" fill="#4CAF50" />
     <text x="1310" y="936" text-anchor="middle" font-size="12" font-weight="600" fill="#2E7D32">Dedicated DB worker</text>
     <text x="1310" y="950" text-anchor="middle" font-size="9" fill="#888">leader tab owns it: OPFS replica, server connection, relay hub</text>
 
     <g transform="translate(1008, 962)">
-      <rect width="296" height="116" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
-      <rect width="3" height="116" rx="1" fill="#4CAF50" />
+      <rect width="296" height="129" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
+      <rect width="3" height="129" rx="1" fill="#4CAF50" />
       <text x="148" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#2E7D32">DB worker (connetto-web)</text>
       <text x="148" y="30" text-anchor="middle" font-size="8.5" fill="#888">WebClientBuilder boot, account choice, OPFS replica (R54)</text>
       <text x="148" y="43" text-anchor="middle" font-size="8.5" fill="#888">upstream ConnettoClient plus capture</text>
@@ -564,6 +564,7 @@
       <text x="148" y="82" text-anchor="middle" font-size="8.5" fill="#4CAF50">offline boot (R20), one builder per platform (R94)</text>
       <text x="148" y="95" text-anchor="middle" font-size="8.5" fill="#4CAF50">resting results table (R83), synced tables, no refs (R92)</text>
       <text x="148" y="108" text-anchor="middle" font-size="8.5" fill="#4CAF50">acknowledged writes re-sent after a restore (R78)</text>
+      <text x="148" y="121" text-anchor="middle" font-size="8.5" fill="#C62828">R78: courier notices held until the first tab acks them</text>
     </g>
     <g transform="translate(1320, 962)">
       <rect width="296" height="76" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
@@ -574,13 +575,13 @@
       <text x="148" y="62" text-anchor="middle" font-size="8.5" fill="#888">seam: SyncAccessHandlePool VFS</text>
     </g>
 
-    <g transform="translate(1008, 1090)">
+    <g transform="translate(1008, 1103)">
       <rect width="296" height="44" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="3" height="44" rx="1" fill="#4CAF50" />
       <text x="148" y="17" text-anchor="middle" font-size="11" font-weight="600" fill="#333">WebSocket (web-sys)</text>
       <text x="148" y="33" text-anchor="middle" font-size="8.5" fill="#888">one socket in the worker, tabs relay through it</text>
     </g>
-    <g transform="translate(1320, 1090)">
+    <g transform="translate(1320, 1103)">
       <rect width="296" height="44" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="44" rx="1" fill="#4CAF50" />
       <text x="148" y="17" text-anchor="middle" font-size="11" font-weight="600" fill="#333">diesel-sqlite-session</text>
@@ -588,7 +589,7 @@
     </g>
 
     <!-- At-rest encryption (browser) -->
-    <g transform="translate(1008, 1146)">
+    <g transform="translate(1008, 1159)">
       <rect width="608" height="114" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="4" height="114" rx="1" fill="#4CAF50" />
       <text x="304" y="18" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">At-rest encryption</text>
@@ -600,7 +601,7 @@
     </g>
 
     <!-- shared public store (R11, browser) -->
-    <g transform="translate(1008, 1272)">
+    <g transform="translate(1008, 1285)">
       <rect width="608" height="36" rx="5" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="3" height="36" rx="1" fill="#4CAF50" />
       <text x="304" y="15" text-anchor="middle" font-size="10.5" font-weight="700" fill="#2E7D32">Shared public store</text>
@@ -608,14 +609,14 @@
     </g>
 
     <!-- retention and R42 (browser) -->
-    <g transform="translate(1008, 1320)">
+    <g transform="translate(1008, 1333)">
       <rect width="296" height="62" rx="5" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="3" height="62" rx="1" fill="#4CAF50" />
       <text x="148" y="18" text-anchor="middle" font-size="10.5" font-weight="700" fill="#2E7D32">Replica retention and trimming</text>
       <text x="148" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">evicts and trims the OPFS replica, same threshold</text>
       <text x="148" y="50" text-anchor="middle" font-size="8.5" fill="#4CAF50">eviction, row coverage, residual pass (R15, R29, R60)</text>
     </g>
-    <g transform="translate(1320, 1320)">
+    <g transform="translate(1320, 1333)">
       <rect width="296" height="48" rx="5" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="3" height="48" rx="1" fill="#4CAF50" />
       <text x="148" y="18" text-anchor="middle" font-size="10.5" font-weight="700" fill="#2E7D32">Several accounts signed in at once</text>
@@ -623,7 +624,7 @@
     </g>
 
     <!-- export and import (browser) -->
-    <g transform="translate(1008, 1394)">
+    <g transform="translate(1008, 1407)">
       <rect width="608" height="36" rx="5" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="3" height="36" rx="1" fill="#4CAF50" />
       <text x="304" y="15" text-anchor="middle" font-size="10.5" font-weight="700" fill="#2E7D32">Local data export and import</text>
@@ -631,7 +632,7 @@
     </g>
 
     <!-- connetto-file-client (browser) -->
-    <g transform="translate(1008, 1442)">
+    <g transform="translate(1008, 1455)">
       <rect width="608" height="32" rx="5" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="3" height="32" rx="1" fill="#4CAF50" />
       <text x="304" y="13" text-anchor="middle" font-size="10.5" font-weight="700" fill="#2E7D32">connetto-file-client in the browser</text>
@@ -645,10 +646,10 @@
 
   <!-- ==================== HEADLESS CLIENT (BOT) ZONE ==================== -->
   <g id="bot-client-zone">
-    <rect x="980" y="1794" width="660" height="150" rx="10" fill="#F5F5F5" stroke="#BDBDBD" stroke-width="1.5" />
-    <text x="1310" y="1810" text-anchor="middle" font-size="15" font-weight="700" fill="#555">Headless client (a bot)</text>
-    <text x="1310" y="1826" text-anchor="middle" font-size="10" fill="#C62828">the connetto-bot runtime on connetto-client with no screen, R103 (chapter 13)</text>
-    <g transform="translate(995, 1838)">
+    <rect x="980" y="1807" width="660" height="150" rx="10" fill="#F5F5F5" stroke="#BDBDBD" stroke-width="1.5" />
+    <text x="1310" y="1823" text-anchor="middle" font-size="15" font-weight="700" fill="#555">Headless client (a bot)</text>
+    <text x="1310" y="1839" text-anchor="middle" font-size="10" fill="#C62828">the connetto-bot runtime on connetto-client with no screen, R103 (chapter 13)</text>
+    <g transform="translate(995, 1851)">
       <rect width="630" height="84" rx="6" fill="#FFEBEE" stroke="#EF5350" stroke-width="1.5" />
       <text x="315" y="18" text-anchor="middle" font-size="9" fill="#555">a program holds a query, is told when it changed, and writes values back through the same client as a screen</text>
       <text x="315" y="34" text-anchor="middle" font-size="9" fill="#555">it signs each connection's challenge with its key, for one installation or as itself (R99)</text>
@@ -690,7 +691,7 @@
     <text x="930" y="411" text-anchor="middle" fill="#4CAF50" font-weight="600">(3) Aggregates</text>
 
     <!-- WS into browser DB worker -->
-    <line x1="970" y1="1402" x2="1008" y2="1402" stroke="#4CAF50" stroke-width="2" marker-end="url(#arrow-green)" />
+    <line x1="970" y1="1415" x2="1008" y2="1415" stroke="#4CAF50" stroke-width="2" marker-end="url(#arrow-green)" />
 
     <!-- HTTP from the native file client, under a ticket, to connetto-file-server -->
     <path d="M 995 889 L 970 889" fill="none" stroke="#4CAF50" stroke-width="1.5" marker-end="url(#arrow-green)" />

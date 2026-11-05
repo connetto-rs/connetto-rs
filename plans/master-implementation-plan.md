@@ -1272,6 +1272,7 @@ Field survivability, a lost device's work is recoverable from the camp. The serv
 39. **The server sends every pending notice right after the handshake** (decided with the maintainer during slice 2), in frames of at most `MAX_MANIFEST_ROWS` rows, each with its own `notice_id`, and each ack deletes its frame's rows. An ack naming no frame of the connection, a repeat among them, is ignored. Rejected: one frame at a time behind each ack, slower for a backlog and a position the server tracks per session.
 40. **Erasing a person deletes every notice naming them as author or courier** (decided with the maintainer during slice 2), so nothing of the person stays, at the cost of the author never hearing of entries an erased courier delivered. Rejected: keeping the author's notices with the courier blanked, which needs a nullable courier and an event allowing an unknown one.
 41. **A client raises one `ClientEvent::WritesCouriered` per frame and acks it at once** (decided with the maintainer during slice 2). A connection lost before the ack receives the same rows at the next handshake, so the application may see them twice. Rejected: one event per row. Rejected: acking only after the application confirms it showed them.
+    **Amended (R78 slice 2 review, 2026-11-05, decided with the maintainer).** The connection that raises the event to the application acks. In the browser that is each tab's connection, and the hub's worker connection relays instead of acking. The worker connection is switched to relay with `ConnettoConnection::relay_courier_notices`, keeps every frame it received on its current transport unacked, raises the event with the server's `notice_id`, and acks a frame upstream when `ack_courier_notice` names it, the hub calling it on the first tab's receipt. The hub sends each held frame under the server's id to every tab that handshakes while it is held. A worker connection acking at once loses every notice sent at a page load, since the boot loop pumps it before the hub exists and discards every event but its barrier `Pong`, and loses any frame that reaches the hub with no tab handshaken. Rejected: the worker acking at once and the hub keeping the rows in memory for later tabs, which loses them when the browser closes before a tab handshakes.
 
 ### Design
 
@@ -1353,12 +1354,25 @@ CREATE TABLE _connetto_courier_notices (id BIGSERIAL PRIMARY KEY, user_id TEXT N
 | The connection ends | nothing | the unacked rows stay, sent at the next handshake |
 | The erasure recipe for a person | the rows naming the person as author or courier go (decision 40) | same |
 
-**The author's notices on a client.** The native `ConnettoConnection` and the browser hub alike (decision 35).
+**The author's notices on a client.** Every connection the application drives, native and each browser tab alike (decisions 35 and 41).
 
 | Event | Any state |
 |---|---|
-| `CourierNotice` arrives | raise one `ClientEvent::WritesCouriered` with its rows, the hub relaying it to every tab as it relays other events, and send `CourierNoticeAck` at once (decision 41) |
+| `CourierNotice` arrives | send `CourierNoticeAck` at once, then raise one `ClientEvent::WritesCouriered` with its id and rows (decision 41) |
 | The connection drops before the ack is sent | nothing, the same rows come again at the next handshake and raise the event again |
+
+**The author's notices in the browser hub.** The worker connection relays (decision 41 as amended). Per worker transport, **H0** no frame held, **H1** frames held unacked.
+
+| Event | H0 | H1 |
+|---|---|---|
+| `CourierNotice` arrives, while the boot loop pumps the worker before the hub exists | hold it, enter H1 | hold it |
+| `CourierNotice` arrives, the hub running | hold it, raise the event, the hub sends it under the server's id to every handshaken tab, enter H1 | same, staying H1 |
+| A tab completes its handshake | nothing | the hub sends the tab every held frame, in arrival order |
+| A tab's `CourierNoticeAck` naming a held frame | n/a | ack it upstream, drop it, enter H0 when none is left |
+| A tab's `CourierNoticeAck` naming no held frame, a second tab's among them | absorbed | absorbed |
+| The worker transport drops, or a new transport attaches | nothing | drop every held frame, enter H0, the server resending their rows at the next handshake under new ids |
+| A tab's ack arrives while the worker is offline | absorbed | n/a, the drop emptied the hold |
+| The hub ends | nothing | nothing, the rows stay on the server |
 
 **The courier on the client.** `courier(author)` sends the rows held for the author from the lowest one not known settled to the offer's newest, with every body it holds and exactly that count declared, and settles the answer row by row in one transaction each, `Applied` and `Settled` adjudicating as a verdict does, `Refused` retracting with its cause, `NotCouriered` and `Retry` keeping the row. A range for another author waits until the open range is answered or the session ends.
 
