@@ -1,8 +1,8 @@
 //! What the tabs of a relay hub learn from a courier notice (R78 decision
-//! 41): the worker's connection acks the server's frame at once, the hub
-//! relays the frame's rows to the tab under an id of its own, and the tab's
-//! receipt of the relayed frame is absorbed by the hub rather than going
-//! upstream. Runs in a dedicated worker for the wasm SQLite build.
+//! 41 as amended): the worker's connection holds the server's frame, the hub
+//! relays it under the server's id to every tab that handshakes while it is
+//! held, and the first tab's receipt is the one the worker acks upstream.
+//! Runs in a dedicated worker for the wasm SQLite build.
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
@@ -66,11 +66,37 @@ fn acked(sent: &[ControlMessage]) -> Vec<String> {
         .collect()
 }
 
-/// The worker's connection raises the notice and acks the server's frame at
-/// once, the hub relays the frame's rows to the tab under its own id, and
-/// the tab's receipt of the relayed frame is absorbed by the hub.
+/// Ping the hub from the tab and wait for its answer, so every frame the tab
+/// sent before has been handled.
+async fn barrier(tab: &mut MessageTransport<MessagePort>, nonce: u64) {
+    tab.send_control(ControlMessage::Ping(Ping { nonce }))
+        .await
+        .expect("the tab pings");
+    loop {
+        if let IncomingFrame::Control(ControlMessage::Pong(Pong { nonce: answered })) =
+            next_frame(tab, "answered the ping").await
+            && answered == nonce
+        {
+            return;
+        }
+    }
+}
+
+/// Post the tab's receipt of the frame `notice_id`, as the tab's own
+/// connection does the moment it raises the event.
+async fn receipt(tab: &mut MessageTransport<MessagePort>, notice_id: &str) {
+    tab.send_control(ControlMessage::CourierNoticeAck(CourierNoticeAck {
+        notice_id: notice_id.to_owned(),
+    }))
+    .await
+    .expect("post the tab's receipt");
+}
+
+/// The server's frame reaches the handshaken tab under the server's id, the
+/// worker acks it upstream only on the tab's receipt, and a repeated receipt
+/// sends nothing more.
 #[wasm_bindgen_test]
-async fn a_courier_notice_reaches_the_tab_and_the_receipts_split() {
+async fn the_tabs_receipt_is_the_one_the_worker_acks() {
     let (mut tab, _worker_close, worker_late, worker_sent) = hub_with_tab_live(
         Script::accepting(true),
         Arc::new(Plan::new(vec![])),
@@ -87,43 +113,54 @@ async fn a_courier_notice_reaches_the_tab_and_the_receipts_split() {
         )))
         .expect("hand the worker its notice");
     let notice = next_notice(&mut tab).await;
-    assert_eq!(
-        notice.notices,
-        rows(),
-        "the relayed frame carries the settled rows"
-    );
-    assert_ne!(
-        notice.notice_id, "server-1",
-        "the relayed frame carries the hub's own id"
-    );
-    assert_eq!(
-        acked(&worker_sent.lock()),
-        vec!["server-1".to_owned()],
-        "the worker's receipt quotes the server's id and only it"
-    );
-    // The tab's own receipt of the relayed frame, which the real tab's
-    // connection sends the moment it raises the event.
-    tab.send_control(ControlMessage::CourierNoticeAck(CourierNoticeAck {
-        notice_id: notice.notice_id.clone(),
-    }))
-    .await
-    .expect("post the tab's receipt");
-    // The hub absorbed it, so the tab's channel still stands and the tab can
-    // still talk.
-    tab.send_control(ControlMessage::Ping(Ping { nonce: 1 }))
-        .await
-        .expect("the tab pings");
-    let frame = next_frame(&mut tab, "answered the ping").await;
+    assert_eq!(notice.notice_id, "server-1", "the tab sees the server's id");
+    assert_eq!(notice.notices, rows(), "the relayed frame carries the rows");
     assert!(
-        matches!(
-            frame,
-            IncomingFrame::Control(ControlMessage::Pong(Pong { nonce: 1 }))
-        ),
-        "the tab's channel stands after its receipt, got {frame:?}"
+        acked(&worker_sent.lock()).is_empty(),
+        "the worker holds the frame until a tab acks it"
     );
+    receipt(&mut tab, "server-1").await;
+    barrier(&mut tab, 1).await;
+    assert_eq!(acked(&worker_sent.lock()), ["server-1"]);
+    receipt(&mut tab, "server-1").await;
+    barrier(&mut tab, 2).await;
     assert_eq!(
         acked(&worker_sent.lock()),
-        vec!["server-1".to_owned()],
-        "the tab's receipt never went upstream"
+        ["server-1"],
+        "a repeated receipt names a frame the worker no longer holds"
     );
+}
+
+/// A frame the worker receives before any tab handshakes waits in the
+/// worker, reaches the tab at its handshake, and is acked upstream on the
+/// tab's receipt.
+#[wasm_bindgen_test]
+async fn a_notice_before_the_first_tab_handshake_waits_for_the_tab() {
+    let (mut tab, _worker_close, worker_late, worker_sent) = hub_with_tab_live(
+        Script::accepting(true),
+        Arc::new(Plan::new(vec![])),
+        Arc::new(Waits::new()),
+    )
+    .await;
+    worker_late
+        .send(IncomingFrame::Control(ControlMessage::CourierNotice(
+            CourierNotice {
+                notice_id: "server-early".to_owned(),
+                notices: rows(),
+            },
+        )))
+        .expect("hand the worker its notice");
+    // Long enough for the hub's pump to take the frame with no tab there.
+    connetto_web::workers::sleep(core::time::Duration::from_millis(300)).await;
+    assert!(
+        acked(&worker_sent.lock()).is_empty(),
+        "the worker holds the frame with no tab to ack it"
+    );
+    handshake(&mut tab).await;
+    let notice = next_notice(&mut tab).await;
+    assert_eq!(notice.notice_id, "server-early");
+    assert_eq!(notice.notices, rows());
+    receipt(&mut tab, "server-early").await;
+    barrier(&mut tab, 1).await;
+    assert_eq!(acked(&worker_sent.lock()), ["server-early"]);
 }

@@ -492,6 +492,11 @@ where
     report_boot_progress("signed-in");
     let (spec, mut worker, content_root_key) =
         replica::open_worker(core, &config, resolved, &storage, &key_store).await?;
+    // Before the first connect, since the server sends the account's courier
+    // notices right after the handshake and the boot's own pump discards the
+    // events they raise, so the worker holds them for the tabs (R78 decision
+    // 41 as amended).
+    worker.relay_courier_notices();
     report_boot_progress("replica-opened");
     services::retry_shared_departures(&mut worker).await;
     report_boot_progress("departures-retried");

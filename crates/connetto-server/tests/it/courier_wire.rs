@@ -1476,7 +1476,7 @@ async fn the_real_client_raises_courier_notices_once() {
         matches!(event, connetto_client::ClientEvent::WritesCouriered { .. })
     })
     .await;
-    let connetto_client::ClientEvent::WritesCouriered { notices } = event else {
+    let connetto_client::ClientEvent::WritesCouriered { notices, .. } = event else {
         unreachable!("pump_until returns the matching event");
     };
     assert_eq!(

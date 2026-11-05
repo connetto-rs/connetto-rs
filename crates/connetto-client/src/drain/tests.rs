@@ -601,6 +601,7 @@ async fn the_main_wire_waits_for_the_drain_to_settle_the_older_prefix() {
         challenge: None,
         #[cfg(feature = "device-identity")]
         number: crate::ConnectionNumber(1),
+        held_notices: Vec::new(),
     });
     conn.bound_writer = Some(WriterRef::Number(7));
     assert!(

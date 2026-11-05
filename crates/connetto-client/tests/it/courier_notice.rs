@@ -4,7 +4,10 @@
 //! answer, and the connection answers `CourierNoticeAck` with the frame's id
 //! at once, raising one `WritesCouriered` per frame. The connection holds no
 //! memory of a frame, so a later connection delivering the same rows raises
-//! them again, as the server re-sends them after an unacked drop.
+//! them again, as the server re-sends them after an unacked drop. A
+//! connection that relays the frames, as the browser hub's worker does,
+//! holds each one unacked on its transport until its ack names it (decision
+//! 41 as amended).
 
 use std::time::Duration;
 
@@ -61,7 +64,7 @@ fn written(events: &[ClientEvent]) -> Vec<&[CourierNoticeRow]> {
     events
         .iter()
         .filter_map(|event| match event {
-            ClientEvent::WritesCouriered { notices } => Some(notices.as_slice()),
+            ClientEvent::WritesCouriered { notices, .. } => Some(notices.as_slice()),
             _ => None,
         })
         .collect()
@@ -180,4 +183,69 @@ async fn a_second_connection_hears_the_same_notice_again() {
         vec!["n2".to_owned()],
         "the second receipt quotes its own frame's id"
     );
+}
+
+/// The ids of the frames `conn` holds unacked, in arrival order.
+fn held(conn: &ConnettoConnection<Script>) -> Vec<String> {
+    conn.held_courier_notices()
+        .iter()
+        .map(|notice| notice.notice_id.clone())
+        .collect()
+}
+
+/// A relaying connection raises each frame with the server's id and acks
+/// nothing until its ack names a frame it holds, which goes upstream once,
+/// while an unknown or repeated ack sends nothing.
+#[tokio::test]
+async fn a_relaying_connection_acks_only_the_frame_its_ack_names() {
+    let script = Script::default();
+    script.say(support::handshake_ack());
+    script.say(notice("n1"));
+    script.say(notice("n2"));
+    let mut conn = connected(&script).await;
+    conn.relay_courier_notices();
+    let seen = drawn(&mut conn, 2).await;
+    let ids: Vec<&str> = seen
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::WritesCouriered { notice_id, .. } => Some(notice_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, ["n1", "n2"], "each event carries the server's id");
+    assert!(acked(&script).is_empty(), "nothing is acked on arrival");
+    assert_eq!(held(&conn), ["n1", "n2"]);
+
+    conn.ack_courier_notice("n2").await.expect("ack n2");
+    assert_eq!(acked(&script), ["n2"]);
+    assert_eq!(held(&conn), ["n1"]);
+    conn.ack_courier_notice("n2").await.expect("repeat ack");
+    conn.ack_courier_notice("no such frame")
+        .await
+        .expect("unknown ack");
+    assert_eq!(
+        acked(&script),
+        ["n2"],
+        "a repeat or unknown ack sends nothing"
+    );
+}
+
+/// A relaying connection's held frames go with its transport, since their
+/// ids name that connection's frames alone, and an ack of one afterwards
+/// sends nothing.
+#[tokio::test]
+async fn a_dropped_transport_takes_the_held_frames_with_it() {
+    let script = Script::default();
+    script.say(support::handshake_ack());
+    script.say(notice("n1"));
+    let mut conn = connected(&script).await;
+    conn.relay_courier_notices();
+    drawn(&mut conn, 1).await;
+    assert_eq!(held(&conn), ["n1"]);
+    conn.disconnect();
+    assert!(held(&conn).is_empty(), "the drop takes the held frame");
+    conn.ack_courier_notice("n1")
+        .await
+        .expect("ack after the drop");
+    assert!(acked(&script).is_empty(), "nothing went upstream");
 }
