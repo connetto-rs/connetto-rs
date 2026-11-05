@@ -527,6 +527,7 @@ jobs:
         run: cargo +stable build --profile "$CARGO_TEST_PROFILE" --all-features --bins ${{ matrix.bins }}
 
       - uses: $/.github/actions/pull-test-images
+      - uses: $/.github/actions/native-postgres
 
       # nextest rather than cargo test, matching the local runner: each test
       # gets its own process, which the merged tests/it targets rely on for
@@ -537,7 +538,7 @@ jobs:
           # The offline-exchange proof reads the binary the build step
           # compiled, so the test does not build a server of its own.
           CONNETTO_SERVER_BIN: ${{ matrix.name == 'rest' && format('{0}/target/{1}/connetto-server', github.workspace, github.event_name == 'pull_request' && 'testfast' || 'release') || '' }}
-        run: keyctl session -- cargo +stable nextest run --cargo-profile "$CARGO_TEST_PROFILE" --all-features --test-threads 4 ${{ matrix.packages }}
+        run: keyctl session -- cargo +stable nextest run --profile native --cargo-profile "$CARGO_TEST_PROFILE" --all-features --test-threads 4 ${{ matrix.packages }}
 
       - name: Prune target cache
         if: always()

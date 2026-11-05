@@ -94,6 +94,7 @@ jobs:
       - uses: taiki-e/install-action@nextest
 
       - uses: $/.github/actions/pull-test-images
+      - uses: $/.github/actions/native-postgres
 
       # testfast is release without the fat link: instrumentation on top of
       # lto and one codegen unit more than doubles the build.
@@ -106,7 +107,7 @@ jobs:
             cargo +stable build --profile testfast --all-features -p connetto-server --bin connetto-server
             export CONNETTO_SERVER_BIN="$PWD/target/testfast/connetto-server"
           fi
-          keyctl session -- cargo +stable nextest run \
+          keyctl session -- cargo +stable nextest run --profile native \
             --cargo-profile testfast \
             --all-features \
             --test-threads 4 \
@@ -235,6 +236,7 @@ jobs:
           path: ${{ runner.temp }}/coverage-server
 
       - uses: $/.github/actions/pull-test-images
+      - uses: $/.github/actions/native-postgres
 
       # Extracted into the checkout, where the tests' compiled-in binary
       # paths and the report expect the target directory.
@@ -245,7 +247,7 @@ jobs:
           source <(cargo +stable llvm-cov show-env --sh)
           mkdir -p target/testfast
           install -m 0755 "$SUITE/connetto-client" target/testfast/connetto-client
-          keyctl session -- cargo +stable nextest run \
+          keyctl session -- cargo +stable nextest run --profile native \
             --archive-file "$SUITE/suite.tar.zst" \
             --workspace-remap "$GITHUB_WORKSPACE" \
             --extract-to "$GITHUB_WORKSPACE" \
