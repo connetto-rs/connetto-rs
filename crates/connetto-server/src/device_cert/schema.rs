@@ -819,6 +819,22 @@ macro_rules! connetto_enrolment_tables {
                 Box::pin(async move {
                     use diesel::{ExpressionMethods as _, OptionalExtension as _, QueryDsl};
                     use diesel_async::RunQueryDsl;
+                    // The latest certificate expiry, read as its own `MAX` so the server can arm
+                    // its one timer per open author at that instant plus the tolerance (R77
+                    // decision 11), the instant compared against the database's own `now()` like
+                    // the liveness checks below (chapter 21, class H).
+                    let certificate_expiry: Option<$crate::ban::Instant> =
+                        diesel::QueryDsl::select(
+                            QueryDsl::filter(
+                                connetto_device_certificates::table,
+                                connetto_device_certificates::key_id.eq(
+                                    key.as_bytes().to_vec(),
+                                ),
+                            ),
+                            diesel::dsl::max(connetto_device_certificates::expires_at),
+                        )
+                        .get_result(conn)
+                        .await?;
                     // The enrolment and its certificate live in different tables, so liveness
                     // is its own EXISTS, compared against the database's own `now()` (chapter 21,
                     // class H).
@@ -893,6 +909,8 @@ macro_rules! connetto_enrolment_tables {
                             revoked,
                             certificate_live: live,
                             certificate_live_past_skew: live_past_skew,
+                            certificate_expiry: certificate_expiry
+                                .map(|instant| std::time::SystemTime::from(instant)),
                             public_key,
                         },
                     ))

@@ -1919,15 +1919,16 @@ async fn drain_events<S, C, O>(
     manager: &SessionManager<S, RosterAuth, ConnettoDefaults, C, O>,
     source: &mut PgSqliteEmuSource,
 ) where
-    S: SnapshotSource,
+    S: SnapshotSource + 'static,
     C: AsyncConnector<
             Backend = Postgres,
             Checkpoint = PgCommitPosition,
             AuthContext = ConnettoReadSetup,
         > + Send
-        + Sync,
+        + Sync
+        + 'static,
     C::Error: core::fmt::Display + connetto_server::FailedRead,
-    O: Oplog,
+    O: Oplog + 'static,
 {
     while let Some(item) = source.next_item().await.expect("poll event") {
         let SourceItem::Event(event) = item else {
@@ -3685,7 +3686,7 @@ async fn gated_server(
 
 /// Drive `sql` through the emulator and fan every resulting event out, exactly
 /// as the standing CDC ingestor does.
-async fn drive_cdc<S: SnapshotSource>(
+async fn drive_cdc<S: SnapshotSource + 'static>(
     source: &mut PgSqliteEmuSource,
     manager: &SessionManager<S, RosterAuth, ConnettoDefaults>,
     sql: &str,
@@ -4180,7 +4181,7 @@ fn status_manager<O: Oplog + core::marker::Send + core::marker::Sync + 'static>(
 }
 
 /// Drive one insert through `manager`, whatever oplog it holds.
-async fn drive_insert<O: Oplog>(
+async fn drive_insert<O: Oplog + 'static>(
     source: &mut PgSqliteEmuSource,
     manager: &SessionManager<StatusSnapshot, RosterAuth, ConnettoDefaults, NoConnector, O>,
     sql: &str,
