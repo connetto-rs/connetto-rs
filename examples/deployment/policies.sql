@@ -29,8 +29,34 @@ CREATE POLICY order_lines_p ON order_lines USING (owner_id = current_setting('ap
 -- same way: Postgres splits it with string_to_array, and the replica's
 -- translation turns the whole membership test into a search over the same
 -- string.
+--
+-- A photo posted to a team is visible to every member of the team, the way
+-- the team's notes are, so a member's device in camp can be served it by
+-- another member's. Only its owner writes a photo, and only into a team the
+-- owner belongs to, so a member removed from a team has the photos it posts
+-- there refused.
 ALTER TABLE photos ENABLE ROW LEVEL SECURITY;
-CREATE POLICY photos_p ON photos USING (
+CREATE POLICY photos_read ON photos FOR SELECT USING (
+  owner_id = current_setting('app.user_id', true)
+  OR owner_id = ANY(string_to_array(current_setting('app.subjects', true), ','))
+  OR team_id IN (SELECT team_id FROM team_members WHERE member_id = current_setting('app.user_id', true))
+);
+CREATE POLICY photos_insert ON photos FOR INSERT WITH CHECK (
+  (owner_id = current_setting('app.user_id', true)
+    OR owner_id = ANY(string_to_array(current_setting('app.subjects', true), ',')))
+  AND (team_id IS NULL
+    OR team_id IN (SELECT team_id FROM team_members WHERE member_id = current_setting('app.user_id', true)))
+);
+CREATE POLICY photos_update ON photos FOR UPDATE USING (
+  owner_id = current_setting('app.user_id', true)
+  OR owner_id = ANY(string_to_array(current_setting('app.subjects', true), ','))
+) WITH CHECK (
+  (owner_id = current_setting('app.user_id', true)
+    OR owner_id = ANY(string_to_array(current_setting('app.subjects', true), ',')))
+  AND (team_id IS NULL
+    OR team_id IN (SELECT team_id FROM team_members WHERE member_id = current_setting('app.user_id', true)))
+);
+CREATE POLICY photos_delete ON photos FOR DELETE USING (
   owner_id = current_setting('app.user_id', true)
   OR owner_id = ANY(string_to_array(current_setting('app.subjects', true), ','))
 );
