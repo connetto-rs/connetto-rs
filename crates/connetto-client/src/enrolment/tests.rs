@@ -2525,6 +2525,253 @@ async fn a_granted_renewal_keeps_the_peer_port_and_the_live_link() {
     run.await.expect("the run ends");
 }
 
+/// The off standing closes the live links with the client's close, refuses
+/// the call before a socket, and hands the machine its standing, which the
+/// coming back dials again (R77 slice 8).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn the_off_standing_refuses_the_call_and_closes_the_live_links() {
+    let (key, der) = attesting_key();
+    let now = whole_second();
+    let authority = authority(now).await;
+    let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let peer = peer(&authority);
+    let (far, mut far_events) = far_peer(&authority, positive_serial(9));
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    let (hotspot_tx, mut hotspot_rx) = mpsc::unbounded_channel();
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        Vec::new(),
+        inbox(),
+        peer,
+        hotspot_tx,
+        bluetooth_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| handle.peer_address().is_some()).await;
+    let addr = handle.peer_address().expect("the open bound a listener");
+    assert!(handle.peer_links_on(), "every start begins with links on");
+    // A live peer dials it.
+    far.link(addr).await.expect("the link completes");
+    poll_until(|| reports_linked(&state)).await;
+
+    // The off standing closes the live link with the client's close and
+    // refuses the call before a socket.
+    handle.set_peer_links(false);
+    assert!(
+        !handle.peer_links_on(),
+        "the standing reads off as soon as the switch returns"
+    );
+    poll_until(|| {
+        state.lock().emitted.iter().any(|event| {
+            matches!(
+                event,
+                ClientEvent::PeerUnlinked {
+                    reason: connetto_peer::CloseReason::Closed,
+                    ..
+                }
+            )
+        })
+    })
+    .await;
+    let far_reasons = far_closes(&mut far_events, Duration::from_secs(2)).await;
+    assert!(
+        far_reasons.contains(&connetto_peer::CloseReason::Closed),
+        "the far end sees the client's close, reasons {far_reasons:?}"
+    );
+    let refused = handle.link_peer(addr).await;
+    assert!(
+        matches!(refused, Err(crate::PeerError::LinksOff)),
+        "the call refuses with the standing's refusal"
+    );
+    let command = hotspot_rx
+        .recv()
+        .await
+        .expect("the machine's channel stays");
+    assert!(
+        matches!(command, crate::hotspot::Command::Links { on: false }),
+        "the machine takes the off standing"
+    );
+
+    // The coming back dials again.
+    handle.set_peer_links(true);
+    assert!(
+        handle.peer_links_on(),
+        "the standing reads on as soon as the switch returns"
+    );
+    far.link(addr).await.expect("the link completes again");
+    poll_until(|| {
+        state
+            .lock()
+            .emitted
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::PeerLinked { .. }))
+            .count()
+            >= 2
+    })
+    .await;
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// The off standing survives a renewal's re-serve, refusing on the renewed
+/// listener, and the coming back dials again (R77 slice 8).
+#[cfg(feature = "peer")]
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the stop, the refused renewal, the grant and the resume run in order on one enrolment"
+)]
+async fn the_off_standing_survives_a_renewals_re_serve() {
+    let (key, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    // Aging with a short window, so the look at the expiry plus the
+    // tolerance stops the node 30 s after the open.
+    let held = issue_for(
+        &authority,
+        &key,
+        now + Duration::from_secs(30) - 7 * MINUTE,
+        2 * MINUTE,
+        positive_serial(5),
+    );
+    let deadline = held.leaf.not_after() + DEVICE_SKEW;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    // The open's renewal and the deadline's look are refused, so the stop
+    // holds, and the next connection's renewal is the re-serve's grant.
+    state.lock().script.extend([
+        Ask::Refused(EnrolRefusal::IssuerUnavailable),
+        Ask::Refused(EnrolRefusal::IssuerUnavailable),
+    ]);
+    let (events_tx, _events_rx) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let peer = peer(&authority);
+    let (far, mut far_events) = far_peer(&authority, positive_serial(9));
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events: events_tx.clone(),
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Grant,
+        gate: None,
+        grant_from: None,
+    };
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        Vec::new(),
+        inbox(),
+        peer,
+        hotspot_tx,
+        bluetooth_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| handle.peer_address().is_some()).await;
+    let addr = handle.peer_address().expect("the open bound a listener");
+    far.link(addr).await.expect("the link completes");
+    poll_until(|| reports_linked(&state)).await;
+
+    // The off standing, to keep across the stop and the re-serve.
+    handle.set_peer_links(false);
+    poll_until(|| !handle.peer_links_on()).await;
+    poll_until(|| {
+        state.lock().emitted.iter().any(|event| {
+            matches!(
+                event,
+                ClientEvent::PeerUnlinked {
+                    reason: connetto_peer::CloseReason::Closed,
+                    ..
+                }
+            )
+        })
+    })
+    .await;
+
+    // The look at the expiry plus the tolerance stops the node.
+    tokio::time::sleep(
+        deadline
+            .duration_since(SystemTime::now())
+            .unwrap_or_default()
+            + Duration::from_secs(1),
+    )
+    .await;
+    poll_until(|| handle.peer_address().is_none()).await;
+
+    // The next connection asks again, and the grant re-serves the same node.
+    state.lock().connection += 1;
+    events_tx
+        .send(ClientEvent::SyncStatus(SyncStatus::Connected))
+        .expect("the run listens");
+    poll_until(|| !state.lock().stored.is_empty()).await;
+    poll_until(|| handle.peer_address().is_some()).await;
+    assert!(
+        !handle.peer_links_on(),
+        "the re-serve keeps the off standing"
+    );
+
+    // The renewed listener still refuses, and the call still refuses.
+    let fresh = handle
+        .peer_address()
+        .expect("the re-serve bound a listener");
+    far.link(fresh)
+        .await
+        .expect("the dial registers on its end");
+    let far_reasons = far_closes(&mut far_events, Duration::from_secs(3)).await;
+    assert!(
+        far_reasons.contains(&connetto_peer::CloseReason::Closed),
+        "the renewed listener refuses before it registers, reasons {far_reasons:?}"
+    );
+    let refused = handle.link_peer(fresh).await;
+    assert!(
+        matches!(refused, Err(crate::PeerError::LinksOff)),
+        "the call refuses with the standing's refusal"
+    );
+
+    // The coming back dials again on the renewed listener.
+    handle.set_peer_links(true);
+    poll_until(|| handle.peer_links_on()).await;
+    far.link(fresh).await.expect("the link lands");
+    poll_until(|| {
+        state
+            .lock()
+            .emitted
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::PeerLinked { .. }))
+            .count()
+            >= 2
+    })
+    .await;
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
 /// Holds back the device key's signature over the messages it names until a
 /// test opens it, counting those signatures and failing them as scripted, so
 /// an offer's signature stays in flight or fails while the link's own

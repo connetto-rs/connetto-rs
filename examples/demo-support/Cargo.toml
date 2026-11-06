@@ -56,6 +56,10 @@ native = [
   "dep:manganis",
   "dep:tokio",
 ]
+# A build for the unattended proof runs, its gate off so no launch asks for
+# Face ID, a fingerprint or the passcode. A feature reaches the Rust build
+# Xcode and Gradle run for a Tauri app, which an environment variable does not.
+unattended = ["native"]
 # Device certificates for the native builds. A wasm build never turns it on,
 # since the certificate stack does not build for wasm.
 device-identity = [
@@ -63,8 +67,9 @@ device-identity = [
   "connetto-client/device-identity",
   "connetto-auth-session?/device-identity",
 ]
-# The nearby panel's lines (R76), behind the client's peer feature, since
-# the link, the events and the provenance reads live there.
+# The nearby panel's lines (R76) and the peer-applied rows' provenance lines
+# (R77), behind the client's peer feature, since the link, the events and the
+# provenance reads live there.
 peer = ["client", "connetto-client/peer", "dep:qrcode"]
 # The browser platform, meaning the transport, the leader election, the relay
 # hub and the DB worker, reached through its WebClientBuilder.

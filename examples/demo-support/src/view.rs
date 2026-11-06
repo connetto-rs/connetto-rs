@@ -74,6 +74,87 @@ pub struct AccountEntry {
     pub label: String,
 }
 
+/// The team notes panel's standing (R77).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamView {
+    /// The team the panel reads and writes, the roster's first until the
+    /// user picks another, empty while the roster names none.
+    pub picked: String,
+    /// The teams the account's roster names.
+    pub teams: Vec<String>,
+    /// One `note: <body> by <author>` line per note of the picked team, a
+    /// peer row followed by `(provisional from <account>)`.
+    pub notes: Vec<String>,
+    /// The picked team's members, the roster rows its notes settle against.
+    pub members: Vec<String>,
+    /// One line per applied, confirmed, rolled-back or refused peer write
+    /// and per tidy pass, newest last.
+    pub events: Vec<String>,
+    /// The last note write's outcome, `idle` before the first.
+    pub outcome: String,
+    /// The roster's or the notes' subscription error.
+    pub error: Option<String>,
+    /// Whether this build carries the peer link, which offers the tidy pass.
+    pub peer: bool,
+}
+
+impl TeamView {
+    /// Take the roster's teams, sorted once each, and pick the first while
+    /// the picker stands empty, so a roster landing after the panel shows
+    /// still fills it and a team the user picked stays picked.
+    pub fn set_teams(&mut self, mut teams: Vec<String>) {
+        teams.sort();
+        teams.dedup();
+        if self.picked.is_empty()
+            && let Some(first) = teams.first()
+        {
+            self.picked.clone_from(first);
+        }
+        self.teams = teams;
+    }
+
+    /// `team: <picked>`, or `team: none` while none is picked.
+    #[must_use]
+    pub fn team_line(&self) -> String {
+        team_line(&self.picked)
+    }
+
+    /// `teams: <a>, <b>`, or `teams: none` while the roster is empty.
+    #[must_use]
+    pub fn teams_line(&self) -> String {
+        teams_line(&self.teams)
+    }
+}
+
+/// `team: <team>`, or `team: none` for an empty one.
+#[must_use]
+pub fn team_line(team: &str) -> String {
+    if team.is_empty() {
+        "team: none".to_owned()
+    } else {
+        format!("team: {team}")
+    }
+}
+
+/// `teams: <a>, <b>` in sorted order, or `teams: none` for an empty roster.
+#[must_use]
+pub fn teams_line(teams: &[String]) -> String {
+    let mut sorted = teams.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.is_empty() {
+        "teams: none".to_owned()
+    } else {
+        format!("teams: {}", sorted.join(", "))
+    }
+}
+
+/// `members: <count>`, the picked team's synced roster.
+#[must_use]
+pub fn members_line(members: &[String]) -> String {
+    format!("members: {}", members.len())
+}
+
 #[cfg(feature = "client")]
 impl AccountEntry {
     /// The entry for `key`, labelled with its decoded identity.
@@ -125,6 +206,16 @@ pub struct NearbyView {
     /// Whether this system hosts a hotspot from the app, never on the
     /// Apple devices, which only join (R77 decision 23).
     pub can_host: bool,
+    /// Whether the runtime peer-link switch stands off, so no nearby phone
+    /// links (R77).
+    pub links_off: bool,
+}
+
+/// `links: on`, or `links: off` while the runtime peer-link switch refuses
+/// every nearby link.
+#[must_use]
+pub fn links_line(off: bool) -> &'static str {
+    if off { "links: off" } else { "links: on" }
 }
 
 /// Whether the nearby panel offers its Bluetooth button for the panel's
@@ -230,6 +321,8 @@ pub struct View {
 
     /// The nearby panel, absent in a build without the peer link.
     pub nearby: Option<NearbyView>,
+    /// The team notes panel, absent until a session stands.
+    pub team: Option<TeamView>,
 
     /// Whether this window's tab client attached, the dashboard's gate.
     pub attached: bool,
@@ -348,11 +441,28 @@ pub enum Action {
     JoinNearby,
     /// Leave the joined hotspot.
     LeaveHotspot,
+    /// Switch every nearby link on or off for the running app.
+    SetPeerLinks {
+        /// Whether nearby phones may link.
+        on: bool,
+    },
+    /// Read and write another team.
+    PickTeam {
+        /// The team's id.
+        team: String,
+    },
+    /// Write one note into the picked team.
+    AddTeamNote {
+        /// The note's body.
+        body: String,
+    },
+    /// Run the eviction pass, which spares provisional rows.
+    TidyTeam,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::offers_bluetooth_on;
+    use super::{TeamView, offers_bluetooth_on};
 
     /// The Bluetooth button stands only while the user can turn the radio on
     /// or grant its permission, and goes once Bluetooth is ready.
@@ -362,5 +472,28 @@ mod tests {
         assert!(offers_bluetooth_on("bluetooth: not permitted"));
         assert!(!offers_bluetooth_on("bluetooth: ready"));
         assert!(!offers_bluetooth_on("bluetooth: unsupported"));
+    }
+
+    /// A roster landing after the panel shows picks its first team, sorted,
+    /// which is what shows the note form.
+    #[test]
+    fn a_roster_landing_late_picks_its_first_team() {
+        let mut team = TeamView::default();
+        team.set_teams(Vec::new());
+        assert_eq!(team.team_line(), "team: none");
+        assert_eq!(team.teams_line(), "teams: none");
+        team.set_teams(vec!["T2".to_owned(), "T1".to_owned(), "T2".to_owned()]);
+        assert_eq!(team.picked, "T1");
+        assert_eq!(team.teams_line(), "teams: T1, T2");
+    }
+
+    /// A picked team stands when the roster changes afterwards.
+    #[test]
+    fn a_picked_team_stands_when_the_roster_changes() {
+        let mut team = TeamView::default();
+        team.set_teams(vec!["T1".to_owned()]);
+        team.set_teams(vec!["T0".to_owned(), "T1".to_owned()]);
+        assert_eq!(team.picked, "T1");
+        assert_eq!(team.team_line(), "team: T1");
     }
 }

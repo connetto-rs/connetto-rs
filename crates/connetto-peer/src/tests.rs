@@ -2178,6 +2178,220 @@ async fn a_stopped_node_dials_nobody() {
     no_events(&mut b_rx, Duration::from_millis(500)).await;
 }
 
+/// The off standing refuses a node's dials before their sockets, and a dial
+/// lands once the standing comes back (R77 slice 8).
+#[tokio::test]
+async fn a_node_with_its_links_off_dials_nobody() {
+    let now = whole_second();
+    let deployment = Deployment::new(19, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alpha = deployment.device(
+        &issuer,
+        "alpha",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let beta = deployment.device(
+        &issuer,
+        "beta",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (a_tx, _a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    serve(&a, &alpha);
+    let b_addr = serve(&b, &beta);
+
+    assert!(a.peer_links_on(), "a fresh node stands its links on");
+    a.set_peer_links(false);
+    assert!(
+        matches!(a.link(b_addr).await, Err(LinkError::LinksOff)),
+        "the off standing refuses the dial"
+    );
+    no_events(&mut b_rx, Duration::from_millis(500)).await;
+
+    a.set_peer_links(true);
+    assert_eq!(
+        a.link(b_addr).await.expect("the link lands"),
+        beta.identity,
+        "the coming back dials again"
+    );
+    a.stop(CloseReason::Closed);
+    b.stop(CloseReason::Closed);
+}
+
+/// The off standing refuses an incoming link before it registers, the
+/// dialer seeing the close, and a dial lands once the standing comes back
+/// (R77 slice 8).
+#[tokio::test]
+async fn a_node_with_its_links_off_refuses_incoming_links() {
+    let now = whole_second();
+    let deployment = Deployment::new(20, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alpha = deployment.device(
+        &issuer,
+        "alpha",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let beta = deployment.device(
+        &issuer,
+        "beta",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (a_tx, mut a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    let a_addr = serve(&a, &alpha);
+    serve(&b, &beta);
+
+    a.set_peer_links(false);
+    // The dial registers on its own end, and the refusal shows as the
+    // dropped stream.
+    let identity = b.link(a_addr).await.expect("the dial registers on its end");
+    assert_eq!(
+        identity, alpha.identity,
+        "the dial answers the served identity"
+    );
+    let event = await_event(&mut b_rx, Duration::from_secs(10), |event| {
+        matches!(
+            event,
+            PeerEvent::Unlinked {
+                reason: CloseReason::Closed,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Unlinked {
+            peer: alpha.identity.clone(),
+            reason: CloseReason::Closed
+        }
+    );
+    // Alpha refused before it registered, so it reports nothing of the link.
+    no_events(&mut a_rx, Duration::from_millis(500)).await;
+
+    a.set_peer_links(true);
+    assert_eq!(
+        b.link(a_addr).await.expect("the link lands"),
+        alpha.identity,
+        "the coming back accepts again"
+    );
+    a.stop(CloseReason::Closed);
+    b.stop(CloseReason::Closed);
+}
+
+/// Closing a node's links with its own close keeps the listener serving, so
+/// a dial lands on the kept port (R77 slice 8).
+#[tokio::test]
+async fn closing_a_node_s_links_keeps_its_listener_serving() {
+    let now = whole_second();
+    let deployment = Deployment::new(21, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alpha = deployment.device(
+        &issuer,
+        "alpha",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let beta = deployment.device(
+        &issuer,
+        "beta",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (a_tx, mut a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    let a_addr = serve(&a, &alpha);
+    serve(&b, &beta);
+
+    let identity = b.link(a_addr).await.expect("the link lands");
+    assert_eq!(identity, alpha.identity);
+    assert!(matches!(
+        await_event(&mut a_rx, Duration::from_secs(10), |event| {
+            matches!(
+                event,
+                PeerEvent::Linked { peer, .. } if peer == &beta.identity
+            )
+        })
+        .await,
+        PeerEvent::Linked { .. }
+    ));
+    assert!(matches!(
+        await_event(&mut b_rx, Duration::from_secs(10), |event| {
+            matches!(
+                event,
+                PeerEvent::Linked { peer, .. } if peer == &alpha.identity
+            )
+        })
+        .await,
+        PeerEvent::Linked { .. }
+    ));
+    a.close_links(CloseReason::Closed);
+    let event = await_event(&mut a_rx, Duration::from_secs(10), |event| {
+        matches!(
+            event,
+            PeerEvent::Unlinked {
+                reason: CloseReason::Closed,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Unlinked {
+            peer: beta.identity.clone(),
+            reason: CloseReason::Closed
+        }
+    );
+    let event = await_event(&mut b_rx, Duration::from_secs(10), |event| {
+        matches!(
+            event,
+            PeerEvent::Unlinked {
+                reason: CloseReason::Closed,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Unlinked {
+            peer: alpha.identity.clone(),
+            reason: CloseReason::Closed
+        }
+    );
+
+    // The listener kept the port, so a dial lands again.
+    assert_eq!(
+        b.link(a_addr).await.expect("the link lands again"),
+        alpha.identity
+    );
+    a.stop(CloseReason::Closed);
+    b.stop(CloseReason::Closed);
+}
+
 /// A prep that records every dial target it prepares.
 struct RecordingPrep {
     targets: Arc<Mutex<Vec<SocketAddr>>>,

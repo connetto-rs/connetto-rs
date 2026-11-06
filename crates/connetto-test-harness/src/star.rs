@@ -185,8 +185,8 @@ pub struct StepReport {
     pub outcome: Result<(), String>,
 }
 
-/// One round's steps: its two joins in join order, its three-way link and
-/// its restore.
+/// One round's steps: its two joins in join order, its three-way link, the
+/// R77 phase where the round walks it, and its restore.
 pub struct RoundReport {
     /// The round the steps walked.
     pub round: Round,
@@ -194,8 +194,21 @@ pub struct RoundReport {
     pub joins: [StepReport; 2],
     /// The three-way link's check, every device naming the other two.
     pub link: StepReport,
+    /// The R77 phase, which walks over the round's standing link.
+    pub r77: Option<StepReport>,
     /// The round's restore: the hotspot down and the devices back at rest.
     pub restore: StepReport,
+}
+
+impl RoundReport {
+    /// The round's steps in the order they ran.
+    pub fn steps(&self) -> impl Iterator<Item = &StepReport> {
+        self.joins
+            .iter()
+            .chain([&self.link])
+            .chain(&self.r77)
+            .chain([&self.restore])
+    }
 }
 
 /// The three-way link's matrix, which device's page named which other device
@@ -289,10 +302,146 @@ fn hotspot_links(page: &str, gateway: Option<Ipv4Addr>) -> impl Iterator<Item = 
     })
 }
 
+/// One R77 provisional line the demo's team notes panel stands, read off a
+/// page dump the way the `linked:` lines are read (R77 slice 8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProvisionalLine {
+    /// A peer entry's row applied, the author's account as the provenance names it.
+    Applied {
+        /// The table the row sits in, as the application names it.
+        table: String,
+        /// The row's key, the panel's spelling.
+        key: String,
+        /// The author's account.
+        account: String,
+    },
+    /// A server write confirmed the row, its provenance cleared.
+    Confirmed {
+        /// The table the row sits in.
+        table: String,
+        /// The row's key.
+        key: String,
+    },
+    /// A retraction rolled the row back, with the cause the retraction named.
+    RolledBack {
+        /// The table the row sits in.
+        table: String,
+        /// The row's key.
+        key: String,
+        /// The cause the panel says, the refused entry by the server's reason.
+        cause: String,
+    },
+    /// The receiver's policies refused the entry as the author.
+    Refused {
+        /// The table the entry named.
+        table: String,
+        /// The entry's key.
+        key: String,
+    },
+}
+
+/// One `provisional:` line as the panel stands it, `None` where the line is not
+/// one. The table and the key are single tokens, the applied line's account the
+/// field's last token, and the rolled-back line's cause everything after `because`.
+fn parse_provisional_line(line: &str) -> Option<ProvisionalLine> {
+    let table_key = |fields: &str| -> Option<(String, String)> {
+        let mut parts = fields.split(' ');
+        let table = parts.next()?;
+        let key = parts.next()?;
+        (parts.next().is_none() && !table.is_empty() && !key.is_empty())
+            .then(|| (table.to_string(), key.to_string()))
+    };
+    let rest = line.trim().strip_prefix("provisional: ")?;
+    if let Some(rest) = rest.strip_prefix("applied ") {
+        let (fields, account) = rest.rsplit_once(" by ")?;
+        let (table, key) = table_key(fields)?;
+        return Some(ProvisionalLine::Applied {
+            table,
+            key,
+            account: account.to_owned(),
+        });
+    }
+    if let Some(rest) = rest.strip_prefix("confirmed ") {
+        return table_key(rest).map(|(table, key)| ProvisionalLine::Confirmed { table, key });
+    }
+    if let Some(rest) = rest.strip_prefix("rolled back ") {
+        let (fields, cause) = rest.rsplit_once(" because ")?;
+        let (table, key) = table_key(fields)?;
+        return Some(ProvisionalLine::RolledBack {
+            table,
+            key,
+            cause: cause.to_owned(),
+        });
+    }
+    rest.strip_prefix("refused ")
+        .and_then(table_key)
+        .map(|(table, key)| ProvisionalLine::Refused { table, key })
+}
+
+/// The provisional lines a page dump carries, in page order, beside the
+/// `linked:` lines the matrix reads.
+#[must_use]
+pub fn provisional_lines(page: &str) -> Vec<ProvisionalLine> {
+    page.lines().filter_map(parse_provisional_line).collect()
+}
+
+/// One team-note line the panel stands, the note's body and author and, where
+/// the row is a peer-applied entry awaiting a verdict, the account the
+/// provenance names it from (R77 slice 8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteLine {
+    /// The note's body, as written.
+    pub body: String,
+    /// The author's id, as the note's row names it.
+    pub author: String,
+    /// The account a provisional peer write stands from, absent for the
+    /// phone's own note and for settled rows.
+    pub provisional_from: Option<String>,
+}
+
+/// Parse one `note:` line the panel stands, `None` where the line is not one.
+/// The author is the line's last field, the body everything before it, and the
+/// provisional account the last field inside the trailing mark.
+fn parse_note_line(line: &str) -> Option<NoteLine> {
+    let rest = line.trim().strip_prefix("note: ")?;
+    let (rest, provisional_from) = match rest.strip_suffix(')') {
+        Some(inner) => match inner.rsplit_once(" (provisional from ") {
+            Some((body_author, account)) => (body_author.to_owned(), Some(account.to_owned())),
+            None => (rest.to_owned(), None),
+        },
+        None => (rest.to_owned(), None),
+    };
+    let (body, author) = rest.rsplit_once(" by ")?;
+    (!body.is_empty() && !author.is_empty()).then(|| NoteLine {
+        body: body.to_owned(),
+        author: author.to_owned(),
+        provisional_from,
+    })
+}
+
+/// The team-note lines a page dump carries, in page order.
+#[must_use]
+pub fn note_lines(page: &str) -> Vec<NoteLine> {
+    page.lines().filter_map(parse_note_line).collect()
+}
+
+/// The count the page's last `tidy:` line reports, the provisional rows the
+/// eviction pass kept, `None` where the page stands no tidy line. The content
+/// pane's `content tidy:` lines are no match, since they do not start with
+/// `tidy:`.
+#[must_use]
+pub fn tidy_remaining(page: &str) -> Option<usize> {
+    page.lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("tidy: ")?.trim().split(' ').next())
+        .and_then(|count| count.parse().ok())
+}
+
 /// The run's one-line step results, excluding private page dumps from errors.
+/// A run that skipped the single-phone proof names it as not run.
 pub fn summary(
     commit: &str,
-    (proof_took, proof): &(Duration, Result<(), String>),
+    proof: Option<&(Duration, Result<(), String>)>,
     rounds: &[RoundReport],
 ) -> String {
     let line = |name: &str, took: Duration, outcome: &Result<(), String>| match outcome {
@@ -304,17 +453,12 @@ pub fn summary(
         ),
     };
     let mut text = format!("commit: {commit}\n");
-    text += &line("single-phone proof", *proof_took, proof);
-    for round in rounds {
-        for report in &round.joins {
-            text += &line(&report.name, report.took, &report.outcome);
-        }
-        text += &line(&round.link.name, round.link.took, &round.link.outcome);
-        text += &line(
-            &round.restore.name,
-            round.restore.took,
-            &round.restore.outcome,
-        );
+    text += &match proof {
+        Some((took, outcome)) => line("single-phone proof", *took, outcome),
+        None => "single-phone proof: not run\n".to_owned(),
+    };
+    for step in rounds.iter().flat_map(RoundReport::steps) {
+        text += &line(&step.name, step.took, &step.outcome);
     }
     text
 }
@@ -325,8 +469,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Device, Join, LinkMatrix, Round, RoundReport, StarError, StepReport, hotspot_gateway,
-        names_hotspot_link, plan, summary, tailscale_holds_vpn,
+        Device, Join, LinkMatrix, NoteLine, ProvisionalLine, Round, RoundReport, StarError,
+        StepReport, hotspot_gateway, names_hotspot_link, note_lines, plan, provisional_lines,
+        summary, tailscale_holds_vpn, tidy_remaining,
     };
 
     /// The M52's VPN agent line, trimmed to the fields the read uses.
@@ -345,7 +490,11 @@ mod tests {
     #[test]
     fn the_summary_excludes_private_page_contents_from_errors() {
         let page_error = "the peer never linked\nhotspot passphrase: private-network-key\nhotspot payload: WIFI:T:WPA;P:private-network-key;;";
-        let text = summary("source", &(Duration::ZERO, Err(page_error.to_owned())), &[]);
+        let text = summary(
+            "source",
+            Some(&(Duration::ZERO, Err(page_error.to_owned()))),
+            &[],
+        );
         assert!(text.contains("the peer never linked"));
         assert!(!text.contains("private-network-key"));
         assert!(!text.contains("WIFI:"));
@@ -489,6 +638,10 @@ mod tests {
                 step(&format!("{} round, {second}", round.name()), fail.clone()),
             ],
             link: step(&format!("{} round, the three-way link", round.name()), fail),
+            r77: Some(step(
+                &format!("{} round, the R77 phase", round.name()),
+                Err("the R77 step never held".to_owned()),
+            )),
             restore: step(&format!("{} round, the restore", round.name()), Ok(())),
         }
     }
@@ -498,7 +651,7 @@ mod tests {
     #[test]
     fn the_summary_names_every_step_and_why_a_step_failed() {
         let rounds = [round(Round::AndroidHosts)];
-        let text = summary("abc123", &(Duration::from_secs(60), Ok(())), &rounds);
+        let text = summary("abc123", Some(&(Duration::from_secs(60), Ok(()))), &rounds);
         for line in [
             "commit: abc123",
             "single-phone proof: passed in 60s",
@@ -506,6 +659,7 @@ mod tests {
             "android-hosts round, the ipad joins by the beacon: failed in 7s: the ipad never named the android as linked",
             "android-hosts round, the three-way link: failed in 7s: the ipad never named the android as linked",
             "android-hosts round, the restore: passed in 7s",
+            "android-hosts round, the R77 phase: failed in 7s: the R77 step never held",
         ] {
             assert!(text.contains(line), "the summary lacks {line}:\n{text}");
         }
@@ -531,5 +685,133 @@ mod tests {
             tailscale_holds_vpn(&ownerless, TAILSCALE_PACKAGE),
             Err(StarError::VpnWithoutOwner)
         ));
+    }
+
+    const NOTE_KEY: &str = "9f1c8001-855d-4b1e-9c2f-73a16b0d4e5a";
+
+    /// The page dump the star walk reads, the peer lines and the panel's lines
+    /// beside the rest of the page.
+    fn team_page() -> String {
+        format!(
+            "peer: listening on 4431 as alice/01234567\n\
+             linked: bob/89abcdef via 10.42.0.7:4432\n\
+             team: camp\n\
+             teams: camp\n\
+             note: head to the ridge by bob (provisional from bob@demo.dev)\n\
+             note: pack the rope by alice\n\
+             provisional: applied team_notes {NOTE_KEY} by bob@demo.dev\n\
+             provisional: confirmed team_notes {NOTE_KEY}\n\
+             provisional: rolled back team_notes {NOTE_KEY} because unauthorized\n\
+             provisional: refused team_notes {NOTE_KEY}\n\
+             tidy: 2 provisional row(s) remain\n"
+        )
+    }
+
+    /// Each R77 line stands its table, key and, where the line carries one,
+    /// its account or cause.
+    #[test]
+    fn each_provisional_line_stands_its_fields() {
+        let lines = provisional_lines(&team_page());
+        assert_eq!(lines.len(), 4);
+        assert_eq!(
+            lines,
+            vec![
+                ProvisionalLine::Applied {
+                    table: "team_notes".to_owned(),
+                    key: NOTE_KEY.to_owned(),
+                    account: "bob@demo.dev".to_owned(),
+                },
+                ProvisionalLine::Confirmed {
+                    table: "team_notes".to_owned(),
+                    key: NOTE_KEY.to_owned(),
+                },
+                ProvisionalLine::RolledBack {
+                    table: "team_notes".to_owned(),
+                    key: NOTE_KEY.to_owned(),
+                    cause: "unauthorized".to_owned(),
+                },
+                ProvisionalLine::Refused {
+                    table: "team_notes".to_owned(),
+                    key: NOTE_KEY.to_owned(),
+                },
+            ]
+        );
+    }
+
+    /// The page's other lines stand no provisional line, and a cause with
+    /// words of its own stays whole.
+    #[test]
+    fn no_other_line_parses_and_the_cause_keeps_its_words() {
+        let page = [
+            "linked: bob/89abcdef via 10.42.0.7:4432",
+            "note: provisional: applied team_notes x by bob",
+            "provisional: applied team_notes",
+            "provisional: applied team_notes a b by bob",
+            "provisional: confirmed team_notes",
+            "provisional: refused",
+            "provisional: rolled back team_notes k",
+            &format!(
+                "provisional: rolled back team_notes {NOTE_KEY} \
+                 because two devices settled different changes at the sequence"
+            ),
+        ]
+        .join("\n");
+        let lines = provisional_lines(&page);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines,
+            vec![ProvisionalLine::RolledBack {
+                table: "team_notes".to_owned(),
+                key: NOTE_KEY.to_owned(),
+                cause: "two devices settled different changes at the sequence".to_owned(),
+            }]
+        );
+    }
+
+    /// The last `tidy:` line counts, the content pane's tidy lines do not.
+    #[test]
+    fn the_last_tidy_line_counts_and_the_content_line_does_not() {
+        let page = [
+            "content tidy: 1 file(s) evicted",
+            "tidy: 2 provisional row(s) remain",
+            "tidy: 0 provisional row(s) remain",
+        ]
+        .join("\n");
+        assert_eq!(tidy_remaining(&page), Some(0));
+        assert_eq!(tidy_remaining("content tidy: 3 file(s) evicted\n"), None);
+        assert_eq!(tidy_remaining(&team_page()), Some(2));
+    }
+
+    /// Each team-note line stands its body, its author and, where the row is a
+    /// peer-applied entry, the account it stands from, and a body with `by` in
+    /// it keeps the author as the line's last field.
+    #[test]
+    fn each_note_line_stands_its_fields() {
+        let lines = note_lines(&team_page());
+        assert_eq!(
+            lines,
+            vec![
+                NoteLine {
+                    body: "head to the ridge".to_owned(),
+                    author: "bob".to_owned(),
+                    provisional_from: Some("bob@demo.dev".to_owned()),
+                },
+                NoteLine {
+                    body: "pack the rope".to_owned(),
+                    author: "alice".to_owned(),
+                    provisional_from: None,
+                },
+            ]
+        );
+        let page = "note: the rope by the gate by alice (provisional from alice@demo.dev)\n\
+             linked: bob/89abcdef via 10.42.0.7:4432";
+        assert_eq!(
+            note_lines(page),
+            vec![NoteLine {
+                body: "the rope by the gate".to_owned(),
+                author: "alice".to_owned(),
+                provisional_from: Some("alice@demo.dev".to_owned()),
+            }]
+        );
     }
 }

@@ -103,13 +103,16 @@ mobile = ["dioxus/mobile", "connetto-demo-support/native"]
 # Enrols this device under the deployment root `CONNETTO_DEMO_BUILD_DEVICE_ROOT`
 # names at build time, which `connetto-demo-stack` mints (R74 decision 30).
 device-identity = ["connetto-demo-support/device-identity"]
-# The peer link and the hotspot it hosts and joins (R76): the device identity
-# the link proves with, and the demo's peer panel, which stands on the
-# shared nearby lines.
+# The peer link and the hotspot it hosts and joins (R76), with the team notes
+# panel's provenance lines (R77): the device identity the link proves with,
+# and the demo's peer panel.
 peer = [
   "connetto-client/peer",
   "connetto-demo-support/peer",
 ]
+# The build the unattended proof runs drive, its gate off and its secrets
+# under their own keyring service.
+unattended = ["connetto-demo-support/unattended"]
 # The end-to-end fixture the native proof runs, on the targets that carry it;
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The provisioning documents the native proof applies to its own Postgres.

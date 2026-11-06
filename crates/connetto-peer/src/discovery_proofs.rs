@@ -15,6 +15,7 @@ use connetto_core::device_cert::{AttestationLevel, DeviceIdentity};
 use tokio::sync::mpsc;
 use tokio::time;
 
+use crate::CloseReason;
 use crate::Discovery;
 use crate::DiscoveryEvent;
 use crate::Fingerprint;
@@ -486,6 +487,64 @@ async fn a_platform_dns_sd_service_serves_in_place_of_mdns() {
     );
     s.discovery.stop();
     await_calls(&s.calls, &[registered, Call::Unregister]).await;
+}
+
+/// The off standing reports and tracks a found peer without dialing it, and
+/// the coming on dials it at once (R77 slice 8).
+#[tokio::test]
+async fn an_off_standing_reports_without_dialing_and_dials_at_the_resume() {
+    let (deployment, alice, bob) = pair(whole_second());
+    let (a_tx, _a_rx) = events();
+    let alice_node = node(deployment.root_der(), a_tx);
+    let a_addr = serve(&alice_node, &alice);
+    let (b_tx, mut b_rx) = events();
+    let bob_node = node(deployment.root_der(), b_tx);
+    let b_addr = serve(&bob_node, &bob);
+    let alice_fp = Fingerprint::of(&alice.leaf);
+    let bob_fp = Fingerprint::of(&bob.leaf);
+
+    let (sinks_tx, mut sinks) = mpsc::unbounded_channel();
+    let service = ScriptedDnsSd {
+        sinks: sinks_tx,
+        calls: Arc::default(),
+        refused_opens: parking_lot::Mutex::new(0),
+        refuse_register: false,
+    };
+    let (found_tx, mut found) = mpsc::unbounded_channel();
+    let discovery =
+        Discovery::new(alice_node.clone(), true, found_tx).with_dns_sd(Arc::new(service));
+    discovery.serve(a_addr.port(), alice_fp);
+    let mut sink = next_sink(&mut sinks).await;
+
+    // The standing goes off before the find, so the browse dials nothing.
+    alice_node.set_peer_links(false);
+    discovery.set_peer_links(false);
+    time::sleep(Duration::from_millis(100)).await;
+    sink(resolved(bob_fp, b_addr));
+    assert_eq!(
+        next_found(&mut found).await,
+        DiscoveryEvent::Found {
+            address: b_addr,
+            fingerprint: bob_fp,
+        },
+        "the found peer reports"
+    );
+    time::sleep(Duration::from_secs(1)).await;
+    while let Ok(event) = b_rx.try_recv() {
+        assert!(
+            !matches!(event, PeerEvent::Linked { .. }),
+            "the off standing dials nothing"
+        );
+    }
+
+    // The coming on dials the found peer at once.
+    alice_node.set_peer_links(true);
+    discovery.set_peer_links(true);
+    await_linked(&mut b_rx, &alice.identity).await;
+
+    discovery.stop();
+    alice_node.stop(CloseReason::Closed);
+    bob_node.stop(CloseReason::Closed);
 }
 
 /// A fault the service survives leaves the browse reporting.

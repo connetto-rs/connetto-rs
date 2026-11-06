@@ -593,6 +593,10 @@ pub enum PeerError {
     /// The local clock puts the device's certificate outside its window.
     #[error("the device clock is outside the certificate window")]
     ClockOutsideWindow,
+    /// The device's peer links are off, so the dial is refused before a
+    /// socket (R77 slice 8).
+    #[error("the device's peer links are off")]
+    LinksOff,
     /// The dial failed.
     #[error(transparent)]
     Link(#[from] LinkError),
