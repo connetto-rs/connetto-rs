@@ -64,6 +64,8 @@ pub mod stack;
 pub mod standby;
 pub mod star;
 
+mod container_slot;
+pub use container_slot::{CONTAINER_SLOTS, ContainerSlot, container_slot};
 mod native;
 use native::NativeCluster;
 pub use native::{POSTGRES_BIN_VAR, POSTGRES_TEMPLATE_VAR};
@@ -951,8 +953,11 @@ pub struct Fixture {
 
 /// What keeps a fixture's Postgres alive.
 enum Cluster {
-    /// A container, the target of [`Fixture::shell`].
-    Container(Box<ContainerAsync<GenericImage>>),
+    /// A container, the target of [`Fixture::shell`], dropped before the slot that admitted it.
+    Container {
+        container: Box<ContainerAsync<GenericImage>>,
+        _slot: ContainerSlot,
+    },
     /// A cluster started as plain processes, see [`native::POSTGRES_BIN_VAR`].
     Native { _guard: NativeCluster },
     /// A cluster something else started and keeps running.
@@ -1041,6 +1046,7 @@ impl Fixture {
             );
             return Self::on_native(&programs, shared_counter_scope, exclusive_counter_scope).await;
         }
+        let slot = container_slot().await;
         sweep_abandoned_containers();
         let mut image = GenericImage::new(POSTGRES_IMAGE, POSTGRES_TAG)
             .with_exposed_port(POSTGRES_PORT.tcp())
@@ -1073,7 +1079,10 @@ impl Fixture {
         let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
         Self::provisioned(
             admin_url,
-            Cluster::Container(Box::new(postgres)),
+            Cluster::Container {
+                container: Box::new(postgres),
+                _slot: slot,
+            },
             spare_url,
             OnceCell::new(),
             shared_counter_scope,
@@ -1135,7 +1144,11 @@ impl Fixture {
     /// exec cannot start, or when the script exits nonzero, printing the
     /// script's standard error.
     pub async fn shell(&self, script: &str) -> String {
-        let Cluster::Container(postgres) = &self.postgres else {
+        let Cluster::Container {
+            container: postgres,
+            ..
+        } = &self.postgres
+        else {
             panic!("a shell needs the fixture's own container");
         };
         let mut run = postgres

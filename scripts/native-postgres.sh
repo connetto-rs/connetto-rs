@@ -4,7 +4,7 @@
 # it, which go to GITHUB_ENV when it is set and to standard output otherwise.
 #
 #   eval "$(scripts/native-postgres.sh DIR [BIN])"
-#   cargo nextest run --profile native --cargo-profile testfast --all-features
+#   cargo nextest run --cargo-profile testfast --all-features
 #
 # BIN holds PostgreSQL 16's initdb and pg_ctl, matching the postgres:16 image.
 set -euo pipefail
