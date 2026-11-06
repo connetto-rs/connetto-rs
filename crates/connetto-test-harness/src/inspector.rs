@@ -572,6 +572,44 @@ mod tests {
         }
     }
 
+    /// The switch clicks the one button naming the signed-in line's short
+    /// identity, and a line naming none is refused before any click.
+    #[tokio::test]
+    async fn the_switch_clicks_the_button_naming_the_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let script = request["params"]["expression"].as_str().unwrap_or_default();
+                // One button starts with the asked prefix, any other finds none.
+                let found = if script.contains("\"Switch to d5e24135\"") {
+                    serde_json::Value::Bool(true)
+                } else {
+                    serde_json::json!(0)
+                };
+                let answer = serde_json::json!({
+                    "id": request["id"],
+                    "result": { "result": { "value": found } },
+                });
+                socket
+                    .send(Message::Text(answer.to_string()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut page = PageSession::devtools(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        page.switch_to_account("Signed in as d5e24135 (alice)")
+            .await
+            .unwrap();
+        let error = page.switch_to_account("Signed in as ").await.unwrap_err();
+        assert!(error.to_string().contains("names no identity"), "{error:#}");
+    }
+
     /// A line is found by its prefix among the page's trimmed lines, and a
     /// page without one names what it shows.
     #[tokio::test]

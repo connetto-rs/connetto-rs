@@ -56,14 +56,23 @@ pub async fn decode_profile(profile: &Path) -> Result<String> {
 ///
 /// When the folder holds no profile of that name, naming the ones it does.
 pub async fn profile_named(name: &str) -> Result<PathBuf> {
-    let folder = profile_folder()?;
-    let mut entries = tokio::fs::read_dir(&folder)
+    find_profile(&profile_folder()?, name, decode_profile).await
+}
+
+/// The profile in `folder` whose decoded `Name` is `name`, skipping a file
+/// `decode` refuses.
+async fn find_profile(
+    folder: &Path,
+    name: &str,
+    decode: impl AsyncFn(&Path) -> Result<String>,
+) -> Result<PathBuf> {
+    let mut entries = tokio::fs::read_dir(folder)
         .await
         .with_context(|| format!("listing {}", folder.display()))?;
     let mut held = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        let Ok(plist) = decode_profile(&path).await else {
+        let Ok(plist) = decode(&path).await else {
             continue;
         };
         match profile_name(&plist) {
@@ -168,4 +177,76 @@ fn home() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME is unset")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use anyhow::{Result, bail};
+
+    use super::{DIOXUS_PROFILE, TAURI_PROFILE, find_profile};
+
+    /// A decoded profile carrying `name`.
+    fn plist(name: &str) -> String {
+        format!("<plist><dict><key>Name</key><string>{name}</string></dict></plist>")
+    }
+
+    /// Read a file as its decoded profile, refusing one named `*.broken` as
+    /// `security` refuses a damaged profile.
+    async fn read(path: &Path) -> Result<String> {
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "broken")
+        {
+            bail!("not a profile");
+        }
+        Ok(tokio::fs::read_to_string(path).await?)
+    }
+
+    /// The profile carrying the asked name is found among others, past a
+    /// file that does not decode and one that holds no name.
+    #[tokio::test]
+    async fn the_profile_with_the_asked_name_is_found() {
+        let folder = tempfile::tempdir().expect("a folder");
+        std::fs::write(folder.path().join("a.broken"), plist(TAURI_PROFILE)).expect("write");
+        std::fs::write(folder.path().join("b.mobileprovision"), "<plist/>").expect("write");
+        std::fs::write(
+            folder.path().join("c.mobileprovision"),
+            plist(DIOXUS_PROFILE),
+        )
+        .expect("write");
+        std::fs::write(
+            folder.path().join("d.mobileprovision"),
+            plist(TAURI_PROFILE),
+        )
+        .expect("write");
+        let found = find_profile(folder.path(), TAURI_PROFILE, read)
+            .await
+            .expect("the profile");
+        assert_eq!(found, folder.path().join("d.mobileprovision"));
+    }
+
+    /// A missing profile names the profiles the folder does hold, or says it
+    /// holds none.
+    #[tokio::test]
+    async fn a_missing_profile_names_what_the_folder_holds() {
+        let folder = tempfile::tempdir().expect("a folder");
+        let empty = find_profile(folder.path(), TAURI_PROFILE, read)
+            .await
+            .expect_err("no profile");
+        assert!(
+            empty.to_string().contains("nothing of a profile's shape"),
+            "{empty:#}"
+        );
+        std::fs::write(
+            folder.path().join("c.mobileprovision"),
+            plist(DIOXUS_PROFILE),
+        )
+        .expect("write");
+        let other = find_profile(folder.path(), TAURI_PROFILE, read)
+            .await
+            .expect_err("no profile");
+        assert!(other.to_string().contains(DIOXUS_PROFILE), "{other:#}");
+    }
 }
