@@ -7,12 +7,17 @@ pub(crate) struct OneEvent(pub(crate) Option<PgChangeEvent>);
 impl CdcSource for OneEvent {
     type Commit = PgCommit;
     type Event = PgChangeEvent;
+    type Relation = core::convert::Infallible;
     type Error = std::io::Error;
 
     fn next_item(
         &mut self,
-    ) -> impl Future<Output = Result<Option<SourceItem<PgChangeEvent, PgCommit>>, std::io::Error>> + Send
-    {
+    ) -> impl Future<
+        Output = Result<
+            Option<SourceItem<PgChangeEvent, PgCommit, core::convert::Infallible>>,
+            std::io::Error,
+        >,
+    > + Send {
         let next = self.0.take();
         async move { Ok(next.map(SourceItem::Event)) }
     }

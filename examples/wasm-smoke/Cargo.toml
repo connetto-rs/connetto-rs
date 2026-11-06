@@ -3,7 +3,7 @@ name = "connetto-wasm-smoke"
 description = "Browser smoke for the connetto client on wasm32: a web_sys WebSocket transport and a dedicated worker test driving the full sync loop against a real connetto-server."
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "MIT"
 publish = false
 
@@ -64,7 +64,7 @@ wasm-bindgen-test = "0.3"
 serde_json = "1"
 # The full-resync parity test hand-builds snapshot patchsets to feed a fake
 # upstream through the relay hub, the same native encoding the wire carries.
-sqlite-diff-rs = { version = "0.18", default-features = false }
+sqlite-diff-rs = { version = "0.19", default-features = false }
 connetto-file-client = { path = "../../crates/connetto-file-client" }
 zstd = "0.13"
 

@@ -225,11 +225,7 @@ async fn a_poisoned_computed_read_ends_alone_without_a_retry() {
             source
                 .execute_sql("INSERT INTO counts (id, n) VALUES (10, 10)")
                 .expect("seed emu");
-            source
-                .next_item()
-                .await
-                .expect("drain emu")
-                .expect("insert event");
+            source.drain().expect("drain emu");
 
             // Deleting the tracked extreme forces a re-execution, which now
             // fails because column n is gone from Postgres.
@@ -419,10 +415,7 @@ async fn a_listed_code_raised_for_real_pauses_and_resumes_delivery() {
     let mut emu = PgSqliteEmuSource::open_in_memory(GATED_DDL).expect("open emu source");
     emu.execute_sql("INSERT INTO gated (id, n) VALUES (10, 10)")
         .expect("seed emu");
-    emu.next_item()
-        .await
-        .expect("drain emu")
-        .expect("insert event");
+    emu.drain().expect("drain emu");
     emu.execute_sql("DELETE FROM gated WHERE id = 10")
         .expect("stage delete");
     let mut delete = None;
@@ -509,11 +502,7 @@ async fn a_poisoned_read_neither_refolds_the_event_nor_loses_a_sibling_answer() 
     source
         .execute_sql("INSERT INTO counts VALUES (10, 10, 10)")
         .expect("stage the deleted row");
-    source
-        .next_item()
-        .await
-        .expect("drain emu")
-        .expect("insert event");
+    source.drain().expect("drain emu");
     source
         .execute_sql("DELETE FROM counts WHERE id = 10")
         .expect("delete the extreme");
@@ -572,11 +561,7 @@ async fn a_transient_read_pause_folds_the_held_event_once() {
     source
         .execute_sql("INSERT INTO counts VALUES (1, 1)")
         .expect("stage the deleted row");
-    source
-        .next_item()
-        .await
-        .expect("drain emu")
-        .expect("insert event");
+    source.drain().expect("drain emu");
     source
         .execute_sql("DELETE FROM counts WHERE id = 1")
         .expect("delete the extreme");
@@ -728,11 +713,7 @@ async fn a_codeless_computed_read_retries_once_then_refuses_alone() {
     source
         .execute_sql("INSERT INTO mins (id, n) VALUES (1, 1.0)")
         .expect("seed emu");
-    source
-        .next_item()
-        .await
-        .expect("drain emu")
-        .expect("insert event");
+    source.drain().expect("drain emu");
     source
         .execute_sql("DELETE FROM mins WHERE id = 1")
         .expect("stage delete");
@@ -788,11 +769,7 @@ async fn a_codeless_computed_read_retries_once_then_refuses_alone() {
     second
         .execute_sql("INSERT INTO counts (id, n) VALUES (10, 10)")
         .expect("seed emu");
-    second
-        .next_item()
-        .await
-        .expect("drain emu")
-        .expect("insert event");
+    second.drain().expect("drain emu");
     second
         .execute_sql("DELETE FROM counts WHERE id = 10")
         .expect("stage delete");

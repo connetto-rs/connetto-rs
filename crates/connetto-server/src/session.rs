@@ -4049,6 +4049,9 @@ where
                     // A row is acknowledged with its commit, since acknowledging it alone moves nothing.
                     self.resume.set(Some(event.position()));
                 }
+                // A relation message states a table's definition, which the
+                // ingest loop has no use for, its rows arriving as events.
+                Ok(Some(SourceItem::Relation(_))) => {}
                 Ok(None) => return Ok(()),
                 Err(err) => return Err(SessionError::Transport(err.to_string())),
             }
