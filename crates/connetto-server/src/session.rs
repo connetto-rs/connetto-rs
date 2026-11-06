@@ -9354,7 +9354,6 @@ where
         transport
             .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                 sub_id: sub.sub_id.clone(),
-                priority: sub.spec.priority,
             }))
             .await
             .map_err(transport_err)?;

@@ -10,19 +10,16 @@ A subscription is a standing query. The client says which rows it wants and asks
 - A **spec**, [`connetto_core::messages::SubscriptionSpec`], the query the client wants to observe.
 - A **resume cursor**, [`connetto_core::cursor::Cursor`], opaque bytes the server issues and the client stores as-is and returns verbatim in its next `Handshake`.
 
-The shipped spec carries three fields.
+The shipped spec carries two fields.
 
 ```text
 SubscriptionSpec {
-  priority: SubscriptionPriority,  // 0 to 3, 0 highest, 1 the default
   query:    String,                // full SELECT in the client's SQLite dialect
   binds:    Vec<BindValue>,        // values for the ? placeholders, in order
 }
 ```
 
 The `query` is a full `SELECT`, and the filter rides in its `WHERE` clause as SQL text. `subql` parses that text and rejects anything it cannot compile at registration. The supported comparison set is `=`, `!=`, `<`, `>`, `IN`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `AND`, `OR`, `NOT`, and arithmetic. A custom predicate tree is the alternative a reader would propose, and it was rejected because the language is owned by `subql` and a second AST connetto maintains would have to grow in lockstep with it. Column projection rides inside the `SELECT` as well. A subscription may name a subset of a table's columns, and the server widens it to whole rows before registration and before the snapshot reads, because the replica holds the application's whole table and `subql` reports no change that touches only a column the list leaves out.
-
-The `priority` field travels on the wire and is echoed by `SnapshotBegin`, and it schedules nothing. Snapshots are delivered serially in message-arrival order. [G12](../../plans/master-implementation-plan.md#g12) records the gap.
 
 A subscription selects from one table. A join as an output shape is composed locally from several subscriptions over the tables it reads. A join as a membership predicate, deciding which rows of a second table the client should hold because of a relationship to rows it already holds, is answered by row-level security and by the [membership term](#the-membership-term) below.
 
@@ -38,7 +35,7 @@ On any failure, before or after registration, the server answers one `NonFatalEr
 
 ### Snapshot delivery
 
-After registration the server delivers an initial snapshot. `SnapshotBegin { sub_id, priority }` opens it, the rows travel as one or more `SnapshotPatch` bulk frames, each carrying `sub_id` and a Zstd-compressed SQLite patchset, and `SnapshotEnd { sub_id, cursor }` completes it. The `priority` in `SnapshotBegin` is informational and matches the value registered in the spec.
+After registration the server delivers an initial snapshot, one subscription at a time in the order the subscriptions arrived. `SnapshotBegin { sub_id }` opens it, the rows travel as one or more `SnapshotPatch` bulk frames, each carrying `sub_id` and a Zstd-compressed SQLite patchset, and `SnapshotEnd { sub_id, cursor }` completes it.
 
 The completion frame is not free of the rows it completes. It shares the session's outbound queue with the patches and costs no credit, so a backlogged client cannot record the resume position over an empty replica and skip the rows it never had.
 

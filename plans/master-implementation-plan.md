@@ -208,12 +208,6 @@ Taken by [R108](#r108-caller-kinds-as-database-roles), which has both translator
 
 A diverging note from `rls2fga` for a policy translated to no access is an upstream request.
 
-### G12
-
-**Snapshot priority is not scheduled.** `SubscriptionPriority` travels on the wire and the server delivers snapshots in arrival order.
-
-Decided. `SubscriptionPriority` leaves the wire with a `PROTOCOL_VERSION` bump, in one pull request.
-
 ### G17
 
 **A snapshot source's cursor contract is unverified.** The resume cursor is opaque to the client, so the client cannot compare two of them, and a stale but non-empty snapshot cursor would regress the resume point. The Postgres source returns the watermark of the commit its read sat at, which is `page_cursor` in [snapshot.rs](../crates/connetto-server/src/snapshot.rs), so production is safe, but no test pins that contract across sources. A regressed cursor widens the catchup or forces a resync.

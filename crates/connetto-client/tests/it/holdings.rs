@@ -11,7 +11,7 @@ use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, LivePatch,
     MembershipOpened, MutationApplied, MutationReject, MutationRejectReason, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority, SubscriptionSpec, WriterGrant,
+    SnapshotEnd, SnapshotPatch, SubscriptionSpec, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
@@ -284,7 +284,6 @@ impl Session {
         self.control(
             ControlMessage::SnapshotBegin(SnapshotBegin {
                 sub_id: sub_id.to_owned(),
-                priority: SubscriptionPriority::default(),
             }),
             "the snapshot's begin",
             |event| matches!(event, ClientEvent::SnapshotBegin { .. }),
@@ -1038,7 +1037,6 @@ async fn a_replacement_whose_pass_cannot_delete_fails_its_end() {
     s.control(
         ControlMessage::SnapshotBegin(SnapshotBegin {
             sub_id: "a".to_owned(),
-            priority: SubscriptionPriority::default(),
         }),
         "the replacement's begin",
         |event| matches!(event, ClientEvent::SnapshotBegin { .. }),

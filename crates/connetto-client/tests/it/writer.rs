@@ -2483,7 +2483,7 @@ fn split_pending_writers(source: &mut ConnettoConnection<Wire>) {
 async fn resync_and_archive_preserve_a_number_insert_followed_by_a_device_delete() {
     use connetto_client::{ExportScope, ImportChoices};
     use connetto_core::messages::{
-        FullResyncReason, FullResyncRequired, SnapshotBegin, SnapshotEnd, SubscriptionPriority,
+        FullResyncReason, FullResyncRequired, SnapshotBegin, SnapshotEnd,
     };
 
     let dir = tempdir().expect("source directory");
@@ -2514,7 +2514,6 @@ async fn resync_and_archive_preserve_a_number_insert_followed_by_a_device_delete
         })),
         IncomingFrame::Control(ControlMessage::SnapshotBegin(SnapshotBegin {
             sub_id: "ordered".to_owned(),
-            priority: SubscriptionPriority::default(),
         })),
         IncomingFrame::Control(ControlMessage::SnapshotEnd(SnapshotEnd {
             sub_id: "ordered".to_owned(),

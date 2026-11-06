@@ -9,7 +9,7 @@ A catalogue of every component the system has, by area, so nothing that must exi
 | `ControlMessage` and `BulkMessage` | The two wire enums, one per plane. Control carries the typed frames, bulk carries the Zstd-compressed payloads. [`connetto_core::messages::ControlMessage`] and [`connetto_core::messages::BulkMessage`], shared by both sides |
 | `MutationHeader` and `MutationPatch` | A client-originated write, split across the two planes. The control frame carries the writer, the sequence and the provenance, the bulk frame the compressed patchset |
 | `ChangeRecord` | The server-side record of one committed change. The table, the primary-key bytes, the row event, and the patch built once for the consumers, in [`connetto_server::oplog::ChangeRecord`] |
-| `SubscriptionSpec` | How a client declares what it wants. The predicate, its parameters, the subscription id, and a delivery priority |
+| `SubscriptionSpec` | How a client declares what it wants. The query and its bound parameters, sent under a client-chosen subscription id |
 | `SchemaVersion` | The hash of the translated schema bundle. The server advertises it in the handshake and the client compares it with the one its build baked |
 | Core traits | [`connetto_core::traits::Transport`] and [`connetto_core::traits::Store`] (the local SQLite), the seams the rest of the system plugs into, beside the credential and key storage traits in the same module. Authorization is not one of them. Visibility goes through `subql`'s seam |
 
