@@ -870,3 +870,50 @@ async fn an_import_keeps_the_later_certificate_end() {
     );
     assert_eq!(expiry_of(&mut r3, b"author-a"), 4_000_000_000);
 }
+
+/// R78 decision 20: an archived held entry that names no state, an origin
+/// that does not decode, a body its state forbids or a
+/// body its digest does not name refuses the import whole, and a held entry
+/// whose digest is not a hash refuses the export.
+#[tokio::test]
+async fn a_malformed_held_entry_refuses_the_archive() {
+    let [body] = captured(PLAIN_DDL, [&|conn| insert_order(conn, 1, "peer-anna", "a")]).await;
+    let anna = author("author-a", "peer-anna", Some("*"));
+    for corruption in [
+        "UPDATE _connetto_peer_entry SET state = 9",
+        "UPDATE _connetto_peer_entry SET origin = x'c1'",
+        "UPDATE _connetto_peer_entry SET state = 2",
+        "UPDATE _connetto_peer_entry SET state = 1, changeset = NULL",
+        "UPDATE _connetto_peer_entry SET state = 1, digest = zeroblob(32)",
+    ] {
+        let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
+        store_raw_entry(&mut r1, &anna, 1, 1, &body);
+        diesel::connection::SimpleConnection::batch_execute(r1.conn(), corruption)
+            .expect("corrupt the entry");
+        let bytes = export(&mut r1, ExportScope::Unsynced);
+        let (mut r2, _) = receiver(POLICY_SCHEMA, POLICIES).await;
+        let plan = r2
+            .import_local_data(std::io::Cursor::new(&bytes))
+            .expect("plan the import");
+        assert!(
+            matches!(
+                r2.apply_import(&plan, &ImportChoices::keeping_the_file()),
+                Err(connetto_client::ClientError::Import(_))
+            ),
+            "{corruption} refuses the import"
+        );
+        assert_eq!(held_entries(&mut r2), Vec::new(), "nothing of it lands");
+    }
+
+    let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
+    store_raw_entry(&mut r1, &anna, 1, 1, &body);
+    diesel::connection::SimpleConnection::batch_execute(
+        r1.conn(),
+        "UPDATE _connetto_peer_entry SET digest = zeroblob(31)",
+    )
+    .expect("corrupt the digest");
+    assert!(matches!(
+        r1.export_local_data(ExportScope::Unsynced, Vec::new()),
+        Err(connetto_client::ClientError::Session(_))
+    ));
+}
