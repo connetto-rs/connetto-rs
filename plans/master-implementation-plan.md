@@ -171,18 +171,6 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 
 Defects and unowned risks with no phase yet. Each states what the code does and why it matters. A phase that takes one links it and the entry goes when the phase lands.
 
-### G1
-
-**Handshake liveness ignores the idle deadline.** `session_is_live` checks only `revoked` and the absolute deadline, in [`InMemoryAuthStore`](../crates/connetto-server/src/authn/store.rs) and in `live_session` in [schema.rs](../crates/connetto-server/src/authn/schema.rs), while the refresh path checks both. A session past its idle window passes the handshake until its access token expires.
-
-Fixed in one pull request with [G2](#g2), by checking the idle deadline in both stores, proven by a session past its idle window refused at the handshake.
-
-### G2
-
-**The refresh lock map is never pruned.** `AuthService::refresh_locks` in [service.rs](../crates/connetto-server/src/authn/service.rs) gains an entry per session that ever refreshed and keeps it for the life of the process.
-
-Fixed with [G1](#g1), by holding the locks weakly and pruning dead entries on insert.
-
 ### G3
 
 **Browser tabs do not receive membership rows.** The relay in [relay.rs](../crates/connetto-web/src/relay.rs) neither forwards `MembershipOpened` nor opens tab-level membership subscriptions, so a tab reading through a membership-shaped policy sees empty results.

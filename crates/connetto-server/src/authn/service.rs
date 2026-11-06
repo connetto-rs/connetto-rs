@@ -9,7 +9,7 @@
 //! time-valid, and it signs the resume blob a caller with no identity presents.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use connetto_core::SessionId;
@@ -92,6 +92,33 @@ pub enum AuthError {
     BanList(String),
 }
 
+/// One async lock per session that callers currently hold, so a map entry
+/// lives only while some caller holds its lock and the map stays as small as
+/// the refreshes in flight.
+#[derive(Default)]
+struct SessionLocks(parking_lot::Mutex<HashMap<SessionId, Weak<AsyncMutex<()>>>>);
+
+impl SessionLocks {
+    /// The lock of `session_id`, shared with every caller still holding it.
+    ///
+    /// A new lock drops the entries of sessions nobody holds a lock for.
+    fn lock_for(&self, session_id: SessionId) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.0.lock();
+        if let Some(held) = locks.get(&session_id).and_then(Weak::upgrade) {
+            return held;
+        }
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(session_id, Arc::downgrade(&lock));
+        lock
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().len()
+    }
+}
+
 /// Mints and rotates connetto tokens over an [`AuthStore`].
 ///
 /// Generic over the store so the concrete choice (in-memory or database) is
@@ -105,7 +132,7 @@ pub struct AuthService<S: AuthStore> {
     /// Per-session async locks serializing retained-token refreshes so two
     /// concurrent callers on one node cannot double-refresh and trip the
     /// provider's rotation-reuse defense.
-    refresh_locks: Mutex<HashMap<SessionId, Arc<AsyncMutex<()>>>>,
+    refresh_locks: SessionLocks,
     /// Observer fired after a session is revoked, set once at startup. The
     /// deployment points it at the session manager so revocation closes the
     /// session's live connection rather than only refusing its next handshake.
@@ -182,7 +209,7 @@ impl<S: AuthStore> AuthService<S> {
             authority,
             store,
             registry: None,
-            refresh_locks: Mutex::new(HashMap::new()),
+            refresh_locks: SessionLocks::default(),
             revocation_hook: std::sync::OnceLock::new(),
             audit_hook: std::sync::OnceLock::new(),
             sign_in_hook: std::sync::OnceLock::new(),
@@ -389,22 +416,11 @@ impl<S: AuthStore> AuthService<S> {
     /// # Errors
     ///
     /// [`AuthError`] if the store or the provider refresh fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `refresh_locks` mutex is poisoned by a thread that panicked while holding it.
     pub async fn provider_access_token(
         &self,
         session_id: SessionId,
     ) -> Result<Option<String>, AuthError> {
-        let lock = {
-            let mut locks = self.refresh_locks.lock().expect("refresh locks");
-            Arc::clone(
-                locks
-                    .entry(session_id)
-                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
-            )
-        };
+        let lock = self.refresh_locks.lock_for(session_id);
         let _guard = lock.lock().await;
 
         let Some(retained) = self.store.retained_provider_token(session_id).await? else {
@@ -817,5 +833,25 @@ where
         self.authority
             .verify_resume(blob)
             .map_err(|err| HandleError(err.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Callers on one session share its lock while any of them holds it, and a
+    /// session nobody holds a lock for leaves the map at the next insert.
+    #[test]
+    fn a_session_lock_is_shared_while_held_and_pruned_once_released() {
+        let locks = SessionLocks::default();
+        let first = SessionId::from_uuid(uuid::Uuid::from_u128(1));
+        let held = locks.lock_for(first);
+        assert!(Arc::ptr_eq(&held, &locks.lock_for(first)));
+        drop(held);
+
+        let second = SessionId::from_uuid(uuid::Uuid::from_u128(2));
+        let _held = locks.lock_for(second);
+        assert_eq!(locks.len(), 1, "the released session's entry is gone");
     }
 }
