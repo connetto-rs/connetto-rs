@@ -83,7 +83,7 @@ jobs:
       - name: Install keyring helpers
         run: |
           sudo apt-get update
-          sudo apt-get install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
 
       # --all-features turns on connetto-dioxus's desktop feature.
       - name: Install desktop dependencies
@@ -176,7 +176,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libdbus-1-dev pkg-config
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
@@ -225,7 +225,7 @@ jobs:
       - name: Install keyring helpers
         run: |
           sudo apt-get update
-          sudo apt-get install -y keyutils dbus gnome-keyring
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
