@@ -574,7 +574,7 @@ async fn prove(
     target.record(&mut app, evidence, "offline-write").await?;
 
     step("upload on reconnect");
-    relay.resume().await?;
+    relay.resume().await;
     app.wait_for_outcome(
         "applied",
         &[
