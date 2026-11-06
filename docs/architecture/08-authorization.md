@@ -85,6 +85,10 @@ The facts behind the authorization store are read on the owner pool instead, bec
 
 The server also refuses to start when row-level security would filter the owner pool. Postgres applies a table's policies to its owner under `FORCE ROW LEVEL SECURITY`, so an owner pool connected that way would read the facts, the move-out withdrawals and the bot registry short and lose rows without an error. The preflight artifact `ReadInFull` asks Postgres's own `row_security_active` for every table the policies read and every synced table, as the owner pool's role, and a filtered table refuses the boot naming itself.
 
+A policy whose `TO` clause names a role other than `PUBLIC` refuses the boot with [`connetto_server::openfga::SetupError::RoleScopedPolicy`], naming the policy, its table and the roles. Every caller runs as the reader role, so neither the model nor the client copy can tell which callers such a policy serves. Every startup refusal, this one and the replica translation's included, runs before the server first writes the authorization store, so a refused deployment leaves the store as it found it. `a_role_scoped_policy_refuses_before_the_authorization_store` and `a_replica_refusal_comes_before_the_authorization_store` in [`builder_coverage.rs`](../../crates/connetto-server/tests/it/builder_coverage.rs) assert both.
+
+A translation note that leaves the boot running is logged at `warn`, with the policy, table, role or function it is about as `subject`, when it asks something of the operator or names a principal the rules do not reach, such as a role with `BYPASSRLS`. The note asking every check to carry a parameter is left out, because connetto supplies that parameter itself. `a_note_that_does_not_refuse_is_logged_for_the_operator` in [`openfga_live.rs`](../../crates/connetto-server/tests/it/openfga_live.rs) asserts it.
+
 ### At change time
 
 For each candidate subscription, authorization is checked against both versions of the row, and the pair decides what is delivered.

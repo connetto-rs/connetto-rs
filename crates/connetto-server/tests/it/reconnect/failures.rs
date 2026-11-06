@@ -230,12 +230,14 @@ async fn shared_wave_truncate_replaces_only_the_affected_table() {
         source
             .execute_sql("DELETE FROM orders WHERE id = 2")
             .expect("delete marker row");
-        let marker = source
-            .next_item()
-            .await
-            .expect("read marker")
-            .and_then(SourceItem::into_event)
-            .expect("marker event");
+        let mut marker = None;
+        while marker.is_none() {
+            let Some(item) = source.next_item().await.expect("read marker") else {
+                break;
+            };
+            marker = item.into_event();
+        }
+        let marker = marker.expect("marker event");
         let truncate = PgChangeEvent::new(
             ChangeEvent::truncate(vec![Arc::from("orders")], false, false, Lsn::new(1)),
             marker.checkpoint().expect("truncate position"),

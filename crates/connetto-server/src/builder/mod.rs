@@ -1728,7 +1728,11 @@ where
                 .map(Arc::new)
             })
             .transpose()?;
-        let write_side = build_write_side::<D>(
+        // The write side is the first to write the authorization service, so
+        // every check that can refuse the deployment runs before it.
+        preflight::require(&pool, &[Artifact::Table(crate::epoch::EPOCH_TABLE)]).await?;
+        // Boxed, since it carries every translation across the store writes.
+        let write_side = Box::pin(build_write_side::<D>(
             Pools {
                 owner: pool.clone(),
                 reader: reader.pool,
@@ -1739,7 +1743,7 @@ where
             second_opinion,
             writable,
             engine_connector,
-        )
+        ))
         .await?;
         let feed = Feed {
             database_url: database.owner_url,
@@ -1749,8 +1753,6 @@ where
         };
         let file_router = reader.file_router;
         let sweep = reader.sweep;
-        // Move-out withdrawals read on the owner pool, where the membership that ended no longer hides the rows (R27 decision 6).
-        let withdrawals = PgSnapshotSource::from_ddl(pool.clone(), &feed.pg_ddl)?;
         let manager = ManagerBuilder::new(
             write_side.materializer,
             reader.snapshot,
@@ -1769,7 +1771,7 @@ where
         )
         .with_upkeep(write_side.upkeep)
         .with_signer(reader.signer)
-        .with_withdrawal_source(withdrawals)
+        .with_withdrawal_source(write_side.withdrawals)
         .with_bot_registry(pg_bot_registry::<D>(pool.clone()));
         let manager = match write_side.second {
             Some(second) => manager.with_second_opinion(Arc::new(second)),
@@ -2246,19 +2248,13 @@ fn require_one_numbering(model: &ParserDB, engine_ddl: &str) -> Result<(), Build
     Ok(())
 }
 
-/// The change path's executor, the deployment's policies translated, the
-/// rules put on the authorization service, and the facts behind them filled
-/// if they are new.
-///
-/// Two clients over one endpoint, questions through [`Counted`] which is
-/// where the counter lives and the setup calls outside it.
-async fn build_authorization<D: ConnettoSchema>(
+/// The deployment's policies translated, and every table they and the synced
+/// tables read checked on the owner pool, with nothing written yet.
+async fn translate_authorization<D: ConnettoSchema>(
     owner_pool: &PgPool,
-    facts: &FactSource,
     schema: &ServerSchema,
     publication: &str,
-    openfga: &OpenFga,
-) -> Result<(ServerAuth<D::Id>, Translator, GrantReach), BuildError> {
+) -> Result<Translated, BuildError> {
     let translated = Translated::of::<String, RegistryIds<D>>(
         &schema.pg_ddl,
         &schema.pg_policies,
@@ -2283,7 +2279,20 @@ async fn build_authorization<D: ConnettoSchema>(
     read_in_full.dedup();
     required.extend(read_in_full.iter().map(|table| Artifact::ReadInFull(table)));
     preflight::require(owner_pool, &required).await?;
+    Ok(translated)
+}
 
+/// The change path's executor, the rules put on the authorization service,
+/// and the facts behind them filled if they are new.
+///
+/// The first write to the service, so every refusal runs before this.
+/// Two clients over one endpoint, questions through [`Counted`] which is
+/// where the counter lives and the setup calls outside it.
+async fn install_authorization<D: ConnettoSchema>(
+    translated: Translated,
+    facts: &FactSource,
+    openfga: &OpenFga,
+) -> Result<(ServerAuth<D::Id>, Translator, GrantReach), BuildError> {
     let channel = openfga.endpoint()?.connect().await.map_err(|err| {
         BuildError::AuthorizationEndpoint(format!(
             "connecting to the authorization service at {}: {err}",
@@ -2337,6 +2346,10 @@ async fn build_authorization<D: ConnettoSchema>(
 /// The manager's write side, the authorization model installed, the
 /// materializer, the second opinion when asked, the upkeep and the write
 /// target.
+///
+/// Everything that can refuse the deployment is built before the
+/// authorization service is written, so a refused deployment leaves its
+/// store as it found it.
 async fn build_write_side<D: ConnettoSchema>(
     pools: Pools,
     schema: &ServerSchema,
@@ -2346,15 +2359,12 @@ async fn build_write_side<D: ConnettoSchema>(
     writable: RuntimeWritableCatalog,
     engine_connector: PgReadConnector,
 ) -> Result<WriteSide<D>, BuildError> {
-    let facts = FactSource::owner(pools.owner.clone());
-    let (auth, translator, reach) =
-        build_authorization::<D>(&pools.owner, &facts, schema, publication, openfga).await?;
-    // The engine and the upkeep each classify membership against the deployment's policies, so each takes a translator.
-    let upkeep_translator = translator.clone();
+    let translated = translate_authorization::<D>(&pools.owner, schema, publication).await?;
     let catalog = schema.catalog::<RegistryIds<D>>()?;
+    // The engine and the upkeep each classify membership against the deployment's policies, so each takes a translator.
     let materializer = Materializer::builder(&catalog)
         .with_write_catalog(writable)
-        .with_translator(translator)
+        .with_translator(translated.translator().clone())
         .with_caller(caller_mapping())
         .with_read_connector(engine_connector)
         .build()?;
@@ -2370,19 +2380,25 @@ async fn build_write_side<D: ConnettoSchema>(
     } else {
         None
     };
-    let upkeep = auth.upkeep(reach, upkeep_translator, facts);
     let write = pg_write_target::<D>(pools.reader, &schema.engine_ddl::<RegistryIds<D>>())?;
+    // Move-out withdrawals read on the owner pool, where the membership that ended no longer hides the rows (R27 decision 6).
+    let withdrawals =
+        PgSnapshotSource::from_ddl(pools.owner.clone(), &schema.engine_ddl::<RegistryIds<D>>())?;
     // A changed policy makes an existing replica stale, so a client holding one is told through the advertised version.
     let bundle = connetto_schema::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
         &schema.pg_ddl,
         &schema.pg_policies,
     )?;
+    let facts = FactSource::owner(pools.owner);
+    let (auth, translator, reach) = install_authorization::<D>(translated, &facts, openfga).await?;
+    let upkeep = auth.upkeep(reach, translator, facts);
     Ok(WriteSide {
         auth,
         materializer,
         second,
         upkeep,
         write,
+        withdrawals,
         version: bundle.version(),
         major: bundle.major(),
     })
@@ -2490,7 +2506,6 @@ async fn wire_manager<D: ConnettoSchema>(
         });
     }));
     // A restore rewinds the session store with the rows, so the cluster and the slot settle before any route is returned (R70 decisions 5 and 10).
-    preflight::require(pool, &[Artifact::Table(crate::epoch::EPOCH_TABLE)]).await?;
     let check = manager
         .check_before_stream(&feed.database_url, pool, &feed.slot)
         .await?;
@@ -2532,14 +2547,15 @@ struct Routes {
 }
 
 /// The manager's write side, the change-path executor, the materializer, the
-/// second opinion when asked, the upkeep, the write target and the schema
-/// version the sessions advertise.
+/// second opinion when asked, the upkeep, the write target, the withdrawal
+/// source and the schema version the sessions advertise.
 struct WriteSide<D: ConnettoSchema> {
     auth: ServerAuth<D::Id>,
     materializer: Materializer<ParserDB, RuntimeWritableCatalog, PgReadConnector>,
     second: Option<RlsAuth<D::Id, String>>,
     upkeep: Arc<dyn crate::openfga::StoreUpkeep>,
     write: PgWriteTarget<D>,
+    withdrawals: PgSnapshotSource,
     version: SchemaVersion,
     major: Major,
 }

@@ -23,6 +23,7 @@ use connetto_server::builder::{
     ServerBuilder, ServerParts, ServerSchema, StoreSpec, TokenKeys,
 };
 use connetto_server::device_cert::DeviceCertConfig;
+use connetto_server::openfga::SetupError;
 use connetto_server::portability::DataRequester;
 use connetto_server::{
     AbuseLimits, AuthConfig, ConnectionLimits, OidcProviderConfig, OplogConfig, PersonLimits,
@@ -37,6 +38,8 @@ use diesel::{ExpressionMethods, QueryDsl, QueryableByName};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl as _};
 use futures_util::{SinkExt as _, StreamExt as _};
+use openfga_client::client::{OpenFgaServiceClient, ReadAuthorizationModelsRequest, ReadRequest};
+use openfga_client::tonic::transport::Channel;
 use openidconnect::reqwest;
 use serde_json::json;
 use tempfile::TempDir;
@@ -1882,6 +1885,119 @@ async fn a_second_boot_reconciles_the_installed_model() {
     http.abort();
 }
 
+/// How many authorization models and how many facts `store` holds.
+async fn store_contents(channel: Channel, store: &str) -> (usize, usize) {
+    let mut client = OpenFgaServiceClient::new(channel);
+    let models = client
+        .read_authorization_models(ReadAuthorizationModelsRequest {
+            store_id: store.to_owned(),
+            page_size: Some(1),
+            continuation_token: String::new(),
+        })
+        .await
+        .expect("read the models")
+        .into_inner()
+        .authorization_models
+        .len();
+    let facts = client
+        .read(ReadRequest {
+            store_id: store.to_owned(),
+            page_size: Some(1),
+            ..ReadRequest::default()
+        })
+        .await
+        .expect("read the facts")
+        .into_inner()
+        .tuples
+        .len();
+    (models, facts)
+}
+
+/// The build over the seeded `owned` table with `policies` as its policy
+/// document, against a store of its own, and that store's contents after it.
+async fn build_owned_with(policies: &str) -> (Result<ServerParts, BuildError>, (usize, usize)) {
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    let idp = MockOauth::start().await;
+    let (channel, store) = fixture.fga_store().await;
+    let user_id =
+        connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "e2e-user").to_string();
+    seed_owned_rls(&pool, &user_id).await;
+    fixture.start_replication(&["owned"]).await;
+    fixture.provision_auth_tables().await;
+    let fga_url = fixture.fga_url().await.to_owned();
+    let builder = builder_schema(
+        &fixture,
+        0,
+        &idp,
+        (&fga_url, &store),
+        OWNED_PG_DDL,
+        policies,
+        "owned",
+    );
+    let built = Box::pin(builder.build()).await;
+    (built, store_contents(channel, &store).await)
+}
+
+/// A policy scoped to a role refuses the build naming the policy, its table
+/// and the role, before the authorization store holds a model or a fact.
+#[tokio::test]
+async fn a_role_scoped_policy_refuses_before_the_authorization_store() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let policies = format!(
+        "{OWNED_POLICIES}\nCREATE ROLE support_staff;\n\
+         CREATE POLICY owned_staff ON owned FOR SELECT TO support_staff USING (true);"
+    );
+    let (built, contents) = build_owned_with(&policies).await;
+    let err = refused(built, "a role-scoped policy refuses");
+    match &err {
+        BuildError::Authorization(SetupError::RoleScopedPolicy {
+            policy,
+            table,
+            roles,
+        }) => {
+            assert_eq!(policy, "owned_staff");
+            assert_eq!(table, "owned");
+            assert_eq!(roles, "support_staff");
+        }
+        other => panic!("the build answered {other:?}"),
+    }
+    assert!(
+        !err.to_string().contains("with_session_user_role"),
+        "the refusal names nothing a deployment author cannot act on: {err}"
+    );
+    assert_eq!(
+        contents,
+        (0, 0),
+        "the refused build wrote nothing to the store"
+    );
+}
+
+/// A policy only the replica translation refuses, a read policy reading its
+/// own table, refuses the build before the authorization store holds a model
+/// or a fact.
+#[tokio::test]
+async fn a_replica_refusal_comes_before_the_authorization_store() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let policies = format!(
+        "{OWNED_POLICIES}\nCREATE POLICY owned_self ON owned FOR SELECT \
+         USING (EXISTS (SELECT 1 FROM owned o WHERE o.id = owned.id));"
+    );
+    let (built, contents) = build_owned_with(&policies).await;
+    let err = refused(built, "a self-referential policy refuses");
+    assert!(
+        matches!(err, BuildError::Schema(_)),
+        "the replica translation refuses: {err:?}"
+    );
+    assert_eq!(
+        contents,
+        (0, 0),
+        "the refused build wrote nothing to the store"
+    );
+}
+
 /// No identity provider is configured, so no client can log in, and the build
 /// says so before it touches a pool.
 #[tokio::test]
@@ -2110,9 +2226,9 @@ async fn a_missing_schema_table_refuses_naming_it() {
         "{bans}"
     );
     let (_, _, issuer) = super::enrolment::rooted_issuer();
-    let devices = missing(&fixture, move |builder| {
+    let devices = Box::pin(missing(&fixture, move |builder| {
         builder.device_identity(Some(DeviceCertConfig::new(issuer)))
-    })
+    }))
     .await;
     assert!(
         devices.starts_with("table connetto_device_enrolments does not exist"),

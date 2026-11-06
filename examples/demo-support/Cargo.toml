@@ -3,7 +3,7 @@ name = "connetto-demo-support"
 description = "The demos' shared core: the view and the actions, the pane wording and helpers, the demo schema rows, and the browser pieces every browser demo carries."
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "MIT"
 publish = false
 

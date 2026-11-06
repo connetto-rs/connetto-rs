@@ -113,13 +113,13 @@ diesel = { workspace = true, features = [
 ] }
 diesel-sqlite-session = { git = "https://github.com/connetto-rs/diesel-sqlite-session" }
 # Counting ops in a captured changeset for the advisory MutationHeader op_count.
-sqlite-diff-rs = { version = "0.18", default-features = false }
+sqlite-diff-rs = { version = "0.19", default-features = false }
 # Bulk payloads ride the wire Zstd-compressed (connetto-core Q2.5).
 zstd = "0.13"
 # Extracting the table set of a live query from its rendered SQL, so the pump
 # refreshes only the handles a changed table affects. Version and rev follow
 # subql via the root [patch] blocks.
-sqlparser = { version = "0.63", default-features = false, features = [
+sqlparser = { version = "0.64", default-features = false, features = [
   "visitor",
 ] }
 # Rendering typed diesel queries to placeholder SQL plus bind values through
@@ -199,12 +199,10 @@ pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main",
 # unrelated crate in the consumer's graph. `cipher::unlock` still probes for
 # the codec at runtime, because a system-library build can bypass both.
 #
-# Native: SQLCipher vendored by libsqlite3-sys in place of the vanilla
-# amalgamation diesel would otherwise compile. This needs 0.38, whose tree is
-# SQLCipher 4.14.0 on SQLite 3.51.3; the 0.37 tree predates
-# `sqlite3changeset_apply_v3`, which diesel-sqlite-session imports.
+# Native: SQLCipher built by libsqlite3-sys from `sqlcipher-src` in place of
+# diesel's vanilla amalgamation (R21).
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
-libsqlite3-sys = { version = ">=0.38, <0.39", features = ["bundled-sqlcipher"] }
+libsqlite3-sys = { version = ">=0.39, <0.40", features = ["bundled-sqlcipher"] }
 
 # The away/return re-check (R94) measures time away from the sleep-counting
 # monotonic clock: CLOCK_BOOTTIME on Linux and Android, CLOCK_MONOTONIC on
@@ -259,7 +257,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"], 
 # ships no OpenSSL, so SQLCipher builds its own from source as on Android.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = { version = "1.1.0", optional = true }
-libsqlite3-sys = { version = ">=0.38, <0.39", features = [
+libsqlite3-sys = { version = ">=0.39, <0.40", features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }
 
@@ -297,7 +295,7 @@ ipnet = "2.12"
 connetto-peer-android = { path = "../connetto-peer-android", optional = true }
 # The streams btleplug's central answers with (R76 decision 22).
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
-libsqlite3-sys = { version = ">=0.38, <0.39", features = [
+libsqlite3-sys = { version = ">=0.39, <0.40", features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }
 

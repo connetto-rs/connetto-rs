@@ -44,6 +44,8 @@ use subql::visibility::openfga::OpenFgaPolicy;
 use subql::visibility::{RowWrite, Verdict, VisibilityPolicy};
 use subql::{PgChangeEvent, PgCommitPosition, PgLsn, PgXid};
 
+use super::logging::with_capture;
+
 /// The schema clients sync.
 const SCHEMA: &str = "CREATE TABLE r5b_notes (id INT PRIMARY KEY, owner TEXT NOT NULL);";
 
@@ -174,6 +176,45 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
         "connetto's own policy shape is settled by the changed row, so the \
          service must not have been asked at all. This is the criterion the \
          counter test asserts at ten and a hundred watchers"
+    );
+}
+
+/// A note that leaves the boot running reaches the operator as a warning
+/// naming what it is about, and the parameter connetto supplies to every
+/// check itself does not.
+#[tokio::test]
+async fn a_note_that_does_not_refuse_is_logged_for_the_operator() {
+    let policies = format!("{}\nCREATE ROLE auditor BYPASSRLS;", policies());
+    let (translated, lines) = with_capture(
+        "a_note_that_does_not_refuse_is_logged_for_the_operator",
+        |capture| async move {
+            let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+                SCHEMA,
+                &policies,
+                "app.user_id",
+            );
+            (translated, capture.lines())
+        },
+    )
+    .await;
+    assert!(
+        translated.is_ok(),
+        "a role bypassing the policies does not refuse the boot"
+    );
+    let warned = |subject: &str| {
+        lines
+            .iter()
+            .any(|line| line["level"] == "WARN" && line["subject"] == subject)
+    };
+    assert!(
+        warned("auditor"),
+        "the bypassing role is reported: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("Every check context must carry"))),
+        "the parameter connetto supplies itself is not reported: {lines:?}"
     );
 }
 
