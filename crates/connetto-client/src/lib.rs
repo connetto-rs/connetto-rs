@@ -4522,19 +4522,20 @@ struct ProvisionalAsk {
     seqs: Vec<u64>,
 }
 
-/// The provisional ask sent and awaited, with the monotonic deadline its
-/// ruling is owed by, counted from the send.
+/// The ask sent and awaited, its id in the sent map, with the deadline its
+/// ruling is owed by.
 #[derive(Debug, Clone)]
 #[cfg(feature = "peer")]
 struct SentAsk {
-    /// The ask as sent.
-    ask: ProvisionalAsk,
+    /// The id of the ask in the sent map.
+    request_id: String,
     /// The monotonic deadline the ruling is owed by.
     deadline: Duration,
 }
 
-/// The session's provisional asks, the queued ones and the one sent and
-/// awaited, held together so the connection's future stays small.
+/// The session's provisional asks, the queued ones, the one sent and
+/// awaited and the ones sent on this connection, held together so the
+/// connection's future stays small.
 #[derive(Debug, Default, Clone)]
 #[cfg(feature = "peer")]
 struct ProvisionalQueue {
@@ -4542,6 +4543,9 @@ struct ProvisionalQueue {
     pending: VecDeque<ProvisionalAsk>,
     /// The ask sent and awaited, at most one at a time.
     in_flight: Option<SentAsk>,
+    /// The asks sent on this connection, keyed by request id, until the
+    /// connection ends, so a pushed ruling can name one (R77 slice 11).
+    sent: HashMap<String, ProvisionalAsk>,
 }
 
 #[cfg(feature = "peer")]
@@ -6026,7 +6030,8 @@ where
         self.flush_provisional_asks().await
     }
 
-    /// Send the next queued provisional ask, one at a time.
+    /// Send the next queued provisional ask, one at a time, and register it
+    /// among this connection's sent asks.
     ///
     /// # Errors
     ///
@@ -6053,18 +6058,20 @@ where
             ))
             .await
             .map_err(|err| ClientError::Transport(err.to_string()))?;
+        let request_id = ask.request_id.clone();
+        self.provisional.sent.insert(ask.request_id.clone(), ask);
         self.provisional.in_flight = Some(SentAsk {
-            ask,
+            request_id,
             deadline: crate::away::SystemClock.monotonic() + PROVISIONAL_ASK_WAIT,
         });
         Ok(())
     }
 
-    /// Settle the ask a `NonFatalError` or `RateLimited` names, stopping this
-    /// session's ask of that author, which the next one re-asks (R77
-    /// decision 11).
+    /// Drop the ask `related_to` names, and forget it from the sent asks on
+    /// a refusal, the server having opened nothing of it, keeping it on a
+    /// lapse for the push the server still owes (R77 slice 11).
     #[cfg(feature = "peer")]
-    fn drop_provisional_ask(&mut self, related_to: Option<&str>) {
+    fn drop_provisional_ask(&mut self, related_to: Option<&str>, forget_sent: bool) {
         let Some(related_to) = related_to else {
             return;
         };
@@ -6072,22 +6079,24 @@ where
             .provisional
             .in_flight
             .as_ref()
-            .is_some_and(|sent| sent.ask.request_id == related_to)
+            .is_some_and(|sent| sent.request_id == related_to)
         {
             let author = self
                 .provisional
-                .in_flight
-                .take()
-                .expect("the ask matched")
-                .ask
+                .sent
+                .get(related_to)
+                .expect("the in-flight ask was sent")
                 .author;
+            self.provisional.in_flight = None;
             self.provisional.pending.retain(|ask| ask.author != author);
+        }
+        if forget_sent {
+            self.provisional.sent.remove(related_to);
         }
     }
 
-    /// Drop the wait on a provisional ask that overran its bound, the ask
-    /// re-owing itself at the next session, the connection standing (R77
-    /// decision 11).
+    /// Drop the wait on an over-bound provisional ask, which re-ows itself at
+    /// the next session (R77 decision 11).
     #[cfg(feature = "peer")]
     fn check_provisional_deadlines(&mut self) {
         let Some(sent) = self.provisional.in_flight.as_ref() else {
@@ -6095,15 +6104,15 @@ where
         };
         if crate::away::SystemClock.monotonic() >= sent.deadline {
             tracing::debug!("the provisional ruling overran its bound, dropping the ask");
-            let request_id = sent.ask.request_id.clone();
-            self.drop_provisional_ask(Some(request_id.as_str()));
+            let request_id = sent.request_id.clone();
+            self.drop_provisional_ask(Some(request_id.as_str()), false);
         }
     }
 
-    /// Apply a ruling's verdicts (R77 decision 11): `Applied` and `Settled`
-    /// adjudicate the sequence the way the frontier does, `Refused` and
-    /// `Abandoned` retract the entry through the retraction, and `Pending`
-    /// keeps it.
+    /// Apply a ruling's verdicts for the ask it names among this connection's
+    /// sent asks, skipping a sequence whose record no longer awaits a verdict,
+    /// and hand the queue on only when that ask is the in-flight one (R77
+    /// slice 11).
     ///
     /// # Errors
     ///
@@ -6112,36 +6121,29 @@ where
     async fn settle_provisional_ask(
         &mut self,
         answer: &connetto_core::messages::ProvisionalVerdicts,
-    ) -> Result<ClientEvent, ClientError> {
-        // A ruling that quotes no open ask stands ignored, and the one it
-        // stands beside stays owed (R77).
-        if self
-            .provisional
-            .in_flight
-            .as_ref()
-            .is_none_or(|sent| sent.ask.request_id != answer.request_id)
-        {
-            return Ok(ClientEvent::NonFatal {
+    ) -> Result<Option<ClientEvent>, ClientError> {
+        // A ruling that names no ask this connection sent stands ignored (R77).
+        let Some(sent) = self.provisional.sent.get(&answer.request_id) else {
+            return Ok(Some(ClientEvent::NonFatal {
                 related_to: Some(answer.request_id.clone()),
                 detail: "a provisional ruling arrived with no open ask".to_owned(),
-            });
-        }
-        let ask = self
-            .provisional
-            .in_flight
-            .take()
-            .expect("the ruling named the open ask")
-            .ask;
+            }));
+        };
+        let author = sent.author;
+        let mut applied = false;
         for (seq, verdict) in &answer.verdicts {
+            if !self.seq_awaits_verdict(&author, *seq)? {
+                continue;
+            }
             match verdict {
                 connetto_core::exchange::Verdict::Applied
                 | connetto_core::exchange::Verdict::Settled => {
-                    self.adjudicate_peer_seq(&ask.author, *seq)?;
+                    self.adjudicate_peer_seq(&author, *seq)?;
                 }
                 connetto_core::exchange::Verdict::Refused(cause) => {
                     self.retract_peer_entry(
                         &peer::PeerAuthor {
-                            key_id: ask.author.to_vec(),
+                            key_id: author.to_vec(),
                             account: String::new(),
                             bot_list: None,
                         },
@@ -6154,7 +6156,7 @@ where
                 connetto_core::exchange::Verdict::Abandoned => {
                     self.retract_peer_entry(
                         &peer::PeerAuthor {
-                            key_id: ask.author.to_vec(),
+                            key_id: author.to_vec(),
                             account: String::new(),
                             bot_list: None,
                         },
@@ -6166,12 +6168,36 @@ where
                 }
                 connetto_core::exchange::Verdict::Pending => {}
             }
+            applied = true;
         }
-        self.flush_provisional_asks().await?;
-        Ok(ClientEvent::NonFatal {
+        // Only the in-flight ask's ruling hands the queue on (R77 slice 11).
+        if self
+            .provisional
+            .in_flight
+            .as_ref()
+            .is_some_and(|sent| sent.request_id == answer.request_id)
+        {
+            self.provisional.in_flight = None;
+            self.flush_provisional_asks().await?;
+        }
+        Ok(applied.then(|| ClientEvent::NonFatal {
             related_to: Some(answer.request_id.clone()),
             detail: "a provisional ruling was applied".to_owned(),
-        })
+        }))
+    }
+
+    /// Whether one author's sequence still awaits a verdict, its records
+    /// standing provisional (R77 slice 11).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the records cannot be read.
+    #[cfg(feature = "peer")]
+    fn seq_awaits_verdict(&mut self, author: &[u8], seq: u64) -> Result<bool, ClientError> {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        Ok(provisional::records_of_entry(&mut self.db, author, seq)?
+            .iter()
+            .any(|record| record.state == provisional::ProvisionalState::Provisional))
     }
 
     /// Adjudicate one stored peer entry on a verdict (R77): its records move
@@ -6919,8 +6945,10 @@ where
         self.writer_in_flight = None;
         #[cfg(feature = "peer")]
         {
+            // The server's questions end with the session, so the sent asks go too.
             self.provisional.pending.clear();
             self.provisional.in_flight = None;
+            self.provisional.sent.clear();
         }
         #[cfg(feature = "device-identity")]
         {
@@ -9264,7 +9292,7 @@ where
                     }
                     return Ok(None);
                 }
-                self.handle_control(msg).await?
+                return self.handle_control(msg).await;
             }
         };
         Ok(Some(event))
@@ -9699,10 +9727,9 @@ where
     /// A server throttle, deferring the pending write it names.
     fn rate_limited(&mut self, limited: connetto_core::messages::RateLimited) -> ClientEvent {
         self.refuse_declaration(limited.related_to.as_deref());
-        // A deferral naming the open provisional ask is the session's lapse,
-        // the next one re-asking (R77 decision 11).
+        // A deferral names the provisional ask, the next session re-asking (R77).
         #[cfg(feature = "peer")]
-        self.drop_provisional_ask(limited.related_to.as_deref());
+        self.drop_provisional_ask(limited.related_to.as_deref(), true);
         // A mutation is correlated by its sequence, and one still pending waits for its resend.
         let throttled_write = limited
             .related_to
@@ -9740,13 +9767,16 @@ where
         clippy::too_many_lines,
         reason = "Each control frame has one explicit protocol dispatch arm."
     )]
-    async fn handle_control(&mut self, msg: ControlMessage) -> Result<ClientEvent, ClientError> {
+    async fn handle_control(
+        &mut self,
+        msg: ControlMessage,
+    ) -> Result<Option<ClientEvent>, ClientError> {
         match msg {
             ControlMessage::SnapshotBegin(begin) => {
                 self.open_snapshots.insert(begin.sub_id.clone());
-                Ok(ClientEvent::SnapshotBegin {
-                    sub_id: begin.sub_id,
-                })
+                Ok(Some(ClientEvent::SnapshotBegin {
+                    sub_id: begin.sub_id.clone(),
+                }))
             }
             ControlMessage::SnapshotEnd(end) => {
                 // This records a resume position for rows delivered on the
@@ -9780,7 +9810,7 @@ where
                 // correlated to this sub is answered.
                 self.refused.remove(&end.sub_id);
                 self.publish_coverage()?;
-                Ok(ClientEvent::SnapshotEnd { sub_id: end.sub_id })
+                Ok(Some(ClientEvent::SnapshotEnd { sub_id: end.sub_id }))
             }
             ControlMessage::AggregateUpdate(update) => {
                 // Resting is a durable consequence of receiving a server frame,
@@ -9796,13 +9826,13 @@ where
                         is_full_result: update.is_full_result,
                     },
                 )?;
-                Ok(ClientEvent::Aggregate {
+                Ok(Some(ClientEvent::Aggregate {
                     sub_id: update.sub_id,
                     result_json: update.result_json,
                     group_key: update.group_key,
                     group_values_json: update.group_values_json,
                     is_full_result: update.is_full_result,
-                })
+                }))
             }
             ControlMessage::FullResyncRequired(resync) => {
                 if resync.reason == FullResyncReason::AuthorizationChange {
@@ -9818,19 +9848,23 @@ where
                 if !aggregate {
                     self.resyncing.insert(resync.sub_id.clone());
                 }
-                Ok(ClientEvent::FullResync {
+                Ok(Some(ClientEvent::FullResync {
                     sub_id: resync.sub_id,
                     reason: resync.reason,
-                })
+                }))
             }
-            ControlMessage::MutationApplied(ack) => self.mutation_applied(ack.client_seq).await,
-            ControlMessage::MutationReject(reject) => self.mutation_rejected(&reject).await,
+            ControlMessage::MutationApplied(ack) => {
+                self.mutation_applied(ack.client_seq).await.map(Some)
+            }
+            ControlMessage::MutationReject(reject) => {
+                self.mutation_rejected(&reject).await.map(Some)
+            }
             ControlMessage::MutationConflict(conflict) => {
                 let refused = PriorRefusal::Conflict {
                     table: conflict.table.clone(),
                 };
                 if let Some(event) = self.restore_answered(conflict.client_seq, Some(&refused))? {
-                    return Ok(event);
+                    return Ok(Some(event));
                 }
                 self.settle_resend();
                 let writer = self
@@ -9839,13 +9873,15 @@ where
                 let rows = self.rollback(writer, conflict.client_seq, &refused)?;
                 #[cfg(feature = "device-identity")]
                 self.finish_number_tail().await?;
-                Ok(ClientEvent::MutationConflict {
+                Ok(Some(ClientEvent::MutationConflict {
                     client_seq: conflict.client_seq,
                     rows,
                     server_row: conflict.server_row,
-                })
+                }))
             }
-            ControlMessage::WriterAnswer(answer) => self.settle_writer_task(&answer).await,
+            ControlMessage::WriterAnswer(answer) => {
+                self.settle_writer_task(&answer).await.map(Some)
+            }
             #[cfg(feature = "peer")]
             ControlMessage::ProvisionalVerdicts(answer) => {
                 self.settle_provisional_ask(&answer).await
@@ -9868,78 +9904,65 @@ where
                     self.recompute_share_key_deadline();
                     self.publish_coverage()?;
                 }
-                Ok(ClientEvent::Pong { nonce: pong.nonce })
+                Ok(Some(ClientEvent::Pong { nonce: pong.nonce }))
             }
-            ControlMessage::ContentTicketGrant(grant) => Ok(ClientEvent::ContentTicket {
+            ControlMessage::ContentTicketGrant(grant) => Ok(Some(ClientEvent::ContentTicket {
                 request_id: grant.request_id,
                 url: grant.url,
-            }),
+            })),
             ControlMessage::NonFatalError(err) => {
                 if let Some(id) = &err.related_to
                     && err.detail == SUBSCRIPTION_REFUSED
                 {
                     self.refused.insert(id.clone());
                 }
-                // A refusal naming the open provisional ask settles it for
-                // the session, the next one re-asking (R77 decision 11).
+                // A refusal names a provisional ask the server opened nothing of (R77).
                 #[cfg(feature = "peer")]
-                self.drop_provisional_ask(err.related_to.as_deref());
+                self.drop_provisional_ask(err.related_to.as_deref(), true);
                 self.refuse_declaration(err.related_to.as_deref());
-                Ok(ClientEvent::NonFatal {
+                Ok(Some(ClientEvent::NonFatal {
                     related_to: err.related_to,
                     detail: err.detail,
-                })
+                }))
             }
-            ControlMessage::RateLimited(limited) => Ok(self.rate_limited(limited)),
-            // A relay saying whether IT can reach the server. For a tab that is
-            // the answer that matters, because a tab whose own link is fine
-            // still cannot sync while the relay cannot, so it rides the same
-            // event as this connection's own state.
-            ControlMessage::SyncStatus(status) => Ok(ClientEvent::SyncStatus(status)),
-            // A relay stating the worker's gate state. For a tab that is the
-            // answer its application acts on, so it rides the same event as
-            // the client's own gate.
-            ControlMessage::GateState(state) => Ok(match state {
+            ControlMessage::RateLimited(limited) => Ok(Some(self.rate_limited(limited))),
+            // A relay's reachability rides this connection's own state event, a tab reading its world through it.
+            ControlMessage::SyncStatus(status) => Ok(Some(ClientEvent::SyncStatus(status))),
+            // The worker's gate state rides the client's own gate event, the application acting on it.
+            ControlMessage::GateState(state) => Ok(Some(match state {
                 GateState::Locked => ClientEvent::Locked,
                 GateState::Unlocked => ClientEvent::Unlocked,
                 GateState::UnlockDismissed => ClientEvent::UnlockDismissed,
-            }),
-            // A relay stating how the worker's drain of held work settled
-            // (R31). The application acts on it wherever it runs.
-            ControlMessage::HeldWork(held) => Ok(ClientEvent::Held(held)),
-            // A relay telling the tab the worker's major's sunset (R107),
-            // which the worker's ack already raised natively.
-            ControlMessage::TabSunset(at_secs) => Ok(ClientEvent::Sunset { at_secs }),
-            // A relay stating who its worker is. The tab's mirror runs the
-            // worker's translated schema, whose views filter on both values.
+            })),
+            // The worker's held-work drain settles (R31), the application acting on it wherever it runs.
+            ControlMessage::HeldWork(held) => Ok(Some(ClientEvent::Held(held))),
+            // The worker's major sunset reaches the tab (R107), the worker's ack having raised it natively.
+            ControlMessage::TabSunset(at_secs) => Ok(Some(ClientEvent::Sunset { at_secs })),
+            // The worker's identity, the tab's mirror views filtering on both values.
             ControlMessage::TabIdentity(identity) => {
                 self.adopt_relay_identity(identity)?;
-                Ok(ClientEvent::IdentityStated)
+                Ok(Some(ClientEvent::IdentityStated))
             }
-            // The server says why it is closing. Surfaced rather than treated
-            // as a violation: the server behaved exactly as the protocol says.
-            ControlMessage::FatalError(fatal) => self.server_closed(fatal.reason),
-            ControlMessage::DeliveryPaused { cause } => Ok(ClientEvent::DeliveryPaused { cause }),
-            ControlMessage::DeliveryResumed => Ok(ClientEvent::DeliveryResumed),
+            // The server's reason for closing, surfaced rather than treated as a violation.
+            ControlMessage::FatalError(fatal) => self.server_closed(fatal.reason).map(Some),
+            ControlMessage::DeliveryPaused { cause } => {
+                Ok(Some(ClientEvent::DeliveryPaused { cause }))
+            }
+            ControlMessage::DeliveryResumed => Ok(Some(ClientEvent::DeliveryResumed)),
             ControlMessage::MembershipOpened(opened) => {
-                // R27 decisions 3, 4 and 7: the server opened a membership
-                // subscription on this client's behalf. Its data frames apply
-                // like any other subscription's, while the table stays out of
-                // the application-facing changed-tables signal. The server
-                // owns its lifecycle, so nothing is declared or re-declared
-                // here.
+                // R27: the server opened a membership subscription here, its data applying while the table stays out of the changed-tables signal.
                 self.hidden_tables
                     .insert(opened.member_table.to_lowercase());
-                Ok(ClientEvent::MembershipOpened {
+                Ok(Some(ClientEvent::MembershipOpened {
                     sub_id: opened.sub_id,
                     member_table: opened.member_table,
-                })
+                }))
             }
             ControlMessage::ShareKeysReplaced(ack) => {
                 self.settle_share_key_replacement(&ack.request_id)?;
-                Ok(ClientEvent::ShareKeysReplaced {
+                Ok(Some(ClientEvent::ShareKeysReplaced {
                     request_id: ack.request_id,
-                })
+                }))
             }
             other => Err(ClientError::Protocol(format!(
                 "unexpected control frame from server: {other:?}"
@@ -11094,18 +11117,20 @@ mod tests {
         }
         conn.resend = Resend::Resent { episode };
 
-        conn.handle_control(ControlMessage::MutationReject(MutationReject {
-            client_seq: first,
-            reason: MutationRejectReason::Unauthorized,
-        }))
-        .await
-        .expect("the refusal settles");
-        conn.handle_control(ControlMessage::MutationReject(MutationReject {
-            client_seq: second,
-            reason: MutationRejectReason::Indeterminate,
-        }))
-        .await
-        .expect("the next outage defers");
+        let _ = conn
+            .handle_control(ControlMessage::MutationReject(MutationReject {
+                client_seq: first,
+                reason: MutationRejectReason::Unauthorized,
+            }))
+            .await
+            .expect("the refusal settles");
+        let _ = conn
+            .handle_control(ControlMessage::MutationReject(MutationReject {
+                client_seq: second,
+                reason: MutationRejectReason::Indeterminate,
+            }))
+            .await
+            .expect("the next outage defers");
         let wait = conn.resend_timer().expect("a resend is armed").wait();
         assert!(
             wait <= RESEND_POLICY.initial_backoff(),
@@ -11509,11 +11534,12 @@ mod tests {
         }
         conn.bound_writer = Some(device);
         for client_seq in [1, 2] {
-            conn.handle_control(ControlMessage::MutationApplied(
-                connetto_core::messages::MutationApplied { client_seq },
-            ))
-            .await
-            .expect("the write settles");
+            let _ = conn
+                .handle_control(ControlMessage::MutationApplied(
+                    connetto_core::messages::MutationApplied { client_seq },
+                ))
+                .await
+                .expect("the write settles");
         }
         conn.bound_writer = None;
         (conn, key, device)
@@ -11568,10 +11594,10 @@ mod tests {
         let refused = PriorRefusal::Rejected(MutationRejectReason::Unauthorized);
         assert_eq!(
             event,
-            ClientEvent::WriteRestored {
+            Some(ClientEvent::WriteRestored {
                 client_seq: 2,
                 refused: Some(refused.clone()),
-            }
+            })
         );
         let logged: Vec<i64> = author::_connetto_retraction::table
             .filter(author::_connetto_retraction::writer.eq(writer_id(&device)))

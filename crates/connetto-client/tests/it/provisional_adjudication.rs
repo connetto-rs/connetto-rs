@@ -19,7 +19,7 @@ use connetto_core::messages::{
 use connetto_core::traits::IncomingFrame;
 use diesel::prelude::*;
 
-use super::peer_support::{captured, manifest, pump_to, receiver};
+use super::peer_support::{captured, drain_quiet, manifest, pump_to, receiver};
 use super::support::{self, Script};
 
 /// The author replica's schema, the receiver's `orders` table with no
@@ -48,6 +48,7 @@ const AUTHOR_A: [u8; 32] = [7; 32];
 const AUTHOR_B: [u8; 32] = [8; 32];
 const AUTHOR_C: [u8; 32] = [9; 32];
 const OFFER_A: &[u8] = b"signed-offer-a";
+const OFFER_B: &[u8] = b"signed-offer-b";
 const OFFER_C: &[u8] = b"signed-offer-c";
 
 diesel::table! {
@@ -537,9 +538,14 @@ async fn a_lapsed_ask_drops_and_the_next_session_re_asks() {
     tokio::time::sleep(Duration::from_secs(31)).await;
     conn.pump_one().await.expect("pump");
 
-    // A ruling that arrives after the drop is one for no open ask.
-    rule(&script, &ask.request_id, vec![(1, Verdict::Abandoned)]);
-    pump_to(&mut conn, no_open_ask).await;
+    // A ruling that arrives after the drop still applies, the wait having
+    // ended but the connection standing.
+    rule(&script, &ask.request_id, vec![(1, Verdict::Pending)]);
+    let quiet = drain_quiet(&mut conn, Duration::from_millis(200)).await;
+    assert!(
+        quiet.iter().any(applied),
+        "the ruling that arrives after the drop applies"
+    );
     assert_eq!(
         record_states(&mut conn, &AUTHOR_A),
         vec![(1, ProvisionalState::Provisional.db())]
@@ -650,4 +656,137 @@ async fn a_dropped_ask_hands_the_session_on_to_the_next_author() {
         .try_into()
         .expect("the next author's ask follows");
     assert_eq!(second.author, AUTHOR_C);
+}
+
+/// A pushed verdict for an earlier ask retracts a provisional row while a
+/// later ask is in flight, and the push hands the queue on to no one, the
+/// in-flight ask's own ruling alone doing that.
+#[tokio::test]
+async fn a_pushed_verdict_retracts_the_row_while_a_later_ask_is_in_flight() {
+    let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
+    let w2 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 2);
+    let bodies = captured(PLAIN_DDL, [&w1, &w2]).await;
+    let (mut conn, _) = receiver(DDL, POLICIES).await;
+    let author = author_of(AUTHOR_A);
+    conn.apply_peer_entry(&author, &manifest(1, &bodies[0]), &bodies[0])
+        .expect("apply sequence 1");
+    conn.apply_peer_entry(&author, &manifest(2, &bodies[1]), &bodies[1])
+        .expect("apply sequence 2");
+    seed_cursor(&mut conn, &AUTHOR_A, 2, OFFER_A);
+    // Two more asks stand one behind the other in the queue.
+    bulk_records(&mut conn, &AUTHOR_B, 1, 1_000);
+    seed_cursor(&mut conn, &AUTHOR_B, 1, OFFER_B);
+    bulk_records(&mut conn, &AUTHOR_C, 1, 2_000);
+    seed_cursor(&mut conn, &AUTHOR_C, 1, OFFER_C);
+
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [first] = asks(&script).try_into().expect("one ask at a time");
+    assert_eq!(first.author, AUTHOR_A);
+    assert_eq!(first.seqs, vec![1, 2]);
+
+    rule(
+        &script,
+        &first.request_id,
+        vec![(1, Verdict::Pending), (2, Verdict::Pending)],
+    );
+    pump_to(&mut conn, applied).await;
+    let [_, second] = asks(&script).try_into().expect("the next ask follows");
+    assert_eq!(second.author, AUTHOR_B);
+
+    // A push for the earlier ask, standing open on its Pending answer,
+    // while the later ask is in flight.
+    rule(&script, &first.request_id, vec![(1, Verdict::Abandoned)]);
+    let quiet = drain_quiet(&mut conn, Duration::from_millis(200)).await;
+    assert!(
+        quiet.iter().any(applied),
+        "the pushed verdict applies as for the first answer"
+    );
+    let retracted = quiet
+        .iter()
+        .find(|event| matches!(event, ClientEvent::ProvisionalRetracted { seq: 1, .. }));
+    assert!(retracted.is_some(), "the pushed verdict retracts the row");
+
+    assert_eq!(
+        record_states(&mut conn, &AUTHOR_A),
+        vec![(2, ProvisionalState::Provisional.db())]
+    );
+    assert_eq!(entry_seqs(&mut conn, &AUTHOR_A), vec![2]);
+    assert_eq!(order_ids(&mut conn), vec![2]);
+    assert_eq!(
+        record_states(&mut conn, &AUTHOR_B),
+        vec![(1, ProvisionalState::Provisional.db())]
+    );
+    // The push hands the queue on to no one, so the later ask still stands
+    // and no third ask went out.
+    assert_eq!(asks(&script).len(), 2);
+
+    // The in-flight ask's own ruling alone hands the queue on.
+    rule(&script, &second.request_id, vec![(1, Verdict::Pending)]);
+    pump_to(&mut conn, applied).await;
+    let [_, _, third] = asks(&script).try_into().expect("the third ask follows");
+    assert_eq!(third.author, AUTHOR_C);
+}
+
+/// A pushed verdict for a sequence the record no longer holds provisional
+/// changes nothing and raises no second event.
+#[tokio::test]
+async fn a_pushed_verdict_for_a_settled_sequence_changes_nothing() {
+    let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
+    let bodies = captured(PLAIN_DDL, [&w1]).await;
+    let mut conn = provisioned(&bodies).await;
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [ask] = asks(&script).try_into().expect("one ask");
+
+    rule(&script, &ask.request_id, vec![(1, Verdict::Applied)]);
+    pump_to(&mut conn, applied).await;
+    assert_eq!(
+        record_states(&mut conn, &AUTHOR_A),
+        vec![(1, ProvisionalState::Adjudicated.db())]
+    );
+    assert_eq!(entry_seqs(&mut conn, &AUTHOR_A), [] as [i64; 0]);
+
+    // A push that rules the settled sequence again changes nothing and
+    // raises no second event.
+    rule(&script, &ask.request_id, vec![(1, Verdict::Applied)]);
+    let quiet = drain_quiet(&mut conn, Duration::from_millis(200)).await;
+    assert!(!quiet.iter().any(applied), "no second event");
+    assert!(!quiet.iter().any(no_open_ask), "the ask still stands known");
+    assert_eq!(
+        record_states(&mut conn, &AUTHOR_A),
+        vec![(1, ProvisionalState::Adjudicated.db())]
+    );
+    assert_eq!(entry_seqs(&mut conn, &AUTHOR_A), [] as [i64; 0]);
+}
+
+/// A push naming an ask the last connection sent is one for no open ask
+/// after a reconnect, the server's questions having ended with the session.
+#[tokio::test]
+async fn a_push_naming_an_old_request_id_is_unknown_after_a_reconnect() {
+    let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
+    let bodies = captured(PLAIN_DDL, [&w1]).await;
+    let mut conn = provisioned(&bodies).await;
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [first] = asks(&script).try_into().expect("one ask");
+
+    // The ask answers Pending, so its ruling may still be pushed.
+    rule(&script, &first.request_id, vec![(1, Verdict::Pending)]);
+    pump_to(&mut conn, applied).await;
+
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [second] = asks(&script).try_into().expect("the re-ask");
+    assert_eq!(second.author, AUTHOR_A);
+    assert_ne!(second.request_id, first.request_id);
+
+    // A push that names the old ask is one for no open ask.
+    rule(&script, &first.request_id, vec![(1, Verdict::Abandoned)]);
+    pump_to(&mut conn, no_open_ask).await;
+    assert_eq!(
+        record_states(&mut conn, &AUTHOR_A),
+        vec![(1, ProvisionalState::Provisional.db())]
+    );
+    assert_eq!(order_ids(&mut conn), vec![1]);
 }
