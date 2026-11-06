@@ -263,6 +263,11 @@ jobs:
     name: iOS simulator proof
     runs-on: macos-latest
     timeout-minutes: 90
+    env:
+      # No thin LTO and 16 codegen units, on main and pull requests alike, so
+      # pull requests reuse the build output main saves. rust-tests keeps the
+      # release profile on main.
+      CARGO_TEST_PROFILE: testfast
     steps:
       - uses: actions/checkout@v7
 
@@ -282,8 +287,8 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: target
-          key: t-ios-simulator-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-{0}-', runner.os) || format('t-ios-simulator-{0}-{1}-partial-', runner.os, hashFiles('**/Cargo.lock')) }}
+          key: t-ios-simulator-testfast-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-testfast-{0}-', runner.os) || format('t-ios-simulator-testfast-{0}-{1}-partial-', runner.os, hashFiles('**/Cargo.lock')) }}
 
       - name: Restore the demo's build output
         id: cache-3
@@ -307,16 +312,16 @@ jobs:
       # One build of the server and the harness, so the dependencies they
       # share compile once.
       - name: Build the server and the proof
-        run: cargo +stable build --release --all-features -p connetto-server -p connetto-test-harness --bin connetto-server --bin connetto-demo-stack --bin connetto-ios-proof
+        run: cargo +stable build --profile "$CARGO_TEST_PROFILE" --all-features -p connetto-server -p connetto-test-harness --bin connetto-server --bin connetto-demo-stack --bin connetto-ios-proof
 
       - uses: $/.github/actions/start-native-services
 
       # The proof builds the demo with `cargo tauri ios build` once the stack has minted its device CA.
       - name: Walk the proof on a simulator
         env:
-          CONNETTO_SERVER_BIN: ${{ github.workspace }}/target/release/connetto-server
+          CONNETTO_SERVER_BIN: ${{ github.workspace }}/target/${{ env.CARGO_TEST_PROFILE }}/connetto-server
           CONNETTO_IOS_TEAM_ID: ABCDE12345
-        run: target/release/connetto-demo-stack target/release/connetto-ios-proof --demo tauri
+        run: '"target/$CARGO_TEST_PROFILE/connetto-demo-stack" "target/$CARGO_TEST_PROFILE/connetto-ios-proof" --demo tauri'
 
       - uses: actions/upload-artifact@v7
         if: failure()
@@ -330,7 +335,7 @@ jobs:
       - name: Prune target caches
         if: always()
         run: |
-          rm -rf target/release/incremental
+          rm -rf "target/$CARGO_TEST_PROFILE/incremental"
           if [ -d examples/tauri-leptos-demo/target ]; then
             find examples/tauri-leptos-demo/target -type d -name incremental -prune -exec rm -rf {} +
           fi
