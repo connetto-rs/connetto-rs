@@ -291,7 +291,7 @@ async fn logout_locally(
     auth_db_name: &str,
     account: Option<&str>,
 ) -> Result<(), crate::auth::AuthError> {
-    let storage = crate::storage::ReplicaStorage::install().await;
+    let storage = crate::storage::ReplicaStorage::install().await?;
     let handle = crate::workers::session::AccountStoreHandle {
         db_name: auth_db_name,
         storage: &storage,

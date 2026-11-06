@@ -165,7 +165,7 @@ async fn connect_at(
 /// wrote.
 #[wasm_bindgen_test]
 async fn a_tab_receives_both_tiers_as_patchsets() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let tier = tier_db_name(REPLICA);
     storage
         .delete_db(REPLICA)
@@ -282,7 +282,7 @@ fn entry_raw(archive: &mut zip::ZipArchive<BufReader<BlobSource>>, name: &str) -
 /// `BlobSink` sees emits them after each entry.
 #[wasm_bindgen_test]
 async fn blob_sink_to_blob_source_round_trip() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let replica = "r26-blob-sink-rt.sqlite";
     let tier = tier_db_name(replica);
     storage.delete_db(replica).expect("clear earlier replica");

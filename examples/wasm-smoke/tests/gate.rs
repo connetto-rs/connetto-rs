@@ -188,7 +188,9 @@ async fn reset_key_store() {
 
 async fn reset_profile() {
     reset_key_store().await;
-    let storage = connetto_web::storage::ReplicaStorage::install().await;
+    let storage = connetto_web::storage::ReplicaStorage::install()
+        .await
+        .expect("install storage");
     for db in [DEFAULT_AUTH_DB, GATE_AUTH_DB] {
         storage.delete_db(db).expect("clear auth database");
     }

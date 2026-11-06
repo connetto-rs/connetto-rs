@@ -119,7 +119,7 @@ async fn reset(storage: &ReplicaStorage, keys: &IdbKeyStore, name: &str) {
 /// pool entry and one key record, and reaches nothing else.
 #[wasm_bindgen_test]
 async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let keys = IdbKeyStore::open().await.expect("open the key store");
     let alice = "e3-wipe-alice.sqlite";
     let bob = "e3-wipe-bob.sqlite";
@@ -149,7 +149,11 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
 
     // The negative claim, read off the pool's own listing rather than the delete.
     assert!(
-        !storage.list().iter().any(|entry| entry == alice),
+        !storage
+            .list()
+            .expect("list the pool")
+            .iter()
+            .any(|entry| entry == alice),
         "the wiped replica is no longer in the pool"
     );
     assert!(!storage.exists(alice), "and does not exist by name either");
@@ -162,7 +166,11 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
 
     // Isolation, which is the bug this ordering exists to avoid.
     assert!(
-        storage.list().iter().any(|entry| entry == bob),
+        storage
+            .list()
+            .expect("list the pool")
+            .iter()
+            .any(|entry| entry == bob),
         "the other identity's replica is still in the pool"
     );
     assert_eq!(
@@ -181,7 +189,7 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
 /// erases them with it while a second identity keeps its set.
 #[wasm_bindgen_test]
 async fn a_wipe_erases_the_share_keys_of_the_identity_it_names_only() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let keys = Rc::new(IdbKeyStore::open().await.expect("open the key store"));
     let alice = "e3-share-wipe-alice.sqlite";
     let bob = "e3-share-wipe-bob.sqlite";
@@ -229,7 +237,7 @@ async fn a_wipe_erases_the_share_keys_of_the_identity_it_names_only() {
 /// name stays stable for that identity.
 #[wasm_bindgen_test]
 async fn a_wipe_destroys_the_tier_beside_the_replica() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let keys = IdbKeyStore::open().await.expect("open the key store");
     let alice = "e3-tier-wipe-alice.sqlite";
     let bob = "e3-tier-wipe-bob.sqlite";
@@ -259,7 +267,7 @@ async fn a_wipe_destroys_the_tier_beside_the_replica() {
         .expect("wipe alice");
 
     // Read off the pool's own listing, not off what the delete returned.
-    let listed = storage.list();
+    let listed = storage.list().expect("list the pool");
     assert!(
         !listed.iter().any(|entry| entry == &tier_db_name(alice)),
         "the wiped identity's device-private database is gone too"
@@ -279,7 +287,7 @@ async fn a_wipe_destroys_the_tier_beside_the_replica() {
 /// through the wipe path.
 #[wasm_bindgen_test]
 async fn a_wipe_destroys_the_hub_meta_beside_the_replica() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let keys = IdbKeyStore::open().await.expect("open the key store");
     let alice = "e3-hubmeta-wipe-alice.sqlite";
     let bob = "e3-hubmeta-wipe-bob.sqlite";
@@ -310,7 +318,7 @@ async fn a_wipe_destroys_the_hub_meta_beside_the_replica() {
         .expect("wipe alice");
 
     // Read off the pool's own listing, not off what the delete returned.
-    let listed = storage.list();
+    let listed = storage.list().expect("list the pool");
     assert!(
         !listed.iter().any(|entry| entry == &alice_hub),
         "the wiped identity's hub state is gone too"
@@ -325,7 +333,7 @@ async fn a_wipe_destroys_the_hub_meta_beside_the_replica() {
 /// queued writes can still be uploaded with the credential that is still live.
 #[wasm_bindgen_test]
 async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let keys = IdbKeyStore::open().await.expect("open the key store");
     let name = "e3-guard.sqlite";
     reset(&storage, &keys, name).await;
@@ -475,7 +483,7 @@ async fn marking_a_wipe_refuses_to_discard_unsynced_writes() {
 /// point: deferring moves *when* it happens, never *what* happens.
 #[wasm_bindgen_test]
 async fn a_deferred_wipe_destroys_the_replica_and_its_key() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let keys = IdbKeyStore::open().await.expect("open the key store");
     let name = "e4c-deferred.sqlite";
     reset(&storage, &keys, name).await;
@@ -508,7 +516,11 @@ async fn a_deferred_wipe_destroys_the_replica_and_its_key() {
     }
 
     assert!(
-        !storage.list().iter().any(|entry| entry == name),
+        !storage
+            .list()
+            .expect("list the pool")
+            .iter()
+            .any(|entry| entry == name),
         "the replica is gone from the pool"
     );
     assert_eq!(
@@ -522,7 +534,7 @@ async fn a_deferred_wipe_destroys_the_replica_and_its_key() {
 /// its key, so no orphaned chunks outlive the key that opened them.
 #[wasm_bindgen_test]
 async fn a_wipe_removes_the_content_namespace_it_is_given() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let keys = IdbKeyStore::open().await.expect("open the key store");
     let name = "e3-content-wipe.sqlite";
     reset(&storage, &keys, name).await;

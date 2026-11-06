@@ -23,7 +23,6 @@
 //! seam, which does not exist yet. The primitives here are complete and
 //! independently usable, and the ordering they encode is documented on each.
 
-use connetto_client::cipher::cipher_url;
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_file_client::{BrowserStore, BrowserStoreError};
 use indexed_db_futures::database::Database as IdbDatabase;
@@ -31,6 +30,9 @@ use indexed_db_futures::object_store::ObjectStore;
 use indexed_db_futures::prelude::*;
 use indexed_db_futures::transaction::TransactionMode;
 use serde::{Deserialize, Serialize};
+use sqlite_wasm_rs::vfs::VfsFilesManager as _;
+use sqlite_wasm_rs::vfs::memvfs::{MemVfsContext, MemVfsUtil};
+use sqlite_wasm_vfs::sahpool::{OpfsSAHPoolCfg, OpfsSAHPoolUtil};
 use wasm_bindgen::JsCast;
 
 use crate::auth::{AuthError, PendingWork};
@@ -43,30 +45,39 @@ use crate::auth::{AuthError, PendingWork};
 /// handle through the application.
 pub enum ReplicaStorage {
     /// OPFS through the sahpool VFS, the durable default.
-    Opfs(sqlite_wasm_vfs::sahpool::OpfsSAHPoolUtil),
+    Opfs(OpfsSAHPoolUtil),
     /// The in-memory VFS, used only when OPFS is unavailable.
-    Memory(sqlite_wasm_rs::MemVfsUtil<sqlite_wasm_rs::WasmOsCallback>),
+    Memory(MemVfsUtil),
 }
 
 impl ReplicaStorage {
-    /// Install OPFS if the browser allows it, otherwise the in-memory VFS
-    /// (already registered as the default VFS at SQLite init, so plain file
-    /// names resolve to it once sahpool declines to take over the default).
-    pub async fn install() -> Self {
+    /// Install OPFS if the browser allows it, otherwise take the in-memory VFS
+    /// SQLite registers as the default at init, so plain file names resolve to
+    /// it once sahpool declines to take over the default.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] when OPFS is refused and SQLite cannot hand out its
+    /// in-memory VFS either, which leaves the worker no storage at all.
+    pub async fn install() -> Result<Self, AuthError> {
         match sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(
-            &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg::default(),
+            &OpfsSAHPoolCfg::default(),
             true,
         )
         .await
         {
-            Ok(util) => Self::Opfs(util),
+            Ok(util) => Ok(Self::Opfs(util)),
             Err(err) => {
                 tracing::warn!(
                     error = ?err,
                     "db worker: OPFS unavailable, using an in-memory replica with no persistence \
                      and no cross-window OPFS sharing this session"
                 );
-                Self::Memory(sqlite_wasm_rs::MemVfsUtil::new())
+                let context = MemVfsContext::try_new()
+                    .map_err(|err| AuthError::Store(format!("initialise SQLite: {err}")))?;
+                let util = MemVfsUtil::get(&context)
+                    .map_err(|err| AuthError::Store(format!("find the in-memory VFS: {err}")))?;
+                Ok(Self::Memory(util))
             }
         }
     }
@@ -75,8 +86,11 @@ impl ReplicaStorage {
     #[must_use]
     pub fn exists(&self, name: &str) -> bool {
         match self {
-            Self::Opfs(util) => util.exists(name).unwrap_or(false),
-            Self::Memory(util) => util.exists(name),
+            Self::Opfs(util) => util.contains(name).unwrap_or(false),
+            Self::Memory(util) => {
+                let Ok(held) = util.contains(name);
+                held
+            }
         }
     }
 
@@ -85,11 +99,20 @@ impl ReplicaStorage {
     /// A wipe proves itself with this: the claim is that a name is gone and a
     /// second identity's is not, which is a statement about the pool rather than
     /// about what a delete returned.
-    #[must_use]
-    pub fn list(&self) -> Vec<String> {
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] when the pool cannot be read, which happens only
+    /// while it is paused, uninstalled or still reconciling its files.
+    pub fn list(&self) -> Result<Vec<String>, AuthError> {
         match self {
-            Self::Opfs(util) => util.list(),
-            Self::Memory(util) => util.list(),
+            Self::Opfs(util) => util
+                .names()
+                .map_err(|err| AuthError::Store(format!("list the pool: {err:?}"))),
+            Self::Memory(util) => {
+                let Ok(names) = util.names();
+                Ok(names)
+            }
         }
     }
 
@@ -104,14 +127,13 @@ impl ReplicaStorage {
 
     /// The database URL that opens `name` in this backend.
     ///
-    /// Always the codec shim over this backend's VFS, named explicitly, because
-    /// the codec intercepts as a VFS layer: a bare name would open the real VFS
-    /// with no codec in the stack and `PRAGMA key` would have nothing to talk to.
-    /// Both backends are covered, so the OPFS-unavailable fallback stays
-    /// encrypted too.
+    /// The VFS is named explicitly rather than left to SQLite's default, so a
+    /// database always opens in the backend this storage manages. The page codec
+    /// lives in SQLite's pager, so a plaintext and an encrypted database open
+    /// under the same URL and only the key tells them apart.
     #[must_use]
     pub fn db_url(&self, name: &str) -> String {
-        cipher_url(name, self.vfs_name())
+        format!("file:{name}?vfs={}", self.vfs_name())
     }
 
     /// Delete the database `name` and any journal or WAL sidecar it left, by
@@ -122,7 +144,7 @@ impl ReplicaStorage {
     /// bookkeeping by name, so a second live handle trips a `debug_assert` rather
     /// than reporting an error. Dropping is enough and needs no await: the
     /// sahpool sync access handle is released synchronously when the connection
-    /// drops, with the codec shim in the stack.
+    /// drops.
     ///
     /// A name that is not in the pool is not an error, so the call is idempotent.
     ///
@@ -134,10 +156,12 @@ impl ReplicaStorage {
             let entry = format!("{name}{suffix}");
             match self {
                 Self::Opfs(util) => {
-                    util.delete_db(&entry)
+                    util.remove(&entry)
                         .map_err(|err| AuthError::Store(format!("delete {entry}: {err:?}")))?;
                 }
-                Self::Memory(util) => util.delete_db(&entry),
+                Self::Memory(util) => {
+                    let Ok(_) = util.remove(&entry);
+                }
             }
         }
         Ok(())
@@ -163,20 +187,16 @@ impl ReplicaStorage {
     ///
     /// # Errors
     ///
-    /// [`AuthError::Store`] if the backend refuses to grow.
+    /// [`AuthError::Store`] if the pool cannot be read or refuses to grow.
     pub async fn reserve(&self, headroom: u32) -> Result<(), AuthError> {
         let Self::Opfs(util) = self else {
             return Ok(());
         };
-        let held = u32::try_from(self.list().len()).unwrap_or(u32::MAX);
-        let want = held.saturating_add(headroom);
-        let have = util.get_capacity();
-        if want > have {
-            util.add_capacity(want - have)
-                .await
-                .map_err(|err| AuthError::Store(format!("grow the pool to {want}: {err:?}")))?;
-        }
-        Ok(())
+        let headroom = usize::try_from(headroom).unwrap_or(usize::MAX);
+        let want = self.list()?.len().saturating_add(headroom);
+        util.ensure_capacity(want)
+            .await
+            .map_err(|err| AuthError::Store(format!("grow the pool to {want}: {err:?}")))
     }
 }
 

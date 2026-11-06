@@ -295,7 +295,7 @@ async fn seed_alice(storage: &ReplicaStorage) {
 /// the hub, joining them with the second's own private rows.
 #[wasm_bindgen_test]
 async fn a_second_identitys_late_tab_reads_the_first_identitys_shared_rows() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let alice_name = connetto_client::replica_db_name(connetto_client::REPLICA_PREFIX, "alice")
         .expect("a replica name");
     let bob_name = connetto_client::replica_db_name(connetto_client::REPLICA_PREFIX, "bob")
@@ -410,7 +410,7 @@ async fn a_second_identitys_late_tab_reads_the_first_identitys_shared_rows() {
 /// and the late tab reads them from the replica, from a fresh name of its own.
 #[wasm_bindgen_test]
 async fn a_disabled_shared_store_never_serves_store_rows() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let carol_name = connetto_client::replica_db_name(connetto_client::REPLICA_PREFIX, "carol")
         .expect("a replica name");
     storage.delete_db(&carol_name).expect("clear the entry");
@@ -500,7 +500,7 @@ impl Transport for Recording {
 /// the tab first wrote each table.
 #[wasm_bindgen_test]
 async fn a_tabs_write_to_a_shared_table_goes_upstream_in_first_write_order() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let dave_name = connetto_client::replica_db_name(connetto_client::REPLICA_PREFIX, "dave")
         .expect("a replica name");
     for name in [dave_name.as_str(), shared_record().as_str()] {

@@ -24,10 +24,7 @@ base64 = { version = "0.22", features = ["std"] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-# Pinned exactly, as `connetto-web` and `wasm-smoke` are: 0.3.104 renamed the
-# `LockManager` request bindings that `connetto-web` calls, so a workspace that
-# floats here fails to build a path dependency that builds everywhere else.
-web-sys = { version = "=0.3.103", features = [
+web-sys = { version = "0.3", features = [
     "BroadcastChannel",
     "DedicatedWorkerGlobalScope",
     "MessageEvent",
@@ -65,6 +62,12 @@ sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", 
 # Until a pg_walstream release carries the startup metadata API subql main
 # uses (isdaniel/pg-walstream #141) and `ChangeEvent::xid`.
 pg_walstream = { git = "https://github.com/isdaniel/pg-walstream", branch = "main" }
+# R21, until Spxg/sqlite-wasm-rs#219 merges: safe memvfs access on single-threaded wasm.
+sqlite-wasm-rs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+rsqlite-vfs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+sqlite-wasm-vfs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+# R21, until rusqlite/rusqlite#1932 merges: the sqlcipher-src release the browser builds.
+libsqlite3-sys = { git = "https://github.com/LucaCappelletti94/rusqlite", branch = "upstream/sqlcipher-src-420" }
 
 # Fast test iteration: release-grade optimization without the fat link.
 # Mirrors the root workspace profile of the same name.

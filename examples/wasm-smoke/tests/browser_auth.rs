@@ -160,7 +160,7 @@ async fn login_as(
 /// row.
 #[wasm_bindgen_test]
 async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let keys = IdbKeyStore::open().await.expect("open the key store");
 
     // Start from nothing, so a rerun in the same origin is not resuming an
@@ -313,7 +313,7 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
 /// meaningful order among stored accounts to choose from.
 #[wasm_bindgen_test]
 async fn a_marker_whose_credential_is_gone_never_signs_the_other_account_in() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     storage.delete_db(STALE_DB).expect("clear an earlier index");
     let store = AccountStore::open(&storage.db_url(STALE_DB)).expect("open the account index");
 
@@ -388,7 +388,7 @@ async fn a_marker_whose_credential_is_gone_never_signs_the_other_account_in() {
 /// provider.
 #[wasm_bindgen_test]
 async fn two_real_logins_leave_two_accounts_signed_in_at_once() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     storage
         .delete_db(TWO_ACCOUNT_DB)
         .expect("clear an earlier index");

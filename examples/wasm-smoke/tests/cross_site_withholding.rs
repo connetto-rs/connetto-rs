@@ -91,7 +91,7 @@ async fn walk_cross_login(login_url: &str, subject: &str) -> (String, String) {
 /// every cross-site request, so the resume asks for a login again.
 #[wasm_bindgen_test]
 async fn a_cross_site_page_never_carries_the_refresh_cookie() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     storage.delete_db(CROSS_DB).expect("clear an earlier index");
     let store = AccountStore::open(&storage.db_url(CROSS_DB)).expect("open the account index");
 

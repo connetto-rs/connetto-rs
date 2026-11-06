@@ -141,7 +141,7 @@ pub mod build {
         #[must_use]
         pub fn new(db: &str, exists: bool) -> Self {
             Self {
-                url: connetto_client::cipher::cipher_url(db, "opfs-sahpool"),
+                url: format!("file:{db}?vfs=opfs-sahpool"),
                 exists,
             }
         }

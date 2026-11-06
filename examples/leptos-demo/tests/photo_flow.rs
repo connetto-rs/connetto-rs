@@ -103,7 +103,7 @@ fn play_the_tab() {
 }
 
 async fn mint_session() -> (String, String) {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let db = format!("leptos-photo-mint-{n}.sqlite");

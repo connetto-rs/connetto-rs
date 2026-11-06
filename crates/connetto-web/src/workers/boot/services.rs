@@ -63,7 +63,9 @@ pub(super) async fn prepare_boot_storage(
     ),
     BootError,
 > {
-    let storage = crate::storage::ReplicaStorage::install().await;
+    let storage = crate::storage::ReplicaStorage::install()
+        .await
+        .map_err(BootError::Storage)?;
     // Encrypted regardless of auth, and the per-replica key also lives here.
     let key_store = std::rc::Rc::new(
         crate::auth::IdbKeyStore::open()
@@ -369,7 +371,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn the_last_identity_out_takes_the_shared_store_and_its_key() {
-        let storage = ReplicaStorage::install().await;
+        let storage = ReplicaStorage::install().await.expect("install storage");
         let keys = IdbKeyStore::open().await.expect("open the key store");
         take_pending_wipes().await.expect("drain");
         let prefix = "r11-last-out";
@@ -391,7 +393,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn an_owed_departure_keeps_its_wipe_until_it_is_settled() {
-        let storage = ReplicaStorage::install().await;
+        let storage = ReplicaStorage::install().await.expect("install storage");
         let keys = IdbKeyStore::open().await.expect("open the key store");
         take_pending_wipes().await.expect("drain");
         let prefix = "r11-depart";

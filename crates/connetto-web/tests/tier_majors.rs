@@ -248,7 +248,7 @@ async fn open_at(
 /// rows, records the new major, and leaves no handle behind on either file.
 #[wasm_bindgen_test]
 async fn a_newer_build_migrates_the_tier_in_the_worker() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let replica_name = "r31-tier-majors.sqlite";
     let tier_name = tier_db_name(replica_name);
     storage.delete_db(replica_name).expect("clear the replica");
@@ -300,7 +300,7 @@ async fn a_newer_build_migrates_the_tier_in_the_worker() {
 /// that migrates the tier for real.
 #[wasm_bindgen_test]
 async fn a_failing_step_rolls_its_boundary_back_and_refuses_the_open() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let replica_name = "r31-failing-step.sqlite";
     let tier_name = tier_db_name(replica_name);
     storage.delete_db(replica_name).expect("clear the replica");
@@ -353,7 +353,7 @@ async fn a_failing_step_rolls_its_boundary_back_and_refuses_the_open() {
 /// opens.
 #[wasm_bindgen_test]
 async fn a_step_that_produces_the_wrong_shape_is_refused() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let replica_name = "r31-wrong-shape.sqlite";
     let tier_name = tier_db_name(replica_name);
     storage.delete_db(replica_name).expect("clear the replica");
@@ -396,7 +396,7 @@ async fn a_step_that_produces_the_wrong_shape_is_refused() {
 /// connection, keeps the rows, and leaves the replica's catalogue untouched.
 #[wasm_bindgen_test]
 async fn a_table_rebuild_stays_in_the_tier() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let replica_name = "r31-rebuild-in-tier.sqlite";
     let tier_name = tier_db_name(replica_name);
     storage.delete_db(replica_name).expect("clear the replica");
@@ -439,7 +439,7 @@ async fn a_table_rebuild_stays_in_the_tier() {
 /// handles free.
 #[wasm_bindgen_test]
 async fn a_tier_ahead_of_the_build_is_refused() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let replica_name = "r31-tier-ahead.sqlite";
     let tier_name = tier_db_name(replica_name);
     storage.delete_db(replica_name).expect("clear the replica");
@@ -482,7 +482,7 @@ async fn a_tier_ahead_of_the_build_is_refused() {
 /// free.
 #[wasm_bindgen_test]
 async fn a_tier_older_than_the_oldest_export_is_refused() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let replica_name = "r31-tier-older.sqlite";
     let tier_name = tier_db_name(replica_name);
     storage.delete_db(replica_name).expect("clear the replica");
@@ -519,7 +519,7 @@ async fn a_tier_older_than_the_oldest_export_is_refused() {
 /// that predates it, records the introducing major, and accepts a write.
 #[wasm_bindgen_test]
 async fn a_tier_a_later_major_introduces_is_created_on_an_existing_install() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let replica_name = "r31-tier-later-major.sqlite";
     let tier_name = tier_db_name(replica_name);
     storage.delete_db(replica_name).expect("clear the replica");
@@ -559,7 +559,7 @@ async fn a_tier_a_later_major_introduces_is_created_on_an_existing_install() {
 /// recreated and the open fails loudly with the replica's handle back free.
 #[wasm_bindgen_test]
 async fn a_lost_tier_still_fails_loudly() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let replica_name = "r31-lost-tier.sqlite";
     let tier_name = tier_db_name(replica_name);
     storage.delete_db(replica_name).expect("clear the replica");
