@@ -18,7 +18,7 @@ use connetto_demo_support::view::OfferView;
 #[cfg(feature = "peer")]
 #[component]
 pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
-    use connetto_client::{HotspotError, HotspotOffer, HotspotSecurity, JoinError};
+    use connetto_client::{HotspotError, HotspotOffer};
     use dioxus_free_icons::Icon;
     use dioxus_free_icons::icons::fa_solid_icons::{
         FaCircleInfo, FaPowerOff, FaQrcode, FaRightFromBracket, FaSatelliteDish, FaStop,
@@ -430,46 +430,24 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
                     }
                     button {
                         onclick: move |_| {
-                            let ssid = join_ssid.peek().trim().to_owned();
-                            let passphrase = join_passphrase.peek().clone();
-                            let port_text = join_port.peek().trim().to_owned();
-                            if ssid.is_empty() || passphrase.is_empty() {
-                                join_outcome.set("the ssid and the passphrase need filling".to_owned());
-                                return;
-                            }
-                            let port = match port_text.as_str() {
-                                "" => None,
-                                text => {
-                                    match text.parse::<u16>() {
-                                        Ok(port) => Some(port),
-                                        Err(_) => {
-                                            join_outcome.set("the port is not a number".to_owned());
-                                            return;
-                                        }
-                                    }
+                            let offer = match nearby::typed_offer(
+                                &join_ssid.peek(),
+                                &join_passphrase.peek(),
+                                &join_port.peek(),
+                            ) {
+                                Ok(offer) => offer,
+                                Err(outcome) => {
+                                    join_outcome.set(outcome.to_owned());
+                                    return;
                                 }
                             };
-                            let offer = HotspotOffer::new(ssid, passphrase, HotspotSecurity::Wpa2, port);
-                            let parts = join_parts.clone();
-                            let mut outcome = join_outcome;
-                            let mut joined = join_joined;
-                            let mut missing = join_missing;
-                            spawn(async move {
-                                outcome.set("joining the hotspot".to_owned());
-                                let gateway = parts.0.native.join_hotspot(&offer).await;
-                                match gateway {
-                                    Ok(gateway) => {
-                                        joined.set(true);
-                                        outcome.set(nearby::joined_outcome(gateway));
-                                    }
-                                    Err(err) => {
-                                        if let JoinError::MissingPermission(name) = &err {
-                                            missing.set(Some(name.clone()));
-                                        }
-                                        outcome.set(err.to_string());
-                                    }
-                                }
-                            });
+                            spawn(join_offer(
+                                join_parts.clone(),
+                                offer,
+                                join_outcome,
+                                join_joined,
+                                join_missing,
+                            ));
                         },
                         Icon { icon: FaWifi, width: 14, height: 14 }
                         "Join the hotspot"
@@ -490,7 +468,6 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
                     button {
                         onclick: move |_| {
                             let mut outcome = payload_outcome;
-                            let mut joined = payload_joined;
                             let offer = match HotspotOffer::from_wifi_payload(join_payload.peek().trim()) {
                                 Ok(offer) => offer,
                                 Err(err) => {
@@ -498,23 +475,13 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
                                     return;
                                 }
                             };
-                            let parts = payload_parts.clone();
-                            let mut missing = payload_missing;
-                            spawn(async move {
-                                outcome.set("joining the hotspot".to_owned());
-                                match parts.0.native.join_hotspot(&offer).await {
-                                    Ok(gateway) => {
-                                        joined.set(true);
-                                        outcome.set(nearby::joined_outcome(gateway));
-                                    }
-                                    Err(err) => {
-                                        if let JoinError::MissingPermission(name) = &err {
-                                            missing.set(Some(name.clone()));
-                                        }
-                                        outcome.set(err.to_string());
-                                    }
-                                }
-                            });
+                            spawn(join_offer(
+                                payload_parts.clone(),
+                                offer,
+                                outcome,
+                                payload_joined,
+                                payload_missing,
+                            ));
                         },
                         Icon { icon: FaQrcode, width: 14, height: 14 }
                         "Join from the payload"
@@ -594,6 +561,31 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
                 }
             }
             super::PaneInfo { text: connetto_demo_support::NEARBY_INFO }
+        }
+    }
+}
+
+/// Join the hotspot `offer` names, showing the join's outcome and the
+/// permission it misses.
+#[cfg(feature = "peer")]
+async fn join_offer(
+    parts: SessionParts,
+    offer: connetto_client::HotspotOffer,
+    mut outcome: Signal<String>,
+    mut joined: Signal<bool>,
+    mut missing: Signal<Option<String>>,
+) {
+    outcome.set(nearby::JOINING_HOTSPOT.to_owned());
+    match parts.0.native.join_hotspot(&offer).await {
+        Ok(gateway) => {
+            joined.set(true);
+            outcome.set(nearby::joined_outcome(gateway));
+        }
+        Err(err) => {
+            if let connetto_client::JoinError::MissingPermission(name) = &err {
+                missing.set(Some(name.clone()));
+            }
+            outcome.set(err.to_string());
         }
     }
 }

@@ -735,62 +735,38 @@ async fn join_hotspot(
     passphrase: String,
     port: String,
 ) {
-    use connetto_client::{HotspotOffer, HotspotSecurity};
-    let Some(session) = core.session() else {
-        return;
-    };
-    let ssid = ssid.trim().to_owned();
-    if ssid.is_empty() || passphrase.is_empty() {
-        core.update(app, |v| {
-            if let Some(panel) = v.nearby.as_mut() {
-                panel.outcome = "the ssid and the passphrase need filling".to_owned();
-            }
-        });
-        return;
-    }
-    let offer = match port.trim() {
-        "" => HotspotOffer::new(ssid, passphrase, HotspotSecurity::Wpa2, None),
-        text => match text.parse::<u16>() {
-            Ok(port) => HotspotOffer::new(ssid, passphrase, HotspotSecurity::Wpa2, Some(port)),
-            Err(_) => {
-                core.update(app, |v| {
-                    if let Some(panel) = v.nearby.as_mut() {
-                        panel.outcome = "the port is not a number".to_owned();
-                    }
-                });
-                return;
-            }
-        },
-    };
-    core.update(app, |v| {
-        if let Some(panel) = v.nearby.as_mut() {
-            panel.outcome = "joining the hotspot".to_owned();
-        }
-    });
-    match session.native.join_hotspot(&offer).await {
-        Ok(gateway) => core.update(app, |v| {
-            if let Some(panel) = v.nearby.as_mut() {
-                panel.joined = true;
-                panel.outcome = support::nearby::joined_outcome(gateway);
-            }
-        }),
-        Err(err) => report_join_error(app, core, &err),
-    }
+    join_offer(
+        app,
+        core,
+        support::nearby::typed_offer(&ssid, &passphrase, &port).map_err(str::to_owned),
+    )
+    .await;
 }
 
 /// Join a hotspot by its pasted or scanned `WIFI:` payload.
 #[cfg(feature = "peer")]
 async fn join_payload(app: &AppHandle, core: &Arc<Core>, payload: String) {
-    use connetto_client::HotspotOffer;
+    let offer = connetto_client::HotspotOffer::from_wifi_payload(payload.trim())
+        .map_err(|err| err.to_string());
+    join_offer(app, core, offer).await;
+}
+
+/// Join the hotspot `offer` names, or show why the form names none.
+#[cfg(feature = "peer")]
+async fn join_offer(
+    app: &AppHandle,
+    core: &Arc<Core>,
+    offer: Result<connetto_client::HotspotOffer, String>,
+) {
     let Some(session) = core.session() else {
         return;
     };
-    let offer = match HotspotOffer::from_wifi_payload(payload.trim()) {
+    let offer = match offer {
         Ok(offer) => offer,
-        Err(err) => {
+        Err(outcome) => {
             core.update(app, |v| {
                 if let Some(panel) = v.nearby.as_mut() {
-                    panel.outcome = err.to_string();
+                    panel.outcome = outcome;
                 }
             });
             return;
@@ -798,7 +774,7 @@ async fn join_payload(app: &AppHandle, core: &Arc<Core>, payload: String) {
     };
     core.update(app, |v| {
         if let Some(panel) = v.nearby.as_mut() {
-            panel.outcome = "joining the hotspot".to_owned();
+            panel.outcome = support::nearby::JOINING_HOTSPOT.to_owned();
         }
     });
     match session.native.join_hotspot(&offer).await {

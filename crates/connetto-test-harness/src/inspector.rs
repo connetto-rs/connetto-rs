@@ -573,7 +573,8 @@ mod tests {
     }
 
     /// The switch clicks the one button naming the signed-in line's short
-    /// identity, and a line naming none is refused before any click.
+    /// identity, finds none for an identity no button names, and refuses a
+    /// line naming no identity before any click.
     #[tokio::test]
     async fn the_switch_clicks_the_button_naming_the_identity() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -606,6 +607,11 @@ mod tests {
         page.switch_to_account("Signed in as d5e24135 (alice)")
             .await
             .unwrap();
+        let unknown = page
+            .switch_to_account("Signed in as cc072008 (bob)")
+            .await
+            .unwrap_err();
+        assert!(unknown.to_string().contains("0 buttons"), "{unknown:#}");
         let error = page.switch_to_account("Signed in as ").await.unwrap_err();
         assert!(error.to_string().contains("names no identity"), "{error:#}");
     }

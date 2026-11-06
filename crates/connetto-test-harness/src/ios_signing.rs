@@ -33,12 +33,18 @@ pub fn profile_folder() -> Result<PathBuf> {
 ///
 /// When `security` cannot decode the profile.
 pub async fn decode_profile(profile: &Path) -> Result<String> {
-    let output = tokio::process::Command::new("security")
-        .args(["cms", "-D", "-i"])
+    decode_with("security", &["cms", "-D", "-i"], profile).await
+}
+
+/// The output of `program` run with `args` and the profile's path, or its
+/// error output when it fails.
+async fn decode_with(program: &str, args: &[&str], profile: &Path) -> Result<String> {
+    let output = tokio::process::Command::new(program)
+        .args(args)
         .arg(profile)
         .output()
         .await
-        .context("starting security")?;
+        .with_context(|| format!("starting {program}"))?;
     if !output.status.success() {
         bail!(
             "decoding the profile {} failed: {}",
@@ -185,7 +191,7 @@ mod tests {
 
     use anyhow::{Result, bail};
 
-    use super::{DIOXUS_PROFILE, TAURI_PROFILE, find_profile};
+    use super::{DIOXUS_PROFILE, TAURI_PROFILE, decode_with, find_profile};
 
     /// A decoded profile carrying `name`.
     fn plist(name: &str) -> String {
@@ -248,5 +254,34 @@ mod tests {
             .await
             .expect_err("no profile");
         assert!(other.to_string().contains(DIOXUS_PROFILE), "{other:#}");
+        let gone = find_profile(&folder.path().join("gone"), TAURI_PROFILE, read)
+            .await
+            .expect_err("no folder");
+        assert!(gone.to_string().starts_with("listing "), "{gone:#}");
+    }
+
+    /// A decoder that succeeds hands back what it printed, one that fails
+    /// names the profile and its error output, and one that cannot start
+    /// names itself.
+    #[tokio::test]
+    async fn a_decoder_hands_back_its_output_or_its_error() {
+        let folder = tempfile::tempdir().expect("a folder");
+        let profile = folder.path().join("p.mobileprovision");
+        std::fs::write(&profile, plist(TAURI_PROFILE)).expect("write");
+        let decoded = decode_with("sh", &["-c", r#"cat "$1""#, "sh"], &profile)
+            .await
+            .expect("the decoded profile");
+        assert_eq!(decoded, plist(TAURI_PROFILE));
+        let refused = decode_with("sh", &["-c", "echo damaged >&2; exit 1", "sh"], &profile)
+            .await
+            .expect_err("a refusal");
+        assert_eq!(
+            refused.to_string(),
+            format!("decoding the profile {} failed: damaged", profile.display())
+        );
+        let absent = decode_with("connetto-no-such-decoder", &[], &profile)
+            .await
+            .expect_err("no decoder");
+        assert_eq!(absent.to_string(), "starting connetto-no-such-decoder");
     }
 }

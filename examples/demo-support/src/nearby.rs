@@ -5,7 +5,9 @@
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 
-use connetto_client::{BeaconState, HostId, HotspotOffer, JoinError, JoinNearbyError, NearbyHost};
+use connetto_client::{
+    BeaconState, HostId, HotspotOffer, HotspotSecurity, JoinError, JoinNearbyError, NearbyHost,
+};
 use connetto_core::device_cert::DeviceIdentity;
 
 use crate::view::OfferView;
@@ -20,6 +22,10 @@ pub const PERSONAL_NOTE: &str = "connetto cannot see whether Personal Hotspot is
 /// The outcome a nearby join shows while it runs, the guard against a
 /// second one.
 pub const JOINING_NEARBY: &str = "joining the nearby host";
+
+/// The outcome a hotspot join by its typed lines or its payload shows while
+/// it runs.
+pub const JOINING_HOTSPOT: &str = "joining the hotspot";
 
 /// A device identity as `account/key prefix`, what the panel names devices
 /// by, its own included.
@@ -112,6 +118,33 @@ pub fn joined_outcome(gateway: IpAddr) -> String {
     format!("joined through the gateway {gateway}")
 }
 
+/// The offer the join form's typed lines name, a WPA2 network with the port
+/// where one is typed.
+///
+/// # Errors
+///
+/// The outcome line naming what is wrong, an empty network name or
+/// passphrase, or a port that is no port number.
+pub fn typed_offer(ssid: &str, passphrase: &str, port: &str) -> Result<HotspotOffer, &'static str> {
+    let ssid = ssid.trim();
+    if ssid.is_empty() || passphrase.is_empty() {
+        return Err("the ssid and the passphrase need filling");
+    }
+    let port = match port.trim() {
+        "" => None,
+        text => Some(
+            text.parse::<u16>()
+                .map_err(|_| "the port is not a number")?,
+        ),
+    };
+    Ok(HotspotOffer::new(
+        ssid,
+        passphrase,
+        HotspotSecurity::Wpa2,
+        port,
+    ))
+}
+
 /// The outcome a nearby join shows, the gateway and the host it reached.
 #[must_use]
 pub fn joined_nearby_outcome(gateway: IpAddr, host: &DeviceIdentity) -> String {
@@ -161,8 +194,36 @@ pub fn strongest(hosts: &[NearbyHost]) -> Option<HostId> {
 
 #[cfg(test)]
 mod tests {
-    use super::{nearby_line, nearby_permission, strongest};
+    use super::{nearby_line, nearby_permission, strongest, typed_offer};
     use connetto_client::{BluetoothError, JoinError, JoinNearbyError, NearbyHost};
+
+    /// The typed lines name a WPA2 offer, the network name trimmed and the
+    /// port optional, and each missing or malformed line says what is wrong.
+    #[test]
+    fn the_typed_lines_name_an_offer_or_what_is_wrong() {
+        let offer = typed_offer("  camp  ", "opensesame", " 4431 ").expect("an offer");
+        assert_eq!(offer.ssid, "camp");
+        assert_eq!(offer.passphrase, "opensesame");
+        assert_eq!(offer.port, Some(4431));
+        assert_eq!(
+            typed_offer("camp", "opensesame", "")
+                .expect("an offer")
+                .port,
+            None
+        );
+        let fill = "the ssid and the passphrase need filling";
+        assert_eq!(typed_offer("   ", "opensesame", "").map(drop), Err(fill));
+        assert_eq!(typed_offer("camp", "", "").map(drop), Err(fill));
+        let port = "the port is not a number";
+        assert_eq!(
+            typed_offer("camp", "opensesame", "port").map(drop),
+            Err(port)
+        );
+        assert_eq!(
+            typed_offer("camp", "opensesame", "70000").map(drop),
+            Err(port)
+        );
+    }
 
     /// A nearby join refused for a missing permission names it, so the
     /// panel asks for it as the typed and payload joins do.
