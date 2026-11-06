@@ -52,6 +52,13 @@ async fn a_catchup_compresses_nothing_for_the_changes_it_walks() {
     let resume_from = away.wait_for_live(DELIVERY).await.cursor;
     away.close().await;
 
+    // The reconnect issues its writer row before the window opens, so its
+    // log entry, which rides the change stream since the bookkeeping tables
+    // joined the publication (R77 decision 11), is logged before `before`.
+    let mut back = server.connect();
+    back.handshake_resuming("catchup-away", "user:alice#away", resume_from, Some(&[]))
+        .await;
+
     fixture
         .exec(&format!(
             "INSERT INTO items (id, owner, label) \
@@ -66,13 +73,10 @@ async fn a_catchup_compresses_nothing_for_the_changes_it_walks() {
         ))
         .await;
     // Logged before fan-out, and the log is in commit order, so every change
-    // above is in the log once this arrives.
+    // above and the writer row are in the log once this arrives.
     stayed.wait_for_live(DELIVERY).await;
 
     let before = counters::snapshot();
-    let mut back = server.connect();
-    back.handshake_resuming("catchup-away", "user:alice#away", resume_from, Some(&[]))
-        .await;
     back.subscribe("items", QUERY).await;
     let mut received = 0;
     loop {
@@ -94,10 +98,10 @@ async fn a_catchup_compresses_nothing_for_the_changes_it_walks() {
     assert_eq!(
         spent.patch_compressions,
         0,
-        "the catchup compressed {} patches walking {} logged changes, each of which was \
+        "the catchup compressed {} patches walking the {} logged changes, each of which was \
          compressed once already when it was logged",
         spent.patch_compressions,
-        OTHERS + 1
+        OTHERS + 2
     );
 
     stayed.close().await;

@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use connetto_server::{Materializer, PgSnapshotSource, RlsAuth};
 use connetto_test_harness::{
-    Fixture, HarnessAuth, ServerConfig, pool_for, spawn_server, with_user,
+    Fixture, HarnessAuth, ServerConfig, engine_ddl, pool_for, spawn_server, with_user,
 };
 use diesel::prelude::*;
 
@@ -63,7 +63,9 @@ fn ids_in(patchset_zstd: &[u8]) -> Vec<i32> {
     let mut replica = SqliteConnection::establish(":memory:").expect("open replica");
     diesel::RunQueryDsl::execute(diesel::sql_query(REPLICA_DDL), &mut replica)
         .expect("replica ddl");
-    Materializer::builder(PG_DDL)
+    // The one catalog the server classifies with, so the patch's table
+    // numbers line up with the replica's (R77 decision 11).
+    Materializer::builder(&engine_ddl(PG_DDL))
         .build()
         .expect("applier")
         .apply_diffset(patchset_zstd, &mut replica)
@@ -116,8 +118,13 @@ async fn a_share_key_filters_the_snapshot_and_the_live_stream_alike() {
         ServerConfig::new(PG_DDL, fixture.admin_url())
             .with_policies(POLICIES)
             .with_replication(["notes"]),
-        PgSnapshotSource::from_ddl(writer_pool.clone(), PG_DDL).expect("snapshot source"),
-        HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth")),
+        // The one catalog the server parts read, the way the harness appends
+        // it inside `spawn_server` (R77 decision 11).
+        PgSnapshotSource::from_ddl(writer_pool.clone(), &engine_ddl(PG_DDL))
+            .expect("snapshot source"),
+        HarnessAuth::rls(
+            RlsAuth::from_ddl(writer_pool.clone(), &engine_ddl(PG_DDL)).expect("rls auth"),
+        ),
         writer_pool,
         fixture.admin().clone(),
     )

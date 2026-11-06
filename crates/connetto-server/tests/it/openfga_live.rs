@@ -109,9 +109,13 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
     provision(&pool).await;
     let (channel, store) = fixture.fga_store().await;
 
-    let translated =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("connetto's own policy shape translates");
+    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+        SCHEMA,
+        &policies(),
+        "app.user_id",
+        true,
+    )
+    .expect("connetto's own policy shape translates");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
     let model = translated
         .install_model(&mut setup, &store)
@@ -192,6 +196,7 @@ async fn a_note_that_does_not_refuse_is_logged_for_the_operator() {
                 SCHEMA,
                 &policies,
                 "app.user_id",
+                true,
             );
             (translated, capture.lines())
         },
@@ -226,18 +231,26 @@ async fn unchanged_rules_are_adopted_rather_than_rewritten() {
     let (channel, store) = fixture.fga_store().await;
     let mut client = OpenFgaServiceClient::new(channel);
 
-    let first =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("translates")
-            .install_model(&mut client, &store)
-            .await
-            .expect("written");
-    let second =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("translates")
-            .install_model(&mut client, &store)
-            .await
-            .expect("adopted");
+    let first = Translated::of::<String, connetto_core::bots::TextIds>(
+        SCHEMA,
+        &policies(),
+        "app.user_id",
+        true,
+    )
+    .expect("translates")
+    .install_model(&mut client, &store)
+    .await
+    .expect("written");
+    let second = Translated::of::<String, connetto_core::bots::TextIds>(
+        SCHEMA,
+        &policies(),
+        "app.user_id",
+        true,
+    )
+    .expect("translates")
+    .install_model(&mut client, &store)
+    .await
+    .expect("adopted");
 
     assert!(matches!(first, ModelState::Written(_)));
     assert_eq!(
@@ -288,9 +301,13 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
     provision(&pool).await;
     let (channel, store) = fixture.fga_store().await;
 
-    let translated =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("translates");
+    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+        SCHEMA,
+        &policies(),
+        "app.user_id",
+        true,
+    )
+    .expect("translates");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
     let model = translated
         .install_model(&mut setup, &store)
@@ -326,12 +343,16 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
     }
     drop(conn);
 
-    let adopted =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("translates")
-            .install_model(&mut setup, &store)
-            .await
-            .expect("adopted");
+    let adopted = Translated::of::<String, connetto_core::bots::TextIds>(
+        SCHEMA,
+        &policies(),
+        "app.user_id",
+        true,
+    )
+    .expect("translates")
+    .install_model(&mut setup, &store)
+    .await
+    .expect("adopted");
     assert_eq!(adopted, ModelState::Adopted(model.id().to_owned()));
     let (added, removed) = translated
         .reconcile_store(&FactSource::owner(pool.clone()), &loader)
@@ -367,9 +388,13 @@ async fn an_adopted_boot_that_cannot_reconcile_refuses() {
     provision(&pool).await;
     let (channel, store) = fixture.fga_store().await;
 
-    let translated =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("translates");
+    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+        SCHEMA,
+        &policies(),
+        "app.user_id",
+        true,
+    )
+    .expect("translates");
     let mut setup = OpenFgaServiceClient::new(channel);
     let model = translated
         .install_model(&mut setup, &store)
@@ -430,9 +455,13 @@ async fn a_table_with_row_level_security_and_no_policy_grants_nobody() {
     let (channel, store) = fixture.fga_store().await;
 
     let policies = "ALTER TABLE r5b_notes ENABLE ROW LEVEL SECURITY;";
-    let translated =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, policies, "app.user_id")
-            .expect("nothing to translate");
+    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+        SCHEMA,
+        policies,
+        "app.user_id",
+        true,
+    )
+    .expect("nothing to translate");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
     let model = translated
         .install_model(&mut setup, &store)
@@ -500,9 +529,13 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
     provision(&pool).await;
     let (channel, store) = fixture.fga_store().await;
 
-    let translated =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("connetto's own policy shape translates");
+    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+        SCHEMA,
+        &policies(),
+        "app.user_id",
+        true,
+    )
+    .expect("connetto's own policy shape translates");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
     let model = translated
         .install_model(&mut setup, &store)
@@ -634,6 +667,7 @@ async fn cross_executor(
         &schema,
         &CROSS_POLICY_STATEMENTS.join(";\n"),
         "app.user_id",
+        true,
     )
     .expect("a membership policy translates");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
@@ -832,6 +866,7 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
         ORDERS_SCHEMA,
         &orders_policies(),
         "app.user_id",
+        true,
     )
     .expect("connetto's own policy shape translates");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
@@ -956,6 +991,7 @@ async fn replay_executor(
         &schema,
         REPLAY_POLICY,
         "app.user_id",
+        true,
     )
     .expect("a share whose replay declares its slice boots since R86");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
@@ -1386,6 +1422,7 @@ async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
         &schema,
         COMPOSITE_POLICY,
         "app.user_id",
+        true,
     )
     .expect("composite shape: no ClauseBelowThreshold, no uncovered refusal");
 
@@ -1577,6 +1614,7 @@ async fn keyed_replay_executor(
         &schema,
         KEYED_REPLAY_POLICY,
         "app.user_id",
+        true,
     )
     .expect("a keyed share whose replay declares its slice boots since R86");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
