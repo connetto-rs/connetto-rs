@@ -13,7 +13,7 @@ use std::time::Duration;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{AnyThread, Message, define_class, msg_send};
+use objc2::{AnyThread, Ivars, Message, define_class, msg_send};
 use objc2_core_bluetooth::{
     CBATTError, CBATTRequest, CBAdvertisementDataServiceUUIDsKey, CBCentral, CBCharacteristic,
     CBManager, CBManagerAuthorization, CBManagerState, CBMutableCharacteristic, CBMutableService,
@@ -271,7 +271,7 @@ fn ensure_manager(recreate: bool, power_alert: bool) {
     standing.advertising = false;
     standing.registration = Registration::Absent;
     standing.wanted = false;
-    let queue = DispatchQueue::new("connetto-peer-apple", None);
+    let queue = DispatchQueue::new(Some(c"connetto-peer-apple"), None);
     let delegate = PeripheralDelegate::new();
     // SAFETY: the delegate and the queue are valid for the process, the
     // options dictionary carries one valid key and value, and the init
@@ -470,6 +470,10 @@ define_class!(
     unsafe impl NSObjectProtocol for PeripheralDelegate {}
 
     unsafe impl CBPeripheralManagerDelegate for PeripheralDelegate {
+        #[expect(
+            clippy::unused_self,
+            reason = "Core Bluetooth calls the delegate instance, and objc2 main's define_class! shows the receiver to clippy"
+        )]
         #[unsafe(method(peripheralManagerDidUpdateState:))]
         fn peripheral_manager_did_update_state(&self, peripheral: &CBPeripheralManager) {
             // SAFETY: the manager is alive for the process, and the
@@ -489,6 +493,10 @@ define_class!(
             }
         }
 
+        #[expect(
+            clippy::unused_self,
+            reason = "Core Bluetooth calls the delegate instance, and objc2 main's define_class! shows the receiver to clippy"
+        )]
         #[unsafe(method(peripheralManagerDidStartAdvertising:error:))]
         fn peripheral_manager_did_start_advertising_error(
             &self,
@@ -505,6 +513,10 @@ define_class!(
             }
         }
 
+        #[expect(
+            clippy::unused_self,
+            reason = "Core Bluetooth calls the delegate instance, and objc2 main's define_class! shows the receiver to clippy"
+        )]
         #[unsafe(method(peripheralManager:didAddService:error:))]
         fn peripheral_manager_did_add_service_error(
             &self,
@@ -543,6 +555,10 @@ define_class!(
             }
         }
 
+        #[expect(
+            clippy::unused_self,
+            reason = "Core Bluetooth calls the delegate instance, and objc2 main's define_class! shows the receiver to clippy"
+        )]
         #[unsafe(method(peripheralManager:central:didSubscribeToCharacteristic:))]
         fn peripheral_manager_central_did_subscribe_to_characteristic(
             &self,
@@ -568,6 +584,10 @@ define_class!(
             EVENTS.lock().push(Event::Connected { device, mtu });
         }
 
+        #[expect(
+            clippy::unused_self,
+            reason = "Core Bluetooth calls the delegate instance, and objc2 main's define_class! shows the receiver to clippy"
+        )]
         #[unsafe(method(peripheralManager:central:didUnsubscribeFromCharacteristic:))]
         fn peripheral_manager_central_did_unsubscribe_from_characteristic(
             &self,
@@ -590,6 +610,10 @@ define_class!(
             }
         }
 
+        #[expect(
+            clippy::unused_self,
+            reason = "Core Bluetooth calls the delegate instance, and objc2 main's define_class! shows the receiver to clippy"
+        )]
         #[unsafe(method(peripheralManager:didReceiveReadRequest:))]
         fn peripheral_manager_did_receive_read_request(
             &self,
@@ -619,6 +643,10 @@ define_class!(
         /// offset order, as one array, and waits for one answer on its first
         /// request, so the parts become one chunk and the answer covers them
         /// all.
+        #[expect(
+            clippy::unused_self,
+            reason = "Core Bluetooth calls the delegate instance, and objc2 main's define_class! shows the receiver to clippy"
+        )]
         #[unsafe(method(peripheralManager:didReceiveWriteRequests:))]
         fn peripheral_manager_did_receive_write_requests(
             &self,
@@ -665,6 +693,10 @@ define_class!(
             unsafe { peripheral.respondToRequest_withResult(&first, result) };
         }
 
+        #[expect(
+            clippy::unused_self,
+            reason = "Core Bluetooth calls the delegate instance, and objc2 main's define_class! shows the receiver to clippy"
+        )]
         #[unsafe(method(peripheralManagerIsReadyToUpdateSubscribers:))]
         fn peripheral_manager_is_ready_to_update_subscribers(
             &self,
@@ -709,7 +741,7 @@ define_class!(
 impl PeripheralDelegate {
     /// The delegate's one instance.
     fn new() -> Retained<Self> {
-        let this = Self::alloc().set_ivars(());
+        let this = Self::alloc().set_ivars(Ivars::<Self> {});
         // SAFETY: the definition registers the class, the alloc answered an
         // uninit object of this class, and NSObject's init answers the
         // initialized object the caller owns.

@@ -141,7 +141,7 @@ keyutils = "0.4"
 [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
 connetto-peer-apple = { path = "../connetto-peer-apple" }
 
-# The mac leg's main thread drains the platform's main queue, which the
-# Location Services prompt and its reads stand on.
+# The mac leg's main thread runs its run loop, which serves the main queue on
+# that thread for the Location Services prompt and its reads.
 [target.'cfg(target_os = "macos")'.dependencies]
-dispatch2 = "0.3.1"
+objc2-core-foundation = { workspace = true, features = ["std", "CFRunLoop"] }
