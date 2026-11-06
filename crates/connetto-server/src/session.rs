@@ -1683,6 +1683,40 @@ struct LiveSession {
     user: Option<String>,
 }
 
+/// One author's open provisional question on one connection (R77 decision 11):
+/// the sequences that answered `Pending`, the row filters that wake it, and
+/// the timer that re-reads it the moment its certificate lapses.
+struct ProvisionalAuthor {
+    /// The author's writer number, learned from its row once the stream or a
+    /// read carries it.
+    writer: Option<i64>,
+    /// The open sequences by the ask that asked them, each ask answered by a
+    /// push naming its own `request_id`.
+    asks: BTreeMap<String, BTreeSet<u64>>,
+    /// The author's row filters, one per registered internal consumer.
+    consumers: Vec<(u64, SubscriptionId)>,
+    /// The instant the author's certificate lapses (its expiry plus the
+    /// tolerance), the deadline its timer sleeps to (R77 decision 11).
+    deadline: Option<SystemTime>,
+    /// The task sleeping to that deadline, aborted the moment the author
+    /// closes so a lapsed certificate of a closed question pushes nothing
+    /// (R77 decision 11).
+    timer: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// A connection's open provisional questions, every author's, with the
+/// connection that owns them so a superseded end cannot drop the successor's.
+struct ProvisionalSessionQ {
+    connection_num: u64,
+    /// The connection's outbound half, pushed on even after the handle is
+    /// superseded, so a verdict answers the ask that asked.
+    tx: OutboundTx,
+    authors: BTreeMap<Vec<u8>, ProvisionalAuthor>,
+    /// The connection's open sequences, every author's sum, the bound the
+    /// asks hold against.
+    open: usize,
+}
+
 /// What a completed handshake establishes for the run loop.
 struct HandshakeOutcome<Id, Key> {
     connection_num: u64,
@@ -2404,6 +2438,12 @@ pub struct SessionManager<
     /// and supersession. The per-subscription route map cannot serve either,
     /// because a session with no subscriptions has no route.
     sessions: Mutex<HashMap<SessionId, LiveSession>>,
+    /// The open provisional questions per connection, answered by a push the
+    /// moment a sequence settles (R77 decision 11).
+    provisional_questions: Mutex<HashMap<SessionId, ProvisionalSessionQ>>,
+    /// The internal row filters those questions watch, the consumer id to the
+    /// connection and author key that owns it.
+    provisional_consumers: Mutex<HashMap<u64, (SessionId, Vec<u8>)>>,
     snapshot_source: Snap,
     auth: Auth,
     /// Checks the grants a handshake presents and signs the resume credential
@@ -2539,6 +2579,7 @@ async fn sunset_watch<Snap, Auth, D, C, O, S>(
     D: ConnettoSchema,
     D::Id: core::fmt::Display + Clone + Send + Sync + 'static,
     S: ContentTicketSigner,
+    ConnettoManager<Snap, Auth, D, C, O, S>: Send + Sync + 'static,
 {
     let mut ticker = tokio::time::interval(SUNSET_WATCH_CADENCE);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2601,6 +2642,8 @@ where
         dispatch_gate: Mutex::new(()),
         computed_routes: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
+        provisional_questions: Mutex::new(HashMap::new()),
+        provisional_consumers: Mutex::new(HashMap::new()),
         snapshot_source,
         auth,
         authority,
@@ -2627,8 +2670,10 @@ where
         bot_registry,
         writer_sessions: Mutex::new(HashMap::new()),
     });
-    // A configured sunset is enforced by the watch, which every construction
-    // shares here, the binary's and the in-process builder's alike (R107).
+    // The sunset watch is the only standing background task; it stands only
+    // when a sunset is configured (R107). The provisional certificate
+    // expiries arm their own timer per open author at ask time (R77
+    // decision 11).
     if let Some(sunset) = sunset
         && has_major
     {
@@ -2666,7 +2711,11 @@ where
     Id: core::fmt::Display + Clone + Send + Sync + 'static,
     Key: CapabilityKey,
     D: ConnettoSchema<Id = Id>,
-    S: ContentTicketSigner,
+    S: ContentTicketSigner + 'static,
+    // A provisional expiry timer spawns a `Send` task on the manager's weak
+    // handle (R77 decision 11), which is `Send` only for a `Send + Sync`
+    // manager, and `tokio::spawn` needs the manager to outlive it.
+    Self: Send + Sync + 'static,
 {
     /// Ask a second executor about every current row alongside the one that
     /// delivers, so a divergence between them is counted and named.
@@ -3180,6 +3229,542 @@ where
         }
     }
 
+    /// The open questions an applied event's bookkeeping rows wake, the
+    /// internal consumers it matched resolved to the connection and author
+    /// key that owns them (R77 decision 11).
+    async fn provisional_targets_of(&self, applied: &Applied) -> HashSet<(SessionId, Vec<u8>)> {
+        let consumers = self.provisional_consumers.lock().await;
+        let mut targets = HashSet::new();
+        for patch in &applied.patches {
+            if let Some((session_id, key)) = consumers.get(&patch.consumer_id) {
+                targets.insert((*session_id, key.clone()));
+            }
+        }
+        for consumer_id in &applied.refused {
+            if let Some((session_id, key)) = consumers.get(consumer_id) {
+                targets.insert((*session_id, key.clone()));
+            }
+        }
+        targets
+    }
+
+    /// Re-read the open questions an event or a reconnect owes, holding the
+    /// dispatch gate so no settle lands between a question's fact read and its
+    /// answer (R77 decision 11).
+    async fn revalidate_provisional_targets(&self, targets: &HashSet<(SessionId, Vec<u8>)>) {
+        if targets.is_empty() {
+            return;
+        }
+        let _gate = self.dispatch_gate.lock().await;
+        for (session_id, key) in targets {
+            self.revalidate_one_locked(*session_id, key).await;
+        }
+    }
+
+    /// Re-read one author's facts, push what turned final, close those
+    /// sequences, and register the settled filter the first time the writer
+    /// number is learned. The caller holds the dispatch gate.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one author's revalidation walks read, rule, push, and close in order"
+    )]
+    async fn revalidate_one_locked(&self, session_id: SessionId, key: &[u8]) {
+        let snapshot = {
+            let questions = self.provisional_questions.lock().await;
+            questions
+                .get(&session_id)
+                .and_then(|q| q.authors.get(key))
+                .map(|author| {
+                    (
+                        author.writer,
+                        author
+                            .asks
+                            .iter()
+                            .map(|(id, seqs)| (id.clone(), seqs.clone()))
+                            .collect::<BTreeMap<_, _>>(),
+                    )
+                })
+        };
+        let Some((writer_known, asks)) = snapshot else {
+            return;
+        };
+        if asks.values().all(BTreeSet::is_empty) {
+            return;
+        }
+        // The facts, read the way the ask answers them, so the push and the
+        // first answer rule identically.
+        let writer_row = match self.target.writer_by_key(key).await {
+            Ok(row) => row,
+            Err(err) => {
+                tracing::warn!(
+                    "the writer read answered no fact for an open question: {}",
+                    err.detail()
+                );
+                return;
+            }
+        };
+        let record = match (self.device_enrolment.get(), key.try_into().ok()) {
+            (Some(enrolment), Some(key_bytes)) => {
+                match enrolment
+                    .key_record(None, KeyId::from_bytes(key_bytes))
+                    .await
+                {
+                    Ok(record) => record,
+                    Err(err) => {
+                        tracing::warn!(
+                            "the enrolment store did not answer for an open question: {err:?}"
+                        );
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let abandoned = record
+            .as_ref()
+            .is_none_or(|record| record.revoked || !record.certificate_live_past_skew);
+        let writer = writer_row.as_ref().map(|row| row.writer);
+        let (frontier, retired) = writer_row.as_ref().map_or((0, false), |row| {
+            (
+                u64::try_from(row.frontier).unwrap_or(0),
+                row.retired_at.is_some(),
+            )
+        });
+        let mut records: HashMap<i64, SettledOutcome> = HashMap::new();
+        if let (Some(low), Some(writer)) = (
+            asks.values()
+                .flat_map(BTreeSet::iter)
+                .filter(|seq| **seq <= frontier)
+                .copied()
+                .min(),
+            writer,
+        ) {
+            match self
+                .target
+                .settled_range(
+                    writer,
+                    i64::try_from(low).unwrap_or(0),
+                    i64::try_from(frontier).unwrap_or(i64::MAX),
+                )
+                .await
+            {
+                Ok(rows) => {
+                    for (seq, settled) in rows {
+                        match SettledOutcome::from_json(&settled.outcome) {
+                            Ok(outcome) => {
+                                records.insert(seq, outcome);
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "a settled record held no outcome the table defines");
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "the settled read answered no fact for an open question: {}",
+                        err.detail()
+                    );
+                    return;
+                }
+            }
+        }
+        let facts = crate::provisional::AskFacts {
+            frontier,
+            retired,
+            abandoned,
+        };
+        // Ruling each open sequence, what turned final goes to the ask that
+        // asked it, never a sequence twice.
+        let mut pushes: BTreeMap<String, Vec<(u64, connetto_core::exchange::Verdict)>> =
+            BTreeMap::new();
+        let mut closed = BTreeSet::new();
+        for (request_id, seqs) in &asks {
+            for seq in seqs {
+                let verdict = crate::provisional::verdict_of(
+                    &facts,
+                    *seq,
+                    records.get(&i64::try_from(*seq).unwrap_or(i64::MAX)),
+                );
+                if verdict != connetto_core::exchange::Verdict::Pending {
+                    closed.insert(*seq);
+                    pushes
+                        .entry(request_id.clone())
+                        .or_default()
+                        .push((*seq, verdict));
+                }
+            }
+        }
+        if !pushes.is_empty() {
+            let tx_opt = {
+                let questions = self.provisional_questions.lock().await;
+                questions.get(&session_id).map(|q| q.tx.clone())
+            };
+            let Some(tx) = tx_opt else {
+                return;
+            };
+            for (request_id, verdicts) in pushes {
+                let _ = tx.send(Outbound::Control(ControlMessage::ProvisionalVerdicts(
+                    ProvisionalVerdicts {
+                        request_id,
+                        verdicts,
+                    },
+                )));
+            }
+        }
+        // The writer number the first read learned, to register the settled
+        // filter the first time it becomes known.
+        let learned_writer = writer.filter(|_| writer_known.is_none());
+        // Close the answered sequences, learn the writer, and retire the
+        // author with its filters and timer when nothing stays open.
+        let mut author_consumers = Vec::new();
+        let mut author_timer = None;
+        let mut author_closed = false;
+        {
+            let mut questions = self.provisional_questions.lock().await;
+            let Some(q) = questions.get_mut(&session_id) else {
+                return;
+            };
+            if let Some(author) = q.authors.get_mut(key) {
+                if let Some(writer) = writer {
+                    author.writer = Some(writer);
+                }
+                for seqs in author.asks.values_mut() {
+                    seqs.retain(|seq| !closed.contains(seq));
+                }
+                author.asks.retain(|_id, seqs| !seqs.is_empty());
+                if author.asks.is_empty() {
+                    author_consumers = std::mem::take(&mut author.consumers);
+                    author_timer = std::mem::take(&mut author.timer);
+                    author_closed = true;
+                }
+            }
+            if author_closed {
+                q.authors.remove(key);
+            }
+            q.open = q.open.saturating_sub(closed.len());
+        }
+        if let Some(timer) = author_timer {
+            timer.abort();
+        }
+        if !author_consumers.is_empty() {
+            let mut materializer = self.materializer.lock().await;
+            for (consumer_id, sub_id) in author_consumers {
+                materializer.unregister(sub_id);
+                self.provisional_consumers.lock().await.remove(&consumer_id);
+            }
+        }
+        // A writer the first read just learned still owes its settled rows to
+        // a question that stays open.
+        if let Some(writer) = learned_writer
+            && self
+                .provisional_questions
+                .lock()
+                .await
+                .get(&session_id)
+                .is_some_and(|q| {
+                    q.authors
+                        .get(key)
+                        .is_some_and(|author| !author.asks.is_empty())
+                })
+        {
+            self.register_settled_filter(session_id, key, writer).await;
+        }
+    }
+
+    /// Register the `_connetto_settled` filter for an author whose writer
+    /// number a revalidation just learned, the settled rows the question
+    /// could not watch while the number was unknown. The caller holds the
+    /// dispatch gate.
+    async fn register_settled_filter(&self, session_id: SessionId, key: &[u8], writer: i64) {
+        let consumer_id = self.next_consumer_id();
+        let sql = "SELECT seq FROM _connetto_settled WHERE writer = $1";
+        let binds = [BindValue::Integer(writer)];
+        let mut materializer = self.materializer.lock().await;
+        match materializer.register_translated(
+            consumer_id,
+            sql,
+            &binds,
+            None,
+            self.guard.reexec_budget(),
+            None,
+        ) {
+            Ok(crate::materializer::Registration::Row(sub_id)) => {
+                self.provisional_consumers
+                    .lock()
+                    .await
+                    .insert(consumer_id, (session_id, key.to_vec()));
+                let mut questions = self.provisional_questions.lock().await;
+                if let Some(q) = questions.get_mut(&session_id)
+                    && let Some(author) = q.authors.get_mut(key)
+                {
+                    author.consumers.push((consumer_id, sub_id));
+                }
+            }
+            other => match other {
+                Err(err) => {
+                    tracing::warn!(
+                        "the settled filter would not register, so the question waits for the next row: {err}"
+                    );
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        "the settled filter would not register, so the question waits for the next row"
+                    );
+                }
+            },
+        }
+    }
+
+    /// Open one author's question from a `Pending` answer, recording the ask
+    /// and whether the author's filters still need registering. `Err` refuses
+    /// the ask whole, its open sequences passing the session's bound or its
+    /// connection superseded (R77 decision 11). The caller holds the dispatch
+    /// gate and, on `Ok(true)`, registers the author's filters.
+    async fn open_provisional_author(
+        &self,
+        session_id: SessionId,
+        connection_num: u64,
+        tx: &OutboundTx,
+        ask: &ProvisionalStatus,
+        writer: Option<i64>,
+        pending: Vec<u64>,
+    ) -> Result<bool, ()> {
+        let mut questions = self.provisional_questions.lock().await;
+        let q = questions
+            .entry(session_id)
+            .or_insert_with(|| ProvisionalSessionQ {
+                connection_num,
+                tx: tx.clone(),
+                authors: BTreeMap::new(),
+                open: 0,
+            });
+        // A superseded connection's question belongs to its successor, so a
+        // stale ask opens nothing.
+        if q.connection_num != connection_num {
+            return Err(());
+        }
+        let author = q
+            .authors
+            .entry(ask.author.to_vec())
+            .or_insert_with(|| ProvisionalAuthor {
+                writer,
+                asks: BTreeMap::new(),
+                consumers: Vec::new(),
+                deadline: None,
+                timer: None,
+            });
+        // Only a sequence not already open for this author counts against the
+        // bound, so a repeated ask of the same sequence stays within it.
+        let already_open: BTreeSet<u64> = author
+            .asks
+            .values()
+            .flat_map(BTreeSet::iter)
+            .copied()
+            .collect();
+        let new_open = pending
+            .iter()
+            .copied()
+            .filter(|seq| !already_open.contains(seq))
+            .count();
+        if q.open + new_open > crate::provisional::MAX_OPEN_PROVISIONAL_SEQUENCES {
+            return Err(());
+        }
+        q.open += new_open;
+        author
+            .asks
+            .entry(ask.request_id.clone())
+            .or_default()
+            .extend(pending);
+        Ok(author.consumers.is_empty())
+    }
+
+    /// Register the row filters a fresh author's question watches and arm its
+    /// expiry timer, called while the caller holds the dispatch gate so no
+    /// settle lands between the question's fact read and its filters starting
+    /// to watch. The writers filter projects the `frontier` and `retired_at`
+    /// columns, the ones a settle or a retirement actually change, and binds
+    /// the writer number, or the device key while the number is unknown. The
+    /// settled filter registers at ask time once the writer number is known,
+    /// and later by a revalidation when the number is only learned then, so a
+    /// settle is caught by the change stream rather than by a reconnect (R77
+    /// decision 11).
+    async fn register_author_filters(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        key: &[u8],
+        writer: Option<i64>,
+        expiry: Option<SystemTime>,
+    ) {
+        let (writers_sql, writers_bind) = match writer {
+            Some(writer) => (
+                "SELECT frontier, retired_at FROM _connetto_writers WHERE writer = $1",
+                BindValue::Integer(writer),
+            ),
+            None => (
+                "SELECT frontier, retired_at FROM _connetto_writers WHERE device_key = $1",
+                BindValue::Blob(key.to_vec()),
+            ),
+        };
+        let mut consumers = Vec::new();
+        let writers_consumer = self.next_consumer_id();
+        if let Some(sub_id) = self
+            .register_one_filter(writers_consumer, writers_sql, &[writers_bind])
+            .await
+        {
+            consumers.push((writers_consumer, sub_id));
+        }
+        let enrolment_consumer = self.next_consumer_id();
+        if let Some(sub_id) = self
+            .register_one_filter(
+                enrolment_consumer,
+                "SELECT revoked_at FROM connetto_device_enrolments WHERE key_id = $1",
+                &[BindValue::Blob(key.to_vec())],
+            )
+            .await
+        {
+            consumers.push((enrolment_consumer, sub_id));
+        }
+        // A settled row is the signal the question waits on, so it registers
+        // at ask time once the writer number is known rather than only when a
+        // later revalidation learns it (R77 decision 11).
+        if let Some(writer) = writer {
+            self.register_settled_filter(session_id, key, writer).await;
+        }
+        for (consumer_id, _sub_id) in &consumers {
+            self.provisional_consumers
+                .lock()
+                .await
+                .insert(*consumer_id, (session_id, key.to_vec()));
+        }
+        {
+            let mut questions = self.provisional_questions.lock().await;
+            if let Some(q) = questions.get_mut(&session_id)
+                && let Some(author) = q.authors.get_mut(key)
+            {
+                author.consumers = consumers;
+            }
+        }
+        // The certificate's expiry plus the tolerance, converted to a
+        // monotonic sleep at arm time so the timer needs no periodic sweep
+        // (R77 decision 11).
+        let Some(expiry) = expiry else {
+            return;
+        };
+        let Some(deadline) = expiry.checked_add(connetto_core::clock::DEVICE_SKEW) else {
+            return;
+        };
+        // `duration_since` errors once the deadline has passed, which is the
+        // instant the timer should fire, so it reads as zero.
+        let duration = deadline
+            .duration_since(SystemTime::now())
+            .unwrap_or_default();
+        let weak = Arc::downgrade(self);
+        let owned_key = key.to_vec();
+        // One task per author, sleeping to the certificate lapse, then
+        // re-reading it (R77 decision 11). Aborted the moment the author
+        // closes, and a re-read of a since-closed author is a no-op.
+        let mut timer = Some(tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            let Some(manager) = weak.upgrade() else {
+                return;
+            };
+            let targets = HashSet::from([(session_id, owned_key)]);
+            manager.revalidate_provisional_targets(&targets).await;
+        }));
+        {
+            let mut questions = self.provisional_questions.lock().await;
+            if let Some(q) = questions.get_mut(&session_id)
+                && let Some(author) = q.authors.get_mut(key)
+            {
+                author.deadline = Some(deadline);
+                author.timer = timer.take();
+            }
+        }
+        // The caller holds the dispatch gate across the ask, so the author
+        // cannot have closed; abort the task if it somehow did.
+        if let Some(timer) = timer {
+            timer.abort();
+        }
+    }
+
+    /// Register one internal row filter, returning its engine subscription id.
+    async fn register_one_filter(
+        &self,
+        consumer_id: u64,
+        sql: &str,
+        binds: &[BindValue],
+    ) -> Option<SubscriptionId> {
+        let mut materializer = self.materializer.lock().await;
+        match materializer.register_translated(
+            consumer_id,
+            sql,
+            binds,
+            None,
+            self.guard.reexec_budget(),
+            None,
+        ) {
+            Ok(crate::materializer::Registration::Row(sub_id)) => Some(sub_id),
+            other => {
+                match other {
+                    Err(err) => {
+                        tracing::warn!("a provisional row filter would not register: {err}");
+                    }
+                    Ok(_) => {
+                        tracing::warn!("a provisional row filter would not register");
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Drop a connection's open questions and their row filters, only if this
+    /// connection still owns them, so a superseded end cannot evict its
+    /// successor's (R77 decision 11).
+    async fn drop_provisional_questions(&self, session_id: SessionId, connection_num: u64) {
+        let removed = {
+            let mut questions = self.provisional_questions.lock().await;
+            match questions.get(&session_id) {
+                Some(q) if q.connection_num == connection_num => questions.remove(&session_id),
+                _ => None,
+            }
+        };
+        let Some(q) = removed else {
+            return;
+        };
+        let mut sub_ids = Vec::new();
+        for author in q.authors.values() {
+            for (_consumer_id, sub_id) in &author.consumers {
+                sub_ids.push(*sub_id);
+            }
+            if let Some(timer) = &author.timer {
+                timer.abort();
+            }
+        }
+        {
+            let mut materializer = self.materializer.lock().await;
+            for sub_id in sub_ids {
+                materializer.unregister(sub_id);
+            }
+        }
+        let mut consumers = self.provisional_consumers.lock().await;
+        consumers.retain(|_id, (sid, _)| *sid != session_id);
+    }
+
+    /// Re-read every open question once after a change-stream (re)connect,
+    /// pushing what settled while the stream was away (R77 decision 11).
+    pub(crate) async fn revalidate_all_provisional(&self) {
+        let targets: HashSet<(SessionId, Vec<u8>)> = self
+            .provisional_questions
+            .lock()
+            .await
+            .iter()
+            .flat_map(|(session_id, q)| q.authors.keys().map(move |key| (*session_id, key.clone())))
+            .collect();
+        self.revalidate_provisional_targets(&targets).await;
+    }
+
     async fn add_route(&self, consumer_id: u64, route: Route<Id, Key>) {
         self.routes.lock().await.insert(consumer_id, route);
     }
@@ -3250,6 +3835,9 @@ where
             self.oplog.append(record).await.map_err(oplog_err)?;
             applied.record = None;
         }
+        // A bookkeeping row an open question watches wakes it (R77 decision
+        // 11), collected before the fan-out drains the patches.
+        let provisional_targets = self.provisional_targets_of(applied).await;
         // Every patch still owed, paired with the route it goes to now.
         // Collected before the visibility question because that question names
         // every watcher at once.
@@ -3320,6 +3908,11 @@ where
                 .await;
         }
         self.deliver_owed(applied).await;
+        // The gate is held here, so the questions an event woke revalidate
+        // in place rather than re-taking it.
+        for (session_id, key) in provisional_targets {
+            self.revalidate_one_locked(session_id, &key).await;
+        }
         self.dispose_read_failure(applied).await
     }
 
@@ -4095,6 +4688,10 @@ where
         loop {
             let error = match connect(self.resume.clone()).await {
                 Ok(mut source) => {
+                    // A (re)connect may have skipped a stretch, so the open
+                    // provisional questions re-read once and push what settled
+                    // meanwhile (R77 decision 11).
+                    self.revalidate_all_provisional().await;
                     let started = Instant::now();
                     match self.ingest(&mut source, &mut on_event).await {
                         Ok(()) => return Ok(()),
@@ -5238,6 +5835,10 @@ where
 
         // Runs on every exit, an error included, so no ended session stays registered.
         self.unregister_connection(session_id, connection_num).await;
+        // The connection is the window its open questions stay pending, so it
+        // ends with the connection (R77 decision 11).
+        self.drop_provisional_questions(session_id, connection_num)
+            .await;
         self.unregister_writer_session(&state).await;
         // The connection is the window for a caller with no identity, so its
         // tallies die here and nothing else expires them.
@@ -6125,7 +6726,7 @@ where
                 self.handle_retire_writer(transport, retire, state).await
             }
             ControlMessage::ProvisionalStatus(ask) => {
-                self.handle_provisional_status(transport, ask).await
+                self.handle_provisional_status(transport, ask, state).await
             }
             // Server-origin frames received from a client are ignored.
             _ => Ok(()),
@@ -6301,9 +6902,10 @@ where
         reason = "one ask walks the verifications and the ruling in order and a split would hide the sequence"
     )]
     async fn handle_provisional_status<T: Transport>(
-        &self,
+        self: &Arc<Self>,
         transport: &mut T,
         ask: ProvisionalStatus,
+        state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
         let refused = || {
             ControlMessage::NonFatalError(NonFatalError {
@@ -6334,6 +6936,9 @@ where
                 .await
                 .map_err(transport_err);
         }
+        // The gate holds no settle between the facts that answer the ask and
+        // the filters a Pending answer starts watching (R77 decision 11).
+        let _gate = self.dispatch_gate.lock().await;
         let record = match self.device_enrolment.get() {
             Some(enrolment) => enrolment
                 .key_record(None, KeyId::from_bytes(ask.author))
@@ -6403,7 +7008,7 @@ where
             retired,
             abandoned,
         };
-        let verdicts = ask
+        let verdicts: Vec<(u64, connetto_core::exchange::Verdict)> = ask
             .seqs
             .iter()
             .map(|seq| {
@@ -6417,6 +7022,53 @@ where
                 )
             })
             .collect();
+        // A Pending answer opens the question the connection stays pending for,
+        // refused whole when its open sequences would pass the session's bound.
+        let pending: Vec<u64> = verdicts
+            .iter()
+            .filter(|(_, verdict)| *verdict == connetto_core::exchange::Verdict::Pending)
+            .map(|(seq, _)| *seq)
+            .collect();
+        if !pending.is_empty() {
+            let Some(connection_num) = self
+                .sessions
+                .lock()
+                .await
+                .get(&state.session_id)
+                .map(|live| live.connection_num)
+            else {
+                return Ok(());
+            };
+            let expiry = record.as_ref().and_then(|record| record.certificate_expiry);
+            match self
+                .open_provisional_author(
+                    state.session_id,
+                    connection_num,
+                    &state.outbound,
+                    &ask,
+                    writer,
+                    pending,
+                )
+                .await
+            {
+                Ok(true) => {
+                    self.register_author_filters(
+                        state.session_id,
+                        ask.author.as_ref(),
+                        writer,
+                        expiry,
+                    )
+                    .await;
+                }
+                Ok(false) => {}
+                Err(()) => {
+                    return transport
+                        .send_control(refused())
+                        .await
+                        .map_err(transport_err);
+                }
+            }
+        }
         transport
             .send_control(ControlMessage::ProvisionalVerdicts(ProvisionalVerdicts {
                 request_id: ask.request_id,

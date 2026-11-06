@@ -894,9 +894,10 @@ pub async fn provision_oplog(pool: &Pool<AsyncPgConnection>) {
 
 /// Set up the publication, slot, and oplog table for logical replication.
 ///
-/// The publication carries `tables` and connetto's bot registry tables, which
-/// every deployment's publication must carry as well, since the registry is
-/// synced like the deployment's own tables.
+/// The publication carries `tables`, connetto's bot registry tables, and the
+/// three bookkeeping tables the server settles writes into, since the
+/// deployment's publication must carry all of them and preflight refuses to
+/// boot while the publication lacks one (R77 decision 11).
 ///
 /// # Panics
 ///
@@ -904,10 +905,27 @@ pub async fn provision_oplog(pool: &Pool<AsyncPgConnection>) {
 pub async fn start_replication_on(pool: &Pool<AsyncPgConnection>, tables: &[&str]) {
     drop_slot(pool).await;
     exec(pool, &format!("DROP PUBLICATION IF EXISTS {PUBLICATION}")).await;
+    // The enrolment base table must exist for the publication to name it,
+    // created idempotently so a test that provisions it with its own typed
+    // DDL beside is unaffected.
+    exec(
+        pool,
+        "CREATE TABLE IF NOT EXISTS connetto_device_enrolments \
+         (key_id BYTEA PRIMARY KEY, user_id TEXT NOT NULL, session_id UUID NOT NULL, \
+          enrolled_at TIMESTAMPTZ NOT NULL, last_seen TIMESTAMPTZ NOT NULL, \
+          revoked_at TIMESTAMPTZ, public_key BYTEA NOT NULL, attestation TEXT NOT NULL)",
+    )
+    .await;
+    provision_writers(pool).await;
     let mut published: Vec<&str> = tables.to_vec();
     for registry in connetto_core::bots::REGISTRY_TABLES {
         if !published.contains(registry) {
             published.push(registry);
+        }
+    }
+    for table in connetto_schema::BOOKKEEPING_TABLES {
+        if !published.contains(table) {
+            published.push(table);
         }
     }
     for table in &published {
@@ -1770,6 +1788,20 @@ impl Server {
     }
 }
 
+/// The catalog DDL the server's engine classifies, the deployment's `pg_ddl`
+/// with the bot registry and the bookkeeping tables the server settles into,
+/// the way the production build appends them (R77 decision 11). A publication
+/// row for a table outside the catalog wedges the change stream, so every
+/// catalog the server parts read, the ingest's, the materializer's, the
+/// snapshot's and the write target's, must be this one text.
+#[must_use]
+pub fn engine_ddl(pg_ddl: &str) -> String {
+    connetto_schema::with_bookkeeping::<connetto_core::bots::TextIds>(
+        &connetto_schema::with_registry::<connetto_core::bots::TextIds>(pg_ddl),
+        true,
+    )
+}
+
 /// Wire a harness server: build the materializer, write target, and re-execution
 /// connector, then spawn the CDC ingest loop.
 ///
@@ -1809,12 +1841,13 @@ pub async fn spawn_server(
         let table_refs: Vec<&str> = replication_tables.iter().map(String::as_str).collect();
         start_replication_on(&admin_pool, &table_refs).await;
     }
-    // The materializer alone reads the policies beside `pg_ddl`, because a folded read rule reads the policy text the engine holds.
+    // The materializer alone reads the policies beside the engine catalog, because a folded read rule reads the policy text the engine holds.
     let upkeep = auth.upkeep();
     let engine_connector = PgReadConnector::with_session_setup(connector_pool.clone());
+    let base_ddl = engine_ddl(&pg_ddl);
     let materializer_ddl = match policies {
-        Some(policies) => std::borrow::Cow::Owned(format!("{pg_ddl}\n{policies}")),
-        None => std::borrow::Cow::Borrowed(&pg_ddl),
+        Some(policies) => std::borrow::Cow::Owned(format!("{base_ddl}\n{policies}")),
+        None => std::borrow::Cow::Borrowed(&base_ddl),
     };
     let mut materializer_builder = Materializer::builder(&materializer_ddl)
         .with_write_catalog(writable)
@@ -1827,15 +1860,16 @@ pub async fn spawn_server(
     }
     let materializer = materializer_builder.build().expect("build materializer");
     let write =
-        pg_write_target::<ConnettoDefaults>(write_pool, &pg_ddl).expect("build write target");
+        pg_write_target::<ConnettoDefaults>(write_pool, &base_ddl).expect("build write target");
     let withdrawal_pool = connector_pool.clone();
     let connector = PgReadConnector::with_session_setup(connector_pool);
     // The harness is test-only, so the stand-in authority reads the subject out of the grant string.
     let authority: Arc<dyn connetto_core::traits::HandshakeAuthority> =
         Arc::new(connetto_core::test_support::TestGrantChecker);
-    // Move-out withdrawals read on the admin pool, keys only (R27 decision 6).
+    // Move-out withdrawals read on the admin pool, keys only (R27 decision 6),
+    // against the same catalog the materializer classifies.
     let withdrawals =
-        PgSnapshotSource::from_ddl(withdrawal_pool, &pg_ddl).expect("build withdrawal source");
+        PgSnapshotSource::from_ddl(withdrawal_pool, &base_ddl).expect("build withdrawal source");
     let mut manager_builder =
         ManagerBuilder::new(materializer, snapshot, auth, authority, connector, write)
             .with_guard(guard)
@@ -1850,7 +1884,7 @@ pub async fn spawn_server(
     let restarts = Arc::new(AtomicU64::new(0));
     let ingest = spawn_ingest_task(
         admin_url,
-        pg_ddl,
+        &pg_ddl,
         Arc::clone(&manager),
         Arc::clone(&restarts),
     );
@@ -1864,13 +1898,14 @@ pub async fn spawn_server(
 /// Spawn the CDC ingest loop that drives `manager` from the replication stream.
 fn spawn_ingest_task(
     admin_url: String,
-    pg_ddl: String,
+    pg_ddl: &str,
     manager: Arc<HarnessManager>,
     restarts: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
+    let catalog_ddl = engine_ddl(pg_ddl);
     tokio::spawn(async move {
         let connect = |resume: connetto_server::ResumePoint| {
-            let (url, ddl) = (admin_url.clone(), pg_ddl.clone());
+            let (url, ddl) = (admin_url.clone(), catalog_ddl.clone());
             async move {
                 let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
                     .map_err(|err| format!("parsing catalog DDL: {err:?}"))?;
@@ -1889,6 +1924,12 @@ fn spawn_ingest_task(
                 }
                 if let ReconnectEvent::AuthRetrying { error, .. } = &event {
                     eprintln!("the harness change feed holds an event the authorization path refused: {error}");
+                }
+                if let ReconnectEvent::ReadRetrying { error, .. } = &event {
+                    eprintln!("the harness change feed holds an event the re-execution read refused: {error}");
+                }
+                if let ReconnectEvent::GaveUp { attempts, error } = &event {
+                    eprintln!("the harness change feed gave up after {attempts} attempts: {error}");
                 }
             })
             .await;

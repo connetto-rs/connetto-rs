@@ -1700,6 +1700,7 @@ dependencies = [
  "connetto-ca",
  "connetto-client",
  "connetto-core",
+ "connetto-file-client",
  "connetto-file-core",
  "connetto-file-server",
  "connetto-peer-apple",

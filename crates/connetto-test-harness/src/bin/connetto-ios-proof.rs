@@ -68,7 +68,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_client::BluetoothState;
 use connetto_test_harness::android_phone;
 use connetto_test_harness::demo::{order_count, wait_for_count};
-use connetto_test_harness::inspector::{PageSession, list_pages};
+use connetto_test_harness::inspector::{PageSession, REPLY_BOUND, list_pages};
 use connetto_test_harness::ios_signing;
 use connetto_test_harness::leg::LegClient;
 use connetto_test_harness::leg_wire::parse_default_gateway;
@@ -578,14 +578,14 @@ async fn sign_in(
             if !submitted
                 && let Some(mut login) = inspector
                     .try_page(|url| url.starts_with(login_prefix))
-                    .await?
+                    .await
             {
                 target.screenshot(evidence, "login-page").await?;
                 submit_login(&mut login, user).await?;
                 submitted = true;
                 continue;
             }
-            if let Some(mut app) = inspector.try_page(is_demo_page).await? {
+            if let Some(mut app) = inspector.try_page(is_demo_page).await {
                 match app.page_text().await {
                     Ok(text) => {
                         if text.contains("status: connected") {
@@ -680,14 +680,14 @@ async fn sign_in_tauri(
             if !submitted
                 && let Some(mut login) = inspector
                     .try_page(|url| url.starts_with(login_prefix))
-                    .await?
+                    .await
             {
                 target.screenshot(evidence, "login-page").await?;
                 submit_login(&mut login, user).await?;
                 submitted = true;
                 continue;
             }
-            if let Some(mut app) = inspector.try_page(is_demo_page).await? {
+            if let Some(mut app) = inspector.try_page(is_demo_page).await {
                 match app.page_text().await {
                     Ok(text) => {
                         if !submitted && text.contains("Sign in to begin.") {
@@ -2702,7 +2702,7 @@ impl Inspector {
     async fn page(&mut self, wanted: impl Fn(&str) -> bool) -> Result<PageSession> {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            if let Some(page) = self.try_page(&wanted).await? {
+            if let Some(page) = self.try_page(&wanted).await {
                 return Ok(page);
             }
             if Instant::now() >= deadline {
@@ -2717,15 +2717,16 @@ impl Inspector {
         }
     }
 
-    /// A session on a page whose URL `wanted` accepts, if one is listed now.
-    async fn try_page(&mut self, wanted: impl Fn(&str) -> bool) -> Result<Option<PageSession>> {
-        match self.find(&wanted).await {
-            Some(url) => {
-                self.restart_at = Instant::now() + PROXY_RESTART;
-                PageSession::webkit(&url).await.map(Some)
-            }
-            None => Ok(None),
+    /// A session on a page whose URL `wanted` accepts, if one listed now attaches.
+    async fn try_page(&mut self, wanted: impl Fn(&str) -> bool) -> Option<PageSession> {
+        let urls = self.find(&wanted).await;
+        let page = PageSession::webkit_first(&urls, REPLY_BOUND).await;
+        if page.is_some() {
+            self.restart_at = Instant::now() + PROXY_RESTART;
+        } else if !urls.is_empty() {
+            self.seen = format!("{} matching pages listed and none attached", urls.len());
         }
+        page
     }
 
     /// A fresh session on the demo's page through a restarted proxy, for
@@ -2767,12 +2768,13 @@ impl Inspector {
         )
     }
 
-    async fn find(&mut self, wanted: &impl Fn(&str) -> bool) -> Option<String> {
+    /// The inspector URLs of every listed page whose URL `wanted` accepts, in listing order.
+    async fn find(&mut self, wanted: &impl Fn(&str) -> bool) -> Vec<String> {
         let devices = match list_pages(self.list_port).await {
             Ok(devices) => devices,
             Err(err) => {
                 self.seen = format!("no device list ({err:#})");
-                return None;
+                return Vec::new();
             }
         };
         let Some(target) = devices
@@ -2784,7 +2786,7 @@ impl Inspector {
                 .filter_map(|device| device["deviceId"].as_str())
                 .collect();
             self.seen = format!("devices {listed:?} without {}", self.device);
-            return None;
+            return Vec::new();
         };
         let Some(port) = target["url"]
             .as_str()
@@ -2792,20 +2794,23 @@ impl Inspector {
             .and_then(|(_, port)| port.parse().ok())
         else {
             self.seen = format!("{} with no page port in {target}", self.device);
-            return None;
+            return Vec::new();
         };
         let pages = match list_pages(port).await {
             Ok(pages) => pages,
             Err(err) => {
                 self.seen = format!("{} with no page list ({err:#})", self.device);
-                return None;
+                return Vec::new();
             }
         };
-        let found = pages.iter().find_map(|page| {
-            wanted(page["url"].as_str()?)
-                .then(|| page["webSocketDebuggerUrl"].as_str().map(str::to_owned))?
-        });
-        if found.is_none() {
+        let found: Vec<String> = pages
+            .iter()
+            .filter_map(|page| {
+                wanted(page["url"].as_str()?)
+                    .then(|| page["webSocketDebuggerUrl"].as_str().map(str::to_owned))?
+            })
+            .collect();
+        if found.is_empty() {
             let urls: Vec<&str> = pages
                 .iter()
                 .filter_map(|page| page["url"].as_str())
@@ -3277,7 +3282,7 @@ async fn ipad_signed_in(
         let mut inspector = Inspector::start(ipad, evidence).await?;
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
-            if let Some(mut page) = inspector.try_page(is_demo_page).await?
+            if let Some(mut page) = inspector.try_page(is_demo_page).await
                 && page.page_text().await?.contains("status: connected")
             {
                 return Ok((inspector, page));

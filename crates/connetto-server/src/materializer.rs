@@ -45,7 +45,7 @@ use sqlite_diff_rs::{
 };
 use sqlparser::ast::{
     BinaryOperator, Distinct, Expr, GroupByExpr, SelectItem, SetExpr, Statement,
-    WildcardAdditionalOptions,
+    WildcardAdditionalOptions, visit_relations,
 };
 use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
@@ -138,6 +138,10 @@ pub enum MaterializerError {
     /// translated to Postgres for `subql`.
     #[error("subscription query translation failed: {0}")]
     Translate(String),
+    /// A client subscription reads a bookkeeping table the server settles
+    /// writes into, which no client may read (R77 decision 11).
+    #[error("subscription reads the server's bookkeeping table `{0}`")]
+    BookkeepingRead(String),
     /// A database read the engine drove through its connector failed for one
     /// subscription, carrying the class the session's three dispositions act
     /// on (R89 decision 1).
@@ -654,6 +658,9 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
         &self,
         sqlite_sql: &str,
     ) -> Result<String, MaterializerError> {
+        if let Some(table) = bookkeeping_read(sqlite_sql) {
+            return Err(MaterializerError::BookkeepingRead(table));
+        }
         let mut pg = translate_select(&self.catalog, self.caller.as_ref(), sqlite_sql)?;
         widen_column_subset(&mut pg);
         Ok(pg.to_string())
@@ -2242,6 +2249,27 @@ fn answers_one_value(pg_sql: &str) -> bool {
             if exprs.is_empty() && mods.is_empty())
 }
 
+/// The bookkeeping table a client subscription names, to refuse it (R77
+/// decision 11). The server settles writes into these tables and they carry
+/// no application policy, so a client reading one would receive its rows
+/// through the change fan-out. `None` when the query parses and names none.
+fn bookkeeping_read(sqlite_sql: &str) -> Option<String> {
+    let statements = Parser::parse_sql(&SQLiteDialect {}, sqlite_sql).ok()?;
+    match visit_relations(&statements, |name| {
+        if let Some(ident) = name.0.last().and_then(|part| part.as_ident())
+            && let Some(table) = connetto_schema::BOOKKEEPING_TABLES
+                .iter()
+                .find(|table| ident.value.eq_ignore_ascii_case(table))
+        {
+            return core::ops::ControlFlow::Break(table.to_string());
+        }
+        core::ops::ControlFlow::Continue(())
+    }) {
+        core::ops::ControlFlow::Break(table) => Some(table),
+        core::ops::ControlFlow::Continue(()) => None,
+    }
+}
+
 /// Reverse translate one SQLite-dialect statement into Postgres against
 /// `catalog`, the caller's SQLite functions mapped to the settings the server
 /// binds. Placeholders translate as syntax, values never enter the SQL.
@@ -2939,6 +2967,7 @@ mod membership_term_tests {
             SCHEMA,
             POLICIES,
             DEFAULT_USER_SETTING,
+            true,
         )
         .expect("the motivating policy translates")
         .into_parts()
@@ -3129,6 +3158,7 @@ mod membership_term_tests {
             OWN_DDL,
             OWN_POLICIES,
             DEFAULT_USER_SETTING,
+            true,
         )
         .expect("the own-shape policy translates");
         let (_, translator, _) = translated.into_parts();

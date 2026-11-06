@@ -468,11 +468,12 @@ async fn a_run_reaching_into_an_older_major_drains_its_prefix_first() {
     let prefix = drain_major_one_writes(&mut conn, &[1, 2]).await;
     let current = queue(&mut conn, WriterRef::Number(7), 3, major(2));
     conn.bound_writer = Some(WriterRef::Number(7));
-    conn.handle_control(ControlMessage::MutationApplied(MutationApplied {
-        client_seq: current,
-    }))
-    .await
-    .expect("the major 2 write settles");
+    let _ = conn
+        .handle_control(ControlMessage::MutationApplied(MutationApplied {
+            client_seq: current,
+        }))
+        .await
+        .expect("the major 2 write settles");
     conn.bound_writer = None;
     assert_eq!(conn.drain_timer(), None, "nothing is held any more");
 
@@ -575,11 +576,12 @@ async fn a_run_whose_older_major_is_gone_is_lost_and_the_writer_moves_on() {
 async fn settle_major_two_write(conn: &mut Conn, id: i32) -> u64 {
     let seq = queue(conn, WriterRef::Number(7), id, major(2));
     conn.bound_writer = Some(WriterRef::Number(7));
-    conn.handle_control(ControlMessage::MutationApplied(MutationApplied {
-        client_seq: seq,
-    }))
-    .await
-    .expect("the major 2 write settles");
+    let _ = conn
+        .handle_control(ControlMessage::MutationApplied(MutationApplied {
+            client_seq: seq,
+        }))
+        .await
+        .expect("the major 2 write settles");
     conn.bound_writer = None;
     seq
 }

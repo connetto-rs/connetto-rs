@@ -287,7 +287,8 @@ async fn two_linked_devices_exchange_their_writers_entries() {
     // The server answers all four, so Anna's settled frontier moves and Ben
     // adjudicates every entry he stored.
     for seq in 1..=4 {
-        anna.conn
+        let _ = anna
+            .conn
             .lock()
             .await
             .handle_control(ControlMessage::MutationApplied(MutationApplied {
