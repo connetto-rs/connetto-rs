@@ -149,7 +149,7 @@ async fn drain_until<T: Transport>(
                 let zstd = match bulk {
                     BulkMessage::LivePatch(patch) => patch.patchset_zstd,
                     BulkMessage::SnapshotPatch(patch) => patch.patchset_zstd,
-                    BulkMessage::MutationPatch(_) => continue,
+                    BulkMessage::MutationPatch(_) | BulkMessage::CourierBody(_) => continue,
                 };
                 // An empty snapshot patch may not parse; that is fine.
                 applier.apply_diffset(&zstd, replica).ok();

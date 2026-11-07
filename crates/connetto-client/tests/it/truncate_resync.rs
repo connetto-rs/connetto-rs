@@ -122,6 +122,7 @@ fn server_scripted(reason: FullResyncReason, seeds: Rows, replacements: Rows) ->
                 resume_token: "truncate".to_owned(),
                 schema_version: None,
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: Some(connetto_core::messages::WriterGrant {
                     number: 1,
@@ -410,6 +411,7 @@ fn membership_server(declared: usize, steps: &'static [Step]) -> LoopbackTranspo
                 resume_token: "membership".to_owned(),
                 schema_version: None,
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: Some(connetto_core::messages::WriterGrant {
                     number: 1,

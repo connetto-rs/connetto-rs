@@ -109,6 +109,8 @@ The builder takes the deployment's schema as its one type parameter. [`connetto_
 
 `CONNETTO_SUNSET` (unset) names the major's sunset, an RFC 3339 instant in UTC. The server announces and enforces it as [02-protocol.md](02-protocol.md#the-sunset) states, checked against the deployment's own disciplined clock ([21-clocks.md](21-clocks.md)), so the instant the operator wrote is the one the deployment enforces, with no skew. The value must be an RFC 3339 instant in UTC at or after the Unix epoch, or the process refuses to start and names it.
 
+`CONNETTO_COURIER` (default `off`) set to `on`, or `ServerBuilder::courier(true)`, accepts courier ranges, the signed entries of a device that a device with a certificate relays ([19-device-to-device.md](19-device-to-device.md#the-courier-path)). Any other value refuses the boot, naming it. The enrolment table carries a nullable `bot_list TEXT` column, the bot list each device's last certificate carries, which a couriered entry applies under.
+
 ## Operating the replication slot
 
 The deployment provisions a logical slot with the `pgoutput` plugin and its publication before the server starts, named by `CONNETTO_SLOT` and `CONNETTO_PUBLICATION` (defaults `connetto_slot` and `connetto_pub`). Startup refuses a missing one and names it, and refuses a slot of the right name bound to another database. Slot names are unique across the cluster, so two deployments sharing a Postgres instance need two names.

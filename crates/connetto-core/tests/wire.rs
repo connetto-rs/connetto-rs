@@ -12,19 +12,22 @@ use connetto_core::{
         decode_control_framed, encode_bulk, encode_bulk_framed, encode_control,
         encode_control_framed,
     },
-    exchange::{Frontier, Offer, RetractCause, Retraction, SignedOffer},
+    exchange::{
+        CourierEntryOutcome, CourierOutcome, CourierRefusal, Frontier, ManifestRow, Offer, Origin,
+        RetractCause, Retraction, SignedOffer,
+    },
     messages::{
         AckCredits, AggregateUpdate, BindDevice, BotListEntry, BotRegistered, BulkMessage,
-        Challenge, ConflictRow, ControlMessage, DeviceAttestation, DeviceRevokedAck, DeviceSummary,
-        DevicesList, DevicesRequest, EnrolChallenge, EnrolChallengeRequest, EnrolGrant,
-        EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
-        FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MutationConflict,
-        MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError,
-        PauseCause, Ping, Pong, Provenance, ProvisionalStatus, ProvisionalVerdicts, RateLimited,
-        RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate, RevokeDeviceRequest,
-        ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
-        SubscriptionSpec, Unsubscribe, Verdict, WriterAnswer, WriterGrant, WriterOutcome,
-        WriterRef, WriterRequest, WriterSecret,
+        Challenge, ConflictRow, ControlMessage, CourierAnswer, CourierBody, CourierRange,
+        DeviceAttestation, DeviceRevokedAck, DeviceSummary, DevicesList, DevicesRequest,
+        EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused,
+        EnrolRequest, FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired, Grant,
+        Handshake, HandshakeAck, LivePatch, MutationConflict, MutationHeader, MutationPatch,
+        MutationReject, MutationRejectReason, NonFatalError, PauseCause, Ping, Pong, Provenance,
+        ProvisionalStatus, ProvisionalVerdicts, RateLimited, RegisterBot, ReplaceShareKeys,
+        RetireWriter, RevocationUpdate, RevokeDeviceRequest, ShareKeysReplaced, SignedList,
+        SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec, Unsubscribe,
+        Verdict, WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
     },
     version::PROTOCOL_VERSION,
 };
@@ -137,6 +140,7 @@ fn handshake_and_ack_round_trip() {
             current_cursor: Cursor::new(vec![1, 2, 3, 4]),
             schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),
             sunset_at_secs: None,
+            courier: false,
             initial_credits: 128,
             writer,
         }));
@@ -700,5 +704,75 @@ fn provisional_frames_round_trip() {
         author: [10; 32],
         offer: rmp_serde::to_vec_named(&signed).expect("a signed offer encodes"),
         seqs: vec![],
+    }));
+}
+
+/// Every courier frame and every outcome its answer can carry round-trip.
+#[test]
+fn courier_frames_round_trip() {
+    let major = Major::new(2).expect("a major");
+    round_trip_control(&ControlMessage::CourierRange(CourierRange {
+        request_id: "c1".into(),
+        author: [4; 32],
+        offer: vec![0x81, 0xa1, 0x6f],
+        rows: vec![
+            ManifestRow {
+                seq: 5,
+                major,
+                origin: None,
+                digest: [1; 32],
+            },
+            ManifestRow {
+                seq: 6,
+                major,
+                origin: Some(Origin {
+                    writer: WriterRef::Number(9),
+                    seq: 2,
+                }),
+                digest: [2; 32],
+            },
+        ],
+        bodies: 1,
+    }));
+    round_trip_bulk(&BulkMessage::CourierBody(CourierBody {
+        request_id: "c1".into(),
+        seq: 5,
+        changeset_zstd: vec![0x28, 0xb5, 0x2f, 0xfd],
+    }));
+    for refusal in [
+        CourierRefusal::Disabled,
+        CourierRefusal::Uncertified,
+        CourierRefusal::Malformed,
+        CourierRefusal::NotEnrolled,
+        CourierRefusal::AuthorBanned,
+        CourierRefusal::WriterRetired,
+        CourierRefusal::Unverified,
+        CourierRefusal::SequenceGap {
+            expected: 3,
+            got: 5,
+        },
+    ] {
+        round_trip_control(&ControlMessage::CourierAnswer(CourierAnswer {
+            request_id: "c1".into(),
+            outcome: CourierOutcome::Refused(refusal),
+        }));
+    }
+    round_trip_control(&ControlMessage::CourierAnswer(CourierAnswer {
+        request_id: "c1".into(),
+        outcome: CourierOutcome::Entries(vec![
+            (5, CourierEntryOutcome::Ruled(Verdict::Applied)),
+            (6, CourierEntryOutcome::Ruled(Verdict::Settled)),
+            (
+                7,
+                CourierEntryOutcome::Ruled(Verdict::Refused(RetractCause::Conflict)),
+            ),
+            (
+                8,
+                CourierEntryOutcome::Retry {
+                    retry_after_ms: 250,
+                },
+            ),
+            (9, CourierEntryOutcome::NotCouriered),
+        ]),
     }));
 }

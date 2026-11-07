@@ -25,6 +25,10 @@ pub enum BulkMessage {
     /// [`crate::messages::mutation::MutationHeader`] control frame that
     /// immediately preceded it.
     MutationPatch(MutationPatch),
+    /// One body of the courier range the connection has open (R78), in
+    /// sequence order after its
+    /// [`crate::messages::courier::CourierRange`].
+    CourierBody(CourierBody),
 }
 
 /// Snapshot chunk for a subscription.
@@ -103,4 +107,17 @@ impl MutationPatch {
             patchset_zstd: patchset_zstd.into(),
         }
     }
+}
+
+/// The body of one manifest row of the open courier range, the entry's
+/// changeset as the author queued it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CourierBody {
+    /// The id of the range the body belongs to.
+    pub request_id: String,
+    /// The sequence of the row the body belongs to.
+    pub seq: u64,
+    /// `Zstd`-compressed `SQLite` patchset bytes.
+    #[serde(with = "serde_bytes")]
+    pub changeset_zstd: Vec<u8>,
 }
