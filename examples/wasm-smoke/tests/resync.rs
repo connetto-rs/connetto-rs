@@ -24,7 +24,7 @@ use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority, SubscriptionSpec, WriterGrant,
+    SnapshotEnd, SnapshotPatch, SubscriptionSpec, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, loopback};
@@ -97,7 +97,6 @@ async fn send_snapshot(
     server
         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
             sub_id: UPSTREAM_SUB.to_owned(),
-            priority: SubscriptionPriority::default(),
         }))
         .await
         .expect("snapshot begin");

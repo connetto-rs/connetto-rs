@@ -11,7 +11,7 @@ use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, SyncSchema
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, LivePatch, MutationApplied, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority, SubscriptionSpec,
+    SnapshotEnd, SnapshotPatch, SubscriptionSpec,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -112,7 +112,6 @@ async fn send_snapshot(
     server
         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
             sub_id: sub_id.to_owned(),
-            priority: SubscriptionPriority::default(),
         }))
         .await
         .expect("begin");

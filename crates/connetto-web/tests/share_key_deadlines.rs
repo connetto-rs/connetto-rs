@@ -20,8 +20,7 @@ use connetto_core::auth::CapabilitySubject;
 use connetto_core::messages::{
     BulkMessage, ContentTicketGrant, ControlMessage, FullResyncReason, FullResyncRequired,
     Handshake, HandshakeAck, MutationApplied, MutationHeader, MutationPatch, ReplaceShareKeys,
-    ShareKeysReplaced, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority,
-    SubscriptionSpec, WriterGrant,
+    ShareKeysReplaced, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionSpec, WriterGrant,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, MaybeSend, ReplicaKeyStore, Transport};
@@ -603,7 +602,6 @@ async fn an_expired_grant_is_swapped_without_any_request() {
         .unbounded_send(IncomingFrame::Control(ControlMessage::SnapshotBegin(
             SnapshotBegin {
                 sub_id: "wire-0".to_owned(),
-                priority: SubscriptionPriority::default(),
             },
         )))
         .expect("queue begin");

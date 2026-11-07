@@ -10,8 +10,7 @@
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, ResidualPass, SyncTuning};
 use connetto_core::Cursor;
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, HandshakeAck, LivePatch, SnapshotBegin, SnapshotEnd,
-    SnapshotPatch, SubscriptionPriority,
+    BulkMessage, ControlMessage, HandshakeAck, LivePatch, SnapshotBegin, SnapshotEnd, SnapshotPatch,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
@@ -88,7 +87,6 @@ fn accumulating_server(extra: u8) -> LoopbackTransport {
                     server
                         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                             sub_id: sub.sub_id.clone(),
-                            priority: SubscriptionPriority::default(),
                         }))
                         .await
                         .expect("begin");
@@ -316,7 +314,6 @@ fn clamp_test_server() -> LoopbackTransport {
                     server
                         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                             sub_id: sub.sub_id.clone(),
-                            priority: SubscriptionPriority::default(),
                         }))
                         .await
                         .expect("begin");
@@ -372,7 +369,6 @@ fn staging_test_server() -> LoopbackTransport {
                     server
                         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                             sub_id: sub.sub_id.clone(),
-                            priority: SubscriptionPriority::default(),
                         }))
                         .await
                         .expect("begin");
@@ -534,7 +530,6 @@ fn failing_pass_server() -> LoopbackTransport {
                     server
                         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                             sub_id: sub.sub_id.clone(),
-                            priority: SubscriptionPriority::default(),
                         }))
                         .await
                         .expect("begin");

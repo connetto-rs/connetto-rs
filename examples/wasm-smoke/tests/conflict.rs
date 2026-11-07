@@ -20,7 +20,7 @@
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::messages::{
     BulkMessage, ConflictRow, ControlMessage, HandshakeAck, MutationConflict, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority, WriterGrant,
+    SnapshotEnd, SnapshotPatch, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
@@ -85,7 +85,6 @@ async fn send_snapshot(server: &mut LoopbackTransport, rows: &[(rosetta_uuid::Uu
     server
         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
             sub_id: UPSTREAM_SUB.to_owned(),
-            priority: SubscriptionPriority::default(),
         }))
         .await
         .expect("snapshot begin");

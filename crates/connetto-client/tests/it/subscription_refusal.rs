@@ -11,7 +11,7 @@ use connetto_client::{ClientBuilder, LiveQuery};
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, NonFatalError, SUBSCRIPTION_REFUSED, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority, WriterGrant,
+    SnapshotEnd, SnapshotPatch, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
@@ -132,7 +132,6 @@ fn scripted_server(answers: Vec<Answer>) -> LoopbackTransport {
             let _ = server
                 .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                     sub_id: sub_id.clone(),
-                    priority: SubscriptionPriority::default(),
                 }))
                 .await;
             let _ = server
