@@ -2,16 +2,18 @@
 //! own device-scoped key to replica connections each keyed for one identity.
 //!
 //! Runs in a dedicated worker against real OPFS, because the codec is
-//! `SQLite3` Multiple Ciphers through the sahpool VFS and only a worker has the
-//! synchronous access handles it needs. Every connection is scoped so only one
-//! is ever live per file, as the pool requires.
+//! `SQLCipher` over the sahpool VFS and only a worker has the synchronous
+//! access handles it needs. Every connection is scoped so only one is ever
+//! live per file, as the pool requires.
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
-use connetto_client::cipher::{ReplicaKey, UnlockError, cipher_url, unlock};
+use connetto_client::cipher::{ReplicaKey, UnlockError, unlock};
 use connetto_client::harden::{AttachPermits, attach_keyed_in_window};
+use connetto_web::storage::ReplicaStorage;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
+use sqlite_wasm_rs::vfs::transfer::DbTransfer as _;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -57,19 +59,20 @@ fn device_key() -> ReplicaKey {
     ReplicaKey::from_bytes([0x33; ReplicaKey::LEN])
 }
 
-async fn pool() -> sqlite_wasm_vfs::sahpool::OpfsSAHPoolUtil {
-    sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(
-        &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg::default(),
-        true,
-    )
-    .await
-    .expect("install the sahpool VFS")
+/// The sahpool VFS the DB worker installs, refusing the in-memory fallback.
+async fn storage() -> ReplicaStorage {
+    let storage = ReplicaStorage::install().await.expect("install storage");
+    assert_eq!(
+        storage.vfs_name(),
+        "opfs-sahpool",
+        "the suite needs the real OPFS pool, not the in-memory fallback"
+    );
+    storage
 }
 
 /// The OPFS database `name` through the page codec, keyed with `key`.
-fn open(name: &str, key: &ReplicaKey) -> SqliteConnection {
-    let mut conn =
-        SqliteConnection::establish(&cipher_url(name, "opfs-sahpool")).expect("open the database");
+fn open(storage: &ReplicaStorage, name: &str, key: &ReplicaKey) -> SqliteConnection {
+    let mut conn = SqliteConnection::establish(&storage.db_url(name)).expect("open the database");
     unlock(&mut conn, key).expect("key the database");
     conn
 }
@@ -77,15 +80,16 @@ fn open(name: &str, key: &ReplicaKey) -> SqliteConnection {
 /// `name`'s replica connection with the shared store attached under the
 /// device key.
 fn replica_with_store(
+    storage: &ReplicaStorage,
     name: &str,
     key: &ReplicaKey,
     store: &str,
     permits: AttachPermits,
 ) -> SqliteConnection {
-    let mut conn = open(name, key);
+    let mut conn = open(storage, name, key);
     attach_keyed_in_window(
         &mut conn,
-        &cipher_url(store, "opfs-sahpool"),
+        &storage.db_url(store),
         SHARED,
         permits,
         &device_key(),
@@ -108,15 +112,20 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[wasm_bindgen_test]
 async fn a_second_identity_reads_and_writes_the_store_the_first_created() {
-    let util = pool().await;
+    let storage = storage().await;
     let (alice, bob, store) = ("r11-alice", "r11-bob", "r11-shared");
     for name in [alice, bob, store] {
-        let _ = util.delete_db(name);
+        storage.delete_db(name).expect("clear an earlier file");
     }
 
     {
-        let mut conn =
-            replica_with_store(alice, &alice_key(), store, AttachPermits::CreateAndWrite);
+        let mut conn = replica_with_store(
+            &storage,
+            alice,
+            &alice_key(),
+            store,
+            AttachPermits::CreateAndWrite,
+        );
         conn.batch_execute(
             "CREATE TABLE connetto_shared.entries (id INTEGER PRIMARY KEY NOT NULL, author TEXT NOT NULL) STRICT;",
         )
@@ -127,7 +136,7 @@ async fn a_second_identity_reads_and_writes_the_store_the_first_created() {
             .expect("alice writes");
     }
     {
-        let mut conn = replica_with_store(bob, &bob_key(), store, AttachPermits::Write);
+        let mut conn = replica_with_store(&storage, bob, &bob_key(), store, AttachPermits::Write);
         assert_eq!(authors(&mut conn), [MARKER]);
         diesel::insert_into(entries::table)
             .values((entries::id.eq(2), entries::author.eq("bob")))
@@ -135,10 +144,14 @@ async fn a_second_identity_reads_and_writes_the_store_the_first_created() {
             .expect("bob writes");
     }
     {
-        let mut conn = replica_with_store(alice, &alice_key(), store, AttachPermits::Write);
+        let mut conn =
+            replica_with_store(&storage, alice, &alice_key(), store, AttachPermits::Write);
         assert_eq!(authors(&mut conn), [MARKER, "bob"]);
     }
 
+    let ReplicaStorage::Opfs(util) = &storage else {
+        unreachable!("`storage` refuses the in-memory fallback");
+    };
     let bytes = util.export_db(store).expect("export the store's bytes");
     assert!(
         !contains(&bytes, MARKER.as_bytes()),
@@ -148,14 +161,19 @@ async fn a_second_identity_reads_and_writes_the_store_the_first_created() {
 
 #[wasm_bindgen_test]
 async fn the_store_opens_under_the_device_key_and_under_no_replica_key() {
-    let util = pool().await;
+    let storage = storage().await;
     let (alice, store) = ("r11-solo-alice", "r11-solo-shared");
     for name in [alice, store] {
-        let _ = util.delete_db(name);
+        storage.delete_db(name).expect("clear an earlier file");
     }
     {
-        let mut conn =
-            replica_with_store(alice, &alice_key(), store, AttachPermits::CreateAndWrite);
+        let mut conn = replica_with_store(
+            &storage,
+            alice,
+            &alice_key(),
+            store,
+            AttachPermits::CreateAndWrite,
+        );
         conn.batch_execute(
             "CREATE TABLE connetto_shared.entries (id INTEGER PRIMARY KEY NOT NULL, author TEXT NOT NULL) STRICT;
              INSERT INTO connetto_shared.entries VALUES (1, 'alice');",
@@ -166,7 +184,7 @@ async fn the_store_opens_under_the_device_key_and_under_no_replica_key() {
     // Opened as its own main database with the codec configured as the replica's
     // is, which proves the attach wrote the layout and the key the replica uses.
     {
-        let mut conn = open(store, &device_key());
+        let mut conn = open(&storage, store, &device_key());
         let rows: Vec<String> = standalone::entries::table
             .select(standalone::entries::author)
             .load(&mut conn)
@@ -174,8 +192,8 @@ async fn the_store_opens_under_the_device_key_and_under_no_replica_key() {
         assert_eq!(rows, ["alice"]);
     }
     for (who, key) in [("alice", alice_key()), ("bob", bob_key())] {
-        let mut conn = SqliteConnection::establish(&cipher_url(store, "opfs-sahpool"))
-            .expect("open the store alone");
+        let mut conn =
+            SqliteConnection::establish(&storage.db_url(store)).expect("open the store alone");
         assert!(
             matches!(unlock(&mut conn, &key), Err(UnlockError::WrongKey(_))),
             "{who}'s replica key must not decrypt the shared store"

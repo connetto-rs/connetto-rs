@@ -253,7 +253,7 @@ async fn stranded_worker(
 /// destroys the replica anyway.
 #[wasm_bindgen_test]
 async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     storage
         .delete_db(REPLICA)
         .expect("clear an earlier replica");

@@ -17,3 +17,6 @@ apple-native-keyring-store = { git = "https://github.com/LucaCappelletti94/apple
 security-framework = { git = "https://github.com/LucaCappelletti94/rust-security-framework", rev = "6ac1b8a3a396d69c9a7fbddc9a9e8b3cc89322c9" }
 android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/android-native-keyring-store", rev = "d82b446a99102f44829d17c39671adffba57a64e" }
 windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/windows-native-keyring-store", rev = "8a8ffde9913b36bd464c8cd5dd24bf80e39dce37" }
+sqlite-wasm-rs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+rsqlite-vfs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+libsqlite3-sys = { git = "https://github.com/LucaCappelletti94/rusqlite", branch = "upstream/sqlcipher-src-420" }

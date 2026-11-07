@@ -156,7 +156,7 @@ async fn fresh(storage: &ReplicaStorage, replica: &str) -> String {
 /// with the same message the native client gives.
 #[wasm_bindgen_test]
 async fn a_rowid_only_table_is_refused_in_the_worker() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let name = "r62-main.sqlite";
     fresh(&storage, name).await;
     let url = storage.db_url(name);
@@ -186,7 +186,7 @@ async fn a_rowid_only_table_is_refused_in_the_worker() {
 /// table through a session diff.
 #[wasm_bindgen_test]
 async fn an_unkeyed_tier_table_is_refused_on_the_create_path() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let name = "r62-tier-create.sqlite";
     let tier = fresh(&storage, name).await;
     let url = storage.db_url(name);
@@ -219,7 +219,7 @@ async fn an_unkeyed_tier_table_is_refused_on_the_create_path() {
 /// every reload after the first.
 #[wasm_bindgen_test]
 async fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let name = "r62-tier-existing.sqlite";
     let tier = fresh(&storage, name).await;
     let url = storage.db_url(name);
@@ -259,7 +259,7 @@ async fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
 /// rather than at the next reload.
 #[wasm_bindgen_test]
 async fn an_accepted_tier_table_records_nothing_and_a_later_one_is_caught() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let name = "r62-accepted.sqlite";
     let tier = fresh(&storage, name).await;
     let url = storage.db_url(name);

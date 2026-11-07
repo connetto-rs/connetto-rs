@@ -175,7 +175,7 @@ fn marker_seq(conn: &mut SqliteConnection) -> Option<i64> {
 /// hub state stays its own across the switch.
 #[wasm_bindgen_test]
 async fn an_account_switch_builds_each_accounts_own_hub() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     assert_eq!(
         storage.vfs_name(),
         "opfs-sahpool",

@@ -6,7 +6,7 @@
 //! half left with R90: the browser holds no credential store, only the plain
 //! account index below, which is checked directly.
 
-use connetto_client::cipher::{ReplicaKey, cipher_url, unlock};
+use connetto_client::cipher::{ReplicaKey, unlock};
 use connetto_core::test_support::two_accounts_keep_their_own_key;
 use connetto_web::auth::{AccountStore, AuthError, IdbKeyStore};
 use connetto_web::storage::ReplicaStorage;
@@ -30,7 +30,7 @@ async fn the_browser_key_store_keeps_two_accounts_apart() {
 /// the index rows with the reserved marker excluded.
 #[wasm_bindgen_test]
 async fn the_account_index_lists_every_account_it_holds() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     storage
         .delete_db(ACCOUNTS_DB)
         .expect("clear any earlier file");
@@ -70,11 +70,11 @@ const STALE_DB: &str = "r90-stale-encrypted.sqlite";
 /// failure the recovery propagates untouched.
 #[wasm_bindgen_test]
 async fn a_stale_encrypted_file_fails_where_the_recovery_lives() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     storage.delete_db(STALE_DB).expect("clear any earlier file");
     {
-        let mut conn = SqliteConnection::establish(&cipher_url(STALE_DB, "opfs-sahpool"))
-            .expect("open the stale store");
+        let mut conn =
+            SqliteConnection::establish(&storage.db_url(STALE_DB)).expect("open the stale store");
         unlock(&mut conn, &ReplicaKey::from_bytes([0x5a; ReplicaKey::LEN]))
             .expect("apply the old device key");
         conn.batch_execute(

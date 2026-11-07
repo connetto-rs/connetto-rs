@@ -200,7 +200,9 @@ pub async fn mint_session() -> (String, String) {
 }
 
 pub async fn mint_session_as(username: &str) -> (String, String) {
-    let storage = connetto_web::storage::ReplicaStorage::install().await;
+    let storage = connetto_web::storage::ReplicaStorage::install()
+        .await
+        .expect("install storage");
     static NEXT_MINT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let unique = NEXT_MINT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let db_name = format!("common-mint-{unique}.sqlite");

@@ -157,6 +157,7 @@ async fn the_number_writer_survives_a_reload() {
     // A fixed file name across runs, so start from nothing.
     connetto_web::storage::ReplicaStorage::install()
         .await
+        .expect("install storage")
         .delete_db(DB_NAME)
         .expect("clear an earlier replica");
     let credential = build::held(token, &user_id);

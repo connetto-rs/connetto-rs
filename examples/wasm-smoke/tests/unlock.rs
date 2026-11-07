@@ -157,7 +157,9 @@ async fn reset_key_store() {
 
 async fn reset_profile() {
     reset_key_store().await;
-    let storage = connetto_web::storage::ReplicaStorage::install().await;
+    let storage = connetto_web::storage::ReplicaStorage::install()
+        .await
+        .expect("install storage");
     for db in [DEFAULT_AUTH_DB, UNLOCK_AUTH_DB] {
         storage.delete_db(db).expect("clear auth database");
     }
@@ -273,8 +275,10 @@ async fn a_declined_unlock_refuses_the_boot_and_destroys_nothing() {
     stage("test 3: credential enrolled in IDB");
 
     // Capture the OPFS pool state before the (failing) boot.
-    let storage = connetto_web::storage::ReplicaStorage::install().await;
-    let pool_before = storage.list();
+    let storage = connetto_web::storage::ReplicaStorage::install()
+        .await
+        .expect("install storage");
+    let pool_before = storage.list().expect("list the pool");
 
     // Arm the failure detector before spawning the worker.
     let failure_rx = wait_debug_for("FAILED");
@@ -311,7 +315,7 @@ async fn a_declined_unlock_refuses_the_boot_and_destroys_nothing() {
     );
 
     // The boot destroyed nothing: the OPFS pool is unchanged.
-    let pool_after = storage.list();
+    let pool_after = storage.list().expect("list the pool");
     assert_eq!(
         pool_before, pool_after,
         "a declined boot must not alter the OPFS pool"
