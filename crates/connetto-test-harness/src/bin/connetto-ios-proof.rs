@@ -82,7 +82,7 @@ use connetto_test_harness::demo::{
 use connetto_test_harness::inspector::{PageSession, REPLY_BOUND, list_pages};
 use connetto_test_harness::ios_signing;
 use connetto_test_harness::ios_signing::{TAPPER_PROFILE, TAURI_PROFILE};
-use connetto_test_harness::leg::LegClient;
+use connetto_test_harness::leg::{LegClient, codesign};
 use connetto_test_harness::leg_wire::parse_default_gateway;
 use connetto_test_harness::peer_devices::{LINK_END_BOUND, own_identity, read_hotspot_offer};
 use connetto_test_harness::peer_proof::{HotspotOfferLines, JoinReport, commit};
@@ -746,36 +746,9 @@ fn signed_in(text: &str) -> bool {
 /// place of the start over.
 async fn sign_out(app: &mut PageSession) -> Result<()> {
     app.click("Delete local data and log out").await?;
-    confirm_the_delete(app).await?;
+    app.confirm_the_delete(Duration::from_secs(30)).await?;
     app.wait_for_outcome("Sign in to begin.", &["Error: "], Duration::from_secs(60))
         .await
-}
-
-/// The delete asks for confirmation while local writes are still unsent, so
-/// the confirmation stands until the click, and the signed-out banner stands
-/// when it does not.
-///
-/// # Errors
-///
-/// When neither stands within the bound.
-async fn confirm_the_delete(app: &mut PageSession) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let page = app.page_text().await?;
-        if page.contains("Confirm: delete and log out") {
-            app.click("Confirm: delete and log out").await?;
-            return Ok(());
-        }
-        if page.contains("Sign in to begin.") || page.contains("Error: ") {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "the sign out asked neither for confirmation nor to sign out, the page shows:\n{page}"
-            );
-        }
-        sleep(Duration::from_millis(500)).await;
-    }
 }
 
 /// Sign the demo out on `phone` when it stands signed in, so a run leaves no
@@ -2173,24 +2146,6 @@ async fn sign_bundled_frameworks(app: &Path, identity: &str, evidence: &Path) ->
     )
     .await?;
     codesign(&["--verify", "--deep", "--strict", "--verbose=2"], app).await
-}
-
-async fn codesign(args: &[&str], path: &Path) -> Result<()> {
-    let output = Command::new("codesign")
-        .args(args)
-        .arg(path)
-        .output()
-        .await
-        .context("starting codesign")?;
-    if !output.status.success() {
-        bail!(
-            "codesign {} {} failed: {}",
-            args.first().copied().unwrap_or_default(),
-            path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
 }
 
 async fn xcrun(args: &[&str]) -> Result<String> {
@@ -4114,25 +4069,11 @@ async fn star_walk(
 mod tests {
     use std::time::Duration;
 
+    use connetto_test_harness::relay::echo_upstream;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpStream;
 
     use super::{Stack, organizational_unit, relay_for};
-
-    /// An upstream that echoes every byte back.
-    async fn echo() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
-        let address = listener.local_addr().expect("echo address").to_string();
-        tokio::spawn(async move {
-            while let Ok((mut socket, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let (mut read, mut write) = socket.split();
-                    let _ = tokio::io::copy(&mut read, &mut write).await;
-                });
-            }
-        });
-        address
-    }
 
     fn stack(server: String, auth_origin: &str) -> Stack {
         Stack {
@@ -4148,7 +4089,7 @@ mod tests {
     /// by the stack's host name, which its certificate names.
     #[tokio::test]
     async fn a_relay_before_a_tls_stack_passes_the_bytes_through() {
-        let server = echo().await;
+        let server = echo_upstream().await.expect("an echo upstream");
         let port = server.rsplit_once(':').expect("port").1.to_owned();
         let host_stack = stack(server, &format!("https://127.0.0.1:{port}"));
         let (relay, url) = relay_for(true, &host_stack).await.expect("relay");
@@ -4175,7 +4116,10 @@ mod tests {
     /// A device dials only `wss`, which a plain stack cannot serve.
     #[tokio::test]
     async fn a_device_refuses_a_plain_stack() {
-        let plain = stack(echo().await, "http://127.0.0.1:7777");
+        let plain = stack(
+            echo_upstream().await.expect("an echo upstream"),
+            "http://127.0.0.1:7777",
+        );
         let Err(refusal) = relay_for(true, &plain).await else {
             panic!("a device run started a relay before a plain stack");
         };

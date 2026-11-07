@@ -455,37 +455,10 @@ async fn prove(
 async fn sign_out(device: &Device, app: &mut PageSession, evidence: &Path) -> Result<()> {
     step("sign out");
     app.click("Delete local data and log out").await?;
-    confirm_the_delete(app).await?;
+    app.confirm_the_delete(Duration::from_secs(30)).await?;
     app.wait_for_outcome("Sign in to begin.", &["Error: "], Duration::from_secs(60))
         .await?;
     device.screenshot(evidence, "signed-out").await
-}
-
-/// The delete asks for confirmation while local writes are still unsent, so
-/// the confirmation stands until the click, and the signed-out banner stands
-/// when it does not.
-///
-/// # Errors
-///
-/// When neither stands within the bound.
-async fn confirm_the_delete(app: &mut PageSession) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let page = app.page_text().await?;
-        if page.contains("Confirm: delete and log out") {
-            app.click("Confirm: delete and log out").await?;
-            return Ok(());
-        }
-        if page.contains("Sign in to begin.") || page.contains("Error: ") {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "the sign out asked neither for confirmation nor to sign out, the page shows:\n{page}"
-            );
-        }
-        sleep(Duration::from_millis(500)).await;
-    }
 }
 
 /// The system may kill the app while its login is open in the browser tab.

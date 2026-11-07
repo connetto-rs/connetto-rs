@@ -142,29 +142,39 @@ async fn serve(listener: TcpListener, upstream: String, tls: Option<TlsAcceptor>
     }
 }
 
+/// An upstream on the loopback that echoes every byte back, for proving a
+/// relay or a client of one, its address returned.
+///
+/// # Errors
+///
+/// When no loopback port can be bound.
+pub async fn echo_upstream() -> Result<String> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("binding the echo upstream")?;
+    let address = listener
+        .local_addr()
+        .context("the echo upstream's address")?
+        .to_string();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (mut read, mut write) = socket.split();
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+    Ok(address)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpStream;
 
-    use super::Relay;
-
-    /// An upstream that echoes every byte back.
-    async fn echo() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
-        let address = listener.local_addr().expect("echo address").to_string();
-        tokio::spawn(async move {
-            while let Ok((mut socket, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let (mut read, mut write) = socket.split();
-                    let _ = tokio::io::copy(&mut read, &mut write).await;
-                });
-            }
-        });
-        address
-    }
+    use super::{Relay, echo_upstream};
 
     async fn round_trip(stream: &mut TcpStream) -> std::io::Result<u8> {
         stream.write_all(&[7]).await?;
@@ -180,9 +190,12 @@ mod tests {
     /// forwards new connections again on the same address.
     #[tokio::test]
     async fn stopping_drops_live_connections_and_resuming_forwards_again() {
-        let mut relay = Relay::start("127.0.0.1:0", &echo().await)
-            .await
-            .expect("start");
+        let mut relay = Relay::start(
+            "127.0.0.1:0",
+            &echo_upstream().await.expect("an echo upstream"),
+        )
+        .await
+        .expect("start");
         let mut live = TcpStream::connect(relay.address()).await.expect("connect");
         assert_eq!(
             round_trip(&mut live).await.expect("echo through the relay"),

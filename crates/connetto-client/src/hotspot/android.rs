@@ -15,7 +15,7 @@ use socket2::SockRef;
 use super::{
     HostStatus, HotspotBackend, HotspotError, HotspotOffer, HotspotSecurity, JoinError, JoinStatus,
 };
-use crate::device_key::JavaAccess;
+use crate::device_key::{JavaAccess, exception_text};
 
 /// The plugin the backend drives, bundled by the app's `dx` build.
 const PLUGIN_CLASS: &str = "dev.connetto.peer.HotspotPlugin";
@@ -92,20 +92,6 @@ fn join_failure(failure: PluginFailure) -> JoinError {
     }
 }
 
-/// The pending Java exception's text, cleared, else the JNI error's.
-pub(crate) fn exception_text(env: &mut JNIEnv<'_>, err: &jni::errors::Error) -> PluginFailure {
-    let pending = env.exception_occurred().ok().filter(|ex| !ex.is_null());
-    let _ = env.exception_clear();
-    let text = pending
-        .and_then(|ex| {
-            env.call_method(&ex, "toString", "()Ljava/lang/String;", &[])
-                .ok()
-        })
-        .and_then(|value| value.l().ok())
-        .and_then(|text| env.get_string(&text.into()).ok().map(String::from));
-    PluginFailure::Java(text.unwrap_or_else(|| err.to_string()))
-}
-
 /// Run `body` on the device's Java VM, a pending exception becoming its text.
 pub(crate) fn call<T>(
     java: &dyn JavaAccess,
@@ -115,7 +101,7 @@ pub(crate) fn call<T>(
     let mut outcome: Option<Result<T, PluginFailure>> = None;
     java.with_env(&mut |env| {
         let Some(body) = body.take() else { return };
-        outcome = Some(body(env).map_err(|err| exception_text(env, &err)));
+        outcome = Some(body(env).map_err(|err| PluginFailure::Java(exception_text(env, &err))));
     })
     .map_err(|err| PluginFailure::NotRun(err.to_string()))?;
     match outcome {
@@ -134,7 +120,8 @@ pub(crate) fn call_on_screen<T>(
     let mut outcome: Option<Result<T, PluginFailure>> = None;
     java.with_activity(&mut |env, activity| {
         let Some(body) = body.take() else { return };
-        outcome = Some(body(env, activity).map_err(|err| exception_text(env, &err)));
+        outcome =
+            Some(body(env, activity).map_err(|err| PluginFailure::Java(exception_text(env, &err))));
     })
     .map_err(|err| PluginFailure::NotRun(err.to_string()))?;
     match outcome {
