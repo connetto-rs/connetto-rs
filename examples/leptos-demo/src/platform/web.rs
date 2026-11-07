@@ -6,10 +6,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::task::{Poll, Waker};
 
 use base64::Engine;
 use connetto_client::{
-    AccountChoice, Auth, ClientEvent, ConnettoClient, Custody, LiveHandle, NoGate, Watchable,
+    AccountChoice, Auth, ClientError, ClientEvent, ConnettoClient, Custody, LiveHandle, LiveQuery,
+    NoGate, Watchable,
 };
 use connetto_demo_support as support;
 use connetto_demo_support::web as glue;
@@ -18,6 +20,7 @@ use connetto_web::builder::{AttachedTab, TabTopology};
 use connetto_web::leader::Membership;
 use connetto_web::unlock::serve_account_choice;
 use connetto_web::{MessageTransport, TabContent, TabResolved, workers};
+use futures_lite::future::poll_fn;
 use js_sys::{Array, Uint8Array};
 use leptos::prelude::*;
 use rosetta_uuid::Uuid;
@@ -28,7 +31,7 @@ use web_sys::{
 };
 
 use connetto_demo_support::view::{
-    AccountEntry, Action, LogoutState, NoteRow, OrderRow, PhotoRow, Session, View,
+    AccountEntry, Action, LogoutState, NoteRow, OrderRow, PhotoRow, Session, TeamView, View,
 };
 
 /// The tab-to-worker transport the window's client rides.
@@ -121,6 +124,43 @@ async fn boot_window() -> Result<Boot, JsValue> {
     })
 }
 
+/// A parked task's rendezvous. A caller sets the flag and wakes the parked
+/// poll, which clears it on its next run.
+struct Wake {
+    /// The flag a caller sets, cleared by the parked poll's next run.
+    fired: Cell<bool>,
+    /// The parked poll's waker, refreshed on each poll.
+    waker: Cell<Option<Waker>>,
+}
+
+impl Wake {
+    /// Let a parked task run, whether or not it holds a poll.
+    fn fire(&self) {
+        if self.fired.replace(true)
+            && let Some(waker) = self.waker.take()
+        {
+            waker.wake();
+        }
+    }
+
+    /// Clear and report the flag, the parked poll's read.
+    fn take(&self) -> bool {
+        self.fired.replace(false)
+    }
+}
+
+/// What a parked team subscription ran on.
+enum TeamPark {
+    /// A control fired the rendezvous.
+    Caller,
+    /// The roster's rows moved.
+    Roster(Result<(), ClientError>),
+    /// The picked team's notes moved.
+    Notes(Result<(), ClientError>),
+    /// The picked team's members moved.
+    Members(Result<(), ClientError>),
+}
+
 /// The page's channels and state cells, alive for the rest of the page's
 /// life, kept alive by the platform handle [`act`] reaches.
 struct PageHolds {
@@ -138,6 +178,8 @@ struct PageHolds {
     covered_photos: Rc<Cell<usize>>,
     /// The newest orders row's key, the remove button's target.
     newest_order: Cell<Option<Uuid>>,
+    /// The team pane's rendezvous, fired while its subscription parks.
+    team_wake: Rc<Wake>,
     _provider: glue::ProviderListener,
     _login: glue::LoginUrlListener,
     _boot_session: glue::BootSessionListener,
@@ -249,8 +291,14 @@ fn boot_page() -> RwSignal<View> {
         })
     };
 
+    let team_wake: Rc<Wake> = Rc::new(Wake {
+        fired: Cell::new(false),
+        waker: Cell::new(None),
+    });
+
     let boot_session_listener = {
         let latest: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let wake = Rc::clone(&team_wake);
         glue::BootSessionListener::new(move |uid, account, expires_at| {
             if view.with_untracked(logging_out) {
                 return;
@@ -270,6 +318,9 @@ fn boot_page() -> RwSignal<View> {
                 }
                 v.session = Session::SignedIn;
             });
+            // The pane's subscription wakes to stand the panel for the new
+            // session and to follow it.
+            wake.fire();
             if let Some(secs) = expires_at {
                 latest.set(Some(secs));
                 let view = view;
@@ -331,6 +382,7 @@ fn boot_page() -> RwSignal<View> {
         covered_notes: Rc::new(Cell::new(0)),
         covered_photos: Rc::new(Cell::new(0)),
         newest_order: Cell::new(None),
+        team_wake,
         _provider: glue::ProviderListener::new(),
         _login: login_listener,
         _boot_session: boot_session_listener,
@@ -359,6 +411,7 @@ fn boot_page() -> RwSignal<View> {
                     spawn_notes(&holds, &view, client.clone());
                     spawn_photos(&holds, &view, client.clone(), content);
                     spawn_products(&view, client.clone());
+                    spawn_team(&holds, &view, client.clone());
                     refresh_storage(&view, &client);
                     let mut events = client.events();
                     while let Ok(event) = events.recv().await {
@@ -472,6 +525,154 @@ fn spawn_products(view: &RwSignal<View>, client: Client) {
                 break;
             }
             rows = handle.snapshot();
+        }
+    });
+}
+
+/// The account's roster and the picked team's notes, the pane's list
+/// subscriptions. The panel stands while the session is signed in, follows
+/// the picker's team with one notes subscription at a time, and parks until
+/// a control fires the rendezvous or a subscription's rows move.
+fn spawn_team(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: Client) {
+    let holds = Rc::clone(holds);
+    let view = *view;
+    spawn_local(async move {
+        let mut roster = match support::teams_of_account().live(&client).await {
+            Ok(roster) => roster,
+            Err(err) => {
+                view.update(|v| {
+                    if let Some(panel) = v.team.as_mut() {
+                        panel.error = Some(err.to_string());
+                    }
+                });
+                return;
+            }
+        };
+        let mut rows: Vec<String> = roster.snapshot();
+        let mut team = String::new();
+        let mut notes: Option<LiveQuery<support::TeamNote>> = None;
+        let mut notes_rows: Vec<support::TeamNote> = Vec::new();
+        let mut members: Option<LiveQuery<String>> = None;
+        let mut members_rows: Vec<String> = Vec::new();
+        loop {
+            view.update(|v| {
+                // Stand the panel up while the session is signed in, and let
+                // it fall away while a sign-out or an account switch stands
+                // the view back to its banner.
+                if v.session == Session::SignedIn && !logging_out(v) {
+                    v.team.get_or_insert_with(|| TeamView {
+                        outcome: "idle".to_owned(),
+                        peer: false,
+                        ..Default::default()
+                    });
+                }
+                if let Some(panel) = v.team.as_mut() {
+                    panel.set_teams(rows.clone());
+                }
+            });
+            let pick = view.with_untracked(|v| {
+                v.team
+                    .as_ref()
+                    .map(|panel| panel.picked.clone())
+                    .unwrap_or_default()
+            });
+            if pick != team {
+                // Drop the old team's subscription, which queues the
+                // unsubscribe.
+                team = pick;
+                notes_rows.clear();
+                notes = None;
+                members_rows.clear();
+                members = None;
+                if !team.is_empty() {
+                    match support::team_members_of(team.clone()).live(&client).await {
+                        Ok(handle) => {
+                            members_rows = handle.snapshot();
+                            members = Some(handle);
+                        }
+                        Err(err) => {
+                            view.update(|v| {
+                                if let Some(panel) = v.team.as_mut() {
+                                    panel.error = Some(err.to_string());
+                                }
+                            });
+                        }
+                    }
+                    match support::team_notes_for(team.clone()).live(&client).await {
+                        Ok(handle) => {
+                            notes_rows = handle.snapshot();
+                            notes = Some(handle);
+                            view.update(|v| {
+                                if let Some(panel) = v.team.as_mut() {
+                                    panel.error = None;
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            view.update(|v| {
+                                if let Some(panel) = v.team.as_mut() {
+                                    panel.error = Some(err.to_string());
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            view.update(|v| {
+                if let Some(panel) = v.team.as_mut()
+                    && !team.is_empty()
+                    && panel.picked == team
+                {
+                    panel.notes = notes_rows
+                        .iter()
+                        .map(|note| support::team_note_line(note, None))
+                        .collect();
+                    panel.members.clone_from(&members_rows);
+                }
+            });
+            let wake = Rc::clone(&holds.team_wake);
+            let mut roster_wait = Box::pin(roster.changed());
+            let mut notes_wait = notes.as_mut().map(|handle| Box::pin(handle.changed()));
+            let mut members_wait = members.as_mut().map(|handle| Box::pin(handle.changed()));
+            let moved = poll_fn(move |cx| {
+                wake.waker.set(Some(cx.waker().clone()));
+                if wake.take() {
+                    return Poll::Ready(TeamPark::Caller);
+                }
+                match roster_wait.as_mut().poll(cx) {
+                    Poll::Ready(result) => return Poll::Ready(TeamPark::Roster(result)),
+                    Poll::Pending => {}
+                }
+                if let Some(wait) = notes_wait.as_mut()
+                    && let Poll::Ready(result) = wait.as_mut().poll(cx)
+                {
+                    return Poll::Ready(TeamPark::Notes(result));
+                }
+                if let Some(wait) = members_wait.as_mut()
+                    && let Poll::Ready(result) = wait.as_mut().poll(cx)
+                {
+                    return Poll::Ready(TeamPark::Members(result));
+                }
+                Poll::Pending
+            })
+            .await;
+            match moved {
+                TeamPark::Caller => {}
+                TeamPark::Roster(Ok(())) => rows = roster.snapshot(),
+                TeamPark::Roster(Err(_)) => break,
+                TeamPark::Notes(Ok(())) => {
+                    if let Some(handle) = &notes {
+                        notes_rows = handle.snapshot();
+                    }
+                }
+                TeamPark::Notes(Err(_)) => break,
+                TeamPark::Members(Ok(())) => {
+                    if let Some(handle) = &members {
+                        members_rows = handle.snapshot();
+                    }
+                }
+                TeamPark::Members(Err(_)) => break,
+            }
         }
     });
 }
@@ -760,10 +961,15 @@ impl Platform {
             Action::LogOutKeep => self.logout_keep(),
             Action::LogOutDelete => self.logout_delete(),
             Action::ConfirmDelete | Action::ForceDelete => self.delete_confirmed(),
-            Action::CancelLogout => self.view.update(|v| {
-                v.logout = LogoutState::Idle;
-                v.refused_pending = None;
-            }),
+            Action::CancelLogout => {
+                self.view.update(|v| {
+                    v.logout = LogoutState::Idle;
+                    v.refused_pending = None;
+                });
+                // An abandoned sign-out keeps the session, and the pane's
+                // subscription stands the panel again.
+                self.holds.team_wake.fire();
+            }
             Action::AddOrder => self.add_order(),
             Action::RemoveNewest => self.remove_newest(),
             Action::StagePhoto { name, bytes } => self.stage_photo(name, bytes),
@@ -777,6 +983,19 @@ impl Platform {
             Action::FreeUpSpace => self.free_up_space(),
             Action::Export => self.export(),
             Action::Import { bytes, .. } => self.import(bytes),
+            Action::PickTeam { team } => self.pick_team(team),
+            Action::AddTeamNote { body } => self.add_team_note(body),
+            // The web's view carries no peer link, so the nearby pane's
+            // controls and the team pane's tidy pass have nothing to act on.
+            Action::EnableBluetooth
+            | Action::HostHotspot
+            | Action::StopHotspot
+            | Action::JoinHotspot { .. }
+            | Action::JoinPayload { .. }
+            | Action::JoinNearby
+            | Action::LeaveHotspot
+            | Action::SetPeerLinks { .. }
+            | Action::TidyTeam => {}
         }
     }
 
@@ -832,7 +1051,11 @@ impl Platform {
             v.identity = None;
             v.account = None;
             v.session = Session::Connecting;
+            v.team = None;
         });
+        // The pane's subscription wakes to drop the old account's notes
+        // subscription.
+        self.holds.team_wake.fire();
         let view = self.view;
         match account {
             None => {
@@ -886,7 +1109,11 @@ impl Platform {
             return;
         }
         let view = self.view;
-        view.update(|v| v.logout = LogoutState::Working);
+        view.update(|v| {
+            v.logout = LogoutState::Working;
+            v.team = None;
+        });
+        self.holds.team_wake.fire();
         spawn_local(async move {
             if let Err(err) = glue::logout_keep().await {
                 view.update(|v| v.logout = LogoutState::Error(err.to_string()));
@@ -899,7 +1126,11 @@ impl Platform {
             return;
         }
         let view = self.view;
-        view.update(|v| v.logout = LogoutState::Working);
+        view.update(|v| {
+            v.logout = LogoutState::Working;
+            v.team = None;
+        });
+        self.holds.team_wake.fire();
         spawn_local(async move {
             match glue::logout_delete().await {
                 Ok(glue::DeleteOutcome::Confirm(pending)) => {
@@ -933,7 +1164,9 @@ impl Platform {
         view.update(|v| {
             v.logout = LogoutState::Working;
             v.refused_pending = None;
+            v.team = None;
         });
+        self.holds.team_wake.fire();
         spawn_local(async move {
             if let Err(err) = glue::logout_delete_confirmed().await {
                 view.update(|v| v.logout = LogoutState::Error(err.to_string()));
@@ -994,6 +1227,68 @@ impl Platform {
             match support::save_note(&client, &body).await {
                 Ok(_) => view.update(|v| v.notes_saved += 1),
                 Err(err) => tracing::error!(error = %err, "note save failed"),
+            }
+        });
+    }
+
+    /// Name the team the pane reads and writes, waking the pane's
+    /// subscription to follow it.
+    fn pick_team(&self, team: String) {
+        let v = self.view.read_untracked();
+        if v.session != Session::SignedIn || logging_out(&v) {
+            return;
+        }
+        drop(v);
+        self.view.update(|v| {
+            if let Some(panel) = v.team.as_mut() {
+                panel.picked = team;
+            }
+        });
+        self.holds.team_wake.fire();
+    }
+
+    /// Write one note into the picked team, answering with the pane's
+    /// outcome line.
+    fn add_team_note(&self, body: String) {
+        let v = self.view.read_untracked();
+        if v.session != Session::SignedIn || logging_out(&v) {
+            return;
+        }
+        let author = v.identity.clone().unwrap_or_default();
+        let team = v
+            .team
+            .as_ref()
+            .map(|panel| panel.picked.clone())
+            .unwrap_or_default();
+        drop(v);
+        if author.is_empty() || team.is_empty() {
+            return;
+        }
+        let Some(client) = self.client() else {
+            return;
+        };
+        let view = self.view;
+        spawn_local(async move {
+            let body = body.trim();
+            if body.is_empty() {
+                view.update(|v| {
+                    if let Some(panel) = v.team.as_mut() {
+                        panel.outcome = "the note needs some text".to_owned();
+                    }
+                });
+                return;
+            }
+            match support::add_team_note(&client, &team, &author, body).await {
+                Ok(_) => view.update(|v| {
+                    if let Some(panel) = v.team.as_mut() {
+                        panel.outcome = "note added".to_owned();
+                    }
+                }),
+                Err(err) => view.update(|v| {
+                    if let Some(panel) = v.team.as_mut() {
+                        panel.outcome = format!("note add failed: {err}");
+                    }
+                }),
             }
         });
     }

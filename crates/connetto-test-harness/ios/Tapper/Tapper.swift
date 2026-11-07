@@ -11,16 +11,12 @@ enum TapperError: LocalizedError {
     }
 }
 
-/// Taps a system alert with a known button, or switches Personal Hotspot in
-/// Settings, one action per start. The action and its arguments arrive as
-/// `TEST_RUNNER_` environment variables the proof writes into the run's
-/// xctestrun file, since a shell environment does not cross from the Mac to
-/// the device.
+/// Taps a system alert with a known button, one action per start. The action
+/// and its arguments arrive as `TEST_RUNNER_` environment variables the
+/// proof writes into the run's xctestrun file, since a shell environment does
+/// not cross from the Mac to the device.
 @MainActor
 final class TapperTests: XCTestCase {
-    /// The demo the tapper returns to after a Settings action.
-    static let demoBundle = "dev.connetto.dioxusdemo"
-
     func testAction() throws {
         let environment = ProcessInfo.processInfo.environment
         let bound = bounded(environment["TEST_RUNNER_TIMEOUT"], default: 90)
@@ -32,8 +28,6 @@ final class TapperTests: XCTestCase {
                 throw TapperError.action("TEST_RUNNER_LABELS names no button")
             }
             try tapAlert(labels: labels, bound: bound, minimum: action == "tap-join-alert" ? bound : 10)
-        case "hotspot-on", "hotspot-off":
-            try personalHotspot(on: action == "hotspot-on", bound: bound)
         default:
             throw TapperError.action(
                 "the tapper action is missing or unsupported (\(action))"
@@ -95,103 +89,5 @@ final class TapperTests: XCTestCase {
             throw TapperError.action("an alert stayed after \(Int(bound))s: \(seen)")
         }
         print(taps == 0 ? "no alert to tap" : "tapped \(taps) alert(s)")
-    }
-
-    /// The Personal Hotspot row's title in the languages the proof's phones
-    /// run.
-    static let paneTitles = ["Hotspot personale", "Personal Hotspot"]
-    /// The pane's switch that lets other devices join, in the same languages.
-    static let joinSwitches = ["Consenti agli altri di accedere", "Allow Others to Join"]
-
-    /// Switch Personal Hotspot on or off in Settings and return to the demo.
-    /// A switch whose value reads as the wanted state is left alone, and the
-    /// value is read again after a tap.
-    private func personalHotspot(on: Bool, bound: TimeInterval) throws {
-        let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
-        let toggle = try openPersonalHotspotPane(settings, bound: bound)
-        let wanted = on ? "1" : "0"
-        if let value = toggle.value as? String, value == wanted {
-            print("Personal Hotspot already \(on ? "on" : "off")")
-        } else {
-            let knob = toggle.switches.firstMatch
-            (knob.exists && knob.isHittable ? knob : toggle).tap()
-            Thread.sleep(forTimeInterval: 1)
-            if let value = toggle.value as? String, value != wanted {
-                throw TapperError.action("the switch reads \(value) after the tap, wanted \(wanted)")
-            }
-            print("Personal Hotspot switched \(on ? "on" : "off")")
-        }
-        try returnToDemo()
-    }
-
-    /// Open the pane from the row that names it, on Settings' top list or
-    /// else among the search results, and answer its join switch, whose
-    /// appearance is what says the pane opened. Only a hittable row counts,
-    /// since the top list's row stays in the hierarchy under the search
-    /// results.
-    private func openPersonalHotspotPane(_ settings: XCUIApplication, bound: TimeInterval) throws -> XCUIElement {
-        let deadline = Date().addingTimeInterval(min(bound, 60))
-        let join = settings.switches
-            .matching(NSPredicate(format: "identifier IN %@", Self.joinSwitches))
-            .firstMatch
-        for title in Self.paneTitles {
-            settings.terminate()
-            settings.launch()
-            guard settings.windows.firstMatch.waitForExistence(timeout: 10) else {
-                throw TapperError.action("Settings never opened")
-            }
-            var row = hittableRow(settings, title: title, within: 5)
-            if row == nil {
-                let search = settings.searchFields.firstMatch
-                guard search.waitForExistence(timeout: 10) else {
-                    throw TapperError.action("no search field in Settings")
-                }
-                search.tap()
-                search.typeText(title)
-                row = hittableRow(settings, title: title, within: 5)
-            }
-            if let row {
-                row.tap()
-                if join.waitForExistence(timeout: 10) {
-                    print("the \(title) pane opened")
-                    return join
-                }
-            }
-            print("no row named \(title) opened its pane, the screen shows:\n\(settings.debugDescription)")
-            guard Date() < deadline else { break }
-        }
-        throw TapperError.action("the Personal Hotspot pane never opened, searched for \(Self.paneTitles)")
-    }
-
-    /// The first hittable cell holding `title`, polled until `within` passes.
-    private func hittableRow(_ settings: XCUIApplication, title: String, within: TimeInterval) -> XCUIElement? {
-        let deadline = Date().addingTimeInterval(within)
-        repeat {
-            let rows = settings.cells
-                .containing(NSPredicate(format: "label ==[c] %@", title))
-                .allElementsBoundByIndex
-            if let row = rows.first(where: { $0.exists && $0.isHittable }) {
-                return row
-            }
-            Thread.sleep(forTimeInterval: 0.5)
-        } while Date() < deadline
-        return nil
-    }
-
-    /// Bring the demo back to the front, where the proof drives its page.
-    /// It is activated, never launched, since a launch would restart it
-    /// without the environment the proof started it with, and a demo that is
-    /// not running stays so.
-    private func returnToDemo() throws {
-        let demo = XCUIApplication(bundleIdentifier: Self.demoBundle)
-        guard demo.state != .notRunning else {
-            print("the demo is not running, so the tapper stays in Settings")
-            return
-        }
-        demo.activate()
-        guard demo.wait(for: .runningForeground, timeout: 10) else {
-            throw TapperError.action("the demo would not come to the front")
-        }
-        print("the demo is in front")
     }
 }

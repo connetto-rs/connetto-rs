@@ -1,6 +1,6 @@
 [package]
 name = "connetto-peer-apple"
-description = "The Apple platform bridge for the connetto peer link, the Bluetooth peripheral the host serves its exchange over, the join a joiner's device asks the system for, the Network Extension's on iOS and CoreWLAN's on macOS, and the Bonjour discovery iOS needs, in the workspace's second unsafe crate."
+description = "The Apple platform bridge for the connetto peer link, the joiner's Bluetooth permission read, the join a joiner's device asks the system for, the Network Extension's on iOS and CoreWLAN's on macOS, and the Bonjour discovery iOS needs, in the workspace's second unsafe crate."
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
@@ -39,14 +39,14 @@ multiple_unsafe_ops_per_block = "deny"
 [dependencies]
 thiserror.workspace = true
 
-# The routing table the joined network's gateway is read from, the beacon's
-# UUIDs the bridge reads, and the locks, queues and framework objects the
-# bridge's calls stand on.
+# The routing table the joined network's gateway is read from, the
+# discovery session's constants, the Bluetooth permission read, and the
+# locks, queues and framework objects the bridge's calls stand on.
 [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
 # The routing table the joined network's gateway is read from.
 libc = "0.2"
-# The beacon's UUIDs, the peer's own constants, read by the Apple bridge (R76).
-connetto-peer = { path = "../connetto-peer", features = ["bluetooth"] }
+# The dns_sd session the Bonjour discovery serves (R76).
+connetto-peer = { path = "../connetto-peer", features = ["discovery"] }
 parking_lot = "0.12"
 dispatch2 = "0.3.1"
 block2 = { version = "0.6", default-features = false, features = ["alloc"] }
@@ -54,44 +54,23 @@ objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
   "std",
   "block2",
-  "NSArray",
-  "NSData",
-  "NSDictionary",
   "NSError",
   "NSObject",
   "NSString",
-  "NSUUID",
 ] }
+# The app's Bluetooth permission, a class property of `CBManager` (R77
+# decision 23).
 objc2-core-bluetooth = { version = "0.3.2", default-features = false, features = [
   "std",
-  "dispatch2",
-  "CBAdvertisementData",
-  "CBAttribute",
-  "CBATTRequest",
-  "CBCentral",
-  "CBCharacteristic",
-  "CBDefines",
-  "CBError",
   "CBManager",
-  "CBPeer",
-  "CBPeripheral",
-  "CBPeripheralManager",
-  "CBPeripheralManagerConstants",
-  "CBService",
-  "CBUUID",
 ] }
 if-addrs = "0.15"
 
-# The Network Extension join the joiner's device asks iOS for, and the
-# device's name the user set on it.
+# The Network Extension join the joiner's device asks iOS for.
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2-network-extension = { version = "0.3.2", default-features = false, features = [
   "std",
   "block2",
-] }
-objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
-  "std",
-  "UIDevice",
 ] }
 
 # The join the joiner's Mac asks CoreWLAN for, by its directed scan and its

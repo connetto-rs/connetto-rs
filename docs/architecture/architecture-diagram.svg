@@ -504,9 +504,9 @@
       <text x="150" y="32" text-anchor="middle" font-size="8.5" fill="#4CAF50">R74: chip key, certificates, attestation under PEN 67105</text>
       <text x="150" y="45" text-anchor="middle" font-size="8.5" fill="#4CAF50">R76 slices 1 to 9c: the link, mDNS, hotspots, beacon</text>
       <text x="150" y="58" text-anchor="middle" font-size="8.5" fill="#4CAF50">Android and Linux host offline, Apple devices join</text>
-      <text x="150" y="71" text-anchor="middle" font-size="8.5" fill="#4CAF50">R75 frontiers, R77 slices 1 to 5, R79 media frames and port</text>
+      <text x="150" y="71" text-anchor="middle" font-size="8.5" fill="#4CAF50">R75 frontiers, R77 exchange and provisional tier, R79 media frames and port</text>
       <text x="150" y="84" text-anchor="middle" font-size="8.5" fill="#C62828">R76 slices 9d and 9e, R74's Windows record</text>
-      <text x="150" y="97" text-anchor="middle" font-size="8.5" fill="#C62828">R77 slices 6 to 8 and 12, R79 step 4, R80, R112 (chapter 19)</text>
+      <text x="150" y="97" text-anchor="middle" font-size="8.5" fill="#C62828">R79 step 4, R80, R112 (chapter 19)</text>
       <text x="150" y="110" text-anchor="middle" font-size="8.5" fill="#C62828">R78: the courier hold and the explicit courier offer</text>
     </g>
   </g>

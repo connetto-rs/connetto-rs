@@ -13,6 +13,9 @@ pub use data::*;
 
 pub mod view;
 
+#[cfg(feature = "peer")]
+pub mod nearby;
+
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
 pub mod web;
 
@@ -88,6 +91,25 @@ input[type=file] { border: none; padding: 0; }
 .warn { color: #7d4e00; background: #fff8c5; border: 1px solid #d4a72c; border-radius: 6px; padding: 4px 8px; margin: 4px 0; }
 .error { color: var(--danger); }
 .peer { border: 1px solid var(--border); border-radius: 10px; padding: 8px 14px; margin-bottom: 12px; }
+.panel { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; background: #fff; }
+.panel h2 { margin: 0 0 8px; font-size: 1.05em; }
+.panel h3 { display: flex; align-items: center; gap: 6px; margin: 10px 0 4px; font-size: 0.95em; }
+.panel p { margin: 4px 0; }
+.panel input[type=text] { width: 100%; max-width: 28em; box-sizing: border-box; }
+.panel .lines { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }
+.toned { border-top: 4px solid var(--tone); background: #fff; background: color-mix(in srgb, var(--tone) 5%, #fff); }
+.toned h2 svg { fill: var(--tone); }
+.tone-orders { --tone: #2f6feb; }
+.tone-photos { --tone: #0f8b8d; }
+.tone-notes { --tone: #cf222e; }
+.tone-retention { --tone: #1a7f37; }
+.tone-your-data { --tone: #d1660f; }
+.tone-catalogue { --tone: #8250df; }
+.tone-nearby { --tone: #4c51bf; }
+.tone-team { --tone: #bf3989; }
+.peering { background: #eef0ff; color: #2f3480; }
+.pane-info { display: flex; align-items: flex-start; gap: 6px; margin: 12px 0 0; font-size: 0.75em; line-height: 1.4; color: var(--muted); }
+.pane-info svg { flex: none; margin-top: 2px; fill: currentColor; }
 img.thumb { max-height: 60px; border-radius: 4px; }
 "#;
 
@@ -111,6 +133,23 @@ pub const RETENTION_BADGE: &str = "trim";
 pub const YOUR_DATA_PANE_TITLE: &str = "your data";
 /// The your-data pane's badge.
 pub const YOUR_DATA_BADGE: &str = "device-only";
+
+/// What the orders pane is for and what it tests.
+pub const ORDERS_INFO: &str = "Orders the signed-in account owns, written here and synced through the server. Tests live queries, the COUNT(*) aggregates the server pushes, and writes made offline that upload on reconnect.";
+/// What the photos pane is for and what it tests.
+pub const PHOTOS_INFO: &str = "Image files staged on this device and uploaded through the content route. Tests the upload, pinning files to keep them, fetching the pinned ones and freeing content storage.";
+/// What the notes pane is for and what it tests.
+pub const NOTES_INFO: &str = "A table that never leaves this device and is not shared with other phones. Tests the local tier, where this app's windows converge through the DB worker without the server.";
+/// What the retention pane is for and what it tests.
+pub const RETENTION_INFO: &str = "The space the replica takes on this device. Tests the eviction of rows no subscription covers any more, and the trimming pass that hands the freed pages back.";
+/// What the your-data pane is for and what it tests.
+pub const YOUR_DATA_INFO: &str = "Saves this device's data to a zip archive and restores one. Tests the archive export and import, where the file's version wins every clash.";
+/// What the catalogue pane is for and what it tests.
+pub const CATALOGUE_INFO: &str = "Products every account on this device reads from one shared copy. Tests the shared store, kept once on the device whichever account is signed in.";
+/// What the nearby panel is for and what it tests.
+pub const NEARBY_INFO: &str = "Links this phone directly to nearby phones over Bluetooth and a local Wi-Fi hotspot, with no server involved. Tests discovery, hosting and joining a hotspot, and the peer link the team notes travel on.";
+/// What the team notes panel is for and what it tests.
+pub const TEAM_INFO: &str = "Notes every member of the team reads and writes. They sync through the server, and while it is out of reach they travel phone to phone over the nearby link, marked provisional until the server confirms or refuses them. Tests the peer exchange, the provisional rows and the tidy pass.";
 
 /// The orders pane's readout line.
 #[must_use]

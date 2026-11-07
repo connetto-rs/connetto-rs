@@ -1028,7 +1028,6 @@ mod tests {
             }),
             Arc::new(|_offer, _reply| {}),
             Arc::new(|_event| {}),
-            Arc::new(|| {}),
         );
         let first = Beacon::of(&fp(1)).to_service_data();
         let renewed = Beacon::of(&fp(2)).to_service_data();

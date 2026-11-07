@@ -412,6 +412,15 @@ pub enum ClientError {
     #[cfg(all(feature = "device-identity", target_os = "android"))]
     #[error("the device key needs JNI access: call NativeDurable::with_java_access")]
     MissingJavaAccess,
+    /// A platform prompt needs the application's screen in front, and the
+    /// application shows none, a backgrounded one or one not started yet.
+    #[cfg(all(feature = "device-identity", target_os = "android"))]
+    #[error("no screen of the application is in front for the prompt")]
+    NoAndroidScreen,
+    /// A call into the application's Java code failed, kept as its text.
+    #[cfg(all(feature = "device-identity", target_os = "android"))]
+    #[error("the application's Java code refused: {0}")]
+    AndroidJava(String),
     /// A build with a device identity connected without naming the roots its
     /// certificates and revocation lists are checked against (R74 decision 23).
     #[cfg(feature = "device-identity")]
@@ -585,6 +594,10 @@ pub enum PeerError {
     /// The local clock puts the device's certificate outside its window.
     #[error("the device clock is outside the certificate window")]
     ClockOutsideWindow,
+    /// The device's peer links are off, so the dial is refused before a
+    /// socket (R77 slice 8).
+    #[error("the device's peer links are off")]
+    LinksOff,
     /// The dial failed.
     #[error(transparent)]
     Link(#[from] LinkError),
@@ -1640,10 +1653,6 @@ pub enum ClientEvent {
     /// The hotspot stopped, on a system stop (R76).
     #[cfg(feature = "peer")]
     HotspotStopped,
-    /// The personal hotspot's offer was handed out but no device landed on
-    /// the network within its bound (R76 decision 26).
-    #[cfg(feature = "peer")]
-    HotspotUnreached,
     /// The joined network was left (R76).
     #[cfg(feature = "peer")]
     HotspotLeft,
@@ -1668,9 +1677,8 @@ pub enum ClientEvent {
     HostNearby {
         /// The host's device.
         host: crate::bluetooth::HostId,
-        /// The beacon's prefix, where the beacon carries one (R76 decision
-        /// 25).
-        prefix: Option<[u8; 8]>,
+        /// The beacon's prefix (R76 decision 18).
+        prefix: [u8; 8],
         /// The signal the beacon carried.
         rssi: Option<i16>,
     },
