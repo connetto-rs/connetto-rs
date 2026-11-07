@@ -2,7 +2,6 @@
 //! btleplug's jni takes.
 
 use manganis::android::with_activity;
-use manganis::jni::JNIEnv;
 use manganis::jni::errors::Error as JniError;
 
 // Declared for `dx`, which builds and bundles the Kotlin module this names.
