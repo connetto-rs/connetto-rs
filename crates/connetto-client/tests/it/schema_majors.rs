@@ -520,10 +520,10 @@ async fn a_rebuild_keeps_the_peer_cursors_and_retractions_and_drops_the_entries(
         let mut conn = open(&dir, schema(1, V1_DDL)).await.expect("fresh open");
         conn.conn()
             .batch_execute(
-                "INSERT INTO _connetto_peer_cursor VALUES (x'aa', 'anna', 4, x'01', x'02'); \
+                "INSERT INTO _connetto_peer_cursor VALUES (x'aa', 'anna', 4, x'01', x'02', 10); \
                  INSERT INTO _connetto_retraction VALUES ('device:aa', 2, x'7b7d'); \
                  INSERT INTO _connetto_peer_entry \
-                 VALUES (x'aa', 4, 1, x'00', 'anna', NULL, 10, 1); \
+                 VALUES (x'aa', 4, 0, 1, NULL, x'00', x'00', 'anna', NULL, 10, 1); \
                  INSERT INTO _connetto_provisional \
                  VALUES ('items', x'01', x'aa', 4, 'anna', 10, 0, NULL, NULL);",
             )

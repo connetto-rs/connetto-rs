@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use connetto_client::peer::PeerAuthor;
+use connetto_client::peer::{HeldState, PeerAuthor};
 use connetto_client::provisional::ProvisionalRow;
 use connetto_client::{
     ClientBuilder, ClientEvent, ConnettoConnection, Grant, KeyValue, SyncSchema,
@@ -50,8 +50,14 @@ diesel::table! {
         author -> Binary,
         /// The author's queue sequence.
         seq -> BigInt,
+        /// What the entry is held as, a `HeldState`.
+        state -> BigInt,
         /// The major the entry was captured under.
         major -> BigInt,
+        /// The hash of the entry's body.
+        digest -> Binary,
+        /// The entry's body, absent for a digest-only entry.
+        changeset -> Nullable<Binary>,
         /// The author's certificate account.
         account -> Text,
         /// The wall clock the entry was received at.
@@ -228,17 +234,67 @@ pub async fn captured<const N: usize>(ddl: &str, writes: [AuthorWrite<'_>; N]) -
     bodies.try_into().expect("one body per write")
 }
 
-/// The receiver's stored peer entries, by author and sequence.
+/// The receiver's provisional peer entries, by author and sequence.
 pub fn stored_entries<T>(conn: &mut ConnettoConnection<T>) -> Vec<(Vec<u8>, i64)>
 where
     T: connetto_core::traits::Transport,
     T::Error: core::fmt::Display,
 {
     _connetto_peer_entry::table
+        .filter(_connetto_peer_entry::state.eq(HeldState::Provisional.db()))
         .select((_connetto_peer_entry::author, _connetto_peer_entry::seq))
         .order(_connetto_peer_entry::position.asc())
         .load(conn.conn())
         .expect("read the entries")
+}
+
+/// Store a cursor for the author `key`, its certificate ending far ahead,
+/// as the adopt of the author's offer leaves one, so the entries the author
+/// has retained stay retained.
+pub fn hold_cursor<T>(conn: &mut ConnettoConnection<T>, key: &[u8])
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    diesel::sql_query(
+        "INSERT INTO _connetto_peer_cursor (author, account, seq, head, offer, expires_at) \
+         VALUES (?, 'peer-anna', 0, zeroblob(32), x'', 4102444800)",
+    )
+    .bind::<diesel::sql_types::Binary, _>(key)
+    .execute(conn.conn())
+    .expect("store the cursor");
+}
+
+/// Every peer entry the receiver holds, by author, sequence and state,
+/// position order.
+pub fn held_entries<T>(conn: &mut ConnettoConnection<T>) -> Vec<(Vec<u8>, i64, HeldState)>
+where
+    T: connetto_core::traits::Transport,
+    T::Error: core::fmt::Display,
+{
+    let rows: Vec<(Vec<u8>, i64, i64)> = _connetto_peer_entry::table
+        .select((
+            _connetto_peer_entry::author,
+            _connetto_peer_entry::seq,
+            _connetto_peer_entry::state,
+        ))
+        .order(_connetto_peer_entry::position.asc())
+        .load(conn.conn())
+        .expect("read the entries");
+    rows.into_iter()
+        .map(|(author, seq, state)| {
+            let state = [
+                HeldState::Provisional,
+                HeldState::CourierOnly,
+                HeldState::DigestOnly,
+                HeldState::Retained,
+            ]
+            .into_iter()
+            .find(|held| held.db() == state)
+            .expect("a stored state");
+            (author, seq, state)
+        })
+        .collect()
 }
 
 /// One row of the provenance table, as the typed read stands it.

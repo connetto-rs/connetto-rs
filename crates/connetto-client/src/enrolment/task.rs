@@ -184,13 +184,23 @@ pub(crate) trait Link: Clone + Send + Sync + 'static {
         &self,
         author: Vec<u8>,
     ) -> impl Future<Output = Result<Frontier, ClientError>> + Send;
-    /// Take `author`'s verified offer with `cursor` (R77).
+    /// Take `author`'s verified offer with `cursor` (R77), its certificate
+    /// ending at `expires_at` (R78 decision 17).
     #[cfg(feature = "peer")]
     fn adopt(
         &self,
         author: PeerAuthor,
         offer: SignedOffer,
         cursor: Frontier,
+        expires_at: std::time::SystemTime,
+    ) -> impl Future<Output = Result<(), ClientError>> + Send;
+    /// Move `author`'s certificate end to `expires_at`, a renewal its link
+    /// reported (R78 decision 17).
+    #[cfg(feature = "peer")]
+    fn renew(
+        &self,
+        author: Vec<u8>,
+        expires_at: std::time::SystemTime,
     ) -> impl Future<Output = Result<(), ClientError>> + Send;
     /// Take `author`'s entry `row`, applying `body` when it crosses, with
     /// the cursor at it (R77).
@@ -1575,13 +1585,16 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 if let Some(event) = peer {
                     run.discovery.on_node_event(&event);
                     match event {
-                        PeerEvent::Linked { peer, public_key, bot_list } => {
+                        PeerEvent::Linked { peer, public_key, bot_list, expires_at } => {
                             let _ = run.enroller.media.forward(crate::media::MediaEvent::Linked {
                                 peer: peer.clone(),
                                 bot_list: bot_list.clone(),
                             });
-                            run.peer_linked(peer.clone(), public_key, bot_list).await;
+                            run.peer_linked(peer.clone(), public_key, bot_list, expires_at).await;
                             run.link.emit(ClientEvent::PeerLinked { peer });
+                        }
+                        PeerEvent::Renewed { peer, expires_at } => {
+                            run.peer_renewed(&peer, expires_at).await;
                         }
                         PeerEvent::Unlinked { peer, reason } => {
                             let _ = run

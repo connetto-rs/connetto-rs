@@ -363,6 +363,15 @@ fn renew(
             .peer_fingerprints
             .lock()
             .insert(key, crate::fingerprint::Fingerprint::of(leaf));
+        // The device keeps the peer's retained entries until the renewed
+        // certificate's end (R78 decision 17).
+        state
+            .events
+            .send(PeerEvent::Renewed {
+                peer: slot.peer.clone(),
+                expires_at: certificate.not_after(),
+            })
+            .ok();
     }
     Ok(())
 }

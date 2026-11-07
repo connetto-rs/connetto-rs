@@ -84,6 +84,9 @@ mod outbox_push;
 mod peer_media;
 
 #[cfg(feature = "peer")]
+mod courier_hold;
+
+#[cfg(feature = "peer")]
 mod peer_apply;
 
 #[cfg(feature = "peer")]

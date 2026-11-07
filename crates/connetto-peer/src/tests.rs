@@ -1931,6 +1931,15 @@ async fn a_renewal_certificate_keeps_the_link_past_the_old_deadline() {
         .expect("the re-serve keeps the listener");
     assert_eq!(served, b_addr);
 
+    // Alice learns the renewed certificate's end, a day out (R78 slice 3a).
+    assert_eq!(
+        next_events(&mut a_rx, 1).await,
+        vec![PeerEvent::Renewed {
+            peer: bob.identity.clone(),
+            expires_at: renewed.not_after(),
+        }]
+    );
+    assert!(renewed.not_after() > bob.not_after());
     // Past the old deadline, the link is still up and still carries frames.
     no_events(&mut a_rx, Duration::from_secs(7)).await;
     let (list, signer) = deployment.issuer_list(&issuer, 1, &[], now);
@@ -3712,6 +3721,7 @@ pub(crate) fn linked_event(peer: &Peer) -> PeerEvent {
         peer: peer.identity.clone(),
         public_key: peer.public_key_info(),
         bot_list: Some(peer.bot_list.clone()),
+        expires_at: peer.not_after(),
     }
 }
 

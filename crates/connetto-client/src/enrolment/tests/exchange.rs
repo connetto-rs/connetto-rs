@@ -11,8 +11,8 @@ use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use super::{
-    Authority, HOUR, RunKeys, attesting_key, authority, far_peer, inbox, issue_for, peer,
-    poll_until, positive_serial, whole_second,
+    AttestingKey, Authority, HOUR, RunKeys, attesting_key, authority, far_peer, inbox, issue_for,
+    peer, poll_until, positive_serial, whole_second,
 };
 use crate::ClientError;
 use crate::ClientEvent;
@@ -119,12 +119,26 @@ impl Link for ReplicaLink {
         author: crate::peer::PeerAuthor,
         offer: SignedOffer,
         cursor: Frontier,
+        expires_at: std::time::SystemTime,
     ) -> Result<(), ClientError> {
         refused(&mut self.refusals.lock().0)?;
+        self.conn.lock().await.adopt_peer_offer(
+            &author,
+            &offer,
+            &cursor,
+            crate::exchange::unix_secs(expires_at),
+        )
+    }
+
+    async fn renew(
+        &self,
+        author: Vec<u8>,
+        expires_at: std::time::SystemTime,
+    ) -> Result<(), ClientError> {
         self.conn
             .lock()
             .await
-            .adopt_peer_offer(&author, &offer, &cursor)
+            .renew_peer_expiry(&author, crate::exchange::unix_secs(expires_at))
     }
 
     async fn take_row(
@@ -150,6 +164,10 @@ struct Device {
     handle: EnrolHandle,
     node: connetto_peer::Node,
     key_id: [u8; 32],
+    /// The end of the device's certificate.
+    certificate_end: std::time::SystemTime,
+    /// The device key's PKCS#8, which a renewal serves again.
+    der: Vec<u8>,
     run: tokio::task::JoinHandle<()>,
     end: watch::Sender<()>,
 }
@@ -168,6 +186,7 @@ impl Device {
             12 * HOUR,
             positive_serial(serial),
         );
+        let certificate_end = held.leaf.not_after();
         let mut conn = replica();
         for (id, captured) in (1..).zip(majors) {
             queue(&mut conn, WriterRef::Device(key_id), id, major(*captured));
@@ -178,7 +197,7 @@ impl Device {
         let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
         let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
         let (enroller, handle) = Enroller::new(
-            Arc::new(RunKeys { der }),
+            Arc::new(RunKeys { der: der.clone() }),
             Some(HOUR),
             Vec::new(),
             vec![authority.root.clone()],
@@ -208,6 +227,8 @@ impl Device {
             handle,
             node,
             key_id,
+            certificate_end,
+            der,
             run,
             end,
         }
@@ -235,14 +256,76 @@ fn items(conn: &tokio::sync::Mutex<Conn>) -> Option<String> {
     .ok()
 }
 
-/// The stored peer entries of the replica.
+/// The stored peer entries of the replica a verdict can still reach, every
+/// one but the retained.
 fn stored_entries(conn: &tokio::sync::Mutex<Conn>) -> Option<i64> {
     let mut conn = conn.try_lock().ok()?;
     diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
-        "(SELECT count(*) FROM _connetto_peer_entry)",
+        "(SELECT count(*) FROM _connetto_peer_entry WHERE state != 3)",
     ))
     .get_result(&mut conn.db)
     .ok()
+}
+
+/// The certificate end `conn` keeps for `author`, read without waiting on a
+/// busy lock.
+fn certificate_end(conn: &tokio::sync::Mutex<Conn>, author: &[u8; 32]) -> Option<i64> {
+    let mut conn = conn.try_lock().ok()?;
+    diesel::sql_query("SELECT expires_at FROM _connetto_peer_cursor WHERE author = ?")
+        .bind::<diesel::sql_types::Binary, _>(author.as_slice())
+        .get_result::<CertificateEnd>(&mut conn.db)
+        .ok()
+        .map(|row| row.expires_at)
+}
+
+/// One cursor's certificate end, as the raw read stands it.
+#[derive(diesel::QueryableByName)]
+struct CertificateEnd {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    expires_at: i64,
+}
+
+/// R78 decision 17: a renewal the author presents on a live link moves the
+/// certificate end the receiver keeps for it, through the link's `Renewed`
+/// event and the receiver's task.
+#[tokio::test]
+async fn a_renewal_on_the_link_moves_the_authors_certificate_end() {
+    let authority = authority(whole_second()).await;
+    let anna = Device::start(&authority, 5, &[2]).await;
+    let ben = Device::start(&authority, 9, &[]).await;
+    ben.node
+        .link(anna.handle.peer_address().expect("anna listens"))
+        .await
+        .expect("the link completes");
+    poll_until(|| {
+        certificate_end(&ben.conn, &anna.key_id)
+            == Some(crate::exchange::unix_secs(anna.certificate_end))
+    })
+    .await;
+
+    let key = AttestingKey::from_pkcs8(&anna.der);
+    let renewed = issue_for(
+        &authority,
+        &key,
+        whole_second(),
+        24 * HOUR,
+        positive_serial(15),
+    );
+    let renewed_end = crate::exchange::unix_secs(renewed.leaf.not_after());
+    assert!(renewed_end > crate::exchange::unix_secs(anna.certificate_end));
+    anna.node
+        .serve(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            connetto_peer::Identity {
+                certificate: renewed.certificate,
+                issuer: renewed.issuer,
+                key: Arc::new(key),
+            },
+        )
+        .expect("anna serves her renewed certificate");
+    poll_until(|| certificate_end(&ben.conn, &anna.key_id) == Some(renewed_end)).await;
+    anna.stop().await;
+    ben.stop().await;
 }
 
 /// R77 slice 6b, the receiver flow end to end. A linked receiver verifies
@@ -274,6 +357,14 @@ async fn two_linked_devices_exchange_their_writers_entries() {
         },
         "the cursor stands at the verified head"
     );
+    // The adopt kept the end of the certificate the link proved (R78
+    // decision 17).
+    let expires_at: i64 = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+        "(SELECT expires_at FROM _connetto_peer_cursor)",
+    ))
+    .get_result(&mut ben.conn.lock().await.db)
+    .expect("read the certificate end");
+    assert_eq!(expires_at, crate::exchange::unix_secs(anna.certificate_end));
 
     // Anna's next write reaches Ben through her fresh offer.
     queue(
@@ -298,6 +389,12 @@ async fn two_linked_devices_exchange_their_writers_entries() {
             .expect("the ack lands");
     }
     poll_until(|| stored_entries(&ben.conn) == Some(0)).await;
+    let retained: i64 = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+        "(SELECT count(*) FROM _connetto_peer_entry WHERE state = 3)",
+    ))
+    .get_result(&mut ben.conn.lock().await.db)
+    .expect("count the retained entries");
+    assert_eq!(retained, 4, "every adjudicated entry is retained");
     assert!(
         ben.conn
             .lock()
