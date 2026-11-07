@@ -466,6 +466,14 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     /// than return its first rows: a truncation the caller cannot tell from a
     /// complete answer is the one outcome this seam may never produce.
     ///
+    /// The page's cursor becomes the client's resume point, and the client
+    /// cannot compare two cursors, so it has to name where the read sat. It
+    /// lies at or past every commit made before the read began, so it never
+    /// moves a resume point behind a change the connection already delivered,
+    /// and before every commit the read did not see, so a catchup from it
+    /// misses none. A source that cannot tell where its read sat returns an
+    /// empty cursor, which leaves the client's resume point where it was.
+    ///
     /// # Errors
     ///
     /// Implementation-defined: a backend read or encoding failure, a row above
