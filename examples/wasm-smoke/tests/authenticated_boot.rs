@@ -115,6 +115,10 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
         Some(user_id.as_str()),
         "the startup reports the account it opened the replica for"
     );
+    assert!(
+        booted_as.replica_persistent,
+        "a signed-in startup with OPFS keeps its replica across a reload"
+    );
 
     // The login went through the tab, so the tab-to-worker handoff ran rather than
     // being bypassed by a silent refresh.

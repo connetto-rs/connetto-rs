@@ -178,12 +178,6 @@ Defects and unowned risks with no phase yet. Each states what the code does and 
 
 Fixed in one pull request in `relay.rs`. The hub forwards `MembershipOpened`, mirrors membership tables into tab snapshots, live routing and resync, proven by a tab reading the demo's membership-shaped `team_notes_p` policy.
 
-### G4
-
-**Without OPFS the web client runs on an in-memory replica.** `ReplicaStorage::install` in [storage.rs](../crates/connetto-web/src/storage.rs) falls back to a memory VFS, so queued writes and the replica are lost on reload and nothing tells the user.
-
-Decided. The client keeps the in-memory replica where OPFS is refused and reports the replica's persistence in its boot report, so the application can warn that a reload loses unsent writes, in one pull request. A durable fallback is [R111](#r111-a-durable-replica-where-opfs-is-refused).
-
 ### G5
 
 **A content ticket outlives the session that minted it.** Every fetch rechecks the file's visibility to the ticket's caller (`file_visible_to_caller` in [serve.rs](../crates/connetto-file-server/src/serve.rs)), so a revoked share, a revoked grant or an erased row denies at once. What outlives the session is the caller's identity. After a logout or a revoked session, a cached ticket keeps reading the files that identity can still see until its expiry, `CONNETTO_CONTENT_TICKET_TTL_SECS` (default 3600 s) plus the server skew.
@@ -1860,7 +1854,7 @@ A session ends when the provider has not confirmed the user within the bound, an
 
 ### Purpose
 
-A browser that refuses OPFS, Firefox private windows among them, runs the replica in memory, [G4](#g4), so a reload loses every unsent write. Firefox private windows keep IndexedDB for the life of the private session. A synchronous VFS over IndexedDB loses commits, which for connetto means a reused writer sequence the server refuses as forked, and `sqlite-wasm-vfs` removed the one it had for that reason. JSPI, in Chrome 137 and Firefox 153, lets a VFS wait for IndexedDB before SQLite's commit returns.
+A browser that refuses OPFS, Firefox private windows among them, runs the replica in memory and reports it in the boot result, so a reload loses every unsent write. Firefox private windows keep IndexedDB for the life of the private session. A synchronous VFS over IndexedDB loses commits, which for connetto means a reused writer sequence the server refuses as forked, and `sqlite-wasm-vfs` removed the one it had for that reason. JSPI, in Chrome 137 and Firefox 153, lets a VFS wait for IndexedDB before SQLite's commit returns.
 
 ### Decisions, taken with the maintainer
 
