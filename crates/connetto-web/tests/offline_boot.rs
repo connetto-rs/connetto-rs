@@ -123,6 +123,10 @@ async fn the_worker_starts_with_no_server_reachable() {
     );
     assert_eq!(booted.session_expires_at, None);
     assert_eq!(booted.account, None);
+    assert!(
+        !booted.replica_persistent,
+        "an anonymous boot runs its replica in memory, so a reload loses it"
+    );
     assert_eq!(booted.content_persistent, Some(false));
     let archive = request_export(ExportScope::Unsynced)
         .await

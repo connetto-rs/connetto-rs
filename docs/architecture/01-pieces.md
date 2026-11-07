@@ -122,7 +122,7 @@ Planned in [R99](../../plans/master-implementation-plan.md#r99-bot-login-and-lif
 | Piece | Description |
 |---|---|
 | Worker isolation | All sync logic runs in a dedicated `Worker` spawned by the Web Locks election winner, and the main thread is never blocked. OPFS sync access handles exist only inside a dedicated worker, so a `SharedWorker` was never an option |
-| Browser storage backend | Local SQLite runs in OPFS (Origin Private File System) or an IndexedDB fallback |
+| Browser storage backend | Local SQLite runs in OPFS (Origin Private File System), or in memory for the session where the browser refuses OPFS |
 | Transport adapter | WebSocket in the browser context, the same `Transport` trait as native |
 | File storage adapter | Content chunks stored in OPFS or the browser cache, with no direct filesystem access |
 | Common interface boundary | Native and WASM clients expose the same public API, so application code is portable. Android is supported both in the browser and as a native app, and the topology is in [09](09-wasm.md) |
