@@ -11,7 +11,7 @@ use super::{
     ReadinessBackend,
 };
 use crate::device_key::JavaAccess;
-use crate::hotspot::android::{call, int, plugin, string};
+use crate::hotspot::android::{call, call_on_screen, int, plugin, string};
 
 /// The bundled plugin's class.
 const PLUGIN_CLASS: &str = "dev.connetto.peer.BluetoothPlugin";
@@ -64,14 +64,25 @@ impl ReadinessBackend for AndroidBluetoothBackend {
     }
 
     fn prompt(&self) -> Result<(), BluetoothError> {
-        // The dialogs open from the application's Activity, which only the
-        // Android glue can reach.
-        match connetto_peer_android::start_bluetooth_prompt() {
+        // The dialogs open over the application's screen in front.
+        let started = call_on_screen(&*self.java, |env, activity| {
+            let class = plugin(env, PLUGIN_CLASS)?;
+            let code = env
+                .call_static_method(
+                    class,
+                    "prompt",
+                    "(Landroid/app/Activity;)I",
+                    &[JValue::Object(activity)],
+                )?
+                .i()?;
+            Ok(code == 0)
+        });
+        match started {
             Ok(true) => Ok(()),
             Ok(false) => Err(BluetoothError::Failed(
                 "the prompt action is blocked".into(),
             )),
-            Err(err) => Err(BluetoothError::Failed(err.to_string())),
+            Err(failure) => Err(BluetoothError::Failed(failure.to_string())),
         }
     }
 

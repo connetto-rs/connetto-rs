@@ -289,10 +289,13 @@ impl Device {
                 return Ok(());
             }
             settings_opened = true;
+            // Settings left open on another screen takes the intent into its
+            // running task without showing the Wi-Fi list, so the task clears.
             self.adb(&[
                 "shell",
                 "am",
                 "start",
+                "--activity-clear-task",
                 "-a",
                 "android.settings.WIFI_SETTINGS",
             ])
@@ -560,6 +563,38 @@ impl Device {
         .map(drop)
     }
 
+    /// The demo's page once its `WebView` answers, retried for a minute while
+    /// the app starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last error when the page does not answer within the minute.
+    pub async fn ready_app(&self) -> Result<PageSession> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match self.app().await {
+                Ok(app) => return Ok(app),
+                Err(err) if Instant::now() >= deadline => return Err(err),
+                Err(_) => sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
+
+    /// Click the demo's Sign in once its setup has parked the login, since
+    /// both demos open the login tab on that click.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the banner or an enabled button does not appear
+    /// within its bound.
+    pub async fn click_sign_in(&self) -> Result<()> {
+        let mut app = self.ready_app().await?;
+        app.wait_for_text("Sign in to begin.", Duration::from_secs(90))
+            .await?;
+        app.click_when_enabled("Sign in", Duration::from_secs(90))
+            .await
+    }
+
     /// A `DevTools` session on the demo's `WebView`, over a forward that lives
     /// until the run removes every forward.
     ///
@@ -725,8 +760,10 @@ pub async fn submit_login(tab: &mut PageSession, user: &str) -> Result<()> {
 }
 
 /// Sign the phone in as the user named and wait for it to connect and
-/// certify, leaving its app page open. The screenshots take the prefix
-/// `shot`, which the caller names after its own role in the run.
+/// certify, leaving its app page open. `unlock` answers the demo's unlock
+/// prompt, and is `None` for a build without the unlock gate. The screenshots
+/// take the prefix `shot`, which the caller names after its own role in the
+/// run.
 ///
 /// # Errors
 ///
@@ -737,22 +774,28 @@ pub async fn sign_in_phone(
     user: &str,
     issuer: &str,
     evidence: &Path,
-    unlock: Unlock<'_>,
+    unlock: Option<Unlock<'_>>,
     shot: &str,
 ) -> Result<PageSession> {
     crate::step(&format!("sign in on {}", phone.serial));
     phone.launch().await?;
+    phone.click_sign_in().await?;
     let mut tab = phone.login_tab(issuer).await?;
     phone
         .screenshot(evidence, &format!("{shot}-login-page"))
         .await?;
     submit_login(&mut tab, user).await?;
     drop(tab);
-    unlock
-        .approve(phone, evidence, &format!("{shot}-launch-unlock"))
-        .await?;
+    if let Some(unlock) = unlock {
+        unlock
+            .approve(phone, evidence, &format!("{shot}-launch-unlock"))
+            .await?;
+    }
     let mut app = phone.app().await?;
-    app.wait_for_text("status: connected", Duration::from_secs(90))
+    // The status line can carry a non-fatal message, such as the retirement
+    // of the writer a cleared app left behind, so the banner stands for the
+    // connection.
+    app.wait_for_text("Signed in as ", Duration::from_secs(90))
         .await?;
     app.wait_for_text("device: certified until", Duration::from_secs(60))
         .await?;

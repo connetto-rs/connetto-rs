@@ -58,6 +58,13 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         CFBundleShortVersionString: 0.0.1
         CFBundleVersion: "0.0.1"
+        # The peer link's Bonjour advertisement and the local network and
+        # Bluetooth prompts it asks (R76), the same strings Dioxus.toml's
+        # bluetooth permission writes into the dioxus demo's plist.
+        NSBonjourServices:
+          - _connetto-peer._tcp
+        NSLocalNetworkUsageDescription: Find and link to nearby devices
+        NSBluetoothAlwaysUsageDescription: Find and link to nearby devices
     entitlements:
       path: connetto-tauri-demo_iOS/connetto-tauri-demo_iOS.entitlements
     scheme:
@@ -88,6 +95,12 @@ targets:
       - sdk: Security.framework
       # The machine name the client's network stack reads.
       - sdk: SystemConfiguration.framework
+      # The peer link (R76), the Bluetooth beacon and central, the hotspot
+      # join and the location the join asks for, named here since a static
+      # library carries no framework link of its own.
+      - sdk: CoreBluetooth.framework
+      - sdk: CoreLocation.framework
+      - sdk: NetworkExtension.framework
       - sdk: UIKit.framework
       - sdk: WebKit.framework
       - target: DioxusSwiftPlugins

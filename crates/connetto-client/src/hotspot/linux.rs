@@ -1149,14 +1149,6 @@ impl HotspotBackend for LinuxHotspotBackend {
             JoinStanding::Ended(JoinOutcome::Lost) => JoinStatus::Lost,
         }
     }
-
-    fn request_personal_host(&self, _ssid: &str, _passphrase: &str) -> Result<(), HotspotError> {
-        Err(HotspotError::Unsupported)
-    }
-
-    fn personal_landed(&self) -> bool {
-        false
-    }
 }
 #[cfg(test)]
 mod tests {
@@ -2164,16 +2156,6 @@ mod tests {
         assert_eq!(deactivates(&h), vec![ACTIVE_PATH.to_string()]);
         activated_event(&h.events);
         pump_until(|| matches!(h.backend.host_status(), HostStatus::Started { .. })).await;
-    }
-
-    #[test]
-    fn personal_host_is_unsupported() {
-        let (backend, _receiver) = LinuxHotspotBackend::unstarted();
-        assert_eq!(
-            backend.request_personal_host("the-ssid", "the-passphrase"),
-            Err(HotspotError::Unsupported)
-        );
-        assert!(!backend.personal_landed());
     }
 
     // The join table.

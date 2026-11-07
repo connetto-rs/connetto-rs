@@ -267,15 +267,27 @@ pub struct DemoDeviceCa {
 /// stack sets.
 pub const DEMO_DEVICE_ROOT_VAR: &str = "CONNETTO_DEMO_BUILD_DEVICE_ROOT";
 
-/// The demo's build features for a mobile target, with its device identity
-/// and the peer link and hotspot it carries when the stack named a
+/// The dioxus demo's build features for a mobile target, with its device
+/// identity and the peer link and hotspot it carries when the stack named a
 /// deployment root.
 #[must_use]
-pub fn demo_mobile_features() -> &'static str {
+pub fn dioxus_mobile_features() -> &'static str {
     if std::env::var_os(DEMO_DEVICE_ROOT_VAR).is_some() {
         "mobile,device-identity,peer"
     } else {
         "mobile"
+    }
+}
+
+/// The Tauri demo's build features for a mobile target, its device identity
+/// and the peer link and hotspot it carries when the stack named a
+/// deployment root, and nothing when it did not.
+#[must_use]
+pub fn tauri_mobile_features() -> &'static str {
+    if std::env::var_os(DEMO_DEVICE_ROOT_VAR).is_some() {
+        "device-identity,peer"
+    } else {
+        ""
     }
 }
 

@@ -255,6 +255,13 @@ pub(crate) enum Command {
     /// changed, so linked peers get a fresh offer (R77).
     #[cfg(feature = "peer")]
     OfferChanged,
+    /// The device's peer links came to stand `on`, the live links closing
+    /// with the client's close when they go off (R77 slice 8).
+    #[cfg(feature = "peer")]
+    SetPeerLinks {
+        /// The standing the links came to.
+        on: bool,
+    },
 }
 
 /// The peer node the task drives, the listener address it binds and the
@@ -575,6 +582,7 @@ impl EnrolHandle {
             Standing::Fresh | Standing::Aging => match self.peer.link(addr).await {
                 Ok(peer) => Ok(peer),
                 Err(LinkError::NotServing) => Err(PeerError::NoIdentity),
+                Err(LinkError::LinksOff) => Err(PeerError::LinksOff),
                 Err(err) => Err(PeerError::Link(err)),
             },
         }
@@ -593,39 +601,6 @@ impl EnrolHandle {
             Ok(Err(_)) => Err(HotspotError::Failed),
             Err(_) => Err(HotspotError::TimedOut),
         }
-    }
-
-    /// Host this device's personal hotspot under its typed details, its
-    /// beacon's outcome beside the offer, within the machines' bounds (R76
-    /// decision 26).
-    #[cfg(feature = "peer")]
-    pub(crate) async fn host_personal_hotspot(
-        &self,
-        ssid: &str,
-        passphrase: &str,
-    ) -> Result<crate::bluetooth::Hosted, HotspotError> {
-        let (reply, answer) = oneshot::channel();
-        self.bluetooth
-            .send(crate::bluetooth::Command::PersonalHost {
-                ssid: ssid.to_owned(),
-                passphrase: passphrase.to_owned(),
-                caller: reply,
-            })
-            .map_err(|_| HotspotError::Failed)?;
-        match tokio::time::timeout(HOST_BOUND + PROMPT_BOUND + MARGIN, answer).await {
-            Ok(Ok(hosted)) => hosted,
-            Ok(Err(_)) => Err(HotspotError::Failed),
-            Err(_) => Err(HotspotError::TimedOut),
-        }
-    }
-
-    /// The personal hotspot's landing bound, started when an exchange
-    /// hands the offer out (R76 decision 26).
-    #[cfg(feature = "peer")]
-    pub(crate) fn personal_offer_handed_out(&self) {
-        let _ = self
-            .hotspot
-            .send(crate::hotspot::Command::PersonalOfferHandedOut);
     }
 
     /// Stop hosting, or cancel the pending request (R76).
@@ -743,6 +718,29 @@ impl EnrolHandle {
         let _ = self
             .bluetooth
             .send(crate::bluetooth::Command::SetPrompt(prompt));
+    }
+
+    /// The device's peer links standing, at run time, the live links closing
+    /// with the client's close when they go off and the found peers dialing
+    /// at once when they come back (R77 slice 8). The node takes the standing
+    /// before the call returns, so [`Self::peer_links_on`] answers it at once
+    /// and the node refuses new links from then on, and the run closes the
+    /// live links and steers the discovery after. A standing already held
+    /// changes nothing.
+    #[cfg(feature = "peer")]
+    pub(crate) fn set_peer_links(&self, on: bool) {
+        if self.peer.peer_links_on() == on {
+            return;
+        }
+        self.peer.set_peer_links(on);
+        let _ = self.commands.send(Command::SetPeerLinks { on });
+        let _ = self.hotspot.send(crate::hotspot::Command::Links { on });
+    }
+
+    /// Whether the device's peer links stand, at run time (R77 slice 8).
+    #[cfg(feature = "peer")]
+    pub(crate) fn peer_links_on(&self) -> bool {
+        self.peer.peer_links_on()
     }
 
     /// The fingerprint the device serves, once it serves (R76).
@@ -1372,6 +1370,19 @@ impl<L: Link> Run<L> {
         self.peer.stop(reason);
     }
 
+    /// The run's half of the device's peer links coming to stand `on`, the
+    /// node having taken the standing in the handle. Off closes every live
+    /// link with the client's close, and the discovery follows either way.
+    /// The standing lasts across a renewal's re-serve on the same node
+    /// (R77 slice 8).
+    #[cfg(feature = "peer")]
+    fn set_peer_links(&mut self, on: bool) {
+        if !on {
+            self.peer.close_links(CloseReason::Closed);
+        }
+        self.discovery.set_peer_links(on);
+    }
+
     /// Act on a live connection as the certificate's standing says
     /// (lifecycle rows "Connected and signed in", "Half-life crossed" and
     /// "Wall clock changes, or the hourly look"). The hourly look never
@@ -1549,6 +1560,8 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 }
                 #[cfg(feature = "peer")]
                 Some(Command::OfferChanged) => run.offer_changed().await,
+                #[cfg(feature = "peer")]
+                Some(Command::SetPeerLinks { on }) => run.set_peer_links(on),
                 None => steering = false,
             },
             Some(lists) = run.enroller.lists.recv() => {

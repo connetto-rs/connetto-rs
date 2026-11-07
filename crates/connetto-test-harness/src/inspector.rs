@@ -351,6 +351,25 @@ impl PageSession {
         }
     }
 
+    /// Switch the account bar back to the account `signed_in_line` named,
+    /// the page's `Signed in as <short identity>` line. Each switch button
+    /// names its account by the full identity, which starts with the short
+    /// one, so the button is found among any others a kept keychain still
+    /// holds.
+    ///
+    /// # Errors
+    ///
+    /// When the line names no identity, when no single button switches to it,
+    /// or as [`PageSession::call`].
+    pub async fn switch_to_account(&mut self, signed_in_line: &str) -> Result<()> {
+        let identity = signed_in_line
+            .strip_prefix("Signed in as ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .ok_or_else(|| anyhow!("the signed-in line {signed_in_line:?} names no identity"))?;
+        self.click_starting_with(&format!("Switch to {identity}"))
+            .await
+    }
+
     /// The first line of the page's text that starts with `prefix`.
     ///
     /// # Errors
@@ -551,6 +570,50 @@ mod tests {
             let error = page.click_starting_with("Switch to ").await.unwrap_err();
             assert!(error.to_string().contains(found), "{error:#}");
         }
+    }
+
+    /// The switch clicks the one button naming the signed-in line's short
+    /// identity, finds none for an identity no button names, and refuses a
+    /// line naming no identity before any click.
+    #[tokio::test]
+    async fn the_switch_clicks_the_button_naming_the_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let script = request["params"]["expression"].as_str().unwrap_or_default();
+                // One button starts with the asked prefix, any other finds none.
+                let found = if script.contains("\"Switch to d5e24135\"") {
+                    serde_json::Value::Bool(true)
+                } else {
+                    serde_json::json!(0)
+                };
+                let answer = serde_json::json!({
+                    "id": request["id"],
+                    "result": { "result": { "value": found } },
+                });
+                socket
+                    .send(Message::Text(answer.to_string()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut page = PageSession::devtools(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        page.switch_to_account("Signed in as d5e24135 (alice)")
+            .await
+            .unwrap();
+        let unknown = page
+            .switch_to_account("Signed in as cc072008 (bob)")
+            .await
+            .unwrap_err();
+        assert!(unknown.to_string().contains("0 buttons"), "{unknown:#}");
+        let error = page.switch_to_account("Signed in as ").await.unwrap_err();
+        assert!(error.to_string().contains("names no identity"), "{error:#}");
     }
 
     /// A line is found by its prefix among the page's trimmed lines, and a
