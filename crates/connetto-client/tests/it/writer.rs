@@ -423,13 +423,16 @@ fn pending(conn: &mut ConnettoConnection<Wire>) -> Vec<PendingRow> {
         .expect("read the queue")
 }
 
-/// Pump until the wire is gone, keeping the events the run announced.
+/// Pump until the wire is gone, keeping the events the run announced. A socket
+/// that ends announces `Closed`, and a session the server ended leaves no wire
+/// to read, so the next pump finds none.
 async fn drain(conn: &mut ConnettoConnection<Wire>) -> Vec<ClientEvent> {
     let mut seen = Vec::new();
     loop {
-        match conn.pump_one().await.expect("pump") {
-            ClientEvent::Closed => break,
-            event => seen.push(event),
+        match conn.pump_one().await {
+            Ok(ClientEvent::Closed) | Err(ClientError::NotConnected) => break,
+            Ok(event) => seen.push(event),
+            Err(err) => panic!("pump: {err}"),
         }
     }
     seen

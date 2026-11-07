@@ -9966,8 +9966,9 @@ where
         }
     }
 
-    /// Apply the writer-state change a writer fatal carries, then surface the
-    /// close, the pump redialing under the fresh writer.
+    /// Apply the writer-state change a writer fatal carries, drop the wire the
+    /// server just ended so the loss is announced before any redial, then
+    /// surface the close, the pump redialing under the fresh writer.
     ///
     /// # Errors
     ///
@@ -10007,6 +10008,7 @@ where
             }
             _ => {}
         }
+        self.disconnected();
         Ok(ClientEvent::ServerClosed { reason })
     }
 
