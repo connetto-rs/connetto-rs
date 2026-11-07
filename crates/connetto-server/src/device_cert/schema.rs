@@ -16,7 +16,8 @@
 //!     last_seen TIMESTAMPTZ NOT NULL,
 //!     revoked_at TIMESTAMPTZ,
 //!     public_key BYTEA NOT NULL,
-//!     attestation TEXT NOT NULL
+//!     attestation TEXT NOT NULL,
+//!     bot_list TEXT
 //!     -- then one column per descriptor field
 //! );
 //! CREATE TABLE connetto_device_certificates (
@@ -82,6 +83,8 @@ pub struct NewEnrolment<'a, Id, D> {
     pub attestation: AttestationLevel,
     /// The device key's `SubjectPublicKeyInfo`, whose hash is the key id.
     pub public_key: Vec<u8>,
+    /// The bot list the certificate carries (R78 decision 9).
+    pub bot_list: &'a str,
 }
 
 /// A renewal of a key already enrolled under the same account.
@@ -95,6 +98,8 @@ pub struct Renewal<D> {
     pub at: SystemTime,
     /// The descriptor the device sent.
     pub descriptor: D,
+    /// The bot list the renewed certificate carries (R78 decision 9).
+    pub bot_list: String,
 }
 
 /// One certificate issued to an enrolled key.
@@ -156,7 +161,7 @@ pub trait ConnettoEnrolmentSchema: Send + Sync + 'static {
         enrolment: NewEnrolment<'c, Self::Id, Self::Descriptor>,
     ) -> Statement<'c, bool>;
 
-    /// Record a renewal's session, sighting and descriptor.
+    /// Record a renewal's session, sighting, descriptor and bot list.
     fn renew_enrolment(
         conn: &mut AsyncPgConnection,
         renewal: Renewal<Self::Descriptor>,
@@ -250,6 +255,7 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                     public_key,
                     descriptor: _,
                     attestation,
+                    bot_list,
                 } = enrolment;
                 let mut facts = S::key_facts(c, key, Some(&user)).await?;
                 if facts.is_none() {
@@ -261,6 +267,7 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                         descriptor: descriptor.clone(),
                         attestation,
                         public_key,
+                        bot_list: &bot_list,
                     };
                     // A concurrent first enrolment of the same key inserted
                     // its row between the read and the insert.
@@ -281,6 +288,7 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                             session,
                             at: issued_at,
                             descriptor,
+                            bot_list,
                         };
                         S::renew_enrolment(c, renewal).await?;
                     }
@@ -461,6 +469,8 @@ macro_rules! connetto_enrolment_tables {
                 public_key -> diesel::sql_types::Bytea,
                 /// The attestation level the first enrolment recorded.
                 attestation -> diesel::sql_types::Text,
+                /// The bot list the key's last certificate carries.
+                bot_list -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
                 $( $field -> $field_sql, )*
             }
         }
@@ -572,6 +582,7 @@ macro_rules! connetto_enrolment_tables {
                         descriptor,
                         attestation,
                         public_key,
+                        bot_list,
                     } = enrolment;
                     let $($shape)* = descriptor;
                     let at = $crate::ban::Instant::from(at);
@@ -584,6 +595,7 @@ macro_rules! connetto_enrolment_tables {
                             connetto_device_enrolments::last_seen.eq(at),
                             connetto_device_enrolments::public_key.eq(public_key),
                             connetto_device_enrolments::attestation.eq(attestation.as_str()),
+                            connetto_device_enrolments::bot_list.eq(Some(bot_list)),
                             $( connetto_device_enrolments::$field.eq($field), )*
                         ))
                         .on_conflict_do_nothing()
@@ -605,6 +617,7 @@ macro_rules! connetto_enrolment_tables {
                         session,
                         at,
                         descriptor,
+                        bot_list,
                     } = renewal;
                     let $($shape)* = descriptor;
                     diesel::update(QueryDsl::filter(
@@ -614,6 +627,7 @@ macro_rules! connetto_enrolment_tables {
                     .set((
                         connetto_device_enrolments::session_id.eq(session),
                         connetto_device_enrolments::last_seen.eq($crate::ban::Instant::from(at)),
+                        connetto_device_enrolments::bot_list.eq(Some(bot_list)),
                         $( connetto_device_enrolments::$field.eq($field), )*
                     ))
                     .execute(conn)
@@ -866,7 +880,7 @@ macro_rules! connetto_enrolment_tables {
                     )))
                     .get_result(conn)
                     .await?;
-                    let found: Option<($id, bool, Vec<u8>)> = match user {
+                    let found: Option<($id, bool, Vec<u8>, Option<String>)> = match user {
                         Some(user) => RunQueryDsl::first(
                             QueryDsl::filter(
                                 QueryDsl::filter(
@@ -876,6 +890,7 @@ macro_rules! connetto_enrolment_tables {
                                             connetto_device_enrolments::user_id,
                                             connetto_device_enrolments::revoked_at.is_not_null(),
                                             connetto_device_enrolments::public_key,
+                                            connetto_device_enrolments::bot_list,
                                         ),
                                     ),
                                     connetto_device_enrolments::key_id.eq(key.as_bytes().to_vec()),
@@ -894,6 +909,7 @@ macro_rules! connetto_enrolment_tables {
                                         connetto_device_enrolments::user_id,
                                         connetto_device_enrolments::revoked_at.is_not_null(),
                                         connetto_device_enrolments::public_key,
+                                        connetto_device_enrolments::bot_list,
                                     ),
                                 ),
                                 connetto_device_enrolments::key_id.eq(key.as_bytes().to_vec()),
@@ -904,7 +920,7 @@ macro_rules! connetto_enrolment_tables {
                         .optional()?,
                     };
                     Ok(found.map(
-                        |(user, revoked, public_key)| $crate::device_cert::KeyRecord {
+                        |(user, revoked, public_key, bot_list)| $crate::device_cert::KeyRecord {
                             user,
                             revoked,
                             certificate_live: live,
@@ -912,6 +928,7 @@ macro_rules! connetto_enrolment_tables {
                             certificate_expiry: certificate_expiry
                                 .map(|instant| std::time::SystemTime::from(instant)),
                             public_key,
+                            bot_list,
                         },
                     ))
                 })

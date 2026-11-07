@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use connetto_core::SessionId;
 use connetto_core::device_cert::{AttestationLevel, KeyId};
 use connetto_server::device_cert::{
-    Enrolment, EnrolmentStore, Recorded, Revocation, pg_enrolment_store,
+    Enrolment, EnrolmentStore, MemoryEnrolments, Recorded, Revocation, pg_enrolment_store,
 };
 use connetto_test_harness::Fixture;
 use diesel_async::AsyncPgConnection;
@@ -45,7 +45,8 @@ const DDL: [&str; 3] = [
     "CREATE TABLE connetto_device_enrolments (\
      key_id BYTEA PRIMARY KEY, user_id TEXT NOT NULL, session_id UUID NOT NULL, \
      enrolled_at TIMESTAMPTZ NOT NULL, last_seen TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ, \
-     public_key BYTEA NOT NULL, attestation TEXT NOT NULL, name TEXT NOT NULL, model TEXT)",
+     public_key BYTEA NOT NULL, attestation TEXT NOT NULL, bot_list TEXT, \
+     name TEXT NOT NULL, model TEXT)",
     "CREATE TABLE connetto_device_certificates (\
      serial BYTEA PRIMARY KEY, \
      key_id BYTEA NOT NULL REFERENCES connetto_device_enrolments (key_id), \
@@ -100,6 +101,7 @@ fn enrolment(
         public_key: Vec::new(),
         descriptor: phone(&format!("{user} {serial}")),
         attestation,
+        bot_list: connetto_core::BOT_LIST_WILDCARD.to_owned(),
     }
 }
 
@@ -517,5 +519,61 @@ async fn a_key_record_reports_its_account_revocation_and_liveness() {
         revoked.public_key,
         vec![0xab; 64],
         "the revocation keeps the public key"
+    );
+}
+
+/// The key record carries the bot list the key's last certificate carries,
+/// written at enrolment and replaced by a renewal, in Postgres and in memory
+/// alike, and a row recorded before the column held one reads `None`.
+#[tokio::test]
+async fn a_key_record_carries_the_last_certificates_bot_list() {
+    let fixture = Fixture::acquire().await;
+    let pg = store(&fixture).await;
+    the_last_bot_list_stands(pg.as_ref()).await;
+    the_last_bot_list_stands(&MemoryEnrolments::<String>::default()).await;
+
+    let manager =
+        AsyncDieselConnectionManager::<AsyncPgConnection>::new(fixture.admin_url().to_owned());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    exec(
+        &pool,
+        "UPDATE connetto_device_enrolments SET bot_list = NULL",
+    )
+    .await;
+    let legacy = pg
+        .key_record(None, key(1))
+        .await
+        .expect("read")
+        .expect("enrolled");
+    assert_eq!(legacy.bot_list, None, "a row without a list reads none");
+}
+
+async fn the_last_bot_list_stands(store: &dyn EnrolmentStore<String>) {
+    let now = SystemTime::now();
+    let mut first = enrolment("alice", key(1), 1, key(9), now, AttestationLevel::Unproven);
+    "orders:read".clone_into(&mut first.bot_list);
+    assert_eq!(store.record(first).await.expect("enrol"), Recorded::Granted);
+    let enrolled = store
+        .key_record(None, key(1))
+        .await
+        .expect("read")
+        .expect("enrolled");
+    assert_eq!(enrolled.bot_list.as_deref(), Some("orders:read"));
+
+    let mut renewal = enrolment("alice", key(1), 2, key(9), now, AttestationLevel::Unproven);
+    "orders:read,orders:insert".clone_into(&mut renewal.bot_list);
+    assert_eq!(
+        store.record(renewal).await.expect("renew"),
+        Recorded::Granted
+    );
+    let renewed = store
+        .key_record(None, key(1))
+        .await
+        .expect("read")
+        .expect("enrolled");
+    assert_eq!(
+        renewed.bot_list.as_deref(),
+        Some("orders:read,orders:insert"),
+        "the renewal's list replaces the enrolment's"
     );
 }
