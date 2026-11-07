@@ -19,6 +19,9 @@ pub trait BotRegistryIdSql {
     /// The registry tables' DDL over this `Id` SQL type, the five `CREATE
     /// TABLE` statements joined by `;`.
     const DDL: &'static str;
+    /// The SQL type the deployment's id columns carry, `TEXT` or `UUID`, the
+    /// one the writer and enrolment bookkeeping columns follow.
+    const ID_SQL_TYPE: &'static str;
 }
 
 /// The registry DDL over `TEXT` ids.
@@ -39,10 +42,12 @@ pub struct UuidIds;
 
 impl BotRegistryIdSql for TextIds {
     const DDL: &'static str = REGISTRY_DDL_TEXT;
+    const ID_SQL_TYPE: &'static str = "TEXT";
 }
 
 impl BotRegistryIdSql for UuidIds {
     const DDL: &'static str = REGISTRY_DDL_UUID;
+    const ID_SQL_TYPE: &'static str = "UUID";
 }
 
 /// The registry tables' DDL over `Id`'s id columns, the one source the
@@ -200,11 +205,13 @@ impl BotList {
 #[cfg(feature = "diesel-pg")]
 impl BotRegistryIdSql for diesel::sql_types::Text {
     const DDL: &'static str = REGISTRY_DDL_TEXT;
+    const ID_SQL_TYPE: &'static str = "TEXT";
 }
 
 #[cfg(feature = "diesel-pg")]
 impl BotRegistryIdSql for diesel::sql_types::Uuid {
     const DDL: &'static str = REGISTRY_DDL_UUID;
+    const ID_SQL_TYPE: &'static str = "UUID";
 }
 
 /// The five bot registry tables' diesel `table!` definitions, one column list

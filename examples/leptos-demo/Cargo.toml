@@ -3,7 +3,7 @@ name = "connetto-leptos-demo"
 description = "Leptos web demo of the connetto browser topology: windows converging a synced orders list through Postgres and a device-private notes list through the DB worker."
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "MIT"
 publish = false
 

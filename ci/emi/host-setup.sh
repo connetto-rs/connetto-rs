@@ -42,7 +42,7 @@ COMMONS_MEMORY_GIB=200
 COMMONS_VMS=16
 COMMONS_CPUS=64
 # The largest flavor, which a VM still being created is counted as.
-LARGEST_GIB=22
+LARGEST_GIB=32
 LARGEST_CPUS=8
 
 case "$MEMBER" in
@@ -378,8 +378,9 @@ if [ "$MEMBER" = emi ]; then
     incus profile device show "$name" --project "$PROJECT" | grep -q "^actions:" \
       || incus profile device add "$name" actions disk source="$CACHE_ROOT/actions" path=/srv/cache/actions readonly=true --project "$PROJECT"
   }
-  # The largest measured peaks are 9.3 GiB light and 19.1 GiB heavy.
-  make_profile ci-light 4 12GiB
+  # The largest measured peaks are 21.8 GiB on a heavy VM, and on a light one
+  # 8.7 GiB for a browser shard's cold wasm build alone, beside the shard's services.
+  make_profile ci-light 4 16GiB
   make_profile ci-heavy "$LARGEST_CPUS" "${LARGEST_GIB}GiB"
 
   log "Account $RUNNER_USER, which runs GARM and holds the GitHub App key"

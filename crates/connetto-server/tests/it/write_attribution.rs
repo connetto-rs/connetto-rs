@@ -69,7 +69,9 @@ async fn served(fixture: &Fixture) -> Served {
         change_stream,
         handle,
         ..
-    } = builder.build().await.expect("the deployment assembles");
+    } = Box::pin(builder.build())
+        .await
+        .expect("the deployment assembles");
     let stream = tokio::spawn(async move {
         let _ = change_stream.await;
     });

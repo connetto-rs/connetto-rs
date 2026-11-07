@@ -44,8 +44,8 @@ use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::{CdcEvent, Postgres};
 use subql::visibility::VisibilityPolicy;
 use subql::{
-    CdcSource, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource, PgXid,
-    SourceItem,
+    CdcSource, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgRelation, PgSqliteEmuSource,
+    PgXid, SourceItem,
 };
 
 mod failures;
@@ -239,9 +239,10 @@ async fn drive<A, O>(
     sql: &str,
 ) -> Vec<PgChangeEvent>
 where
-    A: VisibilityPolicy<Watcher = Arc<connetto_core::auth::Principal>, Backend = Postgres>,
+    A: VisibilityPolicy<Watcher = Arc<connetto_core::auth::Principal>, Backend = Postgres>
+        + 'static,
     A::Error: core::fmt::Display + connetto_server::FailedAuthorization,
-    O: Oplog,
+    O: Oplog + 'static,
 {
     source.execute_sql(sql).expect("execute dml");
     let mut events = Vec::new();
@@ -2412,17 +2413,18 @@ async fn a_fenced_replay_out_of_room_resumes_where_it_stopped() {
 }
 
 /// Items a test drained from the emulator, handed to [`SessionManager::ingest`] as a source.
-struct Replay(std::collections::VecDeque<SourceItem<PgChangeEvent, PgCommit>>);
+struct Replay(std::collections::VecDeque<SourceItem<PgChangeEvent, PgCommit, PgRelation>>);
 
 impl CdcSource for Replay {
     type Commit = PgCommit;
     type Event = PgChangeEvent;
+    type Relation = PgRelation;
     type Error = std::io::Error;
 
     fn next_item(
         &mut self,
-    ) -> impl std::future::Future<
-        Output = Result<Option<SourceItem<PgChangeEvent, PgCommit>>, std::io::Error>,
+    ) -> impl Future<
+        Output = Result<Option<SourceItem<PgChangeEvent, PgCommit, PgRelation>>, std::io::Error>,
     > + Send {
         std::future::ready(Ok(self.0.pop_front()))
     }
@@ -2471,7 +2473,7 @@ async fn pruned_fenced_manager(
         .iter()
         .filter_map(|item| match item {
             SourceItem::Event(event) => Some(event.clone()),
-            SourceItem::Commit(_) => None,
+            SourceItem::Relation(_) | SourceItem::Commit(_) => None,
         })
         .collect();
     assert!(

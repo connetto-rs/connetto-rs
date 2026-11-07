@@ -44,6 +44,17 @@ const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 
+/// The catalog DDL the engine classifies, the orders table with the bot
+/// registry and the bookkeeping tables the publication carries (R77
+/// decision 11). A publication row for a table outside the catalog wedges the
+/// change stream.
+fn catalog_ddl() -> String {
+    connetto_schema::with_bookkeeping::<connetto_core::bots::TextIds>(
+        &connetto_schema::with_registry::<connetto_core::bots::TextIds>(PG_DDL),
+        true,
+    )
+}
+
 async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
     let mut conn = pool.get().await.expect("admin connection");
     diesel_async::RunQueryDsl::execute(sql_query(sql), &mut *conn)
@@ -165,19 +176,20 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         .await;
     fixture.start_replication(&["orders"]).await;
 
+    let catalog = catalog_ddl();
     let manager = ManagerBuilder::new(
-        Materializer::builder(PG_DDL)
+        Materializer::builder(&catalog)
             .build()
             .expect("build materializer"),
         EmptySnapshot,
         RosterAuth::granting("reader").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), &catalog)
             .expect("build write target"),
     )
     .build();
-    let applier = Materializer::builder(PG_DDL)
+    let applier = Materializer::builder(&catalog)
         .build()
         .expect("build applier");
     let mut replica = client_replica();
@@ -207,12 +219,13 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         .with_max_attempts(Some(50))
         .with_healthy_after(Duration::from_secs(1));
     let url = fixture.admin_url().to_owned();
+    let ingest_catalog = catalog.clone();
     let ingest_manager = manager.clone();
     let _ingest = tokio::spawn(async move {
         let connect = |resume: ResumePoint| {
-            let url = url.clone();
+            let (url, catalog) = (url.clone(), ingest_catalog.clone());
             async move {
-                let catalog = ParserDB::parse::<PostgreSqlDialect>(PG_DDL)
+                let catalog = ParserDB::parse::<PostgreSqlDialect>(&catalog)
                     .map_err(|err| format!("{err:?}"))?;
                 let config = PgStreamingConfig::new(url, SLOT, PUBLICATION).start(resume.get());
                 PgStreamingCdcSource::connect(config, catalog)
