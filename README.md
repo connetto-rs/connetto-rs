@@ -25,7 +25,7 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 | Portability | Streamed device archives that restore the tier, unsent writes and unsent content |
 | Files | Chunked, encrypted content with a file server and a client for both platforms, per-identity storage quotas and deployment storage and bandwidth ceilings answered with `Retry-After` |
 | Schema | Postgres DDL translated to the replica at build time by `pg2sqlite`, with write guards, and a major per schema source, so one server runs per major and an updated app drains the writes and files the old build left to the major that captured them and migrates the device-private tier |
-| Peers | Device certificates with hardware attestation, and a mutual TLS link between certified devices found over mDNS or a hotspot handed over by Bluetooth beacon or QR code, hosted on Android and Linux with no SIM and no internet, and joined from those, the iPhone, the iPad and the Mac |
+| Peers | Device certificates with hardware attestation, and a mutual TLS link between certified devices found over mDNS or a hotspot handed over by Bluetooth beacon or QR code, hosted on Android and Linux with no SIM and no internet, and joined from those, the iPhone, the iPad and the Mac. Over it devices exchange offline writes, each applied provisionally under the author's policies until the server confirms it or rolls it back with its reason |
 | Operations | `tracing` logs everywhere, Docker and headless Chrome suites, and CI over every workspace |
 
 ## Where it stands
