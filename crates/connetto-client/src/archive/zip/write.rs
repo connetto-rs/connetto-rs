@@ -303,9 +303,21 @@ fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-/// The stored peer entries as one entry, in position order, each carrying
-/// its author, sequence, capture major, body, the author's account and bot
-/// list and its arrival (R77 decision 16).
+/// A byte string that may be absent, a presence byte before it.
+fn write_optional_bytes(out: &mut Vec<u8>, bytes: Option<&[u8]>) {
+    match bytes {
+        Some(bytes) => {
+            out.push(1);
+            write_bytes(out, bytes);
+        }
+        None => out.push(0),
+    }
+}
+
+/// The held peer entries as one entry, in position order, each carrying its
+/// author, sequence, state, capture major, digest, origin and body when it
+/// holds them, the author's account and bot list and its arrival (R77
+/// decision 16, R78 decision 20).
 pub(super) fn encode_peer_entries(entries: &[super::super::ArchivedPeerEntry]) -> Vec<u8> {
     let count = u64::try_from(entries.len()).expect("slice length exceeds u64");
     let mut out = Vec::new();
@@ -313,8 +325,11 @@ pub(super) fn encode_peer_entries(entries: &[super::super::ArchivedPeerEntry]) -
     for entry in entries {
         write_bytes(&mut out, &entry.author);
         out.extend_from_slice(&entry.seq.to_be_bytes());
+        out.extend_from_slice(&entry.state.to_be_bytes());
         out.extend_from_slice(&entry.major.to_be_bytes());
-        write_bytes(&mut out, &entry.changeset);
+        out.extend_from_slice(&entry.digest);
+        write_optional_bytes(&mut out, entry.origin.as_deref());
+        write_optional_bytes(&mut out, entry.changeset.as_deref());
         write_bytes(&mut out, entry.account.as_bytes());
         match &entry.bot_list {
             Some(bot_list) => {
@@ -329,8 +344,9 @@ pub(super) fn encode_peer_entries(entries: &[super::super::ArchivedPeerEntry]) -
 }
 
 /// The per-author peer cursors as one entry, each carrying its author,
-/// account, verified sequence and head, and the signed offer it was last
-/// verified under (R77 decision 16).
+/// account, verified sequence and head, the signed offer it was last
+/// verified under (R77 decision 16) and the author's certificate end (R78
+/// decision 17).
 pub(super) fn encode_peer_cursors(cursors: &[super::super::ArchivedPeerCursor]) -> Vec<u8> {
     let count = u64::try_from(cursors.len()).expect("slice length exceeds u64");
     let mut out = Vec::new();
@@ -341,6 +357,7 @@ pub(super) fn encode_peer_cursors(cursors: &[super::super::ArchivedPeerCursor]) 
         out.extend_from_slice(&cursor.seq.to_be_bytes());
         out.extend_from_slice(&cursor.head);
         write_bytes(&mut out, &cursor.offer);
+        out.extend_from_slice(&cursor.expires_at.to_be_bytes());
     }
     out
 }

@@ -36,14 +36,15 @@ impl ExportScope {
 
 /// The archive format name.
 const FORMAT: &str = "connetto-local-data";
-/// Version 7 carries each queued write's writer, the secret a number writer
+/// Version 8 carries each queued write's writer, the secret a number writer
 /// was issued under (R70), sequence, chain hash and the application schema
 /// major it was captured under, beside the major the archive was made under
-/// (R31), and for a build that exchanges with peers (R77 decision 16) the
-/// stored peer entries in their position order and the per-author cursors
-/// with their last verified offers, the retraction log and the provisional
+/// (R31), and for a build that exchanges with peers (R77 decision 16) every
+/// held peer entry in its position order with its state, origin and digest
+/// (R78 decision 20) and the per-author cursors with their last verified
+/// offers and certificate ends, the retraction log and the provisional
 /// records apart from them.
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 const MANIFEST: &str = "manifest.json";
 const SYNCED_ROWS: &str = "synced.patchset";
 const LOCAL_ROWS: &str = "device-private.patchset";
@@ -159,18 +160,26 @@ pub(crate) struct ArchivedEntry {
     pub(crate) provenance: Option<connetto_core::messages::Provenance>,
 }
 
-/// One stored peer entry an archive carries, as the store holds it (R77
-/// decision 16), the entries travelling in their position order.
+/// One held peer entry an archive carries, as the store holds it (R77
+/// decision 16, R78 decision 20), the entries travelling in their position
+/// order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ArchivedPeerEntry {
     /// The author's key id.
     pub(crate) author: Vec<u8>,
     /// The author's queue sequence.
     pub(crate) seq: i64,
+    /// What the entry is held as, the stored value of a
+    /// `connetto_client::peer::HeldState`.
+    pub(crate) state: i64,
     /// The major the entry was captured under.
     pub(crate) major: i64,
-    /// The entry's body, as stored.
-    pub(crate) changeset: Vec<u8>,
+    /// The entry's original writer and sequence as stored, `MessagePack`.
+    pub(crate) origin: Option<Vec<u8>>,
+    /// The hash of the entry's body, its manifest row's digest.
+    pub(crate) digest: [u8; 32],
+    /// The entry's body, as stored, absent for a digest-only entry.
+    pub(crate) changeset: Option<Vec<u8>>,
     /// The author's certificate account.
     pub(crate) account: String,
     /// The author's certificate bot list, absent when it carried none.
@@ -192,6 +201,9 @@ pub(crate) struct ArchivedPeerCursor {
     pub(crate) head: [u8; 32],
     /// The author's last verified signed offer, as stored.
     pub(crate) offer: Vec<u8>,
+    /// When the author's certificate ends, in Unix seconds (R78 decision
+    /// 17).
+    pub(crate) expires_at: i64,
 }
 
 /// What an import reads out of an archive.

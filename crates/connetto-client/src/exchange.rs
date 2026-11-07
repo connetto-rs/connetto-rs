@@ -171,9 +171,17 @@ pub(crate) fn all_cursors(
         seq: i64,
         head: Vec<u8>,
         offer: Vec<u8>,
+        expires_at: i64,
     }
     let rows: Vec<Row> = dsl::_connetto_peer_cursor
-        .select((dsl::author, dsl::account, dsl::seq, dsl::head, dsl::offer))
+        .select((
+            dsl::author,
+            dsl::account,
+            dsl::seq,
+            dsl::head,
+            dsl::offer,
+            dsl::expires_at,
+        ))
         .order(dsl::author.asc())
         .load(db)?;
     rows.into_iter()
@@ -186,6 +194,7 @@ pub(crate) fn all_cursors(
                 account: row.account,
                 seq: row.seq,
                 offer: row.offer,
+                expires_at: row.expires_at,
             })
         })
         .collect::<Result<Vec<_>, _>>()
@@ -193,9 +202,8 @@ pub(crate) fn all_cursors(
 
 /// Store or replace `author`'s cursor with `cursor` and its verified `offer`
 /// (R77 decision 16), the archive's import writing it where the receiver held
-/// none. A cursor the import creates counts its author's certificate as
-/// ending [`UNLEARNED_EXPIRY`] from now, and one the receiver held keeps the
-/// end it learned (R78 decision 42).
+/// none, its certificate end `expires_at` where the receiver held no cursor
+/// (R78 decision 20).
 ///
 /// # Errors
 ///
@@ -207,9 +215,9 @@ pub(crate) fn upsert_cursor(
     account: &str,
     cursor: &Frontier,
     offer: &[u8],
+    expires_at: i64,
 ) -> Result<(), ClientError> {
     let seq = stored_seq(cursor.seq)?;
-    let expires_at = unlearned_expiry(crate::clock::now_secs(db)?);
     diesel::insert_into(dsl::_connetto_peer_cursor)
         .values((
             dsl::author.eq(author),
@@ -228,6 +236,28 @@ pub(crate) fn upsert_cursor(
             dsl::offer.eq(offer),
         ))
         .execute(db)?;
+    Ok(())
+}
+
+/// Keep the later of `author`'s stored certificate end and `expires_at`, the
+/// end an archive carries for it (R78 held-row table). An author the
+/// receiver holds no cursor of is left alone.
+///
+/// # Errors
+///
+/// [`ClientError`] when the cursor cannot be written.
+pub(crate) fn keep_later_expiry(
+    db: &mut SqliteConnection,
+    author: &[u8],
+    expires_at: i64,
+) -> Result<(), ClientError> {
+    diesel::update(
+        dsl::_connetto_peer_cursor
+            .filter(dsl::author.eq(author))
+            .filter(dsl::expires_at.lt(expires_at)),
+    )
+    .set(dsl::expires_at.eq(expires_at))
+    .execute(db)?;
     Ok(())
 }
 

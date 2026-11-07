@@ -94,14 +94,15 @@ diesel::table! {
 /// Connetto's own tables a rebuild keeps beside the held batches: the build
 /// record, the device's enrolment, the writer queues with their retirement
 /// bookkeeping and the entries kept for a restore, whose frontiers the server
-/// keeps across majors, and the peer cursors and retraction log, whose owners
-/// settle across majors (R77, R78).
-const KEPT: [&str; 11] = [
+/// keeps across majors, and the peer cursors, held peer entries and
+/// retraction log, whose owners settle across majors (R77, R78 decision 7).
+const KEPT: [&str; 12] = [
     "_connetto_build",
     "_connetto_build_renames",
     "_connetto_device_certificate",
     "_connetto_revocation_list",
     "_connetto_peer_cursor",
+    "_connetto_peer_entry",
     "_connetto_retraction",
     "_connetto_writers",
     "_connetto_pending",
@@ -284,6 +285,8 @@ pub(crate) fn prepare_rebuild(
     if has_table(db, "_connetto_acked")? {
         crate::acked::fill_version(db, old_major, &from.version)?;
     }
+    #[cfg(feature = "peer")]
+    crate::peer::hold_for_rebuild(db)?;
     let held_content = (content.hold)(db, from.major)?;
     if held_writes || held_content {
         diesel::insert_into(held_batch::table)
