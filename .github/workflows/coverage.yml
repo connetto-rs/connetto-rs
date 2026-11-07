@@ -159,6 +159,8 @@ jobs:
       github.event.pull_request.user.login != 'dependabot[bot]')
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Restore cargo downloads
         if: runner.environment == 'github-hosted'
