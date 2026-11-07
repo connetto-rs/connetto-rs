@@ -379,14 +379,14 @@ pub(super) fn offer(key: &KeyPair, key_id: [u8; 32], newest: Frontier) -> Vec<u8
 }
 
 /// Deliver `chain` from `from` on, under the author's offer of its newest
-/// entry.
-async fn deliver(
+/// entry, the failures a store or an enrolment read raises included.
+async fn try_deliver(
     manager: &Manager,
     key: &KeyPair,
     key_id: [u8; 32],
     chain: &Chain,
     from: u64,
-) -> CourierOutcome {
+) -> Result<CourierOutcome, SessionError> {
     manager
         .courier_deliver(
             KeyId::from_bytes(key_id),
@@ -395,6 +395,19 @@ async fn deliver(
             &chain.rows_from(from),
             &chain.bodies_from(from),
         )
+        .await
+}
+
+/// Deliver `chain` from `from` on, under the author's offer of its newest
+/// entry.
+async fn deliver(
+    manager: &Manager,
+    key: &KeyPair,
+    key_id: [u8; 32],
+    chain: &Chain,
+    from: u64,
+) -> CourierOutcome {
+    try_deliver(manager, key, key_id, chain, from)
         .await
         .expect("deliver the range")
 }
@@ -1773,14 +1786,7 @@ async fn a_courier_restore_with_a_provenance_gap_settles_neither() {
         insert_changeset(3, "three", "t2"),
         device_origin(k1_id, 3),
     )]);
-    let error = manager
-        .courier_deliver(
-            KeyId::from_bytes(k2_id),
-            Some(major()),
-            &offer(&k2, k2_id, restored.newest()),
-            &restored.rows,
-            &restored.bodies,
-        )
+    let error = try_deliver(&manager, &k2, k2_id, &restored, 1)
         .await
         .unwrap_err();
     assert!(
@@ -2101,14 +2107,7 @@ async fn an_unreadable_settled_record_fails_the_range() {
         .await
         .expect("spoil the record");
 
-    let error = manager
-        .courier_deliver(
-            KeyId::from_bytes(key_id),
-            Some(major()),
-            &offer(&key, key_id, range.newest()),
-            &range.rows,
-            &range.bodies,
-        )
+    let error = try_deliver(&manager, &key, key_id, &range, 1)
         .await
         .unwrap_err();
     assert!(
@@ -2142,14 +2141,7 @@ async fn an_unreadable_ban_list_fails_the_range_closed() {
     );
 
     let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
-    let error = manager
-        .courier_deliver(
-            KeyId::from_bytes(key_id),
-            Some(major()),
-            &offer(&key, key_id, range.newest()),
-            &range.rows,
-            &range.bodies,
-        )
+    let error = try_deliver(&manager, &key, key_id, &range, 1)
         .await
         .unwrap_err();
     assert!(matches!(error, SessionError::BanList(_)), "got {error:?}");
@@ -2181,14 +2173,7 @@ async fn a_writer_table_failure_fails_the_range() {
     )
     .await;
     let attempt = async || {
-        manager
-            .courier_deliver(
-                KeyId::from_bytes(key_id),
-                Some(major()),
-                &offer(&key, key_id, range.newest()),
-                &range.rows,
-                &range.bodies,
-            )
+        try_deliver(&manager, &key, key_id, &range, 1)
             .await
             .unwrap_err()
     };
@@ -2229,14 +2214,7 @@ async fn a_writer_row_that_will_not_stand_fails_the_range() {
     let (_captured, manager) = courier_manager(&fixture, &store);
     let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
     let attempt = async || {
-        manager
-            .courier_deliver(
-                KeyId::from_bytes(key_id),
-                Some(major()),
-                &offer(&key, key_id, range.newest()),
-                &range.rows,
-                &range.bodies,
-            )
+        try_deliver(&manager, &key, key_id, &range, 1)
             .await
             .unwrap_err()
     };
