@@ -486,18 +486,26 @@ async fn run_camp() {
             })
             .await;
             assert!(retracted.is_some(), "the photo's retraction reaches bob");
+            // The pass removes the manifests before their chunks, so the driver
+            // keeps running until the chunk files are gone too. Dropping it
+            // earlier would cut the pass short and leave chunks behind.
             let until = Instant::now() + BOUND;
-            while holds(&bob_content, full_id).await || holds(&bob_content, thumb_id).await {
-                assert!(Instant::now() < until, "the retraction never swept the photo");
+            loop {
+                let left = chunk_files(dir_b.path());
+                if left == 0
+                    && !holds(&bob_content, full_id).await
+                    && !holds(&bob_content, thumb_id).await
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < until,
+                    "the retraction left the photo on bob's device, {left} chunk files"
+                );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         } => {}
     }
-    assert_eq!(
-        chunk_files(dir_b.path()),
-        0,
-        "the retraction swept every chunk of the photo off bob's device"
-    );
 
     drop(bob_content);
     bob2.close().await;
