@@ -117,6 +117,9 @@ pub(crate) struct NodeState {
     listener: RwLock<Option<ListenerSlot>>,
     /// Whether the node still serves, checked under the links lock.
     pub(crate) serving: AtomicBool,
+    /// Whether the node's peer links stand, checked before a dial's socket
+    /// and under the links lock before a registration (R77 slice 8).
+    pub(crate) links_on: AtomicBool,
     /// The monotonic dial counter a `Hello` carries.
     pub(crate) dial_count: Mutex<u64>,
     /// The registration order, to tell a replaced slot apart.
@@ -314,6 +317,7 @@ impl Node {
             senders: RwLock::new(HashMap::new()),
             listener: RwLock::new(None),
             serving: AtomicBool::new(false),
+            links_on: AtomicBool::new(true),
             dial_count: Mutex::new(0),
             next_seq: Mutex::new(0),
             events,
@@ -394,6 +398,27 @@ impl Node {
     /// Close every link with `reason` and drop the listener.
     pub fn stop(&self, reason: CloseReason) {
         stop_state(&self.state, reason);
+    }
+
+    /// The node's peer links standing, off refusing a dial before its
+    /// socket and an incoming link before it registers (R77 slice 8). A
+    /// fresh node stands the links on.
+    pub fn set_peer_links(&self, on: bool) {
+        self.state.links_on.store(on, Ordering::Release);
+    }
+
+    /// Whether the node's peer links stand (R77 slice 8).
+    #[must_use]
+    pub fn peer_links_on(&self) -> bool {
+        self.state.links_on.load(Ordering::Acquire)
+    }
+
+    /// Close every live link with `reason`, which reports
+    /// [`PeerEvent::Unlinked`] as each link ends, keeping the listener and
+    /// the standing (R77 slice 8).
+    pub fn close_links(&self, reason: CloseReason) {
+        let mut links = self.state.links.lock();
+        close_links_unlocked(&self.state, &mut links, reason);
     }
 
     /// Close the live link to `peer` with `reason`, which reports
@@ -540,6 +565,9 @@ impl Node {
     /// When the peer's presented chain cannot be parsed as device
     /// certificates.
     pub async fn link(&self, addr: SocketAddr) -> Result<DeviceIdentity, LinkError> {
+        if !self.state.links_on.load(Ordering::Acquire) {
+            return Err(LinkError::LinksOff);
+        }
         let identity = self
             .state
             .identity
@@ -745,12 +773,19 @@ fn stop_state(state: &NodeState, reason: CloseReason) {
     if let Some(slot) = state.listener.write().take() {
         let _ = slot.stop.send(true);
     }
-    let drained = {
-        let mut links = state.links.lock();
-        state.serving.store(false, Ordering::Release);
-        std::mem::take(&mut *links)
-    };
-    for (_, slot_state) in drained {
+    let mut links = state.links.lock();
+    state.serving.store(false, Ordering::Release);
+    close_links_unlocked(state, &mut links, reason);
+}
+
+/// Close every live link with `reason` and report the falls, under the
+/// links lock the caller holds.
+fn close_links_unlocked(
+    state: &NodeState,
+    links: &mut HashMap<KeyId, SlotState>,
+    reason: CloseReason,
+) {
+    for (_, slot_state) in std::mem::take(links) {
         match slot_state {
             SlotState::Live(slot) => {
                 let _ = slot.command.send(LinkCommand::Close(reason));
@@ -1186,8 +1221,9 @@ fn catch_up_renewal(state: &NodeState, slot: &LinkSlot, presented: &[u8]) {
 /// # Errors
 ///
 /// [`LinkError::NotServing`] when the node stopped before the link could
-/// register, and [`LinkError::Refused`] when a list kept since the handshake
-/// revokes the peer's chain.
+/// register, [`LinkError::LinksOff`] when the node's peer links went off in
+/// the same gap, and [`LinkError::Refused`] when a list kept since the
+/// handshake revokes the peer's chain.
 #[expect(
     clippy::too_many_lines,
     reason = "the keep decision, the serving check and the insert are atomic under the one links lock"
@@ -1227,6 +1263,11 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         // A stop may have landed between the dial and the registration.
         if !state.serving.load(Ordering::Acquire) {
             return Err(LinkError::NotServing);
+        }
+        // The off standing may have crossed the same gap, refusing before
+        // the link registers.
+        if !state.links_on.load(Ordering::Acquire) {
+            return Err(LinkError::LinksOff);
         }
         // A list kept between the handshake and this registration revokes
         // the chain here, under the same lock `keep_list` sweeps the links in.

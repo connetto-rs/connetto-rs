@@ -82,6 +82,36 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// The team membership rows, synced to every replica the team reads.
+    team_members (team_id, member_id) {
+        /// The team the membership sits in.
+        team_id -> diesel::sql_types::Text,
+        /// The account the membership names, the demo's account ids.
+        member_id -> diesel::sql_types::Text,
+    }
+}
+
+diesel::table! {
+    /// The team note rows, readable and writable by the team's members.
+    team_notes (id) {
+        /// The replica-minted key.
+        id -> rosetta_uuid::sql_types::Uuid,
+        /// The team the note sits in.
+        team_id -> diesel::sql_types::Text,
+        /// Who wrote the note, which the policy settles the row against.
+        author_id -> diesel::sql_types::Text,
+        /// The note's body.
+        body -> diesel::sql_types::Text,
+    }
+}
+
+diesel::define_sql_function! {
+    /// The signed-in account's id, the replica's answer for the caller, which
+    /// the roster's membership filter compares against.
+    fn current_app_user() -> diesel::sql_types::Text;
+}
+
 /// One row of the synced `orders` table.
 #[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
 #[diesel(table_name = orders)]
@@ -136,6 +166,32 @@ pub struct Product {
     pub name: String,
     /// The price in cents.
     pub price_cents: i64,
+}
+
+/// One row of the synced `team_members` roster.
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[diesel(table_name = team_members)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct TeamMember {
+    /// The team the membership sits in.
+    pub team_id: String,
+    /// The account the membership names.
+    pub member_id: String,
+}
+
+/// One row of the synced `team_notes` table.
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[diesel(table_name = team_notes)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct TeamNote {
+    /// The note's id.
+    pub id: Uuid,
+    /// The team the note sits in.
+    pub team_id: String,
+    /// Who wrote the note.
+    pub author_id: String,
+    /// The note's body.
+    pub body: String,
 }
 
 /// The one sync schema the worker, every tab and every device build from.
@@ -469,6 +525,80 @@ where
     products::table.order(products::name.asc())
 }
 
+/// The teams the signed-in account's roster names, from the synced
+/// membership rows, the team picker's subscription.
+#[must_use]
+pub fn teams_of_account<T>() -> impl Watchable<T, String, Handle = LiveQuery<String>>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
+    team_members::table
+        .filter(team_members::member_id.eq(current_app_user()))
+        .select(team_members::team_id)
+}
+
+/// The picked team's members, the subscription that syncs the roster rows a
+/// peer's note settles against, since the note policy reads the author's
+/// membership on the replica that applies it.
+#[must_use]
+pub fn team_members_of<T>(team: String) -> impl Watchable<T, String, Handle = LiveQuery<String>>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
+    team_members::table
+        .filter(team_members::team_id.eq(team))
+        .select(team_members::member_id)
+        .order(team_members::member_id.asc())
+}
+
+/// One team's notes, the pane's list subscription.
+#[must_use]
+pub fn team_notes_for<T>(team: String) -> impl Watchable<T, TeamNote, Handle = LiveQuery<TeamNote>>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
+    team_notes::table
+        .filter(team_notes::team_id.eq(team))
+        .order(team_notes::id.asc())
+}
+
+/// Insert one team note the pane's add button names, the replica minting its
+/// id the way the deployment's key default does.
+///
+/// # Errors
+///
+/// A client error when queueing the write fails, or the write's diesel error.
+pub async fn add_team_note<T>(
+    client: &ConnettoClient<T>,
+    team: &str,
+    author: &str,
+    body: &str,
+) -> Result<usize, ClientError>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
+    let result = client
+        .with_conn(move |conn| {
+            diesel::insert_into(team_notes::table)
+                .values((
+                    team_notes::team_id.eq(team),
+                    team_notes::author_id.eq(author),
+                    team_notes::body.eq(body),
+                ))
+                .execute(conn.conn())
+        })
+        .await
+        .and_then(|insert| insert.map_err(Into::into));
+    if let Err(err) = &result {
+        tracing::error!(error = %err, "team note insert failed");
+    }
+    result
+}
+
 /// Insert one orders row the add button names.
 ///
 /// # Errors
@@ -562,4 +692,298 @@ pub fn expiry_warn_line(warn: &ExpiryWarning, now: SystemTime) -> String {
         .as_secs();
     let days = secs.saturating_sub(now_secs) / 86400;
     format!("Session lapses in {days} day(s). {n} local item(s) at risk. Connect to refresh.")
+}
+
+// The team notes panel's lines (R77 slice 8), the runner-readable form the
+// panel shows and the star walk reads off the page dumps, one line per
+// applied, confirmed, rolled back or refused peer write.
+
+#[cfg(feature = "peer")]
+fn hex_text(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// One primary-key column as the panel's lines name it, a 16-byte blob as its
+/// uuid, the columns joined by `/` where the key spans more than one.
+#[cfg(feature = "peer")]
+#[must_use]
+pub fn key_text(key: &[connetto_client::KeyValue]) -> String {
+    key.iter()
+        .map(|value| match value {
+            connetto_client::KeyValue::Null => "null".to_owned(),
+            connetto_client::KeyValue::Int(value) => value.to_string(),
+            connetto_client::KeyValue::Real(value) => value.to_string(),
+            connetto_client::KeyValue::Text(value) => value.clone(),
+            connetto_client::KeyValue::Blob(bytes) => {
+                let array: Result<[u8; 16], std::array::TryFromSliceError> =
+                    bytes.as_slice().try_into();
+                match array {
+                    Ok(array) => Uuid::from(array).to_string(),
+                    Err(_) => hex_text(bytes),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// One team note row as the panel shows it, the peer-applied rows marked
+/// provisional with the provenance's account beside the row's own author.
+#[must_use]
+pub fn team_note_line(note: &TeamNote, provisional_account: Option<&str>) -> String {
+    let body = note.body.replace(['\n', '\r', '\t'], " ");
+    match provisional_account {
+        Some(account) => {
+            format!(
+                "note: {body} by {} (provisional from {account})",
+                note.author_id
+            )
+        }
+        None => format!("note: {body} by {}", note.author_id),
+    }
+}
+
+/// The retraction's cause as the rolled-back line says it, the refused entry
+/// by the server's own reason.
+#[cfg(feature = "peer")]
+#[must_use]
+pub fn retract_cause(cause: &connetto_core::exchange::RetractCause) -> String {
+    match cause {
+        connetto_core::exchange::RetractCause::Rejected(reason) => reason.to_string(),
+        connetto_core::exchange::RetractCause::Conflict => {
+            "two devices settled different changes at the sequence".to_owned()
+        }
+        connetto_core::exchange::RetractCause::Abandoned => {
+            "the entry was never settled anywhere".to_owned()
+        }
+    }
+}
+
+/// The panel's one line per R77 event, `applied` rows naming the author's
+/// account, the rest the table and key, or `None` for the events the panel
+/// shows no line for.
+#[cfg(feature = "peer")]
+#[must_use]
+pub fn provisional_event_lines(event: &ClientEvent) -> Vec<String> {
+    match event {
+        ClientEvent::ProvisionalApplied { rows, .. } => rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "provisional: applied {} {} by {}",
+                    row.table,
+                    key_text(&row.key),
+                    row.account
+                )
+            })
+            .collect(),
+        ClientEvent::ProvisionalConfirmed { rows } => rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "provisional: confirmed {} {}",
+                    row.table,
+                    key_text(&row.key)
+                )
+            })
+            .collect(),
+        ClientEvent::ProvisionalRetracted { cause, rows, .. } => rows
+            .iter()
+            .map(|(table, key)| {
+                format!(
+                    "provisional: rolled back {table} {} because {}",
+                    key_text(key),
+                    retract_cause(cause)
+                )
+            })
+            .collect(),
+        ClientEvent::PeerWriteRefused { rows, .. } => rows
+            .iter()
+            .map(|(table, key)| format!("provisional: refused {table} {}", key_text(key)))
+            .collect(),
+        // The device's own offline write the server refused, which its peers
+        // see rolled back through the verdicts, stands as the same line.
+        ClientEvent::MutationRejected { reason, rows, .. } => rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "provisional: rolled back {} {} because {reason}",
+                    row.table,
+                    key_text(&row.key)
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The tidy control's line, the provisional rows the eviction pass kept.
+#[cfg(feature = "peer")]
+#[must_use]
+pub fn tidy_line(remaining: usize) -> String {
+    format!("tidy: {remaining} provisional row(s) remain")
+}
+
+#[cfg(all(test, feature = "peer"))]
+mod team_lines_tests {
+    use super::*;
+    use connetto_client::{KeyValue, provisional::ProvisionalRow};
+
+    const NOTE_ID: [u8; 16] = [
+        0x9f, 0x1c, 0x80, 0x01, 0x85, 0x5d, 0x4b, 0x1e, 0x9c, 0x2f, 0x73, 0xa1, 0x6b, 0x0d, 0x4e,
+        0x5a,
+    ];
+
+    fn note_key() -> Vec<KeyValue> {
+        vec![KeyValue::Blob(NOTE_ID.to_vec())]
+    }
+
+    fn record(table: &str, account: &str) -> ProvisionalRow {
+        ProvisionalRow {
+            table: table.to_owned(),
+            key: note_key(),
+            author: account.as_bytes().to_vec(),
+            seq: 3,
+            account: account.to_owned(),
+            received_at: 0,
+            state: connetto_client::provisional::ProvisionalState::Provisional,
+            displaced_author: None,
+            displaced_seq: None,
+        }
+    }
+
+    /// The key's columns stand as their text, the 16-byte blob as its uuid.
+    #[test]
+    fn key_text_names_each_column_and_the_uuid() {
+        let id: Uuid = NOTE_ID.into();
+        assert_eq!(key_text(&note_key()), id.to_string());
+        assert_eq!(key_text(&[KeyValue::Int(-7)]), "-7");
+        assert_eq!(key_text(&[KeyValue::Text("camp".to_owned())]), "camp");
+        assert_eq!(key_text(&[KeyValue::Null]), "null");
+        assert_eq!(key_text(&[KeyValue::Blob(vec![0x01, 0x02])]), "0102");
+        assert_eq!(
+            key_text(&[KeyValue::Text("camp".to_owned()), KeyValue::Int(2)]),
+            "camp/2"
+        );
+    }
+
+    /// A settled row names its author alone, a peer-applied row adds the
+    /// provenance's account.
+    #[test]
+    fn the_note_line_marks_the_peer_row_provisional() {
+        let note = TeamNote {
+            id: NOTE_ID.into(),
+            team_id: "camp".to_owned(),
+            author_id: "bob".to_owned(),
+            body: "head to the ridge".to_owned(),
+        };
+        assert_eq!(
+            team_note_line(&note, None),
+            "note: head to the ridge by bob"
+        );
+        assert_eq!(
+            team_note_line(&note, Some("bob@demo.dev")),
+            "note: head to the ridge by bob (provisional from bob@demo.dev)"
+        );
+        // A wrapped body stays on one line, the page dump's lines holding.
+        let wrapped = TeamNote {
+            body: "head to the\nridge".to_owned(),
+            ..note
+        };
+        assert_eq!(
+            team_note_line(&wrapped, None),
+            "note: head to the ridge by bob"
+        );
+    }
+
+    /// The retraction's cause stands as the line's reason, the refused entry
+    /// by the server's reason.
+    #[test]
+    fn the_cause_lines_name_the_reason() {
+        use connetto_core::exchange::RetractCause;
+        use connetto_core::messages::MutationRejectReason;
+        assert_eq!(
+            retract_cause(&RetractCause::Rejected(MutationRejectReason::Unauthorized)),
+            "unauthorized"
+        );
+        assert_eq!(
+            retract_cause(&RetractCause::Conflict),
+            "two devices settled different changes at the sequence"
+        );
+        assert_eq!(
+            retract_cause(&RetractCause::Abandoned),
+            "the entry was never settled anywhere"
+        );
+    }
+
+    /// Each R77 event stands one line per row it names, the other events none.
+    #[test]
+    fn each_event_stands_its_lines() {
+        let id: Uuid = NOTE_ID.into();
+        let applied = ClientEvent::ProvisionalApplied {
+            author: "bob".as_bytes().to_vec(),
+            seq: 3,
+            rows: vec![record("team_notes", "bob@demo.dev")],
+        };
+        assert_eq!(
+            provisional_event_lines(&applied),
+            [format!(
+                "provisional: applied team_notes {id} by bob@demo.dev"
+            )]
+        );
+        let confirmed = ClientEvent::ProvisionalConfirmed {
+            rows: vec![record("team_notes", "bob@demo.dev")],
+        };
+        assert_eq!(
+            provisional_event_lines(&confirmed),
+            [format!("provisional: confirmed team_notes {id}")]
+        );
+        let retracted = ClientEvent::ProvisionalRetracted {
+            author: "carol".as_bytes().to_vec(),
+            seq: 7,
+            cause: connetto_core::exchange::RetractCause::Rejected(
+                connetto_core::messages::MutationRejectReason::Unauthorized,
+            ),
+            rows: vec![("team_notes".to_owned(), note_key())],
+        };
+        assert_eq!(
+            provisional_event_lines(&retracted),
+            [format!(
+                "provisional: rolled back team_notes {id} because unauthorized"
+            )]
+        );
+        let refused = ClientEvent::PeerWriteRefused {
+            author: "carol".as_bytes().to_vec(),
+            seq: 7,
+            rows: vec![("team_notes".to_owned(), note_key())],
+        };
+        assert_eq!(
+            provisional_event_lines(&refused),
+            [format!("provisional: refused team_notes {id}")]
+        );
+        // The device's own offline note, refused when the server comes back,
+        // stands as the same rollback line its peers show.
+        let rejected = ClientEvent::MutationRejected {
+            client_seq: 3,
+            reason: connetto_core::messages::MutationRejectReason::Unauthorized,
+            rows: vec![connetto_client::AffectedRow {
+                table: "team_notes".to_owned(),
+                key: note_key(),
+            }],
+        };
+        assert_eq!(
+            provisional_event_lines(&rejected),
+            [format!(
+                "provisional: rolled back team_notes {id} because unauthorized"
+            )]
+        );
+        assert!(provisional_event_lines(&ClientEvent::Reconnected).is_empty());
+        assert_eq!(tidy_line(0), "tidy: 0 provisional row(s) remain");
+        assert_eq!(tidy_line(3), "tidy: 3 provisional row(s) remain");
+    }
 }

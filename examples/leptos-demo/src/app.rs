@@ -20,6 +20,8 @@ pub fn App(view: RwSignal<View>) -> impl IntoView {
         <div class="wrap">
             <Header view=view />
             <AccountBar view=view />
+            {move || view.with(|v| v.nearby.is_some()).then(|| view! { <NearbyPane view=view /> })}
+            {move || view.with(|v| v.team.is_some()).then(|| view! { <TeamNotesPane view=view /> })}
             <Dashboard view=view />
         </div>
     }
@@ -36,13 +38,21 @@ fn short_code(id: String) -> impl IntoView {
     view! { <code class="id" title=id>{short}</code> }
 }
 
+/// The app's name in its header, the same `connetto demo` the native dioxus
+/// demo shows in the Tauri app.
+#[cfg(feature = "tauri")]
+const APP_TITLE: &str = "connetto demo";
+/// The app's name in its header.
+#[cfg(not(feature = "tauri"))]
+const APP_TITLE: &str = "connetto web demo (Leptos)";
+
 /// The app name, and the status, gate, device, storage, custody and expiry
 /// lines.
 #[component]
 fn Header(view: RwSignal<View>) -> impl IntoView {
     view! {
         <header>
-            <h1>"connetto web demo (Leptos)"</h1>
+            <h1>{APP_TITLE}</h1>
             <p class="status">"status: " {move || view.with(|v| v.status.clone())}</p>
             {move || status_line(view.with(|v| v.gate_line.clone()))}
             <p class="status">"device: " {move || view.with(|v| v.device_line.clone())}</p>
@@ -322,51 +332,68 @@ fn pane_heading(
     }
 }
 
+/// A pane footer with the info icon and the pane's purpose line.
+#[component]
+fn PaneInfo(text: &'static str) -> impl IntoView {
+    view! {
+        <p class="pane-info">
+            <Fa icon=Icon::CircleInfo size=12 />
+            <span>{text}</span>
+        </p>
+    }
+}
+
 /// The pane layout shown while a stored session is still landing.
 #[component]
 fn PanesSkeleton() -> impl IntoView {
     view! {
         <div class="panes">
-            <div class="pane">
+            <div class="pane toned tone-orders">
                 {pane_heading(Icon::CartShopping, support::ORDERS_PANE_TITLE, "badge synced", support::ORDERS_BADGE)}
                 <p>{support::orders_readout(0, 0)}</p>
                 <table>
                     <thead><tr><th>"id"</th><th>"quantity"</th></tr></thead>
                     <tbody></tbody>
                 </table>
+                <PaneInfo text=support::ORDERS_INFO />
             </div>
-            <div class="pane">
+            <div class="pane toned tone-photos">
                 {pane_heading(Icon::Images, support::PHOTOS_PANE_TITLE, "badge synced", support::PHOTOS_BADGE)}
                 <p>{support::photos_readout(0)}</p>
                 <table>
                     <thead><tr><th>"id"</th><th>"state"</th><th>"image"</th></tr></thead>
                     <tbody></tbody>
                 </table>
+                <PaneInfo text=support::PHOTOS_INFO />
             </div>
-            <div class="pane">
+            <div class="pane toned tone-catalogue">
                 {pane_heading(Icon::Tags, support::CATALOGUE_HEADING, "badge shared", "shared")}
                 <p>{support::CATALOGUE_INTRO}</p>
                 <table>
                     <thead><tr><th>"name"</th><th>"price"</th></tr></thead>
                     <tbody></tbody>
                 </table>
+                <PaneInfo text=support::CATALOGUE_INFO />
             </div>
-            <div class="pane">
+            <div class="pane toned tone-notes">
                 {pane_heading(Icon::NoteSticky, support::NOTES_PANE_TITLE, "badge local", support::NOTES_BADGE)}
                 <p>{support::notes_readout(0)}</p>
                 <table>
                     <thead><tr><th>"id"</th><th>"body"</th></tr></thead>
                     <tbody></tbody>
                 </table>
+                <PaneInfo text=support::NOTES_INFO />
             </div>
-            <div class="pane">
+            <div class="pane toned tone-retention">
                 {pane_heading(Icon::Broom, support::RETENTION_PANE_TITLE, "badge trim", support::RETENTION_BADGE)}
                 <p>{support::retention_readout(0, 0, 0)}</p>
                 <p>{support::RETENTION_EXPLAINER}</p>
+                <PaneInfo text=support::RETENTION_INFO />
             </div>
-            <div class="pane">
+            <div class="pane toned tone-your-data">
                 {pane_heading(Icon::Database, support::YOUR_DATA_PANE_TITLE, "badge local", support::YOUR_DATA_BADGE)}
                 <p>{support::YOUR_DATA_INTRO}</p>
+                <PaneInfo text=support::YOUR_DATA_INFO />
             </div>
         </div>
     }
@@ -378,7 +405,7 @@ fn PanesSkeleton() -> impl IntoView {
 fn OrdersPane(view: RwSignal<View>) -> impl IntoView {
     let no_identity = move || view.with(|v| v.identity.as_deref().is_none_or(str::is_empty));
     view! {
-        <div class="pane">
+        <div class="pane toned tone-orders">
             {pane_heading(Icon::CartShopping, support::ORDERS_PANE_TITLE, "badge synced", support::ORDERS_BADGE)}
             <p>
                 {move || {
@@ -437,6 +464,7 @@ fn OrdersPane(view: RwSignal<View>) -> impl IntoView {
                     }}
                 </tbody>
             </table>
+            <PaneInfo text=support::ORDERS_INFO />
         </div>
     }
 }
@@ -469,7 +497,7 @@ async fn read_picked_file(file: web_sys::File) -> Option<(String, Vec<u8>)> {
 fn PhotosPane(view: RwSignal<View>) -> impl IntoView {
     let no_identity = move || view.with(|v| v.identity.as_deref().is_none_or(str::is_empty));
     view! {
-        <div class="pane">
+        <div class="pane toned tone-photos">
             {pane_heading(Icon::Images, support::PHOTOS_PANE_TITLE, "badge synced", support::PHOTOS_BADGE)}
             <p>{move || view.with(|v| support::photos_readout(v.photos.len()))}</p>
             <div class="row">
@@ -532,6 +560,7 @@ fn PhotosPane(view: RwSignal<View>) -> impl IntoView {
             {move || status_line(view.with(|v| v.content_line.clone()))}
             <RefusedUploads view=view />
             <LostBytes view=view />
+            <PaneInfo text=support::PHOTOS_INFO />
         </div>
     }
 }
@@ -605,7 +634,7 @@ fn LostBytes(view: RwSignal<View>) -> impl IntoView {
 #[component]
 fn ProductsPane(view: RwSignal<View>) -> impl IntoView {
     view! {
-        <div class="pane">
+        <div class="pane toned tone-catalogue">
             {pane_heading(Icon::Tags, support::CATALOGUE_HEADING, "badge shared", "shared")}
             <p>{support::CATALOGUE_INTRO}</p>
             <table>
@@ -630,6 +659,7 @@ fn ProductsPane(view: RwSignal<View>) -> impl IntoView {
                     }}
                 </tbody>
             </table>
+            <PaneInfo text=support::CATALOGUE_INFO />
         </div>
     }
 }
@@ -643,7 +673,7 @@ fn NotesPane(view: RwSignal<View>) -> impl IntoView {
     let saved = move || view.with(|v| v.notes_saved);
     Effect::watch(saved, move |_, _, _| draft.set(String::new()), false);
     view! {
-        <div class="pane">
+        <div class="pane toned tone-notes">
             {pane_heading(Icon::NoteSticky, support::NOTES_PANE_TITLE, "badge local", support::NOTES_BADGE)}
             <p>{move || view.with(|v| support::notes_readout(v.notes.len()))}</p>
             <div class="row">
@@ -686,6 +716,7 @@ fn NotesPane(view: RwSignal<View>) -> impl IntoView {
                     }}
                 </tbody>
             </table>
+            <PaneInfo text=support::NOTES_INFO />
         </div>
     }
 }
@@ -694,7 +725,7 @@ fn NotesPane(view: RwSignal<View>) -> impl IntoView {
 #[component]
 fn RetentionPane(view: RwSignal<View>) -> impl IntoView {
     view! {
-        <div class="pane">
+        <div class="pane toned tone-retention">
             {pane_heading(Icon::Broom, support::RETENTION_PANE_TITLE, "badge trim", support::RETENTION_BADGE)}
             <p>
                 {move || {
@@ -708,6 +739,7 @@ fn RetentionPane(view: RwSignal<View>) -> impl IntoView {
                     "Free up space"
                 </button>
             </div>
+            <PaneInfo text=support::RETENTION_INFO />
         </div>
     }
 }
@@ -716,7 +748,7 @@ fn RetentionPane(view: RwSignal<View>) -> impl IntoView {
 #[component]
 fn YourDataPane(view: RwSignal<View>) -> impl IntoView {
     view! {
-        <div class="pane">
+        <div class="pane toned tone-your-data">
             {pane_heading(Icon::Database, support::YOUR_DATA_PANE_TITLE, "badge local", support::YOUR_DATA_BADGE)}
             <p>{support::YOUR_DATA_INTRO}</p>
             <div class="row">
@@ -738,6 +770,335 @@ fn YourDataPane(view: RwSignal<View>) -> impl IntoView {
                 />
             </div>
             {move || status_line(view.with(|v| v.import_line.clone()))}
+            <PaneInfo text=support::YOUR_DATA_INFO />
+        </div>
+    }
+}
+
+/// The scoped style for the nearby panel, its sections and their forms.
+const PEER_PANEL_STYLE: &str = r#".peer section + section { border-top: 1px solid var(--border); }
+.peer section { padding: 6px 0; }
+.peer h4 { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-size: 0.95em; }
+.peer p { margin: 2px 0; font-size: 0.9em; }
+.peer input { display: block; width: 100%; max-width: 28em; box-sizing: border-box; margin: 4px 0; }"#;
+
+/// The nearby panel (R76): the peer link, the hotspot this device hosts with
+/// its offer as plain lines, and the forms that join a hotspot another
+/// device hosted. It stands beside the panes while the build carries the
+/// peer link.
+#[component]
+fn NearbyPane(view: RwSignal<View>) -> impl IntoView {
+    // The join forms, the typed values the controls keep locally and send
+    // with their actions.
+    let join_ssid = RwSignal::new(String::new());
+    let join_passphrase = RwSignal::new(String::new());
+    let join_port = RwSignal::new(String::new());
+    let join_payload = RwSignal::new(String::new());
+
+    view! {
+        <div class="peer panel toned tone-nearby">
+            <style>{PEER_PANEL_STYLE}</style>
+            <h2>
+                <Fa icon=Icon::SatelliteDish />
+                "nearby "
+                <span class="badge peering">"peer"</span>
+            </h2>
+            {move || {
+                let near = view.with(|v| v.nearby.clone().unwrap_or_default());
+                let support::view::NearbyView {
+                    peer_line,
+                    bluetooth_line,
+                    beacon_line,
+                    linked,
+                    nearby: nearby_lines,
+                    offer,
+                    outcome,
+                    vpn_line,
+                    joined,
+                    can_host,
+                    links_off,
+                } = near;
+                let hosting = offer.is_some();
+                view! {
+                    <section>
+                        <h4>
+                            <Fa icon=Icon::CircleInfo />
+                            "Status"
+                        </h4>
+                        <p>{peer_line}</p>
+                        <p>{bluetooth_line.clone()}</p>
+                        <p>{beacon_line}</p>
+                        <p>{support::view::links_line(links_off)}</p>
+                        {linked.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
+                        {nearby_lines.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
+                        {offer.map(|offer| {
+                            view! {
+                                <p>"hotspot ssid: " {offer.ssid}</p>
+                                <p>"hotspot passphrase: " {offer.passphrase}</p>
+                                <p>"hotspot port: " {offer.port}</p>
+                                <p>"hotspot payload: " {offer.payload}</p>
+                                {offer.qr_svg.map(|svg| view! { <div inner_html=svg /> })}
+                            }
+                        })}
+                        <p>"hotspot: " {outcome}</p>
+                        {vpn_line.map(|line| view! { <p>{line}</p> })}
+                        <div class="row">
+                            {support::view::offers_bluetooth_on(&bluetooth_line).then(|| view! {
+                                <button on:click=move |_| act(Action::EnableBluetooth)>
+                                    <Fa icon=Icon::PowerOff />
+                                    "Turn on Bluetooth"
+                                </button>
+                            })}
+                            <button on:click=move |_| act(Action::SetPeerLinks { on: links_off })>
+                                <Fa icon=Icon::SatelliteDish />
+                                {if links_off { "Resume nearby links" } else { "Pause nearby links" }}
+                            </button>
+                        </div>
+                    </section>
+                    {(can_host && !joined).then(|| {
+                        view! {
+                            <section>
+                                <h4>
+                                    <Fa icon=Icon::TowerBroadcast />
+                                    "Host"
+                                </h4>
+                                <div class="row">
+                                    {(!hosting).then(|| {
+                                        view! {
+                                            <button on:click=move |_| act(Action::HostHotspot)>
+                                                <Fa icon=Icon::TowerBroadcast />
+                                                "Host a hotspot"
+                                            </button>
+                                        }
+                                    })}
+                                    {hosting.then(|| {
+                                        view! {
+                                            <button on:click=move |_| act(Action::StopHotspot)>
+                                                <Fa icon=Icon::Stop />
+                                                "Stop the hotspot"
+                                            </button>
+                                        }
+                                    })}
+                                </div>
+                            </section>
+                        }
+                    })}
+                    {(!hosting && !joined).then(|| {
+                        view! {
+                            <section>
+                                <h4>
+                                    <Fa icon=Icon::Wifi />
+                                    "Join by the offer"
+                                </h4>
+                                <input
+                                    type="text"
+                                    name="ssid"
+                                    placeholder="the offer's ssid"
+                                    style="font-family: monospace;"
+                                    prop:value=move || join_ssid.get()
+                                    on:input=move |ev| join_ssid.set(event_target_value(&ev))
+                                />
+                                <input
+                                    type="text"
+                                    name="passphrase"
+                                    placeholder="the offer's passphrase"
+                                    style="font-family: monospace;"
+                                    prop:value=move || join_passphrase.get()
+                                    on:input=move |ev| join_passphrase.set(event_target_value(&ev))
+                                />
+                                <input
+                                    type="text"
+                                    name="port"
+                                    placeholder="the offer's port"
+                                    style="font-family: monospace;"
+                                    prop:value=move || join_port.get()
+                                    on:input=move |ev| join_port.set(event_target_value(&ev))
+                                />
+                                <button on:click=move |_| {
+                                    let ssid = join_ssid.get_untracked().trim().to_owned();
+                                    let passphrase = join_passphrase.get_untracked().clone();
+                                    let port = join_port.get_untracked().trim().to_owned();
+                                    act(Action::JoinHotspot { ssid, passphrase, port });
+                                }>
+                                    <Fa icon=Icon::Wifi />
+                                    "Join the hotspot"
+                                </button>
+                            </section>
+                            <section>
+                                <h4>
+                                    <Fa icon=Icon::Qrcode />
+                                    "Join by the payload"
+                                </h4>
+                                <input
+                                    type="text"
+                                    name="payload"
+                                    placeholder="WIFI: payload"
+                                    style="font-family: monospace;"
+                                    prop:value=move || join_payload.get()
+                                    on:input=move |ev| join_payload.set(event_target_value(&ev))
+                                />
+                                <button on:click=move |_| {
+                                    let payload = join_payload.get_untracked().trim().to_owned();
+                                    act(Action::JoinPayload { payload });
+                                }>
+                                    <Fa icon=Icon::Qrcode />
+                                    "Join from the payload"
+                                </button>
+                            </section>
+                        }
+                    })}
+                    {(!hosting).then(|| {
+                        view! {
+                            <section>
+                                <h4>
+                                    <Fa icon=Icon::SatelliteDish />
+                                    "Join nearby, or leave"
+                                </h4>
+                                <div class="row">
+                                    {joined.then(|| {
+                                        view! {
+                                            <button on:click=move |_| act(Action::LeaveHotspot)>
+                                                <Fa icon=Icon::RightFromBracket />
+                                                "Leave the hotspot"
+                                            </button>
+                                        }
+                                    })}
+                                    {(!joined).then(|| {
+                                        view! {
+                                            <button on:click=move |_| act(Action::JoinNearby)>
+                                                <Fa icon=Icon::SatelliteDish />
+                                                "Join the nearby host"
+                                            </button>
+                                        }
+                                    })}
+                                </div>
+                            </section>
+                        }
+                    })}
+                }
+            }}
+            <PaneInfo text=support::NEARBY_INFO />
+        </div>
+    }
+}
+
+/// The team notes panel (R77): the team the roster names, the note's field
+/// and write, the team's notes, one line per peer write, and the tidy pass.
+/// It stands beside the nearby panel and syncs through the server.
+#[component]
+fn TeamNotesPane(view: RwSignal<View>) -> impl IntoView {
+    // The team picker and the note's field, the typed values the controls
+    // keep locally and send with their actions.
+    let team_input = RwSignal::new(String::new());
+    let note_body = RwSignal::new(String::new());
+
+    // Fill the team picker from the view's picked while it stands empty, so a
+    // roster landing after the panel mounts still names its first team.
+    Effect::watch(
+        move || {
+            view.with(|v| {
+                v.team
+                    .as_ref()
+                    .map(|t| t.picked.clone())
+                    .unwrap_or_default()
+            })
+        },
+        move |picked, _, _| {
+            if team_input.get_untracked().is_empty() {
+                team_input.set(picked.clone());
+            }
+        },
+        true,
+    );
+
+    view! {
+        <div class="panel toned tone-team">
+            <h2>
+                <Fa icon=Icon::Users />
+                "team notes "
+                <span class="badge synced">"synced + peer"</span>
+            </h2>
+            <p>{move || view.with(|v| v.team.as_ref().map(|t| t.team_line()).unwrap_or_else(|| "team: none".to_owned()))}</p>
+            <p>{move || view.with(|v| v.team.as_ref().map(|t| t.teams_line()).unwrap_or_else(|| "teams: none".to_owned()))}</p>
+            <p>{move || view.with(|v| support::view::members_line(v.team.as_ref().map(|t| t.members.as_slice()).unwrap_or_default()))}</p>
+            <input
+                type="text"
+                name="team"
+                placeholder="the team to read and write"
+                prop:value=move || team_input.get()
+                on:input=move |ev| {
+                    let value = event_target_value(&ev);
+                    team_input.set(value.clone());
+                    act(Action::PickTeam { team: value });
+                }
+                on:change=move |ev| act(Action::PickTeam { team: event_target_value(&ev) })
+            />
+            {move || {
+                let (has_pick, notes, outcome) = view.with(|v| {
+                    v.team
+                        .as_ref()
+                        .map(|t| (!t.picked.is_empty(), t.notes.clone(), t.outcome.clone()))
+                        .unwrap_or((false, Vec::new(), String::new()))
+                });
+                has_pick.then(|| {
+                    let empty = notes.is_empty();
+                    view! {
+                        <div class="lines">
+                            {empty.then(|| view! { <p class="status">"no notes in this team yet"</p> })}
+                            {notes.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
+                        </div>
+                        <div class="row">
+                            <input
+                                type="text"
+                                name="note-body"
+                                placeholder="a note for the team"
+                                prop:value=move || note_body.get()
+                                on:input=move |ev| note_body.set(event_target_value(&ev))
+                            />
+                            <button class="primary" on:click=move |_| {
+                                let body = note_body.get_untracked().trim().to_owned();
+                                note_body.set(String::new());
+                                act(Action::AddTeamNote { body });
+                            }>
+                                <Fa icon=Icon::Plus />
+                                "Add note"
+                            </button>
+                        </div>
+                        <p class="status">{outcome}</p>
+                    }
+                })
+            }}
+            {move || {
+                let events = view.with(|v| v.team.as_ref().map(|t| t.events.clone()).unwrap_or_default());
+                (!events.is_empty()).then(|| {
+                    view! {
+                        <h3>
+                            <Fa icon=Icon::ClockRotateLeft size=12 />
+                            "peer activity"
+                        </h3>
+                        <div class="lines">
+                            {events.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
+                        </div>
+                    }
+                })
+            }}
+            {move || {
+                view.with(|v| v.team.as_ref().map(|t| t.peer).unwrap_or(false)).then(|| {
+                    view! {
+                        <div class="row">
+                            <button on:click=move |_| act(Action::TidyTeam)>
+                                <Fa icon=Icon::Broom />
+                                "Tidy"
+                            </button>
+                        </div>
+                    }
+                })
+            }}
+            {move || {
+                view.with(|v| v.team.as_ref().and_then(|t| t.error.clone()))
+                    .map(|err| view! { <p class="error">{err}</p> })
+            }}
+            <PaneInfo text=support::TEAM_INFO />
         </div>
     }
 }

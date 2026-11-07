@@ -322,6 +322,8 @@ where
                 nearby: None,
                 #[cfg(feature = "peer")]
                 bt_state: None,
+                #[cfg(all(feature = "peer", target_os = "android"))]
+                java: None,
             },
             pump,
         ))
@@ -933,6 +935,10 @@ where
         > = None;
         #[cfg(feature = "peer")]
         let mut bt_state: Option<Arc<dyn crate::bluetooth::ReadinessBackend>> = None;
+        // The application's JNI access, kept for the permission prompt the
+        // panel asks for (R76).
+        #[cfg(all(feature = "peer", target_os = "android"))]
+        let java = device.java.clone();
         #[cfg(feature = "device-identity")]
         let (device, pump) = match keys {
             Some(keys) => {
@@ -1097,18 +1103,25 @@ where
                                 Arc::clone(&backend) as Arc<dyn crate::bluetooth::ReadinessBackend>,
                                 Arc::clone(&backend)
                                     as Arc<dyn crate::bluetooth::PeripheralBackend>,
-                                Some(crate::bluetooth::btleplug_starter()),
+                                Some(crate::bluetooth::btleplug_starter(None)),
                             )
                         }
                         None => crate::bluetooth::unsupported_backends(),
                     };
+                    // Apple devices only join, so no peripheral runs, and the
+                    // central reports the power the readiness reads (R77
+                    // decision 23).
                     #[cfg(any(target_os = "ios", target_os = "macos"))]
                     let (bt_readiness, bt_peripheral, bt_starter) = {
-                        let backend = Arc::new(crate::bluetooth::AppleBluetoothBackend::new());
+                        let readiness = crate::bluetooth::CentralReadiness::new(
+                            crate::bluetooth::apple_permission,
+                        );
+                        let power = readiness.power_report();
                         (
-                            Arc::clone(&backend) as Arc<dyn crate::bluetooth::ReadinessBackend>,
-                            Arc::clone(&backend) as Arc<dyn crate::bluetooth::PeripheralBackend>,
-                            Some(crate::bluetooth::btleplug_starter()),
+                            Arc::new(readiness) as Arc<dyn crate::bluetooth::ReadinessBackend>,
+                            Arc::new(crate::bluetooth::UnsupportedBackend)
+                                as Arc<dyn crate::bluetooth::PeripheralBackend>,
+                            Some(crate::bluetooth::btleplug_starter(Some(power))),
                         )
                     };
                     #[cfg(target_os = "linux")]
@@ -1123,7 +1136,7 @@ where
                                         as Arc<dyn crate::bluetooth::ReadinessBackend>,
                                     Arc::clone(&backend)
                                         as Arc<dyn crate::bluetooth::PeripheralBackend>,
-                                    Some(crate::bluetooth::btleplug_starter()),
+                                    Some(crate::bluetooth::btleplug_starter(None)),
                                 )
                             }
                             Err(err) => {
@@ -1143,7 +1156,6 @@ where
                     let bt_state = Arc::clone(&bt_readiness);
                     let serving_handle = handle.clone();
                     let join_handle = handle.clone();
-                    let handed_handle = handle.clone();
                     let beacon_node = peer_node.clone();
                     let bt_machine = crate::bluetooth::Machine::new(
                         bt_readiness,
@@ -1166,10 +1178,6 @@ where
                         }),
                         Arc::new(move |event: ClientEvent| {
                             let _ = event_sender_bt.send(event);
-                        }),
-                        Arc::new({
-                            let handle = handed_handle;
-                            move || handle.personal_offer_handed_out()
                         }),
                     );
                     (
@@ -1230,6 +1238,8 @@ where
                 nearby,
                 #[cfg(feature = "peer")]
                 bt_state,
+                #[cfg(all(feature = "peer", target_os = "android"))]
+                java,
             },
             pump,
         ))
@@ -1481,6 +1491,10 @@ pub struct NativeClient<T: Transport, C = ()> {
     #[cfg(feature = "peer")]
     /// The platform's Bluetooth standing, readable at any time (R76).
     bt_state: Option<Arc<dyn crate::bluetooth::ReadinessBackend>>,
+    #[cfg(all(feature = "peer", target_os = "android"))]
+    /// The application's JNI access, for the peer link's permission prompt
+    /// (R76).
+    java: Option<Arc<dyn crate::device_key::JavaAccess>>,
 }
 
 impl<T, C> NativeClient<T, C>
@@ -1683,45 +1697,6 @@ where
         }
     }
 
-    /// Host this device's personal hotspot under the caller's typed
-    /// details, the beacon's outcome beside the offer, within the
-    /// machines' bounds (R76 decision 26).
-    ///
-    /// # Errors
-    ///
-    /// [`HotspotError::Unsupported`] on a system without a personal
-    /// hotspot or for a build without a device identity,
-    /// [`HotspotError::Incompatible`] on a model that cannot host, and
-    /// [`HotspotError::TimedOut`] when the answer does not stand within
-    /// its bound. The beacon's refusal stands beside the offer on the
-    /// success.
-    #[cfg(feature = "peer")]
-    pub async fn host_personal_hotspot(
-        &self,
-        ssid: &str,
-        passphrase: &str,
-    ) -> Result<crate::bluetooth::Hosted, HotspotError> {
-        match &self.device {
-            Some(device) => device.host_personal_hotspot(ssid, passphrase).await,
-            None => Err(HotspotError::Unsupported),
-        }
-    }
-
-    /// The personal hotspot's network name, where the platform answers one
-    /// (R76 decision 26).
-    #[cfg(feature = "peer")]
-    #[must_use]
-    pub fn personal_hotspot_name(&self) -> Option<String> {
-        #[cfg(target_os = "ios")]
-        {
-            connetto_peer_apple::device_name()
-        }
-        #[cfg(not(target_os = "ios"))]
-        {
-            None
-        }
-    }
-
     /// Stop hosting, or cancel the pending request (R76).
     ///
     /// A no-op on a system without a hotspot or for a build without a device
@@ -1825,6 +1800,23 @@ where
         }
     }
 
+    /// Ask the system for the peer link's permissions, over the
+    /// application's screen in front, the prompt a host or join that named a
+    /// missing permission leads to (R76). The platform wants it asked from
+    /// its main thread.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::MissingJavaAccess`] in a build without the JNI access,
+    /// [`ClientError::NoAndroidScreen`] when the application shows no screen,
+    /// and [`ClientError::AndroidJava`] when the plugin refuses.
+    #[cfg(all(feature = "peer", target_os = "android"))]
+    pub fn request_peer_permissions(&self) -> Result<(), ClientError> {
+        let java = self.java.as_ref().ok_or(ClientError::MissingJavaAccess)?;
+        crate::hotspot::android::request_permissions(&**java)
+            .map_err(|failure| ClientError::AndroidJava(failure.to_string()))
+    }
+
     /// Join the nearby host's hotspot through the exchange, answered with
     /// the host's proved identity and the network's gateway, within the
     /// machines' bounds (R76 decisions 19 and 25).
@@ -1898,6 +1890,30 @@ where
     pub fn set_bluetooth_prompt(&self, prompt: bool) {
         if let Some(device) = &self.device {
             device.set_bluetooth_prompt(prompt);
+        }
+    }
+
+    /// The peer link's standing, at run time (R77 slice 8). Off means no
+    /// peer link of any kind, every path refusing, and off closes every live
+    /// link with the existing `Closed` frame. On again, every found
+    /// peer dials at once and a joined hotspot whose gateway and port are
+    /// known starts its dial. The standing lasts for the running client,
+    /// every start beginning with links on. A no-op for a build without a
+    /// device identity.
+    #[cfg(feature = "peer")]
+    pub fn set_peer_links(&self, on: bool) {
+        if let Some(device) = &self.device {
+            device.set_peer_links(on);
+        }
+    }
+
+    /// Whether the peer link's standing is on, at run time (R77 slice 8),
+    /// always on for a build without a device identity.
+    #[cfg(feature = "peer")]
+    pub fn peer_links_on(&self) -> bool {
+        match &self.device {
+            Some(device) => device.peer_links_on(),
+            None => true,
         }
     }
 }
@@ -2290,6 +2306,8 @@ impl<T: Transport, C> NativeClient<T, C> {
             nearby: None,
             #[cfg(feature = "peer")]
             bt_state: None,
+            #[cfg(all(feature = "peer", target_os = "android"))]
+            java: None,
         }
     }
 }
@@ -2537,15 +2555,6 @@ mod tests {
         );
         assert!(
             matches!(
-                client
-                    .host_personal_hotspot("iphone", "the passphrase")
-                    .await,
-                Err(crate::hotspot::HotspotError::Unsupported)
-            ),
-            "the build has no device identity to host personally"
-        );
-        assert!(
-            matches!(
                 client.join_hotspot(&offer).await,
                 Err(crate::hotspot::JoinError::Unsupported)
             ),
@@ -2575,10 +2584,6 @@ mod tests {
             "the build has no device identity to join nearby"
         );
         assert_eq!(client.bluetooth_state(), BluetoothState::Unsupported);
-        assert!(
-            client.personal_hotspot_name().is_none(),
-            "no personal hotspot name without the device"
-        );
         assert_eq!(
             client.beacon_state(),
             BeaconState::Off {
@@ -2614,6 +2619,15 @@ mod tests {
         client.set_hotspot_scan(true);
         client.set_hotspot_autojoin(true);
         client.set_bluetooth_prompt(false);
+        assert!(
+            client.peer_links_on(),
+            "a build without a device identity stands its links on"
+        );
+        client.set_peer_links(false);
+        assert!(
+            client.peer_links_on(),
+            "turning links off is a no-op without a device identity"
+        );
 
         client.close().await;
     }
@@ -2672,16 +2686,8 @@ mod tests {
                         Some(crate::hotspot::Command::Leave) => {
                             let _ = note_tx.send("leave").await;
                         }
-                        // The personal request the runner links stands
-                        // unanswered here, and the hand out notes its
-                        // arrival.
-                        Some(command) => {
-                            if matches!(
-                                command,
-                                crate::hotspot::Command::PersonalOfferHandedOut
-                            ) {
-                                let _ = note_tx.send("handed out").await;
-                            }
+                        Some(crate::hotspot::Command::Links { on }) => {
+                            let _ = note_tx.send(if on { "links true" } else { "links false" }).await;
                         }
                         None => break,
                     },
@@ -2716,8 +2722,6 @@ mod tests {
                                 .send(if on { "prompt true" } else { "prompt false" })
                                 .await;
                         }
-                        // The personal hotspot is the iPhone's, which this test does not host.
-                        Some(_) => {}
                         None => break,
                     },
                 }
@@ -2770,7 +2774,7 @@ mod tests {
         let (nearby_tx, nearby_rx) = watch::channel(Vec::new());
         nearby_tx.send_replace(vec![crate::bluetooth::NearbyHost {
             host: 9,
-            prefix: Some([3; 8]),
+            prefix: [3; 8],
             rssi: Some(-55),
         }]);
         let (readiness, _, _) = crate::bluetooth::unsupported_backends();
@@ -2788,6 +2792,8 @@ mod tests {
             nearby: Some(nearby_rx),
             #[cfg(feature = "peer")]
             bt_state: Some(readiness),
+            #[cfg(all(feature = "peer", target_os = "android"))]
+            java: None,
         };
 
         // The calls hand back what the machines answer.
@@ -2839,23 +2845,6 @@ mod tests {
             "the machine's offer reaches the caller"
         );
 
-        // The personal host's call reaches the Bluetooth machine, whose
-        // dropped reply fails it, and the hand out notes its arrival on
-        // the hotspot's side.
-        let error = client
-            .host_personal_hotspot("iphone", "the passphrase")
-            .await
-            .expect_err("the machine drops the personal host's reply");
-        assert!(
-            matches!(error, crate::hotspot::HotspotError::Failed),
-            "a machine that drops the reply fails the call, got {error:?}"
-        );
-        client
-            .device
-            .as_ref()
-            .expect("the device stands")
-            .personal_offer_handed_out();
-
         // The standings read the machines', and the cancels and the run-time
         // standings reach them.
         assert_eq!(
@@ -2872,7 +2861,7 @@ mod tests {
             client.nearby_hosts(),
             vec![crate::bluetooth::NearbyHost {
                 host: 9,
-                prefix: Some([3; 8]),
+                prefix: [3; 8],
                 rssi: Some(-55)
             }],
             "the nearby read stands beside the device"
@@ -2886,10 +2875,20 @@ mod tests {
         client.set_hotspot_scan(true);
         client.set_hotspot_autojoin(false);
         client.set_bluetooth_prompt(true);
+        assert!(client.peer_links_on(), "every start begins with links on");
+        client.set_peer_links(false);
+        assert!(
+            !client.peer_links_on(),
+            "the off standing holds once the call returns"
+        );
+        // A standing already held reaches no machine.
+        client.set_peer_links(false);
+        client.set_peer_links(true);
+        assert!(client.peer_links_on(), "the links stand on again");
         // The standings reach their machines, from the two machines' channels,
         // so the order the notes come back in is not the order sent.
         let mut noted: Vec<&str> = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..7 {
             let got = tokio::time::timeout(Duration::from_secs(10), note_rx.recv())
                 .await
                 .expect("the machine notes the standing within its bound")
@@ -2901,13 +2900,20 @@ mod tests {
             noted,
             [
                 "autojoin false",
-                "handed out",
                 "leave",
+                "links false",
+                "links true",
                 "prompt true",
                 "scan true",
                 "stop"
             ],
             "each standing reaches its machine"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), note_rx.recv())
+                .await
+                .is_err(),
+            "the repeated off standing reaches no machine"
         );
 
         // A certificate-less device refuses the peer's calls by its standing.

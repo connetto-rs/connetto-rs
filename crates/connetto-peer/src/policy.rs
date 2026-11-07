@@ -82,6 +82,9 @@ pub(crate) struct Policy {
     own: Fingerprint,
     /// Whether the device dials what it finds.
     autolink: bool,
+    /// Whether the device's peer links stand, a fresh found dialing and a
+    /// due retry answering only while they do (R77 slice 8).
+    links_on: bool,
     instances: BTreeMap<Fingerprint, Instance>,
     /// The next instance's place in the find order.
     next_seq: u64,
@@ -100,11 +103,13 @@ pub(crate) fn bars(reason: CloseReason) -> bool {
 
 impl Policy {
     /// The policy for the standing that just became serving, the device's own
-    /// fingerprint `own`, dialing what it finds when `autolink`.
+    /// fingerprint `own`, dialing what it finds when `autolink`. A fresh
+    /// policy stands the links on.
     pub(crate) fn new(own: Fingerprint, autolink: bool) -> Self {
         Self {
             own,
             autolink,
+            links_on: true,
             instances: BTreeMap::new(),
             next_seq: 0,
             in_flight: BTreeSet::new(),
@@ -114,6 +119,29 @@ impl Policy {
     /// A renewal moved the device's own fingerprint, which the browse ignores.
     pub(crate) fn set_own(&mut self, own: Fingerprint) {
         self.own = own;
+    }
+
+    /// The device's peer links came to stand `on` at `now`. Coming on, the
+    /// backoff of every found peer resets and its dial starts at once, the
+    /// barred peers staying barred, and the method hands back the dials the
+    /// bound lets run (R77 slice 8).
+    pub(crate) fn set_links(&mut self, on: bool, now: Instant) -> Vec<Fingerprint> {
+        self.links_on = on;
+        if !on {
+            return Vec::new();
+        }
+        for entry in self.instances.values_mut() {
+            if matches!(entry.state, InstanceState::New | InstanceState::Waiting) {
+                entry.wait = FIRST_WAIT;
+                entry.retry_at = Some(now);
+            }
+        }
+        self.due(now)
+    }
+
+    /// Whether the device's peer links stand on.
+    pub(crate) fn links_on(&self) -> bool {
+        self.links_on
     }
 
     /// The instance `name`, carrying `fp`, was found or resolved at
@@ -175,6 +203,7 @@ impl Policy {
         entry.addresses = resolved;
         if entry.state == InstanceState::New
             && self.autolink
+            && self.links_on
             && capacity > 0
             && !self.in_flight.contains(&fp)
         {
@@ -276,8 +305,12 @@ impl Policy {
         vec![Action::Browse]
     }
 
-    /// The instances whose dial starts now, the bound of running dials held.
+    /// The instances whose dial starts now, the bound of running dials held,
+    /// nothing while the device's peer links stand off.
     pub(crate) fn due(&mut self, now: Instant) -> Vec<Fingerprint> {
+        if !self.links_on {
+            return Vec::new();
+        }
         let capacity = MAX_DIALS.saturating_sub(self.in_flight.len());
         if capacity == 0 {
             return Vec::new();
@@ -983,5 +1016,57 @@ mod tests {
             Vec::<Action>::new(),
             "a repeat reports nothing"
         );
+    }
+
+    /// The off standing reports and tracks a found peer without dialing it,
+    /// and a due retry answers nothing (R77 slice 8).
+    #[test]
+    fn the_off_standing_dials_nothing_of_what_it_finds() {
+        let mut policy = autolink();
+        // A found peer that went unreachable, so its retry is pending.
+        policy.found("n", PEER, &[ADDR]);
+        policy.dial_result(now(), PEER, DialOutcome::Unreachable);
+        assert_eq!(policy.state(&PEER), Some(InstanceState::Waiting));
+
+        policy.set_links(false, now());
+        assert!(
+            policy.due(now() + Duration::from_secs(3600)).is_empty(),
+            "the due retry dials nothing"
+        );
+        // A fresh found while off reports and tracks, without dialing.
+        let actions = policy.found("m", OTHER, &[ADDR2]);
+        assert_eq!(
+            actions,
+            vec![Action::Found(ADDR2)],
+            "the found is reported, the dial is not"
+        );
+        assert_eq!(policy.state(&OTHER), Some(InstanceState::New));
+        assert!(
+            policy.due(now() + Duration::from_secs(3600)).is_empty(),
+            "a fresh found dials nothing"
+        );
+    }
+
+    /// The coming on resets the backoff of every found peer and dials each
+    /// at once, the barred peers staying barred (R77 slice 8).
+    #[test]
+    fn coming_on_dials_the_found_peers_at_once() {
+        let mut policy = autolink();
+        policy.found("n", PEER, &[ADDR]);
+        policy.dial_result(now(), PEER, DialOutcome::Unreachable);
+        policy.found("m", OTHER, &[ADDR2]);
+        policy.dial_result(now(), OTHER, DialOutcome::Unreachable);
+        policy.found("r", RENEWED, &[ADDR]);
+        policy.dial_result(now(), RENEWED, DialOutcome::Refused);
+        assert_eq!(policy.state(&RENEWED), Some(InstanceState::Barred));
+
+        policy.set_links(false, now());
+        let due = policy.set_links(true, now());
+        assert_eq!(
+            due,
+            vec![PEER, OTHER],
+            "the found peers dial at once, the barred one does not"
+        );
+        assert_eq!(policy.state(&RENEWED), Some(InstanceState::Barred));
     }
 }

@@ -16,7 +16,7 @@ use rosetta_uuid::Uuid;
 use connetto_dioxus::use_live;
 use connetto_file_core::FileId;
 
-use super::{ClientSlot, ContentSlot, UserId};
+use super::{ClientSlot, ContentSlot, PaneInfo, UserId};
 /// The identity the display sources were fetched for, every row's id and
 /// content state with the generation the fetch button bumps.
 type PhotoSrcKey = (Vec<(Uuid, String)>, u64);
@@ -103,7 +103,7 @@ pub fn PhotosPane() -> Element {
     let srcs = photo_srcs.read().clone();
 
     rsx! {
-        div { class: "pane",
+        div { class: "pane toned tone-photos",
             h2 {
                 Icon { icon: FaImages, width: 14, height: 14 }
                 {support::PHOTOS_PANE_TITLE} " "
@@ -162,6 +162,7 @@ pub fn PhotosPane() -> Element {
             PinControls { refresh: src_refresh }
             RefusedUploads { refused }
             LostBytes { retired }
+            PaneInfo { text: support::PHOTOS_INFO }
         }
     }
 }
