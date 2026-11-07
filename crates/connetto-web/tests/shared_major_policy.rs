@@ -178,8 +178,6 @@ diesel::table! {
         id -> Text,
         /// Its query row.
         query_id -> Integer,
-        /// Its delivery priority.
-        priority -> Integer,
         /// The pin's name, when one names it.
         pin_name -> Nullable<Text>,
         /// When it was stopped, when it is.

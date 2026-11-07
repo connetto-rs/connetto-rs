@@ -13,7 +13,7 @@ use connetto_client::{
 };
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, Pong, RateLimited, SnapshotBegin, SnapshotEnd,
-    SnapshotPatch, SubscriptionPriority, TabIdentity,
+    SnapshotPatch, TabIdentity,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaBundle, loopback};
@@ -125,7 +125,6 @@ fn snapshot_server() -> LoopbackTransport {
                     server
                         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                             sub_id: sub.sub_id.clone(),
-                            priority: SubscriptionPriority::default(),
                         }))
                         .await
                         .expect("snapshot begin");
