@@ -92,11 +92,6 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
     let mut join_port: Signal<String> = use_signal(String::new);
     // A pasted or scanned `WIFI:` payload (R76 decision 24).
     let mut join_payload: Signal<String> = use_signal(String::new);
-    // The personal hotspot's form, the network name pre-filled from the
-    // device's user-set name where the platform answers one (R76 decision 26).
-    let mut personal_ssid: Signal<String> =
-        use_signal(|| parts.0.native.personal_hotspot_name().unwrap_or_default());
-    let mut personal_passphrase: Signal<String> = use_signal(String::new);
 
     // The link's and the hotspot's events, which the panel owns.
     let client = parts.0.client.clone();
@@ -131,9 +126,6 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
                             let mut held = nearby.peek().clone();
                             held.retain(|known| known.host != host);
                             nearby.set(held);
-                        }
-                        ClientEvent::HotspotUnreached => {
-                            outcome.set("unreached".to_owned());
                         }
                         ClientEvent::JoinedNetworkBlockedByVpn => {
                             vpn_blocked.set(true);
@@ -183,9 +175,6 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
     let nearby_parts = parts.clone();
     let nearby_outcome = outcome;
     let nearby_hosts = nearby;
-    let personal_parts = parts.clone();
-    let personal_offer = offer;
-    let mut personal_outcome = outcome;
     let join_joined = joined;
     let payload_joined = joined;
     let nearby_joined = joined;
@@ -206,10 +195,6 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
     let hosting = offer.is_some();
     let joined_now = joined();
     let vpn_line = (joined() && vpn_blocked()).then_some(nearby::VPN_LINE);
-    #[cfg(target_os = "ios")]
-    let personal_note: Option<&str> = Some(nearby::PERSONAL_NOTE);
-    #[cfg(not(target_os = "ios"))]
-    let personal_note: Option<&str> = None;
 
     rsx! {
         div { class: "peer panel toned tone-nearby",
@@ -235,9 +220,6 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
                 p { {beacon_line()} }
                 for line in peers.iter().cloned() {
                     p { {line} }
-                }
-                if let Some(note) = personal_note {
-                    p { {note} }
                 }
                 for line in nearby_lines {
                     p { {line} }
@@ -290,7 +272,8 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
                     }
                 }
             }
-            if !cfg!(target_os = "macos") && !joined_now {
+            // Apple devices only join (R77 decision 23).
+            if !cfg!(any(target_os = "ios", target_os = "macos")) && !joined_now {
                 section {
                     h4 {
                         Icon { icon: FaTowerBroadcast, width: 14, height: 14 }
@@ -346,56 +329,7 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
                             }
                         }
                     }
-                    if cfg!(target_os = "ios") && !hosting {
-                        input {
-                            r#type: "text",
-                            name: "personal-ssid",
-                            placeholder: "the personal hotspot's network name",
-                            value: "{personal_ssid}",
-                            oninput: move |event| personal_ssid.set(event.value()),
-                            style: "font-family: monospace;",
-                        }
-                        input {
-                            r#type: "text",
-                            name: "personal-passphrase",
-                            placeholder: "the personal hotspot's passphrase",
-                            value: "{personal_passphrase}",
-                            oninput: move |event| personal_passphrase.set(event.value()),
-                            style: "font-family: monospace;",
-                        }
-                        button {
-                            onclick: move |_| {
-                                let ssid = personal_ssid.peek().trim().to_owned();
-                                let passphrase = personal_passphrase.peek().clone();
-                                if ssid.is_empty() || passphrase.is_empty() {
-                                    personal_outcome
-                                        .set("the network name and the passphrase need filling".to_owned());
-                                    return;
-                                }
-                                let parts = personal_parts.clone();
-                                let mut offer = personal_offer;
-                                let mut outcome = personal_outcome;
-                                spawn(async move {
-                                    outcome.set("asking for the personal hotspot".to_owned());
-                                    let result =
-                                        parts.0.native.host_personal_hotspot(&ssid, &passphrase).await;
-                                    match result {
-                                        Ok(hosted) => {
-                                            offer.set(Some(nearby::offer_view(&hosted.offer)));
-                                            outcome.set(nearby::hosted_outcome(&hosted.beacon));
-                                        }
-                                        Err(err) => outcome.set(err.to_string()),
-                                    }
-                                });
-                            },
-                            Icon {
-                                icon: FaTowerBroadcast,
-                                width: 14,
-                                height: 14,
-                            }
-                            "Host my Personal Hotspot"
-                        }
-                    }
+
                 }
             }
             if !hosting && !joined_now {

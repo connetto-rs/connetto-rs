@@ -1103,18 +1103,25 @@ where
                                 Arc::clone(&backend) as Arc<dyn crate::bluetooth::ReadinessBackend>,
                                 Arc::clone(&backend)
                                     as Arc<dyn crate::bluetooth::PeripheralBackend>,
-                                Some(crate::bluetooth::btleplug_starter()),
+                                Some(crate::bluetooth::btleplug_starter(None)),
                             )
                         }
                         None => crate::bluetooth::unsupported_backends(),
                     };
+                    // Apple devices only join, so no peripheral runs, and the
+                    // central reports the power the readiness reads (R77
+                    // decision 23).
                     #[cfg(any(target_os = "ios", target_os = "macos"))]
                     let (bt_readiness, bt_peripheral, bt_starter) = {
-                        let backend = Arc::new(crate::bluetooth::AppleBluetoothBackend::new());
+                        let readiness = crate::bluetooth::CentralReadiness::new(
+                            crate::bluetooth::apple_permission,
+                        );
+                        let power = readiness.power_report();
                         (
-                            Arc::clone(&backend) as Arc<dyn crate::bluetooth::ReadinessBackend>,
-                            Arc::clone(&backend) as Arc<dyn crate::bluetooth::PeripheralBackend>,
-                            Some(crate::bluetooth::btleplug_starter()),
+                            Arc::new(readiness) as Arc<dyn crate::bluetooth::ReadinessBackend>,
+                            Arc::new(crate::bluetooth::UnsupportedBackend)
+                                as Arc<dyn crate::bluetooth::PeripheralBackend>,
+                            Some(crate::bluetooth::btleplug_starter(Some(power))),
                         )
                     };
                     #[cfg(target_os = "linux")]
@@ -1129,7 +1136,7 @@ where
                                         as Arc<dyn crate::bluetooth::ReadinessBackend>,
                                     Arc::clone(&backend)
                                         as Arc<dyn crate::bluetooth::PeripheralBackend>,
-                                    Some(crate::bluetooth::btleplug_starter()),
+                                    Some(crate::bluetooth::btleplug_starter(None)),
                                 )
                             }
                             Err(err) => {
@@ -1149,7 +1156,6 @@ where
                     let bt_state = Arc::clone(&bt_readiness);
                     let serving_handle = handle.clone();
                     let join_handle = handle.clone();
-                    let handed_handle = handle.clone();
                     let beacon_node = peer_node.clone();
                     let bt_machine = crate::bluetooth::Machine::new(
                         bt_readiness,
@@ -1172,10 +1178,6 @@ where
                         }),
                         Arc::new(move |event: ClientEvent| {
                             let _ = event_sender_bt.send(event);
-                        }),
-                        Arc::new({
-                            let handle = handed_handle;
-                            move || handle.personal_offer_handed_out()
                         }),
                     );
                     (
@@ -1692,45 +1694,6 @@ where
         match &self.device {
             Some(device) => device.host_hotspot().await,
             None => Err(HotspotError::Unsupported),
-        }
-    }
-
-    /// Host this device's personal hotspot under the caller's typed
-    /// details, the beacon's outcome beside the offer, within the
-    /// machines' bounds (R76 decision 26).
-    ///
-    /// # Errors
-    ///
-    /// [`HotspotError::Unsupported`] on a system without a personal
-    /// hotspot or for a build without a device identity,
-    /// [`HotspotError::Incompatible`] on a model that cannot host, and
-    /// [`HotspotError::TimedOut`] when the answer does not stand within
-    /// its bound. The beacon's refusal stands beside the offer on the
-    /// success.
-    #[cfg(feature = "peer")]
-    pub async fn host_personal_hotspot(
-        &self,
-        ssid: &str,
-        passphrase: &str,
-    ) -> Result<crate::bluetooth::Hosted, HotspotError> {
-        match &self.device {
-            Some(device) => device.host_personal_hotspot(ssid, passphrase).await,
-            None => Err(HotspotError::Unsupported),
-        }
-    }
-
-    /// The personal hotspot's network name, where the platform answers one
-    /// (R76 decision 26).
-    #[cfg(feature = "peer")]
-    #[must_use]
-    pub fn personal_hotspot_name(&self) -> Option<String> {
-        #[cfg(target_os = "ios")]
-        {
-            connetto_peer_apple::device_name()
-        }
-        #[cfg(not(target_os = "ios"))]
-        {
-            None
         }
     }
 
@@ -2568,15 +2531,6 @@ mod tests {
         );
         assert!(
             matches!(
-                client
-                    .host_personal_hotspot("iphone", "the passphrase")
-                    .await,
-                Err(crate::hotspot::HotspotError::Unsupported)
-            ),
-            "the build has no device identity to host personally"
-        );
-        assert!(
-            matches!(
                 client.join_hotspot(&offer).await,
                 Err(crate::hotspot::JoinError::Unsupported)
             ),
@@ -2606,10 +2560,6 @@ mod tests {
             "the build has no device identity to join nearby"
         );
         assert_eq!(client.bluetooth_state(), BluetoothState::Unsupported);
-        assert!(
-            client.personal_hotspot_name().is_none(),
-            "no personal hotspot name without the device"
-        );
         assert_eq!(
             client.beacon_state(),
             BeaconState::Off {
@@ -2703,17 +2653,6 @@ mod tests {
                         Some(crate::hotspot::Command::Leave) => {
                             let _ = note_tx.send("leave").await;
                         }
-                        // The personal request the runner links stands
-                        // unanswered here, and the hand out notes its
-                        // arrival.
-                        Some(command) => {
-                            if matches!(
-                                command,
-                                crate::hotspot::Command::PersonalOfferHandedOut
-                            ) {
-                                let _ = note_tx.send("handed out").await;
-                            }
-                        }
                         None => break,
                     },
                     command = bluetooth_rx.recv() => match command {
@@ -2747,8 +2686,6 @@ mod tests {
                                 .send(if on { "prompt true" } else { "prompt false" })
                                 .await;
                         }
-                        // The personal hotspot is the iPhone's, which this test does not host.
-                        Some(_) => {}
                         None => break,
                     },
                 }
@@ -2801,7 +2738,7 @@ mod tests {
         let (nearby_tx, nearby_rx) = watch::channel(Vec::new());
         nearby_tx.send_replace(vec![crate::bluetooth::NearbyHost {
             host: 9,
-            prefix: Some([3; 8]),
+            prefix: [3; 8],
             rssi: Some(-55),
         }]);
         let (readiness, _, _) = crate::bluetooth::unsupported_backends();
@@ -2872,23 +2809,6 @@ mod tests {
             "the machine's offer reaches the caller"
         );
 
-        // The personal host's call reaches the Bluetooth machine, whose
-        // dropped reply fails it, and the hand out notes its arrival on
-        // the hotspot's side.
-        let error = client
-            .host_personal_hotspot("iphone", "the passphrase")
-            .await
-            .expect_err("the machine drops the personal host's reply");
-        assert!(
-            matches!(error, crate::hotspot::HotspotError::Failed),
-            "a machine that drops the reply fails the call, got {error:?}"
-        );
-        client
-            .device
-            .as_ref()
-            .expect("the device stands")
-            .personal_offer_handed_out();
-
         // The standings read the machines', and the cancels and the run-time
         // standings reach them.
         assert_eq!(
@@ -2905,7 +2825,7 @@ mod tests {
             client.nearby_hosts(),
             vec![crate::bluetooth::NearbyHost {
                 host: 9,
-                prefix: Some([3; 8]),
+                prefix: [3; 8],
                 rssi: Some(-55)
             }],
             "the nearby read stands beside the device"
@@ -2922,7 +2842,7 @@ mod tests {
         // The standings reach their machines, from the two machines' channels,
         // so the order the notes come back in is not the order sent.
         let mut noted: Vec<&str> = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..5 {
             let got = tokio::time::timeout(Duration::from_secs(10), note_rx.recv())
                 .await
                 .expect("the machine notes the standing within its bound")
@@ -2934,7 +2854,6 @@ mod tests {
             noted,
             [
                 "autojoin false",
-                "handed out",
                 "leave",
                 "prompt true",
                 "scan true",

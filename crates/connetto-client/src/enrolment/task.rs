@@ -595,39 +595,6 @@ impl EnrolHandle {
         }
     }
 
-    /// Host this device's personal hotspot under its typed details, its
-    /// beacon's outcome beside the offer, within the machines' bounds (R76
-    /// decision 26).
-    #[cfg(feature = "peer")]
-    pub(crate) async fn host_personal_hotspot(
-        &self,
-        ssid: &str,
-        passphrase: &str,
-    ) -> Result<crate::bluetooth::Hosted, HotspotError> {
-        let (reply, answer) = oneshot::channel();
-        self.bluetooth
-            .send(crate::bluetooth::Command::PersonalHost {
-                ssid: ssid.to_owned(),
-                passphrase: passphrase.to_owned(),
-                caller: reply,
-            })
-            .map_err(|_| HotspotError::Failed)?;
-        match tokio::time::timeout(HOST_BOUND + PROMPT_BOUND + MARGIN, answer).await {
-            Ok(Ok(hosted)) => hosted,
-            Ok(Err(_)) => Err(HotspotError::Failed),
-            Err(_) => Err(HotspotError::TimedOut),
-        }
-    }
-
-    /// The personal hotspot's landing bound, started when an exchange
-    /// hands the offer out (R76 decision 26).
-    #[cfg(feature = "peer")]
-    pub(crate) fn personal_offer_handed_out(&self) {
-        let _ = self
-            .hotspot
-            .send(crate::hotspot::Command::PersonalOfferHandedOut);
-    }
-
     /// Stop hosting, or cancel the pending request (R76).
     #[cfg(feature = "peer")]
     pub(crate) fn stop_hotspot(&self) {

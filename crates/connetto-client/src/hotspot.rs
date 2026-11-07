@@ -234,12 +234,6 @@ pub(crate) trait HotspotBackend: Send + Sync {
     fn leave_join(&self);
     /// What the join side stands, for the machine's look.
     fn join_status(&self) -> JoinStatus;
-    /// Request the personal hotspot under the user's `ssid` and
-    /// `passphrase`, answering a refusal at once (R76 decision 26).
-    fn request_personal_host(&self, ssid: &str, passphrase: &str) -> Result<(), HotspotError>;
-    /// Whether the personal hotspot's network has landed, for the machine's
-    /// landing bound (R76 decision 26).
-    fn personal_landed(&self) -> bool;
 }
 
 /// The backend for a system without a hotspot (R76).
@@ -267,14 +261,6 @@ impl HotspotBackend for UnsupportedBackend {
     fn join_status(&self) -> JoinStatus {
         JoinStatus::Pending
     }
-
-    fn request_personal_host(&self, _ssid: &str, _passphrase: &str) -> Result<(), HotspotError> {
-        Err(HotspotError::Unsupported)
-    }
-
-    fn personal_landed(&self) -> bool {
-        false
-    }
 }
 
 /// The one-shot answer the machine sends, the API methods awaiting it under
@@ -292,21 +278,6 @@ enum HostState {
     },
     /// Hosting, with the details the answers hand out.
     Hosting { offer: HotspotOffer },
-}
-
-/// The personal host side's standing (R76 decisions 26 and 27).
-#[derive(Clone, Debug)]
-enum PersonalState {
-    /// Not hosting the personal hotspot.
-    Idle,
-    /// Hosting, with the typed offer and the landing's bound, where an
-    /// exchange has handed it out.
-    Hosting {
-        /// The offer the user typed, its peer port where the device serves.
-        offer: HotspotOffer,
-        /// The landing's bound, once an exchange hands the offer out.
-        landing: Option<tokio::time::Instant>,
-    },
 }
 
 /// The join side's standing (R76).
@@ -388,19 +359,6 @@ pub(crate) enum Command {
     Host(Reply<Result<HotspotOffer, HotspotError>>),
     /// Stop hosting.
     StopHost,
-    /// Host the personal hotspot under the user's typed details, answered
-    /// with its offer (R76 decision 26).
-    PersonalHost {
-        /// The network's name, as the user types it.
-        ssid: String,
-        /// The network's passphrase, as the user types it.
-        passphrase: String,
-        /// The answer, with the offer.
-        reply: Reply<Result<HotspotOffer, HotspotError>>,
-    },
-    /// The offer handed out by an exchange, the landing's bound starts
-    /// (R76 decision 26).
-    PersonalOfferHandedOut,
     /// Join the offer's network, answered with its gateway.
     Join {
         /// The network to join.
@@ -428,7 +386,6 @@ pub(crate) struct Machine {
     /// Emit an event to the application.
     emit: Arc<dyn Fn(ClientEvent) + Send + Sync>,
     host: HostState,
-    personal: PersonalState,
     join: JoinState,
 }
 
@@ -451,7 +408,6 @@ impl Machine {
             dial,
             emit,
             host: HostState::Off,
-            personal: PersonalState::Idle,
             join: JoinState::Idle,
         }
     }
@@ -472,14 +428,11 @@ impl Machine {
         }
     }
 
-    /// The offer the host side holds, while it hosts or personal-hosts.
+    /// The offer the host side holds, while it hosts.
     pub(crate) fn hosting_offer(&self) -> Option<HotspotOffer> {
         match &self.host {
             HostState::Hosting { offer } => Some(offer.clone()),
-            _ => match &self.personal {
-                PersonalState::Hosting { offer, .. } => Some(offer.clone()),
-                PersonalState::Idle => None,
-            },
+            _ => None,
         }
     }
 
@@ -513,11 +466,10 @@ impl Machine {
                 }
             }
             Command::StopHost => {
-                let regular = matches!(
+                let hosting = matches!(
                     self.host,
                     HostState::Starting { .. } | HostState::Hosting { .. }
                 );
-                let personal = matches!(self.personal, PersonalState::Hosting { .. });
                 if let HostState::Starting { replies, .. } =
                     core::mem::replace(&mut self.host, HostState::Off)
                 {
@@ -525,21 +477,8 @@ impl Machine {
                         let _ = reply.send(Err(HotspotError::Failed));
                     }
                 }
-                if personal {
-                    self.personal = PersonalState::Idle;
-                }
-                if regular || personal {
+                if hosting {
                     self.backend.stop_host();
-                }
-            }
-            Command::PersonalHost {
-                ssid,
-                passphrase,
-                reply,
-            } => self.host_personal(ssid, passphrase, reply),
-            Command::PersonalOfferHandedOut => {
-                if let PersonalState::Hosting { landing, .. } = &mut self.personal {
-                    *landing = Some(tokio::time::Instant::now() + JOIN_BOUND);
                 }
             }
             Command::Join { offer, reply } => {
@@ -579,30 +518,6 @@ impl Machine {
                 }
             },
         }
-    }
-
-    /// Host the Personal Hotspot the user switched on and typed in, keeping
-    /// a running landing bound (R76 decisions 26 and 27).
-    fn host_personal(
-        &mut self,
-        ssid: String,
-        passphrase: String,
-        reply: Reply<Result<HotspotOffer, HotspotError>>,
-    ) {
-        if let Err(err) = self.backend.request_personal_host(&ssid, &passphrase) {
-            let _ = reply.send(Err(err));
-            return;
-        }
-        let landing = match &self.personal {
-            PersonalState::Hosting { landing, .. } => *landing,
-            PersonalState::Idle => None,
-        };
-        let offer = HotspotOffer::new(ssid, passphrase, HotspotSecurity::Wpa2, (self.peer_port)());
-        self.personal = PersonalState::Hosting {
-            offer: offer.clone(),
-            landing,
-        };
-        let _ = reply.send(Ok(offer));
     }
 
     /// Look at the backends' outcomes and apply the tables' transitions.
@@ -672,18 +587,6 @@ impl Machine {
         {
             self.host = HostState::Off;
             (self.emit)(ClientEvent::HotspotStopped);
-        }
-
-        // The personal host's landing, the bound run by the looks.
-        if let PersonalState::Hosting { landing, .. } = &mut self.personal
-            && let Some(deadline) = landing
-        {
-            if self.backend.personal_landed() {
-                *landing = None;
-            } else if tokio::time::Instant::now() >= *deadline {
-                *landing = None;
-                (self.emit)(ClientEvent::HotspotUnreached);
-            }
         }
 
         if matches!(self.join, JoinState::Requesting { .. }) {
@@ -794,8 +697,7 @@ impl Machine {
         if matches!(
             self.host,
             HostState::Starting { .. } | HostState::Hosting { .. }
-        ) || matches!(self.personal, PersonalState::Hosting { .. })
-        {
+        ) {
             self.backend.stop_host();
         }
         if matches!(
@@ -808,7 +710,6 @@ impl Machine {
             }
         }
         self.host = HostState::Off;
-        self.personal = PersonalState::Idle;
         self.join = JoinState::Idle;
     }
 }
@@ -854,8 +755,6 @@ mod tests {
     struct FakeBackend {
         host_request: Mutex<Result<(), HotspotError>>,
         join_request: Mutex<Result<(), JoinError>>,
-        personal_request: Mutex<Result<(), HotspotError>>,
-        landed: Mutex<bool>,
         host_status: Mutex<HostStatus>,
         join_status: Mutex<JoinStatus>,
         calls: Mutex<Vec<&'static str>>,
@@ -867,8 +766,6 @@ mod tests {
             Self {
                 host_request: Mutex::new(Ok(())),
                 join_request: Mutex::new(Ok(())),
-                personal_request: Mutex::new(Err(HotspotError::Unsupported)),
-                landed: Mutex::new(false),
                 host_status: Mutex::new(HostStatus::Pending),
                 join_status: Mutex::new(JoinStatus::Pending),
                 calls: Mutex::new(Vec::new()),
@@ -928,20 +825,6 @@ mod tests {
 
         fn join_status(&self) -> JoinStatus {
             self.join_status.lock().clone()
-        }
-
-        fn request_personal_host(
-            &self,
-            _ssid: &str,
-            _passphrase: &str,
-        ) -> Result<(), HotspotError> {
-            self.calls.lock().push("request_personal_host");
-            self.personal_request.lock().clone()
-        }
-
-        fn personal_landed(&self) -> bool {
-            self.calls.lock().push("personal_landed");
-            *self.landed.lock()
         }
     }
 
@@ -1252,243 +1135,6 @@ mod tests {
         h.machine.tick();
         h.machine.close();
         assert_eq!(h.backend.counted("stop_host"), 2);
-    }
-    /// The personal host row `host_personal_hotspot | Off | the typed
-    /// answer stands, the port where the device serves` (R76 decision 26).
-    #[test]
-    fn a_personal_host_request_answers_its_typed_offer() {
-        let mut h = Harness::new(true);
-        *h.backend.personal_request.lock() = Ok(());
-        let (reply, mut answer) = oneshot::channel();
-        h.machine.handle(Command::PersonalHost {
-            ssid: "luca's iphone".into(),
-            passphrase: "the passphrase".into(),
-            reply,
-        });
-        assert_eq!(
-            answer.try_recv().unwrap(),
-            Ok(HotspotOffer::new(
-                "luca's iphone",
-                "the passphrase",
-                HotspotSecurity::Wpa2,
-                Some(54321),
-            ))
-        );
-        assert!(h.machine.hosting_offer().is_some());
-    }
-
-    /// The personal host row `host_personal_hotspot | the device does not
-    /// serve | the port stays out of the offer` (R76 decision 26).
-    #[test]
-    fn a_personal_host_request_without_serving_answers_its_portless_offer() {
-        let mut h = Harness::new(true);
-        *h.backend.personal_request.lock() = Ok(());
-        *h.port.lock() = None;
-        let (reply, mut answer) = oneshot::channel();
-        h.machine.handle(Command::PersonalHost {
-            ssid: "luca's iphone".into(),
-            passphrase: "the passphrase".into(),
-            reply,
-        });
-        assert_eq!(
-            answer.try_recv().unwrap(),
-            Ok(HotspotOffer::new(
-                "luca's iphone",
-                "the passphrase",
-                HotspotSecurity::Wpa2,
-                None,
-            ))
-        );
-    }
-
-    /// The personal host row `host_personal_hotspot | Hosting | replace
-    /// the offer` (R76 decision 26).
-    #[test]
-    fn a_second_personal_host_request_replaces_the_offer() {
-        let mut h = Harness::new(true);
-        *h.backend.personal_request.lock() = Ok(());
-        let (reply, mut answer) = oneshot::channel();
-        h.machine.handle(Command::PersonalHost {
-            ssid: "the first".into(),
-            passphrase: "one".into(),
-            reply,
-        });
-        assert_eq!(answer.try_recv().unwrap().unwrap().ssid, "the first");
-        let (second, mut second_answer) = oneshot::channel();
-        h.machine.handle(Command::PersonalHost {
-            ssid: "the second".into(),
-            passphrase: "two".into(),
-            reply: second,
-        });
-        assert_eq!(
-            second_answer.try_recv().unwrap().unwrap().ssid,
-            "the second"
-        );
-        assert_eq!(h.machine.hosting_offer().unwrap().ssid, "the second");
-    }
-
-    /// The personal host row `host_personal_hotspot | the model cannot
-    /// host | the typed refusal stands` (R76 decision 26).
-    #[test]
-    fn a_refused_personal_host_request_answers_its_error() {
-        let mut h = Harness::new(true);
-        *h.backend.personal_request.lock() = Err(HotspotError::Incompatible);
-        let (reply, mut answer) = oneshot::channel();
-        h.machine.handle(Command::PersonalHost {
-            ssid: "luca's ipad".into(),
-            passphrase: "the passphrase".into(),
-            reply,
-        });
-        assert_eq!(answer.try_recv().unwrap(), Err(HotspotError::Incompatible));
-        assert!(h.machine.hosting_offer().is_none());
-    }
-
-    /// The personal host rows `an exchange hands the offer out | start the
-    /// landing bound of the join bound` and `host_personal_hotspot | the
-    /// bound runs only from the hand out` (R76 decision 26).
-    #[tokio::test(start_paused = true)]
-    async fn a_handout_starts_the_landing_bound() {
-        let mut h = Harness::new(true);
-        *h.backend.personal_request.lock() = Ok(());
-        let (reply, mut answer) = oneshot::channel();
-        h.machine.handle(Command::PersonalHost {
-            ssid: "luca's iphone".into(),
-            passphrase: "the passphrase".into(),
-            reply,
-        });
-        assert!(answer.try_recv().unwrap().is_ok());
-        // The host alone starts no bound.
-        tokio::time::sleep(JOIN_BOUND + Duration::from_secs(1)).await;
-        h.machine.tick();
-        assert!(h.events.lock().is_empty());
-        // The hand out starts the bound, which has not run.
-        h.machine.handle(Command::PersonalOfferHandedOut);
-        h.machine.tick();
-        assert!(h.events.lock().is_empty());
-        // The bound runs, so the unreached stands.
-        tokio::time::sleep(JOIN_BOUND + Duration::from_secs(1)).await;
-        h.machine.tick();
-        assert_eq!(h.events.lock().as_slice(), [ClientEvent::HotspotUnreached]);
-    }
-
-    /// The personal host row `the network lands | end the landing bound`
-    /// (R76 decision 26).
-    #[tokio::test(start_paused = true)]
-    async fn a_landed_device_ends_the_landing_bound() {
-        let mut h = Harness::new(true);
-        *h.backend.personal_request.lock() = Ok(());
-        let (reply, mut answer) = oneshot::channel();
-        h.machine.handle(Command::PersonalHost {
-            ssid: "luca's iphone".into(),
-            passphrase: "the passphrase".into(),
-            reply,
-        });
-        assert!(answer.try_recv().unwrap().is_ok());
-        h.machine.handle(Command::PersonalOfferHandedOut);
-        *h.backend.landed.lock() = true;
-        h.machine.tick();
-        assert!(h.events.lock().is_empty());
-        tokio::time::sleep(JOIN_BOUND + Duration::from_secs(1)).await;
-        h.machine.tick();
-        assert!(h.events.lock().is_empty());
-    }
-
-    /// The personal host row `the landing's bound runs without a landing |
-    /// the unreached stands, the hosting continues` (R76 decision 26).
-    #[tokio::test(start_paused = true)]
-    async fn a_passed_landing_bound_emits_unreached_and_keeps_hosting() {
-        let mut h = Harness::new(true);
-        *h.backend.personal_request.lock() = Ok(());
-        let (reply, mut answer) = oneshot::channel();
-        h.machine.handle(Command::PersonalHost {
-            ssid: "luca's iphone".into(),
-            passphrase: "the passphrase".into(),
-            reply,
-        });
-        assert!(answer.try_recv().unwrap().is_ok());
-        h.machine.handle(Command::PersonalOfferHandedOut);
-        tokio::time::sleep(JOIN_BOUND + Duration::from_secs(1)).await;
-        h.machine.tick();
-        assert_eq!(h.events.lock().as_slice(), [ClientEvent::HotspotUnreached]);
-        // The hosting continues, so the offer and the bound stand again.
-        assert!(h.machine.hosting_offer().is_some());
-        h.machine.handle(Command::PersonalOfferHandedOut);
-        tokio::time::sleep(JOIN_BOUND + Duration::from_secs(1)).await;
-        h.machine.tick();
-        assert_eq!(
-            h.events.lock().as_slice(),
-            [ClientEvent::HotspotUnreached, ClientEvent::HotspotUnreached,]
-        );
-    }
-
-    /// The personal host row `stop_hotspot | Hosting | become Idle, the
-    /// backend's stop stands` (R76 decision 26).
-    #[test]
-    fn a_stop_closes_a_personal_host() {
-        let mut h = Harness::new(true);
-        *h.backend.personal_request.lock() = Ok(());
-        let (reply, mut answer) = oneshot::channel();
-        h.machine.handle(Command::PersonalHost {
-            ssid: "luca's iphone".into(),
-            passphrase: "the passphrase".into(),
-            reply,
-        });
-        assert!(answer.try_recv().unwrap().is_ok());
-        h.machine.handle(Command::StopHost);
-        assert_eq!(h.backend.counted("stop_host"), 1);
-        assert!(h.machine.hosting_offer().is_none());
-    }
-
-    /// The personal host row `Client closed | Hosting | become Idle, the
-    /// backend's stop stands` (R76 decision 26).
-    #[test]
-    fn a_closed_client_closes_a_personal_host() {
-        let mut h = Harness::new(true);
-        *h.backend.personal_request.lock() = Ok(());
-        let (reply, _answer) = oneshot::channel();
-        h.machine.handle(Command::PersonalHost {
-            ssid: "luca's iphone".into(),
-            passphrase: "the passphrase".into(),
-            reply,
-        });
-        h.machine.close();
-        assert_eq!(h.backend.counted("stop_host"), 1);
-        assert!(h.machine.hosting_offer().is_none());
-    }
-
-    /// The personal host row `host_personal_hotspot | the system cannot
-    /// host a personal hotspot | the typed refusal stands, and its network
-    /// never lands` (R76 decision 26).
-    #[cfg(not(any(target_os = "ios", target_os = "macos")))]
-    #[test]
-    fn a_system_without_a_personal_hotspot_refuses_the_request() {
-        let backend = UnsupportedBackend;
-        assert!(!backend.personal_landed());
-        let mut machine = Machine::new(
-            Arc::new(backend) as Arc<dyn HotspotBackend>,
-            false,
-            Arc::new(|| Some(54321)),
-            Arc::new(|_subnet| {}),
-            Arc::new(|_addr, _answer| {}),
-            Arc::new(|_event| {}),
-        );
-        let (reply, mut answer) = oneshot::channel();
-        machine.handle(Command::PersonalHost {
-            ssid: "iphone".into(),
-            passphrase: "the passphrase".into(),
-            reply,
-        });
-        assert_eq!(answer.try_recv().unwrap(), Err(HotspotError::Unsupported));
-    }
-
-    /// The personal host row `an exchange hands the offer out | no personal
-    /// host stands | nothing starts` (R76 decision 26).
-    #[test]
-    fn a_handout_without_a_personal_host_starts_nothing() {
-        let mut h = Harness::new(true);
-        h.machine.handle(Command::PersonalOfferHandedOut);
-        h.machine.tick();
-        assert!(h.events.lock().is_empty());
     }
 
     /// The join row `join_hotspot | Idle | a missing permission answers
