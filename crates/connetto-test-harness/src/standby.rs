@@ -135,7 +135,7 @@ impl Pair {
     /// When Docker is unreachable or either server does not come up within
     /// the harness's startup timeout, which are test setup failures.
     pub async fn start() -> Self {
-        let slot = container_slot().await;
+        let slot = container_slot().await.expect("a container slot");
         sweep_abandoned_containers();
         let network = format!("connetto-standby-{}", uuid_like());
         let network_labels = label_args("network");

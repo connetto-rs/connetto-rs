@@ -1046,7 +1046,7 @@ impl Fixture {
             );
             return Self::on_native(&programs, shared_counter_scope, exclusive_counter_scope).await;
         }
-        let slot = container_slot().await;
+        let slot = container_slot().await.expect("a container slot");
         sweep_abandoned_containers();
         let mut image = GenericImage::new(POSTGRES_IMAGE, POSTGRES_TAG)
             .with_exposed_port(POSTGRES_PORT.tcp())
