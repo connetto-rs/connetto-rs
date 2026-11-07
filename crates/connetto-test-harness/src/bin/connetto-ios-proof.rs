@@ -20,7 +20,9 @@
 //! Android phone, cabled to the Mac, hosts its local-only hotspot and the
 //! iPhone and the iPad join it (R76 slice 9f). The round requires all six
 //! directed peer observations after a 60s freshness interval and preserves
-//! its matrix, pages and cleanup result.
+//! its matrix, pages and cleanup result. An unattended run walks the round's
+//! R77 phase beside its three-way link, and with `--r77-only` the walk skips
+//! the single-phone proof and walks the round with its R77 phase.
 //!
 //! It runs on a Mac through a private driver script passed to `connetto-demo-stack`, which supplies the stack environment without logging the script's password arguments.
 //!
@@ -33,7 +35,8 @@
 //!     [--demo dioxus|tauri] [--app PATH] \
 //!     [--mac-peer --identity SHA1 --android-peer SERIAL --android-apk APK |
 //!      --star --device UDID --identity SHA1 --peer-device UDID \
-//!       --android-peer SERIAL --android-apk APK [--join beacon|payload|form]] \
+//!       --android-peer SERIAL --android-apk APK [--join beacon|payload|form] \
+//!       [--unattended] [--r77-only]] \
 //!     [--android-unlock-pin PIN]
 //! ```
 //!
@@ -73,7 +76,9 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_client::BluetoothState;
 use connetto_test_harness::android_phone;
-use connetto_test_harness::demo::{order_count, wait_for_count};
+use connetto_test_harness::demo::{
+    order_count, remove_team_member, seed_team_members, wait_for_count,
+};
 use connetto_test_harness::inspector::{PageSession, REPLY_BOUND, list_pages};
 use connetto_test_harness::ios_signing;
 use connetto_test_harness::ios_signing::{TAPPER_PROFILE, TAURI_PROFILE};
@@ -114,8 +119,15 @@ enum Demo {
 /// The demo this run deploys, set once from the command line.
 static DEMO: std::sync::OnceLock<Demo> = std::sync::OnceLock::new();
 
+/// Whether the run skips its unlock gate, set once from the command line.
+static UNATTENDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn demo() -> Demo {
     DEMO.get().copied().unwrap_or_default()
+}
+
+fn unattended() -> bool {
+    UNATTENDED.get().copied().unwrap_or_default()
 }
 
 /// The phone's demo the run deploys, which the star's Android phone takes
@@ -219,6 +231,7 @@ fn main() -> Result<()> {
 async fn driver() -> Result<()> {
     let stack = Stack::from_env()?;
     let parsed = parse_arguments(&std::env::args().skip(1).collect::<Vec<_>>())?;
+    let _ = UNATTENDED.set(parsed.unattended);
     // The mac peer run drives the Android phone and the Mac's own leg, and
     // stands no iOS handheld, so it runs beside the target's proof.
     if parsed.mac_peer {
@@ -248,7 +261,7 @@ async fn driver() -> Result<()> {
 
     let app = match parsed.app {
         Some(app) => app,
-        None => target.build(&evidence).await?,
+        None => target.build(&evidence, parsed.unattended).await?,
     };
     let (mut relay, sync_url) = relay_for(matches!(target, Target::Device { .. }), &stack).await?;
     let started = std::time::SystemTime::now();
@@ -266,10 +279,21 @@ async fn driver() -> Result<()> {
             parsed.android_apk.as_deref(),
             parsed.android_unlock_pin.as_deref(),
             parsed.join.unwrap_or_default(),
+            parsed.unattended,
+            parsed.r77_only,
         )
         .await
     } else {
-        prove(&target, &app, &stack, &evidence, &mut relay, &sync_url).await
+        prove(
+            &target,
+            &app,
+            &stack,
+            &evidence,
+            &mut relay,
+            &sync_url,
+            parsed.unattended,
+        )
+        .await
     };
     if let Target::Simulator { .. } = &target {
         let log = target.app_log(started).await.unwrap_or_default();
@@ -322,6 +346,7 @@ async fn mac_peer_walk(stack: &Stack, parsed: &ParsedArguments) -> Result<()> {
         stack,
         &evidence,
         android_unlock_pin,
+        false,
     )
     .await?;
     if let Err(err) = setup {
@@ -476,6 +501,7 @@ async fn prove(
     evidence: &Path,
     relay: &mut Relay,
     sync_url: &str,
+    unattended: bool,
 ) -> Result<()> {
     step("install");
     target.install(app).await?;
@@ -563,7 +589,14 @@ async fn prove(
     wait_for_count(&stack.pg_url, offline + 1).await?;
     target.record(&mut app, evidence, "uploaded").await?;
 
-    let mut app = recheck_after_time_away(target, &mut inspector, stack, evidence).await?;
+    // The re-check is a person-only step, a Face ID or passcode the gate
+    // raises on the return, so an unattended build, whose gate is off, skips
+    // it and goes straight to the sign out.
+    let mut app = if unattended {
+        app
+    } else {
+        recheck_after_time_away(target, &mut inspector, stack, evidence).await?
+    };
 
     step("sign out");
     sign_out(&mut app).await?;
@@ -689,14 +722,20 @@ async fn second_account_shares_catalogue(
 
 /// Whether the demo's page shows a finished sign-in. Both demos name the
 /// signed-in account and the replica's custody once the client stands, and a
-/// gated Tauri build's custody is the verified one. The status line is no
-/// sign, since every later client event overwrites it.
+/// gated Tauri build's custody is the verified one, while an unattended
+/// build, whose gate is off, reads its custody stored without user
+/// verification. The status line is no sign, since every later client event
+/// overwrites it.
 fn signed_in(text: &str) -> bool {
     match demo() {
         Demo::Dioxus => text.contains("Signed in as ") && text.contains("custody: "),
         Demo::Tauri => {
             text.contains("Signed in as ")
-                && text.contains("custody: released only after user verification")
+                && text.contains(if unattended() {
+                    "custody: stored without user verification"
+                } else {
+                    "custody: released only after user verification"
+                })
         }
     }
 }
@@ -807,6 +846,10 @@ async fn recheck_after_time_away(
 
 /// What the command line names, before anything runs.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the flags are plain command-line switches, not a state machine"
+)]
 struct ParsedArguments {
     simulator: Option<String>,
     device: Option<String>,
@@ -819,6 +862,10 @@ struct ParsedArguments {
     android_apk: Option<PathBuf>,
     android_unlock_pin: Option<String>,
     join: Option<star::Join>,
+    unattended: bool,
+    /// Skip the single-phone proof of an unattended star run, which then
+    /// walks its round with the R77 phase.
+    r77_only: bool,
 }
 
 /// `--simulator`, or `--device` with `--identity` and `--app`, and, for the
@@ -867,9 +914,17 @@ fn parse_arguments(args: &[String]) -> Result<ParsedArguments> {
             "--join" => {
                 arguments.join = Some(star::Join::parse(argument_value(&mut args, arg)?)?);
             }
+            "--r77-only" => arguments.r77_only = true,
+            "--unattended" => arguments.unattended = true,
             other => bail!("unknown argument {other:?}"),
         }
     }
+    check_arguments(&arguments)?;
+    Ok(arguments)
+}
+
+/// The combinations the flags refuse.
+fn check_arguments(arguments: &ParsedArguments) -> Result<()> {
     if arguments.star && arguments.simulator.is_some() {
         bail!(
             "--star drives the iPhone, the iPad and the Android phone, so it needs --device, not --simulator"
@@ -886,6 +941,9 @@ fn parse_arguments(args: &[String]) -> Result<ParsedArguments> {
             || arguments.android_apk.is_none())
     {
         bail!("--star needs --device, --identity, --peer-device, --android-peer and --android-apk");
+    }
+    if arguments.r77_only && !(arguments.star && arguments.unattended) {
+        bail!("--r77-only narrows an unattended --star run, so it needs --star and --unattended");
     }
     if arguments.simulator.is_some() && arguments.device.is_some() {
         bail!("give either --simulator or --device, not both");
@@ -919,8 +977,7 @@ fn parse_arguments(args: &[String]) -> Result<ParsedArguments> {
     {
         bail!("--peer-device names the same device as --device");
     }
-
-    Ok(arguments)
+    Ok(())
 }
 
 /// The value the argument names, which the argument is not complete without.
@@ -954,9 +1011,9 @@ impl Target {
         }
     }
 
-    async fn build(&self, evidence: &Path) -> Result<PathBuf> {
+    async fn build(&self, evidence: &Path, unattended: bool) -> Result<PathBuf> {
         if let Demo::Tauri = demo() {
-            return self.build_tauri(evidence).await;
+            return self.build_tauri(evidence, unattended).await;
         }
         let demo = repo_path(&DEMO_DIR)?;
         step("build");
@@ -966,7 +1023,7 @@ impl Target {
             "--ios",
             "--no-default-features",
             "--features",
-            dioxus_mobile_features(),
+            &with_unattended(dioxus_mobile_features(), unattended),
         ]);
         match self {
             Self::Simulator { .. } => {
@@ -1009,15 +1066,15 @@ impl Target {
     /// simulator build signs from the development team, and the device build
     /// passes `--no-sign`, so the proof embeds the profile and signs the app
     /// with the run's identity.
-    async fn build_tauri(&self, evidence: &Path) -> Result<PathBuf> {
+    async fn build_tauri(&self, evidence: &Path, unattended: bool) -> Result<PathBuf> {
         let demo = repo_path(&TAURI_DIR)?;
         step("build");
         let mut cargo = Command::new("cargo");
         cargo.current_dir(&demo);
         cargo.args(["tauri", "ios", "build", "--debug"]);
-        let features = tauri_mobile_features();
+        let features = with_unattended(tauri_mobile_features(), unattended);
         if !features.is_empty() {
-            cargo.args(["--features", features]);
+            cargo.args(["--features", &features]);
         }
         cargo.env("APPLE_DEVELOPMENT_TEAM", signing_team().await?);
         match self {
@@ -1241,6 +1298,17 @@ impl Target {
             &format!("process == \"{}\"", process()),
         ])
         .await
+    }
+}
+
+/// `features` with the demos' `unattended` feature added for an unattended
+/// run, the build-time switch that turns the gate off and stores the secrets
+/// under a keyring service a gated run's keychain items cannot meet.
+fn with_unattended(features: &str, unattended: bool) -> String {
+    match (features.is_empty(), unattended) {
+        (_, false) => features.to_owned(),
+        (true, true) => "unattended".to_owned(),
+        (false, true) => format!("{features},unattended"),
     }
 }
 
@@ -2300,8 +2368,8 @@ impl Inspector {
     }
 
     /// A fresh session on the demo's page through a restarted proxy, for
-    /// after a Personal Hotspot switch, which resets the USB link the proxy
-    /// and every page session ride on.
+    /// after a hotspot switch, which resets the USB link the proxy and every
+    /// page session ride on.
     async fn reattach(&mut self) -> Result<PageSession> {
         self.restart_at = Instant::now();
         self.keep_alive().await?;
@@ -2515,6 +2583,68 @@ impl StarPage<'_> {
             }
         }
     }
+
+    /// Click the button labelled `label` on this page, reattaching the session
+    /// when the click's read drops, the way [`Self::text`] does.
+    async fn click(&mut self, label: &str) -> Result<()> {
+        match self {
+            Self::Ios { app, inspector } => {
+                let app = &mut **app;
+                let inspector = &mut **inspector;
+                match app.click(label).await {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        eprintln!("the page did not answer ({err:#}), on a fresh session");
+                        *app = inspector.reattach().await?;
+                        app.click(label).await
+                    }
+                }
+            }
+            Self::Android { device, app } => {
+                let app = &mut **app;
+                let device = &**device;
+                match app.click(label).await {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        eprintln!("the Android page did not answer ({err:#}), on a fresh session");
+                        *app = device.app().await?;
+                        app.click(label).await
+                    }
+                }
+            }
+        }
+    }
+
+    /// Put `text` into the input named `name`, the panel's field a note or a
+    /// team is written through, reattaching the session on a dropped read.
+    async fn set_input(&mut self, name: &str, text: &str) -> Result<()> {
+        match self {
+            Self::Ios { app, inspector } => {
+                let app = &mut **app;
+                let inspector = &mut **inspector;
+                match app.set_input(name, text).await {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        eprintln!("the page did not answer ({err:#}), on a fresh session");
+                        *app = inspector.reattach().await?;
+                        app.set_input(name, text).await
+                    }
+                }
+            }
+            Self::Android { device, app } => {
+                let app = &mut **app;
+                let device = &**device;
+                match app.set_input(name, text).await {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        eprintln!("the Android page did not answer ({err:#}), on a fresh session");
+                        *app = device.app().await?;
+                        app.set_input(name, text).await
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The `JoinBy` a star's join uses on the iOS joiner.
@@ -2551,6 +2681,7 @@ fn failed_round(plan: star::RoundPlan, err: &anyhow::Error) -> star::RoundReport
             failed(step_name(round, plan.joiners[1], plan.join)),
         ],
         link: failed(format!("{} round, the three-way link", round.name())),
+        r77: None,
         restore: failed(format!("{} round, the restore", round.name())),
     }
 }
@@ -2743,13 +2874,15 @@ async fn restore_android_network(android: &StarAndroid) -> Result<()> {
 
 /// The star's one-time Android setup: the phone awake and unlocked, the demo
 /// installed clear of its earlier run, the links the demo dials reversed, the
-/// Bluetooth permissions granted and its own account signed in.
+/// Bluetooth permissions granted and its own account signed in. An unattended
+/// build has no unlock gate, so its sign-in approves no prompt.
 async fn star_android_setup(
     device: android_phone::Device,
     apk: &Path,
     stack: &Stack,
     evidence: &Path,
     unlock_pin: Option<&str>,
+    unattended: bool,
 ) -> Result<(StarAndroid, Result<(), String>)> {
     // The run's own values of the phone's settings, read before it moves
     // any of them, so a failed setup still brings them back.
@@ -2828,7 +2961,7 @@ async fn star_android_setup(
             star::Device::Android.account(),
             &stack.issuer,
             evidence,
-            unlock,
+            (!unattended).then_some(unlock),
             "android",
         )
         .await?;
@@ -2987,6 +3120,7 @@ fn round_report_failed(
             failed(step_name(round, plan.joiners[1], plan.join)),
         ],
         link: failed(format!("{} round, the three-way link", round.name())),
+        r77: None,
         restore: star::StepReport {
             name: format!("{} round, the restore", round.name()),
             took: restore.0,
@@ -2995,14 +3129,15 @@ fn round_report_failed(
     }
 }
 
-/// The star's first round: the Android phone hosts its local-only hotspot,
-/// and the iPhone and the iPad join it and stay joined until every device
-/// links to every other. It ends with the hotspot down, every link ended and
-/// the Android phone back on its usual network, off Bluetooth.
+/// The star's one round (R76 slice 9f): the Android phone hosts its
+/// local-only hotspot, and the iPhone and the iPad join it and stay joined
+/// until every device links to every other. The unattended run walks its
+/// R77 phase beside the three-way link. It ends with the hotspot down, every
+/// link ended and the Android phone back on its usual network, off Bluetooth.
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "the plan, the two iOS handhelds, the Android phone, both tappers, the build, the stack, the evidence and the sync url are each the round's own"
+    reason = "the plan, the two iOS handhelds, the Android phone, both tappers, the build, the stack, the evidence, the sync url, the relay and the R77 member ids are each the round's own"
 )]
 async fn android_hosts_round(
     plan: &star::RoundPlan,
@@ -3015,6 +3150,8 @@ async fn android_hosts_round(
     stack: &Stack,
     evidence: &Path,
     sync_url: &str,
+    relay: &mut Relay,
+    r77: Option<[String; 3]>,
 ) -> star::RoundReport {
     let round = plan.round;
     let names: [&str; 3] = [
@@ -3185,6 +3322,68 @@ async fn android_hosts_round(
         .await;
         (started.elapsed(), outcome.map_err(|err| format!("{err:#}")))
     };
+    // The R77 phase runs while the phones are linked, and closes the peer
+    // links itself before the server carries the verdicts. A failed phase
+    // brings the server back, which every later step signs in and out through.
+    let r77 = match r77 {
+        None => None,
+        Some(member_ids) => {
+            let started = Instant::now();
+            let outcome = async {
+                if let Err(err) = &link.1 {
+                    bail!("the three-way link never stood: {err}");
+                }
+                let mut android_app = android.device.app().await?;
+                let r77_accounts = [
+                    star::Device::IPhone.account(),
+                    star::Device::IPad.account(),
+                    star::Device::Android.account(),
+                ];
+                r77_phase(
+                    [
+                        &mut StarPage::Ios {
+                            app: &mut iphone_app,
+                            inspector: &mut iphone_inspector,
+                        },
+                        &mut StarPage::Ios {
+                            app: &mut ipad_app,
+                            inspector: &mut ipad_inspector,
+                        },
+                        &mut StarPage::Android {
+                            device: &android.device,
+                            app: &mut android_app,
+                        },
+                    ],
+                    relay,
+                    stack,
+                    evidence,
+                    r77_accounts,
+                    [&member_ids[0], &member_ids[1], &member_ids[2]],
+                    gateway,
+                    android,
+                )
+                .await
+            }
+            .await;
+            let outcome = match outcome {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    eprintln!("the R77 phase: {err:#}");
+                    match relay.resume().await {
+                        Ok(()) => Err(format!("{err:#}")),
+                        Err(resume) => {
+                            Err(format!("{err:#}, and the server stayed down: {resume:#}"))
+                        }
+                    }
+                }
+            };
+            Some(star::StepReport {
+                name: format!("{} round, the R77 phase", round.name()),
+                took: started.elapsed(),
+                outcome,
+            })
+        }
+    };
     let restore = star_round_restore(
         &mut iphone_app,
         &mut iphone_inspector,
@@ -3214,6 +3413,7 @@ async fn android_hosts_round(
             took: link.0,
             outcome: link.1,
         },
+        r77,
         restore: star::StepReport {
             name: format!("{} round, the restore", round.name()),
             took: restore.0,
@@ -3221,6 +3421,350 @@ async fn android_hosts_round(
         },
     }
 }
+/// The team the R77 walk seeds, its one team the three accounts all join.
+const R77_TEAM: &str = "T1";
+/// The bound one R77 step waits for its lines, the verdicts settling within
+/// the same bound the server's return and the resync take.
+const R77_STEP: Duration = Duration::from_secs(120);
+/// How long the Android phone gets to rejoin its saved Wi-Fi after the
+/// hotspot leave.
+const ANDROID_REJOIN: Duration = Duration::from_secs(60);
+
+/// Wait until `holds` is true of the three star pages' texts, re-reading
+/// within `bound`, and return the last complete set the step read.
+async fn r77_wait(
+    mut read: impl AsyncFnMut(Instant) -> [Result<String>; 3],
+    bound: Duration,
+    holds: impl Fn(&[String; 3]) -> bool,
+) -> Result<[String; 3]> {
+    let deadline = Instant::now() + bound;
+    let mut last = std::array::from_fn(|_| String::new());
+    loop {
+        let answers = read(deadline.min(Instant::now() + Duration::from_secs(15))).await;
+        let mut complete = true;
+        for (index, answer) in answers.into_iter().enumerate() {
+            match answer {
+                Ok(text) => last[index] = text,
+                Err(_) => complete = false,
+            }
+        }
+        if complete && holds(&last) {
+            return Ok(last);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "the R77 step never held, the pages show:\n{}",
+                last.iter()
+                    .enumerate()
+                    .map(|(index, text)| format!("--- page {index} ---\n{text}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Whether the note whose body is `body` stands on the page, and whether it
+/// stands provisional.
+fn note_stands(page: &str, body: &str) -> (bool, bool) {
+    star::note_lines(page)
+        .iter()
+        .find(|line| line.body == body)
+        .map_or((false, false), |line| {
+            (true, line.provisional_from.is_some())
+        })
+}
+
+/// Hold until the Android phone stands on a Wi-Fi network again, which it
+/// rejoins by itself only where its saved network allows auto reconnect.
+async fn android_on_home_wifi(device: &android_phone::Device) -> Result<()> {
+    step("wait for the M52 back on its saved Wi-Fi");
+    let deadline = Instant::now() + ANDROID_REJOIN;
+    loop {
+        let status = device.adb(&["shell", "cmd", "wifi", "status"]).await?;
+        if status
+            .lines()
+            .any(|line| line.starts_with("Wifi is connected to"))
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "the M52 stood on no Wi-Fi network {} s after the hotspot leave, so check that its saved network allows auto reconnect",
+                ANDROID_REJOIN.as_secs()
+            );
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// The R77 slice 8 phase, the page order [alice, bob, carol]. The server
+/// stops and each phone writes a team note, the peers' notes stand
+/// provisional over the standing link, and the tidy pass leaves them standing.
+/// Then every phone switches its nearby links off and leaves the hotspot, so
+/// the phones stand apart before the operator removes carol from the team.
+/// The server comes back and each phone reaches it alone, alice's and bob's
+/// notes are confirmed, carol's is rolled back with its reason on all three,
+/// and the team's notes leave carol's phone, the answer the block the summary
+/// writes per phone. The links come back on at the end.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the phase runs the sub-steps and the per-phone block in order, and splitting it would hide that order"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pages, the relay, the stack, the evidence, the accounts, the member ids, the gateway and the Android host are each the phase's own"
+)]
+async fn r77_phase(
+    pages: [&mut StarPage<'_>; 3],
+    relay: &mut Relay,
+    stack: &Stack,
+    evidence: &Path,
+    accounts: [&str; 3],
+    member_ids: [&str; 3],
+    gateway: Option<std::net::Ipv4Addr>,
+    android: &StarAndroid,
+) -> Result<()> {
+    use std::fmt::Write as _;
+    let [alice, bob, carol] = pages;
+    let bodies: Vec<String> = accounts
+        .iter()
+        .map(|account| format!("note from {account}"))
+        .collect();
+    let body = |index: usize| &bodies[index];
+
+    // Each phone settles a peer's note against the author's membership row,
+    // so the whole team's roster stands on every phone before the server goes.
+    step("R77: the team's roster reaches every phone");
+    r77_wait(
+        async |deadline| read_star_pages([&mut *alice, &mut *bob, &mut *carol], deadline).await,
+        R77_STEP,
+        |texts| {
+            texts
+                .iter()
+                .all(|text| text.lines().any(|line| line.trim() == "members: 3"))
+        },
+    )
+    .await?;
+
+    // a. The server goes away for all three, the live sessions among them.
+    step("R77: stop the server");
+    relay.stop().await;
+
+    // b. Each phone writes its team note, its own standing plain and the
+    // peers' provisional, the peers applying them over the standing link.
+    for index in 0..3 {
+        step(&format!("R77: {} writes a note", accounts[index]));
+        let page = match index {
+            0 => &mut *alice,
+            1 => &mut *bob,
+            2 => &mut *carol,
+            _ => unreachable!("a page index is in 0..3"),
+        };
+        // A web view can drop the typed body's input event, so only the
+        // empty-note refusal writes again, three tries. A note missing
+        // without it may be a write in flight, and a second write would add
+        // a second note, so the run stops there with the page.
+        let mut written = false;
+        for _ in 0..3 {
+            page.set_input("note-body", &bodies[index]).await?;
+            page.click("Add note").await?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut text = page.text().await?;
+            while Instant::now() < deadline && !note_stands(&text, &bodies[index]).0 {
+                sleep(Duration::from_millis(500)).await;
+                text = page.text().await?;
+            }
+            if note_stands(&text, &bodies[index]).0 {
+                written = true;
+                break;
+            }
+            if !text
+                .lines()
+                .any(|line| line.trim() == "the note needs some text")
+            {
+                bail!(
+                    "{} wrote a note that never showed and was not refused as empty, the page shows:\n{text}",
+                    accounts[index]
+                );
+            }
+        }
+        if !written {
+            bail!(
+                "{}'s note was refused as empty three times",
+                accounts[index]
+            );
+        }
+    }
+    let texts = r77_wait(
+        async |deadline| read_star_pages([&mut *alice, &mut *bob, &mut *carol], deadline).await,
+        R77_STEP,
+        |texts| {
+            (0..3).all(|index| {
+                (0..3).all(|other| {
+                    if other == index {
+                        note_stands(&texts[index], body(index)) == (true, false)
+                    } else {
+                        note_stands(&texts[index], body(other)) == (true, true)
+                    }
+                })
+            })
+        },
+    )
+    .await?;
+    for index in 0..3 {
+        tokio::fs::write(
+            evidence.join(format!(
+                "r77-{account}-offline.txt",
+                account = accounts[index]
+            )),
+            &texts[index],
+        )
+        .await
+        .context("writing an R77 offline page")?;
+    }
+
+    // c. The tidy pass runs on each phone and leaves the provisional rows.
+    for (index, account) in accounts.iter().enumerate() {
+        step(&format!("R77: {account} tidies"));
+        let page = match index {
+            0 => &mut *alice,
+            1 => &mut *bob,
+            2 => &mut *carol,
+            _ => unreachable!("a page index is in 0..3"),
+        };
+        page.click("Tidy").await?;
+    }
+    r77_wait(
+        async |deadline| read_star_pages([&mut *alice, &mut *bob, &mut *carol], deadline).await,
+        R77_STEP,
+        |texts| {
+            (0..3).all(|index| {
+                star::tidy_remaining(&texts[index]).is_some()
+                    && (0..3).all(|other| {
+                        note_stands(&texts[index], body(other)) == (true, other != index)
+                    })
+            })
+        },
+    )
+    .await?;
+
+    // The phones stand apart from here on. Each switches its nearby links off
+    // first, so neither the hotspot's links nor the home network they return
+    // to links them again, then the joiners leave the hotspot and the host
+    // stops it, and no linked line may stand on any page when it ends.
+    step("R77: the phones switch their nearby links off");
+    for page in [&mut *alice, &mut *bob, &mut *carol] {
+        page.click("Pause nearby links").await?;
+    }
+    r77_wait(
+        async |deadline| read_star_pages([&mut *alice, &mut *bob, &mut *carol], deadline).await,
+        R77_STEP,
+        |texts| {
+            texts
+                .iter()
+                .all(|text| text.lines().any(|line| line.trim() == "links: off"))
+        },
+    )
+    .await?;
+    step("R77: the phones leave the hotspot");
+    bob.leave_hotspot().await?;
+    alice.leave_hotspot().await?;
+    stop_android_hosting(android).await?;
+    // The link-end wait reads the gateway's addresses, so a phase with none
+    // would pass it without looking.
+    let Some(gateway) = gateway else {
+        bail!("the R77 phase needs the hotspot gateway the link rounds read");
+    };
+    wait_star_links_end([&mut *alice, &mut *bob, &mut *carol], Some(gateway)).await?;
+    // The Android host is off its saved Wi-Fi while it hosts, so its network
+    // comes back before it reaches the server alone.
+    step("R77: the Android phone back on its home network");
+    restore_android_network(android).await?;
+    android_on_home_wifi(&android.device).await?;
+
+    // d. The operator removes carol, the Android phone, from the team while
+    // every phone stands offline, so the removal crosses no link.
+    step("R77: remove carol from the team");
+    remove_team_member(&stack.pg_url, R77_TEAM, member_ids[2]).await?;
+
+    // e. The server comes back with every nearby link off, so the verdicts
+    // land through the sync alone, and the block the summary records per
+    // phone.
+    step("R77: the server comes back");
+    relay.resume().await?;
+    let texts = r77_wait(
+        async |deadline| read_star_pages([&mut *alice, &mut *bob, &mut *carol], deadline).await,
+        R77_STEP,
+        |texts| {
+            let settled = |index: usize, other: usize| {
+                note_stands(&texts[index], body(other)) == (true, false)
+            };
+            // Carol left the team, so its notes are hidden from her phone,
+            // and every phone shows her own note rolled back with its reason.
+            let carol_sees_none = (0..3).all(|other| !note_stands(&texts[2], body(other)).0);
+            (0..3).all(|index| {
+                !note_stands(&texts[index], body(2)).0
+                    && !texts[index].contains("linked: ")
+                    && texts[index].contains("provisional: rolled back team_notes")
+            }) && settled(0, 0)
+                && settled(0, 1)
+                && settled(1, 0)
+                && settled(1, 1)
+                && carol_sees_none
+        },
+    )
+    .await?;
+    for index in 0..3 {
+        tokio::fs::write(
+            evidence.join(format!("r77-{}-verdict.txt", accounts[index])),
+            &texts[index],
+        )
+        .await
+        .context("writing an R77 verdict page")?;
+    }
+    // The cause the panel names, the refused entry by the server's reason.
+    let cause = texts
+        .iter()
+        .find_map(|text| {
+            star::provisional_lines(text)
+                .iter()
+                .find_map(|line| match line {
+                    star::ProvisionalLine::RolledBack { cause, .. } => Some(cause.clone()),
+                    _ => None,
+                })
+        })
+        .unwrap_or_else(|| "unspecified".to_owned());
+    let mut block = String::from("R77 slice 8 phase\n");
+    for index in 0..3 {
+        let held = (0..3)
+            .filter(|other| note_stands(&texts[index], body(*other)).0)
+            .map(|other| accounts[other])
+            .collect::<Vec<_>>()
+            .join(", ");
+        let gone = (0..3)
+            .filter(|other| !note_stands(&texts[index], body(*other)).0)
+            .map(|other| accounts[other])
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            block,
+            "{} ({}): notes held {held}, notes gone {gone}, cause {cause}",
+            star::Device::ALL[index].name(),
+            accounts[index]
+        );
+    }
+    tokio::fs::write(evidence.join("r77-summary.txt"), &block)
+        .await
+        .context("writing the R77 summary block")?;
+    step("R77: the phones switch their nearby links back on");
+    for page in [&mut *alice, &mut *bob, &mut *carol] {
+        page.click("Resume nearby links").await?;
+    }
+    Ok(())
+}
+
 /// The star's end of day: both iOS handhelds signed out, and the Android
 /// phone back at rest, every cleanup attempted and the first failure kept.
 async fn star_finish(
@@ -3341,13 +3885,13 @@ async fn android_finish(android: &StarAndroid, evidence: &Path) -> Result<()> {
     .await
 }
 
-/// The star's rounds and their end of day: the Android phone's setup and both
+/// The star's round and its end of day: the Android phone's setup and both
 /// tappers first, and a failure there brings the phone's own state back and
-/// fails the rounds' setup, then the two rounds and the devices' way back to
-/// rest, which the run's failure keeps while the summary records the rounds.
+/// fails the round's setup, then the round and the devices' way back to rest,
+/// which the run's failure keeps while the summary records the round.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the two iOS handhelds, the build, the stack, the evidence, the sync url, the identity, the Android phone and its arguments and the join are each the run's own"
+    reason = "the two iOS handhelds, the build, the stack, the evidence, the sync url, the identity, the Android phone and its arguments, the join, the relay, the R77 member ids and the unattended flag are each the run's own"
 )]
 async fn run_star_rounds(
     target: &Target,
@@ -3361,6 +3905,9 @@ async fn run_star_rounds(
     android_apk: &Path,
     android_unlock_pin: Option<&str>,
     join: star::Join,
+    relay: &mut Relay,
+    r77: Option<[String; 3]>,
+    unattended: bool,
 ) -> (Vec<star::RoundReport>, Result<(), String>) {
     let prep = async {
         let android = match star_android_setup(
@@ -3369,6 +3916,7 @@ async fn run_star_rounds(
             stack,
             evidence,
             android_unlock_pin,
+            unattended,
         )
         .await
         {
@@ -3428,6 +3976,8 @@ async fn run_star_rounds(
             stack,
             evidence,
             sync_url,
+            relay,
+            r77,
         )
         .await,
     ];
@@ -3441,11 +3991,14 @@ async fn run_star_rounds(
 
 /// The handheld star (R76 slice 9f): the iPhone proves, then the round runs,
 /// the Android phone hosting while the iPhone and the iPad join it, and in
-/// the round every device links to every other over the one hotspot. It ends
-/// with every device back at rest and the summary written.
+/// the round every device links to every other over the one hotspot, the
+/// unattended run walking its R77 phase beside the three-way link. It ends
+/// with every device back at rest and the summary written. With `r77_only`
+/// the walk skips the proof and installs the iPhone's build in the proof's
+/// place.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the phone, its build, the stack, the evidence, the relay, the sync url, the identity, the peer, the Android phone and its arguments and the join are each the run's own"
+    reason = "the phone, its build, the stack, the evidence, the relay, the sync url, the identity, the peer, the Android phone and its arguments, the join, the unattended flag and the r77-only flag are each the run's own"
 )]
 async fn star_walk(
     target: &Target,
@@ -3460,6 +4013,8 @@ async fn star_walk(
     android_apk: Option<&Path>,
     android_unlock_pin: Option<&str>,
     join: star::Join,
+    unattended: bool,
+    r77_only: bool,
 ) -> Result<()> {
     let identity = identity.context("--star needs the --identity connetto-ios-signing printed")?;
     let peer = peer.context("--star needs --peer-device")?;
@@ -3468,18 +4023,43 @@ async fn star_walk(
     if !demo_has_device_identity() {
         bail!("the star needs a demo build with its device identity");
     }
-    let started = Instant::now();
-    let outcome = prove(target, app, stack, evidence, relay, sync_url).await;
-    let proved = (
-        started.elapsed(),
-        outcome.as_ref().map_err(|err| format!("{err:#}")).map(drop),
-    );
+    // The unattended run seeds the team before any phone signs in and syncs
+    // its roster, the `member_id`s the deterministic UUIDs the policies
+    // compare, and keeps the ids the R77 phase removes carol by.
+    let r77_member_ids = if unattended {
+        let ids = star::Device::ALL
+            .iter()
+            .map(|device| {
+                connetto_server::authn::identity::deterministic_uuid(
+                    &stack.issuer,
+                    device.account(),
+                )
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        seed_team_members(&stack.pg_url, R77_TEAM, &[&ids[0], &ids[1], &ids[2]]).await?;
+        Some([ids[0].clone(), ids[1].clone(), ids[2].clone()])
+    } else {
+        None
+    };
+    let (outcome, proved) = if r77_only {
+        step("install the demo on the iPhone");
+        (target.install(app).await, None)
+    } else {
+        let started = Instant::now();
+        let outcome = prove(target, app, stack, evidence, relay, sync_url, unattended).await;
+        let proved = (
+            started.elapsed(),
+            outcome.as_ref().map_err(|err| format!("{err:#}")).map(drop),
+        );
+        (outcome, Some(proved))
+    };
     let (rounds, rest) = if outcome.is_ok() {
         let ipad = Target::Device {
             udid: peer.to_owned(),
             identity: identity.to_owned(),
         };
-        run_star_rounds(
+        Box::pin(run_star_rounds(
             target,
             &ipad,
             app,
@@ -3491,16 +4071,24 @@ async fn star_walk(
             android_apk,
             android_unlock_pin,
             join,
-        )
+            relay,
+            r77_member_ids,
+            unattended,
+        ))
         .await
     } else {
         (Vec::new(), Ok(()))
     };
     // The summary records the run either way, and the devices' rest's
     // failure records itself beside the rounds.
-    let mut summary = star::summary(&commit().await, &proved, &rounds);
+    let mut summary = star::summary(&commit().await, proved.as_ref(), &rounds);
     if let Err(err) = &rest {
         writeln!(&mut summary, "the devices' rest: failed: {err}")?;
+    }
+    if unattended
+        && let Ok(block) = tokio::fs::read_to_string(evidence.join("r77-summary.txt")).await
+    {
+        summary.push_str(&block);
     }
     eprintln!("{summary}");
     tokio::fs::write(evidence.join("summary.txt"), &summary)
@@ -3508,17 +4096,9 @@ async fn star_walk(
         .context("writing the summary")?;
     let mut failed: Vec<String> = rounds
         .iter()
-        .flat_map(|report| {
-            [
-                &report.joins[0],
-                &report.joins[1],
-                &report.link,
-                &report.restore,
-            ]
-            .into_iter()
-            .filter(|step| step.outcome.is_err())
-            .map(|step| step.name.clone())
-        })
+        .flat_map(star::RoundReport::steps)
+        .filter(|step| step.outcome.is_err())
+        .map(|step| step.name.clone())
         .collect();
     if let Err(err) = &rest {
         failed.push(format!("the devices' rest: {err}"));
@@ -3720,10 +4300,43 @@ mod tests {
             .is_ok(),
             "the unlock pin"
         );
+        let unattended = [&star[..], &["--unattended"]].concat();
+        assert!(
+            super::parse_arguments(
+                &unattended
+                    .iter()
+                    .copied()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            )
+            .is_ok(),
+            "the unattended star run"
+        );
+        let r77 = [&unattended[..], &["--r77-only"]].concat();
+        assert!(
+            super::parse_arguments(&r77.iter().copied().map(String::from).collect::<Vec<_>>())
+                .is_ok(),
+            "the r77-only run"
+        );
         for broken in [
             args(&["--star"]),
             args(&["--star", "--simulator", "SIM-1"]),
             args(&["--star", "--mac-peer"]),
+            args(&["--r77-only"]),
+            args(&[
+                "--star",
+                "--device",
+                "u1",
+                "--identity",
+                "sha1",
+                "--peer-device",
+                "u2",
+                "--android-peer",
+                "192.168.1.10:5555",
+                "--android-apk",
+                "app.apk",
+                "--r77-only",
+            ]),
             args(&[
                 "--star",
                 "--device",

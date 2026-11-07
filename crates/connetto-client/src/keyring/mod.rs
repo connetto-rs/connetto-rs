@@ -201,6 +201,31 @@ impl Keyring {
         }
     }
 
+    /// The refresh token stored under `name`, or `None` when none was stored.
+    /// With the gate off, a token only a gated launch stored is deleted
+    /// without a prompt and reads as `None`, which costs one sign-in.
+    pub(crate) async fn read_token(&self, name: &str) -> Result<Option<String>, ClientError> {
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
+        {
+            let name = name.to_owned();
+            gated::blocking(&self.service, move |gate| gate.read_token(&name)).await
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        )))]
+        {
+            self.read(name).await
+        }
+    }
+
     /// Persist `secret` under `name`, replacing any prior one.
     #[cfg_attr(
         not(any(

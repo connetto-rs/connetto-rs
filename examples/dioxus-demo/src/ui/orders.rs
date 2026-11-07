@@ -7,7 +7,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::{FaCartShopping, FaMinus, FaPlus};
 
-use super::{ClientSlot, UserId};
+use super::{ClientSlot, PaneInfo, UserId};
 
 /// The orders pane.
 #[component]
@@ -35,7 +35,7 @@ pub fn OrdersPane() -> Element {
     let remove_client = client.clone();
 
     rsx! {
-        div { class: "pane",
+        div { class: "pane toned tone-orders",
             h2 {
                 Icon { icon: FaCartShopping, width: 14, height: 14 }
                 {support::ORDERS_PANE_TITLE} " "
@@ -104,6 +104,7 @@ pub fn OrdersPane() -> Element {
                     }
                 }
             }
+            PaneInfo { text: support::ORDERS_INFO }
         }
     }
 }

@@ -760,8 +760,10 @@ pub async fn submit_login(tab: &mut PageSession, user: &str) -> Result<()> {
 }
 
 /// Sign the phone in as the user named and wait for it to connect and
-/// certify, leaving its app page open. The screenshots take the prefix
-/// `shot`, which the caller names after its own role in the run.
+/// certify, leaving its app page open. `unlock` answers the demo's unlock
+/// prompt, and is `None` for a build without the unlock gate. The screenshots
+/// take the prefix `shot`, which the caller names after its own role in the
+/// run.
 ///
 /// # Errors
 ///
@@ -772,7 +774,7 @@ pub async fn sign_in_phone(
     user: &str,
     issuer: &str,
     evidence: &Path,
-    unlock: Unlock<'_>,
+    unlock: Option<Unlock<'_>>,
     shot: &str,
 ) -> Result<PageSession> {
     crate::step(&format!("sign in on {}", phone.serial));
@@ -784,9 +786,11 @@ pub async fn sign_in_phone(
         .await?;
     submit_login(&mut tab, user).await?;
     drop(tab);
-    unlock
-        .approve(phone, evidence, &format!("{shot}-launch-unlock"))
-        .await?;
+    if let Some(unlock) = unlock {
+        unlock
+            .approve(phone, evidence, &format!("{shot}-launch-unlock"))
+            .await?;
+    }
     let mut app = phone.app().await?;
     // The status line can carry a non-fatal message, such as the retirement
     // of the writer a cleared app left behind, so the banner stands for the

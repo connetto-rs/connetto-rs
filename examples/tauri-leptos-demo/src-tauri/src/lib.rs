@@ -16,8 +16,8 @@ use std::time::Duration;
 use connetto_client::teardown::{ForgetError, ForgetRefusal};
 use connetto_client::{
     AccountChoice, AccountChooser, Auth, ClientError, ClientEvent, ConnettoClient, ExportScope,
-    KeyringAuth, LiveHandle as _, Moment, NativeAuthenticator, NativeClient, NativeTransport,
-    SystemClock, dsl::Watchable as _,
+    KeyringAuth, LiveHandle as _, LiveQuery, Moment, NativeAuthenticator, NativeClient,
+    NativeTransport, SystemClock, dsl::Watchable as _,
 };
 use connetto_demo_support as support;
 use connetto_file_client::FileId;
@@ -44,7 +44,15 @@ const DEFAULT_WS: &str = "ws://127.0.0.1:7777/sync";
 const DEFAULT_AUTH_ORIGIN: &str = "http://127.0.0.1:7777";
 const DEFAULT_PG: &str = "postgres://postgres:postgres@127.0.0.1:55456/postgres";
 const AUTH_PROVIDER: &str = "dev-idp";
-const KEYRING_SERVICE: &str = "connetto-tauri-demo";
+/// The keyring service the demo stores its secrets under, a separate name in
+/// an unattended build so a replica key or refresh token a gated earlier run
+/// left in the keychain, which survives a reinstall, cannot meet the
+/// unattended build and prompt.
+const KEYRING_SERVICE: &str = if cfg!(feature = "unattended") {
+    "connetto-tauri-demo-unattended"
+} else {
+    "connetto-tauri-demo"
+};
 /// The login redirect, whose scheme is the Android applicationId and the
 /// iOS bundle identifier.
 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -269,8 +277,23 @@ async fn serve(app: &AppHandle, core: &Arc<Core>, action: Action) -> Result<(), 
         | Action::JoinHotspot { .. }
         | Action::JoinPayload { .. }
         | Action::JoinNearby
-        | Action::LeaveHotspot => {
+        | Action::LeaveHotspot
+        | Action::SetPeerLinks { .. } => {
             serve_nearby(app, core, action).await;
+            Ok(())
+        }
+        Action::PickTeam { team } => {
+            core.update(app, |v| {
+                if let Some(view) = v.team.as_mut() {
+                    view.picked = team;
+                }
+            });
+            Ok(())
+        }
+        Action::AddTeamNote { body } => add_team_note(app, core, body).await,
+        Action::TidyTeam => {
+            #[cfg(feature = "peer")]
+            tidy_team(app, core).await;
             Ok(())
         }
     }
@@ -293,8 +316,25 @@ async fn serve_nearby(app: &AppHandle, core: &Arc<Core>, action: Action) {
         Action::JoinPayload { payload } => join_payload(app, core, payload).await,
         Action::JoinNearby => join_nearby(app, core).await,
         Action::LeaveHotspot => leave_hotspot(app, core).await,
+        Action::SetPeerLinks { on } => set_peer_links(app, core, on),
         _ => {}
     }
+}
+
+/// Switch every nearby link on or off for the running app, the panel's line
+/// following the client's standing.
+#[cfg(feature = "peer")]
+fn set_peer_links(app: &AppHandle, core: &Arc<Core>, on: bool) {
+    let Some(session) = core.session() else {
+        return;
+    };
+    session.native.set_peer_links(on);
+    let off = !session.native.peer_links_on();
+    core.update(app, |v| {
+        if let Some(panel) = v.nearby.as_mut() {
+            panel.links_off = off;
+        }
+    });
 }
 
 /// The nearby panel's actions in a build without the peer link, which the
@@ -618,6 +658,87 @@ async fn free_up_space(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandE
     Ok(())
 }
 
+/// Write one note into the picked team, answering with the line the panel's
+/// outcome shows.
+async fn add_team_note(
+    app: &AppHandle,
+    core: &Arc<Core>,
+    body: String,
+) -> Result<(), CommandError> {
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let client = session.native.client().clone();
+    let team = core
+        .view
+        .lock()
+        .team
+        .as_ref()
+        .map(|team| team.picked.clone())
+        .unwrap_or_default();
+    let author = user_id(&session);
+    let body = body.trim().to_owned();
+    if body.is_empty() {
+        core.update(app, |v| {
+            if let Some(team) = v.team.as_mut() {
+                team.outcome = "the note needs some text".to_owned();
+            }
+        });
+        return Ok(());
+    }
+    match support::add_team_note(&client, &team, &author, &body).await {
+        Ok(_) => core.update(app, |v| {
+            if let Some(team) = v.team.as_mut() {
+                team.outcome = "note added".to_owned();
+            }
+        }),
+        Err(err) => core.update(app, |v| {
+            if let Some(team) = v.team.as_mut() {
+                team.outcome = format!("note add failed: {err}");
+            }
+        }),
+    }
+    Ok(())
+}
+
+/// Run the eviction pass the tidy control offers, which spares provisional
+/// rows, and tell the panel how many remain.
+#[cfg(feature = "peer")]
+async fn tidy_team(app: &AppHandle, core: &Arc<Core>) {
+    let Some(session) = core.session() else {
+        return;
+    };
+    let client = session.native.client().clone();
+    match client.tidy().await {
+        Ok(()) => {
+            let remaining = client
+                .provisional_rows()
+                .await
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|row| {
+                            row.state == connetto_client::provisional::ProvisionalState::Provisional
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
+            core.update(app, |v| {
+                if let Some(team) = v.team.as_mut() {
+                    append_team_events(&mut team.events, vec![support::tidy_line(remaining)]);
+                }
+            });
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "the tidy pass failed");
+            core.update(app, |v| {
+                if let Some(team) = v.team.as_mut() {
+                    append_team_events(
+                        &mut team.events,
+                        vec![format!("tidy: the pass failed: {err}")],
+                    );
+                }
+            });
+        }
+    }
+}
 /// Ask the platform for the permission a host or join named as missing, on
 /// the platform's main thread, where the prompt wants to be asked from.
 #[cfg(feature = "peer")]
@@ -1184,6 +1305,11 @@ async fn setup(
         // with no gate never locks.
         v.offers_unlock = false;
         v.backend_writer = true;
+        v.team = Some(support::view::TeamView {
+            outcome: "idle".to_owned(),
+            peer: cfg!(feature = "peer"),
+            ..Default::default()
+        });
         #[cfg(feature = "peer")]
         {
             v.nearby = Some(nearby);
@@ -1224,6 +1350,7 @@ async fn setup(
             Arc::clone(&holds),
         ));
         tasks.spawn(feed_device(app.clone(), Arc::clone(&core), parts.clone()));
+        tasks.spawn(feed_team(app.clone(), Arc::clone(&core), client.clone()));
         #[cfg(feature = "peer")]
         tasks.spawn(feed_nearby(app.clone(), Arc::clone(&core), parts.clone()));
         #[cfg(feature = "peer")]
@@ -1231,6 +1358,12 @@ async fn setup(
             app.clone(),
             Arc::clone(&core),
             parts.clone(),
+            client.clone(),
+        ));
+        #[cfg(feature = "peer")]
+        tasks.spawn(feed_team_events(
+            app.clone(),
+            Arc::clone(&core),
             client.clone(),
         ));
         tasks.spawn(feed_content(
@@ -1617,6 +1750,179 @@ async fn feed_peer_events(
     }
 }
 
+/// The team roster and the picked team's notes, whose peer rows re-read their
+/// provenance every second, since the provenance moves without a row change.
+async fn feed_team(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>) {
+    let mut roster = match support::teams_of_account::<Ws>().live(&client).await {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(error = %err, "the team roster subscription stopped");
+            core.update(&app, |v| {
+                if let Some(team) = v.team.as_mut() {
+                    team.error = Some(err.to_string());
+                }
+            });
+            return;
+        }
+    };
+    let mut last: Vec<String> = Vec::new();
+    let mut notes: Option<LiveQuery<support::TeamNote>> = None;
+    let mut members: Option<LiveQuery<String>> = None;
+    let mut subscribed: Option<String> = None;
+    loop {
+        let rows = roster.snapshot();
+        if rows != last {
+            last = rows.clone();
+            core.update(&app, |v| {
+                if let Some(team) = v.team.as_mut() {
+                    team.set_teams(rows);
+                }
+            });
+        }
+        let picked = core
+            .view
+            .lock()
+            .team
+            .as_ref()
+            .map(|team| team.picked.clone())
+            .unwrap_or_default();
+        if subscribed.as_deref() != Some(picked.as_str()) {
+            core.update(&app, |v| {
+                if let Some(team) = v.team.as_mut() {
+                    team.notes.clear();
+                    team.members.clear();
+                    team.error = None;
+                }
+            });
+            notes = None;
+            members = None;
+            if picked.is_empty() {
+                subscribed = None;
+            } else {
+                subscribed = Some(picked.clone());
+                match support::team_members_of::<Ws>(picked.clone())
+                    .live(&client)
+                    .await
+                {
+                    Ok(handle) => members = Some(handle),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "the team members subscription stopped");
+                        core.update(&app, |v| {
+                            if let Some(team) = v.team.as_mut() {
+                                team.error = Some(err.to_string());
+                            }
+                        });
+                    }
+                }
+                match support::team_notes_for::<Ws>(picked).live(&client).await {
+                    Ok(handle) => notes = Some(handle),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "the team notes subscription stopped");
+                        core.update(&app, |v| {
+                            if let Some(team) = v.team.as_mut() {
+                                team.error = Some(err.to_string());
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(notes) = &mut notes {
+            let rows: Vec<support::TeamNote> = notes.snapshot().to_vec();
+            let mut lines = Vec::with_capacity(rows.len());
+            for row in &rows {
+                #[cfg(feature = "peer")]
+                let account: Option<String> = {
+                    let key = vec![connetto_client::KeyValue::Blob(row.id.as_bytes().to_vec())];
+                    client
+                        .provenance("team_notes", &key)
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|record| {
+                            record.state
+                                == connetto_client::provisional::ProvisionalState::Provisional
+                        })
+                        .map(|record| record.account)
+                };
+                #[cfg(not(feature = "peer"))]
+                let account: Option<String> = None;
+                lines.push(support::team_note_line(row, account.as_deref()));
+            }
+            let member_rows: Vec<String> = members
+                .as_ref()
+                .map(|handle| handle.snapshot().to_vec())
+                .unwrap_or_default();
+            core.update(&app, |v| {
+                if let Some(team) = v.team.as_mut() {
+                    team.notes = lines;
+                    team.members = member_rows;
+                }
+            });
+            let members_changed = async {
+                match members.as_mut() {
+                    Some(handle) => handle.changed().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                changed = notes.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                changed = members_changed => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        } else {
+            tokio::select! {
+                changed = roster.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    }
+}
+
+/// The provisional events drive the team panel's activity lines, which keep
+/// the newest [`MAX_TEAM_EVENT_LINES`].
+#[cfg(feature = "peer")]
+async fn feed_team_events(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>) {
+    let mut events = client.events();
+    while let Ok(event) = events.recv().await {
+        let added = support::provisional_event_lines(&event);
+        if added.is_empty() {
+            continue;
+        }
+        core.update(&app, |v| {
+            if let Some(team) = v.team.as_mut() {
+                append_team_events(&mut team.events, added);
+            }
+        });
+    }
+}
+
+/// The event lines the team panel keeps, newest last.
+#[cfg(feature = "peer")]
+const MAX_TEAM_EVENT_LINES: usize = 40;
+
+/// Append the lines to the team panel's standing, keeping the newest
+/// [`MAX_TEAM_EVENT_LINES`].
+#[cfg(feature = "peer")]
+fn append_team_events(events: &mut Vec<String>, added: Vec<String>) {
+    events.extend(added);
+    let excess = events.len().saturating_sub(MAX_TEAM_EVENT_LINES);
+    if excess > 0 {
+        events.drain(..excess);
+    }
+}
 /// The content events drive the content line, the refused uploads and the
 /// lost files.
 async fn feed_content(app: AppHandle, core: Arc<Core>, content: Content) {

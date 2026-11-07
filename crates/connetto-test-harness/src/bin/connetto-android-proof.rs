@@ -933,8 +933,15 @@ async fn run_peer_proof(
         }
     }
 
-    let mut peer_app =
-        sign_in_phone(joiner, PEER_USER, &stack.issuer, evidence, *unlock, "peer").await?;
+    let mut peer_app = sign_in_phone(
+        joiner,
+        PEER_USER,
+        &stack.issuer,
+        evidence,
+        Some(*unlock),
+        "peer",
+    )
+    .await?;
     let mut app = host.app().await?;
     app.wait_for_text("device: certified until", Duration::from_secs(60))
         .await?;

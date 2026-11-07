@@ -637,6 +637,7 @@ dependencies = [
  "connetto-web",
  "diesel",
  "futures-channel",
+ "futures-lite",
  "js-sys",
  "leptos",
  "rosetta-uuid",

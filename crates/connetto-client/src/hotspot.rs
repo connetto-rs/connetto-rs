@@ -292,6 +292,9 @@ enum JoinState {
     },
     /// Joined, with the gateway's dial standing beside it.
     Joined {
+        /// The address the dials reach, known while joined and the offer's
+        /// port stands, and what a coming back dials at once (R77 slice 8).
+        dial_address: Option<SocketAddr>,
         /// The dial's standing, absent without autolink or a port, and
         /// dropped once a link stands or the redial gives up.
         dial: Option<DialPlan>,
@@ -368,6 +371,13 @@ pub(crate) enum Command {
     },
     /// Leave the joined network.
     Leave,
+    /// The device's peer links came to stand `on`, off dialing nothing of
+    /// the joined gateway and on dialing it at once while it stays joined
+    /// (R77 slice 8).
+    Links {
+        /// The standing the links came to.
+        on: bool,
+    },
 }
 
 /// Bind the dials' sockets to a joined subnet, or stop binding (R76).
@@ -377,6 +387,9 @@ pub(crate) type SubnetBind = Arc<dyn Fn(Option<(Ipv4Addr, u8)>) + Send + Sync>;
 pub(crate) struct Machine {
     pub(crate) backend: Arc<dyn HotspotBackend>,
     autolink: bool,
+    /// The device's peer links standing, off dialing nothing of the joined
+    /// gateway and raising no unreached for it (R77 slice 8).
+    links_on: bool,
     /// The peer port the device serves, from its listener's standing.
     peer_port: Arc<dyn Fn() -> Option<u16> + Send + Sync>,
     /// Bind the dials' sockets to `subnet`, or stop binding with `None`.
@@ -403,6 +416,7 @@ impl Machine {
         Self {
             backend,
             autolink,
+            links_on: true,
             peer_port,
             bind,
             dial,
@@ -517,6 +531,40 @@ impl Machine {
                     (self.bind)(None);
                 }
             },
+            Command::Links { on } => self.set_links(on),
+        }
+    }
+
+    /// The links' standing came to `on`. The off standing ends the
+    /// in-flight dial and the redial wait, so neither runs its bound, and the
+    /// coming back dials the joined gateway at once while it stays joined.
+    fn set_links(&mut self, on: bool) {
+        self.links_on = on;
+        if !on {
+            if let JoinState::Joined {
+                dial: Some(plan), ..
+            } = &mut self.join
+            {
+                plan.in_flight = None;
+                plan.next = None;
+            }
+            return;
+        }
+        let address = match &self.join {
+            JoinState::Joined { dial, dial_address } => match dial {
+                Some(plan) if plan.in_flight.is_none() && plan.next.is_none() => Some(plan.address),
+                None => *dial_address,
+                Some(_) => None,
+            },
+            _ => None,
+        };
+        if self.autolink
+            && let Some(address) = address
+        {
+            let dial = self.start_dial(address);
+            if let JoinState::Joined { dial: slot, .. } = &mut self.join {
+                *slot = Some(dial);
+            }
         }
     }
 
@@ -602,14 +650,15 @@ impl Machine {
                         unreachable!("the join side left Requesting between the look and the take");
                     };
                     (self.bind)(Some((address, prefix)));
-                    let dial = if self.autolink {
-                        offer
-                            .port
-                            .map(|port| self.start_dial(SocketAddr::new(gateway, port)))
+                    // The dial's standing, beside the address a coming back
+                    // dials, absent without autolink or a port.
+                    let dial_address = offer.port.map(|port| SocketAddr::new(gateway, port));
+                    let dial = if self.autolink && self.links_on {
+                        dial_address.map(|address| self.start_dial(address))
                     } else {
                         None
                     };
-                    self.join = JoinState::Joined { dial };
+                    self.join = JoinState::Joined { dial_address, dial };
                     let _ = reply.send(Ok(gateway));
                 }
                 JoinStatus::Unavailable | JoinStatus::Lost => {
@@ -643,11 +692,16 @@ impl Machine {
             (self.emit)(ClientEvent::HotspotLeft);
         }
 
-        // The gateway's dial standing, after the rows that end the join.
+        // The gateway's dial standing, after the rows that end the join,
+        // the off standing dialing nothing and running no bound.
         let mut ended = false;
         let mut unreached = false;
         let mut blocked = false;
-        if let JoinState::Joined { dial: Some(plan) } = &mut self.join {
+        if let JoinState::Joined {
+            dial: Some(plan), ..
+        } = &mut self.join
+            && self.links_on
+        {
             let now = tokio::time::Instant::now();
             let mut linked = false;
             if let Some(mut in_flight) = plan.in_flight.take() {
@@ -677,8 +731,8 @@ impl Machine {
                 plan.next = None;
             }
         }
-        if ended {
-            self.join = JoinState::Joined { dial: None };
+        if ended && let JoinState::Joined { dial, .. } = &mut self.join {
+            *dial = None;
             if unreached {
                 (self.emit)(ClientEvent::JoinedHostUnreached);
             }
@@ -1354,6 +1408,97 @@ mod tests {
         assert_eq!(
             h.events.lock().as_slice(),
             &[ClientEvent::JoinedHostUnreached]
+        );
+    }
+
+    /// The off standing joins the Wi-Fi and dials nothing, and the coming
+    /// back dials the joined gateway at once (R77 slice 8).
+    #[test]
+    fn the_off_standing_joins_without_dialing_and_dials_at_the_resume() {
+        let mut h = Harness::new(true);
+        h.machine.handle(Command::Links { on: false });
+        h.joined();
+        assert_eq!(
+            h.dials.lock().as_slice(),
+            &[] as &[SocketAddr],
+            "the off standing joins and dials nothing"
+        );
+        h.machine.handle(Command::Links { on: true });
+        assert_eq!(
+            h.dials.lock().len(),
+            1,
+            "the coming back dials the joined gateway at once"
+        );
+    }
+
+    /// The off standing runs no redial and no bound of the joined dial, and
+    /// the coming back stands a fresh dial (R77 slice 8).
+    #[tokio::test]
+    async fn the_off_standing_runs_no_redial_and_no_bound() {
+        tokio::time::pause();
+        let mut h = Harness::new(true);
+        h.joined();
+        // The dial fails and the redial wait stands.
+        h.dial.finish(false);
+        h.machine.tick();
+        h.machine.handle(Command::Links { on: false });
+        tokio::time::advance(DIAL_BOUND * 2).await;
+        h.machine.tick();
+        assert_eq!(
+            h.dials.lock().len(),
+            1,
+            "no redial runs while the standing is off"
+        );
+        assert!(
+            h.events.lock().is_empty(),
+            "no bound runs while the standing is off"
+        );
+        h.machine.handle(Command::Links { on: true });
+        assert_eq!(
+            h.dials.lock().len(),
+            2,
+            "the coming back stands a fresh dial"
+        );
+    }
+
+    /// A links standing already on starts no second dial beside the joined
+    /// one in flight (R77 slice 8).
+    #[test]
+    fn links_on_again_leaves_the_running_dial_alone() {
+        let mut h = Harness::new(true);
+        h.joined();
+        assert_eq!(h.dials.lock().len(), 1, "the join dials its gateway");
+        h.machine.handle(Command::Links { on: true });
+        assert_eq!(
+            h.dials.lock().len(),
+            1,
+            "the dial in flight stays the only one"
+        );
+    }
+
+    /// Links turned off and on before any join dial nothing, and the later
+    /// join dials its gateway as it would have (R77 slice 8).
+    #[test]
+    fn links_before_a_join_dial_nothing_until_the_join() {
+        let mut h = Harness::new(true);
+        h.machine.handle(Command::Links { on: false });
+        h.machine.handle(Command::Links { on: true });
+        assert!(h.dials.lock().is_empty(), "nothing is joined to dial");
+        h.joined();
+        assert_eq!(h.dials.lock().len(), 1, "the join dials its gateway");
+    }
+
+    /// With the autolink off, links coming back dial nothing, the joined
+    /// gateway waiting for the app to link it (R77 slice 8).
+    #[test]
+    fn links_coming_back_without_autolink_dial_nothing() {
+        let mut h = Harness::new(false);
+        h.machine.handle(Command::Links { on: false });
+        h.joined();
+        h.machine.handle(Command::Links { on: true });
+        assert!(
+            h.dials.lock().is_empty(),
+            "the autolink off leaves the gateway undialed"
         );
     }
 

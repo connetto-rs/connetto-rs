@@ -1892,6 +1892,30 @@ where
             device.set_bluetooth_prompt(prompt);
         }
     }
+
+    /// The peer link's standing, at run time (R77 slice 8). Off means no
+    /// peer link of any kind, every path refusing, and off closes every live
+    /// link with the existing `Closed` frame. On again, every found
+    /// peer dials at once and a joined hotspot whose gateway and port are
+    /// known starts its dial. The standing lasts for the running client,
+    /// every start beginning with links on. A no-op for a build without a
+    /// device identity.
+    #[cfg(feature = "peer")]
+    pub fn set_peer_links(&self, on: bool) {
+        if let Some(device) = &self.device {
+            device.set_peer_links(on);
+        }
+    }
+
+    /// Whether the peer link's standing is on, at run time (R77 slice 8),
+    /// always on for a build without a device identity.
+    #[cfg(feature = "peer")]
+    pub fn peer_links_on(&self) -> bool {
+        match &self.device {
+            Some(device) => device.peer_links_on(),
+            None => true,
+        }
+    }
 }
 
 #[cfg(feature = "native-auth")]
@@ -2595,6 +2619,15 @@ mod tests {
         client.set_hotspot_scan(true);
         client.set_hotspot_autojoin(true);
         client.set_bluetooth_prompt(false);
+        assert!(
+            client.peer_links_on(),
+            "a build without a device identity stands its links on"
+        );
+        client.set_peer_links(false);
+        assert!(
+            client.peer_links_on(),
+            "turning links off is a no-op without a device identity"
+        );
 
         client.close().await;
     }
@@ -2652,6 +2685,9 @@ mod tests {
                         }
                         Some(crate::hotspot::Command::Leave) => {
                             let _ = note_tx.send("leave").await;
+                        }
+                        Some(crate::hotspot::Command::Links { on }) => {
+                            let _ = note_tx.send(if on { "links true" } else { "links false" }).await;
                         }
                         None => break,
                     },
@@ -2839,10 +2875,20 @@ mod tests {
         client.set_hotspot_scan(true);
         client.set_hotspot_autojoin(false);
         client.set_bluetooth_prompt(true);
+        assert!(client.peer_links_on(), "every start begins with links on");
+        client.set_peer_links(false);
+        assert!(
+            !client.peer_links_on(),
+            "the off standing holds once the call returns"
+        );
+        // A standing already held reaches no machine.
+        client.set_peer_links(false);
+        client.set_peer_links(true);
+        assert!(client.peer_links_on(), "the links stand on again");
         // The standings reach their machines, from the two machines' channels,
         // so the order the notes come back in is not the order sent.
         let mut noted: Vec<&str> = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..7 {
             let got = tokio::time::timeout(Duration::from_secs(10), note_rx.recv())
                 .await
                 .expect("the machine notes the standing within its bound")
@@ -2855,11 +2901,19 @@ mod tests {
             [
                 "autojoin false",
                 "leave",
+                "links false",
+                "links true",
                 "prompt true",
                 "scan true",
                 "stop"
             ],
             "each standing reaches its machine"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), note_rx.recv())
+                .await
+                .is_err(),
+            "the repeated off standing reaches no machine"
         );
 
         // A certificate-less device refuses the peer's calls by its standing.

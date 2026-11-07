@@ -53,14 +53,17 @@ connetto-peer-apple = { path = "../../../crates/connetto-peer-apple", optional =
 # Enrols this device under the deployment root `CONNETTO_DEMO_BUILD_DEVICE_ROOT`
 # names at build time, as the dioxus demo's feature does.
 device-identity = ["connetto-client/device-identity", "connetto-demo-support/device-identity"]
-# The peer link and the hotspot it hosts and joins (R76), and the nearby panel
-# the core serves.
+# The peer link and the hotspot it hosts and joins (R76), with the team
+# notes' provenance lines (R77), and the nearby panel the core serves.
 peer = [
   "connetto-client/peer",
   "connetto-demo-support/peer",
   "dep:connetto-peer-apple",
   "dep:connetto-peer-android",
 ]
+# The build the unattended proof runs drive, its gate off and its secrets
+# under their own keyring service.
+unattended = ["connetto-demo-support/unattended"]
 
 [build-dependencies]
 tauri-build = { version = "2.7", features = [] }

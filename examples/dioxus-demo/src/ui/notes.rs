@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::{FaFloppyDisk, FaNoteSticky};
 
-use super::ClientSlot;
+use super::{ClientSlot, PaneInfo};
 
 /// The notes pane.
 #[component]
@@ -28,7 +28,7 @@ pub fn NotesPane() -> Element {
     };
 
     rsx! {
-        div { class: "pane",
+        div { class: "pane toned tone-notes",
             h2 {
                 Icon { icon: FaNoteSticky, width: 14, height: 14 }
                 {support::NOTES_PANE_TITLE} " "
@@ -77,6 +77,7 @@ pub fn NotesPane() -> Element {
                     }
                 }
             }
+            PaneInfo { text: support::NOTES_INFO }
         }
     }
 }

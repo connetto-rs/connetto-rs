@@ -180,6 +180,10 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
     let nearby_joined = joined;
     let leave_joined = joined;
     let leave_vpn_blocked = vpn_blocked;
+    // The runtime peer-link switch's standing, read back from the client
+    // after each switch.
+    let links_parts = parts.clone();
+    let mut links_off: Signal<bool> = use_signal(|| false);
 
     let certificate = parts.0.native.device_certificate();
     let peer_line = nearby::peer_line(
@@ -218,6 +222,7 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
                 p { {peer_line} }
                 p { {bluetooth_line()} }
                 p { {beacon_line()} }
+                p { {connetto_demo_support::view::links_line(links_off())} }
                 for line in peers.iter().cloned() {
                     p { {line} }
                 }
@@ -268,6 +273,18 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
                             },
                             Icon { icon: FaPowerOff, width: 14, height: 14 }
                             "Turn on Bluetooth"
+                        }
+                    }
+                    button {
+                        onclick: move |_| {
+                            links_parts.0.native.set_peer_links(links_off());
+                            links_off.set(!links_parts.0.native.peer_links_on());
+                        },
+                        Icon { icon: FaSatelliteDish, width: 14, height: 14 }
+                        if links_off() {
+                            "Resume nearby links"
+                        } else {
+                            "Pause nearby links"
                         }
                     }
                 }
