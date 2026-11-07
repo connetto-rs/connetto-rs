@@ -430,6 +430,15 @@ where
             }
         }
         let _writing = self.content_writes.lock().await;
+        // A retention pass may have evicted the file while this read waited on
+        // the lock, so the manifest is read again under it.
+        let Some(manifest) = self
+            .client
+            .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
+            .await??
+        else {
+            return Ok(None);
+        };
         let outboard = outboard_of(&manifest, &store)
             .await
             .map_err(|err| ContentError::Store(err.to_string()))?;
@@ -1339,6 +1348,61 @@ mod tests {
         assert!(
             matches!(event, ContentEvent::UploadDeferred { file_id: f, .. } if f == file_id),
             "the driver must attempt the cleared entry and emit UploadDeferred, got {event:?}"
+        );
+    }
+
+    /// An outboard read that loaded the manifest before a retention pass
+    /// evicted the file answers `None` once the pass releases the content
+    /// lock, rather than hashing the chunks the pass removed.
+    #[tokio::test]
+    async fn an_outboard_read_overtaken_by_the_retention_pass_finds_the_file_gone() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = FsStore::new(dir.path().join("chunks"));
+        let connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
+        let (client, pump) = ConnettoClient::with_pump(connection);
+        tokio::spawn(pump);
+        let content = Arc::new(
+            ContentClient::attach(client, store.clone(), [1; 32], ReqwestHttp::default())
+                .await
+                .expect("content attaches"),
+        );
+        let encrypted = EncryptingStore::new(store, &[1u8; 32]);
+        let manifest = process_file(
+            &vec![7u8; 3 * 1024 * 1024 + 17],
+            MimeClass::Jpeg,
+            &encrypted,
+        )
+        .await
+        .expect("the bytes chunk");
+        let file_id = manifest.file_id();
+        content
+            .client
+            .with_conn(|conn| db::put_manifest(conn.conn(), &manifest))
+            .await
+            .expect("gate not locked")
+            .expect("record the manifest");
+
+        // The pass holds the content lock while the read starts, so the read
+        // loads the manifest and then waits on the lock.
+        let pass = content.content_writes.lock().await;
+        let reader = content.clone();
+        let read = tokio::spawn(async move { reader.outboard(file_id).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        content
+            .client
+            .with_conn(move |conn| db::drop_manifest(conn.conn(), file_id))
+            .await
+            .expect("gate not locked")
+            .expect("evict the manifest");
+        std::fs::remove_dir_all(dir.path().join("chunks")).expect("remove the chunks");
+        drop(pass);
+
+        assert_eq!(
+            read.await
+                .expect("the read task")
+                .expect("the read answers"),
+            None,
+            "the evicted file has no outboard"
         );
     }
 }

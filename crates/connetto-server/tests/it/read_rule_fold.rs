@@ -162,6 +162,7 @@ async fn connected_clients(
             PG_DDL,
             POLICIES,
             DEFAULT_USER_SETTING,
+            true,
         )
         .expect("the policy translates");
     let (_, translator, _) = translated.into_parts();

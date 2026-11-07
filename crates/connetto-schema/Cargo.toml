@@ -22,7 +22,7 @@ pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main",
 # Applies the translated DDL to a throwaway database so a bad translation fails the build.
 diesel = { workspace = true, features = ["returning_clauses_for_sqlite_3_35"] }
 # View names and policy reads are read off the AST, resolved by the root patch blocks.
-sqlparser = { version = "0.63", default-features = false, features = ["visitor"] }
+sqlparser = { version = "0.64", default-features = false, features = ["visitor"] }
 thiserror.workspace = true
 # The boundary declaration files a tier history ships beside its exports.
 toml = "0.8"

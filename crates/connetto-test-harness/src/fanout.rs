@@ -831,9 +831,10 @@ async fn provision_with(
     let borrowed: Vec<&str> = statements.iter().map(String::as_str).collect();
     fixture.setup(&borrowed).await;
     let reader_pool = pool_for(&with_user(fixture.admin_url(), READER, READER)).await;
-    // The model's catalog carries the registry tables, so every catalog this
-    // server builds reads the same composed text and numbers the tables alike.
-    let engine_ddl = connetto_schema::with_registry::<connetto_core::bots::TextIds>(shape.ddl());
+    // The model's catalog carries the registry and bookkeeping tables, so
+    // every catalog this server builds reads the same composed text and
+    // numbers the tables alike (R77 decision 11).
+    let engine_ddl = crate::engine_ddl(shape.ddl());
     let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &engine_ddl)
         .expect("snapshot source")
         .with_publication(PUBLICATION);
@@ -849,7 +850,7 @@ async fn provision_with(
     // The binary always carries the deployment's caller pairing, so a fixture
     // that names none gets the canonical one.
     let caller = caller.unwrap_or_else(caller_mapping);
-    let config = ServerConfig::new(engine_ddl.clone(), fixture.admin_url())
+    let config = ServerConfig::new(shape.ddl(), fixture.admin_url())
         .with_policies(shape.policies())
         .with_writable(
             RuntimeWritableCatalog::builder()
@@ -893,6 +894,7 @@ async fn fga_auth(
         shape.ddl(),
         shape.policies(),
         connetto_core::auth::DEFAULT_USER_SETTING,
+        true,
     )
     .expect("the fixture's policy is one rls2fga classifies");
     let mut setup = OpenFgaServiceClient::new(channel.clone());

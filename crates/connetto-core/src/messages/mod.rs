@@ -56,8 +56,8 @@ pub use storage::{
     SharedStoreUse, StorageUse, StoreBytes, TabStorageAnswer, TabStorageOutcome, TabStorageUse,
 };
 pub use subscription::{
-    BindValue, MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority,
-    SubscriptionSpec, Unsubscribe,
+    BindValue, MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionSpec,
+    Unsubscribe,
 };
 pub use writer::{
     BindDevice, Provenance, RetireWriter, WRITER_BIND_DOMAIN, WriterAnswer, WriterGrant,

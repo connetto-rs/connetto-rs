@@ -6,7 +6,7 @@ use connetto_client::{
 use connetto_core::Cursor;
 use connetto_core::messages::{
     ControlMessage, FullResyncReason, FullResyncRequired, MutationReject, MutationRejectReason,
-    SnapshotBegin, SnapshotEnd, SubscriptionPriority,
+    SnapshotBegin, SnapshotEnd,
 };
 use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::IncomingFrame;
@@ -239,7 +239,6 @@ async fn a_queued_public_write_is_reapplied_to_the_shared_store_after_a_full_res
             })),
             IncomingFrame::Control(ControlMessage::SnapshotBegin(SnapshotBegin {
                 sub_id: sub.clone(),
-                priority: SubscriptionPriority::default(),
             })),
             IncomingFrame::Control(ControlMessage::SnapshotEnd(SnapshotEnd {
                 sub_id: sub.clone(),

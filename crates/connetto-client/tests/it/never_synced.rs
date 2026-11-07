@@ -219,7 +219,6 @@ async fn an_empty_first_sync_still_counts_as_having_synced() {
     script.say(IncomingFrame::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
             sub_id: query.sub_id().to_owned(),
-            priority: connetto_core::messages::SubscriptionPriority::default(),
         },
     )));
     script.say(IncomingFrame::Control(ControlMessage::SnapshotEnd(

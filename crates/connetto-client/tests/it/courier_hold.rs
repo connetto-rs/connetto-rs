@@ -12,7 +12,7 @@ use connetto_core::Major;
 use connetto_core::exchange::{ManifestRow, RetractCause, Retraction};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, SnapshotBegin, SnapshotEnd,
-    SnapshotPatch, SubscriptionPriority,
+    SnapshotPatch,
 };
 use connetto_core::traits::IncomingFrame;
 use diesel::connection::SimpleConnection as _;
@@ -370,7 +370,6 @@ async fn deliver_empty_snapshot(
     server.say(IncomingFrame::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
             sub_id: "a".to_owned(),
-            priority: SubscriptionPriority::default(),
         },
     )));
     // An empty replacement, so whatever comes back is the re-apply's.

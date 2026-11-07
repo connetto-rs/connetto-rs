@@ -13,8 +13,8 @@ use connetto_core::SessionId;
 use connetto_core::messages::{ControlMessage, FatalErrorReason, MutationRejectReason};
 use connetto_server::{PgSnapshotSource, RuntimeWritableCatalog};
 use connetto_test_harness::{
-    Fixture, HarnessAuth, RosterAuth, Server, ServerConfig, WITHHELD_ID, insert_changeset,
-    number_writer, spawn_server,
+    Fixture, HarnessAuth, RosterAuth, Server, ServerConfig, WITHHELD_ID, engine_ddl,
+    insert_changeset, number_writer, spawn_server,
 };
 use sqlite_diff_rs::Value;
 
@@ -30,8 +30,10 @@ async fn serve(fixture: &Fixture) -> Server {
             "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
         ])
         .await;
-    let snapshot =
-        PgSnapshotSource::from_ddl(fixture.admin().clone(), PG_DDL).expect("snapshot source");
+    // The one catalog the server parts read, the way the harness appends it
+    // inside `spawn_server` (R77 decision 11).
+    let snapshot = PgSnapshotSource::from_ddl(fixture.admin().clone(), &engine_ddl(PG_DDL))
+        .expect("snapshot source");
     spawn_server(
         ServerConfig::new(PG_DDL, fixture.admin_url())
             .with_writable(

@@ -19,8 +19,8 @@ use connetto_core::{PROTOCOL_VERSION, Principal, Subject};
 use connetto_server::{
     AuthConfig, AuthService, CookieSameSite, GenericOidcProvider, InMemoryAuthStore,
     ManagerBuilder, Materializer, NoConnector, PageSpec, ProviderRegistry, RedirectPolicy,
-    RequestGuard, ResolvedIdentity, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
-    TokenAuthority, auth_router, loopback, pg_write_target,
+    RefreshLifetimes, RequestGuard, ResolvedIdentity, SessionManager, SnapshotEstimate,
+    SnapshotPage, SnapshotSource, TokenAuthority, auth_router, loopback, pg_write_target,
 };
 use connetto_test_harness::{
     ConnettoDefaults, Fixture, MOCK_OAUTH_PROVIDER, MockOauth, RosterAuth, WITHHELD_ID,
@@ -443,6 +443,40 @@ async fn refresh_rotates_and_reusing_the_old_token_revokes_the_session() {
         .check_grant(&Grant::new(&rotated.access_token))
         .await;
     assert_eq!(refused, Err(GrantRefused::Revoked));
+}
+
+/// A session past its idle window is refused at the handshake while its
+/// access token still verifies, as a refresh of it would be.
+#[tokio::test]
+async fn a_session_past_its_idle_window_is_refused_at_the_handshake() {
+    let config = AuthConfig::default();
+    let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
+    let idle = Duration::from_millis(50);
+    let store = Arc::new(InMemoryAuthStore::new(RefreshLifetimes::new(
+        idle,
+        Duration::from_secs(3600),
+    )));
+    let svc = AuthService::new(authority, store, Arc::new(RequestGuard::default()));
+    let pair = svc.login(&identity("dana"), origin()).await.expect("login");
+    let handshake: &dyn connetto_core::traits::HandshakeAuthority = &svc.handshake_authority();
+    assert!(
+        handshake
+            .check_grant(&Grant::new(&pair.access_token))
+            .await
+            .is_ok(),
+        "a session inside its idle window opens a handshake"
+    );
+
+    tokio::time::sleep(idle * 3).await;
+    assert_eq!(
+        handshake.check_grant(&Grant::new(&pair.access_token)).await,
+        Err(GrantRefused::Revoked),
+        "the access token is still time-valid, the session is not"
+    );
+    assert!(
+        svc.refresh(&pair.refresh_token).await.is_err(),
+        "a refresh refuses the same session"
+    );
 }
 
 #[tokio::test]

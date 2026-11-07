@@ -66,7 +66,6 @@ fn resnapshot(sub_id: &str) -> IncomingFrame {
 fn snapshot_begin(sub_id: &str) -> IncomingFrame {
     IncomingFrame::Control(ControlMessage::SnapshotBegin(SnapshotBegin {
         sub_id: sub_id.to_owned(),
-        priority: connetto_core::messages::SubscriptionPriority::default(),
     }))
 }
 

@@ -17,7 +17,7 @@ use connetto_client::{
 };
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, Pong, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority,
+    SnapshotEnd, SnapshotPatch,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
@@ -131,7 +131,6 @@ impl TransportFactory for Scripted {
                             server
                                 .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                                     sub_id: sub.sub_id.clone(),
-                                    priority: SubscriptionPriority::default(),
                                 }))
                                 .await
                                 .expect("snapshot begin");
@@ -650,7 +649,6 @@ async fn a_busy_link_is_never_probed() {
                             server
                                 .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                                     sub_id: sub.sub_id.clone(),
-                                    priority: SubscriptionPriority::default(),
                                 }))
                                 .await
                                 .expect("snapshot begin");

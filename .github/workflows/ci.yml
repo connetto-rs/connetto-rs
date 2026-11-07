@@ -10,9 +10,10 @@ name: CI
 permissions:
   contents: read
 
+# A main run is never cut short, and a newer merge replaces only the pending main run.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,7 +21,10 @@ env:
 
 # Caches are saved only from main, which restores exact keys only, so a
 # tree saved after a Cargo.lock change holds none of the artifacts the
-# older lock left behind. Pull requests also restore the nearest older key.
+# older lock left behind. A main run that fails or is cancelled saves its
+# build output under its key with a -partial- suffix, which a later main run
+# of the same lock restores, so a cold build its timeout cut short resumes.
+# Pull requests also restore the nearest older key.
 # Self-hosted runners skip these steps, since their host-mounted cargo
 # registry and sccache already hold the same work without a download.
 jobs:
@@ -155,6 +159,48 @@ jobs:
             ~/.cargo/git/db
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
+  nightly-clippy:
+    # The gate's clippy, on the dated nightly ci/clippy-nightly names, so a
+    # lint that fires only on nightly fails a pull request.
+    name: Clippy root nightly
+    runs-on: *light-runner
+    timeout-minutes: 40
+    env:
+      CONNETTO_DEMO_BUILD_DEVICE_ROOT: /dev/null
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
+
+      - name: Read the pinned nightly
+        id: nightly
+        run: echo "toolchain=$(cat ci/clippy-nightly)" >> "$GITHUB_OUTPUT"
+
+      - name: Install the pinned nightly with clippy
+        uses: $/.github/actions/install-rust
+        with:
+          toolchain: ${{ steps.nightly.outputs.toolchain }}
+          components: clippy
+
+      - name: Install desktop dependencies
+        uses: $/.github/actions/install-desktop-deps
+
+      - name: Run clippy
+        env:
+          TOOLCHAIN: ${{ steps.nightly.outputs.toolchain }}
+        run: cargo "+$TOOLCHAIN" clippy --all-targets --all-features -- -D warnings
+
   android:
     # R88: the phone build of the demo, built and linked without a
     # device. Its own job because the matrix legs pass their own flags, which
@@ -260,6 +306,11 @@ jobs:
     name: iOS simulator proof
     runs-on: macos-latest
     timeout-minutes: 90
+    env:
+      # No thin LTO and 16 codegen units, on main and pull requests alike, so
+      # pull requests reuse the build output main saves. rust-tests keeps the
+      # release profile on main.
+      CARGO_TEST_PROFILE: testfast
     steps:
       - uses: actions/checkout@v7
 
@@ -279,8 +330,8 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: target
-          key: t-ios-simulator-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-{0}-', runner.os) || '' }}
+          key: t-ios-simulator-testfast-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-testfast-{0}-', runner.os) || format('t-ios-simulator-testfast-{0}-{1}-partial-', runner.os, hashFiles('**/Cargo.lock')) }}
 
       - name: Restore the demo's build output
         id: cache-3
@@ -288,7 +339,16 @@ jobs:
         with:
           path: examples/tauri-leptos-demo/target
           key: t-ios-simulator-tauri-${{ runner.os }}-${{ hashFiles('examples/tauri-leptos-demo/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-tauri-{0}-', runner.os) || '' }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-tauri-{0}-', runner.os) || format('t-ios-simulator-tauri-{0}-{1}-partial-', runner.os, hashFiles('examples/tauri-leptos-demo/Cargo.lock')) }}
+
+      # The demo's `beforeBuildCommand` builds the Leptos UI with trunk in its own workspace.
+      - name: Restore the UI's build output
+        id: cache-4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: examples/leptos-demo/target
+          key: t-ios-simulator-ui-${{ runner.os }}-${{ hashFiles('examples/leptos-demo/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-ui-{0}-', runner.os) || format('t-ios-simulator-ui-{0}-{1}-partial-', runner.os, hashFiles('examples/leptos-demo/Cargo.lock')) }}
 
       - name: Install stable toolchain with the simulator target
         uses: $/.github/actions/install-rust
@@ -301,20 +361,19 @@ jobs:
       - name: Install ios_webkit_debug_proxy
         run: brew install ios-webkit-debug-proxy
 
-      # One release tree, whose dependencies the server and the harness share.
+      # One build of the server and the harness, so the dependencies they
+      # share compile once.
       - name: Build the server and the proof
-        run: |
-          cargo +stable build --release --all-features -p connetto-server --bin connetto-server
-          cargo +stable build --release -p connetto-test-harness --bin connetto-demo-stack --bin connetto-ios-proof
+        run: cargo +stable build --profile "$CARGO_TEST_PROFILE" --all-features -p connetto-server -p connetto-test-harness --bin connetto-server --bin connetto-demo-stack --bin connetto-ios-proof
 
       - uses: $/.github/actions/start-native-services
 
       # The proof builds the demo with `cargo tauri ios build` once the stack has minted its device CA.
       - name: Walk the proof on a simulator
         env:
-          CONNETTO_SERVER_BIN: ${{ github.workspace }}/target/release/connetto-server
+          CONNETTO_SERVER_BIN: ${{ github.workspace }}/target/${{ env.CARGO_TEST_PROFILE }}/connetto-server
           CONNETTO_IOS_TEAM_ID: ABCDE12345
-        run: target/release/connetto-demo-stack target/release/connetto-ios-proof --demo tauri
+        run: '"target/$CARGO_TEST_PROFILE/connetto-demo-stack" "target/$CARGO_TEST_PROFILE/connetto-ios-proof" --demo tauri'
 
       - uses: actions/upload-artifact@v7
         if: failure()
@@ -325,11 +384,27 @@ jobs:
             ${{ runner.temp }}/native-services/logs
           retention-days: 7
 
+      # A walk cut short leaves its demo build writing into the targets the saves archive.
+      - name: Stop the walk's leftover builds
+        if: always()
+        run: |
+          builds='cargo|cargo-tauri|rustc|trunk|xcodebuild'
+          pkill -TERM -x "$builds" || true
+          for _ in $(seq 30); do
+            pgrep -x "$builds" > /dev/null || exit 0
+            sleep 1
+          done
+          pkill -KILL -x "$builds" || true
+
       - name: Prune target caches
         if: always()
         run: |
-          rm -rf target/release/incremental
-          find examples/tauri-leptos-demo/target -type d -name incremental -prune -exec rm -rf {} +
+          rm -rf "target/$CARGO_TEST_PROFILE/incremental"
+          for dir in examples/tauri-leptos-demo/target examples/leptos-demo/target; do
+            if [ -d "$dir" ]; then
+              find "$dir" -type d -name incremental -prune -exec rm -rf {} +
+            fi
+          done
 
       - name: Save cargo downloads
         if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
@@ -354,6 +429,34 @@ jobs:
         with:
           path: examples/tauri-leptos-demo/target
           key: ${{ steps.cache-3.outputs.cache-primary-key }}
+
+      - name: Save the UI's build output
+        if: github.event_name == 'push' && steps.cache-4.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: examples/leptos-demo/target
+          key: ${{ steps.cache-4.outputs.cache-primary-key }}
+
+      - name: Save the partial native build output
+        if: (failure() || cancelled()) && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}-partial-${{ github.run_id }}
+
+      - name: Save the partial demo build output
+        if: (failure() || cancelled()) && github.event_name == 'push' && steps.cache-3.outputs.cache-hit != 'true' && steps.cache-3.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: examples/tauri-leptos-demo/target
+          key: ${{ steps.cache-3.outputs.cache-primary-key }}-partial-${{ github.run_id }}
+
+      - name: Save the partial UI build output
+        if: (failure() || cancelled()) && github.event_name == 'push' && steps.cache-4.outputs.cache-hit != 'true' && steps.cache-4.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: examples/leptos-demo/target
+          key: ${{ steps.cache-4.outputs.cache-primary-key }}-partial-${{ github.run_id }}
 
   ios-crate-tests:
     # The client crates' own tests, run inside an iOS simulator. The runner
@@ -504,7 +607,7 @@ jobs:
         with:
           path: target
           key: t-rust-tests-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-rust-tests-{0}-{1}-', matrix.name, runner.os) || '' }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-rust-tests-{0}-{1}-', matrix.name, runner.os) || format('t-rust-tests-{0}-{1}-{2}-partial-', matrix.name, runner.os, hashFiles('**/Cargo.lock')) }}
 
       - name: Install stable toolchain
         uses: $/.github/actions/install-rust
@@ -538,7 +641,7 @@ jobs:
           # The offline-exchange proof reads the binary the build step
           # compiled, so the test does not build a server of its own.
           CONNETTO_SERVER_BIN: ${{ matrix.name == 'rest' && format('{0}/target/{1}/connetto-server', github.workspace, github.event_name == 'pull_request' && 'testfast' || 'release') || '' }}
-        run: keyctl session -- cargo +stable nextest run --profile native --cargo-profile "$CARGO_TEST_PROFILE" --all-features --test-threads 4 ${{ matrix.packages }}
+        run: keyctl session -- cargo +stable nextest run --cargo-profile "$CARGO_TEST_PROFILE" --all-features --test-threads 4 ${{ matrix.packages }}
 
       - name: Prune target cache
         if: always()
@@ -565,6 +668,13 @@ jobs:
         with:
           path: target
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
+
+      - name: Save partial rust test output
+        if: (failure() || cancelled()) && runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}-partial-${{ github.run_id }}
 
   custody-tests:
     # R71's Linux secret-store groups that need a private session bus, root,
@@ -597,7 +707,7 @@ jobs:
         with:
           path: target
           key: t-custody-tests-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-custody-tests-{0}-', runner.os) || '' }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-custody-tests-{0}-', runner.os) || format('t-custody-tests-{0}-{1}-partial-', runner.os, hashFiles('**/Cargo.lock')) }}
 
       - name: Install stable toolchain
         uses: $/.github/actions/install-rust
@@ -662,6 +772,13 @@ jobs:
           path: target
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
 
+      - name: Save partial custody test output
+        if: (failure() || cancelled()) && runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}-partial-${{ github.run_id }}
+
   browser-build:
     name: Browser stack build
     # This job hands its binaries to the shards and the Android proof, so all
@@ -698,7 +815,7 @@ jobs:
         with:
           path: target
           key: t-browser-native-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-native-{0}-', runner.os) || '' }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-native-{0}-', runner.os) || format('t-browser-native-{0}-{1}-partial-', runner.os, hashFiles('**/Cargo.lock')) }}
 
       - name: Install stable browser toolchain
         uses: $/.github/actions/install-rust
@@ -766,6 +883,13 @@ jobs:
           path: target
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
 
+      - name: Save the partial native build output
+        if: (failure() || cancelled()) && runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}-partial-${{ github.run_id }}
+
   browser-tests:
     name: Browser tests ${{ matrix.shard }}/4
     needs: browser-build
@@ -806,7 +930,7 @@ jobs:
         with:
           path: target-wasm
           key: t-browser-wasm-lines-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-wasm-lines-{0}-', runner.os) || '' }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-wasm-lines-{0}-', runner.os) || format('t-browser-wasm-lines-{0}-{1}-partial-', runner.os, hashFiles('**/Cargo.lock')) }}
 
       - uses: $/.github/actions/get-files
         with:
@@ -861,6 +985,13 @@ jobs:
           path: target-wasm
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
 
+      - name: Save partial wasm build output
+        if: (failure() || cancelled()) && runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: target-wasm
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}-partial-${{ github.run_id }}
+
   android-emulator:
     # R88's proof, walked on an emulator with the Tauri demo's APK, so the
     # Gradle build, the Kotlin sign-in plugin and the app itself run in CI.
@@ -891,7 +1022,7 @@ jobs:
         with:
           path: examples/tauri-leptos-demo/target
           key: t-android-emulator-tauri-${{ runner.os }}-${{ hashFiles('examples/tauri-leptos-demo/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-android-emulator-tauri-{0}-', runner.os) || '' }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-android-emulator-tauri-{0}-', runner.os) || format('t-android-emulator-tauri-{0}-{1}-partial-', runner.os, hashFiles('examples/tauri-leptos-demo/Cargo.lock')) }}
 
       - uses: $/.github/actions/get-files
         with:
@@ -1003,6 +1134,13 @@ jobs:
           path: examples/tauri-leptos-demo/target
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
 
+      - name: Save the partial demo build output
+        if: (failure() || cancelled()) && runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: examples/tauri-leptos-demo/target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}-partial-${{ github.run_id }}
+
   file-core-wasm:
     name: File core wasm
     runs-on: *light-runner
@@ -1079,7 +1217,7 @@ jobs:
         with:
           path: examples/webauthn-unlock/target
           key: t-passkey-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-passkey-{0}-', runner.os) || '' }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-passkey-{0}-', runner.os) || format('t-passkey-{0}-{1}-partial-', runner.os, hashFiles('**/Cargo.lock')) }}
 
       - name: Install stable browser toolchain with the wasm target
         uses: $/.github/actions/install-rust
@@ -1127,3 +1265,10 @@ jobs:
         with:
           path: examples/webauthn-unlock/target
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
+
+      - name: Save partial passkey build output
+        if: (failure() || cancelled()) && runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: examples/webauthn-unlock/target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}-partial-${{ github.run_id }}

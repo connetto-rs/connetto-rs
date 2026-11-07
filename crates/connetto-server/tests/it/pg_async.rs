@@ -817,6 +817,7 @@ fn two_transactions() -> (Vec<ChangeRecord>, Vec<PgCommit>) {
                             .expect("build oplog record"),
                     );
                 }
+                SourceItem::Relation(_) => {}
                 SourceItem::Commit(commit) => commits.push(commit),
             }
         }
@@ -1416,5 +1417,76 @@ async fn a_page_cursor_fences_the_snapshot_it_was_read_under() {
     assert!(
         fence.unseen().contains(running),
         "{running:?} is among the transactions {fence:?} did not see"
+    );
+}
+
+/// A page's cursor becomes the client's resume point, so it sits at or past every commit made before the read, and a later read after another commit sits strictly later. A cursor behind a delivered change would move the resume point backwards, widening the catchup or forcing a resync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_cursor_never_falls_behind_a_commit_made_before_the_read() {
+    const DDL: &str = "CREATE TABLE watermarked (id INT PRIMARY KEY);";
+    #[derive(diesel::QueryableByName)]
+    struct Wal {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        lsn: String,
+    }
+    async fn commit_one(conn: &mut AsyncPgConnection, id: i32) -> PgLsn {
+        sql_query(format!("INSERT INTO watermarked VALUES ({id})"))
+            .execute(conn)
+            .await
+            .expect("insert");
+        let wal: Wal = sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
+            .get_result(conn)
+            .await
+            .expect("read the flushed WAL position");
+        PgLsn::parse(&wal.lsn).expect("Postgres prints a position")
+    }
+
+    let fixture = Fixture::acquire().await;
+    fixture
+        .setup(&[
+            "DROP TABLE IF EXISTS watermarked",
+            DDL.trim_end_matches(';'),
+        ])
+        .await;
+    let pool = fixture.admin().clone();
+    let source = PgSnapshotSource::from_ddl(pool.clone(), DDL).expect("build source");
+    let read = || async {
+        let page = source
+            .snapshot_page(
+                "SELECT * FROM watermarked",
+                &[],
+                &connetto_core::Principal::<String, String>::unidentified(
+                    connetto_core::SessionId::from_token_hash("test-user"),
+                ),
+                &PageSpec {
+                    after: None,
+                    max_rows: 1024,
+                    timeout: std::time::Duration::from_secs(30),
+                },
+            )
+            .await
+            .expect("read a page");
+        split_snapshot_cursor(page.cursor.as_bytes())
+            .expect("a page cursor")
+            .0
+    };
+    let mut conn = pool.get().await.expect("connection");
+
+    let first_commit = commit_one(&mut conn, 1).await;
+    let first = read().await;
+    assert!(
+        first.commit_lsn() >= first_commit,
+        "the cursor {first:?} sits behind the commit ending at {first_commit:?}"
+    );
+
+    let second_commit = commit_one(&mut conn, 2).await;
+    let second = read().await;
+    assert!(
+        second.commit_lsn() >= second_commit,
+        "the cursor {second:?} sits behind the commit ending at {second_commit:?}"
+    );
+    assert!(
+        second > first,
+        "a later read after a commit moves the cursor forward"
     );
 }

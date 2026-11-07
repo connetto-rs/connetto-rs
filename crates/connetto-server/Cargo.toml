@@ -57,7 +57,7 @@ bigdecimal = { version = "0.4", default-features = false }
 # Naming the Postgres dialect when building subql's catalog and engine, and the
 # visitor pass that substitutes subscription bind placeholders in the parsed
 # statement. Version and rev follow subql via the root [patch] blocks.
-sqlparser = { version = "0.63", default-features = false, features = ["visitor"] }
+sqlparser = { version = "0.64", default-features = false, features = ["visitor"] }
 # Bulk payloads ride the wire Zstd-compressed (connetto-core Q2.5). The
 # materializer compresses outbound patchsets and decompresses inbound ones.
 zstd = "0.13"
@@ -66,13 +66,13 @@ zstd = "0.13"
 # from this crate for the session layer and tests.
 # Parsing an uploaded diffset into ops for authorization and conflict detection,
 # and the Value type bound into conflict-detection queries.
-sqlite-diff-rs = { version = "0.18", default-features = false }
+sqlite-diff-rs = { version = "0.19", default-features = false }
 # Reading the current server row back as a JSON object for MutationConflict.
 serde_json = "1"
 # Reading the database's timeline history over a replication connection
 # (`timeline.rs`, R73). Already in the graph through sqlite-diff-rs, at the same
 # version and default features.
-pg_walstream = "0.9"
+pg_walstream = "0.10"
 # The data download (R61) stages its SQLite file in a temp file, packs it into
 # a streamed zip with the person's files chunk by chunk, and names the query
 # list by a blake3 hash.

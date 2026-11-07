@@ -68,6 +68,7 @@ fn records() -> (Vec<ChangeRecord>, Vec<PgCommit>) {
                             .expect("build oplog record"),
                     );
                 }
+                SourceItem::Relation(_) => {}
                 SourceItem::Commit(commit) => commits.push(commit),
             }
         }

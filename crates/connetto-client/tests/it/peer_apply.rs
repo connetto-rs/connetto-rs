@@ -15,7 +15,7 @@ use connetto_core::Major;
 use connetto_core::exchange::{ManifestRow, RetractCause, Retraction};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, LivePatch, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority,
+    SnapshotEnd, SnapshotPatch,
 };
 use connetto_core::traits::IncomingFrame;
 use diesel::connection::SimpleConnection;
@@ -713,7 +713,6 @@ async fn deliver_snapshot(
     server.say(IncomingFrame::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
             sub_id: "a".to_owned(),
-            priority: SubscriptionPriority::default(),
         },
     )));
     server.say(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(
@@ -1652,7 +1651,6 @@ async fn a_stored_entry_under_no_expressible_major_fails_the_reapply() {
     server.say(IncomingFrame::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
             sub_id: "a".to_owned(),
-            priority: SubscriptionPriority::default(),
         },
     )));
     server.say(IncomingFrame::Control(ControlMessage::SnapshotEnd(
@@ -2020,7 +2018,6 @@ async fn resync_orders(
     server.say(IncomingFrame::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
             sub_id: "a".to_owned(),
-            priority: SubscriptionPriority::default(),
         },
     )));
     server.say(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(
