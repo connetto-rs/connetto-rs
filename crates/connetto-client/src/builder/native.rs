@@ -2619,6 +2619,15 @@ mod tests {
         client.set_hotspot_scan(true);
         client.set_hotspot_autojoin(true);
         client.set_bluetooth_prompt(false);
+        assert!(
+            client.peer_links_on(),
+            "a build without a device identity stands its links on"
+        );
+        client.set_peer_links(false);
+        assert!(
+            client.peer_links_on(),
+            "turning links off is a no-op without a device identity"
+        );
 
         client.close().await;
     }
@@ -2677,7 +2686,9 @@ mod tests {
                         Some(crate::hotspot::Command::Leave) => {
                             let _ = note_tx.send("leave").await;
                         }
-                        Some(crate::hotspot::Command::Links { .. }) => {}
+                        Some(crate::hotspot::Command::Links { on }) => {
+                            let _ = note_tx.send(if on { "links true" } else { "links false" }).await;
+                        }
                         None => break,
                     },
                     command = bluetooth_rx.recv() => match command {
@@ -2864,10 +2875,20 @@ mod tests {
         client.set_hotspot_scan(true);
         client.set_hotspot_autojoin(false);
         client.set_bluetooth_prompt(true);
+        assert!(client.peer_links_on(), "every start begins with links on");
+        client.set_peer_links(false);
+        assert!(
+            !client.peer_links_on(),
+            "the off standing holds once the call returns"
+        );
+        // A standing already held reaches no machine.
+        client.set_peer_links(false);
+        client.set_peer_links(true);
+        assert!(client.peer_links_on(), "the links stand on again");
         // The standings reach their machines, from the two machines' channels,
         // so the order the notes come back in is not the order sent.
         let mut noted: Vec<&str> = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..7 {
             let got = tokio::time::timeout(Duration::from_secs(10), note_rx.recv())
                 .await
                 .expect("the machine notes the standing within its bound")
@@ -2880,11 +2901,19 @@ mod tests {
             [
                 "autojoin false",
                 "leave",
+                "links false",
+                "links true",
                 "prompt true",
                 "scan true",
                 "stop"
             ],
             "each standing reaches its machine"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), note_rx.recv())
+                .await
+                .is_err(),
+            "the repeated off standing reaches no machine"
         );
 
         // A certificate-less device refuses the peer's calls by its standing.

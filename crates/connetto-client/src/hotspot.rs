@@ -1461,6 +1461,47 @@ mod tests {
         );
     }
 
+    /// A links standing already on starts no second dial beside the joined
+    /// one in flight (R77 slice 8).
+    #[test]
+    fn links_on_again_leaves_the_running_dial_alone() {
+        let mut h = Harness::new(true);
+        h.joined();
+        assert_eq!(h.dials.lock().len(), 1, "the join dials its gateway");
+        h.machine.handle(Command::Links { on: true });
+        assert_eq!(
+            h.dials.lock().len(),
+            1,
+            "the dial in flight stays the only one"
+        );
+    }
+
+    /// Links turned off and on before any join dial nothing, and the later
+    /// join dials its gateway as it would have (R77 slice 8).
+    #[test]
+    fn links_before_a_join_dial_nothing_until_the_join() {
+        let mut h = Harness::new(true);
+        h.machine.handle(Command::Links { on: false });
+        h.machine.handle(Command::Links { on: true });
+        assert!(h.dials.lock().is_empty(), "nothing is joined to dial");
+        h.joined();
+        assert_eq!(h.dials.lock().len(), 1, "the join dials its gateway");
+    }
+
+    /// With the autolink off, links coming back dial nothing, the joined
+    /// gateway waiting for the app to link it (R77 slice 8).
+    #[test]
+    fn links_coming_back_without_autolink_dial_nothing() {
+        let mut h = Harness::new(false);
+        h.machine.handle(Command::Links { on: false });
+        h.joined();
+        h.machine.handle(Command::Links { on: true });
+        assert!(
+            h.dials.lock().is_empty(),
+            "the autolink off leaves the gateway undialed"
+        );
+    }
+
     /// The join row `The dial answers BlockedByVpn | dial in flight | end the
     /// standing, emit JoinedNetworkBlockedByVpn once`, with no redial.
     #[tokio::test]

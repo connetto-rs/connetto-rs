@@ -106,3 +106,55 @@ pub async fn seed_team_members(pg_url: &str, team: &str, members: &[&str]) -> Re
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use diesel::{ExpressionMethods as _, QueryDsl as _};
+    use diesel_async::RunQueryDsl as _;
+
+    use super::{remove_team_member, seed_team_members, team_members};
+    use crate::Fixture;
+    use crate::stack::DEMO_DEPLOYMENT;
+
+    /// The members the demo's Postgres holds for `team`, sorted.
+    async fn members_of(fixture: &Fixture, team: &str) -> Vec<String> {
+        let mut conn = fixture.admin().get().await.expect("an admin connection");
+        team_members::table
+            .filter(team_members::team_id.eq(team))
+            .select(team_members::member_id)
+            .order(team_members::member_id)
+            .load(&mut conn)
+            .await
+            .expect("the team's membership rows")
+    }
+
+    /// A rerun seeds no duplicate, and a removal takes only the named
+    /// account off only the named team.
+    #[tokio::test]
+    async fn a_team_seeds_once_and_loses_only_the_removed_member() {
+        let fixture = Fixture::acquire().await;
+        fixture.setup(&[DEMO_DEPLOYMENT.schema]).await;
+        let url = fixture.admin_url();
+
+        seed_team_members(url, "r77", &["alice", "bob", "carol"])
+            .await
+            .expect("the first seed");
+        seed_team_members(url, "r77", &["alice", "bob", "carol"])
+            .await
+            .expect("a rerun over the same rows");
+        seed_team_members(url, "other", &["bob"])
+            .await
+            .expect("another team");
+        assert_eq!(members_of(&fixture, "r77").await, ["alice", "bob", "carol"]);
+
+        remove_team_member(url, "r77", "bob")
+            .await
+            .expect("the removal");
+        assert_eq!(members_of(&fixture, "r77").await, ["alice", "carol"]);
+        assert_eq!(
+            members_of(&fixture, "other").await,
+            ["bob"],
+            "bob stays a member of every team the removal does not name"
+        );
+    }
+}

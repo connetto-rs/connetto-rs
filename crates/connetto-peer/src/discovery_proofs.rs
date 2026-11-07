@@ -547,6 +547,61 @@ async fn an_off_standing_reports_without_dialing_and_dials_at_the_resume() {
     bob_node.stop(CloseReason::Closed);
 }
 
+/// An off standing set while the discovery serves nothing carries into the
+/// next serve, which reports a found peer without dialing it until the
+/// standing comes back on (R77 slice 8). The node's own links stay on
+/// throughout, so only the discovery's standing holds the dial back.
+#[tokio::test]
+async fn an_off_standing_set_before_the_serve_holds_through_it() {
+    let (deployment, alice, bob) = pair(whole_second());
+    let (a_tx, _a_rx) = events();
+    let alice_node = node(deployment.root_der(), a_tx);
+    let a_addr = serve(&alice_node, &alice);
+    let (b_tx, mut b_rx) = events();
+    let bob_node = node(deployment.root_der(), b_tx);
+    let b_addr = serve(&bob_node, &bob);
+    let alice_fp = Fingerprint::of(&alice.leaf);
+    let bob_fp = Fingerprint::of(&bob.leaf);
+
+    let (sinks_tx, mut sinks) = mpsc::unbounded_channel();
+    let service = ScriptedDnsSd {
+        sinks: sinks_tx,
+        calls: Arc::default(),
+        refused_opens: parking_lot::Mutex::new(0),
+        refuse_register: false,
+    };
+    let (found_tx, mut found) = mpsc::unbounded_channel();
+    let discovery =
+        Discovery::new(alice_node.clone(), true, found_tx).with_dns_sd(Arc::new(service));
+    // The discovery's standing goes off before anything serves.
+    discovery.set_peer_links(false);
+    discovery.serve(a_addr.port(), alice_fp);
+    let mut sink = next_sink(&mut sinks).await;
+    sink(resolved(bob_fp, b_addr));
+    assert_eq!(
+        next_found(&mut found).await,
+        DiscoveryEvent::Found {
+            address: b_addr,
+            fingerprint: bob_fp,
+        },
+        "the found peer reports"
+    );
+    time::sleep(Duration::from_secs(1)).await;
+    while let Ok(event) = b_rx.try_recv() {
+        assert!(
+            !matches!(event, PeerEvent::Linked { .. }),
+            "the serve keeps the off standing and dials nothing"
+        );
+    }
+
+    discovery.set_peer_links(true);
+    await_linked(&mut b_rx, &alice.identity).await;
+
+    discovery.stop();
+    alice_node.stop(CloseReason::Closed);
+    bob_node.stop(CloseReason::Closed);
+}
+
 /// A fault the service survives leaves the browse reporting.
 #[tokio::test]
 async fn a_dns_sd_fault_leaves_the_browse_serving() {

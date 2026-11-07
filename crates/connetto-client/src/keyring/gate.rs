@@ -414,6 +414,8 @@ mod tests {
         /// The key behind the gated copies is gone, as after a screen lock or
         /// Windows Hello was removed.
         key_gone: bool,
+        /// Every clear fails, as a store that refuses a delete does.
+        clear_fails: bool,
     }
 
     /// Why the fake platform cannot hold a gated item.
@@ -539,6 +541,9 @@ mod tests {
         }
 
         fn clear(&self, _service: &str, name: &str, storage: Storage) -> Result<(), ClientError> {
+            if self.script.lock().expect("lock").clear_fails {
+                return Err(ClientError::Auth("delete refused".into()));
+            }
             match storage {
                 Storage::Gated => self.gated.lock().expect("lock").remove(name).map(drop),
                 Storage::Ungated(_) => self.plain.lock().expect("lock").remove(name).map(drop),
@@ -917,6 +922,7 @@ mod tests {
             explicit_open: false,
             creation_authorises: false,
             key_gone: false,
+            clear_fails: false,
         },
         Script {
             dismiss: false,
@@ -924,6 +930,7 @@ mod tests {
             explicit_open: true,
             creation_authorises: false,
             key_gone: false,
+            clear_fails: false,
         },
     ];
 
@@ -962,6 +969,31 @@ mod tests {
             assert_eq!(fake.storage_of(KEY), Some(PLAIN));
             assert_eq!(fake.prompts(), 1, "the key moves out through one prompt");
             assert_eq!(gate.protection(), Custody::Unverified(NoGate::Offerable));
+        }
+    }
+
+    /// A gated token the gate turned off cannot delete fails the read and
+    /// stays where it was, so no launch takes a token it could not drop for
+    /// one it has no copy of.
+    #[test]
+    fn a_gated_token_that_cannot_be_dropped_fails_the_read_and_stays() {
+        for script in STORES {
+            let (gate, fake) = gate(Script {
+                clear_fails: true,
+                ..script
+            });
+            gate.configure(false);
+            fake.seed(TOKEN, "refresh", Storage::Gated);
+            assert!(
+                matches!(gate.read_token(TOKEN), Err(ClientError::Auth(_))),
+                "the refused delete reaches the caller"
+            );
+            assert_eq!(
+                fake.storage_of(TOKEN),
+                Some(Storage::Gated),
+                "the token stays where it was"
+            );
+            assert_eq!(fake.prompts(), 0, "the failed drop asks nothing");
         }
     }
 

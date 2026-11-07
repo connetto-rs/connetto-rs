@@ -2702,6 +2702,10 @@ fn a_link_error_keeps_its_kind_as_the_exchange_error() {
         ExchangeError::from(LinkError::Tls(tls)),
         ExchangeError::Tls(_)
     ));
+    assert!(matches!(
+        ExchangeError::from(LinkError::LinksOff),
+        ExchangeError::LinksOff
+    ));
 }
 
 /// The node's `linked` read stands its live peers, and a close drops the

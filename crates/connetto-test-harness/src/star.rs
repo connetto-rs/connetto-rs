@@ -665,6 +665,13 @@ mod tests {
         }
     }
 
+    /// A run that skipped the single-phone proof names it as not run.
+    #[test]
+    fn the_summary_names_a_skipped_single_phone_proof() {
+        let text = summary("abc123", None, &[]);
+        assert_eq!(text, "commit: abc123\nsingle-phone proof: not run\n");
+    }
+
     #[test]
     fn tailscale_holds_the_vpn_only_when_it_owns_the_connected_one() {
         let wifi = "  NetworkAgentInfo{network{151}  ni{WIFI CONNECTED extra: } nc{[ Transports: WIFI OwnerUid: 1000]}";
@@ -750,6 +757,7 @@ mod tests {
             "provisional: confirmed team_notes",
             "provisional: refused",
             "provisional: rolled back team_notes k",
+            "provisional: rolled back team_notes because unauthorized",
             &format!(
                 "provisional: rolled back team_notes {NOTE_KEY} \
                  because two devices settled different changes at the sequence"
@@ -811,6 +819,23 @@ mod tests {
                 body: "the rope by the gate".to_owned(),
                 author: "alice".to_owned(),
                 provisional_from: Some("alice@demo.dev".to_owned()),
+            }]
+        );
+    }
+
+    /// A note line without an author stands no note, and a closing
+    /// parenthesis that is no provisional mark stays part of the author.
+    #[test]
+    fn a_note_without_an_author_stands_none_and_a_plain_parenthesis_stays() {
+        let page = "note: the rope at the gate\n\
+             note: by alice\n\
+             note: the rope by alice (late)";
+        assert_eq!(
+            note_lines(page),
+            vec![NoteLine {
+                body: "the rope".to_owned(),
+                author: "alice (late)".to_owned(),
+                provisional_from: None,
             }]
         );
     }
