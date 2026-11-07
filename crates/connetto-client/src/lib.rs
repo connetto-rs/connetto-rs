@@ -6988,11 +6988,7 @@ where
         let due = self
             .share_key_deadline
             .is_some_and(|at| crate::away::SystemClock.monotonic() >= at);
-        let changed = if due {
-            self.expire_share_keys(persist).await?
-        } else {
-            false
-        };
+        let changed = due && self.expire_share_keys(persist).await?;
         if persist
             && self.share_key_save_pending
             && let Some(store) = &self.share_key_persistence

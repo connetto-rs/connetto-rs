@@ -10,20 +10,21 @@ The `Status` table is the one status record of the programme, and every statemen
 
 ## The gate
 
-The gate is what a session runs in full before any push, and CI runs the same gate on every pull request, except that its clippy legs run `+stable` where the gate prescribes `+nightly`. `.github/workflows/ci.yml` checks each of the eight workspaces in eleven legs, fmt, `cargo +stable clippy --all-targets` and the doc build with `-D warnings`, runs the test shards `server`, `client`, `files` and `rest` under `cargo nextest` with `--test-threads 4` inside a `keyctl session`, and runs the browser suites as four shards of `connetto-browser-stack --shard`. `.github/workflows/coverage.yml` re-runs the three native test shards `server`, `client` and `rest` under `cargo llvm-cov` and uploads them to Codecov. There is no task runner reconciling this prose, the workflows and `.config/nextest.toml`, so the workflows and the config are the executable record of what CI proves.
+The gate is what a session runs in full before any push, and CI runs the same gate on every pull request. `.github/workflows/ci.yml` checks each of the eight workspaces in eleven legs, fmt, `cargo +stable clippy --all-targets` and the doc build with `-D warnings`, runs the root's clippy once more on the dated nightly that `ci/clippy-nightly` names, runs the test shards `server`, `client`, `files` and `rest` under `cargo nextest` with `--test-threads 4` inside a `keyctl session`, and runs the browser suites as four shards of `connetto-browser-stack --shard`. `.github/workflows/coverage.yml` re-runs the three native test shards `server`, `client` and `rest` under `cargo llvm-cov` and uploads them to Codecov. There is no task runner reconciling this prose, the workflows and `.config/nextest.toml`, so the workflows and the config are the executable record of what CI proves.
 
 Eight workspaces, each with its own lockfile, the root, `crates/connetto-web`, the four demos, `examples/wasm-smoke` and `examples/webauthn-unlock`.
 
-The root workspace runs the four proof legs.
+The root workspace runs the five proof legs.
 
 ```sh
 cargo +stable fmt --all -- --check
-cargo +nightly clippy --all-targets --all-features -- -D warnings
+cargo +stable clippy --all-targets --all-features -- -D warnings
+cargo +"$(cat ci/clippy-nightly)" clippy --all-targets --all-features -- -D warnings
 cargo +stable test --release --all-features
 RUSTDOCFLAGS="-D warnings" cargo +stable doc --no-deps --all-features
 ```
 
-**`cargo +stable` for every build and test, `cargo +nightly` only for clippy.** The rule is load-bearing, because nightly has been observed to ICE on tokio in release, and there is no `rust-toolchain.toml`, so the plus-selector is the only thing enforcing it. The clippy mismatch between the gate and CI is [G14](#g14), and it means a lint that fires only on nightly reaches `main` with CI green.
+**`cargo +stable` for every build and test, nightly only for clippy.** The rule is load-bearing, because nightly has been observed to ICE on tokio in release, and there is no `rust-toolchain.toml`, so the plus-selector is the only thing enforcing it. The nightly is pinned to a date so a lint that lands upstream fails no pull request that did not ask for it. Moving the date is a pull request of its own, carrying the fixes the newer nightly asks for.
 
 Tests run `--release`. Debug builds of these workloads are one to two orders of magnitude slower, and a full debug run is a session-eating trap. Use debug only when targeting overflow checks, `debug_assert!` bodies, or a bug that only appears unoptimized, and say so when you do.
 
@@ -218,12 +219,6 @@ A diverging note from `rls2fga` for a policy translated to no access is an upstr
 **Snapshot priority is not scheduled.** `SubscriptionPriority` travels on the wire and the server delivers snapshots in arrival order.
 
 Decided. `SubscriptionPriority` leaves the wire with a `PROTOCOL_VERSION` bump, in one pull request.
-
-### G14
-
-**The local gate and CI run different clippy.** The gate prescribes `+nightly`, the CI Check job runs `+stable`, so a nightly-only lint can land on `main` with CI green.
-
-Fixed in one pull request, by a CI leg running the gate's clippy on a pinned dated nightly.
 
 ### G17
 

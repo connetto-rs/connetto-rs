@@ -159,6 +159,48 @@ jobs:
             ~/.cargo/git/db
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
+  nightly-clippy:
+    # The gate's clippy, on the dated nightly ci/clippy-nightly names, so a
+    # lint that fires only on nightly fails a pull request.
+    name: Clippy root nightly
+    runs-on: *light-runner
+    timeout-minutes: 40
+    env:
+      CONNETTO_DEMO_BUILD_DEVICE_ROOT: /dev/null
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
+
+      - name: Read the pinned nightly
+        id: nightly
+        run: echo "toolchain=$(cat ci/clippy-nightly)" >> "$GITHUB_OUTPUT"
+
+      - name: Install the pinned nightly with clippy
+        uses: $/.github/actions/install-rust
+        with:
+          toolchain: ${{ steps.nightly.outputs.toolchain }}
+          components: clippy
+
+      - name: Install desktop dependencies
+        uses: $/.github/actions/install-desktop-deps
+
+      - name: Run clippy
+        env:
+          TOOLCHAIN: ${{ steps.nightly.outputs.toolchain }}
+        run: cargo "+$TOOLCHAIN" clippy --all-targets --all-features -- -D warnings
+
   android:
     # R88: the phone build of the demo, built and linked without a
     # device. Its own job because the matrix legs pass their own flags, which
