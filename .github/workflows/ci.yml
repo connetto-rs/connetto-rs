@@ -299,6 +299,15 @@ jobs:
           key: t-ios-simulator-tauri-${{ runner.os }}-${{ hashFiles('examples/tauri-leptos-demo/Cargo.lock') }}
           restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-tauri-{0}-', runner.os) || format('t-ios-simulator-tauri-{0}-{1}-partial-', runner.os, hashFiles('examples/tauri-leptos-demo/Cargo.lock')) }}
 
+      # The demo's `beforeBuildCommand` builds the Leptos UI with trunk in its own workspace.
+      - name: Restore the UI's build output
+        id: cache-4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: examples/leptos-demo/target
+          key: t-ios-simulator-ui-${{ runner.os }}-${{ hashFiles('examples/leptos-demo/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-ui-{0}-', runner.os) || format('t-ios-simulator-ui-{0}-{1}-partial-', runner.os, hashFiles('examples/leptos-demo/Cargo.lock')) }}
+
       - name: Install stable toolchain with the simulator target
         uses: $/.github/actions/install-rust
         with:
@@ -333,13 +342,27 @@ jobs:
             ${{ runner.temp }}/native-services/logs
           retention-days: 7
 
+      # A walk cut short leaves its demo build writing into the targets the saves archive.
+      - name: Stop the walk's leftover builds
+        if: always()
+        run: |
+          builds='cargo|cargo-tauri|rustc|trunk|xcodebuild'
+          pkill -TERM -x "$builds" || true
+          for _ in $(seq 30); do
+            pgrep -x "$builds" > /dev/null || exit 0
+            sleep 1
+          done
+          pkill -KILL -x "$builds" || true
+
       - name: Prune target caches
         if: always()
         run: |
           rm -rf "target/$CARGO_TEST_PROFILE/incremental"
-          if [ -d examples/tauri-leptos-demo/target ]; then
-            find examples/tauri-leptos-demo/target -type d -name incremental -prune -exec rm -rf {} +
-          fi
+          for dir in examples/tauri-leptos-demo/target examples/leptos-demo/target; do
+            if [ -d "$dir" ]; then
+              find "$dir" -type d -name incremental -prune -exec rm -rf {} +
+            fi
+          done
 
       - name: Save cargo downloads
         if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
@@ -365,6 +388,13 @@ jobs:
           path: examples/tauri-leptos-demo/target
           key: ${{ steps.cache-3.outputs.cache-primary-key }}
 
+      - name: Save the UI's build output
+        if: github.event_name == 'push' && steps.cache-4.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: examples/leptos-demo/target
+          key: ${{ steps.cache-4.outputs.cache-primary-key }}
+
       - name: Save the partial native build output
         if: (failure() || cancelled()) && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -378,6 +408,13 @@ jobs:
         with:
           path: examples/tauri-leptos-demo/target
           key: ${{ steps.cache-3.outputs.cache-primary-key }}-partial-${{ github.run_id }}
+
+      - name: Save the partial UI build output
+        if: (failure() || cancelled()) && github.event_name == 'push' && steps.cache-4.outputs.cache-hit != 'true' && steps.cache-4.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: examples/leptos-demo/target
+          key: ${{ steps.cache-4.outputs.cache-primary-key }}-partial-${{ github.run_id }}
 
   ios-crate-tests:
     # The client crates' own tests, run inside an iOS simulator. The runner
