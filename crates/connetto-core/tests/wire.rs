@@ -27,8 +27,8 @@ use connetto_core::{
         NonFatalError, PauseCause, Ping, Pong, Provenance, ProvisionalStatus, ProvisionalVerdicts,
         RateLimited, RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate,
         RevokeDeviceRequest, ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd,
-        SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec, Unsubscribe, Verdict,
-        WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
+        SnapshotPatch, Subscribe, SubscriptionSpec, Unsubscribe, Verdict, WriterAnswer,
+        WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
     },
     version::PROTOCOL_VERSION,
 };
@@ -234,20 +234,17 @@ fn share_key_frames_round_trip() {
 fn subscription_lifecycle_round_trips() {
     round_trip_control(&ControlMessage::Subscribe(Subscribe {
         sub_id: "sub-orders".into(),
-        spec: SubscriptionSpec::new("SELECT * FROM orders WHERE user_id = 1")
-            .with_priority(SubscriptionPriority::HIGHEST),
+        spec: SubscriptionSpec::new("SELECT * FROM orders WHERE user_id = 1"),
     }));
     round_trip_control(&ControlMessage::Subscribe(Subscribe {
         sub_id: "sub-count".into(),
-        spec: SubscriptionSpec::new("SELECT region, COUNT(*) FROM orders GROUP BY region")
-            .with_priority(SubscriptionPriority::new(2)),
+        spec: SubscriptionSpec::new("SELECT region, COUNT(*) FROM orders GROUP BY region"),
     }));
     round_trip_control(&ControlMessage::Unsubscribe(Unsubscribe {
         sub_id: "sub-orders".into(),
     }));
     round_trip_control(&ControlMessage::SnapshotBegin(SnapshotBegin {
         sub_id: "sub-orders".into(),
-        priority: SubscriptionPriority::HIGHEST,
     }));
     round_trip_control(&ControlMessage::SnapshotEnd(SnapshotEnd {
         sub_id: "sub-orders".into(),

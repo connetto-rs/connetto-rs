@@ -84,8 +84,8 @@ use connetto_core::messages::{
     FatalErrorReason, FullResyncReason, FullResyncRequired, GateState, HandshakeAck, LivePatch,
     MutationApplied, MutationConflict, MutationReject, MutationRejectReason, NonFatalError, Pong,
     RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
-    SubscriptionPriority, SubscriptionSpec, SyncStatus, TabShareKeyAnswer, TabShareKeyChange,
-    TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse,
+    SubscriptionSpec, SyncStatus, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome,
+    TabStorageAnswer, TabStorageOutcome, TabStorageUse,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Major, Transport};
@@ -470,9 +470,6 @@ mod local_schema {
 struct TabSub {
     sub_id: String,
     tables: HashSet<String>,
-    /// Delivery tier from the tab's Subscribe, replayed on a resync
-    /// re-snapshot so the tab's `SnapshotBegin` matches the original.
-    priority: SubscriptionPriority,
 }
 
 /// One aggregate subscription multiplexed onto the worker connection.
@@ -3282,15 +3279,9 @@ where
                 send_tab_nonfatal(tab, &subscribe.sub_id, SUBSCRIPTION_REFUSED);
                 return Ok(());
             }
-            if let Err(err) = serve_snapshot(
-                worker,
-                blank,
-                local_tables,
-                tab,
-                &subscribe.sub_id,
-                subscribe.spec.priority,
-                &tables,
-            ) {
+            if let Err(err) =
+                serve_snapshot(worker, blank, local_tables, tab, &subscribe.sub_id, &tables)
+            {
                 tracing::warn!(tab = %id, sub_id = %subscribe.sub_id, error = %err, "tab snapshot failed");
                 send_tab_nonfatal(tab, &subscribe.sub_id, SUBSCRIPTION_REFUSED);
                 return Ok(());
@@ -3299,7 +3290,6 @@ where
             tab.subs.push(TabSub {
                 sub_id: subscribe.sub_id,
                 tables,
-                priority: subscribe.spec.priority,
             });
             Ok(())
         }
@@ -5172,17 +5162,17 @@ where
     let Some(worker_tables) = state.resync_tables.get(worker_sub).cloned() else {
         return Ok(());
     };
-    let targets: Vec<(TabId, String, SubscriptionPriority, HashSet<String>)> = state
+    let targets: Vec<(TabId, String, HashSet<String>)> = state
         .tabs
         .iter()
         .flat_map(|(id, tab)| {
             tab.subs
                 .iter()
                 .filter(|sub| !sub.tables.is_disjoint(&worker_tables))
-                .map(move |sub| (*id, sub.sub_id.clone(), sub.priority, sub.tables.clone()))
+                .map(move |sub| (*id, sub.sub_id.clone(), sub.tables.clone()))
         })
         .collect();
-    for (tab_id, tab_sub, priority, tab_tables) in targets {
+    for (tab_id, tab_sub, tab_tables) in targets {
         let Some(tab) = state.tabs.get_mut(&tab_id) else {
             continue;
         };
@@ -5200,7 +5190,6 @@ where
             &state.local_tables,
             tab,
             &tab_sub,
-            priority,
             &tab_tables,
         )?;
     }
@@ -5369,7 +5358,6 @@ fn serve_snapshot<U>(
     tier_tables: &HashSet<String>,
     tab: &mut TabState,
     sub_id: &str,
-    priority: SubscriptionPriority,
     tables: &HashSet<String>,
 ) -> Result<(), RelayError>
 where
@@ -5410,7 +5398,6 @@ where
     let _ = tab.out.send(TabOut::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
             sub_id: sub_id.to_owned(),
-            priority,
         },
     )));
     for payload in payloads {
@@ -7255,7 +7242,6 @@ mod tests {
             tab.subs.push(super::TabSub {
                 sub_id: table.to_owned(),
                 tables: [table.to_owned()].into(),
-                priority: connetto_core::messages::SubscriptionPriority::default(),
             });
         }
         (worker, state, author_rx, sibling_rx)

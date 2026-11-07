@@ -4892,7 +4892,7 @@ fn install_replica_metadata(
             Err(error) => return Err(error.into()),
         }
     }
-    db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
+    subscriptions::install(db)?;
     db.batch_execute(holdings::HOLDING_DDL)?;
     // After the subscription tables, since it references `_connetto_query`.
     db.batch_execute(aggregates::AGGREGATE_DDL)?;

@@ -413,6 +413,10 @@ pub struct BootedSession<Id> {
     pub session_expires_at: Option<u64>,
     /// Credential-store key this identity's account is addressed by.
     pub account: Option<String>,
+    /// Whether the replica survives a reload. `false` for an anonymous boot and
+    /// for a signed-in one in a browser that refuses OPFS, where a reload loses
+    /// the replica and every write not yet sent.
+    pub replica_persistent: bool,
     /// Whether configured content storage is durable, or `None` when content is disabled.
     pub content_persistent: Option<bool>,
 }
@@ -497,6 +501,9 @@ where
     // events they raise, so the worker holds them for the tabs (R78 decision
     // 41 as amended).
     worker.relay_courier_notices();
+    // An anonymous boot never opens through the pool, so only a signed-in one
+    // can be persistent, and only where the pool is OPFS.
+    let replica_persistent = spec.identified && storage.is_persistent();
     report_boot_progress("replica-opened");
     services::retry_shared_departures(&mut worker).await;
     report_boot_progress("departures-retried");
@@ -520,6 +527,7 @@ where
         identity: spec.identity,
         session_expires_at: spec.session_expires_at,
         account: spec.active_account,
+        replica_persistent,
         content_persistent,
     })
 }

@@ -19,7 +19,7 @@ use connetto_client::{
 
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, LivePatch, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority,
+    SnapshotEnd, SnapshotPatch,
 };
 use connetto_core::traits::IncomingFrame;
 use diesel::connection::SimpleConnection;
@@ -264,7 +264,6 @@ fn send_snapshot(server: &Script, sub_id: &str, payload: Vec<u8>, cursor: u8) {
     server.say(IncomingFrame::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
             sub_id: sub_id.to_owned(),
-            priority: SubscriptionPriority::default(),
         },
     )));
     server.say(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(

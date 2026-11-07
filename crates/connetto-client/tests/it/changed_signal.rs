@@ -13,9 +13,7 @@
 
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::Cursor;
-use connetto_core::messages::{
-    ControlMessage, HandshakeAck, SnapshotBegin, SnapshotEnd, SubscriptionPriority,
-};
+use connetto_core::messages::{ControlMessage, HandshakeAck, SnapshotBegin, SnapshotEnd};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
 use diesel::prelude::*;
@@ -64,7 +62,6 @@ fn cursor_only_server() -> LoopbackTransport {
             server
                 .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                     sub_id: "sub".to_owned(),
-                    priority: SubscriptionPriority::default(),
                 }))
                 .await
                 .expect("begin");
