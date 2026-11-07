@@ -92,6 +92,10 @@ pub enum AuthOp {
     /// answered from the settled record. State, because the cross-path
     /// delivery is the trace the courier needs.
     WriteRedelivered,
+    /// A couriered entry settled, applied or refused alike, since both fix
+    /// the sequence. The row names the author in `user_id` and the courier's
+    /// account in `courier_user_id` (R78 decision 10).
+    WriteCouriered,
     /// A person's data left the server as a portability download (R61). The
     /// row names the query-list hash and the archive size.
     DataDownloaded,
@@ -122,6 +126,7 @@ impl AuthOp {
             Self::BanLifted => "ban_lifted",
             Self::WriteForked => "write_forked",
             Self::WriteRedelivered => "write_redelivered",
+            Self::WriteCouriered => "write_couriered",
             Self::DataDownloaded => "data_downloaded",
             Self::DataErased => "data_erased",
         }
@@ -153,6 +158,7 @@ impl FromSql<AuthOpSql, Pg> for AuthOp {
             b"ban_lifted" => Ok(Self::BanLifted),
             b"write_forked" => Ok(Self::WriteForked),
             b"write_redelivered" => Ok(Self::WriteRedelivered),
+            b"write_couriered" => Ok(Self::WriteCouriered),
             b"data_downloaded" => Ok(Self::DataDownloaded),
             b"data_erased" => Ok(Self::DataErased),
             other => Err(format!(
@@ -197,6 +203,9 @@ pub struct AuthEvent<Id> {
     pub path: Option<SettlePath>,
     /// The arriving write's path.
     pub other_path: Option<SettlePath>,
+    /// The courier's account, on a couriered write the author's identity came
+    /// through, absent for every other event (R78 decision 10).
+    pub courier_user_id: Option<Id>,
     /// The configured provider a sign-in came through, absent for everything
     /// else.
     pub provider: Option<String>,
@@ -231,6 +240,7 @@ impl<Id> AuthEvent<Id> {
             seq: None,
             path: None,
             other_path: None,
+            courier_user_id: None,
             provider: None,
             issuer: None,
             subject: None,
@@ -254,6 +264,7 @@ impl<Id> AuthEvent<Id> {
             seq: None,
             path: None,
             other_path: None,
+            courier_user_id: None,
             provider: None,
             issuer: None,
             subject: None,
@@ -306,6 +317,14 @@ impl<Id> AuthEvent<Id> {
     pub fn about_login(mut self, provider: impl Into<String>, issuer: impl Into<String>) -> Self {
         self.provider = Some(provider.into());
         self.issuer = Some(issuer.into());
+        self
+    }
+
+    /// Name the courier's account a couriered write came through, the shape a
+    /// `write_couriered` row carries.
+    #[must_use]
+    pub fn about_courier(mut self, courier_user_id: Id) -> Self {
+        self.courier_user_id = Some(courier_user_id);
         self
     }
 
@@ -549,6 +568,9 @@ macro_rules! connetto_audit_table {
                 path -> diesel::sql_types::Nullable<$crate::writer_schema::SettlePathSql>,
                 /// The arriving write's path.
                 other_path -> diesel::sql_types::Nullable<$crate::writer_schema::SettlePathSql>,
+                /// The courier's account, on a couriered write the author's
+                /// identity came through, absent for every other event.
+                courier_user_id -> diesel::sql_types::Nullable<$id_sql>,
                 /// The configured provider a sign-in came through.
                 provider -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
                 /// The issuer a sign-in's identity was verified from.
@@ -576,6 +598,7 @@ macro_rules! connetto_audit_table {
             seq: Option<i64>,
             path: Option<$crate::writer_schema::SettlePath>,
             other_path: Option<$crate::writer_schema::SettlePath>,
+            courier_user_id: Option<$id>,
             provider: Option<String>,
             issuer: Option<String>,
             subject: Option<String>,
@@ -618,6 +641,7 @@ macro_rules! connetto_audit_table {
                     seq: event.seq,
                     path: event.path,
                     other_path: event.other_path,
+                    courier_user_id: event.courier_user_id,
                     provider: event.provider,
                     issuer: event.issuer,
                     subject: event.subject,

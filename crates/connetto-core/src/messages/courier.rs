@@ -5,11 +5,14 @@
 //! offer, its manifest rows and the number of bodies that follow, sends that
 //! many [`CourierBody`](crate::messages::bulk::CourierBody) frames on the bulk
 //! plane in sequence order, and the server answers once, after the last
-//! counted body. One range is open per connection at a time.
+//! counted body. One range is open per connection at a time. The author's
+//! next sessions hear what was couriered in [`CourierNotice`] frames, each
+//! acked by a [`CourierNoticeAck`] that lets the server delete its rows.
 
 use serde::{Deserialize, Serialize};
 
-use crate::exchange::{CourierOutcome, ManifestRow};
+use crate::exchange::{CourierOutcome, ManifestRow, Verdict};
+use crate::messages::WriterRef;
 
 /// A courier range for one author.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,4 +39,35 @@ pub struct CourierAnswer {
     pub request_id: String,
     /// The refusal or the outcome of each row answered.
     pub outcome: CourierOutcome,
+}
+
+/// One entry a courier settled for the session's account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CourierNoticeRow {
+    /// The courier's account, as the deployment renders its user id.
+    pub courier: String,
+    /// The author's writer the entry settled under.
+    pub writer: WriterRef,
+    /// The entry's sequence under that writer.
+    pub seq: u64,
+    /// How the entry settled, `Applied` or `Refused` with its cause.
+    pub verdict: Verdict,
+}
+
+/// The entries couriers settled for the session's account since it last
+/// acked, sent after the handshake (R78 decisions 12, 34 and 39).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CourierNotice {
+    /// The id the ack quotes.
+    pub notice_id: String,
+    /// At most [`MAX_MANIFEST_ROWS`](crate::exchange::MAX_MANIFEST_ROWS)
+    /// rows.
+    pub notices: Vec<CourierNoticeRow>,
+}
+
+/// The client's receipt of one [`CourierNotice`], which deletes its rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CourierNoticeAck {
+    /// The id of the notice acked.
+    pub notice_id: String,
 }

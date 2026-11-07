@@ -18,16 +18,17 @@ use connetto_core::{
     },
     messages::{
         AckCredits, AggregateUpdate, BindDevice, BotListEntry, BotRegistered, BulkMessage,
-        Challenge, ConflictRow, ControlMessage, CourierAnswer, CourierBody, CourierRange,
-        DeviceAttestation, DeviceRevokedAck, DeviceSummary, DevicesList, DevicesRequest,
-        EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused,
-        EnrolRequest, FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired, Grant,
-        Handshake, HandshakeAck, LivePatch, MutationConflict, MutationHeader, MutationPatch,
-        MutationReject, MutationRejectReason, NonFatalError, PauseCause, Ping, Pong, Provenance,
-        ProvisionalStatus, ProvisionalVerdicts, RateLimited, RegisterBot, ReplaceShareKeys,
-        RetireWriter, RevocationUpdate, RevokeDeviceRequest, ShareKeysReplaced, SignedList,
-        SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec, Unsubscribe,
-        Verdict, WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
+        Challenge, ConflictRow, ControlMessage, CourierAnswer, CourierBody, CourierNotice,
+        CourierNoticeAck, CourierNoticeRow, CourierRange, DeviceAttestation, DeviceRevokedAck,
+        DeviceSummary, DevicesList, DevicesRequest, EnrolChallenge, EnrolChallengeRequest,
+        EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason,
+        FullResyncReason, FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch,
+        MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
+        NonFatalError, PauseCause, Ping, Pong, Provenance, ProvisionalStatus, ProvisionalVerdicts,
+        RateLimited, RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate,
+        RevokeDeviceRequest, ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd,
+        SnapshotPatch, Subscribe, SubscriptionSpec, Unsubscribe, Verdict, WriterAnswer,
+        WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
     },
     version::PROTOCOL_VERSION,
 };
@@ -774,5 +775,32 @@ fn courier_frames_round_trip() {
             ),
             (9, CourierEntryOutcome::NotCouriered),
         ]),
+    }));
+}
+
+/// The author's notices and their ack round-trip.
+#[test]
+fn courier_notice_frames_round_trip() {
+    round_trip_control(&ControlMessage::CourierNotice(CourierNotice {
+        notice_id: "n1".into(),
+        notices: vec![
+            CourierNoticeRow {
+                courier: "bruno".into(),
+                writer: WriterRef::Device([3; 32]),
+                seq: 5,
+                verdict: Verdict::Applied,
+            },
+            CourierNoticeRow {
+                courier: "bruno".into(),
+                writer: WriterRef::Device([3; 32]),
+                seq: 6,
+                verdict: Verdict::Refused(RetractCause::Rejected(
+                    MutationRejectReason::Unauthorized,
+                )),
+            },
+        ],
+    }));
+    round_trip_control(&ControlMessage::CourierNoticeAck(CourierNoticeAck {
+        notice_id: "n1".into(),
     }));
 }

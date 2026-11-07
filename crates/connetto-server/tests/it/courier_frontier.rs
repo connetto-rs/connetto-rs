@@ -43,7 +43,7 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
 use connetto_server::ban::{Ban, BanError, BanFuture, BanStore, NewBan};
 use connetto_server::courier::CourierEntry;
-use connetto_server::defaults::{_connetto_settled, _connetto_writers};
+use connetto_server::defaults::{_connetto_courier_notices, _connetto_settled, _connetto_writers};
 use connetto_server::device_cert::{DeviceEnrolment, Enrolment, EnrolmentStore};
 use connetto_server::writer_schema::{SettlePath, SettledOutcome};
 use connetto_server::{
@@ -233,6 +233,16 @@ impl Captured {
             .cloned()
             .collect()
     }
+
+    /// The `write_couriered` events, the ones a courier range settled.
+    pub(super) fn couriered_events(&self) -> Vec<AuthEvent<String>> {
+        self.0
+            .lock()
+            .iter()
+            .filter(|event| matches!(event.op, AuthOp::WriteCouriered))
+            .cloned()
+            .collect()
+    }
 }
 
 /// The manager every test drives.
@@ -378,17 +388,33 @@ pub(super) fn offer(key: &KeyPair, key_id: [u8; 32], newest: Frontier) -> Vec<u8
     rmp_serde::to_vec_named(&SignedOffer { offer, signature }).expect("an offer encodes")
 }
 
+/// The account and session an in-process range settles under, a fresh
+/// session each time, since the audit row names it.
+fn courier_caller(user: &str) -> connetto_server::courier::CourierIdentity<String> {
+    connetto_server::courier::CourierIdentity {
+        user_id: user.to_owned(),
+        session: SessionId::from_uuid(uuid::Uuid::new_v4()),
+    }
+}
+
 /// Deliver `chain` from `from` on, under the author's offer of its newest
-/// entry, the failures a store or an enrolment read raises included.
-async fn try_deliver(
-    manager: &Manager,
+/// entry, settling under `courier`, the failures a store or an enrolment read
+/// raises included.
+async fn try_deliver_as<A>(
+    manager: &Arc<SessionManager<NoSnapshot, A, ConnettoDefaults>>,
+    courier: connetto_server::courier::CourierIdentity<String>,
     key: &KeyPair,
     key_id: [u8; 32],
     chain: &Chain,
     from: u64,
-) -> Result<CourierOutcome, SessionError> {
+) -> Result<CourierOutcome, SessionError>
+where
+    A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
+    A::Error: core::fmt::Display + FailedAuthorization,
+{
     manager
         .courier_deliver(
+            courier,
             KeyId::from_bytes(key_id),
             Some(major()),
             &offer(key, key_id, chain.newest()),
@@ -399,7 +425,37 @@ async fn try_deliver(
 }
 
 /// Deliver `chain` from `from` on, under the author's offer of its newest
-/// entry.
+/// entry, settling under `courier`.
+pub(super) async fn deliver_as<A>(
+    manager: &Arc<SessionManager<NoSnapshot, A, ConnettoDefaults>>,
+    courier: connetto_server::courier::CourierIdentity<String>,
+    key: &KeyPair,
+    key_id: [u8; 32],
+    chain: &Chain,
+    from: u64,
+) -> CourierOutcome
+where
+    A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
+    A::Error: core::fmt::Display + FailedAuthorization,
+{
+    try_deliver_as(manager, courier, key, key_id, chain, from)
+        .await
+        .expect("deliver the range")
+}
+
+/// Deliver `chain` from `from` on under `bob`, the failures a store or an
+/// enrolment read raises included.
+async fn try_deliver(
+    manager: &Manager,
+    key: &KeyPair,
+    key_id: [u8; 32],
+    chain: &Chain,
+    from: u64,
+) -> Result<CourierOutcome, SessionError> {
+    try_deliver_as(manager, courier_caller("bob"), key, key_id, chain, from).await
+}
+
+/// Deliver `chain` from `from` on under `bob`.
 async fn deliver(
     manager: &Manager,
     key: &KeyPair,
@@ -407,9 +463,7 @@ async fn deliver(
     chain: &Chain,
     from: u64,
 ) -> CourierOutcome {
-    try_deliver(manager, key, key_id, chain, from)
-        .await
-        .expect("deliver the range")
+    deliver_as(manager, courier_caller("bob"), key, key_id, chain, from).await
 }
 
 /// The answer of a row the range settled or found settled under `verdict`.
@@ -656,6 +710,42 @@ impl BanStore<String> for Bans {
     }
 }
 
+/// A roster that denies every write, so a couriered entry settles refused
+/// `Unauthorized`.
+pub(super) struct DenyingWrites(pub(super) RosterAuth);
+
+impl VisibilityPolicy for DenyingWrites {
+    type Watcher = Arc<Principal>;
+    type Error = std::convert::Infallible;
+    type Backend = PgBackend;
+
+    async fn may_see<R>(
+        &self,
+        row: &R,
+        watchers: &[Self::Watcher],
+        verdicts: &mut [PolicyVerdict],
+    ) -> Result<(), Self::Error>
+    where
+        R: RowView<Backend = PgBackend> + Sync + ?Sized,
+    {
+        self.0.may_see(row, watchers, verdicts).await
+    }
+
+    async fn may_write<R>(
+        &self,
+        write: RowWrite<'_, R>,
+        watcher: &Self::Watcher,
+    ) -> Result<PolicyVerdict, Self::Error>
+    where
+        R: RowView<Backend = PgBackend> + Sync + ?Sized,
+    {
+        self.0
+            .may_write(write, watcher)
+            .await
+            .map(|_| PolicyVerdict::Deny)
+    }
+}
+
 /// The note id whose insert the [`Faulting`] policy cannot judge.
 pub(super) const FAULTED: i64 = 900;
 
@@ -790,6 +880,7 @@ async fn a_forged_offer_is_refused_before_anything_settles() {
     let other = chain(vec![plain(insert_changeset(2, "forged", "t1"))]);
     let diverged = manager
         .courier_deliver(
+            courier_caller("bob"),
             KeyId::from_bytes(key_id),
             Some(major()),
             &offer(&key, key_id, range.newest()),
@@ -809,6 +900,7 @@ async fn a_forged_offer_is_refused_before_anything_settles() {
     ]);
     let short = manager
         .courier_deliver(
+            courier_caller("bob"),
             KeyId::from_bytes(key_id),
             Some(major()),
             &offer(&key, key_id, longer.newest()),
@@ -856,6 +948,7 @@ async fn a_malformed_range_is_refused_before_anything_settles() {
     refused(
         manager
             .courier_deliver(
+                courier_caller("bob"),
                 author,
                 Some(major()),
                 b"garbage",
@@ -869,7 +962,14 @@ async fn a_malformed_range_is_refused_before_anything_settles() {
     let skipping = vec![range.rows[0].clone(), range.rows[2].clone()];
     refused(
         manager
-            .courier_deliver(author, Some(major()), &signed, &skipping, &[])
+            .courier_deliver(
+                courier_caller("bob"),
+                author,
+                Some(major()),
+                &signed,
+                &skipping,
+                &[],
+            )
             .await
             .expect("deliver"),
         "rows that skip a sequence",
@@ -884,7 +984,14 @@ async fn a_malformed_range_is_refused_before_anything_settles() {
     );
     refused(
         manager
-            .courier_deliver(author, Some(major()), &short, &range.rows, &range.bodies)
+            .courier_deliver(
+                courier_caller("bob"),
+                author,
+                Some(major()),
+                &short,
+                &range.rows,
+                &range.bodies,
+            )
             .await
             .expect("deliver"),
         "rows past the offer's newest",
@@ -893,7 +1000,14 @@ async fn a_malformed_range_is_refused_before_anything_settles() {
     surplus.push(range.bodies[0].clone());
     refused(
         manager
-            .courier_deliver(author, Some(major()), &signed, &range.rows, &surplus)
+            .courier_deliver(
+                courier_caller("bob"),
+                author,
+                Some(major()),
+                &signed,
+                &range.rows,
+                &surplus,
+            )
             .await
             .expect("deliver"),
         "more bodies than rows",
@@ -939,7 +1053,14 @@ async fn a_broken_body_fails_the_range_and_what_settled_stands() {
         ),
     ] {
         let error = manager
-            .courier_deliver(author, Some(major()), &signed, &range.rows, &bodies)
+            .courier_deliver(
+                courier_caller("bob"),
+                author,
+                Some(major()),
+                &signed,
+                &range.rows,
+                &bodies,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -1250,6 +1371,7 @@ async fn a_range_stops_at_a_digest_only_row_and_at_a_number_original() {
         .collect();
     let answer = manager
         .courier_deliver(
+            courier_caller("bob"),
             KeyId::from_bytes(key_id),
             Some(major()),
             &offer(&key, key_id, range.newest()),
@@ -1300,6 +1422,7 @@ async fn a_body_of_another_major_is_not_couriered_on_this_connection() {
     let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
     let answer = manager
         .courier_deliver(
+            courier_caller("bob"),
             KeyId::from_bytes(key_id),
             Major::new(2),
             &offer(&key, key_id, range.newest()),
@@ -1338,6 +1461,12 @@ async fn a_direct_reupload_of_a_courier_settled_entry_is_answered_from_the_recor
     let (challenge, _) = client
         .handshake_challenge_writing("reup-1", &["user:alice"], None, WriterRequest::Device, None)
         .await;
+    // The couriered settle's notice frame stands for the author and arrives
+    // before the bind answer.
+    match client.next_control().await {
+        ControlMessage::CourierNotice(notice) => assert_eq!(notice.notices.len(), 1),
+        other => panic!("expected the notice frame, got {other:?}"),
+    }
     let answer = client
         .bind_device(
             "b1",
@@ -1692,6 +1821,7 @@ async fn the_offer_covers_the_entries_provenance() {
     ] {
         let answer = manager
             .courier_deliver(
+                courier_caller("bob"),
                 author,
                 Some(major()),
                 &offer(&k2, k2_id, offered.newest()),
@@ -1915,6 +2045,7 @@ async fn concurrent_courier_restores_reserve_the_original_before_applying() {
                     let delivery = tokio::time::timeout(
                         Duration::from_secs(30),
                         manager.courier_deliver(
+                            courier_caller("bob"),
                             KeyId::from_bytes(id),
                             Some(major()),
                             &signed,
@@ -1987,16 +2118,7 @@ async fn a_row_that_settles_nothing_is_offered_again_from_it() {
         plain(insert_changeset(FAULTED, "faulted", "t2")),
         plain(insert_changeset(4, "four", "t3")),
     ]);
-    let answer = faulting
-        .courier_deliver(
-            KeyId::from_bytes(key_id),
-            Some(major()),
-            &offer(&key, key_id, range.newest()),
-            &range.rows,
-            &range.bodies,
-        )
-        .await
-        .expect("deliver the range");
+    let answer = deliver_as(&faulting, courier_caller("bob"), &key, key_id, &range, 1).await;
     assert_eq!(
         entries(answer),
         vec![
@@ -2248,4 +2370,281 @@ async fn a_writer_row_that_will_not_stand_fails_the_range() {
     fixture
         .setup(&["DROP FUNCTION drop_writer_rows() CASCADE"])
         .await;
+}
+
+/// A couriered entry that settles applied or refused earns one `write_couriered`
+/// row naming the author's account as `user_id`, the courier's as
+/// `courier_user_id`, the author's writer and the Courier path under the
+/// courier's session, and nothing else for the settle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_couriered_settle_writes_one_write_couriered_row_naming_both_accounts() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (captured, manager) = courier_manager(&fixture, &store);
+    let caller = courier_caller("bob");
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+    ]);
+    assert_eq!(
+        entries(deliver_as(&manager, caller.clone(), &key, key_id, &range, 1).await),
+        vec![applied(1), applied(2)]
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    let events = captured.couriered_events();
+    assert_eq!(events.len(), 2, "one row per entry the range settled");
+    for (i, expected) in [1_i64, 2_i64].into_iter().enumerate() {
+        let event = &events[i];
+        assert_eq!(event.session, Some(caller.session));
+        assert_eq!(event.user_id.as_deref(), Some("alice"));
+        assert_eq!(event.courier_user_id.as_deref(), Some("bob"));
+        assert_eq!(event.writer, Some(writer));
+        assert_eq!(event.seq, Some(expected));
+        assert_eq!(event.path, Some(SettlePath::Courier));
+        assert_eq!(event.other_path, Some(SettlePath::Courier));
+    }
+    assert!(
+        captured.write_events().is_empty(),
+        "a fresh couriered settle earns no writer-state row"
+    );
+}
+
+/// A couriered entry the policy refuses settles `Unauthorized` and still
+/// earns its `write_couriered` row, the refusal standing for re-delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_couriered_settle_writes_its_write_couriered_row() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (captured, guard) = audited_guard();
+    let manager = manager_over(
+        fixture.admin(),
+        guard,
+        Some(store.installable()),
+        SessionConfig::default(),
+        DenyingWrites(roster()),
+    );
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    assert_eq!(
+        entries(deliver_as(&manager, courier_caller("bob"), &key, key_id, &range, 1).await),
+        vec![ruled(
+            1,
+            Verdict::Refused(RetractCause::Rejected(MutationRejectReason::Unauthorized))
+        )]
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    let events = captured.couriered_events();
+    let [event] = events.as_slice() else {
+        panic!("the refused settle audits once, got {}", events.len());
+    };
+    assert_eq!(event.user_id.as_deref(), Some("alice"));
+    assert_eq!(event.courier_user_id.as_deref(), Some("bob"));
+    assert_eq!(event.writer, Some(writer));
+    assert_eq!(event.seq, Some(1));
+    assert_eq!(event.path, Some(SettlePath::Courier));
+    assert_eq!(event.other_path, Some(SettlePath::Courier));
+    let rows = settled_rows(fixture.admin(), writer).await;
+    let [row] = rows.as_slice() else {
+        panic!("the refusal stands its record");
+    };
+    assert_eq!(row.path, SettlePath::Courier);
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+}
+
+/// A row at or below the writer's frontier earns no `write_couriered`, and
+/// the range's one fresh row earns its one, under the courier's session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_settled_prefix_earns_no_write_couriered_rows() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+        plain(insert_changeset(4, "four", "t3")),
+    ]);
+    settle_directly(
+        &manager,
+        "alice",
+        &key,
+        key_id,
+        vec![
+            range.bodies[0].changeset.clone(),
+            range.bodies[1].changeset.clone(),
+        ],
+    )
+    .await;
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![applied(1), applied(2), applied(3)]
+    );
+    let events = captured.couriered_events();
+    let [event] = events.as_slice() else {
+        panic!(
+            "only the fresh row earns a couriered row, got {}",
+            events.len()
+        );
+    };
+    assert_eq!(event.writer, Some(writer));
+    assert_eq!(event.seq, Some(3));
+    assert!(
+        captured.write_events().is_empty(),
+        "the prefix answers from its records"
+    );
+}
+
+/// A sequence another path settled keeps its own audit rows. A different
+/// standing entry earns `write_forked`, the same standing entry earns
+/// `write_redelivered`, and neither earns a `write_couriered`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_already_settled_sequence_keeps_its_own_audit_rows() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    settle_directly(&manager, "alice", &key, key_id, Vec::new()).await;
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+
+    // A different entry stands at the sequence, the frontier not yet read
+    // by the range, so the range forks and stops.
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    diesel::insert_into(_connetto_settled::table)
+        .values((
+            _connetto_settled::writer.eq(writer),
+            _connetto_settled::seq.eq(1_i64),
+            _connetto_settled::entry_hash.eq([7_u8; 32].as_slice()),
+            _connetto_settled::previous_hash.eq(GENESIS),
+            _connetto_settled::outcome.eq(SettledOutcome::Applied.json()),
+            _connetto_settled::path.eq(SettlePath::Direct),
+        ))
+        .execute(&mut *conn)
+        .await
+        .expect("the other entry's record");
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![ruled(
+            1,
+            Verdict::Refused(RetractCause::Rejected(MutationRejectReason::Forked))
+        )]
+    );
+    let events = captured.write_events();
+    let [event] = events.as_slice() else {
+        panic!("the fork audits once, got {}", events.len());
+    };
+    assert_eq!(event.op, AuthOp::WriteForked);
+    assert!(
+        captured.couriered_events().is_empty(),
+        "a forked sequence keeps its fork row alone"
+    );
+
+    // The same entry stands at the sequence, so the range redelivers it.
+    diesel::update(_connetto_settled::table.filter(_connetto_settled::seq.eq(1_i64)))
+        .set(_connetto_settled::entry_hash.eq(range.head(1).as_slice()))
+        .execute(&mut *conn)
+        .await
+        .expect("the record the range carries");
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![applied(1)]
+    );
+    let events = captured.write_events();
+    assert_eq!(
+        events.iter().map(|event| &event.op).collect::<Vec<_>>(),
+        vec![&AuthOp::WriteForked, &AuthOp::WriteRedelivered]
+    );
+    assert!(
+        captured.couriered_events().is_empty(),
+        "a redelivered sequence keeps its redelivered row alone"
+    );
+}
+
+/// The notice row lands in the transaction that settles the entry, so a
+/// failed notice insert leaves the entry unsettled and the notice unwritten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_notice_insert_rolls_back_the_settle() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    fixture
+        .setup(&[
+            "CREATE FUNCTION no_notices() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RAISE EXCEPTION 'no notices'; END $$",
+            "CREATE TRIGGER no_notices BEFORE INSERT ON _connetto_courier_notices \
+             FOR EACH ROW EXECUTE FUNCTION no_notices()",
+        ])
+        .await;
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    let error = try_deliver(&manager, &key, key_id, &range, 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, SessionError::WriteTarget(_)),
+        "got {error:?}"
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    assert_eq!(
+        settled_rows(fixture.admin(), writer).await.len(),
+        0,
+        "the settle rolled back"
+    );
+    assert_eq!(notice_rows(fixture.admin()).await, Vec::new());
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+    fixture.setup(&["DROP FUNCTION no_notices() CASCADE"]).await;
+}
+
+/// A couriered entry that settles writes its one notice row naming the
+/// author's and the courier's accounts, the author's device key, the
+/// sequence and the stored outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_couriered_settle_writes_its_notice_row() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![applied(1)]
+    );
+    let rows = notice_rows(fixture.admin()).await;
+    let [(id, author, courier, device_key, seq, outcome)] = rows.as_slice() else {
+        panic!("one notice stands, got {:?}", rows.len());
+    };
+    assert!(*id > 0);
+    assert_eq!(author.as_str(), "alice");
+    assert_eq!(courier.as_str(), "bob");
+    assert_eq!(*device_key, key_id.to_vec());
+    assert_eq!(*seq, 1);
+    assert_eq!(outcome, &SettledOutcome::Applied.json());
+}
+
+/// The account's standing notice rows, by id.
+async fn notice_rows(
+    pool: &Pool<AsyncPgConnection>,
+) -> Vec<(i64, String, String, Vec<u8>, i64, String)> {
+    let mut conn = pool.get().await.expect("admin connection");
+    _connetto_courier_notices::table
+        .select((
+            _connetto_courier_notices::id,
+            _connetto_courier_notices::user_id,
+            _connetto_courier_notices::courier_user_id,
+            _connetto_courier_notices::device_key,
+            _connetto_courier_notices::seq,
+            _connetto_courier_notices::outcome,
+        ))
+        .order(_connetto_courier_notices::id.asc())
+        .load(&mut *conn)
+        .await
+        .expect("read the notices")
 }
