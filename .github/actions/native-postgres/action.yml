@@ -2,7 +2,6 @@ name: Select native Postgres for the test fixtures
 description: >-
   Makes the stopped PostgreSQL 16 template each test fixture copies and starts
   in place of a Postgres container, and exports the variables selecting it.
-  Run the suite with nextest's native profile, which lifts the docker group's bound.
 runs:
   using: composite
   steps:

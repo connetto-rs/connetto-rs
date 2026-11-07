@@ -110,7 +110,7 @@ jobs:
             cargo +stable build --profile testfast --all-features -p connetto-server --bin connetto-server
             export CONNETTO_SERVER_BIN="$PWD/target/testfast/connetto-server"
           fi
-          keyctl session -- cargo +stable nextest run --profile native \
+          keyctl session -- cargo +stable nextest run \
             --cargo-profile testfast \
             --all-features \
             --test-threads 4 \
@@ -252,7 +252,7 @@ jobs:
           source <(cargo +stable llvm-cov show-env --sh)
           mkdir -p target/testfast
           install -m 0755 "$SUITE/connetto-client" target/testfast/connetto-client
-          keyctl session -- cargo +stable nextest run --profile native \
+          keyctl session -- cargo +stable nextest run \
             --archive-file "$SUITE/suite.tar.zst" \
             --workspace-remap "$GITHUB_WORKSPACE" \
             --extract-to "$GITHUB_WORKSPACE" \
