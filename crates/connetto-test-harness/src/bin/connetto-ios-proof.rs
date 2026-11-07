@@ -3365,18 +3365,11 @@ async fn android_hosts_round(
                 .await
             }
             .await;
-            let outcome = match outcome {
-                Ok(()) => Ok(()),
-                Err(err) => {
-                    eprintln!("the R77 phase: {err:#}");
-                    match relay.resume().await {
-                        Ok(()) => Err(format!("{err:#}")),
-                        Err(resume) => {
-                            Err(format!("{err:#}, and the server stayed down: {resume:#}"))
-                        }
-                    }
-                }
-            };
+            if let Err(err) = &outcome {
+                eprintln!("the R77 phase: {err:#}");
+                relay.resume().await;
+            }
+            let outcome = outcome.map_err(|err| format!("{err:#}"));
             Some(star::StepReport {
                 name: format!("{} round, the R77 phase", round.name()),
                 took: started.elapsed(),
@@ -3693,7 +3686,7 @@ async fn r77_phase(
     // land through the sync alone, and the block the summary records per
     // phone.
     step("R77: the server comes back");
-    relay.resume().await?;
+    relay.resume().await;
     let texts = r77_wait(
         async |deadline| read_star_pages([&mut *alice, &mut *bob, &mut *carol], deadline).await,
         R77_STEP,
