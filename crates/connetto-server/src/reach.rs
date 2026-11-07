@@ -353,6 +353,7 @@ mod tests {
             shape.0,
             shape.1,
             DEFAULT_USER_SETTING,
+            true,
         )
         .expect("the shape translates")
         .into_parts()
@@ -369,6 +370,7 @@ mod tests {
             CROSS_TABLE.0,
             CROSS_TABLE.1,
             DEFAULT_USER_SETTING,
+            true,
         )
         .expect("the shape translates");
         // The member relation is the team's leaf relation. Its name comes from

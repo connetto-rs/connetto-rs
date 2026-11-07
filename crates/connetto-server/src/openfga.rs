@@ -637,6 +637,13 @@ impl Translated {
     /// [`CallerBinding`](crate::capability) binds for Postgres, so the two
     /// executors are told one thing.
     ///
+    /// `devices` carries the deployment's device identity, so the model's
+    /// catalog holds the enrolment table exactly when the engine's does. The
+    /// two catalogs must hold the same tables, because a table id is the
+    /// table's place in the catalog's by-name order and one extra table shifts
+    /// every id that sorts after it, the disagreement `require_one_numbering`
+    /// refuses at boot.
+    ///
     /// # Errors
     ///
     /// [`SetupError::Catalog`] when the two documents do not parse, and
@@ -645,6 +652,7 @@ impl Translated {
         schema_sql: &str,
         policy_sql: &str,
         user_setting: &str,
+        devices: bool,
     ) -> Result<Self, SetupError> {
         // The cap travels with the policies it caps. The model must hold a
         // bot to its list exactly as Postgres does, so it is translated as
@@ -653,8 +661,13 @@ impl Translated {
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
         // The cap names the registry tables connetto appends, so the catalog
         // the model is built over must carry them, the way the cap's own
-        // generation does.
-        let schema_sql = connetto_schema::with_registry::<Id>(schema_sql);
+        // generation does. The bookkeeping tables ride the same append, with
+        // the enrolment table only under the deployment's device identity, so
+        // the model and the engine hold the same tables and number them alike.
+        let schema_sql = connetto_schema::with_bookkeeping::<Id>(
+            &connetto_schema::with_registry::<Id>(schema_sql),
+            devices,
+        );
         let mut sql = String::with_capacity(schema_sql.len() + policy_sql.len() + cap.len() + 1);
         sql.push_str(&schema_sql);
         sql.push('\n');
@@ -2035,6 +2048,7 @@ mod tests {
             SCHEMA,
             policies,
             DEFAULT_USER_SETTING,
+            true,
         )
         .expect("every policy here is one rls2fga classifies")
     }
@@ -2200,7 +2214,13 @@ mod tests {
         let naming = translated.naming();
         let (shapes, _translator, _reach) = translated.into_parts();
         let auth: FgaAuth<String, String, Never> = FgaAuth::new(shapes, delegate_never(), naming);
-        let engine = connetto_schema::with_registry::<connetto_core::bots::TextIds>(SCHEMA);
+        // The naming the row is judged against was built through `of`, which
+        // appends the bookkeeping tables, so the engine catalog must carry
+        // them too or its table numbering will not line up with the naming.
+        let engine = connetto_schema::with_bookkeeping::<connetto_core::bots::TextIds>(
+            &connetto_schema::with_registry::<connetto_core::bots::TextIds>(SCHEMA),
+            true,
+        );
         let session = subql::ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&engine)
             .expect("the engine catalog parses");
         let notes = catalog_helpers::table_id::<Postgres, _>(&session, "notes")
@@ -2265,6 +2285,7 @@ mod tests {
             SHARE_SCHEMA,
             SHARE_POLICY,
             DEFAULT_USER_SETTING,
+            true,
         )
         .expect("the share shape settles from one row");
         let naming = translated.naming();
@@ -2527,6 +2548,7 @@ mod tests {
             "CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);",
             "",
             DEFAULT_USER_SETTING,
+            true,
         )
         .expect("a schema with no policy has nothing to refuse")
         .shapes();
@@ -2546,6 +2568,7 @@ mod tests {
             SCHEMA,
             "CREATE POLICY notes_p ON notes FOR ALL USING (mystery_function(owner))",
             DEFAULT_USER_SETTING,
+            true,
         );
         assert!(
             matches!(refused, Err(super::SetupError::Untranslated(_))),
@@ -2595,6 +2618,7 @@ mod tests {
             SHARE_SCHEMA,
             SHARE_POLICY,
             DEFAULT_USER_SETTING,
+            true,
         );
         assert!(
             translated.is_ok(),
@@ -2624,12 +2648,14 @@ mod tests {
         const POLICY: &str = "CREATE POLICY papers_p ON papers FOR SELECT USING (\
             current_setting('app.user_id', true) = ANY(viewers))";
 
-        let Err(super::SetupError::Unwithdrawable(named)) = Translated::of::<
-            String,
-            connetto_core::bots::TextIds,
-        >(
-            SCHEMA, POLICY, DEFAULT_USER_SETTING
-        ) else {
+        let Err(super::SetupError::Unwithdrawable(named)) =
+            Translated::of::<String, connetto_core::bots::TextIds>(
+                SCHEMA,
+                POLICY,
+                DEFAULT_USER_SETTING,
+                true,
+            )
+        else {
             panic!(
                 "nothing can withdraw this grant, so it must stop the server rather than \
                  serve access the database has taken away"
@@ -2670,6 +2696,7 @@ mod tests {
             SCHEMA,
             POLICY,
             DEFAULT_USER_SETTING,
+            true,
         );
         assert!(
             translated.is_ok(),
@@ -2699,6 +2726,7 @@ mod tests {
             SCHEMA,
             POLICY,
             DEFAULT_USER_SETTING,
+            true,
         )
         .expect("translates");
         let mats = translated.shapes.materialisations();
@@ -2741,12 +2769,14 @@ mod tests {
         const POLICY: &str = "CREATE POLICY p ON \"user\" FOR SELECT USING (\
             owner = current_setting('app.user_id', true))";
 
-        let Err(super::SetupError::Unplannable(detail)) = Translated::of::<
-            String,
-            connetto_core::bots::TextIds,
-        >(
-            SCHEMA, POLICY, DEFAULT_USER_SETTING
-        ) else {
+        let Err(super::SetupError::Unplannable(detail)) =
+            Translated::of::<String, connetto_core::bots::TextIds>(
+                SCHEMA,
+                POLICY,
+                DEFAULT_USER_SETTING,
+                true,
+            )
+        else {
             panic!("two things under one type name must stop the boot");
         };
         assert!(
@@ -2783,6 +2813,7 @@ mod tests {
             SCHEMA,
             POLICIES,
             DEFAULT_USER_SETTING,
+            true,
         )
         .expect("both policies are one rls2fga classifies");
         let naming = translated.naming();

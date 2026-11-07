@@ -22,6 +22,29 @@ struct Recorded {
     new: Option<String>,
 }
 
+/// Recorded rows with each `{"r": text}` read back as its `f64`, so a real compares by value, not by SQLite's rendering.
+fn reals_read(
+    rows: Vec<Recorded>,
+) -> Vec<(
+    String,
+    String,
+    Option<serde_json::Value>,
+    Option<serde_json::Value>,
+)> {
+    let read = |json: String| {
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("recorded JSON");
+        for cell in value.as_object_mut().expect("a JSON object").values_mut() {
+            if let Some(real) = cell.get("r").and_then(serde_json::Value::as_str) {
+                *cell = serde_json::json!({ "r": real.parse::<f64>().expect("a real") });
+            }
+        }
+        value
+    };
+    rows.into_iter()
+        .map(|row| (row.tbl, row.op, row.old.map(read), row.new.map(read)))
+        .collect()
+}
+
 fn recorded(conn: &mut ConnettoConnection<FakeTransport>) -> Vec<Recorded> {
     diesel::sql_query("SELECT tbl, op, old, new FROM _connetto_outbox ORDER BY seq")
         .load(conn.conn())
@@ -84,32 +107,32 @@ fn row(tbl: &str, op: &str, old: Option<&str>, new: Option<&str>) -> Recorded {
     }
 }
 
-/// Each value keeps its storage class: a real round trips through its 17
-/// digits, text with a quote stays text, and a blob is stored raw beside its
+/// Each value keeps its storage class: a real reads back as the same value,
+/// text with a quote stays text, and a blob is stored raw beside its
 /// row with a marker in the JSON. An update records the key and the cells it
 /// changed, an insert the whole new row and a delete the whole old one.
 #[tokio::test]
 async fn each_write_is_recorded_with_its_values() {
     let mut conn = open(DDL);
     conn.batch_execute(
-        "INSERT INTO items VALUES (1, 'it''s \"here\"', 0.1, x'00ff'); \
+        "INSERT INTO items VALUES (1, 'it''s \"here\"', 0.30000000000000004, x'00ff'); \
          UPDATE items SET label = NULL, weight = 2 WHERE id = 1; \
          DELETE FROM items WHERE id = 1",
     )
     .expect("write a row three times");
 
     let inserted =
-        r#"{"id":1,"label":"it's \"here\"","weight":{"r":"0.10000000000000001"},"data":{"b":0}}"#;
-    let before = r#"{"id":1,"label":"it's \"here\"","weight":{"r":"0.10000000000000001"}}"#;
+        r#"{"id":1,"label":"it's \"here\"","weight":{"r":"0.30000000000000004"},"data":{"b":0}}"#;
+    let before = r#"{"id":1,"label":"it's \"here\"","weight":{"r":"0.30000000000000004"}}"#;
     let after = r#"{"id":1,"label":null,"weight":{"r":"2.0"}}"#;
     let deleted = r#"{"id":1,"label":null,"weight":{"r":"2.0"},"data":{"b":0}}"#;
     assert_eq!(
-        recorded(&mut conn),
-        vec![
+        reals_read(recorded(&mut conn)),
+        reals_read(vec![
             row("items", "I", None, Some(inserted)),
             row("items", "U", Some(before), Some(after)),
             row("items", "D", Some(deleted), None),
-        ]
+        ])
     );
     assert_eq!(
         blobs(&mut conn),

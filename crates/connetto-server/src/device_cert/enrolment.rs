@@ -61,6 +61,12 @@ pub struct KeyRecord<Id> {
     /// peer still accepts it within, the read minus `DEVICE_SKEW` (R77
     /// decision 11).
     pub certificate_live_past_skew: bool,
+    /// When the key's last certificate expires, `None` when it holds none.
+    ///
+    /// The server arms one timer per author it answers `Pending` for, at this
+    /// instant plus `DEVICE_SKEW`, and answers `Abandoned` to the sequences
+    /// still open when it fires (R77 decision 11).
+    pub certificate_expiry: Option<SystemTime>,
     /// The device key's `SubjectPublicKeyInfo`.
     pub public_key: Vec<u8>,
     /// The bot list the key's last certificate carries, `None` for an
@@ -398,6 +404,14 @@ impl<Id: Clone + PartialEq + Send + Sync + 'static> EnrolmentStore<Id> for Memor
                         .find(|grant| grant.key == key)
                         .map(|grant| grant.public_key.clone())
                         .unwrap_or_default();
+                    // The latest expiry across the key's certificates is when
+                    // the tolerance window closes, the instant the timer fires.
+                    let certificate_expiry = state
+                        .grants
+                        .iter()
+                        .filter(|grant| grant.key == key)
+                        .map(|grant| grant.expires_at)
+                        .max();
                     KeyRecord {
                         user: row.user.clone(),
                         revoked: row.revoked_at.is_some(),
@@ -409,6 +423,7 @@ impl<Id: Clone + PartialEq + Send + Sync + 'static> EnrolmentStore<Id> for Memor
                             .grants
                             .iter()
                             .any(|grant| grant.key == key && grant.expires_at > past_skew),
+                        certificate_expiry,
                         public_key,
                         bot_list: Some(row.bot_list.clone()),
                     }

@@ -105,11 +105,12 @@ fn a_range_under_another_build_carries_no_body() {
 async fn a_settled_entry_leaves_its_head_and_takes_its_range() {
     let (mut conn, seqs) = author(3);
     let first = hash_at(&conn, seqs[0]);
-    conn.handle_control(ControlMessage::MutationApplied(MutationApplied {
-        client_seq: seqs[0],
-    }))
-    .await
-    .expect("the ack lands");
+    let _ = conn
+        .handle_control(ControlMessage::MutationApplied(MutationApplied {
+            client_seq: seqs[0],
+        }))
+        .await
+        .expect("the ack lands");
     let served = conn
         .serve_range(KEY, 2, 2, &own_build())
         .expect("read the range")
@@ -123,11 +124,12 @@ async fn a_settled_entry_leaves_its_head_and_takes_its_range() {
     );
     assert_eq!(conn.serve_body(KEY, seqs[0]).expect("read the body"), None);
 
-    conn.handle_control(ControlMessage::MutationApplied(MutationApplied {
-        client_seq: seqs[1],
-    }))
-    .await
-    .expect("the ack lands");
+    let _ = conn
+        .handle_control(ControlMessage::MutationApplied(MutationApplied {
+            client_seq: seqs[1],
+        }))
+        .await
+        .expect("the ack lands");
     assert_eq!(
         conn.serve_range(KEY, 2, 3, &own_build())
             .expect("read the range"),

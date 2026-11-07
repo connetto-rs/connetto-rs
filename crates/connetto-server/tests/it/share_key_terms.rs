@@ -43,10 +43,14 @@ async fn manager(fixture: &Fixture, clock: &ExpiryClock) -> Manager {
             "CREATE PUBLICATION share_key_terms_pub FOR TABLE items, team_members",
         ])
         .await;
-    let (_, translator, _) =
-        Translated::of::<String, connetto_core::bots::TextIds>(DDL, POLICIES, DEFAULT_USER_SETTING)
-            .expect("the membership policy translates")
-            .into_parts();
+    let (_, translator, _) = Translated::of::<String, connetto_core::bots::TextIds>(
+        DDL,
+        POLICIES,
+        DEFAULT_USER_SETTING,
+        true,
+    )
+    .expect("the membership policy translates")
+    .into_parts();
     ManagerBuilder::new(
         Materializer::builder(DDL)
             .with_write_catalog(RuntimeWritableCatalog::default())

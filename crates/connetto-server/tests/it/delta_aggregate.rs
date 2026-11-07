@@ -9,7 +9,7 @@ use connetto_server::{Materializer, Registration, SeedPlan};
 use subql::backend::{ScalarFamily, Value as PgValue};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 
-const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT);";
+const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT, ts TIMESTAMPTZ);";
 
 #[test]
 fn register_classifies_fold_aggregate_and_row() {
@@ -346,8 +346,9 @@ async fn an_event_that_cannot_be_encoded_is_applied_without_a_patch() {
     mat.install_fold_seed(cap.subscription_id, vec![vec![PgValue::Int(0)]], None)
         .expect("seed fold");
 
-    // A column the catalog does not know, as a schema change ahead of the deployment delivers.
-    let drifted = orders_insert(&[("id", "1"), ("quantity", "10"), ("note", "x")], 1);
+    // A `timestamptz` infinity, a value Postgres can hold but the wire
+    // cannot carry, so the fold cannot encode the event.
+    let drifted = orders_insert(&[("id", "1"), ("quantity", "10"), ("ts", "infinity")], 1);
     let dispatched = mat
         .dispatch(&drifted)
         .await
@@ -374,7 +375,14 @@ async fn an_event_that_cannot_be_encoded_is_applied_without_a_patch() {
         "the fold still counted the unencodable insert"
     );
 
-    let valid = orders_insert(&[("id", "2"), ("quantity", "20")], 2);
+    let valid = orders_insert(
+        &[
+            ("id", "2"),
+            ("quantity", "20"),
+            ("ts", "2026-01-01 00:00:00+00"),
+        ],
+        2,
+    );
     let dispatched = mat.dispatch(&valid).await.expect("dispatch");
     let values: Vec<Option<&str>> = dispatched
         .computed

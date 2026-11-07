@@ -94,10 +94,33 @@ impl PageSession {
     /// When the socket does not open or announces no committed page within
     /// [`REPLY_BOUND`].
     pub async fn webkit(url: &str) -> Result<Self> {
+        Self::webkit_within(url, REPLY_BOUND).await
+    }
+
+    /// A session on the first of `urls` whose page attaches through
+    /// [`webkit`](Self::webkit) within `bound`, or [`None`] when none does.
+    ///
+    /// The proxy keeps listing a page after iOS suspended its process, as the
+    /// login view of a sign-in that finished, and such a page accepts the
+    /// connection and announces nothing, so a page that does not attach is
+    /// skipped rather than ending the caller's wait.
+    pub async fn webkit_first(urls: &[String], bound: Duration) -> Option<Self> {
+        for url in urls {
+            match Self::webkit_within(url, bound).await {
+                Ok(page) => return Some(page),
+                Err(err) => {
+                    eprintln!("{url} did not attach ({err:#}), trying the next listed page");
+                }
+            }
+        }
+        None
+    }
+
+    async fn webkit_within(url: &str, bound: Duration) -> Result<Self> {
         let (mut socket, _) = tokio_tungstenite::connect_async(url)
             .await
             .context("opening the WebKit inspector session")?;
-        let deadline = Instant::now() + REPLY_BOUND;
+        let deadline = Instant::now() + bound;
         let mut target_events = Vec::new();
         // Frames commit provisional targets too, so only a page's commit is followed.
         let mut provisional_pages = Vec::new();
@@ -826,5 +849,37 @@ mod tests {
             format!("{error:#}").contains("no reply within 200ms"),
             "{error:#}"
         );
+    }
+
+    /// A page the proxy still lists after iOS suspended it, as the login view
+    /// of a finished sign-in, accepts the connection and announces nothing,
+    /// so the session goes to the next page the listing matched.
+    #[tokio::test]
+    async fn a_listed_page_that_never_announces_itself_is_skipped() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let suspended = format!("ws://{}", listener.local_addr().unwrap());
+        // The two attaches the test makes, held open and silent by the receiver.
+        let (accepted, _held) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let _ = accepted.send(tokio_tungstenite::accept_async(stream).await.unwrap());
+            }
+        });
+        let (seen, mut expressions) = tokio::sync::mpsc::unbounded_channel();
+        let live = webkit_endpoint(seen).await;
+
+        let mut page =
+            PageSession::webkit_first(&[suspended.clone(), live], Duration::from_millis(200))
+                .await
+                .expect("the live page attaches");
+        page.set_input("user", "second").await.unwrap();
+        assert!(
+            expressions.try_recv().is_ok(),
+            "the session reached the live page"
+        );
+
+        let none = PageSession::webkit_first(&[suspended], Duration::from_millis(200)).await;
+        assert!(none.is_none(), "no listed page attached");
     }
 }

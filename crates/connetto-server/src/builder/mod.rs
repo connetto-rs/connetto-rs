@@ -315,6 +315,7 @@ impl Database {
 pub struct ServerSchema {
     pg_ddl: String,
     pg_policies: String,
+    devices: bool,
 }
 
 impl ServerSchema {
@@ -325,7 +326,16 @@ impl ServerSchema {
         Self {
             pg_ddl: pg_ddl.into(),
             pg_policies: pg_policies.into(),
+            devices: false,
         }
+    }
+
+    /// Hold the device enrolment table in the catalog, the device identity
+    /// deployments set at build (R77 decision 11).
+    #[must_use]
+    pub fn with_devices(mut self, devices: bool) -> Self {
+        self.devices = devices;
+        self
     }
 
     /// The deployment's DDL with connetto's bot registry tables appended, the
@@ -338,7 +348,12 @@ impl ServerSchema {
     /// the authorization model's, reads this text.
     #[must_use]
     pub fn engine_ddl<Id: connetto_core::bots::BotRegistryIdSql>(&self) -> String {
-        connetto_schema::with_registry::<Id>(&self.pg_ddl)
+        // Bookkeeping appends after the registry, so every catalog numbers the
+        // tables in the one fixed order `require_one_numbering` compares.
+        connetto_schema::with_bookkeeping::<Id>(
+            &connetto_schema::with_registry::<Id>(&self.pg_ddl),
+            self.devices,
+        )
     }
 
     /// The one catalog the engine classifies, the policies beside
@@ -1598,6 +1613,7 @@ where
             sign_in,
             deployment_schema: _,
         } = self;
+        let schema = schema.with_devices(device_identity.is_some());
 
         if oidc_providers.is_empty() {
             return Err(BuildError::NoProviders);
@@ -1670,6 +1686,7 @@ where
             &oplog_table,
             oplog_config,
             slot_lag_watch,
+            device_identity.is_some(),
         )
         .await?;
         let reader_pool_size = reader_reserve.total();
@@ -2012,6 +2029,7 @@ async fn prepare_change_log(
     oplog_table: &str,
     oplog_config: OplogConfig,
     lag_watch: Duration,
+    device_identity: bool,
 ) -> Result<(PgOplog, Option<BackgroundTask>), BuildError> {
     // Absent, these turn the change stream into a retry loop that never
     // succeeds and the first change into a failure on a boot that looked
@@ -2019,26 +2037,41 @@ async fn prepare_change_log(
     // whether a caller could see the version that just went (R6).
     let commit_table = PgOplog::commit_table(oplog_table);
     let xid_table = PgOplog::xid_table(oplog_table);
-    preflight::require(
-        pool,
-        &[
-            Artifact::ReplicationSlot(slot),
-            Artifact::Publication(publication),
-            Artifact::Table(oplog_table),
-            Artifact::TableColumn {
-                table: oplog_table,
-                column: "payload",
-            },
-            Artifact::Table(&commit_table),
-            Artifact::TableColumn {
-                table: &commit_table,
-                column: "xid_horizon",
-            },
-            Artifact::Table(&xid_table),
-            Artifact::PreviousImages { publication },
-        ],
-    )
-    .await?;
+    let mut artifacts = vec![
+        Artifact::ReplicationSlot(slot),
+        Artifact::Publication(publication),
+        Artifact::Table(oplog_table),
+        Artifact::TableColumn {
+            table: oplog_table,
+            column: "payload",
+        },
+        Artifact::Table(&commit_table),
+        Artifact::TableColumn {
+            table: &commit_table,
+            column: "xid_horizon",
+        },
+        Artifact::Table(&xid_table),
+        // The pending verdicts push on a row the stream must carry (R77
+        // decision 11). The writer and settled tables always stand.
+        Artifact::PublishedTable {
+            publication,
+            table: connetto_schema::BOOKKEEPING_TABLES[0],
+        },
+        Artifact::PublishedTable {
+            publication,
+            table: connetto_schema::BOOKKEEPING_TABLES[1],
+        },
+    ];
+    // The enrolment table stands only with device identity, so its publication
+    // is required only then (R77 decision 11).
+    if device_identity {
+        artifacts.push(Artifact::PublishedTable {
+            publication,
+            table: connetto_schema::BOOKKEEPING_TABLES[2],
+        });
+    }
+    artifacts.push(Artifact::PreviousImages { publication });
+    preflight::require(pool, &artifacts).await?;
     let watch = if lag_watch.is_zero() {
         tracing::warn!(
             "the slot lag watch is off, so nothing will report a slot filling \
@@ -2259,6 +2292,7 @@ async fn translate_authorization<D: ConnettoSchema>(
         &schema.pg_ddl,
         &schema.pg_policies,
         DEFAULT_USER_SETTING,
+        schema.devices,
     )?;
     let engine_ddl = schema.engine_ddl::<RegistryIds<D>>();
     require_one_numbering(translated.shapes_arc().catalog(), &engine_ddl)?;

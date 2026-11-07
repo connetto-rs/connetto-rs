@@ -49,16 +49,17 @@ The entry also carries the compressed patch, beside the event. [`connetto_server
 
 ### Retention window
 
-The oplog is a ring buffer with a configurable retention window, bounded two ways, whichever is hit first, and both are configurable per deployment.
+The oplog is a ring buffer with a configurable retention window, bounded three ways, whichever is hit first, and all three are configurable per deployment.
 
 | Bound | Default |
 |---|---|
-| Maximum number of entries, `OplogConfig::max_entries` | 1M |
-| Maximum age, `OplogConfig::max_age` | 72 hours |
+| Maximum number of entries, `OplogConfig::with_max_entries` | 1M |
+| Maximum age, `OplogConfig::with_max_age` | 72 hours |
+| Maximum stored bytes, `OplogConfig::with_max_bytes` | 1 GiB |
 
 Entries outside the window are pruned, and tombstones follow the same rules as any other entry. Pruning is unconditional on the window. No per-client cursor tracking goes into the predicate, and a client outside it gets a full re-sync, the frame [`connetto_core::messages::FullResyncRequired`] on the plane [02-protocol.md](02-protocol.md#message-families) owns. A client whose cursor predates a pruned tombstone does not lose the delete, since it is outside the window and takes the full re-sync, which re-derives every row it holds.
 
-The log's total bytes are not bounded today [G9](../../plans/master-implementation-plan.md#g9). Planned in [the shared frame design](../../plans/master-implementation-plan.md#shared-frames-and-the-oplog-byte-bound), the window gains a byte bound, and the pruning names which bound fired.
+An entry's bytes are what the Postgres log stores for it, the change encoded as JSON, the compressed patch, the primary key and the table name, and the in-memory log counts the same quantity so one setting means the same on either backend. The default has no measurement behind it. A bound set too small costs extra full resyncs and never data, which look like a client defect while being a retention setting, so the server logs at info level which bound prunes whenever another one takes over.
 
 It is a memory bound and not an abuse defence. One entry per change event, appended once regardless of who is watching or how many, so a caller cannot enlarge the log by connecting. Only a writer to Postgres adds entries.
 

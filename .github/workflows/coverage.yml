@@ -10,9 +10,10 @@ name: Coverage
 permissions:
   contents: read
 
+# A main run is never cut short, and a newer merge replaces only the pending main run.
 concurrency:
   group: coverage-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -62,6 +63,8 @@ jobs:
               -p connetto-exchange
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Restore cargo downloads
         if: runner.environment == 'github-hosted'
@@ -94,6 +97,7 @@ jobs:
       - uses: taiki-e/install-action@nextest
 
       - uses: $/.github/actions/pull-test-images
+      - uses: $/.github/actions/native-postgres
 
       # testfast is release without the fat link: instrumentation on top of
       # lto and one codegen unit more than doubles the build.
@@ -215,6 +219,8 @@ jobs:
         partition: ${{ fromJSON(!startsWith(vars.LINUX_LIGHT, 'ubuntu-') && !startsWith(vars.LINUX_HEAVY, 'ubuntu-') && vars.LINUX_LIGHT && vars.LINUX_HEAVY && '[1, 2, 3, 4]' || '[1, 2, 3]') }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install stable toolchain with llvm-tools
         uses: $/.github/actions/install-rust
@@ -235,6 +241,7 @@ jobs:
           path: ${{ runner.temp }}/coverage-server
 
       - uses: $/.github/actions/pull-test-images
+      - uses: $/.github/actions/native-postgres
 
       # Extracted into the checkout, where the tests' compiled-in binary
       # paths and the report expect the target directory.
