@@ -322,6 +322,8 @@ where
                 nearby: None,
                 #[cfg(feature = "peer")]
                 bt_state: None,
+                #[cfg(all(feature = "peer", target_os = "android"))]
+                java: None,
             },
             pump,
         ))
@@ -933,6 +935,10 @@ where
         > = None;
         #[cfg(feature = "peer")]
         let mut bt_state: Option<Arc<dyn crate::bluetooth::ReadinessBackend>> = None;
+        // The application's JNI access, kept for the permission prompt the
+        // panel asks for (R76).
+        #[cfg(all(feature = "peer", target_os = "android"))]
+        let java = device.java.clone();
         #[cfg(feature = "device-identity")]
         let (device, pump) = match keys {
             Some(keys) => {
@@ -1230,6 +1236,8 @@ where
                 nearby,
                 #[cfg(feature = "peer")]
                 bt_state,
+                #[cfg(all(feature = "peer", target_os = "android"))]
+                java,
             },
             pump,
         ))
@@ -1481,6 +1489,10 @@ pub struct NativeClient<T: Transport, C = ()> {
     #[cfg(feature = "peer")]
     /// The platform's Bluetooth standing, readable at any time (R76).
     bt_state: Option<Arc<dyn crate::bluetooth::ReadinessBackend>>,
+    #[cfg(all(feature = "peer", target_os = "android"))]
+    /// The application's JNI access, for the peer link's permission prompt
+    /// (R76).
+    java: Option<Arc<dyn crate::device_key::JavaAccess>>,
 }
 
 impl<T, C> NativeClient<T, C>
@@ -1823,6 +1835,23 @@ where
             Some(device) => device.enable_bluetooth().await,
             None => Err(crate::bluetooth::BluetoothError::Unsupported),
         }
+    }
+
+    /// Ask the system for the peer link's permissions, over the
+    /// application's screen in front, the prompt a host or join that named a
+    /// missing permission leads to (R76). The platform wants it asked from
+    /// its main thread.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::MissingJavaAccess`] in a build without the JNI access,
+    /// [`ClientError::NoAndroidScreen`] when the application shows no screen,
+    /// and [`ClientError::AndroidJava`] when the plugin refuses.
+    #[cfg(all(feature = "peer", target_os = "android"))]
+    pub fn request_peer_permissions(&self) -> Result<(), ClientError> {
+        let java = self.java.as_ref().ok_or(ClientError::MissingJavaAccess)?;
+        crate::hotspot::android::request_permissions(&**java)
+            .map_err(|failure| ClientError::AndroidJava(failure.to_string()))
     }
 
     /// Join the nearby host's hotspot through the exchange, answered with
@@ -2290,6 +2319,8 @@ impl<T: Transport, C> NativeClient<T, C> {
             nearby: None,
             #[cfg(feature = "peer")]
             bt_state: None,
+            #[cfg(all(feature = "peer", target_os = "android"))]
+            java: None,
         }
     }
 }
@@ -2788,6 +2819,8 @@ mod tests {
             nearby: Some(nearby_rx),
             #[cfg(feature = "peer")]
             bt_state: Some(readiness),
+            #[cfg(all(feature = "peer", target_os = "android"))]
+            java: None,
         };
 
         // The calls hand back what the machines answer.

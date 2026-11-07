@@ -48,6 +48,21 @@ pub trait JavaAccess: Send + Sync {
     ///
     /// [`ClientError`] when no Java VM is reachable.
     fn with_env(&self, body: &mut dyn FnMut(&mut JNIEnv<'_>)) -> Result<(), ClientError>;
+
+    /// Run `body` with a JNI environment and the application's screen in
+    /// front, an `android.app.Activity`, for the platform's prompts that open
+    /// over a screen. The process's registered context is no screen under
+    /// every host, Tauri's registering the `Application`, so the access looks
+    /// the screen up each time.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::NoAndroidScreen`] when the application shows no screen,
+    /// and [`ClientError`] when no Java VM is reachable.
+    fn with_activity(
+        &self,
+        body: &mut dyn FnMut(&mut JNIEnv<'_>, &JObject<'_>),
+    ) -> Result<(), ClientError>;
 }
 
 /// The Android Keystore, reached through the application's JNI access.

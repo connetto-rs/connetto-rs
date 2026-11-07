@@ -1,7 +1,7 @@
-//! Deploys `examples/dioxus-demo` to an iOS simulator or a paired
-//! iPhone or iPad, or with `--demo tauri` `examples/tauri-leptos-demo` to a
-//! simulator, and walks R88's proof on it, which is sign in, sync, write
-//! offline and upload on reconnect, then R51's re-check after time away.
+//! Deploys `examples/tauri-leptos-demo`, or with `--demo dioxus`
+//! `examples/dioxus-demo`, to an iOS simulator or a paired iPhone or iPad,
+//! and walks R88's proof on it, which is sign in, sync, write offline and
+//! upload on reconnect, then R51's re-check after time away.
 //!
 //! With `--peer-device UDID --every-join --hotspot-passphrase PASS` a second
 //! paired phone joins the first in one run (R76 slice 9a), the first hosting
@@ -46,7 +46,14 @@
 //! without the certificate. A device build is signed with the identity
 //! `connetto-ios-signing` prepared, whose keychain the driver unlocks, and a
 //! device run needs the stack on a host the device reaches, which on the
-//! maintainer's tailnet is `CONNETTO_STACK_PUBLIC_HOST` with TLS. The demo and
+//! maintainer's tailnet is `CONNETTO_STACK_PUBLIC_HOST` with TLS. A Tauri
+//! device run is prepared by `connetto-ios-signing`, which writes the profile
+//! this proof embeds in the app and signs it with, the build passing
+//! `--no-sign` so this proof, not Xcode, does the signing. The Tauri Xcode
+//! build phase does not keep `RUSTUP_TOOLCHAIN`, so the Mac's Rust toolchain
+//! for it must be arm64, which a `rustup override set
+//! stable-aarch64-apple-darwin` in `examples/tauri-leptos-demo` serves. The
+//! demo and
 //! its login page are read and driven through the `WebKit` remote inspector,
 //! reached with `ios_webkit_debug_proxy`, which must be on `PATH`. The app
 //! dials the sync server through a relay the driver owns, over `wss` with the
@@ -70,6 +77,7 @@ use connetto_test_harness::android_phone;
 use connetto_test_harness::demo::{order_count, wait_for_count};
 use connetto_test_harness::inspector::{PageSession, REPLY_BOUND, list_pages};
 use connetto_test_harness::ios_signing;
+use connetto_test_harness::ios_signing::{TAPPER_PROFILE, TAURI_PROFILE};
 use connetto_test_harness::leg::LegClient;
 use connetto_test_harness::leg_wire::parse_default_gateway;
 use connetto_test_harness::peer_devices::{
@@ -78,8 +86,8 @@ use connetto_test_harness::peer_devices::{
 use connetto_test_harness::peer_proof::{HotspotOfferLines, JoinReport, commit, summary};
 use connetto_test_harness::relay::Relay;
 use connetto_test_harness::stack::{
-    TLS_CERT_VAR, TLS_KEY_VAR, demo_has_device_identity, demo_mobile_features, now_millis,
-    repo_path,
+    TLS_CERT_VAR, TLS_KEY_VAR, demo_has_device_identity, dioxus_mobile_features, now_millis,
+    repo_path, tauri_mobile_features,
 };
 use connetto_test_harness::star;
 use connetto_test_harness::step;
@@ -93,13 +101,16 @@ const APP: &str = "target/dx/connetto-dioxus-demo/debug/ios/ConnettoDioxusDemo.a
 const TAURI_DIR: [&str; 3] = ["examples", "tauri-leptos-demo", "src-tauri"];
 /// Where `cargo tauri ios build` leaves a simulator build.
 const TAURI_APP: &str = "gen/apple/build/arm64-sim/connetto-tauri-demo.app";
+/// Where a `--no-sign` device build leaves the app, inside the archive's
+/// products and clear of the simulator's `arm64-sim` and `arm64` folders.
+const TAURI_DEVICE_APP: &str = "gen/apple/build/connetto-tauri-demo_iOS.xcarchive/Products/Applications/connetto-tauri-demo.app";
 
-/// The demo the proof deploys, `--demo dioxus` (the default) or `--demo
-/// tauri` (`examples/tauri-leptos-demo`).
+/// The demo the proof deploys, `--demo tauri` (the default) or `--demo
+/// dioxus` (`examples/dioxus-demo`).
 #[derive(Clone, Copy, Default)]
 enum Demo {
-    #[default]
     Dioxus,
+    #[default]
     Tauri,
 }
 
@@ -108,6 +119,15 @@ static DEMO: std::sync::OnceLock<Demo> = std::sync::OnceLock::new();
 
 fn demo() -> Demo {
     DEMO.get().copied().unwrap_or_default()
+}
+
+/// The phone's demo the run deploys, which the star's Android phone takes
+/// its package and activity from.
+fn phone_demo() -> android_phone::Demo {
+    match demo() {
+        Demo::Tauri => android_phone::Demo::Tauri,
+        Demo::Dioxus => android_phone::Demo::Dioxus,
+    }
 }
 
 /// The orders write button the sync step clicks, which only the Tauri demo
@@ -171,9 +191,6 @@ const ALERT_LABELS: [&str; 7] = [
     "OK",
     "Continua a provare con la rete Wi-Fi",
 ];
-/// The iOS development profile the tapper's runner signs with, as
-/// `connetto-ios-signing` names it.
-const TAPPER_PROFILE: &str = "connetto tapper development";
 /// How long the Mac's `en0` gets to stand back on its home network after a
 /// join's leave, measured at 10 s (R76 slice 9c).
 const GATEWAY_BACK_BOUND: Duration = Duration::from_secs(60);
@@ -567,13 +584,11 @@ async fn sign_in(
     evidence: &Path,
     user: &str,
 ) -> Result<PageSession> {
-    if matches!(demo(), Demo::Tauri) {
-        return sign_in_tauri(target, inspector, login_prefix, evidence, user).await;
-    }
     let deadline = Instant::now() + Duration::from_secs(90);
-    let mut demo = String::from("no demo page");
+    let mut shown = String::from("no demo page");
     let observe = async {
         let mut submitted = false;
+        let mut clicked = false;
         loop {
             if !submitted
                 && let Some(mut login) = inspector
@@ -588,23 +603,30 @@ async fn sign_in(
             if let Some(mut app) = inspector.try_page(is_demo_page).await {
                 match app.page_text().await {
                     Ok(text) => {
-                        if text.contains("status: connected") {
-                            if !submitted {
-                                eprintln!(
-                                    "an earlier credential signed the demo in, signing out first"
-                                );
-                                sign_out(&mut app).await?;
-                            } else if text
-                                .contains("custody: released only after user verification")
-                            {
-                                return Ok::<_, anyhow::Error>(app);
-                            }
+                        if !clicked && text.contains("Sign in to begin.") {
+                            // Both demos park the login URL and open it on the
+                            // sign-in click. A second click would open a
+                            // second login over the first, so only a refused
+                            // click retries on the next poll.
+                            clicked = app
+                                .click_when_enabled("Sign in", Duration::from_secs(5))
+                                .await
+                                .is_ok();
+                            continue;
                         }
-                        demo = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        if !submitted && signed_in(&text) {
+                            eprintln!(
+                                "an earlier credential signed the demo in, signing out first"
+                            );
+                            sign_out(&mut app).await?;
+                        } else if submitted && signed_in(&text) {
+                            return Ok::<_, anyhow::Error>(app);
+                        }
+                        shown = text.split_whitespace().collect::<Vec<_>>().join(" ");
                     }
                     Err(err) => {
-                        demo = format!("a page that did not answer ({err:#})");
-                        eprintln!("{demo}, reattaching the inspector");
+                        shown = format!("a page that did not answer ({err:#})");
+                        eprintln!("{shown}, reattaching the inspector");
                         inspector.restart_at = Instant::now();
                     }
                 }
@@ -616,7 +638,12 @@ async fn sign_in(
     if let Ok(outcome) = tokio::time::timeout_at(deadline, observe).await {
         outcome
     } else {
-        let shown: String = demo.chars().take(400).collect();
+        // The screen shows what held the sign-in, a system sheet or alert
+        // the inspector cannot read.
+        if let Err(err) = target.screenshot(evidence, "sign-in-timeout").await {
+            eprintln!("the sign-in timeout's screenshot failed: {err:#}");
+        }
+        let shown: String = shown.chars().take(400).collect();
         bail!(
             "sign-in did not finish within 90s, the demo showed {shown:?}, {}",
             inspector.state()
@@ -645,7 +672,7 @@ async fn second_account_shares_catalogue(
         .await?;
     let first = app.line_starting_with("Signed in as ").await?;
     app.click("Add another account").await?;
-    let mut app = sign_in_tauri(target, inspector, login_prefix, evidence, SECOND_USER).await?;
+    let mut app = sign_in(target, inspector, login_prefix, evidence, SECOND_USER).await?;
     app.wait_for_text("Espresso machine", Duration::from_secs(90))
         .await?;
     app.wait_for_text("used by 2 accounts", Duration::from_secs(90))
@@ -653,9 +680,7 @@ async fn second_account_shares_catalogue(
     target
         .record(&mut app, evidence, "catalogue-two-accounts")
         .await?;
-    // The account bar names each account by its identity, which the run only
-    // learns from the signed-in line, and the first is the one other account.
-    app.click_starting_with("Switch to ").await?;
+    app.switch_to_account(&first).await?;
     app.wait_for_text(&first, Duration::from_secs(90)).await?;
     target
         .record(&mut app, evidence, "back-to-first-account")
@@ -663,69 +688,17 @@ async fn second_account_shares_catalogue(
     Ok(app)
 }
 
-/// Sign in the Tauri demo, which parks the login URL and opens the login on
-/// the sign-in click, and return the demo's page.
-async fn sign_in_tauri(
-    target: &Target,
-    inspector: &mut Inspector,
-    login_prefix: &str,
-    evidence: &Path,
-    user: &str,
-) -> Result<PageSession> {
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let mut shown = String::from("no demo page");
-    let observe = async {
-        let mut submitted = false;
-        loop {
-            if !submitted
-                && let Some(mut login) = inspector
-                    .try_page(|url| url.starts_with(login_prefix))
-                    .await
-            {
-                target.screenshot(evidence, "login-page").await?;
-                submit_login(&mut login, user).await?;
-                submitted = true;
-                continue;
-            }
-            if let Some(mut app) = inspector.try_page(is_demo_page).await {
-                match app.page_text().await {
-                    Ok(text) => {
-                        if !submitted && text.contains("Sign in to begin.") {
-                            // The click opens the login once the demo has
-                            // parked its URL, and a refused click retries on
-                            // the next poll.
-                            let _ = app
-                                .click_when_enabled("Sign in", Duration::from_secs(5))
-                                .await;
-                            continue;
-                        }
-                        if submitted
-                            && text.contains("Signed in as ")
-                            && text.contains("custody: released only after user verification")
-                        {
-                            return Ok::<_, anyhow::Error>(app);
-                        }
-                        shown = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                    }
-                    Err(err) => {
-                        shown = format!("a page that did not answer ({err:#})");
-                        eprintln!("{shown}, reattaching the inspector");
-                        inspector.restart_at = Instant::now();
-                    }
-                }
-            }
-            inspector.keep_alive().await?;
-            sleep(Duration::from_secs(1)).await;
+/// Whether the demo's page shows a finished sign-in. Both demos name the
+/// signed-in account and the replica's custody once the client stands, and a
+/// gated Tauri build's custody is the verified one. The status line is no
+/// sign, since every later client event overwrites it.
+fn signed_in(text: &str) -> bool {
+    match demo() {
+        Demo::Dioxus => text.contains("Signed in as ") && text.contains("custody: "),
+        Demo::Tauri => {
+            text.contains("Signed in as ")
+                && text.contains("custody: released only after user verification")
         }
-    };
-    if let Ok(outcome) = tokio::time::timeout_at(deadline, observe).await {
-        outcome
-    } else {
-        let shown: String = shown.chars().take(400).collect();
-        bail!(
-            "sign-in did not finish within 90s, the demo showed {shown:?}, {}",
-            inspector.state()
-        );
     }
 }
 
@@ -967,9 +940,6 @@ fn parse_arguments(args: &[String]) -> Result<ParsedArguments> {
     {
         bail!("--peer-device names the same device as --device");
     }
-    if (arguments.every_join || arguments.star) && matches!(demo(), Demo::Tauri) {
-        bail!("--every-join and --star need the dioxus demo, whose panel holds the peer controls");
-    }
     Ok(arguments)
 }
 
@@ -1006,7 +976,7 @@ impl Target {
 
     async fn build(&self, evidence: &Path) -> Result<PathBuf> {
         if let Demo::Tauri = demo() {
-            return self.build_tauri().await;
+            return self.build_tauri(evidence).await;
         }
         let demo = repo_path(&DEMO_DIR)?;
         step("build");
@@ -1016,7 +986,7 @@ impl Target {
             "--ios",
             "--no-default-features",
             "--features",
-            demo_mobile_features(),
+            dioxus_mobile_features(),
         ]);
         match self {
             Self::Simulator { .. } => {
@@ -1055,34 +1025,49 @@ impl Target {
         Ok(app)
     }
 
-    /// Build the Tauri demo for the simulator. Xcode embeds the application
-    /// identifier the keychain needs from the development team.
-    async fn build_tauri(&self) -> Result<PathBuf> {
-        let Self::Simulator { .. } = self else {
-            bail!("the Tauri demo is proven on a simulator only");
-        };
+    /// Build the Tauri demo, for the simulator or a paired device. The
+    /// simulator build signs from the development team, and the device build
+    /// passes `--no-sign`, so the proof embeds the profile and signs the app
+    /// with the run's identity.
+    async fn build_tauri(&self, evidence: &Path) -> Result<PathBuf> {
         let demo = repo_path(&TAURI_DIR)?;
         step("build");
         let mut cargo = Command::new("cargo");
-        cargo
-            .current_dir(&demo)
-            .args([
-                "tauri",
-                "ios",
-                "build",
-                "--debug",
-                "--target",
-                "aarch64-sim",
-            ])
-            .env("APPLE_DEVELOPMENT_TEAM", signing_team().await?);
-        if demo_has_device_identity() {
-            cargo.args(["--features", "device-identity"]);
+        cargo.current_dir(&demo);
+        cargo.args(["tauri", "ios", "build", "--debug"]);
+        let features = tauri_mobile_features();
+        if !features.is_empty() {
+            cargo.args(["--features", features]);
         }
-        let status = cargo.status().await.context("starting cargo tauri")?;
-        if !status.success() {
-            bail!("cargo tauri ios build failed with {status}");
+        cargo.env("APPLE_DEVELOPMENT_TEAM", signing_team().await?);
+        match self {
+            Self::Simulator { .. } => {
+                cargo.args(["--target", "aarch64-sim"]);
+                let status = cargo.status().await.context("starting cargo tauri")?;
+                if !status.success() {
+                    bail!("cargo tauri ios build failed with {status}");
+                }
+                Ok(demo.join(TAURI_APP))
+            }
+            Self::Device { identity, .. } => {
+                ios_signing::unlock().await?;
+                cargo.args(["--target", "aarch64", "--no-sign"]);
+                let status = cargo.status().await.context("starting cargo tauri")?;
+                if !status.success() {
+                    bail!("cargo tauri ios build failed with {status}");
+                }
+                let app = demo.join(TAURI_DEVICE_APP);
+                if !app.exists() {
+                    bail!(
+                        "cargo tauri ios build left no device app at {}",
+                        app.display()
+                    );
+                }
+                let profile = ios_signing::profile_named(TAURI_PROFILE).await?;
+                sign_tauri_device_build(&app, &profile, identity, evidence).await?;
+                Ok(app)
+            }
         }
-        Ok(demo.join(TAURI_APP))
     }
 
     /// Install the app afresh.
@@ -1278,6 +1263,7 @@ impl Target {
         .await
     }
 }
+
 /// How the second phone learns the hotspot the first one hosts.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JoinBy {
@@ -1976,9 +1962,13 @@ async fn peer_proof(
 
 /// Turn Bluetooth on through the demo, since a fresh install has not been
 /// allowed it and the joiner scans only once it is, so the user's own action
-/// asks for it (R76 decision 21).
+/// asks for it (R76 decision 21). A page already reading `bluetooth: ready`
+/// offers no button and needs nothing.
 async fn turn_on_bluetooth(app: &mut PageSession, tapper: &Tapper, evidence: &Path) -> Result<()> {
     step("turn on Bluetooth on the second phone");
+    if app.page_text().await?.contains("bluetooth: ready") {
+        return Ok(());
+    }
     app.click("Turn on Bluetooth").await?;
     tapper
         .run("tap-alert", 40, evidence, "peer-bluetooth")
@@ -2499,6 +2489,60 @@ fn plist_json_path(path: &Path) -> PathBuf {
         path.file_stem()
             .map_or("plist", |stem| stem.to_str().unwrap_or("plist"))
     ))
+}
+
+/// Embed the profile in the `--no-sign` Tauri build, sign its frameworks and
+/// the app with the profile's entitlements and the run's identity in the
+/// order Xcode signs, and verify the result so an unsigned bundle is named
+/// here rather than by the install.
+async fn sign_tauri_device_build(
+    app: &Path,
+    profile: &Path,
+    identity: &str,
+    evidence: &Path,
+) -> Result<()> {
+    tokio::fs::copy(profile, app.join("embedded.mobileprovision"))
+        .await
+        .with_context(|| format!("embedding the profile in {}", app.display()))?;
+    let entitlements = evidence.join("tauri-device-entitlements.plist");
+    let plist = ios_signing::decode_profile(profile).await?;
+    let mut plutil = Command::new("plutil")
+        .args(["-extract", "Entitlements", "xml1", "-o"])
+        .arg(&entitlements)
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("starting plutil")?;
+    if let Some(mut stdin) = plutil.stdin.take() {
+        stdin
+            .write_all(plist.as_bytes())
+            .await
+            .context("writing the profile to plutil")?;
+    }
+    let status = plutil.wait().await.context("waiting for plutil")?;
+    if !status.success() {
+        bail!("plutil -extract failed with {status} on the profile's entitlements");
+    }
+    if tokio::fs::try_exists(app.join("Frameworks")).await? {
+        let mut frameworks = tokio::fs::read_dir(app.join("Frameworks"))
+            .await
+            .context("listing the app's frameworks")?;
+        while let Some(framework) = frameworks.next_entry().await? {
+            codesign(&["--force", "--sign", identity], &framework.path()).await?;
+        }
+    }
+    codesign(
+        &[
+            "--force",
+            "--sign",
+            identity,
+            "--entitlements",
+            &entitlements.display().to_string(),
+        ],
+        app,
+    )
+    .await?;
+    codesign(&["--verify", "--deep", "--strict", "--verbose=2"], app).await
 }
 
 /// Sign every framework `dx` bundled, then the app again with its own
@@ -3223,7 +3267,7 @@ async fn star_android_setup(
         let unlock = android_phone::Unlock { pin: unlock_pin };
         unlock.dismiss_keyguard(&star.device).await?;
         step("install the demo on the Android phone");
-        let package = android_phone::Demo::Dioxus.package();
+        let package = phone_demo().package();
         star.device
             .adb(&["install", "-r", "-t", &apk.display().to_string()])
             .await?;
@@ -3283,7 +3327,7 @@ async fn ipad_signed_in(
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if let Some(mut page) = inspector.try_page(is_demo_page).await
-                && page.page_text().await?.contains("status: connected")
+                && signed_in(&page.page_text().await?)
             {
                 return Ok((inspector, page));
             }
@@ -4185,12 +4229,7 @@ async fn android_finish(android: &StarAndroid, evidence: &Path) -> Result<()> {
         }
         if let Err(err) = android
             .device
-            .adb(&[
-                "shell",
-                "am",
-                "force-stop",
-                android_phone::Demo::Dioxus.package(),
-            ])
+            .adb(&["shell", "am", "force-stop", phone_demo().package()])
             .await
         {
             eprintln!("stopping the Android demo: {err:#}");
@@ -4281,7 +4320,7 @@ async fn run_star_rounds(
 ) -> (Vec<star::RoundReport>, Result<(), String>) {
     let prep = async {
         let android = match star_android_setup(
-            android_phone::Device::new(android_serial.to_owned(), android_phone::Demo::Dioxus),
+            android_phone::Device::new(android_serial.to_owned(), phone_demo()),
             android_apk,
             stack,
             evidence,
