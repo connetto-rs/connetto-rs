@@ -450,3 +450,35 @@ async fn db_store_refuses_a_session_whose_deadline_lapsed_in_the_database() {
         "rotation refuses a session whose deadlines lapsed, got {refused:?}"
     );
 }
+
+/// A session whose idle deadline the database clock has passed is not live,
+/// although its absolute ceiling is hours away, so the handshake refuses it as
+/// a refresh does.
+#[tokio::test]
+async fn db_store_holds_a_session_past_its_idle_deadline_dead() {
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    reset_auth_tables(fixture.admin()).await;
+    let store = build_store(fixture.admin());
+    let issued = store
+        .create_session(&identity("iris"), origin())
+        .await
+        .expect("create");
+    let mut conn = fixture.admin().get().await.expect("connection");
+    sql_query(
+        "UPDATE connetto_sessions SET idle_deadline = now() - interval '1 minute' \
+         WHERE session_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(issued.session_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("lapse the idle deadline");
+
+    assert!(
+        !store
+            .session_is_live(issued.session_id)
+            .await
+            .expect("live"),
+        "a lapsed idle deadline is not live"
+    );
+}

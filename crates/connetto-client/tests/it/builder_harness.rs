@@ -19,7 +19,7 @@ use connetto_core::traits::{IncomingFrame, MaybeSend, ReplicaKeyStore, Transport
 use connetto_core::{Cursor, ReplicaKey};
 use connetto_server::{LoopbackTransport, PgSnapshotSource, RlsAuth, SessionConfig, loopback};
 use connetto_test_harness::{
-    Fixture, HarnessAuth, RosterAuth, ServerConfig, pool_for, spawn_server, with_user,
+    Fixture, HarnessAuth, RosterAuth, ServerConfig, engine_ddl, pool_for, spawn_server, with_user,
 };
 use diesel::prelude::*;
 use tempfile::tempdir;
@@ -255,9 +255,13 @@ async fn builder_held_credential_reads_the_callers_own_row() {
         )
         .await;
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
+    // The one catalog the server parts read, the way the harness appends it
+    // inside `spawn_server` (R77 decision 11).
+    let engine_ddl = engine_ddl(PG_DDL);
     let snapshot =
-        PgSnapshotSource::from_ddl(writer_pool.clone(), PG_DDL).expect("snapshot source");
-    let auth = HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth"));
+        PgSnapshotSource::from_ddl(writer_pool.clone(), &engine_ddl).expect("snapshot source");
+    let auth =
+        HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), &engine_ddl).expect("rls auth"));
     let server = spawn_server(
         ServerConfig::new(PG_DDL, fixture.admin_url())
             .with_replication(["orders"])

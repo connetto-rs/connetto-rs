@@ -12,7 +12,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
-use crate::{STARTUP_TIMEOUT, container_labels, sweep_abandoned_containers, uuid_like};
+use crate::{
+    ContainerSlot, STARTUP_TIMEOUT, container_labels, container_slot, sweep_abandoned_containers,
+    uuid_like,
+};
 
 /// The image the pair runs. Failover slots need 17 or later.
 const IMAGE: &str = "postgres:18";
@@ -119,6 +122,8 @@ pub struct Pair {
     network: String,
     primary: String,
     standby: String,
+    /// Released after [`Drop`] removed both containers.
+    _slot: ContainerSlot,
 }
 
 impl Pair {
@@ -130,6 +135,7 @@ impl Pair {
     /// When Docker is unreachable or either server does not come up within
     /// the harness's startup timeout, which are test setup failures.
     pub async fn start() -> Self {
+        let slot = container_slot().await.expect("a container slot");
         sweep_abandoned_containers();
         let network = format!("connetto-standby-{}", uuid_like());
         let network_labels = label_args("network");
@@ -143,6 +149,7 @@ impl Pair {
             network,
             primary: String::new(),
             standby: String::new(),
+            _slot: slot,
         };
 
         let primary_name = format!("{}-primary", pair.network);

@@ -102,6 +102,13 @@ impl ReplicaStorage {
         }
     }
 
+    /// Whether a database in this backend survives a reload, which only OPFS
+    /// gives.
+    #[must_use]
+    pub const fn is_persistent(&self) -> bool {
+        matches!(self, Self::Opfs(_))
+    }
+
     /// The database URL that opens `name` in this backend.
     ///
     /// Always the codec shim over this backend's VFS, named explicitly, because

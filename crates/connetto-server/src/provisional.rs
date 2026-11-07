@@ -3,6 +3,14 @@
 use crate::writer_schema::SettledOutcome;
 use connetto_core::exchange::{RetractCause, Verdict};
 
+/// The most open provisional sequences one session may hold.
+///
+/// A connection that asked beyond the bound is refused as a whole rather
+/// than opening the question that would outlive its own memory, so the bound
+/// is a per-session cap on the sum of every author's open sequences (R77
+/// decision 11).
+pub(crate) const MAX_OPEN_PROVISIONAL_SEQUENCES: usize = 65_536;
+
 /// The one-sided facts of an author the ruling consults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AskFacts {

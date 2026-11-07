@@ -3,7 +3,7 @@ name = "connetto-webauthn-unlock"
 description = "End-to-end proof of the R23 passkey gate: enrol under a simulated authenticator, write, restart the worker, re-derive the same key, then refuse once the authenticator is deleted."
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "MIT"
 publish = false
 

@@ -21,7 +21,7 @@ pub(crate) struct BootReplicaSpec<Id> {
     pub(crate) replica_db_name: String,
     /// The account key the identity is addressed by.
     pub(crate) active_account: Option<String>,
-    /// Whether the replica is durable, which only a signed-in boot is.
+    /// Whether a signed-in identity opened the replica through the storage pool.
     pub(crate) identified: bool,
     /// Whether the replica was already in the pool.
     pub(crate) existing: bool,

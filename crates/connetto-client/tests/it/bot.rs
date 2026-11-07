@@ -9,8 +9,7 @@ use connetto_client::bot::{Registration, register};
 use connetto_client::{ClientBuilder, ClientError, ClientEvent, SyncSchema, TransportFactory};
 use connetto_core::messages::{
     BotListEntry, BotRegistered, BulkMessage, Challenge, ControlMessage, FatalErrorReason,
-    HandshakeAck, SnapshotBegin, SnapshotEnd, SnapshotPatch, SubscriptionPriority,
-    bot_registration_message,
+    HandshakeAck, SnapshotBegin, SnapshotEnd, SnapshotPatch, bot_registration_message,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaBundle, loopback};
@@ -120,7 +119,6 @@ fn challenged_server() -> LoopbackTransport {
                 server
                     .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                         sub_id: sub.sub_id.clone(),
-                        priority: SubscriptionPriority::default(),
                     }))
                     .await
                     .expect("snapshot begin");

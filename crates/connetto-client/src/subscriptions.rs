@@ -10,7 +10,7 @@
 //! Normalised into three tables so a query shared by several subscriptions is
 //! stored once. R15 reads this same set to decide which rows are still covered.
 
-use connetto_core::messages::{BindValue, SubscriptionPriority, SubscriptionSpec};
+use connetto_core::messages::{BindValue, SubscriptionSpec};
 use core::time::Duration;
 
 use diesel::prelude::*;
@@ -26,12 +26,32 @@ pub(crate) const SUBSCRIPTION_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_
     (id INTEGER PRIMARY KEY, sql TEXT NOT NULL UNIQUE); \
     CREATE TABLE IF NOT EXISTS _connetto_subscription \
     (id TEXT PRIMARY KEY, query_id INTEGER NOT NULL REFERENCES _connetto_query(id), \
-    priority INTEGER NOT NULL, pin_name TEXT UNIQUE, stopped_at INTEGER, \
+    pin_name TEXT UNIQUE, stopped_at INTEGER, \
     grace_secs INTEGER NOT NULL); \
     CREATE TABLE IF NOT EXISTS _connetto_bind \
     (subscription_id TEXT NOT NULL REFERENCES _connetto_subscription(id) ON DELETE CASCADE, \
     position INTEGER NOT NULL, kind INTEGER NOT NULL, value BLOB, \
     PRIMARY KEY (subscription_id, position))";
+
+/// Record the persisted subscription set's tables, upgrading a replica written
+/// when each subscription stored a delivery priority.
+///
+/// # Errors
+///
+/// [`ClientError::Db`] when the replica rejects the DDL.
+pub(crate) fn install(db: &mut SqliteConnection) -> Result<(), ClientError> {
+    use diesel::connection::SimpleConnection;
+    db.batch_execute(SUBSCRIPTION_DDL)?;
+    match db.batch_execute("ALTER TABLE _connetto_subscription DROP COLUMN priority") {
+        Ok(()) => Ok(()),
+        Err(diesel::result::Error::DatabaseError(_, info))
+            if info.message().contains("no such column") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 
 diesel::table! {
     /// Subscription query text, shared by every subscription that declares it.
@@ -52,8 +72,6 @@ diesel::table! {
         id -> Text,
         /// The query this subscription runs.
         query_id -> Integer,
-        /// Delivery priority, as its raw byte.
-        priority -> Integer,
         /// The application's name for a pin, and `NULL` for a watch. This is
         /// the only kind discriminant: a second one could disagree with it.
         pin_name -> Nullable<Text>,
@@ -160,9 +178,9 @@ pub const DEFAULT_GRACE: Duration = Duration::from_mins(5);
 /// rather than by documentation.
 pub const MAX_GRACE: Duration = Duration::from_mins(10);
 
-/// One row of the join behind [`declared`]: id, query text, priority, pin
-/// name, stop moment, grace.
-type DeclaredRow = (String, String, i32, Option<String>, Option<i64>, i64);
+/// One row of the join behind [`declared`]: id, query text, pin name, stop
+/// moment, grace.
+type DeclaredRow = (String, String, Option<String>, Option<i64>, i64);
 
 /// One persisted subscription and what keeps it alive.
 pub(crate) struct Declared {
@@ -208,7 +226,6 @@ pub(crate) fn remember(
             .values((
                 subscription::id.eq(sub_id),
                 subscription::query_id.eq(query_id),
-                subscription::priority.eq(i32::from(spec.priority.get())),
                 subscription::pin_name.eq(None::<String>),
                 subscription::stopped_at.eq(None::<i64>),
                 subscription::grace_secs.eq(grace_secs),
@@ -217,7 +234,6 @@ pub(crate) fn remember(
             .do_update()
             .set((
                 subscription::query_id.eq(query_id),
-                subscription::priority.eq(i32::from(spec.priority.get())),
                 subscription::stopped_at.eq(None::<i64>),
                 subscription::grace_secs.eq(grace_secs),
             ))
@@ -364,7 +380,6 @@ pub(crate) fn declared(db: &mut SqliteConnection) -> Result<Vec<Declared>, Clien
         .select((
             subscription::id,
             query_text::sql,
-            subscription::priority,
             subscription::pin_name,
             subscription::stopped_at,
             subscription::grace_secs,
@@ -373,7 +388,7 @@ pub(crate) fn declared(db: &mut SqliteConnection) -> Result<Vec<Declared>, Clien
         .load(db)?;
 
     let mut out = Vec::with_capacity(rows.len());
-    for (sub_id, sql, priority, pin_name, stopped_at, grace_secs) in rows {
+    for (sub_id, sql, pin_name, stopped_at, grace_secs) in rows {
         let stored: Vec<(i32, Option<Vec<u8>>)> = bind::table
             .filter(bind::subscription_id.eq(&sub_id))
             .order(bind::position)
@@ -383,11 +398,6 @@ pub(crate) fn declared(db: &mut SqliteConnection) -> Result<Vec<Declared>, Clien
         for (kind, value) in stored {
             binds.push(decode_bind(kind, value)?);
         }
-        let raw = u8::try_from(priority).map_err(|_| {
-            ClientError::Session(format!(
-                "a persisted subscription priority is out of range: {priority}"
-            ))
-        })?;
         // A pin has no clock. A watch is live while held, and after its last
         // handle drops until the grace runs out. Nothing runs to end it: the
         // comparison is the expiry, which is how ban expiry and provider token
@@ -398,11 +408,7 @@ pub(crate) fn declared(db: &mut SqliteConnection) -> Result<Vec<Declared>, Clien
         };
         out.push(Declared {
             sub_id,
-            spec: SubscriptionSpec {
-                priority: SubscriptionPriority::new(raw),
-                query: sql,
-                binds,
-            },
+            spec: SubscriptionSpec { query: sql, binds },
             live,
         });
     }
@@ -623,7 +629,7 @@ mod tests {
 
     fn replica() -> SqliteConnection {
         let mut db = SqliteConnection::establish(":memory:").expect("open");
-        db.batch_execute(SUBSCRIPTION_DDL).expect("ddl");
+        install(&mut db).expect("ddl");
         // `forget` reads `_connetto_aggregates` to spare a query row a rested
         // value references, so the fixture carries it like an open replica does.
         db.batch_execute(crate::aggregates::AGGREGATE_DDL)
@@ -644,13 +650,44 @@ mod tests {
         remember(db, id, spec, DEFAULT_GRACE).expect("remember");
     }
 
+    /// A replica whose subscriptions each stored a delivery priority keeps its
+    /// declarations across the upgrade and accepts new ones.
+    #[test]
+    fn a_replica_storing_priorities_keeps_and_takes_declarations() {
+        let mut db = SqliteConnection::establish(":memory:").expect("open");
+        db.batch_execute(
+            "CREATE TABLE _connetto_query (id INTEGER PRIMARY KEY, sql TEXT NOT NULL UNIQUE); \
+             CREATE TABLE _connetto_subscription \
+             (id TEXT PRIMARY KEY, query_id INTEGER NOT NULL REFERENCES _connetto_query(id), \
+             priority INTEGER NOT NULL, pin_name TEXT UNIQUE, stopped_at INTEGER, \
+             grace_secs INTEGER NOT NULL); \
+             INSERT INTO _connetto_query (id, sql) VALUES (1, 'SELECT * FROM orders'); \
+             INSERT INTO _connetto_subscription (id, query_id, priority, grace_secs) \
+             VALUES ('wire-0', 1, 3, 60)",
+        )
+        .expect("an older replica");
+        install(&mut db).expect("upgrade");
+        install(&mut db).expect("a second open");
+        let spec = SubscriptionSpec::new("SELECT * FROM items");
+        watch(&mut db, "wire-1", &spec);
+        assert_eq!(
+            listed(&mut db),
+            vec![
+                (
+                    "wire-0".to_owned(),
+                    SubscriptionSpec::new("SELECT * FROM orders")
+                ),
+                ("wire-1".to_owned(), spec),
+            ]
+        );
+    }
+
     /// Every storage class survives the round trip as itself. A value that
     /// changed class would silently change which rows the server matches.
     #[test]
     fn every_bind_kind_round_trips() {
         let mut db = replica();
         let spec = SubscriptionSpec {
-            priority: SubscriptionPriority::new(3),
             query: "SELECT * FROM orders WHERE a = ? AND b = ? AND c = ? AND d = ? AND e = ?"
                 .to_owned(),
             binds: vec![
@@ -676,7 +713,6 @@ mod tests {
                 &mut db,
                 id,
                 &SubscriptionSpec {
-                    priority: SubscriptionPriority::default(),
                     query: sql.to_owned(),
                     binds: vec![BindValue::Integer(customer)],
                 },
@@ -727,13 +763,11 @@ mod tests {
             &mut db,
             "wire-0",
             &SubscriptionSpec {
-                priority: SubscriptionPriority::default(),
                 query: "SELECT * FROM orders WHERE a = ? AND b = ?".to_owned(),
                 binds: vec![BindValue::Integer(1), BindValue::Integer(2)],
             },
         );
         let narrowed = SubscriptionSpec {
-            priority: SubscriptionPriority::default(),
             query: "SELECT * FROM orders WHERE a = ?".to_owned(),
             binds: vec![BindValue::Integer(1)],
         };

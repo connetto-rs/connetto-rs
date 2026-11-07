@@ -27,6 +27,8 @@ mod parity;
 
 mod peer_exchange;
 
+mod peer_media;
+
 mod provisional_adjudication;
 
 mod read_rule_fold;
