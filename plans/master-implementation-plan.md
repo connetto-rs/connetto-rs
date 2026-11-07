@@ -208,12 +208,6 @@ Taken by [R108](#r108-caller-kinds-as-database-roles), which has both translator
 
 A diverging note from `rls2fga` for a policy translated to no access is an upstream request.
 
-### G18
-
-**The browser hub's upstream reconnect is never tested against a real server.** The fake-transport browser suites drive `hub_recover` in [relay.rs](../crates/connetto-web/src/relay.rs) through attach refusal, terminal close, rate limiting, resubscription and resync fan-out. No suite drives it across a real server restart, because the shared demo stack cannot be killed mid-run.
-
-Fixed in one pull request, by a browser CI shard with its own restartable stack and a suite that restarts the server mid-run.
-
 ## Upstream dependencies
 
 **No phase waits on an upstream merge.** A phase that needs a change in a dependency requests it upstream, then builds against the fork through a `[patch.crates-io]` entry pinned to a revision, and drops the entry once a release carries the change. A review that takes months therefore holds nothing, and an upstream finding lists no phase in its blockers. What follows holds only the requests still open, each checked against its upstream.

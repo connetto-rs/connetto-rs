@@ -400,6 +400,33 @@ async fn a_socket_lost_while_uploading_a_write_is_recovered() {
     );
 }
 
+/// The server ends the session as it shuts down for a restart, and the redial
+/// keeps failing while it is away. The app hears the client is offline before
+/// the first redial, as it does for a socket that just ends.
+#[tokio::test]
+async fn a_server_shutting_down_is_announced_offline_before_the_redial() {
+    let (client, script, _dir, _pump) = client().await;
+    let mut events = client.events();
+    while tokio::time::timeout(BOUND, events.recv())
+        .await
+        .expect("the connection stands in time")
+        .expect("the event stream stays open")
+        != ClientEvent::SyncStatus(SyncStatus::Connected)
+    {}
+    script.say(IncomingFrame::Control(ControlMessage::FatalError(
+        FatalError::new(FatalErrorReason::ServerShuttingDown),
+    )));
+    let seen = until_reconnecting(&mut events).await;
+    let closed = seen
+        .iter()
+        .position(|event| matches!(event, ClientEvent::ServerClosed { .. }))
+        .unwrap_or_else(|| panic!("the reason reaches the app, saw {seen:?}"));
+    assert!(
+        seen[closed..].contains(&ClientEvent::SyncStatus(SyncStatus::Offline)),
+        "the server's close is announced before the redial, saw {seen:?}"
+    );
+}
+
 /// The server ends the session with no reconnect driver to resume it, so the
 /// pump queues the last writes and ends without announcing a fault. The
 /// replica stays readable, and the end is signalled to `close`.

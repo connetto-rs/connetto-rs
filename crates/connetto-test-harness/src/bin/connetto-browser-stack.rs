@@ -64,6 +64,12 @@ const LANDING_PATH: &str = "/dev/landing";
 const SHARE_PATH: &str = "/dev/share";
 /// Where a suite posts hex file ids whose stored chunks the stack deletes before restarting the server, so the boot reconcile marks those files lost.
 const LOSE_CONTENT_PATH: &str = "/dev/lose-content";
+/// Where a suite posts how many milliseconds the server stays down, and the
+/// stack stops it, waits that long and starts it again before answering.
+const RESTART_PATH: &str = "/dev/restart";
+/// The longest outage a restart request may ask for, so a stray request cannot
+/// hold the stack down past a suite's deadline.
+const MAX_DOWN: Duration = Duration::from_secs(30);
 const BROWSER_PROVIDER: &str = "dev-idp";
 /// The port the wasm-bindgen-test runner's content server listens on unless
 /// `CONNETTO_STACK_PAGE_PORT` moves it, the origin the server lists for
@@ -179,7 +185,7 @@ struct Running {
     handle: ServerHandle,
 }
 
-/// The in-process server, which the lose-content route stops and starts again.
+/// The in-process server, which the restart and lose-content routes stop and start again.
 #[derive(Clone)]
 struct InProcServer {
     config: Arc<ServerConfig>,
@@ -290,6 +296,28 @@ impl InProcServer {
         Ok(())
     }
 
+    /// Stops `running` and waits until its address is free.
+    async fn stop(&self, running: Running) {
+        // The listener goes first, so a reconnecting suite cannot land on a
+        // manager that is already shutting down.
+        running.serve.abort();
+        running.handle.shutdown().await;
+        running.stream.abort();
+        wait_until_closed(&self.bind, Duration::from_secs(10)).await;
+    }
+
+    /// Stops the server, keeps it down for `down`, and starts it again.
+    async fn restart(&self, down: Duration) -> Result<()> {
+        let mut slot = self.state.lock().await;
+        let Some(running) = slot.take() else {
+            return Err(anyhow!("the in-process server is not running"));
+        };
+        self.stop(running).await;
+        tokio::time::sleep(down).await;
+        *slot = Some(self.build_running().await?);
+        Ok(())
+    }
+
     /// Stops the server, deletes the stored chunks of `file_ids`, and starts it again.
     async fn lose_content_and_restart(&self, file_ids: Vec<Vec<u8>>) -> Result<()> {
         let hashes = self.lost_chunk_hashes(&file_ids).await?;
@@ -300,15 +328,9 @@ impl InProcServer {
         let Some(running) = slot.take() else {
             return Err(anyhow!("the in-process server is not running"));
         };
-        // The listener goes first, so a reconnecting suite cannot land on a
-        // manager that is already shutting down.
-        running.serve.abort();
-        running.handle.shutdown().await;
-        running.stream.abort();
-        wait_until_closed(&self.bind, Duration::from_secs(10)).await;
+        self.stop(running).await;
         self.delete_chunks(&hashes).await?;
-        let running = self.build_running().await?;
-        *slot = Some(running);
+        *slot = Some(self.build_running().await?);
         Ok(())
     }
 
@@ -373,6 +395,7 @@ fn writable_catalog(spec: &str) -> RuntimeWritableCatalog {
 
 /// The stack's development routes, mounted on the server's own router.
 fn dev_routes(server: InProcServer, share: Share) -> Router {
+    let restarting = server.clone();
     // The R90 browser contract fetches with `credentials: "include"`, and a
     // wildcard `Access-Control-Allow-Origin` is hard-rejected with credentials,
     // so the harness echoes the requesting origin instead of `Any`.
@@ -412,7 +435,31 @@ fn dev_routes(server: InProcServer, share: Share) -> Router {
                 }
             }),
         )
+        .route(
+            RESTART_PATH,
+            post(|body: String| async move {
+                let Some(down) = parse_down(&body) else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "the body names the milliseconds to stay down, at most {}",
+                            MAX_DOWN.as_millis()
+                        ),
+                    );
+                };
+                match restarting.restart(down).await {
+                    Ok(()) => (StatusCode::OK, String::new()),
+                    Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")),
+                }
+            }),
+        )
         .layer(cors)
+}
+
+/// Parses the outage a restart request asks for, in milliseconds up to [`MAX_DOWN`].
+fn parse_down(body: &str) -> Option<Duration> {
+    let down = Duration::from_millis(body.trim().parse().ok()?);
+    (down <= MAX_DOWN).then_some(down)
 }
 
 /// Parses whitespace-separated 64-character hex file ids.
