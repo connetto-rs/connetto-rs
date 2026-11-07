@@ -12,7 +12,7 @@ use connetto_client::{ClientBuilder, ClientError, SyncSchema};
 use connetto_core::{SchemaBundle, SchemaVersion};
 use connetto_server::{PgSnapshotSource, RlsAuth, SessionConfig};
 use connetto_test_harness::{
-    Fixture, HarnessAuth, ServerConfig, pool_for, spawn_server, with_user,
+    Fixture, HarnessAuth, ServerConfig, engine_ddl, pool_for, spawn_server, with_user,
 };
 
 const PG_DDL: &str = "-- connetto:major 1
@@ -53,9 +53,13 @@ async fn the_handshake_gate_hashes_the_same_bundle_on_both_sides() {
         )
         .await;
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
+    // The one catalog the server parts read, the way the harness appends it
+    // inside `spawn_server` (R77 decision 11).
+    let engine_ddl = engine_ddl(PG_DDL);
     let snapshot =
-        PgSnapshotSource::from_ddl(writer_pool.clone(), PG_DDL).expect("snapshot source");
-    let auth = HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth"));
+        PgSnapshotSource::from_ddl(writer_pool.clone(), &engine_ddl).expect("snapshot source");
+    let auth =
+        HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), &engine_ddl).expect("rls auth"));
     let server = spawn_server(
         ServerConfig::new(PG_DDL, fixture.admin_url())
             .with_replication(["orders"])

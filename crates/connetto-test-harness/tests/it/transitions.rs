@@ -21,6 +21,7 @@ use connetto_core::messages::{BulkMessage, ControlMessage};
 use connetto_core::traits::IncomingFrame;
 use connetto_server::Materializer;
 use connetto_test_harness::Fixture;
+use connetto_test_harness::engine_ddl;
 use connetto_test_harness::fanout::{FANOUT_PG_DDL, visibility_fixture};
 use diesel::prelude::*;
 
@@ -68,7 +69,10 @@ impl Replica {
             .expect("replica ddl");
         Self {
             conn,
-            applier: Materializer::builder(FANOUT_PG_DDL)
+            // The one catalog the fixture's server classifies with, so the
+            // patch's table numbers line up with the replica's (R77
+            // decision 11).
+            applier: Materializer::builder(&engine_ddl(FANOUT_PG_DDL))
                 .build()
                 .expect("applier"),
         }

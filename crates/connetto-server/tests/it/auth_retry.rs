@@ -146,6 +146,17 @@ async fn aggregate_updates(counter: &mut Client) -> Vec<Option<String>> {
     counts
 }
 
+/// The first row change `source` produces. The table's relation message leads
+/// the stream and the commit ends it, so both are skipped over.
+async fn first_event(source: &mut PgSqliteEmuSource) -> PgChangeEvent {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        if let subql::SourceItem::Event(event) = item {
+            return event;
+        }
+    }
+    panic!("the stream ended without a row change");
+}
+
 /// When `may_see` returns an error, `dispatch_event` must return
 /// `Err(SessionError::AuthUnavailable)` so the ingest loop withholds the
 /// source `ack`, keeping the replication slot cursor stationary until the
@@ -216,12 +227,7 @@ async fn dispatch_event_returns_auth_unavailable_and_holds_cursor() {
     source
         .execute_sql("INSERT INTO items (id, data) VALUES (1, 'hello')")
         .expect("execute dml");
-    let event = source
-        .next_item()
-        .await
-        .expect("poll source")
-        .and_then(subql::SourceItem::into_event)
-        .expect("one event");
+    let event = first_event(&mut source).await;
 
     // The key assertion. Before the fix: Ok(()) (error discarded, cursor
     // would advance). After the fix: Err(AuthUnavailable) (cursor held).
@@ -606,12 +612,7 @@ async fn a_row_level_security_outage_holds_the_event() {
     source
         .execute_sql("INSERT INTO items (id, data) VALUES (7, 'held')")
         .expect("execute dml");
-    let event = source
-        .next_item()
-        .await
-        .expect("poll source")
-        .and_then(subql::SourceItem::into_event)
-        .expect("one event");
+    let event = first_event(&mut source).await;
 
     let result = manager.dispatch_event(&event).await;
     assert!(
@@ -794,12 +795,7 @@ async fn an_auth_outage_retry_folds_the_held_event_once() {
     source
         .execute_sql("INSERT INTO items (id, data) VALUES (1, 'held')")
         .expect("execute dml");
-    let insert = source
-        .next_item()
-        .await
-        .expect("poll source")
-        .and_then(subql::SourceItem::into_event)
-        .expect("one event");
+    let insert = first_event(&mut source).await;
     fixture
         .exec("INSERT INTO items (id, data) VALUES (1, 'held')")
         .await;
@@ -874,12 +870,7 @@ async fn an_auth_outage_during_the_refusal_verdict_refuses_once_and_folds_once()
     source
         .execute_sql("INSERT INTO stamps (id, at) VALUES (1, 'infinity')")
         .expect("execute dml");
-    let insert = source
-        .next_item()
-        .await
-        .expect("poll source")
-        .and_then(subql::SourceItem::into_event)
-        .expect("one event");
+    let insert = first_event(&mut source).await;
     fixture
         .exec("INSERT INTO stamps (id, at) VALUES (1, 'infinity')")
         .await;

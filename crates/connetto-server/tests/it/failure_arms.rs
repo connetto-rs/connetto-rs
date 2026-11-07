@@ -38,7 +38,7 @@ use connetto_server::{
 use connetto_test_harness::fanout::caller_mapping;
 use connetto_test_harness::{
     Client, ConnettoDefaults, Fixture, HarnessAuth, OPLOG_TABLE, PUBLICATION, SLOT, Server,
-    ServerConfig, pool_for, spawn_server, with_user,
+    ServerConfig, engine_ddl, pool_for, spawn_server, with_user,
 };
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -118,17 +118,21 @@ where
     A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres> + Send + Sync + 'static,
     <A as VisibilityPolicy>::Error: std::fmt::Display + FailedAuthorization,
 {
+    // The publication carries the registry and the bookkeeping tables, so the
+    // materializer, the snapshot source and the write target read the same
+    // catalog the ingest does (R77 decision 11).
+    let engine_ddl = engine_ddl(schema_ddl);
     ManagerBuilder::new(
-        Materializer::builder(schema_ddl)
+        Materializer::builder(&engine_ddl)
             .with_write_catalog(RuntimeWritableCatalog::default())
             .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
             .build()
             .expect("build materializer"),
-        PgSnapshotSource::from_ddl(pool.clone(), schema_ddl).expect("snapshot source"),
+        PgSnapshotSource::from_ddl(pool.clone(), &engine_ddl).expect("snapshot source"),
         auth,
         Arc::new(TestGrantChecker),
         PgReadConnector::with_session_setup(pool.clone()),
-        pg_write_target::<ConnettoDefaults>(pool, schema_ddl).expect("build write target"),
+        pg_write_target::<ConnettoDefaults>(pool, &engine_ddl).expect("build write target"),
     )
     .with_guard(guard())
     .with_oplog(oplog)
@@ -160,7 +164,9 @@ where
     <A as VisibilityPolicy>::Error: std::fmt::Display + FailedAuthorization,
 {
     let session = Arc::clone(manager);
-    let ddl = schema_ddl.to_owned();
+    // The publication carries the bookkeeping tables, so the ingest catalog
+    // must carry them too (R77 decision 11).
+    let ddl = engine_ddl(schema_ddl);
     let retries = Arc::clone(retries);
     let in_place = Arc::clone(in_place);
     tokio::spawn(async move {
@@ -265,7 +271,9 @@ async fn a_withdrawal_after_a_primary_key_change_uses_the_old_key() {
     client.handshake_with("alice", "user:alice").await;
     client.subscribe("notes", "SELECT * FROM notes").await;
 
-    let applier = Materializer::builder(PG).build().expect("build applier");
+    let applier = Materializer::builder(&engine_ddl(PG))
+        .build()
+        .expect("build applier");
     let mut replica = client_replica(SQLITE);
     for patch in client.expect_snapshot("notes").await {
         applier
@@ -370,7 +378,7 @@ async fn a_withdrawal_from_a_wire_unencodable_old_value_must_not_kill_the_stream
     client.subscribe("instants", "SELECT * FROM instants").await;
     client.subscribe("notes", "SELECT * FROM notes").await;
 
-    let applier = Materializer::builder(INSTANTS_PG)
+    let applier = Materializer::builder(&engine_ddl(INSTANTS_PG))
         .build()
         .expect("build applier");
     let mut replica = client_replica(INSTANTS_SQLITE);
@@ -585,7 +593,7 @@ async fn an_unencodable_event_must_refuse_the_subscriber_on_catchup() {
     // The catchup owes the client the note's later row and the refusal of
     // the subscription the unencodable event matched. The replica starts
     // empty, since the client's snapshots were.
-    let applier = Materializer::builder(INSTANTS_PG)
+    let applier = Materializer::builder(&engine_ddl(INSTANTS_PG))
         .build()
         .expect("build applier");
     let mut replica = client_replica(INSTANTS_SQLITE);
@@ -731,7 +739,10 @@ async fn flip_stack(fixture: &Fixture) -> Server {
     fixture.setup(&statements).await;
 
     let reader = pool_for(&with_user(fixture.admin_url(), FLIP_READER, FLIP_READER)).await;
-    let engine_ddl = connetto_schema::with_registry::<connetto_core::bots::TextIds>(FLIP_DDL);
+    // The one catalog the server parts read, the way the harness appends it
+    // inside `spawn_server`, so the snapshot's numbering matches the
+    // materializer's (R77 decision 11).
+    let snapshot_ddl = engine_ddl(FLIP_DDL);
 
     // The composition the shipped binary builds, over one fresh store.
     let (channel, store) = fixture.fga_store().await;
@@ -739,6 +750,7 @@ async fn flip_stack(fixture: &Fixture) -> Server {
         FLIP_DDL,
         &FLIP_POLICY_STATEMENTS.join(";\n"),
         DEFAULT_USER_SETTING,
+        true,
     )
     .expect("the membership policy translates");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
@@ -773,10 +785,10 @@ async fn flip_stack(fixture: &Fixture) -> Server {
         FactSource::owner(fixture.admin().clone()),
     );
 
-    let snapshot = PgSnapshotSource::from_ddl(reader.clone(), &engine_ddl)
+    let snapshot = PgSnapshotSource::from_ddl(reader.clone(), &snapshot_ddl)
         .expect("snapshot source")
         .with_publication(PUBLICATION);
-    let config = ServerConfig::new(engine_ddl, fixture.admin_url())
+    let config = ServerConfig::new(FLIP_DDL, fixture.admin_url())
         .with_policies(FLIP_POLICY_STATEMENTS.join(";\n"))
         .with_translation(translator, Some(caller_mapping()))
         .with_replication(["docs", "members"]);
@@ -934,7 +946,9 @@ async fn flip_scenario(label: &str, statements: &[FlipStatement]) {
     let mut client = server.connect();
     client.handshake_with("alice", "user:alice").await;
 
-    let applier = Materializer::builder(FLIP_DDL)
+    // The same engine catalog the server classifies with, so the patch's
+    // table numbers line up with the replica's (R77 decision 11).
+    let applier = Materializer::builder(&engine_ddl(FLIP_DDL))
         .build()
         .expect("build the applier");
     let mut replica = client_replica(FLIP_SQLITE);

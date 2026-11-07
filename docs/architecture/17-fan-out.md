@@ -41,7 +41,7 @@ Per subscriber, and nothing beyond this.
 
 ## The shared frame
 
-The bulk frame today embeds the payload in the encoded envelope, so every send copies the compressed payload into a MessagePack buffer and again into the tagged frame, three copies per subscriber per event. Planned in [the shared frame design](../../plans/master-implementation-plan.md#shared-frames-and-the-oplog-byte-bound), the frame becomes the tag, a short encoded header, and the compressed payload appended untouched, the payload travels as one shared `Arc<[u8]>`, the data frame carries a server handle derived from the question, and one frame per distinct pair of handle and event is built once and cloned per socket.
+The bulk frame today embeds the payload in the encoded envelope, so every send copies the compressed payload into a MessagePack buffer and again into the tagged frame, three copies per subscriber per event. Planned in [the shared frame design](../../plans/master-implementation-plan.md#shared-frames), the frame becomes the tag, a short encoded header, and the compressed payload appended untouched, the payload travels as one shared `Arc<[u8]>`, the data frame carries a server handle derived from the question, and one frame per distinct pair of handle and event is built once and cloned per socket.
 
 No part of that shape goes upstream. The predicate identity the handle derives from is already in `subql`'s registration result, and `subql`'s patchset builder returns an owned buffer, so the shared payload wraps without touching `subql`.
 

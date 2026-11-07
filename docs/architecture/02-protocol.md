@@ -19,7 +19,7 @@ Over message-delimited transports such as WebSocket, a frame is the tag byte plu
 
 MessagePack is the serialization for both planes. It was chosen over protobuf, FlatBuffers and JSON for the wire. The shape is known at compile time, the encoding is compact, and named structs tolerate an unknown or a missing field, which is what an additive change needs. JSON is reserved for one place, the aggregate results, whose shape is genuinely unknown at compile time and is deserialized client-side into whatever type the caller named.
 
-Planned in [the shared frame design](../../plans/master-implementation-plan.md#shared-frames-and-the-oplog-byte-bound), the bulk frame as a short header with the compressed payload appended, so the payload reaches a socket without a copy. [17](17-fan-out.md) owns the reasoning.
+Planned in [the shared frame design](../../plans/master-implementation-plan.md#shared-frames), the bulk frame as a short header with the compressed payload appended, so the payload reaches a socket without a copy. [17](17-fan-out.md) owns the reasoning.
 
 ## Message families
 

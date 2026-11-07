@@ -77,10 +77,7 @@ async fn served(fixture: &Fixture) -> Served {
         change_stream,
         handle,
         ..
-    } = builder
-        .bans(true)
-        .abuse(two_strikes())
-        .build()
+    } = Box::pin(builder.bans(true).abuse(two_strikes()).build())
         .await
         .expect("the deployment assembles");
     let stream = tokio::spawn(async move {

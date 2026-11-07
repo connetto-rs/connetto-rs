@@ -25,9 +25,10 @@
 //!
 //! # Retention window
 //!
-//! [`OplogConfig`] bounds the log by entry count and age, whichever is hit first
-//! (default one million entries or 72 hours). Both are configurable per
-//! deployment.
+//! [`OplogConfig`] bounds the log by entry count, age and stored bytes,
+//! whichever is hit first (default one million entries, 72 hours or 1 GiB).
+//! All three are configurable per deployment, and the log names the bound
+//! that prunes whenever it changes.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
@@ -51,24 +52,29 @@ use crate::fence::{Unseen, UnseenIds};
 const DEFAULT_MAX_AGE: Duration = Duration::from_hours(72);
 /// Default retention count: one million entries (`06-reconnect.md` line 69).
 const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
+/// Default retention size: 1 GiB of stored entries, a starting point with no measurement behind it.
+const DEFAULT_MAX_BYTES: u64 = 1 << 30;
 /// How many recorded commits pass between two truncations of the transaction index.
 const XID_TRUNCATION_PERIOD: u64 = 1024;
 
-/// Retention window for an [`Oplog`]: entries older than either bound are
-/// pruned, whichever bound is hit first.
+/// Retention window for an [`Oplog`]: entries outside any bound are pruned,
+/// whichever bound is hit first.
 #[derive(Debug, Clone)]
 pub struct OplogConfig {
     /// Maximum number of retained entries. The oldest are dropped first.
-    max_entries: usize,
+    entries: usize,
     /// Maximum age of a retained entry, measured against the oplog's clock.
-    max_age: Duration,
+    age: Duration,
+    /// Maximum total of the retained entries' [`ChangeRecord::stored_bytes`].
+    bytes: u64,
 }
 
 impl Default for OplogConfig {
     fn default() -> Self {
         Self {
-            max_entries: DEFAULT_MAX_ENTRIES,
-            max_age: DEFAULT_MAX_AGE,
+            entries: DEFAULT_MAX_ENTRIES,
+            age: DEFAULT_MAX_AGE,
+            bytes: DEFAULT_MAX_BYTES,
         }
     }
 }
@@ -83,16 +89,113 @@ impl OplogConfig {
     /// Sets the maximum number of retained entries.
     #[must_use]
     pub const fn with_max_entries(mut self, max_entries: usize) -> Self {
-        self.max_entries = max_entries;
+        self.entries = max_entries;
         self
     }
 
     /// Sets the maximum age of a retained entry.
     #[must_use]
     pub const fn with_max_age(mut self, max_age: Duration) -> Self {
-        self.max_age = max_age;
+        self.age = max_age;
         self
     }
+
+    /// Sets the most bytes the retained entries may store together, each
+    /// counted as its [`ChangeRecord::stored_bytes`].
+    #[must_use]
+    pub const fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.bytes = max_bytes;
+        self
+    }
+}
+
+/// The retention bound that dropped an entry from the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetentionBound {
+    Age,
+    Entries,
+    Bytes,
+}
+
+impl RetentionBound {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Age => "age",
+            Self::Entries => "entries",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
+/// How many entries one prune dropped under each bound.
+#[derive(Debug, Default)]
+struct Pruned {
+    age: u64,
+    entries: u64,
+    bytes: u64,
+}
+
+impl Pruned {
+    /// The bound that pruned, the first of age, entry count and bytes that dropped anything.
+    const fn bound(&self) -> Option<RetentionBound> {
+        if self.age > 0 {
+            Some(RetentionBound::Age)
+        } else if self.entries > 0 {
+            Some(RetentionBound::Entries)
+        } else if self.bytes > 0 {
+            Some(RetentionBound::Bytes)
+        } else {
+            None
+        }
+    }
+
+    const fn total(&self) -> u64 {
+        self.age
+            .saturating_add(self.entries)
+            .saturating_add(self.bytes)
+    }
+
+    /// Log this prune, naming its bound at info level when another bound pruned the time before, since extra full resyncs look like a client defect and are a retention setting.
+    fn report(&self, last: &mut Option<RetentionBound>, config: &OplogConfig) {
+        let Some(bound) = self.bound() else {
+            return;
+        };
+        tracing::debug!(
+            by_age = self.age,
+            by_entries = self.entries,
+            by_bytes = self.bytes,
+            "the oplog pruned its oldest entries"
+        );
+        if *last != Some(bound) {
+            tracing::info!(
+                bound = bound.name(),
+                max_entries = config.entries,
+                max_age_secs = config.age.as_secs(),
+                max_bytes = config.bytes,
+                "the oplog started pruning by another bound"
+            );
+            *last = Some(bound);
+        }
+    }
+}
+
+/// Counts what a serializer writes without keeping it.
+struct ByteCount(u64);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(len_bytes(buf.len()));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `len` as a byte count, saturating where `usize` is wider than `u64`.
+fn len_bytes(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
 }
 
 /// One change retained in the oplog, keyed by its commit position.
@@ -177,6 +280,26 @@ impl ChangeRecord {
     #[must_use]
     pub fn payload(&self) -> Option<&[u8]> {
         self.payload.as_deref()
+    }
+
+    /// The bytes this record counts against the log's byte bound, what the
+    /// Postgres oplog stores for it: the event encoded as JSON, the patch, the
+    /// primary key and the table name.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: a change event's fields all encode as JSON, so the
+    /// one failure `serde_json` reports cannot happen.
+    #[must_use]
+    pub fn stored_bytes(&self) -> u64 {
+        let mut event = ByteCount(0);
+        serde_json::to_writer(&mut event, self.event.change())
+            .expect("a change event's fields all encode as JSON");
+        event
+            .0
+            .saturating_add(len_bytes(self.payload.as_ref().map_or(0, Vec::len)))
+            .saturating_add(len_bytes(self.pk.len()))
+            .saturating_add(len_bytes(self.table.len()))
     }
 
     /// Whether this record is a delete tombstone.
@@ -507,6 +630,8 @@ fn widen_xid(near: u64, xid: PgXid) -> u64 {
 /// One retained entry plus the clock reading taken when it was appended.
 struct Entry {
     appended_micros: u64,
+    /// The entry's [`ChangeRecord::stored_bytes`], counted once at append.
+    bytes: u64,
     record: ChangeRecord,
 }
 
@@ -526,6 +651,10 @@ struct Inner {
     newest_xid: u64,
     /// Commits recorded since `xids` was last truncated.
     since_truncation: u64,
+    /// The total of every retained entry's bytes.
+    bytes: u64,
+    /// The bound that pruned last, so the log names a bound only when it takes over.
+    pruning_by: Option<RetentionBound>,
 }
 
 /// An in-memory ring-buffer [`Oplog`] for Docker-free tests and single-node use.
@@ -559,6 +688,8 @@ impl InMemoryOplog {
                 horizon: None,
                 newest_xid: 0,
                 since_truncation: 0,
+                bytes: 0,
+                pruning_by: None,
             }),
             config,
             clock,
@@ -569,17 +700,24 @@ impl InMemoryOplog {
     fn prune_locked(&self, inner: &mut Inner, now: u64) {
         // `Duration::as_micros` is u128; saturate into u64 the same way
         // `StdClock` does, so an absurd configured age never wraps.
-        let max_age_micros = u64::try_from(self.config.max_age.as_micros()).unwrap_or(u64::MAX);
+        let max_age_micros = u64::try_from(self.config.age.as_micros()).unwrap_or(u64::MAX);
+        let mut pruned = Pruned::default();
         while let Some(front) = inner.entries.front() {
-            let too_old = now.saturating_sub(front.appended_micros) > max_age_micros;
-            let too_many = inner.entries.len() > self.config.max_entries;
-            if too_old || too_many {
-                inner.entries.pop_front();
-                inner.since_truncation += 1;
+            let tally = if now.saturating_sub(front.appended_micros) > max_age_micros {
+                &mut pruned.age
+            } else if inner.entries.len() > self.config.entries {
+                &mut pruned.entries
+            } else if inner.bytes > self.config.bytes {
+                &mut pruned.bytes
             } else {
                 break;
-            }
+            };
+            *tally += 1;
+            inner.bytes = inner.bytes.saturating_sub(front.bytes);
+            inner.entries.pop_front();
         }
+        inner.since_truncation += pruned.total();
+        pruned.report(&mut inner.pruning_by, &self.config);
         if inner.since_truncation >= XID_TRUNCATION_PERIOD {
             inner.since_truncation = 0;
             Self::truncate_xids_locked(inner);
@@ -622,6 +760,7 @@ impl Oplog for InMemoryOplog {
     )]
     async fn append(&self, record: &ChangeRecord) -> Result<(), Infallible> {
         let now = self.clock.now_micros();
+        let bytes = record.stored_bytes();
         let mut inner = self.inner.lock();
         let position = record.position();
         // Positions arrive in commit order, so one at or before the latest was appended already.
@@ -629,8 +768,10 @@ impl Oplog for InMemoryOplog {
             return Ok(());
         }
         inner.max_position = Some(position);
+        inner.bytes = inner.bytes.saturating_add(bytes);
         inner.entries.push_back(Entry {
             appended_micros: now,
+            bytes,
             record: record.clone(),
         });
         self.prune_locked(&mut inner, now);
@@ -764,10 +905,16 @@ impl Oplog for InMemoryOplog {
         reason = "the trait method is async and this body finishes without awaiting"
     )]
     async fn forget_through(&self, through: PgCommitPosition) -> Result<(), Infallible> {
-        self.inner
-            .lock()
-            .entries
-            .retain(|e| e.record.position() > through);
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+        // Entries run in commit order, so the forgotten ones are a prefix.
+        while let Some(front) = inner.entries.front() {
+            if front.record.position() > through {
+                break;
+            }
+            inner.bytes = inner.bytes.saturating_sub(front.bytes);
+            inner.entries.pop_front();
+        }
         Ok(())
     }
 }
@@ -780,11 +927,15 @@ mod pg {
     use diesel::{QueryableByName, sql_query};
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::bb8::Pool;
+    use parking_lot::Mutex;
     use subql::{ChangeEvent, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgXid};
 
     use crate::fence::{Unseen, UnseenIds};
 
-    use super::{CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, ChangeRecord, Oplog, OplogConfig};
+    use super::{
+        CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, ChangeRecord, Oplog, OplogConfig, Pruned,
+        RetentionBound,
+    };
 
     /// Failure surfaced by [`PgOplog`].
     #[derive(Debug, thiserror::Error)]
@@ -823,6 +974,8 @@ mod pg {
         config: OplogConfig,
         /// Commits recorded since the transaction index was last truncated.
         since_truncation: std::sync::atomic::AtomicU64,
+        /// The bound that pruned last, so the log names a bound only when it takes over.
+        pruning_by: Mutex<Option<RetentionBound>>,
     }
 
     /// A row read back from the oplog table.
@@ -917,6 +1070,7 @@ mod pg {
                 table: table.into(),
                 config,
                 since_truncation: std::sync::atomic::AtomicU64::new(0),
+                pruning_by: Mutex::new(None),
             }
         }
 
@@ -1065,7 +1219,7 @@ mod pg {
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let table = quote_ident(&self.table);
             // Count-based: keep the newest `max_entries` rows, drop the rest.
-            let keep = i64::try_from(self.config.max_entries).unwrap_or(i64::MAX);
+            let keep = i64::try_from(self.config.entries).unwrap_or(i64::MAX);
             let by_count = format!(
                 "DELETE FROM {table} WHERE (commit_lsn, xid, ordinal) IN (\
                      SELECT commit_lsn, xid, ordinal FROM {table} \
@@ -1076,7 +1230,7 @@ mod pg {
                 .execute(&mut *conn)
                 .await?;
             // Age-based: drop rows older than the window.
-            let secs = i64::try_from(self.config.max_age.as_secs()).unwrap_or(i64::MAX);
+            let secs = i64::try_from(self.config.age.as_secs()).unwrap_or(i64::MAX);
             let by_age = format!(
                 "DELETE FROM {table} WHERE appended_at < now() - make_interval(secs => $1)"
             );
@@ -1084,8 +1238,30 @@ mod pg {
                 .bind::<BigInt, _>(secs)
                 .execute(&mut *conn)
                 .await?;
+            // A running total needs a window function, which the typed DSL cannot express.
+            let budget = i64::try_from(self.config.bytes).unwrap_or(i64::MAX);
+            let by_bytes = format!(
+                "DELETE FROM {table} WHERE (commit_lsn, xid, ordinal) IN (\
+                     SELECT commit_lsn, xid, ordinal FROM (\
+                         SELECT commit_lsn, xid, ordinal, SUM(octet_length(event) \
+                             + octet_length(payload) + octet_length(pk) + octet_length(table_name)) \
+                             OVER (ORDER BY commit_lsn DESC, xid DESC, ordinal DESC) AS kept \
+                         FROM {table}) AS newest_first \
+                     WHERE kept > $1)",
+            );
+            let by_bytes = sql_query(by_bytes)
+                .bind::<BigInt, _>(budget)
+                .execute(&mut *conn)
+                .await?;
             drop(conn);
-            let pruned = u64::try_from(by_count + by_age).unwrap_or(u64::MAX);
+            let count = |rows: usize| u64::try_from(rows).unwrap_or(u64::MAX);
+            let tally = Pruned {
+                age: count(by_age),
+                entries: count(by_count),
+                bytes: count(by_bytes),
+            };
+            tally.report(&mut self.pruning_by.lock(), &self.config);
+            let pruned = tally.total();
             if pruned == 0 {
                 return Ok(());
             }
@@ -1503,6 +1679,60 @@ mod tests {
             .await
             .expect("record an older commit");
         assert_eq!(log.last_commit().await.expect("read"), Some(later));
+    }
+
+    /// Past its byte budget the log drops its oldest entries, keeping the newest ones whose stored bytes fit, while the entry and age bounds are nowhere near.
+    #[tokio::test]
+    async fn the_byte_bound_drops_the_oldest_entries_past_the_budget() {
+        let rows: Vec<ChangeRecord> = (1..=5_u32)
+            .map(|n| {
+                let position = PgCommitPosition::new(PgLsn(0x100 * u64::from(n)), PgXid(n), 1);
+                row(i64::from(n), position)
+            })
+            .collect();
+        let budget: u64 = rows[2..].iter().map(ChangeRecord::stored_bytes).sum();
+        let log = InMemoryOplog::new(OplogConfig::default().with_max_bytes(budget));
+        for record in &rows {
+            log.append(record).await.expect("append");
+        }
+        let kept: Vec<_> = log
+            .entries_since(PgCommitPosition::before_commit(PgLsn(0)))
+            .await
+            .expect("read")
+            .iter()
+            .map(ChangeRecord::position)
+            .collect();
+        let newest: Vec<_> = rows[2..].iter().map(ChangeRecord::position).collect();
+        assert_eq!(kept, newest, "the three newest fit the budget exactly");
+    }
+
+    /// An entry older than the age bound is dropped at the next append, and one exactly at the bound stays.
+    #[tokio::test]
+    async fn the_age_bound_drops_entries_past_it_at_the_next_append() {
+        let clock = Arc::new(subql::ManualClock::new(0));
+        let handle: ClockHandle = clock.clone();
+        let log = InMemoryOplog::with_clock(
+            OplogConfig::default().with_max_age(Duration::from_secs(10)),
+            handle,
+        );
+        let at = |n: u32| PgCommitPosition::new(PgLsn(0x100 * u64::from(n)), PgXid(n), 1);
+        log.append(&row(1, at(1))).await.expect("append");
+        clock.advance(Duration::from_secs(5));
+        log.append(&row(2, at(2))).await.expect("append");
+        clock.advance(Duration::from_secs(5));
+        log.append(&row(3, at(3))).await.expect("append");
+        assert_eq!(
+            log.min_position().await.expect("min"),
+            Some(at(1)),
+            "ten seconds old stays"
+        );
+        clock.advance(Duration::from_secs(1));
+        log.append(&row(4, at(4))).await.expect("append");
+        assert_eq!(
+            log.min_position().await.expect("min"),
+            Some(at(2)),
+            "eleven seconds old goes"
+        );
     }
 
     /// A row delivered again after a failed dispatch is kept once.

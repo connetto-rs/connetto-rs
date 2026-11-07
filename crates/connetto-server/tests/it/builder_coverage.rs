@@ -2226,12 +2226,14 @@ async fn a_missing_schema_table_refuses_naming_it() {
         "{bans}"
     );
     let (_, _, issuer) = super::enrolment::rooted_issuer();
-    let devices = missing(&fixture, move |builder| {
+    // The publication setup creates the enrolment base table, so the first
+    // enrolment table the build names is the certificate one (R77 decision 11).
+    let devices = Box::pin(missing(&fixture, move |builder| {
         builder.device_identity(Some(DeviceCertConfig::new(issuer)))
-    })
+    }))
     .await;
     assert!(
-        devices.starts_with("table connetto_device_enrolments does not exist"),
+        devices.starts_with("table connetto_device_certificates does not exist"),
         "{devices}"
     );
 

@@ -49,11 +49,7 @@ impl SnapshotSource for HeldPage {
         }
         let more = {
             let mut paged = self.paged.lock();
-            if page.after.is_none() {
-                std::mem::take(&mut *paged)
-            } else {
-                false
-            }
+            page.after.is_none() && std::mem::take(&mut *paged)
         };
         let mut result = self.inner.snapshot_page(sql, binds, caller, page).await?;
         result.next = more.then(|| connetto_server::PageKey {
