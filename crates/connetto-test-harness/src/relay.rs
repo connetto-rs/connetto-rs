@@ -15,12 +15,14 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
 /// Forwards every connection accepted on one address to `upstream` while it
-/// runs.
+/// runs, and resets each one while stopped.
 pub struct Relay {
+    listener: Arc<TcpListener>,
     listen: SocketAddr,
     upstream: String,
     tls: Option<TlsAcceptor>,
-    task: Option<JoinHandle<()>>,
+    /// The task serving the listener, forwarding or resetting.
+    task: JoinHandle<()>,
 }
 
 impl Relay {
@@ -63,9 +65,11 @@ impl Relay {
             .await
             .with_context(|| format!("binding the relay on {listen}"))?;
         let listen = listener.local_addr().context("the relay's address")?;
+        let listener = Arc::new(listener);
         let upstream = upstream.to_owned();
-        let task = Some(tokio::spawn(serve(listener, upstream.clone(), tls.clone())));
+        let task = tokio::spawn(serve(Arc::clone(&listener), upstream.clone(), tls.clone()));
         Ok(Self {
+            listener,
             listen,
             upstream,
             tls,
@@ -79,45 +83,51 @@ impl Relay {
         self.listen
     }
 
-    /// Stop listening and drop every connection through the relay, returning
-    /// once the listener is closed.
+    /// Drop every connection through the relay and reset each new one,
+    /// returning once the forwarding has ended. The listener stays, so the
+    /// port stays the relay's.
     pub async fn stop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-            let _ = task.await;
-        }
+        let refusing = refuse(Arc::clone(&self.listener));
+        self.replace_task(refusing).await;
     }
 
-    /// Listen again on the same address.
-    ///
-    /// # Errors
-    ///
-    /// When the address cannot be bound again.
-    pub async fn resume(&mut self) -> Result<()> {
-        self.stop().await;
-        let listener = TcpListener::bind(self.listen)
-            .await
-            .with_context(|| format!("binding the relay on {} again", self.listen))?;
-        self.task = Some(tokio::spawn(serve(
-            listener,
+    /// Forward new connections again.
+    pub async fn resume(&mut self) {
+        let serving = serve(
+            Arc::clone(&self.listener),
             self.upstream.clone(),
             self.tls.clone(),
-        )));
-        Ok(())
+        );
+        self.replace_task(serving).await;
+    }
+
+    /// End the current task, its connections with it, then run `next` in its
+    /// place.
+    async fn replace_task(&mut self, next: impl Future<Output = ()> + Send + 'static) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+        self.task = tokio::spawn(next);
     }
 }
 
 impl Drop for Relay {
     fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
+        self.task.abort();
+    }
+}
+
+/// Accept and reset until aborted, the answer of a port nothing listens on.
+async fn refuse(listener: Arc<TcpListener>) {
+    loop {
+        if let Ok((client, _)) = listener.accept().await {
+            let _ = client.set_zero_linger();
         }
     }
 }
 
 /// Accept and forward until aborted. The connections live in a set this task
 /// owns, so aborting it aborts every one of them.
-async fn serve(listener: TcpListener, upstream: String, tls: Option<TlsAcceptor>) {
+async fn serve(listener: Arc<TcpListener>, upstream: String, tls: Option<TlsAcceptor>) {
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
@@ -194,12 +204,14 @@ mod tests {
             round_trip(&mut live).await.is_err(),
             "the live connection survived"
         );
-        assert!(
-            TcpStream::connect(relay.address()).await.is_err(),
-            "a stopped relay accepted a connection"
-        );
+        if let Ok(mut stray) = TcpStream::connect(relay.address()).await {
+            assert!(
+                round_trip(&mut stray).await.is_err(),
+                "a stopped relay forwarded a new connection"
+            );
+        }
 
-        relay.resume().await.expect("resume");
+        relay.resume().await;
         let mut again = TcpStream::connect(relay.address())
             .await
             .expect("reconnect");
@@ -207,5 +219,20 @@ mod tests {
             round_trip(&mut again).await.expect("echo after resuming"),
             7
         );
+    }
+
+    /// A stopped relay keeps its port, so no other listener takes it while
+    /// the app is offline.
+    #[tokio::test]
+    async fn a_stopped_relay_keeps_its_port() {
+        let mut relay = Relay::start("127.0.0.1:0", &echo().await)
+            .await
+            .expect("start");
+        relay.stop().await;
+        assert!(
+            TcpListener::bind(relay.address()).await.is_err(),
+            "another listener took the stopped relay's port"
+        );
+        relay.resume().await;
     }
 }
