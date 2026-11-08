@@ -9,6 +9,7 @@ pub mod aggregate;
 pub mod bulk;
 pub mod content;
 pub mod control;
+pub mod courier;
 pub mod enrolment;
 pub mod error;
 pub mod flow;
@@ -24,9 +25,10 @@ pub mod writer;
 
 pub use crate::exchange::Verdict;
 pub use aggregate::AggregateUpdate;
-pub use bulk::{BulkMessage, LivePatch, MutationPatch, SnapshotPatch};
+pub use bulk::{BulkMessage, CourierBody, LivePatch, MutationPatch, SnapshotPatch};
 pub use content::{ContentTicketGrant, ContentTicketRequest, ContentVerb};
 pub use control::{ControlMessage, GateState, PauseCause, SyncStatus, TabIdentity};
+pub use courier::{CourierAnswer, CourierNotice, CourierNoticeAck, CourierNoticeRow, CourierRange};
 pub use enrolment::{
     DeviceAttestation, DeviceRevokedAck, DeviceSummary, DevicesList, DevicesRequest,
     EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest,

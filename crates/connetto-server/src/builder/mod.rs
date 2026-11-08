@@ -1169,6 +1169,7 @@ pub struct ServerBuilder<D: ConnettoSchema = ConnettoDefaults> {
     owner_pool_size: u32,
     slot_lag_watch: Duration,
     sunset: Option<time::OffsetDateTime>,
+    courier: bool,
     oplog_config: OplogConfig,
     reader_reserve: ReaderReserve,
     throttle: ThrottleConfig,
@@ -1248,6 +1249,7 @@ impl ServerBuilder {
             owner_pool_size: 10,
             slot_lag_watch: Duration::from_secs(60),
             sunset: None,
+            courier: false,
             oplog_config: OplogConfig::default(),
             reader_reserve: ReaderReserve::new(),
             throttle: ThrottleConfig::default(),
@@ -1296,6 +1298,7 @@ where
             owner_pool_size,
             slot_lag_watch,
             sunset,
+            courier,
             oplog_config,
             reader_reserve,
             throttle,
@@ -1329,6 +1332,7 @@ where
             owner_pool_size,
             slot_lag_watch,
             sunset,
+            courier,
             oplog_config,
             reader_reserve,
             throttle,
@@ -1405,6 +1409,15 @@ where
     #[must_use]
     pub fn sunset(mut self, sunset: Option<time::OffsetDateTime>) -> Self {
         self.sunset = sunset;
+        self
+    }
+
+    /// Accept courier ranges, another device's signed entries a certified
+    /// device relays (R78 decision 1). Off by default, and every handshake
+    /// ack tells the client which.
+    #[must_use]
+    pub fn courier(mut self, on: bool) -> Self {
+        self.courier = on;
         self
     }
 
@@ -1591,6 +1604,7 @@ where
             owner_pool_size,
             slot_lag_watch,
             sunset,
+            courier,
             oplog_config,
             reader_reserve,
             throttle,
@@ -1784,7 +1798,8 @@ where
             session_config
                 .with_schema_version(Some(write_side.version))
                 .with_schema_major(Some(write_side.major))
-                .with_sunset(sunset),
+                .with_sunset(sunset)
+                .with_courier(courier),
         )
         .with_upkeep(write_side.upkeep)
         .with_signer(reader.signer)

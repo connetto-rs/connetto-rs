@@ -647,6 +647,7 @@ pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixt
     exec(pool, "DROP TABLE IF EXISTS _connetto_settled").await;
     exec(pool, "DROP TABLE IF EXISTS _connetto_writers").await;
     exec(pool, "DROP TABLE IF EXISTS _connetto_session_writers").await;
+    exec(pool, "DROP TABLE IF EXISTS _connetto_courier_notices").await;
     connetto_test_harness::provision_writers(pool).await;
     reset_audit_table(pool).await;
     exec(pool, PG_DDL).await;
@@ -666,7 +667,12 @@ pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixt
     exec(
         pool,
         "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
-         _connetto_session_writers TO app_reader",
+         _connetto_session_writers, _connetto_courier_notices TO app_reader",
+    )
+    .await;
+    exec(
+        pool,
+        "GRANT USAGE ON SEQUENCE _connetto_courier_notices_id_seq TO app_reader",
     )
     .await;
     exec(pool, "INSERT INTO orders VALUES (1, 1.0, 3, 'seed')").await;

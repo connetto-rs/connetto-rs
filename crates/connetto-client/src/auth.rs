@@ -122,8 +122,10 @@ fn indexed_without(known: &[String], account: &str) -> Option<Vec<String>> {
 impl RefreshTokenStore for KeyringStore {
     type Error = ClientError;
 
+    /// A token a gated launch left while the gate is now off is deleted
+    /// without a prompt, so the account signs in again.
     fn load<'a>(&'a self, account: &'a str) -> RefreshFuture<'a, Option<String>, ClientError> {
-        Box::pin(self.keyring.read(account))
+        Box::pin(self.keyring.read_token(account))
     }
 
     /// Writes the entry, then records the account in the index so

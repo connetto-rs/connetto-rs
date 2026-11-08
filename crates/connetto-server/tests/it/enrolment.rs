@@ -553,6 +553,69 @@ async fn a_server_without_an_issuer_refuses() {
     );
 }
 
+/// An account no certificate can name, one holding a character outside the
+/// identity URI's path set, is refused unidentified and nothing is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_account_no_certificate_can_name_is_refused() {
+    let fixture = Fixture::acquire().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let mut client = session(
+        &fixture,
+        Some("al@ice"),
+        Some(DeviceCertConfig::new(issuer().1)),
+        &store,
+    )
+    .await;
+    let key = device_key();
+    let handed = nonce(&mut client).await;
+    let reply = enrol(&mut client, &key, handed, None, Vec::new()).await;
+    assert_eq!(reply, refused(EnrolRefusal::Unidentified, "e"));
+    assert_eq!(store.records(), Vec::new());
+}
+
+/// An issuer expiring before the certificate would cannot sign it, so the
+/// enrolment is refused as an unavailable issuer and nothing is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_issuer_expiring_before_the_certificate_refuses() {
+    let fixture = Fixture::acquire().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let now = SystemTime::now();
+    let root = RootCa::create(
+        DeploymentId::from_uuid(uuid::Uuid::from_u128(0x5eed)),
+        now - DAY,
+        3650 * DAY,
+    )
+    .expect("root");
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
+    let cert = root
+        .sign_issuer(
+            &key.subject_public_key_info(),
+            now - DAY,
+            2 * DAY,
+            CertificateSerial::new([1; 16]).expect("the serial is positive"),
+        )
+        .expect("issuer");
+    let lapsing = DeviceIssuer::new(cert, key, root.certificate()).expect("load");
+    let mut client = session(
+        &fixture,
+        Some("alice"),
+        Some(DeviceCertConfig::new(lapsing)),
+        &store,
+    )
+    .await;
+    let handed = nonce(&mut client).await;
+    let reply = enrol(
+        &mut client,
+        &device_key(),
+        handed,
+        Some(7 * DAY.as_secs()),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(reply, refused(EnrolRefusal::IssuerUnavailable, "e"));
+    assert_eq!(store.records(), Vec::new());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_nonce_serves_one_request_only() {
     let fixture = Fixture::acquire().await;

@@ -29,9 +29,6 @@ rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # The pane and button icons, Font Awesome's solid set, on every renderer.
 dioxus-free-icons = { version = "0.10.0", features = ["font-awesome-solid"] }
-# The hosted hotspot's `WIFI:` payload drawn as a QR code (R76 decision 23),
-# on the builds that carry the peer link.
-qrcode = { version = "0.14.1", default-features = false, features = ["svg"], optional = true }
 
 # The browser platform: the transport, the leader election, the relay hub and
 # the DB worker, booted and attached through the worker glue.
@@ -106,9 +103,16 @@ mobile = ["dioxus/mobile", "connetto-demo-support/native"]
 # Enrols this device under the deployment root `CONNETTO_DEMO_BUILD_DEVICE_ROOT`
 # names at build time, which `connetto-demo-stack` mints (R74 decision 30).
 device-identity = ["connetto-demo-support/device-identity"]
-# The peer link and the hotspot it hosts and joins (R76): the device identity
-# the link proves with, and the demo's peer panel.
-peer = ["connetto-client/peer", "dep:qrcode"]
+# The peer link and the hotspot it hosts and joins (R76), with the team notes
+# panel's provenance lines (R77): the device identity the link proves with,
+# and the demo's peer panel.
+peer = [
+  "connetto-client/peer",
+  "connetto-demo-support/peer",
+]
+# The build the unattended proof runs drive, its gate off and its secrets
+# under their own keyring service.
+unattended = ["connetto-demo-support/unattended"]
 # The end-to-end fixture the native proof runs, on the targets that carry it;
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The provisioning documents the native proof applies to its own Postgres.

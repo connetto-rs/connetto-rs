@@ -91,6 +91,8 @@ fn state() -> State {
         key_expiry: BTreeMap::new(),
         closing: false,
         enrol_challenge: None,
+        courier: None,
+        notices: HashMap::new(),
     }
 }
 

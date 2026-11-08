@@ -22,6 +22,17 @@ pub const SIGN_IN_OPEN: &str = "the browser page is open";
 /// How long the app may be away before it asks for Face ID, a fingerprint or
 /// the device passcode again, where the platform gates the stored secrets.
 pub const RECHECK_AFTER: Duration = Duration::from_secs(30);
+
+/// The gate the session runs under. An unattended build turns it off, so no
+/// launch locks the stored secret and no return asks for Face ID, a
+/// fingerprint or the passcode.
+fn demo_gate() -> Gate {
+    if cfg!(feature = "unattended") {
+        Gate::off()
+    } else {
+        Gate::default().with_recheck(Some(RECHECK_AFTER))
+    }
+}
 /// How long a login in the browser tab may take.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 const LOGIN_WINDOW: Duration = Duration::from_secs(600);
@@ -279,7 +290,7 @@ pub async fn connect(
         ))
         .signed_in(sign_in)
         .durable(data_dir)
-        .with_gate(Gate::default().with_recheck(Some(RECHECK_AFTER)));
+        .with_gate(demo_gate());
 
     // The roots install method only exists in a device-identity build, so the
     // roots the caller ships are applied there and nowhere else.

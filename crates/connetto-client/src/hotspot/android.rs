@@ -9,13 +9,13 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
 
 use jni::JNIEnv;
-use jni::objects::{JClass, JString, JValue};
+use jni::objects::{JClass, JObject, JString, JValue};
 use socket2::SockRef;
 
 use super::{
     HostStatus, HotspotBackend, HotspotError, HotspotOffer, HotspotSecurity, JoinError, JoinStatus,
 };
-use crate::device_key::JavaAccess;
+use crate::device_key::{JavaAccess, exception_text};
 
 /// The plugin the backend drives, bundled by the app's `dx` build.
 const PLUGIN_CLASS: &str = "dev.connetto.peer.HotspotPlugin";
@@ -55,9 +55,10 @@ pub(crate) enum PluginFailure {
     /// A refusal from the Java side, kept as the exception's text, else the JNI error's.
     #[error("the peer plugin refused: {0}")]
     Java(String),
-    /// The process has no reachable Java VM.
+    /// The JNI access could not run the body, the process reaching no Java
+    /// VM, or no screen in front for a prompt.
     #[error("the peer plugin will not run: {0}")]
-    NoVm(String),
+    NotRun(String),
     /// The application's JNI access returned without running the body.
     #[error("the peer plugin will not run: the JNI access ran nothing")]
     RanNothing,
@@ -77,7 +78,7 @@ fn host_failure(failure: PluginFailure) -> HotspotError {
         PluginFailure::Java(text) => {
             permission_in(&text).map_or(HotspotError::Failed, HotspotError::MissingPermission)
         }
-        PluginFailure::NoVm(_) | PluginFailure::RanNothing => HotspotError::Failed,
+        PluginFailure::NotRun(_) | PluginFailure::RanNothing => HotspotError::Failed,
     }
 }
 
@@ -87,22 +88,8 @@ fn join_failure(failure: PluginFailure) -> JoinError {
         PluginFailure::Java(text) => {
             permission_in(&text).map_or(JoinError::Failed, JoinError::MissingPermission)
         }
-        PluginFailure::NoVm(_) | PluginFailure::RanNothing => JoinError::Failed,
+        PluginFailure::NotRun(_) | PluginFailure::RanNothing => JoinError::Failed,
     }
-}
-
-/// The pending Java exception's text, cleared, else the JNI error's.
-pub(crate) fn exception_text(env: &mut JNIEnv<'_>, err: &jni::errors::Error) -> PluginFailure {
-    let pending = env.exception_occurred().ok().filter(|ex| !ex.is_null());
-    let _ = env.exception_clear();
-    let text = pending
-        .and_then(|ex| {
-            env.call_method(&ex, "toString", "()Ljava/lang/String;", &[])
-                .ok()
-        })
-        .and_then(|value| value.l().ok())
-        .and_then(|text| env.get_string(&text.into()).ok().map(String::from));
-    PluginFailure::Java(text.unwrap_or_else(|| err.to_string()))
 }
 
 /// Run `body` on the device's Java VM, a pending exception becoming its text.
@@ -114,13 +101,52 @@ pub(crate) fn call<T>(
     let mut outcome: Option<Result<T, PluginFailure>> = None;
     java.with_env(&mut |env| {
         let Some(body) = body.take() else { return };
-        outcome = Some(body(env).map_err(|err| exception_text(env, &err)));
+        outcome = Some(body(env).map_err(|err| PluginFailure::Java(exception_text(env, &err))));
     })
-    .map_err(|err| PluginFailure::NoVm(err.to_string()))?;
+    .map_err(|err| PluginFailure::NotRun(err.to_string()))?;
     match outcome {
         Some(outcome) => outcome,
         None => Err(PluginFailure::RanNothing),
     }
+}
+
+/// Run `body` with the application's screen in front, for a plugin action
+/// that opens a system prompt over it, a pending exception becoming its text.
+pub(crate) fn call_on_screen<T>(
+    java: &dyn JavaAccess,
+    body: impl FnOnce(&mut JNIEnv<'_>, &JObject<'_>) -> jni::errors::Result<T>,
+) -> Result<T, PluginFailure> {
+    let mut body = Some(body);
+    let mut outcome: Option<Result<T, PluginFailure>> = None;
+    java.with_activity(&mut |env, activity| {
+        let Some(body) = body.take() else { return };
+        outcome =
+            Some(body(env, activity).map_err(|err| PluginFailure::Java(exception_text(env, &err))));
+    })
+    .map_err(|err| PluginFailure::NotRun(err.to_string()))?;
+    match outcome {
+        Some(outcome) => outcome,
+        None => Err(PluginFailure::RanNothing),
+    }
+}
+
+/// Ask the system for the peer link's permissions, on the application's
+/// screen in front (R76).
+///
+/// # Errors
+///
+/// The plugin failure when no screen stands or the plugin refuses.
+pub(crate) fn request_permissions(java: &dyn JavaAccess) -> Result<(), PluginFailure> {
+    call_on_screen(java, |env, activity| {
+        let class = plugin(env, PLUGIN_CLASS)?;
+        env.call_static_method(
+            class,
+            "requestPermissions",
+            "(Landroid/app/Activity;)V",
+            &[JValue::Object(activity)],
+        )?;
+        Ok(())
+    })
 }
 
 /// The `class` on the application's class loader.
@@ -364,16 +390,6 @@ impl HotspotBackend for AndroidHotspotBackend {
             // The plugin's idle and pending standings.
             _ => JoinStatus::Pending,
         }
-    }
-
-    // Android hosts from the app, so a hand-started personal hotspot has no
-    // place here (R76 decision 26).
-    fn request_personal_host(&self, _ssid: &str, _passphrase: &str) -> Result<(), HotspotError> {
-        Err(HotspotError::Unsupported)
-    }
-
-    fn personal_landed(&self) -> bool {
-        false
     }
 }
 

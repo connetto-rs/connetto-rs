@@ -113,6 +113,7 @@ async fn ack_handshake(server: &mut LoopbackTransport) {
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
             sunset_at_secs: None,
+            courier: false,
             initial_credits: 64,
             writer: Some(connetto_core::messages::WriterGrant {
                 number: 1,

@@ -80,12 +80,12 @@ use connetto_client::{
     replay_aborting, replica_schema, subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
-    AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError, FatalErrorReason,
-    FullResyncReason, FullResyncRequired, GateState, HandshakeAck, LivePatch, MutationApplied,
-    MutationConflict, MutationReject, MutationRejectReason, NonFatalError, Pong, RateLimited,
-    SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
-    SyncStatus, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, TabStorageAnswer,
-    TabStorageOutcome, TabStorageUse,
+    AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, CourierNotice, FatalError,
+    FatalErrorReason, FullResyncReason, FullResyncRequired, GateState, HandshakeAck, LivePatch,
+    MutationApplied, MutationConflict, MutationReject, MutationRejectReason, NonFatalError, Pong,
+    RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
+    SubscriptionSpec, SyncStatus, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome,
+    TabStorageAnswer, TabStorageOutcome, TabStorageUse,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Major, Transport};
@@ -1090,6 +1090,10 @@ fn prepare_hub_worker<U: Transport>(
     if let Some(content) = content {
         content.install(worker)?;
     }
+    // The tabs' connections ack the courier notices the worker relays, so
+    // the worker holds each frame until a tab does (R78 decision 41 as
+    // amended).
+    worker.relay_courier_notices();
     // Hub metadata must share the replica codec and key salt.
     connetto_client::harden::attach_in_window(
         worker.conn(),
@@ -3390,6 +3394,7 @@ where
                     // the tab's client raises the event from its own ack and
                     // prompts its application to update (R107).
                     sunset_at_secs: state.sunset,
+                    courier: false,
                     initial_credits: INITIAL_CREDITS,
                     writer: Some(WriterGrant {
                         number,
@@ -3417,6 +3422,16 @@ where
                 let _ = tab
                     .out
                     .send(TabOut::Control(ControlMessage::GateState(gate)));
+            }
+            // The courier notices no tab has acked yet, the ones the boot
+            // received before the hub existed among them (R78 decision 41 as
+            // amended).
+            for notice in worker.held_courier_notices() {
+                let _ = tab
+                    .out
+                    .send(TabOut::Control(ControlMessage::CourierNotice(
+                        notice.clone(),
+                    )));
             }
             let _ = notices.send(HubNotice::Handshake {
                 tab: id,
@@ -3466,6 +3481,17 @@ where
         }
         ControlMessage::TabStorageUse(request) if tab.handshaken => {
             serve_tab_storage_use(worker, state, id, request);
+            Ok(())
+        }
+        // A tab's receipt of a relayed courier notice frame, the first of
+        // which the worker acks upstream, a later one naming a frame the
+        // worker no longer holds and sending nothing (R78 decision 41 as
+        // amended). A failed ack leaves the worker's own pump to find the
+        // dropped transport, and the rows come again at the next handshake.
+        ControlMessage::CourierNoticeAck(ack) if tab.handshaken => {
+            if let Err(err) = worker.ack_courier_notice(&ack.notice_id).await {
+                tracing::warn!(error = %err, "acking a courier notice upstream failed");
+            }
             Ok(())
         }
         ControlMessage::BindDevice(_) | ControlMessage::RetireWriter(_) => {
@@ -4914,6 +4940,10 @@ where
     Ok(wake)
 }
 /// Handle one upstream event from the worker connection.
+#[expect(
+    clippy::too_many_lines,
+    reason = "each upstream event has one explicit relay arm."
+)]
 fn handle_worker_event<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
@@ -5037,7 +5067,22 @@ where
             }
             Ok(())
         }
+        ClientEvent::WritesCouriered { notice_id, notices } => {
+            forward_courier_notice(state, &CourierNotice { notice_id, notices });
+            Ok(())
+        }
         _ => Ok(()),
+    }
+}
+
+/// Relay one courier notice frame the worker holds to every handshaken tab
+/// under the server's id, so the first tab's receipt is the one the worker
+/// acks upstream (R78 decision 41 as amended).
+fn forward_courier_notice(state: &HubState, notice: &CourierNotice) {
+    for tab in state.tabs.values().filter(|tab| tab.handshaken) {
+        let _ = tab.out.send(TabOut::Control(ControlMessage::CourierNotice(
+            notice.clone(),
+        )));
     }
 }
 
@@ -5924,6 +5969,7 @@ mod tests {
                     current_cursor: Cursor::new(Vec::new()),
                     schema_version: Some(version),
                     sunset_at_secs: None,
+                    courier: false,
                     initial_credits: 64,
                     writer: Some(WriterGrant {
                         number: 7,

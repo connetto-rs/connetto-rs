@@ -1,22 +1,23 @@
 //! Docker-gated acceptance tests for the courier range and the writer-row
-//! sweep (R75).
+//! sweep (R75, R78 slice 1a).
 //!
-//! A courier range carries one author's queued entries, signed by the
-//! author's device key over the range's chain, which binds every entry's
-//! provenance original. It settles them through the write path the direct
-//! upload takes, as the `Courier` path. The range continues the author's
-//! settled chain and applies under the author's account identity. A carried
-//! entry settles its provenance original the way the direct upload does, so
-//! the logical write applies once whichever copy arrives first. The sweep
-//! prunes the settled rows of the device writers whose enrolment is revoked
-//! or has gone absent, keeps the writer row and its frontier, and spares the
-//! writers whose enrolment still stands, expired certificates included.
+//! A courier presents one author's stored offer, the manifest rows it holds up
+//! to the offer's newest entry and the bodies of those rows it holds. The rows
+//! above the writer's frontier recompute the author's chain from the writer's
+//! head to the offer's signed newest head, which binds every entry's major and
+//! provenance original, so a courier can neither forge nor relabel an entry.
+//! Rows at or below the frontier are answered with the verdict a provisional
+//! ask gives, and the rows above it settle in order under the author's account
+//! and the bot list its certificate carries, through the write path the direct
+//! upload takes, as the `Courier` path. The range stops at a row without a
+//! body or with a number original. A carried entry settles its provenance
+//! original the way the direct upload does, so the logical write applies once
+//! whichever copy arrives first. The sweep prunes the settled rows of the
+//! device writers whose enrolment is revoked or has gone absent, keeps the
+//! writer row and its frontier, and spares the writers whose enrolment still
+//! stands, expired certificates included.
 //!
 //! Needs Docker: the fixture starts its own Postgres.
-#![expect(
-    clippy::too_many_lines,
-    reason = "the acceptance tests walk one courier delivery in order and a split would hide the sequence"
-)]
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -28,29 +29,37 @@ use super::writer_shared::{
 use connetto_core::Major;
 use connetto_core::SessionId;
 use connetto_core::auth::Principal;
-use connetto_core::chain::{GENESIS, entry_hash, range_message};
+use connetto_core::chain::{GENESIS, chain_walk, entry_hash, offer_message};
+use connetto_core::clock::DEVICE_SKEW;
 use connetto_core::device_cert::{AttestationLevel, KeyId};
-use connetto_core::exchange::Origin;
+use connetto_core::exchange::{
+    CourierEntryOutcome, CourierOutcome, CourierRefusal, Frontier, ManifestRow, Offer, Origin,
+    RetractCause, SignedOffer, Verdict,
+};
 use connetto_core::messages::{
-    ControlMessage, MutationRejectReason, Provenance, WriterOutcome, WriterRef, WriterRequest,
+    ControlMessage, MutationRejectReason, WriterOutcome, WriterRef, WriterRequest,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
-use connetto_server::courier::{CourierDelivery, CourierEntry, CourierRefusal};
-use connetto_server::defaults::{_connetto_settled, _connetto_writers};
+use connetto_server::ban::{Ban, BanError, BanFuture, BanStore, NewBan};
+use connetto_server::courier::CourierEntry;
+use connetto_server::defaults::{_connetto_courier_notices, _connetto_settled, _connetto_writers};
 use connetto_server::device_cert::{DeviceEnrolment, Enrolment, EnrolmentStore};
 use connetto_server::writer_schema::{SettlePath, SettledOutcome};
 use connetto_server::{
-    AbuseConfig, ManagerBuilder, Materializer, NoConnector, PageSpec, RequestGuard, SessionConfig,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, ThrottleConfig,
-    pg_write_target,
+    AbuseConfig, FailedAuthorization, ManagerBuilder, Materializer, NoConnector, PageSpec,
+    RequestGuard, SessionConfig, SessionError, SessionManager, SnapshotEstimate, SnapshotPage,
+    SnapshotSource, ThrottleConfig, pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
-use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
+use diesel::{ExpressionMethods, OptionalExtension as _, QueryDsl, SelectableHelper};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use parking_lot::Mutex;
 use rcgen::{KeyPair, PublicKeyData as _, SigningKey as _};
+use sha2::{Digest as _, Sha256};
+use subql::backend::{Postgres as PgBackend, Value};
+use subql::visibility::{RowView, RowWrite, Verdict as PolicyVerdict, VisibilityPolicy};
 
 /// The handshake authority every test manager takes.
 fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
@@ -59,7 +68,7 @@ fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
 
 /// No subscriptions are made in these tests, so the snapshot source is never
 /// invoked.
-struct NoSnapshot;
+pub(super) struct NoSnapshot;
 
 impl SnapshotSource for NoSnapshot {
     type Error = Infallible;
@@ -116,13 +125,13 @@ diesel::table! {
 #[derive(diesel::Queryable, diesel::Selectable, Debug, PartialEq)]
 #[diesel(table_name = notes)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
-struct Note {
+pub(super) struct Note {
     id: i32,
     body: String,
     edited_at: String,
 }
 
-fn note(id: i32, body: &str, edited_at: &str) -> Note {
+pub(super) fn note(id: i32, body: &str, edited_at: &str) -> Note {
     Note {
         id,
         body: body.to_owned(),
@@ -131,7 +140,7 @@ fn note(id: i32, body: &str, edited_at: &str) -> Note {
 }
 
 /// The `notes` rows, read through the admin pool.
-async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
+pub(super) async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
     let mut conn = pool.get().await.expect("admin connection");
     notes::table
         .order(notes::id)
@@ -142,14 +151,14 @@ async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
 }
 
 /// The writer's account, frontier, head and retirement state, read as admin.
-struct WriterFacts {
+pub(super) struct WriterFacts {
     user: Option<String>,
     frontier: i64,
     head: Option<Vec<u8>>,
     retired: bool,
 }
 
-async fn writer_facts(pool: &Pool<AsyncPgConnection>, writer: i64) -> WriterFacts {
+pub(super) async fn writer_facts(pool: &Pool<AsyncPgConnection>, writer: i64) -> WriterFacts {
     let mut conn = pool.get().await.expect("admin connection");
     let (user, frontier, head, retired) = _connetto_writers::table
         .filter(_connetto_writers::writer.eq(writer))
@@ -171,14 +180,14 @@ async fn writer_facts(pool: &Pool<AsyncPgConnection>, writer: i64) -> WriterFact
 }
 
 /// One settled entry, read as admin, ordered by sequence.
-struct SettledFacts {
+pub(super) struct SettledFacts {
     seq: i64,
     entry_hash: Vec<u8>,
     outcome: String,
     path: SettlePath,
 }
 
-async fn settled_rows(pool: &Pool<AsyncPgConnection>, writer: i64) -> Vec<SettledFacts> {
+pub(super) async fn settled_rows(pool: &Pool<AsyncPgConnection>, writer: i64) -> Vec<SettledFacts> {
     let mut conn = pool.get().await.expect("admin connection");
     _connetto_settled::table
         .filter(_connetto_settled::writer.eq(writer))
@@ -204,7 +213,7 @@ async fn settled_rows(pool: &Pool<AsyncPgConnection>, writer: i64) -> Vec<Settle
 
 /// Collects the audit events the guard emits, in order.
 #[derive(Default)]
-struct Captured(Arc<Mutex<Vec<AuthEvent<String>>>>);
+pub(super) struct Captured(Arc<Mutex<Vec<AuthEvent<String>>>>);
 
 impl Captured {
     /// A fresh sink with its audit hook.
@@ -224,7 +233,20 @@ impl Captured {
             .cloned()
             .collect()
     }
+
+    /// The `write_couriered` events, the ones a courier range settled.
+    pub(super) fn couriered_events(&self) -> Vec<AuthEvent<String>> {
+        self.0
+            .lock()
+            .iter()
+            .filter(|event| matches!(event.op, AuthOp::WriteCouriered))
+            .cloned()
+            .collect()
+    }
 }
+
+/// The manager every test drives.
+pub(super) type Manager = Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>>;
 
 impl Enrolments {
     /// Renew the same key with a certificate that stands until `expires_at`.
@@ -241,37 +263,284 @@ impl Enrolments {
             public_key: key.subject_public_key_info().clone(),
             descriptor: vec![0x91, 0x01],
             attestation: AttestationLevel::Unproven,
+            bot_list: connetto_core::BOT_LIST_WILDCARD.to_owned(),
         };
         self.store.record(record).await.expect("record the renewal");
     }
 }
 
 /// The ECDSA P-256 SHA-256 signature of `key` over `message`.
-fn sign(key: &KeyPair, message: &[u8]) -> Vec<u8> {
+pub(super) fn sign(key: &KeyPair, message: &[u8]) -> Vec<u8> {
     key.sign(message).expect("sign the message").clone()
 }
 
-/// The signature the author's key signs over the range's chain, up to its
-/// last entry, which binds every entry's major and provenance original.
-fn range_signature(key: &KeyPair, key_id: [u8; 32], seq: u64, head: [u8; 32]) -> Vec<u8> {
-    sign(key, &range_message(&key_id, seq, &head))
+/// The schema major every test range and connection declares.
+pub(super) fn major() -> Major {
+    Major::new(1).expect("a positive major")
 }
 
-fn writing_manager(
+/// One entry of an author's chain, its changeset and the original it was
+/// first written under.
+pub(super) struct Link {
+    changeset: Vec<u8>,
+    origin: Option<Origin>,
+}
+
+/// An entry the author's writer started itself.
+pub(super) fn plain(changeset: Vec<u8>) -> Link {
+    Link {
+        changeset,
+        origin: None,
+    }
+}
+
+/// An entry carried from `original`.
+fn copied(changeset: Vec<u8>, original: Origin) -> Link {
+    Link {
+        changeset,
+        origin: Some(original),
+    }
+}
+
+/// The original at `seq` of the device writer `key`.
+fn device_origin(key: [u8; 32], seq: u64) -> Origin {
+    Origin {
+        writer: WriterRef::Device(key),
+        seq,
+    }
+}
+
+/// An author's chain from genesis, one manifest row and one body per link
+/// from sequence 1, every entry captured under [`major`].
+pub(super) struct Chain {
+    pub(super) rows: Vec<ManifestRow>,
+    pub(super) bodies: Vec<CourierEntry>,
+}
+
+pub(super) fn chain(links: Vec<Link>) -> Chain {
+    let mut rows = Vec::with_capacity(links.len());
+    let mut bodies = Vec::with_capacity(links.len());
+    for (seq, link) in (1..).zip(links) {
+        rows.push(ManifestRow {
+            seq,
+            major: major(),
+            origin: link.origin,
+            digest: Sha256::digest(&link.changeset).into(),
+        });
+        bodies.push(CourierEntry {
+            seq,
+            changeset: link.changeset,
+        });
+    }
+    Chain { rows, bodies }
+}
+
+impl Chain {
+    /// The chain's hash at `seq`.
+    pub(super) fn head(&self, seq: u64) -> [u8; 32] {
+        chain_walk(
+            &GENESIS,
+            self.rows
+                .iter()
+                .take_while(|row| row.seq <= seq)
+                .map(|row| (row.seq, Some(row.major), row.origin, row.digest)),
+        )
+    }
+
+    /// The chain's newest frontier.
+    pub(super) fn newest(&self) -> Frontier {
+        let seq = self.rows.last().map_or(0, |row| row.seq);
+        Frontier {
+            seq,
+            head: self.head(seq),
+        }
+    }
+
+    /// The rows from `seq` on.
+    fn rows_from(&self, seq: u64) -> Vec<ManifestRow> {
+        self.rows
+            .iter()
+            .filter(|row| row.seq >= seq)
+            .cloned()
+            .collect()
+    }
+
+    /// The bodies from `seq` on.
+    fn bodies_from(&self, seq: u64) -> Vec<CourierEntry> {
+        self.bodies
+            .iter()
+            .filter(|body| body.seq >= seq)
+            .cloned()
+            .collect()
+    }
+}
+
+/// The offer naming `newest` that `key` signs, encoded as the exchange
+/// stores it.
+pub(super) fn offer(key: &KeyPair, key_id: [u8; 32], newest: Frontier) -> Vec<u8> {
+    let offer = Offer {
+        builds: Vec::new(),
+        settled: None,
+        newest: Some(newest),
+        retractions: Vec::new(),
+    };
+    let signature = sign(key, &offer_message(&key_id, &offer));
+    rmp_serde::to_vec_named(&SignedOffer { offer, signature }).expect("an offer encodes")
+}
+
+/// The account and session an in-process range settles under, a fresh
+/// session each time, since the audit row names it.
+fn courier_caller(user: &str) -> connetto_server::courier::CourierIdentity<String> {
+    connetto_server::courier::CourierIdentity {
+        user_id: user.to_owned(),
+        session: SessionId::from_uuid(uuid::Uuid::new_v4()),
+    }
+}
+
+/// Deliver `chain` from `from` on, under the author's offer of its newest
+/// entry, settling under `courier`, the failures a store or an enrolment read
+/// raises included.
+async fn try_deliver_as<A>(
+    manager: &Arc<SessionManager<NoSnapshot, A, ConnettoDefaults>>,
+    courier: connetto_server::courier::CourierIdentity<String>,
+    key: &KeyPair,
+    key_id: [u8; 32],
+    chain: &Chain,
+    from: u64,
+) -> Result<CourierOutcome, SessionError>
+where
+    A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
+    A::Error: core::fmt::Display + FailedAuthorization,
+{
+    manager
+        .courier_deliver(
+            courier,
+            KeyId::from_bytes(key_id),
+            Some(major()),
+            &offer(key, key_id, chain.newest()),
+            &chain.rows_from(from),
+            &chain.bodies_from(from),
+        )
+        .await
+}
+
+/// Deliver `chain` from `from` on, under the author's offer of its newest
+/// entry, settling under `courier`.
+pub(super) async fn deliver_as<A>(
+    manager: &Arc<SessionManager<NoSnapshot, A, ConnettoDefaults>>,
+    courier: connetto_server::courier::CourierIdentity<String>,
+    key: &KeyPair,
+    key_id: [u8; 32],
+    chain: &Chain,
+    from: u64,
+) -> CourierOutcome
+where
+    A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
+    A::Error: core::fmt::Display + FailedAuthorization,
+{
+    try_deliver_as(manager, courier, key, key_id, chain, from)
+        .await
+        .expect("deliver the range")
+}
+
+/// Deliver `chain` from `from` on under `bob`, the failures a store or an
+/// enrolment read raises included.
+async fn try_deliver(
+    manager: &Manager,
+    key: &KeyPair,
+    key_id: [u8; 32],
+    chain: &Chain,
+    from: u64,
+) -> Result<CourierOutcome, SessionError> {
+    try_deliver_as(manager, courier_caller("bob"), key, key_id, chain, from).await
+}
+
+/// Deliver `chain` from `from` on under `bob`.
+async fn deliver(
+    manager: &Manager,
+    key: &KeyPair,
+    key_id: [u8; 32],
+    chain: &Chain,
+    from: u64,
+) -> CourierOutcome {
+    deliver_as(manager, courier_caller("bob"), key, key_id, chain, from).await
+}
+
+/// The answer of a row the range settled or found settled under `verdict`.
+pub(super) fn ruled(seq: u64, verdict: Verdict) -> (u64, CourierEntryOutcome) {
+    (seq, CourierEntryOutcome::Ruled(verdict))
+}
+
+/// The answer of a row that stands applied.
+pub(super) fn applied(seq: u64) -> (u64, CourierEntryOutcome) {
+    ruled(seq, Verdict::Applied)
+}
+
+/// The rows the range answered, failing the test on a refusal.
+pub(super) fn entries(outcome: CourierOutcome) -> Vec<(u64, CourierEntryOutcome)> {
+    match outcome {
+        CourierOutcome::Entries(entries) => entries,
+        CourierOutcome::Refused(refusal) => panic!("expected answered rows, got {refusal:?}"),
+    }
+}
+
+/// The writer row of `key_id`, `None` when the key holds none.
+pub(super) async fn writer_row(pool: &Pool<AsyncPgConnection>, key_id: [u8; 32]) -> Option<i64> {
+    let mut conn = pool.get().await.expect("admin connection");
+    _connetto_writers::table
+        .filter(_connetto_writers::device_key.eq(key_id.to_vec()))
+        .select(_connetto_writers::writer)
+        .get_result(&mut *conn)
+        .await
+        .optional()
+        .expect("read the device writer")
+}
+
+/// How many settled records stand across every writer.
+pub(super) async fn settled_count(pool: &Pool<AsyncPgConnection>) -> i64 {
+    let mut conn = pool.get().await.expect("admin connection");
+    _connetto_settled::table
+        .count()
+        .get_result(&mut *conn)
+        .await
+        .expect("count the settled rows")
+}
+
+/// The roster every test grants, the two accounts the tests sign in as.
+pub(super) fn roster() -> RosterAuth {
+    RosterAuth::granting("alice")
+        .and("bob")
+        .withholding(WITHHELD_ID)
+}
+
+pub(super) fn writing_manager(
     pool: &Pool<AsyncPgConnection>,
     guard: Arc<RequestGuard<String>>,
     enrolment: Option<DeviceEnrolment<String>>,
     session: SessionConfig,
-) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>> {
+) -> Manager {
+    manager_over(pool, guard, enrolment, session, roster())
+}
+
+/// A manager asking `auth` whether each write may land.
+pub(super) fn manager_over<A>(
+    pool: &Pool<AsyncPgConnection>,
+    guard: Arc<RequestGuard<String>>,
+    enrolment: Option<DeviceEnrolment<String>>,
+    session: SessionConfig,
+    auth: A,
+) -> Arc<SessionManager<NoSnapshot, A, ConnettoDefaults>>
+where
+    A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
+    A::Error: core::fmt::Display + FailedAuthorization,
+{
     let manager = ManagerBuilder::new(
         Materializer::builder(PG_DDL)
             .with_write_catalog(writable_catalog())
             .build()
             .expect("build materializer"),
         NoSnapshot,
-        RosterAuth::granting("alice")
-            .and("bob")
-            .withholding(WITHHELD_ID),
+        auth,
         test_verifier(),
         NoConnector,
         pg_write_target::<ConnettoDefaults>(pool.clone(), PG_DDL).expect("build write target"),
@@ -289,6 +558,34 @@ fn writing_manager(
     manager
 }
 
+/// A guard auditing into a fresh sink.
+pub(super) fn audited_guard() -> (Captured, Arc<RequestGuard<String>>) {
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    (captured, guard)
+}
+
+/// A manager over a fresh store with an audited guard.
+pub(super) fn courier_manager(fixture: &Fixture, store: &Enrolments) -> (Captured, Manager) {
+    let (captured, guard) = audited_guard();
+    let manager = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(store.installable()),
+        SessionConfig::default(),
+    );
+    (captured, manager)
+}
+
+/// A day from now, a certificate's expiry in most tests.
+pub(super) fn tomorrow() -> SystemTime {
+    SystemTime::now() + Duration::from_hours(24)
+}
+
 /// The durable-apply acknowledgement of `client_seq`.
 async fn expect_applied(client: &mut Client, client_seq: u64) {
     let ControlMessage::MutationApplied(applied) = client.next_control().await else {
@@ -297,537 +594,41 @@ async fn expect_applied(client: &mut Client, client_seq: u64) {
     assert_eq!(applied.client_seq, client_seq);
 }
 
-/// A courier range over a fresh author's chain settles every entry in order
-/// as the `Courier` path, under the author's account identity, and stands
-/// the author's writer row at the range's head.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_good_courier_range_settles_the_authors_entries_under_courier() {
-    let fixture = Fixture::acquire().await;
-    seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
-    let store = Enrolments::new();
-    let (key, key_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-    let _ = captured;
-
-    // The range carries the author's first two entries, chained from genesis.
-    let cs1 = insert_changeset(2, "two", "t1");
-    let cs2 = insert_changeset(3, "three", "t2");
-    let head1 = entry_hash(&GENESIS, 1, None, None, &cs1);
-    let head2 = entry_hash(&head1, 2, None, None, &cs2);
-    let entries = vec![
-        CourierEntry {
-            seq: 1,
-            changeset: cs1.clone(),
-            provenance: None,
-        },
-        CourierEntry {
-            seq: 2,
-            changeset: cs2.clone(),
-            provenance: None,
-        },
-    ];
-    let signature = range_signature(&key, key_id, 2, head2);
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(key_id), None, &entries, &signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Entries(outcomes) = delivery else {
-        panic!("expected delivered entries, got a refusal");
-    };
-    assert_eq!(
-        outcomes,
-        vec![SettledOutcome::Applied, SettledOutcome::Applied]
-    );
-
-    // Both entries landed, under the author's account.
-    assert_eq!(
-        notes(fixture.admin()).await,
-        vec![
-            note(1, "hello", "t0"),
-            note(2, "two", "t1"),
-            note(3, "three", "t2"),
-        ]
-    );
-    let writer = writer_for_key(fixture.admin(), key_id).await;
-    let facts = writer_facts(fixture.admin(), writer).await;
-    assert_eq!(
-        facts.user,
-        Some("alice".to_owned()),
-        "the range applies as the author"
-    );
-    assert_eq!(facts.frontier, 2);
-    assert_eq!(facts.head, Some(head2.to_vec()));
-    assert!(!facts.retired);
-    let rows = settled_rows(fixture.admin(), writer).await;
-    assert_eq!(
-        rows.iter()
-            .map(|row| (row.seq, row.path))
-            .collect::<Vec<_>>(),
-        vec![(1, SettlePath::Courier), (2, SettlePath::Courier),]
-    );
-    assert_eq!(rows[0].entry_hash, head1.to_vec());
-    assert_eq!(rows[1].entry_hash, head2.to_vec());
-    assert_eq!(
-        rows.iter()
-            .map(|row| row.outcome.as_str())
-            .collect::<Vec<_>>(),
-        vec!["\"applied\"", "\"applied\""]
-    );
+/// A loopback connection driven as a harness `Client` declaring [`major`].
+pub(super) fn loopback_client<A>(
+    manager: &Arc<SessionManager<NoSnapshot, A, ConnettoDefaults>>,
+) -> (
+    Client,
+    tokio::task::JoinHandle<Result<(), connetto_server::SessionError>>,
+)
+where
+    A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
+    A::Error: core::fmt::Display + FailedAuthorization,
+{
+    let (server_transport, client) = connetto_server::loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    (Client::new(client).declaring(major()), server)
 }
 
-/// A range the author's key did not sign over its own chain is refused
-/// before anything settles, the same way a key no enrolment holds is.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_courier_range_missing_the_authors_signature_is_refused() {
-    let fixture = Fixture::acquire().await;
-    seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
-    let store = Enrolments::new();
-    let (key, key_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-    let _ = captured;
-
-    // The signature vouches a chain head the range does not reach.
-    let cs1 = insert_changeset(2, "two", "t1");
-    let entries = vec![CourierEntry {
-        seq: 1,
-        changeset: cs1,
-        provenance: None,
-    }];
-    let wrong_signature = range_signature(&key, key_id, 1, GENESIS);
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(key_id), None, &entries, &wrong_signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Refused(refusal) = delivery else {
-        panic!("expected a courier refusal");
-    };
-    assert_eq!(refusal, CourierRefusal::NotEnrolled);
-    let mut conn = fixture.admin().get().await.expect("admin connection");
-    let settled: i64 = _connetto_settled::table
-        .count()
-        .get_result(&mut *conn)
-        .await
-        .expect("count the settled rows");
-    assert_eq!(settled, 0, "the refusal settled nothing");
-    assert_eq!(
-        notes(fixture.admin()).await,
-        vec![note(1, "hello", "t0")],
-        "the refusal settled nothing"
-    );
+/// The message a device key signs to bind to a connection's challenge.
+pub(super) fn bind_nonce_message(nonce: &[u8; 32]) -> Vec<u8> {
+    connetto_core::messages::writer_bind_message(nonce)
 }
 
-/// A range that starts past the author's settled frontier is refused with
-/// the gap, and settles nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_courier_range_past_the_authors_frontier_is_refused() {
-    let fixture = Fixture::acquire().await;
-    seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
-    let store = Enrolments::new();
-    let (key, key_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-    let _ = captured;
-
-    // The author settles one entry directly.
-    let (mut client, server) = loopback_client(&manager);
-    let (challenge, _) = client
-        .handshake_challenge_writing("gap-1", &["user:alice"], None, WriterRequest::Device, None)
-        .await;
-    let answer = client
-        .bind_device(
-            "b1",
-            key_id,
-            sign(&key, &bind_nonce_message(&challenge.nonce)),
-        )
-        .await;
-    assert_eq!(answer.outcome, WriterOutcome::Bound { frontier: 0 });
-    let cs1 = insert_changeset(2, "two", "t1");
-    client.upload(1, cs1).await;
-    expect_applied(&mut client, 1).await;
-    client.close().await;
-    server.await.expect("join 1").expect("session ok");
-
-    // The range names the third sequence, past the frontier.
-    let cs3 = insert_changeset(4, "four", "t3");
-    let entries = vec![CourierEntry {
-        seq: 3,
-        changeset: cs3,
-        provenance: None,
-    }];
-    let head1 = entry_hash(&GENESIS, 1, None, None, &insert_changeset(2, "two", "t1"));
-    let head3 = entry_hash(&head1, 3, None, None, &entries[0].changeset);
-    let signature = range_signature(&key, key_id, 3, head3);
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(key_id), None, &entries, &signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Refused(refusal) = delivery else {
-        panic!("expected a courier refusal");
-    };
-    assert_eq!(
-        refusal,
-        CourierRefusal::SequenceGap {
-            expected: 2,
-            got: 3
-        }
-    );
-    let writer = writer_for_key(fixture.admin(), key_id).await;
-    assert_eq!(
-        writer_facts(fixture.admin(), writer).await.frontier,
-        1,
-        "the gap settles nothing"
-    );
-    assert_eq!(settled_rows(fixture.admin(), writer).await.len(), 1);
-    assert_eq!(
-        notes(fixture.admin()).await,
-        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
-        "the gap settled nothing"
-    );
-}
-
-/// A range for a retired author is refused, and the author's record stands.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_courier_range_for_a_retired_author_is_refused() {
-    let fixture = Fixture::acquire().await;
-    seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
-    let store = Enrolments::new();
-    let (key, key_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-    let _ = captured;
-
-    // The author settles one entry directly, then retires the writer.
-    let (mut client, server) = loopback_client(&manager);
-    let (challenge, _) = client
-        .handshake_challenge_writing("ret-1", &["user:alice"], None, WriterRequest::Device, None)
-        .await;
-    let answer = client
-        .bind_device(
-            "b1",
-            key_id,
-            sign(&key, &bind_nonce_message(&challenge.nonce)),
-        )
-        .await;
-    assert_eq!(answer.outcome, WriterOutcome::Bound { frontier: 0 });
-    let cs1 = insert_changeset(2, "two", "t1");
-    client.upload(1, cs1.clone()).await;
-    expect_applied(&mut client, 1).await;
-    client.close().await;
-    server.await.expect("join 1").expect("session ok");
-
-    let (mut client, server) = loopback_client(&manager);
-    client.handshake_with("ret-2", "user:alice").await;
-    let answer = client.retire_writer("r1", WriterRef::Device(key_id)).await;
-    assert_eq!(answer.outcome, WriterOutcome::Retired);
-    client.close().await;
-    server.await.expect("join 2").expect("session ok");
-
-    // The range for the retired author settles nothing.
-    let cs2 = insert_changeset(3, "three", "t2");
-    let head1 = entry_hash(&GENESIS, 1, None, None, &cs1);
-    let head2 = entry_hash(&head1, 2, None, None, &cs2);
-    let entries = vec![CourierEntry {
-        seq: 2,
-        changeset: cs2.clone(),
-        provenance: None,
-    }];
-    let signature = range_signature(&key, key_id, 2, head2);
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(key_id), None, &entries, &signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Refused(CourierRefusal::WriterRetired) = delivery else {
-        panic!("expected a WriterRetired refusal");
-    };
-    let writer = writer_for_key(fixture.admin(), key_id).await;
-    let facts = writer_facts(fixture.admin(), writer).await;
-    assert!(facts.retired);
-    assert_eq!(facts.frontier, 1, "the retirement stands the record");
-    assert_eq!(settled_rows(fixture.admin(), writer).await.len(), 1);
-    assert_eq!(
-        notes(fixture.admin()).await,
-        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
-        "the refusal settled nothing"
-    );
-}
-
-/// The direct re-upload of a courier-settled entry is answered applied from
-/// the record, audited `write_redelivered` across the two paths, and applies
-/// the entry once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_direct_reupload_of_a_courier_settled_entry_is_answered_from_the_record_and_audited() {
-    let fixture = Fixture::acquire().await;
-    seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
-    let store = Enrolments::new();
-    let (key, key_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-
-    // The courier settles the author's first entry.
-    let cs1 = insert_changeset(2, "two", "t1");
-    let head1 = entry_hash(&GENESIS, 1, None, None, &cs1);
-    let entries = vec![CourierEntry {
-        seq: 1,
-        changeset: cs1.clone(),
-        provenance: None,
-    }];
-    let signature = range_signature(&key, key_id, 1, head1);
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(key_id), None, &entries, &signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Entries(outcomes) = delivery else {
-        panic!("expected delivered entries, got a refusal");
-    };
-    assert_eq!(outcomes, vec![SettledOutcome::Applied]);
-    let writer = writer_for_key(fixture.admin(), key_id).await;
-    assert_eq!(
-        settled_rows(fixture.admin(), writer).await[0].path,
-        SettlePath::Courier
-    );
-
-    // The author's direct connection re-uploads the same entry at its
-    // settled sequence.
-    let (mut client, server) = loopback_client(&manager);
-    let (challenge, _) = client
-        .handshake_challenge_writing("reup-1", &["user:alice"], None, WriterRequest::Device, None)
-        .await;
-    let answer = client
-        .bind_device(
-            "b1",
-            key_id,
-            sign(&key, &bind_nonce_message(&challenge.nonce)),
-        )
-        .await;
-    assert_eq!(answer.outcome, WriterOutcome::Bound { frontier: 1 });
-    client.upload(1, cs1).await;
-    expect_applied(&mut client, 1).await;
-
-    // Audited redelivered across the two paths, the entry applied once.
-    let events = captured.write_events();
-    assert_eq!(events.len(), 1, "the cross-path redelivery audits once");
-    let event = &events[0];
-    assert_eq!(event.op, AuthOp::WriteRedelivered);
-    assert_eq!(event.user_id.as_deref(), Some("alice"));
-    assert_eq!(event.writer, Some(writer));
-    assert_eq!(event.seq, Some(1));
-    assert_eq!(event.path, Some(SettlePath::Courier));
-    assert_eq!(event.other_path, Some(SettlePath::Direct));
-    let rows = settled_rows(fixture.admin(), writer).await;
-    assert_eq!(rows.len(), 1, "the re-upload settles nothing new");
-    assert_eq!(rows[0].path, SettlePath::Courier, "the first path stands");
-    assert_eq!(
-        notes(fixture.admin()).await,
-        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
-        "the entry applied once"
-    );
-    client.close().await;
-    server.await.expect("join server").expect("session ok");
-}
-
-/// The sweep prunes the settled rows of the writers whose enrolment no
-/// longer stands, keeps the writer row and its frontier, and spares the
-/// writers whose enrolment still does.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_sweep_prunes_a_revoked_writers_settled_rows_and_keeps_its_row() {
-    let fixture = Fixture::acquire().await;
-    seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
-    let store = Enrolments::new();
-    let (k1, k1_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let (k2, k2_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-    let _ = captured;
-
-    // Both keys bind and settle one entry directly.
-    let (mut client, server) = loopback_client(&manager);
+/// Bind `key` as `user`'s device writer and upload `changesets` from
+/// sequence 1, each acknowledged applied, then close.
+pub(super) async fn settle_directly(
+    manager: &Manager,
+    user: &str,
+    key: &KeyPair,
+    key_id: [u8; 32],
+    changesets: Vec<Vec<u8>>,
+) {
+    let (mut client, server) = loopback_client(manager);
     let (challenge, _) = client
         .handshake_challenge_writing(
-            "sweep-1",
-            &["user:alice"],
-            None,
-            WriterRequest::Device,
-            None,
-        )
-        .await;
-    let answer = client
-        .bind_device(
-            "b1",
-            k1_id,
-            sign(&k1, &bind_nonce_message(&challenge.nonce)),
-        )
-        .await;
-    assert_eq!(answer.outcome, WriterOutcome::Bound { frontier: 0 });
-    let cs1 = insert_changeset(2, "two", "t1");
-    client.upload(1, cs1).await;
-    expect_applied(&mut client, 1).await;
-    client.close().await;
-    server.await.expect("join 1").expect("session ok");
-
-    let (mut client, server) = loopback_client(&manager);
-    let (challenge, _) = client
-        .handshake_challenge_writing(
-            "sweep-2",
-            &["user:alice"],
-            None,
-            WriterRequest::Device,
-            None,
-        )
-        .await;
-    let answer = client
-        .bind_device(
-            "b1",
-            k2_id,
-            sign(&k2, &bind_nonce_message(&challenge.nonce)),
-        )
-        .await;
-    assert_eq!(answer.outcome, WriterOutcome::Bound { frontier: 0 });
-    let cs2 = insert_changeset(3, "three", "t2");
-    client.upload(1, cs2).await;
-    expect_applied(&mut client, 1).await;
-    client.close().await;
-    server.await.expect("join 2").expect("session ok");
-
-    // The revocation of the first key makes its writer sweepable.
-    store.revoke(k1_id);
-    let pruned = manager.sweep_writer_rows().await.expect("sweep the rows");
-    assert_eq!(pruned, 1, "one writer's rows pruned");
-
-    // The pruned writer's rows are gone, its row stands, and the live
-    // writer's rows stand.
-    let writer_1 = writer_for_key(fixture.admin(), k1_id).await;
-    assert!(settled_rows(fixture.admin(), writer_1).await.is_empty());
-    let facts_1 = writer_facts(fixture.admin(), writer_1).await;
-    assert_eq!(facts_1.frontier, 1, "the sweep keeps the frontier");
-    assert!(facts_1.head.is_some(), "the sweep keeps the head");
-    assert!(!facts_1.retired);
-    let writer_2 = writer_for_key(fixture.admin(), k2_id).await;
-    assert_eq!(settled_rows(fixture.admin(), writer_2).await.len(), 1);
-    assert_eq!(
-        notes(fixture.admin()).await,
-        vec![
-            note(1, "hello", "t0"),
-            note(2, "two", "t1"),
-            note(3, "three", "t2"),
-        ],
-        "the sweep prunes records, not rows"
-    );
-
-    // A second pass stands the same state.
-    manager.sweep_writer_rows().await.expect("sweep again");
-    assert!(settled_rows(fixture.admin(), writer_1).await.is_empty());
-    assert_eq!(settled_rows(fixture.admin(), writer_2).await.len(), 1);
-}
-
-/// The sweep keeps the settled rows of a writer whose certificate has
-/// expired but whose enrolment still stands, the courier still refuses the
-/// expired certificate, and a same-key renewal keeps the writer delivering
-/// with its replay and fork evidence intact.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_sweep_keeps_an_expired_writers_records_and_a_renewed_key_keeps_delivering() {
-    let fixture = Fixture::acquire().await;
-    seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
-    let store = Enrolments::new();
-    // The certificate expired an hour ago, the enrolment still stands.
-    let (key, key_id) = store
-        .enrol("alice", SystemTime::now() - Duration::from_hours(1))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-    let _ = captured;
-
-    // The expired key still binds and settles, as an authenticated direct use.
-    let (mut client, server) = loopback_client(&manager);
-    let (challenge, _) = client
-        .handshake_challenge_writing(
-            "sweep-exp-1",
-            &["user:alice"],
+            "direct",
+            &[&format!("user:{user}")],
             None,
             WriterRequest::Device,
             None,
@@ -837,246 +638,20 @@ async fn a_sweep_keeps_an_expired_writers_records_and_a_renewed_key_keeps_delive
         .bind_device(
             "b1",
             key_id,
-            sign(&key, &bind_nonce_message(&challenge.nonce)),
+            sign(key, &bind_nonce_message(&challenge.nonce)),
         )
         .await;
     assert_eq!(answer.outcome, WriterOutcome::Bound { frontier: 0 });
-    let cs1 = insert_changeset(2, "two", "t1");
-    client.upload(1, cs1.clone()).await;
-    expect_applied(&mut client, 1).await;
-    let writer = writer_for_key(fixture.admin(), key_id).await;
-    assert_eq!(
-        settled_rows(fixture.admin(), writer).await.len(),
-        1,
-        "the expired writer settles as any other"
-    );
-
-    // The sweep spares the expired but unrevoked writer.
-    let pruned = manager.sweep_writer_rows().await.expect("sweep the rows");
-    assert_eq!(pruned, 0, "an expired certificate does not dead the writer");
-    assert_eq!(
-        settled_rows(fixture.admin(), writer).await.len(),
-        1,
-        "the replay and fork evidence stands"
-    );
-
-    // The courier still refuses the expired certificate.
-    let cs2 = insert_changeset(3, "three", "t2");
-    let head1 = entry_hash(&GENESIS, 1, None, None, &cs1);
-    let head2 = entry_hash(&head1, 2, None, None, &cs2);
-    let entries = vec![CourierEntry {
-        seq: 2,
-        changeset: cs2,
-        provenance: None,
-    }];
-    let signature = range_signature(&key, key_id, 2, head2);
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(key_id), None, &entries, &signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Refused(refusal) = delivery else {
-        panic!("the expired courier range is refused");
-    };
-    assert_eq!(refusal, CourierRefusal::NotEnrolled);
-    assert_eq!(
-        writer_facts(fixture.admin(), writer).await.frontier,
-        1,
-        "the refusal settles nothing"
-    );
-
-    // The redelivery answers from the kept record, a different entry at the
-    // kept sequence is refused as a fork, the same-key renewal stands, and
-    // the writer keeps delivering.
-    client.upload(1, cs1).await;
-    expect_applied(&mut client, 1).await;
-    client.upload(1, insert_changeset(2, "forked", "t9")).await;
-    let ControlMessage::MutationReject(reject) = client.next_control().await else {
-        panic!("expected the fork refusal");
-    };
-    assert_eq!(reject.client_seq, 1);
-    assert_eq!(reject.reason, MutationRejectReason::Forked);
-    store
-        .renew(&key, "alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    client.upload(2, insert_changeset(4, "four", "t3")).await;
-    expect_applied(&mut client, 2).await;
-    assert_eq!(
-        settled_rows(fixture.admin(), writer).await.len(),
-        2,
-        "the renewed key settles on"
-    );
+    for (seq, changeset) in (1..).zip(changesets) {
+        client.upload(seq, changeset).await;
+        expect_applied(&mut client, seq).await;
+    }
     client.close().await;
-    server.await.expect("join 1").expect("session ok");
+    server.await.expect("join the session").expect("session ok");
 }
 
-/// The restored copy of an entry whose original already settled answers from
-/// the original's record and settles without reapplying, so a row the
-/// logical write later deleted is not recreated.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_courier_restore_answers_a_settled_original_without_reapplying() {
-    let fixture = Fixture::acquire().await;
-    seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
-    let store = Enrolments::new();
-    let (k1, k1_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let (k2, k2_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-    let _ = captured;
-
-    // The author settles the original entry.
-    let cs1 = insert_changeset(2, "two", "t1");
-    let head1 = entry_hash(&GENESIS, 1, None, None, &cs1);
-    let entries = vec![CourierEntry {
-        seq: 1,
-        changeset: cs1.clone(),
-        provenance: None,
-    }];
-    let signature = range_signature(&k1, k1_id, 1, head1);
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k1_id), None, &entries, &signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Entries(outcomes) = delivery else {
-        panic!("expected delivered entries, got a refusal");
-    };
-    assert_eq!(outcomes, vec![SettledOutcome::Applied]);
-    let writer_1 = writer_for_key(fixture.admin(), k1_id).await;
-
-    // The logical write's row is later deleted, as an authorized write would.
-    let mut conn = fixture.admin().get().await.expect("admin connection");
-    diesel::delete(notes::table.filter(notes::id.eq(2_i32)))
-        .execute(&mut *conn)
-        .await
-        .expect("delete the settled row");
-
-    // The renewed key couriers the restored copy with the original's
-    // identity, which settles without reapplying.
-    let original = Provenance {
-        writer: WriterRef::Device(k1_id),
-        seq: 1,
-        secret: None,
-    };
-    let head_copy = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs1);
-    let restored = vec![CourierEntry {
-        seq: 1,
-        changeset: cs1,
-        provenance: Some(original),
-    }];
-    let signature = range_signature(&k2, k2_id, 1, head_copy);
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), None, &restored, &signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Entries(outcomes) = delivery else {
-        panic!("expected delivered entries, got a refusal");
-    };
-    assert_eq!(
-        outcomes,
-        vec![SettledOutcome::Applied],
-        "the stored outcome stands"
-    );
-    assert_eq!(
-        notes(fixture.admin()).await,
-        vec![note(1, "hello", "t0")],
-        "the deleted row is not recreated"
-    );
-    let writer_2 = writer_for_key(fixture.admin(), k2_id).await;
-    let rows = settled_rows(fixture.admin(), writer_2).await;
-    assert_eq!(rows.len(), 1, "the copy settles under the renewed key");
-    assert_eq!(rows[0].path, SettlePath::Courier);
-    assert_eq!(rows[0].outcome, r#""applied""#);
-    // The original's record stands untouched.
-    assert_eq!(writer_facts(fixture.admin(), writer_1).await.frontier, 1);
-    assert_eq!(settled_rows(fixture.admin(), writer_1).await.len(), 1);
-}
-
-/// The restored copy of an entry whose original stands unsettled settles the
-/// original and the copy together, so the logical write applies once and both
-/// identities advance.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_courier_restore_settles_the_unsettled_original_with_the_copy() {
-    let fixture = Fixture::acquire().await;
-    seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
-    let store = Enrolments::new();
-    // The original's key enrolled but never bound, so it holds no writer row.
-    let (_k1, k1_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let (k2, k2_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-    let _ = captured;
-
-    let cs1 = insert_changeset(2, "two", "t1");
-    let original = Provenance {
-        writer: WriterRef::Device(k1_id),
-        seq: 1,
-        secret: None,
-    };
-    let original_head = entry_hash(&GENESIS, 1, None, None, &cs1);
-    let head1 = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs1);
-    let restored = vec![CourierEntry {
-        seq: 1,
-        changeset: cs1,
-        provenance: Some(original),
-    }];
-    let signature = range_signature(&k2, k2_id, 1, head1);
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), None, &restored, &signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Entries(outcomes) = delivery else {
-        panic!("expected delivered entries, got a refusal");
-    };
-    assert_eq!(outcomes, vec![SettledOutcome::Applied]);
-    assert_eq!(
-        notes(fixture.admin()).await,
-        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
-        "the logical write applied once"
-    );
-
-    // The original settled under the author's writer as the restore.
-    let writer_1 = writer_for_key(fixture.admin(), k1_id).await;
-    let rows_1 = settled_rows(fixture.admin(), writer_1).await;
-    assert_eq!(rows_1.len(), 1, "the original settled with the copy");
-    assert_eq!(rows_1[0].seq, 1);
-    assert_eq!(rows_1[0].path, SettlePath::Restore);
-    assert_eq!(rows_1[0].entry_hash, original_head.to_vec());
-    assert_eq!(writer_facts(fixture.admin(), writer_1).await.frontier, 1);
-    // The copy settled under the renewed key as the courier.
-    let writer_2 = writer_for_key(fixture.admin(), k2_id).await;
-    let rows_2 = settled_rows(fixture.admin(), writer_2).await;
-    assert_eq!(rows_2.len(), 1);
-    assert_eq!(rows_2[0].path, SettlePath::Courier);
-    assert_eq!(writer_facts(fixture.admin(), writer_2).await.frontier, 1);
-}
-
+/// Seed a direct refusal at sequence 1 of `writer`, standing its frontier
+/// at 1 with `head`.
 async fn seed_direct_refusal(pool: &Pool<AsyncPgConnection>, writer: i64, head: &[u8; 32]) {
     let mut conn = pool.get().await.expect("admin connection");
     diesel::insert_into(_connetto_settled::table)
@@ -1102,38 +677,914 @@ async fn seed_direct_refusal(pool: &Pool<AsyncPgConnection>, writer: i64, head: 
         .expect("frontier");
 }
 
-/// The restored copy of an entry whose original settled refused answers with
-/// the stored refusal and settles it, so the logical write never applies.
+/// A ban list that bans one account, or one that cannot be read for one.
+pub(super) enum Bans {
+    Refusing(&'static str),
+    Unreachable(&'static str),
+}
+
+impl BanStore<String> for Bans {
+    fn check<'a>(&'a self, user_id: &'a String) -> BanFuture<'a, Option<Ban>> {
+        let answer = match self {
+            Self::Refusing(banned) => Ok((user_id == banned).then(|| Ban {
+                session: SessionId::from_uuid(uuid::Uuid::nil()),
+                reason: "test".to_owned(),
+                banned_at: SystemTime::now().into(),
+                expires_at: None,
+                applies: true,
+            })),
+            Self::Unreachable(unread) if user_id == unread => {
+                Err(BanError::new("the ban table is unreachable"))
+            }
+            Self::Unreachable(_) => Ok(None),
+        };
+        Box::pin(core::future::ready(answer))
+    }
+
+    fn impose(&self, _ban: NewBan<String>) -> BanFuture<'_, ()> {
+        Box::pin(core::future::ready(Ok(())))
+    }
+
+    fn lift<'a>(&'a self, _user_id: &'a String) -> BanFuture<'a, bool> {
+        Box::pin(core::future::ready(Ok(false)))
+    }
+}
+
+/// A roster that denies every write, so a couriered entry settles refused
+/// `Unauthorized`.
+pub(super) struct DenyingWrites(pub(super) RosterAuth);
+
+impl VisibilityPolicy for DenyingWrites {
+    type Watcher = Arc<Principal>;
+    type Error = std::convert::Infallible;
+    type Backend = PgBackend;
+
+    async fn may_see<R>(
+        &self,
+        row: &R,
+        watchers: &[Self::Watcher],
+        verdicts: &mut [PolicyVerdict],
+    ) -> Result<(), Self::Error>
+    where
+        R: RowView<Backend = PgBackend> + Sync + ?Sized,
+    {
+        self.0.may_see(row, watchers, verdicts).await
+    }
+
+    async fn may_write<R>(
+        &self,
+        write: RowWrite<'_, R>,
+        watcher: &Self::Watcher,
+    ) -> Result<PolicyVerdict, Self::Error>
+    where
+        R: RowView<Backend = PgBackend> + Sync + ?Sized,
+    {
+        self.0
+            .may_write(write, watcher)
+            .await
+            .map(|_| PolicyVerdict::Deny)
+    }
+}
+
+/// The note id whose insert the [`Faulting`] policy cannot judge.
+pub(super) const FAULTED: i64 = 900;
+
+/// The suite's roster, except that whether the note [`FAULTED`] may be
+/// inserted it cannot answer, as a policy store that stopped answering.
+pub(super) struct Faulting(pub(super) RosterAuth);
+
+impl VisibilityPolicy for Faulting {
+    type Watcher = Arc<Principal>;
+    type Error = std::io::Error;
+    type Backend = PgBackend;
+
+    async fn may_see<R>(
+        &self,
+        row: &R,
+        watchers: &[Self::Watcher],
+        verdicts: &mut [PolicyVerdict],
+    ) -> Result<(), Self::Error>
+    where
+        R: RowView<Backend = PgBackend> + Sync + ?Sized,
+    {
+        match self.0.may_see(row, watchers, verdicts).await {
+            Ok(()) => Ok(()),
+            Err(never) => match never {},
+        }
+    }
+
+    async fn may_write<R>(
+        &self,
+        write: RowWrite<'_, R>,
+        watcher: &Self::Watcher,
+    ) -> Result<PolicyVerdict, Self::Error>
+    where
+        R: RowView<Backend = PgBackend> + Sync + ?Sized,
+    {
+        if let RowWrite::Insert { new } = &write
+            && matches!(new.value_at(0), Ok(Value::Int(FAULTED)))
+        {
+            return Err(std::io::Error::other("the policy store did not answer"));
+        }
+        match self.0.may_write(write, watcher).await {
+            Ok(verdict) => Ok(verdict),
+            Err(never) => match never {},
+        }
+    }
+}
+
+/// A courier range over a fresh author's chain settles every entry in order
+/// as the `Courier` path, under the author's account identity, and stands
+/// the author's writer row at the range's head.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_courier_restore_keeps_a_refused_original_outcome() {
+async fn a_good_courier_range_settles_the_authors_entries_under_courier() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
     let store = Enrolments::new();
-    let (k1, k1_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+    ]);
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![applied(1), applied(2)]
+    );
+
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "two", "t1"),
+            note(3, "three", "t2"),
+        ]
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    let facts = writer_facts(fixture.admin(), writer).await;
+    assert_eq!(
+        facts.user,
+        Some("alice".to_owned()),
+        "the range applies as the author"
+    );
+    assert_eq!(facts.frontier, 2);
+    assert_eq!(facts.head, Some(range.head(2).to_vec()));
+    assert!(!facts.retired);
+    let rows = settled_rows(fixture.admin(), writer).await;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row.seq,
+                row.path,
+                row.entry_hash.clone(),
+                row.outcome.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                1,
+                SettlePath::Courier,
+                range.head(1).to_vec(),
+                r#""applied""#
+            ),
+            (
+                2,
+                SettlePath::Courier,
+                range.head(2).to_vec(),
+                r#""applied""#
+            ),
+        ]
+    );
+}
+
+/// An offer the author's key did not sign, or one whose newest head the
+/// rows do not reach, is refused unverified before anything settles, and
+/// the refusal stands no writer row for the author.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forged_offer_is_refused_before_anything_settles() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (forger, _) = store.enrol("bob", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+
+    // Another key signs the author's offer.
+    assert_eq!(
+        deliver(&manager, &forger, key_id, &range, 1).await,
+        CourierOutcome::Refused(CourierRefusal::Unverified)
+    );
+    // The author signed a chain the delivered body does not continue.
+    let other = chain(vec![plain(insert_changeset(2, "forged", "t1"))]);
+    let diverged = manager
+        .courier_deliver(
+            courier_caller("bob"),
+            KeyId::from_bytes(key_id),
+            Some(major()),
+            &offer(&key, key_id, range.newest()),
+            &other.rows,
+            &other.bodies,
+        )
+        .await
+        .expect("deliver the range");
+    assert_eq!(
+        diverged,
+        CourierOutcome::Refused(CourierRefusal::Unverified)
+    );
+    // The author's offer names a newest entry past the rows the courier holds.
+    let longer = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+    ]);
+    let short = manager
+        .courier_deliver(
+            courier_caller("bob"),
+            KeyId::from_bytes(key_id),
+            Some(major()),
+            &offer(&key, key_id, longer.newest()),
+            &range.rows,
+            &range.bodies,
+        )
+        .await
+        .expect("deliver the range");
+    assert_eq!(short, CourierOutcome::Refused(CourierRefusal::Unverified));
+
+    assert_eq!(settled_count(fixture.admin()).await, 0, "nothing settled");
+    assert_eq!(
+        writer_row(fixture.admin(), key_id).await,
+        None,
+        "a refused range stands no writer row"
+    );
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+}
+
+/// A range that does not hold together is refused malformed before anything
+/// settles: an offer that does not decode, rows that skip a sequence or run
+/// past the offer's newest, and more bodies than rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_range_is_refused_before_anything_settles() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+        plain(insert_changeset(4, "four", "t3")),
+    ]);
+    let signed = offer(&key, key_id, range.newest());
+    let author = KeyId::from_bytes(key_id);
+    let refused = |outcome: CourierOutcome, what: &str| {
+        assert_eq!(
+            outcome,
+            CourierOutcome::Refused(CourierRefusal::Malformed),
+            "{what}"
+        );
+    };
+
+    refused(
+        manager
+            .courier_deliver(
+                courier_caller("bob"),
+                author,
+                Some(major()),
+                b"garbage",
+                &range.rows,
+                &range.bodies,
+            )
+            .await
+            .expect("deliver"),
+        "an offer that does not decode",
+    );
+    let skipping = vec![range.rows[0].clone(), range.rows[2].clone()];
+    refused(
+        manager
+            .courier_deliver(
+                courier_caller("bob"),
+                author,
+                Some(major()),
+                &signed,
+                &skipping,
+                &[],
+            )
+            .await
+            .expect("deliver"),
+        "rows that skip a sequence",
+    );
+    let short = offer(
+        &key,
+        key_id,
+        Frontier {
+            seq: 2,
+            head: range.head(2),
+        },
+    );
+    refused(
+        manager
+            .courier_deliver(
+                courier_caller("bob"),
+                author,
+                Some(major()),
+                &short,
+                &range.rows,
+                &range.bodies,
+            )
+            .await
+            .expect("deliver"),
+        "rows past the offer's newest",
+    );
+    let mut surplus = range.bodies.clone();
+    surplus.push(range.bodies[0].clone());
+    refused(
+        manager
+            .courier_deliver(
+                courier_caller("bob"),
+                author,
+                Some(major()),
+                &signed,
+                &range.rows,
+                &surplus,
+            )
+            .await
+            .expect("deliver"),
+        "more bodies than rows",
+    );
+
+    assert_eq!(settled_count(fixture.admin()).await, 0, "nothing settled");
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+}
+
+/// A body that names no row, comes out of order or disagrees with its row's
+/// digest fails the range as the connection it would close, and the entries
+/// settled before it stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_body_fails_the_range_and_what_settled_stands() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+        plain(insert_changeset(4, "four", "t3")),
+    ]);
+    let signed = offer(&key, key_id, range.newest());
+    let author = KeyId::from_bytes(key_id);
+    let stray = vec![CourierEntry {
+        seq: 9,
+        changeset: insert_changeset(9, "nine", "t9"),
+    }];
+    let reversed = vec![range.bodies[1].clone(), range.bodies[0].clone()];
+    let mut swapped = range.bodies.clone();
+    swapped[1].changeset = insert_changeset(3, "swapped", "t2");
+    for (bodies, detail) in [
+        (
+            stray,
+            "a courier body naming sequence 9, no row of the range",
+        ),
+        (reversed, "a courier body for sequence 1 out of order"),
+        (
+            swapped,
+            "a courier body for sequence 2 disagrees with its row's digest",
+        ),
+    ] {
+        let error = manager
+            .courier_deliver(
+                courier_caller("bob"),
+                author,
+                Some(major()),
+                &signed,
+                &range.rows,
+                &bodies,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, SessionError::Protocol(told) if told == detail),
+            "got {error:?}"
+        );
+    }
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "the entry settled before the broken body stands"
+    );
+}
+
+/// A range whose rows above the writer's frontier start past it is refused
+/// with the gap, and settles nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_courier_range_past_the_authors_frontier_is_refused() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+        plain(insert_changeset(4, "four", "t3")),
+    ]);
+    settle_directly(
+        &manager,
+        "alice",
+        &key,
+        key_id,
+        vec![range.bodies[0].changeset.clone()],
+    )
+    .await;
+
+    assert_eq!(
+        deliver(&manager, &key, key_id, &range, 3).await,
+        CourierOutcome::Refused(CourierRefusal::SequenceGap {
+            expected: 2,
+            got: 3
+        })
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    assert_eq!(writer_facts(fixture.admin(), writer).await.frontier, 1);
+    assert_eq!(settled_rows(fixture.admin(), writer).await.len(), 1);
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "the gap settled nothing"
+    );
+}
+
+/// A range starting at or below the writer's frontier answers those rows
+/// with the verdict their records give, applying and auditing nothing for
+/// them, and settles the rows above it from the writer's head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_courier_range_skips_the_settled_prefix_with_its_verdicts() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+        plain(insert_changeset(4, "four", "t3")),
+    ]);
+    settle_directly(&manager, "alice", &key, key_id, Vec::new()).await;
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    // The first entry stands refused under a direct record.
+    seed_direct_refusal(fixture.admin(), writer, &range.head(1)).await;
+
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![
+            ruled(
+                1,
+                Verdict::Refused(RetractCause::Rejected(MutationRejectReason::Unauthorized))
+            ),
+            applied(2),
+            applied(3),
+        ]
+    );
+    assert!(
+        captured.write_events().is_empty(),
+        "the settled prefix is answered without an audit row"
+    );
+    let rows = settled_rows(fixture.admin(), writer).await;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.seq, row.path))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, SettlePath::Direct),
+            (2, SettlePath::Courier),
+            (3, SettlePath::Courier),
+        ],
+        "the prefix keeps its own record"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(3, "three", "t2"),
+            note(4, "four", "t3"),
+        ],
+        "the refused entry never applies"
+    );
+
+    // Delivered again, every row is answered from its record.
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![
+            ruled(
+                1,
+                Verdict::Refused(RetractCause::Rejected(MutationRejectReason::Unauthorized))
+            ),
+            applied(2),
+            applied(3),
+        ]
+    );
+    assert_eq!(settled_rows(fixture.admin(), writer).await.len(), 3);
+}
+
+/// A range for a retired author is refused, and the author's record stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_courier_range_for_a_retired_author_is_refused() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+    ]);
+    settle_directly(
+        &manager,
+        "alice",
+        &key,
+        key_id,
+        vec![range.bodies[0].changeset.clone()],
+    )
+    .await;
+    let (mut client, server) = loopback_client(&manager);
+    client.handshake_with("ret-2", "user:alice").await;
+    let answer = client.retire_writer("r1", WriterRef::Device(key_id)).await;
+    assert_eq!(answer.outcome, WriterOutcome::Retired);
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
+
+    assert_eq!(
+        deliver(&manager, &key, key_id, &range, 2).await,
+        CourierOutcome::Refused(CourierRefusal::WriterRetired)
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    let facts = writer_facts(fixture.admin(), writer).await;
+    assert!(facts.retired);
+    assert_eq!(facts.frontier, 1, "the retirement stands the record");
+    assert_eq!(settled_rows(fixture.admin(), writer).await.len(), 1);
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "the refusal settled nothing"
+    );
+}
+
+/// A revoked key is refused whatever the reason, and an enrolment past its
+/// certificate's expiry plus `DEVICE_SKEW` is refused as absent, while one
+/// within the tolerance still delivers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_or_long_expired_author_is_refused_and_one_within_skew_delivers() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (revoked, revoked_id) = store.enrol("alice", tomorrow()).await;
+    let (expired, expired_id) = store
+        .enrol(
+            "alice",
+            SystemTime::now() - DEVICE_SKEW - Duration::from_mins(1),
+        )
         .await;
-    let (k2, k2_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+    let (lapsing, lapsing_id) = store
+        .enrol("alice", SystemTime::now() - DEVICE_SKEW / 2)
         .await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    store.revoke(revoked_id);
+
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    assert_eq!(
+        deliver(&manager, &revoked, revoked_id, &range, 1).await,
+        CourierOutcome::Refused(CourierRefusal::NotEnrolled),
+        "a revoked key"
+    );
+    assert_eq!(
+        deliver(&manager, &expired, expired_id, &range, 1).await,
+        CourierOutcome::Refused(CourierRefusal::NotEnrolled),
+        "a certificate past its expiry plus DEVICE_SKEW"
+    );
+    assert_eq!(settled_count(fixture.admin()).await, 0, "nothing settled");
+
+    assert_eq!(
+        entries(deliver(&manager, &lapsing, lapsing_id, &range, 1).await),
+        vec![applied(1)],
+        "a certificate within DEVICE_SKEW of its expiry"
+    );
+}
+
+/// A banned author's range is refused before anything settles, so its
+/// entries stay deliverable once the ban lifts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_banned_authors_range_is_refused_unsettled() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let guard = Arc::new(
+        RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
+            .with_bans(Arc::new(Bans::Refusing("alice"))),
+    );
     let manager = writing_manager(
         fixture.admin(),
         guard,
         Some(store.installable()),
         SessionConfig::default(),
     );
-    let _ = captured;
 
-    // The author binds, standing its writer row at frontier 0.
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    assert_eq!(
+        deliver(&manager, &key, key_id, &range, 1).await,
+        CourierOutcome::Refused(CourierRefusal::AuthorBanned)
+    );
+    assert_eq!(settled_count(fixture.admin()).await, 0, "nothing settled");
+    assert_eq!(writer_row(fixture.admin(), key_id).await, None);
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+}
+
+/// A couriered entry runs under the bot list the author's certificate
+/// carries, the wildcard for a person, and a list that does not parse binds
+/// the empty list, which sees and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_couriered_entry_binds_the_authors_certificate_bot_list() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    // The row records the list its write ran under.
+    fixture
+        .setup(&[
+            "CREATE OR REPLACE FUNCTION stamp_bot_list() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN NEW.body := current_setting('app.bot_list', true); RETURN NEW; END $$",
+            "CREATE TRIGGER stamp_bot_list BEFORE INSERT ON notes \
+             FOR EACH ROW EXECUTE FUNCTION stamp_bot_list()",
+        ])
+        .await;
+    let store = Enrolments::new();
+    let (bot, bot_id) = store
+        .enrol_listing("alice", tomorrow(), "notes:read,notes:insert")
+        .await;
+    let (person, person_id) = store.enrol("alice", tomorrow()).await;
+    let (unreadable, unreadable_id) = store.enrol_listing("alice", tomorrow(), "notes:drop").await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+
+    for (key, key_id, id) in [
+        (&bot, bot_id, 2),
+        (&person, person_id, 3),
+        (&unreadable, unreadable_id, 4),
+    ] {
+        let range = chain(vec![plain(insert_changeset(id, "unstamped", "t1"))]);
+        assert_eq!(
+            entries(deliver(&manager, key, key_id, &range, 1).await),
+            vec![applied(1)]
+        );
+    }
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "notes:read,notes:insert", "t1"),
+            note(3, "*", "t1"),
+            note(4, "", "t1"),
+        ]
+    );
+}
+
+/// The range stops at the first row the courier holds no body for, and at a
+/// row whose original is a number writer, whose secret only that writer
+/// holds, answering it `NotCouriered` and settling nothing past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_range_stops_at_a_digest_only_row_and_at_a_number_original() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (number_key, number_key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+        plain(insert_changeset(4, "four", "t3")),
+    ]);
+    let held: Vec<CourierEntry> = range
+        .bodies
+        .iter()
+        .filter(|body| body.seq != 2)
+        .cloned()
+        .collect();
+    let answer = manager
+        .courier_deliver(
+            courier_caller("bob"),
+            KeyId::from_bytes(key_id),
+            Some(major()),
+            &offer(&key, key_id, range.newest()),
+            &range.rows,
+            &held,
+        )
+        .await
+        .expect("deliver the range");
+    assert_eq!(
+        entries(answer),
+        vec![applied(1), (2, CourierEntryOutcome::NotCouriered)]
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    assert_eq!(writer_facts(fixture.admin(), writer).await.frontier, 1);
+
+    let numbered = chain(vec![
+        copied(
+            insert_changeset(5, "five", "t4"),
+            Origin {
+                writer: WriterRef::Number(7),
+                seq: 1,
+            },
+        ),
+        plain(insert_changeset(6, "six", "t5")),
+    ]);
+    assert_eq!(
+        entries(deliver(&manager, &number_key, number_key_id, &numbered, 1).await),
+        vec![(1, CourierEntryOutcome::NotCouriered)]
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "nothing past a stop settled"
+    );
+}
+
+/// A body captured under another major than the delivering connection's is
+/// not couriered on it, since the drain wire of its own major delivers it,
+/// and the range stops there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_of_another_major_is_not_couriered_on_this_connection() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    let answer = manager
+        .courier_deliver(
+            courier_caller("bob"),
+            KeyId::from_bytes(key_id),
+            Major::new(2),
+            &offer(&key, key_id, range.newest()),
+            &range.rows,
+            &range.bodies,
+        )
+        .await
+        .expect("deliver the range");
+    assert_eq!(
+        entries(answer),
+        vec![(1, CourierEntryOutcome::NotCouriered)]
+    );
+    assert_eq!(settled_count(fixture.admin()).await, 0, "nothing settled");
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+}
+
+/// The author's own later replay of a couriered entry is answered applied
+/// from the record, audited `write_redelivered` across the two paths, and
+/// applies the entry once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_reupload_of_a_courier_settled_entry_is_answered_from_the_record_and_audited() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (captured, manager) = courier_manager(&fixture, &store);
+
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![applied(1)]
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+
+    let (mut client, server) = loopback_client(&manager);
+    let (challenge, _) = client
+        .handshake_challenge_writing("reup-1", &["user:alice"], None, WriterRequest::Device, None)
+        .await;
+    // The couriered settle's notice frame stands for the author and arrives
+    // before the bind answer.
+    match client.next_control().await {
+        ControlMessage::CourierNotice(notice) => assert_eq!(notice.notices.len(), 1),
+        other => panic!("expected the notice frame, got {other:?}"),
+    }
+    let answer = client
+        .bind_device(
+            "b1",
+            key_id,
+            sign(&key, &bind_nonce_message(&challenge.nonce)),
+        )
+        .await;
+    assert_eq!(answer.outcome, WriterOutcome::Bound { frontier: 1 });
+    client.upload(1, range.bodies[0].changeset.clone()).await;
+    expect_applied(&mut client, 1).await;
+
+    let events = captured.write_events();
+    let [event] = events.as_slice() else {
+        panic!(
+            "the cross-path redelivery audits once, got {}",
+            events.len()
+        );
+    };
+    assert_eq!(event.op, AuthOp::WriteRedelivered);
+    assert_eq!(event.user_id.as_deref(), Some("alice"));
+    assert_eq!(event.writer, Some(writer));
+    assert_eq!(event.seq, Some(1));
+    assert_eq!(event.path, Some(SettlePath::Courier));
+    assert_eq!(event.other_path, Some(SettlePath::Direct));
+    let rows = settled_rows(fixture.admin(), writer).await;
+    assert_eq!(rows.len(), 1, "the re-upload settles nothing new");
+    assert_eq!(rows[0].path, SettlePath::Courier, "the first path stands");
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "the entry applied once"
+    );
+    client.close().await;
+    server.await.expect("join server").expect("session ok");
+}
+
+/// The sweep prunes the settled rows of the writers whose enrolment no
+/// longer stands, keeps the writer row and its frontier, and spares the
+/// writers whose enrolment still does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sweep_prunes_a_revoked_writers_settled_rows_and_keeps_its_row() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (k1, k1_id) = store.enrol("alice", tomorrow()).await;
+    let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    settle_directly(
+        &manager,
+        "alice",
+        &k1,
+        k1_id,
+        vec![insert_changeset(2, "two", "t1")],
+    )
+    .await;
+    settle_directly(
+        &manager,
+        "alice",
+        &k2,
+        k2_id,
+        vec![insert_changeset(3, "three", "t2")],
+    )
+    .await;
+
+    // The revocation of the first key makes its writer sweepable.
+    store.revoke(k1_id);
+    let pruned = manager.sweep_writer_rows().await.expect("sweep the rows");
+    assert_eq!(pruned, 1, "one writer's rows pruned");
+
+    let writer_1 = writer_for_key(fixture.admin(), k1_id).await;
+    assert!(settled_rows(fixture.admin(), writer_1).await.is_empty());
+    let facts_1 = writer_facts(fixture.admin(), writer_1).await;
+    assert_eq!(facts_1.frontier, 1, "the sweep keeps the frontier");
+    assert!(facts_1.head.is_some(), "the sweep keeps the head");
+    assert!(!facts_1.retired);
+    let writer_2 = writer_for_key(fixture.admin(), k2_id).await;
+    assert_eq!(settled_rows(fixture.admin(), writer_2).await.len(), 1);
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "two", "t1"),
+            note(3, "three", "t2"),
+        ],
+        "the sweep prunes records, not rows"
+    );
+
+    // A second pass stands the same state.
+    manager.sweep_writer_rows().await.expect("sweep again");
+    assert!(settled_rows(fixture.admin(), writer_1).await.is_empty());
+    assert_eq!(settled_rows(fixture.admin(), writer_2).await.len(), 1);
+}
+
+/// The sweep keeps the settled rows of a writer whose certificate has
+/// expired but whose enrolment still stands, the courier refuses the
+/// certificate once it is past its expiry plus `DEVICE_SKEW`, and a same-key
+/// renewal keeps the writer delivering with its replay and fork evidence
+/// intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sweep_keeps_an_expired_writers_records_and_a_renewed_key_keeps_delivering() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    // The certificate expired an hour ago, the enrolment still stands.
+    let (key, key_id) = store
+        .enrol("alice", SystemTime::now() - Duration::from_hours(1))
+        .await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+    ]);
+
+    // The expired key still binds and settles, as an authenticated direct use.
     let (mut client, server) = loopback_client(&manager);
     let (challenge, _) = client
         .handshake_challenge_writing(
-            "prov-ref-1",
+            "sweep-exp-1",
             &["user:alice"],
             None,
             WriterRequest::Device,
@@ -1143,44 +1594,177 @@ async fn a_courier_restore_keeps_a_refused_original_outcome() {
     let answer = client
         .bind_device(
             "b1",
-            k1_id,
-            sign(&k1, &bind_nonce_message(&challenge.nonce)),
+            key_id,
+            sign(&key, &bind_nonce_message(&challenge.nonce)),
         )
         .await;
     assert_eq!(answer.outcome, WriterOutcome::Bound { frontier: 0 });
+    client.upload(1, range.bodies[0].changeset.clone()).await;
+    expect_applied(&mut client, 1).await;
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+
+    // The sweep spares the expired but unrevoked writer.
+    let pruned = manager.sweep_writer_rows().await.expect("sweep the rows");
+    assert_eq!(pruned, 0, "an expired certificate does not dead the writer");
+    assert_eq!(
+        settled_rows(fixture.admin(), writer).await.len(),
+        1,
+        "the replay and fork evidence stands"
+    );
+
+    // The courier refuses the certificate past its tolerance.
+    assert_eq!(
+        deliver(&manager, &key, key_id, &range, 2).await,
+        CourierOutcome::Refused(CourierRefusal::NotEnrolled)
+    );
+    assert_eq!(
+        writer_facts(fixture.admin(), writer).await.frontier,
+        1,
+        "the refusal settles nothing"
+    );
+
+    // The redelivery answers from the kept record, a different entry at the
+    // kept sequence is refused as a fork, the same-key renewal stands, and
+    // the writer keeps delivering.
+    client.upload(1, range.bodies[0].changeset.clone()).await;
+    expect_applied(&mut client, 1).await;
+    client.upload(1, insert_changeset(2, "forked", "t9")).await;
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("expected the fork refusal");
+    };
+    assert_eq!(reject.client_seq, 1);
+    assert_eq!(reject.reason, MutationRejectReason::Forked);
+    store.renew(&key, "alice", tomorrow()).await;
+    client.upload(2, insert_changeset(4, "four", "t3")).await;
+    expect_applied(&mut client, 2).await;
+    assert_eq!(
+        settled_rows(fixture.admin(), writer).await.len(),
+        2,
+        "the renewed key settles on"
+    );
     client.close().await;
     server.await.expect("join 1").expect("session ok");
+}
+
+/// The restored copy of an entry whose original already settled answers from
+/// the original's record and settles without reapplying, so a row the
+/// logical write later deleted is not recreated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_courier_restore_answers_a_settled_original_without_reapplying() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (k1, k1_id) = store.enrol("alice", tomorrow()).await;
+    let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+
+    // The courier settles the original entry.
+    let cs1 = insert_changeset(2, "two", "t1");
+    let original = chain(vec![plain(cs1.clone())]);
+    assert_eq!(
+        entries(deliver(&manager, &k1, k1_id, &original, 1).await),
+        vec![applied(1)]
+    );
     let writer_1 = writer_for_key(fixture.admin(), k1_id).await;
 
-    // The original's refusal stands settled under it, as a direct denial
-    // does.
+    // The logical write's row is later deleted, as an authorized write would.
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    diesel::delete(notes::table.filter(notes::id.eq(2_i32)))
+        .execute(&mut *conn)
+        .await
+        .expect("delete the settled row");
+
+    // The renewed key couriers the restored copy with the original's
+    // identity, which settles without reapplying.
+    let restored = chain(vec![copied(cs1, device_origin(k1_id, 1))]);
+    assert_eq!(
+        entries(deliver(&manager, &k2, k2_id, &restored, 1).await),
+        vec![applied(1)],
+        "the stored outcome stands"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0")],
+        "the deleted row is not recreated"
+    );
+    let writer_2 = writer_for_key(fixture.admin(), k2_id).await;
+    let rows = settled_rows(fixture.admin(), writer_2).await;
+    assert_eq!(rows.len(), 1, "the copy settles under the renewed key");
+    assert_eq!(rows[0].path, SettlePath::Courier);
+    assert_eq!(rows[0].outcome, r#""applied""#);
+    assert_eq!(writer_facts(fixture.admin(), writer_1).await.frontier, 1);
+    assert_eq!(settled_rows(fixture.admin(), writer_1).await.len(), 1);
+}
+
+/// The restored copy of an entry whose original stands unsettled settles the
+/// original and the copy together, so the logical write applies once and both
+/// identities advance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_courier_restore_settles_the_unsettled_original_with_the_copy() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    // The original's key enrolled but never bound, so it holds no writer row.
+    let (_k1, k1_id) = store.enrol("alice", tomorrow()).await;
+    let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+
     let cs1 = insert_changeset(2, "two", "t1");
-    let head1 = entry_hash(&GENESIS, 1, None, None, &cs1);
+    let original_head = entry_hash(&GENESIS, 1, Some(major()), None, &cs1);
+    let restored = chain(vec![copied(cs1, device_origin(k1_id, 1))]);
+    assert_eq!(
+        entries(deliver(&manager, &k2, k2_id, &restored, 1).await),
+        vec![applied(1)]
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "the logical write applied once"
+    );
+
+    // The original settled under the author's writer as the restore.
+    let writer_1 = writer_for_key(fixture.admin(), k1_id).await;
+    let rows_1 = settled_rows(fixture.admin(), writer_1).await;
+    assert_eq!(rows_1.len(), 1, "the original settled with the copy");
+    assert_eq!(rows_1[0].seq, 1);
+    assert_eq!(rows_1[0].path, SettlePath::Restore);
+    assert_eq!(rows_1[0].entry_hash, original_head.to_vec());
+    assert_eq!(writer_facts(fixture.admin(), writer_1).await.frontier, 1);
+    // The copy settled under the renewed key as the courier.
+    let writer_2 = writer_for_key(fixture.admin(), k2_id).await;
+    let rows_2 = settled_rows(fixture.admin(), writer_2).await;
+    assert_eq!(rows_2.len(), 1);
+    assert_eq!(rows_2[0].path, SettlePath::Courier);
+    assert_eq!(writer_facts(fixture.admin(), writer_2).await.frontier, 1);
+}
+
+/// The restored copy of an entry whose original settled refused answers with
+/// the stored refusal and settles it, so the logical write never applies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_courier_restore_keeps_a_refused_original_outcome() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (k1, k1_id) = store.enrol("alice", tomorrow()).await;
+    let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
+    let (captured, manager) = courier_manager(&fixture, &store);
+
+    // The author binds, standing its writer row at frontier 0, and the
+    // original's refusal stands settled under it, as a direct denial does.
+    settle_directly(&manager, "alice", &k1, k1_id, Vec::new()).await;
+    let writer_1 = writer_for_key(fixture.admin(), k1_id).await;
+    let cs1 = insert_changeset(2, "two", "t1");
+    let head1 = entry_hash(&GENESIS, 1, Some(major()), None, &cs1);
     seed_direct_refusal(fixture.admin(), writer_1, &head1).await;
 
     // The renewed key couriers the restored copy.
-    let original = Provenance {
-        writer: WriterRef::Device(k1_id),
-        seq: 1,
-        secret: None,
-    };
-    let head_copy = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs1);
-    let restored = vec![CourierEntry {
-        seq: 1,
-        changeset: cs1,
-        provenance: Some(original),
-    }];
-    let signature = range_signature(&k2, k2_id, 1, head_copy);
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), None, &restored, &signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Entries(outcomes) = delivery else {
-        panic!("expected delivered entries, got a refusal");
-    };
+    let restored = chain(vec![copied(cs1, device_origin(k1_id, 1))]);
     assert_eq!(
-        outcomes,
-        vec![SettledOutcome::Rejected(MutationRejectReason::Unauthorized)],
+        entries(deliver(&manager, &k2, k2_id, &restored, 1).await),
+        vec![ruled(
+            1,
+            Verdict::Refused(RetractCause::Rejected(MutationRejectReason::Unauthorized))
+        )],
         "the stored refusal stands"
     );
     assert_eq!(
@@ -1203,160 +1787,58 @@ async fn a_courier_restore_keeps_a_refused_original_outcome() {
     assert_eq!(event.op, AuthOp::WriteRedelivered);
     assert_eq!(event.path, Some(SettlePath::Direct));
     assert_eq!(event.other_path, Some(SettlePath::Courier));
-    // The original's record stands untouched.
     assert_eq!(writer_facts(fixture.admin(), writer_1).await.frontier, 1);
     assert_eq!(settled_rows(fixture.admin(), writer_1).await.len(), 1);
 }
 
 /// A courier that strips, substitutes or adds an entry's provenance original
-/// fails the author's signature and settles nothing.
+/// breaks the chain the author's offer signs, so the range is refused
+/// unverified and settles nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_courier_range_signature_covers_the_entries_provenance() {
+async fn the_offer_covers_the_entries_provenance() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
     let store = Enrolments::new();
-    let (_k1, k1_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let (k2, k2_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-    let _ = captured;
+    let (_k1, k1_id) = store.enrol("alice", tomorrow()).await;
+    let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
 
     let cs1 = insert_changeset(2, "two", "t1");
-    let head_plain = entry_hash(&GENESIS, 1, None, None, &cs1);
-    let original = Provenance {
-        writer: WriterRef::Device(k1_id),
-        seq: 1,
-        secret: None,
-    };
-    let head_signed = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs1);
-    let signed = vec![CourierEntry {
-        seq: 1,
-        changeset: cs1.clone(),
-        provenance: Some(original),
-    }];
-    let signature = range_signature(&k2, k2_id, 1, head_signed);
-
-    // Signed with the provenance, stripped on delivery.
-    let stripped = vec![CourierEntry {
-        seq: 1,
-        changeset: cs1.clone(),
-        provenance: None,
-    }];
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), None, &stripped, &signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Refused(CourierRefusal::NotEnrolled) = delivery else {
-        panic!("the stripped provenance fails the signature");
-    };
-
-    // Signed with the provenance, substituted on delivery.
-    let substituted = vec![CourierEntry {
-        seq: 1,
-        changeset: cs1.clone(),
-        provenance: Some(Provenance {
+    let signed = chain(vec![copied(cs1.clone(), device_origin(k1_id, 1))]);
+    let plain_chain = chain(vec![plain(cs1.clone())]);
+    let substituted = chain(vec![copied(
+        cs1,
+        Origin {
             writer: WriterRef::Number(5),
             seq: 1,
-            secret: None,
-        }),
-    }];
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), None, &substituted, &signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Refused(CourierRefusal::NotEnrolled) = delivery else {
-        panic!("the substituted provenance fails the signature");
-    };
-
-    // Signed over a chain that carries no provenance, delivered with one.
-    let plain_signature = range_signature(&k2, k2_id, 1, head_plain);
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), None, &signed, &plain_signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Refused(CourierRefusal::NotEnrolled) = delivery else {
-        panic!("the added provenance fails the signature");
-    };
-
-    let writer = writer_for_key(fixture.admin(), k2_id).await;
-    assert!(
-        settled_rows(fixture.admin(), writer).await.is_empty(),
-        "the refusals settled nothing"
-    );
-    assert_eq!(
-        notes(fixture.admin()).await,
-        vec![note(1, "hello", "t0")],
-        "the refusals settled nothing"
-    );
-}
-
-/// A range delivered under a schema major the author's signature did not
-/// vouch for fails the signature and settles nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_courier_range_relabelled_to_another_major_is_refused() {
-    let fixture = Fixture::acquire().await;
-    seed_notes(&fixture).await;
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    let store = Enrolments::new();
-    let (key, key_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-
-    // The signature vouches the chain under one major, and the delivery
-    // declares another.
-    let cs1 = insert_changeset(2, "two", "t1");
-    let entries = vec![CourierEntry {
-        seq: 1,
-        changeset: cs1.clone(),
-        provenance: None,
-    }];
-    let head = entry_hash(&GENESIS, 1, Major::new(1), None, &cs1);
-    let signature = range_signature(&key, key_id, 1, head);
-    let delivery = manager
-        .courier_deliver(
-            KeyId::from_bytes(key_id),
-            Major::new(2),
-            &entries,
-            &signature,
-        )
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Refused(CourierRefusal::NotEnrolled) = delivery else {
-        panic!("the relabelled major fails the signature");
-    };
-    let writer = writer_for_key(fixture.admin(), key_id).await;
-    assert!(
-        settled_rows(fixture.admin(), writer).await.is_empty(),
-        "the refusal settled nothing"
-    );
-    assert_eq!(
-        notes(fixture.admin()).await,
-        vec![note(1, "hello", "t0")],
-        "the refusal settled nothing"
-    );
+        },
+    )]);
+    let author = KeyId::from_bytes(k2_id);
+    for (offered, delivered, what) in [
+        (&signed, &plain_chain, "a stripped original"),
+        (&signed, &substituted, "a substituted original"),
+        (&plain_chain, &signed, "an added original"),
+    ] {
+        let answer = manager
+            .courier_deliver(
+                courier_caller("bob"),
+                author,
+                Some(major()),
+                &offer(&k2, k2_id, offered.newest()),
+                &delivered.rows,
+                &delivered.bodies,
+            )
+            .await
+            .expect("deliver the range");
+        assert_eq!(
+            answer,
+            CourierOutcome::Refused(CourierRefusal::Unverified),
+            "{what}"
+        );
+    }
+    assert_eq!(settled_count(fixture.admin()).await, 0, "nothing settled");
+    assert_eq!(writer_row(fixture.admin(), k2_id).await, None);
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
 }
 
 /// The restored copy of an entry whose original is another account's writer
@@ -1365,80 +1847,31 @@ async fn a_courier_range_relabelled_to_another_major_is_refused() {
 async fn a_courier_restore_of_a_foreign_original_applies_plain() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
     let store = Enrolments::new();
-    let (k2, k2_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let (k3, k3_id) = store
-        .enrol("bob", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-    let _ = captured;
+    let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
+    let (k3, k3_id) = store.enrol("bob", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
 
     // bob's key binds and settles its own first entry.
-    let (mut client, server) = loopback_client(&manager);
-    let (challenge, _) = client
-        .handshake_challenge_writing(
-            "prov-fgn-1",
-            &["user:bob"],
-            None,
-            WriterRequest::Device,
-            None,
-        )
-        .await;
-    let answer = client
-        .bind_device(
-            "b1",
-            k3_id,
-            sign(&k3, &bind_nonce_message(&challenge.nonce)),
-        )
-        .await;
-    assert_eq!(answer.outcome, WriterOutcome::Bound { frontier: 0 });
-    let cs3 = insert_changeset(5, "five", "t1");
-    client.upload(1, cs3).await;
-    expect_applied(&mut client, 1).await;
-    client.close().await;
-    server.await.expect("join 1").expect("session ok");
+    settle_directly(
+        &manager,
+        "bob",
+        &k3,
+        k3_id,
+        vec![insert_changeset(5, "five", "t1")],
+    )
+    .await;
     let writer_3 = writer_for_key(fixture.admin(), k3_id).await;
-    assert_eq!(
-        writer_facts(fixture.admin(), writer_3).await.frontier,
-        1,
-        "bob's original stands settled"
-    );
 
     // alice's renewed key couriers a copy claiming the foreign original.
-    let cs2 = insert_changeset(6, "six", "t2");
-    let original = Provenance {
-        writer: WriterRef::Device(k3_id),
-        seq: 1,
-        secret: None,
-    };
-    let head1 = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs2);
-    let restored = vec![CourierEntry {
-        seq: 1,
-        changeset: cs2,
-        provenance: Some(original),
-    }];
-    let signature = range_signature(&k2, k2_id, 1, head1);
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), None, &restored, &signature)
-        .await
-        .expect("deliver the range");
-    let CourierDelivery::Entries(outcomes) = delivery else {
-        panic!("expected delivered entries, got a refusal");
-    };
-    assert_eq!(outcomes, vec![SettledOutcome::Applied]);
+    let restored = chain(vec![copied(
+        insert_changeset(6, "six", "t2"),
+        device_origin(k3_id, 1),
+    )]);
+    assert_eq!(
+        entries(deliver(&manager, &k2, k2_id, &restored, 1).await),
+        vec![applied(1)]
+    );
     assert_eq!(
         notes(fixture.admin()).await,
         vec![
@@ -1452,7 +1885,6 @@ async fn a_courier_restore_of_a_foreign_original_applies_plain() {
     let rows_2 = settled_rows(fixture.admin(), writer_2).await;
     assert_eq!(rows_2.len(), 1, "the copy settled under the author");
     assert_eq!(rows_2[0].path, SettlePath::Courier);
-    // The foreign original stands untouched.
     assert_eq!(writer_facts(fixture.admin(), writer_3).await.frontier, 1);
     assert_eq!(settled_rows(fixture.admin(), writer_3).await.len(), 1);
 }
@@ -1464,70 +1896,27 @@ async fn a_courier_restore_of_a_foreign_original_applies_plain() {
 async fn a_courier_restore_with_a_provenance_gap_settles_neither() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
     let store = Enrolments::new();
-    let (k1, k1_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let (k2, k2_id) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-    let _ = captured;
-
-    // The author settles its own first entry directly.
-    let (mut client, server) = loopback_client(&manager);
-    let (challenge, _) = client
-        .handshake_challenge_writing(
-            "prov-gap-1",
-            &["user:alice"],
-            None,
-            WriterRequest::Device,
-            None,
-        )
-        .await;
-    let answer = client
-        .bind_device(
-            "b1",
-            k1_id,
-            sign(&k1, &bind_nonce_message(&challenge.nonce)),
-        )
-        .await;
-    assert_eq!(answer.outcome, WriterOutcome::Bound { frontier: 0 });
-    let cs1 = insert_changeset(2, "two", "t1");
-    client.upload(1, cs1).await;
-    expect_applied(&mut client, 1).await;
-    client.close().await;
-    server.await.expect("join 1").expect("session ok");
+    let (k1, k1_id) = store.enrol("alice", tomorrow()).await;
+    let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    settle_directly(
+        &manager,
+        "alice",
+        &k1,
+        k1_id,
+        vec![insert_changeset(2, "two", "t1")],
+    )
+    .await;
     let writer_1 = writer_for_key(fixture.admin(), k1_id).await;
 
     // The renewed key couriers a copy whose original sequence skips the
     // original's frontier.
-    let cs2 = insert_changeset(3, "three", "t2");
-    let original = Provenance {
-        writer: WriterRef::Device(k1_id),
-        seq: 3,
-        secret: None,
-    };
-    let head1 = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs2);
-    let restored = vec![CourierEntry {
-        seq: 1,
-        changeset: cs2,
-        provenance: Some(original),
-    }];
-    let signature = range_signature(&k2, k2_id, 1, head1);
-    let error = manager
-        .courier_deliver(KeyId::from_bytes(k2_id), None, &restored, &signature)
+    let restored = chain(vec![copied(
+        insert_changeset(3, "three", "t2"),
+        device_origin(k1_id, 3),
+    )]);
+    let error = try_deliver(&manager, &k2, k2_id, &restored, 1)
         .await
         .unwrap_err();
     assert!(
@@ -1551,74 +1940,31 @@ async fn a_courier_restore_with_a_provenance_gap_settles_neither() {
     );
 }
 
-/// A loopback connection driven as a harness `Client`.
-fn loopback_client(
-    manager: &Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>>,
-) -> (
-    Client,
-    tokio::task::JoinHandle<Result<(), connetto_server::SessionError>>,
-) {
-    let (server_transport, client) = connetto_server::loopback();
-    let server = tokio::spawn(manager.clone().serve(server_transport));
-    (Client::new(client), server)
-}
-
-/// The message a device key signs to bind to a connection's challenge.
-fn bind_nonce_message(nonce: &[u8; 32]) -> Vec<u8> {
-    connetto_core::messages::writer_bind_message(nonce)
-}
-
+/// A refused restored copy settles the original it names with the same
+/// refusal, so neither identity applies the logical write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_courier_restore_settles_the_unsettled_original() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
     let store = Enrolments::new();
-    let (_, original_key) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let (author, author_key) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
+    let (_, original_key) = store.enrol("alice", tomorrow()).await;
+    let (author, author_key) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+
+    let restored = chain(vec![copied(vec![0], device_origin(original_key, 1))]);
+    let answered = entries(deliver(&manager, &author, author_key, &restored, 1).await);
+    assert!(
+        matches!(
+            answered.as_slice(),
+            [(
+                1,
+                CourierEntryOutcome::Ruled(Verdict::Refused(RetractCause::Rejected(
+                    MutationRejectReason::Malformed { .. }
+                )))
+            )]
+        ),
+        "a signed malformed logical write reaches settlement"
     );
-    let entries = [CourierEntry {
-        seq: 1,
-        changeset: vec![0],
-        provenance: Some(Provenance {
-            writer: WriterRef::Device(original_key),
-            seq: 1,
-            secret: None,
-        }),
-    }];
-    let head = entry_hash(
-        &GENESIS,
-        1,
-        None,
-        entries[0].provenance.map(Origin::from),
-        &entries[0].changeset,
-    );
-    let signature = range_signature(&author, author_key, 1, head);
-    let delivery = manager
-        .courier_deliver(KeyId::from_bytes(author_key), None, &entries, &signature)
-        .await
-        .expect("deliver malformed logical write");
-    let CourierDelivery::Entries(outcomes) = delivery else {
-        panic!("signed malformed logical write reaches settlement");
-    };
-    assert!(matches!(
-        outcomes.as_slice(),
-        [SettledOutcome::Rejected(
-            MutationRejectReason::Malformed { .. }
-        )]
-    ));
     let original_writer = writer_for_key(fixture.admin(), original_key).await;
     let copy_writer = writer_for_key(fixture.admin(), author_key).await;
     let original_rows = settled_rows(fixture.admin(), original_writer).await;
@@ -1664,48 +2010,26 @@ async fn wait_for_transaction_barrier(pool: &Pool<AsyncPgConnection>) {
     .expect("both restored copies reach the transaction barrier");
 }
 
+/// Two couriers restoring copies of one unsettled original reserve the
+/// original before applying, so the logical write applies once and the
+/// losing copy is answered from the record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_courier_restores_reserve_the_original_before_applying() {
     use diesel_async::{AsyncConnection as _, SimpleAsyncConnection as _};
 
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let (captured, hook) = Captured::new();
-    let guard = Arc::new(RequestGuard::new(
-        ThrottleConfig::default(),
-        AbuseConfig::default(),
-    ));
-    guard.set_audit_hook(hook);
     let store = Enrolments::new();
-    let (_, original_key) = store
-        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-        .await;
+    let (_, original_key) = store.enrol("alice", tomorrow()).await;
     let authors = [
-        store
-            .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-            .await,
-        store
-            .enrol("alice", SystemTime::now() + Duration::from_hours(24))
-            .await,
+        store.enrol("alice", tomorrow()).await,
+        store.enrol("alice", tomorrow()).await,
     ];
-    let manager = writing_manager(
-        fixture.admin(),
-        guard,
-        Some(store.installable()),
-        SessionConfig::default(),
-    );
-    let cs = insert_changeset(2, "two", "t1");
-    let original = Provenance {
-        writer: WriterRef::Device(original_key),
-        seq: 1,
-        secret: None,
-    };
-    let head = entry_hash(&GENESIS, 1, None, Some(Origin::from(original)), &cs);
-    let entries = Arc::new([CourierEntry {
-        seq: 1,
-        changeset: cs,
-        provenance: Some(original),
-    }]);
+    let (captured, manager) = courier_manager(&fixture, &store);
+    let restored = Arc::new(chain(vec![copied(
+        insert_changeset(2, "two", "t1"),
+        device_origin(original_key, 1),
+    )]));
     let pool = fixture.admin().clone();
     let mut blocker = fixture.admin().get().await.expect("lock connection");
     let jobs = blocker
@@ -1714,17 +2038,19 @@ async fn concurrent_courier_restores_reserve_the_original_before_applying() {
                 .await?;
             let mut jobs = Vec::with_capacity(authors.len());
             for (key, id) in authors {
-                let signature = range_signature(&key, id, 1, head);
                 let manager = Arc::clone(&manager);
-                let entries = Arc::clone(&entries);
+                let signed = offer(&key, id, restored.newest());
+                let restored = Arc::clone(&restored);
                 jobs.push(tokio::spawn(async move {
                     let delivery = tokio::time::timeout(
                         Duration::from_secs(30),
                         manager.courier_deliver(
+                            courier_caller("bob"),
                             KeyId::from_bytes(id),
-                            None,
-                            &entries[..],
-                            &signature,
+                            Some(major()),
+                            &signed,
+                            &restored.rows,
+                            &restored.bodies,
                         ),
                     )
                     .await
@@ -1743,10 +2069,7 @@ async fn concurrent_courier_restores_reserve_the_original_before_applying() {
             .await
             .expect("join deadline")
             .expect("courier task");
-        let CourierDelivery::Entries(outcomes) = delivery else {
-            panic!("author {id:?} was refused");
-        };
-        assert_eq!(outcomes, [SettledOutcome::Applied], "author {id:?}");
+        assert_eq!(entries(delivery), vec![applied(1)], "author {id:?}");
     }
     let original_writer = writer_for_key(fixture.admin(), original_key).await;
     assert_eq!(
@@ -1770,4 +2093,558 @@ async fn concurrent_courier_restores_reserve_the_original_before_applying() {
         "the losing restore audits its original replay"
     );
     assert_eq!(events[0].op, AuthOp::WriteRedelivered);
+}
+
+/// A row the policy cannot judge settles nothing and is answered `Retry`,
+/// nothing past it settles, and the range offered again once the policy
+/// answers settles from that row on, the earlier rows answered from their
+/// records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_that_settles_nothing_is_offered_again_from_it() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, guard) = audited_guard();
+    let faulting = manager_over(
+        fixture.admin(),
+        Arc::clone(&guard),
+        Some(store.installable()),
+        SessionConfig::default(),
+        Faulting(roster()),
+    );
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(FAULTED, "faulted", "t2")),
+        plain(insert_changeset(4, "four", "t3")),
+    ]);
+    let answer = deliver_as(&faulting, courier_caller("bob"), &key, key_id, &range, 1).await;
+    assert_eq!(
+        entries(answer),
+        vec![
+            applied(1),
+            (2, CourierEntryOutcome::Retry { retry_after_ms: 0 })
+        ]
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    assert_eq!(writer_facts(fixture.admin(), writer).await.frontier, 1);
+    assert_eq!(settled_rows(fixture.admin(), writer).await.len(), 1);
+
+    let answering = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(store.installable()),
+        SessionConfig::default(),
+    );
+    assert_eq!(
+        entries(deliver(&answering, &key, key_id, &range, 1).await),
+        vec![applied(1), applied(2), applied(3)]
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "two", "t1"),
+            note(4, "four", "t3"),
+            note(900, "faulted", "t2"),
+        ]
+    );
+}
+
+/// A sequence another path settled under a different entry after the range
+/// read the writer's frontier answers refused `Forked`, audited as a fork,
+/// and the range stops there, since the rest of it no longer continues the
+/// server's chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_range_stops_at_a_sequence_settled_under_another_entry() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (captured, manager) = courier_manager(&fixture, &store);
+    settle_directly(&manager, "alice", &key, key_id, Vec::new()).await;
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    // The record the other path's transaction left, its frontier not yet
+    // read by the range.
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    diesel::insert_into(_connetto_settled::table)
+        .values((
+            _connetto_settled::writer.eq(writer),
+            _connetto_settled::seq.eq(1_i64),
+            _connetto_settled::entry_hash.eq([7_u8; 32].as_slice()),
+            _connetto_settled::previous_hash.eq(GENESIS),
+            _connetto_settled::outcome.eq(SettledOutcome::Applied.json()),
+            _connetto_settled::path.eq(SettlePath::Direct),
+        ))
+        .execute(&mut *conn)
+        .await
+        .expect("the other entry's record");
+
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+    ]);
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![ruled(
+            1,
+            Verdict::Refused(RetractCause::Rejected(MutationRejectReason::Forked))
+        )]
+    );
+    let events = captured.write_events();
+    let [event] = events.as_slice() else {
+        panic!("the fork audits once, got {}", events.len());
+    };
+    assert_eq!(event.op, AuthOp::WriteForked);
+    assert_eq!(event.seq, Some(1));
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+    assert_eq!(settled_rows(fixture.admin(), writer).await.len(), 1);
+}
+
+/// A settled record holding no outcome the table defines fails the range
+/// rather than answering the row settled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_settled_record_fails_the_range() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+    ]);
+    settle_directly(
+        &manager,
+        "alice",
+        &key,
+        key_id,
+        vec![range.bodies[0].changeset.clone()],
+    )
+    .await;
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    diesel::update(_connetto_settled::table)
+        .set(_connetto_settled::outcome.eq(r#""bogus""#))
+        .execute(&mut *conn)
+        .await
+        .expect("spoil the record");
+
+    let error = try_deliver(&manager, &key, key_id, &range, 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, SessionError::Protocol(_)),
+        "an unreadable record is a protocol failure, got {error:?}"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "nothing past the record settles"
+    );
+}
+
+/// A ban list that cannot be read fails the range closed, so an outage
+/// never lets a banned author's writes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_ban_list_fails_the_range_closed() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let guard = Arc::new(
+        RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
+            .with_bans(Arc::new(Bans::Unreachable("alice"))),
+    );
+    let manager = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(store.installable()),
+        SessionConfig::default(),
+    );
+
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    let error = try_deliver(&manager, &key, key_id, &range, 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SessionError::BanList(_)), "got {error:?}");
+    assert_eq!(settled_count(fixture.admin()).await, 0, "nothing settled");
+    assert_eq!(writer_row(fixture.admin(), key_id).await, None);
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+}
+
+/// Writer tables that fail a read fail the range rather than reading as an
+/// author with no writer row or no records, which would apply its entries
+/// again from the start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_writer_table_failure_fails_the_range() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+    ]);
+    settle_directly(
+        &manager,
+        "alice",
+        &key,
+        key_id,
+        vec![range.bodies[0].changeset.clone()],
+    )
+    .await;
+    let attempt = async || {
+        try_deliver(&manager, &key, key_id, &range, 1)
+            .await
+            .unwrap_err()
+    };
+
+    // The settled prefix's records cannot be read.
+    fixture
+        .setup(&["DROP TABLE _connetto_settled CASCADE"])
+        .await;
+    let error = attempt().await;
+    assert!(
+        matches!(error, SessionError::WriteTarget(_)),
+        "got {error:?}"
+    );
+
+    // The writer row cannot be read.
+    fixture
+        .setup(&["DROP TABLE _connetto_writers CASCADE"])
+        .await;
+    let error = attempt().await;
+    assert!(
+        matches!(error, SessionError::WriteTarget(_)),
+        "got {error:?}"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")]
+    );
+}
+
+/// The writer row a range creates for an author that never bound fails the
+/// range when its insert fails or the row does not stand after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_writer_row_that_will_not_stand_fails_the_range() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    let attempt = async || {
+        try_deliver(&manager, &key, key_id, &range, 1)
+            .await
+            .unwrap_err()
+    };
+
+    // The insert reports success and leaves no row.
+    fixture
+        .setup(&[
+            "CREATE OR REPLACE FUNCTION drop_writer_rows() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$",
+            "CREATE TRIGGER drop_writer_rows BEFORE INSERT ON _connetto_writers \
+             FOR EACH ROW EXECUTE FUNCTION drop_writer_rows()",
+        ])
+        .await;
+    let error = attempt().await;
+    assert!(matches!(error, SessionError::Protocol(_)), "got {error:?}");
+
+    // The insert fails.
+    fixture
+        .setup(&[
+            "CREATE OR REPLACE FUNCTION drop_writer_rows() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'no writer rows'; END $$",
+        ])
+        .await;
+    let error = attempt().await;
+    assert!(
+        matches!(error, SessionError::WriteTarget(_)),
+        "got {error:?}"
+    );
+    assert_eq!(settled_count(fixture.admin()).await, 0, "nothing settled");
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+    fixture
+        .setup(&["DROP FUNCTION drop_writer_rows() CASCADE"])
+        .await;
+}
+
+/// A couriered entry that settles applied or refused earns one `write_couriered`
+/// row naming the author's account as `user_id`, the courier's as
+/// `courier_user_id`, the author's writer and the Courier path under the
+/// courier's session, and nothing else for the settle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_couriered_settle_writes_one_write_couriered_row_naming_both_accounts() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (captured, manager) = courier_manager(&fixture, &store);
+    let caller = courier_caller("bob");
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+    ]);
+    assert_eq!(
+        entries(deliver_as(&manager, caller.clone(), &key, key_id, &range, 1).await),
+        vec![applied(1), applied(2)]
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    let events = captured.couriered_events();
+    assert_eq!(events.len(), 2, "one row per entry the range settled");
+    for (i, expected) in [1_i64, 2_i64].into_iter().enumerate() {
+        let event = &events[i];
+        assert_eq!(event.session, Some(caller.session));
+        assert_eq!(event.user_id.as_deref(), Some("alice"));
+        assert_eq!(event.courier_user_id.as_deref(), Some("bob"));
+        assert_eq!(event.writer, Some(writer));
+        assert_eq!(event.seq, Some(expected));
+        assert_eq!(event.path, Some(SettlePath::Courier));
+        assert_eq!(event.other_path, Some(SettlePath::Courier));
+    }
+    assert!(
+        captured.write_events().is_empty(),
+        "a fresh couriered settle earns no writer-state row"
+    );
+}
+
+/// A couriered entry the policy refuses settles `Unauthorized` and still
+/// earns its `write_couriered` row, the refusal standing for re-delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_couriered_settle_writes_its_write_couriered_row() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (captured, guard) = audited_guard();
+    let manager = manager_over(
+        fixture.admin(),
+        guard,
+        Some(store.installable()),
+        SessionConfig::default(),
+        DenyingWrites(roster()),
+    );
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    assert_eq!(
+        entries(deliver_as(&manager, courier_caller("bob"), &key, key_id, &range, 1).await),
+        vec![ruled(
+            1,
+            Verdict::Refused(RetractCause::Rejected(MutationRejectReason::Unauthorized))
+        )]
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    let events = captured.couriered_events();
+    let [event] = events.as_slice() else {
+        panic!("the refused settle audits once, got {}", events.len());
+    };
+    assert_eq!(event.user_id.as_deref(), Some("alice"));
+    assert_eq!(event.courier_user_id.as_deref(), Some("bob"));
+    assert_eq!(event.writer, Some(writer));
+    assert_eq!(event.seq, Some(1));
+    assert_eq!(event.path, Some(SettlePath::Courier));
+    assert_eq!(event.other_path, Some(SettlePath::Courier));
+    let rows = settled_rows(fixture.admin(), writer).await;
+    let [row] = rows.as_slice() else {
+        panic!("the refusal stands its record");
+    };
+    assert_eq!(row.path, SettlePath::Courier);
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+}
+
+/// A row at or below the writer's frontier earns no `write_couriered`, and
+/// the range's one fresh row earns its one, under the courier's session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_settled_prefix_earns_no_write_couriered_rows() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+        plain(insert_changeset(4, "four", "t3")),
+    ]);
+    settle_directly(
+        &manager,
+        "alice",
+        &key,
+        key_id,
+        vec![
+            range.bodies[0].changeset.clone(),
+            range.bodies[1].changeset.clone(),
+        ],
+    )
+    .await;
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![applied(1), applied(2), applied(3)]
+    );
+    let events = captured.couriered_events();
+    let [event] = events.as_slice() else {
+        panic!(
+            "only the fresh row earns a couriered row, got {}",
+            events.len()
+        );
+    };
+    assert_eq!(event.writer, Some(writer));
+    assert_eq!(event.seq, Some(3));
+    assert!(
+        captured.write_events().is_empty(),
+        "the prefix answers from its records"
+    );
+}
+
+/// A sequence another path settled keeps its own audit rows. A different
+/// standing entry earns `write_forked`, the same standing entry earns
+/// `write_redelivered`, and neither earns a `write_couriered`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_already_settled_sequence_keeps_its_own_audit_rows() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    settle_directly(&manager, "alice", &key, key_id, Vec::new()).await;
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+
+    // A different entry stands at the sequence, the frontier not yet read
+    // by the range, so the range forks and stops.
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    diesel::insert_into(_connetto_settled::table)
+        .values((
+            _connetto_settled::writer.eq(writer),
+            _connetto_settled::seq.eq(1_i64),
+            _connetto_settled::entry_hash.eq([7_u8; 32].as_slice()),
+            _connetto_settled::previous_hash.eq(GENESIS),
+            _connetto_settled::outcome.eq(SettledOutcome::Applied.json()),
+            _connetto_settled::path.eq(SettlePath::Direct),
+        ))
+        .execute(&mut *conn)
+        .await
+        .expect("the other entry's record");
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![ruled(
+            1,
+            Verdict::Refused(RetractCause::Rejected(MutationRejectReason::Forked))
+        )]
+    );
+    let events = captured.write_events();
+    let [event] = events.as_slice() else {
+        panic!("the fork audits once, got {}", events.len());
+    };
+    assert_eq!(event.op, AuthOp::WriteForked);
+    assert!(
+        captured.couriered_events().is_empty(),
+        "a forked sequence keeps its fork row alone"
+    );
+
+    // The same entry stands at the sequence, so the range redelivers it.
+    diesel::update(_connetto_settled::table.filter(_connetto_settled::seq.eq(1_i64)))
+        .set(_connetto_settled::entry_hash.eq(range.head(1).as_slice()))
+        .execute(&mut *conn)
+        .await
+        .expect("the record the range carries");
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![applied(1)]
+    );
+    let events = captured.write_events();
+    assert_eq!(
+        events.iter().map(|event| &event.op).collect::<Vec<_>>(),
+        vec![&AuthOp::WriteForked, &AuthOp::WriteRedelivered]
+    );
+    assert!(
+        captured.couriered_events().is_empty(),
+        "a redelivered sequence keeps its redelivered row alone"
+    );
+}
+
+/// The notice row lands in the transaction that settles the entry, so a
+/// failed notice insert leaves the entry unsettled and the notice unwritten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_notice_insert_rolls_back_the_settle() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    fixture
+        .setup(&[
+            "CREATE FUNCTION no_notices() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RAISE EXCEPTION 'no notices'; END $$",
+            "CREATE TRIGGER no_notices BEFORE INSERT ON _connetto_courier_notices \
+             FOR EACH ROW EXECUTE FUNCTION no_notices()",
+        ])
+        .await;
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    let error = try_deliver(&manager, &key, key_id, &range, 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, SessionError::WriteTarget(_)),
+        "got {error:?}"
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    assert_eq!(
+        settled_rows(fixture.admin(), writer).await.len(),
+        0,
+        "the settle rolled back"
+    );
+    assert_eq!(notice_rows(fixture.admin()).await, Vec::new());
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+    fixture.setup(&["DROP FUNCTION no_notices() CASCADE"]).await;
+}
+
+/// A couriered entry that settles writes its one notice row naming the
+/// author's and the courier's accounts, the author's device key, the
+/// sequence and the stored outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_couriered_settle_writes_its_notice_row() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
+    assert_eq!(
+        entries(deliver(&manager, &key, key_id, &range, 1).await),
+        vec![applied(1)]
+    );
+    let rows = notice_rows(fixture.admin()).await;
+    let [(id, author, courier, device_key, seq, outcome)] = rows.as_slice() else {
+        panic!("one notice stands, got {:?}", rows.len());
+    };
+    assert!(*id > 0);
+    assert_eq!(author.as_str(), "alice");
+    assert_eq!(courier.as_str(), "bob");
+    assert_eq!(*device_key, key_id.to_vec());
+    assert_eq!(*seq, 1);
+    assert_eq!(outcome, &SettledOutcome::Applied.json());
+}
+
+/// The account's standing notice rows, by id.
+async fn notice_rows(
+    pool: &Pool<AsyncPgConnection>,
+) -> Vec<(i64, String, String, Vec<u8>, i64, String)> {
+    let mut conn = pool.get().await.expect("admin connection");
+    _connetto_courier_notices::table
+        .select((
+            _connetto_courier_notices::id,
+            _connetto_courier_notices::user_id,
+            _connetto_courier_notices::courier_user_id,
+            _connetto_courier_notices::device_key,
+            _connetto_courier_notices::seq,
+            _connetto_courier_notices::outcome,
+        ))
+        .order(_connetto_courier_notices::id.asc())
+        .load(&mut *conn)
+        .await
+        .expect("read the notices")
 }

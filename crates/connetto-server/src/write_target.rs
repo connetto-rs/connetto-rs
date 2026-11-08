@@ -72,6 +72,9 @@ pub(crate) enum WriteOutcome {
 pub(crate) struct Settlement {
     pub(crate) row: SettledRow,
     pub(crate) forked: bool,
+    /// Whether this call won the sequence, `false` when a standing record
+    /// answered it.
+    pub(crate) fresh: bool,
 }
 
 /// A failure while committing a mutation.
@@ -124,6 +127,22 @@ fn seq_storage(client_seq: u64) -> Result<i64, WriteError> {
         .map_err(|_| WriteError::Backend("client sequence overflows storage".to_owned()))
 }
 
+/// A settle's provenance original in the storage types, the writer, the
+/// sequence, the entry hash and the predecessor.
+type StoredOriginal = (i64, i64, [u8; 32], [u8; 32]);
+
+/// A settle's provenance original, or `None` when the entry is its own
+/// original or its sequence overflows storage.
+fn original_of<Id>(settle: &SettleSpec<Id>) -> Result<Option<StoredOriginal>, WriteError> {
+    settle
+        .original
+        .filter(|(writer, seq, _, _)| *writer != settle.writer || *seq != settle.seq)
+        .map(|(writer, seq, hash, previous)| {
+            seq_storage(seq).map(|seq| (writer, seq, hash, previous))
+        })
+        .transpose()
+}
+
 /// Build the conflict outcome for a stale op.
 fn conflict_outcome(conflict: &PlannedConflict, row: Option<ServerRow>) -> WriteOutcome {
     WriteOutcome::Conflict {
@@ -142,8 +161,22 @@ fn conflict_outcome(conflict: &PlannedConflict, row: Option<ServerRow>) -> Write
     }
 }
 
+/// The accounts a couriered entry settles between, what the settle
+/// transaction's notice row names and the `write_couriered` audit row reads
+/// (R78 decisions 10 and 37).
+pub(crate) struct CourierSettle<Id> {
+    /// The courier's account.
+    pub user_id: Id,
+    /// The courier's session, the audit row's `session` column.
+    pub session: connetto_core::SessionId,
+    /// The author's account.
+    pub author: Id,
+    /// The author's device key, the writer the entry settles under.
+    pub device_key: Vec<u8>,
+}
+
 /// One entry's settle instruction, what `commit` records once it applies.
-pub(crate) struct SettleSpec {
+pub(crate) struct SettleSpec<Id> {
     /// The writer the entry settles under.
     pub writer: i64,
     /// The entry's sequence for that writer.
@@ -156,6 +189,9 @@ pub(crate) struct SettleSpec {
     pub path: SettlePath,
     /// The original writer, sequence, entry hash and predecessor for shared settlement.
     pub original: Option<(i64, u64, [u8; 32], [u8; 32])>,
+    /// The courier range that settles the entry, absent for the direct and
+    /// restore paths.
+    pub courier: Option<CourierSettle<Id>>,
 }
 
 /// A Postgres write target that applies under the caller's RLS context.
@@ -439,16 +475,10 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         caller: &Principal<D::Id, Key>,
         plan: &WritePlan,
         payload_zstd: &[u8],
-        settle: &SettleSpec,
+        settle: &SettleSpec<D::Id>,
     ) -> Result<WriteOutcome, WriteError> {
         let seq = seq_storage(settle.seq)?;
-        let original = settle
-            .original
-            .filter(|(writer, seq, _, _)| *writer != settle.writer || *seq != settle.seq)
-            .map(|(writer, seq, hash, previous)| {
-                seq_storage(seq).map(|seq| (writer, seq, hash, previous))
-            })
-            .transpose()?;
+        let original = original_of(settle)?;
         let bytes = crate::materializer::decompress(payload_zstd)
             .map_err(|err| WriteError::Backend(format!("decompress: {err}")))?;
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
@@ -475,6 +505,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                     return Ok(WriteOutcome::Settled(Settlement {
                         forked: row.entry_hash != settle.entry_hash,
                         row,
+                        fresh: false,
                     }));
                 }
                 if let Some(row) = Self::reserve_original(c, original, &applied).await? {
@@ -482,10 +513,15 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                         diesel::result::Error::DeserializationError(Box::new(err))
                     })?;
                     D::Writers::settle_outcome(c, settle.writer, seq, text).await?;
+                    Self::courier_notice(c, settle, seq, text).await?;
                     if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
                         return Err(CommitError::Frontier);
                     }
-                    return Ok(WriteOutcome::Settled(Settlement { row, forked: false }));
+                    return Ok(WriteOutcome::Settled(Settlement {
+                        row,
+                        forked: false,
+                        fresh: true,
+                    }));
                 }
                 binding.apply(c).await?;
                 crate::capability::bind_writer::<D::Writers>(c, settle.writer, seq).await?;
@@ -513,6 +549,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                             D::Writers::settle_outcome(c, writer, oseq, &text).await?;
                         }
                         Self::advance_original(c, original).await?;
+                        Self::courier_notice(c, settle, seq, &text).await?;
                         if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
                             return Err(CommitError::Frontier);
                         }
@@ -527,6 +564,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                     return Err(CommitError::Denied);
                 }
                 Self::advance_original(c, original).await?;
+                Self::courier_notice(c, settle, seq, &applied).await?;
                 if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
                     return Err(CommitError::Frontier);
                 }
@@ -576,10 +614,34 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         Ok(())
     }
 
+    /// The notice row of a couriered entry, written beside the settle it
+    /// names in the same transaction, a no-op for the direct and restore
+    /// paths.
+    async fn courier_notice(
+        conn: &mut AsyncPgConnection,
+        settle: &SettleSpec<D::Id>,
+        seq: i64,
+        outcome: &str,
+    ) -> Result<(), CommitError> {
+        let Some(courier) = settle.courier.as_ref() else {
+            return Ok(());
+        };
+        D::Writers::courier_notice_insert(
+            conn,
+            &courier.author,
+            &courier.user_id,
+            &courier.device_key,
+            seq,
+            outcome,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Settles a terminal outcome and returns the first-seen record.
     pub(crate) async fn settle_refusal(
         &self,
-        settle: &SettleSpec,
+        settle: &SettleSpec<D::Id>,
         outcome: &SettledOutcome,
     ) -> Result<Settlement, WriteError> {
         let seq = seq_storage(settle.seq)?;
@@ -610,15 +672,22 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                 return Ok(Settlement {
                     forked: row.entry_hash != settle.entry_hash,
                     row,
+                    fresh: false,
                 });
             }
             let result = if let Some(row) = Self::reserve_original(c, original, &text).await? {
                 let stored = std::str::from_utf8(&row.outcome)
                     .map_err(|err| diesel::result::Error::DeserializationError(Box::new(err)))?;
                 D::Writers::settle_outcome(c, settle.writer, seq, stored).await?;
-                Settlement { row, forked: false }
+                Self::courier_notice(c, settle, seq, stored).await?;
+                Settlement {
+                    row,
+                    forked: false,
+                    fresh: true,
+                }
             } else {
                 Self::advance_original(c, original).await?;
+                Self::courier_notice(c, settle, seq, &text).await?;
                 Settlement {
                     row: SettledRow {
                         entry_hash: settle.entry_hash.to_vec(),
@@ -627,6 +696,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                         path: settle.path,
                     },
                     forked: false,
+                    fresh: true,
                 }
             };
             if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
@@ -636,6 +706,29 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         })
         .await
         .map_err(commit_failure)
+    }
+
+    /// The account's courier notice rows, in the order they settled, each
+    /// with the id its ack's delete takes and the courier's account as the
+    /// database's text.
+    pub(crate) async fn courier_notices(
+        &self,
+        user_id: &D::Id,
+    ) -> Result<Vec<(i64, D::Id, Vec<u8>, i64, String)>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::courier_notices(&mut conn, user_id)
+            .await
+            .map_err(WriteError::from)
+    }
+
+    /// Delete the notice rows an acked frame carried, whatever still stands,
+    /// so a second session's ack of the same ids deletes nothing.
+    pub(crate) async fn delete_courier_notices(&self, ids: Vec<i64>) -> Result<(), WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::courier_notices_delete(&mut conn, ids)
+            .await
+            .map(|_| ())
+            .map_err(WriteError::from)
     }
 
     /// Whether `caller` may see `file_id` per the deployment's

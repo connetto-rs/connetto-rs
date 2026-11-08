@@ -732,11 +732,19 @@ pub const WRITERS_DDL: &str = "DO $$ BEGIN \
      writer BIGINT NOT NULL, \
      first_seq BIGINT NOT NULL, \
      bound_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-     PRIMARY KEY (session_id, writer))";
+     PRIMARY KEY (session_id, writer)); \
+    CREATE TABLE IF NOT EXISTS _connetto_courier_notices \
+    (id BIGSERIAL PRIMARY KEY, \
+     user_id TEXT NOT NULL, \
+     courier_user_id TEXT NOT NULL, \
+     device_key BYTEA NOT NULL, \
+     seq BIGINT NOT NULL, \
+     outcome TEXT NOT NULL)";
 
 /// Create the reference settle-path enum and writer tables if missing, as
 /// admin. A restricted writer role needs `SELECT, INSERT, UPDATE, DELETE` on
-/// all three tables, granted separately.
+/// all four tables and `USAGE` on the notices table's id sequence, granted
+/// separately.
 pub async fn provision_writers(pool: &Pool<AsyncPgConnection>) {
     exec(pool, WRITERS_DDL).await;
 }
@@ -751,7 +759,7 @@ pub const AUDIT_DDL: &str = "DO $$ BEGIN \
     'ended_by_owner', 'ended_all', 'ended_others', 'ended_by_ban', \
     'capability_minted', 'permission_change', 'model_change', \
     'banned', 'ban_lifted', 'write_forked', 'write_redelivered', \
-    'data_downloaded', 'data_erased'); \
+    'write_couriered', 'data_downloaded', 'data_erased'); \
     EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
     CREATE TABLE IF NOT EXISTS auth_events \
     (at TIMESTAMPTZ NOT NULL DEFAULT now(), \
@@ -765,6 +773,7 @@ pub const AUDIT_DDL: &str = "DO $$ BEGIN \
      seq BIGINT, \
      path connetto_settle_path, \
      other_path connetto_settle_path, \
+     courier_user_id TEXT, \
      provider TEXT, \
      issuer TEXT, \
      query_list_hash TEXT, \
@@ -915,7 +924,8 @@ pub async fn start_replication_on(pool: &Pool<AsyncPgConnection>, tables: &[&str
         "CREATE TABLE IF NOT EXISTS connetto_device_enrolments \
          (key_id BYTEA PRIMARY KEY, user_id TEXT NOT NULL, session_id UUID NOT NULL, \
           enrolled_at TIMESTAMPTZ NOT NULL, last_seen TIMESTAMPTZ NOT NULL, \
-          revoked_at TIMESTAMPTZ, public_key BYTEA NOT NULL, attestation TEXT NOT NULL)",
+          revoked_at TIMESTAMPTZ, public_key BYTEA NOT NULL, attestation TEXT NOT NULL, \
+          bot_list TEXT)",
     )
     .await;
     provision_writers(pool).await;
@@ -1959,6 +1969,9 @@ pub struct Client {
     /// commit, and an assertion about what was delivered has to weigh that
     /// patch rather than never meet it.
     live_backlog: VecDeque<LivePatch>,
+    /// The schema major every handshake declares, the capture major of the
+    /// entries the connection settles.
+    schema_major: Option<connetto_core::Major>,
 }
 
 impl Client {
@@ -1970,7 +1983,19 @@ impl Client {
         Self {
             transport,
             live_backlog: VecDeque::new(),
+            schema_major: None,
         }
+    }
+
+    /// Declare `major` in every handshake this client sends, the capture
+    /// major of the entries the connection settles.
+    // Out of line, since rustc otherwise copies so small a function into each
+    // calling crate of a non-incremental build, where coverage never counts it.
+    #[must_use]
+    #[inline(never)]
+    pub fn declaring(mut self, major: connetto_core::Major) -> Self {
+        self.schema_major = Some(major);
+        self
     }
 
     /// Send the handshake as `client_id` and wait for its ack. The client id
@@ -2012,6 +2037,7 @@ impl Client {
         let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
             .with_grants(grants.iter().map(|grant| Grant::new(*grant)))
             .with_writer(writer);
+        handshake.schema_major = self.schema_major;
         if let Some(token) = resume_token {
             handshake = handshake.with_resume_token(token);
         }
@@ -2065,6 +2091,7 @@ impl Client {
         let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
             .with_grant(Grant::new(grant))
             .with_cursor(cursor);
+        handshake.schema_major = self.schema_major;
         if let Some(subjects) = cursor_subjects {
             handshake = handshake.with_cursor_subjects(subjects.iter().copied());
         }
@@ -2093,6 +2120,7 @@ impl Client {
         let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
             .with_grants(grants.iter().map(|grant| Grant::new(*grant)))
             .with_writer(writer);
+        handshake.schema_major = self.schema_major;
         if let Some(token) = resume_token {
             handshake = handshake.with_resume_token(token);
         }
@@ -2268,6 +2296,46 @@ impl Client {
             )))
             .await
             .expect("send mutation patch");
+    }
+
+    /// Open a courier range (R78), its bodies to follow.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `CourierRange` frame fails on the transport.
+    pub async fn courier_range(&mut self, range: connetto_core::messages::CourierRange) {
+        self.transport
+            .send_control(ControlMessage::CourierRange(range))
+            .await
+            .expect("send courier range");
+    }
+
+    /// Send one body of the open courier range.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `CourierBody` frame fails on the transport.
+    pub async fn courier_body(&mut self, body: connetto_core::messages::CourierBody) {
+        self.transport
+            .send_bulk(BulkMessage::CourierBody(body))
+            .await
+            .expect("send courier body");
+    }
+
+    /// Ack the courier notice frame a connection received (R78).
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `CourierNoticeAck` frame fails on the transport.
+    pub async fn courier_notice_ack(&mut self, notice_id: &str) {
+        self.transport
+            .send_control(ControlMessage::CourierNoticeAck(
+                connetto_core::messages::CourierNoticeAck {
+                    notice_id: notice_id.to_owned(),
+                },
+            ))
+            .await
+            .expect("send courier notice ack");
     }
 
     /// Prove the connection's device key with a signature over the

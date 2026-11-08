@@ -48,6 +48,21 @@ pub trait JavaAccess: Send + Sync {
     ///
     /// [`ClientError`] when no Java VM is reachable.
     fn with_env(&self, body: &mut dyn FnMut(&mut JNIEnv<'_>)) -> Result<(), ClientError>;
+
+    /// Run `body` with a JNI environment and the application's screen in
+    /// front, an `android.app.Activity`, for the platform's prompts that open
+    /// over a screen. The process's registered context is no screen under
+    /// every host, Tauri's registering the `Application`, so the access looks
+    /// the screen up each time.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::NoAndroidScreen`] when the application shows no screen,
+    /// and [`ClientError`] when no Java VM is reachable.
+    fn with_activity(
+        &self,
+        body: &mut dyn FnMut(&mut JNIEnv<'_>, &JObject<'_>),
+    ) -> Result<(), ClientError>;
 }
 
 /// The Android Keystore, reached through the application's JNI access.
@@ -334,14 +349,15 @@ fn java<T>(
     access
         .with_env(&mut |env| {
             let Some(body) = body.take() else { return };
-            outcome = Some(body(env).map_err(|err| exception_text(env, &err)));
+            outcome =
+                Some(body(env).map_err(|err| KeystoreFailure::Java(exception_text(env, &err))));
         })
         .map_err(|err| KeystoreFailure::NoVm(err.to_string()))?;
     outcome.unwrap_or_else(|| Err(KeystoreFailure::RanNothing))
 }
 
 /// The pending Java exception's text, cleared, else the JNI error's.
-fn exception_text(env: &mut JNIEnv<'_>, err: &jni::errors::Error) -> KeystoreFailure {
+pub(crate) fn exception_text(env: &mut JNIEnv<'_>, err: &jni::errors::Error) -> String {
     let pending = env.exception_occurred().ok().filter(|ex| !ex.is_null());
     let _ = env.exception_clear();
     let text = pending
@@ -351,7 +367,7 @@ fn exception_text(env: &mut JNIEnv<'_>, err: &jni::errors::Error) -> KeystoreFai
         })
         .and_then(|value| value.l().ok())
         .and_then(|text| env.get_string(&text.into()).ok().map(String::from));
-    KeystoreFailure::Java(text.unwrap_or_else(|| err.to_string()))
+    text.unwrap_or_else(|| err.to_string())
 }
 
 impl From<KeystoreFailure> for ChipError {

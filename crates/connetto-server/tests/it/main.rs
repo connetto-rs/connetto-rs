@@ -164,4 +164,6 @@ mod provisional_push;
 
 mod courier_frontier;
 
+mod courier_wire;
+
 mod upkeep_consulted;

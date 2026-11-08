@@ -316,6 +316,33 @@ impl PageSession {
         }
     }
 
+    /// Confirm the demo's delete and log out where it asks, which it does
+    /// while local writes are still unsent, and return once the page shows
+    /// the confirmation clicked, the signed-out banner or an error.
+    ///
+    /// # Errors
+    ///
+    /// When none of them shows within `limit`, naming what the page shows,
+    /// or as [`PageSession::call`].
+    pub async fn confirm_the_delete(&mut self, limit: Duration) -> Result<()> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let page = self.page_text().await?;
+            if page.contains("Confirm: delete and log out") {
+                return self.click("Confirm: delete and log out").await;
+            }
+            if page.contains("Sign in to begin.") || page.contains("Error: ") {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "the sign out asked neither for confirmation nor to sign out, the page shows:\n{page}"
+                );
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     /// Click the button labelled `label`.
     ///
     /// # Errors
@@ -349,6 +376,25 @@ impl PageSession {
             serde_json::Value::Bool(true) => Ok(()),
             found => bail!("the page has {found} buttons starting with {prefix:?}, not one"),
         }
+    }
+
+    /// Switch the account bar back to the account `signed_in_line` named,
+    /// the page's `Signed in as <short identity>` line. Each switch button
+    /// names its account by the full identity, which starts with the short
+    /// one, so the button is found among any others a kept keychain still
+    /// holds.
+    ///
+    /// # Errors
+    ///
+    /// When the line names no identity, when no single button switches to it,
+    /// or as [`PageSession::call`].
+    pub async fn switch_to_account(&mut self, signed_in_line: &str) -> Result<()> {
+        let identity = signed_in_line
+            .strip_prefix("Signed in as ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .ok_or_else(|| anyhow!("the signed-in line {signed_in_line:?} names no identity"))?;
+        self.click_starting_with(&format!("Switch to {identity}"))
+            .await
     }
 
     /// The first line of the page's text that starts with `prefix`.
@@ -553,6 +599,50 @@ mod tests {
         }
     }
 
+    /// The switch clicks the one button naming the signed-in line's short
+    /// identity, finds none for an identity no button names, and refuses a
+    /// line naming no identity before any click.
+    #[tokio::test]
+    async fn the_switch_clicks_the_button_naming_the_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let script = request["params"]["expression"].as_str().unwrap_or_default();
+                // One button starts with the asked prefix, any other finds none.
+                let found = if script.contains("\"Switch to d5e24135\"") {
+                    serde_json::Value::Bool(true)
+                } else {
+                    serde_json::json!(0)
+                };
+                let answer = serde_json::json!({
+                    "id": request["id"],
+                    "result": { "result": { "value": found } },
+                });
+                socket
+                    .send(Message::Text(answer.to_string()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut page = PageSession::devtools(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        page.switch_to_account("Signed in as d5e24135 (alice)")
+            .await
+            .unwrap();
+        let unknown = page
+            .switch_to_account("Signed in as cc072008 (bob)")
+            .await
+            .unwrap_err();
+        assert!(unknown.to_string().contains("0 buttons"), "{unknown:#}");
+        let error = page.switch_to_account("Signed in as ").await.unwrap_err();
+        assert!(error.to_string().contains("names no identity"), "{error:#}");
+    }
+
     /// A line is found by its prefix among the page's trimmed lines, and a
     /// page without one names what it shows.
     #[tokio::test]
@@ -569,6 +659,57 @@ mod tests {
         );
         let error = page.line_starting_with("Signed in as ").await.unwrap_err();
         assert!(error.to_string().contains("status: online"), "{error:#}");
+    }
+
+    /// A delete that asks is confirmed by its button, a signed-out banner
+    /// needs no click, and a page showing neither fails within its bound
+    /// naming what it shows.
+    #[tokio::test]
+    async fn a_delete_is_confirmed_where_it_asks() {
+        let confirm = "1 write unsent\nConfirm: delete and log out";
+        let url = value_endpoint(vec![serde_json::json!(confirm), serde_json::json!(true)]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.confirm_the_delete(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let url = value_endpoint(vec![serde_json::json!(confirm), serde_json::json!(false)]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        let missing = page
+            .confirm_the_delete(Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(
+            missing.to_string().contains("Confirm: delete and log out"),
+            "{missing:#}"
+        );
+        let url = value_endpoint(vec![serde_json::json!("Sign in to begin.")]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.confirm_the_delete(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let url = value_endpoint(vec![serde_json::json!("status: online")]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        let neither = page.confirm_the_delete(Duration::ZERO).await.unwrap_err();
+        assert!(
+            neither.to_string().contains("status: online"),
+            "{neither:#}"
+        );
+    }
+
+    /// A page that shows the confirmation only on a later read is waited on,
+    /// and the confirmation is clicked once it shows.
+    #[tokio::test]
+    async fn a_delete_waits_for_a_confirmation_that_shows_late() {
+        let url = value_endpoint(vec![
+            serde_json::json!("status: online"),
+            serde_json::json!("1 write unsent\nConfirm: delete and log out"),
+            serde_json::json!(true),
+        ])
+        .await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.confirm_the_delete(Duration::from_secs(5))
+            .await
+            .unwrap();
     }
 
     /// A click waits for the button to stand enabled, and clicks it the

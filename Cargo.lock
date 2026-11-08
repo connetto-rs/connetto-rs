@@ -1326,7 +1326,6 @@ dependencies = [
  "diesel-sqlite-session",
  "futures-util",
  "getrandom 0.3.4",
- "if-addrs",
  "ipnet",
  "jni 0.21.1",
  "js-sys",
@@ -1423,6 +1422,7 @@ dependencies = [
  "diesel",
  "js-sys",
  "manganis",
+ "qrcode",
  "rosetta-uuid",
  "serde",
  "thiserror 2.0.21",
@@ -1605,7 +1605,6 @@ dependencies = [
  "objc2-core-wlan",
  "objc2-foundation",
  "objc2-network-extension",
- "objc2-ui-kit",
  "parking_lot",
  "thiserror 2.0.21",
 ]
@@ -6279,7 +6278,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79b30b9eacc37434a61377866f68b27acef9fa5496f25cc9ca8b2549032e0394"
 dependencies = [
  "bitflags 2.13.2",
- "dispatch2",
  "objc2",
  "objc2-foundation",
 ]
@@ -7561,6 +7559,12 @@ checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"

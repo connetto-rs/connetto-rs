@@ -1,7 +1,7 @@
-//! Deploys `examples/dioxus-demo`, or with `--app tauri`
-//! `examples/tauri-leptos-demo`, to an attached Android device or emulator
-//! and walks R88's proof on it, which is sign in, sync, write offline and
-//! upload on reconnect.
+//! Deploys `examples/tauri-leptos-demo`, or with `--app dioxus`
+//! `examples/dioxus-demo`, to an attached Android device or emulator and
+//! walks R88's proof on it, which is sign in, sync, write offline and upload
+//! on reconnect.
 //!
 //! It runs as the command of `connetto-demo-stack`, which provides the stack
 //! and the environment naming it.
@@ -21,8 +21,19 @@
 //! fingerprint or PIN, while the driver waits and says so.
 //!
 //! Without `--apk` it builds the APK for the device's ABI, with `dx` or with
-//! `cargo tauri android build`. The demo
-//! and the device's browser are read and driven over the `DevTools` protocol,
+//! `cargo tauri android build`, whose vendored `OpenSSL` takes the NDK's
+//! `clang`
+//! archives from the target-prefixed `AR_` and `RANLIB_` variables the build
+//! sets from `NDK_HOME` or `ANDROID_NDK_HOME`, the NDK's bin on the build's
+//! `PATH` beside them. A Tauri device run is prepared by
+//! `connetto-ios-signing`, which writes the profile the iOS proof embeds in
+//! the app and signs it with, the build passing `--no-sign` so the proof,
+//! not Xcode, does the signing. The Tauri Xcode build phase does not keep
+//! `RUSTUP_TOOLCHAIN`, so the Mac's Rust toolchain for it must be arm64,
+//! which a `rustup override set stable-aarch64-apple-darwin` in
+//! `examples/tauri-leptos-demo` serves. The
+//! demo and the device's browser are read and driven over the `DevTools`
+//! protocol,
 //! because neither exposes web content to `uiautomator`. The demo opens the
 //! login in a Custom Tab, where the driver types the user with trusted input,
 //! so the browser follows the final redirect into the app as it would after a
@@ -33,8 +44,7 @@
 //! session's forwards and reverses on this machine too. A wireless serial
 //! (`host:port`) is reconnected after the restart.
 //!
-//! With `--peer-serial` a second attached phone joins the proof, on the dioxus
-//! demo, whose panel holds the peer controls. The main
+//! With `--peer-serial` a second attached phone joins the proof. The main
 //! phone hosts a hotspot from the demo and the second signs in as its own
 //! account and joins it through the demo's join form, the driver tapping the
 //! system's approval in place of the user (R76 decision 16). Each phone's
@@ -91,9 +101,10 @@ use connetto_test_harness::peer_devices::{
 };
 use connetto_test_harness::peer_proof::{JoinReport, commit, summary};
 use connetto_test_harness::stack::{
-    demo_has_device_identity, demo_mobile_features, now_millis, repo_path,
+    demo_has_device_identity, dioxus_mobile_features, now_millis, repo_path, tauri_mobile_features,
 };
 use connetto_test_harness::step;
+use std::ffi::OsString;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -119,15 +130,9 @@ fn demo_app() -> Demo {
     APP.get().copied().unwrap_or_default()
 }
 
-/// The line the demo shows once it signed in. The Tauri demo's status line
-/// carries whichever client event came last, so its account bar stands in,
-/// and the dioxus demo stands `connected` from its setup.
-fn signed_in_line() -> &'static str {
-    match demo_app() {
-        Demo::Tauri => "Signed in as ",
-        Demo::Dioxus => "status: connected",
-    }
-}
+/// The line both demos show once signed in. Their status line carries
+/// whichever client event came last, so the account bar stands in.
+const SIGNED_IN_LINE: &str = "Signed in as ";
 
 /// The orders write button the sync step clicks, which only the Tauri demo
 /// names as its backend writer.
@@ -135,23 +140,6 @@ fn insert_backend_label() -> &'static str {
     match demo_app() {
         Demo::Tauri => "Insert via Postgres (backend writer)",
         Demo::Dioxus => "Add order",
-    }
-}
-
-/// A `DevTools` session on the demo's page, retried while the `WebView`
-/// stands up after a launch or a screen rebuild.
-///
-/// # Errors
-///
-/// When the page does not stand within the retry bound.
-async fn app_page(device: &Device) -> Result<PageSession> {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        match device.app().await {
-            Ok(app) => return Ok(app),
-            Err(err) if Instant::now() >= deadline => return Err(err),
-            Err(_) => sleep(Duration::from_millis(500)).await,
-        }
     }
 }
 
@@ -382,22 +370,14 @@ async fn prove(
 
     step("sign in");
     device.launch().await?;
-    // The Tauri demo parks the login URL and opens the login on the Sign in
-    // click, so the tab the driver types into opens with the click.
-    if matches!(demo_app(), Demo::Tauri) {
-        let mut app = app_page(device).await?;
-        app.wait_for_text("Sign in to begin.", Duration::from_secs(90))
-            .await?;
-        app.click_when_enabled("Sign in", Duration::from_secs(90))
-            .await?;
-    }
+    device.click_sign_in().await?;
     let mut tab = device.login_tab(&stack.issuer).await?;
     device.screenshot(evidence, "login-page").await?;
     submit_login(&mut tab, USER).await?;
     drop(tab);
     unlock.approve(device, evidence, "launch-unlock").await?;
-    let mut app = app_page(device).await?;
-    app.wait_for_text(signed_in_line(), Duration::from_secs(90))
+    let mut app = device.ready_app().await?;
+    app.wait_for_text(SIGNED_IN_LINE, Duration::from_secs(90))
         .await?;
     app.wait_for_text(
         "custody: released only after user verification",
@@ -461,7 +441,7 @@ async fn prove(
         rebuild_the_screen(device).await?;
     }
     recheck_after_time_away(device, evidence, unlock).await?;
-    let mut app = app_page(device).await?;
+    let mut app = device.ready_app().await?;
     sign_out(device, &mut app, evidence).await?;
     sign_in_across_a_killed_process(device, &stack.issuer, evidence, unlock).await?;
     step("proof complete");
@@ -475,37 +455,10 @@ async fn prove(
 async fn sign_out(device: &Device, app: &mut PageSession, evidence: &Path) -> Result<()> {
     step("sign out");
     app.click("Delete local data and log out").await?;
-    confirm_the_delete(app).await?;
+    app.confirm_the_delete(Duration::from_secs(30)).await?;
     app.wait_for_outcome("Sign in to begin.", &["Error: "], Duration::from_secs(60))
         .await?;
     device.screenshot(evidence, "signed-out").await
-}
-
-/// The delete asks for confirmation while local writes are still unsent, so
-/// the confirmation stands until the click, and the signed-out banner stands
-/// when it does not.
-///
-/// # Errors
-///
-/// When neither stands within the bound.
-async fn confirm_the_delete(app: &mut PageSession) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let page = app.page_text().await?;
-        if page.contains("Confirm: delete and log out") {
-            app.click("Confirm: delete and log out").await?;
-            return Ok(());
-        }
-        if page.contains("Sign in to begin.") || page.contains("Error: ") {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "the sign out asked neither for confirmation nor to sign out, the page shows:\n{page}"
-            );
-        }
-        sleep(Duration::from_millis(500)).await;
-    }
 }
 
 /// The system may kill the app while its login is open in the browser tab.
@@ -520,16 +473,9 @@ async fn sign_in_across_a_killed_process(
     unlock: Unlock<'_>,
 ) -> Result<()> {
     step("sign in across a killed process");
-    // The signed-out demo stands at its sign-in banner, and the Tauri demo
-    // opens its login on the sign-in click, so the tab the driver types into
-    // opens with the click.
-    if matches!(demo_app(), Demo::Tauri) {
-        let mut app = app_page(device).await?;
-        app.wait_for_text("Sign in to begin.", Duration::from_secs(90))
-            .await?;
-        app.click_when_enabled("Sign in", Duration::from_secs(90))
-            .await?;
-    }
+    // The signed-out demo stands at its sign-in banner, and the login opens
+    // on the sign-in click.
+    device.click_sign_in().await?;
     let mut tab = device.login_tab(issuer).await?;
     let killed = device
         .adb(&["shell", "pidof", demo_app().package()])
@@ -558,10 +504,11 @@ async fn sign_in_across_a_killed_process(
     submit_login(&mut tab, USER).await?;
     drop(tab);
     unlock.approve(device, evidence, "restart-unlock").await?;
-    let mut app = app_page(device)
+    let mut app = device
+        .ready_app()
         .await
         .context("the redirect never started the app again")?;
-    app.wait_for_text(signed_in_line(), Duration::from_secs(90))
+    app.wait_for_text(SIGNED_IN_LINE, Duration::from_secs(90))
         .await?;
     device.screenshot(evidence, "resumed").await
 }
@@ -598,8 +545,8 @@ async fn second_account_shares_catalogue(
     drop(tab);
     // The login's redirect restarts the app on its custom scheme, so the
     // page the driver attached to is gone and a fresh page has to stand.
-    *app = app_page(device).await?;
-    app.wait_for_text(signed_in_line(), Duration::from_secs(90))
+    *app = device.ready_app().await?;
+    app.wait_for_text(SIGNED_IN_LINE, Duration::from_secs(90))
         .await?;
     app.wait_for_text("Espresso machine", Duration::from_secs(90))
         .await?;
@@ -608,9 +555,7 @@ async fn second_account_shares_catalogue(
     device
         .screenshot(evidence, "catalogue-two-accounts")
         .await?;
-    // The account bar names each account by its identity, which the run only
-    // learns from the signed-in line, and the first is the one other account.
-    app.click_starting_with("Switch to ").await?;
+    app.switch_to_account(&first).await?;
     app.wait_for_text(&first, Duration::from_secs(90)).await?;
     device.screenshot(evidence, "back-to-first-account").await
 }
@@ -652,7 +597,7 @@ async fn rebuild_the_screen(device: &Device) -> Result<()> {
     wait_for_rebuild(device, pid).await?;
     // The rebuilt page reloads the demo and asks the core for its view, and
     // stands signed in again.
-    let mut app = app_page(device).await?;
+    let mut app = device.ready_app().await?;
     app.wait_for_text("Signed in as ", Duration::from_secs(60))
         .await
 }
@@ -675,7 +620,7 @@ async fn recheck_after_time_away(
     sleep(RECHECK_AFTER + Duration::from_secs(30)).await;
     device.launch().await?;
     unlock.approve(device, evidence, "recheck-unlock").await?;
-    let mut app = app_page(device).await?;
+    let mut app = device.ready_app().await?;
     app.wait_for_text("gate: open", Duration::from_secs(30))
         .await?;
     device.screenshot(evidence, "unlocked").await
@@ -961,8 +906,15 @@ async fn run_peer_proof(
         }
     }
 
-    let mut peer_app =
-        sign_in_phone(joiner, PEER_USER, &stack.issuer, evidence, *unlock, "peer").await?;
+    let mut peer_app = sign_in_phone(
+        joiner,
+        PEER_USER,
+        &stack.issuer,
+        evidence,
+        Some(*unlock),
+        "peer",
+    )
+    .await?;
     let mut app = host.app().await?;
     app.wait_for_text("device: certified until", Duration::from_secs(60))
         .await?;
@@ -1806,7 +1758,7 @@ async fn phone_hosts_walk(
                 .context("the beacon line carries no prefix")?
                 .to_owned();
             step("find the beacon on linux");
-            let host = leg.wait_nearby(Some(&prefix)).await?;
+            let host = leg.wait_nearby(&prefix).await?;
             leg.join_nearby(&host).await?.1
         }
     };
@@ -2283,12 +2235,12 @@ fn cli_arguments() -> Result<Arguments> {
             other => bail!("unknown argument {other}"),
         }
     }
-    validate_arguments(&arguments, demo_app())?;
+    validate_arguments(&arguments)?;
     Ok(arguments)
 }
 
 /// The argument rules, checked before the run starts.
-fn validate_arguments(arguments: &Arguments, app: Demo) -> Result<()> {
+fn validate_arguments(arguments: &Arguments) -> Result<()> {
     if arguments.linux_peer && arguments.peer_serial.is_some() {
         bail!("--linux-peer and --peer-serial name the same side twice, pick one");
     }
@@ -2307,13 +2259,6 @@ fn validate_arguments(arguments: &Arguments, app: Demo) -> Result<()> {
     if arguments.every_join && (arguments.bluetooth || arguments.payload) {
         bail!("--every-join runs every join, so --bluetooth and --payload name none");
     }
-    if (arguments.peer_serial.is_some() || arguments.bluetooth || arguments.linux_peer)
-        && matches!(app, Demo::Tauri)
-    {
-        bail!(
-            "--peer-serial, --linux-peer and --bluetooth need the dioxus demo, whose panel holds the peer controls"
-        );
-    }
     Ok(())
 }
 
@@ -2331,7 +2276,7 @@ async fn build_apk(target: &str) -> Result<PathBuf> {
             target,
             "--no-default-features",
             "--features",
-            demo_mobile_features(),
+            dioxus_mobile_features(),
         ])
         .current_dir(&demo)
         .status()
@@ -2345,7 +2290,9 @@ async fn build_apk(target: &str) -> Result<PathBuf> {
     ))
 }
 
-/// Build the Tauri demo's debug APK for the one ABI of `target`.
+/// Build the Tauri demo's debug APK for the one ABI of `target`, with the
+/// NDK's `clang` archives for its vendored `OpenSSL` when `NDK_HOME` or
+/// `ANDROID_NDK_HOME` names the NDK.
 async fn build_tauri_apk(target: &str) -> Result<PathBuf> {
     let abi = match target {
         "aarch64-linux-android" => "aarch64",
@@ -2357,8 +2304,23 @@ async fn build_tauri_apk(target: &str) -> Result<PathBuf> {
     cargo.current_dir(&demo).args([
         "tauri", "android", "build", "--debug", "--apk", "--target", abi,
     ]);
-    if demo_has_device_identity() {
-        cargo.args(["--features", "device-identity"]);
+    let features = tauri_mobile_features();
+    if !features.is_empty() {
+        cargo.args(["--features", features]);
+    }
+    if let Some(bin) = ndk_bin() {
+        let triple = target.replace('-', "_");
+        cargo
+            .env(format!("AR_{triple}"), bin.join("llvm-ar"))
+            .env(format!("RANLIB_{triple}"), bin.join("llvm-ranlib"));
+        if let Some(path) = std::env::var_os("PATH") {
+            let mut joined = OsString::from(bin);
+            joined.push(":");
+            joined.push(path);
+            cargo.env("PATH", joined);
+        } else {
+            cargo.env("PATH", bin);
+        }
     }
     let status = cargo.status().await.context("starting cargo tauri")?;
     if !status.success() {
@@ -2367,12 +2329,32 @@ async fn build_tauri_apk(target: &str) -> Result<PathBuf> {
     Ok(demo.join("gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk"))
 }
 
+/// The NDK's bin for this host, from `NDK_HOME` or `ANDROID_NDK_HOME`, so the
+/// vendored `OpenSSL` finds its `clang` archives there.
+fn ndk_bin() -> Option<PathBuf> {
+    let ndk = std::env::var_os("NDK_HOME").or_else(|| std::env::var_os("ANDROID_NDK_HOME"))?;
+    let host = if cfg!(target_os = "macos") {
+        "darwin-x86_64"
+    } else {
+        "linux-x86_64"
+    };
+    Some(
+        Path::new(&ndk)
+            .join("toolchains")
+            .join("llvm")
+            .join("prebuilt")
+            .join(host)
+            .join("bin"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    /// The demo's set and service as an A35 on Android 15 dumps them.
-    const BEACON_DUMP: &str = "    dev.connetto.dioxusdemo
+    /// The demo's set and service as an A35 on Android 15 dumps them, under
+    /// the Tauri demo the run names by default.
+    const BEACON_DUMP: &str = "    dev.connetto.tauridemo
      Advertising ID                                     : 3
       1:
         \u{2514}Start time                                     : 10-09 03:05:30
@@ -2408,7 +2390,7 @@ mod tests {
             ("xxxxxxxxxxxx, 9]", "xxxxxxxxxxxx, 27]"),
             ("started true", "started false"),
             ("Characteristic 62ba3a58", "Characteristic 00000000"),
-            ("    dev.connetto.dioxusdemo", "    com.example.other"),
+            ("    dev.connetto.tauridemo", "    com.example.other"),
         ] {
             let broken = BEACON_DUMP.replace(from, to);
             assert!(
@@ -2597,25 +2579,18 @@ mod tests {
         );
     }
 
-    /// The walk's mode needs the dioxus panel, so `--linux-peer` with the
-    /// Tauri demo is refused before the run starts.
+    /// The walk's modes run on either demo, so `--linux-peer` with
+    /// `--every-join` validates with no demo named.
     #[test]
-    fn linux_peer_with_the_tauri_demo_is_refused() {
+    fn linux_peer_walk_validates_on_every_demo() {
         let arguments = super::Arguments {
             linux_peer: true,
             every_join: true,
             ..Default::default()
         };
         assert!(
-            super::validate_arguments(&arguments, super::Demo::Dioxus).is_ok(),
-            "the dioxus demo carries the peer panel"
-        );
-        let err = super::validate_arguments(&arguments, super::Demo::Tauri)
-            .expect_err("the tauri demo has no peer panel");
-        let text = format!("{err:#}");
-        assert!(
-            text.contains("--peer-serial, --linux-peer and --bluetooth"),
-            "{text}"
+            super::validate_arguments(&arguments).is_ok(),
+            "both demos carry the peer panel"
         );
     }
 }
