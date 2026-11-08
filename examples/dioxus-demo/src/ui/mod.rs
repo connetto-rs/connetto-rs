@@ -13,6 +13,10 @@ mod your_data;
 pub(crate) mod peer;
 #[cfg(all(feature = "peer", not(target_arch = "wasm32")))]
 pub(crate) use peer::PeerPanel;
+#[cfg(all(feature = "peer", not(target_arch = "wasm32")))]
+pub(crate) mod teams;
+#[cfg(all(feature = "peer", not(target_arch = "wasm32")))]
+pub(crate) use teams::TeamNotesPanel;
 
 pub use notes::NotesPane;
 pub use orders::OrdersPane;
@@ -26,11 +30,24 @@ use connetto_demo_support as support;
 use dioxus::prelude::*;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaArrowRightArrowLeft, FaCheck, FaCircleUser, FaFingerprint, FaRightFromBracket,
-    FaRightToBracket, FaTrashCan, FaUserPlus, FaXmark,
+    FaArrowRightArrowLeft, FaBroom, FaCartShopping, FaCheck, FaCircleInfo, FaCircleUser,
+    FaDatabase, FaFingerprint, FaImages, FaNoteSticky, FaRightFromBracket, FaRightToBracket,
+    FaTags, FaTrashCan, FaUserPlus, FaXmark,
 };
 
 use crate::platform::{Client, DemoContent, Ops};
+
+/// The small grey line at a panel's foot saying what the panel is for and
+/// what it tests.
+#[component]
+pub fn PaneInfo(text: &'static str) -> Element {
+    rsx! {
+        p { class: "pane-info",
+            Icon { icon: FaCircleInfo, width: 12, height: 12 }
+            span { {text} }
+        }
+    }
+}
 
 /// The app's own status line, set by the platform's event loop.
 #[derive(Clone, Copy)]
@@ -452,46 +469,76 @@ pub struct EnrolMsg(pub(crate) Signal<Option<String>>);
 fn PanesSkeleton() -> Element {
     rsx! {
         div { class: "panes",
-            div { class: "pane",
-                h2 { {support::ORDERS_PANE_TITLE} " " span { class: "badge synced", {support::ORDERS_BADGE} } }
+            div { class: "pane toned tone-orders",
+                h2 {
+                    Icon { icon: FaCartShopping, width: 14, height: 14 }
+                    {support::ORDERS_PANE_TITLE} " "
+                    span { class: "badge synced", {support::ORDERS_BADGE} }
+                }
                 p { {support::orders_readout(0, 0)} }
                 table {
                     thead { tr { th { "id" } th { "quantity" } } }
                     tbody {}
                 }
+                PaneInfo { text: support::ORDERS_INFO }
             }
-            div { class: "pane",
-                h2 { {support::PHOTOS_PANE_TITLE} " " span { class: "badge synced", {support::PHOTOS_BADGE} } }
+            div { class: "pane toned tone-photos",
+                h2 {
+                    Icon { icon: FaImages, width: 14, height: 14 }
+                    {support::PHOTOS_PANE_TITLE} " "
+                    span { class: "badge synced", {support::PHOTOS_BADGE} }
+                }
                 p { {support::photos_readout(0)} }
                 table {
                     thead { tr { th { "id" } th { "state" } th { "image" } } }
                     tbody {}
                 }
+                PaneInfo { text: support::PHOTOS_INFO }
             }
-            div { class: "pane",
-                h2 { {support::NOTES_PANE_TITLE} " " span { class: "badge local", {support::NOTES_BADGE} } }
+            div { class: "pane toned tone-notes",
+                h2 {
+                    Icon { icon: FaNoteSticky, width: 14, height: 14 }
+                    {support::NOTES_PANE_TITLE} " "
+                    span { class: "badge local", {support::NOTES_BADGE} }
+                }
                 p { {support::notes_readout(0)} }
                 table {
                     thead { tr { th { "id" } th { "body" } } }
                     tbody {}
                 }
+                PaneInfo { text: support::NOTES_INFO }
             }
-            div { class: "pane",
-                h2 { {support::RETENTION_PANE_TITLE} " " span { class: "badge trim", {support::RETENTION_BADGE} } }
+            div { class: "pane toned tone-retention",
+                h2 {
+                    Icon { icon: FaBroom, width: 14, height: 14 }
+                    {support::RETENTION_PANE_TITLE} " "
+                    span { class: "badge trim", {support::RETENTION_BADGE} }
+                }
                 p { {support::retention_readout(0, 0, 0)} }
                 p { {support::RETENTION_EXPLAINER} }
+                PaneInfo { text: support::RETENTION_INFO }
             }
-            div { class: "pane",
-                h2 { {support::YOUR_DATA_PANE_TITLE} " " span { class: "badge local", {support::YOUR_DATA_BADGE} } }
+            div { class: "pane toned tone-your-data",
+                h2 {
+                    Icon { icon: FaDatabase, width: 14, height: 14 }
+                    {support::YOUR_DATA_PANE_TITLE} " "
+                    span { class: "badge local", {support::YOUR_DATA_BADGE} }
+                }
                 p { {support::YOUR_DATA_INTRO} }
+                PaneInfo { text: support::YOUR_DATA_INFO }
             }
-            div { class: "pane",
-                h2 { {support::CATALOGUE_HEADING} " " span { class: "badge shared", "shared" } }
+            div { class: "pane toned tone-catalogue",
+                h2 {
+                    Icon { icon: FaTags, width: 14, height: 14 }
+                    {support::CATALOGUE_HEADING} " "
+                    span { class: "badge shared", "shared" }
+                }
                 p { {support::CATALOGUE_INTRO} }
                 table {
                     thead { tr { th { "name" } th { "price" } } }
                     tbody {}
                 }
+                PaneInfo { text: support::CATALOGUE_INFO }
             }
         }
     }
@@ -512,10 +559,15 @@ fn Panes() -> Element {
     }
 }
 
-/// The whole page: the stylesheet, the header, the account bar and the panes
-/// or their skeleton.
+/// The whole page: the stylesheet, the header, the account bar, the peer and
+/// team panels and the panes or their skeleton.
 #[component]
-pub fn Page(ready: bool, restoring: bool, peer: Option<Element>) -> Element {
+pub fn Page(
+    ready: bool,
+    restoring: bool,
+    peer: Option<Element>,
+    teams: Option<Element>,
+) -> Element {
     rsx! {
         style { {support::CSS} }
         div { class: "wrap",
@@ -523,6 +575,9 @@ pub fn Page(ready: bool, restoring: bool, peer: Option<Element>) -> Element {
             AccountBar {}
             if let Some(peer) = peer {
                 {peer}
+            }
+            if let Some(teams) = teams {
+                {teams}
             }
             if ready {
                 Panes {}

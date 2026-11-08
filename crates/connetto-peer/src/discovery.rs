@@ -258,6 +258,12 @@ enum Command {
     },
     /// A retry timer woke, so the due instances dial.
     RetryDue,
+    /// The device's peer links came to stand `on`, off dialing nothing of
+    /// the found peers and on dialing them at once (R77 slice 8).
+    Links {
+        /// The standing the links came to.
+        on: bool,
+    },
 }
 
 impl Discovery {
@@ -336,6 +342,12 @@ impl Discovery {
         let _ = self.tx.send(Command::Stop);
     }
 
+    /// The device's peer links standing, off dialing nothing of the found
+    /// peers and on dialing them at once (R77 slice 8).
+    pub fn set_peer_links(&self, on: bool) {
+        let _ = self.tx.send(Command::Links { on });
+    }
+
     /// Hand a node link event to the policy, which maps it by the peer's
     /// leaf.
     pub fn on_node_event(&self, event: &PeerEvent) {
@@ -370,21 +382,31 @@ async fn run(
     commands_tx: mpsc::WeakUnboundedSender<Command>,
     events: mpsc::UnboundedSender<DiscoveryEvent>,
 ) {
+    // The links' standing outlives the serving standing it was set in, so
+    // the next standing's policy starts from it.
+    let mut links_on = true;
     loop {
         let (port, own) = match commands.recv().await {
             Some(Command::Serve { port, own }) => (port, own),
-            // Nothing serves, so the events nothing serves wait.
-            Some(Command::NodeEvent { .. } | Command::DialOutcome { .. } | Command::RetryDue) => {
+            Some(Command::Links { on }) => {
+                links_on = on;
                 continue;
             }
-            // A stop while idle is the standing's own, and the driver waits
-            // for its next serve.
-            Some(Command::Stop) => continue,
+            // Nothing serves, so the events nothing serves wait, and a stop
+            // while idle is the standing's own, which waits for its next
+            // serve.
+            Some(
+                Command::NodeEvent { .. }
+                | Command::DialOutcome { .. }
+                | Command::RetryDue
+                | Command::Stop,
+            ) => continue,
             // The last driver reference is gone, so the runner ends with it.
             None => return,
         };
         // A new standing, a new policy, until the standing leaves.
         let mut policy = Policy::new(own, autolink);
+        policy.set_links(links_on, Instant::now());
         let mut current = (port, own);
         loop {
             let re_browse = serve_round(
@@ -403,6 +425,7 @@ async fn run(
             // The local addresses changed, so the same standing and the same
             // policy browse again.
         }
+        links_on = policy.links_on();
     }
 }
 
@@ -481,6 +504,14 @@ async fn serve_round(
                         Command::RetryDue => {
                             let now = Instant::now();
                             for fp in policy.due(now) {
+                                spawn_dial(node, commands_tx, fp, policy.addresses(&fp));
+                            }
+                        }
+                        // The coming on resets the backoff and dials the
+                        // found peers at once, the bound allowing.
+                        Command::Links { on } => {
+                            let now = Instant::now();
+                            for fp in policy.set_links(on, now) {
                                 spawn_dial(node, commands_tx, fp, policy.addresses(&fp));
                             }
                         }
@@ -673,9 +704,16 @@ async fn dial(node: &Node, addresses: Vec<SocketAddr>) -> DialOutcome {
     }
     ordered.extend(rest);
     for address in ordered {
+        // A dial the off standing refused in the same gap is no refusal of
+        // the instance, so the peer stays waiting its retry.
         let linked = match node.link(address).await {
             Ok(_) => true,
-            Err(LinkError::Unreachable(_) | LinkError::Timeout | LinkError::NotServing) => false,
+            Err(
+                LinkError::Unreachable(_)
+                | LinkError::Timeout
+                | LinkError::NotServing
+                | LinkError::LinksOff,
+            ) => false,
             Err(_) => return DialOutcome::Refused,
         };
         if linked {

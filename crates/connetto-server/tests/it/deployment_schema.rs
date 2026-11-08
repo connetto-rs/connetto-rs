@@ -69,6 +69,17 @@ mod app {
         }
     }
 
+    diesel::table! {
+        app_courier_notices (id) {
+            id -> BigInt,
+            user_id -> Uuid,
+            courier_user_id -> Uuid,
+            device_key -> Bytea,
+            seq -> BigInt,
+            outcome -> Text,
+        }
+    }
+
     diesel::joinable!(app_session_writers -> app_writers (writer));
     diesel::allow_tables_to_appear_in_same_query!(app_session_writers, app_writers);
 
@@ -88,7 +99,7 @@ mod app {
     type SettledRangeTuple = (i64, Vec<u8>, Vec<u8>, String, SettlePath);
 
     /// The deployment's own writer tables and the reader's grant on them.
-    pub const WRITERS_DDL: [&str; 5] = [
+    pub const WRITERS_DDL: [&str; 6] = [
         "CREATE TABLE app_writers (\
          writer BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY, \
          user_id UUID, session_id UUID, device_key BYTEA UNIQUE, \
@@ -104,16 +115,23 @@ mod app {
         "CREATE TABLE app_session_writers (\
          session_id UUID NOT NULL, writer BIGINT NOT NULL, first_seq BIGINT NOT NULL, \
          bound_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (session_id, writer))",
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON app_writers, app_settled, app_session_writers \
-         TO app_reader",
+        "CREATE TABLE app_courier_notices (\
+         id BIGSERIAL PRIMARY KEY, user_id UUID NOT NULL, courier_user_id UUID NOT NULL, \
+         device_key BYTEA NOT NULL, seq BIGINT NOT NULL, outcome TEXT NOT NULL)",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON app_writers, app_settled, \
+         app_session_writers, app_courier_notices TO app_reader",
     ];
 
     pub struct AppWriters;
 
     impl ConnettoWriterSchema for AppWriters {
         type Id = uuid::Uuid;
-        const TABLES: &'static [&'static str] =
-            &["app_writers", "app_settled", "app_session_writers"];
+        const TABLES: &'static [&'static str] = &[
+            "app_writers",
+            "app_settled",
+            "app_session_writers",
+            "app_courier_notices",
+        ];
 
         fn issue(
             conn: &mut AsyncPgConnection,
@@ -551,6 +569,69 @@ mod app {
                         },
                     )
                     .collect())
+            })
+        }
+
+        fn courier_notice_insert<'c>(
+            conn: &'c mut AsyncPgConnection,
+            user_id: &'c Self::Id,
+            courier_user_id: &'c Self::Id,
+            device_key: &'c [u8],
+            seq: i64,
+            outcome: &'c str,
+        ) -> Statement<'c, ()> {
+            Box::pin(async move {
+                use diesel::ExpressionMethods as _;
+                use diesel_async::RunQueryDsl as _;
+                diesel::insert_into(app_courier_notices::table)
+                    .values((
+                        app_courier_notices::user_id.eq(user_id),
+                        app_courier_notices::courier_user_id.eq(courier_user_id),
+                        app_courier_notices::device_key.eq(device_key.to_vec()),
+                        app_courier_notices::seq.eq(seq),
+                        app_courier_notices::outcome.eq(outcome),
+                    ))
+                    .execute(&mut *conn)
+                    .await
+                    .map(drop)
+            })
+        }
+
+        fn courier_notices<'c>(
+            conn: &'c mut AsyncPgConnection,
+            user_id: &'c Self::Id,
+        ) -> Statement<'c, Vec<(i64, Self::Id, Vec<u8>, i64, String)>> {
+            Box::pin(async move {
+                use diesel::{ExpressionMethods, QueryDsl};
+                use diesel_async::RunQueryDsl as _;
+                let rows: Vec<(i64, uuid::Uuid, Vec<u8>, i64, String)> = app_courier_notices::table
+                    .filter(app_courier_notices::user_id.eq(user_id))
+                    .order(app_courier_notices::id.asc())
+                    .select((
+                        app_courier_notices::id,
+                        app_courier_notices::courier_user_id,
+                        app_courier_notices::device_key,
+                        app_courier_notices::seq,
+                        app_courier_notices::outcome,
+                    ))
+                    .load(&mut *conn)
+                    .await?;
+                Ok(rows)
+            })
+        }
+
+        fn courier_notices_delete(
+            conn: &mut AsyncPgConnection,
+            ids: Vec<i64>,
+        ) -> Statement<'_, i64> {
+            Box::pin(async move {
+                use diesel::ExpressionMethods as _;
+                use diesel_async::RunQueryDsl as _;
+                diesel::delete(app_courier_notices::table)
+                    .filter(app_courier_notices::id.eq_any(ids))
+                    .execute(&mut *conn)
+                    .await
+                    .map(|affected| i64::try_from(affected).unwrap_or(i64::MAX))
             })
         }
     }

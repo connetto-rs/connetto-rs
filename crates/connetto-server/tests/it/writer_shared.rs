@@ -43,6 +43,7 @@ pub(super) async fn seed_notes(fixture: &Fixture) {
             "DROP TABLE IF EXISTS notes CASCADE",
             "DROP TABLE IF EXISTS _connetto_settled",
             "DROP TABLE IF EXISTS _connetto_session_writers",
+            "DROP TABLE IF EXISTS _connetto_courier_notices",
             "DROP TABLE IF EXISTS _connetto_writers",
             "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
         ])
@@ -117,6 +118,18 @@ impl Enrolments {
     /// Enrol `user`'s fresh key with a certificate that stands until
     /// `expires_at`, and hand back the key and its id.
     pub(super) async fn enrol(&self, user: &str, expires_at: SystemTime) -> (KeyPair, [u8; 32]) {
+        self.enrol_listing(user, expires_at, connetto_core::BOT_LIST_WILDCARD)
+            .await
+    }
+
+    /// Enrol `user`'s fresh key with a certificate carrying `bot_list` that
+    /// stands until `expires_at`, and hand back the key and its id.
+    pub(super) async fn enrol_listing(
+        &self,
+        user: &str,
+        expires_at: SystemTime,
+        bot_list: &str,
+    ) -> (KeyPair, [u8; 32]) {
         let key = device_key();
         let key_id = *KeyId::of_public_key(&key.subject_public_key_info()).as_bytes();
         let record = Enrolment {
@@ -130,6 +143,7 @@ impl Enrolments {
             public_key: key.subject_public_key_info().clone(),
             descriptor: vec![0x91, 0x01],
             attestation: AttestationLevel::Unproven,
+            bot_list: bot_list.to_owned(),
         };
         self.store
             .record(record)

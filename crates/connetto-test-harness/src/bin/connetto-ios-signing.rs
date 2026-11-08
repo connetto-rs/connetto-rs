@@ -1,5 +1,6 @@
-//! Prepares a Mac to sign `examples/dioxus-demo` for the iOS devices
-//! paired with it, unattended, through an App Store Connect API key.
+//! Prepares a Mac to sign the Tauri demo and `examples/dioxus-demo` for the
+//! iOS devices paired with it, unattended, through an App Store Connect API
+//! key.
 //!
 //! ```text
 //! CONNETTO_ASC_KEY_ID=… CONNETTO_ASC_ISSUER=… CONNETTO_ASC_KEY=AuthKey_….p8 \
@@ -11,12 +12,13 @@
 //! key, so an SSH session can sign while the login keychain stays locked.
 //! `security` takes that password only as an argument, where other processes
 //! of the same user can read it while it runs, so this suits a single-user
-//! Mac and not a shared runner. The
-//! demo's bundle identifier, every paired iPhone and iPad and this Mac are
-//! registered, and two development profiles are written where `dx` looks for
-//! them, one covering the phones and tablets and one covering this Mac, which
-//! the macOS `.app` embeds so the data protection keychain admits it (R51).
-//! It prints the identity's SHA-1, which `dx build --apple-team-id` takes.
+//! Mac and not a shared runner. Both demos' bundle identifiers, every paired
+//! iPhone and iPad and this Mac are registered, and development profiles are
+//! written where `dx` and Xcode look for them, one per demo covering the
+//! phones and tablets, one for the tapper's runner, and one covering this Mac
+//! for the dioxus demo, which the macOS `.app` embeds so the data protection
+//! keychain admits it (R51). It prints the identity's SHA-1, which
+//! `dx build --apple-team-id` takes.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,30 +33,34 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 
 const BUNDLE: &str = "dev.connetto.dioxusdemo";
+/// The Tauri demo's app id, `identifier` in its `tauri.conf.json`.
+const TAURI_BUNDLE: &str = "dev.connetto.tauridemo";
 /// The app id the tapper's test runner signs with, which `xcodebuild`
 /// derives from the test bundle's id plus the `xctrunner` suffix.
 const TAPPER_BUNDLE: &str = "dev.connetto.dioxusdemo.tapper.xctrunner";
-/// The three development profiles, for iOS and for this Mac, and one for
-/// the tapper's runner.
+/// The development profiles, the dioxus demo's for iOS and for this Mac, the
+/// Tauri demo's for iOS, and one for the tapper's runner.
 #[derive(Clone, Copy)]
 enum Profile {
     Ios,
     Mac,
+    TauriIos,
     Tapper,
 }
 
 impl Profile {
     const fn name(self) -> &'static str {
         match self {
-            Self::Ios => "connetto dioxus demo development",
-            Self::Mac => "connetto dioxus demo macos development",
-            Self::Tapper => "connetto tapper development",
+            Self::Ios => ios_signing::DIOXUS_PROFILE,
+            Self::Mac => ios_signing::DIOXUS_MACOS_PROFILE,
+            Self::TauriIos => ios_signing::TAURI_PROFILE,
+            Self::Tapper => ios_signing::TAPPER_PROFILE,
         }
     }
 
     const fn kind(self) -> &'static str {
         match self {
-            Self::Ios | Self::Tapper => "IOS_APP_DEVELOPMENT",
+            Self::Ios | Self::TauriIos | Self::Tapper => "IOS_APP_DEVELOPMENT",
             Self::Mac => "MAC_APP_DEVELOPMENT",
         }
     }
@@ -62,7 +68,7 @@ impl Profile {
     const fn extension(self) -> &'static str {
         match self {
             Self::Mac => "provisionprofile",
-            Self::Ios | Self::Tapper => "mobileprovision",
+            Self::Ios | Self::TauriIos | Self::Tapper => "mobileprovision",
         }
     }
 }
@@ -77,7 +83,7 @@ async fn main() -> Result<()> {
     let keychain = Keychain::open(&dir).await?;
     let certificate = ensure_certificate(&api, &keychain, &dir).await?;
     let bundle = ensure_bundle(&api).await?;
-    ensure_capabilities(&api, &bundle).await?;
+    ensure_capabilities(&api, &bundle, BUNDLE).await?;
     let devices = ensure_devices(&api).await?;
     let profile = ensure_profile(&api, &bundle, &certificate, &devices, Profile::Ios).await?;
     eprintln!(
@@ -85,6 +91,17 @@ async fn main() -> Result<()> {
         profile.display(),
         devices.len()
     );
+    let tauri_bundle = ensure_bundle_id(&api, TAURI_BUNDLE, "connetto tauri demo").await?;
+    ensure_capabilities(&api, &tauri_bundle, TAURI_BUNDLE).await?;
+    let profile = ensure_profile(
+        &api,
+        &tauri_bundle,
+        &certificate,
+        &devices,
+        Profile::TauriIos,
+    )
+    .await?;
+    eprintln!("profile {} covers the Tauri demo", profile.display());
     let tapper_bundle = ensure_tapper_bundle(&api).await?;
     let profile = ensure_profile(
         &api,
@@ -504,7 +521,7 @@ const CAPABILITIES: [&str; 2] = ["APP_ATTEST", "HOT_SPOT"];
 /// which replaces the whole set, so the existing capabilities go out with
 /// the missing ones. Where the API is read-only it names the portal step,
 /// since the profile takes its entitlements from the bundle id.
-async fn ensure_capabilities(api: &Api, bundle: &str) -> Result<()> {
+async fn ensure_capabilities(api: &Api, bundle: &str, identifier: &str) -> Result<()> {
     let found = api
         .get(&format!("bundleIds/{bundle}/bundleIdCapabilities"))
         .await?;
@@ -546,7 +563,7 @@ async fn ensure_capabilities(api: &Api, bundle: &str) -> Result<()> {
         }
         Err(err) if err.to_string().contains("does not allow 'CREATE'") => {
             eprintln!(
-                "the API keeps the bundle id's capabilities read-only, so enable App Attest and Personal Hotspot on the App ID `{BUNDLE}` at developer.apple.com. The profile takes the entitlements from the bundle id, and the joiner's NEHotspotConfiguration join refuses without the Hotspot one"
+                "the API keeps the bundle id's capabilities read-only, so enable App Attest and Personal Hotspot on the App ID `{identifier}` at developer.apple.com. The profile takes the entitlements from the bundle id, and the joiner's NEHotspotConfiguration join refuses without the Hotspot one"
             );
             Ok(())
         }
@@ -738,19 +755,12 @@ async fn remove_stale_profiles(folder: &Path, profile: Profile, keep: &Path) -> 
         let Ok(decoded) = run("security", &["cms", "-D", "-i", file]).await else {
             continue;
         };
-        if profile_name(&decoded) == Some(profile.name()) {
+        if ios_signing::profile_name(&decoded) == Some(profile.name()) {
             eprintln!("removing the stale profile {}", path.display());
             tokio::fs::remove_file(&path).await?;
         }
     }
     Ok(())
-}
-
-/// The `Name` of a decoded profile's property list.
-fn profile_name(plist: &str) -> Option<&str> {
-    let (_, after) = plist.split_once("<key>Name</key>")?;
-    let (_, value) = after.split_once("<string>")?;
-    value.split_once("</string>").map(|(name, _)| name)
 }
 
 async fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -782,7 +792,7 @@ async fn run(program: &str, args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::profile_name;
+    use connetto_test_harness::ios_signing::profile_name;
 
     #[test]
     fn a_profile_name_is_the_string_after_its_key() {

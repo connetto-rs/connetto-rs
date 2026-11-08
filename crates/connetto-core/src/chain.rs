@@ -5,12 +5,11 @@
 //! major and its provenance, and its changeset, as a Scuttlebutt feed links
 //! each message to the previous one. The client keeps the hash with each
 //! pending entry, and the server computes the same chain from the entries
-//! it settles, so a direct write carries no hash on the wire. A device
-//! writer signs the newest entry of a range it hands to a peer or a
-//! courier, and the receiver checks the range back to the last entry it
-//! verified. Because the head binds every entry's major and provenance, one
-//! attestation serves both paths. The device key also signs one offer per
-//! hand-off, and a manifest's rows recompute the chain from a verified head.
+//! it settles, so a direct write carries no hash on the wire. The device key
+//! signs one offer per hand-off over its newest frontier, and a manifest's
+//! rows recompute the chain from a verified head to it, for a peer and a
+//! courier alike. Because the head binds every entry's major and
+//! provenance, the offer vouches for both.
 
 #[cfg(feature = "device-cert")]
 use ring::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
@@ -29,9 +28,6 @@ pub const GENESIS: [u8; 32] = [0; 32];
 
 /// The domain separator of an entry hash.
 const ENTRY_DOMAIN: &[u8] = b"connetto-chain-v2\0";
-
-/// The domain separator of the message a device key signs over a range.
-const SIGN_DOMAIN: &[u8] = b"connetto-chain-sign-v1\0";
 
 /// The domain separator of the message a device key signs over an offer.
 const OFFER_DOMAIN: &[u8] = b"connetto-exchange-offer-v1\0";
@@ -109,21 +105,6 @@ fn encode_origin(out: &mut Sha256, origin: Option<Origin>) {
             }
         },
     }
-}
-
-/// The message a device key signs to vouch for its chain up to the entry at
-/// `seq` whose hash is `head`, for a peer and a courier alike.
-///
-/// The key id is inside the message, so a signature over one writer's chain
-/// cannot be presented as another writer's.
-#[must_use]
-pub fn range_message(key_id: &[u8; 32], seq: u64, head: &[u8; 32]) -> Vec<u8> {
-    let mut message = Vec::with_capacity(SIGN_DOMAIN.len() + 32 + 8 + 32);
-    message.extend_from_slice(SIGN_DOMAIN);
-    message.extend_from_slice(key_id);
-    message.extend_from_slice(&seq.to_be_bytes());
-    message.extend_from_slice(head);
-    message
 }
 
 /// The message a device key signs over an exchange offer: its settled and
@@ -210,23 +191,6 @@ fn encode_reject_reason(out: &mut Vec<u8>, reason: &MutationRejectReason) {
         );
         out.extend_from_slice(detail.as_bytes());
     }
-}
-
-/// Whether `signature` is the key's ECDSA P-256 SHA-256 signature over the
-/// range at `seq` headed by `head`, the check a peer and a courier run.
-///
-/// `public_key` is the `SubjectPublicKeyInfo` the certificate and the
-/// server's writer row hold.
-#[cfg(feature = "device-cert")]
-#[must_use]
-pub fn verify_range(
-    public_key: &[u8],
-    key_id: &[u8; 32],
-    seq: u64,
-    head: &[u8; 32],
-    signature: &[u8],
-) -> bool {
-    verify_signature(public_key, &range_message(key_id, seq, head), signature)
 }
 
 /// Whether `signed` carries the key's ECDSA P-256 SHA-256 signature over
@@ -413,51 +377,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_range_message_names_its_writer() {
-        let head = entry_hash(&GENESIS, 1, Some(major(2)), None, b"one");
-        assert_ne!(
-            range_message(&[1; 32], 1, &head),
-            range_message(&[2; 32], 1, &head)
-        );
-        assert_ne!(
-            range_message(&[1; 32], 1, &head),
-            range_message(&[1; 32], 2, &head)
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "device-cert")]
-    fn a_range_signature_verifies_and_fails_on_changes() {
-        let (key, spki) = keypair();
-        let (_, other_spki) = keypair();
-        let head = entry_hash(&GENESIS, 1, Some(major(2)), None, b"one");
-        let signature = sign(&key, &range_message(&[9; 32], 1, &head));
-        assert!(
-            verify_range(&spki, &[9; 32], 1, &head, &signature),
-            "the key's signature verifies"
-        );
-        assert!(
-            !verify_range(&other_spki, &[9; 32], 1, &head, &signature),
-            "another key does not verify"
-        );
-        let other_head = entry_hash(&GENESIS, 1, Some(major(2)), None, b"two");
-        assert!(
-            !verify_range(&spki, &[9; 32], 1, &other_head, &signature),
-            "another head does not verify"
-        );
-        assert!(
-            !verify_range(&spki, &[9; 32], 2, &head, &signature),
-            "another sequence does not verify"
-        );
-        let mut flipped = signature.clone();
-        flipped[0] ^= 1;
-        assert!(
-            !verify_range(&spki, &[9; 32], 1, &head, &flipped),
-            "a flipped byte does not verify"
-        );
-    }
-
     fn offer() -> Offer {
         Offer {
             settled: Some(Frontier {
@@ -621,17 +540,11 @@ mod tests {
     #[cfg(feature = "device-cert")]
     fn a_malformed_key_verifies_nothing() {
         let (key, _) = keypair();
-        let head = entry_hash(&GENESIS, 1, Some(major(2)), None, b"one");
-        let range = sign(&key, &range_message(&[9; 32], 1, &head));
         let offered = SignedOffer {
             signature: sign(&key, &offer_message(&[5; 32], &offer())),
             offer: offer(),
         };
         for malformed in [&b""[..], b"not a key", &[0x30; 91]] {
-            assert!(
-                !verify_range(malformed, &[9; 32], 1, &head, &range),
-                "{malformed:?} verifies a range"
-            );
             assert!(
                 !verify_offer(malformed, &[5; 32], &offered),
                 "{malformed:?} verifies an offer"

@@ -20,6 +20,7 @@ web = [
     "dep:connetto-client",
     "dep:connetto-file-core",
     "dep:connetto-web",
+    "dep:futures-lite",
     "dep:rosetta-uuid",
 ]
 # The Tauri layer, which sends every action over invoke to the native core in
@@ -51,6 +52,9 @@ base64 = { version = "0.22", optional = true }
 # The actions and the view cross invoke as plain JS objects.
 serde = { version = "1", features = ["derive"], optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
+# The team pane's park, which polls the rendezvous flag beside the
+# subscriptions' change futures.
+futures-lite = { version = "2.6", optional = true }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

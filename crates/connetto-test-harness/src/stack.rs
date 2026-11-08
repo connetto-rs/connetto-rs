@@ -237,7 +237,8 @@ pub const ENROLMENT_DDL: [&str; 3] = [
     "CREATE TABLE IF NOT EXISTS connetto_device_enrolments (\
      key_id BYTEA PRIMARY KEY, user_id TEXT NOT NULL, session_id UUID NOT NULL, \
      enrolled_at TIMESTAMPTZ NOT NULL, last_seen TIMESTAMPTZ NOT NULL, \
-     revoked_at TIMESTAMPTZ, public_key BYTEA NOT NULL, attestation TEXT NOT NULL)",
+     revoked_at TIMESTAMPTZ, public_key BYTEA NOT NULL, attestation TEXT NOT NULL, \
+     bot_list TEXT)",
     "CREATE TABLE connetto_device_certificates (\
      serial BYTEA PRIMARY KEY, \
      key_id BYTEA NOT NULL REFERENCES connetto_device_enrolments (key_id), \
@@ -266,15 +267,27 @@ pub struct DemoDeviceCa {
 /// stack sets.
 pub const DEMO_DEVICE_ROOT_VAR: &str = "CONNETTO_DEMO_BUILD_DEVICE_ROOT";
 
-/// The demo's build features for a mobile target, with its device identity
-/// and the peer link and hotspot it carries when the stack named a
+/// The dioxus demo's build features for a mobile target, with its device
+/// identity and the peer link and hotspot it carries when the stack named a
 /// deployment root.
 #[must_use]
-pub fn demo_mobile_features() -> &'static str {
+pub fn dioxus_mobile_features() -> &'static str {
     if std::env::var_os(DEMO_DEVICE_ROOT_VAR).is_some() {
         "mobile,device-identity,peer"
     } else {
         "mobile"
+    }
+}
+
+/// The Tauri demo's build features for a mobile target, its device identity
+/// and the peer link and hotspot it carries when the stack named a
+/// deployment root, and nothing when it did not.
+#[must_use]
+pub fn tauri_mobile_features() -> &'static str {
+    if std::env::var_os(DEMO_DEVICE_ROOT_VAR).is_some() {
+        "device-identity,peer"
+    } else {
+        ""
     }
 }
 

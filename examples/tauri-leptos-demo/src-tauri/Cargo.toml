@@ -41,11 +41,29 @@ thiserror = "2"
 # Each formatted log line lands in logcat, since an Android app's stdout goes
 # nowhere.
 android_log-sys = "0.3.2"
+# The peer link's hotspot hosting and joining and its Bluetooth beacon,
+# asked through the plugin the panel's prompt drives.
+connetto-peer-android = { path = "../../../crates/connetto-peer-android", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The Location Services prompt a Mac's join asks for (R76 slice 9c).
+connetto-peer-apple = { path = "../../../crates/connetto-peer-apple", optional = true }
 
 [features]
 # Enrols this device under the deployment root `CONNETTO_DEMO_BUILD_DEVICE_ROOT`
 # names at build time, as the dioxus demo's feature does.
 device-identity = ["connetto-client/device-identity", "connetto-demo-support/device-identity"]
+# The peer link and the hotspot it hosts and joins (R76), with the team
+# notes' provenance lines (R77), and the nearby panel the core serves.
+peer = [
+  "connetto-client/peer",
+  "connetto-demo-support/peer",
+  "dep:connetto-peer-apple",
+  "dep:connetto-peer-android",
+]
+# The build the unattended proof runs drive, its gate off and its secrets
+# under their own keyring service.
+unattended = ["connetto-demo-support/unattended"]
 
 [build-dependencies]
 tauri-build = { version = "2.7", features = [] }

@@ -16,8 +16,8 @@ use std::time::Duration;
 use connetto_client::teardown::{ForgetError, ForgetRefusal};
 use connetto_client::{
     AccountChoice, AccountChooser, Auth, ClientError, ClientEvent, ConnettoClient, ExportScope,
-    KeyringAuth, LiveHandle as _, Moment, NativeAuthenticator, NativeClient, NativeTransport,
-    SystemClock, dsl::Watchable as _,
+    KeyringAuth, LiveHandle as _, LiveQuery, Moment, NativeAuthenticator, NativeClient,
+    NativeTransport, SystemClock, dsl::Watchable as _,
 };
 use connetto_demo_support as support;
 use connetto_file_client::FileId;
@@ -44,7 +44,15 @@ const DEFAULT_WS: &str = "ws://127.0.0.1:7777/sync";
 const DEFAULT_AUTH_ORIGIN: &str = "http://127.0.0.1:7777";
 const DEFAULT_PG: &str = "postgres://postgres:postgres@127.0.0.1:55456/postgres";
 const AUTH_PROVIDER: &str = "dev-idp";
-const KEYRING_SERVICE: &str = "connetto-tauri-demo";
+/// The keyring service the demo stores its secrets under, a separate name in
+/// an unattended build so a replica key or refresh token a gated earlier run
+/// left in the keychain, which survives a reinstall, cannot meet the
+/// unattended build and prompt.
+const KEYRING_SERVICE: &str = if cfg!(feature = "unattended") {
+    "connetto-tauri-demo-unattended"
+} else {
+    "connetto-tauri-demo"
+};
 /// The login redirect, whose scheme is the Android applicationId and the
 /// iOS bundle identifier.
 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -96,6 +104,10 @@ struct Holds {
     covered_photos: AtomicUsize,
     covered_products: AtomicUsize,
     thumb_refresh: AtomicU64,
+    /// The hosts whose beacons show, as the link's events report them, the
+    /// nearby panel's join picks the strongest of.
+    #[cfg(feature = "peer")]
+    nearby_hosts: Mutex<Vec<connetto_client::NearbyHost>>,
 }
 
 impl Default for Holds {
@@ -108,6 +120,8 @@ impl Default for Holds {
             covered_photos: AtomicUsize::new(0),
             covered_products: AtomicUsize::new(0),
             thumb_refresh: AtomicU64::new(0),
+            #[cfg(feature = "peer")]
+            nearby_hosts: Mutex::new(Vec::new()),
         }
     }
 }
@@ -257,8 +271,76 @@ async fn serve(app: &AppHandle, core: &Arc<Core>, action: Action) -> Result<(), 
         Action::FreeUpSpace => free_up_space(app, core).await,
         Action::Export => export(app, core).await,
         Action::Import { bytes, .. } => import(app, core, bytes).await,
+        Action::EnableBluetooth
+        | Action::HostHotspot
+        | Action::StopHotspot
+        | Action::JoinHotspot { .. }
+        | Action::JoinPayload { .. }
+        | Action::JoinNearby
+        | Action::LeaveHotspot
+        | Action::SetPeerLinks { .. } => {
+            serve_nearby(app, core, action).await;
+            Ok(())
+        }
+        Action::PickTeam { team } => {
+            core.update(app, |v| {
+                if let Some(view) = v.team.as_mut() {
+                    view.picked = team;
+                }
+            });
+            Ok(())
+        }
+        Action::AddTeamNote { body } => add_team_note(app, core, body).await,
+        Action::TidyTeam => {
+            #[cfg(feature = "peer")]
+            tidy_team(app, core).await;
+            Ok(())
+        }
     }
 }
+
+/// The nearby panel's actions, which stand behind the peer feature and answer
+/// nothing in a build that carries no peer link, since the panel never stands
+/// there.
+#[cfg(feature = "peer")]
+async fn serve_nearby(app: &AppHandle, core: &Arc<Core>, action: Action) {
+    match action {
+        Action::EnableBluetooth => enable_bluetooth(app, core).await,
+        Action::HostHotspot => host_hotspot(app, core).await,
+        Action::StopHotspot => stop_hotspot(app, core).await,
+        Action::JoinHotspot {
+            ssid,
+            passphrase,
+            port,
+        } => join_hotspot(app, core, ssid, passphrase, port).await,
+        Action::JoinPayload { payload } => join_payload(app, core, payload).await,
+        Action::JoinNearby => join_nearby(app, core).await,
+        Action::LeaveHotspot => leave_hotspot(app, core).await,
+        Action::SetPeerLinks { on } => set_peer_links(app, core, on),
+        _ => {}
+    }
+}
+
+/// Switch every nearby link on or off for the running app, the panel's line
+/// following the client's standing.
+#[cfg(feature = "peer")]
+fn set_peer_links(app: &AppHandle, core: &Arc<Core>, on: bool) {
+    let Some(session) = core.session() else {
+        return;
+    };
+    session.native.set_peer_links(on);
+    let off = !session.native.peer_links_on();
+    core.update(app, |v| {
+        if let Some(panel) = v.nearby.as_mut() {
+            panel.links_off = off;
+        }
+    });
+}
+
+/// The nearby panel's actions in a build without the peer link, which the
+/// panel never sends, since it never stands there.
+#[cfg(not(feature = "peer"))]
+async fn serve_nearby(_app: &AppHandle, _core: &Arc<Core>, _action: Action) {}
 
 /// Start the parked login the moment the user asks. The system browser on a
 /// desktop, the platform's auth session on a phone, or a re-run of the setup
@@ -576,6 +658,327 @@ async fn free_up_space(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandE
     Ok(())
 }
 
+/// Write one note into the picked team, answering with the line the panel's
+/// outcome shows.
+async fn add_team_note(
+    app: &AppHandle,
+    core: &Arc<Core>,
+    body: String,
+) -> Result<(), CommandError> {
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let client = session.native.client().clone();
+    let team = core
+        .view
+        .lock()
+        .team
+        .as_ref()
+        .map(|team| team.picked.clone())
+        .unwrap_or_default();
+    let author = user_id(&session);
+    let body = body.trim().to_owned();
+    if body.is_empty() {
+        core.update(app, |v| {
+            if let Some(team) = v.team.as_mut() {
+                team.outcome = "the note needs some text".to_owned();
+            }
+        });
+        return Ok(());
+    }
+    match support::add_team_note(&client, &team, &author, &body).await {
+        Ok(_) => core.update(app, |v| {
+            if let Some(team) = v.team.as_mut() {
+                team.outcome = "note added".to_owned();
+            }
+        }),
+        Err(err) => core.update(app, |v| {
+            if let Some(team) = v.team.as_mut() {
+                team.outcome = format!("note add failed: {err}");
+            }
+        }),
+    }
+    Ok(())
+}
+
+/// Run the eviction pass the tidy control offers, which spares provisional
+/// rows, and tell the panel how many remain.
+#[cfg(feature = "peer")]
+async fn tidy_team(app: &AppHandle, core: &Arc<Core>) {
+    let Some(session) = core.session() else {
+        return;
+    };
+    let client = session.native.client().clone();
+    match client.tidy().await {
+        Ok(()) => {
+            let remaining = client
+                .provisional_rows()
+                .await
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|row| {
+                            row.state == connetto_client::provisional::ProvisionalState::Provisional
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
+            core.update(app, |v| {
+                if let Some(team) = v.team.as_mut() {
+                    append_team_events(&mut team.events, vec![support::tidy_line(remaining)]);
+                }
+            });
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "the tidy pass failed");
+            core.update(app, |v| {
+                if let Some(team) = v.team.as_mut() {
+                    append_team_events(
+                        &mut team.events,
+                        vec![format!("tidy: the pass failed: {err}")],
+                    );
+                }
+            });
+        }
+    }
+}
+/// Ask the platform for the permission a host or join named as missing, on
+/// the platform's main thread, where the prompt wants to be asked from.
+#[cfg(feature = "peer")]
+fn ask_peer_permission(app: &AppHandle, core: &Arc<Core>) {
+    #[cfg(target_os = "android")]
+    let session = core.session();
+    #[cfg(not(target_os = "android"))]
+    let _ = core;
+    let sent = app.run_on_main_thread(move || {
+        #[cfg(target_os = "android")]
+        if let Some(session) = session
+            && let Err(err) = session.native.request_peer_permissions()
+        {
+            tracing::warn!(error = %err, "the peer permissions could not be asked");
+        }
+        #[cfg(target_os = "macos")]
+        connetto_peer_apple::hotspot::request_location_access();
+    });
+    if let Err(err) = sent {
+        tracing::warn!(error = %err, "asking the platform permission");
+    }
+}
+
+/// Turn Bluetooth on, through the system's prompt where it asks.
+#[cfg(feature = "peer")]
+async fn enable_bluetooth(app: &AppHandle, core: &Arc<Core>) {
+    let Some(session) = core.session() else {
+        return;
+    };
+    core.update(app, |v| {
+        if let Some(panel) = v.nearby.as_mut() {
+            panel.outcome = "turning on bluetooth".to_owned();
+        }
+    });
+    match session.native.enable_bluetooth().await {
+        Ok(()) => core.update(app, |v| {
+            if let Some(panel) = v.nearby.as_mut() {
+                panel.outcome = "bluetooth is on".to_owned();
+            }
+        }),
+        Err(err) => core.update(app, |v| {
+            if let Some(panel) = v.nearby.as_mut() {
+                panel.outcome = err.to_string();
+            }
+        }),
+    }
+}
+
+/// Host a hotspot from the app, and show its offer as the panel's lines.
+#[cfg(feature = "peer")]
+async fn host_hotspot(app: &AppHandle, core: &Arc<Core>) {
+    let Some(session) = core.session() else {
+        return;
+    };
+    core.update(app, |v| {
+        if let Some(panel) = v.nearby.as_mut() {
+            panel.outcome = "asking for the hotspot".to_owned();
+        }
+    });
+    match session.native.host_hotspot().await {
+        Ok(hosted) => core.update(app, |v| {
+            if let Some(panel) = v.nearby.as_mut() {
+                panel.offer = Some(support::nearby::offer_view(&hosted.offer));
+                panel.outcome = support::nearby::hosted_outcome(&hosted.beacon);
+            }
+        }),
+        Err(err) => {
+            if matches!(err, connetto_client::HotspotError::MissingPermission(_)) {
+                ask_peer_permission(app, core);
+            }
+            core.update(app, |v| {
+                if let Some(panel) = v.nearby.as_mut() {
+                    panel.outcome = err.to_string();
+                }
+            });
+        }
+    }
+}
+
+/// Stop the hotspot this device hosts.
+#[cfg(feature = "peer")]
+async fn stop_hotspot(app: &AppHandle, core: &Arc<Core>) {
+    let Some(session) = core.session() else {
+        return;
+    };
+    session.native.stop_hotspot().await;
+    core.update(app, |v| {
+        if let Some(panel) = v.nearby.as_mut() {
+            panel.offer = None;
+            panel.outcome = "stopped".to_owned();
+        }
+    });
+}
+
+/// The join's outcome, asking the platform for a missing permission where
+/// the error names one.
+#[cfg(feature = "peer")]
+fn report_join_error(app: &AppHandle, core: &Arc<Core>, err: &connetto_client::JoinError) {
+    if matches!(err, connetto_client::JoinError::MissingPermission(_)) {
+        ask_peer_permission(app, core);
+    }
+    core.update(app, |v| {
+        if let Some(panel) = v.nearby.as_mut() {
+            panel.outcome = err.to_string();
+        }
+    });
+}
+
+/// Join a hotspot by its offer's typed lines.
+#[cfg(feature = "peer")]
+async fn join_hotspot(
+    app: &AppHandle,
+    core: &Arc<Core>,
+    ssid: String,
+    passphrase: String,
+    port: String,
+) {
+    join_offer(
+        app,
+        core,
+        support::nearby::typed_offer(&ssid, &passphrase, &port).map_err(str::to_owned),
+    )
+    .await;
+}
+
+/// Join a hotspot by its pasted or scanned `WIFI:` payload.
+#[cfg(feature = "peer")]
+async fn join_payload(app: &AppHandle, core: &Arc<Core>, payload: String) {
+    let offer = connetto_client::HotspotOffer::from_wifi_payload(payload.trim())
+        .map_err(|err| err.to_string());
+    join_offer(app, core, offer).await;
+}
+
+/// Join the hotspot `offer` names, or show why the form names none.
+#[cfg(feature = "peer")]
+async fn join_offer(
+    app: &AppHandle,
+    core: &Arc<Core>,
+    offer: Result<connetto_client::HotspotOffer, String>,
+) {
+    let Some(session) = core.session() else {
+        return;
+    };
+    let offer = match offer {
+        Ok(offer) => offer,
+        Err(outcome) => {
+            core.update(app, |v| {
+                if let Some(panel) = v.nearby.as_mut() {
+                    panel.outcome = outcome;
+                }
+            });
+            return;
+        }
+    };
+    core.update(app, |v| {
+        if let Some(panel) = v.nearby.as_mut() {
+            panel.outcome = support::nearby::JOINING_HOTSPOT.to_owned();
+        }
+    });
+    match session.native.join_hotspot(&offer).await {
+        Ok(gateway) => core.update(app, |v| {
+            if let Some(panel) = v.nearby.as_mut() {
+                panel.joined = true;
+                panel.outcome = support::nearby::joined_outcome(gateway);
+            }
+        }),
+        Err(err) => report_join_error(app, core, &err),
+    }
+}
+
+/// Leave the joined hotspot.
+#[cfg(feature = "peer")]
+async fn leave_hotspot(app: &AppHandle, core: &Arc<Core>) {
+    let Some(session) = core.session() else {
+        return;
+    };
+    session.native.leave_hotspot().await;
+    core.update(app, |v| {
+        if let Some(panel) = v.nearby.as_mut() {
+            panel.joined = false;
+            panel.vpn_line = None;
+            panel.outcome = "left".to_owned();
+        }
+    });
+}
+
+/// Join the strongest host whose beacon shows, one at a time.
+#[cfg(feature = "peer")]
+async fn join_nearby(app: &AppHandle, core: &Arc<Core>) {
+    let Some(session) = core.session() else {
+        return;
+    };
+    // One nearby join at a time, so its outcome is the one shown.
+    let outcome = core
+        .view
+        .lock()
+        .nearby
+        .as_ref()
+        .map(|panel| panel.outcome.clone())
+        .unwrap_or_default();
+    if outcome == support::nearby::JOINING_NEARBY {
+        return;
+    }
+    let host = {
+        let hosts = session.holds.nearby_hosts.lock();
+        support::nearby::strongest(&hosts)
+    };
+    let Some(host) = host else {
+        core.update(app, |v| {
+            if let Some(panel) = v.nearby.as_mut() {
+                panel.outcome = "no host is nearby".to_owned();
+            }
+        });
+        return;
+    };
+    core.update(app, |v| {
+        if let Some(panel) = v.nearby.as_mut() {
+            panel.outcome = support::nearby::JOINING_NEARBY.to_owned();
+        }
+    });
+    match session.native.join_nearby(&host).await {
+        Ok((identity, gateway)) => core.update(app, |v| {
+            if let Some(panel) = v.nearby.as_mut() {
+                panel.joined = true;
+                panel.outcome = support::nearby::joined_nearby_outcome(gateway, &identity);
+            }
+        }),
+        Err(err) => {
+            if support::nearby::nearby_permission(&err).is_some() {
+                ask_peer_permission(app, core);
+            }
+            core.update(app, |v| {
+                if let Some(panel) = v.nearby.as_mut() {
+                    panel.outcome = err.to_string();
+                }
+            });
+        }
+    }
+}
+
 /// Offer the Save As window, then write the archive where it points. A
 /// dismissed window leaves the view unchanged.
 async fn export(app: &AppHandle, core: &Arc<Core>) -> Result<(), CommandError> {
@@ -869,6 +1272,24 @@ async fn setup(
     } else {
         "none, local data opens without user verification"
     };
+    // The nearby panel's standing, pre-read from the device the way the
+    // first feed tick would.
+    #[cfg(feature = "peer")]
+    let nearby = {
+        let port = native.peer_address().map(|address| address.port());
+        let certificate = native.device_certificate();
+        let me = certificate
+            .as_ref()
+            .map(|certificate| certificate.identity());
+        support::view::NearbyView {
+            peer_line: support::nearby::peer_line(port, me),
+            bluetooth_line: format!("bluetooth: {}", native.bluetooth_state()),
+            beacon_line: support::nearby::beacon_line(native.beacon_state()),
+            outcome: "idle".to_owned(),
+            can_host: !cfg!(any(target_os = "macos", target_os = "ios")),
+            ..Default::default()
+        }
+    };
     core.update(&app, |v| {
         *v = View::initial();
         v.session = Session::SignedIn;
@@ -884,6 +1305,15 @@ async fn setup(
         // with no gate never locks.
         v.offers_unlock = false;
         v.backend_writer = true;
+        v.team = Some(support::view::TeamView {
+            outcome: "idle".to_owned(),
+            peer: cfg!(feature = "peer"),
+            ..Default::default()
+        });
+        #[cfg(feature = "peer")]
+        {
+            v.nearby = Some(nearby);
+        }
     });
 
     let (backend, commands) = mpsc::unbounded_channel::<BackendCmd>();
@@ -920,6 +1350,22 @@ async fn setup(
             Arc::clone(&holds),
         ));
         tasks.spawn(feed_device(app.clone(), Arc::clone(&core), parts.clone()));
+        tasks.spawn(feed_team(app.clone(), Arc::clone(&core), client.clone()));
+        #[cfg(feature = "peer")]
+        tasks.spawn(feed_nearby(app.clone(), Arc::clone(&core), parts.clone()));
+        #[cfg(feature = "peer")]
+        tasks.spawn(feed_peer_events(
+            app.clone(),
+            Arc::clone(&core),
+            parts.clone(),
+            client.clone(),
+        ));
+        #[cfg(feature = "peer")]
+        tasks.spawn(feed_team_events(
+            app.clone(),
+            Arc::clone(&core),
+            client.clone(),
+        ));
         tasks.spawn(feed_content(
             app.clone(),
             Arc::clone(&core),
@@ -1208,6 +1654,275 @@ async fn each_second<T>(session: Weak<T>, mut each: impl FnMut(&T)) {
     }
 }
 
+/// The nearby panel's standing, read again every second, since the listener
+/// opens beside the pump the way enrolment does. It holds the session weakly,
+/// since the session owns this task.
+#[cfg(feature = "peer")]
+async fn feed_nearby(app: AppHandle, core: Arc<Core>, session: Weak<Parts>) {
+    each_second(session, |session| {
+        let port = session.native.peer_address().map(|address| address.port());
+        let certificate = session.native.device_certificate();
+        let me = certificate
+            .as_ref()
+            .map(|certificate| certificate.identity());
+        let peer_line = support::nearby::peer_line(port, me);
+        let bluetooth_line = format!("bluetooth: {}", session.native.bluetooth_state());
+        let beacon_line = support::nearby::beacon_line(session.native.beacon_state());
+        let mut linked: Vec<String> = session
+            .native
+            .linked_peers()
+            .iter()
+            .map(|link| support::nearby::linked_line(&link.peer, link.remote))
+            .collect();
+        linked.sort();
+        core.update(&app, |v| {
+            if let Some(panel) = v.nearby.as_mut() {
+                panel.peer_line = peer_line;
+                panel.bluetooth_line = bluetooth_line;
+                panel.beacon_line = beacon_line;
+                panel.linked = linked;
+            }
+        });
+    })
+    .await;
+}
+
+/// The hotspot events drive the nearby panel's offer, its outcome and the
+/// hosts whose beacons show, the strongest of which its join reaches.
+#[cfg(feature = "peer")]
+async fn feed_peer_events(
+    app: AppHandle,
+    core: Arc<Core>,
+    session: Weak<Parts>,
+    client: ConnettoClient<Ws>,
+) {
+    let mut events = client.events();
+    while let Ok(event) = events.recv().await {
+        let Some(session) = session.upgrade() else {
+            break;
+        };
+        match event {
+            ClientEvent::HotspotStopped => {
+                core.update(&app, |v| {
+                    if let Some(panel) = v.nearby.as_mut() {
+                        panel.offer = None;
+                        panel.outcome = "stopped by the system or the user".to_owned();
+                    }
+                });
+            }
+            ClientEvent::HotspotLeft => {
+                core.update(&app, |v| {
+                    if let Some(panel) = v.nearby.as_mut() {
+                        panel.joined = false;
+                        panel.vpn_line = None;
+                        panel.outcome = "the joined network was lost".to_owned();
+                    }
+                });
+            }
+            ClientEvent::HostNearby { host, prefix, rssi } => {
+                let mut hosts = session.holds.nearby_hosts.lock();
+                hosts.retain(|known| known.host != host);
+                hosts.push(connetto_client::NearbyHost { host, prefix, rssi });
+                core.update(&app, |v| {
+                    if let Some(panel) = v.nearby.as_mut() {
+                        panel.nearby = hosts.iter().map(support::nearby::nearby_line).collect();
+                    }
+                });
+            }
+            ClientEvent::HostGone { host } => {
+                let mut hosts = session.holds.nearby_hosts.lock();
+                hosts.retain(|known| known.host != host);
+                core.update(&app, |v| {
+                    if let Some(panel) = v.nearby.as_mut() {
+                        panel.nearby = hosts.iter().map(support::nearby::nearby_line).collect();
+                    }
+                });
+            }
+            ClientEvent::JoinedNetworkBlockedByVpn => {
+                core.update(&app, |v| {
+                    if let Some(panel) = v.nearby.as_mut() {
+                        panel.vpn_line = Some(support::nearby::VPN_LINE.to_owned());
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The team roster and the picked team's notes, whose peer rows re-read their
+/// provenance every second, since the provenance moves without a row change.
+async fn feed_team(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>) {
+    let mut roster = match support::teams_of_account::<Ws>().live(&client).await {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(error = %err, "the team roster subscription stopped");
+            core.update(&app, |v| {
+                if let Some(team) = v.team.as_mut() {
+                    team.error = Some(err.to_string());
+                }
+            });
+            return;
+        }
+    };
+    let mut last: Vec<String> = Vec::new();
+    let mut notes: Option<LiveQuery<support::TeamNote>> = None;
+    let mut members: Option<LiveQuery<String>> = None;
+    let mut subscribed: Option<String> = None;
+    loop {
+        let rows = roster.snapshot();
+        if rows != last {
+            last = rows.clone();
+            core.update(&app, |v| {
+                if let Some(team) = v.team.as_mut() {
+                    team.set_teams(rows);
+                }
+            });
+        }
+        let picked = core
+            .view
+            .lock()
+            .team
+            .as_ref()
+            .map(|team| team.picked.clone())
+            .unwrap_or_default();
+        if subscribed.as_deref() != Some(picked.as_str()) {
+            core.update(&app, |v| {
+                if let Some(team) = v.team.as_mut() {
+                    team.notes.clear();
+                    team.members.clear();
+                    team.error = None;
+                }
+            });
+            notes = None;
+            members = None;
+            if picked.is_empty() {
+                subscribed = None;
+            } else {
+                subscribed = Some(picked.clone());
+                match support::team_members_of::<Ws>(picked.clone())
+                    .live(&client)
+                    .await
+                {
+                    Ok(handle) => members = Some(handle),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "the team members subscription stopped");
+                        core.update(&app, |v| {
+                            if let Some(team) = v.team.as_mut() {
+                                team.error = Some(err.to_string());
+                            }
+                        });
+                    }
+                }
+                match support::team_notes_for::<Ws>(picked).live(&client).await {
+                    Ok(handle) => notes = Some(handle),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "the team notes subscription stopped");
+                        core.update(&app, |v| {
+                            if let Some(team) = v.team.as_mut() {
+                                team.error = Some(err.to_string());
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(notes) = &mut notes {
+            let rows: Vec<support::TeamNote> = notes.snapshot().to_vec();
+            let mut lines = Vec::with_capacity(rows.len());
+            for row in &rows {
+                #[cfg(feature = "peer")]
+                let account: Option<String> = {
+                    let key = vec![connetto_client::KeyValue::Blob(row.id.as_bytes().to_vec())];
+                    client
+                        .provenance("team_notes", &key)
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|record| {
+                            record.state
+                                == connetto_client::provisional::ProvisionalState::Provisional
+                        })
+                        .map(|record| record.account)
+                };
+                #[cfg(not(feature = "peer"))]
+                let account: Option<String> = None;
+                lines.push(support::team_note_line(row, account.as_deref()));
+            }
+            let member_rows: Vec<String> = members
+                .as_ref()
+                .map(|handle| handle.snapshot().to_vec())
+                .unwrap_or_default();
+            core.update(&app, |v| {
+                if let Some(team) = v.team.as_mut() {
+                    team.notes = lines;
+                    team.members = member_rows;
+                }
+            });
+            let members_changed = async {
+                match members.as_mut() {
+                    Some(handle) => handle.changed().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                changed = notes.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                changed = members_changed => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        } else {
+            tokio::select! {
+                changed = roster.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    }
+}
+
+/// The provisional events drive the team panel's activity lines, which keep
+/// the newest [`MAX_TEAM_EVENT_LINES`].
+#[cfg(feature = "peer")]
+async fn feed_team_events(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>) {
+    let mut events = client.events();
+    while let Ok(event) = events.recv().await {
+        let added = support::provisional_event_lines(&event);
+        if added.is_empty() {
+            continue;
+        }
+        core.update(&app, |v| {
+            if let Some(team) = v.team.as_mut() {
+                append_team_events(&mut team.events, added);
+            }
+        });
+    }
+}
+
+/// The event lines the team panel keeps, newest last.
+#[cfg(feature = "peer")]
+const MAX_TEAM_EVENT_LINES: usize = 40;
+
+/// Append the lines to the team panel's standing, keeping the newest
+/// [`MAX_TEAM_EVENT_LINES`].
+#[cfg(feature = "peer")]
+fn append_team_events(events: &mut Vec<String>, added: Vec<String>) {
+    events.extend(added);
+    let excess = events.len().saturating_sub(MAX_TEAM_EVENT_LINES);
+    if excess > 0 {
+        events.drain(..excess);
+    }
+}
 /// The content events drive the content line, the refused uploads and the
 /// lost files.
 async fn feed_content(app: AppHandle, core: Arc<Core>, content: Content) {

@@ -40,6 +40,10 @@
 //!   closes every live connection with the update-required reason. Refused
 //!   at boot when the value is not an RFC 3339 instant in UTC at or after
 //!   the Unix epoch, naming it.
+//! - `CONNETTO_COURIER` (default `off`): `on` accepts courier ranges, the
+//!   signed entries of a device a certified device relays (R78). Every
+//!   handshake acknowledgement tells the client which. Refused at boot for
+//!   any other value, naming it.
 //! - `CONNETTO_AUTH`: the login machinery. Only `database` is served, which
 //!   stores sessions and provider tokens in Postgres and signs users in
 //!   through the identity providers below.
@@ -205,6 +209,18 @@ fn database_toggle(key: &str) -> Result<bool> {
         "" => Ok(false),
         "database" => Ok(true),
         other => Err(anyhow!("unknown {key} mode {other:?}, expected database")),
+    }
+}
+
+/// Whether `CONNETTO_COURIER` turns the courier path on, `off` or unset
+/// leaving it off (R78 decision 1).
+fn parse_courier(text: Option<&str>) -> Result<bool> {
+    match text {
+        None | Some("off") => Ok(false),
+        Some("on") => Ok(true),
+        Some(other) => Err(anyhow!(
+            "unknown CONNETTO_COURIER {other:?}, expected on or off"
+        )),
     }
 }
 
@@ -556,6 +572,7 @@ async fn builder_from_env() -> Result<ServerBuilder> {
     let content = content_settings().await?;
     let device_identity = device_certs()?;
     let sunset = sunset_from_env()?;
+    let courier = parse_courier(var_nonempty("CONNETTO_COURIER").as_deref())?;
     let openfga = OpenFga::new(
         var_or("CONNETTO_FGA_URL", "http://127.0.0.1:8081"),
         std::env::var("CONNETTO_FGA_STORE").map_err(|_| {
@@ -580,7 +597,8 @@ async fn builder_from_env() -> Result<ServerBuilder> {
         .writable(writable_catalog())
         .content(content)
         .device_identity(device_identity)
-        .sunset(sunset))
+        .sunset(sunset)
+        .courier(courier))
 }
 
 /// Resolve on the first SIGINT or SIGTERM. On a platform without SIGTERM only
@@ -638,6 +656,17 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `on` turns the courier path on, `off` or no value leaves it off, and
+    /// any other value is refused naming it.
+    #[test]
+    fn the_courier_switch_reads_on_and_off_only() {
+        assert!(parse_courier(Some("on")).expect("on"));
+        assert!(!parse_courier(Some("off")).expect("off"));
+        assert!(!parse_courier(None).expect("unset"));
+        let err = parse_courier(Some("yes")).expect_err("an unknown value");
+        assert!(err.to_string().contains("\"yes\""), "{err}");
+    }
 
     #[test]
     fn the_sunset_parser_reads_an_rfc3339_utc_instant() {

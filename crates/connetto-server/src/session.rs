@@ -35,7 +35,9 @@ use std::time::{Duration, Instant, SystemTime};
 use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
 use connetto_core::chain::{self, GENESIS};
 use connetto_core::device_cert::{KeyId, spki_point};
-use connetto_core::exchange::{Origin, SignedOffer};
+use connetto_core::exchange::{
+    CourierEntryOutcome, CourierOutcome, CourierRefusal, ManifestRow, Origin, SignedOffer,
+};
 use connetto_core::messages::{
     AggregateUpdate, BindDevice, BindValue, BotRegistered, BulkMessage, CONTENT_TICKET_REFUSED,
     CONTENT_TICKET_SIGNER_ERROR, Challenge, ConflictRow, ContentTicketGrant, ContentTicketRequest,
@@ -49,6 +51,9 @@ use connetto_core::messages::{
     SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
     WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
     bot_registration_message, writer_bind_message,
+};
+use connetto_core::messages::{
+    CourierAnswer, CourierBody, CourierNotice, CourierNoticeAck, CourierNoticeRow, CourierRange,
 };
 use connetto_core::traits::{
     CheckedGrant, ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport,
@@ -84,7 +89,9 @@ use crate::bots::schema::{ListEntry, PgBotRegistry, RegistryError, Verb};
 
 use crate::audit::{AuthEvent, AuthOp};
 use crate::counters;
-use crate::courier::{CourierDelivery, CourierEntry, CourierRefusal};
+use crate::courier::{
+    Admitted, Applier, CourierAuthor, CourierEntry, CourierRun, CourierViolation, Settling, Slot,
+};
 use crate::fence::{ReadFence, split_snapshot_cursor};
 use crate::guard::RequestGuard;
 use crate::materializer::{
@@ -594,6 +601,8 @@ pub struct SessionConfig {
     idle_limit: Duration,
     /// Bytes of live patches one connection may have queued and unsent before it is closed.
     send_queue_bytes: u64,
+    /// Whether the deployment accepts courier ranges (R78 decision 1).
+    courier: bool,
     #[cfg(feature = "test-seams")]
     key_expiry_clock: Option<tokio::sync::watch::Receiver<SystemTime>>,
 }
@@ -611,6 +620,7 @@ impl Default for SessionConfig {
             first_frame_budget: Duration::from_secs(30),
             idle_limit: Duration::from_secs(60),
             send_queue_bytes: 64 * 1024 * 1024,
+            courier: false,
             #[cfg(feature = "test-seams")]
             key_expiry_clock: None,
         }
@@ -651,6 +661,14 @@ impl SessionConfig {
     #[must_use]
     pub fn with_sunset(mut self, sunset: Option<time::OffsetDateTime>) -> Self {
         self.sunset = sunset;
+        self
+    }
+
+    /// Accepts courier ranges when `on` (R78 decision 1), which every
+    /// handshake ack tells the client. Off by default.
+    #[must_use]
+    pub const fn with_courier(mut self, on: bool) -> Self {
+        self.courier = on;
         self
     }
 
@@ -1791,7 +1809,7 @@ impl Deliverable {
                 Some(&patch.sub_id)
             }
             Self::Rows(BulkMessage::SnapshotPatch(patch)) => Some(&patch.sub_id),
-            Self::Rows(BulkMessage::MutationPatch(_)) => None,
+            Self::Rows(BulkMessage::MutationPatch(_) | BulkMessage::CourierBody(_)) => None,
             Self::SnapshotComplete(end) => Some(&end.sub_id),
         }
     }
@@ -2083,6 +2101,13 @@ struct SessionState<Id, Key> {
     closing: bool,
     /// The enrolment nonce this session was last handed, spent by its next enrolment request.
     enrol_challenge: Option<crate::device_cert::PendingChallenge>,
+    /// The courier range open on this connection, one at a time (R78
+    /// decision 30).
+    courier: Option<CourierRun<Id, Key>>,
+    /// The courier notice frames this connection was sent, by frame id, each
+    /// holding the notice rows the frame carried, so its ack deletes exactly
+    /// those (R78 decision 39).
+    notices: HashMap<String, Vec<i64>>,
 }
 
 /// One computed subscription, as a key change has to find it again.
@@ -2557,6 +2582,46 @@ impl Drop for OpenSessionTally {
 /// The manager over the `String` ids and keys every construction shares.
 pub(crate) type ConnettoManager<Snap, Auth, D, C, O, S> =
     SessionManager<Snap, Auth, D, C, O, <D as ConnettoSchema>::Id, String, S>;
+
+/// End the connection for a courier frame no conforming client sends (R78
+/// decision 29), telling the client why.
+///
+/// # Errors
+///
+/// Always [`SessionError::Protocol`], which ends the connection.
+async fn courier_violation<T: Transport>(
+    transport: &mut T,
+    violation: &CourierViolation,
+) -> Result<(), SessionError> {
+    let detail = violation.to_string();
+    let _ = transport
+        .send_control(ControlMessage::FatalError(FatalError::new(
+            FatalErrorReason::ProtocolViolation {
+                detail: detail.clone(),
+            },
+        )))
+        .await;
+    Err(SessionError::Protocol(detail))
+}
+
+/// Send a finished courier range's one answer.
+///
+/// # Errors
+///
+/// [`SessionError`] when the transport fails.
+async fn answer_courier<T: Transport, Id, Key>(
+    transport: &mut T,
+    run: CourierRun<Id, Key>,
+) -> Result<(), SessionError> {
+    let (request_id, outcome) = run.finish();
+    transport
+        .send_control(ControlMessage::CourierAnswer(CourierAnswer {
+            request_id,
+            outcome,
+        }))
+        .await
+        .map_err(transport_err)
+}
 
 /// The sunset's seconds since the Unix epoch, which the wire carries (R107).
 fn sunset_secs(sunset: time::OffsetDateTime) -> u64 {
@@ -5314,6 +5379,7 @@ where
                 // The major's configured sunset, so the client's application
                 // can prompt an update before the server enforces it (R107).
                 sunset_at_secs: self.config.sunset.map(sunset_secs),
+                courier: self.config.courier,
                 initial_credits: self.config.initial_credits,
                 writer: writer_grant,
             }))
@@ -5787,8 +5853,11 @@ where
             key_expiry,
             closing: refused == Reaction::Close,
             enrol_challenge: None,
+            courier: None,
+            notices: HashMap::new(),
         };
         self.send_revocation_lists(&mut transport, &state).await;
+        self.send_courier_notices(&mut transport, &mut state).await;
 
         // Every exit breaks with its result rather than returning, so the teardown below always runs.
         let mut last_inbound = tokio::time::Instant::now();
@@ -5876,6 +5945,9 @@ where
             Some(IncomingFrame::Control(msg)) => self.handle_control(transport, msg, state).await?,
             Some(IncomingFrame::Bulk(BulkMessage::MutationPatch(patch))) => {
                 self.handle_mutation(transport, patch, state).await?;
+            }
+            Some(IncomingFrame::Bulk(BulkMessage::CourierBody(body))) => {
+                self.handle_courier_body(transport, body, state).await?;
             }
             Some(IncomingFrame::Bulk(_)) => {
                 return Err(SessionError::Protocol(
@@ -6487,6 +6559,84 @@ where
         }
     }
 
+    /// The account's standing courier notices, sent after the identified
+    /// handshake as `CourierNotice` frames of at most
+    /// [`connetto_core::exchange::MAX_MANIFEST_ROWS`] rows, each with a
+    /// fresh id the client's ack quotes back (R78 decisions 12 and 39).
+    ///
+    /// Anonymous sessions hear nothing, a frame the transport drops leaves
+    /// its rows standing for the next handshake, and a row that will not
+    /// render is warned and left standing.
+    async fn send_courier_notices<T: Transport>(
+        &self,
+        transport: &mut T,
+        state: &mut SessionState<Id, Key>,
+    ) {
+        let Some(identity) = state.principal.identity() else {
+            return;
+        };
+        let rows = match self.target.courier_notices(&identity.user_id).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    error = err.detail(),
+                    "the courier notices could not be read, they stand for the next handshake"
+                );
+                return;
+            }
+        };
+        let facts = crate::provisional::AskFacts {
+            frontier: 0,
+            retired: false,
+            abandoned: false,
+        };
+        for frame in rows.chunks(connetto_core::exchange::MAX_MANIFEST_ROWS) {
+            let mut notices = Vec::with_capacity(frame.len());
+            let mut ids = Vec::with_capacity(frame.len());
+            for (id, courier, key, seq, outcome) in frame {
+                let Ok(key) = <[u8; 32]>::try_from(key.as_slice()) else {
+                    tracing::warn!(id, "a courier notice holds no device key, it stands");
+                    continue;
+                };
+                let Ok(seq) = u64::try_from(*seq) else {
+                    tracing::warn!(id, "a courier notice holds no sequence, it stands");
+                    continue;
+                };
+                let Ok(outcome) = SettledOutcome::from_json(outcome.as_bytes()) else {
+                    tracing::warn!(id, "a courier notice holds no stored outcome, it stands");
+                    continue;
+                };
+                notices.push(CourierNoticeRow {
+                    courier: format!("{courier}"),
+                    writer: WriterRef::Device(key),
+                    seq,
+                    verdict: crate::provisional::verdict_of(&facts, seq, Some(&outcome)),
+                });
+                ids.push(*id);
+            }
+            if notices.is_empty() {
+                continue;
+            }
+            let notice = CourierNotice {
+                notice_id: Uuid::new_v4().to_string(),
+                notices,
+            };
+            let notice_id = notice.notice_id.clone();
+            if transport
+                .send_control(ControlMessage::CourierNotice(notice))
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    notice_id = %notice_id,
+                    "a courier notice frame could not be sent, its rows stand"
+                );
+                break;
+            }
+            state.notices.insert(notice_id, ids);
+        }
+    }
+
     /// Close the revoked device's connection, push the new lists to every
     /// identified connection, and revoke the auth-store session.
     async fn after_revocation(
@@ -6736,9 +6886,41 @@ where
             ControlMessage::ProvisionalStatus(ask) => {
                 self.handle_provisional_status(transport, ask, state).await
             }
+            ControlMessage::CourierRange(range) => {
+                self.handle_courier_range(transport, range, state).await
+            }
+            ControlMessage::CourierNoticeAck(ack) => {
+                self.handle_courier_notice_ack(ack, state).await
+            }
             // Server-origin frames received from a client are ignored.
             _ => Ok(()),
         }
+    }
+
+    /// Delete the notice rows a frame of this connection carried, so the
+    /// author's next connection hears the rest, forgetting the frame either
+    /// way so a repeated ack of it deletes nothing (R78 decision 39).
+    ///
+    /// # Errors
+    ///
+    /// Absent. A delete that fails is warned, the rows stand for the next
+    /// handshake, and the connection keeps running.
+    async fn handle_courier_notice_ack(
+        &self,
+        ack: CourierNoticeAck,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let Some(ids) = state.notices.remove(&ack.notice_id) else {
+            return Ok(());
+        };
+        if let Err(err) = self.target.delete_courier_notices(ids).await {
+            tracing::warn!(
+                notice_id = %ack.notice_id,
+                error = err.detail(),
+                "a courier notice ack could not delete its rows, they stand"
+            );
+        }
+        Ok(())
     }
 
     /// Verify a device key's signature over this connection's bind nonce and
@@ -6989,28 +7171,10 @@ where
             .filter(|seq| **seq <= frontier)
             .copied()
             .min();
-        let mut records: HashMap<i64, SettledOutcome> = HashMap::new();
-        if let (Some(low), Some(writer)) = (low, writer) {
-            for (seq, settled) in self
-                .target
-                .settled_range(
-                    writer,
-                    i64::try_from(low).unwrap_or(0),
-                    i64::try_from(frontier).unwrap_or(i64::MAX),
-                )
-                .await
-                .map_err(|err| SessionError::WriteTarget(err.detail()))?
-            {
-                records.insert(
-                    seq,
-                    SettledOutcome::from_json(&settled.outcome).map_err(|err| {
-                        SessionError::Protocol(format!(
-                            "a settled record holds no outcome the table defines: {err}"
-                        ))
-                    })?,
-                );
-            }
-        }
+        let records = match (low, writer) {
+            (Some(low), Some(writer)) => self.settled_records(writer, low, frontier).await?,
+            _ => HashMap::new(),
+        };
         let facts = crate::provisional::AskFacts {
             frontier,
             retired,
@@ -7022,11 +7186,7 @@ where
             .map(|seq| {
                 (
                     *seq,
-                    crate::provisional::verdict_of(
-                        &facts,
-                        *seq,
-                        records.get(&i64::try_from(*seq).unwrap_or(i64::MAX)),
-                    ),
+                    crate::provisional::verdict_of(&facts, *seq, records.get(seq)),
                 )
             })
             .collect();
@@ -7199,40 +7359,283 @@ where
             .map_err(|err| SessionError::WriteTarget(err.detail()))
     }
 
-    /// Settle a range the courier carried from the author's device (R75),
-    /// with `major` the application schema major the delivering connection
-    /// declared, the capture major of every entry the range settles.
+    /// Open the courier range a connection sent (R78 decisions 1, 28 to 32),
+    /// refused `Disabled` when the deployment accepts none and `Uncertified`
+    /// on a connection that bound no device writer, answering at once when it
+    /// counts no bodies.
     ///
-    /// The author's signature verifies against the author's live enrolment
-    /// over the range's chain, whose head binds every entry's major and
-    /// provenance original, the entries continue the author's settled chain
-    /// from the writer's frontier, and each entry settles at the frontier
-    /// plus one, in order, under the author's identity, so an entry another
-    /// path settled is answered from the record and never applied twice. A
+    /// # Errors
+    ///
+    /// [`SessionError::Protocol`] when a range is already open, which ends
+    /// the connection, and as [`Self::courier_deliver`].
+    async fn handle_courier_range<T: Transport>(
+        &self,
+        transport: &mut T,
+        range: CourierRange,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        if state.courier.is_some() {
+            return courier_violation(transport, &CourierViolation::RangeOpen).await;
+        }
+        let CourierRange {
+            request_id,
+            author,
+            offer,
+            rows,
+            bodies,
+        } = range;
+        let certified = matches!(
+            state.writer,
+            Some(BoundWriter {
+                key: WriterKey::Device(_),
+                ..
+            })
+        );
+        let run = if !self.config.courier {
+            CourierRun::refused(request_id, rows, bodies, CourierRefusal::Disabled)
+        } else if !certified {
+            CourierRun::refused(request_id, rows, bodies, CourierRefusal::Uncertified)
+        } else {
+            // An anonymous session binds no device writer.
+            let identity = state
+                .principal
+                .identity()
+                .expect("a bound device writer implies an identity");
+            self.courier_open(
+                request_id,
+                crate::courier::CourierIdentity {
+                    user_id: identity.user_id.clone(),
+                    session: state.session_id,
+                },
+                KeyId::from_bytes(author),
+                state.schema_major,
+                &offer,
+                rows,
+                bodies,
+            )
+            .await?
+        };
+        if run.done() {
+            return answer_courier(transport, run).await;
+        }
+        state.courier = Some(run);
+        Ok(())
+    }
+
+    /// Take one body of the open courier range, settling it when the range
+    /// is settling and answering the range after its last counted body.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Protocol`] for a body the stream table counts a
+    /// protocol violation, which ends the connection, and as
+    /// [`Self::courier_deliver`].
+    async fn handle_courier_body<T: Transport>(
+        &self,
+        transport: &mut T,
+        body: CourierBody,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let Some(run) = state.courier.as_mut() else {
+            return courier_violation(transport, &CourierViolation::NoRange).await;
+        };
+        match run.admit(&body.request_id, body.seq) {
+            Err(violation) => return courier_violation(transport, &violation).await,
+            Ok(Admitted::Dropped) => {
+                // An unread body still drew on the courier's bytes.
+                let _ = self.guard.bytes().allow_courier_bytes(
+                    &crate::capability::meter_key(&state.principal, state.session_id),
+                    u64::try_from(body.changeset_zstd.len()).unwrap_or(u64::MAX),
+                );
+            }
+            Ok(Admitted::Row(mut slot)) => {
+                let Ok(changeset) = crate::materializer::decompress(&body.changeset_zstd) else {
+                    return courier_violation(transport, &CourierViolation::Envelope(body.seq))
+                        .await;
+                };
+                if let Err(violation) = slot.check_digest(&changeset) {
+                    return courier_violation(transport, &violation).await;
+                }
+                let len = u64::try_from(body.changeset_zstd.len()).unwrap_or(u64::MAX);
+                let draw = self.guard.bytes().allow_courier_bytes(
+                    &crate::capability::meter_key(&state.principal, state.session_id),
+                    len,
+                );
+                match draw {
+                    Err(wait) => {
+                        let oversized = self
+                            .guard
+                            .bytes()
+                            .courier_limit()
+                            .is_some_and(|limit| len > limit);
+                        slot.stop_at_next(if oversized {
+                            CourierEntryOutcome::NotCouriered
+                        } else {
+                            CourierEntryOutcome::Retry {
+                                retry_after_ms: retry_ms(wait),
+                            }
+                        });
+                    }
+                    Ok(()) => {
+                        self.courier_settle_row(slot, &changeset, &body.changeset_zstd)
+                            .await?;
+                    }
+                }
+            }
+        }
+        if run.done()
+            && let Some(run) = state.courier.take()
+        {
+            return answer_courier(transport, run).await;
+        }
+        Ok(())
+    }
+
+    /// Settle a range a courier carried for its author in process (R75, R78
+    /// decisions 2 to 4, 6, 8, 9, 13 to 15 and 28 to 32), with `major` the
+    /// schema major the delivering connection declared, the capture major of
+    /// every body the range settles. `courier` is the account and session the
+    /// range settles under, the `write_couriered` audit rows' session and the
+    /// notice rows' courier, and the driver meters nothing, since it holds
+    /// one range the process already admitted.
+    ///
+    /// `offer` is the author's stored [`SignedOffer`] in MessagePack, `rows`
+    /// the manifest rows the courier holds up to the offer's newest entry, in
+    /// sequence order, and `bodies` the bodies it holds of them, in the same
+    /// order. Each body is driven through the range as a connection's
+    /// `CourierBody` frame is, so the outcome is the one `CourierAnswer` a
+    /// connection would carry. The range is refused unsettled when it is
+    /// malformed, the author's enrolment is absent, revoked or past its
+    /// expiry plus `DEVICE_SKEW`, the author's account is banned, its writer
+    /// is retired, the offer's signature fails, the rows above the writer's
+    /// frontier do not start right after it, or they do not chain from the
+    /// writer's head to the offer's newest head. Rows at or below the
+    /// frontier are answered with the verdict their records give and touch
+    /// nothing. The rows above it settle in order under the author's
+    /// account, the bot list its certificate carries and no subjects, so an
+    /// entry another path settled is answered from the record and never
+    /// applied twice. The range stops at a row with no body, of another
+    /// major or with a number original, and at a row that settles nothing. A
     /// carried entry settles its provenance original the way the direct
     /// upload does.
     ///
     /// # Errors
     ///
-    /// [`SessionError::Protocol`] when no enrolment is installed, the store
-    /// does not answer, or the writer row does not stand.
+    /// [`SessionError::Protocol`] when a body names no row, comes out of
+    /// order or disagrees with its row's digest, the bodies a connection is
+    /// closed for, when no enrolment is installed, the store does not answer,
+    /// the writer row does not stand, or a provenance sequence is past its
+    /// original's frontier.
+    /// [`SessionError::BanList`] when the ban list cannot be read.
     /// [`SessionError::WriteTarget`] when the writer tables or the apply
     /// database fail.
-    ///
-    /// # Panics
-    ///
-    /// When one identity cannot settle one run, a guarantee `accept` upholds.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the author's signature verifies the whole range and each entry settles in order under its identity, so the range settles as one unit"
-    )]
     pub async fn courier_deliver(
         &self,
+        courier: crate::courier::CourierIdentity<Id>,
         author: KeyId,
         major: Option<Major>,
-        entries: &[CourierEntry],
-        signature: &[u8],
-    ) -> Result<CourierDelivery, SessionError> {
+        offer: &[u8],
+        rows: &[ManifestRow],
+        bodies: &[CourierEntry],
+    ) -> Result<CourierOutcome, SessionError> {
+        let count = u32::try_from(bodies.len()).unwrap_or(u32::MAX);
+        let mut run = self
+            .courier_open(
+                String::new(),
+                courier,
+                author,
+                major,
+                offer,
+                rows.to_vec(),
+                count,
+            )
+            .await?;
+        // In process nothing is on a wire to drain past a refusal.
+        if let Some(refusal) = run.refusal() {
+            return Ok(CourierOutcome::Refused(refusal));
+        }
+        for body in bodies {
+            let violation = |err: CourierViolation| SessionError::Protocol(err.to_string());
+            if let Admitted::Row(slot) = run.admit("", body.seq).map_err(violation)? {
+                slot.check_digest(&body.changeset).map_err(violation)?;
+                let payload = compress(&body.changeset).map_err(|err| {
+                    SessionError::Protocol(format!("the changeset will not compress, {err}"))
+                })?;
+                self.courier_settle_row(slot, &body.changeset, &payload)
+                    .await?;
+            }
+        }
+        Ok(run.finish().1)
+    }
+
+    /// Open a courier range on R78's checks, its rows at or below the
+    /// writer's frontier answered with the verdict their records give.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::courier_deliver`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the wire frame and the in-process caller both hold the range's fields flat"
+    )]
+    async fn courier_open(
+        &self,
+        request_id: String,
+        courier: crate::courier::CourierIdentity<Id>,
+        author: KeyId,
+        major: Option<Major>,
+        offer: &[u8],
+        rows: Vec<ManifestRow>,
+        bodies: u32,
+    ) -> Result<CourierRun<Id, Key>, SessionError> {
+        let author = match self.courier_checks(author, offer, &rows, bodies).await? {
+            Ok(author) => author,
+            Err(refusal) => return Ok(CourierRun::refused(request_id, rows, bodies, refusal)),
+        };
+        let next = rows.partition_point(|row| row.seq <= author.frontier);
+        let mut answers = Vec::with_capacity(rows.len());
+        if let (Some(first), Some(writer)) = (rows.first().filter(|_| next > 0), author.writer) {
+            let records = self
+                .settled_records(writer, first.seq, author.frontier)
+                .await?;
+            let facts = author.facts();
+            answers.extend(rows[..next].iter().map(|row| {
+                (
+                    row.seq,
+                    CourierEntryOutcome::Ruled(crate::provisional::verdict_of(
+                        &facts,
+                        row.seq,
+                        records.get(&row.seq),
+                    )),
+                )
+            }));
+        }
+        let previous = author.head;
+        Ok(CourierRun::settling(
+            request_id,
+            rows,
+            bodies,
+            answers,
+            Settling::new(author, courier, major, next, previous),
+        ))
+    }
+
+    /// R78's checks of one courier range in their order, the first that
+    /// fails naming the refusal, else the author's standing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::courier_deliver`].
+    async fn courier_checks(
+        &self,
+        author: KeyId,
+        offer: &[u8],
+        rows: &[ManifestRow],
+        bodies: u32,
+    ) -> Result<Result<CourierAuthor<Id>, CourierRefusal>, SessionError> {
+        let Some(signed) = crate::courier::well_formed(offer, rows, bodies) else {
+            return Ok(Err(CourierRefusal::Malformed));
+        };
         let enrolment = self
             .device_enrolment
             .get()
@@ -7241,127 +7644,266 @@ where
             .key_record(None, author)
             .await
             .map_err(|_| SessionError::Protocol("the enrolment store did not answer".into()))?
+            .filter(|record| !record.revoked && record.certificate_live_past_skew)
         else {
-            return Ok(CourierDelivery::Refused(CourierRefusal::NotEnrolled));
+            return Ok(Err(CourierRefusal::NotEnrolled));
         };
-        if record.revoked || !record.certificate_live {
-            return Ok(CourierDelivery::Refused(CourierRefusal::NotEnrolled));
+        if self
+            .guard
+            .banned(&record.user)
+            .await
+            .map_err(|err| SessionError::BanList(err.detail().to_owned()))?
+            .is_some()
+        {
+            return Ok(Err(CourierRefusal::AuthorBanned));
         }
         let key: Vec<u8> = author.as_bytes().to_vec();
-        let writer_row = match self
+        let writer_row = self
             .target
             .writer_by_key(&key)
             .await
-            .map_err(|err| SessionError::WriteTarget(err.detail()))?
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        if writer_row
+            .as_ref()
+            .is_some_and(|row| row.retired_at.is_some())
         {
-            Some(row) if row.retired_at.is_some() => {
-                return Ok(CourierDelivery::Refused(CourierRefusal::WriterRetired));
-            }
-            Some(row) => row,
-            // A live enrolment that never bound takes its row at frontier 0.
-            None => {
-                self.target
-                    .insert_device_writer(Some(record.user.clone()), &key)
-                    .await
-                    .map_err(|err| SessionError::WriteTarget(err.detail()))?;
-                self.target
-                    .writer_by_key(&key)
-                    .await
-                    .map_err(|err| SessionError::WriteTarget(err.detail()))?
-                    .ok_or_else(|| {
-                        SessionError::Protocol("the device writer row did not stand".into())
-                    })?
-            }
-        };
-        // The entries continue the author's settled chain.
-        let frontier = u64::try_from(writer_row.frontier).unwrap_or(0);
-        let head = writer_row.head.as_deref().map_or(GENESIS, |head| {
-            <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
-        });
-        let mut previous = head;
-        let mut hashes = Vec::with_capacity(entries.len());
-        let mut expected = frontier.saturating_add(1);
-        for entry in entries {
-            if entry.seq != expected {
-                return Ok(CourierDelivery::Refused(CourierRefusal::SequenceGap {
+            return Ok(Err(CourierRefusal::WriterRetired));
+        }
+        if !chain::verify_offer(&record.public_key, author.as_bytes(), &signed) {
+            return Ok(Err(CourierRefusal::Unverified));
+        }
+        let frontier = writer_row
+            .as_ref()
+            .map_or(0, |row| u64::try_from(row.frontier).unwrap_or(0));
+        let head = writer_row
+            .as_ref()
+            .and_then(|row| row.head.as_deref())
+            .map_or(GENESIS, |head| {
+                <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
+            });
+        let unsettled = &rows[rows.partition_point(|row| row.seq <= frontier)..];
+        if let Some(first) = unsettled.first() {
+            let expected = frontier.saturating_add(1);
+            if first.seq != expected {
+                return Ok(Err(CourierRefusal::SequenceGap {
                     expected,
-                    got: entry.seq,
+                    got: first.seq,
                 }));
             }
-            let hash = chain::entry_hash(
-                &previous,
-                entry.seq,
-                major,
-                entry.provenance.map(Origin::from),
-                &entry.changeset,
-            );
-            previous = hash;
-            expected = entry.seq.saturating_add(1);
-            hashes.push(hash);
-        }
-        // The author vouches the range's chain up to its last entry, or its
-        // own head when the range carries none.
-        let (vouch_seq, vouch_head) = match entries.last() {
-            Some(last) => (last.seq, previous),
-            None => (frontier, head),
-        };
-        if !chain::verify_range(
-            &record.public_key,
-            author.as_bytes(),
-            vouch_seq,
-            &vouch_head,
-            signature,
-        ) {
-            return Ok(CourierDelivery::Refused(CourierRefusal::NotEnrolled));
-        }
-        // The author's identity every entry applies under.
-        let session = SessionId::from_uuid(Uuid::new_v4());
-        let session_uuid = *session.as_uuid();
-        let mut author_principal = Principal::unidentified(session);
-        author_principal
-            .accept(Subject::Identity(VerifiedSession {
-                context: AuthContext::new(record.user),
-                session_id: session,
-                bot_list: None,
-            }))
-            .expect("one identity settles one run");
-        let author: Arc<Principal<Id, Key>> = Arc::new(author_principal);
-        let mut outcomes: Vec<SettledOutcome> = Vec::with_capacity(entries.len());
-        let mut previous = head;
-        for (entry, hash) in entries.iter().zip(hashes.iter()) {
-            let outcome = self
-                .courier_entry(
-                    &author,
-                    session_uuid,
-                    major,
-                    writer_row.writer,
-                    entry,
-                    *hash,
-                    previous,
-                )
-                .await?;
-            previous = *hash;
-            // A refusal stops the range.
-            let stops = matches!(outcome, SettledOutcome::Rejected(_));
-            outcomes.push(outcome);
-            if stops {
-                break;
+            // The rows above the frontier run to the signed newest entry and
+            // continue the writer's own head to its hash.
+            let reached = signed.offer.newest.as_ref().is_some_and(|newest| {
+                unsettled.last().is_some_and(|last| last.seq == newest.seq)
+                    && chain::chain_walk(
+                        &head,
+                        unsettled
+                            .iter()
+                            .map(|row| (row.seq, Some(row.major), row.origin, row.digest)),
+                    ) == newest.head
+            });
+            if !reached {
+                return Ok(Err(CourierRefusal::Unverified));
             }
         }
-        Ok(CourierDelivery::Entries(outcomes))
+        Ok(Ok(CourierAuthor {
+            user: record.user,
+            bot_list: record.bot_list,
+            key,
+            writer: writer_row.map(|row| row.writer),
+            frontier,
+            head,
+        }))
     }
 
-    /// Settle one courier entry at the frontier as [`SettlePath::Courier`].
+    /// Settle the body `slot` admitted, already checked against its row's
+    /// digest, as the stream table says: a row at or below the frontier is
+    /// consumed, the next row above it settles, and a later row stops the
+    /// range at the one skipped.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::courier_deliver`].
+    ///
+    /// # Panics
+    ///
+    /// When one identity cannot settle one run, a guarantee `accept` upholds.
+    async fn courier_settle_row(
+        &self,
+        mut slot: Slot<'_, Id, Key>,
+        changeset: &[u8],
+        payload: &[u8],
+    ) -> Result<(), SessionError> {
+        let next = slot.settling.next;
+        if slot.index < next {
+            return Ok(());
+        }
+        let row = &slot.rows[next];
+        let number_original = row
+            .origin
+            .is_some_and(|origin| matches!(origin.writer, WriterRef::Number(_)));
+        if slot.index > next || slot.settling.major != Some(row.major) || number_original {
+            slot.answer(next, CourierEntryOutcome::NotCouriered, true);
+            return Ok(());
+        }
+        let courier = crate::write_target::CourierSettle {
+            user_id: slot.settling.courier.user_id.clone(),
+            session: slot.settling.courier.session,
+            author: slot.settling.author.user.clone(),
+            device_key: slot.settling.author.key.clone(),
+        };
+        let settling = &mut *slot.settling;
+        let applier = match settling.applier.take() {
+            Some(applier) => applier,
+            None => self.courier_applier(&settling.author).await?,
+        };
+        let previous = settling.previous;
+        let hash = chain::chain_walk(
+            &previous,
+            [(row.seq, Some(row.major), row.origin, row.digest)],
+        );
+        let outcome = self
+            .courier_entry(
+                &applier.principal,
+                applier.session,
+                settling.major,
+                applier.writer,
+                row,
+                changeset,
+                payload,
+                hash,
+                previous,
+                courier,
+            )
+            .await?;
+        let seq = row.seq;
+        let facts = settling.author.facts();
+        settling.applier = Some(applier);
+        settling.previous = hash;
+        settling.next = next + 1;
+        match outcome {
+            // Settles nothing, so the range is offered again from here.
+            SettledOutcome::Rejected(MutationRejectReason::Indeterminate) => {
+                slot.answer(next, CourierEntryOutcome::Retry { retry_after_ms: 0 }, true);
+            }
+            outcome => {
+                // Another entry stands at the sequence, so the rest of the
+                // range no longer continues the server's chain.
+                let forked = matches!(
+                    outcome,
+                    SettledOutcome::Rejected(MutationRejectReason::Forked)
+                );
+                let verdict = crate::provisional::verdict_of(&facts, seq, Some(&outcome));
+                slot.answer(next, CourierEntryOutcome::Ruled(verdict), forked);
+            }
+        }
+        Ok(())
+    }
+
+    /// The writer a range's entries settle on and the author's identity
+    /// they apply under, made when the first body applies.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::courier_writer`].
+    ///
+    /// # Panics
+    ///
+    /// When one identity cannot settle one run, a guarantee `accept` upholds.
+    async fn courier_applier(
+        &self,
+        author: &CourierAuthor<Id>,
+    ) -> Result<Applier<Id, Key>, SessionError> {
+        let writer = match author.writer {
+            Some(writer) => writer,
+            // A live enrolment that never bound takes its row at frontier 0.
+            None => self.courier_writer(author).await?,
+        };
+        let session = SessionId::from_uuid(Uuid::new_v4());
+        let mut principal = Principal::unidentified(session);
+        principal
+            .accept(Subject::Identity(VerifiedSession {
+                context: AuthContext::new(author.user.clone()),
+                session_id: session,
+                bot_list: crate::courier::author_bot_list(author.bot_list.as_deref()),
+            }))
+            .expect("one identity settles one run");
+        Ok(Applier {
+            writer,
+            principal: Arc::new(principal),
+            session: *session.as_uuid(),
+        })
+    }
+
+    /// The writer row a courier range creates for an author whose live
+    /// enrolment never bound, at frontier 0.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::WriteTarget`] when the writer tables fail,
+    /// [`SessionError::Protocol`] when the row does not stand.
+    async fn courier_writer(&self, author: &CourierAuthor<Id>) -> Result<i64, SessionError> {
+        self.target
+            .insert_device_writer(Some(author.user.clone()), &author.key)
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        self.target
+            .writer_by_key(&author.key)
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?
+            .map(|row| row.writer)
+            .ok_or_else(|| SessionError::Protocol("the device writer row did not stand".into()))
+    }
+
+    /// The settled records of `writer` from `low` through `frontier`, by
+    /// sequence, the one read a provisional ask and a courier range's
+    /// settled prefix take (R77 decision 11).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::WriteTarget`] when the writer tables fail,
+    /// [`SessionError::Protocol`] when a record holds no outcome the table
+    /// defines.
+    async fn settled_records(
+        &self,
+        writer: i64,
+        low: u64,
+        frontier: u64,
+    ) -> Result<HashMap<u64, SettledOutcome>, SessionError> {
+        let mut records = HashMap::new();
+        for (seq, settled) in self
+            .target
+            .settled_range(
+                writer,
+                i64::try_from(low).unwrap_or(i64::MAX),
+                i64::try_from(frontier).unwrap_or(i64::MAX),
+            )
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?
+        {
+            records.insert(
+                u64::try_from(seq).unwrap_or(0),
+                SettledOutcome::from_json(&settled.outcome).map_err(|err| {
+                    SessionError::Protocol(format!(
+                        "a settled record holds no outcome the table defines: {err}"
+                    ))
+                })?,
+            );
+        }
+        Ok(records)
+    }
+
+    /// Settle one courier row at the frontier as [`SettlePath::Courier`],
+    /// `changeset` its body and `payload` the same body compressed.
     ///
     /// # Errors
     ///
     /// [`SessionError::WriteTarget`] when the apply database or the writer
     /// tables fail.
-    /// [`SessionError::Protocol`] when the changeset will not compress, or
-    /// the provenance sequence is past the original's frontier.
+    /// [`SessionError::Protocol`] when the provenance sequence is past the
+    /// original's frontier.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the author, its declared major and the entry's hash and predecessor are the range's per-entry identity, and the range hands each over as it settles"
+        reason = "the author, its declared major and the entry's row, body, hash and predecessor are the range's per-entry identity, and the range hands each over as it settles"
     )]
     async fn courier_entry(
         &self,
@@ -7369,29 +7911,36 @@ where
         session_id: uuid::Uuid,
         major: Option<Major>,
         writer: i64,
-        entry: &CourierEntry,
+        row: &ManifestRow,
+        changeset: &[u8],
+        payload: &[u8],
         entry_hash: [u8; 32],
         previous_hash: [u8; 32],
+        courier: crate::write_target::CourierSettle<Id>,
     ) -> Result<SettledOutcome, SessionError> {
-        let changeset = entry.changeset.as_slice();
         let mut settle = SettleSpec {
             writer,
-            seq: entry.seq,
+            seq: row.seq,
             entry_hash,
             previous_hash,
             path: SettlePath::Courier,
             original: None,
+            courier: Some(courier),
         };
         if let Some(outcome) = self
-            .courier_original(author, session_id, major, entry, &mut settle)
+            .courier_original(
+                author,
+                session_id,
+                major,
+                row.origin,
+                changeset,
+                &mut settle,
+            )
             .await?
         {
             return Ok(outcome);
         }
-        let payload = compress(changeset).map_err(|err| {
-            SessionError::Protocol(format!("the changeset will not compress, {err}"))
-        })?;
-        let plan = match self.materializer.lock().await.plan_write(&payload) {
+        let plan = match self.materializer.lock().await.plan_write(payload) {
             Ok(plan) => plan,
             Err(err) => {
                 return self
@@ -7415,23 +7964,30 @@ where
             }
         }
         let outcome = self
-            .commit_with_retry(author, &plan, &payload, &settle)
+            .commit_with_retry(author, &plan, payload, &settle)
             .await;
         match outcome {
-            Ok(WriteOutcome::Applied) => Ok(SettledOutcome::Applied),
+            Ok(WriteOutcome::Applied) => {
+                self.record_couriered(&settle, true);
+                Ok(SettledOutcome::Applied)
+            }
             Ok(WriteOutcome::Conflict {
                 table,
                 version_column,
                 pk_columns,
                 pk_values,
                 ..
-            }) => Ok(SettledOutcome::Conflict {
-                table,
-                version_column,
-                pk_columns,
-                pk_values,
-            }),
+            }) => {
+                self.record_couriered(&settle, true);
+                Ok(SettledOutcome::Conflict {
+                    table,
+                    version_column,
+                    pk_columns,
+                    pk_values,
+                })
+            }
             Ok(WriteOutcome::Settled(settlement)) => {
+                self.record_couriered(&settle, settlement.fresh);
                 self.recorded_outcome(author, &settle, &settlement)
             }
             Err(WriteError::Unauthorized) => {
@@ -7463,14 +8019,21 @@ where
         author: &Arc<Principal<Id, Key>>,
         session_id: uuid::Uuid,
         major: Option<Major>,
-        entry: &CourierEntry,
-        settle: &mut SettleSpec,
+        origin: Option<Origin>,
+        changeset: &[u8],
+        settle: &mut SettleSpec<Id>,
     ) -> Result<Option<SettledOutcome>, SessionError> {
-        let Some(provenance) = entry.provenance else {
+        // A courier never holds a number's secret, so only a device original
+        // reaches here and it names its writer alone.
+        let Some(provenance) = origin.map(|origin| Provenance {
+            writer: origin.writer,
+            seq: origin.seq,
+            secret: None,
+        }) else {
             return Ok(None);
         };
         match self
-            .provenance_original(&provenance, major, &entry.changeset, author, session_id)
+            .provenance_original(&provenance, major, changeset, author, session_id)
             .await?
         {
             Some((writer, frontier, _, _)) if provenance.seq <= frontier => {
@@ -7482,15 +8045,22 @@ where
                 let outcome = match stored {
                     // A pruned record stands applied.
                     None => SettledOutcome::Applied,
-                    Some(row) => {
-                        self.recorded_outcome(author, settle, &Settlement { row, forked: false })?
-                    }
+                    Some(row) => self.recorded_outcome(
+                        author,
+                        settle,
+                        &Settlement {
+                            row,
+                            forked: false,
+                            fresh: false,
+                        },
+                    )?,
                 };
                 let settlement = self
                     .target
                     .settle_refusal(settle, &outcome)
                     .await
                     .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+                self.record_couriered(settle, settlement.fresh);
                 self.recorded_outcome(author, settle, &settlement).map(Some)
             }
             Some((writer, frontier, hash, previous)) if provenance.seq == frontier + 1 => {
@@ -7514,7 +8084,7 @@ where
     async fn courier_settle_refusal(
         &self,
         author: &Principal<Id, Key>,
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
         reason: MutationRejectReason,
     ) -> Result<SettledOutcome, SessionError> {
         let settlement = self
@@ -7522,6 +8092,7 @@ where
             .settle_refusal(settle, &SettledOutcome::Rejected(reason))
             .await
             .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        self.record_couriered(settle, settlement.fresh);
         self.recorded_outcome(author, settle, &settlement)
     }
 
@@ -7773,6 +8344,7 @@ where
                 previous_hash: previous,
                 path: SettlePath::Direct,
                 original: None,
+                courier: None,
             };
             return self
                 .settle_and_refuse(
@@ -8043,6 +8615,7 @@ where
             previous_hash: previous,
             path: SettlePath::Direct,
             original: None,
+            courier: None,
         };
         // A provenance entry the original already settled settles this copy
         // with the stored outcome, so the logical write applies once.
@@ -8263,10 +8836,33 @@ where
         Ok(Some((row.writer, frontier, entry_hash, previous)))
     }
 
+    /// The one `write_couriered` row of a couriered entry this range settled,
+    /// absent when the range carries no courier or the sequence stood settled
+    /// already.
+    fn record_couriered(&self, settle: &SettleSpec<Id>, fresh: bool) {
+        let Some(courier) = settle.courier.as_ref().filter(|_| fresh) else {
+            return;
+        };
+        self.guard.record(
+            AuthEvent::new(
+                courier.session,
+                Some(courier.author.clone()),
+                AuthOp::WriteCouriered,
+            )
+            .about_write(
+                settle.writer,
+                i64::try_from(settle.seq).unwrap_or(i64::MAX),
+                SettlePath::Courier,
+                SettlePath::Courier,
+            )
+            .about_courier(courier.user_id.clone()),
+        );
+    }
+
     fn recorded_outcome(
         &self,
         caller: &Principal<Id, Key>,
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
         settlement: &Settlement,
     ) -> Result<SettledOutcome, SessionError> {
         let row = &settlement.row;
@@ -8304,7 +8900,7 @@ where
         transport: &mut T,
         outcome: Result<WriteOutcome, WriteError>,
         seq: u64,
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
         match outcome {
@@ -8366,7 +8962,7 @@ where
     async fn settle_and_refuse<T: Transport>(
         &self,
         transport: &mut T,
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
         reason: MutationRejectReason,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
@@ -8380,7 +8976,7 @@ where
     async fn settle_prior_refusal<T: Transport>(
         &self,
         transport: &mut T,
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
         refused: &PriorRefusal,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
@@ -8401,7 +8997,7 @@ where
     async fn settle_refused<T: Transport>(
         &self,
         transport: &mut T,
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
         outcome: &SettledOutcome,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
@@ -8429,7 +9025,7 @@ where
         caller: &Principal<Id, Key>,
         plan: &crate::materializer::WritePlan,
         payload_zstd: &[u8],
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
     ) -> Result<WriteOutcome, WriteError> {
         let policy =
             RetryPolicy::new().with_max_total_backoff(Some(self.config.write_retry_budget));

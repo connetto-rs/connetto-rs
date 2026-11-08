@@ -102,6 +102,7 @@ fn drain_server(
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: Some(version),
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: None,
             }))
@@ -475,6 +476,7 @@ async fn attach_held(conn: &mut ConnettoConnection<LoopbackTransport>) -> Loopba
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: Some(schema(1).version()),
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: None,
             }))

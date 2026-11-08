@@ -7,7 +7,7 @@ use std::sync::Arc;
 use jni::JNIEnv;
 use jni::objects::{GlobalRef, JValue};
 
-use crate::device_key::JavaAccess;
+use crate::device_key::{JavaAccess, exception_text};
 
 /// The tag the lock announces to the Wi-Fi manager.
 const LOCK_TAG: &str = "connetto-peer";
@@ -72,7 +72,8 @@ impl MulticastLock {
         let mut outcome = None;
         java.with_env(&mut |env| {
             let Some(body) = body.take() else { return };
-            outcome = Some(body(env).map_err(|err| exception_text(env, &err)));
+            outcome =
+                Some(body(env).map_err(|err| MulticastFailure::Java(exception_text(env, &err))));
         })
         .map_err(|err| MulticastFailure::NoVm(err.to_string()))?;
         let lock = outcome.unwrap_or_else(|| Err(MulticastFailure::RanNothing))?;
@@ -91,18 +92,4 @@ impl Drop for MulticastLock {
     fn drop(&mut self) {
         self.release();
     }
-}
-
-/// The pending Java exception's text, cleared, else the JNI error's.
-fn exception_text(env: &mut JNIEnv, err: &jni::errors::Error) -> MulticastFailure {
-    let pending = env.exception_occurred().ok().filter(|ex| !ex.is_null());
-    let _ = env.exception_clear();
-    let text = pending
-        .and_then(|ex| {
-            env.call_method(&ex, "toString", "()Ljava/lang/String;", &[])
-                .ok()
-        })
-        .and_then(|value| value.l().ok())
-        .and_then(|text| env.get_string(&text.into()).ok().map(String::from));
-    MulticastFailure::Java(text.unwrap_or_else(|| err.to_string()))
 }

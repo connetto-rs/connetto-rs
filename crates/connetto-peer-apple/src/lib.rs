@@ -29,47 +29,6 @@ pub enum Error {
     Unsupported,
 }
 
-/// The device's role in the system's interface families (R76).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Idiom {
-    /// A phone.
-    Phone,
-    /// A pad.
-    Pad,
-    /// Neither, including every non-Apple target.
-    Other,
-}
-
-/// The device's user-set name, or `None` for the platform's generic answer.
-///
-/// iOS answers the user's name only under the
-/// `com.apple.developer.device-information.user-assigned-device-name` entitlement,
-/// and answers its generic model name without it, which this reads as `None`
-/// (R76 decision 17). macOS answers the hostname the user sets for the Mac.
-pub fn device_name() -> Option<String> {
-    crate::platform::device::device_name()
-}
-
-/// The device's interface idiom.
-///
-/// A Wi-Fi pad's Personal Hotspot cannot be turned on from an app, so the
-/// client's hotspot backend reads this to answer a typed refusal for a
-/// personal host on anything but a phone (R76 decision 27). The Mac answers
-/// `Other` and never hosts (R76 decision 1).
-pub fn device_idiom() -> Idiom {
-    crate::platform::device::device_idiom()
-}
-
-/// The names the platform answers for a device it does not name.
-#[cfg_attr(
-    not(any(target_os = "ios", test)),
-    expect(
-        dead_code,
-        reason = "the iOS platform and the tests read these, a host build without tests uses neither"
-    )
-)]
-const GENERIC_NAMES: [&str; 3] = ["iPhone", "iPad", "iPod"];
-
 /// The domain the system's join answers in.
 #[cfg_attr(
     not(any(target_os = "ios", test)),
@@ -91,19 +50,6 @@ pub(crate) const HOTSPOT_JOIN_DOMAIN: &str = "NEHotspotConfigurationErrorDomain"
 )]
 pub(crate) const HOTSPOT_ALREADY_ASSOCIATED: isize = 13;
 
-/// Whether the platform's name answer stands generic, so [`device_name`]
-/// reads `None` (R76 decision 17).
-#[cfg_attr(
-    not(any(target_os = "ios", test)),
-    expect(
-        dead_code,
-        reason = "the iOS platform and the tests call this, a host build without tests uses neither"
-    )
-)]
-pub(crate) fn is_generic_name(name: &str) -> bool {
-    GENERIC_NAMES.contains(&name)
-}
-
 /// Whether the system's join error stands for a network the device already
 /// stands on, so the join's goal stands reached (R76).
 #[cfg_attr(
@@ -117,83 +63,9 @@ pub(crate) fn join_already_associated(domain: &str, code: isize) -> bool {
     domain == HOTSPOT_JOIN_DOMAIN && code == HOTSPOT_ALREADY_ASSOCIATED
 }
 
-/// One hex digit's value, sixteen standing for invalid.
-#[cfg_attr(
-    not(any(target_os = "ios", target_os = "macos", test)),
-    expect(
-        dead_code,
-        reason = "the iOS platform and the tests call this, a host build without tests uses neither"
-    )
-)]
-pub(crate) fn nibble(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => 16,
-    }
-}
-
-/// The first eight bytes of a canonical UUID text, big-endian, the device
-/// key the exchange stands on (R76).
-#[cfg_attr(
-    not(any(target_os = "ios", target_os = "macos", test)),
-    expect(
-        dead_code,
-        reason = "the iOS platform and the tests call this, a host build without tests uses neither"
-    )
-)]
-pub(crate) fn key_from_uuid_text(text: &str) -> Option<u64> {
-    let bytes = text.as_bytes();
-    if bytes.len() != 36
-        || bytes[8] != b'-'
-        || bytes[13] != b'-'
-        || bytes[18] != b'-'
-        || bytes[23] != b'-'
-    {
-        return None;
-    }
-    let starts = [0, 2, 4, 6, 9, 11, 14, 16];
-    let mut out = [0u8; 8];
-    for (pair, position) in out.iter_mut().zip(starts) {
-        let hi = nibble(bytes[position]);
-        let lo = nibble(bytes[position + 1]);
-        if hi == 16 || lo == 16 {
-            return None;
-        }
-        *pair = hi * 16 + lo;
-    }
-    Some(u64::from_be_bytes(out))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        HOTSPOT_JOIN_DOMAIN, is_generic_name, join_already_associated, key_from_uuid_text,
-    };
-
-    #[test]
-    fn the_device_key_takes_the_uuids_first_half_big_endian() {
-        let text = "a9952637-85d5-4071-9ed8-c28bd7ba670c";
-        assert_eq!(key_from_uuid_text(text), Some(0xa995_2637_85d5_4071));
-    }
-
-    #[test]
-    fn the_device_key_rejects_short_and_non_hex_text() {
-        assert_eq!(key_from_uuid_text("a995"), None);
-        assert_eq!(
-            key_from_uuid_text("z9952637-85d5-4071-9ed8-c28bd7ba670c"),
-            None
-        );
-    }
-
-    #[test]
-    fn the_platforms_generic_names_stand_generic() {
-        assert!(is_generic_name("iPhone"));
-        assert!(is_generic_name("iPad"));
-        assert!(!is_generic_name("Luca's iPhone"));
-        assert!(!is_generic_name(""));
-    }
+    use super::{HOTSPOT_JOIN_DOMAIN, join_already_associated};
 
     #[test]
     fn the_join_domain_stands_already_associated_only_there() {
@@ -205,141 +77,23 @@ mod tests {
     }
 }
 
-/// The host's Bluetooth, the GATT service the peer exchange runs over and
-/// the beacon advertisement that points to it (R76).
+/// The app's Bluetooth permission, read with no manager, so reading it asks
+/// the user nothing (R77 decision 23).
 pub mod bluetooth {
-    /// The radio's standing, as the platform reports it (R76 decision 21).
+    /// The app's Bluetooth authorization, as the platform answers it.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum State {
-        /// The radio is on and the app may use it.
-        Ready,
-        /// The radio is off, or its standing is not settled yet.
-        Off,
-        /// The app may not use the radio.
-        NotPermitted,
-        /// The platform has no such radio.
-        Unsupported,
+    pub enum Authorization {
+        /// The user has not been asked yet.
+        NotDetermined,
+        /// The user or a policy refused it, or the target has no Bluetooth.
+        Denied,
+        /// The app may use Bluetooth.
+        Allowed,
     }
 
-    /// How a prompt action ended, once it settled.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum PromptOutcome {
-        /// The standing was already the call's, so nothing was asked.
-        NotAsked,
-        /// The platform asked, and the user declined.
-        Declined,
-    }
-
-    /// An event the host's GATT service reports (R76).
-    #[derive(Clone, Debug)]
-    pub enum Event {
-        /// A central subscribed to the outbox, `mtu` its frame length.
-        Connected {
-            /// The central's key, the first eight bytes of its identifier.
-            device: u64,
-            /// The central's frame length.
-            mtu: u16,
-        },
-        /// A central wrote to the inbox.
-        Chunk {
-            /// The central's key.
-            device: u64,
-            /// What the central wrote.
-            bytes: Vec<u8>,
-        },
-        /// A central's subscription ended.
-        Disconnected {
-            /// The central's key.
-            device: u64,
-        },
-        /// The platform's frameworks failed at the service's work.
-        Failed(String),
-    }
-
-    /// The radio's standing (R76 decision 21).
-    ///
-    /// Before a manager exists the app's Bluetooth authorization answers,
-    /// `NotPermitted` until the user allowed the app, since creating the
-    /// manager is the platform's strongest action and asks for that access.
-    /// An app already allowed creates its manager without the power alert
-    /// and reads `Off` until the radio's standing arrives.
-    pub fn state() -> State {
-        crate::platform::peripheral::state()
-    }
-
-    /// Run the platform's strongest action once (R76 decision 21).
-    ///
-    /// On Apple the action creates the manager with its power alert where
-    /// that stands to show, and recreates the manager when the radio is off
-    /// to show it again.
-    ///
-    /// # Errors
-    ///
-    /// A framework error where the platform answers one.
-    pub fn prompt() -> Result<(), crate::Error> {
-        crate::platform::peripheral::prompt()
-    }
-
-    /// The last [`prompt`]'s outcome, once it settles.
-    ///
-    /// It answers `Some` once the standing is terminal for the prompt, and
-    /// `None` while the platform's alert may still be on screen, since the
-    /// platform reports no decline for its power alert and the caller's
-    /// bound ends a prompt that never settles.
-    pub fn prompt_outcome() -> Option<PromptOutcome> {
-        crate::platform::peripheral::prompt_outcome()
-    }
-
-    /// Open the GATT service and begin its beacon advertisement (R76).
-    ///
-    /// The advertisement carries the service's UUID alone (R76 decision 25),
-    /// and the service's add and the advertisement's start settle on the
-    /// platform's own queue, so this answer may stand before the
-    /// advertisement is live. On the Mac the service stands refused, since
-    /// the Mac never hosts (R76 decision 1).
-    ///
-    /// # Errors
-    ///
-    /// A framework error where the platform answers one, or its queue not
-    /// answering within its bound.
-    pub fn start() -> Result<(), crate::Error> {
-        crate::platform::peripheral::start()
-    }
-
-    /// Stop the advertisement and close the service (R76).
-    ///
-    /// # Errors
-    ///
-    /// A framework error where the platform answers one, or its queue not
-    /// answering within its bound.
-    pub fn stop() -> Result<(), crate::Error> {
-        crate::platform::peripheral::stop()
-    }
-
-    /// Take the events the service has reported since the last call.
-    pub fn poll() -> Vec<Event> {
-        crate::platform::peripheral::poll()
-    }
-
-    /// Send one outbox notification to a subscribed central.
-    ///
-    /// A frame the platform cannot take yet is held, and sent when the
-    /// platform says it is ready, so back-pressure drops no frame.
-    ///
-    /// # Errors
-    ///
-    /// A framework error where the platform answers one, or its queue not
-    /// answering within its bound.
-    pub fn notify(device: u64, bytes: &[u8]) -> Result<(), crate::Error> {
-        crate::platform::peripheral::notify(device, bytes)
-    }
-
-    /// Close the central's connection.
-    ///
-    /// The platform's peripheral role cannot cancel a central's connection
-    /// (R76), so this stands ready and records nothing.
-    pub fn disconnect(device: u64) {
-        crate::platform::peripheral::disconnect(device);
+    /// The app's authorization, `CBManager.authorization` on Apple.
+    pub fn authorization() -> Authorization {
+        crate::platform::bluetooth::authorization()
     }
 }
 
@@ -406,7 +160,7 @@ pub mod hotspot {
         crate::platform::hotspot::leave(ssid)
     }
 
-    /// What a joined network stands at (R76 decision 26).
+    /// What a joined network stands at (R76).
     ///
     /// It answers `Some` once the device's interface carries the joined
     /// network's address, and its gateway is `None` while the system reports

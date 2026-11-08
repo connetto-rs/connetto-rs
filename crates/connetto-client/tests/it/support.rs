@@ -427,6 +427,7 @@ pub fn handshake_ack() -> IncomingFrame {
             current_cursor: connetto_core::Cursor::from(Vec::new()),
             schema_version: None,
             sunset_at_secs: None,
+            courier: false,
             initial_credits: 64,
             writer: Some(connetto_core::messages::WriterGrant {
                 number: 1,
