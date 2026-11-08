@@ -2902,6 +2902,19 @@ async fn restart_with_the_owed_row_asks_the_retained_rows_again() {
     assert!(matches!(event, ClientEvent::Closed));
 }
 
+/// A session that finds the ask owed but no retained row left to ask answers the owed row at once (R78 decision 49).
+#[tokio::test]
+async fn an_owed_ask_with_no_retained_row_left_clears_at_session_start() {
+    let mut conn = replica();
+    peer::owe_retained_ask(&mut conn.db).expect("owe the ask");
+    let (mut conn, server) = attach(conn, true).await;
+    assert!(
+        !peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
+        "nothing stands to ask, so the owed row goes"
+    );
+    drop(server);
+}
+
 /// A push ruling a retained row the resync's ask answered Pending ends its candidacy with the row still retained and the candidates restated (R78 decisions 45 and 46).
 #[tokio::test]
 async fn push_ending_marked_retained_rows_keeps_them_retained() {
