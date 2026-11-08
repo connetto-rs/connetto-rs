@@ -24,6 +24,20 @@ pub(crate) const PEER_ENTRY_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_pe
       digest BLOB NOT NULL, changeset BLOB, account TEXT NOT NULL, bot_list TEXT, \
       received_at INTEGER NOT NULL, position INTEGER NOT NULL, PRIMARY KEY (author, seq))";
 
+/// Creates the single row that stands while the resync's asks about the
+/// retained rows are owed (R78 decision 49).
+pub(crate) const RETAINED_ASK_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_retained_ask \
+     (id INTEGER PRIMARY KEY CHECK (id = 1))";
+
+diesel::table! {
+    /// The row that stands while the resync's asks about the retained rows
+    /// are owed (R78 decision 49).
+    _connetto_retained_ask (id) {
+        /// The row's only value.
+        id -> Integer,
+    }
+}
+
 diesel::table! {
     /// Every peer entry the receiver holds until a verdict takes it (R77,
     /// R78 decision 19).
@@ -341,8 +355,43 @@ pub(crate) fn unapplied(db: &mut SqliteConnection) -> Result<Vec<(Vec<u8>, i64)>
         .load(db)?)
 }
 
+/// Every retained entry, author and sequence, which a full resync's end
+/// asks about (R78 decision 49).
+pub(crate) fn retained_rows(db: &mut SqliteConnection) -> Result<Vec<(Vec<u8>, i64)>, ClientError> {
+    Ok(dsl::_connetto_peer_entry
+        .select((dsl::author, dsl::seq))
+        .filter(dsl::state.eq(HeldState::Retained.db()))
+        .load(db)?)
+}
+
+/// Whether the resync's asks about the retained rows still stand owed (R78
+/// decision 49).
+pub(crate) fn retained_ask_owed(db: &mut SqliteConnection) -> Result<bool, ClientError> {
+    Ok(diesel::select(diesel::dsl::exists(
+        _connetto_retained_ask::table.filter(_connetto_retained_ask::id.eq(1)),
+    ))
+    .get_result::<bool>(db)?)
+}
+
+/// Owe the resync's asks about the retained rows, from a full resync's end
+/// (R78 decision 49).
+pub(crate) fn owe_retained_ask(db: &mut SqliteConnection) -> Result<(), ClientError> {
+    diesel::insert_into(_connetto_retained_ask::table)
+        .values(_connetto_retained_ask::id.eq(1))
+        .execute(db)?;
+    Ok(())
+}
+
+/// Answer the owed retained asks, every ruling having landed (R78 decision
+/// 49).
+pub(crate) fn clear_retained_ask(db: &mut SqliteConnection) -> Result<(), ClientError> {
+    diesel::delete(_connetto_retained_ask::table).execute(db)?;
+    Ok(())
+}
+
 /// The author's held rows at or below a sequence, which the courier's range
-/// stands (R78 slice 4), sequence order, a retained row never among them.
+/// stands (R78 slice 4), sequence order, a retained row among them only while
+/// its mark stands.
 ///
 /// # Errors
 ///
@@ -353,22 +402,43 @@ pub(crate) fn held_at_or_below(
     db: &mut SqliteConnection,
     author: &[u8],
     seq: i64,
+    marked: Option<Vec<i64>>,
 ) -> Result<Vec<HeldRow>, ClientError> {
     type Row = (i64, i64, i64, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>);
-    let rows: Vec<Row> = dsl::_connetto_peer_entry
-        .select((
-            dsl::seq,
-            dsl::major,
-            dsl::state,
-            dsl::origin,
-            dsl::digest,
-            dsl::changeset,
-        ))
-        .filter(dsl::author.eq(author))
-        .filter(dsl::seq.le(seq))
-        .filter(dsl::state.ne(HeldState::Retained.db()))
-        .order(dsl::seq.asc())
-        .load(db)?;
+    let fields = (
+        dsl::seq,
+        dsl::major,
+        dsl::state,
+        dsl::origin,
+        dsl::digest,
+        dsl::changeset,
+    );
+    let rows: Vec<Row> = match marked {
+        None => dsl::_connetto_peer_entry
+            .select(fields)
+            .filter(dsl::author.eq(author))
+            .filter(dsl::seq.le(seq))
+            .filter(dsl::state.ne(HeldState::Retained.db()))
+            .order(dsl::seq.asc())
+            .load(db)?,
+        Some(marked) => dsl::_connetto_peer_entry
+            .select(fields)
+            .filter(dsl::author.eq(author))
+            .filter(dsl::seq.le(seq))
+            .filter(
+                dsl::state
+                    .eq_any([
+                        HeldState::Provisional.db(),
+                        HeldState::CourierOnly.db(),
+                        HeldState::DigestOnly.db(),
+                    ])
+                    .or(dsl::state
+                        .eq(HeldState::Retained.db())
+                        .and(dsl::seq.eq_any(marked))),
+            )
+            .order(dsl::seq.asc())
+            .load(db)?,
+    };
     rows.into_iter()
         .map(|(seq, major, state, origin, digest, changeset)| {
             let corrupt = |what: &str| {
