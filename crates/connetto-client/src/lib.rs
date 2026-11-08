@@ -603,6 +603,79 @@ pub enum PeerError {
     Link(#[from] LinkError),
 }
 
+/// One author's courier candidates the session would offer on the main wire,
+/// the run of its held rows the build's major stands (R78 decision 16).
+#[cfg(feature = "peer")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CourierCandidate {
+    /// The author's device key.
+    pub author: Vec<u8>,
+    /// The account the author's stored offer names.
+    pub account: String,
+    /// The sequences the run covers, lowest first.
+    pub seqs: Vec<u64>,
+    /// The bytes the run's bodies stand.
+    pub bytes: u64,
+    /// The verdict the session last heard from the server on the run's
+    /// lowest sequence, `None` while it heard none (R78 decision 50).
+    pub last: Option<connetto_core::exchange::Verdict>,
+}
+
+/// How one courier range ended on the server (R78 decision 32).
+#[cfg(feature = "peer")]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CourierReport {
+    /// The sequences the range settled.
+    pub settled: Vec<u64>,
+    /// The sequences the range refused.
+    pub refused: Vec<u64>,
+    /// The sequences the range left held.
+    pub kept: Vec<u64>,
+    /// The wait the server named before the run is offered again.
+    pub retry_after: Option<Duration>,
+}
+
+/// Why a [`ConnettoConnection::courier`] call could not settle its range.
+#[cfg(feature = "peer")]
+#[derive(Debug, thiserror::Error)]
+pub enum CourierError {
+    /// No server session, or the deployment's courier path is off (C0).
+    #[error("the courier path is off")]
+    Unavailable,
+    /// The author holds no rows to offer (C1).
+    #[error("the author holds nothing to courier")]
+    NothingHeld,
+    /// The author's range is outstanding or queued (C3).
+    #[error("the author's range is outstanding")]
+    Busy,
+    /// The server refused the range before settling any of it.
+    #[error("the server refused the range: {0:?}")]
+    Refused(connetto_core::exchange::CourierRefusal),
+    /// The range's answer overran its bound and the wait dropped.
+    #[error("the courier answer overran its bound")]
+    TimedOut,
+    /// The session ended before the range's answer.
+    #[error("the session ended before the answer")]
+    SessionLost,
+    /// The range is queued behind the late answer its wait already dropped.
+    #[error("the range is queued behind a late answer")]
+    QueuedBehindLateAnswer,
+    /// A local failure sending or settling the range.
+    #[error(transparent)]
+    Client(#[from] ClientError),
+}
+
+/// The wait on one author's courier range, resolved by the pump (R78
+/// decision 48).
+#[cfg(feature = "peer")]
+#[derive(Debug)]
+pub(crate) struct CourierWait {
+    /// The reply the pump settles, resolved as soon as it does.
+    pub receiver: tokio::sync::oneshot::Receiver<Result<CourierReport, CourierError>>,
+    /// How long the caller may wait on it, from any clock.
+    pub bound: Duration,
+}
+
 /// One queued write awaiting its final answer, named by the writer and the
 /// sequence it is the writer's, with the application schema major it was
 /// captured under.
@@ -1742,6 +1815,11 @@ pub enum ClientEvent {
         /// The keys the retraction inverted.
         rows: Vec<(String, Vec<KeyValue>)>,
     },
+    /// The session's courier candidates for one author changed, the set it
+    /// would offer on the main wire, empty when nothing is left to courier
+    /// (R78 decisions 16 and 46).
+    #[cfg(feature = "peer")]
+    CourierCandidates(CourierCandidate),
     /// The server accepted a share-key replacement and queued its authorization resends.
     ShareKeysReplaced {
         /// The correlation token the swap it answers carried.
@@ -4183,6 +4261,9 @@ struct HandshakeOk {
     writer: Option<WriterGrant>,
     schema_version: Option<SchemaVersion>,
     sunset_at_secs: Option<u64>,
+    /// Whether the deployment accepts courier ranges (R78 decision 1).
+    #[cfg(feature = "peer")]
+    courier: bool,
     #[cfg(feature = "device-identity")]
     challenge: Option<[u8; 32]>,
 }
@@ -4351,6 +4432,8 @@ where
                 writer: ack.writer,
                 schema_version: ack.schema_version,
                 sunset_at_secs: ack.sunset_at_secs,
+                #[cfg(feature = "peer")]
+                courier: ack.courier,
                 #[cfg(feature = "device-identity")]
                 challenge,
             })
@@ -4666,6 +4749,108 @@ fn provisional_request_id() -> String {
     )
 }
 
+/// How long a courier range waits for its answer before the wait drops
+/// (decision 33), the same bound a provisional ask waits under.
+#[cfg(feature = "peer")]
+const COURIER_RANGE_WAIT: Duration = Duration::from_secs(30);
+
+/// The slack a courier call's own bound keeps over the range's deadline, so
+/// the pump settles the lapse before the call gives up.
+#[cfg(feature = "peer")]
+const COURIER_CALL_SLACK: Duration = Duration::from_secs(5);
+
+/// One courier range the server is answering, its deadline and the wait's
+/// reply (R78 decision 30).
+#[derive(Debug)]
+#[cfg(feature = "peer")]
+struct CourierOpen {
+    /// The id the bodies and the answer quote.
+    request_id: String,
+    /// The author's device key.
+    author: [u8; 32],
+    /// The sequences the range covers.
+    seqs: Vec<u64>,
+    /// The monotonic deadline the answer is owed by.
+    deadline: Duration,
+    /// Whether the wait dropped on the deadline, the range staying open for
+    /// its late answer.
+    wait_dropped: bool,
+    /// The wait's reply, `None` once it dropped.
+    reply: Option<tokio::sync::oneshot::Sender<Result<CourierReport, CourierError>>>,
+}
+
+/// A courier range queued behind the open one, its reply `None` when the
+/// caller heard [`CourierError::QueuedBehindLateAnswer`] at once.
+#[derive(Debug)]
+#[cfg(feature = "peer")]
+struct CourierQueued {
+    /// The author's device key.
+    author: [u8; 32],
+    /// The wait's reply, when the caller is still waiting.
+    reply: Option<tokio::sync::oneshot::Sender<Result<CourierReport, CourierError>>>,
+}
+
+/// Why an author's courier rows wait, cleared by the next offer (decisions 7
+/// and 29), a ruling taking the writer's exclusion and a session the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "peer")]
+enum CourierExclusion {
+    /// The rows wait for the author's next offer, the answer having stopped
+    /// at one of them (`NotCouriered` or `SequenceGap`).
+    NewOffer,
+    /// The rows wait for the next session, the refusal being the
+    /// deployment's (`Uncertified` or `AuthorBanned`).
+    NextSession,
+    /// The rows wait for the author's next ruling, its writer having dropped
+    /// out (`NotEnrolled`, `WriterRetired` or `Unverified`).
+    NextRuling,
+}
+
+/// The rows the courier offers one author on the main wire, beside the
+/// bodies that cross it (R78 decisions 5 and 16).
+#[cfg(feature = "peer")]
+struct CourierRows {
+    /// The offer the range presents, the cursor's stored bytes.
+    offer: Vec<u8>,
+    /// The manifest rows the range carries, in sequence order.
+    rows: Vec<connetto_core::exchange::ManifestRow>,
+    /// The bodies of the rows holding one, in sequence order.
+    bodies: Vec<(u64, Vec<u8>)>,
+}
+
+/// The session's courier ranges, the open one, the queued ones, the authors
+/// whose rows wait and the candidates last raised (R78 slice 4), held
+/// together so the connection's future stays small.
+#[derive(Debug, Default)]
+#[cfg(feature = "peer")]
+struct CourierQueue {
+    /// Whether the deployment's courier path is on, the attach's flag.
+    enabled: bool,
+    /// The range sent and awaited, at most one at a time.
+    open: Option<CourierOpen>,
+    /// The ranges queued behind it, in call order.
+    queued: VecDeque<CourierQueued>,
+    /// The authors whose rows wait, and why.
+    excluded: BTreeMap<[u8; 32], CourierExclusion>,
+    /// The sequences the server ruled Pending on, the candidates' last
+    /// ruling.
+    heard: BTreeMap<[u8; 32], BTreeSet<u64>>,
+    /// The candidates last raised, author by author.
+    raised: BTreeMap<[u8; 32], CourierCandidate>,
+}
+
+#[cfg(feature = "peer")]
+static NEXT_COURIER_REQUEST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// A fresh request id for a courier range this session will send.
+#[cfg(feature = "peer")]
+fn courier_request_id() -> String {
+    format!(
+        "courier-{}",
+        NEXT_COURIER_REQUEST.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 static NEXT_WRITER_REQUEST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// A fresh request id for a bind or retirement this connection will send.
@@ -4742,6 +4927,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// small.
     #[cfg(feature = "peer")]
     provisional: Box<ProvisionalQueue>,
+    /// The session's courier ranges, boxed so the connection's future stays
+    /// small.
+    #[cfg(feature = "peer")]
+    courier: Box<CourierQueue>,
     /// A device bind signed and held, sent once the number's tail settles.
     #[cfg(feature = "device-identity")]
     pending_bind: Option<WriterTask>,
@@ -5290,6 +5479,8 @@ where
             writer_in_flight: None,
             #[cfg(feature = "peer")]
             provisional: Box::default(),
+            #[cfg(feature = "peer")]
+            courier: Box::default(),
             #[cfg(feature = "device-identity")]
             pending_bind: None,
             #[cfg(feature = "device-identity")]
@@ -5648,6 +5839,10 @@ where
         // The session's asks go out once the replay stands, one per author.
         #[cfg(feature = "peer")]
         self.plan_provisional_asks().await?;
+        // The deployment's courier path stands from the ack, the session's
+        // ranges, exclusions and candidates fresh (R78 decision 1).
+        #[cfg(feature = "peer")]
+        self.reset_courier_state(ack.courier);
         Ok(())
     }
 
@@ -6189,44 +6384,53 @@ where
 
     /// Drop the ask `related_to` names, and forget it from the sent asks on
     /// a refusal, the server having opened nothing of it, keeping it on a
-    /// lapse for the push the server still owes (R77 slice 11).
+    /// lapse for the push the server still owes (R77 slice 11), naming the
+    /// ask's author so the courier candidates can restate.
     #[cfg(feature = "peer")]
-    fn drop_provisional_ask(&mut self, related_to: Option<&str>, forget_sent: bool) {
-        let Some(related_to) = related_to else {
-            return;
-        };
+    fn drop_provisional_ask(
+        &mut self,
+        related_to: Option<&str>,
+        forget_sent: bool,
+    ) -> Option<[u8; 32]> {
+        let related_to = related_to?;
+        let author = self.provisional.sent.get(related_to).map(|ask| ask.author);
         if self
             .provisional
             .in_flight
             .as_ref()
             .is_some_and(|sent| sent.request_id == related_to)
         {
-            let author = self
-                .provisional
-                .sent
-                .get(related_to)
-                .expect("the in-flight ask was sent")
-                .author;
             self.provisional.in_flight = None;
-            self.provisional.pending.retain(|ask| ask.author != author);
+            self.provisional
+                .pending
+                .retain(|ask| ask.author != author.expect("the in-flight ask was sent"));
         }
         if forget_sent {
             self.provisional.sent.remove(related_to);
         }
+        author
     }
 
     /// Drop the wait on an over-bound provisional ask, which re-ows itself at
-    /// the next session (R77 decision 11).
+    /// the next session (R77 decision 11), restating the author's courier
+    /// candidates on the way.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows or the stored offer cannot be read.
     #[cfg(feature = "peer")]
-    fn check_provisional_deadlines(&mut self) {
+    fn check_provisional_deadlines(&mut self) -> Result<(), ClientError> {
         let Some(sent) = self.provisional.in_flight.as_ref() else {
-            return;
+            return Ok(());
         };
         if crate::away::SystemClock.monotonic() >= sent.deadline {
             tracing::debug!("the provisional ruling overran its bound, dropping the ask");
             let request_id = sent.request_id.clone();
-            self.drop_provisional_ask(Some(request_id.as_str()), false);
+            if let Some(author) = self.drop_provisional_ask(Some(request_id.as_str()), false) {
+                self.raise_courier_candidates_if_changed(author)?;
+            }
         }
+        Ok(())
     }
 
     /// Apply a ruling's verdicts for the ask it names among this connection's
@@ -6252,44 +6456,22 @@ where
         let author = sent.author;
         let mut applied = false;
         for (seq, verdict) in &answer.verdicts {
-            if !self.seq_awaits_verdict(&author, *seq)? {
-                continue;
+            if self.settle_verdict_row(&author, *seq, verdict)? {
+                applied = true;
+                if matches!(verdict, connetto_core::exchange::Verdict::Pending) {
+                    self.courier.heard.entry(author).or_default().insert(*seq);
+                }
             }
-            match verdict {
-                connetto_core::exchange::Verdict::Applied
-                | connetto_core::exchange::Verdict::Settled => {
-                    self.adjudicate_peer_seq(&author, *seq)?;
-                }
-                connetto_core::exchange::Verdict::Refused(cause) => {
-                    self.retract_peer_entry(
-                        &peer::PeerAuthor {
-                            key_id: author.to_vec(),
-                            account: String::new(),
-                            bot_list: None,
-                        },
-                        &connetto_core::exchange::Retraction {
-                            seq: *seq,
-                            cause: cause.clone(),
-                        },
-                    )?;
-                }
-                connetto_core::exchange::Verdict::Abandoned => {
-                    self.retract_peer_entry(
-                        &peer::PeerAuthor {
-                            key_id: author.to_vec(),
-                            account: String::new(),
-                            bot_list: None,
-                        },
-                        &connetto_core::exchange::Retraction {
-                            seq: *seq,
-                            cause: connetto_core::exchange::RetractCause::Abandoned,
-                        },
-                    )?;
-                }
-                connetto_core::exchange::Verdict::Pending => {}
-            }
-            applied = true;
         }
+        // A ruling stands for the author, so its rows wait no longer for one
+        // held back by a courier refusal (R78 slice 4).
+        if matches!(
+            self.courier.excluded.get(&author),
+            Some(CourierExclusion::NextRuling)
+        ) {
+            self.courier.excluded.remove(&author);
+        }
+        self.raise_courier_candidates_if_changed(author)?;
         // Only the in-flight ask's ruling hands the queue on (R77 slice 11).
         if self
             .provisional
@@ -6355,6 +6537,594 @@ where
             peer::retain(db, author, seq)?;
             peer::prune_retained(db)
         })
+    }
+
+    /// The session's courier state stands fresh from the attach's flag
+    /// (R78 decision 1), the previous session's ranges and exclusions gone.
+    #[cfg(feature = "peer")]
+    fn reset_courier_state(&mut self, on: bool) {
+        self.courier.enabled = on;
+        self.courier.open = None;
+        self.courier.queued.clear();
+        self.courier.excluded.clear();
+        self.courier.heard.clear();
+        self.courier.raised.clear();
+    }
+
+    /// Settle one author's sequence on a verdict (R77, R78 slice 4),
+    /// reporting whether the row still awaited it, a row the server ruled
+    /// twice changing nothing the second time (decision 44).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the verdict cannot be applied.
+    #[cfg(feature = "peer")]
+    fn settle_verdict_row(
+        &mut self,
+        author: &[u8],
+        seq: u64,
+        verdict: &connetto_core::exchange::Verdict,
+    ) -> Result<bool, ClientError> {
+        if !self.seq_awaits_verdict(author, seq)? {
+            return Ok(false);
+        }
+        match verdict {
+            connetto_core::exchange::Verdict::Applied
+            | connetto_core::exchange::Verdict::Settled => {
+                self.adjudicate_peer_seq(author, seq)?;
+            }
+            connetto_core::exchange::Verdict::Refused(cause) => {
+                self.retract_peer_entry(
+                    &peer::PeerAuthor {
+                        key_id: author.to_vec(),
+                        account: String::new(),
+                        bot_list: None,
+                    },
+                    &connetto_core::exchange::Retraction {
+                        seq,
+                        cause: cause.clone(),
+                    },
+                )?;
+            }
+            connetto_core::exchange::Verdict::Abandoned => {
+                self.retract_peer_entry(
+                    &peer::PeerAuthor {
+                        key_id: author.to_vec(),
+                        account: String::new(),
+                        bot_list: None,
+                    },
+                    &connetto_core::exchange::Retraction {
+                        seq,
+                        cause: connetto_core::exchange::RetractCause::Abandoned,
+                    },
+                )?;
+            }
+            connetto_core::exchange::Verdict::Pending => {}
+        }
+        Ok(true)
+    }
+
+    /// The rows the courier offers one author on the main wire (R78 slice 4):
+    /// the author's held rows of the build's major, contiguous from the
+    /// lowest and running to the offer's newest, beside the bodies that
+    /// cross. `None` when the path is off, the author waits excluded, or it
+    /// holds no stored offer.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the cursor or the held rows cannot be read, or a
+    /// stored offer does not decode.
+    #[cfg(feature = "peer")]
+    fn courier_rows(
+        &mut self,
+        author: [u8; 32],
+    ) -> Result<Option<(String, CourierRows)>, ClientError> {
+        if !self.courier.enabled || self.courier.excluded.contains_key(&author) {
+            return Ok(None);
+        }
+        let Some((offer, account)) = exchange::offer_and_account(&mut self.db, &author)? else {
+            return Ok(None);
+        };
+        let signed: connetto_core::exchange::SignedOffer = rmp_serde::from_slice(&offer[..])
+            .map_err(|_| ClientError::Session("a stored offer does not decode".to_owned()))?;
+        let newest = signed.offer.newest.map_or(i64::MAX, |frontier| {
+            i64::try_from(frontier.seq).unwrap_or(i64::MAX)
+        });
+        let held = peer::held_at_or_below(&mut self.db, &author, newest)?;
+        Ok(Some((
+            account,
+            Self::range_rows(offer, held, self.config.schema_major),
+        )))
+    }
+
+    /// Cut the held rows down to the range the main wire sends (R78 slice
+    /// 4): the build's major alone, contiguous from the first, to the row
+    /// bound, stopped at a gap or a row of another major.
+    #[cfg(feature = "peer")]
+    fn range_rows(offer: Vec<u8>, held: Vec<peer::HeldRow>, build: Option<Major>) -> CourierRows {
+        let mut rows: Vec<connetto_core::exchange::ManifestRow> = Vec::new();
+        let mut bodies: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut last: Option<i64> = None;
+        for row in held {
+            if Some(row.major) != build
+                || rows.len() >= connetto_core::exchange::MAX_MANIFEST_ROWS
+                || last.is_some_and(|last| row.seq != last + 1)
+            {
+                break;
+            }
+            last = Some(row.seq);
+            let seq = u64::try_from(row.seq).unwrap_or(u64::MAX);
+            rows.push(connetto_core::exchange::ManifestRow {
+                seq,
+                major: row.major,
+                origin: row.origin,
+                digest: row.digest,
+            });
+            if let Some(changeset) = row.changeset {
+                bodies.push((seq, changeset));
+            }
+        }
+        CourierRows {
+            offer,
+            rows,
+            bodies,
+        }
+    }
+
+    /// One author's courier candidates, the run of its held rows the build's
+    /// major stands beside its account, the bytes and the last ruling heard
+    /// on its lowest sequence, `None` while the path is off, the author
+    /// waits excluded, or it holds no rows to offer (R78 decision 16).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the cursor or the held rows cannot be read, or a
+    /// stored offer does not decode.
+    #[cfg(feature = "peer")]
+    fn courier_candidate(
+        &mut self,
+        author: [u8; 32],
+    ) -> Result<Option<CourierCandidate>, ClientError> {
+        let Some((account, rows)) = self.courier_rows(author)? else {
+            return Ok(None);
+        };
+        if rows.rows.is_empty() {
+            return Ok(None);
+        }
+        let seqs: Vec<u64> = rows.rows.iter().map(|row| row.seq).collect();
+        let bytes: u64 = rows
+            .bodies
+            .iter()
+            .map(|(_, body)| u64::try_from(body.len()).unwrap_or(u64::MAX))
+            .sum();
+        let last = seqs
+            .first()
+            .filter(|seq| {
+                self.courier
+                    .heard
+                    .get(&author)
+                    .is_some_and(|heard| heard.contains(seq))
+            })
+            .map(|_| connetto_core::exchange::Verdict::Pending);
+        Ok(Some(CourierCandidate {
+            author: author.to_vec(),
+            account,
+            seqs,
+            bytes,
+            last,
+        }))
+    }
+
+    /// The session's courier candidates, one per author with a stored offer,
+    /// author order (R78 decision 16), the empty list when the path is off.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the cursors or the held rows cannot be read.
+    #[cfg(feature = "peer")]
+    pub fn courier_candidates(&mut self) -> Result<Vec<CourierCandidate>, ClientError> {
+        let mut candidates = Vec::new();
+        for cursor in exchange::all_cursors(&mut self.db)? {
+            let Ok(author) = <[u8; 32]>::try_from(cursor.author.as_slice()) else {
+                continue;
+            };
+            if let Some(candidate) = self.courier_candidate(author)? {
+                candidates.push(candidate);
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Courier the author's held rows to the server on the main wire (R78
+    /// decision 48): the range goes out when none is open, queues behind the
+    /// open one otherwise, and the wait resolves as the pump settles the
+    /// answer, the lapse or the session's end.
+    ///
+    /// # Errors
+    ///
+    /// [`CourierError`] when the path is off (`Unavailable`), the author's
+    /// range is outstanding or queued (`Busy`), it holds nothing to offer
+    /// (`NothingHeld`), it is queued behind a late answer
+    /// (`QueuedBehindLateAnswer`), or a send fails.
+    #[cfg(feature = "peer")]
+    pub(crate) async fn courier(&mut self, author: [u8; 32]) -> Result<CourierWait, CourierError> {
+        if self.wire.is_none() || !self.courier.enabled {
+            return Err(CourierError::Unavailable);
+        }
+        let busy = self
+            .courier
+            .open
+            .as_ref()
+            .is_some_and(|open| open.author == author)
+            || self
+                .courier
+                .queued
+                .iter()
+                .any(|queued| queued.author == author);
+        if busy {
+            return Err(CourierError::Busy);
+        }
+        // A range whose bound already ran out has dropped its wait (decision
+        // 33), so a call for another author hears the queue at once.
+        if let Some(open) = self.courier.open.as_mut()
+            && (open.wait_dropped || crate::away::SystemClock.monotonic() >= open.deadline)
+        {
+            open.wait_dropped = true;
+            if let Some(reply) = open.reply.take() {
+                let _ = reply.send(Err(CourierError::TimedOut));
+            }
+        }
+        let Some((_, rows)) = self.courier_rows(author)? else {
+            return Err(CourierError::NothingHeld);
+        };
+        if rows.rows.is_empty() {
+            return Err(CourierError::NothingHeld);
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // A queued call waits out what is left of the open range's bound,
+        // then its own (decision 48).
+        let now = crate::away::SystemClock.monotonic();
+        let open_deadline = self.courier.open.as_ref().map(|open| {
+            open.deadline.saturating_sub(now) + COURIER_RANGE_WAIT + COURIER_CALL_SLACK
+        });
+        let wait_dropped = self
+            .courier
+            .open
+            .as_ref()
+            .is_some_and(|open| open.wait_dropped);
+        if let Some(bound) = open_deadline {
+            if wait_dropped {
+                self.courier.queued.push_back(CourierQueued {
+                    author,
+                    reply: None,
+                });
+                return Err(CourierError::QueuedBehindLateAnswer);
+            }
+            self.courier.queued.push_back(CourierQueued {
+                author,
+                reply: Some(tx),
+            });
+            return Ok(CourierWait {
+                receiver: rx,
+                bound,
+            });
+        }
+        let request_id = courier_request_id();
+        self.courier.open = Some(CourierOpen {
+            request_id: request_id.clone(),
+            author,
+            seqs: rows.rows.iter().map(|row| row.seq).collect(),
+            deadline: crate::away::SystemClock.monotonic() + COURIER_RANGE_WAIT,
+            wait_dropped: false,
+            reply: Some(tx),
+        });
+        if let Err(err) = self.send_courier_range(&request_id, author, &rows).await {
+            self.disconnected();
+            return Err(CourierError::Client(err));
+        }
+        Ok(CourierWait {
+            receiver: rx,
+            bound: COURIER_RANGE_WAIT + COURIER_CALL_SLACK,
+        })
+    }
+
+    /// Send the open courier range and its declared bodies (R78 decisions 5
+    /// and 28), the range first on the control plane and each body on the
+    /// bulk plane in sequence order.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::NotConnected`] without a socket,
+    /// [`ClientError::Transport`] when a frame cannot be sent, and the
+    /// compression failure a body surfaces.
+    #[cfg(feature = "peer")]
+    async fn send_courier_range(
+        &mut self,
+        request_id: &str,
+        author: [u8; 32],
+        rows: &CourierRows,
+    ) -> Result<(), ClientError> {
+        let wire = self.wire.as_mut().ok_or(ClientError::NotConnected)?;
+        wire.transport
+            .send_control(ControlMessage::CourierRange(
+                connetto_core::messages::CourierRange {
+                    request_id: request_id.to_owned(),
+                    author,
+                    offer: rows.offer.clone(),
+                    rows: rows.rows.clone(),
+                    bodies: u32::try_from(rows.bodies.len()).expect("the bodies fit the count"),
+                },
+            ))
+            .await
+            .map_err(|err| ClientError::Transport(err.to_string()))?;
+        for (seq, changeset) in &rows.bodies {
+            wire.transport
+                .send_bulk(BulkMessage::CourierBody(
+                    connetto_core::messages::CourierBody {
+                        request_id: request_id.to_owned(),
+                        seq: *seq,
+                        changeset_zstd: zstd::encode_all(&changeset[..], ZSTD_LEVEL)?,
+                    },
+                ))
+                .await
+                .map_err(|err| ClientError::Transport(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Send the next queued courier range, one at a time, and register it as
+    /// the open one (decision 30), a call whose rows no longer stand hearing
+    /// `NothingHeld` at once.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows cannot be read or a send fails.
+    #[cfg(feature = "peer")]
+    async fn flush_courier_ranges(&mut self) -> Result<(), ClientError> {
+        loop {
+            if self.courier.open.is_some() {
+                return Ok(());
+            }
+            let Some(queued) = self.courier.queued.pop_front() else {
+                return Ok(());
+            };
+            let author = queued.author;
+            let rows = match self.courier_rows(author) {
+                Ok(Some((_, rows))) if !rows.rows.is_empty() => rows,
+                Ok(_) => {
+                    if let Some(reply) = queued.reply {
+                        let _ = reply.send(Err(CourierError::NothingHeld));
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let request_id = courier_request_id();
+            if self.wire.is_none() {
+                self.courier.queued.push_front(queued);
+                return Ok(());
+            }
+            if let Err(err) = self.send_courier_range(&request_id, author, &rows).await {
+                self.courier.queued.push_front(queued);
+                return Err(err);
+            }
+            self.courier.open = Some(CourierOpen {
+                request_id,
+                author,
+                seqs: rows.rows.iter().map(|row| row.seq).collect(),
+                deadline: crate::away::SystemClock.monotonic() + COURIER_RANGE_WAIT,
+                wait_dropped: false,
+                reply: queued.reply,
+            });
+            return Ok(());
+        }
+    }
+
+    /// Drop the wait on an over-bound courier range (decision 33), holding
+    /// the range open for its late answer and every later range queued.
+    #[cfg(feature = "peer")]
+    fn check_courier_deadline(&mut self) {
+        let Some(open) = self.courier.open.as_mut() else {
+            return;
+        };
+        if open.wait_dropped || crate::away::SystemClock.monotonic() < open.deadline {
+            return;
+        }
+        tracing::debug!("the courier answer overran its bound, dropping the wait");
+        open.wait_dropped = true;
+        if let Some(reply) = open.reply.take() {
+            let _ = reply.send(Err(CourierError::TimedOut));
+        }
+    }
+
+    /// Settle the server's answer on the open courier range (R78 decisions
+    /// 31 and 32): a refusal refuses the whole range, the entries rule their
+    /// rows one by one, the wait hears the outcome, and the next queued range
+    /// goes out.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when a row cannot be settled or a send fails.
+    #[cfg(feature = "peer")]
+    async fn settle_courier_answer(
+        &mut self,
+        answer: &connetto_core::messages::CourierAnswer,
+    ) -> Result<Option<ClientEvent>, ClientError> {
+        // An answer that names no range this connection sent stands ignored.
+        let open = self
+            .courier
+            .open
+            .as_ref()
+            .filter(|open| open.request_id == answer.request_id);
+        let Some(open) = open else {
+            return Ok(Some(ClientEvent::NonFatal {
+                related_to: Some(answer.request_id.clone()),
+                detail: "a courier answer arrived with no open range".to_owned(),
+            }));
+        };
+        let author = open.author;
+        let seqs = open.seqs.clone();
+        let result: Result<CourierReport, CourierError> = match &answer.outcome {
+            connetto_core::exchange::CourierOutcome::Refused(refusal) => {
+                self.refuse_courier_range(&author, *refusal)?;
+                Err(CourierError::Refused(*refusal))
+            }
+            connetto_core::exchange::CourierOutcome::Entries(outcomes) => {
+                let mut report = CourierReport::default();
+                for (seq, outcome) in outcomes {
+                    match outcome {
+                        connetto_core::exchange::CourierEntryOutcome::Ruled(verdict) => {
+                            self.settle_verdict_row(&author, *seq, verdict)?;
+                            if matches!(
+                                verdict,
+                                connetto_core::exchange::Verdict::Applied
+                                    | connetto_core::exchange::Verdict::Settled
+                            ) {
+                                report.settled.push(*seq);
+                            } else if matches!(
+                                verdict,
+                                connetto_core::exchange::Verdict::Refused(..)
+                            ) {
+                                report.refused.push(*seq);
+                            }
+                        }
+                        connetto_core::exchange::CourierEntryOutcome::NotCouriered => {
+                            // The rows from it stay held, waiting for the
+                            // author's own device or its next offer.
+                            self.courier
+                                .excluded
+                                .insert(author, CourierExclusion::NewOffer);
+                            break;
+                        }
+                        connetto_core::exchange::CourierEntryOutcome::Retry { retry_after_ms } => {
+                            report.retry_after = Some(Duration::from_millis(*retry_after_ms));
+                            break;
+                        }
+                    }
+                }
+                let settled: HashSet<u64> = report.settled.iter().copied().collect();
+                let refused: HashSet<u64> = report.refused.iter().copied().collect();
+                for seq in &seqs {
+                    if !settled.contains(seq) && !refused.contains(seq) {
+                        report.kept.push(*seq);
+                    }
+                }
+                Ok(report)
+            }
+        };
+        let open = self.courier.open.take().expect("the open range stands");
+        if let Some(reply) = open.reply {
+            let _ = reply.send(result);
+        }
+        self.raise_courier_candidates_if_changed(author)?;
+        self.flush_courier_ranges().await?;
+        Ok(None)
+    }
+
+    /// Take the server's whole-range refusal on the author's rows (R78
+    /// decision 29): the deployment's refusals end or exclude the path, the
+    /// writer's refusals take the rows the courier offered, and none of them
+    /// touches a row the author still writes under.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows cannot be deleted.
+    #[cfg(feature = "peer")]
+    fn refuse_courier_range(
+        &mut self,
+        author: &[u8; 32],
+        refusal: connetto_core::exchange::CourierRefusal,
+    ) -> Result<(), ClientError> {
+        use connetto_core::exchange::CourierRefusal as Refusal;
+        match refusal {
+            Refusal::Disabled => self.courier.enabled = false,
+            Refusal::Uncertified => {
+                tracing::warn!(
+                    "the server refused the courier range as uncertified, \
+                     excluding the author until the next session"
+                );
+                self.courier
+                    .excluded
+                    .insert(*author, CourierExclusion::NextSession);
+            }
+            Refusal::Malformed => {
+                tracing::warn!("the server refused the courier range as malformed");
+            }
+            Refusal::NotEnrolled | Refusal::WriterRetired | Refusal::Unverified => {
+                if refusal == Refusal::Unverified {
+                    self.notices.push_back(ClientEvent::PeerChainInvalid {
+                        author: author.to_vec(),
+                    });
+                }
+                let _exempt = ExemptWrites::raise(&self.write_flags);
+                peer::drop_courier_rows(&mut self.db, author)?;
+                self.courier
+                    .excluded
+                    .insert(*author, CourierExclusion::NextRuling);
+            }
+            Refusal::AuthorBanned => {
+                self.courier
+                    .excluded
+                    .insert(*author, CourierExclusion::NextSession);
+            }
+            Refusal::SequenceGap { .. } => {
+                self.courier
+                    .excluded
+                    .insert(*author, CourierExclusion::NewOffer);
+            }
+        }
+        Ok(())
+    }
+
+    /// Restate the author's courier candidates once the session's view of its
+    /// rows changed, raising `CourierCandidates` when the set moved (R78
+    /// decisions 16 and 46), an empty set meaning nothing is left to courier.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows or the stored offer cannot be read.
+    #[cfg(feature = "peer")]
+    fn raise_courier_candidates_if_changed(&mut self, author: [u8; 32]) -> Result<(), ClientError> {
+        let candidate = self.courier_candidate(author)?;
+        match (candidate, self.courier.raised.get(&author)) {
+            (Some(candidate), Some(raised)) if *raised == candidate => Ok(()),
+            (Some(candidate), _) => {
+                self.notices
+                    .push_back(ClientEvent::CourierCandidates(candidate.clone()));
+                self.courier.raised.insert(author, candidate);
+                Ok(())
+            }
+            (None, Some(raised)) => {
+                let empty = CourierCandidate {
+                    author: author.to_vec(),
+                    account: raised.account.clone(),
+                    seqs: Vec::new(),
+                    bytes: 0,
+                    last: None,
+                };
+                self.notices
+                    .push_back(ClientEvent::CourierCandidates(empty));
+                self.courier.raised.remove(&author);
+                Ok(())
+            }
+            (None, None) => Ok(()),
+        }
+    }
+
+    /// A new offer for the author stood, so its courier rows stand again:
+    /// clear whatever waits hold them and restate the candidates (R78 slice
+    /// 4).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows or the stored offer cannot be read.
+    #[cfg(feature = "peer")]
+    fn courier_offer_stood(&mut self, author: &[u8]) -> Result<(), ClientError> {
+        let Ok(key) = <[u8; 32]>::try_from(author) else {
+            return Ok(());
+        };
+        self.courier.excluded.remove(&key);
+        self.raise_courier_candidates_if_changed(key)
     }
 
     /// Settle a `WriterAnswer` for a bind or retirement this connection sent.
@@ -7079,6 +7849,22 @@ where
             self.provisional.pending.clear();
             self.provisional.in_flight = None;
             self.provisional.sent.clear();
+            // An open or queued range's answer no longer arrives, so each
+            // wait ends lost and the session's courier state goes too.
+            if let Some(open) = self.courier.open.take()
+                && let Some(reply) = open.reply
+            {
+                let _ = reply.send(Err(CourierError::SessionLost));
+            }
+            for queued in self.courier.queued.drain(..) {
+                if let Some(reply) = queued.reply {
+                    let _ = reply.send(Err(CourierError::SessionLost));
+                }
+            }
+            self.courier.enabled = false;
+            self.courier.excluded.clear();
+            self.courier.heard.clear();
+            self.courier.raised.clear();
         }
         #[cfg(feature = "device-identity")]
         {
@@ -9345,8 +10131,10 @@ where
             self.check_writer_deadlines();
             #[cfg(feature = "peer")]
             {
-                self.check_provisional_deadlines();
+                self.check_provisional_deadlines()?;
                 self.flush_provisional_asks().await?;
+                self.check_courier_deadline();
+                self.flush_courier_ranges().await?;
             }
             self.check_drain_deadline().await;
             self.step_drain_share_keys().await?;
@@ -9380,11 +10168,14 @@ where
         // A writer answer that overran its bound drops the connection before
         // the next frame is waited on, so the pump redials without stalling.
         self.check_writer_deadlines();
-        // A lapsed, deferred or refused ask hands the session's next ask on.
+        // A lapsed, deferred or refused ask hands the session's next ask on,
+        // a lapsed courier range dropping its wait and a queued range going out.
         #[cfg(feature = "peer")]
         {
-            self.check_provisional_deadlines();
+            self.check_provisional_deadlines()?;
             self.flush_provisional_asks().await?;
+            self.check_courier_deadline();
+            self.flush_courier_ranges().await?;
         }
         self.check_share_key_deadlines();
         self.step_share_keys().await?;
@@ -10109,6 +10900,8 @@ where
             ControlMessage::ProvisionalVerdicts(answer) => {
                 self.settle_provisional_ask(&answer).await
             }
+            #[cfg(feature = "peer")]
+            ControlMessage::CourierAnswer(answer) => self.settle_courier_answer(&answer).await,
             ControlMessage::Pong(pong) => {
                 let fence = if self
                     .declaration_fence
@@ -10141,7 +10934,12 @@ where
                 }
                 // A refusal names a provisional ask the server opened nothing of (R77).
                 #[cfg(feature = "peer")]
-                self.drop_provisional_ask(err.related_to.as_deref(), true);
+                {
+                    if let Some(author) = self.drop_provisional_ask(err.related_to.as_deref(), true)
+                    {
+                        self.raise_courier_candidates_if_changed(author)?;
+                    }
+                }
                 self.refuse_declaration(err.related_to.as_deref());
                 Ok(Some(ClientEvent::NonFatal {
                     related_to: err.related_to,
@@ -11241,6 +12039,9 @@ impl<T: Transport + Send> LoadConnection<DefaultLoadingMode> for ConnettoConnect
         self.db.load(source)
     }
 }
+
+#[cfg(test)]
+mod courier_tests;
 
 #[cfg(test)]
 mod tests {

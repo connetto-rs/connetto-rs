@@ -2541,6 +2541,56 @@ where
         state.conn.provisional_rows()
     }
 
+    /// The session's courier candidates, one per author with a stored offer
+    /// (R78 decision 16).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, and the
+    /// [`ClientError`] the read surfaces.
+    #[cfg(feature = "peer")]
+    pub async fn courier_candidates(&self) -> Result<Vec<crate::CourierCandidate>, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
+        state.conn.courier_candidates()
+    }
+
+    /// Courier the author's held rows to the server on the main wire (R78
+    /// decision 48), the range sent or queued by the connection and the
+    /// report settled by the pump.
+    ///
+    /// # Errors
+    ///
+    /// [`CourierError::Client`] while the gate is locked or the author's key
+    /// is not 32 bytes, and the [`CourierError`] the range or its settlement
+    /// surfaces.
+    #[cfg(feature = "peer")]
+    pub async fn courier(
+        &self,
+        author: &[u8],
+    ) -> Result<crate::CourierReport, crate::CourierError> {
+        let wait: crate::CourierWait;
+        {
+            let mut state = self.shared.lock_interrupting().await;
+            if self.shared.gate.is_locked() {
+                return Err(crate::CourierError::Client(ClientError::Locked));
+            }
+            let author: [u8; 32] = author.try_into().map_err(|_| {
+                crate::CourierError::Client(ClientError::Session(
+                    "an author key must be 32 bytes".to_owned(),
+                ))
+            })?;
+            wait = state.conn.courier(author).await?;
+        }
+        self.shared.wake.notify_one();
+        tokio::time::timeout(wait.bound, wait.receiver)
+            .await
+            .map_err(|_| crate::CourierError::TimedOut)?
+            .unwrap_or_else(|_| Err(crate::CourierError::SessionLost))
+    }
+
     /// Run a closure against the shared connection: one-off diesel reads and
     /// captured writes. Local writes committed here are auto-submitted by the
     /// pump's next flush, and any live query reading the written tables
