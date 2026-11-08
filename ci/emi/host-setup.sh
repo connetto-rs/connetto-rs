@@ -175,13 +175,50 @@ Wants=wg-quick@$WG.service
 After=wg-quick@$WG.service
 RequiresMountsFor=$POOL_DIR
 EOF
-cat > /etc/systemd/system/incus.service.d/ci-cpu-weight.conf <<EOF
-[Service]
-CPUWeight=10
+# The VMs' QEMU runs in incus.service's own cgroup, and a weight counts only against its siblings,
+# so Incus sits in a top-level slice beside user.slice and system.slice, each weighing 100.
+# A busy host leaves CI about one percent of the CPU, the share of nice 19, and an idle one all of it.
+cat > /etc/systemd/system/ci.slice <<EOF
+[Unit]
+Description=connetto CI runner VMs
+
+[Slice]
+CPUWeight=1
 EOF
+cat > /etc/systemd/system/incus.service.d/ci-slice.conf <<EOF
+[Service]
+Slice=ci.slice
+EOF
+rm -f /etc/systemd/system/incus.service.d/ci-cpu-weight.conf
 systemctl daemon-reload
-# No instance exists yet on a first run, so the restart interrupts nothing.
-incus list --all-projects --format csv --columns n | grep -q . || systemctl restart incus.service
+current=$(systemctl show incus.service -p ControlGroup --value)
+if [ "$current" != /ci.slice/incus.service ]; then
+  # incus.service kills only its main process on a stop, so a running VM would stay behind in the old cgroup.
+  vms=0
+  if [ -n "$current" ]; then
+    procs=$(cat "/sys/fs/cgroup$current/cgroup.procs") \
+      || { echo "cannot read the processes of $current, so incus.service stays there" >&2; exit 1; }
+    for pid in $procs; do
+      case $(cat "/proc/$pid/comm" 2>/dev/null) in qemu-system*) vms=$((vms + 1)) ;; esac
+    done
+  fi
+  if [ "$vms" -gt 0 ]; then
+    echo "incus.service in $current still runs $vms VMs: run this again once $MEMBER has none, ci-share.sh $MEMBER 0 0 0 stops new runners there" >&2
+    exit 1
+  fi
+  if [ -n "$current" ]; then
+    systemctl stop incus.socket incus.service
+    # systemd keeps a unit's old cgroup while anything is left in it, dnsmasq included, so the rest is killed first.
+    [ -z "$(cat "/sys/fs/cgroup$current/cgroup.procs" 2>/dev/null || true)" ] || systemctl kill incus.service
+    for _ in $(seq 1 30); do
+      [ -z "$(systemctl show incus.service -p ControlGroup --value)" ] && break
+      sleep 1
+    done
+    [ -z "$(systemctl show incus.service -p ControlGroup --value)" ] \
+      || { echo "incus.service still holds $current and is stopped: start it with systemctl start incus.socket incus.service" >&2; exit 1; }
+  fi
+  systemctl start incus.socket incus.service
+fi
 
 log "Host caches every runner VM mounts"
 # Only what is read and written with plain file IO: virtiofs in these VMs refuses shared mmap,
