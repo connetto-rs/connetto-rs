@@ -279,6 +279,7 @@ impl Enrolments {
             public_key,
             descriptor: vec![0x91, 0x01],
             attestation: AttestationLevel::Unproven,
+            bot_list: connetto_core::BOT_LIST_WILDCARD.to_owned(),
         };
         self.store
             .record(record)

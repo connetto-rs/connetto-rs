@@ -585,6 +585,49 @@ async fn an_overbound_or_forged_ask_is_refused() {
     server.await.expect("join bob").expect("session ok");
 }
 
+/// Settled records that cannot be read fail the ask and end the session,
+/// rather than ruling a recordless sequence below the frontier settled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_record_table_fails_the_ask() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let live = SystemTime::now() + Duration::from_hours(24);
+    let enrol = Enrolments::new();
+    let (x1, x1_id) = enrol.enrol_key("x1", live).await;
+    let manager = manager(fixture.admin(), guard, Some(enrol.installable()));
+    insert_writer_row(fixture.admin(), "x1", x1_id, 2).await;
+    fixture
+        .setup(&["DROP TABLE _connetto_settled CASCADE"])
+        .await;
+
+    let (server_transport, mut recv) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    super::ticket_shared::do_handshake_with(&mut recv, "pv-recv", &["user:bob"]).await;
+    recv.send_control(ControlMessage::ProvisionalStatus(ProvisionalStatus {
+        request_id: "s1".to_owned(),
+        author: x1_id,
+        offer: x1.signed_offer(Some(Frontier {
+            seq: 2,
+            head: [2; 32],
+        })),
+        seqs: vec![1],
+    }))
+    .await
+    .expect("send the ask");
+    let error = server
+        .await
+        .expect("join bob")
+        .expect_err("the session ends on the failed read");
+    assert!(
+        matches!(error, connetto_server::SessionError::WriteTarget(_)),
+        "got {error:?}"
+    );
+}
+
 /// A follow-up ask for the same author on the same session gets its own
 /// ruling, the way the receiver's next chunk is answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -395,7 +395,8 @@ pub fn enrolment_ddl<Id: BotRegistryIdSql>() -> String {
           last_seen TIMESTAMPTZ NOT NULL, \
           revoked_at TIMESTAMPTZ, \
           public_key BYTEA NOT NULL, \
-          attestation TEXT NOT NULL)",
+          attestation TEXT NOT NULL, \
+          bot_list TEXT)",
         Id::ID_SQL_TYPE
     )
 }
