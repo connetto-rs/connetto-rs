@@ -3049,7 +3049,11 @@ fn reapply_imported_peer_state(
                     head: cursor.head,
                 },
                 &cursor.offer,
+                cursor.expires_at,
             )?;
+        }
+        if let Some(cursor) = archived {
+            exchange::keep_later_expiry(db, author, cursor.expires_at)?;
         }
         above.insert(author, threshold);
     }
@@ -3062,15 +3066,23 @@ fn reapply_imported_peer_state(
             reapply_archived_entry(db, config, frame, entry, &mut next_position, &mut state)?;
         }
     }
+    peer::prune_retained(db)?;
     Ok(state)
 }
 
-/// One archived entry through the peer apply, recorded in `state` as landed
-/// or refused. An entry captured under another major is left alone.
+/// One archived entry restored (R78 decision 20). A provisional entry of
+/// this build's major goes through the peer apply, recorded in `state` as
+/// landed or refused, a refused one held courier-only (decision 3). A
+/// provisional entry of another major is held courier-only under its major
+/// (decision 43), and a courier-only, digest-only or retained entry is held
+/// as it is. An entry the receiver holds already stays as it stands.
 ///
 /// # Errors
 ///
-/// [`ClientError`] when the entry cannot be parsed or its apply fails.
+/// [`ClientError::Import`] when the entry names no state, a major the build
+/// cannot express, an origin that does not decode, or a body its digest does
+/// not name or that its state forbids, and [`ClientError`] when its apply or
+/// its hold fails.
 #[cfg(feature = "peer")]
 fn reapply_archived_entry(
     db: &mut SqliteConnection,
@@ -3080,55 +3092,90 @@ fn reapply_archived_entry(
     next_position: &mut i64,
     state: &mut PeerImportState,
 ) -> Result<(), ClientError> {
+    let malformed = |what: &str| ClientError::Import(format!("an archived peer entry {what}"));
+    let held = peer::HeldState::from_db(entry.state).map_err(|_| malformed("names no state"))?;
     let major = u32::try_from(entry.major)
         .ok()
         .and_then(Major::new)
-        .ok_or_else(|| {
-            ClientError::Import(
-                "an archived peer entry holds a major the build cannot express".to_owned(),
-            )
-        })?;
-    if Some(major) != config.schema_major {
-        return Ok(());
-    }
-    let diff = peer_changeset(
-        &config.policy_tables,
-        &entry.changeset,
-        "an archived peer entry",
-    )?;
+        .ok_or_else(|| malformed("holds a major the build cannot express"))?;
+    let origin = entry
+        .origin
+        .as_deref()
+        .map(rmp_serde::from_slice)
+        .transpose()
+        .map_err(|_| malformed("holds an origin that does not decode"))?;
+    let body = match (held, entry.changeset.as_deref()) {
+        (peer::HeldState::DigestOnly, None) => None,
+        (peer::HeldState::DigestOnly, Some(_)) => {
+            return Err(malformed("is digest-only and carries a body"));
+        }
+        (_, None) => return Err(malformed("carries no body")),
+        (_, Some(body)) => {
+            let digest: [u8; 32] = Sha256::digest(body).into();
+            if digest != entry.digest {
+                return Err(malformed("carries a body its digest does not name"));
+            }
+            Some(body)
+        }
+    };
+    let row = connetto_core::exchange::ManifestRow {
+        seq: u64::try_from(entry.seq).map_err(|_| malformed("holds a negative sequence"))?,
+        major,
+        origin,
+        digest: entry.digest,
+    };
     let author = peer::PeerAuthor {
         key_id: entry.author.clone(),
         account: entry.account.clone(),
         bot_list: entry.bot_list.clone(),
     };
-    let cx = peer::OpsContext {
-        config,
-        held: &frame.held,
-        author: &author,
-        seq: entry.seq,
-        receiver: &frame.receiver,
-        now: entry.received_at,
-    };
-    let row = connetto_core::exchange::ManifestRow {
-        seq: u64::try_from(entry.seq).unwrap_or(u64::MAX),
-        major,
-        origin: None,
-        digest: Sha256::digest(&entry.changeset).into(),
-    };
-    let store = EntryToStore {
-        row: &row,
-        body: &entry.changeset,
-        received_at: entry.received_at,
-        position: *next_position,
-    };
-    match land_peer_entry(db, &cx, frame.subjects.as_ref(), &diff, &store, None)? {
-        Ok((rows, position)) => {
-            *next_position = (*next_position).max(position + 1);
-            state.applied.push((author.key_id, entry.seq, rows));
+    let hold_as = match (held, body) {
+        (peer::HeldState::Provisional, Some(body)) if Some(major) == config.schema_major => {
+            let diff = peer_changeset(&config.policy_tables, body, "an archived peer entry")?;
+            let cx = peer::OpsContext {
+                config,
+                held: &frame.held,
+                author: &author,
+                seq: entry.seq,
+                receiver: &frame.receiver,
+                now: entry.received_at,
+            };
+            let store = EntryToStore {
+                row: &row,
+                body,
+                received_at: entry.received_at,
+                position: *next_position,
+            };
+            let Err(_) = land_peer_entry(db, &cx, frame.subjects.as_ref(), &diff, &store, None)?
+                .map(|(rows, position)| {
+                    *next_position = (*next_position).max(position + 1);
+                    state.applied.push((author.key_id.clone(), entry.seq, rows));
+                })
+            else {
+                return Ok(());
+            };
+            state.refused.push((
+                author.key_id.clone(),
+                entry.seq,
+                peer::entry_rows(diff.iter()),
+            ));
+            peer::HeldState::CourierOnly
         }
-        Err(_) => state
-            .refused
-            .push((author.key_id, entry.seq, peer::entry_rows(diff.iter()))),
+        (peer::HeldState::Provisional, _) => peer::HeldState::CourierOnly,
+        (held, _) => held,
+    };
+    if peer::store_entry(
+        db,
+        &author,
+        &peer::NewEntry {
+            row: &row,
+            state: hold_as,
+            body,
+            received_at: entry.received_at,
+            position: *next_position,
+        },
+    )? {
+        *next_position += 1;
     }
     Ok(())
 }
@@ -8509,18 +8556,7 @@ where
         // The retraction log and provisional records are never exported (R77 decision 16).
         #[cfg(feature = "peer")]
         let (peer_entries, peer_cursors) = {
-            let entries = peer::all_entries(&mut self.db)?
-                .into_iter()
-                .map(|entry| archive::ArchivedPeerEntry {
-                    author: entry.author,
-                    seq: entry.seq,
-                    major: entry.major,
-                    changeset: entry.changeset,
-                    account: entry.account,
-                    bot_list: entry.bot_list,
-                    received_at: entry.received_at,
-                })
-                .collect();
+            let entries = peer::all_held(&mut self.db)?;
             let cursors = exchange::all_cursors(&mut self.db)?;
             (entries, cursors)
         };

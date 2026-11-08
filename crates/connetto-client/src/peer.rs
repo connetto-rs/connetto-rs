@@ -87,7 +87,7 @@ impl HeldState {
     /// # Errors
     ///
     /// [`ClientError::Session`] for a value no state stores.
-    fn from_db(value: i64) -> Result<Self, ClientError> {
+    pub(crate) fn from_db(value: i64) -> Result<Self, ClientError> {
         match value {
             0 => Ok(Self::Provisional),
             1 => Ok(Self::CourierOnly),
@@ -336,6 +336,84 @@ pub(crate) fn all_entries(db: &mut SqliteConnection) -> Result<Vec<Entry>, Clien
         .order(dsl::position.asc())
         .load(db)?;
     rows.into_iter().map(into_entry).collect()
+}
+
+/// Every held entry as the archive carries it, position order (R78
+/// decision 20).
+///
+/// # Errors
+///
+/// [`ClientError::Session`] when a stored digest is not a hash.
+pub(crate) fn all_held(
+    db: &mut SqliteConnection,
+) -> Result<Vec<crate::archive::ArchivedPeerEntry>, ClientError> {
+    #[derive(diesel::Queryable)]
+    struct Row {
+        author: Vec<u8>,
+        seq: i64,
+        state: i64,
+        major: i64,
+        origin: Option<Vec<u8>>,
+        digest: Vec<u8>,
+        changeset: Option<Vec<u8>>,
+        account: String,
+        bot_list: Option<String>,
+        received_at: i64,
+    }
+    let rows: Vec<Row> = dsl::_connetto_peer_entry
+        .select((
+            dsl::author,
+            dsl::seq,
+            dsl::state,
+            dsl::major,
+            dsl::origin,
+            dsl::digest,
+            dsl::changeset,
+            dsl::account,
+            dsl::bot_list,
+            dsl::received_at,
+        ))
+        .order(dsl::position.asc())
+        .load(db)?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(crate::archive::ArchivedPeerEntry {
+                digest: <[u8; 32]>::try_from(row.digest.as_slice()).map_err(|_| {
+                    ClientError::Session(format!(
+                        "the held peer entry at sequence {} holds no digest",
+                        row.seq
+                    ))
+                })?,
+                author: row.author,
+                seq: row.seq,
+                state: row.state,
+                major: row.major,
+                origin: row.origin,
+                changeset: row.changeset,
+                account: row.account,
+                bot_list: row.bot_list,
+                received_at: row.received_at,
+            })
+        })
+        .collect()
+}
+
+/// Hold every provisional entry courier-only, the R31 rebuild dropping the
+/// records that made them provisional with the synced tables (R78 decision
+/// 7). An entry table of an earlier build comes to the held shape first.
+///
+/// # Errors
+///
+/// [`ClientError`] when the table cannot be upgraded or written.
+pub(crate) fn hold_for_rebuild(db: &mut SqliteConnection) -> Result<(), ClientError> {
+    if columns_of(db, "_connetto_peer_entry")?.is_empty() {
+        return Ok(());
+    }
+    upgrade_entries(db)?;
+    diesel::update(dsl::_connetto_peer_entry.filter(dsl::state.eq(HeldState::Provisional.db())))
+        .set(dsl::state.eq(HeldState::CourierOnly.db()))
+        .execute(db)?;
+    Ok(())
 }
 
 /// The position a stored entry already took, `None` when the entry is not
