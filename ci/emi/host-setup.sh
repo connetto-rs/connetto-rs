@@ -51,6 +51,8 @@ PHONE_PROFILE=ci-android
 PHONE_USER=lucac
 # A small VM on the phone member that holds a phone for hands-on adb while phone-hold.sh holds it.
 HANDS_ON_PROFILE=ci-hands-on
+HANDS_ON_GIB=12
+HANDS_ON_CPUS=4
 
 case "$MEMBER" in
   emi)
@@ -448,7 +450,7 @@ if [ "$MEMBER" = emi ]; then
   make_profile ci-heavy "$LARGEST_CPUS" "${LARGEST_GIB}GiB"
   # The phone VM, sized as a heavy one. Its phones are usb devices sync-phones.sh adds from ci/emi/phones.
   make_profile "$PHONE_PROFILE" "$LARGEST_CPUS" "${LARGEST_GIB}GiB"
-  make_profile "$HANDS_ON_PROFILE" 4 12GiB
+  make_profile "$HANDS_ON_PROFILE" "$HANDS_ON_CPUS" "${HANDS_ON_GIB}GiB"
   for name in "$PHONE_PROFILE" "$HANDS_ON_PROFILE"; do
     incus profile device show "$name" --project "$PROJECT" | grep -q '^android-adb:' \
       || incus profile device add "$name" android-adb disk source="$CACHE_ROOT/android-adb" path=/srv/cache/android-adb readonly=true --project "$PROJECT"
@@ -507,7 +509,7 @@ if [ "$MEMBER" = emi ]; then
     sudo -u "$PHONE_USER" incus remote add ci https://127.0.0.1:8443 --project "$PROJECT" --accept-certificate
   fi
 
-  log "Placement: each new CI VM goes to the member with the most CI memory left, within the share ci-share.sh set, and a phone or hands-on VM to the member the phones are plugged into"
+  log "Placement: each new CI VM goes to the member with the most CI memory left, within the share ci-share.sh set, and a phone or hands-on VM to the member the phones are plugged into, where runners leave their room free"
   incus config set instances.placement.scriptlet="$(cat <<EOF
 LARGEST = $LARGEST_GIB
 LARGEST_CPUS = $LARGEST_CPUS
@@ -531,6 +533,16 @@ def cpus(instance):
         return LARGEST_CPUS
     return int(value)
 
+def reserved(instance):
+    return "$PHONE_PROFILE" in instance.profiles or "$HANDS_ON_PROFILE" in instance.profiles
+
+def runner_flavor(profiles):
+    if "ci-heavy" in profiles:
+        return "heavy"
+    if "ci-light" in profiles:
+        return "light"
+    return None
+
 def instance_placement(request, candidate_members):
     if request.project != "$PROJECT" or request.reason != "new":
         return
@@ -539,6 +551,7 @@ def instance_placement(request, candidate_members):
     wanted_cpus = resources.cpu_cores
     # incus passes a host's USB devices only to VMs on that host.
     phones = "$PHONE_PROFILE" in request.profiles or "$HANDS_ON_PROFILE" in request.profiles
+    flavor = runner_flavor(request.profiles)
     phone_members = 0
     best = None
     best_room = -1
@@ -558,13 +571,33 @@ def instance_placement(request, candidate_members):
         stopped = len([i for i in instances if i.status == "Stopped"])
         unrecorded = max(0, operations - stopped)
         count = len(instances) + unrecorded
+        # ci-share.sh sized each member's slots to fit together, so any order of requests within GARM's caps places.
+        # A creation without a record yet may be of either flavor, so it takes a slot of both.
+        if flavor != None:
+            taken = len([i for i in instances if runner_flavor(i.profiles) == flavor]) + unrecorded
+            if taken >= share(member, flavor + "_slots"):
+                continue
         used = LARGEST * unrecorded
         used_cpus = LARGEST_CPUS * unrecorded
+        held_memory = 0
+        held_cpus = 0
+        held_vms = 0
         for instance in instances:
             used += memory_gib(instance)
             used_cpus += cpus(instance)
+            if reserved(instance):
+                held_memory += memory_gib(instance)
+                held_cpus += cpus(instance)
+                held_vms += 1
         room = share_memory - used
-        fits = count < share_vms and room >= wanted and share_cpus - used_cpus >= wanted_cpus
+        cpu_room = share_cpus - used_cpus
+        vm_room = share_vms - count
+        # A runner leaves room for the phone and hands-on VMs that don't exist yet.
+        if not phones:
+            room -= max(0, share(member, "reserved_memory_gib") - held_memory)
+            cpu_room -= max(0, share(member, "reserved_cpus") - held_cpus)
+            vm_room -= max(0, share(member, "reserved_vms") - held_vms)
+        fits = vm_room > 0 and room >= wanted and cpu_room >= wanted_cpus
         if fits and room > best_room:
             best = name
             best_room = room
@@ -620,9 +653,13 @@ for entry in "emi $EMI_MEMORY_GIB $EMI_VMS $EMI_CPUS" "commons $COMMONS_MEMORY_G
   incus cluster set "$name" user.ci.ceiling_cpus="$cpus"
 done
 
-log "$PHONE_MEMBER holds the CI phones, so the placement scriptlet sends the phone and hands-on VMs there"
-incus cluster list --format csv --columns n | grep -qx "$PHONE_MEMBER" \
-  && incus cluster set "$PHONE_MEMBER" user.ci.phones=true
+log "$PHONE_MEMBER holds the CI phones, so the placement scriptlet sends the phone and hands-on VMs there and keeps their room free of runners"
+if incus cluster list --format csv --columns n | grep -qx "$PHONE_MEMBER"; then
+  incus cluster set "$PHONE_MEMBER" user.ci.phones=true
+  incus cluster set "$PHONE_MEMBER" user.ci.reserved_memory_gib=$((LARGEST_GIB + HANDS_ON_GIB))
+  incus cluster set "$PHONE_MEMBER" user.ci.reserved_cpus=$((LARGEST_CPUS + HANDS_ON_CPUS))
+  incus cluster set "$PHONE_MEMBER" user.ci.reserved_vms=2
+fi
 
 log "Docker Hub pull-through mirror on $BRIDGE_IP:$MIRROR_PORT"
 # Host networking, because a published port DNATs to Docker's 172.17/16, which the CI egress ACL drops.

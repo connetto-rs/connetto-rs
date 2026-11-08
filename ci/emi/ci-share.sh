@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Sets how much of one cluster member CI may use, and sizes GARM's scale sets to all members' shares together.
+# Sets how much of one cluster member CI may use, gives each member as many heavy and light runner slots
+# as its own share holds after the phone and hands-on VMs' reserve, and caps GARM's scale sets at their sums.
 #
 # Run as: sudo bash ci-share.sh MEMBER MEMORY_GIB VMS CPUS   (on emi_machine)
 #         sudo bash ci-share.sh commons 0 0 0                (commons gives CI nothing)
@@ -60,23 +61,43 @@ incus cluster set "$member" user.ci.memory_gib="$memory"
 incus cluster set "$member" user.ci.vms="$vms"
 incus cluster set "$member" user.ci.cpus="$cpus"
 
-total_memory=0 total_vms=0 total_cpus=0
+# Half a member's memory and CPUs go to heavy VMs, the rest to light ones, each member on its own,
+# since the placement scriptlet holds a runner to its flavor's slots on one member.
+slots_of() {
+  local memory=$1 vms=$2 cpus=$3 heavy light
+  heavy=$(min $((memory / 2 / heavy_gib)) $((cpus / 2 / heavy_cpus)))
+  heavy=$(min "$heavy" "$vms")
+  light=$(min $(((memory - heavy * heavy_gib) / light_gib)) $(((cpus - heavy * heavy_cpus) / light_cpus)))
+  light=$(min "$light" $((vms - heavy)))
+  echo "$heavy $light"
+}
+
+heavy=0 light=0
 while read -r name; do
   share_memory=$(member_key "$name" memory_gib)
   share_vms=$(member_key "$name" vms)
   share_cpus=$(member_key "$name" cpus)
   { number "$share_memory" && number "$share_vms" && number "$share_cpus"; } || continue
-  echo "$name: ${share_memory} GiB, $share_vms VMs, $share_cpus CPUs"
-  total_memory=$((total_memory + share_memory))
-  total_vms=$((total_vms + share_vms))
-  total_cpus=$((total_cpus + share_cpus))
+  reserved_memory=0 reserved_vms=0 reserved_cpus=0
+  if [ "$share_memory" -gt 0 ]; then
+    reserved_memory=$(member_key "$name" reserved_memory_gib)
+    reserved_vms=$(member_key "$name" reserved_vms)
+    reserved_cpus=$(member_key "$name" reserved_cpus)
+    reserved_memory=${reserved_memory:-0} reserved_vms=${reserved_vms:-0} reserved_cpus=${reserved_cpus:-0}
+    { number "$reserved_memory" && number "$reserved_vms" && number "$reserved_cpus"; } \
+      || fail "$name has a malformed user.ci.reserved_* key: run host-setup.sh emi"
+    { [ "$reserved_memory" -le "$share_memory" ] && [ "$reserved_vms" -lt "$share_vms" ] && [ "$reserved_cpus" -le "$share_cpus" ]; } \
+      || fail "$name reserves ${reserved_memory} GiB, $reserved_vms VMs and $reserved_cpus CPUs for its phone VMs, which leaves no room for a runner in its share"
+  fi
+  read -r member_heavy member_light <<<"$(slots_of $((share_memory - reserved_memory)) $((share_vms - reserved_vms)) $((share_cpus - reserved_cpus)))"
+  incus cluster set "$name" user.ci.heavy_slots="$member_heavy"
+  incus cluster set "$name" user.ci.light_slots="$member_light"
+  kept=""
+  [ "$reserved_vms" -gt 0 ] && kept=", keeping ${reserved_memory} GiB, $reserved_vms VMs and $reserved_cpus CPUs for the phone and hands-on VMs"
+  echo "$name: ${share_memory} GiB, $share_vms VMs, $share_cpus CPUs$kept, room for $member_heavy heavy and $member_light light runners"
+  heavy=$((heavy + member_heavy))
+  light=$((light + member_light))
 done <<<"$members"
-
-# Half the memory and half the CPUs go to heavy VMs, the rest to light ones.
-heavy=$(min $((total_memory / 2 / heavy_gib)) $((total_cpus / 2 / heavy_cpus)))
-heavy=$(min "$heavy" "$total_vms")
-light=$(min $(((total_memory - heavy * heavy_gib) / light_gib)) $(((total_cpus - heavy * heavy_cpus) / light_cpus)))
-light=$(min "$light" $((total_vms - heavy)))
 
 garm scaleset update "$light_set" --max-runners "$light" >/dev/null
 garm scaleset update "$heavy_set" --max-runners "$heavy" >/dev/null
