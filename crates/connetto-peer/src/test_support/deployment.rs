@@ -302,6 +302,18 @@ pub struct Peer {
 }
 
 impl Peer {
+    /// The end of the leaf's validity.
+    ///
+    /// # Panics
+    ///
+    /// When the leaf does not parse, which a minted peer's always does.
+    #[must_use]
+    pub fn not_after(&self) -> SystemTime {
+        DeviceCertificate::parse(&self.leaf)
+            .expect("the profile holds")
+            .not_after()
+    }
+
     /// The peer `leaf` names, signed for by `key` under `issuer`.
     fn parsed(key: Device, level: AttestationLevel, leaf: Vec<u8>, issuer: &Issuer) -> Self {
         let parsed = DeviceCertificate::parse(&leaf).expect("the profile holds");

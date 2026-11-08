@@ -60,6 +60,8 @@ diesel::table! {
         head -> Binary,
         /// The last verified offer bytes.
         offer -> Binary,
+        /// When the author's certificate ends, in Unix seconds.
+        expires_at -> BigInt,
     }
 }
 
@@ -88,6 +90,7 @@ fn seed_cursor<T>(
             _connetto_peer_cursor::seq.eq(seq),
             _connetto_peer_cursor::head.eq(head),
             _connetto_peer_cursor::offer.eq(offer),
+            _connetto_peer_cursor::expires_at.eq(4_102_444_800_i64),
         ))
         .execute(conn.conn())
         .expect("seed the cursor");
@@ -554,13 +557,15 @@ fn store_raw_entry<T>(
 {
     diesel::sql_query(
         "INSERT INTO _connetto_peer_entry \
-         (author, seq, major, changeset, account, bot_list, received_at, position) \
-         VALUES (?, ?, ?, ?, ?, NULL, 1000, \
+         (author, seq, state, major, digest, changeset, account, bot_list, received_at, \
+         position) \
+         VALUES (?, ?, 0, ?, ?, ?, ?, NULL, 1000, \
          (SELECT coalesce(max(position), 0) + 1 FROM _connetto_peer_entry))",
     )
     .bind::<diesel::sql_types::Binary, _>(&author.key_id)
     .bind::<diesel::sql_types::BigInt, _>(seq)
     .bind::<diesel::sql_types::BigInt, _>(major)
+    .bind::<diesel::sql_types::Binary, _>(manifest(1, body).digest.to_vec())
     .bind::<diesel::sql_types::Binary, _>(body)
     .bind::<diesel::sql_types::Text, _>(&author.account)
     .execute(conn.conn())
@@ -677,8 +682,8 @@ async fn an_impossible_peer_record_refuses_the_whole_import() {
 async fn a_cursor_with_a_corrupt_head_refuses_the_export() {
     let (mut r1, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     diesel::sql_query(
-        "INSERT INTO _connetto_peer_cursor (author, account, seq, head, offer) \
-         VALUES (x'aa', 'peer-anna', 1, x'0102', x'00')",
+        "INSERT INTO _connetto_peer_cursor (author, account, seq, head, offer, expires_at) \
+         VALUES (x'aa', 'peer-anna', 1, x'0102', x'00', 4102444800)",
     )
     .execute(r1.conn())
     .expect("seed a corrupt cursor");

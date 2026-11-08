@@ -1329,6 +1329,9 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         peer: slot.peer.clone(),
                         public_key: slot.public_key.clone(),
                         bot_list: slot.bot_list.clone(),
+                        expires_at: DeviceCertificate::parse(&slot.leaf)
+                            .expect("the peer's leaf was verified at the handshake")
+                            .not_after(),
                     })
                     .ok();
             }

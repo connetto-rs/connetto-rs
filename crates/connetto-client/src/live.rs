@@ -3427,13 +3427,31 @@ where
         author: crate::peer::PeerAuthor,
         offer: connetto_core::exchange::SignedOffer,
         cursor: connetto_core::exchange::Frontier,
+        expires_at: std::time::SystemTime,
     ) -> Result<(), ClientError> {
         let mut state = self.shared.lock_interrupting().await;
-        let adopted = state.conn.adopt_peer_offer(&author, &offer, &cursor);
+        let adopted = state.conn.adopt_peer_offer(
+            &author,
+            &offer,
+            &cursor,
+            crate::exchange::unix_secs(expires_at),
+        );
         drop(state);
         // The pump hands on what the adopt raised, offline too.
         self.shared.wake.notify_one();
         adopted
+    }
+
+    #[cfg(feature = "peer")]
+    async fn renew(
+        &self,
+        author: Vec<u8>,
+        expires_at: std::time::SystemTime,
+    ) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state
+            .conn
+            .renew_peer_expiry(&author, crate::exchange::unix_secs(expires_at))
     }
 
     #[cfg(feature = "peer")]

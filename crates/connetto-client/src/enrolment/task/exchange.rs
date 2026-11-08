@@ -60,6 +60,9 @@ struct Linked {
     /// The `SubjectPublicKeyInfo` the link proved, which its offers verify
     /// against.
     public_key: Vec<u8>,
+    /// The end of the certificate the link last proved, which the adopt
+    /// stores (R78 decision 17).
+    expires_at: std::time::SystemTime,
 }
 
 /// The exchange's state in the task, empty when the build has no peer link.
@@ -248,13 +251,14 @@ impl<L: Link> Run<L> {
         self.act(actions).await;
     }
 
-    /// A link came up with `peer`, whose certificate proved `public_key` and
-    /// carries `bot_list`.
+    /// A link came up with `peer`, whose certificate proved `public_key`,
+    /// carries `bot_list` and ends at `expires_at`.
     pub(super) async fn peer_linked(
         &mut self,
         peer: DeviceIdentity,
         public_key: Vec<u8>,
         bot_list: Option<String>,
+        expires_at: std::time::SystemTime,
     ) {
         let author = PeerAuthor {
             key_id: peer.key().as_bytes().to_vec(),
@@ -268,13 +272,35 @@ impl<L: Link> Run<L> {
                 crate::exchange::FRESH_CURSOR
             }
         };
-        self.exchange
-            .linked
-            .insert(peer.clone(), Linked { author, public_key });
+        self.exchange.linked.insert(
+            peer.clone(),
+            Linked {
+                author,
+                public_key,
+                expires_at,
+            },
+        );
         let actions = self.exchange.machine.linked(peer, cursor);
         self.act(actions).await;
         if self.exchange.machine.own_offer().is_none() && self.exchange.signing.is_none() {
             self.sign_offer().await;
+        }
+    }
+
+    /// `peer` renewed its certificate on its link, so its retained entries
+    /// are kept until `expires_at` and its next adopt stores that end (R78
+    /// decision 17).
+    pub(super) async fn peer_renewed(
+        &mut self,
+        peer: &DeviceIdentity,
+        expires_at: std::time::SystemTime,
+    ) {
+        if let Some(linked) = self.exchange.linked.get_mut(peer) {
+            linked.expires_at = expires_at;
+        }
+        let author = peer.key().as_bytes().to_vec();
+        if let Err(err) = self.link.renew(author, expires_at).await {
+            tracing::warn!(error = %err, "a peer's renewed certificate end could not be stored");
         }
     }
 
@@ -315,8 +341,8 @@ impl<L: Link> Run<L> {
                     offer,
                     cursor,
                 } => {
-                    let author = self.linked_author(&peer);
-                    if let Err(err) = self.link.adopt(author, offer, cursor).await {
+                    let (author, expires_at) = self.linked_author(&peer);
+                    if let Err(err) = self.link.adopt(author, offer, cursor, expires_at).await {
                         tracing::warn!(error = %err, "a peer's offer could not be taken");
                         self.commit_failed(&peer, Commit::Adopt, &mut actions).await;
                     }
@@ -384,7 +410,7 @@ impl<L: Link> Run<L> {
         cursor: connetto_core::exchange::Frontier,
         actions: &mut VecDeque<Action<DeviceIdentity>>,
     ) {
-        let author = self.linked_author(peer);
+        let (author, _) = self.linked_author(peer);
         if let Err(err) = self.link.take_row(author, row, body, cursor).await {
             tracing::warn!(error = %err, "a peer's entry could not be taken");
             self.commit_failed(peer, Commit::Row, actions).await;
@@ -421,7 +447,7 @@ impl<L: Link> Run<L> {
             | Action::Skip { peer: of, .. } => of != peer,
             _ => true,
         });
-        let key_id = self.linked_author(peer).key_id;
+        let key_id = self.linked_author(peer).0.key_id;
         match self.link.peer_cursor(key_id).await {
             Ok(stored) => match commit {
                 Commit::Adopt => self
@@ -440,15 +466,16 @@ impl<L: Link> Run<L> {
         }
     }
 
-    /// The author `peer`'s link proved. The machine acts only for linked
-    /// peers, and a link's author is kept from its link up to its unlink.
-    fn linked_author(&self, peer: &DeviceIdentity) -> PeerAuthor {
-        self.exchange
+    /// The author `peer`'s link proved and the end of its certificate. The
+    /// machine acts only for linked peers, and a link's author is kept from
+    /// its link up to its unlink.
+    fn linked_author(&self, peer: &DeviceIdentity) -> (PeerAuthor, std::time::SystemTime) {
+        let linked = self
+            .exchange
             .linked
             .get(peer)
-            .expect("the machine acts only for a linked peer")
-            .author
-            .clone()
+            .expect("the machine acts only for a linked peer");
+        (linked.author.clone(), linked.expires_at)
     }
 }
 
