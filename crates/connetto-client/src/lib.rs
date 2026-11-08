@@ -10112,6 +10112,9 @@ where
             }
             _ => {}
         }
+        // The server ended the session, so the wire goes now and the loss is
+        // announced before any redial.
+        self.disconnected();
         Ok(ClientEvent::ServerClosed { reason })
     }
 
