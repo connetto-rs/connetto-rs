@@ -1,0 +1,5 @@
+# The phones CI enrols on emi, one per line: serial, USB vendor id, then a free description.
+# sync-phones.sh makes profile ci-android hold exactly these.
+RZCY10GSZSF 04e8 Galaxy A35 SM-A356B, Android 14
+RZCY10GL6CN 04e8 Galaxy A35 SM-A356B, Android 15
+230814b 18d1 Fairphone 4, /e/OS 12
