@@ -102,11 +102,13 @@ async fn served(fixture: &Fixture) -> Served {
         change_stream,
         handle,
         ..
-    } = builder
-        .device_identity(Some(DeviceCertConfig::new(issuer)))
-        .build()
-        .await
-        .expect("the deployment assembles");
+    } = Box::pin(
+        builder
+            .device_identity(Some(DeviceCertConfig::new(issuer)))
+            .build(),
+    )
+    .await
+    .expect("the deployment assembles");
     let stream = tokio::spawn(async move {
         let _ = change_stream.await;
     });

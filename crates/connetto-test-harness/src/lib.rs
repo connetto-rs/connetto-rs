@@ -2289,6 +2289,30 @@ impl Client {
             .expect("send mutation patch");
     }
 
+    /// Open a courier range (R78), its bodies to follow.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `CourierRange` frame fails on the transport.
+    pub async fn courier_range(&mut self, range: connetto_core::messages::CourierRange) {
+        self.transport
+            .send_control(ControlMessage::CourierRange(range))
+            .await
+            .expect("send courier range");
+    }
+
+    /// Send one body of the open courier range.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `CourierBody` frame fails on the transport.
+    pub async fn courier_body(&mut self, body: connetto_core::messages::CourierBody) {
+        self.transport
+            .send_bulk(BulkMessage::CourierBody(body))
+            .await
+            .expect("send courier body");
+    }
+
     /// Prove the connection's device key with a signature over the
     /// connection's challenge nonce, and wait for the `WriterAnswer` that
     /// settles the bind.

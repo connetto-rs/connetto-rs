@@ -139,6 +139,7 @@ fn resync_server() -> LoopbackTransport {
                 resume_token: "resync".to_owned(),
                 schema_version: None,
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: Some(connetto_core::messages::WriterGrant {
                     number: 1,
@@ -264,6 +265,7 @@ fn aggregate_resync_server() -> LoopbackTransport {
                 resume_token: "agg-resync".to_owned(),
                 schema_version: None,
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: Some(connetto_core::messages::WriterGrant {
                     number: 1,
@@ -368,6 +370,7 @@ fn aggregate_resync_live_server(
                 resume_token: "agg-live".to_owned(),
                 schema_version: None,
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: Some(connetto_core::messages::WriterGrant {
                     number: 1,

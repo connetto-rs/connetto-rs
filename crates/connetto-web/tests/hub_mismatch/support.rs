@@ -131,6 +131,7 @@ impl FakeUpstream {
                 // The scenario's sunset, when it names one, so the tabs the
                 // hub relays the acknowledgement to carry the same instant.
                 sunset_at_secs: self.script.sunset,
+                courier: false,
                 initial_credits: 64,
                 writer,
             })),
