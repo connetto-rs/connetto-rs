@@ -182,7 +182,7 @@ mod tests {
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::net::TcpStream;
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::{Relay, echo_upstream};
 
@@ -238,9 +238,12 @@ mod tests {
     /// the app is offline.
     #[tokio::test]
     async fn a_stopped_relay_keeps_its_port() {
-        let mut relay = Relay::start("127.0.0.1:0", &echo().await)
-            .await
-            .expect("start");
+        let mut relay = Relay::start(
+            "127.0.0.1:0",
+            &echo_upstream().await.expect("an echo upstream"),
+        )
+        .await
+        .expect("start");
         relay.stop().await;
         assert!(
             TcpListener::bind(relay.address()).await.is_err(),
