@@ -306,52 +306,6 @@ jobs:
             ~/.cargo/git/db
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
-  ios:
-    # R88: the phone build of the demo for iOS, built without a
-    # device, for the same reason the Android leg is its own job. It links,
-    # because only the link sees a C object built for another iOS version.
-    name: Build dioxus-demo ios
-    runs-on: macos-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Restore cargo downloads
-        id: cache-1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
-
-      - name: Install stable toolchain with the iOS targets
-        uses: $/.github/actions/install-rust
-        with:
-          targets: aarch64-apple-ios aarch64-apple-ios-sim
-
-      - name: Build the demo for iOS devices and the simulator
-        working-directory: examples/dioxus-demo
-        run: |
-          for target in aarch64-apple-ios aarch64-apple-ios-sim; do
-            cargo +stable build \
-              --target "$target" \
-              --no-default-features \
-              --features mobile
-          done
-
-      - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: ${{ steps.cache-1.outputs.cache-primary-key }}
-
   ios-simulator:
     # R88's proof, walked on an iOS simulator with the Tauri demo. The runner
     # cannot run Docker, so the backend runs as plain processes and the
