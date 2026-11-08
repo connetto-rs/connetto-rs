@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Sets how much of one cluster member CI may use, gives each member as many heavy and light runner slots
-# as its own share holds after the phone and hands-on VMs' reserve, and caps GARM's scale sets at their sums.
+# Sets one member's CI share, then sizes every member's heavy and light slots and GARM's caps from the shares.
 #
-# Run as: sudo bash ci-share.sh MEMBER MEMORY_GIB VMS CPUS   (on emi_machine)
-#         sudo bash ci-share.sh commons 0 0 0                (commons gives CI nothing)
+# Run as: sudo bash ci-share.sh MEMBER MEMORY_GIB VMS CPUS [HEAVY]   (on emi_machine)
+#         sudo bash ci-share.sh commons 0 0 0                        (commons gives CI nothing)
 # Lowering a share stops new runner VMs there, and the VMs already there finish their jobs.
 set -euo pipefail
 
@@ -11,7 +10,7 @@ PROJECT=ci
 RUNNER_USER=ci-runner
 GARM_CLI=/srv/ci-runner/garm/bin/garm-cli
 
-usage() { echo "usage: sudo bash ci-share.sh MEMBER MEMORY_GIB VMS CPUS" >&2; exit 1; }
+usage() { echo "usage: sudo bash ci-share.sh MEMBER MEMORY_GIB VMS CPUS [HEAVY]" >&2; exit 1; }
 fail() { echo "$*" >&2; exit 1; }
 number() { [[ $1 =~ ^(0|[1-9][0-9]*)$ ]]; }
 min() { echo $(($1 < $2 ? $1 : $2)); }
@@ -27,13 +26,14 @@ flavor() {
   echo "${memory%GiB} $cpus"
 }
 
-[ $# -eq 4 ] || usage
-member=$1 memory=$2 vms=$3 cpus=$4
-{ number "$memory" && number "$vms" && number "$cpus"; } || usage
+{ [ $# -eq 4 ] || [ $# -eq 5 ]; } || usage
+member=$1 memory=$2 vms=$3 cpus=$4 wanted=${5-}
+{ number "$memory" && number "$vms" && number "$cpus" && { [ -z "$wanted" ] || number "$wanted"; }; } || usage
 [ "$(id -u)" -eq 0 ] || fail "run this with sudo"
 { [ "$memory" -eq 0 ] && [ "$vms" -eq 0 ] && [ "$cpus" -eq 0 ]; } \
   || { [ "$memory" -gt 0 ] && [ "$vms" -gt 0 ] && [ "$cpus" -gt 0 ]; } \
   || fail "MEMORY_GIB, VMS and CPUS are all 0 or all above 0"
+{ [ -z "$wanted" ] || [ "$memory" -gt 0 ]; } || fail "HEAVY needs a share above 0"
 
 members=$(incus cluster list --format csv --columns n)
 grep -qx "$member" <<<"$members" || fail "$member is not a cluster member: $(echo "$members" | paste -sd' ')"
@@ -57,28 +57,24 @@ scale_set_of() {
 light_set=$(scale_set_of ci-light)
 heavy_set=$(scale_set_of ci-heavy)
 
-incus cluster set "$member" user.ci.memory_gib="$memory"
-incus cluster set "$member" user.ci.vms="$vms"
-incus cluster set "$member" user.ci.cpus="$cpus"
-
-# Half a member's memory and CPUs go to heavy VMs, the rest to light ones, each member on its own,
-# since the placement scriptlet holds a runner to its flavor's slots on one member.
+# Without a HEAVY count, half a member's memory and CPUs go to heavy VMs.
 slots_of() {
-  local memory=$1 vms=$2 cpus=$3 heavy light
-  heavy=$(min $((memory / 2 / heavy_gib)) $((cpus / 2 / heavy_cpus)))
-  heavy=$(min "$heavy" "$vms")
+  local memory=$1 vms=$2 cpus=$3 heavy=$4 light
+  if [ -z "$heavy" ]; then
+    heavy=$(min $((memory / 2 / heavy_gib)) $((cpus / 2 / heavy_cpus)))
+    heavy=$(min "$heavy" "$vms")
+  elif [ $((heavy * heavy_gib)) -gt "$memory" ] || [ $((heavy * heavy_cpus)) -gt "$cpus" ] || [ "$heavy" -gt "$vms" ]; then
+    fail "$heavy heavy runners need $((heavy * heavy_gib)) GiB, $((heavy * heavy_cpus)) CPUs and $heavy VMs, more than the ${memory} GiB, $cpus CPUs and $vms VMs left after the reserve"
+  fi
   light=$(min $(((memory - heavy * heavy_gib) / light_gib)) $(((cpus - heavy * heavy_cpus) / light_cpus)))
   light=$(min "$light" $((vms - heavy)))
   echo "$heavy $light"
 }
 
-heavy=0 light=0
-while read -r name; do
-  share_memory=$(member_key "$name" memory_gib)
-  share_vms=$(member_key "$name" vms)
-  share_cpus=$(member_key "$name" cpus)
-  { number "$share_memory" && number "$share_vms" && number "$share_cpus"; } || continue
-  reserved_memory=0 reserved_vms=0 reserved_cpus=0
+# Prints a member's heavy and light slots and its reserve, for a share given or read from its keys.
+member_slots() {
+  local name=$1 share_memory=$2 share_vms=$3 share_cpus=$4 wanted=$5 slots
+  local reserved_memory=0 reserved_vms=0 reserved_cpus=0
   if [ "$share_memory" -gt 0 ]; then
     reserved_memory=$(member_key "$name" reserved_memory_gib)
     reserved_vms=$(member_key "$name" reserved_vms)
@@ -89,7 +85,30 @@ while read -r name; do
     { [ "$reserved_memory" -le "$share_memory" ] && [ "$reserved_vms" -lt "$share_vms" ] && [ "$reserved_cpus" -le "$share_cpus" ]; } \
       || fail "$name reserves ${reserved_memory} GiB, $reserved_vms VMs and $reserved_cpus CPUs for its phone VMs, which leaves no room for a runner in its share"
   fi
-  read -r member_heavy member_light <<<"$(slots_of $((share_memory - reserved_memory)) $((share_vms - reserved_vms)) $((share_cpus - reserved_cpus)))"
+  slots=$(slots_of $((share_memory - reserved_memory)) $((share_vms - reserved_vms)) $((share_cpus - reserved_cpus)) "$wanted") || exit 1
+  echo "$slots $reserved_memory $reserved_vms $reserved_cpus"
+}
+
+# Checked before any key is set, so a HEAVY count that does not fit changes nothing.
+slots=$(member_slots "$member" "$memory" "$vms" "$cpus" "$wanted")
+
+incus cluster set "$member" user.ci.memory_gib="$memory"
+incus cluster set "$member" user.ci.vms="$vms"
+incus cluster set "$member" user.ci.cpus="$cpus"
+if [ -n "$wanted" ]; then
+  incus cluster set "$member" user.ci.heavy_wanted="$wanted"
+elif [ -n "$(member_key "$member" heavy_wanted)" ]; then
+  incus cluster unset "$member" user.ci.heavy_wanted
+fi
+
+heavy=0 light=0
+while read -r name; do
+  share_memory=$(member_key "$name" memory_gib)
+  share_vms=$(member_key "$name" vms)
+  share_cpus=$(member_key "$name" cpus)
+  { number "$share_memory" && number "$share_vms" && number "$share_cpus"; } || continue
+  slots=$(member_slots "$name" "$share_memory" "$share_vms" "$share_cpus" "$(member_key "$name" heavy_wanted)")
+  read -r member_heavy member_light reserved_memory reserved_vms reserved_cpus <<<"$slots"
   incus cluster set "$name" user.ci.heavy_slots="$member_heavy"
   incus cluster set "$name" user.ci.light_slots="$member_light"
   kept=""

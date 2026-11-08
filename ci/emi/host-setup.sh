@@ -37,7 +37,8 @@ ZABBLY_FINGERPRINT=4EFC590696CB15B87C73A3AD82CC8797C838DCFD
 # commons is shared with other people, who keep about 50 GiB of its 251 GiB.
 EMI_MEMORY_GIB=440
 EMI_VMS=28
-EMI_CPUS=64
+# Above emi's 64 threads, since its runners leave most of their vCPUs idle and ci.slice yields to emi's people.
+EMI_CPUS=88
 COMMONS_MEMORY_GIB=200
 COMMONS_VMS=16
 COMMONS_CPUS=64
