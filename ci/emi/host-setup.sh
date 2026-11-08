@@ -44,6 +44,13 @@ COMMONS_CPUS=64
 # The largest flavor, which a VM still being created is counted as.
 LARGEST_GIB=32
 LARGEST_CPUS=8
+# The member the CI phones are plugged into, the profile its phone VM uses, and the
+# emi account that enrols and holds the phones with its own Incus certificate.
+PHONE_MEMBER=emi
+PHONE_PROFILE=ci-android
+PHONE_USER=lucac
+# A small VM on the phone member that holds a phone for hands-on adb while phone-hold.sh holds it.
+HANDS_ON_PROFILE=ci-hands-on
 
 case "$MEMBER" in
   emi)
@@ -229,6 +236,25 @@ done
 if [ "$MEMBER" = emi ]; then
   chown "$GUEST_UID:$GUEST_UID" "$CACHE_ROOT/cargo-registry" "$CACHE_ROOT/sccache" "$CACHE_ROOT/handoff"
   chmod 0755 "$CACHE_ROOT"
+  # The adb key the phones trust, readable by the phone VM's runner and by the account that enrols phones, which share uid 1001 on emi.
+  install -d -m 0700 -o "$GUEST_UID" -g "$GUEST_UID" "$CACHE_ROOT/android-adb"
+  [ -f "$CACHE_ROOT/android-adb/enrolled" ] || install -m 0600 -o "$GUEST_UID" -g "$GUEST_UID" /dev/null "$CACHE_ROOT/android-adb/enrolled"
+
+  log "Phones sync-phones.sh enrolled are root-only on emi from their next plug-in, so no host adb claims one before the phone VM"
+  # A serial only ever restricts a device, so the list may stay writable by the account that enrols phones.
+  install -d -m 0755 /usr/local/libexec
+  cat > /usr/local/libexec/ci-phone-enrolled <<EOF
+#!/bin/sh
+case "\$1" in ''|*[!A-Za-z0-9]*) exit 1 ;; esac
+exec grep -qxF -- "\$1" $CACHE_ROOT/android-adb/enrolled
+EOF
+  chmod 0755 /usr/local/libexec/ci-phone-enrolled
+  # Sorts after 60-libgphoto2 and 69-libmtp and before 70-uaccess, which would tag the phone for a desktop session's ACL, since udev 255 cannot untag a device mid-event.
+  cat > /etc/udev/rules.d/70-ci-phones.rules <<'EOF'
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{serial}=="?*", PROGRAM="/usr/local/libexec/ci-phone-enrolled $attr{serial}", MODE:="0600", GROUP:="root", ENV{ID_USB_INTERFACES}="", ENV{ID_GPHOTO2}="", ENV{ID_MTP_DEVICE}="", ENV{ID_MEDIA_PLAYER}="", ENV{ID_PDA}=""
+EOF
+  udevadm control --reload-rules
+  udevadm trigger --subsystem-match=usb --action=change
 else
   chown "$GUEST_UID:$GUEST_UID" "$CACHE_ROOT/cargo-registry" "$CACHE_ROOT/sccache"
   # uid 1001 is a person on commons, so only root may reach the caches. The VMs reach them through virtiofsd, which runs as root.
@@ -384,6 +410,7 @@ if [ "$MEMBER" = emi ]; then
     restricted=true \
     restricted.devices.disk=allow \
     restricted.devices.disk.paths="$CACHE_ROOT" \
+    restricted.devices.usb=allow \
     restricted.networks.access="$BRIDGE" \
     restricted.storage-pools.access="$POOL" \
     limits.memory="$((EMI_MEMORY_GIB + COMMONS_MEMORY_GIB))GiB" \
@@ -393,7 +420,7 @@ if [ "$MEMBER" = emi ]; then
   # Incus 7.0.1 refuses to launch the project's own published images while this option is set (upstream/incus-restricted-image-servers-blocks-local-images.md).
   incus project unset "$PROJECT" restricted.images.servers
 
-  log "Profiles: default (disk, network), ci-light and ci-heavy (size and caches)"
+  log "Profiles: default (disk, network), ci-light, ci-heavy, $PHONE_PROFILE and $HANDS_ON_PROFILE (size and caches)"
   incus profile device show default --project "$PROJECT" | grep -q '^root:' \
     || incus profile device add default root disk path=/ pool="$POOL" size=100GiB --project "$PROJECT"
   incus profile device show default --project "$PROJECT" | grep -q '^eth0:' \
@@ -419,6 +446,13 @@ if [ "$MEMBER" = emi ]; then
   # 8.7 GiB for a browser shard's cold wasm build alone, beside the shard's services.
   make_profile ci-light 4 16GiB
   make_profile ci-heavy "$LARGEST_CPUS" "${LARGEST_GIB}GiB"
+  # The phone VM, sized as a heavy one. Its phones are usb devices sync-phones.sh adds from ci/emi/phones.
+  make_profile "$PHONE_PROFILE" "$LARGEST_CPUS" "${LARGEST_GIB}GiB"
+  make_profile "$HANDS_ON_PROFILE" 4 12GiB
+  for name in "$PHONE_PROFILE" "$HANDS_ON_PROFILE"; do
+    incus profile device show "$name" --project "$PROJECT" | grep -q '^android-adb:' \
+      || incus profile device add "$name" android-adb disk source="$CACHE_ROOT/android-adb" path=/srv/cache/android-adb readonly=true --project "$PROJECT"
+  done
 
   log "Account $RUNNER_USER, which runs GARM and holds the GitHub App key"
   id "$RUNNER_USER" >/dev/null 2>&1 \
@@ -438,6 +472,18 @@ if [ "$MEMBER" = emi ]; then
   incus config trust list --format json | grep -q "\"name\":\"$RUNNER_USER\"" \
     || incus config trust add-certificate "$RUNNER_HOME/incus/client.crt" --name "$RUNNER_USER" --restricted --projects "$PROJECT"
 
+  log "Incus client certificate for $PHONE_USER, valid in project $PROJECT only, for sync-phones.sh and phone-hold.sh"
+  phone_home=$(getent passwd "$PHONE_USER" | cut -d: -f6)
+  phone_config=$phone_home/.config/incus
+  sudo -u "$PHONE_USER" mkdir -p "$phone_config"
+  if [ ! -f "$phone_config/client.crt" ]; then
+    sudo -u "$PHONE_USER" openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 \
+      -days 3650 -subj "/CN=$PHONE_USER" \
+      -keyout "$phone_config/client.key" -out "$phone_config/client.crt"
+  fi
+  incus config trust list --format json | grep -q "\"name\":\"$PHONE_USER\"" \
+    || incus config trust add-certificate "$phone_config/client.crt" --name "$PHONE_USER" --restricted --projects "$PROJECT"
+
   log "Cluster bootstrapped on emi, its only database voter, reached by commons over the link"
   if ! clustered; then
     if incus list --project "$PROJECT" --format csv --columns n | grep -q .; then
@@ -454,8 +500,14 @@ if [ "$MEMBER" = emi ]; then
   # ci-runner's own incus remote, which the image build uses, pins it too.
   remote_cert=$RUNNER_HOME/.config/incus/servercerts/emi.crt
   [ -f "$remote_cert" ] && install -m 0644 -o "$RUNNER_USER" -g "$RUNNER_USER" "$cert" "$remote_cert"
+  # $PHONE_USER's remote ci pins it as well, and is added once the certificate is trusted.
+  if sudo -u "$PHONE_USER" incus remote list --format csv | grep -q '^ci,'; then
+    install -m 0644 -o "$PHONE_USER" -g "$PHONE_USER" "$cert" "$phone_config/servercerts/ci.crt"
+  else
+    sudo -u "$PHONE_USER" incus remote add ci https://127.0.0.1:8443 --project "$PROJECT" --accept-certificate
+  fi
 
-  log "Placement: each new CI VM goes to the member with the most CI memory left, within the share ci-share.sh set"
+  log "Placement: each new CI VM goes to the member with the most CI memory left, within the share ci-share.sh set, and a phone or hands-on VM to the member the phones are plugged into"
   incus config set instances.placement.scriptlet="$(cat <<EOF
 LARGEST = $LARGEST_GIB
 LARGEST_CPUS = $LARGEST_CPUS
@@ -485,10 +537,16 @@ def instance_placement(request, candidate_members):
     resources = get_instance_resources()
     wanted = resources.memory_size // GIB
     wanted_cpus = resources.cpu_cores
+    # incus passes a host's USB devices only to VMs on that host.
+    phones = "$PHONE_PROFILE" in request.profiles or "$HANDS_ON_PROFILE" in request.profiles
+    phone_members = 0
     best = None
     best_room = -1
     for member in candidate_members:
         name = member.server_name
+        if phones and member.config.get("user.ci.phones", "") != "true":
+            continue
+        phone_members += 1
         share_memory = share(member, "memory_gib")
         share_vms = share(member, "vms")
         share_cpus = share(member, "cpus")
@@ -510,6 +568,10 @@ def instance_placement(request, candidate_members):
         if fits and room > best_room:
             best = name
             best_room = room
+    if phones and phone_members == 0:
+        fail("no cluster member has user.ci.phones=true, which host-setup.sh sets on the member holding the CI phones")
+    if best == None and phones:
+        fail("the member with the CI phones is at its CI share")
     if best == None:
         fail("every member is at its CI share")
     set_target(best)
@@ -558,6 +620,10 @@ for entry in "emi $EMI_MEMORY_GIB $EMI_VMS $EMI_CPUS" "commons $COMMONS_MEMORY_G
   incus cluster set "$name" user.ci.ceiling_cpus="$cpus"
 done
 
+log "$PHONE_MEMBER holds the CI phones, so the placement scriptlet sends the phone and hands-on VMs there"
+incus cluster list --format csv --columns n | grep -qx "$PHONE_MEMBER" \
+  && incus cluster set "$PHONE_MEMBER" user.ci.phones=true
+
 log "Docker Hub pull-through mirror on $BRIDGE_IP:$MIRROR_PORT"
 # Host networking, because a published port DNATs to Docker's 172.17/16, which the CI egress ACL drops.
 if [ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' ci-registry-mirror 2>/dev/null)" != host ]; then
@@ -575,4 +641,5 @@ if [ "$MEMBER" = emi ]; then
   incus project show "$PROJECT"
   incus config trust list
   echo "ci-runner can now reach Incus at https://127.0.0.1:8443 with the certificate in $RUNNER_HOME/incus"
+  echo "$PHONE_USER enrols the phones listed in ci/emi/phones with: bash ci/emi/sync-phones.sh"
 fi

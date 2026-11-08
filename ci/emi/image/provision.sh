@@ -33,9 +33,12 @@ apt-get install -y --no-install-recommends \
 # Installed like GitHub's image, server programs present and the service off.
 systemctl disable --now postgresql
 
-echo "== runner account, uid $RUNNER_UID, passwordless sudo, docker and kvm"
+echo "== runner account, uid $RUNNER_UID, passwordless sudo, docker, kvm and the phones the phone VM is handed"
 id "$RUNNER" >/dev/null 2>&1 || useradd --create-home --uid "$RUNNER_UID" --shell /bin/bash "$RUNNER"
-usermod -aG docker,kvm,sudo "$RUNNER"
+usermod -aG docker,kvm,sudo,plugdev "$RUNNER"
+# Any device with an ADB interface, the same match as emi's own rule, since the phone VM receives only enrolled phones.
+echo 'SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:ff4201:*", MODE="0660", GROUP="plugdev"' \
+  > /etc/udev/rules.d/51-android-adb.rules
 echo "$RUNNER ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-$RUNNER"
 chmod 0440 "/etc/sudoers.d/90-$RUNNER"
 
