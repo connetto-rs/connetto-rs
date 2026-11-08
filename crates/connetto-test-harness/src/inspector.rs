@@ -316,6 +316,33 @@ impl PageSession {
         }
     }
 
+    /// Confirm the demo's delete and log out where it asks, which it does
+    /// while local writes are still unsent, and return once the page shows
+    /// the confirmation clicked, the signed-out banner or an error.
+    ///
+    /// # Errors
+    ///
+    /// When none of them shows within `limit`, naming what the page shows,
+    /// or as [`PageSession::call`].
+    pub async fn confirm_the_delete(&mut self, limit: Duration) -> Result<()> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let page = self.page_text().await?;
+            if page.contains("Confirm: delete and log out") {
+                return self.click("Confirm: delete and log out").await;
+            }
+            if page.contains("Sign in to begin.") || page.contains("Error: ") {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "the sign out asked neither for confirmation nor to sign out, the page shows:\n{page}"
+                );
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     /// Click the button labelled `label`.
     ///
     /// # Errors
@@ -632,6 +659,57 @@ mod tests {
         );
         let error = page.line_starting_with("Signed in as ").await.unwrap_err();
         assert!(error.to_string().contains("status: online"), "{error:#}");
+    }
+
+    /// A delete that asks is confirmed by its button, a signed-out banner
+    /// needs no click, and a page showing neither fails within its bound
+    /// naming what it shows.
+    #[tokio::test]
+    async fn a_delete_is_confirmed_where_it_asks() {
+        let confirm = "1 write unsent\nConfirm: delete and log out";
+        let url = value_endpoint(vec![serde_json::json!(confirm), serde_json::json!(true)]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.confirm_the_delete(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let url = value_endpoint(vec![serde_json::json!(confirm), serde_json::json!(false)]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        let missing = page
+            .confirm_the_delete(Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(
+            missing.to_string().contains("Confirm: delete and log out"),
+            "{missing:#}"
+        );
+        let url = value_endpoint(vec![serde_json::json!("Sign in to begin.")]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.confirm_the_delete(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let url = value_endpoint(vec![serde_json::json!("status: online")]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        let neither = page.confirm_the_delete(Duration::ZERO).await.unwrap_err();
+        assert!(
+            neither.to_string().contains("status: online"),
+            "{neither:#}"
+        );
+    }
+
+    /// A page that shows the confirmation only on a later read is waited on,
+    /// and the confirmation is clicked once it shows.
+    #[tokio::test]
+    async fn a_delete_waits_for_a_confirmation_that_shows_late() {
+        let url = value_endpoint(vec![
+            serde_json::json!("status: online"),
+            serde_json::json!("1 write unsent\nConfirm: delete and log out"),
+            serde_json::json!(true),
+        ])
+        .await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.confirm_the_delete(Duration::from_secs(5))
+            .await
+            .unwrap();
     }
 
     /// A click waits for the button to stand enabled, and clicks it the

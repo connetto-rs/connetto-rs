@@ -1459,13 +1459,12 @@ async fn end_leg_app() {
     }
 }
 
-/// One `codesign` call, named with its refusal on failure.
+/// One `codesign` call on `path`, named with its refusal on failure.
 ///
 /// # Errors
 ///
-/// When `codesign` refuses.
-#[cfg(target_os = "macos")]
-async fn codesign(args: &[&str], path: &Path) -> Result<()> {
+/// When `codesign` cannot start or refuses.
+pub async fn codesign(args: &[&str], path: &Path) -> Result<()> {
     let output = Command::new("codesign")
         .args(args)
         .arg(path)
