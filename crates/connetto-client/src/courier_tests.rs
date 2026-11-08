@@ -13,6 +13,7 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, Major, SchemaVersion, loopback};
+use core::fmt::Write as _;
 use core::time::Duration;
 use diesel::connection::SimpleConnection as _;
 use sha2::{Digest, Sha256};
@@ -30,6 +31,16 @@ const BOUND: Duration = Duration::from_secs(5);
 const CERT_END: i64 = 4_102_444_800;
 const AUTHOR: [u8; 32] = [0x01; 32];
 const OTHER: [u8; 32] = [0x02; 32];
+const THIRD: [u8; 32] = [0x03; 32];
+
+/// The stored byte form of a device key, for the tests' raw SQL.
+fn hex_of(author: [u8; 32]) -> String {
+    let mut out = String::new();
+    for byte in author {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
 
 fn major(number: u32) -> Major {
     Major::new(number).expect("a major")
@@ -498,6 +509,41 @@ async fn second_call_for_open_author_answers_busy() {
         .await
         .expect_err("the queued author is busy too");
     assert!(matches!(busy, CourierError::Busy));
+}
+
+/// A range the socket refuses ends the session, so the call fails with the
+/// transport's error and the next call finds the path gone.
+#[tokio::test]
+async fn a_range_the_socket_refuses_ends_the_session() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"one"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    let (mut conn, server) = attach(conn, true).await;
+    drop(server);
+    let err = conn
+        .courier(AUTHOR)
+        .await
+        .expect_err("the socket refuses the range");
+    assert!(matches!(
+        err,
+        CourierError::Client(crate::ClientError::Transport(_))
+    ));
+    let gone = conn
+        .courier(AUTHOR)
+        .await
+        .expect_err("the session ended with the send");
+    assert!(matches!(gone, CourierError::Unavailable));
+    assert!(matches!(
+        peer::state_of(&mut conn.db, &AUTHOR, 1),
+        Ok(Some(HeldState::Provisional))
+    ));
 }
 
 /// A call for another author queues behind the open range and its range goes
@@ -1692,4 +1738,791 @@ async fn candidates_last_is_none_without_a_ruling() {
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].seqs, [1]);
     assert_eq!(candidates[0].last, None, "no ruling was ever heard");
+}
+
+/// The pump's own tick drops the wait on a courier range that overran its
+/// bound, the range staying open for its late answer (decision 33).
+#[tokio::test]
+async fn the_pump_drops_the_lapsed_range_wait() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the held"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    let (mut conn, mut server) = attach(conn, true).await;
+    let wait = conn.courier(AUTHOR).await.expect("send the range");
+    let _range = next_range(&mut server).await;
+    let _ = next_body(&mut server).await;
+    conn.courier
+        .open
+        .as_mut()
+        .expect("the range is open")
+        .deadline = Duration::ZERO;
+    let event = conn
+        .pump_one_or(std::future::ready(()))
+        .await
+        .expect("the step stands");
+    assert!(event.is_none(), "the lapse stands no event");
+    assert!(
+        conn.courier
+            .open
+            .as_ref()
+            .expect("the range stays open")
+            .wait_dropped
+    );
+    let reply = wait
+        .receiver
+        .await
+        .expect("the wait stands")
+        .expect_err("the bound ran");
+    assert!(matches!(reply, CourierError::TimedOut));
+}
+
+/// An answer naming no range this connection sent stands a non-fatal notice
+/// and never touches the session's state.
+#[tokio::test]
+async fn an_answer_with_no_open_range_stands_nonfatal() {
+    let (mut conn, mut server) = attach(replica(), true).await;
+    deliver_answer(
+        &mut server,
+        "courier-999",
+        CourierOutcome::Entries(Vec::new()),
+    )
+    .await;
+    server.close().await.expect("hang up");
+    let event = conn.pump_one().await.expect("the stranger stands");
+    let ClientEvent::NonFatal { related_to, detail } = event else {
+        panic!("the stranger stands a notice, not {event:?}");
+    };
+    assert_eq!(related_to.as_deref(), Some("courier-999"));
+    assert!(detail.contains("no open range"), "{detail}");
+}
+
+/// A queued range whose rows no longer stand hears `NothingHeld` at once
+/// when the open range settles, the queue going on without it.
+#[tokio::test]
+async fn a_queued_range_whose_rows_are_gone_hears_nothing_held() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the first"),
+    );
+    hold(
+        &mut conn,
+        OTHER,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the other"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    adopt(&mut conn, OTHER, Some(1));
+    let (mut conn, mut server) = attach(conn, true).await;
+    let wait_a = conn.courier(AUTHOR).await.expect("send the first range");
+    let range_a = next_range(&mut server).await;
+    let _ = next_body(&mut server).await;
+    let wait_b = conn.courier(OTHER).await.expect("queue the second range");
+    // The second author's run is gone before the first range settles.
+    conn.db
+        .batch_execute(&format!(
+            "DELETE FROM _connetto_peer_entry WHERE author = x'{}'; \
+             DELETE FROM _connetto_peer_cursor WHERE author = x'{}'",
+            hex_of(OTHER),
+            hex_of(OTHER)
+        ))
+        .expect("drop the other author's run");
+    deliver_answer(
+        &mut server,
+        &range_a.request_id,
+        CourierOutcome::Entries(vec![(1, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+    )
+    .await;
+    server.close().await.expect("hang up");
+    let event = conn.pump_one().await.expect("the first range settles");
+    assert!(matches!(event, ClientEvent::Closed));
+    let report = wait_a
+        .receiver
+        .await
+        .expect("the first call stands")
+        .expect("the first range settles");
+    assert_eq!(report.settled, [1]);
+    let gone = wait_b
+        .receiver
+        .await
+        .expect("the second call stands")
+        .expect_err("the rows are gone");
+    assert!(matches!(gone, CourierError::NothingHeld));
+}
+
+/// A queued range whose rows no longer decode fails the flush and the pump
+/// step, the settled range having already heard its report.
+#[tokio::test]
+async fn a_queued_range_with_corrupt_rows_fails_the_flush() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the first"),
+    );
+    hold(
+        &mut conn,
+        OTHER,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the other"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    adopt(&mut conn, OTHER, Some(1));
+    let (mut conn, mut server) = attach(conn, true).await;
+    let wait_a = conn.courier(AUTHOR).await.expect("send the first range");
+    let range_a = next_range(&mut server).await;
+    let _ = next_body(&mut server).await;
+    let _wait_b = conn.courier(OTHER).await.expect("queue the second range");
+    conn.db
+        .batch_execute(&format!(
+            "UPDATE _connetto_peer_entry SET digest = x'{}' WHERE author = x'{}'",
+            "00".repeat(8),
+            hex_of(OTHER)
+        ))
+        .expect("corrupt the other author's digest");
+    deliver_answer(
+        &mut server,
+        &range_a.request_id,
+        CourierOutcome::Entries(vec![(1, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+    )
+    .await;
+    let err = conn
+        .pump_one()
+        .await
+        .expect_err("the flush fails on the corrupt rows");
+    assert!(err.to_string().contains("holds no digest"), "{err}");
+    let report = wait_a
+        .receiver
+        .await
+        .expect("the first call stands")
+        .expect("the first range settles");
+    assert_eq!(report.settled, [1]);
+}
+
+/// A flush whose send cannot reach the server requeues the range behind the
+/// error, and the session's end ends the requeued wait.
+#[tokio::test]
+async fn a_flush_send_failure_requeues_the_range() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the first"),
+    );
+    hold(
+        &mut conn,
+        OTHER,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the other"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    adopt(&mut conn, OTHER, Some(1));
+    let (mut conn, mut server) = attach(conn, true).await;
+    let wait_a = conn.courier(AUTHOR).await.expect("send the first range");
+    let range_a = next_range(&mut server).await;
+    let _ = next_body(&mut server).await;
+    let wait_b = conn.courier(OTHER).await.expect("queue the second range");
+    deliver_answer(
+        &mut server,
+        &range_a.request_id,
+        CourierOutcome::Entries(vec![(1, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+    )
+    .await;
+    server.close().await.expect("hang up");
+    let err = conn
+        .pump_one()
+        .await
+        .expect_err("the flush cannot send the queued range");
+    assert!(matches!(err, crate::ClientError::Transport(_)), "{err}");
+    assert_eq!(
+        conn.courier.queued.len(),
+        1,
+        "the range goes back to the queue"
+    );
+    let report = wait_a
+        .receiver
+        .await
+        .expect("the first call stands")
+        .expect("the first range settles");
+    assert_eq!(report.settled, [1]);
+    // The tick finds the send still failing, the range queued again.
+    let err = conn
+        .pump_one()
+        .await
+        .expect_err("the pump's tick finds the send still failing");
+    assert!(matches!(err, crate::ClientError::Transport(_)), "{err}");
+    let err = conn
+        .pump_one_or(std::future::ready(()))
+        .await
+        .expect_err("the step's tick finds the send still failing");
+    assert!(matches!(err, crate::ClientError::Transport(_)), "{err}");
+    conn.db
+        .batch_execute(&format!(
+            "DELETE FROM _connetto_peer_entry WHERE author = x'{}'; \
+             DELETE FROM _connetto_peer_cursor WHERE author = x'{}'",
+            hex_of(OTHER),
+            hex_of(OTHER)
+        ))
+        .expect("drop the other author's run");
+    let event = conn.pump_one().await.expect("the session ends");
+    assert!(matches!(event, ClientEvent::Closed));
+    let gone = wait_b
+        .receiver
+        .await
+        .expect("the second call stands")
+        .expect_err("the rows are gone");
+    assert!(matches!(gone, CourierError::NothingHeld));
+}
+
+/// An author with held rows but no stored offer holds nothing to courier.
+#[tokio::test]
+async fn an_author_without_a_stored_offer_hears_nothing_held() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the held"),
+    );
+    let (mut conn, _server) = attach(conn, true).await;
+    let err = conn.courier(AUTHOR).await.expect_err("no offer stands");
+    assert!(matches!(err, CourierError::NothingHeld));
+}
+
+/// A stored offer whose author holds no standing rows holds nothing to
+/// courier.
+#[tokio::test]
+async fn an_offer_without_standing_rows_hears_nothing_held() {
+    let mut conn = replica();
+    adopt(&mut conn, AUTHOR, Some(1));
+    let (mut conn, _server) = attach(conn, true).await;
+    let err = conn.courier(AUTHOR).await.expect_err("nothing stands");
+    assert!(matches!(err, CourierError::NothingHeld));
+}
+
+/// A stored offer that does not decode refuses the call rather than stand a
+/// range from it.
+#[tokio::test]
+async fn a_stored_offer_that_does_not_decode_refuses_the_call() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the held"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    let (mut conn, _server) = attach(conn, true).await;
+    conn.db
+        .batch_execute("UPDATE _connetto_peer_cursor SET offer = x'00'")
+        .expect("corrupt the stored offer");
+    let err = conn
+        .courier(AUTHOR)
+        .await
+        .expect_err("the offer does not decode");
+    assert!(
+        matches!(err, CourierError::Client(crate::ClientError::Session(_))),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("a stored offer does not decode"),
+        "{err}"
+    );
+}
+
+/// A cursor whose author key is not a device key is skipped in the
+/// candidates, never an error.
+#[tokio::test]
+async fn a_cursor_of_another_length_is_skipped_in_the_candidates() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the held"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    let (mut conn, _server) = attach(conn, true).await;
+    conn.db
+        .batch_execute(&format!(
+            "INSERT INTO _connetto_peer_cursor \
+             (author, account, seq, head, offer, expires_at) \
+             VALUES (x'{short}', 'short', 0, zeroblob(32), x'', {CERT_END})",
+            short = "42".repeat(5)
+        ))
+        .expect("store the short cursor");
+    let candidates = conn.courier_candidates().expect("read the candidates");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "the short key is skipped, not an error: {candidates:?}"
+    );
+    assert_eq!(candidates[0].author, AUTHOR.to_vec());
+}
+
+/// A retained-only author stands no candidate, its settled rows out of the
+/// run the main wire would send.
+#[tokio::test]
+async fn a_cursor_without_standing_rows_is_absent_from_the_candidates() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Retained,
+        major(2),
+        Some(b"the retained"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    let (mut conn, _server) = attach(conn, true).await;
+    let candidates = conn.courier_candidates().expect("read the candidates");
+    assert!(candidates.is_empty(), "{candidates:?}");
+}
+
+/// An offer whose newest runs past what a sequence stores clips the bound
+/// instead of refusing the run.
+#[tokio::test]
+async fn an_offer_newest_past_the_replica_reads_every_row() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::CourierOnly,
+        major(2),
+        Some(b"the held"),
+    );
+    adopt(&mut conn, AUTHOR, Some(u64::MAX));
+    let (mut conn, _server) = attach(conn, true).await;
+    let candidates = conn.courier_candidates().expect("the bound clips");
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    assert_eq!(candidates[0].seqs, [1]);
+}
+
+/// A provisional ask that overran its bound keeps its author's candidates
+/// restated, the ask waiting out the lapse for a fresh session.
+#[tokio::test]
+async fn a_lapsed_ask_restates_the_author_candidates() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::CourierOnly,
+        major(2),
+        Some(b"the held"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
+    conn.provisional
+        .in_flight
+        .as_mut()
+        .expect("the ask is in flight")
+        .deadline = Duration::ZERO;
+    let event = conn
+        .pump_one_or(std::future::ready(()))
+        .await
+        .expect("the lapse stands")
+        .expect("the lapse restates");
+    let candidate = expect_candidates(event);
+    assert_eq!(candidate.seqs, [1]);
+    assert!(conn.provisional.in_flight.is_none(), "the ask is dropped");
+    assert!(
+        conn.provisional.pending.is_empty(),
+        "the lapse keeps no ask for this session"
+    );
+}
+
+/// A verdict the server ruled Pending keeps the row held and the report's
+/// kept list, the row no nearer settled.
+#[tokio::test]
+async fn a_pending_verdict_keeps_the_row_in_the_report() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::CourierOnly,
+        major(2),
+        Some(b"the held"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
+    let wait = conn.courier(AUTHOR).await.expect("send the range");
+    let range = next_range(&mut server).await;
+    let _ = next_body(&mut server).await;
+    deliver_answer(
+        &mut server,
+        &range.request_id,
+        CourierOutcome::Entries(vec![(1, CourierEntryOutcome::Ruled(Verdict::Pending))]),
+    )
+    .await;
+    let candidate = expect_candidates(conn.pump_one().await.expect("restate"));
+    assert_eq!(candidate.seqs, [1]);
+    server.close().await.expect("hang up");
+    let event = conn.pump_one().await.expect("end the session");
+    assert!(matches!(event, ClientEvent::Closed));
+    let report = wait
+        .receiver
+        .await
+        .expect("the call stands")
+        .expect("the range settles");
+    assert_eq!(report.kept, [1]);
+    assert!(
+        report.settled.is_empty() && report.refused.is_empty(),
+        "{report:?}"
+    );
+    assert!(matches!(
+        peer::state_of(&mut conn.db, &AUTHOR, 1),
+        Ok(Some(HeldState::CourierOnly))
+    ));
+}
+
+/// A call that finds the open range's wait already dropped hears the queue
+/// at once, the dropped range keeping no reply to send again.
+#[tokio::test]
+async fn a_call_after_a_lapsed_range_hears_the_queue_at_once() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the first"),
+    );
+    hold(
+        &mut conn,
+        OTHER,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the other"),
+    );
+    hold(
+        &mut conn,
+        THIRD,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the third"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    adopt(&mut conn, OTHER, Some(1));
+    adopt(&mut conn, THIRD, Some(1));
+    let (mut conn, mut server) = attach(conn, true).await;
+    let wait_a = conn.courier(AUTHOR).await.expect("send the first range");
+    let _range = next_range(&mut server).await;
+    conn.courier
+        .open
+        .as_mut()
+        .expect("the range is open")
+        .deadline = Duration::ZERO;
+    let queued = conn
+        .courier(OTHER)
+        .await
+        .expect_err("queued behind the late answer");
+    assert!(matches!(queued, CourierError::QueuedBehindLateAnswer));
+    let again = conn
+        .courier(THIRD)
+        .await
+        .expect_err("the wait is already dropped");
+    assert!(matches!(again, CourierError::QueuedBehindLateAnswer));
+    assert_eq!(conn.courier.queued.len(), 2, "both ranges are queued");
+    let reply = wait_a
+        .receiver
+        .await
+        .expect("the first wait stands")
+        .expect_err("the bound ran");
+    assert!(matches!(reply, CourierError::TimedOut));
+}
+
+/// A lost session drains a queued range whose wait already dropped, keeping
+/// no reply to end, and ends the session without a second send.
+#[tokio::test]
+async fn a_lost_session_ends_a_wait_that_already_dropped() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the first"),
+    );
+    hold(
+        &mut conn,
+        OTHER,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the other"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    adopt(&mut conn, OTHER, Some(1));
+    let (mut conn, mut server) = attach(conn, true).await;
+    let wait_a = conn.courier(AUTHOR).await.expect("send the first range");
+    let _range = next_range(&mut server).await;
+    conn.courier
+        .open
+        .as_mut()
+        .expect("the range is open")
+        .deadline = Duration::ZERO;
+    let queued = conn
+        .courier(OTHER)
+        .await
+        .expect_err("queued behind the late answer");
+    assert!(matches!(queued, CourierError::QueuedBehindLateAnswer));
+    server.close().await.expect("hang up");
+    let event = conn.pump_one().await.expect("the loss stands");
+    assert!(matches!(event, ClientEvent::Closed));
+    // The open range's wait dropped on the lapse, so the loss keeps no reply
+    // to end it, and the queued range queued without one.
+    let reply = wait_a
+        .receiver
+        .await
+        .expect("the first wait stands")
+        .expect_err("the bound ran on the lapse");
+    assert!(matches!(reply, CourierError::TimedOut));
+}
+
+/// A taken row whose author key is not a device key stands its offer and
+/// entry, naming no candidate the key cannot carry.
+#[tokio::test]
+async fn a_short_author_key_stands_its_offer_without_a_candidate() {
+    let conn0 = replica();
+    let (mut conn, _server) = attach(conn0, true).await;
+    let body = b"the taken row";
+    let digest: [u8; 32] = Sha256::digest(body).into();
+    let row = ManifestRow {
+        seq: 1,
+        major: major(2),
+        origin: None,
+        digest,
+    };
+    let author = PeerAuthor {
+        key_id: vec![0x42; 10],
+        account: "short".to_owned(),
+        bot_list: None,
+    };
+    let encoded = rmp_serde::to_vec_named(&offer(Some(1))).expect("the offer encodes");
+    crate::exchange::upsert_cursor(
+        &mut conn.db,
+        &author.key_id,
+        "short",
+        &Frontier {
+            seq: 0,
+            head: GENESIS,
+        },
+        &encoded,
+        CERT_END,
+    )
+    .expect("adopt the short key's offer");
+    let cursor = Frontier {
+        seq: 1,
+        head: [7; 32],
+    };
+    conn.take_peer_row(&author, &row, None, &cursor)
+        .expect("the short key stands its offer");
+    assert!(matches!(
+        peer::state_of(&mut conn.db, &author.key_id, 1),
+        Ok(Some(HeldState::DigestOnly))
+    ));
+    assert!(
+        conn.notices
+            .iter()
+            .all(|event| !matches!(event, ClientEvent::CourierCandidates(_))),
+        "the short key names no candidate"
+    );
+}
+
+/// A taken row whose author holds a corrupt entry behind it refuses the
+/// offer restatement, the taken row keeping its hold.
+#[tokio::test]
+async fn a_corrupt_row_behind_the_taken_one_refuses_the_offer() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::CourierOnly,
+        major(2),
+        Some(b"the corrupt"),
+    );
+    conn.db
+        .batch_execute(&format!(
+            "UPDATE _connetto_peer_entry SET digest = x'{}' WHERE author = x'{}'",
+            "00".repeat(8),
+            hex_of(AUTHOR)
+        ))
+        .expect("corrupt the earlier row");
+    adopt(&mut conn, AUTHOR, Some(1));
+    let (mut conn, _server) = attach(conn, true).await;
+    let body = b"the taken row";
+    let digest: [u8; 32] = Sha256::digest(body).into();
+    let row = ManifestRow {
+        seq: 2,
+        major: major(2),
+        origin: None,
+        digest,
+    };
+    let cursor = Frontier {
+        seq: 2,
+        head: [8; 32],
+    };
+    let err = conn
+        .take_peer_row(&author_of(AUTHOR), &row, None, &cursor)
+        .expect_err("the corrupter refuses the offer");
+    assert!(err.to_string().contains("holds no digest"), "{err}");
+    assert!(matches!(
+        peer::state_of(&mut conn.db, &AUTHOR, 2),
+        Ok(Some(HeldState::DigestOnly))
+    ));
+}
+
+/// A stored major the build cannot express refuses the held-row read, never
+/// a row misread.
+#[test]
+fn a_major_the_build_cannot_express_refuses_the_rows() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the held"),
+    );
+    conn.db
+        .batch_execute("UPDATE _connetto_peer_entry SET major = 5000000000")
+        .expect("corrupt the major");
+    let err = peer::held_at_or_below(&mut conn.db, &AUTHOR, i64::MAX)
+        .err()
+        .expect("the major stands no build");
+    assert!(
+        err.to_string().contains("a major the build cannot express"),
+        "{err}"
+    );
+}
+
+/// A stored major no schema declares refuses the held-row read the same
+/// way.
+#[test]
+fn a_major_no_schema_declares_refuses_the_rows() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the held"),
+    );
+    conn.db
+        .batch_execute("UPDATE _connetto_peer_entry SET major = 0")
+        .expect("corrupt the major");
+    let err = peer::held_at_or_below(&mut conn.db, &AUTHOR, i64::MAX)
+        .err()
+        .expect("zero declares no major");
+    assert!(
+        err.to_string().contains("a major the build cannot express"),
+        "{err}"
+    );
+}
+
+/// A stored state no held row stores refuses the held-row read.
+#[test]
+fn an_unknown_state_refuses_the_rows() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the held"),
+    );
+    conn.db
+        .batch_execute("UPDATE _connetto_peer_entry SET state = 99")
+        .expect("corrupt the state");
+    let err = peer::held_at_or_below(&mut conn.db, &AUTHOR, i64::MAX)
+        .err()
+        .expect("the state stands no held row");
+    assert!(err.to_string().contains("no held state"), "{err}");
+}
+
+/// An origin that does not decode refuses the held-row read.
+#[test]
+fn an_unreadable_origin_refuses_the_rows() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the held"),
+    );
+    conn.db
+        .batch_execute("UPDATE _connetto_peer_entry SET origin = x'ff'")
+        .expect("corrupt the origin");
+    let err = peer::held_at_or_below(&mut conn.db, &AUTHOR, i64::MAX)
+        .err()
+        .expect("the origin does not decode");
+    assert!(err.to_string().contains("an unreadable origin"), "{err}");
+}
+
+/// A digest of another length refuses the held-row read.
+#[test]
+fn a_digest_of_another_length_refuses_the_rows() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the held"),
+    );
+    conn.db
+        .batch_execute(&format!(
+            "UPDATE _connetto_peer_entry SET digest = x'{}'",
+            "00".repeat(8)
+        ))
+        .expect("corrupt the digest");
+    let err = peer::held_at_or_below(&mut conn.db, &AUTHOR, i64::MAX)
+        .err()
+        .expect("the digest holds no 32 bytes");
+    assert!(err.to_string().contains("no digest"), "{err}");
 }

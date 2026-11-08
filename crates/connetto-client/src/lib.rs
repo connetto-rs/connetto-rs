@@ -6900,10 +6900,6 @@ where
                 Err(err) => return Err(err),
             };
             let request_id = courier_request_id();
-            if self.wire.is_none() {
-                self.courier.queued.push_front(queued);
-                return Ok(());
-            }
             if let Err(err) = self.send_courier_range(&request_id, author, &rows).await {
                 self.courier.queued.push_front(queued);
                 return Err(err);
