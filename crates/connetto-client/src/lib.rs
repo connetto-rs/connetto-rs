@@ -21,11 +21,12 @@ use connetto_core::device_cert::DeviceKey;
 use connetto_core::exchange::Origin;
 use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
-    ControlMessage, FatalErrorReason, GateState, Handshake, HeldWork, MutationHeader,
-    MutationPatch, MutationReject, MutationRejectReason, Ping, PriorRefusal, Provenance,
-    ReplaceShareKeys, RetireWriter, SUBSCRIPTION_REFUSED, ShareKeyChange, Subscribe,
-    SubscriptionSpec, TabIdentity, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome,
-    TabStorageAnswer, TabStorageOutcome, TabStorageUse, Unsubscribe, WriterAnswer,
+    ControlMessage, CourierNotice, CourierNoticeAck, CourierNoticeRow, FatalErrorReason, GateState,
+    Handshake, HeldWork, MutationHeader, MutationPatch, MutationReject, MutationRejectReason, Ping,
+    PriorRefusal, Provenance, ReplaceShareKeys, RetireWriter, SUBSCRIPTION_REFUSED, ShareKeyChange,
+    Subscribe, SubscriptionSpec, TabIdentity, TabShareKeyAnswer, TabShareKeyChange,
+    TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse, Unsubscribe,
+    WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -1745,6 +1746,21 @@ pub enum ClientEvent {
     ShareKeysReplaced {
         /// The correlation token the swap it answers carried.
         request_id: String,
+    },
+    /// The entries a courier settled for the session's account, sent after
+    /// the handshake and deleted by the receipt the connection answers at
+    /// once, or, on a connection that
+    /// [relays them](ConnettoConnection::relay_courier_notices), when
+    /// [`ConnettoConnection::ack_courier_notice`] names the frame (R78
+    /// decisions 12, 34 and 41). Raised once per frame, and the same rows
+    /// raise again on a later connection when the receipt did not reach the
+    /// server, so an application may see them twice.
+    WritesCouriered {
+        /// The id of the server's frame, which a relaying connection's
+        /// [`ConnettoConnection::ack_courier_notice`] takes.
+        notice_id: String,
+        /// The settled entries, one row each, naming the courier's account.
+        notices: Vec<CourierNoticeRow>,
     },
 }
 
@@ -4466,6 +4482,10 @@ struct Wire<T> {
     /// Which of the connection's handshakes attached this wire.
     #[cfg(feature = "device-identity")]
     number: ConnectionNumber,
+    /// The courier notice frames a relaying connection received on this wire
+    /// and has not acked, in arrival order (R78 decision 41 as amended). They
+    /// go with the wire, since their ids name this connection's frames alone.
+    held_notices: Vec<CourierNotice>,
 }
 
 /// Which handshake of a [`ConnettoConnection`] a wire came from, counted from
@@ -4614,6 +4634,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// State changes waiting to be handed to the application, drained ahead of
     /// the transport so an offline connection can still report itself.
     notices: VecDeque<ClientEvent>,
+    /// Whether this connection relays courier notices to other connections,
+    /// holding each frame until [`Self::ack_courier_notice`] names it, rather
+    /// than acking it at once (R78 decision 41 as amended).
+    relays_courier_notices: bool,
     /// How many handshakes this connection has completed.
     #[cfg(feature = "device-identity")]
     handshakes: u64,
@@ -5171,6 +5195,7 @@ where
             run: None,
             attach_replay: AttachReplay::Idle,
             notices: VecDeque::new(),
+            relays_courier_notices: false,
             #[cfg(feature = "device-identity")]
             handshakes: 0,
             db,
@@ -5504,6 +5529,7 @@ where
             challenge: ack.challenge,
             #[cfg(feature = "device-identity")]
             number: ConnectionNumber(self.handshakes),
+            held_notices: Vec::new(),
         });
         // The ack is the first inbound frame, so the clock starts with it.
         self.keepalive = KeepalivePhase::Idle {
@@ -6984,6 +7010,55 @@ where
     /// Drop the current transport while preserving the resumable session.
     pub fn disconnect(&mut self) {
         self.disconnected();
+    }
+
+    /// Relay courier notices rather than acking them, for a connection that
+    /// hands the server's frames to the connections an application drives,
+    /// as the browser hub's worker does for its tabs (R78 decision 41 as
+    /// amended). Each frame stays held, unacked, until
+    /// [`Self::ack_courier_notice`] names it or its transport drops, after
+    /// which the server sends its rows again at the next handshake.
+    pub fn relay_courier_notices(&mut self) {
+        self.relays_courier_notices = true;
+    }
+
+    /// The courier notice frames this relaying connection received on its
+    /// current transport and has not acked, in arrival order, empty on a
+    /// connection that acks at once or has no transport.
+    #[must_use]
+    pub fn held_courier_notices(&self) -> &[CourierNotice] {
+        self.wire
+            .as_ref()
+            .map_or(&[], |wire| wire.held_notices.as_slice())
+    }
+
+    /// Ack the held courier notice frame `notice_id` to the server, which
+    /// deletes its rows, and stop holding it. A frame this connection does
+    /// not hold, already acked or received on an earlier transport, sends
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the ack cannot be sent, the frame
+    /// then no longer held and its rows coming again at the next handshake.
+    pub async fn ack_courier_notice(&mut self, notice_id: &str) -> Result<(), ClientError> {
+        let Some(wire) = self.wire.as_mut() else {
+            return Ok(());
+        };
+        let Some(at) = wire
+            .held_notices
+            .iter()
+            .position(|held| held.notice_id == notice_id)
+        else {
+            return Ok(());
+        };
+        let held = wire.held_notices.remove(at);
+        wire.transport
+            .send_control(ControlMessage::CourierNoticeAck(CourierNoticeAck {
+                notice_id: held.notice_id,
+            }))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))
     }
 
     /// Prepare expiry, protocol work and live-wire coverage before a driver selects its wait, deferring secret writes while `persist` is `false`.
@@ -9966,6 +10041,28 @@ where
                 self.settle_share_key_replacement(&ack.request_id)?;
                 Ok(Some(ClientEvent::ShareKeysReplaced {
                     request_id: ack.request_id,
+                }))
+            }
+            // The receipt goes ahead of the event, so the rows are deleted
+            // while the connection still stands to carry the event, and a
+            // relaying connection holds the frame for the receipt of the
+            // connection it relays to (R78 decision 41 as amended).
+            ControlMessage::CourierNotice(notice) => {
+                let relays = self.relays_courier_notices;
+                let wire = self.wire()?;
+                if relays {
+                    wire.held_notices.push(notice.clone());
+                } else {
+                    wire.transport
+                        .send_control(ControlMessage::CourierNoticeAck(CourierNoticeAck {
+                            notice_id: notice.notice_id.clone(),
+                        }))
+                        .await
+                        .map_err(|e| ClientError::Transport(e.to_string()))?;
+                }
+                Ok(Some(ClientEvent::WritesCouriered {
+                    notice_id: notice.notice_id,
+                    notices: notice.notices,
                 }))
             }
             other => Err(ClientError::Protocol(format!(

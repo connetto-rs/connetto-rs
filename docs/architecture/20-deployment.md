@@ -10,7 +10,7 @@ A deployment holds state in three places. Its Postgres cluster, the stores besid
 |---|---|---|---|
 | Application tables | `CONNETTO_PG_DDL` | Yes | The deployment's own concern |
 | `connetto_sessions`, `connetto_provider_tokens` | `ConnettoSchema::Auth`, emitted by `connetto_schema!` | Yes | Refused by [`connetto_server::preflight::require`] (`Artifact::Table`) |
-| `_connetto_writers`, `_connetto_settled` and `_connetto_session_writers`, the per-writer applied frontier and each session's binds | `ConnettoSchema::Writers`, emitted by `connetto_schema!` | Yes | Refused by [`connetto_server::preflight::require`] (`Artifact::Table`) |
+| `_connetto_writers`, `_connetto_settled`, `_connetto_session_writers` and `_connetto_courier_notices`, the per-writer applied frontier, each session's binds and the author's standing courier notices | `ConnettoSchema::Writers`, emitted by `connetto_schema!` | Yes | Refused by [`connetto_server::preflight::require`] (`Artifact::Table`) |
 | `connetto_bans`, only under `CONNETTO_BANS=database` | `ConnettoSchema::Bans` | Yes | Refused by [`connetto_server::preflight::require`] (`Artifact::Table`) when bans are on |
 | The audit table `auth_events` | `ConnettoSchema::Audit` | Yes | Refused by [`connetto_server::preflight::require`] (`Artifact::Table`), always |
 | `connetto_device_enrolments`, `connetto_device_certificates`, `connetto_device_lists`, only with device identity | `ConnettoSchema::Enrolments` | Yes | Refused by [`connetto_server::preflight::require`] (`Artifact::Table`) when device identity is on |
@@ -88,6 +88,7 @@ connetto has no erase function. A function erasing over a list of queries could 
 | `connetto_bans` | The person's ban. Once the identity is gone it stops nothing |
 | The bot registry | For each bot the person owns (`connetto_bots.owner`), its installations' `connetto_installation_optional_tables` rows, its `connetto_installations`, `connetto_bot_lists` and `connetto_registration_codes` rows, then the bot. Then the codes the person created (`creator`) and the installations serving the person (`connetto_installations.owner`, optional tables first). Another person's bot the person installed stays |
 | `_cfs_manifests` | The manifests whose `uploaded_by` is the person's id, or a share key the application's own tables bind to the person's account. `_cfs_manifest_chunks` follows by cascade. connetto binds no share key to an account, so an upload under a key bound to no account belongs to the space that key opens and goes when that space's rows go |
+| `_connetto_courier_notices` | Every notice whose `user_id` or `courier_user_id` is the person, the entries the person wrote or carried |
 
 **The file bytes go at the next sweep pass.** The sweep reclaims a chunk once no manifest names it and the grace window has passed, `CONNETTO_CONTENT_SWEEP_SECS` defaulting to an hour and `CONNETTO_CONTENT_SWEEP_GRACE_SECS` to the upload ticket lifetime, as [18-file-handling.md](18-file-handling.md#server-storage) states. A chunk another uploader's manifest also names stays, because it is that uploader's file too.
 
@@ -109,7 +110,7 @@ The builder takes the deployment's schema as its one type parameter. [`connetto_
 
 `CONNETTO_SUNSET` (unset) names the major's sunset, an RFC 3339 instant in UTC. The server announces and enforces it as [02-protocol.md](02-protocol.md#the-sunset) states, checked against the deployment's own disciplined clock ([21-clocks.md](21-clocks.md)), so the instant the operator wrote is the one the deployment enforces, with no skew. The value must be an RFC 3339 instant in UTC at or after the Unix epoch, or the process refuses to start and names it.
 
-`CONNETTO_COURIER` (default `off`) set to `on`, or `ServerBuilder::courier(true)`, accepts courier ranges, the signed entries of a device that a device with a certificate relays ([19-device-to-device.md](19-device-to-device.md#the-courier-path)). Any other value refuses the boot, naming it. The enrolment table carries a nullable `bot_list TEXT` column, the bot list each device's last certificate carries, which a couriered entry applies under.
+`CONNETTO_COURIER` (default `off`) set to `on`, or `ServerBuilder::courier(true)`, accepts courier ranges, the signed entries of a device that a device with a certificate relays ([19-device-to-device.md](19-device-to-device.md#the-courier-path)). Any other value refuses the boot, naming it. The enrolment table carries a nullable `bot_list TEXT` column, the bot list each device's last certificate carries, which a couriered entry applies under. Every deployment carries the nullable `courier_user_id` column on the audit table, which every audit row the server writes names, and the `_connetto_courier_notices` table in the writer group, which startup requires, and the reader role takes `SELECT`, `INSERT` and `DELETE` on it and `USAGE` on its id sequence. A deployment that turns the path on adds the `write_couriered` label to the audit enum.
 
 ## Operating the replication slot
 

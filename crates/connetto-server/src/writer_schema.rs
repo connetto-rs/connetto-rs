@@ -7,7 +7,7 @@
 //! [`connetto_writers_table!`](crate::connetto_writers_table), and names it as
 //! the `Writers` member of its [`ConnettoSchema`](crate::schema::ConnettoSchema).
 //!
-//! Three tables carry the domain. `_connetto_writers` holds one row per writer
+//! Four tables carry the domain. `_connetto_writers` holds one row per writer
 //! with its applied frontier: `writer` (a number the server issues; a number
 //! writer's number is its own `writer` value), `user_id` (the account, absent
 //! for an anonymous caller), `device_key` (the device key's id, absent for a
@@ -20,7 +20,11 @@
 //! `_connetto_session_writers` holds one row per identified session and writer
 //! it bound, with the first sequence still to settle at that session's first
 //! bind, which is how a session's writes are told from another's on the same
-//! writer (R105 decision 6).
+//! writer (R105 decision 6). `_connetto_courier_notices` holds one row per
+//! couriered entry that settled, naming the author's account, the courier's
+//! account, the writer's key and the outcome, so the author's next sessions
+//! hear what was couriered and the first ack deletes the rows (R78 decision
+//! 12).
 //!
 //! Every associated statement is laundered as a boxed future because the
 //! diesel `future` trait solver cannot name the `INSERT ... ON CONFLICT ...
@@ -183,6 +187,11 @@ impl SettledOutcome {
 /// One statement of a [`ConnettoWriterSchema`], run on a borrowed
 /// connection.
 pub type Statement<'c, T> = Pin<Box<dyn Future<Output = QueryResult<T>> + Send + 'c>>;
+
+/// One standing courier notice row, the id the ack's delete takes, the
+/// courier's account, the author's device key, the sequence and the stored
+/// outcome.
+pub type CourierNoticeRow<Id> = (i64, Id, Vec<u8>, i64, String);
 
 /// One writer's row, as the schema reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,6 +388,30 @@ pub trait ConnettoWriterSchema: Send + Sync + 'static {
         conn: &'c mut AsyncPgConnection,
         session_id: &'c uuid::Uuid,
     ) -> Statement<'c, Vec<SessionBind<Self::Id>>>;
+    /// `INSERT INTO _connetto_courier_notices (user_id, courier_user_id,
+    /// device_key, seq, outcome) VALUES`, one notice of a couriered entry
+    /// `user_id` settled, run inside the transaction that settles the entry,
+    /// so a settled entry always has its notice and a failed notice rolls the
+    /// settle back (R78 decisions 12 and 37).
+    fn courier_notice_insert<'c>(
+        conn: &'c mut AsyncPgConnection,
+        user_id: &'c Self::Id,
+        courier_user_id: &'c Self::Id,
+        device_key: &'c [u8],
+        seq: i64,
+        outcome: &'c str,
+    ) -> Statement<'c, ()>;
+    /// `SELECT id, courier_user_id, device_key, seq, outcome` of `user_id`'s
+    /// notice rows, in the order they settled, each as a
+    /// [`CourierNoticeRow`]. Empty when the account has none standing.
+    fn courier_notices<'c>(
+        conn: &'c mut AsyncPgConnection,
+        user_id: &'c Self::Id,
+    ) -> Statement<'c, Vec<CourierNoticeRow<Self::Id>>>;
+    /// `DELETE FROM _connetto_courier_notices WHERE id = ANY(...)`, the rows
+    /// an acked notice frame carried, reporting how many went. A second ack
+    /// of the same ids matches nothing.
+    fn courier_notices_delete(conn: &mut AsyncPgConnection, ids: Vec<i64>) -> Statement<'_, i64>;
 }
 
 /// Generate the default connetto writer tables and their
@@ -471,11 +504,33 @@ macro_rules! connetto_writers_table {
             }
         }
 
+        diesel::table! {
+            /// One notice of a couriered entry that settled (R78 decision 12),
+            /// written in the transaction that settles the entry.
+            _connetto_courier_notices (id) {
+                /// When the notice settled, ordered by the sequence's settle.
+                id -> diesel::sql_types::BigInt,
+                /// The author's account, the notices' recipient.
+                user_id -> $id_sql,
+                /// The courier's account, the entry's bearer.
+                courier_user_id -> $id_sql,
+                /// The author's device key, the writer the entry settled
+                /// under.
+                device_key -> diesel::sql_types::Bytea,
+                /// The entry's sequence under that writer.
+                seq -> diesel::sql_types::BigInt,
+                /// The stored outcome, [`$crate::writer_schema::SettledOutcome`]
+                /// as JSON text.
+                outcome -> diesel::sql_types::Text,
+            }
+        }
+
         diesel::joinable!(_connetto_session_writers -> _connetto_writers (writer));
         diesel::allow_tables_to_appear_in_same_query!(
             _connetto_writers,
             _connetto_settled,
             _connetto_session_writers,
+            _connetto_courier_notices,
         );
 
         /// The default connetto writer schema over the deployment's `Id` type.
@@ -488,6 +543,7 @@ macro_rules! connetto_writers_table {
                 "_connetto_writers",
                 "_connetto_settled",
                 "_connetto_session_writers",
+                "_connetto_courier_notices",
             ];
 
             fn issue(
@@ -1051,6 +1107,76 @@ macro_rules! connetto_writers_table {
                             },
                         )
                         .collect())
+                })
+            }
+
+            fn courier_notice_insert<'c>(
+                conn: &'c mut diesel_async::AsyncPgConnection,
+                user_id: &'c Self::Id,
+                courier_user_id: &'c Self::Id,
+                device_key: &'c [u8],
+                seq: i64,
+                outcome: &'c str,
+            ) -> $crate::writer_schema::Statement<'c, ()> {
+                Box::pin(async move {
+                    use diesel::ExpressionMethods as _;
+                    use diesel_async::RunQueryDsl;
+                    diesel::insert_into(_connetto_courier_notices::table)
+                        .values((
+                            _connetto_courier_notices::user_id.eq(user_id),
+                            _connetto_courier_notices::courier_user_id.eq(courier_user_id),
+                            _connetto_courier_notices::device_key.eq(device_key.to_vec()),
+                            _connetto_courier_notices::seq.eq(seq),
+                            _connetto_courier_notices::outcome.eq(outcome),
+                        ))
+                        .execute(&mut *conn)
+                        .await
+                        .map(drop)
+                })
+            }
+
+            fn courier_notices<'c>(
+                conn: &'c mut diesel_async::AsyncPgConnection,
+                user_id: &'c Self::Id,
+            ) -> $crate::writer_schema::Statement<'c, Vec<(i64, $id, Vec<u8>, i64, String)>>
+            {
+                Box::pin(async move {
+                    use diesel::{ExpressionMethods, QueryDsl};
+                    use diesel_async::RunQueryDsl;
+                    let query = QueryDsl::order(
+                        QueryDsl::select(
+                            QueryDsl::filter(
+                                _connetto_courier_notices::table,
+                                _connetto_courier_notices::user_id.eq(user_id),
+                            ),
+                            (
+                                _connetto_courier_notices::id,
+                                _connetto_courier_notices::courier_user_id,
+                                _connetto_courier_notices::device_key,
+                                _connetto_courier_notices::seq,
+                                _connetto_courier_notices::outcome,
+                            ),
+                        ),
+                        _connetto_courier_notices::id.asc(),
+                    );
+                    let rows: Vec<(i64, $id, Vec<u8>, i64, String)> =
+                        RunQueryDsl::load(query, &mut *conn).await?;
+                    Ok(rows)
+                })
+            }
+
+            fn courier_notices_delete(
+                conn: &mut diesel_async::AsyncPgConnection,
+                ids: Vec<i64>,
+            ) -> $crate::writer_schema::Statement<'_, i64> {
+                Box::pin(async move {
+                    use diesel::ExpressionMethods as _;
+                    use diesel_async::RunQueryDsl;
+                    diesel::delete(_connetto_courier_notices::table)
+                        .filter(_connetto_courier_notices::id.eq_any(ids))
+                        .execute(&mut *conn)
+                        .await
+                        .map(|affected| i64::try_from(affected).unwrap_or(i64::MAX))
                 })
             }
         }

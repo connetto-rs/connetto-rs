@@ -43,6 +43,7 @@ pub(super) async fn seed_notes(fixture: &Fixture) {
             "DROP TABLE IF EXISTS notes CASCADE",
             "DROP TABLE IF EXISTS _connetto_settled",
             "DROP TABLE IF EXISTS _connetto_session_writers",
+            "DROP TABLE IF EXISTS _connetto_courier_notices",
             "DROP TABLE IF EXISTS _connetto_writers",
             "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
         ])

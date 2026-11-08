@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use connetto_core::Major;
+use connetto_core::SessionId;
 use connetto_core::auth::Principal;
 use connetto_core::bots::BotList;
 use connetto_core::exchange::{
@@ -25,6 +26,19 @@ use connetto_core::exchange::{
 use sha2::{Digest as _, Sha256};
 
 use crate::provisional::AskFacts;
+
+/// The account and session a courier range settles under (R78 decisions 10
+/// and 12), the `write_couriered` audit row's `session` and the notice rows'
+/// `courier_user_id`. On the wire path the range's connection carries them,
+/// and the in-process [`SessionManager::courier_deliver`](crate::session::SessionManager::courier_deliver)
+/// takes them from its caller.
+#[derive(Clone)]
+pub struct CourierIdentity<Id> {
+    /// The courier's account.
+    pub user_id: Id,
+    /// The courier's session.
+    pub session: SessionId,
+}
 
 /// The body of one manifest row of a courier range, the entry's changeset as
 /// the uncompressed patchset bytes the author queued.
@@ -133,6 +147,8 @@ pub(crate) struct Applier<Id, Key> {
 pub(crate) struct Settling<Id, Key> {
     /// What the checks established about the author.
     pub author: CourierAuthor<Id>,
+    /// The account and session the range settles under.
+    pub courier: CourierIdentity<Id>,
     /// The major the connection declared, every body's capture major.
     pub major: Option<Major>,
     /// The index of the next row to settle, the first above the frontier
@@ -148,15 +164,17 @@ pub(crate) struct Settling<Id, Key> {
 
 impl<Id, Key> Settling<Id, Key> {
     /// The settling state of a range whose next row to settle is `next`,
-    /// chained from `previous`.
+    /// chained from `previous`, settling under `courier`.
     pub(crate) fn new(
         author: CourierAuthor<Id>,
+        courier: CourierIdentity<Id>,
         major: Option<Major>,
         next: usize,
         previous: [u8; 32],
     ) -> Self {
         Self {
             author,
+            courier,
             major,
             next,
             previous,
@@ -210,6 +228,15 @@ impl<Id, Key> Slot<'_, Id, Key> {
     pub(crate) fn answer(&mut self, index: usize, outcome: CourierEntryOutcome, stops: bool) {
         self.answers.push((self.rows[index].seq, outcome));
         self.settling.stopped |= stops;
+    }
+
+    /// Answer the next unsettled row with `outcome`, when the range has one
+    /// left, and stop the range.
+    pub(crate) fn stop_at_next(&mut self, outcome: CourierEntryOutcome) {
+        if let Some(row) = self.rows.get(self.settling.next) {
+            self.answers.push((row.seq, outcome));
+        }
+        self.settling.stopped = true;
     }
 }
 
@@ -483,6 +510,12 @@ mod tests {
     }
 
     fn settling(bodies: u32) -> CourierRun<String, String> {
+        settling_from(bodies, 0)
+    }
+
+    /// A settling range over rows 4 to 6 whose next row to settle is the one
+    /// at `next`.
+    fn settling_from(bodies: u32, next: usize) -> CourierRun<String, String> {
         CourierRun::settling(
             "c1".to_owned(),
             vec![row(4, b"four"), row(5, b"five"), row(6, b"six")],
@@ -497,11 +530,28 @@ mod tests {
                     frontier: 3,
                     head: [0; 32],
                 },
+                CourierIdentity {
+                    user_id: "bob".to_owned(),
+                    session: SessionId::from_uuid(uuid::Uuid::new_v4()),
+                },
                 None,
-                0,
+                next,
                 [0; 32],
             ),
         )
+    }
+
+    /// A stop on a body of a range whose every row is already answered adds
+    /// no row, and the range answers no `NotCouriered` past it.
+    #[test]
+    fn a_stop_with_no_row_left_answers_nothing_more() {
+        let mut run = settling_from(1, 3);
+        let Ok(Admitted::Row(mut slot)) = run.admit("c1", 6) else {
+            panic!("a settling range reads its body");
+        };
+        slot.stop_at_next(CourierEntryOutcome::Retry { retry_after_ms: 9 });
+        assert!(run.done());
+        assert_eq!(run.finish().1, CourierOutcome::Entries(Vec::new()));
     }
 
     /// A settling range reads its bodies, checking each against its own

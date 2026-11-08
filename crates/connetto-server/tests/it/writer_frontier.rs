@@ -74,7 +74,7 @@ fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
 
 /// No subscriptions are made in these tests, so the snapshot source is never
 /// invoked.
-struct NoSnapshot;
+pub(super) struct NoSnapshot;
 
 impl SnapshotSource for NoSnapshot {
     type Error = Infallible;
@@ -4138,7 +4138,7 @@ fn accept_bundle() -> SyncSchema {
 
 /// The manager the acceptance client reaches: the suite's write manager at
 /// major 1, the bundle's version advertised the way the deployment does.
-fn accept_manager(
+pub(super) fn accept_manager(
     pool: &Pool<AsyncPgConnection>,
     guard: Arc<RequestGuard<String>>,
 ) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>> {
@@ -4168,6 +4168,23 @@ fn accept_manager(
 async fn accept_client(
     manager: &Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>>,
 ) -> ConnettoConnection<LoopbackTransport> {
+    let mut client = signed_in_alice(manager).await;
+    client
+        .subscribe("notes", "SELECT * FROM notes")
+        .await
+        .expect("subscribe");
+    pump_until(&mut client, |event| {
+        matches!(event, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    client
+}
+
+/// The in-process acceptance client, signed in as alice over one of the
+/// manager's loopback ends, its pump not yet driven.
+pub(super) async fn signed_in_alice(
+    manager: &Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>>,
+) -> ConnettoConnection<LoopbackTransport> {
     let (server_end, client_end) = loopback();
     let serving = Arc::clone(manager);
     tokio::spawn(async move {
@@ -4182,25 +4199,16 @@ async fn accept_client(
     };
     let credential =
         HeldCredential::new(Grant::new("user:alice"), "alice").expect("the credential holds");
-    let mut client = ClientBuilder::new(accept_bundle(), dial)
+    ClientBuilder::new(accept_bundle(), dial)
         .signed_in(credential)
         .connect_driven()
         .await
-        .expect("the client connects");
-    client
-        .subscribe("notes", "SELECT * FROM notes")
-        .await
-        .expect("subscribe");
-    pump_until(&mut client, |event| {
-        matches!(event, ClientEvent::SnapshotEnd { .. })
-    })
-    .await;
-    client
+        .expect("the client connects")
 }
 
 /// Drive the client until its pump reports an event matching `pred`,
 /// applying every frame in between, bounded so a wedged pump fails.
-async fn pump_until(
+pub(super) async fn pump_until(
     client: &mut ConnettoConnection<LoopbackTransport>,
     pred: impl Fn(&ClientEvent) -> bool,
 ) -> ClientEvent {
