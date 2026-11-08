@@ -9,7 +9,9 @@
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use connetto_client::{ConnettoClient, Grant, HeldCredential, NativeClientBuilder, SyncSchema};
+use connetto_client::{
+    ClientEvent, ConnettoClient, Grant, HeldCredential, NativeClientBuilder, SyncSchema,
+};
 use connetto_core::{Cursor, HandshakeAuthority, test_support::TestGrantChecker};
 use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
@@ -298,6 +300,24 @@ async fn render_until(vdom: &mut VirtualDom, pred: impl Fn(&str) -> bool) -> Str
     }
 }
 
+/// Wait until the server ends a row subscription's snapshot, which it sends
+/// only after installing that subscription's live route.
+async fn row_snapshot_ended(events: &mut tokio::sync::broadcast::Receiver<ClientEvent>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let Ok(received) = tokio::time::timeout_at(deadline, events.recv()).await else {
+            panic!("the row subscription's snapshot never ended");
+        };
+        match received {
+            Ok(ClientEvent::SnapshotEnd { .. }) => return,
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                panic!("the client's event stream closed before the snapshot ended")
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn use_live_renders_and_follows_cdc() {
     let fixture = Fixture::acquire().await;
@@ -342,6 +362,7 @@ async fn use_live_renders_and_follows_cdc() {
         .client()
         .clone();
     *CLIENT.lock().expect("client slot poisoned") = Some(client.clone());
+    let mut events = client.events();
 
     let mut vdom = VirtualDom::new(app);
     vdom.rebuild(&mut dioxus_core::NoOpMutations);
@@ -351,6 +372,10 @@ async fn use_live_renders_and_follows_cdc() {
         html.contains("rows:0") && html.contains("count:Some(0)")
     })
     .await;
+    // The snapshot source is empty, so an insert dispatched before the row
+    // hook's subscription has its route would never reach the replica, and
+    // "rows:0" is the hook's value before it subscribes at all.
+    row_snapshot_ended(&mut events).await;
 
     // One allowed CDC insert and one withheld one drive the change path. The row
     // hook sees only the allowed row, so rows:1 rather than rows:2 proves the

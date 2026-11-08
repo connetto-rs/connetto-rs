@@ -167,6 +167,28 @@ async fn drain_until<T: Transport>(
     }
 }
 
+/// Read frames until the server ends `sub_id`'s snapshot, which it sends only
+/// after installing the subscription's live route. Returns false on timeout,
+/// a closed transport, or a transport error.
+async fn await_snapshot_end<T: Transport>(client: &mut T, sub_id: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(remaining, client.recv()).await {
+            Ok(Ok(Some(IncomingFrame::Control(ControlMessage::SnapshotEnd(end)))))
+                if end.sub_id == sub_id =>
+            {
+                return true;
+            }
+            Ok(Ok(Some(_))) => {}
+            _ => return false,
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cdc_ingest_reconnects_after_walsender_drop() {
     let fixture = Fixture::acquire().await;
@@ -211,6 +233,12 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         }))
         .await
         .expect("send subscribe");
+    // The snapshot source is empty, so a row the ingest dispatches before the
+    // subscription's route exists would never reach the client.
+    assert!(
+        await_snapshot_end(&mut client, "orders", Duration::from_secs(15)).await,
+        "the server never ended the subscription's snapshot"
+    );
 
     // Resilient ingest: reconnect the streaming source with a brisk backoff.
     let policy = ReconnectPolicy::new()
