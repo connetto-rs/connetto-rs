@@ -635,7 +635,7 @@ pub struct CourierReport {
     pub retry_after: Option<Duration>,
 }
 
-/// Why a [`ConnettoConnection::courier`] call could not settle its range.
+/// Why a [`ConnettoClient::courier`] call could not settle its range.
 #[cfg(feature = "peer")]
 #[derive(Debug, thiserror::Error)]
 pub enum CourierError {

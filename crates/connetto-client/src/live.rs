@@ -2563,9 +2563,9 @@ where
     ///
     /// # Errors
     ///
-    /// [`CourierError::Client`] while the gate is locked or the author's key
-    /// is not 32 bytes, and the [`CourierError`] the range or its settlement
-    /// surfaces.
+    /// [`crate::CourierError::Client`] while the gate is locked or the
+    /// author's key is not 32 bytes, and the [`crate::CourierError`] the range
+    /// or its settlement surfaces.
     #[cfg(feature = "peer")]
     pub async fn courier(
         &self,
