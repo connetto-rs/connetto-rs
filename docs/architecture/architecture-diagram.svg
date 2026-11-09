@@ -399,11 +399,12 @@
 
     <!-- Sync engine and local SQLite -->
     <g transform="translate(995, 284)">
-      <rect width="300" height="56" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
-      <rect width="4" height="56" rx="1" fill="#4CAF50" />
+      <rect width="300" height="66" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="66" rx="1" fill="#4CAF50" />
       <text x="150" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Sync engine</text>
       <text x="150" y="36" text-anchor="middle" font-size="10" font-family="monospace" fill="#4CAF50">tokio-tungstenite</text>
       <text x="150" y="50" text-anchor="middle" font-size="8.5" fill="#888">boot without a server (R20), reconnect, backoff (R95, R31)</text>
+      <text x="150" y="61" text-anchor="middle" font-size="8.5" fill="#C62828">R78: the drain wire dialed for an older major's courier rows</text>
     </g>
     <g transform="translate(1325, 284)">
       <rect width="300" height="56" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
