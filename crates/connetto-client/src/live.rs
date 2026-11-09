@@ -3162,6 +3162,8 @@ async fn pump<T, F, S>(
     let mut key_timer = None;
     // The drain's owed dial retains its sleep across pump steps.
     let mut drain = None;
+    // The courier's owed dial retains its sleep across pump steps.
+    let mut courier_drain = None;
     loop {
         if alive.upgrade().is_none() {
             pump_exit(&shared).await;
@@ -3253,16 +3255,25 @@ async fn pump<T, F, S>(
                 .zip(reconnect.as_mut())
                 .map(|(timer, driver)| (timer, Box::pin(driver.sleeper.sleep(timer.wait()))));
         }
+        #[cfg(feature = "peer")]
+        let courier_owed = state.conn.courier_drain_timer();
+        #[cfg(feature = "peer")]
+        if courier_owed != courier_drain.as_ref().map(|(timer, _)| *timer) {
+            courier_drain = courier_owed
+                .zip(reconnect.as_mut())
+                .map(|(timer, driver)| (timer, Box::pin(driver.sleeper.sleep(timer.wait()))));
+        }
         // Drive the gate's prompt, if one is pending, alongside the frame wait.
         let mut ask = shared.gate.take_ask();
         let mut ask_outcome = None;
-        let (stepped, drain_due) = step_or_resend_or_keepalive(
+        let (stepped, drain_due, courier_due) = step_or_resend_or_keepalive(
             &mut state.conn,
             &shared.wake,
             &mut resend,
             &mut keepalive,
             &mut key_timer,
             &mut drain,
+            &mut courier_drain,
             &mut ask,
             &mut ask_outcome,
         )
@@ -3313,10 +3324,32 @@ async fn pump<T, F, S>(
 
         // The drain's dial fell due. Dialed outside the state lock, like a
         // reconnect, and handed over under it.
+        let mut drain_owed = None;
         if drain_due && let Some((timer, _)) = drain.take() {
+            drain_owed = Some(timer);
+        }
+        #[cfg(feature = "peer")]
+        let mut courier_owed = None;
+        #[cfg(feature = "peer")]
+        if courier_due && let Some((timer, _)) = courier_drain.take() {
+            courier_owed = Some(timer);
+        }
+        #[cfg(feature = "peer")]
+        let dial_now = drain_owed.is_some() || courier_owed.is_some();
+        #[cfg(not(feature = "peer"))]
+        let dial_now = drain_owed.is_some();
+        if dial_now {
             drop(state);
+        }
+        if let Some(timer) = drain_owed {
             dial_drain_owed(&shared, &mut reconnect, timer).await;
         }
+        #[cfg(feature = "peer")]
+        if let Some(timer) = courier_owed {
+            dial_courier_drain_owed(&shared, &mut reconnect, timer).await;
+        }
+        #[cfg(not(feature = "peer"))]
+        let _ = courier_due;
     }
 }
 
@@ -3346,6 +3379,37 @@ async fn dial_drain_owed<T, F, S>(
         Err(err) => {
             tracing::debug!(error = %err, "dialing the drain failed, backing off");
             state.conn.drain_dial_failed(timer);
+        }
+    }
+}
+
+/// Dials the courier wire its dial has fallen due, presenting the open
+/// range's major over the fresh transport (R78 decision 47).
+#[cfg(feature = "peer")]
+async fn dial_courier_drain_owed<T, F, S>(
+    shared: &Shared<T>,
+    reconnect: &mut Option<ReconnectDriver<F, S>>,
+    timer: DrainTimer,
+) where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+    F: TransportFactory<Transport = T> + MaybeSend + 'static,
+    S: Sleeper + MaybeSend + 'static,
+{
+    let Some(driver) = reconnect.as_mut() else {
+        return;
+    };
+    let dialed = driver.factory.connect().await;
+    let mut state = shared.state.lock().await;
+    match dialed {
+        Ok(transport) => {
+            if let Err(err) = state.conn.attach_courier_drain(timer, transport).await {
+                tracing::warn!(error = %err, "attaching the courier wire failed");
+            }
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "dialing the courier wire failed, backing off");
+            state.conn.courier_drain_dial_failed(timer);
         }
     }
 }
@@ -3943,9 +4007,10 @@ async fn step_or_resend_or_keepalive<T, F, G>(
     keepalive: &mut Option<(KeepaliveTimer, core::pin::Pin<Box<F>>)>,
     key_timer: &mut Option<(ShareKeyTimer, KeySleep)>,
     drain: &mut Option<(DrainTimer, core::pin::Pin<Box<G>>)>,
+    courier_drain: &mut Option<(DrainTimer, core::pin::Pin<Box<G>>)>,
     ask: &mut Option<GateAskFuture>,
     ask_outcome: &mut Option<GateAskOutcome>,
-) -> (Result<Option<ClientEvent>, ClientError>, bool)
+) -> (Result<Option<ClientEvent>, ClientError>, bool, bool)
 where
     T: Transport,
     T::Error: core::fmt::Display,
@@ -3956,6 +4021,7 @@ where
     let ka_due = AtomicBool::new(false);
     let key_due = AtomicBool::new(false);
     let drain_due = AtomicBool::new(false);
+    let courier_due = AtomicBool::new(false);
     let cancel = async {
         tokio::select! {
             biased;
@@ -3964,6 +4030,7 @@ where
             () = wait_timer(keepalive) => ka_due.store(true, Ordering::Relaxed),
             () = wait_timer(key_timer) => key_due.store(true, Ordering::Relaxed),
             () = wait_timer(drain) => drain_due.store(true, Ordering::Relaxed),
+            () = wait_timer(courier_drain) => courier_due.store(true, Ordering::Relaxed),
             outcome = async {
                 match ask.as_mut() {
                     Some(ask) => ask.as_mut().await,
@@ -3980,15 +4047,19 @@ where
         && let Some((timer, _)) = resend.take()
         && let Err(err) = conn.resend_deferred(timer).await
     {
-        return (Err(err), false);
+        return (Err(err), false, false);
     }
     if ka_due.load(Ordering::Relaxed)
         && let Some((timer, _)) = keepalive.take()
         && let Err(err) = conn.keepalive_fire(timer).await
     {
-        return (Err(err), false);
+        return (Err(err), false, false);
     }
-    (stepped, drain_due.load(Ordering::Relaxed))
+    (
+        stepped,
+        drain_due.load(Ordering::Relaxed),
+        courier_due.load(Ordering::Relaxed),
+    )
 }
 
 /// Fan out the aggregate pushes a lock held, then re-run every live query

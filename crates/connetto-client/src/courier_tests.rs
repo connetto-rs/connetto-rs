@@ -8,9 +8,9 @@ use connetto_core::exchange::{
     Verdict,
 };
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, CourierAnswer, CourierBody, CourierRange, FullResyncReason,
-    FullResyncRequired, HandshakeAck, ProvisionalStatus, ProvisionalVerdicts, SnapshotEnd,
-    WriterGrant,
+    BulkMessage, Challenge, ControlMessage, CourierAnswer, CourierBody, CourierRange,
+    FullResyncReason, FullResyncRequired, HandshakeAck, ProvisionalStatus, ProvisionalVerdicts,
+    SnapshotEnd, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, Major, SchemaVersion, loopback};
@@ -208,6 +208,41 @@ async fn attach(mut conn: Conn, on: bool) -> (Conn, LoopbackTransport) {
                     number: 1,
                     frontier: 0,
                 }),
+                courier: on,
+            }))
+            .await
+            .expect("answer the handshake");
+    };
+    let (attached, ()) = tokio::join!(conn.attach(client), reply);
+    attached.expect("attach the courier");
+    while matches!(conn.notices.pop_front(), Some(ClientEvent::SyncStatus(_))) {}
+    (conn, server)
+}
+
+/// Attach a main replica that carries a device identity to a scripted server
+/// whose courier path is `on`. The handshake presents the device writer, so
+/// the server challenges it, answers without a grant, and binds the writer.
+async fn attach_device(mut conn: Conn, on: bool) -> (Conn, LoopbackTransport) {
+    let (client, mut server) = loopback();
+    let reply = async {
+        let frame = next(&mut server).await;
+        let IncomingFrame::Control(ControlMessage::Handshake(_)) = frame else {
+            panic!("the wire opens with the handshake");
+        };
+        server
+            .send_control(ControlMessage::Challenge(Challenge { nonce: [5; 32] }))
+            .await
+            .expect("the challenge");
+        server
+            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id: "courier".to_owned(),
+                session_token: "courier".to_owned(),
+                resume_token: "courier".to_owned(),
+                current_cursor: Cursor::new(Vec::new()),
+                schema_version: Some(version()),
+                sunset_at_secs: None,
+                initial_credits: 64,
+                writer: None,
                 courier: on,
             }))
             .await
@@ -457,8 +492,9 @@ async fn range_carries_rows_and_declares_bodies_in_order() {
     }
 }
 
-/// The run is contiguous and of the build's major only, so the range stops
-/// at the first row of another major and leaves the rest held.
+/// The run is of the build's major, so the first range stops at the first
+/// row of another major, the build's later row standing its own range
+/// behind it (R78 slice 4).
 #[tokio::test]
 async fn range_stops_at_first_row_of_another_major() {
     let mut conn = replica();
@@ -501,30 +537,61 @@ async fn range_stops_at_first_row_of_another_major() {
     assert_eq!(body.seq, 1);
     let candidates = conn.courier_candidates().expect("read the candidates");
     assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].seqs, [1]);
+    assert_eq!(
+        candidates[0].seqs,
+        [1, 3],
+        "the build's rows stand, the foreign row held"
+    );
     deliver_answer(
         &mut server,
         &range.request_id,
         CourierOutcome::Entries(vec![(1, CourierEntryOutcome::Ruled(Verdict::Applied))]),
     )
     .await;
-    server.close().await.expect("hang up");
-    let event = conn.pump_one().await.expect("settle the range");
-    assert!(matches!(event, ClientEvent::Closed));
-    wait.receiver
+    let event = conn.pump_one().await.expect("the first range settles");
+    assert_eq!(
+        expect_candidates(event).seqs,
+        [3],
+        "the settled range leaves the build's later row"
+    );
+    let range = next_range(&mut server).await;
+    assert_eq!(
+        range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        [3],
+        "the build's later row stands its own range"
+    );
+    let body = next_body(&mut server).await;
+    assert_eq!(body.seq, 3);
+    deliver_answer(
+        &mut server,
+        &range.request_id,
+        CourierOutcome::Entries(vec![(3, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+    )
+    .await;
+    let event = conn.pump_one().await.expect("the call ends");
+    assert_eq!(
+        expect_candidates(event).seqs,
+        [] as [u64; 0],
+        "the author's candidates restate empty"
+    );
+    let report = wait
+        .receiver
         .await
         .expect("the call stands")
         .expect("settled");
+    assert_eq!(report.settled, [1, 3]);
     assert!(matches!(
         peer::state_of(&mut conn.db, &AUTHOR, 1),
         Ok(Some(HeldState::Retained))
     ));
-    for seq in [2, 3] {
-        assert!(matches!(
-            peer::state_of(&mut conn.db, &AUTHOR, seq),
-            Ok(Some(HeldState::Provisional))
-        ));
-    }
+    assert!(matches!(
+        peer::state_of(&mut conn.db, &AUTHOR, 2),
+        Ok(Some(HeldState::Provisional))
+    ));
+    assert!(matches!(
+        peer::state_of(&mut conn.db, &AUTHOR, 3),
+        Ok(Some(HeldState::Retained))
+    ));
 }
 
 /// One range per author at a time, open or queued, so a second call for the
@@ -3285,4 +3352,550 @@ async fn pruned_marked_retained_row_restates_candidates() {
     server.close().await.expect("hang up");
     let event = conn.pump_one().await.expect("the session ends");
     assert!(matches!(event, ClientEvent::Closed));
+}
+
+#[cfg(feature = "device-identity")]
+mod r78_4c {
+    use connetto_core::exchange::{Frontier, SignedOffer, Verdict};
+    use connetto_core::messages::{
+        Challenge, ControlMessage, HandshakeAck, WriterAnswer, WriterOutcome, WriterRequest,
+    };
+    use connetto_core::traits::{IncomingFrame, Transport};
+    use connetto_core::{Cursor, LoopbackTransport, SchemaVersion, loopback};
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::drain::tests::r78_4c::device_identity;
+    use crate::peer;
+
+    fn old_version() -> SchemaVersion {
+        SchemaVersion::from_hash(b"the major 1 bundle".to_vec())
+    }
+
+    /// The signed offer the tests stand, `builds` as given.
+    fn offer_builds(builds: &[(Major, SchemaVersion)], newest: Option<u64>) -> SignedOffer {
+        SignedOffer {
+            offer: connetto_core::exchange::Offer {
+                builds: builds.to_vec(),
+                settled: None,
+                newest: newest.map(|seq| Frontier {
+                    seq,
+                    head: [99; 32],
+                }),
+                retractions: Vec::new(),
+            },
+            signature: vec![1, 2, 3],
+        }
+    }
+
+    /// Store `author`'s cursor with `builds`.
+    fn adopt_builds(
+        conn: &mut Conn,
+        author: [u8; 32],
+        builds: &[(Major, SchemaVersion)],
+        newest: Option<u64>,
+    ) {
+        let encoded =
+            rmp_serde::to_vec_named(&offer_builds(builds, newest)).expect("the offer encodes");
+        crate::exchange::upsert_cursor(
+            &mut conn.db,
+            author.as_ref(),
+            "courier-author",
+            &Frontier {
+                seq: 0,
+                head: GENESIS,
+            },
+            &encoded,
+            CERT_END,
+        )
+        .expect("keep the cursor");
+    }
+
+    /// The major 3 bundle hash a build standing at major 3 presents.
+    fn version3() -> SchemaVersion {
+        SchemaVersion::from_hash(b"the major 3 bundle".to_vec())
+    }
+
+    /// A major 3 replica with no wire and nothing queued, so the build stands
+    /// above two older majors the offer can list.
+    fn replica3() -> Conn {
+        let config = ClientConfig::new("courier")
+            .with_schema_major(Some(major(3)))
+            .with_schema_version(Some(version3()));
+        let mut conn = ConnettoConnection::open(
+            &Replica::in_memory(),
+            "CREATE TABLE items (id INTEGER PRIMARY KEY)",
+            &config,
+            None,
+        )
+        .expect("open the major 3 replica");
+        assert!(
+            matches!(conn.notices.pop_front(), Some(ClientEvent::SyncStatus(_))),
+            "the offline open states itself first"
+        );
+        conn
+    }
+
+    /// Attach the major 3 replica to a scripted server whose courier path is
+    /// `on`, answering the handshake with the build's version and draining
+    /// the state notices.
+    async fn attach3(mut conn: Conn, on: bool) -> (Conn, LoopbackTransport) {
+        let (client, mut server) = loopback();
+        let reply = async {
+            let frame = next(&mut server).await;
+            let IncomingFrame::Control(ControlMessage::Handshake(_)) = frame else {
+                panic!("the wire opens with the handshake");
+            };
+            server
+                .send_control(ControlMessage::Challenge(Challenge { nonce: [5; 32] }))
+                .await
+                .expect("the challenge");
+            server
+                .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                    connection_id: "courier".to_owned(),
+                    session_token: "courier".to_owned(),
+                    resume_token: "courier".to_owned(),
+                    current_cursor: Cursor::new(Vec::new()),
+                    schema_version: Some(version3()),
+                    sunset_at_secs: None,
+                    initial_credits: 64,
+                    writer: None,
+                    courier: on,
+                }))
+                .await
+                .expect("answer the handshake");
+        };
+        let (attached, ()) = tokio::join!(conn.attach(client), reply);
+        attached.expect("attach the courier");
+        while matches!(conn.notices.pop_front(), Some(ClientEvent::SyncStatus(_))) {}
+        (conn, server)
+    }
+
+    /// Dial the courier wire for `presented` against a scripted server: the
+    /// challenge, the handshake answered with the courier path on and the
+    /// major's version, the device writer bound. Returns the far end.
+    async fn dial_courier_wire(
+        conn: &mut Conn,
+        timer: crate::DrainTimer,
+        presented: Major,
+        version: SchemaVersion,
+    ) -> LoopbackTransport {
+        let (courier, mut old) = loopback();
+        let reply = async {
+            let frame = next(&mut old).await;
+            let IncomingFrame::Control(ControlMessage::Handshake(handshake)) = frame else {
+                panic!("the courier wire opens with the handshake");
+            };
+            assert_eq!(
+                handshake.schema_major,
+                Some(presented),
+                "the courier wire presents the range's major"
+            );
+            assert!(
+                matches!(handshake.writer, WriterRequest::Device),
+                "the device writer is presented"
+            );
+            old.send_control(ControlMessage::Challenge(Challenge { nonce: [7; 32] }))
+                .await
+                .expect("the challenge");
+            old.send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id: "old".to_owned(),
+                session_token: "old".to_owned(),
+                resume_token: "old".to_owned(),
+                current_cursor: Cursor::new(Vec::new()),
+                schema_version: Some(version),
+                sunset_at_secs: None,
+                initial_credits: 64,
+                writer: None,
+                courier: true,
+            }))
+            .await
+            .expect("the handshake is answered");
+            let frame = next(&mut old).await;
+            let IncomingFrame::Control(ControlMessage::BindDevice(bind)) = frame else {
+                panic!("the device writer binds, not {frame:?}");
+            };
+            let request_id = bind.request_id;
+            old.send_control(ControlMessage::WriterAnswer(WriterAnswer {
+                request_id,
+                outcome: WriterOutcome::Bound { frontier: 0 },
+            }))
+            .await
+            .expect("the writer binds");
+        };
+        let (attached, ()) = tokio::join!(conn.attach_courier_drain(timer, courier), reply);
+        attached.expect("the courier wire attaches");
+        old
+    }
+
+    /// R78 decision 47: a range spanning majors couriers the older major on
+    /// its own dial first and continues on the main wire, the call settling
+    /// every row and the courier wire closing behind its last answer.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one test walks the whole two-wire call"
+    )]
+    #[tokio::test]
+    async fn a_spanning_range_couriers_the_older_major_on_its_own_wire_first() {
+        let b1 = real_changeset(1);
+        let b2 = real_changeset(2);
+        let b3 = real_changeset(3);
+        let (cert, keys) = device_identity().await;
+        let mut conn = replica();
+        conn.store_device_certificate(&cert)
+            .await
+            .expect("the certificate stores");
+        hold(
+            &mut conn,
+            AUTHOR,
+            1,
+            HeldState::CourierOnly,
+            major(1),
+            Some(&b1),
+        );
+        hold(
+            &mut conn,
+            AUTHOR,
+            2,
+            HeldState::CourierOnly,
+            major(1),
+            Some(&b2),
+        );
+        hold(
+            &mut conn,
+            AUTHOR,
+            3,
+            HeldState::Provisional,
+            major(2),
+            Some(&b3),
+        );
+        adopt_builds(
+            &mut conn,
+            AUTHOR,
+            &[(major(1), old_version()), (major(2), version())],
+            Some(3),
+        );
+        let (mut conn, mut server) = attach_device(conn, true).await;
+        conn.writer_keys = Some(keys);
+        let ask = next_ask(&mut server).await;
+        assert_eq!(ask.seqs, [1, 2], "the unapplied rows are asked");
+        let wait = conn.courier(AUTHOR).await.expect("the call owes a dial");
+        let timer = conn.courier_drain_timer().expect("major 1 owes a dial");
+        let mut old = dial_courier_wire(&mut conn, timer, major(1), old_version()).await;
+        // The bound writer's answer frees the range for the courier wire.
+        conn.pump_one_or(std::future::pending::<()>())
+            .await
+            .expect("one step");
+        let range = next_range(&mut old).await;
+        assert_eq!(
+            range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [1, 2],
+            "the older major's rows ride the courier wire"
+        );
+        let body = next_body(&mut old).await;
+        assert_eq!(body.seq, 1);
+        assert_eq!(
+            zstd::decode_all(&body.changeset_zstd[..]).expect("a body"),
+            b1
+        );
+        let body = next_body(&mut old).await;
+        assert_eq!(body.seq, 2);
+        assert_eq!(
+            zstd::decode_all(&body.changeset_zstd[..]).expect("a body"),
+            b2
+        );
+        deliver_answer(
+            &mut old,
+            &range.request_id,
+            CourierOutcome::Entries(vec![
+                (1, CourierEntryOutcome::Ruled(Verdict::Applied)),
+                (2, CourierEntryOutcome::Ruled(Verdict::Applied)),
+            ]),
+        )
+        .await;
+        let event = conn.pump_one().await.expect("the older major settles");
+        assert_eq!(
+            expect_candidates(event).seqs,
+            [3],
+            "the remaining range keeps the author's candidates"
+        );
+        let range = next_range(&mut server).await;
+        assert_eq!(
+            range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [3],
+            "the current major's rows ride the main wire"
+        );
+        let body = next_body(&mut server).await;
+        assert_eq!(body.seq, 3);
+        assert_eq!(
+            zstd::decode_all(&body.changeset_zstd[..]).expect("a body"),
+            b3
+        );
+        deliver_answer(
+            &mut server,
+            &range.request_id,
+            CourierOutcome::Entries(vec![(3, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+        )
+        .await;
+        let event = conn.pump_one().await.expect("the call ends");
+        assert_eq!(
+            expect_candidates(event).seqs,
+            [] as [u64; 0],
+            "the author's candidates restated empty"
+        );
+        let report = timeout(BOUND, wait.receiver)
+            .await
+            .expect("the call stands")
+            .expect("the answer lands")
+            .expect("every row settles");
+        assert_eq!(report.settled, [1, 2, 3]);
+        assert_eq!(report.refused, [] as [u64; 0]);
+        assert_eq!(report.kept, [] as [u64; 0]);
+        assert!(
+            matches!(
+                timeout(BOUND, old.recv()).await.expect("within the bound"),
+                Ok(None)
+            ),
+            "the courier wire closes behind its last answer"
+        );
+    }
+
+    /// R78 decision 47: rows that span two older majors the offer builds ride
+    /// each major's own courier dial in major order, the build's major
+    /// following on the main wire, each courier wire closing behind its last
+    /// answer.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one test walks the two dials and the main wire"
+    )]
+    #[tokio::test]
+    async fn two_older_majors_each_dial_their_own_wire_before_the_main() {
+        let b1 = real_changeset(1);
+        let b2 = real_changeset(2);
+        let b3 = real_changeset(3);
+        let (cert, keys) = device_identity().await;
+        let mut conn = replica3();
+        conn.store_device_certificate(&cert)
+            .await
+            .expect("the certificate stores");
+        hold(
+            &mut conn,
+            AUTHOR,
+            1,
+            HeldState::CourierOnly,
+            major(1),
+            Some(&b1),
+        );
+        hold(
+            &mut conn,
+            AUTHOR,
+            2,
+            HeldState::CourierOnly,
+            major(2),
+            Some(&b2),
+        );
+        hold(
+            &mut conn,
+            AUTHOR,
+            3,
+            HeldState::Provisional,
+            major(3),
+            Some(&b3),
+        );
+        adopt_builds(
+            &mut conn,
+            AUTHOR,
+            &[
+                (major(1), old_version()),
+                (major(2), version()),
+                (major(3), version3()),
+            ],
+            Some(3),
+        );
+        let (mut conn, mut server) = attach3(conn, true).await;
+        conn.writer_keys = Some(keys);
+        let ask = next_ask(&mut server).await;
+        assert_eq!(ask.seqs, [1, 2], "the unapplied rows are asked");
+        let wait = conn.courier(AUTHOR).await.expect("the call owes a dial");
+        let timer = conn.courier_drain_timer().expect("major 1 owes a dial");
+        let mut old = dial_courier_wire(&mut conn, timer, major(1), old_version()).await;
+        // The bound writer's answer frees the range for the courier wire.
+        conn.pump_one_or(std::future::pending::<()>())
+            .await
+            .expect("one step");
+        let range = next_range(&mut old).await;
+        assert_eq!(
+            range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [1],
+            "the oldest major's row rides its own courier wire"
+        );
+        let body = next_body(&mut old).await;
+        assert_eq!(body.seq, 1);
+        assert_eq!(
+            zstd::decode_all(&body.changeset_zstd[..]).expect("a body"),
+            b1
+        );
+        deliver_answer(
+            &mut old,
+            &range.request_id,
+            CourierOutcome::Entries(vec![(1, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+        )
+        .await;
+        let event = conn.pump_one().await.expect("the oldest major settles");
+        assert_eq!(
+            expect_candidates(event).seqs,
+            [2, 3],
+            "the settled major leaves the rest"
+        );
+        // The second older major dials its own wire.
+        let timer = conn.courier_drain_timer().expect("major 2 owes a dial");
+        let mut mid = dial_courier_wire(&mut conn, timer, major(2), version()).await;
+        conn.pump_one_or(std::future::pending::<()>())
+            .await
+            .expect("one step");
+        let range = next_range(&mut mid).await;
+        assert_eq!(
+            range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [2],
+            "the middle major's row rides its own courier wire"
+        );
+        let body = next_body(&mut mid).await;
+        assert_eq!(body.seq, 2);
+        assert_eq!(
+            zstd::decode_all(&body.changeset_zstd[..]).expect("a body"),
+            b2
+        );
+        deliver_answer(
+            &mut mid,
+            &range.request_id,
+            CourierOutcome::Entries(vec![(2, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+        )
+        .await;
+        let event = conn.pump_one().await.expect("the middle major settles");
+        assert_eq!(
+            expect_candidates(event).seqs,
+            [3],
+            "the settled major leaves the build's row"
+        );
+        // The build's major follows on the main wire.
+        let range = next_range(&mut server).await;
+        assert_eq!(
+            range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [3],
+            "the build's major rides the main wire"
+        );
+        let body = next_body(&mut server).await;
+        assert_eq!(body.seq, 3);
+        assert_eq!(
+            zstd::decode_all(&body.changeset_zstd[..]).expect("a body"),
+            b3
+        );
+        deliver_answer(
+            &mut server,
+            &range.request_id,
+            CourierOutcome::Entries(vec![(3, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+        )
+        .await;
+        let event = conn.pump_one().await.expect("the call ends");
+        assert_eq!(
+            expect_candidates(event).seqs,
+            [] as [u64; 0],
+            "the author's candidates restate empty"
+        );
+        let report = timeout(BOUND, wait.receiver)
+            .await
+            .expect("the call stands")
+            .expect("the answer lands")
+            .expect("every row settles");
+        assert_eq!(report.settled, [1, 2, 3]);
+        assert_eq!(report.refused, [] as [u64; 0]);
+        assert_eq!(report.kept, [] as [u64; 0]);
+        assert!(
+            matches!(
+                timeout(BOUND, old.recv()).await.expect("within the bound"),
+                Ok(None)
+            ),
+            "the first courier wire closes behind its last answer"
+        );
+        assert!(
+            matches!(
+                timeout(BOUND, mid.recv()).await.expect("within the bound"),
+                Ok(None)
+            ),
+            "the second courier wire closes behind its last answer"
+        );
+    }
+
+    /// R78 decision 47: a held row whose major the stored offer does not
+    /// build is not a courier candidate and owes no dial, and the settle
+    /// restates nothing, the session never having raised the author's
+    /// candidates.
+    #[tokio::test]
+    async fn a_major_the_offer_does_not_build_is_not_couriered() {
+        let b1 = real_changeset(1);
+        let b2 = real_changeset(2);
+        let mut conn = replica();
+        hold(
+            &mut conn,
+            AUTHOR,
+            1,
+            HeldState::CourierOnly,
+            major(1),
+            Some(&b1),
+        );
+        hold(
+            &mut conn,
+            AUTHOR,
+            2,
+            HeldState::Provisional,
+            major(2),
+            Some(&b2),
+        );
+        adopt(&mut conn, AUTHOR, Some(2));
+        let (mut conn, mut server) = attach(conn, true).await;
+        let ask = next_ask(&mut server).await;
+        assert_eq!(ask.seqs, [1], "the unapplied row is asked");
+        let candidates = conn.courier_candidates().expect("the candidates read");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].seqs,
+            [2],
+            "only the listed major's row is a candidate"
+        );
+        let wait = conn.courier(AUTHOR).await.expect("the range goes out");
+        assert!(conn.courier_drain_timer().is_none(), "no dial is owed");
+        let range = next_range(&mut server).await;
+        assert_eq!(
+            range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [2]
+        );
+        let body = next_body(&mut server).await;
+        assert_eq!(body.seq, 2);
+        assert_eq!(
+            zstd::decode_all(&body.changeset_zstd[..]).expect("a body"),
+            b2
+        );
+        deliver_answer(
+            &mut server,
+            &range.request_id,
+            CourierOutcome::Entries(vec![(2, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+        )
+        .await;
+        server.close().await.expect("hang up");
+        let event = conn.pump_one().await.expect("the range settles");
+        assert!(matches!(event, ClientEvent::Closed));
+        let report = timeout(BOUND, wait.receiver)
+            .await
+            .expect("the call stands")
+            .expect("the answer lands")
+            .expect("the row settles");
+        assert_eq!(report.settled, [2]);
+        assert!(
+            matches!(
+                peer::state_of(&mut conn.db, &AUTHOR, 1),
+                Ok(Some(HeldState::CourierOnly)),
+            ),
+            "the unlisted major's row stays held"
+        );
+    }
 }

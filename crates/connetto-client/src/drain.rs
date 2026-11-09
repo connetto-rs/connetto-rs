@@ -57,10 +57,22 @@ pub struct DrainTimer {
 }
 
 impl DrainTimer {
+    /// A fresh dial identity with its wait.
+    #[must_use]
+    pub const fn new(armed: u64, wait: Duration) -> Self {
+        Self { armed, wait }
+    }
+
     /// How long to wait before dialing.
     #[must_use]
     pub const fn wait(&self) -> Duration {
         self.wait
+    }
+
+    /// The arm count the dial rode on.
+    #[must_use]
+    pub const fn armed(&self) -> u64 {
+        self.armed
     }
 }
 
@@ -247,7 +259,7 @@ where
 
     /// The writer the draining major's next write is queued under: the one
     /// holding its entry of the lowest append position.
-    fn drain_writer(&self, major: Major) -> Option<WriterRef> {
+    pub(crate) fn drain_writer(&self, major: Major) -> Option<WriterRef> {
         // A run's entries of the major precede its writer's pending ones.
         if let Some(restore) = self.restore.as_ref()
             && restore
@@ -311,7 +323,7 @@ where
 
     /// What the drain presents for `writer`, or `None` while it is a device
     /// whose bind cannot be signed yet.
-    fn drain_request(
+    pub(crate) fn drain_request(
         &mut self,
         writer: Option<WriterRef>,
     ) -> Result<Option<WriterRequest>, ClientError> {
@@ -342,7 +354,7 @@ where
     /// that key in standing, an issued number when the key is gone, and a
     /// wait while the certificate is outside its window.
     #[cfg(feature = "device-identity")]
-    fn drain_device_request(
+    pub(crate) fn drain_device_request(
         &mut self,
         key_id: [u8; 32],
     ) -> Result<Option<WriterRequest>, ClientError> {
@@ -372,7 +384,7 @@ where
         clippy::unused_self,
         reason = "the device build's body reads the certificate and can fail"
     )]
-    fn drain_device_request(
+    pub(crate) fn drain_device_request(
         &mut self,
         _key_id: [u8; 32],
     ) -> Result<Option<WriterRequest>, ClientError> {
@@ -1013,7 +1025,15 @@ where
             let _suspended = ExemptWrites::raise(&self.write_flags);
             crate::majors::forget_batch(&mut self.db, major, self.config.held_content)?;
         }
-        self.drop_drain_wire().await;
+        // A range riding the shared wire settles on it after the batch's
+        // own writes, so its wire stands (R78 decision 47).
+        #[cfg(feature = "peer")]
+        let rides = self.courier_rides_the_drain();
+        #[cfg(not(feature = "peer"))]
+        let rides = false;
+        if !rides {
+            self.drop_drain_wire().await;
+        }
         self.notices
             .push_back(ClientEvent::Held(HeldWork::Drained { major }));
         self.load_drain()?;
@@ -1080,6 +1100,19 @@ where
         frame: Option<IncomingFrame>,
     ) -> Result<(), ClientError> {
         let Some(major) = self.draining_major() else {
+            // The batch's own writes can settle before the shared range's
+            // answer, which this wire still carries (R78 decision 47).
+            #[cfg(feature = "peer")]
+            if self.courier_rides_the_drain() {
+                if let Some(IncomingFrame::Control(ControlMessage::CourierAnswer(answer))) = frame {
+                    if let Some(event) = self.settle_courier_answer(&answer).await? {
+                        self.notices.push_back(event);
+                    }
+                    return Ok(());
+                }
+                self.drop_drain_wire().await;
+                return Ok(());
+            }
             self.drop_drain_wire().await;
             return Ok(());
         };
@@ -1205,6 +1238,15 @@ where
                 }
                 let event = self.rate_limited(limited);
                 self.notices.push_back(event);
+                return Ok(());
+            }
+            // A shared courier range the device's own drain settled (R78
+            // decision 47), correlated by request id like the main wire.
+            #[cfg(feature = "peer")]
+            Some(IncomingFrame::Control(ControlMessage::CourierAnswer(answer))) => {
+                if let Some(event) = self.settle_courier_answer(&answer).await? {
+                    self.notices.push_back(event);
+                }
                 return Ok(());
             }
             // Nothing else concerns a session with no subscription.

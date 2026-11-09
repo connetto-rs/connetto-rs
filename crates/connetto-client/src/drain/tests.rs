@@ -733,3 +733,620 @@ async fn a_run_whose_older_rows_carry_no_bundle_hash_is_not_armed() {
         "the run is left to the writer's retirement"
     );
 }
+
+#[cfg(all(feature = "peer", feature = "device-identity"))]
+pub(crate) mod r78_4c {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::time::Duration;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::SystemTime;
+
+    use base64::Engine as _;
+    use connetto_core::chain::GENESIS;
+    use connetto_core::device_cert::{
+        AttestationLevel, CertificateRequest, CertificateSerial, CertificateSigner, DeploymentId,
+        DeviceCertificate, DeviceIssuer, DeviceKey, DeviceKeyError, KeyHome, RootCa,
+        public_key_info,
+    };
+    use connetto_core::exchange::{
+        CourierEntryOutcome, CourierOutcome, Frontier, ManifestRow, SignedOffer,
+    };
+    use connetto_core::messages::{
+        BulkMessage, Challenge, ControlMessage, CourierAnswer, DeviceAttestation, HandshakeAck,
+        WriterRequest,
+    };
+    use connetto_core::traits::{IncomingFrame, Transport};
+    use connetto_core::{Cursor, LoopbackTransport, Major, SchemaVersion, loopback};
+    use parking_lot::Mutex;
+    use ring::rand::SystemRandom;
+    use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _};
+    use serde_bytes::ByteBuf;
+    use sha2::{Digest, Sha256};
+
+    use super::*;
+    use crate::device_key::{KeyRecords, OpenedKey, open_software_key};
+    use crate::enrolment::{DeviceKeys, Held};
+    use crate::peer::{self, HeldState, PeerAuthor};
+    use crate::{ClientEvent, CourierCandidate, CourierError};
+
+    const AUTHOR: [u8; 32] = [0x11; 32];
+
+    /// The major 2 bundle hash the main wire presents.
+    fn main_version() -> SchemaVersion {
+        SchemaVersion::from_hash(b"the major 2 bundle".to_vec())
+    }
+
+    /// The stored offer the tests stand, `builds` as given.
+    fn offer_with(builds: &[(Major, SchemaVersion)], newest: Option<u64>) -> SignedOffer {
+        SignedOffer {
+            offer: connetto_core::exchange::Offer {
+                builds: builds.to_vec(),
+                settled: None,
+                newest: newest.map(|seq| Frontier {
+                    seq,
+                    head: [99; 32],
+                }),
+                retractions: Vec::new(),
+            },
+            signature: vec![1, 2, 3],
+        }
+    }
+
+    /// Hold one entry of `author` at `seq` as `state`, its body the test's
+    /// own.
+    fn hold_entry(
+        conn: &mut Conn,
+        author: [u8; 32],
+        seq: u64,
+        state: HeldState,
+        major: Major,
+        body: &[u8],
+    ) {
+        let digest: [u8; 32] = {
+            let mut hasher = Sha256::new();
+            hasher.update(body);
+            hasher.finalize().into()
+        };
+        let row = ManifestRow {
+            seq,
+            major,
+            origin: None,
+            digest,
+        };
+        let author = PeerAuthor {
+            key_id: author.to_vec(),
+            account: "courier-author".to_owned(),
+            bot_list: None,
+        };
+        let position = i64::try_from(peer::load_next_position(&mut conn.db).expect("a position"))
+            .expect("fits");
+        peer::store_entry(
+            &mut conn.db,
+            &author,
+            &peer::NewEntry {
+                row: &row,
+                state,
+                body: Some(body),
+                received_at: 1,
+                position,
+            },
+        )
+        .expect("store the entry");
+    }
+
+    /// Store `author`'s cursor with the test's offer.
+    fn adopt_offer(
+        conn: &mut Conn,
+        author: [u8; 32],
+        builds: &[(Major, SchemaVersion)],
+        newest: Option<u64>,
+    ) {
+        let encoded = rmp_serde::to_vec_named(&offer_with(builds, newest)).expect("encodes");
+        crate::exchange::upsert_cursor(
+            &mut conn.db,
+            author.as_ref(),
+            "courier-author",
+            &Frontier {
+                seq: 0,
+                head: GENESIS,
+            },
+            &encoded,
+            4_102_444_800,
+        )
+        .expect("keep the cursor");
+    }
+
+    /// Attach a main wire whose scripted server answers the handshake with
+    /// the courier path `courier`.
+    async fn attach_main(mut conn: Conn, courier: bool) -> (Conn, LoopbackTransport) {
+        let (client, mut server) = loopback();
+        let wire = Wire {
+            end: client,
+            broken: Arc::new(AtomicBool::new(false)),
+        };
+        let reply = async {
+            let Some(ControlMessage::Handshake(_)) = sent(&mut server).await else {
+                panic!("the main wire opens with the handshake");
+            };
+            server
+                .send_control(ControlMessage::Challenge(Challenge { nonce: [9; 32] }))
+                .await
+                .expect("the challenge");
+            server
+                .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                    connection_id: "main".to_owned(),
+                    session_token: "main".to_owned(),
+                    resume_token: "main".to_owned(),
+                    current_cursor: Cursor::new(Vec::new()),
+                    schema_version: Some(main_version()),
+                    sunset_at_secs: None,
+                    courier,
+                    initial_credits: 64,
+                    writer: None,
+                }))
+                .await
+                .expect("answer the handshake");
+        };
+        let (attached, ()) = tokio::join!(conn.attach(wire), reply);
+        attached.expect("attach the main wire");
+        while let Some(notice) = conn.notices.pop_front() {
+            if matches!(
+                notice,
+                crate::ClientEvent::SyncStatus(_) | crate::ClientEvent::CourierCandidates(_)
+            ) {
+                continue;
+            }
+            conn.notices.push_front(notice);
+            break;
+        }
+        (conn, server)
+    }
+
+    /// The evidence the fake key offers.
+    fn evidence() -> DeviceAttestation {
+        DeviceAttestation::AndroidKeyChain(vec![ByteBuf::from(vec![0x30, 0x06])])
+    }
+
+    /// A real ring key and the PKCS #8 bytes the fake store reopens.
+    fn attesting_key() -> (AttestingKey, Vec<u8>) {
+        let rng = SystemRandom::new();
+        let der = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
+            .expect("the key generates");
+        (
+            AttestingKey::from_pkcs8(der.as_ref()),
+            der.as_ref().to_vec(),
+        )
+    }
+
+    /// A key that signs with ring and offers Android-style evidence.
+    struct AttestingKey {
+        pair: EcdsaKeyPair,
+        point: [u8; 65],
+        rng: SystemRandom,
+    }
+
+    impl AttestingKey {
+        fn from_pkcs8(der: &[u8]) -> Self {
+            let rng = SystemRandom::new();
+            let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, der, &rng)
+                .expect("the key reads back");
+            let point = pair
+                .public_key()
+                .as_ref()
+                .try_into()
+                .expect("a P-256 point");
+            Self { pair, point, rng }
+        }
+    }
+
+    impl DeviceKey for AttestingKey {
+        fn public_point(&self) -> [u8; 65] {
+            self.point
+        }
+
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, DeviceKeyError> {
+            self.pair
+                .sign(&self.rng, message)
+                .map(|signature| signature.as_ref().to_vec())
+                .map_err(|err| DeviceKeyError::Platform(Box::new(err)))
+        }
+
+        fn home(&self) -> KeyHome {
+            KeyHome::Software
+        }
+
+        fn attestation(&self, _csr: &[u8]) -> Result<Option<DeviceAttestation>, DeviceKeyError> {
+            Ok(Some(evidence()))
+        }
+    }
+
+    /// The keys the run opens, always the same attesting key.
+    struct RunKeys {
+        der: Vec<u8>,
+    }
+
+    impl DeviceKeys for RunKeys {
+        fn open(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<OpenedKey<Box<dyn DeviceKey>>, crate::ClientError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let der = self.der.clone();
+            Box::pin(async move {
+                let key: Box<dyn DeviceKey> = Box::new(AttestingKey::from_pkcs8(&der));
+                Ok(OpenedKey {
+                    key,
+                    created: false,
+                })
+            })
+        }
+
+        fn delete(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), crate::ClientError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A key record store that never leaves memory.
+    #[derive(Default)]
+    struct CertMemory(Mutex<HashMap<String, String>>);
+
+    impl KeyRecords for CertMemory {
+        fn read(
+            &self,
+            name: &str,
+        ) -> impl Future<Output = Result<Option<String>, crate::ClientError>> + Send {
+            std::future::ready(Ok(self.0.lock().get(name).cloned()))
+        }
+
+        fn write(
+            &self,
+            name: &str,
+            secret: &str,
+        ) -> impl Future<Output = Result<(), crate::ClientError>> + Send {
+            self.0.lock().insert(name.to_owned(), secret.to_owned());
+            std::future::ready(Ok(()))
+        }
+
+        fn delete(
+            &self,
+            name: &str,
+        ) -> impl Future<Output = Result<(), crate::ClientError>> + Send {
+            self.0.lock().remove(name);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// The device's certificate and the keys that open its key, standing
+    /// fresh.
+    pub(crate) async fn device_identity() -> (Held, Arc<dyn DeviceKeys>) {
+        let (key, der) = attesting_key();
+        let records = CertMemory::default();
+        let issuer_key = open_software_key(&records, "issuer")
+            .await
+            .expect("issuer key");
+        let issuer_pkcs8 = base64::engine::general_purpose::STANDARD
+            .decode(
+                records
+                    .0
+                    .lock()
+                    .get(&crate::device_key_record("issuer"))
+                    .expect("stored")
+                    .as_bytes(),
+            )
+            .expect("base64");
+        let root = RootCa::create(
+            DeploymentId::from_uuid(uuid::Uuid::from_u128(7)),
+            SystemTime::now() - Duration::from_hours(10),
+            Duration::from_hours(3650 * 24),
+        )
+        .expect("the root");
+        let certificate = root
+            .sign_issuer(
+                &public_key_info(&issuer_key.key),
+                SystemTime::now() - Duration::from_hours(10),
+                Duration::from_hours(400 * 24),
+                CertificateSerial::new([2; 16]).expect("the serial is positive"),
+            )
+            .expect("the issuer signs");
+        let issuer_der = certificate.clone();
+        let issuer = DeviceIssuer::from_pkcs8(certificate, &issuer_pkcs8, root.certificate())
+            .expect("the issuer loads");
+        let csr = CertificateRequest::build(&CertificateSigner::new(&key), &[1; 32])
+            .expect("the csr builds");
+        let request = CertificateRequest::parse(&csr).expect("the csr parses");
+        let not_before = SystemTime::now();
+        // The leaf stays inside the issuer's window, which started ten hours
+        // ago and runs 400 days.
+        let lifetime = Duration::from_hours(399 * 24);
+        let certificate = issuer
+            .issue(
+                &request,
+                "alice",
+                not_before,
+                lifetime,
+                CertificateSerial::new([3; 16]).expect("the serial is positive"),
+                AttestationLevel::Unproven,
+                connetto_core::BOT_LIST_WILDCARD,
+            )
+            .expect("the issuer signs");
+        (
+            Held {
+                leaf: DeviceCertificate::parse(&certificate).expect("the profile"),
+                certificate,
+                issuer: issuer_der,
+                lifetime: Some(lifetime),
+            },
+            Arc::new(RunKeys { der }),
+        )
+    }
+
+    /// A replica standing behind a test device, with a main wire whose
+    /// courier path is on, the author's row held and the offer stored.
+    async fn couriered_author() -> (Conn, LoopbackTransport, u64) {
+        let (cert, keys) = device_identity().await;
+        let mut conn = replica();
+        conn.store_device_certificate(&cert)
+            .await
+            .expect("store the certificate");
+        hold_entry(
+            &mut conn,
+            AUTHOR,
+            1,
+            HeldState::CourierOnly,
+            major(1),
+            b"the old note",
+        );
+        adopt_offer(&mut conn, AUTHOR, &[(major(1), old_version())], Some(1));
+        let (conn, main) = attach_main(conn, true).await;
+        let mut conn = conn;
+        conn.writer_keys = Some(keys);
+        (conn, main, 1)
+    }
+
+    /// The next frame the far end receives, bounded.
+    async fn next_frame(old: &mut LoopbackTransport) -> IncomingFrame {
+        tokio::time::timeout(Duration::from_secs(5), old.recv())
+            .await
+            .expect("a frame within the bound")
+            .expect("receive")
+            .expect("the wire is open")
+    }
+
+    /// R78 decision 47: a range whose major the device's own drain is
+    /// draining rides that wire, the call owing no dial of its own, and a
+    /// `CourierAnswer` on the drain wire settles its rows.
+    #[tokio::test]
+    async fn a_courier_range_rides_the_drain_draining_its_major() {
+        let (mut conn, _main, seq) = couriered_author().await;
+        // The device's own drain drains major 1: it owes its own writes of
+        // the major, so the dial binds its writer and the batch stays past
+        // the first settle.
+        queue(&mut conn, WriterRef::Device([1; 32]), 2, major(1));
+        queue(&mut conn, WriterRef::Device([1; 32]), 3, major(1));
+        hold_major_one(&mut conn);
+        let (_asked, mut old, _broken) = dial(&mut conn, vec![granting(7)], Then::Stay).await;
+        let wait = conn.courier(AUTHOR).await.expect("send the range");
+        assert!(
+            conn.courier_drain_timer().is_none(),
+            "the device's own drain is shared, no second dial"
+        );
+        // The shared drain wire carries the device's own writes first.
+        for client_seq in [1u64, 2] {
+            let frame = next_frame(&mut old).await;
+            let IncomingFrame::Control(ControlMessage::MutationHeader(_)) = frame else {
+                panic!("the drain wire carries the device's own write, not {frame:?}");
+            };
+            let frame = next_frame(&mut old).await;
+            let IncomingFrame::Bulk(BulkMessage::MutationPatch(_)) = frame else {
+                panic!("the drain wire carries the mutation body, not {frame:?}");
+            };
+            old.send_control(ControlMessage::MutationApplied(MutationApplied {
+                client_seq,
+            }))
+            .await
+            .expect("apply the device's own write");
+        }
+        let frame = next_frame(&mut old).await;
+        let IncomingFrame::Control(ControlMessage::CourierRange(range)) = frame else {
+            panic!("the drain wire takes the range, not {frame:?}");
+        };
+        assert_eq!(
+            range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [seq]
+        );
+        let frame = next_frame(&mut old).await;
+        let IncomingFrame::Bulk(BulkMessage::CourierBody(_)) = frame else {
+            panic!("the range declares one body, not {frame:?}");
+        };
+        old.send_control(ControlMessage::CourierAnswer(CourierAnswer {
+            request_id: range.request_id,
+            outcome: CourierOutcome::Entries(vec![(
+                seq,
+                CourierEntryOutcome::Ruled(connetto_core::exchange::Verdict::Applied),
+            )]),
+        }))
+        .await
+        .expect("answer the range");
+        // The device's own writes settle, then the answer settles the range.
+        loop {
+            match conn
+                .pump_one_or(std::future::pending::<()>())
+                .await
+                .unwrap()
+            {
+                Some(
+                    ClientEvent::Held(HeldWork::Applied { .. } | HeldWork::Drained { .. })
+                    | ClientEvent::CourierCandidates(_),
+                ) => {}
+                None => break,
+                other => panic!("the range settles, not {other:?}"),
+            }
+        }
+        let report = tokio::time::timeout(Duration::from_secs(5), wait.receiver)
+            .await
+            .expect("the call stands")
+            .expect("the answer lands")
+            .expect("the range settles");
+        assert_eq!(report.settled, [seq]);
+        assert_eq!(report.refused, [] as [u64; 0]);
+        assert_eq!(report.kept, [] as [u64; 0]);
+        assert!(
+            conn.drain.wire.is_some(),
+            "the device's own drain keeps its wire"
+        );
+        assert!(
+            matches!(
+                peer::state_of(
+                    &mut conn.db,
+                    &AUTHOR,
+                    i64::try_from(seq).expect("a test seq"),
+                ),
+                Ok(Some(HeldState::Retained))
+            ),
+            "the row becomes retained"
+        );
+    }
+
+    /// R78 decision 47: a courier dial that never attaches within its bound
+    /// ends the call `TimedOut`, the rows kept and the dial no longer owed.
+    #[tokio::test]
+    async fn a_courier_dial_that_never_attaches_times_out() {
+        let (mut conn, mut main, seq) = couriered_author().await;
+        let wait = conn.courier(AUTHOR).await.expect("owe the dial");
+        assert!(conn.courier_drain_timer().is_some(), "the dial is owed");
+        conn.courier.open.as_mut().unwrap().deadline = Duration::ZERO;
+        // The call's candidates notice is queued ahead of the tick.
+        assert!(
+            matches!(pump(&mut conn).await, ClientEvent::CourierCandidates(_)),
+            "the candidates notice lands first"
+        );
+        main.send_control(ControlMessage::NonFatalError(
+            connetto_core::messages::NonFatalError {
+                related_to: None,
+                detail: "a tick".to_owned(),
+            },
+        ))
+        .await
+        .expect("tick the pump");
+        assert_eq!(
+            pump(&mut conn).await,
+            ClientEvent::NonFatal {
+                related_to: None,
+                detail: "a tick".to_owned(),
+            },
+            "the tick passes through"
+        );
+        let err = tokio::time::timeout(Duration::from_secs(5), wait.receiver)
+            .await
+            .expect("the call stands")
+            .expect("the wait drops")
+            .expect_err("the bound lapsed");
+        assert!(matches!(err, CourierError::TimedOut));
+        assert!(
+            conn.courier_drain_timer().is_none(),
+            "the dial goes with the call"
+        );
+        let candidates = conn.courier_candidates().expect("read the candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].seqs, [seq], "the rows stay candidates");
+    }
+
+    /// R78 decision 47: a handshake answering that the deployment no longer
+    /// serves the major ends the call `MajorUnserved`, the rows kept and out
+    /// of the candidates until the next session.
+    #[tokio::test]
+    async fn a_courier_major_the_server_no_longer_serves_is_unserved() {
+        let (mut conn, _main, seq) = couriered_author().await;
+        let wait = conn.courier(AUTHOR).await.expect("owe the dial");
+        let timer = conn.courier_drain_timer().expect("the dial is owed");
+        let (courier, mut old, _broken) = wire();
+        let reply = async {
+            let frame = next_frame(&mut old).await;
+            let IncomingFrame::Control(ControlMessage::Handshake(handshake)) = frame else {
+                panic!("the courier wire opens with the handshake");
+            };
+            assert_eq!(
+                handshake.schema_major,
+                Some(major(1)),
+                "the courier wire presents major 1"
+            );
+            assert!(
+                matches!(handshake.writer, WriterRequest::Device),
+                "the device writer is presented"
+            );
+            old.send_control(major_one_gone())
+                .await
+                .expect("the major is gone");
+        };
+        let (attached, ()) = tokio::join!(conn.attach_courier_drain(timer, courier), reply);
+        attached.expect("attach the courier wire");
+        let err = tokio::time::timeout(Duration::from_secs(5), wait.receiver)
+            .await
+            .expect("the call stands")
+            .expect("the wait drops")
+            .expect_err("the major is unserved");
+        assert!(
+            matches!(err, CourierError::MajorUnserved(unserved) if unserved == major(1)),
+            "the call names the unserved major"
+        );
+        assert!(conn.courier.open.is_none(), "the range is closed");
+        assert!(conn.courier_wire.is_none(), "the courier wire is dropped");
+        assert!(conn.courier_drain_timer().is_none(), "no dial is left owed");
+        assert!(
+            matches!(
+                peer::state_of(
+                    &mut conn.db,
+                    &AUTHOR,
+                    i64::try_from(seq).expect("a test seq"),
+                ),
+                Ok(Some(HeldState::CourierOnly))
+            ),
+            "the rows stay held"
+        );
+        assert_eq!(
+            conn.courier_candidates().expect("read the candidates"),
+            [] as [CourierCandidate; 0],
+            "the major's rows are out until the next session"
+        );
+    }
+
+    /// R78 decision 47: the handshake's courier flag on the courier wire is
+    /// read as on the main wire, off answering Unavailable with no range.
+    #[tokio::test]
+    async fn a_courier_wire_whose_path_is_off_answers_unavailable() {
+        let (mut conn, _main, _seq) = couriered_author().await;
+        let wait = conn.courier(AUTHOR).await.expect("owe the dial");
+        let timer = conn.courier_drain_timer().expect("the dial is owed");
+        let (courier, mut old, _broken) = wire();
+        let reply = async {
+            let frame = next_frame(&mut old).await;
+            let IncomingFrame::Control(ControlMessage::Handshake(_)) = frame else {
+                panic!("the courier wire opens with the handshake");
+            };
+            old.send_control(ack(None))
+                .await
+                .expect("answer the handshake");
+        };
+        let (attached, ()) = tokio::join!(conn.attach_courier_drain(timer, courier), reply);
+        attached.expect("attach the courier wire");
+        let err = tokio::time::timeout(Duration::from_secs(5), wait.receiver)
+            .await
+            .expect("the call stands")
+            .expect("the wait drops")
+            .expect_err("the path is off");
+        assert!(matches!(err, CourierError::Unavailable));
+        assert_eq!(sent(&mut old).await, None, "the wire closes with no range");
+        let candidates = conn.courier_candidates().expect("read the candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].seqs, [1], "the rows stay candidates");
+    }
+}
