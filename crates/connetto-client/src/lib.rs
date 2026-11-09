@@ -4768,12 +4768,6 @@ const COURIER_RANGE_WAIT: Duration = Duration::from_secs(30);
 #[cfg(feature = "peer")]
 const COURIER_CALL_SLACK: Duration = Duration::from_secs(5);
 
-/// How a courier dial to an older major's server backs off (R78 decision
-/// 47), the reconnect loop's own shape.
-#[cfg(feature = "peer")]
-static COURIER_DRAIN_POLICY: std::sync::LazyLock<RetryPolicy> =
-    std::sync::LazyLock::new(RetryPolicy::new);
-
 /// One major's run of the held rows one courier range rides (R78 slice 4).
 #[derive(Debug)]
 #[cfg(feature = "peer")]
@@ -4826,10 +4820,8 @@ struct CourierDrainOwed {
     /// The monotonic deadline the range's answer is owed by, the backoff's
     /// lapses keeping it.
     deadline: Duration,
-    /// The wait before the next dial.
-    wait: Duration,
-    /// The backoff the failed dials count on.
-    episode: Backoff<'static>,
+    /// The dial's backoff.
+    dial: drain::OwedDial,
 }
 
 /// One courier range the server is answering, its deadline and the wait's
@@ -6417,28 +6409,10 @@ where
         for (author, seq) in peer::unapplied(&mut self.db)? {
             by_author.entry(author).or_default().push(seq);
         }
-        for (author, mut seqs) in by_author {
-            let Ok(key) = <[u8; 32]>::try_from(author.as_slice()) else {
-                continue;
-            };
-            let Some(offer) = exchange::offer_of(&mut self.db, &key)? else {
-                continue;
-            };
-            seqs.sort_unstable();
-            seqs.dedup();
-            let seqs: Vec<u64> = seqs
-                .into_iter()
-                .map(|seq| u64::try_from(seq).unwrap_or(u64::MAX))
-                .collect();
-            for chunk in seqs.chunks(connetto_core::exchange::MAX_MANIFEST_ROWS) {
-                self.provisional.pending.push_back(ProvisionalAsk {
-                    author: key,
-                    request_id: provisional_request_id(),
-                    offer: offer.clone(),
-                    seqs: chunk.to_vec(),
-                    retained: false,
-                });
-            }
+        for (author, seqs) in by_author {
+            // An author without a stored offer or a 32-byte key asks for
+            // nothing.
+            self.queue_author_asks(&author, seqs, false)?;
         }
         // A restart that left the resync's asks owed re-asks the retained
         // rows after these (R78 decision 49).
@@ -6463,31 +6437,56 @@ where
             by_author.entry(author).or_default().push(seq);
         }
         let mut asked = false;
-        for (author, mut seqs) in by_author {
-            let Ok(key) = <[u8; 32]>::try_from(author.as_slice()) else {
-                continue;
-            };
-            let Some(offer) = exchange::offer_of(&mut self.db, &key)? else {
-                continue;
-            };
-            seqs.sort_unstable();
-            seqs.dedup();
-            let seqs: Vec<u64> = seqs
-                .into_iter()
-                .map(|seq| u64::try_from(seq).unwrap_or(u64::MAX))
-                .collect();
-            for chunk in seqs.chunks(connetto_core::exchange::MAX_MANIFEST_ROWS) {
-                let request_id = provisional_request_id();
-                self.provisional.pending.push_back(ProvisionalAsk {
-                    author: key,
-                    request_id: request_id.clone(),
-                    offer: offer.clone(),
-                    seqs: chunk.to_vec(),
-                    retained: true,
-                });
+        for (author, seqs) in by_author {
+            asked |= self.queue_author_asks(&author, seqs, true)?;
+        }
+        Ok(asked)
+    }
+
+    /// Queue an author's provisional asks, one per manifest frame of its
+    /// sequences, reporting whether an ask stands (R77, R78 decision 49).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the stored offer cannot be read.
+    #[cfg(feature = "peer")]
+    fn queue_author_asks(
+        &mut self,
+        author: &[u8],
+        mut seqs: Vec<i64>,
+        retained: bool,
+    ) -> Result<bool, ClientError> {
+        let Ok(key) = <[u8; 32]>::try_from(author) else {
+            return Ok(false);
+        };
+        let Some(offer) = exchange::offer_of(&mut self.db, &key)? else {
+            return Ok(false);
+        };
+        seqs.sort_unstable();
+        seqs.dedup();
+        let seqs: Vec<u64> = seqs
+            .into_iter()
+            .map(|seq| u64::try_from(seq).unwrap_or(u64::MAX))
+            .collect();
+        let mut asked = false;
+        for chunk in seqs.chunks(connetto_core::exchange::MAX_MANIFEST_ROWS) {
+            let request_id = provisional_request_id();
+            let ask_id = if retained {
+                // The retained ask awaits its answer among this connection's.
+                let id = request_id.clone();
                 self.courier.retained_awaiting.insert(request_id);
-                asked = true;
-            }
+                id
+            } else {
+                request_id
+            };
+            self.provisional.pending.push_back(ProvisionalAsk {
+                author: key,
+                request_id: ask_id,
+                offer: offer.clone(),
+                seqs: chunk.to_vec(),
+                retained,
+            });
+            asked = true;
         }
         Ok(asked)
     }
@@ -6789,30 +6788,19 @@ where
             | connetto_core::exchange::Verdict::Settled => {
                 self.adjudicate_peer_seq(author, seq)?;
             }
-            connetto_core::exchange::Verdict::Refused(cause) => {
+            cause @ (connetto_core::exchange::Verdict::Refused(_)
+            | connetto_core::exchange::Verdict::Abandoned) => {
+                let cause = match cause {
+                    connetto_core::exchange::Verdict::Refused(cause) => cause.clone(),
+                    _ => connetto_core::exchange::RetractCause::Abandoned,
+                };
                 self.retract_peer_entry(
                     &peer::PeerAuthor {
                         key_id: author.to_vec(),
                         account: String::new(),
                         bot_list: None,
                     },
-                    &connetto_core::exchange::Retraction {
-                        seq,
-                        cause: cause.clone(),
-                    },
-                )?;
-            }
-            connetto_core::exchange::Verdict::Abandoned => {
-                self.retract_peer_entry(
-                    &peer::PeerAuthor {
-                        key_id: author.to_vec(),
-                        account: String::new(),
-                        bot_list: None,
-                    },
-                    &connetto_core::exchange::Retraction {
-                        seq,
-                        cause: connetto_core::exchange::RetractCause::Abandoned,
-                    },
+                    &connetto_core::exchange::Retraction { seq, cause },
                 )?;
             }
             connetto_core::exchange::Verdict::Pending => {}
@@ -7138,8 +7126,7 @@ where
                     .clone()
                     .expect("the range's major stands a version"),
                 deadline: crate::away::SystemClock.monotonic() + COURIER_RANGE_WAIT,
-                wait: Duration::ZERO,
-                episode: COURIER_DRAIN_POLICY.start(),
+                dial: drain::OwedDial::fresh(),
             });
         }
         CourierOpenWire::Courier
@@ -7359,6 +7346,59 @@ where
         Ok(())
     }
 
+    /// End the open courier call with `reply` (R78 decision 47): the range's
+    /// answer goes out, the courier wire closes, the owed dial goes, the
+    /// author's candidates are restated and the queue flushed.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the candidates cannot be restated or the queued
+    /// ranges cannot be read or sent.
+    #[cfg(feature = "peer")]
+    async fn end_courier_call(
+        &mut self,
+        open: CourierOpen,
+        reply: CourierError,
+    ) -> Result<(), ClientError> {
+        if let Some(sender) = open.reply {
+            let _ = sender.send(Err(reply));
+        }
+        self.close_courier_wire().await;
+        self.courier.drain_owed = None;
+        self.raise_courier_candidates_if_changed(open.author)?;
+        self.flush_courier_ranges().await
+    }
+
+    /// Open the device key and sign the wire's `challenge` with it, the bind
+    /// standing under `key_id`, a fresh request id on (R78 decision 47).
+    ///
+    /// The device holding another key now stands `None`, the callers moving
+    /// the old key's rows or uncertifying the range.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::DeviceChip`] when the key cannot be opened or the bind
+    /// cannot be signed.
+    #[cfg(feature = "device-identity")]
+    pub(crate) async fn sign_device_bind(
+        keys: &Arc<dyn crate::enrolment::DeviceKeys>,
+        challenge: &[u8; 32],
+        key_id: [u8; 32],
+    ) -> Result<Option<(String, Vec<u8>)>, ClientError> {
+        let opened = keys.open().await?;
+        if *connetto_core::device_cert::key_id(&*opened.key).as_bytes() != key_id {
+            return Ok(None);
+        }
+        let signature = opened
+            .key
+            .sign(&connetto_core::messages::writer_bind_message(challenge))
+            .map_err(|err| {
+                ClientError::DeviceChip(crate::device_key::ChipError::Failed(Box::new(err)))
+            })?;
+        let request_id = crate::writer_request_id();
+        Ok(Some((request_id, signature)))
+    }
+
     /// Close and forget the courier wire and end the range it was dialing
     /// for, the rows kept and the queue flushed (R78 decision 47).
     ///
@@ -7367,18 +7407,12 @@ where
     /// [`ClientError`] when the queued ranges cannot be read or sent.
     #[cfg(feature = "peer")]
     async fn drop_courier_wire(&mut self) -> Result<(), ClientError> {
-        if let Some(mut wire) = self.courier_wire.take() {
-            let _ = wire.close().await;
-        }
+        self.close_courier_wire().await;
         self.courier.drain_owed = None;
         let Some(open) = self.courier.open.take() else {
             return self.flush_courier_ranges().await;
         };
-        if let Some(reply) = open.reply {
-            let _ = reply.send(Err(CourierError::TimedOut));
-        }
-        self.raise_courier_candidates_if_changed(open.author)?;
-        self.flush_courier_ranges().await
+        self.end_courier_call(open, CourierError::TimedOut).await
     }
 
     /// The dial the open courier range owes on its major's server (R78
@@ -7389,7 +7423,7 @@ where
         self.courier
             .drain_owed
             .as_ref()
-            .map(|owed| drain::DrainTimer::new(self.courier.drain_dials, owed.wait))
+            .map(|owed| drain::DrainTimer::new(self.courier.drain_dials, owed.dial.wait()))
     }
 
     /// A dial for `timer` failed, so the courier's dial backs off, the
@@ -7404,10 +7438,7 @@ where
         {
             self.courier.drain_dials += 1;
             if let Some(owed) = self.courier.drain_owed.as_mut() {
-                owed.wait = owed
-                    .episode
-                    .next_wait()
-                    .unwrap_or_else(|| COURIER_DRAIN_POLICY.max_backoff());
+                owed.dial.back_off();
             }
         }
     }
@@ -7459,12 +7490,7 @@ where
             let Some(open) = self.courier.open.take() else {
                 return Ok(());
             };
-            if let Some(reply) = open.reply {
-                let _ = reply.send(Err(CourierError::TimedOut));
-            }
-            self.raise_courier_candidates_if_changed(open.author)?;
-            self.flush_courier_ranges().await?;
-            return Ok(());
+            return self.end_courier_call(open, CourierError::TimedOut).await;
         }
         #[cfg(not(feature = "device-identity"))]
         {
@@ -7489,26 +7515,9 @@ where
             // request does until a bind follows it.
             WriterRequest::Device
         };
-        let now = crate::clock::now_secs(&mut self.db)?;
-        let presented = self
-            .config
-            .clone()
-            .with_schema_major(Some(major))
-            .with_schema_version(Some(version));
-        let outcome = exchange_handshake(
-            &mut transport,
-            HandshakeInput {
-                config: &presented,
-                token_source: self.token_source.as_ref(),
-                resume: None,
-                resume_token: None,
-                writer: request,
-                settled_through: None,
-                now,
-                cursor_subjects: None,
-            },
-        )
-        .await;
+        let outcome = self
+            .handshake_majored_wire(&mut transport, major, version, request, None)
+            .await;
         match outcome {
             Ok(ack) => self.attach_courier_ack(ack, transport).await,
             Err(err) => {
@@ -7539,35 +7548,24 @@ where
             let Some(open) = self.courier.open.take() else {
                 return Ok(());
             };
-            if let Some(reply) = open.reply {
-                let _ = reply.send(Err(CourierError::Unavailable));
-            }
-            self.raise_courier_candidates_if_changed(open.author)?;
-            self.flush_courier_ranges().await?;
-            return Ok(());
+            return self.end_courier_call(open, CourierError::Unavailable).await;
         }
         self.courier_wire = Some(transport);
         let (Some(challenge), Some(keys)) = (ack.challenge, self.writer_keys.clone()) else {
             // The device cannot sign the bind, so the range is uncertified.
             return self.uncertify_courier_range().await;
         };
-        let opened = keys.open().await?;
         let Some(held) = self.device_certificate()? else {
             // The certificate is gone, so the range is uncertified.
             return self.uncertify_courier_range().await;
         };
         let key_id = *held.leaf.identity().key().as_bytes();
-        if *connetto_core::device_cert::key_id(&*opened.key).as_bytes() != key_id {
+        let Some((request_id, signature)) =
+            Self::sign_device_bind(&keys, &challenge, key_id).await?
+        else {
             // The device holds another key now, so the range is uncertified.
             return self.uncertify_courier_range().await;
-        }
-        let signature = opened
-            .key
-            .sign(&connetto_core::messages::writer_bind_message(&challenge))
-            .map_err(|err| {
-                ClientError::DeviceChip(crate::device_key::ChipError::Failed(Box::new(err)))
-            })?;
-        let request_id = crate::writer_request_id();
+        };
         let Some(wire) = self.courier_wire.as_mut() else {
             return Ok(());
         };
@@ -7612,30 +7610,19 @@ where
         timer: drain::DrainTimer,
         mut transport: T,
     ) -> Result<(), ClientError> {
-        match err {
-            ClientError::UpdateRequired { .. }
-            | ClientError::ServerBehind { .. }
-            | ClientError::SchemaOutdated { .. } => {
+        match crate::drain::drain_refusal_class(&err) {
+            crate::drain::DrainRefusal::MajorGone => {
                 // The major is gone, so its rows wait for the next session.
-                let author = self.courier.open.as_ref().map(|open| open.author);
                 let Some(open) = self.courier.open.take() else {
                     let _ = transport.close().await;
                     return Ok(());
                 };
                 self.major_unserved(open.author, major);
-                if let Some(reply) = open.reply {
-                    let _ = reply.send(Err(CourierError::MajorUnserved(major)));
-                }
                 let _ = transport.close().await;
-                self.courier.drain_owed = None;
-                if let Some(author) = author {
-                    self.raise_courier_candidates_if_changed(author)?;
-                }
-                self.flush_courier_ranges().await
+                self.end_courier_call(open, CourierError::MajorUnserved(major))
+                    .await
             }
-            ClientError::Refused {
-                reason: FatalErrorReason::SessionRevoked,
-            } => {
+            crate::drain::DrainRefusal::SessionRevoked => {
                 let Some(open) = self.courier.open.take() else {
                     let _ = transport.close().await;
                     return Ok(());
@@ -7647,14 +7634,12 @@ where
                 self.courier.drain_owed = None;
                 Ok(())
             }
-            ClientError::Refused {
-                reason: FatalErrorReason::DeviceRevoked,
-            } => {
+            crate::drain::DrainRefusal::DeviceRevoked => {
                 self.exclude_device_writers(crate::Carry::Named)?;
                 let _ = transport.close().await;
                 self.uncertify_courier_range().await
             }
-            _ => {
+            crate::drain::DrainRefusal::WriterRefused(_) | crate::drain::DrainRefusal::BackOff => {
                 // Anything else backs the dial off, the deadline keeping the
                 // range's bound.
                 let _ = transport.close().await;
@@ -7737,17 +7722,10 @@ where
                         self.drop_courier_wire().await?;
                         return Ok(None);
                     };
-                    let (major, author) = (open.range.major, open.author);
-                    self.major_unserved(author, major);
-                    if let Some(reply) = open.reply {
-                        let _ = reply.send(Err(CourierError::MajorUnserved(major)));
-                    }
-                    if let Some(mut wire) = self.courier_wire.take() {
-                        let _ = wire.close().await;
-                    }
-                    self.courier.drain_owed = None;
-                    self.raise_courier_candidates_if_changed(author)?;
-                    self.flush_courier_ranges().await?;
+                    let major = open.range.major;
+                    self.major_unserved(open.author, major);
+                    self.end_courier_call(open, CourierError::MajorUnserved(major))
+                        .await?;
                 }
                 FatalErrorReason::SessionRevoked => {
                     let Some(open) = self.courier.open.take() else {
@@ -7785,21 +7763,15 @@ where
             return self.drop_courier_wire().await;
         };
         let author = open.author;
-        if let Some(reply) = open.reply {
-            let _ = reply.send(Err(CourierError::Refused(
-                connetto_core::exchange::CourierRefusal::Uncertified,
-            )));
-        }
         self.refuse_courier_range(
             &author,
             connetto_core::exchange::CourierRefusal::Uncertified,
         )?;
-        if let Some(mut wire) = self.courier_wire.take() {
-            let _ = wire.close().await;
-        }
-        self.courier.drain_owed = None;
-        self.raise_courier_candidates_if_changed(author)?;
-        self.flush_courier_ranges().await
+        self.end_courier_call(
+            open,
+            CourierError::Refused(connetto_core::exchange::CourierRefusal::Uncertified),
+        )
+        .await
     }
 
     /// Settle the server's answer on the open courier range (R78 decisions
@@ -7843,6 +7815,24 @@ where
             return Ok(None);
         }
         self.end_courier_range(open, author, result).await
+    }
+
+    /// Settle one `CourierAnswer` and queue its event on the notices, the
+    /// drain wire riding the call's answers behind its own frames (R78
+    /// decision 47).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the answer cannot be settled.
+    #[cfg(feature = "peer")]
+    async fn settle_courier_answer_and_queue(
+        &mut self,
+        answer: &connetto_core::messages::CourierAnswer,
+    ) -> Result<(), ClientError> {
+        if let Some(event) = self.settle_courier_answer(answer).await? {
+            self.notices.push_back(event);
+        }
+        Ok(())
     }
 
     /// Rule the answered entries' rows into `open`'s report (R78 decisions

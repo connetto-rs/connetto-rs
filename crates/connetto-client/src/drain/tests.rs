@@ -1,17 +1,22 @@
+use core::fmt::Write as _;
 use core::time::Duration;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use connetto_core::chain::GENESIS;
+use connetto_core::exchange::{Frontier, ManifestRow, SignedOffer};
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, HeldWork, HeldWrite,
-    MutationApplied, MutationReject, MutationRejectReason, WriterGrant, WriterRef, WriterRequest,
-    WriterSecret,
+    BulkMessage, Challenge, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, HeldWork,
+    HeldWrite, MutationApplied, MutationReject, MutationRejectReason, WriterGrant, WriterRef,
+    WriterRequest, WriterSecret,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, Major, SchemaVersion, loopback};
 use diesel::connection::SimpleConnection as _;
 use diesel::prelude::*;
+use sha2::{Digest, Sha256};
 
+use crate::peer::{self, HeldState, PeerAuthor};
 use crate::{ClientConfig, ClientEvent, ConnettoConnection, Replica, SyncStatus};
 
 /// A loopback end whose receive fails once the test breaks it, the way an
@@ -58,30 +63,12 @@ pub(crate) fn old_version() -> SchemaVersion {
 
 /// A major 2 replica with no wire and nothing queued.
 pub(crate) fn replica() -> Conn {
-    replica_tuned(crate::SyncTuning::default())
+    replica_named("drain", crate::SyncTuning::default())
 }
 
 /// [`replica`] with the build's `tuning`.
 pub(crate) fn replica_tuned(tuning: crate::SyncTuning) -> Conn {
-    let mut config = ClientConfig::new("drain")
-        .with_schema_major(Some(major(2)))
-        .with_schema_version(Some(SchemaVersion::from_hash(
-            b"the major 2 bundle".to_vec(),
-        )));
-    config.tuning = tuning;
-    let mut conn = ConnettoConnection::open(
-        &Replica::in_memory(),
-        "CREATE TABLE items (id INTEGER PRIMARY KEY)",
-        &config,
-        None,
-    )
-    .expect("open the major 2 replica");
-    assert_eq!(
-        conn.notices.pop_front(),
-        Some(ClientEvent::SyncStatus(SyncStatus::Offline)),
-        "the offline open states itself first"
-    );
-    conn
+    replica_named("drain", tuning)
 }
 
 /// Queue a write of row `id` under `writer`, as the build at `captured`
@@ -202,17 +189,7 @@ pub(crate) async fn dial(
 
 /// The old major's acknowledgement of the drain handshake, granting `grant`.
 pub(crate) fn ack(grant: Option<WriterGrant>) -> ControlMessage {
-    ControlMessage::HandshakeAck(HandshakeAck {
-        connection_id: "old".to_owned(),
-        session_token: "old".to_owned(),
-        resume_token: "old".to_owned(),
-        current_cursor: Cursor::new(Vec::new()),
-        schema_version: Some(old_version()),
-        sunset_at_secs: None,
-        courier: false,
-        initial_credits: 64,
-        writer: grant,
-    })
+    handshake_ack("old", Some(old_version()), grant, false)
 }
 
 /// The old major's acknowledgement, granting writer `number` with nothing
@@ -267,6 +244,202 @@ pub(crate) async fn pump(conn: &mut Conn) -> ClientEvent {
         .await
         .expect("a pump step within the bound")
         .expect("a pump step")
+}
+
+/// The hex of `bytes`, the tests' raw SQL reading the stored bytes back.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// The scripted server's `HandshakeAck`, every id the wire's own `id`.
+pub(crate) fn handshake_ack(
+    id: &str,
+    schema_version: Option<SchemaVersion>,
+    writer: Option<WriterGrant>,
+    courier: bool,
+) -> ControlMessage {
+    ControlMessage::HandshakeAck(HandshakeAck {
+        connection_id: id.to_owned(),
+        session_token: id.to_owned(),
+        resume_token: id.to_owned(),
+        current_cursor: Cursor::new(Vec::new()),
+        schema_version,
+        sunset_at_secs: None,
+        initial_credits: 64,
+        writer,
+        courier,
+    })
+}
+
+/// The next frame the far end receives, bounded.
+pub(crate) async fn next(old: &mut LoopbackTransport) -> IncomingFrame {
+    tokio::time::timeout(Duration::from_secs(5), old.recv())
+        .await
+        .expect("a frame within the bound")
+        .expect("receive")
+        .expect("the wire is open")
+}
+
+/// The major 2 bundle hash the build presents.
+pub(crate) fn main_version() -> SchemaVersion {
+    SchemaVersion::from_hash(b"the major 2 bundle".to_vec())
+}
+
+/// The certificate end a test cursor carries, the retained rows live on.
+pub(crate) const CERT_END: i64 = 4_102_444_800;
+
+/// A major 2 replica for `client_id` with no wire and nothing queued, the
+/// build's `tuning` on.
+pub(crate) fn replica_named<T>(client_id: &str, tuning: crate::SyncTuning) -> ConnettoConnection<T>
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    let mut config = ClientConfig::new(client_id)
+        .with_schema_major(Some(major(2)))
+        .with_schema_version(Some(main_version()));
+    config.tuning = tuning;
+    let mut conn = ConnettoConnection::open(
+        &Replica::in_memory(),
+        "CREATE TABLE items (id INTEGER PRIMARY KEY)",
+        &config,
+        None,
+    )
+    .expect("open the major 2 replica");
+    assert_eq!(
+        conn.notices.pop_front(),
+        Some(ClientEvent::SyncStatus(SyncStatus::Offline)),
+        "the offline open states itself first"
+    );
+    conn
+}
+
+/// Hold one entry of `author` at `seq` as `state`, its body `body` and its
+/// digest the body's hash.
+pub(crate) fn hold_entry<T: connetto_core::traits::Transport>(
+    conn: &mut ConnettoConnection<T>,
+    author: [u8; 32],
+    seq: u64,
+    state: HeldState,
+    major: Major,
+    body: Option<&[u8]>,
+) {
+    let digest: [u8; 32] = {
+        let mut hasher = Sha256::new();
+        if let Some(body) = body {
+            hasher.update(body);
+        }
+        hasher.finalize().into()
+    };
+    let row = ManifestRow {
+        seq,
+        major,
+        origin: None,
+        digest,
+    };
+    let author = PeerAuthor {
+        key_id: author.to_vec(),
+        account: "courier-author".to_owned(),
+        bot_list: None,
+    };
+    let position =
+        i64::try_from(peer::load_next_position(&mut conn.db).expect("a position")).expect("fits");
+    peer::store_entry(
+        &mut conn.db,
+        &author,
+        &peer::NewEntry {
+            row: &row,
+            state,
+            body,
+            received_at: 1,
+            position,
+        },
+    )
+    .expect("store the entry");
+}
+
+/// The signed offer the tests stand, nothing settled, `newest` naming the
+/// offer's newest entry.
+pub(crate) fn offer_with(builds: &[(Major, SchemaVersion)], newest: Option<u64>) -> SignedOffer {
+    SignedOffer {
+        offer: connetto_core::exchange::Offer {
+            builds: builds.to_vec(),
+            settled: None,
+            newest: newest.map(|seq| Frontier {
+                seq,
+                head: [99; 32],
+            }),
+            retractions: Vec::new(),
+        },
+        signature: vec![1, 2, 3],
+    }
+}
+
+/// Store `author`'s cursor behind `offer`, the test's certificate end on.
+pub(crate) fn store_offer<T: connetto_core::traits::Transport>(
+    conn: &mut ConnettoConnection<T>,
+    author: [u8; 32],
+    offer: &SignedOffer,
+) {
+    let encoded = rmp_serde::to_vec_named(offer).expect("the offer encodes");
+    crate::exchange::upsert_cursor(
+        &mut conn.db,
+        author.as_ref(),
+        "courier-author",
+        &Frontier {
+            seq: 0,
+            head: GENESIS,
+        },
+        &encoded,
+        CERT_END,
+    )
+    .expect("keep the cursor");
+}
+
+/// Answer the handshake the scripted `server` owes and attach `conn` on
+/// `client`, the answer standing `challenge` and `ack`, draining the
+/// notices `skip` holds.
+pub(crate) async fn attach_scripted<T>(
+    mut conn: ConnettoConnection<T>,
+    client: T,
+    mut server: LoopbackTransport,
+    challenge: Option<[u8; 32]>,
+    ack: ControlMessage,
+    skip: impl Fn(&ClientEvent) -> bool,
+) -> (ConnettoConnection<T>, LoopbackTransport)
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    let reply = async {
+        let frame = next(&mut server).await;
+        let IncomingFrame::Control(ControlMessage::Handshake(_)) = frame else {
+            panic!("the wire opens with the handshake");
+        };
+        if let Some(nonce) = challenge {
+            server
+                .send_control(ControlMessage::Challenge(Challenge { nonce }))
+                .await
+                .expect("the challenge");
+        }
+        server
+            .send_control(ack)
+            .await
+            .expect("answer the handshake");
+    };
+    let (attached, ()) = tokio::join!(conn.attach(client), reply);
+    attached.expect("attach");
+    while let Some(notice) = conn.notices.pop_front() {
+        if !skip(&notice) {
+            conn.notices.push_front(notice);
+            break;
+        }
+    }
+    (conn, server)
 }
 
 /// R31: a major held under two writers drains one writer per wire, the
@@ -736,300 +909,31 @@ async fn a_run_whose_older_rows_carry_no_bundle_hash_is_not_armed() {
 
 #[cfg(all(feature = "peer", feature = "device-identity"))]
 pub(crate) mod r78_4c {
-    use core::future::Future;
-    use core::pin::Pin;
-    use core::time::Duration;
-    use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
     use std::time::SystemTime;
 
     use base64::Engine as _;
-    use connetto_core::chain::GENESIS;
+    use connetto_core::LoopbackTransport;
     use connetto_core::device_cert::{
         AttestationLevel, CertificateRequest, CertificateSerial, CertificateSigner, DeploymentId,
-        DeviceCertificate, DeviceIssuer, DeviceKey, DeviceKeyError, KeyHome, RootCa,
-        public_key_info,
+        DeviceCertificate, DeviceIssuer, RootCa, public_key_info,
     };
-    use connetto_core::exchange::{
-        CourierEntryOutcome, CourierOutcome, Frontier, ManifestRow, SignedOffer,
-    };
-    use connetto_core::messages::{
-        BulkMessage, Challenge, ControlMessage, CourierAnswer, DeviceAttestation, HandshakeAck,
-        WriterRequest,
-    };
-    use connetto_core::traits::{IncomingFrame, Transport};
-    use connetto_core::{Cursor, LoopbackTransport, Major, SchemaVersion, loopback};
-    use parking_lot::Mutex;
-    use ring::rand::SystemRandom;
-    use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _};
-    use serde_bytes::ByteBuf;
-    use sha2::{Digest, Sha256};
+    use connetto_core::exchange::{CourierEntryOutcome, CourierOutcome};
+    use connetto_core::messages::{BulkMessage, ControlMessage, CourierAnswer, WriterRequest};
 
     use super::*;
-    use crate::device_key::{KeyRecords, OpenedKey, open_software_key};
+    use crate::device_key::open_software_key;
+    use crate::enrolment::tests::{Memory, RunKeys, attesting_key};
     use crate::enrolment::{DeviceKeys, Held};
-    use crate::peer::{self, HeldState, PeerAuthor};
-    use crate::{ClientEvent, CourierCandidate, CourierError};
+    use crate::{CourierCandidate, CourierError};
 
     const AUTHOR: [u8; 32] = [0x11; 32];
-
-    /// The major 2 bundle hash the main wire presents.
-    fn main_version() -> SchemaVersion {
-        SchemaVersion::from_hash(b"the major 2 bundle".to_vec())
-    }
-
-    /// The stored offer the tests stand, `builds` as given.
-    fn offer_with(builds: &[(Major, SchemaVersion)], newest: Option<u64>) -> SignedOffer {
-        SignedOffer {
-            offer: connetto_core::exchange::Offer {
-                builds: builds.to_vec(),
-                settled: None,
-                newest: newest.map(|seq| Frontier {
-                    seq,
-                    head: [99; 32],
-                }),
-                retractions: Vec::new(),
-            },
-            signature: vec![1, 2, 3],
-        }
-    }
-
-    /// Hold one entry of `author` at `seq` as `state`, its body the test's
-    /// own.
-    fn hold_entry(
-        conn: &mut Conn,
-        author: [u8; 32],
-        seq: u64,
-        state: HeldState,
-        major: Major,
-        body: &[u8],
-    ) {
-        let digest: [u8; 32] = {
-            let mut hasher = Sha256::new();
-            hasher.update(body);
-            hasher.finalize().into()
-        };
-        let row = ManifestRow {
-            seq,
-            major,
-            origin: None,
-            digest,
-        };
-        let author = PeerAuthor {
-            key_id: author.to_vec(),
-            account: "courier-author".to_owned(),
-            bot_list: None,
-        };
-        let position = i64::try_from(peer::load_next_position(&mut conn.db).expect("a position"))
-            .expect("fits");
-        peer::store_entry(
-            &mut conn.db,
-            &author,
-            &peer::NewEntry {
-                row: &row,
-                state,
-                body: Some(body),
-                received_at: 1,
-                position,
-            },
-        )
-        .expect("store the entry");
-    }
-
-    /// Store `author`'s cursor with the test's offer.
-    fn adopt_offer(
-        conn: &mut Conn,
-        author: [u8; 32],
-        builds: &[(Major, SchemaVersion)],
-        newest: Option<u64>,
-    ) {
-        let encoded = rmp_serde::to_vec_named(&offer_with(builds, newest)).expect("encodes");
-        crate::exchange::upsert_cursor(
-            &mut conn.db,
-            author.as_ref(),
-            "courier-author",
-            &Frontier {
-                seq: 0,
-                head: GENESIS,
-            },
-            &encoded,
-            4_102_444_800,
-        )
-        .expect("keep the cursor");
-    }
-
-    /// Attach a main wire whose scripted server answers the handshake with
-    /// the courier path `courier`.
-    async fn attach_main(mut conn: Conn, courier: bool) -> (Conn, LoopbackTransport) {
-        let (client, mut server) = loopback();
-        let wire = Wire {
-            end: client,
-            broken: Arc::new(AtomicBool::new(false)),
-        };
-        let reply = async {
-            let Some(ControlMessage::Handshake(_)) = sent(&mut server).await else {
-                panic!("the main wire opens with the handshake");
-            };
-            server
-                .send_control(ControlMessage::Challenge(Challenge { nonce: [9; 32] }))
-                .await
-                .expect("the challenge");
-            server
-                .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-                    connection_id: "main".to_owned(),
-                    session_token: "main".to_owned(),
-                    resume_token: "main".to_owned(),
-                    current_cursor: Cursor::new(Vec::new()),
-                    schema_version: Some(main_version()),
-                    sunset_at_secs: None,
-                    courier,
-                    initial_credits: 64,
-                    writer: None,
-                }))
-                .await
-                .expect("answer the handshake");
-        };
-        let (attached, ()) = tokio::join!(conn.attach(wire), reply);
-        attached.expect("attach the main wire");
-        while let Some(notice) = conn.notices.pop_front() {
-            if matches!(
-                notice,
-                crate::ClientEvent::SyncStatus(_) | crate::ClientEvent::CourierCandidates(_)
-            ) {
-                continue;
-            }
-            conn.notices.push_front(notice);
-            break;
-        }
-        (conn, server)
-    }
-
-    /// The evidence the fake key offers.
-    fn evidence() -> DeviceAttestation {
-        DeviceAttestation::AndroidKeyChain(vec![ByteBuf::from(vec![0x30, 0x06])])
-    }
-
-    /// A real ring key and the PKCS #8 bytes the fake store reopens.
-    fn attesting_key() -> (AttestingKey, Vec<u8>) {
-        let rng = SystemRandom::new();
-        let der = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
-            .expect("the key generates");
-        (
-            AttestingKey::from_pkcs8(der.as_ref()),
-            der.as_ref().to_vec(),
-        )
-    }
-
-    /// A key that signs with ring and offers Android-style evidence.
-    struct AttestingKey {
-        pair: EcdsaKeyPair,
-        point: [u8; 65],
-        rng: SystemRandom,
-    }
-
-    impl AttestingKey {
-        fn from_pkcs8(der: &[u8]) -> Self {
-            let rng = SystemRandom::new();
-            let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, der, &rng)
-                .expect("the key reads back");
-            let point = pair
-                .public_key()
-                .as_ref()
-                .try_into()
-                .expect("a P-256 point");
-            Self { pair, point, rng }
-        }
-    }
-
-    impl DeviceKey for AttestingKey {
-        fn public_point(&self) -> [u8; 65] {
-            self.point
-        }
-
-        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, DeviceKeyError> {
-            self.pair
-                .sign(&self.rng, message)
-                .map(|signature| signature.as_ref().to_vec())
-                .map_err(|err| DeviceKeyError::Platform(Box::new(err)))
-        }
-
-        fn home(&self) -> KeyHome {
-            KeyHome::Software
-        }
-
-        fn attestation(&self, _csr: &[u8]) -> Result<Option<DeviceAttestation>, DeviceKeyError> {
-            Ok(Some(evidence()))
-        }
-    }
-
-    /// The keys the run opens, always the same attesting key.
-    struct RunKeys {
-        der: Vec<u8>,
-    }
-
-    impl DeviceKeys for RunKeys {
-        fn open(
-            &self,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<OpenedKey<Box<dyn DeviceKey>>, crate::ClientError>>
-                    + Send
-                    + '_,
-            >,
-        > {
-            let der = self.der.clone();
-            Box::pin(async move {
-                let key: Box<dyn DeviceKey> = Box::new(AttestingKey::from_pkcs8(&der));
-                Ok(OpenedKey {
-                    key,
-                    created: false,
-                })
-            })
-        }
-
-        fn delete(
-            &self,
-        ) -> Pin<Box<dyn Future<Output = Result<(), crate::ClientError>> + Send + '_>> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    /// A key record store that never leaves memory.
-    #[derive(Default)]
-    struct CertMemory(Mutex<HashMap<String, String>>);
-
-    impl KeyRecords for CertMemory {
-        fn read(
-            &self,
-            name: &str,
-        ) -> impl Future<Output = Result<Option<String>, crate::ClientError>> + Send {
-            std::future::ready(Ok(self.0.lock().get(name).cloned()))
-        }
-
-        fn write(
-            &self,
-            name: &str,
-            secret: &str,
-        ) -> impl Future<Output = Result<(), crate::ClientError>> + Send {
-            self.0.lock().insert(name.to_owned(), secret.to_owned());
-            std::future::ready(Ok(()))
-        }
-
-        fn delete(
-            &self,
-            name: &str,
-        ) -> impl Future<Output = Result<(), crate::ClientError>> + Send {
-            self.0.lock().remove(name);
-            std::future::ready(Ok(()))
-        }
-    }
 
     /// The device's certificate and the keys that open its key, standing
     /// fresh.
     pub(crate) async fn device_identity() -> (Held, Arc<dyn DeviceKeys>) {
         let (key, der) = attesting_key();
-        let records = CertMemory::default();
+        let records = Memory::default();
         let issuer_key = open_software_key(&records, "issuer")
             .await
             .expect("issuer key");
@@ -1103,22 +1007,35 @@ pub(crate) mod r78_4c {
             1,
             HeldState::CourierOnly,
             major(1),
-            b"the old note",
+            Some(b"the old note"),
         );
-        adopt_offer(&mut conn, AUTHOR, &[(major(1), old_version())], Some(1));
-        let (conn, main) = attach_main(conn, true).await;
+        store_offer(
+            &mut conn,
+            AUTHOR,
+            &offer_with(&[(major(1), old_version())], Some(1)),
+        );
+        let (client, server) = loopback();
+        let wire = Wire {
+            end: client,
+            broken: Arc::new(AtomicBool::new(false)),
+        };
+        let (conn, main) = attach_scripted(
+            conn,
+            wire,
+            server,
+            Some([9; 32]),
+            handshake_ack("main", Some(main_version()), None, true),
+            |event| {
+                matches!(
+                    event,
+                    ClientEvent::SyncStatus(_) | ClientEvent::CourierCandidates(_)
+                )
+            },
+        )
+        .await;
         let mut conn = conn;
         conn.writer_keys = Some(keys);
         (conn, main, 1)
-    }
-
-    /// The next frame the far end receives, bounded.
-    async fn next_frame(old: &mut LoopbackTransport) -> IncomingFrame {
-        tokio::time::timeout(Duration::from_secs(5), old.recv())
-            .await
-            .expect("a frame within the bound")
-            .expect("receive")
-            .expect("the wire is open")
     }
 
     /// R78 decision 47: a range whose major the device's own drain is
@@ -1141,11 +1058,11 @@ pub(crate) mod r78_4c {
         );
         // The shared drain wire carries the device's own writes first.
         for client_seq in [1u64, 2] {
-            let frame = next_frame(&mut old).await;
+            let frame = next(&mut old).await;
             let IncomingFrame::Control(ControlMessage::MutationHeader(_)) = frame else {
                 panic!("the drain wire carries the device's own write, not {frame:?}");
             };
-            let frame = next_frame(&mut old).await;
+            let frame = next(&mut old).await;
             let IncomingFrame::Bulk(BulkMessage::MutationPatch(_)) = frame else {
                 panic!("the drain wire carries the mutation body, not {frame:?}");
             };
@@ -1155,7 +1072,7 @@ pub(crate) mod r78_4c {
             .await
             .expect("apply the device's own write");
         }
-        let frame = next_frame(&mut old).await;
+        let frame = next(&mut old).await;
         let IncomingFrame::Control(ControlMessage::CourierRange(range)) = frame else {
             panic!("the drain wire takes the range, not {frame:?}");
         };
@@ -1163,7 +1080,7 @@ pub(crate) mod r78_4c {
             range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
             [seq]
         );
-        let frame = next_frame(&mut old).await;
+        let frame = next(&mut old).await;
         let IncomingFrame::Bulk(BulkMessage::CourierBody(_)) = frame else {
             panic!("the range declares one body, not {frame:?}");
         };
@@ -1270,7 +1187,7 @@ pub(crate) mod r78_4c {
         let timer = conn.courier_drain_timer().expect("the dial is owed");
         let (courier, mut old, _broken) = wire();
         let reply = async {
-            let frame = next_frame(&mut old).await;
+            let frame = next(&mut old).await;
             let IncomingFrame::Control(ControlMessage::Handshake(handshake)) = frame else {
                 panic!("the courier wire opens with the handshake");
             };
@@ -1328,7 +1245,7 @@ pub(crate) mod r78_4c {
         let timer = conn.courier_drain_timer().expect("the dial is owed");
         let (courier, mut old, _broken) = wire();
         let reply = async {
-            let frame = next_frame(&mut old).await;
+            let frame = next(&mut old).await;
             let IncomingFrame::Control(ControlMessage::Handshake(_)) = frame else {
                 panic!("the courier wire opens with the handshake");
             };

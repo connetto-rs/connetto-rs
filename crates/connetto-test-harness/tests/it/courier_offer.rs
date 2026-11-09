@@ -19,6 +19,7 @@
     reason = "the phase drives two full client lifecycles, its futures are large by design"
 )]
 
+use core::future::Future;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -210,18 +211,13 @@ async fn run_courier() {
         .await
         .expect("alice serves her peer listener");
     bob.link_peer(alice_addr).await.expect("bob links alice");
-    let until = Instant::now() + BOUND;
-    loop {
-        let rows = bob.provisional_rows().await.expect("the rows are read");
-        if rows.len() == NOTES.len() {
-            break;
-        }
-        assert!(
-            Instant::now() < until,
-            "alice's notes never applied on bob, the records hold {rows:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    wait_until(
+        BOUND,
+        || async { bob.provisional_rows().await.expect("the rows are read") },
+        |rows| rows.len() == NOTES.len(),
+    )
+    .await
+    .unwrap_or_else(|rows| panic!("alice's notes never applied on bob, the records hold {rows:?}"));
 
     // Alice's device goes away for good, its queue never reaching the server.
     drop(alice_watches);
@@ -302,21 +298,18 @@ async fn run_courier() {
     );
 
     // Bob's records of alice's notes stand adjudicated.
-    let until = Instant::now() + BOUND;
-    loop {
-        let rows = bob2.provisional_rows().await.expect("read bob's records");
-        if rows
-            .iter()
-            .all(|row| row.state != ProvisionalState::Provisional)
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < until,
-            "the courier answer never adjudicated bob's records, they hold {rows:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_until(
+        BOUND,
+        || async { bob2.provisional_rows().await.expect("read bob's records") },
+        |rows| {
+            rows.iter()
+                .all(|row| row.state != ProvisionalState::Provisional)
+        },
+    )
+    .await
+    .unwrap_or_else(|rows| {
+        panic!("the courier answer never adjudicated bob's records, they hold {rows:?}")
+    });
 
     // The server holds both notes under alice's account, each audited as
     // couriered by bob.
@@ -378,30 +371,49 @@ async fn run_courier() {
     drop(alice2);
 }
 
+/// Poll `read` until `done` holds of its value, a hundred milliseconds
+/// between laps, bounded by `bound`; on overrun the last reading stands as
+/// the error.
+async fn wait_until<T, F, Fut, P>(bound: Duration, mut read: F, done: P) -> Result<T, T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = T>,
+    P: Fn(&T) -> bool,
+{
+    let until = Instant::now() + bound;
+    loop {
+        let value = read().await;
+        if done(&value) {
+            return Ok(value);
+        }
+        if Instant::now() >= until {
+            return Err(value);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Poll `courier_candidates` until `author` is a candidate, bounded by
 /// `BOUND`.
 async fn wait_candidate(
     client: &connetto_client::NativeClient<connetto_client::NativeTransport>,
     author: &[u8],
 ) -> CourierCandidate {
-    let until = Instant::now() + BOUND;
-    loop {
-        let candidates = client
-            .courier_candidates()
-            .await
-            .expect("the candidates are read");
-        if let Some(candidate) = candidates
-            .into_iter()
-            .find(|candidate| candidate.author == author)
-        {
-            return candidate;
-        }
-        assert!(
-            Instant::now() < until,
-            "the author never became a courier candidate"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    wait_until(
+        BOUND,
+        || async {
+            client
+                .courier_candidates()
+                .await
+                .expect("the candidates are read")
+                .into_iter()
+                .find(|candidate| candidate.author == author)
+        },
+        Option::is_some,
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the author never became a courier candidate"))
+    .expect("the candidate stood")
 }
 
 /// The server's notes are alice's two, each once.

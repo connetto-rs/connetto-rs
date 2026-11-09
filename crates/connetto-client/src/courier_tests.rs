@@ -8,18 +8,20 @@ use connetto_core::exchange::{
     Verdict,
 };
 use connetto_core::messages::{
-    BulkMessage, Challenge, ControlMessage, CourierAnswer, CourierBody, CourierRange,
-    FullResyncReason, FullResyncRequired, HandshakeAck, ProvisionalStatus, ProvisionalVerdicts,
-    SnapshotEnd, WriterGrant,
+    BulkMessage, ControlMessage, CourierAnswer, CourierBody, CourierRange, FullResyncReason,
+    FullResyncRequired, ProvisionalStatus, ProvisionalVerdicts, SnapshotEnd, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, Major, SchemaVersion, loopback};
-use core::fmt::Write as _;
 use core::time::Duration;
 use diesel::connection::SimpleConnection as _;
 use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 
+use crate::drain::tests::major;
+use crate::drain::tests::{
+    attach_scripted, handshake_ack, hex, hold_entry, main_version, next, offer_with, store_offer,
+};
 use crate::peer::{self, HeldState, PeerAuthor};
 use crate::{
     ClientConfig, ClientEvent, ConnettoConnection, CourierCandidate, CourierError, Replica,
@@ -34,40 +36,13 @@ const AUTHOR: [u8; 32] = [0x01; 32];
 const OTHER: [u8; 32] = [0x02; 32];
 const THIRD: [u8; 32] = [0x03; 32];
 
-/// The stored byte form of a device key, for the tests' raw SQL.
-fn hex_of(author: [u8; 32]) -> String {
-    let mut out = String::new();
-    for byte in author {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-fn major(number: u32) -> Major {
-    Major::new(number).expect("a major")
-}
-
 fn version() -> SchemaVersion {
-    SchemaVersion::from_hash(b"the major 2 bundle".to_vec())
+    main_version()
 }
 
 /// A major 2 replica with no wire and nothing queued.
 fn replica() -> Conn {
-    let config = ClientConfig::new("courier")
-        .with_schema_major(Some(major(2)))
-        .with_schema_version(Some(version()));
-    let mut conn = ConnettoConnection::open(
-        &Replica::in_memory(),
-        "CREATE TABLE items (id INTEGER PRIMARY KEY)",
-        &config,
-        None,
-    )
-    .expect("open the major 2 replica");
-    assert!(
-        matches!(conn.notices.pop_front(), Some(ClientEvent::SyncStatus(_))),
-        "the offline open states itself first"
-    );
-    conn
+    crate::drain::tests::replica_named("courier", crate::SyncTuning::default())
 }
 
 /// Hold one entry of `author` at `seq` as `state`, its body the test's own
@@ -80,34 +55,7 @@ fn hold(
     major: Major,
     body: Option<&[u8]>,
 ) {
-    let digest: [u8; 32] = {
-        let mut hasher = Sha256::new();
-        if let Some(body) = body {
-            hasher.update(body);
-        }
-        hasher.finalize().into()
-    };
-    let row = ManifestRow {
-        seq,
-        major,
-        origin: None,
-        digest,
-    };
-    let author = author_of(author);
-    let position =
-        i64::try_from(peer::load_next_position(&mut conn.db).expect("a position")).expect("fits");
-    peer::store_entry(
-        &mut conn.db,
-        &author,
-        &peer::NewEntry {
-            row: &row,
-            state,
-            body,
-            received_at: 1,
-            position,
-        },
-    )
-    .expect("store the entry");
+    hold_entry(conn, author, seq, state, major, body);
 }
 
 fn author_of(author: [u8; 32]) -> PeerAuthor {
@@ -121,35 +69,12 @@ fn author_of(author: [u8; 32]) -> PeerAuthor {
 /// The signed offer the tests stand, nothing settled, `newest` naming the
 /// offer's newest entry.
 fn offer(newest: Option<u64>) -> SignedOffer {
-    SignedOffer {
-        offer: connetto_core::exchange::Offer {
-            builds: vec![(major(2), version())],
-            settled: None,
-            newest: newest.map(|seq| Frontier {
-                seq,
-                head: [99; 32],
-            }),
-            retractions: Vec::new(),
-        },
-        signature: vec![1, 2, 3],
-    }
+    offer_with(&[(major(2), version())], newest)
 }
 
 /// Store `author`'s cursor with the test's offer.
 fn adopt(conn: &mut Conn, author: [u8; 32], newest: Option<u64>) {
-    let encoded = rmp_serde::to_vec_named(&offer(newest)).expect("the offer encodes");
-    crate::exchange::upsert_cursor(
-        &mut conn.db,
-        author.as_ref(),
-        "courier-author",
-        &Frontier {
-            seq: 0,
-            head: GENESIS,
-        },
-        &encoded,
-        CERT_END,
-    )
-    .expect("keep the cursor");
+    store_offer(conn, author, &offer(newest));
 }
 
 /// The signed offer the tests stand for a fully synced author, the queue
@@ -171,87 +96,46 @@ fn settled_offer(settled: u64) -> SignedOffer {
 
 /// Store `author`'s cursor with the settled-only offer.
 fn adopt_settled(conn: &mut Conn, author: [u8; 32], settled: u64) {
-    let encoded = rmp_serde::to_vec_named(&settled_offer(settled)).expect("the offer encodes");
-    crate::exchange::upsert_cursor(
-        &mut conn.db,
-        author.as_ref(),
-        "courier-author",
-        &Frontier {
-            seq: 0,
-            head: GENESIS,
-        },
-        &encoded,
-        CERT_END,
-    )
-    .expect("keep the cursor");
+    store_offer(conn, author, &settled_offer(settled));
 }
 
 /// Attach the replica to a scripted server whose courier path is `on`,
 /// answering the handshake and draining the state notices.
-async fn attach(mut conn: Conn, on: bool) -> (Conn, LoopbackTransport) {
-    let (client, mut server) = loopback();
-    let reply = async {
-        let frame = next(&mut server).await;
-        let IncomingFrame::Control(ControlMessage::Handshake(_)) = frame else {
-            panic!("the wire opens with the handshake");
-        };
-        server
-            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-                connection_id: "courier".to_owned(),
-                session_token: "courier".to_owned(),
-                resume_token: "courier".to_owned(),
-                current_cursor: Cursor::new(Vec::new()),
-                schema_version: Some(version()),
-                sunset_at_secs: None,
-                initial_credits: 64,
-                writer: Some(WriterGrant {
-                    number: 1,
-                    frontier: 0,
-                }),
-                courier: on,
-            }))
-            .await
-            .expect("answer the handshake");
-    };
-    let (attached, ()) = tokio::join!(conn.attach(client), reply);
-    attached.expect("attach the courier");
-    while matches!(conn.notices.pop_front(), Some(ClientEvent::SyncStatus(_))) {}
-    (conn, server)
+async fn attach(conn: Conn, on: bool) -> (Conn, LoopbackTransport) {
+    let (client, server) = loopback();
+    attach_scripted(
+        conn,
+        client,
+        server,
+        None,
+        handshake_ack(
+            "courier",
+            Some(version()),
+            Some(WriterGrant {
+                number: 1,
+                frontier: 0,
+            }),
+            on,
+        ),
+        |event| matches!(event, ClientEvent::SyncStatus(_)),
+    )
+    .await
 }
 
 /// Attach a main replica that carries a device identity to a scripted server
 /// whose courier path is `on`. The handshake presents the device writer, so
 /// the server challenges it, answers without a grant, and binds the writer.
-async fn attach_device(mut conn: Conn, on: bool) -> (Conn, LoopbackTransport) {
-    let (client, mut server) = loopback();
-    let reply = async {
-        let frame = next(&mut server).await;
-        let IncomingFrame::Control(ControlMessage::Handshake(_)) = frame else {
-            panic!("the wire opens with the handshake");
-        };
-        server
-            .send_control(ControlMessage::Challenge(Challenge { nonce: [5; 32] }))
-            .await
-            .expect("the challenge");
-        server
-            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-                connection_id: "courier".to_owned(),
-                session_token: "courier".to_owned(),
-                resume_token: "courier".to_owned(),
-                current_cursor: Cursor::new(Vec::new()),
-                schema_version: Some(version()),
-                sunset_at_secs: None,
-                initial_credits: 64,
-                writer: None,
-                courier: on,
-            }))
-            .await
-            .expect("answer the handshake");
-    };
-    let (attached, ()) = tokio::join!(conn.attach(client), reply);
-    attached.expect("attach the courier");
-    while matches!(conn.notices.pop_front(), Some(ClientEvent::SyncStatus(_))) {}
-    (conn, server)
+async fn attach_device(conn: Conn, on: bool) -> (Conn, LoopbackTransport) {
+    let (client, server) = loopback();
+    attach_scripted(
+        conn,
+        client,
+        server,
+        Some([5; 32]),
+        handshake_ack("courier", Some(version()), None, on),
+        |event| matches!(event, ClientEvent::SyncStatus(_)),
+    )
+    .await
 }
 
 /// The server's full resync, `FullResyncRequired` first and the replacement
@@ -280,15 +164,6 @@ async fn resync(conn: &mut Conn, server: &mut LoopbackTransport) {
             _ => {}
         }
     }
-}
-
-/// The next frame within the bound, the wire open.
-async fn next(server: &mut LoopbackTransport) -> IncomingFrame {
-    timeout(BOUND, server.recv())
-        .await
-        .expect("a frame within the bound")
-        .expect("the transport stands")
-        .expect("the wire is open")
 }
 
 /// The next ask the connection sends.
@@ -1966,8 +1841,8 @@ async fn a_queued_range_whose_rows_are_gone_hears_nothing_held() {
         .batch_execute(&format!(
             "DELETE FROM _connetto_peer_entry WHERE author = x'{}'; \
              DELETE FROM _connetto_peer_cursor WHERE author = x'{}'",
-            hex_of(OTHER),
-            hex_of(OTHER)
+            hex(&OTHER),
+            hex(&OTHER)
         ))
         .expect("drop the other author's run");
     deliver_answer(
@@ -2025,7 +1900,7 @@ async fn a_queued_range_with_corrupt_rows_fails_the_flush() {
         .batch_execute(&format!(
             "UPDATE _connetto_peer_entry SET digest = x'{}' WHERE author = x'{}'",
             "00".repeat(8),
-            hex_of(OTHER)
+            hex(&OTHER)
         ))
         .expect("corrupt the other author's digest");
     deliver_answer(
@@ -2113,8 +1988,8 @@ async fn a_flush_send_failure_requeues_the_range() {
         .batch_execute(&format!(
             "DELETE FROM _connetto_peer_entry WHERE author = x'{}'; \
              DELETE FROM _connetto_peer_cursor WHERE author = x'{}'",
-            hex_of(OTHER),
-            hex_of(OTHER)
+            hex(&OTHER),
+            hex(&OTHER)
         ))
         .expect("drop the other author's run");
     let event = conn.pump_one().await.expect("the session ends");
@@ -2589,7 +2464,7 @@ async fn a_corrupt_row_behind_the_taken_one_refuses_the_offer() {
         .batch_execute(&format!(
             "UPDATE _connetto_peer_entry SET digest = x'{}' WHERE author = x'{}'",
             "00".repeat(8),
-            hex_of(AUTHOR)
+            hex(&AUTHOR)
         ))
         .expect("corrupt the earlier row");
     adopt(&mut conn, AUTHOR, Some(1));
@@ -3356,60 +3231,17 @@ async fn pruned_marked_retained_row_restates_candidates() {
 
 #[cfg(feature = "device-identity")]
 mod r78_4c {
-    use connetto_core::exchange::{Frontier, SignedOffer, Verdict};
+    use connetto_core::exchange::Verdict;
     use connetto_core::messages::{
-        Challenge, ControlMessage, HandshakeAck, WriterAnswer, WriterOutcome, WriterRequest,
+        Challenge, ControlMessage, WriterAnswer, WriterOutcome, WriterRequest,
     };
-    use connetto_core::traits::{IncomingFrame, Transport};
-    use connetto_core::{Cursor, LoopbackTransport, SchemaVersion, loopback};
+    use connetto_core::{LoopbackTransport, SchemaVersion, loopback};
     use tokio::time::timeout;
 
     use super::*;
     use crate::drain::tests::r78_4c::device_identity;
+    use crate::drain::tests::{handshake_ack, old_version};
     use crate::peer;
-
-    fn old_version() -> SchemaVersion {
-        SchemaVersion::from_hash(b"the major 1 bundle".to_vec())
-    }
-
-    /// The signed offer the tests stand, `builds` as given.
-    fn offer_builds(builds: &[(Major, SchemaVersion)], newest: Option<u64>) -> SignedOffer {
-        SignedOffer {
-            offer: connetto_core::exchange::Offer {
-                builds: builds.to_vec(),
-                settled: None,
-                newest: newest.map(|seq| Frontier {
-                    seq,
-                    head: [99; 32],
-                }),
-                retractions: Vec::new(),
-            },
-            signature: vec![1, 2, 3],
-        }
-    }
-
-    /// Store `author`'s cursor with `builds`.
-    fn adopt_builds(
-        conn: &mut Conn,
-        author: [u8; 32],
-        builds: &[(Major, SchemaVersion)],
-        newest: Option<u64>,
-    ) {
-        let encoded =
-            rmp_serde::to_vec_named(&offer_builds(builds, newest)).expect("the offer encodes");
-        crate::exchange::upsert_cursor(
-            &mut conn.db,
-            author.as_ref(),
-            "courier-author",
-            &Frontier {
-                seq: 0,
-                head: GENESIS,
-            },
-            &encoded,
-            CERT_END,
-        )
-        .expect("keep the cursor");
-    }
 
     /// The major 3 bundle hash a build standing at major 3 presents.
     fn version3() -> SchemaVersion {
@@ -3439,36 +3271,17 @@ mod r78_4c {
     /// Attach the major 3 replica to a scripted server whose courier path is
     /// `on`, answering the handshake with the build's version and draining
     /// the state notices.
-    async fn attach3(mut conn: Conn, on: bool) -> (Conn, LoopbackTransport) {
-        let (client, mut server) = loopback();
-        let reply = async {
-            let frame = next(&mut server).await;
-            let IncomingFrame::Control(ControlMessage::Handshake(_)) = frame else {
-                panic!("the wire opens with the handshake");
-            };
-            server
-                .send_control(ControlMessage::Challenge(Challenge { nonce: [5; 32] }))
-                .await
-                .expect("the challenge");
-            server
-                .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-                    connection_id: "courier".to_owned(),
-                    session_token: "courier".to_owned(),
-                    resume_token: "courier".to_owned(),
-                    current_cursor: Cursor::new(Vec::new()),
-                    schema_version: Some(version3()),
-                    sunset_at_secs: None,
-                    initial_credits: 64,
-                    writer: None,
-                    courier: on,
-                }))
-                .await
-                .expect("answer the handshake");
-        };
-        let (attached, ()) = tokio::join!(conn.attach(client), reply);
-        attached.expect("attach the courier");
-        while matches!(conn.notices.pop_front(), Some(ClientEvent::SyncStatus(_))) {}
-        (conn, server)
+    async fn attach3(conn: Conn, on: bool) -> (Conn, LoopbackTransport) {
+        let (client, server) = loopback();
+        attach_scripted(
+            conn,
+            client,
+            server,
+            Some([5; 32]),
+            handshake_ack("courier", Some(version3()), None, on),
+            |event| matches!(event, ClientEvent::SyncStatus(_)),
+        )
+        .await
     }
 
     /// Dial the courier wire for `presented` against a scripted server: the
@@ -3498,19 +3311,9 @@ mod r78_4c {
             old.send_control(ControlMessage::Challenge(Challenge { nonce: [7; 32] }))
                 .await
                 .expect("the challenge");
-            old.send_control(ControlMessage::HandshakeAck(HandshakeAck {
-                connection_id: "old".to_owned(),
-                session_token: "old".to_owned(),
-                resume_token: "old".to_owned(),
-                current_cursor: Cursor::new(Vec::new()),
-                schema_version: Some(version),
-                sunset_at_secs: None,
-                initial_credits: 64,
-                writer: None,
-                courier: true,
-            }))
-            .await
-            .expect("the handshake is answered");
+            old.send_control(handshake_ack("old", Some(version), None, true))
+                .await
+                .expect("the handshake is answered");
             let frame = next(&mut old).await;
             let IncomingFrame::Control(ControlMessage::BindDevice(bind)) = frame else {
                 panic!("the device writer binds, not {frame:?}");
@@ -3569,11 +3372,10 @@ mod r78_4c {
             major(2),
             Some(&b3),
         );
-        adopt_builds(
+        store_offer(
             &mut conn,
             AUTHOR,
-            &[(major(1), old_version()), (major(2), version())],
-            Some(3),
+            &offer_with(&[(major(1), old_version()), (major(2), version())], Some(3)),
         );
         let (mut conn, mut server) = attach_device(conn, true).await;
         conn.writer_keys = Some(keys);
@@ -3702,15 +3504,17 @@ mod r78_4c {
             major(3),
             Some(&b3),
         );
-        adopt_builds(
+        store_offer(
             &mut conn,
             AUTHOR,
-            &[
-                (major(1), old_version()),
-                (major(2), version()),
-                (major(3), version3()),
-            ],
-            Some(3),
+            &offer_with(
+                &[
+                    (major(1), old_version()),
+                    (major(2), version()),
+                    (major(3), version3()),
+                ],
+                Some(3),
+            ),
         );
         let (mut conn, mut server) = attach3(conn, true).await;
         conn.writer_keys = Some(keys);

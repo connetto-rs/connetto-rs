@@ -3342,53 +3342,87 @@ async fn pump<T, F, S>(
             drop(state);
         }
         if let Some(timer) = drain_owed {
-            dial_drain_owed(&shared, &mut reconnect, timer).await;
+            dial_owed(&shared, &mut reconnect, OwedWire::Drain, timer).await;
         }
         #[cfg(feature = "peer")]
         if let Some(timer) = courier_owed {
-            dial_courier_drain_owed(&shared, &mut reconnect, timer).await;
+            dial_owed(&shared, &mut reconnect, OwedWire::Courier, timer).await;
         }
         #[cfg(not(feature = "peer"))]
         let _ = courier_due;
     }
 }
 
-/// Dials the drain wire its dial has fallen due, attaching the held major
-/// over the fresh transport (R31).
-async fn dial_drain_owed<T, F, S>(
-    shared: &Shared<T>,
-    reconnect: &mut Option<ReconnectDriver<F, S>>,
-    timer: DrainTimer,
-) where
-    T: Transport + MaybeSend + 'static,
-    T::Error: core::fmt::Display,
-    F: TransportFactory<Transport = T> + MaybeSend + 'static,
-    S: Sleeper + MaybeSend + 'static,
-{
-    let Some(driver) = reconnect.as_mut() else {
-        return;
-    };
-    let dialed = driver.factory.connect().await;
-    let mut state = shared.state.lock().await;
-    match dialed {
-        Ok(transport) => {
-            if let Err(err) = state.conn.attach_drain(timer, transport).await {
-                tracing::warn!(error = %err, "attaching the drain failed");
-            }
+/// The wire an owed dial dials, its attach and back-off named by kind.
+#[derive(Clone, Copy)]
+enum OwedWire {
+    /// The drain wire its dial has fallen due.
+    Drain,
+    /// The courier wire its dial has fallen due (R78 decision 47).
+    #[cfg(feature = "peer")]
+    Courier,
+}
+
+impl OwedWire {
+    /// The log line the wire's failed attach stands under.
+    const fn attach_log(self) -> &'static str {
+        match self {
+            OwedWire::Drain => "attaching the drain failed",
+            #[cfg(feature = "peer")]
+            OwedWire::Courier => "attaching the courier wire failed",
         }
-        Err(err) => {
-            tracing::debug!(error = %err, "dialing the drain failed, backing off");
-            state.conn.drain_dial_failed(timer);
+    }
+
+    /// The log line the wire's failed dial stands under.
+    const fn dial_failed_log(self) -> &'static str {
+        match self {
+            OwedWire::Drain => "dialing the drain failed, backing off",
+            #[cfg(feature = "peer")]
+            OwedWire::Courier => "dialing the courier wire failed, backing off",
+        }
+    }
+
+    /// Attach a fresh `transport` to the wire, or report a failed dial to
+    /// its back-off.
+    async fn attach_or_back_off<E, T>(
+        self,
+        conn: &mut ConnettoConnection<T>,
+        timer: DrainTimer,
+        dialed: Result<T, E>,
+    ) where
+        T: Transport,
+        T::Error: core::fmt::Display,
+        E: core::fmt::Display,
+    {
+        match dialed {
+            Ok(transport) => {
+                let outcome = match self {
+                    OwedWire::Drain => conn.attach_drain(timer, transport).await,
+                    #[cfg(feature = "peer")]
+                    OwedWire::Courier => conn.attach_courier_drain(timer, transport).await,
+                };
+                if let Err(err) = outcome {
+                    tracing::warn!(error = %err, "{}", self.attach_log());
+                }
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "{}", self.dial_failed_log());
+                match self {
+                    OwedWire::Drain => conn.drain_dial_failed(timer),
+                    #[cfg(feature = "peer")]
+                    OwedWire::Courier => conn.courier_drain_dial_failed(timer),
+                }
+            }
         }
     }
 }
 
-/// Dials the courier wire its dial has fallen due, presenting the open
-/// range's major over the fresh transport (R78 decision 47).
-#[cfg(feature = "peer")]
-async fn dial_courier_drain_owed<T, F, S>(
+/// Dials the wire its dial has fallen due over the reconnect driver's
+/// factory, the fresh transport handed to the wire's attach (R31).
+async fn dial_owed<T, F, S>(
     shared: &Shared<T>,
     reconnect: &mut Option<ReconnectDriver<F, S>>,
+    wire: OwedWire,
     timer: DrainTimer,
 ) where
     T: Transport + MaybeSend + 'static,
@@ -3401,17 +3435,8 @@ async fn dial_courier_drain_owed<T, F, S>(
     };
     let dialed = driver.factory.connect().await;
     let mut state = shared.state.lock().await;
-    match dialed {
-        Ok(transport) => {
-            if let Err(err) = state.conn.attach_courier_drain(timer, transport).await {
-                tracing::warn!(error = %err, "attaching the courier wire failed");
-            }
-        }
-        Err(err) => {
-            tracing::debug!(error = %err, "dialing the courier wire failed, backing off");
-            state.conn.courier_drain_dial_failed(timer);
-        }
-    }
+    wire.attach_or_back_off(&mut state.conn, timer, dialed)
+        .await;
 }
 
 /// The running client as the enrolment task sees it.

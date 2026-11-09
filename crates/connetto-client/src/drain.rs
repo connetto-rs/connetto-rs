@@ -49,6 +49,39 @@ use crate::{
 /// doubling to 5 s, for ever.
 static DRAIN_POLICY: std::sync::LazyLock<RetryPolicy> = std::sync::LazyLock::new(RetryPolicy::new);
 
+/// The class of a refused drain or courier dial, the outcomes each caller
+/// maps to its own state.
+pub(crate) enum DrainRefusal {
+    /// The server no longer serves the major at the build's schema.
+    MajorGone,
+    /// The session the dial rode was revoked.
+    SessionRevoked,
+    /// The device's key was revoked.
+    DeviceRevoked,
+    /// The asked writer is unknown or retired, carrying the reason.
+    WriterRefused(FatalErrorReason),
+    /// Anything else, the dial backing off.
+    BackOff,
+}
+
+/// Classify a refused dial's error into its [`DrainRefusal`].
+pub(crate) fn drain_refusal_class(err: &ClientError) -> DrainRefusal {
+    match err {
+        ClientError::UpdateRequired { .. }
+        | ClientError::ServerBehind { .. }
+        | ClientError::SchemaOutdated { .. } => DrainRefusal::MajorGone,
+        ClientError::Refused { reason } => match reason {
+            FatalErrorReason::SessionRevoked => DrainRefusal::SessionRevoked,
+            FatalErrorReason::DeviceRevoked => DrainRefusal::DeviceRevoked,
+            FatalErrorReason::WriterUnknown | FatalErrorReason::WriterRetired => {
+                DrainRefusal::WriterRefused(reason.clone())
+            }
+            _ => DrainRefusal::BackOff,
+        },
+        _ => DrainRefusal::BackOff,
+    }
+}
+
 /// A dial the drain owes, identified so a stale one is recognized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DrainTimer {
@@ -73,6 +106,40 @@ impl DrainTimer {
     #[must_use]
     pub const fn armed(&self) -> u64 {
         self.armed
+    }
+}
+
+/// The backoff a courier dial owes, the drain's own shape (R78 decision 47).
+#[cfg(feature = "peer")]
+#[derive(Debug)]
+pub(crate) struct OwedDial {
+    /// The wait before the next dial.
+    wait: Duration,
+    /// The backoff the failed dials count on.
+    episode: Backoff<'static>,
+}
+
+#[cfg(feature = "peer")]
+impl OwedDial {
+    /// A fresh dial, waiting nothing, on a fresh episode.
+    pub(crate) fn fresh() -> Self {
+        Self {
+            wait: Duration::ZERO,
+            episode: DRAIN_POLICY.start(),
+        }
+    }
+
+    /// The wait before the next dial.
+    pub(crate) fn wait(&self) -> Duration {
+        self.wait
+    }
+
+    /// Owe the next dial on the backoff.
+    pub(crate) fn back_off(&mut self) {
+        self.wait = self
+            .episode
+            .next_wait()
+            .unwrap_or_else(|| DRAIN_POLICY.max_backoff());
     }
 }
 
@@ -391,6 +458,44 @@ where
         Ok(Some(crate::issue_request()))
     }
 
+    /// Present the held major `major` at `version` over `transport`, the
+    /// writer asked as `request` and `settled_through` on, the handshake
+    /// answering with the major's ack.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the clock cannot be read or the handshake cannot
+    /// be exchanged.
+    pub(crate) async fn handshake_majored_wire(
+        &mut self,
+        transport: &mut T,
+        major: Major,
+        version: SchemaVersion,
+        request: WriterRequest,
+        settled_through: Option<u64>,
+    ) -> Result<HandshakeOk, ClientError> {
+        let now = clock::now_secs(&mut self.db)?;
+        let presented = self
+            .config
+            .clone()
+            .with_schema_major(Some(major))
+            .with_schema_version(Some(version));
+        exchange_handshake(
+            transport,
+            HandshakeInput {
+                config: &presented,
+                token_source: self.token_source.as_ref(),
+                resume: None,
+                resume_token: None,
+                writer: request,
+                settled_through,
+                now,
+                cursor_subjects: None,
+            },
+        )
+        .await
+    }
+
     /// Present the held major over `transport`, bound to the writer of its
     /// oldest write, and upload that writer's writes of the major.
     ///
@@ -435,26 +540,9 @@ where
             }
             WriterRequest::Issue { .. } | WriterRequest::Device => None,
         };
-        let now = clock::now_secs(&mut self.db)?;
-        let presented = self
-            .config
-            .clone()
-            .with_schema_major(Some(major))
-            .with_schema_version(Some(version));
-        let outcome = exchange_handshake(
-            &mut transport,
-            HandshakeInput {
-                config: &presented,
-                token_source: self.token_source.as_ref(),
-                resume: None,
-                resume_token: None,
-                writer: request,
-                settled_through,
-                now,
-                cursor_subjects: None,
-            },
-        )
-        .await;
+        let outcome = self
+            .handshake_majored_wire(&mut transport, major, version, request, settled_through)
+            .await;
         match outcome {
             Ok(ack) => {
                 self.drain.dial = timer.armed;
@@ -463,34 +551,26 @@ where
                 self.drain.authorization = DrainAuthorization::Current(self.share_key_generation);
                 self.drain_bound(major, writer, request, ack).await
             }
-            Err(
-                ClientError::UpdateRequired { .. }
-                | ClientError::ServerBehind { .. }
-                | ClientError::SchemaOutdated { .. },
-            ) => self.lose_major(major).await,
-            Err(ClientError::Refused {
-                reason: reason @ (FatalErrorReason::WriterUnknown | FatalErrorReason::WriterRetired),
-            }) => {
-                if let Some(writer) = writer {
-                    self.drain.dead.insert(writer, crate::carry_after(&reason));
+            Err(err) => match drain_refusal_class(&err) {
+                DrainRefusal::MajorGone => self.lose_major(major).await,
+                DrainRefusal::WriterRefused(reason) => {
+                    if let Some(writer) = writer {
+                        self.drain.dead.insert(writer, crate::carry_after(&reason));
+                    }
+                    self.drain.arm(Duration::ZERO);
+                    Ok(())
                 }
-                self.drain.arm(Duration::ZERO);
-                Ok(())
-            }
-            Err(ClientError::Refused {
-                reason: FatalErrorReason::SessionRevoked,
-            }) => Ok(()),
-            Err(ClientError::Refused {
-                reason: FatalErrorReason::DeviceRevoked,
-            }) => {
-                self.exclude_device_writers(crate::Carry::Named)?;
-                self.drain.arm(Duration::ZERO);
-                Ok(())
-            }
-            Err(_) => {
-                self.drain.back_off();
-                Ok(())
-            }
+                DrainRefusal::SessionRevoked => Ok(()),
+                DrainRefusal::DeviceRevoked => {
+                    self.exclude_device_writers(crate::Carry::Named)?;
+                    self.drain.arm(Duration::ZERO);
+                    Ok(())
+                }
+                DrainRefusal::BackOff => {
+                    self.drain.back_off();
+                    Ok(())
+                }
+            },
         }
     }
 
@@ -556,8 +636,9 @@ where
             self.drop_drain_wire().await;
             return Ok(());
         };
-        let opened = keys.open().await?;
-        if *connetto_core::device_cert::key_id(&*opened.key).as_bytes() != key_id {
+        let Some((request_id, signature)) =
+            Self::sign_device_bind(&keys, &challenge, key_id).await?
+        else {
             // The device holds another key now, so the old one's entries move.
             self.drain
                 .dead
@@ -565,14 +646,7 @@ where
             self.drop_drain_wire().await;
             self.drain.arm(Duration::ZERO);
             return Ok(());
-        }
-        let signature = opened
-            .key
-            .sign(&connetto_core::messages::writer_bind_message(&challenge))
-            .map_err(|err| {
-                ClientError::DeviceChip(crate::device_key::ChipError::Failed(Box::new(err)))
-            })?;
-        let request_id = crate::writer_request_id();
+        };
         let Some(wire) = self.drain.wire.as_mut() else {
             return Ok(());
         };
@@ -1105,9 +1179,7 @@ where
             #[cfg(feature = "peer")]
             if self.courier_rides_the_drain() {
                 if let Some(IncomingFrame::Control(ControlMessage::CourierAnswer(answer))) = frame {
-                    if let Some(event) = self.settle_courier_answer(&answer).await? {
-                        self.notices.push_back(event);
-                    }
+                    self.settle_courier_answer_and_queue(&answer).await?;
                     return Ok(());
                 }
                 self.drop_drain_wire().await;
@@ -1244,9 +1316,7 @@ where
             // decision 47), correlated by request id like the main wire.
             #[cfg(feature = "peer")]
             Some(IncomingFrame::Control(ControlMessage::CourierAnswer(answer))) => {
-                if let Some(event) = self.settle_courier_answer(&answer).await? {
-                    self.notices.push_back(event);
-                }
+                self.settle_courier_answer_and_queue(&answer).await?;
                 return Ok(());
             }
             // Nothing else concerns a session with no subscription.
