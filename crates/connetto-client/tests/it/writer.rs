@@ -2443,6 +2443,86 @@ async fn a_failed_retirement_preserves_the_device_tail_for_retry() {
     assert_eq!(conn.unsynced(), Vec::<UnsyncedWrite>::new());
 }
 
+/// The replica's spelling of the device writer `key`, its bytes in lowercase
+/// hex, the `writer_id` pattern.
+#[cfg(feature = "device-identity")]
+fn device_spelling(key: [u8; 32]) -> String {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in key {
+        out.push(char::from(HEX[(byte >> 4) as usize]));
+        out.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    out
+}
+
+/// The writers the replica owes a retirement of, in writer order.
+#[cfg(feature = "device-identity")]
+fn owed_retires(conn: &mut ConnettoConnection<Wire>) -> Vec<String> {
+    _connetto_retire::table
+        .select(_connetto_retire::writer)
+        .order(_connetto_retire::writer)
+        .load(conn.conn())
+        .expect("read the owed retirements")
+}
+
+/// Decision 53's row: a device the server revokes owes a retirement of its
+/// writer that outlives the connection and a restart, goes up on the next
+/// connection, and the answer clears the obligation.
+#[cfg(feature = "device-identity")]
+#[tokio::test]
+async fn a_device_retirement_stays_owed_across_a_restart_and_clears_on_answer() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    conn.attach(Wire::default().silent()).await.expect("attach");
+    write(&mut conn, 1);
+    conn.push().await.expect("number write");
+    let (leaf, issuer, key) = mint_device_certificate("tester");
+    store_certificate(&mut conn, &leaf, &issuer);
+    write(&mut conn, 2);
+    conn.push().await.expect("device write");
+    let device = WriterRef::Device(key);
+
+    // The server revokes the device. Its tail travels to the number and the
+    // writer owes a retirement the connection cannot carry.
+    conn.attach(
+        Wire::default()
+            .silent()
+            .closing(FatalErrorReason::DeviceRevoked),
+    )
+    .await
+    .expect("revocation");
+    drain(&mut conn).await;
+    assert_eq!(
+        owed_retires(&mut conn),
+        vec![format!("device:{}", device_spelling(key))],
+        "the retirement outlives the connection"
+    );
+
+    // A restart keeps the obligation owed, and the next connection sends it.
+    drop(conn);
+    let mut conn = open(&dir).await;
+    let wire = Wire::default();
+    conn.attach(wire.clone()).await.expect("reconnect");
+    drain(&mut conn).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(log.retires.len(), 1, "the owed retirement went up once");
+        assert_eq!(log.retires[0].writer, device);
+        assert_eq!(
+            log.retires[0].secret, None,
+            "a device writer carries no secret"
+        );
+        assert_eq!(log.mutations, vec![1, 2], "the carried tail went up too");
+    }
+    assert!(conn.unsynced().is_empty(), "the answers settled the tail");
+    assert_eq!(
+        owed_retires(&mut conn),
+        Vec::<String>::new(),
+        "the answer cleared the obligation"
+    );
+}
+
 #[cfg(feature = "device-identity")]
 fn split_pending_writers(source: &mut ConnettoConnection<Wire>) {
     let first_hash: Vec<u8> = _connetto_pending::table
