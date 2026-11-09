@@ -5632,6 +5632,10 @@ where
             .push_back(ClientEvent::SyncStatus(SyncStatus::Connected));
         // Relaxed: same-task flag, no ordering dependency.
         self.dirty.store(true, Ordering::Relaxed);
+        // The durable record alone stands for what is owed at a fresh
+        // connection, so a queue an operation left behind no connection goes
+        // before the re-queueing and nothing sends twice.
+        self.writer_tasks.clear();
         #[cfg(feature = "device-identity")]
         self.plan_bind().await?;
         // A retirement owed before the last connection is re-sent here, queued
@@ -6575,7 +6579,8 @@ where
     /// Atomically carries the entries of `dead` that `carried` admits to
     /// `target`, in append order, re-chained after the target's own. A dead
     /// writer's state goes once nothing of it remains, and a dead device's
-    /// key is excluded either way.
+    /// key is excluded either way, the server's retirement of the writer owed
+    /// beside it and queued to send.
     fn carry_matching(
         &mut self,
         dead: &[WriterRef],
@@ -6611,6 +6616,12 @@ where
                 persist_writer_state(db, target, next_seq, &head)?;
             }
             for writer in dead {
+                if let WriterRef::Device(_) = writer {
+                    // The owed retirement stands with the exclusion, so a
+                    // crash leaves no writer the replica gave up unretired
+                    // on the server.
+                    persist_retire(db, writer, None)?;
+                }
                 #[cfg(feature = "device-identity")]
                 if let WriterRef::Device(key) = writer {
                     persist_retired_key(db, *key)?;
@@ -6645,6 +6656,15 @@ where
         for writer in dead {
             if emptied.contains(writer) {
                 self.writers.remove(writer);
+            }
+            if matches!(writer, WriterRef::Device(_)) {
+                // The connection the exclusion ran on may die before the
+                // answer, so the durable row re-queues the send on the next.
+                self.writer_tasks.push_back(WriterTask {
+                    kind: WriterTaskKind::Retire(*writer, None),
+                    request_id: writer_request_id(),
+                    deadline: crate::away::SystemClock.monotonic() + WRITER_ANSWER_WAIT,
+                });
             }
             #[cfg(feature = "device-identity")]
             if let WriterRef::Device(key) = writer {
@@ -6812,7 +6832,8 @@ where
             .collect()
     }
 
-    /// Durably retires device queues before requesting fresh enrolment.
+    /// Durably retires device queues, owing each writer a server retirement,
+    /// before requesting fresh enrolment.
     ///
     /// # Errors
     ///
@@ -11912,6 +11933,42 @@ mod tests {
             conn.writers[&unissued()].pending[&1].provenance,
             None,
             "nothing past the restored frontier is named"
+        );
+    }
+
+    /// Decision 53's device row: the same retirement owes the old writer a
+    /// server retirement, durable in the replica and queued to send.
+    #[cfg(feature = "device-identity")]
+    #[tokio::test]
+    async fn a_rewound_device_retirement_owes_the_writers_retirement() {
+        let (mut conn, key, device) =
+            device_settled_two_of_three(SyncTuning::default().with_acked_retention(Duration::ZERO))
+                .await;
+        conn.answer_bind(
+            key,
+            "below".to_owned(),
+            WriterOutcome::Bound { frontier: 1 },
+        )
+        .await
+        .expect("the bind is answered");
+        let owed: Vec<String> = _connetto_retire::table
+            .select(_connetto_retire::writer)
+            .load(&mut conn.db)
+            .expect("read the owed retirements");
+        assert_eq!(
+            owed,
+            vec![writer_id(&device)],
+            "the old writer owes a retirement, durable for a restart"
+        );
+        assert!(
+            conn.writer_tasks.iter().any(|task| {
+                matches!(
+                    &task.kind,
+                    WriterTaskKind::Retire(writer, secret)
+                        if *writer == device && secret.is_none()
+                )
+            }),
+            "the retirement is queued to go up"
         );
     }
 
