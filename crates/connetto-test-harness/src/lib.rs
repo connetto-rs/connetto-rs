@@ -90,6 +90,13 @@ pub use connetto_server::defaults::ConnettoDefaults;
 pub const SLOT: &str = "connetto_slot";
 /// The publication the slot follows. Matches the server binary default.
 pub const PUBLICATION: &str = "connetto_pub";
+/// The dump a restore reads, the globals and the whole database, taken
+/// while the server runs.
+const DUMP: &str = "pg_dumpall --globals-only -f /tmp/globals.sql && \
+                    pg_dump -Fc -d postgres -f /tmp/db.dump";
+/// The dump restored over the cluster it came from, the slot dropped by the
+/// caller and recreated with the publication checked after.
+const RESTORE_INTO_SAME: &str = "pg_restore --clean --if-exists -d postgres /tmp/db.dump";
 
 /// The secret the harness client issues every number writer under, so a test
 /// presents its number again with [`number_writer`].
@@ -1196,6 +1203,37 @@ impl Fixture {
             String::from_utf8_lossy(&stderr)
         );
         String::from_utf8(stdout).expect("the script printed UTF-8")
+    }
+
+    /// Take the deployment's backup, the globals and a custom dump of the
+    /// whole database, while the server runs.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::shell`].
+    pub async fn dump_backup(&self) -> String {
+        self.shell(DUMP).await
+    }
+
+    /// Restore the backup [`Self::dump_backup`] took over the cluster it came
+    /// from, dropping the slot first and recreating it with the publication
+    /// checked, as an operator restores same-cluster.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::shell`].
+    pub async fn restore_same_cluster(&self) {
+        self.shell(&format!(
+            "psql -d postgres -q -c \"SELECT pg_drop_replication_slot('{SLOT}')\""
+        ))
+        .await;
+        self.shell(RESTORE_INTO_SAME).await;
+        self
+            .shell(&format!(
+                "psql -d postgres -q -c \"SELECT pg_create_logical_replication_slot('{SLOT}', 'pgoutput')\" \
+                 -c \"SELECT 1 FROM pg_publication WHERE pubname = '{PUBLICATION}'\""
+            ))
+            .await;
     }
 
     /// The admin conninfo of the second cluster a restorable fixture's test starts on port 5433.

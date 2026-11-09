@@ -7,9 +7,9 @@
 //! pending entry, and the server computes the same chain from the entries
 //! it settles, so a direct write carries no hash on the wire. The device key
 //! signs one offer per hand-off over its newest frontier, and a manifest's
-//! rows recompute the chain from a verified head to it, for a peer and a
-//! courier alike. Because the head binds every entry's major and
-//! provenance, the offer vouches for both.
+//! rows recompute the chain from a verified head to the signed head, the
+//! offer's frontier for a courier. Because the head binds every entry's
+//! major and provenance, the offer vouches for both.
 
 #[cfg(feature = "device-cert")]
 use ring::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};

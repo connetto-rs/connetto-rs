@@ -17,7 +17,7 @@ use std::time::Duration;
 use super::courier_frontier::{
     Bans, Chain, FAULTED, Faulting, Manager, applied, audited_guard, bind_nonce_message, chain,
     courier_manager, manager_over, note, notes, offer, plain, roster, ruled, settle_directly,
-    settled_count, sign, tomorrow, writing_manager,
+    settled_count, settled_offer, sign, tomorrow, writing_manager,
 };
 use super::writer_frontier::{accept_manager, pump_until, signed_in_alice};
 use super::writer_shared::{Enrolments, insert_changeset, seed_notes, writer_for_key};
@@ -100,6 +100,30 @@ fn range_frame(
         request_id: request_id.to_owned(),
         author: author_id,
         offer: offer(author, author_id, range.newest()),
+        rows: range
+            .rows
+            .iter()
+            .filter(|row| row.seq >= from)
+            .cloned()
+            .collect(),
+        bodies,
+    }
+}
+
+/// The `CourierRange` for `range` from `from` on, under the author's
+/// settled-only offer of its frontier, the queue empty, declaring `bodies`.
+fn settled_range_frame(
+    request_id: &str,
+    author: &KeyPair,
+    author_id: [u8; 32],
+    range: &Chain,
+    from: u64,
+    bodies: u32,
+) -> CourierRange {
+    CourierRange {
+        request_id: request_id.to_owned(),
+        author: author_id,
+        offer: settled_offer(author, author_id, &range.newest()),
         rows: range
             .rows
             .iter()
@@ -419,6 +443,49 @@ async fn a_body_for_a_settled_row_is_consumed_and_applies_nothing() {
             note(1, "hello", "t0"),
             note(2, "two", "t1"),
             note(3, "three", "t2"),
+        ],
+        "the settled row applied once"
+    );
+    client.close().await;
+    server.await.expect("join").expect("session ok");
+}
+
+/// A range bounded by the author's settled frontier, its queue empty,
+/// verifies to the settled head and settles the rows above the writer's
+/// frontier, the rows at or below it answered from their records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_range_bounded_by_the_settled_frontier_settles_over_the_wire() {
+    let (fixture, _store, (author, author_id), (courier, courier_id), manager) = camp().await;
+    let range = three();
+    settle_directly(
+        &manager,
+        "alice",
+        &author,
+        author_id,
+        vec![range.bodies[0].changeset.clone()],
+    )
+    .await;
+    let (mut client, server) = courier_session(&manager, "bob", &courier, courier_id).await;
+
+    client
+        .courier_range(settled_range_frame("c1", &author, author_id, &range, 1, 3))
+        .await;
+    client.courier_body(body_frame("c1", &range, 1)).await;
+    client.courier_body(body_frame("c1", &range, 2)).await;
+    no_answer_yet(&mut client).await;
+    client.courier_body(body_frame("c1", &range, 3)).await;
+    assert_eq!(
+        answered(answer(&mut client).await),
+        vec![ruled(1, Verdict::Applied), applied(2), applied(3),],
+        "the settled bound verifies and settles"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "two", "t1"),
+            note(3, "three", "t2"),
+            note(4, "four", "t3"),
         ],
         "the settled row applied once"
     );

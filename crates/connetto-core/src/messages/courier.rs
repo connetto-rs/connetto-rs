@@ -26,7 +26,7 @@ pub struct CourierRange {
     #[serde(with = "serde_bytes")]
     pub offer: Vec<u8>,
     /// The manifest rows the courier holds, in sequence order, from the first
-    /// it holds to the offer's newest.
+    /// it holds to the offer's frontier.
     pub rows: Vec<ManifestRow>,
     /// How many bodies follow on the bulk plane.
     pub bodies: u32,

@@ -1,9 +1,9 @@
 //! The courier path (R75, R78).
 //!
 //! A courier presents one author's stored [`SignedOffer`], the manifest rows
-//! it holds up to the offer's newest frontier, and the number of bodies that
+//! it holds up to the offer's frontier, and the number of bodies that
 //! follow. The rows recompute the author's chain from the writer's head to
-//! the signed newest head, which binds every entry's capture major and
+//! the offer's frontier head, which binds every entry's capture major and
 //! provenance original, so a courier cannot forge, relabel or substitute
 //! either. Each body settles as it lands through the write path the direct
 //! upload takes, as
@@ -109,7 +109,7 @@ impl<Id> CourierAuthor<Id> {
 /// The author's offer when the range holds together, `None` when it is
 /// malformed: the offer does not decode, the rows exceed
 /// [`MAX_MANIFEST_ROWS`], start at sequence 0, skip or repeat a sequence or
-/// run past the offer's newest, or `bodies` exceeds the rows.
+/// run past the offer's frontier, or `bodies` exceeds the rows.
 pub(crate) fn well_formed(offer: &[u8], rows: &[ManifestRow], bodies: u32) -> Option<SignedOffer> {
     let signed: SignedOffer = rmp_serde::from_slice(offer).ok()?;
     if rows.len() > MAX_MANIFEST_ROWS
@@ -121,10 +121,10 @@ pub(crate) fn well_formed(offer: &[u8], rows: &[ManifestRow], bodies: u32) -> Op
     {
         return None;
     }
-    let newest = signed.offer.newest.as_ref().map(|newest| newest.seq);
+    let frontier = signed.offer.frontier().map(|frontier| frontier.seq);
     if rows
         .last()
-        .is_some_and(|last| newest.is_none_or(|newest| last.seq > newest))
+        .is_some_and(|last| frontier.is_none_or(|frontier| last.seq > frontier))
     {
         return None;
     }
@@ -388,11 +388,11 @@ mod tests {
         }
     }
 
-    fn offer(newest: Option<u64>) -> Vec<u8> {
+    fn offer(settled: Option<u64>, newest: Option<u64>) -> Vec<u8> {
         rmp_serde::to_vec_named(&SignedOffer {
             offer: Offer {
                 builds: Vec::new(),
-                settled: None,
+                settled: settled.map(|seq| Frontier { seq, head: [0; 32] }),
                 newest: newest.map(|seq| Frontier { seq, head: [0; 32] }),
                 retractions: Vec::new(),
             },
@@ -401,47 +401,65 @@ mod tests {
         .expect("an offer encodes")
     }
 
-    /// Rows in sequence up to the offer's newest hold together with any body
-    /// count up to the rows, and an empty range with no bodies does too.
+    /// Rows in sequence up to the offer's frontier hold together with any
+    /// body count up to the rows, and an empty range with no bodies does
+    /// too.
     #[test]
     fn a_contiguous_range_counting_no_more_bodies_than_rows_is_well_formed() {
         let rows = [row(4, b"four"), row(5, b"five"), row(6, b"six")];
         for bodies in 0..=3 {
             assert!(
-                well_formed(&offer(Some(6)), &rows, bodies).is_some(),
+                well_formed(&offer(None, Some(6)), &rows, bodies).is_some(),
                 "{bodies}"
             );
         }
-        assert!(well_formed(&offer(None), &[], 0).is_some());
+        // The settled frontier is the bound when the offer signs no newest,
+        // and when it runs past the newest.
+        assert!(well_formed(&offer(Some(6), None), &rows, 0).is_some());
+        assert!(well_formed(&offer(Some(6), Some(4)), &rows, 0).is_some());
+        assert!(well_formed(&offer(None, None), &[], 0).is_some());
     }
 
     /// Every way a range fails to hold together is malformed.
     #[test]
     fn a_range_that_does_not_hold_together_is_malformed() {
         let rows = vec![row(4, b"four"), row(5, b"five")];
-        let cases: [(&str, Vec<u8>, Vec<ManifestRow>, u32); 7] = [
+        let cases: [(&str, Vec<u8>, Vec<ManifestRow>, u32); 8] = [
             ("garbage offer", b"garbage".to_vec(), rows.clone(), 0),
             (
                 "a zeroth sequence",
-                offer(Some(1)),
+                offer(None, Some(1)),
                 vec![row(0, b"zero"), row(1, b"one")],
                 0,
             ),
             (
                 "a skipped sequence",
-                offer(Some(6)),
+                offer(None, Some(6)),
                 vec![row(4, b"four"), row(6, b"six")],
                 0,
             ),
             (
                 "a repeated sequence",
-                offer(Some(5)),
+                offer(None, Some(5)),
                 vec![row(4, b"four"), row(4, b"four")],
                 0,
             ),
-            ("rows past the newest", offer(Some(4)), rows.clone(), 0),
-            ("rows with no newest", offer(None), rows.clone(), 0),
-            ("more bodies than rows", offer(Some(5)), rows, 3),
+            (
+                "rows past the newest",
+                offer(None, Some(4)),
+                rows.clone(),
+                0,
+            ),
+            // With no newest, the settled frontier is the bound.
+            (
+                "rows past the settled",
+                offer(Some(4), None),
+                rows.clone(),
+                0,
+            ),
+            // With no frontier at all, every row runs past both.
+            ("rows with no frontier", offer(None, None), rows.clone(), 0),
+            ("more bodies than rows", offer(None, Some(5)), rows, 3),
         ];
         for (what, offer, rows, bodies) in cases {
             assert!(well_formed(&offer, &rows, bodies).is_none(), "{what}");
@@ -455,8 +473,8 @@ mod tests {
             .map(|seq| row(seq, b"x"))
             .collect();
         let newest = rows.last().map(|row| row.seq);
-        assert!(well_formed(&offer(newest), &rows, 0).is_none());
-        assert!(well_formed(&offer(newest), &rows[1..], 0).is_some());
+        assert!(well_formed(&offer(None, newest), &rows, 0).is_none());
+        assert!(well_formed(&offer(None, newest), &rows[1..], 0).is_some());
     }
 
     fn refused(bodies: u32) -> CourierRun<String, String> {
