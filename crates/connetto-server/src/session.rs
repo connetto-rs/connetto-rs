@@ -7500,7 +7500,7 @@ where
     /// one range the process already admitted.
     ///
     /// `offer` is the author's stored [`SignedOffer`] in MessagePack, `rows`
-    /// the manifest rows the courier holds up to the offer's newest entry, in
+    /// the manifest rows the courier holds up to the offer's frontier, in
     /// sequence order, and `bodies` the bodies it holds of them, in the same
     /// order. Each body is driven through the range as a connection's
     /// `CourierBody` frame is, so the outcome is the one `CourierAnswer` a
@@ -7509,7 +7509,7 @@ where
     /// expiry plus `DEVICE_SKEW`, the author's account is banned, its writer
     /// is retired, the offer's signature fails, the rows above the writer's
     /// frontier do not start right after it, or they do not chain from the
-    /// writer's head to the offer's newest head. Rows at or below the
+    /// writer's head to the offer's frontier head. Rows at or below the
     /// frontier are answered with the verdict their records give and touch
     /// nothing. The rows above it settle in order under the author's
     /// account, the bot list its certificate carries and no subjects, so an
@@ -7690,16 +7690,19 @@ where
                     got: first.seq,
                 }));
             }
-            // The rows above the frontier run to the signed newest entry and
+            // The rows above the frontier run to the offer's frontier and
             // continue the writer's own head to its hash.
-            let reached = signed.offer.newest.as_ref().is_some_and(|newest| {
-                unsettled.last().is_some_and(|last| last.seq == newest.seq)
+            let frontier = signed.offer.frontier();
+            let reached = frontier.is_some_and(|frontier| {
+                unsettled
+                    .last()
+                    .is_some_and(|last| last.seq == frontier.seq)
                     && chain::chain_walk(
                         &head,
                         unsettled
                             .iter()
                             .map(|row| (row.seq, Some(row.major), row.origin, row.digest)),
-                    ) == newest.head
+                    ) == frontier.head
             });
             if !reached {
                 return Ok(Err(CourierRefusal::Unverified));

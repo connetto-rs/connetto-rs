@@ -152,6 +152,40 @@ fn adopt(conn: &mut Conn, author: [u8; 32], newest: Option<u64>) {
     .expect("keep the cursor");
 }
 
+/// The signed offer the tests stand for a fully synced author, the queue
+/// empty and `settled` naming the acked frontier.
+fn settled_offer(settled: u64) -> SignedOffer {
+    SignedOffer {
+        offer: connetto_core::exchange::Offer {
+            builds: vec![(major(2), version())],
+            settled: Some(Frontier {
+                seq: settled,
+                head: [77; 32],
+            }),
+            newest: None,
+            retractions: Vec::new(),
+        },
+        signature: vec![1, 2, 3],
+    }
+}
+
+/// Store `author`'s cursor with the settled-only offer.
+fn adopt_settled(conn: &mut Conn, author: [u8; 32], settled: u64) {
+    let encoded = rmp_serde::to_vec_named(&settled_offer(settled)).expect("the offer encodes");
+    crate::exchange::upsert_cursor(
+        &mut conn.db,
+        author.as_ref(),
+        "courier-author",
+        &Frontier {
+            seq: 0,
+            head: GENESIS,
+        },
+        &encoded,
+        CERT_END,
+    )
+    .expect("keep the cursor");
+}
+
 /// Attach the replica to a scripted server whose courier path is `on`,
 /// answering the handshake and draining the state notices.
 async fn attach(mut conn: Conn, on: bool) -> (Conn, LoopbackTransport) {
@@ -2155,6 +2189,81 @@ async fn an_offer_newest_past_the_replica_reads_every_row() {
     let candidates = conn.courier_candidates().expect("the bound clips");
     assert_eq!(candidates.len(), 1, "{candidates:?}");
     assert_eq!(candidates[0].seqs, [1]);
+}
+
+/// A stored offer without a newest binds the range to its settled frontier,
+/// and a row past it stays held.
+#[tokio::test]
+async fn an_offer_without_a_newest_binds_the_range_to_the_settled_frontier() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the first"),
+    );
+    hold(&mut conn, AUTHOR, 2, HeldState::DigestOnly, major(2), None);
+    hold(&mut conn, AUTHOR, 3, HeldState::DigestOnly, major(2), None);
+    hold(
+        &mut conn,
+        AUTHOR,
+        4,
+        HeldState::Provisional,
+        major(2),
+        Some(b"the held above"),
+    );
+    adopt_settled(&mut conn, AUTHOR, 3);
+    let (mut conn, mut server) = attach(conn, true).await;
+    let ask = next_ask(&mut server).await;
+    assert_eq!(ask.seqs, [2, 3], "the unapplied rows are asked");
+    let wait = conn.courier(AUTHOR).await.expect("send the range");
+    let range = next_range(&mut server).await;
+    let signed: SignedOffer =
+        rmp_serde::from_slice(&range.offer[..]).expect("the stored offer decodes");
+    assert!(signed.offer.newest.is_none(), "the offer signs no newest");
+    assert_eq!(
+        signed.offer.settled,
+        Some(Frontier {
+            seq: 3,
+            head: [77; 32]
+        })
+    );
+    assert_eq!(
+        range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        [1, 2, 3],
+        "the row past the settled frontier is not offered"
+    );
+    assert_eq!(range.bodies, 1, "only row 1 holds a body");
+    let body = next_body(&mut server).await;
+    assert_eq!(body.seq, 1);
+    deliver_answer(
+        &mut server,
+        &range.request_id,
+        CourierOutcome::Entries(vec![
+            (1, CourierEntryOutcome::Ruled(Verdict::Applied)),
+            (2, CourierEntryOutcome::Ruled(Verdict::Applied)),
+            (3, CourierEntryOutcome::Ruled(Verdict::Applied)),
+        ]),
+    )
+    .await;
+    server.close().await.expect("hang up");
+    let event = conn.pump_one().await.expect("settle the range");
+    assert!(matches!(event, ClientEvent::Closed));
+    let report = wait
+        .receiver
+        .await
+        .expect("the call stands")
+        .expect("the range settles");
+    assert_eq!(report.settled, [1, 2, 3]);
+    assert!(
+        matches!(
+            peer::state_of(&mut conn.db, &AUTHOR, 4),
+            Ok(Some(HeldState::Provisional))
+        ),
+        "row 4 stays held"
+    );
 }
 
 /// A provisional ask that overran its bound keeps its author's candidates

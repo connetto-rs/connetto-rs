@@ -6732,7 +6732,7 @@ where
 
     /// The rows the courier offers one author on the main wire (R78 slice 4):
     /// the author's held rows of the build's major, contiguous from the
-    /// lowest and running to the offer's newest, beside the bodies that
+    /// lowest and running to the offer's frontier, beside the bodies that
     /// cross. `None` when the path is off, the author waits excluded, or it
     /// holds no stored offer.
     ///
@@ -6753,7 +6753,9 @@ where
         };
         let signed: connetto_core::exchange::SignedOffer = rmp_serde::from_slice(&offer[..])
             .map_err(|_| ClientError::Session("a stored offer does not decode".to_owned()))?;
-        let newest = signed.offer.newest.map_or(i64::MAX, |frontier| {
+        // The range runs to the offer's frontier (R78 decision 52), the
+        // higher of its signed settled and newest.
+        let frontier = signed.offer.frontier().map_or(i64::MAX, |frontier| {
             i64::try_from(frontier.seq).unwrap_or(i64::MAX)
         });
         let marked: Option<Vec<i64>> = self.courier.marked.get(&author).map(|rows| {
@@ -6761,7 +6763,7 @@ where
                 .map(|seq| i64::try_from(*seq).unwrap_or(i64::MAX))
                 .collect()
         });
-        let held = peer::held_at_or_below(&mut self.db, &author, newest, marked)?;
+        let held = peer::held_at_or_below(&mut self.db, &author, frontier, marked)?;
         Ok(Some((
             account,
             Self::range_rows(offer, held, self.config.schema_major),
