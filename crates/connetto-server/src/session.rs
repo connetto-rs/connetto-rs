@@ -7111,14 +7111,13 @@ where
                 .map_err(transport_err);
         };
         // One ask carries at most the manifest frame's bound, and no sequence
-        // past the offer's signed head.
+        // past the higher of the offer's signed heads (R78 decision 52).
         if ask.seqs.len() > connetto_core::exchange::MAX_MANIFEST_ROWS
             || ask.seqs.iter().any(|seq| {
                 signed
                     .offer
-                    .newest
-                    .as_ref()
-                    .is_none_or(|newest| *seq > newest.seq)
+                    .frontier()
+                    .is_none_or(|frontier| *seq > frontier.seq)
             })
         {
             return transport

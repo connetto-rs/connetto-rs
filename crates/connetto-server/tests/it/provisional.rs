@@ -455,6 +455,36 @@ async fn a_ruling_answers_every_row_of_the_verdict_table() {
     assert_eq!(verdicts.request_id, "p3");
     assert_eq!(verdicts.verdicts, vec![(1, Verdict::Pending)]);
 
+    // An author whose every write was acknowledged signs no newest, and the
+    // ask about a sequence its settled frontier covers is ruled all the same
+    // (R78 decision 52).
+    let reply = ask_provisional(
+        &mut recv,
+        ProvisionalStatus {
+            request_id: "p4".to_owned(),
+            author: dave_id,
+            offer: dave.signed_offer_bytes(&Offer {
+                builds: vec![(
+                    Major::new(1).expect("a positive major"),
+                    SchemaVersion::from_hash(vec![1; 32]),
+                )],
+                settled: Some(Frontier {
+                    seq: 1,
+                    head: [1; 32],
+                }),
+                newest: None,
+                retractions: Vec::new(),
+            }),
+            seqs: vec![1],
+        },
+    )
+    .await;
+    let ControlMessage::ProvisionalVerdicts(verdicts) = reply else {
+        panic!("expected the ruling for a settled-only offer, got {reply:?}");
+    };
+    assert_eq!(verdicts.request_id, "p4");
+    assert_eq!(verdicts.verdicts, vec![(1, Verdict::Pending)]);
+
     let _ = recv.close().await;
     server.await.expect("join bob").expect("session ok");
 }
