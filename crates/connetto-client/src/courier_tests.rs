@@ -3702,4 +3702,222 @@ mod r78_4c {
             "the unlisted major's row stays held"
         );
     }
+
+    /// R78 decision 47: a run of held rows longer than the manifest's bound
+    /// rides its older major at the cut, the run's tail staying held behind
+    /// it.
+    #[tokio::test]
+    async fn a_run_longer_than_the_manifest_cut_rides_at_the_cut() {
+        let cut = u64::try_from(connetto_core::exchange::MAX_MANIFEST_ROWS)
+            .expect("the bound fits a seq");
+        let rows = cut + 1;
+        let (cert, keys) = device_identity().await;
+        let mut conn = replica();
+        conn.store_device_certificate(&cert)
+            .await
+            .expect("the certificate stores");
+        for seq in 1..=rows {
+            hold(
+                &mut conn,
+                AUTHOR,
+                seq,
+                HeldState::CourierOnly,
+                major(1),
+                Some(b"x"),
+            );
+        }
+        store_offer(
+            &mut conn,
+            AUTHOR,
+            &offer_with(&[(major(1), old_version())], Some(rows)),
+        );
+        let (mut conn, _server) = attach_device(conn, true).await;
+        conn.writer_keys = Some(keys);
+        let wait = conn.courier(AUTHOR).await.expect("the call owes a dial");
+        let timer = conn.courier_drain_timer().expect("major 1 owes a dial");
+        let mut old = dial_courier_wire(&mut conn, timer, major(1), old_version()).await;
+        conn.pump_one_or(std::future::pending::<()>())
+            .await
+            .expect("one step");
+        let range = next_range(&mut old).await;
+        assert_eq!(
+            range.rows.len(),
+            connetto_core::exchange::MAX_MANIFEST_ROWS,
+            "the run rides at the manifest cut"
+        );
+        assert_eq!(
+            range.rows.last().map(|row| row.seq),
+            Some(cut),
+            "the cut falls on the last ranged row"
+        );
+        let tail = i64::try_from(rows).expect("the tail fits");
+        assert!(
+            matches!(
+                peer::state_of(&mut conn.db, &AUTHOR, tail),
+                Ok(Some(HeldState::CourierOnly))
+            ),
+            "the tail row stays held behind the cut"
+        );
+        deliver_answer(
+            &mut old,
+            &range.request_id,
+            CourierOutcome::Entries(vec![(1, CourierEntryOutcome::NotCouriered)]),
+        )
+        .await;
+        let _ = conn
+            .pump_one_or(tokio::time::sleep(BOUND))
+            .await
+            .expect("the range settles");
+        let report = timeout(BOUND, wait.receiver)
+            .await
+            .expect("the call stands")
+            .expect("the answer lands")
+            .expect("the call ends");
+        assert_eq!(
+            report.kept.len(),
+            connetto_core::exchange::MAX_MANIFEST_ROWS,
+            "the ranged rows stay held"
+        );
+        assert_eq!(report.settled, [] as [u64; 0]);
+        assert_eq!(report.refused, [] as [u64; 0]);
+    }
+
+    /// R78 decision 47: a settle whose next range would ride the main wire
+    /// that is gone fails the call on the advance, the next range's row
+    /// staying held.
+    #[tokio::test]
+    async fn an_advance_to_the_main_wire_that_is_gone_fails_the_call() {
+        let b1 = real_changeset(1);
+        let b2 = real_changeset(2);
+        let (cert, keys) = device_identity().await;
+        let mut conn = replica();
+        conn.store_device_certificate(&cert)
+            .await
+            .expect("the certificate stores");
+        hold(
+            &mut conn,
+            AUTHOR,
+            1,
+            HeldState::CourierOnly,
+            major(1),
+            Some(&b1),
+        );
+        hold(
+            &mut conn,
+            AUTHOR,
+            2,
+            HeldState::Provisional,
+            major(2),
+            Some(&b2),
+        );
+        store_offer(
+            &mut conn,
+            AUTHOR,
+            &offer_with(&[(major(1), old_version()), (major(2), version())], Some(2)),
+        );
+        let (mut conn, mut server) = attach_device(conn, true).await;
+        conn.writer_keys = Some(keys);
+        let ask = next_ask(&mut server).await;
+        assert_eq!(ask.seqs, [1], "the older major's row is asked");
+        let wait = conn.courier(AUTHOR).await.expect("the call owes a dial");
+        let timer = conn.courier_drain_timer().expect("major 1 owes a dial");
+        let mut old = dial_courier_wire(&mut conn, timer, major(1), old_version()).await;
+        conn.pump_one_or(std::future::pending::<()>())
+            .await
+            .expect("one step");
+        let range = next_range(&mut old).await;
+        assert_eq!(
+            range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [1],
+            "the older major's row rides the courier wire"
+        );
+        // The main wire goes before the advance, so the advance's send fails.
+        conn.wire = None;
+        deliver_answer(
+            &mut old,
+            &range.request_id,
+            CourierOutcome::Entries(vec![(1, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+        )
+        .await;
+        let _ = conn
+            .pump_one_or(tokio::time::sleep(BOUND))
+            .await
+            .expect("the older major settles");
+        let err = timeout(BOUND, wait.receiver)
+            .await
+            .expect("the call stands")
+            .expect("the answer lands")
+            .expect_err("the advance fails");
+        assert!(
+            matches!(err, CourierError::Client(_)),
+            "the advance to the gone main wire fails"
+        );
+        assert!(
+            matches!(
+                peer::state_of(&mut conn.db, &AUTHOR, 2),
+                Ok(Some(HeldState::Provisional))
+            ),
+            "the main row stays held"
+        );
+    }
+
+    /// R78 decision 47: a range sent on a wire that is gone answers
+    /// `NotConnected`, and a courier dial that owns the range needs no wire.
+    #[tokio::test]
+    async fn a_send_on_a_gone_wire_answers_not_connected() {
+        let mut conn = replica();
+        let range = crate::PlannedRange {
+            major: major(2),
+            version: Some(version()),
+            rows: vec![ManifestRow {
+                seq: 1,
+                major: major(2),
+                origin: None,
+                digest: [0; 32],
+            }],
+            bodies: vec![],
+        };
+        let err = conn
+            .send_on_wire(crate::CourierOpenWire::Main, "r", AUTHOR, &[], &range)
+            .await
+            .expect_err("no main wire");
+        assert!(
+            matches!(err, crate::ClientError::NotConnected),
+            "the main wire is gone"
+        );
+        let err = conn
+            .send_on_wire(crate::CourierOpenWire::Drain, "r", AUTHOR, &[], &range)
+            .await
+            .expect_err("no drain wire");
+        assert!(
+            matches!(err, crate::ClientError::NotConnected),
+            "the drain wire is gone"
+        );
+        conn.send_on_wire(crate::CourierOpenWire::Courier, "r", AUTHOR, &[], &range)
+            .await
+            .expect("the dial owns the range");
+    }
+
+    /// R78 decision 47: a build that stands no schema major couriers nothing
+    /// held, the plan it cannot stand naming the author's rows to no one.
+    #[tokio::test]
+    async fn a_build_with_no_schema_major_couriers_nothing_held() {
+        let config = ClientConfig::new("courier").with_schema_version(Some(version()));
+        let conn = ConnettoConnection::open(
+            &Replica::in_memory(),
+            "CREATE TABLE items (id INTEGER PRIMARY KEY)",
+            &config,
+            None,
+        )
+        .expect("open the replica");
+        assert!(
+            conn.config.schema_major.is_none(),
+            "the build stands no major"
+        );
+        let (mut conn, _server) = attach(conn, true).await;
+        assert!(
+            matches!(conn.courier(AUTHOR).await, Err(CourierError::NothingHeld)),
+            "the plan it cannot stand names nothing"
+        );
+    }
 }
