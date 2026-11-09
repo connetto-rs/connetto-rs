@@ -61,8 +61,8 @@ const RESTORE_INTO_FRESH: &str = "rm -rf /tmp/fresh && \
      echo 'host all all all trust' >> /tmp/fresh/pg_hba.conf && \
      pg_ctl -D /tmp/fresh -l /tmp/fresh.log -w -t 60 \
        -o \"-p 5433 -c listen_addresses='*' -c wal_level=logical -c fsync=off\" start && \
-     psql -p 5433 -d postgres -q -f /tmp/globals.sql >/dev/null 2>&1 || true; \
-     pg_restore -p 5433 -d postgres /tmp/db.dump";
+     psql -p 5433 -d postgres -q -f \"$DUMP_DIR/globals.sql\" >/dev/null 2>&1 || true; \
+     pg_restore -p 5433 -d postgres \"$DUMP_DIR/db.dump\"";
 
 /// The application launching on its replica.
 fn launch(ws: &str, db: &Path, token: &str) -> ChildGuard {

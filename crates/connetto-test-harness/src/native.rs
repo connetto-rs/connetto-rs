@@ -57,8 +57,9 @@ pub(crate) struct NativeCluster {
     pg_ctl: PathBuf,
     data: PathBuf,
     port: u16,
-    /// Removed after [`Drop`] stopped the server in it.
-    _dir: TempDir,
+    /// Removed after [`Drop`] stopped the server in it, and the dump
+    /// directory of [`Self::shell`].
+    dir: TempDir,
 }
 
 impl NativeCluster {
@@ -106,7 +107,7 @@ impl NativeCluster {
                     pg_ctl,
                     data,
                     port,
-                    _dir: dir,
+                    dir,
                 };
             }
             assert!(
@@ -124,6 +125,28 @@ impl NativeCluster {
             "postgres://postgres:postgres@127.0.0.1:{}/postgres",
             self.port
         )
+    }
+
+    /// A `bash -euo pipefail` running `script` against this cluster, as the
+    /// container's `postgres` user runs it there: the programs beside
+    /// `pg_ctl` first on `PATH`, `PGHOST`, `PGPORT` and `PGUSER` naming the
+    /// cluster, and `DUMP_DIR` naming a directory this cluster alone uses.
+    pub(crate) fn shell(&self, script: &str) -> Command {
+        let bin = self.pg_ctl.parent().unwrap_or_else(|| Path::new("."));
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(bin.to_owned()).chain(std::env::split_paths(&inherited)),
+        )
+        .expect("the programs' directory joins PATH");
+        let mut command = Command::new("bash");
+        command
+            .args(["-euo", "pipefail", "-c", script])
+            .env("PATH", path)
+            .env("PGHOST", "127.0.0.1")
+            .env("PGPORT", self.port.to_string())
+            .env("PGUSER", "postgres")
+            .env("DUMP_DIR", &self.dir.path);
+        command
     }
 }
 
