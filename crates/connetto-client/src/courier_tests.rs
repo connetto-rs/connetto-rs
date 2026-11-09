@@ -2915,6 +2915,67 @@ async fn an_owed_ask_with_no_retained_row_left_clears_at_session_start() {
     drop(server);
 }
 
+/// Owing the retained ask twice leaves one row standing (R78 decision 49).
+#[test]
+fn owing_the_retained_ask_twice_leaves_one_row() {
+    let mut conn = replica();
+    peer::owe_retained_ask(&mut conn.db).expect("owe the ask");
+    peer::owe_retained_ask(&mut conn.db).expect("owe the ask again");
+    assert_eq!(
+        peer::retained_ask_count(&mut conn.db).expect("count the owed rows"),
+        1,
+        "the second owing stands the row as it stands"
+    );
+}
+
+/// A session whose retained ask still awaits an answer when a second resync
+/// ends keeps the ask owed and restates nothing, the owed row going with the
+/// answer (R78 decision 49).
+#[tokio::test]
+async fn a_second_resync_end_keeps_the_owed_ask_without_asking_again() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Retained,
+        major(2),
+        Some(b"the only row"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    let (mut conn, mut server) = attach(conn, true).await;
+    resync(&mut conn, &mut server).await;
+    let ask = next_ask(&mut server).await;
+    assert_eq!(ask.author, AUTHOR);
+    assert_eq!(ask.seqs, [1]);
+    assert!(
+        peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
+        "the first resync owes the ask"
+    );
+    resync(&mut conn, &mut server).await;
+    assert!(
+        timeout(Duration::from_millis(100), server.recv())
+            .await
+            .is_err(),
+        "an ask the session still owes an answer is not restated"
+    );
+    assert!(
+        peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
+        "the second resync end leaves the owed row standing"
+    );
+    deliver_verdicts(&mut server, &ask.request_id, &[(1, Verdict::Pending)]).await;
+    let event = conn.pump_one().await.expect("the ruling settles");
+    assert!(matches!(event, ClientEvent::NonFatal { .. }));
+    let _ = expect_candidates(conn.pump_one().await.expect("restate"));
+    assert!(
+        !peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
+        "the answer clears the owed row"
+    );
+    server.close().await.expect("hang up");
+    let event = conn.pump_one().await.expect("the session ends");
+    assert!(matches!(event, ClientEvent::Closed));
+}
+
 /// A push ruling a retained row the resync's ask answered Pending ends its candidacy with the row still retained and the candidates restated (R78 decisions 45 and 46).
 #[tokio::test]
 async fn push_ending_marked_retained_rows_keeps_them_retained() {

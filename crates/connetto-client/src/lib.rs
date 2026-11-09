@@ -10944,8 +10944,10 @@ where
                     if self.resyncing.is_empty() {
                         self.pass_released()?;
                         // A restored server may hold retained rows Pending (R78 decision 49).
+                        // An ask this session still awaits an answer for is not
+                        // restated under fresh request ids.
                         #[cfg(feature = "peer")]
-                        if self.plan_retained_asks()? {
+                        if self.courier.retained_awaiting.is_empty() && self.plan_retained_asks()? {
                             peer::owe_retained_ask(&mut self.db)?;
                             self.flush_provisional_asks().await?;
                         }

@@ -373,11 +373,20 @@ pub(crate) fn retained_ask_owed(db: &mut SqliteConnection) -> Result<bool, Clien
     .get_result::<bool>(db)?)
 }
 
+/// The owed rows standing, which the tests read (R78 decision 49).
+#[cfg(test)]
+pub(crate) fn retained_ask_count(db: &mut SqliteConnection) -> Result<i64, ClientError> {
+    Ok(_connetto_retained_ask::table.count().get_result(db)?)
+}
+
 /// Owe the resync's asks about the retained rows, from a full resync's end
-/// (R78 decision 49).
+/// (R78 decision 49). It stands as it stands, so an owing while the row does
+/// changes nothing.
 pub(crate) fn owe_retained_ask(db: &mut SqliteConnection) -> Result<(), ClientError> {
     diesel::insert_into(_connetto_retained_ask::table)
         .values(_connetto_retained_ask::id.eq(1))
+        .on_conflict(_connetto_retained_ask::id)
+        .do_nothing()
         .execute(db)?;
     Ok(())
 }
