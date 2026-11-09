@@ -91,12 +91,12 @@ pub const SLOT: &str = "connetto_slot";
 /// The publication the slot follows. Matches the server binary default.
 pub const PUBLICATION: &str = "connetto_pub";
 /// The dump a restore reads, the globals and the whole database, taken
-/// while the server runs.
-const DUMP: &str = "pg_dumpall --globals-only -f /tmp/globals.sql && \
-                    pg_dump -Fc -d postgres -f /tmp/db.dump";
+/// while the server runs into the [`Fixture::shell`]'s `DUMP_DIR`.
+const DUMP: &str = "pg_dumpall --globals-only -f \"$DUMP_DIR/globals.sql\" && \
+                    pg_dump -Fc -d postgres -f \"$DUMP_DIR/db.dump\"";
 /// The dump restored over the cluster it came from, the slot dropped by the
 /// caller and recreated with the publication checked after.
-const RESTORE_INTO_SAME: &str = "pg_restore --clean --if-exists -d postgres /tmp/db.dump";
+const RESTORE_INTO_SAME: &str = "pg_restore --clean --if-exists -d postgres \"$DUMP_DIR/db.dump\"";
 
 /// The secret the harness client issues every number writer under, so a test
 /// presents its number again with [`number_writer`].
@@ -988,13 +988,14 @@ pub struct Fixture {
 
 /// What keeps a fixture's Postgres alive.
 enum Cluster {
-    /// A container, the target of [`Fixture::shell`], dropped before the slot that admitted it.
+    /// A container, the target of [`Fixture::shell`] inside it, dropped before the slot that admitted it.
     Container {
         container: Box<ContainerAsync<GenericImage>>,
         _slot: ContainerSlot,
     },
-    /// A cluster started as plain processes, see [`native::POSTGRES_BIN_VAR`].
-    Native { _guard: NativeCluster },
+    /// A cluster started as plain processes, see [`native::POSTGRES_BIN_VAR`],
+    /// the target of [`Fixture::shell`] with its own programs.
+    Native { cluster: NativeCluster },
     /// A cluster something else started and keeps running.
     Running,
 }
@@ -1135,7 +1136,7 @@ impl Fixture {
         let cluster = NativeCluster::start(&programs.bin, &programs.template).await;
         Self::provisioned(
             cluster.admin_url(),
-            Cluster::Native { _guard: cluster },
+            Cluster::Native { cluster },
             None,
             OnceCell::new(),
             shared_counter_scope,
@@ -1170,36 +1171,55 @@ impl Fixture {
         }
     }
 
-    /// Run a `bash` script inside the container as the `postgres` user and
-    /// return its standard output.
+    /// Run a `bash` script against the fixture's own cluster and return its
+    /// standard output, inside the container as the `postgres` user, or for a
+    /// native cluster with the programs beside its `pg_ctl` and `PGHOST`,
+    /// `PGPORT` and `PGUSER` naming it. `DUMP_DIR` names a directory only this
+    /// cluster uses, `/tmp` inside the container.
     ///
     /// # Panics
     ///
     /// Panics when the fixture runs over a cluster it did not start, when the
-    /// exec cannot start, or when the script exits nonzero, printing the
-    /// script's standard error.
+    /// script cannot start, or when it exits nonzero, printing the script's
+    /// standard error.
     pub async fn shell(&self, script: &str) -> String {
-        let Cluster::Container {
-            container: postgres,
-            ..
-        } = &self.postgres
-        else {
-            panic!("a shell needs the fixture's own container");
+        let (code, stdout, stderr) = match &self.postgres {
+            Cluster::Container {
+                container: postgres,
+                ..
+            } => {
+                let exported = format!("export DUMP_DIR=/tmp\n{script}");
+                let mut run = postgres
+                    .exec(
+                        ExecCommand::new([
+                            "gosu", "postgres", "bash", "-euo", "pipefail", "-c", &exported,
+                        ])
+                        .with_cmd_ready_condition(CmdWaitFor::exit()),
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("starting `{script}` in the container: {err}"));
+                let stdout = run.stdout_to_vec().await.expect("read the script's stdout");
+                let stderr = run.stderr_to_vec().await.expect("read the script's stderr");
+                let code = run.exit_code().await.expect("read the script's exit code");
+                (code, stdout, stderr)
+            }
+            Cluster::Native { cluster } => {
+                let output =
+                    cluster.shell(script).output().await.unwrap_or_else(|err| {
+                        panic!("starting `{script}` beside the cluster: {err}")
+                    });
+                (
+                    output.status.code().map(i64::from),
+                    output.stdout,
+                    output.stderr,
+                )
+            }
+            Cluster::Running => panic!("a shell needs a cluster the fixture started"),
         };
-        let mut run = postgres
-            .exec(
-                ExecCommand::new(["gosu", "postgres", "bash", "-euo", "pipefail", "-c", script])
-                    .with_cmd_ready_condition(CmdWaitFor::exit()),
-            )
-            .await
-            .unwrap_or_else(|err| panic!("starting `{script}` in the container: {err}"));
-        let stdout = run.stdout_to_vec().await.expect("read the script's stdout");
-        let stderr = run.stderr_to_vec().await.expect("read the script's stderr");
-        let code = run.exit_code().await.expect("read the script's exit code");
         assert_eq!(
             code,
             Some(0),
-            "`{script}` failed in the container: {}",
+            "`{script}` failed on the fixture's cluster: {}",
             String::from_utf8_lossy(&stderr)
         );
         String::from_utf8(stdout).expect("the script printed UTF-8")
