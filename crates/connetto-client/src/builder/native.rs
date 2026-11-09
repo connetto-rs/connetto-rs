@@ -1655,6 +1655,32 @@ where
         self.client().provisional_rows().await
     }
 
+    /// The session's courier candidates, one per author with a stored offer
+    /// (R78 decision 16).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, and the
+    /// [`ClientError`] the read surfaces.
+    #[cfg(feature = "peer")]
+    pub async fn courier_candidates(&self) -> Result<Vec<crate::CourierCandidate>, ClientError> {
+        self.client().courier_candidates().await
+    }
+
+    /// Courier the author's held rows to the server on the main wire (R78
+    /// decision 48).
+    ///
+    /// # Errors
+    ///
+    /// The [`crate::CourierError`] the call surfaces.
+    #[cfg(feature = "peer")]
+    pub async fn courier(
+        &self,
+        author: &[u8],
+    ) -> Result<crate::CourierReport, crate::CourierError> {
+        self.client().courier(author).await
+    }
+
     /// Dial `addr`, refusing by this device's standing before any socket
     /// opens and handing back the peer's identity once the link is live
     /// (R76).

@@ -155,6 +155,26 @@ pub(crate) fn offer_of(
     Ok(offer)
 }
 
+/// The author's last verified signed offer with the account its cursor
+/// names, the cursor's stored `MessagePack` bytes and the account recorded
+/// at the write, `None` when nothing of the author was ever verified (R78
+/// slice 4).
+///
+/// # Errors
+///
+/// [`ClientError`] when the cursor cannot be read.
+pub(crate) fn offer_and_account(
+    db: &mut SqliteConnection,
+    author: &[u8],
+) -> Result<Option<(Vec<u8>, String)>, ClientError> {
+    let row: Option<(Vec<u8>, String)> = dsl::_connetto_peer_cursor
+        .filter(dsl::author.eq(author))
+        .select((dsl::offer, dsl::account))
+        .first(db)
+        .optional()?;
+    Ok(row)
+}
+
 /// Every stored cursor, author order, the archive's copy of the peer state
 /// (R77 decision 16).
 ///
@@ -472,7 +492,9 @@ where
                 dsl::expires_at.eq(expires_at),
             ))
             .execute(&mut self.db)?;
-        crate::peer::prune_retained(&mut self.db)
+        crate::peer::prune_retained(&mut self.db)?;
+        self.settle_pruned_marks()?;
+        self.courier_offer_stood(&author.key_id)
     }
 
     /// Move `author`'s certificate end to `expires_at`, in Unix seconds, as a
@@ -493,7 +515,8 @@ where
         diesel::update(dsl::_connetto_peer_cursor.filter(dsl::author.eq(author)))
             .set(dsl::expires_at.eq(expires_at))
             .execute(&mut self.db)?;
-        crate::peer::prune_retained(&mut self.db)
+        crate::peer::prune_retained(&mut self.db)?;
+        self.settle_pruned_marks()
     }
 
     /// Take `author`'s entry `row` with the cursor at it (R77 state table,
@@ -514,13 +537,17 @@ where
         cursor: &Frontier,
     ) -> Result<(), ClientError> {
         let Some(body) = body else {
-            return self.hold_peer_entry(
+            let result = self.hold_peer_entry(
                 author,
                 row,
                 crate::peer::HeldState::DigestOnly,
                 None,
                 Some(cursor),
             );
+            if result.is_ok() {
+                self.courier_offer_stood(&author.key_id)?;
+            }
+            return result;
         };
         if let crate::peer::PeerApplyOutcome::Refused {
             cause: crate::peer::PeerRefusal::DigestMismatch,
@@ -530,7 +557,7 @@ where
             let _exempt = ExemptWrites::raise(&self.write_flags);
             store_cursor(&mut self.db, &author.key_id, cursor)?;
         }
-        Ok(())
+        self.courier_offer_stood(&author.key_id)
     }
 }
 

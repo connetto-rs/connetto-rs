@@ -8,6 +8,10 @@ mod cap_policies;
 
 mod catchup_cost;
 
+mod courier_offer;
+
+mod courier_restore;
+
 mod demo;
 
 mod fanout_counters;

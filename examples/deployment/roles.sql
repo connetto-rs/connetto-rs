@@ -2,7 +2,8 @@
 -- CONNETTO_READER_URL. Kept apart from schema.sql because that file also
 -- feeds CONNETTO_PG_DDL and the pg2sqlite translation in build.rs, which
 -- expect pure table DDL. Apply after schema.sql and after creating the
--- _connetto_writers, _connetto_settled and _connetto_session_writers writer tables.
+-- _connetto_writers, _connetto_settled, _connetto_session_writers and
+-- _connetto_courier_notices writer tables.
 DO $$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'connetto_reader') THEN
     CREATE ROLE connetto_reader LOGIN PASSWORD 'connetto_reader';
@@ -22,4 +23,6 @@ GRANT SELECT ON products TO connetto_reader;
 -- rows the reader role only reads and the notes it writes like the orders.
 GRANT SELECT ON team_members TO connetto_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON team_notes TO connetto_reader;
-GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, _connetto_session_writers TO connetto_reader;
+GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, _connetto_session_writers, _connetto_courier_notices TO connetto_reader;
+-- A couriered entry writes its notice row in the transaction that settles it.
+GRANT USAGE ON SEQUENCE _connetto_courier_notices_id_seq TO connetto_reader;

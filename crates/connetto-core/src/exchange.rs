@@ -100,6 +100,23 @@ pub struct Offer {
     pub retractions: Vec<Retraction>,
 }
 
+impl Offer {
+    /// The higher of the offer's signed `settled` and `newest` frontiers
+    /// (R78 decision 52), the head the courier's chain is verified to and
+    /// the bound its range runs to, `None` when the offer carries neither.
+    #[must_use]
+    pub fn frontier(&self) -> Option<&Frontier> {
+        self.newest
+            .as_ref()
+            .filter(|newest| {
+                self.settled
+                    .as_ref()
+                    .is_none_or(|settled| newest.seq > settled.seq)
+            })
+            .or(self.settled.as_ref())
+    }
+}
+
 /// An [`Offer`] with the device key's signature over
 /// [`offer_message`](crate::chain::offer_message), which rebuilds the
 /// signed bytes from the fields.
@@ -157,7 +174,7 @@ pub enum CourierRefusal {
     WriterRetired,
     /// The offer's signature does not verify against the author's key, or
     /// the rows above the writer's frontier do not chain from its head to
-    /// the offer's newest.
+    /// the offer's frontier.
     Unverified,
     /// The rows above the writer's frontier do not start right after it.
     SequenceGap {
@@ -199,4 +216,51 @@ pub enum CourierOutcome {
     /// under another entry, ruled refused `Forked`, whose chain the rest of
     /// the range no longer continues.
     Entries(Vec<(u64, CourierEntryOutcome)>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Frontier, Offer};
+
+    fn frontier(seq: u64, head: u8) -> Frontier {
+        Frontier {
+            seq,
+            head: [head; 32],
+        }
+    }
+
+    fn offer(settled: Option<Frontier>, newest: Option<Frontier>) -> Offer {
+        Offer {
+            builds: Vec::new(),
+            settled,
+            newest,
+            retractions: Vec::new(),
+        }
+    }
+
+    /// The frontier is the higher of the two signed frontiers, the newest
+    /// while it runs ahead, the settled when it does not, and neither when
+    /// the offer carries neither.
+    #[test]
+    fn the_frontier_is_the_higher_signed_one() {
+        assert!(offer(None, None).frontier().is_none());
+        assert_eq!(
+            offer(None, Some(frontier(4, 1))).frontier(),
+            Some(&frontier(4, 1))
+        );
+        assert_eq!(
+            offer(Some(frontier(4, 2)), None).frontier(),
+            Some(&frontier(4, 2))
+        );
+        assert_eq!(
+            offer(Some(frontier(2, 1)), Some(frontier(4, 2))).frontier(),
+            Some(&frontier(4, 2)),
+            "the newest runs ahead"
+        );
+        assert_eq!(
+            offer(Some(frontier(4, 1)), Some(frontier(2, 2))).frontier(),
+            Some(&frontier(4, 1)),
+            "the settled runs past the newest"
+        );
+    }
 }

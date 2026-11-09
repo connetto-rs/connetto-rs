@@ -42,8 +42,6 @@ enum Method {
 
 /// The backup half, taken while the server runs.
 const BASE_BACKUP: &str = "rm -rf /tmp/base && pg_basebackup -D /tmp/base -X stream -c fast";
-const DUMP: &str = "pg_dumpall --globals-only -f /tmp/globals.sql && \
-                    pg_dump -Fc -d postgres -f /tmp/db.dump";
 
 /// Recovery to the base backup's consistent point on the spare port.
 /// `restore_command` is required for targeted recovery, and every segment it
@@ -65,9 +63,6 @@ const RESTORE_INTO_FRESH: &str = "rm -rf /tmp/fresh && \
        -o \"-p 5433 -c listen_addresses='*' -c wal_level=logical -c fsync=off\" start && \
      psql -p 5433 -d postgres -q -f /tmp/globals.sql >/dev/null 2>&1 || true; \
      pg_restore -p 5433 -d postgres /tmp/db.dump";
-
-/// The dump restored over the cluster it came from.
-const RESTORE_INTO_SAME: &str = "pg_restore --clean --if-exists -d postgres /tmp/db.dump";
 
 /// The application launching on its replica.
 fn launch(ws: &str, db: &Path, token: &str) -> ChildGuard {
@@ -177,28 +172,19 @@ async fn restore(
     method: Method,
     primary_url: String,
 ) -> (String, i64, i64, String) {
-    let target_url = match method {
+    let (target_url, port_flag) = match method {
         Method::PointInTime => {
             fixture.shell(RECOVER_TO_BACKUP).await;
-            fixture.spare_url().to_owned()
+            (fixture.spare_url().to_owned(), "-p 5433")
         }
         Method::FreshCluster => {
             fixture.shell(RESTORE_INTO_FRESH).await;
-            fixture.spare_url().to_owned()
+            (fixture.spare_url().to_owned(), "-p 5433")
         }
         Method::SameCluster => {
-            fixture
-                .shell(&format!(
-                    "psql -d postgres -q -c \"SELECT pg_drop_replication_slot('{SLOT}')\""
-                ))
-                .await;
-            fixture.shell(RESTORE_INTO_SAME).await;
-            primary_url
+            fixture.restore_same_cluster().await;
+            (primary_url, "")
         }
-    };
-    let port_flag = match method {
-        Method::SameCluster => "",
-        Method::PointInTime | Method::FreshCluster => "-p 5433",
     };
     let read = |sql: &'static str| {
         let script = format!("psql {port_flag} -d postgres -At -c '{sql}'");
@@ -214,12 +200,19 @@ async fn restore(
     let slots = read("SELECT count(*) FROM pg_replication_slots").await;
     let timeline = read("SELECT timeline_id FROM pg_control_checkpoint()").await;
     let identifier = system_identifier(fixture, port_flag).await;
-    fixture
-        .shell(&format!(
-            "psql {port_flag} -d postgres -q -c \"SELECT pg_create_logical_replication_slot('{SLOT}', 'pgoutput')\" \
-             -c \"SELECT 1 FROM pg_publication WHERE pubname = '{PUBLICATION}'\""
-        ))
-        .await;
+    // The same-cluster restore recreated its own slot, so the two spare
+    // clusters alone wait for the operator's recreation.
+    match method {
+        Method::SameCluster => {}
+        Method::PointInTime | Method::FreshCluster => {
+            fixture
+                .shell(&format!(
+                    "psql {port_flag} -d postgres -q -c \"SELECT pg_create_logical_replication_slot('{SLOT}', 'pgoutput')\" \
+                     -c \"SELECT 1 FROM pg_publication WHERE pubname = '{PUBLICATION}'\""
+                ))
+                .await;
+        }
+    }
     (target_url, slots, timeline, identifier)
 }
 
@@ -247,12 +240,10 @@ async fn back_up_then_advance(
     stale: &str,
     db: &Path,
 ) -> (String, Vec<i32>) {
-    fixture
-        .shell(match method {
-            Method::PointInTime => BASE_BACKUP,
-            Method::FreshCluster | Method::SameCluster => DUMP,
-        })
-        .await;
+    match method {
+        Method::PointInTime => fixture.shell(BASE_BACKUP).await,
+        Method::FreshCluster | Method::SameCluster => fixture.dump_backup().await,
+    };
     insert_order(primary, 4).await;
     insert_order(primary, 5).await;
     let (status, rotated) = refresh(auth_base, &holder).await;
@@ -551,7 +542,7 @@ async fn a_restore_takes_a_retained_run_back_and_moves_unknown_numbers() {
     let a = launch_writing(&ws, &early, &token, &local_order(10));
     wait_for_server(&primary, &[10]).await;
     drop(a);
-    fixture.shell(DUMP).await;
+    fixture.dump_backup().await;
 
     // After the backup A settles order 11, and client B is issued its number
     // and settles order 20.
@@ -681,24 +672,14 @@ async fn authorization_facts_across_a_restore() {
     let (server, ports) = start_server(&auth_stack, secs, spawn).await;
     let alice_at_boot = authorization.await_tuples("alice").await;
 
-    fixture.shell(DUMP).await;
+    fixture.dump_backup().await;
     fixture
         .exec("INSERT INTO project_members VALUES (1, 'mallory')")
         .await;
     let mallory_granted = authorization.await_tuples("mallory").await;
 
     drop(server);
-    fixture
-        .shell(&format!(
-            "psql -d postgres -q -c \"SELECT pg_drop_replication_slot('{SLOT}')\""
-        ))
-        .await;
-    fixture.shell(RESTORE_INTO_SAME).await;
-    fixture
-        .shell(&format!(
-            "psql -d postgres -q -c \"SELECT pg_create_logical_replication_slot('{SLOT}', 'pgoutput')\""
-        ))
-        .await;
+    fixture.restore_same_cluster().await;
     let _server = restart_server(&auth_stack, ports, secs, spawn).await;
     tokio::time::sleep(Duration::from_secs(5)).await;
 

@@ -2541,6 +2541,56 @@ where
         state.conn.provisional_rows()
     }
 
+    /// The session's courier candidates, one per author with a stored offer
+    /// (R78 decision 16).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, and the
+    /// [`ClientError`] the read surfaces.
+    #[cfg(feature = "peer")]
+    pub async fn courier_candidates(&self) -> Result<Vec<crate::CourierCandidate>, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
+        state.conn.courier_candidates()
+    }
+
+    /// Courier the author's held rows to the server on the main wire (R78
+    /// decision 48), the range sent or queued by the connection and the
+    /// report settled by the pump.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CourierError::Client`] while the gate is locked or the
+    /// author's key is not 32 bytes, and the [`crate::CourierError`] the range
+    /// or its settlement surfaces.
+    #[cfg(feature = "peer")]
+    pub async fn courier(
+        &self,
+        author: &[u8],
+    ) -> Result<crate::CourierReport, crate::CourierError> {
+        let wait: crate::CourierWait;
+        {
+            let mut state = self.shared.lock_interrupting().await;
+            if self.shared.gate.is_locked() {
+                return Err(crate::CourierError::Client(ClientError::Locked));
+            }
+            let author: [u8; 32] = author.try_into().map_err(|_| {
+                crate::CourierError::Client(ClientError::Session(
+                    "an author key must be 32 bytes".to_owned(),
+                ))
+            })?;
+            wait = state.conn.courier(author).await?;
+        }
+        self.shared.wake.notify_one();
+        tokio::time::timeout(wait.bound, wait.receiver)
+            .await
+            .map_err(|_| crate::CourierError::TimedOut)?
+            .unwrap_or_else(|_| Err(crate::CourierError::SessionLost))
+    }
+
     /// Run a closure against the shared connection: one-off diesel reads and
     /// captured writes. Local writes committed here are auto-submitted by the
     /// pump's next flush, and any live query reading the written tables
@@ -3112,6 +3162,8 @@ async fn pump<T, F, S>(
     let mut key_timer = None;
     // The drain's owed dial retains its sleep across pump steps.
     let mut drain = None;
+    // The courier's owed dial retains its sleep across pump steps.
+    let mut courier_drain = None;
     loop {
         if alive.upgrade().is_none() {
             pump_exit(&shared).await;
@@ -3203,16 +3255,25 @@ async fn pump<T, F, S>(
                 .zip(reconnect.as_mut())
                 .map(|(timer, driver)| (timer, Box::pin(driver.sleeper.sleep(timer.wait()))));
         }
+        #[cfg(feature = "peer")]
+        let courier_owed = state.conn.courier_drain_timer();
+        #[cfg(feature = "peer")]
+        if courier_owed != courier_drain.as_ref().map(|(timer, _)| *timer) {
+            courier_drain = courier_owed
+                .zip(reconnect.as_mut())
+                .map(|(timer, driver)| (timer, Box::pin(driver.sleeper.sleep(timer.wait()))));
+        }
         // Drive the gate's prompt, if one is pending, alongside the frame wait.
         let mut ask = shared.gate.take_ask();
         let mut ask_outcome = None;
-        let (stepped, drain_due) = step_or_resend_or_keepalive(
+        let (stepped, drain_due, courier_due) = step_or_resend_or_keepalive(
             &mut state.conn,
             &shared.wake,
             &mut resend,
             &mut keepalive,
             &mut key_timer,
             &mut drain,
+            &mut courier_drain,
             &mut ask,
             &mut ask_outcome,
         )
@@ -3263,18 +3324,105 @@ async fn pump<T, F, S>(
 
         // The drain's dial fell due. Dialed outside the state lock, like a
         // reconnect, and handed over under it.
+        let mut drain_owed = None;
         if drain_due && let Some((timer, _)) = drain.take() {
+            drain_owed = Some(timer);
+        }
+        #[cfg(feature = "peer")]
+        let mut courier_owed = None;
+        #[cfg(feature = "peer")]
+        if courier_due && let Some((timer, _)) = courier_drain.take() {
+            courier_owed = Some(timer);
+        }
+        #[cfg(feature = "peer")]
+        let dial_now = drain_owed.is_some() || courier_owed.is_some();
+        #[cfg(not(feature = "peer"))]
+        let dial_now = drain_owed.is_some();
+        if dial_now {
             drop(state);
-            dial_drain_owed(&shared, &mut reconnect, timer).await;
+        }
+        if let Some(timer) = drain_owed {
+            dial_owed(&shared, &mut reconnect, OwedWire::Drain, timer).await;
+        }
+        #[cfg(feature = "peer")]
+        if let Some(timer) = courier_owed {
+            dial_owed(&shared, &mut reconnect, OwedWire::Courier, timer).await;
+        }
+        #[cfg(not(feature = "peer"))]
+        let _ = courier_due;
+    }
+}
+
+/// The wire an owed dial dials, its attach and back-off named by kind.
+#[derive(Clone, Copy)]
+enum OwedWire {
+    /// The drain wire its dial has fallen due.
+    Drain,
+    /// The courier wire its dial has fallen due (R78 decision 47).
+    #[cfg(feature = "peer")]
+    Courier,
+}
+
+impl OwedWire {
+    /// The log line the wire's failed attach stands under.
+    const fn attach_log(self) -> &'static str {
+        match self {
+            OwedWire::Drain => "attaching the drain failed",
+            #[cfg(feature = "peer")]
+            OwedWire::Courier => "attaching the courier wire failed",
+        }
+    }
+
+    /// The log line the wire's failed dial stands under.
+    const fn dial_failed_log(self) -> &'static str {
+        match self {
+            OwedWire::Drain => "dialing the drain failed, backing off",
+            #[cfg(feature = "peer")]
+            OwedWire::Courier => "dialing the courier wire failed, backing off",
+        }
+    }
+
+    /// Attach a fresh `transport` to the wire, or report a failed dial to
+    /// its back-off.
+    async fn attach_or_back_off<E, T>(
+        self,
+        conn: &mut ConnettoConnection<T>,
+        timer: DrainTimer,
+        dialed: Result<T, E>,
+    ) where
+        T: Transport,
+        T::Error: core::fmt::Display,
+        E: core::fmt::Display,
+    {
+        match dialed {
+            Ok(transport) => {
+                let outcome = match self {
+                    OwedWire::Drain => conn.attach_drain(timer, transport).await,
+                    #[cfg(feature = "peer")]
+                    OwedWire::Courier => conn.attach_courier_drain(timer, transport).await,
+                };
+                if let Err(err) = outcome {
+                    tracing::warn!(error = %err, "{}", self.attach_log());
+                }
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "{}", self.dial_failed_log());
+                match self {
+                    OwedWire::Drain => conn.drain_dial_failed(timer),
+                    #[cfg(feature = "peer")]
+                    OwedWire::Courier => conn.courier_drain_dial_failed(timer),
+                }
+            }
         }
     }
 }
 
-/// Dials the drain wire its dial has fallen due, attaching the held major
-/// over the fresh transport (R31).
-async fn dial_drain_owed<T, F, S>(
+/// Dials the wire its dial has fallen due over the reconnect driver's
+/// factory, the fresh transport handed to the wire's attach (R31).
+async fn dial_owed<T, F, S>(
     shared: &Shared<T>,
     reconnect: &mut Option<ReconnectDriver<F, S>>,
+    wire: OwedWire,
     timer: DrainTimer,
 ) where
     T: Transport + MaybeSend + 'static,
@@ -3287,17 +3435,8 @@ async fn dial_drain_owed<T, F, S>(
     };
     let dialed = driver.factory.connect().await;
     let mut state = shared.state.lock().await;
-    match dialed {
-        Ok(transport) => {
-            if let Err(err) = state.conn.attach_drain(timer, transport).await {
-                tracing::warn!(error = %err, "attaching the drain failed");
-            }
-        }
-        Err(err) => {
-            tracing::debug!(error = %err, "dialing the drain failed, backing off");
-            state.conn.drain_dial_failed(timer);
-        }
-    }
+    wire.attach_or_back_off(&mut state.conn, timer, dialed)
+        .await;
 }
 
 /// The running client as the enrolment task sees it.
@@ -3893,9 +4032,10 @@ async fn step_or_resend_or_keepalive<T, F, G>(
     keepalive: &mut Option<(KeepaliveTimer, core::pin::Pin<Box<F>>)>,
     key_timer: &mut Option<(ShareKeyTimer, KeySleep)>,
     drain: &mut Option<(DrainTimer, core::pin::Pin<Box<G>>)>,
+    courier_drain: &mut Option<(DrainTimer, core::pin::Pin<Box<G>>)>,
     ask: &mut Option<GateAskFuture>,
     ask_outcome: &mut Option<GateAskOutcome>,
-) -> (Result<Option<ClientEvent>, ClientError>, bool)
+) -> (Result<Option<ClientEvent>, ClientError>, bool, bool)
 where
     T: Transport,
     T::Error: core::fmt::Display,
@@ -3906,6 +4046,7 @@ where
     let ka_due = AtomicBool::new(false);
     let key_due = AtomicBool::new(false);
     let drain_due = AtomicBool::new(false);
+    let courier_due = AtomicBool::new(false);
     let cancel = async {
         tokio::select! {
             biased;
@@ -3914,6 +4055,7 @@ where
             () = wait_timer(keepalive) => ka_due.store(true, Ordering::Relaxed),
             () = wait_timer(key_timer) => key_due.store(true, Ordering::Relaxed),
             () = wait_timer(drain) => drain_due.store(true, Ordering::Relaxed),
+            () = wait_timer(courier_drain) => courier_due.store(true, Ordering::Relaxed),
             outcome = async {
                 match ask.as_mut() {
                     Some(ask) => ask.as_mut().await,
@@ -3930,15 +4072,19 @@ where
         && let Some((timer, _)) = resend.take()
         && let Err(err) = conn.resend_deferred(timer).await
     {
-        return (Err(err), false);
+        return (Err(err), false, false);
     }
     if ka_due.load(Ordering::Relaxed)
         && let Some((timer, _)) = keepalive.take()
         && let Err(err) = conn.keepalive_fire(timer).await
     {
-        return (Err(err), false);
+        return (Err(err), false, false);
     }
-    (stepped, drain_due.load(Ordering::Relaxed))
+    (
+        stepped,
+        drain_due.load(Ordering::Relaxed),
+        courier_due.load(Ordering::Relaxed),
+    )
 }
 
 /// Fan out the aggregate pushes a lock held, then re-run every live query
