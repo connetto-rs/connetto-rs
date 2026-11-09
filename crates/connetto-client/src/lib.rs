@@ -4708,6 +4708,9 @@ struct ProvisionalAsk {
     offer: Vec<u8>,
     /// The sequences asked about, at most one manifest frame's rows.
     seqs: Vec<u64>,
+    /// Whether the ask is the resync's one about the retained rows (R78
+    /// decision 49), whose answers clear the owed row.
+    retained: bool,
 }
 
 /// The ask sent and awaited, its id in the sent map, with the deadline its
@@ -4835,6 +4838,12 @@ struct CourierQueue {
     /// The sequences the server ruled Pending on, the candidates' last
     /// ruling.
     heard: BTreeMap<[u8; 32], BTreeSet<u64>>,
+    /// The retained rows the session's asks answered Pending, beside the
+    /// other candidates until a ruling names them (R78 decisions 45 and 49).
+    marked: BTreeMap<[u8; 32], BTreeSet<u64>>,
+    /// The ids of the retained asks the session owes an answer for, which
+    /// keep the owed row standing (R78 decision 49).
+    retained_awaiting: BTreeSet<String>,
     /// The candidates last raised, author by author.
     raised: BTreeMap<[u8; 32], CourierCandidate>,
 }
@@ -5179,6 +5188,7 @@ fn install_replica_metadata(
         let now = crate::clock::now_secs(db)?;
         peer::upgrade_entries(db)?;
         db.batch_execute(peer::PEER_ENTRY_DDL)?;
+        db.batch_execute(peer::RETAINED_ASK_DDL)?;
         db.batch_execute(author::RETRACTION_DDL)?;
         exchange::upgrade_cursors(db, now)?;
         db.batch_execute(exchange::PEER_CURSOR_DDL)?;
@@ -5840,13 +5850,14 @@ where
         }
         self.flush_writer_tasks().await?;
         self.resume_attach().await?;
-        // The session's asks go out once the replay stands, one per author.
-        #[cfg(feature = "peer")]
-        self.plan_provisional_asks().await?;
         // The deployment's courier path stands from the ack, the session's
         // ranges, exclusions and candidates fresh (R78 decision 1).
         #[cfg(feature = "peer")]
         self.reset_courier_state(ack.courier);
+        // The session's asks go out once the replay stands, one per author,
+        // the resync's retained ones beside them when the row owes them.
+        #[cfg(feature = "peer")]
+        self.plan_provisional_asks().await?;
         Ok(())
     }
 
@@ -6343,10 +6354,60 @@ where
                     request_id: provisional_request_id(),
                     offer: offer.clone(),
                     seqs: chunk.to_vec(),
+                    retained: false,
                 });
             }
         }
+        // A restart that left the resync's asks owed re-asks the retained
+        // rows after these (R78 decision 49).
+        if peer::retained_ask_owed(&mut self.db)? && !self.plan_retained_asks()? {
+            // No retained row stands to ask, so the owed row answers at once.
+            peer::clear_retained_ask(&mut self.db)?;
+        }
         self.flush_provisional_asks().await
+    }
+
+    /// Queue the resync's asks about the authors' retained rows, one per
+    /// manifest frame of an author's sequences (R78 decision 49), reporting
+    /// whether an ask stands.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows or the offers cannot be read.
+    #[cfg(feature = "peer")]
+    fn plan_retained_asks(&mut self) -> Result<bool, ClientError> {
+        let mut by_author: BTreeMap<Vec<u8>, Vec<i64>> = BTreeMap::new();
+        for (author, seq) in peer::retained_rows(&mut self.db)? {
+            by_author.entry(author).or_default().push(seq);
+        }
+        let mut asked = false;
+        for (author, mut seqs) in by_author {
+            let Ok(key) = <[u8; 32]>::try_from(author.as_slice()) else {
+                continue;
+            };
+            let Some(offer) = exchange::offer_of(&mut self.db, &key)? else {
+                continue;
+            };
+            seqs.sort_unstable();
+            seqs.dedup();
+            let seqs: Vec<u64> = seqs
+                .into_iter()
+                .map(|seq| u64::try_from(seq).unwrap_or(u64::MAX))
+                .collect();
+            for chunk in seqs.chunks(connetto_core::exchange::MAX_MANIFEST_ROWS) {
+                let request_id = provisional_request_id();
+                self.provisional.pending.push_back(ProvisionalAsk {
+                    author: key,
+                    request_id: request_id.clone(),
+                    offer: offer.clone(),
+                    seqs: chunk.to_vec(),
+                    retained: true,
+                });
+                self.courier.retained_awaiting.insert(request_id);
+                asked = true;
+            }
+        }
+        Ok(asked)
     }
 
     /// Send the next queued provisional ask, one at a time, and register it
@@ -6458,6 +6519,7 @@ where
             }));
         };
         let author = sent.author;
+        let retained = sent.retained;
         let mut applied = false;
         for (seq, verdict) in &answer.verdicts {
             if self.settle_verdict_row(&author, *seq, verdict)? {
@@ -6465,7 +6527,21 @@ where
                 if matches!(verdict, connetto_core::exchange::Verdict::Pending) {
                     self.courier.heard.entry(author).or_default().insert(*seq);
                 }
+                continue;
             }
+            if retained
+                && matches!(verdict, connetto_core::exchange::Verdict::Pending)
+                && self.courier.marked.entry(author).or_default().insert(*seq)
+            {
+                self.courier.heard.entry(author).or_default().insert(*seq);
+                applied = true;
+            }
+        }
+        if retained
+            && self.courier.retained_awaiting.remove(&answer.request_id)
+            && self.courier.retained_awaiting.is_empty()
+        {
+            peer::clear_retained_ask(&mut self.db)?;
         }
         // A ruling stands for the author, so its rows wait no longer for one
         // held back by a courier refusal (R78 slice 4).
@@ -6540,7 +6616,46 @@ where
             }
             peer::retain(db, author, seq)?;
             peer::prune_retained(db)
-        })
+        })?;
+        self.settle_pruned_marks()
+    }
+
+    /// The retention pass may have taken a marked retained row, so its mark
+    /// drops and the author's candidates restate (R78 slice 4).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows or the stored offer cannot be read.
+    #[cfg(feature = "peer")]
+    fn settle_pruned_marks(&mut self) -> Result<(), ClientError> {
+        if self.courier.marked.is_empty() {
+            return Ok(());
+        }
+        let authors: Vec<[u8; 32]> = self.courier.marked.keys().copied().collect();
+        for author in authors {
+            let marked: Vec<u64> = self.courier.marked[&author].iter().copied().collect();
+            let mut dropped = false;
+            for seq in marked {
+                if peer::state_of(
+                    &mut self.db,
+                    &author,
+                    i64::try_from(seq).unwrap_or(i64::MAX),
+                )?
+                .is_none()
+                {
+                    self.courier
+                        .marked
+                        .get_mut(&author)
+                        .expect("the mark stood")
+                        .remove(&seq);
+                    dropped = true;
+                }
+            }
+            if dropped {
+                self.raise_courier_candidates_if_changed(author)?;
+            }
+        }
+        Ok(())
     }
 
     /// The session's courier state stands fresh from the attach's flag
@@ -6552,6 +6667,8 @@ where
         self.courier.queued.clear();
         self.courier.excluded.clear();
         self.courier.heard.clear();
+        self.courier.marked.clear();
+        self.courier.retained_awaiting.clear();
         self.courier.raised.clear();
     }
 
@@ -6569,6 +6686,15 @@ where
         seq: u64,
         verdict: &connetto_core::exchange::Verdict,
     ) -> Result<bool, ClientError> {
+        // A retained row the session's asks answered Pending ends its
+        // candidacy on whatever ruling names it, staying retained (R78
+        // decisions 44 and 45).
+        if let Ok(key) = <[u8; 32]>::try_from(author)
+            && let Some(mark) = self.courier.marked.get_mut(&key)
+            && mark.remove(&seq)
+        {
+            return Ok(true);
+        }
         if !self.seq_awaits_verdict(author, seq)? {
             return Ok(false);
         }
@@ -6634,7 +6760,12 @@ where
         let newest = signed.offer.newest.map_or(i64::MAX, |frontier| {
             i64::try_from(frontier.seq).unwrap_or(i64::MAX)
         });
-        let held = peer::held_at_or_below(&mut self.db, &author, newest)?;
+        let marked: Option<Vec<i64>> = self.courier.marked.get(&author).map(|rows| {
+            rows.iter()
+                .map(|seq| i64::try_from(*seq).unwrap_or(i64::MAX))
+                .collect()
+        });
+        let held = peer::held_at_or_below(&mut self.db, &author, newest, marked)?;
         Ok(Some((
             account,
             Self::range_rows(offer, held, self.config.schema_major),
@@ -7058,6 +7189,7 @@ where
                 }
                 let _exempt = ExemptWrites::raise(&self.write_flags);
                 peer::drop_courier_rows(&mut self.db, author)?;
+                self.courier.marked.remove(author);
                 self.courier
                     .excluded
                     .insert(*author, CourierExclusion::NextRuling);
@@ -7881,6 +8013,8 @@ where
             self.courier.enabled = false;
             self.courier.excluded.clear();
             self.courier.heard.clear();
+            self.courier.marked.clear();
+            self.courier.retained_awaiting.clear();
             self.courier.raised.clear();
         }
         #[cfg(feature = "device-identity")]
@@ -9226,7 +9360,8 @@ where
                 peer::retain(db, &held.author, held.seq)?;
             }
             peer::prune_retained(db)
-        })
+        })?;
+        self.settle_pruned_marks()
     }
 
     /// Re-apply the stored peer entries after a resync's replacement
@@ -10829,6 +10964,14 @@ where
                     // notices released and nothing took back go now.
                     if self.resyncing.is_empty() {
                         self.pass_released()?;
+                        // A restored server may hold retained rows Pending (R78 decision 49).
+                        // An ask this session still awaits an answer for is not
+                        // restated under fresh request ids.
+                        #[cfg(feature = "peer")]
+                        if self.courier.retained_awaiting.is_empty() && self.plan_retained_asks()? {
+                            peer::owe_retained_ask(&mut self.db)?;
+                            self.flush_provisional_asks().await?;
+                        }
                     }
                     // The stored peer entries go back ahead of the receiver's
                     // own unsent writes, in their append-position order (R77
