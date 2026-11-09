@@ -48,7 +48,7 @@ const MINUTE: Duration = Duration::from_mins(1);
 const ALICE: &str = "alice";
 
 #[derive(Default)]
-struct Memory(Mutex<HashMap<String, String>>);
+pub(crate) struct Memory(pub(crate) Mutex<HashMap<String, String>>);
 
 impl KeyRecords for Memory {
     fn read(&self, name: &str) -> impl Future<Output = Result<Option<String>, ClientError>> + Send {
@@ -317,7 +317,7 @@ fn evidence() -> DeviceAttestation {
 }
 
 /// A real ring key and the PKCS #8 bytes the fake store reopens.
-fn attesting_key() -> (AttestingKey, Vec<u8>) {
+pub(crate) fn attesting_key() -> (AttestingKey, Vec<u8>) {
     let rng = SystemRandom::new();
     let der = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
         .expect("the key generates");
@@ -328,7 +328,7 @@ fn attesting_key() -> (AttestingKey, Vec<u8>) {
 }
 
 /// A key that signs with ring and offers Android-style evidence.
-struct AttestingKey {
+pub(crate) struct AttestingKey {
     pair: EcdsaKeyPair,
     point: [u8; 65],
     rng: SystemRandom,
@@ -370,8 +370,8 @@ impl DeviceKey for AttestingKey {
 }
 
 /// The keys the run opens, always the same attesting key.
-struct RunKeys {
-    der: Vec<u8>,
+pub(crate) struct RunKeys {
+    pub(crate) der: Vec<u8>,
 }
 
 impl DeviceKeys for RunKeys {
