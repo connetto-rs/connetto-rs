@@ -2,9 +2,9 @@
 //! sweep (R75, R78 slice 1a).
 //!
 //! A courier presents one author's stored offer, the manifest rows it holds up
-//! to the offer's newest entry and the bodies of those rows it holds. The rows
+//! to the offer's frontier and the bodies of those rows it holds. The rows
 //! above the writer's frontier recompute the author's chain from the writer's
-//! head to the offer's signed newest head, which binds every entry's major and
+//! head to the offer's frontier head, which binds every entry's major and
 //! provenance original, so a courier can neither forge nor relabel an entry.
 //! Rows at or below the frontier are answered with the verdict a provisional
 //! ask gives, and the rows above it settle in order under the author's account
@@ -382,6 +382,19 @@ pub(super) fn offer(key: &KeyPair, key_id: [u8; 32], newest: Frontier) -> Vec<u8
         builds: Vec::new(),
         settled: None,
         newest: Some(newest),
+        retractions: Vec::new(),
+    };
+    let signature = sign(key, &offer_message(&key_id, &offer));
+    rmp_serde::to_vec_named(&SignedOffer { offer, signature }).expect("an offer encodes")
+}
+
+/// The offer of a fully synced author, naming only `settled`, that `key`
+/// signs.
+pub(super) fn settled_offer(key: &KeyPair, key_id: [u8; 32], settled: &Frontier) -> Vec<u8> {
+    let offer = Offer {
+        builds: Vec::new(),
+        settled: Some(settled.clone()),
+        newest: None,
         retractions: Vec::new(),
     };
     let signature = sign(key, &offer_message(&key_id, &offer));
@@ -920,9 +933,167 @@ async fn a_forged_offer_is_refused_before_anything_settles() {
     assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
 }
 
+/// The settled-only offer of a fully synced author stands beside a
+/// frontier-2 writer, its first two entries standing under direct records.
+async fn settled_camp(
+    manager: &Manager,
+    fixture: &Fixture,
+    store: &Enrolments,
+) -> ((KeyPair, [u8; 32]), i64, Chain) {
+    let (key, key_id) = store.enrol("alice", tomorrow()).await;
+    let range = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+        plain(insert_changeset(4, "four", "t3")),
+    ]);
+    // The server stands the first two entries under direct records, the
+    // author's queue empty since, so its offer names settled 3 and no
+    // newest.
+    settle_directly(
+        manager,
+        "alice",
+        &key,
+        key_id,
+        vec![
+            range.bodies[0].changeset.clone(),
+            range.bodies[1].changeset.clone(),
+        ],
+    )
+    .await;
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    assert_eq!(writer_facts(fixture.admin(), writer).await.frontier, 2);
+    ((key, key_id), writer, range)
+}
+
+/// A settled-only offer whose rows run past the settled bound is malformed,
+/// and one whose settled head the chain does not recompute to is unverified,
+/// settling nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_bounded_range_past_the_bound_or_forged_is_refused() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let ((key, key_id), writer, range) = settled_camp(&manager, &fixture, &store).await;
+    let author = KeyId::from_bytes(key_id);
+
+    // Rows past the settled bound are malformed.
+    let settled = Frontier {
+        seq: 3,
+        head: range.head(3),
+    };
+    let longer = chain(vec![
+        plain(insert_changeset(2, "two", "t1")),
+        plain(insert_changeset(3, "three", "t2")),
+        plain(insert_changeset(4, "four", "t3")),
+        plain(insert_changeset(5, "five", "t4")),
+    ]);
+    assert_eq!(
+        manager
+            .courier_deliver(
+                courier_caller("bob"),
+                author,
+                Some(major()),
+                &settled_offer(&key, key_id, &settled),
+                &longer.rows,
+                &longer.bodies,
+            )
+            .await
+            .expect("deliver the range"),
+        CourierOutcome::Refused(CourierRefusal::Malformed),
+        "rows past the offer's settled"
+    );
+    // A settled head the chain does not recompute to is unverified.
+    let forged = Frontier {
+        seq: 3,
+        head: range.head(2),
+    };
+    assert_eq!(
+        manager
+            .courier_deliver(
+                courier_caller("bob"),
+                author,
+                Some(major()),
+                &settled_offer(&key, key_id, &forged),
+                &range.rows,
+                &range.bodies,
+            )
+            .await
+            .expect("deliver the range"),
+        CourierOutcome::Refused(CourierRefusal::Unverified),
+        "a forged settled head"
+    );
+    assert_eq!(
+        writer_facts(fixture.admin(), writer).await.frontier,
+        2,
+        "the refusals settle nothing"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "two", "t1"),
+            note(3, "three", "t2"),
+        ],
+        "the refusals apply nothing more"
+    );
+}
+
+/// A range bounded by the offer's settled frontier alone, the author's
+/// queue empty, verifies to the settled head and settles: the rows at or
+/// below the writer's frontier answer from their records, and the rows
+/// above it chain from the writer's head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_range_bounded_by_the_settled_frontier_verifies_and_settles() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let store = Enrolments::new();
+    let (_captured, manager) = courier_manager(&fixture, &store);
+    let ((key, key_id), writer, range) = settled_camp(&manager, &fixture, &store).await;
+    let author = KeyId::from_bytes(key_id);
+    let settled = Frontier {
+        seq: 3,
+        head: range.head(3),
+    };
+
+    assert_eq!(
+        manager
+            .courier_deliver(
+                courier_caller("bob"),
+                author,
+                Some(major()),
+                &settled_offer(&key, key_id, &settled),
+                &range.rows,
+                &range.bodies,
+            )
+            .await
+            .expect("deliver the range"),
+        CourierOutcome::Entries(vec![
+            ruled(1, Verdict::Applied),
+            ruled(2, Verdict::Applied),
+            applied(3),
+        ]),
+        "the settled bound verifies and settles"
+    );
+    assert_eq!(
+        writer_facts(fixture.admin(), writer).await.frontier,
+        3,
+        "the row above the frontier settled"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "two", "t1"),
+            note(3, "three", "t2"),
+            note(4, "four", "t3"),
+        ]
+    );
+}
+
 /// A range that does not hold together is refused malformed before anything
 /// settles: an offer that does not decode, rows that skip a sequence or run
-/// past the offer's newest, and more bodies than rows.
+/// past the offer's frontier, and more bodies than rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_malformed_range_is_refused_before_anything_settles() {
     let fixture = Fixture::acquire().await;
