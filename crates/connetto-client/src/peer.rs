@@ -178,6 +178,20 @@ pub(crate) struct Held {
     pub(crate) state: HeldState,
 }
 
+/// One held row the courier offers, as its range stands it (R78 slice 4).
+pub(crate) struct HeldRow {
+    /// The author's queue sequence.
+    pub(crate) seq: i64,
+    /// The major the entry was captured under.
+    pub(crate) major: connetto_core::Major,
+    /// The entry's original writer, when it carries one.
+    pub(crate) origin: Option<connetto_core::exchange::Origin>,
+    /// The hash of the entry's body.
+    pub(crate) digest: [u8; 32],
+    /// The entry's body, absent for a digest-only entry.
+    pub(crate) changeset: Option<Vec<u8>>,
+}
+
 #[derive(diesel::Queryable)]
 struct StoredEntry {
     author: Vec<u8>,
@@ -325,6 +339,87 @@ pub(crate) fn unapplied(db: &mut SqliteConnection) -> Result<Vec<(Vec<u8>, i64)>
         .select((dsl::author, dsl::seq))
         .filter(dsl::state.eq_any([HeldState::CourierOnly.db(), HeldState::DigestOnly.db()]))
         .load(db)?)
+}
+
+/// The author's held rows at or below a sequence, which the courier's range
+/// stands (R78 slice 4), sequence order, a retained row never among them.
+///
+/// # Errors
+///
+/// [`ClientError`] when a stored row holds a major the build cannot express,
+/// a state no held row stores, an unreadable origin or a digest of another
+/// length.
+pub(crate) fn held_at_or_below(
+    db: &mut SqliteConnection,
+    author: &[u8],
+    seq: i64,
+) -> Result<Vec<HeldRow>, ClientError> {
+    type Row = (i64, i64, i64, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>);
+    let rows: Vec<Row> = dsl::_connetto_peer_entry
+        .select((
+            dsl::seq,
+            dsl::major,
+            dsl::state,
+            dsl::origin,
+            dsl::digest,
+            dsl::changeset,
+        ))
+        .filter(dsl::author.eq(author))
+        .filter(dsl::seq.le(seq))
+        .filter(dsl::state.ne(HeldState::Retained.db()))
+        .order(dsl::seq.asc())
+        .load(db)?;
+    rows.into_iter()
+        .map(|(seq, major, state, origin, digest, changeset)| {
+            let corrupt = |what: &str| {
+                ClientError::Session(format!(
+                    "the held peer entry at sequence {seq} holds {what}"
+                ))
+            };
+            let major = u32::try_from(major)
+                .ok()
+                .and_then(connetto_core::Major::new)
+                .ok_or_else(|| corrupt("a major the build cannot express"))?;
+            HeldState::from_db(state).map_err(|_| corrupt("no held state"))?;
+            let origin = origin
+                .as_deref()
+                .map(rmp_serde::from_slice)
+                .transpose()
+                .map_err(|_| corrupt("an unreadable origin"))?;
+            let digest =
+                <[u8; 32]>::try_from(digest.as_slice()).map_err(|_| corrupt("no digest"))?;
+            Ok(HeldRow {
+                seq,
+                major,
+                origin,
+                digest,
+                changeset,
+            })
+        })
+        .collect()
+}
+
+/// The author's rows a courier offered, gone with the server's refusal that
+/// takes them (R78 slice 4).
+///
+/// # Errors
+///
+/// [`ClientError`] when the rows cannot be written.
+pub(crate) fn drop_courier_rows(
+    db: &mut SqliteConnection,
+    author: &[u8],
+) -> Result<(), ClientError> {
+    diesel::delete(
+        dsl::_connetto_peer_entry
+            .filter(dsl::author.eq(author))
+            .filter(dsl::state.eq_any([
+                HeldState::CourierOnly.db(),
+                HeldState::DigestOnly.db(),
+                HeldState::Retained.db(),
+            ])),
+    )
+    .execute(db)?;
+    Ok(())
 }
 
 /// Every provisional entry, position order, the resync's re-apply and the
