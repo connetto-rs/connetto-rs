@@ -72,6 +72,7 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | [R110](#r110-a-session-bound-by-provider-staleness) | not started |  | Session lifetime bounded by the time since the identity provider last confirmed the user, replacing the fixed idle window and ceiling |  |  |
 | [R111](#r111-a-durable-replica-where-opfs-is-refused) | blocked | the JSPI IndexedDB VFS upstream in `sqlite-wasm-rs` | A durable browser replica on IndexedDB through JSPI where OPFS is refused, memory kept only where JSPI is missing |  |  |
 | [R112](#r112-an-apple-peer-to-peer-link) | not started |  | A link between Apple devices over Apple's peer-to-peer Wi-Fi, for an all-Apple group with no hotspot host and no shared network, after its gate run and open points |  |  |
+| [R113](#r113-tests-that-wait-on-events) | blocked | Refreshed dependency graph | CI-backed sequential test and event-hook fixes, ranked by downstream impact and observed flakiness, with targeted repetition only | | |
 | [R21](#r21-one-page-codec-on-both-backends) | in progress |  | Slices 2 to 5, the browser on `sqlite-wasm-rs` 0.6 and then on SQLCipher, one open contract, the capability and hardening proof, and SQLCipher 4.20.0 |  | [#402](https://github.com/connetto-rs/connetto-rs/pull/402) |
 | R0 | done | | The always-on change-path counters in `counters.rs` and the `fanout_load` harness that priced the dispatch loop, with the ceiling measured as one sequential visibility round trip per subscriber per event and the lock wait at zero | [fanout_counters.rs](../crates/connetto-test-harness/tests/it/fanout_counters.rs), [fanout_load.rs](../crates/connetto-test-harness/tests/it/fanout_load.rs) | |
 | R1 | done | | The three permissive stand-ins reachable from configuration alone are gone, and the reference binary refuses to start without a reader role and a recognised `CONNETTO_OIDC_PROVIDER` | [e2e.rs](../crates/connetto-server/tests/it/e2e.rs) | |
@@ -1717,6 +1718,57 @@ An iPhone, an iPad and a Mac with mobile data off and no shared network discover
 ### Done when
 
 An all-Apple group with no hotspot host and no shared Wi-Fi links and syncs offline.
+
+---
+
+## R113: tests that wait on events
+
+**Status.** CI evidence collected. Implementation blocked by the refreshed dependency graph.
+
+**Dependencies.** R78 owns the courier restore and retired-writer proofs. R113 proceeds independently outside those files.
+
+**Changes state.** Client tables, none. Server tables, none. Wire messages, none planned, and a missing hook that needs one names it in its own slice. Archive format, none.
+
+### Purpose
+
+A wait that synchronises on time assumes the machine is fast enough. It passes on an idle machine and fails under load, so it merges green and returns as a flake, as the R78 courier proofs did once the CI runners and the local machine were busy. An event says the state was reached at the moment it was reached. This phase moves every wait onto an event hook wherever one exists or can be built, so timing flakes cannot happen by construction.
+
+A first heuristic pass over `main` at 7cffaf2d5 found about 270 sleeps in code following a `#[cfg(test)]` line or under `tests`, across about 90 files, sorted by the code around each into fixed sleeps, polls until a deadline, polls with no deadline and fixed windows asserting that nothing happened. Those counts are candidates. Some sites are product timers sitting below a test module, and slice 1 establishes the verified baseline. The shared harness helpers `wait_roster`, `wait_unsynced_empty` and `assert_bodies` poll, and every end-to-end proof since R77 copies them.
+
+### Rules
+
+1. **A wait listens to the event that signals its state**, subscribed before the action that causes it, through the client's event stream, a live query, the awaited action or a process exit.
+2. **A state with no event is a finding.** The slice names the state, the code that changes it and the hook that would expose it, and the hook is one a consumer of the API can use, never a test-only seam. Server-side changes reach clients through subql.
+3. **A bound stays on every event wait as failure detection only**, so a broken run fails instead of hanging.
+4. **A timer wait stays only where time is the subject**, a product backoff, keepalive or throttle, a test of one on a paused clock where the test runs in process, a silence assertion bounded by the change it is about, or an external system with no notification, each with its reason at the site.
+
+### Slices
+
+Each candidate below is a separate pull request, investigated and completed before starting the next. A candidate already corrected on `main` leaves the queue. Each pull request contains only its consumer-usable hook, affected callers, one test migration and required API documentation. Open it after its checks pass. Dependent fixes stack on the preceding branch, independent fixes start from `main`.
+
+1. **Live column updates.** `column_subset::a_left_out_column_matches_the_server` protects replica freshness. Two failures in the sampled CI runs, [41912933385](https://github.com/connetto-rs/connetto-rs/actions/runs/41912933385) and [41912925956](https://github.com/connetto-rs/connetto-rs/actions/runs/41912925956). The test drives the pump in 500 ms windows. First establish whether the historical missing update remains possible.
+2. **Writes with invisible parents.** `synced_references::a_child_whose_parent_is_invisible_lands_and_uploads` protects writes through row-level security. Two failures in the same sampled runs. It already waits on events, so identify the missing producer or ordering contract before changing its wait.
+3. **Revocation across reconnect.** `enrolment::tests::a_revoked_device_stays_spectator_when_its_pump_says_connected_again` protects device-key revocation. One failure in [42350971834](https://github.com/connetto-rs/connetto-rs/actions/runs/42350971834). Initial enrolment polls internal state and the reconnect assertion uses a one-second silence window.
+4. **Startup sunset notification.** `sunset::the_ack_carries_the_configured_sunset_and_raises_the_event` protects upgrade notifications. One failure in [42291879651](https://github.com/connetto-rs/connetto-rs/actions/runs/42291879651). On `main`, it starts the pump before subscribing to its event stream.
+5. **Keepalive through a locked gate.** `keepalive::the_probe_runs_while_the_gate_is_locked` protects connection continuity while authentication is pending. One failure in [42184627708](https://github.com/connetto-rs/connetto-rs/actions/runs/42184627708), at the launch approval wait. The later ping assertion also uses a fixed sleep. Diagnose the launch failure before attributing it to that sleep.
+6. **Browser photo readiness.** `a_photo_round_trips_through_stage_commit_resolve_and_http_fetch` protects browser media startup. One failure in [42395628048](https://github.com/connetto-rs/connetto-rs/actions/runs/42395628048), reporting readiness stuck at `signed-in`. Establish the missing boot transition before selecting its hook.
+7. **Remaining classified waits.** Extend the CI-backed queue after the named candidates, retaining one test per pull request and ordering by downstream impact followed by observed flakiness.
+8. **The guard.** A separate `disallowed-methods` pull request for `tokio::time::sleep` and `std::thread::sleep`, with each legitimate timer carrying an `expect` and a reason.
+
+These are observed failure counts in a selected historical sample, not estimated failure probabilities. Every named test also passed in sampled logs. The failing branches are `feat/r77-s11c-pushed-verdicts`, `feat/r77-s11b-bookkeeping-catalog`, `test/harness-container-slots`, `refactor/fold-harness-and-android-duplicates`, `ci/apt-lock-timeout` and `main`, respectively. Current source was inspected for candidates 1 to 5. Their current runtime behaviour and other branches are unchecked. PR #457 changes different tests and does not discharge candidates 1 or 2.
+
+### Verification
+
+Use CI history as the source of flakiness evidence. After an edit, hammer only the affected test. No companion suite or unrelated tests as stress load. Keep deadlines solely for failure detection. Record the exact repetition count and outcomes with each fix.
+
+### Open points
+
+1. **Dependency graph.** The scoped client test build fails before tests in `pg2sqlite` and `rls2fga-types` after following Git dependency tips. The R108 owner is implementing the deployment API migration and owns upstream request `follow-sql-traits-341` (`57786543-9503-4f1b-b4c5-10bdaeab42de`). R113 waits for those prerequisites without duplicating their work.
+2. **Silence assertions.** Determine the processing boundary for the specific test when its slice is reached.
+
+### Done when
+
+No wait in the workspace synchronises on a timer except sites carrying an `expect` and a reason, the clippy guard refuses a new one, and each converted test passes its targeted repetition run.
 
 ---
 
