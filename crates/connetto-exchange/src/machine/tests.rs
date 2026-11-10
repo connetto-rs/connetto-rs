@@ -2291,3 +2291,231 @@ fn an_adopt_failure_keeps_the_offered_range_for_the_retry() {
         "the retry must cover the kept offer's newest, so row 4 is fetched"
     );
 }
+
+/// A re-link re-issues the outstanding request with a fresh id (never the old
+/// one), stops the serving stream that ran on the dead link, and re-presents
+/// the own offer, all at once.
+#[test]
+fn a_relink_reissues_with_a_fresh_id_and_represents_the_own_offer() {
+    let now = Instant::now();
+    let (offer3, _, _) = author(3);
+    let (own, _, _) = author(2);
+
+    let mut bob = Exchange::<&str>::new(Some(build()));
+    bob.set_own_offer(own);
+    bob.linked("a", first_frontier());
+
+    let actions = bob.offer(&"a", offer3, true, now);
+    let Transfer::Request {
+        request_id: r0,
+        from,
+        to,
+        ..
+    } = request_of(&actions).expect("bob requests rows 1-3")
+    else {
+        panic!("bob requests rows 1-3, got {actions:?}");
+    };
+    assert_eq!((from, to), (1, 3));
+
+    // alice requests bob's rows, so bob is serving at the re-link.
+    let actions = bob.message(&"a", request(99, 1, 2), now);
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::Serve { .. })),
+        "bob serves, got {actions:?}"
+    );
+
+    let actions = bob.relinked(&"a", now);
+    let Transfer::Request {
+        request_id: r1,
+        from,
+        to,
+        ..
+    } = request_of(&actions).expect("bob re-issues the outstanding request")
+    else {
+        panic!("bob re-issues the outstanding request, got {actions:?}");
+    };
+    assert_ne!(r1, r0, "the re-issue uses a fresh id, got {r1} (was {r0})");
+    assert_eq!((from, to), (1, 3), "the re-issue covers the same range");
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::StopServing { .. })),
+        "the serving stream stops, got {actions:?}"
+    );
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            Action::Send {
+                message: Message::Offer(_),
+                ..
+            }
+        )),
+        "the own offer is re-presented, got {actions:?}"
+    );
+}
+
+/// The run-09 stall at the re-link, not the frame bound: while the request
+/// stands with a kept newer offer, the re-link drops its answer. `relinked`
+/// aborts the request keeping the kept offer and re-issues a fresh request
+/// covering the kept offer's newest, so the newest row is fetched.
+#[test]
+fn a_relink_keeps_the_newer_offer_for_the_reissue() {
+    let now = Instant::now();
+    let (offer3, rows3, bodies3) = author(3);
+    let (offer4, _, _) = author(4);
+    let (offer5, _, _) = author(5);
+
+    let mut bob = Exchange::<&str>::new(Some(build()));
+    bob.linked("a", first_frontier());
+
+    let actions = bob.offer(&"a", offer3, true, now);
+    let Transfer::Request {
+        request_id: r0,
+        from,
+        to,
+        ..
+    } = request_of(&actions).expect("bob requests rows 1-3")
+    else {
+        panic!("bob requests rows 1-3, got {actions:?}");
+    };
+    assert_eq!((from, to), (1, 3));
+    serve_all(&mut bob, r0, &rows3, &bodies3, 3, now);
+    assert_eq!(bob.next_deadline(), None);
+
+    let actions = bob.offer(&"a", offer4, true, now);
+    let Transfer::Request {
+        request_id: r1,
+        from,
+        to,
+        ..
+    } = request_of(&actions).expect("bob requests row 4")
+    else {
+        panic!("bob requests row 4, got {actions:?}");
+    };
+    assert_eq!((from, to), (4, 4));
+
+    let actions = bob.offer(&"a", offer5, true, now);
+    assert_eq!(
+        actions,
+        Vec::new(),
+        "the newer offer is kept for the outstanding request, got {actions:?}"
+    );
+
+    let actions = bob.relinked(&"a", now);
+    let Transfer::Request {
+        request_id: r2, to, ..
+    } = request_of(&actions).expect("bob re-issues the outstanding request")
+    else {
+        panic!("bob re-issues the outstanding request, got {actions:?}");
+    };
+    assert_ne!(r2, r1, "the re-issue uses a fresh id, got {r2} (was {r1})");
+    assert_eq!(
+        to, 5,
+        "the re-issue must cover the kept offer's newest, so row 5 is fetched"
+    );
+}
+
+/// A send that fails `Unlinked` aborts the request it carried when that id is
+/// still the outstanding one, keeping its kept offer and scheduling no
+/// backoff; the re-issue waits for the link event and covers the kept offer's
+/// newest.
+#[test]
+fn a_lost_send_aborts_the_request_keeping_its_kept_offer() {
+    let now = Instant::now();
+    let (offer3, rows3, bodies3) = author(3);
+    let (offer4, _, _) = author(4);
+    let (offer5, _, _) = author(5);
+
+    let mut bob = Exchange::<&str>::new(Some(build()));
+    bob.linked("a", first_frontier());
+
+    let actions = bob.offer(&"a", offer3, true, now);
+    let Transfer::Request { request_id: r0, .. } =
+        request_of(&actions).expect("bob requests rows 1-3")
+    else {
+        panic!("bob requests rows 1-3, got {actions:?}");
+    };
+    serve_all(&mut bob, r0, &rows3, &bodies3, 3, now);
+    assert_eq!(bob.next_deadline(), None);
+
+    let actions = bob.offer(&"a", offer4, true, now);
+    let Transfer::Request {
+        request_id: r1,
+        from,
+        to,
+        ..
+    } = request_of(&actions).expect("bob requests row 4")
+    else {
+        panic!("bob requests row 4, got {actions:?}");
+    };
+    assert_eq!((from, to), (4, 4));
+
+    let actions = bob.offer(&"a", offer5, true, now);
+    assert_eq!(
+        actions,
+        Vec::new(),
+        "the newer offer is kept for the outstanding request, got {actions:?}"
+    );
+
+    bob.send_lost(&"a", r1);
+    assert_eq!(bob.next_deadline(), None, "no backoff is scheduled");
+
+    let actions = bob.relinked(&"a", now);
+    let Transfer::Request { to, .. } = request_of(&actions).expect("bob re-issues") else {
+        panic!("bob re-issues, got {actions:?}");
+    };
+    assert_eq!(
+        to, 5,
+        "the re-issue must cover the kept offer's newest, so row 5 is fetched"
+    );
+}
+
+/// A send failure whose id is no longer the outstanding one is a no-op, so a
+/// request already re-issued on the new link is never aborted by the old
+/// send's failure.
+#[test]
+fn a_lost_send_with_a_stale_id_is_a_noop() {
+    let now = Instant::now();
+    let (offer3, rows3, bodies3) = author(3);
+    let (offer4, _, _) = author(4);
+
+    let mut bob = Exchange::<&str>::new(Some(build()));
+    bob.linked("a", first_frontier());
+
+    let actions = bob.offer(&"a", offer3, true, now);
+    let Transfer::Request {
+        request_id: r0,
+        from,
+        to,
+        ..
+    } = request_of(&actions).expect("bob requests rows 1-3")
+    else {
+        panic!("bob requests rows 1-3, got {actions:?}");
+    };
+    assert_eq!((from, to), (1, 3));
+    serve_all(&mut bob, r0, &rows3, &bodies3, 3, now);
+    assert_eq!(bob.next_deadline(), None);
+
+    let actions = bob.offer(&"a", offer4, true, now);
+    let Transfer::Request { request_id: r1, .. } =
+        request_of(&actions).expect("bob requests row 4")
+    else {
+        panic!("bob requests row 4, got {actions:?}");
+    };
+
+    let actions = bob.relinked(&"a", now);
+    let Transfer::Request { request_id: r2, .. } = request_of(&actions).expect("bob re-issues")
+    else {
+        panic!("bob re-issues, got {actions:?}");
+    };
+    assert_ne!(r2, r1, "the re-issue uses a fresh id, got {r2} (was {r1})");
+
+    bob.send_lost(&"a", r1);
+    assert_eq!(
+        bob.next_deadline(),
+        Some(now + FRAME_BOUND),
+        "r2 is not aborted by r1's stale failure"
+    );
+}

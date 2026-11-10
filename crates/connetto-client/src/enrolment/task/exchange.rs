@@ -304,6 +304,35 @@ impl<L: Link> Run<L> {
         }
     }
 
+    /// The link to `peer` was replaced by a new one on the same identity, so
+    /// its retained entries are kept until the new end and the machine
+    /// re-issues and re-presents at once on the new link (R78 decision 17). A
+    /// replacement the machine no longer holds takes the fresh-link path.
+    pub(super) async fn peer_relink(
+        &mut self,
+        peer: &DeviceIdentity,
+        public_key: Vec<u8>,
+        bot_list: Option<String>,
+        expires_at: std::time::SystemTime,
+    ) {
+        if !self.exchange.linked.contains_key(peer) {
+            self.peer_linked(peer.clone(), public_key, bot_list, expires_at)
+                .await;
+            return;
+        }
+        if let Some(linked) = self.exchange.linked.get_mut(peer) {
+            linked.public_key = public_key;
+            linked.expires_at = expires_at;
+            linked.author.bot_list = bot_list;
+        }
+        let author = peer.key().as_bytes().to_vec();
+        if let Err(err) = self.link.renew(author, expires_at).await {
+            tracing::warn!(error = %err, "a peer's re-linked certificate end could not be stored");
+        }
+        let actions = self.exchange.machine.relinked(peer, Instant::now());
+        self.act(actions).await;
+    }
+
     /// The last link to `peer` closed.
     pub(super) async fn peer_unlinked(&mut self, peer: &DeviceIdentity) {
         self.exchange.linked.remove(peer);
@@ -417,14 +446,24 @@ impl<L: Link> Run<L> {
         }
     }
 
-    /// Queue `message` on the link to `peer`. A link that closed meanwhile
-    /// reaches the machine as unlinked, while a message over the wire's
-    /// bounds is a defect of this device the receiver would wait out.
-    async fn send(&self, peer: &DeviceIdentity, message: Message) {
+    /// Queue `message` on the link to `peer`. A send lost to a gone link
+    /// aborts the request it carried, keeping its kept offer, while a message
+    /// over the wire's bounds is a defect of this device the receiver would
+    /// wait out.
+    async fn send(&mut self, peer: &DeviceIdentity, message: Message) {
+        let lost_request = match &message {
+            Message::Transfer(Transfer::Request { request_id, .. }) => Some(*request_id),
+            _ => None,
+        };
         match self.peer.send_exchange(peer, message).await {
             Ok(()) => {}
             Err(err @ PeerSendError::FrameAboveBounds { .. }) => {
                 tracing::error!(error = %err, "an exchange message could not be sent");
+            }
+            Err(PeerSendError::Unlinked { .. }) => {
+                if let Some(request_id) = lost_request {
+                    self.exchange.machine.send_lost(peer, request_id);
+                }
             }
             Err(err) => tracing::debug!(error = %err, "an exchange message did not reach a peer"),
         }

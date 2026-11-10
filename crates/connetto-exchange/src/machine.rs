@@ -316,6 +316,57 @@ impl<P: Clone + Eq + Hash + Debug> Exchange<P> {
         }
     }
 
+    /// A send to `peer` failed because the link was gone (decision: a failed
+    /// `Unlinked` send). When the failed send was the outstanding request,
+    /// abort it keeping its kept offer, with no backoff; the re-issue is
+    /// driven by the link event that follows, never the frame bound. A stale
+    /// id, or a send that was the own offer or a stream frame, does nothing.
+    pub fn send_lost(&mut self, peer: &P, request_id: u64) {
+        let Some(state) = self.peers.get_mut(peer) else {
+            return;
+        };
+        if let Some(request) = state.receiver.request.as_ref()
+            && request.id == request_id
+        {
+            absorb_kept_offer(&mut state.receiver);
+        }
+    }
+
+    /// The link to `peer` was replaced by a new one on the same identity
+    /// (a duplicate re-link), so the old link's frames are gone. Stop any
+    /// serving stream, carry an outstanding request's kept offer into the
+    /// last verified one, re-issue a fresh request from the last verified
+    /// offer when its range still sits behind the cursor, and re-present the
+    /// own offer, all at once on the new link, never via the frame bound. A
+    /// peer no longer held takes the fresh-link path in the driver.
+    pub fn relinked(&mut self, peer: &P, now: Instant) -> Vec<Action<P>> {
+        let Some(state) = self.peers.get_mut(peer) else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        if let Sender::Serving { .. } = &state.sender {
+            state.sender = Sender::Idle;
+            actions.push(Action::StopServing { peer: peer.clone() });
+        }
+        absorb_kept_offer(&mut state.receiver);
+        if state.receiver.last_offer.is_some() {
+            actions.extend(retry_request(
+                state,
+                peer.clone(),
+                self.build.as_ref(),
+                &mut self.next_id,
+                now,
+            ));
+        }
+        if let Some(offer) = self.own_offer.clone() {
+            actions.push(Action::Send {
+                peer: peer.clone(),
+                message: Message::Offer(offer),
+            });
+        }
+        actions
+    }
+
     /// An `Offer` message from `peer`, `valid` being the driver's signature
     /// check against the key the link proved. A valid offer is adopted and,
     /// when it sits above the cursor and the device holds a build, a request
@@ -620,13 +671,11 @@ fn retry_request<P: Clone>(
     actions
 }
 
-/// Abort the outstanding request, keep what has been processed, and schedule
-/// a retry at the current backoff, doubling it for the next stall (decision
-/// 22). An aborted request's kept offer, when it names a range at least as
-/// new as the last verified one, becomes that offer and stands owed, so the
-/// retry adopts it and requests its range instead of leaving the newer rows
-/// behind the cursor.
-fn abort_with_retry(receiver: &mut Receiver, now: Instant) {
+/// Take the outstanding request and, when it held a kept offer at least as new
+/// as the last verified one, make that offer the last verified one and stand
+/// it owed (decision 22), so the next request adopts it and covers its newest
+/// instead of leaving the newer rows behind the cursor.
+fn absorb_kept_offer(receiver: &mut Receiver) {
     if let Some(request) = receiver.request.take()
         && let Some(kept) = request.kept
         && let Some(kept_newest) = kept.offer.newest.as_ref()
@@ -641,6 +690,13 @@ fn abort_with_retry(receiver: &mut Receiver, now: Instant) {
             receiver.adopt_owed = true;
         }
     }
+}
+
+/// Abort the outstanding request, keep what has been processed, and schedule
+/// a retry at the current backoff, doubling it for the next stall (decision
+/// 22). The kept-offer transfer is the shared [`absorb_kept_offer`].
+fn abort_with_retry(receiver: &mut Receiver, now: Instant) {
+    absorb_kept_offer(receiver);
     receiver.retry_at = Some(now + receiver.backoff);
     receiver.backoff = receiver.backoff.saturating_mul(2).min(RETRY_CEILING);
 }

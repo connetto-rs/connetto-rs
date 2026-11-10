@@ -917,11 +917,9 @@ async fn two_devices_dialing_each_other_keep_one_link_each() {
     assert_eq!(a_to_b.as_ref().ok(), Some(&beta.identity));
     assert_eq!(b_to_a.as_ref().ok(), Some(&alpha.identity));
 
-    // Exactly one link per side, and the duplicate rule raises nothing.
+    // Each side's first registration is fresh, so each reports `Linked`.
     assert_eq!(next_events(&mut a_rx, 1).await, vec![linked_event(&beta)]);
     assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alpha)]);
-    no_events(&mut a_rx, Duration::from_secs(1)).await;
-    no_events(&mut b_rx, Duration::from_secs(1)).await;
 
     // The kept link is the same on both ends, so traffic crosses it both
     // ways, while a disagreeing pair would have closed both.
@@ -951,6 +949,10 @@ async fn two_devices_dialing_each_other_keep_one_link_each() {
             signer: signer_b
         }
     );
+
+    // The replacement reports, when any, land with the registrations, so nothing follows the traffic.
+    no_events(&mut a_rx, Duration::from_secs(1)).await;
+    no_events(&mut b_rx, Duration::from_secs(1)).await;
 
     a.stop(CloseReason::Closed);
     b.stop(CloseReason::Closed);
@@ -1053,10 +1055,20 @@ async fn a_second_dial_from_the_same_node_keeps_the_same_link() {
     let second = a.link(b_addr).await;
     assert_eq!(second.as_ref().ok(), Some(&beta.identity));
 
-    // The kept link is the same on both ends, so neither side reports the
-    // peer as unlinked and the duplicate close is silent on both.
-    no_events(&mut a_rx, Duration::from_secs(2)).await;
-    no_events(&mut b_rx, Duration::from_secs(2)).await;
+    // The replacement reports `LinkReplaced` once per side, and the close itself is silent.
+    let event = await_event(&mut b_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::LinkReplaced { .. })
+    })
+    .await;
+    assert_eq!(event, link_replaced_event(&alpha));
+    no_events(&mut b_rx, Duration::from_secs(1)).await;
+
+    let event = await_event(&mut a_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::LinkReplaced { .. })
+    })
+    .await;
+    assert_eq!(event, link_replaced_event(&beta));
+    no_events(&mut a_rx, Duration::from_secs(1)).await;
 
     // The surviving link still carries traffic.
     let (list, signer) = deployment.issuer_list(&issuer, 1, &[], now);
@@ -2827,8 +2839,8 @@ async fn a_duplicate_close_holds_the_peer_in_the_link_read() {
     assert_eq!(next_events(&mut h_rx, 1).await, vec![linked_event(&gone)]);
     assert_eq!(peers(host_node.linked()), vec![gone.identity.clone()]);
 
-    // The duplicate close holds the peer in the read while its kept link
-    // registers, which raises no second event for the same peer.
+    // The duplicate close is silent and holds the peer in the read until its
+    // kept link registers, which reports the replacement.
     write_frame(
         &mut raw,
         &PeerFrame::Close {
@@ -2850,6 +2862,11 @@ async fn a_duplicate_close_holds_the_peer_in_the_link_read() {
         "the held peer stays in the read without an address"
     );
     let mut raw = raw_linked(deployment.root_der(), &gone, host_addr).await;
+    let event = await_event(&mut h_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::LinkReplaced { .. })
+    })
+    .await;
+    assert_eq!(event, link_replaced_event(&gone));
     no_events(&mut h_rx, Duration::from_millis(500)).await;
     assert_eq!(
         peers(host_node.linked()),
@@ -2877,6 +2894,89 @@ async fn a_duplicate_close_holds_the_peer_in_the_link_read() {
     );
     no_events(&mut h_rx, Duration::from_millis(500)).await;
     host_node.stop(CloseReason::Closed);
+}
+
+/// A re-dial whose duplicate close reaches the accepting side first: both
+/// sides await the keeper, and the keeper's registration reports the
+/// replacement on each, with no unlink (R78 slice 6).
+#[tokio::test]
+async fn a_duplicate_close_then_a_redial_reports_link_replaced_on_both_sides() {
+    let now = whole_second();
+    let deployment = Deployment::new(33, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+
+    let alpha = deployment.device(
+        &issuer,
+        "alpha",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let beta = deployment.device(
+        &issuer,
+        "beta",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (a_tx, mut a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+
+    let _a_addr = serve(&a, &alpha);
+    let b_addr = serve(&b, &beta);
+
+    let first = a.link(b_addr).await;
+    assert_eq!(first.as_ref().ok(), Some(&beta.identity));
+    assert_eq!(next_events(&mut a_rx, 1).await, vec![linked_event(&beta)]);
+    assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alpha)]);
+
+    // Both sides finish the close before the re-dial, so both await the keeper.
+    a.close(&beta.identity, CloseReason::Duplicate);
+    for (node, peer) in [(&a, &beta.identity), (&b, &alpha.identity)] {
+        time::timeout(Duration::from_secs(10), async {
+            loop {
+                if node
+                    .linked()
+                    .iter()
+                    .any(|link| link.peer == *peer && link.remote.is_none())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the duplicate close reaches the node");
+    }
+
+    let second = a.link(b_addr).await;
+    assert_eq!(second.as_ref().ok(), Some(&beta.identity));
+
+    let event = await_event(&mut b_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::LinkReplaced { .. })
+    })
+    .await;
+    assert_eq!(event, link_replaced_event(&alpha));
+    no_events(&mut b_rx, Duration::from_secs(1)).await;
+
+    let event = await_event(&mut a_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::LinkReplaced { .. })
+    })
+    .await;
+    assert_eq!(event, link_replaced_event(&beta));
+    no_events(&mut a_rx, Duration::from_secs(1)).await;
+
+    // The kept link stands on both ends.
+    assert_eq!(peers(a.linked()), vec![beta.identity.clone()]);
+    assert_eq!(peers(b.linked()), vec![alpha.identity.clone()]);
+
+    a.stop(CloseReason::Closed);
+    b.stop(CloseReason::Closed);
 }
 
 /// A duplicate close's held peer stays in the node's `linked` read until the
@@ -3718,6 +3818,17 @@ async fn closing_one_peer_ends_its_link_on_both_sides() {
 /// certificate proved and the list it carries.
 pub(crate) fn linked_event(peer: &Peer) -> PeerEvent {
     PeerEvent::Linked {
+        peer: peer.identity.clone(),
+        public_key: peer.public_key_info(),
+        bot_list: Some(peer.bot_list.clone()),
+        expires_at: peer.not_after(),
+    }
+}
+
+/// The report a replaced link to `peer` raises, carrying what the new link
+/// proved.
+pub(crate) fn link_replaced_event(peer: &Peer) -> PeerEvent {
+    PeerEvent::LinkReplaced {
         peer: peer.identity.clone(),
         public_key: peer.public_key_info(),
         bot_list: Some(peer.bot_list.clone()),

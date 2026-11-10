@@ -1290,6 +1290,12 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             // leaf, which the slot records.
             #[cfg(feature = "discovery")]
             let fingerprint = Fingerprint::of(&leaf);
+            // The duplicate close is silent, so note the replaced slot now: a
+            // live link, or the awaiting slot the close left this keeper.
+            let replaced = matches!(
+                links.get(&peer_key),
+                Some(SlotState::Live(_) | SlotState::AwaitingKeeper { .. })
+            );
             // Close the losing link, if the new one keeps the slot. Its frame
             // task sends the `Close` frame and exits on the command.
             if let Some(SlotState::Live(existing)) = links.get(&peer_key) {
@@ -1322,18 +1328,33 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             );
             #[cfg(feature = "discovery")]
             state.peer_fingerprints.lock().insert(peer_key, fingerprint);
-            if fresh && let Some(SlotState::Live(slot)) = links.get(&peer_key) {
-                state
-                    .events
-                    .send(PeerEvent::Linked {
+            let reestablished = fresh || replaced;
+            let event = if let Some(SlotState::Live(slot)) = links.get(&peer_key)
+                && reestablished
+            {
+                let expires_at = DeviceCertificate::parse(&slot.leaf)
+                    .expect("the peer's leaf was verified at the handshake")
+                    .not_after();
+                Some(if fresh {
+                    PeerEvent::Linked {
                         peer: slot.peer.clone(),
                         public_key: slot.public_key.clone(),
                         bot_list: slot.bot_list.clone(),
-                        expires_at: DeviceCertificate::parse(&slot.leaf)
-                            .expect("the peer's leaf was verified at the handshake")
-                            .not_after(),
-                    })
-                    .ok();
+                        expires_at,
+                    }
+                } else {
+                    PeerEvent::LinkReplaced {
+                        peer: slot.peer.clone(),
+                        public_key: slot.public_key.clone(),
+                        bot_list: slot.bot_list.clone(),
+                        expires_at,
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(event) = event {
+                state.events.send(event).ok();
             }
         }
         keep_new
