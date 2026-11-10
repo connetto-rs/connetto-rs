@@ -2230,6 +2230,39 @@ async fn an_offer_without_a_newest_binds_the_range_to_the_settled_frontier() {
     );
 }
 
+/// A stored offer that signs neither a settled nor a newest frontier covers
+/// no sequence, so the session asks nothing the server would refuse whole.
+#[tokio::test]
+async fn an_offer_without_a_frontier_asks_nothing() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::CourierOnly,
+        major(2),
+        Some(b"the held"),
+    );
+    adopt(&mut conn, AUTHOR, None);
+    let (mut conn, mut server) = attach(conn, true).await;
+    assert!(
+        timeout(Duration::from_millis(100), server.recv())
+            .await
+            .is_err(),
+        "no ask names a sequence the offer does not sign"
+    );
+    assert!(
+        matches!(
+            peer::state_of(&mut conn.db, &AUTHOR, 1),
+            Ok(Some(HeldState::CourierOnly))
+        ),
+        "the row stays held for the author's next offer"
+    );
+    server.close().await.expect("hang up");
+    let event = conn.pump_one().await.expect("the session ends");
+    assert!(matches!(event, ClientEvent::Closed));
+}
+
 /// A provisional ask that overran its bound keeps its author's candidates
 /// restated, the ask waiting out the lapse for a fresh session.
 #[tokio::test]
