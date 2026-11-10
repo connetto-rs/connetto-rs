@@ -23,7 +23,7 @@ use connetto_client::{
     ClientEvent, CourierCandidate, CourierError, KeyringAuth, NativeClientBuilder, SyncTuning,
     WriterRef, provisional::ProvisionalState,
 };
-use connetto_core::exchange::{CourierRefusal, Verdict};
+use connetto_core::exchange::Verdict;
 use connetto_server::audit::AuthOp;
 use connetto_server::authn::identity::deterministic_uuid;
 use connetto_server::defaults::{_connetto_writers, auth_events};
@@ -514,7 +514,7 @@ diesel::table! {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_courier_for_a_retired_author_is_refused() {
+async fn a_retired_authors_held_copies_leave_nothing_to_courier() {
     if std::env::var(RETIRED_PHASE).is_ok() {
         run_retired().await;
         return;
@@ -560,7 +560,7 @@ async fn a_courier_retired_phase() {
     run_retired().await;
 }
 
-/// One assertion per step, in the order alice's notes travel to their refusal.
+/// One assertion per step, in the order alice's notes travel to their ruling.
 #[expect(
     clippy::too_many_lines,
     reason = "one scenario per assertion, in the order the notes travel"
@@ -801,7 +801,7 @@ async fn run_retired() {
     wait_for_certificate(&bob2, BOUND)
         .await
         .expect("bob holds his device");
-    let candidate = wait_candidate_or_refusal(&bob2, &mut bob_events, &alice_key).await;
+    let candidate = wait_pending_candidate(&bob2, &mut bob_events, &alice_key).await;
     assert!(
         candidate.seqs.contains(&3) && candidate.seqs.contains(&4) && candidate.seqs.contains(&5),
         "n3, n4 and n5 stand as candidates, the candidate is {candidate:?}"
@@ -843,9 +843,7 @@ async fn run_retired() {
         "alice's fresh queue settles behind the applies"
     );
 
-    // Step eleven: bob resumes from his dir, so the candidacy stands; the
-    // courier is refused WriterRetired, the courier-only and retained rows
-    // drop (decision 18).
+    // Step eleven: bob resumes with only alice's retained entries 1 and 2, which offer nothing to courier.
     let bob3 = connect_client(
         addr,
         fresh_login(&base, APP_BOB, "bob"),
@@ -854,21 +852,22 @@ async fn run_retired() {
         peer_listener,
     )
     .await;
+    let mut resumed = bob3.client().events();
     wait_for_certificate(&bob3, BOUND)
         .await
         .expect("bob holds his device");
-    let refused = bob3
-        .courier(&alice_key)
-        .await
-        .expect_err("the range is refused");
+    wait_held_on_events(
+        &bob3,
+        &mut resumed,
+        &alice_key,
+        &[(1, HeldState::Retained), (2, HeldState::Retained)],
+    )
+    .await;
+    let nothing = bob3.courier(&alice_key).await.expect_err("nothing is held");
     assert!(
-        matches!(
-            refused,
-            CourierError::Refused(CourierRefusal::WriterRetired)
-        ),
-        "the refusal names the retired writer, the call spelled {refused:?}"
+        matches!(nothing, CourierError::NothingHeld),
+        "bob offers nothing of the retired writer, the call spelled {nothing:?}"
     );
-    wait_held(&bob3, &alice_key, &[]).await;
     assert_retired_notes(&provisioned.fixture, &alice_id, &[2, 3, 4]).await;
     let mut conn = provisioned
         .fixture
@@ -997,6 +996,33 @@ async fn held_rows(
     rows.into_iter()
         .map(|(seq, state)| (seq, held_state(state)))
         .collect()
+}
+
+/// Wait until `author`'s held rows stand `expected`, re-reading them after every event of `events`, bounded by `BOUND`.
+async fn wait_held_on_events(
+    client: &connetto_client::NativeClient<connetto_client::NativeTransport>,
+    events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
+    author: &[u8],
+    expected: &[(i64, HeldState)],
+) {
+    let deadline = tokio::time::Instant::now() + BOUND;
+    loop {
+        let rows = held_rows(client, author).await;
+        if rows == expected {
+            return;
+        }
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                panic!("the event stream closed while the replica held {rows:?}")
+            }
+            Err(elapsed) => {
+                panic!(
+                    "the held rows never stood {expected:?} ({elapsed}), the replica holds {rows:?}"
+                )
+            }
+        }
+    }
 }
 
 /// The held state a stored value names, panicking with the value when it
