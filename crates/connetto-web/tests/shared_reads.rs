@@ -129,18 +129,29 @@ fn once<T: Transport + 'static>(
     FirstThen::new(transport, || core::future::ready(Err("spent")))
 }
 
-/// The OPFS pool as the replica place: every name lands in the pool under
-/// its own entry.
+/// The OPFS pool as the replica place, every name under the test's own tag.
+///
+/// A hub keeps its worker's files open for as long as its pump runs, and the
+/// pump outlives the test that spawned it, so a later test in the same module
+/// cannot delete a file an earlier one opened. The tag keeps the tests' files
+/// apart.
 struct Opfs<'a> {
     storage: &'a ReplicaStorage,
+    tag: &'a str,
+}
+
+/// The pool file the test tagged `tag` keeps `name` in.
+fn file(tag: &str, name: &str) -> String {
+    format!("{tag}-{name}")
 }
 
 impl ReplicaPlace for Opfs<'_> {
     fn locate(&self, name: &str) -> Result<Located, ClientError> {
+        let file = file(self.tag, name);
         Ok(Located::new(
             name,
-            self.storage.db_url(name),
-            self.storage.exists(name),
+            self.storage.db_url(&file),
+            self.storage.exists(&file),
             ContentPlace::InMemory,
         ))
     }
@@ -185,10 +196,11 @@ impl ReplicaKeyStore for Keys {
     }
 }
 
-/// The signed-in identity `id` over the fixture schema, on the OPFS pool, the
-/// shared store enabled when `shared`.
+/// The signed-in identity `id` over the fixture schema, on the OPFS pool under
+/// `tag`, the shared store enabled when `shared`.
 async fn connect(
     storage: &ReplicaStorage,
+    tag: &str,
     id: &str,
     key: ReplicaKey,
     shared: bool,
@@ -196,6 +208,7 @@ async fn connect(
     // A default accepting() closes the upstream after its frames, and the hub's pump would drop the tabs with it.
     connect_over(
         storage,
+        tag,
         id,
         key,
         shared,
@@ -207,6 +220,7 @@ async fn connect(
 /// [`connect`] over `upstream`.
 async fn connect_over<T: Transport + 'static>(
     storage: &ReplicaStorage,
+    tag: &str,
     id: &str,
     key: ReplicaKey,
     shared: bool,
@@ -219,7 +233,7 @@ async fn connect_over<T: Transport + 'static>(
                 .expect("a string identity serializes"),
         )
         .durable(
-            Opfs { storage },
+            Opfs { storage, tag },
             Keys {
                 replica: key,
                 shared: ReplicaKey::from_bytes([0x33; ReplicaKey::LEN]),
@@ -266,10 +280,11 @@ async fn hub_with_late_tab<U: Transport + 'static>(
     (hub, tab)
 }
 
-/// Alice's run, which writes the shared rows to the one shared file.
-async fn seed_alice(storage: &ReplicaStorage) {
+/// Alice's run under `tag`, which writes the shared rows to the one shared file.
+async fn seed_alice(storage: &ReplicaStorage, tag: &str) {
     let mut alice = connect(
         storage,
+        tag,
         "alice",
         ReplicaKey::from_bytes([0x11; ReplicaKey::LEN]),
         true,
@@ -295,17 +310,16 @@ async fn seed_alice(storage: &ReplicaStorage) {
 /// the hub, joining them with the second's own private rows.
 #[wasm_bindgen_test]
 async fn a_second_identitys_late_tab_reads_the_first_identitys_shared_rows() {
-    let storage = ReplicaStorage::install().await;
+    const TAG: &str = "late-tab";
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let alice_name = connetto_client::replica_db_name(connetto_client::REPLICA_PREFIX, "alice")
         .expect("a replica name");
     let bob_name = connetto_client::replica_db_name(connetto_client::REPLICA_PREFIX, "bob")
         .expect("a replica name");
-    for name in [
-        alice_name.as_str(),
-        bob_name.as_str(),
-        shared_record().as_str(),
-    ] {
-        storage.delete_db(name).expect("clear the entry");
+    for name in [alice_name, bob_name, shared_record()] {
+        storage
+            .delete_db(&file(TAG, &name))
+            .expect("clear the entry");
     }
     // Bob's open writes his replica and the shared store, where it records
     // him present, in one transaction, so each database holds a journal slot
@@ -313,13 +327,14 @@ async fn a_second_identitys_late_tab_reads_the_first_identitys_shared_rows() {
     storage.reserve(6).await.expect("room in the pool");
 
     // Alice writes the shared rows to the one shared file, then her run ends.
-    seed_alice(&storage).await;
+    seed_alice(&storage, TAG).await;
 
     // Bob's fresh replica gets the policy object recreated in its own main
     // file, and the shared rows are visible through it while living outside
     // main.
     let mut bob = connect(
         &storage,
+        TAG,
         "bob",
         ReplicaKey::from_bytes([0x22; ReplicaKey::LEN]),
         true,
@@ -410,14 +425,18 @@ async fn a_second_identitys_late_tab_reads_the_first_identitys_shared_rows() {
 /// and the late tab reads them from the replica, from a fresh name of its own.
 #[wasm_bindgen_test]
 async fn a_disabled_shared_store_never_serves_store_rows() {
-    let storage = ReplicaStorage::install().await;
+    const TAG: &str = "no-store";
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let carol_name = connetto_client::replica_db_name(connetto_client::REPLICA_PREFIX, "carol")
         .expect("a replica name");
-    storage.delete_db(&carol_name).expect("clear the entry");
+    storage
+        .delete_db(&file(TAG, &carol_name))
+        .expect("clear the entry");
     storage.reserve(2).await.expect("room in the pool");
 
     let mut carol = connect(
         &storage,
+        TAG,
         "carol",
         ReplicaKey::from_bytes([0x44; ReplicaKey::LEN]),
         false,
@@ -500,11 +519,14 @@ impl Transport for Recording {
 /// the tab first wrote each table.
 #[wasm_bindgen_test]
 async fn a_tabs_write_to_a_shared_table_goes_upstream_in_first_write_order() {
-    let storage = ReplicaStorage::install().await;
+    const TAG: &str = "write-order";
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let dave_name = connetto_client::replica_db_name(connetto_client::REPLICA_PREFIX, "dave")
         .expect("a replica name");
-    for name in [dave_name.as_str(), shared_record().as_str()] {
-        storage.delete_db(name).expect("clear the entry");
+    for name in [dave_name, shared_record()] {
+        storage
+            .delete_db(&file(TAG, &name))
+            .expect("clear the entry");
     }
     storage.reserve(3).await.expect("room in the pool");
 
@@ -515,6 +537,7 @@ async fn a_tabs_write_to_a_shared_table_goes_upstream_in_first_write_order() {
     };
     let dave = connect_over(
         &storage,
+        TAG,
         "dave",
         ReplicaKey::from_bytes([0x55; ReplicaKey::LEN]),
         true,

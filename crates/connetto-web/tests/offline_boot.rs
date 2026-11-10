@@ -51,7 +51,7 @@ fn builder() -> WebClientBuilder {
 /// The worker comes up with nothing listening, and says so by completing.
 #[wasm_bindgen_test]
 async fn the_worker_starts_with_no_server_reachable() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     storage.reserve(8).await.expect("room in the pool");
     take_pending_wipes().await.expect("drain old wipes");
     let worker: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();

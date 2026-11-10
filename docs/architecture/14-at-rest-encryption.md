@@ -8,7 +8,7 @@ Every durable replica on a device is ciphertext, and the local tier that attache
 
 | Store | Native | Browser |
 |---|---|---|
-| Replica | SQLCipher file, per-replica key | sqlite3mc file in OPFS, per-replica key |
+| Replica | SQLCipher file, per-replica key | SQLCipher file in OPFS, per-replica key |
 | Local (never-syncing) tier | attached, inherits replica key | Separate connection, same per-replica key passed explicitly |
 | Refresh token | OS keyring, no SQLite involved | none, an `HttpOnly` cookie the browser keeps |
 | Account index and last-used marker | OS keyring index record | plain OPFS SQLite database, never secret |
@@ -193,25 +193,17 @@ Call `provision_replica_key` only for a replica that does not yet exist. For one
 
 ## The page codec
 
-connetto does not implement encryption. At each connect it states whether the database holds encrypted pages and hands the key to an off-the-shelf codec. Natively the codec is SQLCipher 4.19.0 on SQLite 3.53.4, which `libsqlite3-sys` builds under `bundled-sqlcipher` from the `sqlcipher-src` crate. In the browser it is SQLite3 Multiple Ciphers, vendored by `sqlite-wasm-rs` under `sqlite3mc`. The two are not the same codebase, which forces an explicit pin.
+connetto does not implement encryption. At each connect it states whether the database holds encrypted pages and hands the key to an off-the-shelf codec. Both targets build SQLCipher 4.20.0 on SQLite 3.54.1 from the same `sqlcipher-src` release, natively through `libsqlite3-sys` under `bundled-sqlcipher` and in the browser through `sqlite-wasm-rs` under `sqlcipher`, so a file written on one target opens on the other.
 
-The construction on both sides is SQLCipher version 4. AES-256-CBC per page, with a fresh 16-byte random IV on every page write, plus a 64-byte HMAC-SHA512 over the ciphertext, the IV, and the page number. Both live in the 80 reserved bytes at the end of every page that SQLite accounts for through its page-reserve field. Page 1 carries a 16-byte random per-database salt in the clear. Rewriting a page in place never reuses an IV.
+The construction is SQLCipher version 4. AES-256-CBC per page, with a fresh 16-byte random IV on every page write, plus a 64-byte HMAC-SHA512 over the ciphertext, the IV, and the page number. Both live in the 80 reserved bytes at the end of every page that SQLite accounts for through its page-reserve field. Page 1 carries a 16-byte random per-database salt in the clear. Rewriting a page in place never reuses an IV. On the browser's `opfs-sahpool` VFS a new database gets an all-zero salt instead, because SQLCipher reads the salt after the VFS has preallocated the file ([sqlcipher/sqlcipher#633](https://github.com/sqlcipher/sqlcipher/pull/633)).
 
 The key is supplied as 32 raw bytes through the `x'...'` form of `PRAGMA key`, documented in [cipher.rs](../../crates/connetto-client/src/cipher.rs), skipping the passphrase KDF because the key is already uniformly random.
 
-The pin is required in the browser. SQLite3 Multiple Ciphers defaults to ChaCha20-Poly1305, and naming `sqlcipher` as the cipher is not enough, because its own `sqlcipher` scheme defaults to a non-legacy variant that places different data in the first bytes of page 1 and cannot read a real SQLCipher file. The two pragmas that establish byte-for-byte compatibility are [`connetto_client::cipher::CIPHER_PRAGMAS`].
+Planned in [R21](../../plans/master-implementation-plan.md#r21-one-page-codec-on-both-backends), every encrypted open declares the SQLCipher 4 settings.
 
-```text
-PRAGMA cipher = 'sqlcipher'; PRAGMA legacy = 4;
-```
+`sqlcipher_export` is in the amalgamation both targets build, and connetto does not call it. An encrypted database is born encrypted and takes its schema from statements.
 
-The native codec is SQLCipher itself and needs no pinning, so `cipher::unlock` applies them only on wasm.
-
-Planned in [R21](../../plans/master-implementation-plan.md#r21-one-page-codec-on-both-backends), the browser moves to SQLCipher from the same `sqlcipher-src` release, every encrypted open declares the SQLCipher 4 settings, and the pin goes.
-
-`sqlcipher_export` exists in the SQLCipher amalgamation and not in the sqlite3mc amalgamation, so no plaintext-to-encrypted transform works on both backends.
-
-The browser codec intercepts as a VFS shim, so a database must be opened through a URI that names the codec layer. [`connetto_client::cipher::cipher_url`] composes `file:<name>?vfs=multipleciphers-<vfs>` over the installed VFS (`opfs-sahpool` for OPFS, `memvfs` for the in-memory fallback), so the OPFS-unavailable fallback stays encrypted rather than silently degrading.
+The codec lives in SQLite's pager, so a plaintext and an encrypted database open under the same URI. In the browser `ReplicaStorage::db_url` in [storage.rs](../../crates/connetto-web/src/storage.rs) composes `file:<name>?vfs=<vfs>` over the installed VFS (`opfs-sahpool` for OPFS, `memvfs` for the in-memory fallback), so the OPFS-unavailable fallback is encrypted too.
 
 ## Ordering constraints
 
@@ -223,11 +215,11 @@ One further pragma follows `PRAGMA journal_mode=WAL` and precedes the first `CRE
 
 `PRAGMA foreign_keys = ON` follows on every open, reconnects included, through `SqliteConnection::set_foreign_keys_enabled` in `open_inner`, and before the first statement that writes a row. Enforcement is connection state, and the browser build does not enforce by default, so connetto sets it on both. It precedes the replica DDL, which runs with every synced `REFERENCES` and `FOREIGN KEY` clause removed, so it governs the device-local tier's references alone. Two transactions move their checks to commit with `PRAGMA defer_foreign_keys = ON`, which SQLite clears at the commit or the rollback. They are the archive import (`apply_import_with_bookkeeping`) and the relay hub's replay of a tab's tier mutation.
 
-A bare `ATTACH` gives the attached database the connection's derived key. A database it creates takes the main database's key salt, and an existing one is read under the main database's derived key. This holds on both codecs, as the tests in [`encrypted_replica.rs`](../../crates/connetto-client/tests/it/encrypted_replica.rs) show.
+A bare `ATTACH` gives the attached database the connection's derived key. A database it creates takes the main database's key salt, and an existing one is read under the main database's derived key, as the tests in [`encrypted_replica.rs`](../../crates/connetto-client/tests/it/encrypted_replica.rs) show.
 
 A local tier must therefore be first-booted through the replica connection, which is what `Replica::with_tier` asks for, so both databases share the same key salt. A tier file created by any other connection carries its own salt and will fail to decrypt through the replica connection. A later run says `with_existing_tier` and it works because the salt already matches. The tier is named on the replica rather than attached afterwards, which is what makes a durable tier beside an unkeyed replica unrepresentable.
 
-An attached database can carry a key of its own, given as the `KEY` clause's text `x'<64 hex digits>'`, which both codecs apply to that database alone as a raw key. `attach_keyed_in_window` in [harden.rs](../../crates/connetto-client/src/harden.rs) attaches that way, and it is how every identity's connection reaches the shared public store under the device-scoped key. The same bytes given as a blob literal are taken for a passphrase and run through the KDF into a different key, and `PRAGMA <schema>.key` after the attach is ignored by SQLCipher while sqlite3mc fails it with `SQLITE_NOTADB`. Neither is used.
+An attached database can carry a key of its own, given as the `KEY` clause's text `x'<64 hex digits>'`, which SQLCipher applies to that database alone as a raw key. `attach_keyed_in_window` in [harden.rs](../../crates/connetto-client/src/harden.rs) attaches that way, and it is how every identity's connection reaches the shared public store under the device-scoped key. The same bytes given as a blob literal are taken for a passphrase and run through the KDF into a different key, and SQLCipher ignores `PRAGMA <schema>.key` after the attach. Neither is used.
 
 `sqlite-wasm-rs` allows one connection per database and the sahpool VFS keys its bookkeeping by name, so two live connections to one OPFS file trip a `debug_assert`. The browser local tier is therefore attached to the DB worker's replica connection, exactly as natively, and nothing else opens it ([`local_tier_one_handle.rs`](../../crates/connetto-web/tests/local_tier_one_handle.rs)). It inherits the replica connection's key and its enforcement of references with the attachment. The shared public store is attached to the same connection, under its own key ([`shared_store.rs`](../../crates/connetto-web/tests/shared_store.rs)).
 

@@ -473,7 +473,7 @@ async fn seeded_run(
 /// hash and the major it was captured in.
 #[wasm_bindgen_test]
 async fn a_shared_major_upgrade_keeps_another_accounts_queued_write_under_its_major() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let alice = replica_name("rmaj-upg-alice");
     let bob = replica_name("rmaj-upg-bob");
     clear(&storage, &[alice.as_str(), shared_record().as_str()]).await;
@@ -559,7 +559,7 @@ async fn a_shared_major_upgrade_keeps_another_accounts_queued_write_under_its_ma
 /// second account's open clears none of them.
 #[wasm_bindgen_test]
 async fn a_second_account_opening_after_a_shared_upgrade_retains_the_shared_rows() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let alice = replica_name("rmaj-late-alice");
     let bob = replica_name("rmaj-late-bob");
     let carol = replica_name("rmaj-late-carol");
@@ -649,7 +649,7 @@ async fn a_second_account_opening_after_a_shared_upgrade_retains_the_shared_rows
 /// file.
 #[wasm_bindgen_test]
 async fn an_older_build_refuses_a_newer_shared_file_even_for_a_fresh_account() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let alice = replica_name("rmaj-newer-alice");
     let bob = replica_name("rmaj-newer-bob");
     clear(
@@ -732,7 +732,7 @@ async fn an_older_build_refuses_a_newer_shared_file_even_for_a_fresh_account() {
 /// the refusal leaves the record the first run stamped still serving.
 #[wasm_bindgen_test]
 async fn a_same_major_shared_hash_mismatch_is_refused_without_mutation() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let alice = replica_name("rmaj-mismatch-alice");
     let bob = replica_name("rmaj-mismatch-bob");
     clear(
@@ -806,7 +806,7 @@ async fn a_same_major_shared_hash_mismatch_is_refused_without_mutation() {
 /// Replacing a cache invalidates resume state without losing account work or pins.
 #[wasm_bindgen_test]
 async fn a_replaced_shared_cache_clears_resume_state_but_keeps_pending_work() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let alice = replica_name("rmaj-gen-alice");
     clear(&storage, &[alice.as_str(), shared_record().as_str()]).await;
 
@@ -901,7 +901,7 @@ async fn a_replaced_shared_cache_clears_resume_state_but_keeps_pending_work() {
 /// rows the previous run wrote.
 #[wasm_bindgen_test]
 async fn a_same_generation_reopen_keeps_the_accounts_resume_state() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let alice = replica_name("rmaj-keep-alice");
     clear(&storage, &[alice.as_str(), shared_record().as_str()]).await;
 

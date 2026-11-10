@@ -27,8 +27,8 @@ wasm-bindgen-futures = "0.4"
 # thread, so the wrapper's cross-thread check never fires.
 send_wrapper = { version = "0.6", features = ["futures"] }
 # OPFS persistence: the sahpool VFS install and its file management utility.
-sqlite-wasm-vfs = "0.2"
-sqlite-wasm-rs = { version = "0.5", default-features = false }
+sqlite-wasm-vfs = { version = "0.3", features = ["sahpool"] }
+sqlite-wasm-rs = { version = "0.6", default-features = false }
 thiserror = "2"
 web-sys = { version = "0.3", features = [
   "AuthenticationExtensionsClientInputs",
@@ -190,6 +190,12 @@ sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", 
 # Until a pg_walstream release carries the startup metadata API subql main
 # uses (isdaniel/pg-walstream #141) and `ChangeEvent::xid`.
 pg_walstream = { git = "https://github.com/isdaniel/pg-walstream", branch = "main" }
+# R21, until Spxg/sqlite-wasm-rs#219 merges: safe memvfs access on single-threaded wasm.
+sqlite-wasm-rs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+rsqlite-vfs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+sqlite-wasm-vfs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+# R21, until a libsqlite3-sys release carries rusqlite/rusqlite#1932: the sqlcipher-src release the browser builds.
+libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite" }
 
 # The same deny-level lint discipline the root workspace carries: this is
 # product code, proven by the smoke browser suite, not test scaffolding.

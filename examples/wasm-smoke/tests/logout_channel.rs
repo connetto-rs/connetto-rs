@@ -21,7 +21,7 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 /// Query, log out and keep, log out and delete, against a live worker.
 #[wasm_bindgen_test]
 async fn a_tab_queries_the_count_then_logs_out_keeping_and_then_deleting() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     take_pending_wipes().await.expect("drain any earlier wipes");
     storage
         .delete_db(ACCOUNT_DB)

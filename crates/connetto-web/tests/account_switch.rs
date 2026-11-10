@@ -214,7 +214,7 @@ async fn first_boot_with_a_queued_row(url: &str, key: ReplicaKey) -> Vec<Unsynce
 /// deleted, all against a real OPFS pool.
 #[wasm_bindgen_test]
 async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
 
     // The pool is shared with the other suites in this origin, so start from a
     // known state rather than from whatever an earlier run left.
@@ -256,7 +256,7 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
 
     // Nothing was deleted by the switch, read off the pool's own listing. This is
     // what makes a return fast and what makes a wipe have to be explicit.
-    let listed = storage.list();
+    let listed = storage.list().expect("list the pool");
     assert!(
         listed.iter().any(|entry| entry == &alice) && listed.iter().any(|entry| entry == &bob),
         "a switch deletes neither replica"
@@ -297,7 +297,7 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
 /// because the browser tier is not attached and carries its own salt.
 #[wasm_bindgen_test]
 async fn a_second_identity_gets_its_own_openable_local_tier() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
 
     // Named from the replica, which is itself named from the identity, so the
     // convention under test is the worker's own rather than a copy of it.

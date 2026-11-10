@@ -5913,7 +5913,9 @@ mod tests {
             }
         }
 
-        let storage = crate::storage::ReplicaStorage::install().await;
+        let storage = crate::storage::ReplicaStorage::install()
+            .await
+            .expect("install storage");
         let name = "share-key-gate-deadline.sqlite";
         storage.delete_db(name).expect("clear the fixture replica");
         storage

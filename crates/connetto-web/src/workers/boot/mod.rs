@@ -70,6 +70,9 @@ pub enum BootError {
     /// A pending data wipe could not be applied.
     #[error("pending wipe: {0}")]
     PendingWipe(#[from] crate::storage::WipeError),
+    /// Neither OPFS nor SQLite's in-memory VFS could hold the worker's databases.
+    #[error("storage: {0}")]
+    Storage(crate::auth::AuthError),
     /// Database slot reservation failed.
     #[error("slot reservation: {0}")]
     SlotReservation(crate::auth::AuthError),

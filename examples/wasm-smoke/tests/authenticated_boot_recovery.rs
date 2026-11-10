@@ -26,7 +26,7 @@ const PLANTED: &str = "\"tester\"";
 /// boot failure.
 #[wasm_bindgen_test]
 async fn a_marker_that_cannot_refresh_is_replaced_by_a_fresh_login() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     storage
         .delete_db(ACCOUNT_DB)
         .expect("clear an earlier account index");

@@ -2,15 +2,15 @@
 //!
 //! connetto does not implement encryption. It states, at every connect, whether
 //! the database it is about to open holds encrypted pages, and hands the key to
-//! an off-the-shelf codec compiled into the SQLite it links. Natively that codec
-//! is `SQLCipher`, vendored by `libsqlite3-sys` under `bundled-sqlcipher`. In the
-//! browser it is `SQLite3` Multiple Ciphers, vendored by `sqlite-wasm-rs` under
-//! `sqlite3mc`. Both are page codecs rather than VFS layers, so neither needs a
-//! nonce scheme invented here and neither needs a line of `unsafe`.
+//! an off-the-shelf codec compiled into the SQLite it links. That codec is
+//! `SQLCipher` on both targets, built from the same `sqlcipher-src` release,
+//! natively by `libsqlite3-sys` under `bundled-sqlcipher` and in the browser by
+//! `sqlite-wasm-rs` under `sqlcipher`. It is a page codec rather than a VFS
+//! layer, so it needs no nonce scheme invented here and no line of `unsafe`.
 //!
-//! The construction is `SQLCipher` version 4 on both sides: AES-256-CBC per page
-//! with a fresh 16-byte random IV on every page write, plus a 64-byte
-//! HMAC-SHA512, both living in the 80 reserved bytes per page that SQLite itself
+//! The construction is `SQLCipher` version 4: AES-256-CBC per page with a fresh
+//! 16-byte random IV on every page write, plus a 64-byte HMAC-SHA512, both
+//! living in the 80 reserved bytes per page that SQLite itself
 //! accounts for. No header page is added and no offset is remapped. Page 1
 //! carries a 16-byte random per-database salt in the clear and nothing else.
 //! Rewriting a page in place therefore never reuses an IV, which is the failure
@@ -39,28 +39,6 @@ use zeroize::Zeroizing;
 /// matching crate versions.
 pub use connetto_core::ReplicaKey;
 
-/// The VFS-name prefix `SQLite3` Multiple Ciphers recognises. Opening a database
-/// under `<PREFIX>-<real vfs>` builds the codec shim over that real VFS.
-///
-/// Browser only, and mandatory there: the codec intercepts through a VFS shim,
-/// so a plain file name opens the real VFS with no codec in the stack and
-/// `PRAGMA key` has nothing to talk to. Compose the URL with [`cipher_url`].
-pub const CIPHER_VFS_PREFIX: &str = "multipleciphers";
-
-/// The pragmas that pin the browser codec to the construction the native codec
-/// already implements.
-///
-/// `SQLite3` Multiple Ciphers defaults to ChaCha20-Poly1305, so the scheme has
-/// to be named. Naming it is not enough: its own `sqlcipher` scheme defaults to
-/// a non-legacy variant that leaves the first 24 bytes of page 1 in the clear
-/// rather than `SQLCipher`'s 16, and that variant cannot read a real `SQLCipher`
-/// file. `legacy = 4` selects the byte-compatible layout, which phase E0 proved
-/// by having the browser codec read a file the native codec wrote.
-///
-/// The native codec is `SQLCipher` itself and needs no pinning, so [`unlock`]
-/// applies these only on wasm.
-pub const CIPHER_PRAGMAS: &str = "PRAGMA cipher = 'sqlcipher'; PRAGMA legacy = 4;";
-
 /// Why applying a cipher to a connection failed.
 #[derive(Debug, thiserror::Error)]
 pub enum UnlockError {
@@ -73,7 +51,7 @@ pub enum UnlockError {
         "this build links a SQLite with no page codec, so it cannot open an encrypted database"
     )]
     CodecMissing,
-    /// Applying the key, or selecting the cipher scheme, failed outright.
+    /// Applying the key failed outright.
     #[error("applying the replica key failed: {0}")]
     Pragma(diesel::result::Error),
     /// The key was accepted syntactically but does not decrypt this file, so the
@@ -120,10 +98,6 @@ fn unlock_within(
     wait: core::time::Duration,
 ) -> Result<(), UnlockError> {
     codec_present(conn)?;
-
-    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-    conn.batch_execute(CIPHER_PRAGMAS)
-        .map_err(UnlockError::Pragma)?;
 
     conn.batch_execute(unlock_statement(key).as_str())
         .map_err(UnlockError::Pragma)?;
@@ -200,12 +174,12 @@ fn unlock_statement(key: &ReplicaKey) -> Zeroizing<String> {
     statement
 }
 
-/// `key` as the text `x'<64 hex digits>'`, which both codecs read as a raw key.
+/// `key` as the text `x'<64 hex digits>'`, which `SQLCipher` reads as a raw key.
 ///
 /// The hex literal with exactly 64 digits is the raw key form, whose bytes
 /// become the page key directly with no KDF. It has to reach the codec as
 /// text. A blob holding the same bytes is taken for a passphrase and run
-/// through the KDF into a different key, on both codecs. Wiped on drop.
+/// through the KDF into a different key. Wiped on drop.
 pub(crate) fn raw_key_literal(key: &ReplicaKey) -> Zeroizing<String> {
     let mut literal = Zeroizing::new(String::with_capacity(3 + ReplicaKey::LEN * 2));
     literal.push_str("x'");
@@ -216,34 +190,12 @@ pub(crate) fn raw_key_literal(key: &ReplicaKey) -> Zeroizing<String> {
     literal
 }
 
-/// The database URL that opens `name` through the page codec layered over the
-/// already installed browser VFS `vfs`.
-///
-/// SQLite builds the codec shim on demand while parsing this URI, so `vfs` only
-/// has to be registered first, under its usual name (`opfs-sahpool` for OPFS,
-/// `memvfs` for the in-memory fallback). A plaintext database needs no URL and
-/// opens under its bare name.
-#[must_use]
-pub fn cipher_url(name: &str, vfs: &str) -> String {
-    format!("file:{name}?vfs={CIPHER_VFS_PREFIX}-{vfs}")
-}
-
 /// Prove a page codec is actually linked, so [`ReplicaCipher::Encrypted`] cannot
 /// quietly degrade to plaintext.
 ///
-/// The two codecs answer different probes, and each probe is chosen so that a
-/// codec-less SQLite fails it rather than passing by silence.
-///
-/// Natively, `SQLCipher` patches `PRAGMA cipher_version` into the pragma parser
-/// and returns its version under a column of that name. Vanilla SQLite ignores
-/// the unknown pragma and returns no row at all, so an absent row is the answer.
-///
-/// In the browser, `SQLite3` Multiple Ciphers handles its pragmas through the
-/// VFS shim's file control, which reports a rejected value as a statement error.
-/// A cipher name it does not know is therefore an error when the codec is in the
-/// stack and silence when it is not, so this probe succeeds only when the pragma
-/// fails.
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+/// `SQLCipher` patches `PRAGMA cipher_version` into the pragma parser and
+/// returns its version under a column of that name. Vanilla SQLite ignores the
+/// unknown pragma and returns no row at all, so an absent row is the answer.
 fn codec_present(conn: &mut SqliteConnection) -> Result<(), UnlockError> {
     use diesel::RunQueryDsl as _;
 
@@ -261,21 +213,6 @@ fn codec_present(conn: &mut SqliteConnection) -> Result<(), UnlockError> {
         .load(conn)
         .map_err(UnlockError::Pragma)?;
     if probe.iter().any(|row| !row.version.is_empty()) {
-        Ok(())
-    } else {
-        Err(UnlockError::CodecMissing)
-    }
-}
-
-/// See the native twin of this function for why the browser probe is inverted.
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-fn codec_present(conn: &mut SqliteConnection) -> Result<(), UnlockError> {
-    // A name no cipher registry can hold, so the only way this succeeds is that
-    // nothing was listening.
-    if conn
-        .batch_execute("PRAGMA cipher = 'connetto-codec-probe';")
-        .is_err()
-    {
         Ok(())
     } else {
         Err(UnlockError::CodecMissing)
@@ -305,18 +242,6 @@ mod tests {
         assert_eq!(
             rendered.len(),
             "PRAGMA key = \"x''\";".len() + ReplicaKey::LEN * 2
-        );
-    }
-
-    #[test]
-    fn a_cipher_url_names_the_codec_shim_over_the_real_vfs() {
-        assert_eq!(
-            cipher_url("replica.sqlite", "opfs-sahpool"),
-            "file:replica.sqlite?vfs=multipleciphers-opfs-sahpool"
-        );
-        assert_eq!(
-            cipher_url("replica.sqlite", "memvfs"),
-            "file:replica.sqlite?vfs=multipleciphers-memvfs"
         );
     }
 

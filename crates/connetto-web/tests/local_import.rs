@@ -193,7 +193,7 @@ async fn connect_at(
 /// the counts alone.
 #[wasm_bindgen_test]
 async fn a_blob_lands_in_the_worker_tier() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let src_tier = tier_db_name(SRC);
     let dst_tier = tier_db_name(DST);
     storage.delete_db(SRC).expect("clear earlier src replica");
@@ -324,7 +324,7 @@ async fn verify_tier_row_restored(
 /// page.
 #[wasm_bindgen_test]
 async fn export_reply_blob_round_trips_into_import() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let src_tier = tier_db_name(RT_SRC);
     let dst_tier = tier_db_name(RT_DST);
     storage

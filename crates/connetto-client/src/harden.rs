@@ -90,10 +90,10 @@ pub fn attach_in_window(
 /// public store every identity attaches (R11). A bare attach applies the
 /// connection's own derived key, so it cannot reach a database keyed for the
 /// whole device. The key travels as the text form of its raw literal, which
-/// both codecs apply to the attached database alone, and SQLite reads the
+/// `SQLCipher` applies to the attached database alone, and SQLite reads the
 /// attached schema during the `ATTACH`, so a key the file does not decrypt
 /// under fails here rather than at the first query. In the browser `path` is a
-/// [`cipher_url`](crate::cipher::cipher_url), as a tier's is.
+/// `file:` URI naming the storage VFS, as a tier's is.
 ///
 /// # Errors
 ///

@@ -422,7 +422,7 @@
       <text x="315" y="16" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">At-rest encryption</text>
       <text x="315" y="32" text-anchor="middle" font-size="9.5" fill="#555">SQLCipher, per-replica key, OS keyring custody</text>
       <text x="315" y="46" text-anchor="middle" font-size="9" fill="#555">local (never-syncing) tier attached, inherits the replica key</text>
-      <text x="315" y="61" text-anchor="middle" font-size="8.5" fill="#C62828">R21: one page codec on both targets</text>
+      <text x="315" y="61" text-anchor="middle" font-size="8.5" fill="#C62828">R21: one open contract, capability check, typed codec calls</text>
       <text x="315" y="76" text-anchor="middle" font-size="8.5" fill="#4CAF50">unlock gate built in the browser (R23) and natively on Apple, Android and Windows (R51, R52, R53)</text>
       <text x="315" y="91" text-anchor="middle" font-size="8.5" fill="#555">Linux custody survives a reboot: Secret Service, sandbox keyring, sealed files (R71)</text>
       <text x="315" y="105" text-anchor="middle" font-size="8.5" fill="#4CAF50">one secret store seam, R41</text>
@@ -572,8 +572,8 @@
       <rect width="296" height="76" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="3" height="76" rx="1" fill="#4CAF50" />
       <text x="148" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#333">sqlite-wasm-rs</text>
-      <text x="148" y="32" text-anchor="middle" font-size="8.5" fill="#4CAF50">crates.io</text>
-      <text x="148" y="47" text-anchor="middle" font-size="8.5" fill="#888">SQLite over OPFS</text>
+      <text x="148" y="32" text-anchor="middle" font-size="8.5" fill="#4CAF50">git, until sqlite-wasm-rs #219 merges</text>
+      <text x="148" y="47" text-anchor="middle" font-size="8.5" fill="#888">SQLCipher over OPFS</text>
       <text x="148" y="62" text-anchor="middle" font-size="8.5" fill="#888">seam: SyncAccessHandlePool VFS</text>
     </g>
 
@@ -595,9 +595,9 @@
       <rect width="608" height="114" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
       <rect width="4" height="114" rx="1" fill="#4CAF50" />
       <text x="304" y="18" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">At-rest encryption</text>
-      <text x="304" y="36" text-anchor="middle" font-size="9.5" fill="#555">sqlite3mc over OPFS, SQLCipher v4 file format, per-replica key</text>
+      <text x="304" y="36" text-anchor="middle" font-size="9.5" fill="#555">SQLCipher over OPFS, per-replica key</text>
       <text x="304" y="52" text-anchor="middle" font-size="9" fill="#555">IndexedDB custody, KEK wraps per-identity replica keys, refresh rides an HttpOnly cookie</text>
-      <text x="304" y="70" text-anchor="middle" font-size="8.5" fill="#C62828">R21: one page codec on both targets</text>
+      <text x="304" y="70" text-anchor="middle" font-size="8.5" fill="#C62828">R21: one open contract, capability check, typed codec calls</text>
       <text x="304" y="86" text-anchor="middle" font-size="8.5" fill="#4CAF50">unlock gate built: passkey-derived key (WebAuthn PRF), enrolment re-wraps custody</text>
       <text x="304" y="100" text-anchor="middle" font-size="8.5" fill="#4CAF50">one secret store seam, R41</text>
     </g>
@@ -642,9 +642,9 @@
     </g>
   </g>
 
-  <!-- Codec format pin link between the two encryption boxes -->
+  <!-- One codec link between the two encryption boxes -->
   <path d="M 1625 390 L 1648 390 L 1648 1490 L 1616 1490" fill="none" stroke="#4CAF50" stroke-width="1.5" stroke-dasharray="5 3" />
-  <text x="1658" y="940" text-anchor="middle" font-size="9" fill="#2E7D32" transform="rotate(90 1658 940)">same file format both sides: PRAGMA cipher 'sqlcipher', legacy 4 (R21 removes the pin)</text>
+  <text x="1658" y="940" text-anchor="middle" font-size="9" fill="#2E7D32" transform="rotate(90 1658 940)">one SQLCipher release on both sides, a file opens on either</text>
 
   <!-- ==================== HEADLESS CLIENT (BOT) ZONE ==================== -->
   <g id="bot-client-zone">

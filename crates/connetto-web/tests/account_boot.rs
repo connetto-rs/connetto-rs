@@ -39,7 +39,7 @@ fn authenticator(account: Option<String>) -> BrowserAuthenticator {
 /// An account index of this suite's own, emptied first so a rerun in the same
 /// origin is not reading an earlier one's rows.
 async fn fresh_store() -> AccountStore {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     storage
         .delete_db(ACCOUNT_DB)
         .expect("clear any earlier file");

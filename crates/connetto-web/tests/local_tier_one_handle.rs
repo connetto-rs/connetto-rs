@@ -179,7 +179,7 @@ async fn open_at(
 /// file back the moment that one connection drops.
 #[wasm_bindgen_test]
 async fn the_tier_is_attached_to_the_replica_and_frees_with_it() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let replica_name = "r43-one-handle.sqlite";
     let tier_name = tier_db_name(replica_name);
     storage.delete_db(replica_name).expect("clear the replica");
@@ -225,7 +225,7 @@ async fn the_tier_is_attached_to_the_replica_and_frees_with_it() {
     storage
         .delete_db(replica_name)
         .expect("and so was the replica's");
-    let listed = storage.list();
+    let listed = storage.list().expect("list the pool");
     assert!(
         !listed.iter().any(|entry| entry == &tier_name),
         "the tier file is gone from the pool"
@@ -236,7 +236,7 @@ async fn the_tier_is_attached_to_the_replica_and_frees_with_it() {
 /// two handles can each hold pages the other has superseded.
 #[wasm_bindgen_test]
 async fn a_device_private_row_survives_a_reopen_through_the_attachment() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let replica_name = "r43-reopen.sqlite";
     let tier_name = tier_db_name(replica_name);
     storage.delete_db(replica_name).expect("clear the replica");
@@ -292,7 +292,7 @@ struct Now {
 /// merely that the query runs.
 #[wasm_bindgen_test]
 async fn the_replica_clock_works_in_the_browser() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     storage.delete_db("r29-clock.sqlite").expect("clear");
     storage.reserve(4).await.expect("room in the pool");
     let key = ReplicaKey::from_bytes([0x29; ReplicaKey::LEN]);

@@ -174,6 +174,12 @@ android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/and
 # R53 and R74, until released: the fork's `future` branch, the sealed and
 # Windows Hello store stack merged with the TPM signing key (upstream #19).
 windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/windows-native-keyring-store", rev = "8a8ffde9913b36bd464c8cd5dd24bf80e39dce37" }
+# R21, until Spxg/sqlite-wasm-rs#219 merges: safe memvfs access on single-threaded wasm.
+sqlite-wasm-rs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+rsqlite-vfs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+sqlite-wasm-vfs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+# R21, until a libsqlite3-sys release carries rusqlite/rusqlite#1932: the sqlcipher-src release the browser builds.
+libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite" }
 
 [workspace.lints.rust]
 missing_docs = "forbid"

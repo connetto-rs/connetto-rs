@@ -27,8 +27,8 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 indexed_db_futures = "0.6"
 # The tier tests import baked templates directly through the sahpool VFS.
-sqlite-wasm-vfs = "0.2"
-sqlite-wasm-rs = { version = "0.5", default-features = false }
+sqlite-wasm-vfs = { version = "0.3", features = ["sahpool"] }
+sqlite-wasm-rs = { version = "0.6", default-features = false }
 # Client-authored uuid v4 keys for the synced orders table: one strongly typed
 # `rosetta_uuid::Uuid` that maps to SQLite BLOB and Postgres uuid from a single
 # schema, generated with the browser CSPRNG through getrandom's wasm_js backend.
@@ -81,6 +81,12 @@ sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", 
 # Until a pg_walstream release carries the startup metadata API subql main
 # uses (isdaniel/pg-walstream #141) and `ChangeEvent::xid`.
 pg_walstream = { git = "https://github.com/isdaniel/pg-walstream", branch = "main" }
+# R21, until Spxg/sqlite-wasm-rs#219 merges: safe memvfs access on single-threaded wasm.
+sqlite-wasm-rs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+rsqlite-vfs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+sqlite-wasm-vfs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
+# R21, until a libsqlite3-sys release carries rusqlite/rusqlite#1932: the sqlcipher-src release the browser builds.
+libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite" }
 
 # Fast test iteration: release-grade optimization without the fat link.
 # Mirrors the root workspace profile of the same name.

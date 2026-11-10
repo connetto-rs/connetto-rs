@@ -42,7 +42,7 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 /// The logged-in startup, end to end, including the delete-at-startup step.
 #[wasm_bindgen_test]
 async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
-    let storage = ReplicaStorage::install().await;
+    let storage = ReplicaStorage::install().await.expect("install storage");
     let keys = IdbKeyStore::open().await.expect("open the key store");
 
     // Start from nothing, so a rerun is not resuming an earlier session.
@@ -152,7 +152,7 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
     // is what R17 closed: it used to carry one name for the whole device while
     // its key was per identity, so the second account to sign in opened the first
     // one's file and could not unlock it.
-    let listed = storage.list();
+    let listed = storage.list().expect("list the pool");
     assert!(
         listed.iter().any(|entry| entry == &replica_name),
         "the account's replica is in the pool"
