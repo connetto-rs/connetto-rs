@@ -3,7 +3,7 @@
 //! acknowledges after the backup, bob's device holds them as retained beside
 //! the offer alice's device re-presents with her settled frontier, alice's
 //! device goes away for good, the database is restored to the backup, bob
-//! logs in again, the full resync's retained ask answers his rows `Pending`
+//! logs in again, his session's retained ask answers his rows `Pending`
 //! and `courier(alice)` brings them back, which the restored server holds
 //! under alice's account once, one `write_couriered` audit row each.
 //!
@@ -244,7 +244,7 @@ async fn run_restore() {
         .expect("server three");
 
     // Bob logs in again; the restore rewinds the reconnect log, so his session
-    // is revoked and his full resync ends owing the retained ask.
+    // is revoked and the new one asks about his retained rows.
     let bob2 = connect_client(
         addr,
         fresh_login(&base, APP_BOB, "bob"),
@@ -843,7 +843,7 @@ async fn run_retired() {
         "alice's fresh queue settles behind the applies"
     );
 
-    // Step eleven: bob resumes with only alice's retained entries 1 and 2, which offer nothing to courier.
+    // Step eleven: bob's resumed session asks again, and the retired writer's Abandoned takes alice's retained entries 1 and 2.
     let bob3 = connect_client(
         addr,
         fresh_login(&base, APP_BOB, "bob"),
@@ -856,13 +856,7 @@ async fn run_retired() {
     wait_for_certificate(&bob3, BOUND)
         .await
         .expect("bob holds his device");
-    wait_held_on_events(
-        &bob3,
-        &mut resumed,
-        &alice_key,
-        &[(1, HeldState::Retained), (2, HeldState::Retained)],
-    )
-    .await;
+    wait_held_on_events(&bob3, &mut resumed, &alice_key, &[]).await;
     let nothing = bob3.courier(&alice_key).await.expect_err("nothing is held");
     assert!(
         matches!(nothing, CourierError::NothingHeld),
