@@ -1992,3 +1992,302 @@ fn a_valid_offer_with_nothing_behind_the_cursor_adopts_only() {
     assert_eq!(actions.len(), 1);
     assert_eq!(receiver.next_deadline(), None);
 }
+
+/// The request transfer among the `Send` actions of `actions`, the first one.
+fn request_of(actions: &[Action<&'static str>]) -> Option<Transfer> {
+    actions.iter().find_map(|action| match action {
+        Action::Send {
+            message: Message::Transfer(transfer),
+            ..
+        } => Some(transfer.clone()),
+        _ => None,
+    })
+}
+
+/// The R78 courier-restore re-link (investigate/relink-delivery), as the
+/// failing run-09 trace shows it. bob's request goes out for the range the
+/// acted-on offer named, and the re-link's duplicate close drops its send, so
+/// the request stands with no answer. While it stands, alice's newer offer
+/// (newest 5) arrives and is kept for it. The request's frame bound then runs
+/// out and aborts it, and the abort must keep the newer offer, or the retry
+/// re-requests only the range the older offer named and entry 5 is never
+/// fetched.
+#[test]
+fn a_relink_that_drops_a_request_must_keep_the_newer_offer_for_the_retry() {
+    let now = Instant::now();
+    let (offer2, rows2, bodies2) = author(2);
+    let (offer3, rows3, bodies3) = author(3);
+    let (offer4, _, _) = author(4);
+    let (offer5, _, _) = author(5);
+    let head2 = chain(2, major()).2;
+
+    let mut bob = Exchange::<&str>::new(Some(build()));
+    bob.linked("a", first_frontier());
+
+    // bob already holds rows 1-2, so the offer at 3 requests the one row
+    // above his cursor.
+    let actions = bob.offer(&"a", offer2, true, now);
+    let Transfer::Request {
+        request_id: r0,
+        from,
+        to,
+        ..
+    } = request_of(&actions).expect("bob requests rows 1-2")
+    else {
+        panic!("bob requests rows 1-2, got {actions:?}");
+    };
+    assert_eq!((from, to), (1, 2));
+    let applied = serve_all(&mut bob, r0, &rows2, &bodies2, 2, now);
+    assert_eq!(applies(&applied), 2);
+    assert_eq!(bob.next_deadline(), None);
+
+    // alice writes row 3; bob adopts the offer and requests 3..=3.
+    let actions = bob.offer(&"a", offer3, true, now);
+    let Transfer::Request {
+        request_id: r1,
+        from,
+        to,
+        ..
+    } = request_of(&actions).expect("bob requests row 3")
+    else {
+        panic!("bob requests row 3, got {actions:?}");
+    };
+    assert_eq!((from, to), (3, 3));
+
+    // alice writes row 4 while r1 stands; the offer is kept for r1.
+    let actions = bob.offer(&"a", offer4, true, now);
+    assert_eq!(
+        actions,
+        Vec::new(),
+        "the newer offer is kept for the outstanding request, got {actions:?}"
+    );
+
+    // alice serves row 3; at r1's end the kept offer is acted on and opens
+    // the request the re-link then drops.
+    let mut applied = bob.message(
+        &"a",
+        Transfer::Manifest {
+            request_id: r1,
+            previous: head2,
+            rows: rows3[2..].to_vec(),
+            last: true,
+        },
+        now,
+    );
+    for (row, body) in rows3[2..].iter().zip(bodies3[2..].iter()) {
+        applied.extend(bob.message(
+            &"a",
+            Transfer::Body {
+                request_id: r1,
+                seq: row.seq,
+                changeset: body.clone(),
+            },
+            now,
+        ));
+    }
+    applied.extend(bob.message(
+        &"a",
+        Transfer::End {
+            request_id: r1,
+            outcome: EndOutcome::Complete,
+        },
+        now,
+    ));
+    assert_eq!(applies(&applied), 1);
+    let Transfer::Request { from, to, .. } =
+        request_of(&applied).expect("the kept offer opens the next request")
+    else {
+        panic!("the kept offer opens the next request, got {applied:?}");
+    };
+    assert_eq!((from, to), (4, 4));
+
+    // alice writes row 5 while r2 stands; the offer is kept for r2.
+    let actions = bob.offer(&"a", offer5, true, now);
+    assert_eq!(
+        actions,
+        Vec::new(),
+        "the newer offer is kept for the outstanding request, got {actions:?}"
+    );
+
+    // The re-link's duplicate close drops r2's send, so alice never answers.
+    // r2's frame bound runs out and aborts the request.
+    let deadline = now + FRAME_BOUND;
+    assert_eq!(bob.next_deadline(), Some(deadline));
+    let actions = bob.timeout(deadline);
+    assert_eq!(actions, Vec::new());
+
+    // The retry must re-request up to the kept offer's newest, so entry 5 is
+    // fetched. The abort losing the kept offer leaves the retry at row 4,
+    // and entry 5 never lands.
+    let actions = bob.timeout(deadline + RETRY_FIRST);
+    let Transfer::Request { to, .. } =
+        request_of(&actions).expect("the retry re-requests the range")
+    else {
+        panic!("the retry re-requests the range, got {actions:?}");
+    };
+    assert_eq!(
+        to, 5,
+        "the retry must cover the kept offer's newest, so entry 5 is fetched"
+    );
+}
+
+/// A failed commit aborts the outstanding request, and its kept offer
+/// survives into the retry, so the newer range is re-requested rather than
+/// left behind the cursor.
+#[test]
+fn a_commit_failure_keeps_the_offered_range_for_the_retry() {
+    let now = Instant::now();
+    let (offer2, rows2, bodies2) = author(2);
+    let (offer3, rows3, bodies3) = author(3);
+    let (offer4, _, _) = author(4);
+    let head2 = chain(2, major()).2;
+
+    let mut bob = Exchange::<&str>::new(Some(build()));
+    bob.linked("a", first_frontier());
+
+    // bob holds rows 1-2, adopts the offer at 3 and requests 3..=3.
+    let actions = bob.offer(&"a", offer2, true, now);
+    let Transfer::Request {
+        request_id: r0,
+        from,
+        to,
+        ..
+    } = request_of(&actions).expect("bob requests rows 1-2")
+    else {
+        panic!("bob requests rows 1-2, got {actions:?}");
+    };
+    assert_eq!((from, to), (1, 2));
+    serve_all(&mut bob, r0, &rows2, &bodies2, 2, now);
+
+    let actions = bob.offer(&"a", offer3, true, now);
+    let Transfer::Request {
+        request_id: r1,
+        from,
+        to,
+        ..
+    } = request_of(&actions).expect("bob requests row 3")
+    else {
+        panic!("bob requests row 3, got {actions:?}");
+    };
+    assert_eq!((from, to), (3, 3));
+
+    // alice writes row 4 while r1 stands; the offer is kept for r1.
+    let actions = bob.offer(&"a", offer4, true, now);
+    assert_eq!(
+        actions,
+        Vec::new(),
+        "the newer offer is kept for the outstanding request, got {actions:?}"
+    );
+
+    // alice streams row 3, then the driver reports the commit failed, so the
+    // request aborts from the stored cursor and the kept offer must stand.
+    let mut applied = bob.message(
+        &"a",
+        Transfer::Manifest {
+            request_id: r1,
+            previous: head2,
+            rows: rows3[2..].to_vec(),
+            last: true,
+        },
+        now,
+    );
+    for (row, body) in rows3[2..].iter().zip(bodies3[2..].iter()) {
+        applied.extend(bob.message(
+            &"a",
+            Transfer::Body {
+                request_id: r1,
+                seq: row.seq,
+                changeset: body.clone(),
+            },
+            now,
+        ));
+    }
+    assert_eq!(applies(&applied), 1);
+    bob.commit_failed(
+        &"a",
+        Frontier {
+            seq: 2,
+            head: head2,
+        },
+        now,
+    );
+    assert_eq!(bob.next_deadline(), Some(now + RETRY_FIRST));
+
+    // The retry must re-request up to the kept offer's newest, so row 4 is
+    // fetched. Losing the kept offer leaves the retry at row 3.
+    let actions = bob.timeout(now + RETRY_FIRST);
+    let Transfer::Request { to, .. } =
+        request_of(&actions).expect("the retry re-requests the range")
+    else {
+        panic!("the retry re-requests the range, got {actions:?}");
+    };
+    assert_eq!(
+        to, 4,
+        "the retry must cover the kept offer's newest, so row 4 is fetched"
+    );
+}
+
+/// A failed adopt aborts the outstanding request, and its kept offer
+/// survives so the retry re-adopts it and re-requests its range.
+#[test]
+fn an_adopt_failure_keeps_the_offered_range_for_the_retry() {
+    let now = Instant::now();
+    let (offer2, rows2, bodies2) = author(2);
+    let (offer3, _, _) = author(3);
+    let (offer4, _, _) = author(4);
+    let head2 = chain(2, major()).2;
+
+    let mut bob = Exchange::<&str>::new(Some(build()));
+    bob.linked("a", first_frontier());
+
+    // bob holds rows 1-2, adopts the offer at 3 and requests 3..=3.
+    let actions = bob.offer(&"a", offer2, true, now);
+    let Transfer::Request {
+        request_id: r0,
+        from,
+        to,
+        ..
+    } = request_of(&actions).expect("bob requests rows 1-2")
+    else {
+        panic!("bob requests rows 1-2, got {actions:?}");
+    };
+    assert_eq!((from, to), (1, 2));
+    serve_all(&mut bob, r0, &rows2, &bodies2, 2, now);
+
+    let actions = bob.offer(&"a", offer3, true, now);
+    let Transfer::Request { from, to, .. } = request_of(&actions).expect("bob requests row 3")
+    else {
+        panic!("bob requests row 3, got {actions:?}");
+    };
+    assert_eq!((from, to), (3, 3));
+
+    // alice writes row 4; the offer is kept for the outstanding request.
+    let actions = bob.offer(&"a", offer4, true, now);
+    assert_eq!(
+        actions,
+        Vec::new(),
+        "the newer offer is kept for the outstanding request, got {actions:?}"
+    );
+
+    // The adopt of the offer at 3 fails to commit, so the request aborts and
+    // the retry must re-adopt the kept offer at 4 and request its range.
+    bob.adopt_failed(
+        &"a",
+        Frontier {
+            seq: 2,
+            head: head2,
+        },
+        now,
+    );
+    assert_eq!(bob.next_deadline(), Some(now + RETRY_FIRST));
+    let actions = bob.timeout(now + RETRY_FIRST);
+    let Transfer::Request { to, .. } =
+        request_of(&actions).expect("the retry re-requests the range")
+    else {
+        panic!("the retry re-requests the range, got {actions:?}");
+    };
+    assert_eq!(
+        to, 4,
+        "the retry must cover the kept offer's newest, so row 4 is fetched"
+    );
+}

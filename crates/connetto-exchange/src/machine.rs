@@ -622,9 +622,25 @@ fn retry_request<P: Clone>(
 
 /// Abort the outstanding request, keep what has been processed, and schedule
 /// a retry at the current backoff, doubling it for the next stall (decision
-/// 22).
+/// 22). An aborted request's kept offer, when it names a range at least as
+/// new as the last verified one, becomes that offer and stands owed, so the
+/// retry adopts it and requests its range instead of leaving the newer rows
+/// behind the cursor.
 fn abort_with_retry(receiver: &mut Receiver, now: Instant) {
-    receiver.request = None;
+    if let Some(request) = receiver.request.take()
+        && let Some(kept) = request.kept
+        && let Some(kept_newest) = kept.offer.newest.as_ref()
+    {
+        let last_newest = receiver
+            .last_offer
+            .as_ref()
+            .and_then(|offer| offer.offer.newest.as_ref())
+            .map(|frontier| frontier.seq);
+        if kept_newest.seq >= last_newest.unwrap_or(0) {
+            receiver.last_offer = Some(kept);
+            receiver.adopt_owed = true;
+        }
+    }
     receiver.retry_at = Some(now + receiver.backoff);
     receiver.backoff = receiver.backoff.saturating_mul(2).min(RETRY_CEILING);
 }
