@@ -1593,6 +1593,13 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                             run.peer_linked(peer.clone(), public_key, bot_list, expires_at).await;
                             run.link.emit(ClientEvent::PeerLinked { peer });
                         }
+                        PeerEvent::LinkReplaced { peer, public_key, bot_list, expires_at } => {
+                            let _ = run.enroller.media.forward(crate::media::MediaEvent::Linked {
+                                peer: peer.clone(),
+                                bot_list: bot_list.clone(),
+                            });
+                            run.peer_relink(&peer, public_key, bot_list, expires_at).await;
+                        }
                         PeerEvent::Renewed { peer, expires_at } => {
                             run.peer_renewed(&peer, expires_at).await;
                         }

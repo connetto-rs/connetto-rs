@@ -26,6 +26,21 @@ pub enum PeerEvent {
         /// peer's retained entries until (R78 decision 17).
         expires_at: SystemTime,
     },
+    /// A live link to a peer was replaced by a new one on the same identity
+    /// (a duplicate re-link), so the old link's frames are gone; the peer's
+    /// identity, key, bot list and certificate end are re-presented.
+    LinkReplaced {
+        /// The peer the re-link reached.
+        peer: DeviceIdentity,
+        /// The peer's `SubjectPublicKeyInfo`, DER, which its offers verify
+        /// against.
+        public_key: Vec<u8>,
+        /// The bot list the peer's certificate carries, `None` for a
+        /// certificate without the extension.
+        bot_list: Option<String>,
+        /// The end of the peer's certificate.
+        expires_at: SystemTime,
+    },
     /// A linked peer presented a renewed certificate on its link, on the
     /// same key (R78 slice 3a).
     Renewed {
