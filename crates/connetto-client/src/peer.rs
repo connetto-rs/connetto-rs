@@ -332,12 +332,12 @@ pub(crate) fn unsettled_at_or_below(
         .collect()
 }
 
-/// Every courier-only and digest-only entry, author and sequence, which the
-/// session's asks cover beside the provisional records (R78 slice 3a).
-pub(crate) fn unapplied(db: &mut SqliteConnection) -> Result<Vec<(Vec<u8>, i64)>, ClientError> {
+/// Every stored entry a verdict still reaches, author and sequence, which the
+/// session's asks cover beside the provisional records (R115 decision 1).
+pub(crate) fn unretained(db: &mut SqliteConnection) -> Result<Vec<(Vec<u8>, i64)>, ClientError> {
     Ok(dsl::_connetto_peer_entry
         .select((dsl::author, dsl::seq))
-        .filter(dsl::state.eq_any([HeldState::CourierOnly.db(), HeldState::DigestOnly.db()]))
+        .filter(dsl::state.ne(HeldState::Retained.db()))
         .load(db)?)
 }
 

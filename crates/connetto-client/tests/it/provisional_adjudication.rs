@@ -11,15 +11,17 @@ use std::time::Duration;
 use connetto_client::peer::{HeldState, PeerAuthor};
 use connetto_client::provisional::{ProvisionalState, encode_key};
 use connetto_client::{ClientEvent, ConnettoConnection, KeyValue};
-use connetto_core::exchange::{RetractCause, Verdict};
+use connetto_core::exchange::{Frontier, Offer, RetractCause, SignedOffer, Verdict};
 use connetto_core::messages::{
-    ControlMessage, MutationRejectReason, NonFatalError, PROVISIONAL_ASK_REFUSED,
-    ProvisionalStatus, ProvisionalVerdicts, RateLimited,
+    BulkMessage, ControlMessage, LivePatch, MutationRejectReason, NonFatalError,
+    PROVISIONAL_ASK_REFUSED, ProvisionalStatus, ProvisionalVerdicts, RateLimited,
 };
 use connetto_core::traits::IncomingFrame;
 use diesel::prelude::*;
 
-use super::peer_support::{captured, drain_quiet, manifest, pump_to, receiver};
+use super::peer_support::{
+    captured, cursor_byte, drain_quiet, manifest, orders_payload, pump_to, receiver,
+};
 use super::support::{self, Script};
 
 /// The author replica's schema, the receiver's `orders` table with no
@@ -151,8 +153,27 @@ fn insert_order(conn: &mut ConnettoConnection<Script>, id: i64) {
         .expect("insert the order");
 }
 
-/// Store `author`'s cursor row with `offer`, the offer the ask will carry.
-fn seed_cursor<T>(conn: &mut ConnettoConnection<T>, author: &[u8; 32], seq: i64, offer: &[u8])
+/// The signed offer `tag` names, its newest entry at `newest`, encoded as the
+/// cursor stores it, so the ask covers sequences 1 to `newest`.
+fn signed_offer(tag: &[u8], newest: i64) -> Vec<u8> {
+    let signed = SignedOffer {
+        offer: Offer {
+            builds: Vec::new(),
+            settled: None,
+            newest: Some(Frontier {
+                seq: u64::try_from(newest).expect("a sequence is positive"),
+                head: [0; 32],
+            }),
+            retractions: Vec::new(),
+        },
+        signature: tag.to_vec(),
+    };
+    rmp_serde::to_vec_named(&signed).expect("the offer encodes")
+}
+
+/// Store `author`'s cursor row with the offer `tag` names, its newest entry
+/// at `seq`, the offer the ask will carry.
+fn seed_cursor<T>(conn: &mut ConnettoConnection<T>, author: &[u8; 32], seq: i64, tag: &[u8])
 where
     T: connetto_core::traits::Transport,
     T::Error: core::fmt::Display,
@@ -163,7 +184,7 @@ where
             _connetto_peer_cursor::account.eq("peer-anna"),
             _connetto_peer_cursor::seq.eq(seq),
             _connetto_peer_cursor::head.eq(vec![0u8; 32]),
-            _connetto_peer_cursor::offer.eq(offer.to_vec()),
+            _connetto_peer_cursor::offer.eq(signed_offer(tag, seq)),
             _connetto_peer_cursor::expires_at.eq(4_102_444_800_i64),
         ))
         .execute(conn.conn())
@@ -335,7 +356,7 @@ async fn attach_asks_each_author_it_holds_an_offer_from() {
     let [first] = asks(&script).try_into().expect("one ask at a time");
     assert_eq!(first.author, AUTHOR_A);
     assert_eq!(first.seqs, vec![1, 2, 3]);
-    assert_eq!(first.offer, OFFER_A);
+    assert_eq!(first.offer, signed_offer(OFFER_A, 3));
 
     rule(
         &script,
@@ -352,7 +373,7 @@ async fn attach_asks_each_author_it_holds_an_offer_from() {
     let second = &asks[1];
     assert_eq!(second.author, AUTHOR_C);
     assert_eq!(second.seqs, vec![1, 2, 3]);
-    assert_eq!(second.offer, OFFER_C);
+    assert_eq!(second.offer, signed_offer(OFFER_C, 3));
     assert!(
         !asks.iter().any(|ask| ask.author == AUTHOR_B),
         "an author with no stored offer is never asked"
@@ -462,6 +483,49 @@ async fn an_ask_covers_every_held_entry_but_the_retained() {
     let [ask] = asks(&script).try_into().expect("one ask");
     assert_eq!(ask.author, AUTHOR_A);
     assert_eq!(ask.seqs, vec![2, 3, 4]);
+}
+
+/// A provisional entry whose every record a live patch confirmed still
+/// awaits its verdict, so the next session asks about it and its `Applied`
+/// ruling retains it (R115 decision 1).
+#[tokio::test]
+async fn a_confirmed_provisional_entry_is_asked_and_retained() {
+    let w1 = |conn: &mut ConnettoConnection<Script>| insert_order(conn, 1);
+    let [b1] = captured(PLAIN_DDL, [&w1]).await;
+    let (mut conn, server) = receiver(DDL, POLICIES).await;
+    seed_cursor(&mut conn, &AUTHOR_A, 1, OFFER_A);
+    conn.apply_peer_entry(&author_of(AUTHOR_A), &manifest(1, &b1), &b1)
+        .expect("apply sequence 1");
+    server.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+        "orders".to_owned(),
+        cursor_byte(1),
+        orders_payload(&[(1, "peer-anna", "open")]),
+    ))));
+    pump_to(&mut conn, |event| {
+        matches!(event, ClientEvent::ProvisionalConfirmed { .. })
+    })
+    .await;
+    assert_eq!(record_states(&mut conn, &AUTHOR_A), Vec::new());
+    assert_eq!(
+        entry_states(&mut conn, &AUTHOR_A),
+        vec![(1, HeldState::Provisional.db())],
+        "the patch is no verdict on the entry"
+    );
+
+    conn.disconnect();
+    let (mut conn, script) = attach(conn).await;
+    let [ask] = asks(&script)
+        .try_into()
+        .expect("the confirmed entry is asked");
+    assert_eq!(ask.author, AUTHOR_A);
+    assert_eq!(ask.seqs, vec![1]);
+    rule(&script, &ask.request_id, vec![(1, Verdict::Applied)]);
+    pump_to(&mut conn, applied).await;
+    assert_eq!(
+        entry_states(&mut conn, &AUTHOR_A),
+        vec![(1, HeldState::Retained.db())]
+    );
+    assert_eq!(order_ids(&mut conn), vec![1]);
 }
 
 /// A ruling retains a courier-only or digest-only entry it settles and

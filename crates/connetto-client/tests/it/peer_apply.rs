@@ -20,12 +20,12 @@ use connetto_core::messages::{
 use connetto_core::traits::IncomingFrame;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
-use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, PatchSet, SimpleTable, Value};
+use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
 
 use super::peer_support::{
     _connetto_peer_entry, author, board_rows, captured, cursor_byte, drain_quiet, held_entries,
-    hold_cursor, insert_order, manifest, order_rows, orders, provenance_of, pump_to, receiver,
-    receiver_holding, stored_entries, write_board,
+    hold_cursor, insert_order, manifest, order_rows, orders, orders_patch, orders_payload,
+    provenance_of, pump_to, receiver, receiver_holding, stored_entries, write_board,
 };
 use super::support::{self, Script};
 
@@ -112,31 +112,6 @@ where
         .get_result(conn.conn())
         .expect("count the pending entries");
     row.count
-}
-
-/// An uncompressed insert patchset over `orders`.
-fn orders_patch(rows: &[(i64, &str, &str)]) -> Vec<u8> {
-    let mut patch = PatchSet::<SimpleTable, String, Vec<u8>>::new();
-    for (id, owner, status) in rows {
-        let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
-            "orders",
-            &[("id", ""), ("owner", ""), ("status", "")],
-            &[0],
-        ))
-        .set(0, Value::<String, Vec<u8>>::Integer(*id))
-        .expect("set the key")
-        .set(1, Value::<String, Vec<u8>>::Text(owner.to_string()))
-        .expect("set the owner")
-        .set(2, Value::<String, Vec<u8>>::Text(status.to_string()))
-        .expect("set the status");
-        patch = patch.insert(insert);
-    }
-    patch.build()
-}
-
-/// A compressed insert patchset over `orders`.
-fn orders_payload(rows: &[(i64, &str, &str)]) -> Vec<u8> {
-    zstd::encode_all(orders_patch(rows).as_slice(), 3).expect("compress the patch")
 }
 
 /// A policy-passing author write lands, records its provenance, and raises
