@@ -161,7 +161,7 @@ async fn a_refused_requester_and_an_absent_file_get_the_same_answer() {
                 len: 100,
             },
         ] {
-            let request_id = request.request_id();
+            let request_id = request.request_id().expect("a request carries its id");
             assert_eq!(
                 ask(&carl, &mut carl_events, &holder, request).await,
                 vec![Media::Refused { request_id }],
@@ -336,7 +336,7 @@ async fn a_file_a_readable_row_names_but_the_holder_lacks_is_refused() {
                 len: 100,
             },
         ] {
-            let request_id = request.request_id();
+            let request_id = request.request_id().expect("a request carries its id");
             assert_eq!(
                 ask(&anna, &mut anna_events, &holder, request).await,
                 vec![Media::Refused { request_id }],

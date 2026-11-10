@@ -487,6 +487,9 @@ where
                         Vec::new()
                     }
                 }
+                // The links keep the report, which placement and the
+                // candidate order read when they next decide.
+                MediaAction::Reported { .. } => Vec::new(),
             };
             queue.extend(more);
         }
@@ -665,7 +668,13 @@ where
                 more.extend(self.next_holder(tag, now));
                 more
             }
-            Media::Want { .. } | Media::Fetch { .. } => self.release(&peer, done, now),
+            // A request or a report never arrives as a reply, since the links
+            // route both before matching a request id.
+            Media::Want { .. }
+            | Media::Fetch { .. }
+            | Media::Holdings { .. }
+            | Media::Held { .. }
+            | Media::Room { .. } => self.release(&peer, done, now),
         }
     }
 

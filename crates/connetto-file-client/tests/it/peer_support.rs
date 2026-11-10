@@ -282,7 +282,9 @@ pub fn bare_holder(
                 continue;
             };
             record.lock().push(message.clone());
-            let request_id = message.request_id();
+            let Some(request_id) = message.request_id() else {
+                continue;
+            };
             match (fault, message) {
                 (Fault::Silent, _) => {}
                 (Fault::AlwaysBusy, _) => {

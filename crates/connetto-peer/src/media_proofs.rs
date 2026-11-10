@@ -1,10 +1,11 @@
-//! The media frames on the link, at peer protocol version 3 (R79 slice 2).
+//! The media frames on the link, at peer protocol version 3 (R79 slices 2
+//! and 9).
 
 use std::time::Duration;
 
 use connetto_core::device_cert::{AttestationLevel, DeviceIdentity};
 use connetto_exchange::MAX_MANIFEST_ROWS;
-use connetto_exchange::media::{MAX_PIECE_BYTES, Media};
+use connetto_exchange::media::{MAX_PIECE_BYTES, MAX_REPORT_ENTRIES, Media};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
@@ -13,8 +14,8 @@ use crate::test_support::{DAY, Deployment, events, node, serve, whole_second};
 use crate::tests::{await_event, linked_event, next_events, raw_linked};
 use crate::{CloseReason, Node, PeerEvent, PeerSendError};
 
-/// One message of each kind, every reply quoting `request_id`.
-fn media_messages(request_id: u64) -> [Media; 6] {
+/// One message of each kind, every request and reply quoting `request_id`.
+fn media_messages(request_id: u64) -> [Media; 9] {
     [
         Media::Want {
             request_id,
@@ -38,6 +39,22 @@ fn media_messages(request_id: u64) -> [Media; 6] {
         },
         Media::Refused { request_id },
         Media::Busy { request_id },
+        Media::Holdings {
+            room: 1 << 30,
+            rates: vec![([4; 32], 2_000_000)],
+            held: vec![[5; 32], [6; 32]],
+            leaving: vec![[6; 32]],
+            last: true,
+        },
+        Media::Held {
+            added: vec![[7; 32]],
+            removed: vec![[5; 32]],
+            leaving: vec![],
+        },
+        Media::Room {
+            room: 0,
+            rates: vec![([4; 32], 1_500_000)],
+        },
     ]
 }
 
@@ -60,7 +77,8 @@ async fn every_media_message_round_trips_its_encoding() {
 }
 
 #[tokio::test]
-async fn a_manifest_at_the_row_bound_and_a_whole_piece_encode_under_the_ceiling() {
+async fn every_media_message_at_its_bounds_encodes_under_the_ceiling() {
+    let entries = vec![[0xff; 32]; MAX_REPORT_ENTRIES];
     let frames = [
         PeerFrame::Media(Media::Manifest {
             request_id: 1,
@@ -71,6 +89,18 @@ async fn a_manifest_at_the_row_bound_and_a_whole_piece_encode_under_the_ceiling(
             request_id: 2,
             encoded: vec![0xff; MAX_PIECE_BYTES],
             last: true,
+        }),
+        PeerFrame::Media(Media::Holdings {
+            room: u64::MAX,
+            rates: vec![([0xff; 32], u64::MAX); MAX_REPORT_ENTRIES],
+            held: entries.clone(),
+            leaving: entries.clone(),
+            last: true,
+        }),
+        PeerFrame::Media(Media::Held {
+            added: entries.clone(),
+            removed: entries.clone(),
+            leaving: entries,
         }),
     ];
     for frame in frames {
@@ -93,7 +123,7 @@ async fn media_reaches_in_order(
     from: &DeviceIdentity,
     to: &DeviceIdentity,
     rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
-    messages: [Media; 6],
+    messages: [Media; 9],
 ) {
     for message in &messages {
         sender
