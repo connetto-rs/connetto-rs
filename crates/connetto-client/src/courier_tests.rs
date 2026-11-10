@@ -1345,6 +1345,13 @@ async fn author_banned_keeps_every_row() {
         [1, 2],
         "the held rows stand beside the offer"
     );
+    let retained = next_ask(&mut server).await;
+    assert_eq!(
+        retained.seqs,
+        [3],
+        "the session asks about the retained row"
+    );
+    deliver_verdicts(&mut server, &retained.request_id, &[(3, Verdict::Settled)]).await;
     let wait = conn.courier(AUTHOR).await.expect("send the range");
     let range = next_range(&mut server).await;
     let _ = next_body(&mut server).await;
@@ -2607,9 +2614,9 @@ fn a_digest_of_another_length_refuses_the_rows() {
     assert!(err.to_string().contains("no digest"), "{err}");
 }
 
-/// A full resync's end asks the retained rows and owes the ask, a resync still running asking nothing (R78 decision 49).
+/// The attach asks the retained rows, and a full resync's end asks nothing more (R114 decision 1).
 #[tokio::test]
-async fn resync_end_asks_retained_rows_and_owes_the_ask() {
+async fn attach_asks_retained_rows_and_a_resync_end_asks_nothing_more() {
     let mut conn = replica();
     hold(
         &mut conn,
@@ -2629,64 +2636,168 @@ async fn resync_end_asks_retained_rows_and_owes_the_ask() {
     );
     adopt(&mut conn, AUTHOR, Some(2));
     let (mut conn, mut server) = attach(conn, true).await;
-    assert!(
-        !peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "a session that never resynced owes nothing"
-    );
-    server
-        .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
-            sub_id: "items".to_owned(),
-            reason: FullResyncReason::CursorOutsideRetention,
-        }))
-        .await
-        .expect("resync");
-    let event = conn.pump_one().await.expect("the resync lands");
-    assert!(matches!(event, ClientEvent::FullResync { .. }));
-    assert!(
-        timeout(Duration::from_millis(100), server.recv())
-            .await
-            .is_err(),
-        "a resync still running asks nothing"
-    );
-    assert!(
-        !peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "a resync still running owes nothing yet"
-    );
-    server
-        .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
-            sub_id: "items".to_owned(),
-            cursor: Cursor::new(Vec::new()),
-        }))
-        .await
-        .expect("end the snapshot");
-    let event = conn.pump_one().await.expect("the snapshot ends");
-    assert!(matches!(event, ClientEvent::SnapshotEnd { .. }));
     let ask = next_ask(&mut server).await;
     assert_eq!(ask.author, AUTHOR);
     assert_eq!(ask.seqs, [1, 2]);
-    assert!(
-        peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "the ended resync owes the ask"
-    );
     deliver_verdicts(
         &mut server,
         &ask.request_id,
         &[(1, Verdict::Applied), (2, Verdict::Applied)],
     )
     .await;
+    resync(&mut conn, &mut server).await;
+    assert!(
+        timeout(Duration::from_millis(100), server.recv())
+            .await
+            .is_err(),
+        "the resync's end asks nothing the attach asked"
+    );
+    server.close().await.expect("hang up");
+    let event = conn.pump_one().await.expect("the session ends");
+    assert!(matches!(event, ClientEvent::Closed));
+    for seq in [1, 2] {
+        assert!(
+            matches!(
+                peer::state_of(&mut conn.db, &AUTHOR, seq),
+                Ok(Some(HeldState::Retained)),
+            ),
+            "the row stays retained"
+        );
+    }
+}
+
+/// A restart after a Pending answer asks again, and the Pending answer stands the row a candidate again (R114 decision 1).
+#[tokio::test]
+async fn restart_after_a_pending_answer_stands_the_candidacy_again() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Retained,
+        major(2),
+        Some(b"the only row"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    let (mut conn, mut server) = attach(conn, true).await;
+    let ask = next_ask(&mut server).await;
+    deliver_verdicts(&mut server, &ask.request_id, &[(1, Verdict::Pending)]).await;
+    let event = conn.pump_one().await.expect("the ruling settles");
+    assert!(matches!(event, ClientEvent::NonFatal { .. }));
+    let candidate = expect_candidates(conn.pump_one().await.expect("restate"));
+    assert_eq!(candidate.seqs, [1]);
+    server.close().await.expect("hang up");
+    let event = conn.pump_one().await.expect("the session ends");
+    assert!(matches!(event, ClientEvent::Closed));
+    let (mut conn, mut server) = attach(conn, true).await;
+    let ask = next_ask(&mut server).await;
+    assert_eq!(ask.author, AUTHOR);
+    assert_eq!(ask.seqs, [1], "the restart asks the retained row again");
+    deliver_verdicts(&mut server, &ask.request_id, &[(1, Verdict::Pending)]).await;
+    let event = conn.pump_one().await.expect("the ruling settles");
+    assert!(matches!(event, ClientEvent::NonFatal { .. }));
+    let candidate = expect_candidates(conn.pump_one().await.expect("restate"));
+    assert_eq!(candidate.seqs, [1], "the candidacy stands again");
+    assert_eq!(candidate.last, Some(Verdict::Pending));
+    server.close().await.expect("hang up");
+    let event = conn.pump_one().await.expect("the session ends");
+    assert!(matches!(event, ClientEvent::Closed));
+}
+
+/// An Abandoned answer deletes the retained rows it names and no other, a Settled one beside it staying retained (R114 decision 2).
+#[tokio::test]
+async fn abandoned_answer_deletes_only_the_retained_rows_it_names() {
+    let mut conn = replica();
+    for (seq, body) in [
+        (1u64, b"the first" as &[u8]),
+        (2, b"the second" as &[u8]),
+        (3, b"the third" as &[u8]),
+    ] {
+        hold(
+            &mut conn,
+            AUTHOR,
+            seq,
+            HeldState::Retained,
+            major(2),
+            Some(body),
+        );
+    }
+    adopt(&mut conn, AUTHOR, Some(3));
+    let (mut conn, mut server) = attach(conn, true).await;
+    let ask = next_ask(&mut server).await;
+    assert_eq!(ask.seqs, [1, 2, 3]);
+    deliver_verdicts(
+        &mut server,
+        &ask.request_id,
+        &[
+            (1, Verdict::Settled),
+            (2, Verdict::Abandoned),
+            (3, Verdict::Abandoned),
+        ],
+    )
+    .await;
+    let event = conn.pump_one().await.expect("the ruling settles");
+    assert!(matches!(event, ClientEvent::NonFatal { .. }));
+    assert!(
+        matches!(
+            peer::state_of(&mut conn.db, &AUTHOR, 1),
+            Ok(Some(HeldState::Retained)),
+        ),
+        "the settled row stays retained"
+    );
+    for seq in [2, 3] {
+        assert!(
+            matches!(peer::state_of(&mut conn.db, &AUTHOR, seq), Ok(None)),
+            "the abandoned row {seq} is deleted"
+        );
+    }
     server.close().await.expect("hang up");
     let event = conn.pump_one().await.expect("the session ends");
     assert!(
         matches!(event, ClientEvent::Closed),
-        "the rulings settle with no event"
-    );
-    assert!(
-        !peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "every answer landed"
+        "no candidate stood, so none restates"
     );
 }
 
-/// A Pending answer to the resync's ask stands the rows as candidates with the last ruling heard, and the courier sends them (R78 decisions 45 and 50).
+/// A pushed Abandoned deletes a candidate and restates the author's emptied set (R114 decision 2).
+#[tokio::test]
+async fn pushed_abandoned_deletes_a_candidate_and_restates_the_set() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::Retained,
+        major(2),
+        Some(b"the only row"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    let (mut conn, mut server) = attach(conn, true).await;
+    let ask = next_ask(&mut server).await;
+    deliver_verdicts(&mut server, &ask.request_id, &[(1, Verdict::Pending)]).await;
+    let event = conn.pump_one().await.expect("the ruling settles");
+    assert!(matches!(event, ClientEvent::NonFatal { .. }));
+    let candidate = expect_candidates(conn.pump_one().await.expect("restate"));
+    assert_eq!(candidate.seqs, [1]);
+    deliver_verdicts(&mut server, &ask.request_id, &[(1, Verdict::Abandoned)]).await;
+    let event = conn.pump_one().await.expect("the push settles");
+    assert!(matches!(event, ClientEvent::NonFatal { .. }));
+    let candidate = expect_candidates(conn.pump_one().await.expect("restate"));
+    assert!(candidate.seqs.is_empty(), "nothing is left to courier");
+    assert!(
+        matches!(peer::state_of(&mut conn.db, &AUTHOR, 1), Ok(None)),
+        "the abandoned candidate is deleted"
+    );
+    assert!(
+        matches!(conn.courier(AUTHOR).await, Err(CourierError::NothingHeld)),
+        "the courier holds nothing of the author"
+    );
+    server.close().await.expect("hang up");
+    let event = conn.pump_one().await.expect("the session ends");
+    assert!(matches!(event, ClientEvent::Closed));
+}
+
+/// A Pending answer to the session's ask stands the rows as candidates with the last ruling heard, and the courier sends them (R78 decisions 45 and 50).
 #[tokio::test]
 async fn pending_answer_marks_retained_rows_and_the_courier_sends_them() {
     let mut conn = replica();
@@ -2708,7 +2819,6 @@ async fn pending_answer_marks_retained_rows_and_the_courier_sends_them() {
     );
     adopt(&mut conn, AUTHOR, Some(2));
     let (mut conn, mut server) = attach(conn, true).await;
-    resync(&mut conn, &mut server).await;
     let ask = next_ask(&mut server).await;
     assert_eq!(ask.seqs, [1, 2]);
     deliver_verdicts(
@@ -2761,7 +2871,7 @@ async fn pending_answer_marks_retained_rows_and_the_courier_sends_them() {
     }
 }
 
-/// A ruling other than Pending to the resync's ask leaves the row retained and out of the run, breaking its contiguity (R78 decisions 45 and 49).
+/// A ruling other than Pending to the session's ask leaves the row retained and out of the run, breaking its contiguity (R78 decision 45).
 #[tokio::test]
 async fn other_answers_leave_retained_rows_out_of_the_run() {
     let mut conn = replica();
@@ -2781,7 +2891,6 @@ async fn other_answers_leave_retained_rows_out_of_the_run() {
     }
     adopt(&mut conn, AUTHOR, Some(3));
     let (mut conn, mut server) = attach(conn, true).await;
-    resync(&mut conn, &mut server).await;
     let ask = next_ask(&mut server).await;
     assert_eq!(ask.seqs, [1, 2, 3]);
     deliver_verdicts(
@@ -2817,217 +2926,7 @@ async fn other_answers_leave_retained_rows_out_of_the_run() {
     assert!(matches!(event, ClientEvent::Closed));
 }
 
-/// The owed row stands until every retained ask of the resync is answered (R78 decision 49).
-#[tokio::test]
-async fn owed_row_cleared_when_every_retained_ask_is_answered() {
-    let mut conn = replica();
-    hold(
-        &mut conn,
-        AUTHOR,
-        1,
-        HeldState::Retained,
-        major(2),
-        Some(b"the first"),
-    );
-    hold(
-        &mut conn,
-        OTHER,
-        1,
-        HeldState::Retained,
-        major(2),
-        Some(b"the other"),
-    );
-    adopt(&mut conn, AUTHOR, Some(1));
-    adopt(&mut conn, OTHER, Some(1));
-    let (mut conn, mut server) = attach(conn, true).await;
-    resync(&mut conn, &mut server).await;
-    let first = next_ask(&mut server).await;
-    assert_eq!(first.author, AUTHOR);
-    assert!(peer::retained_ask_owed(&mut conn.db).expect("read the owed row"));
-    deliver_verdicts(&mut server, &first.request_id, &[(1, Verdict::Pending)]).await;
-    let event = conn.pump_one().await.expect("the ruling settles");
-    assert!(matches!(event, ClientEvent::NonFatal { .. }));
-    let _ = expect_candidates(conn.pump_one().await.expect("restate"));
-    assert!(
-        peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "the other ask still stands"
-    );
-    let second = next_ask(&mut server).await;
-    assert_eq!(second.author, OTHER);
-    deliver_verdicts(&mut server, &second.request_id, &[(1, Verdict::Pending)]).await;
-    let event = conn.pump_one().await.expect("the ruling settles");
-    assert!(matches!(event, ClientEvent::NonFatal { .. }));
-    let _ = expect_candidates(conn.pump_one().await.expect("restate"));
-    assert!(
-        !peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "every retained ask is answered"
-    );
-    server.close().await.expect("hang up");
-    let event = conn.pump_one().await.expect("the session ends");
-    assert!(matches!(event, ClientEvent::Closed));
-}
-
-/// A lapse keeps the owed row standing, and the late answer that still answers the ask clears it (R78 decision 49).
-#[tokio::test]
-async fn lapse_keeps_the_owed_row_until_the_late_answer() {
-    let mut conn = replica();
-    hold(
-        &mut conn,
-        AUTHOR,
-        1,
-        HeldState::Retained,
-        major(2),
-        Some(b"the only row"),
-    );
-    adopt(&mut conn, AUTHOR, Some(1));
-    let (mut conn, mut server) = attach(conn, true).await;
-    resync(&mut conn, &mut server).await;
-    let ask = next_ask(&mut server).await;
-    assert!(peer::retained_ask_owed(&mut conn.db).expect("read the owed row"));
-    conn.provisional
-        .in_flight
-        .as_mut()
-        .expect("the ask is in flight")
-        .deadline = Duration::ZERO;
-    let outcome = conn
-        .pump_one_or(std::future::ready(()))
-        .await
-        .expect("the step stands");
-    assert!(outcome.is_none(), "the lapse stands no event");
-    assert!(
-        peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "the lapse keeps the owed row"
-    );
-    deliver_verdicts(&mut server, &ask.request_id, &[(1, Verdict::Pending)]).await;
-    let event = conn.pump_one().await.expect("the late ruling settles");
-    assert!(matches!(event, ClientEvent::NonFatal { .. }));
-    let _ = expect_candidates(conn.pump_one().await.expect("restate"));
-    assert!(
-        !peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "the late answer landed"
-    );
-    server.close().await.expect("hang up");
-    let event = conn.pump_one().await.expect("the session ends");
-    assert!(matches!(event, ClientEvent::Closed));
-}
-
-/// A restart that finds the owed row standing asks the retained rows again (R78 decision 49).
-#[tokio::test]
-async fn restart_with_the_owed_row_asks_the_retained_rows_again() {
-    let mut conn = replica();
-    hold(
-        &mut conn,
-        AUTHOR,
-        1,
-        HeldState::Retained,
-        major(2),
-        Some(b"the only row"),
-    );
-    adopt(&mut conn, AUTHOR, Some(1));
-    let (mut conn, mut server) = attach(conn, true).await;
-    resync(&mut conn, &mut server).await;
-    let _ask = next_ask(&mut server).await;
-    assert!(peer::retained_ask_owed(&mut conn.db).expect("read the owed row"));
-    server.close().await.expect("hang up");
-    let event = conn.pump_one().await.expect("the session ends");
-    assert!(matches!(event, ClientEvent::Closed));
-    assert!(
-        peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "the session's end never answers the owed row"
-    );
-    let (mut conn, mut server) = attach(conn, true).await;
-    let ask = next_ask(&mut server).await;
-    assert_eq!(ask.author, AUTHOR);
-    assert_eq!(ask.seqs, [1]);
-    assert!(peer::retained_ask_owed(&mut conn.db).expect("read the owed row"));
-    deliver_verdicts(&mut server, &ask.request_id, &[(1, Verdict::Pending)]).await;
-    let event = conn.pump_one().await.expect("the ruling settles");
-    assert!(matches!(event, ClientEvent::NonFatal { .. }));
-    let _ = expect_candidates(conn.pump_one().await.expect("restate"));
-    assert!(
-        !peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "the ask is answered again"
-    );
-    server.close().await.expect("hang up");
-    let event = conn.pump_one().await.expect("the session ends");
-    assert!(matches!(event, ClientEvent::Closed));
-}
-
-/// A session that finds the ask owed but no retained row left to ask answers the owed row at once (R78 decision 49).
-#[tokio::test]
-async fn an_owed_ask_with_no_retained_row_left_clears_at_session_start() {
-    let mut conn = replica();
-    peer::owe_retained_ask(&mut conn.db).expect("owe the ask");
-    let (mut conn, server) = attach(conn, true).await;
-    assert!(
-        !peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "nothing stands to ask, so the owed row goes"
-    );
-    drop(server);
-}
-
-/// Owing the retained ask twice leaves one row standing (R78 decision 49).
-#[test]
-fn owing_the_retained_ask_twice_leaves_one_row() {
-    let mut conn = replica();
-    peer::owe_retained_ask(&mut conn.db).expect("owe the ask");
-    peer::owe_retained_ask(&mut conn.db).expect("owe the ask again");
-    assert_eq!(
-        peer::retained_ask_count(&mut conn.db).expect("count the owed rows"),
-        1,
-        "the second owing stands the row as it stands"
-    );
-}
-
-/// A session whose retained ask still awaits an answer when a second resync
-/// ends keeps the ask owed and restates nothing, the owed row going with the
-/// answer (R78 decision 49).
-#[tokio::test]
-async fn a_second_resync_end_keeps_the_owed_ask_without_asking_again() {
-    let mut conn = replica();
-    hold(
-        &mut conn,
-        AUTHOR,
-        1,
-        HeldState::Retained,
-        major(2),
-        Some(b"the only row"),
-    );
-    adopt(&mut conn, AUTHOR, Some(1));
-    let (mut conn, mut server) = attach(conn, true).await;
-    resync(&mut conn, &mut server).await;
-    let ask = next_ask(&mut server).await;
-    assert_eq!(ask.author, AUTHOR);
-    assert_eq!(ask.seqs, [1]);
-    assert!(
-        peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "the first resync owes the ask"
-    );
-    resync(&mut conn, &mut server).await;
-    assert!(
-        timeout(Duration::from_millis(100), server.recv())
-            .await
-            .is_err(),
-        "an ask the session still owes an answer is not restated"
-    );
-    assert!(
-        peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "the second resync end leaves the owed row standing"
-    );
-    deliver_verdicts(&mut server, &ask.request_id, &[(1, Verdict::Pending)]).await;
-    let event = conn.pump_one().await.expect("the ruling settles");
-    assert!(matches!(event, ClientEvent::NonFatal { .. }));
-    let _ = expect_candidates(conn.pump_one().await.expect("restate"));
-    assert!(
-        !peer::retained_ask_owed(&mut conn.db).expect("read the owed row"),
-        "the answer clears the owed row"
-    );
-    server.close().await.expect("hang up");
-    let event = conn.pump_one().await.expect("the session ends");
-    assert!(matches!(event, ClientEvent::Closed));
-}
-
-/// A push ruling a retained row the resync's ask answered Pending ends its candidacy with the row still retained and the candidates restated (R78 decisions 45 and 46).
+/// A push ruling a retained row the session's ask answered Pending ends its candidacy with the row still retained and the candidates restated (R78 decisions 45 and 46).
 #[tokio::test]
 async fn push_ending_marked_retained_rows_keeps_them_retained() {
     let mut conn = replica();
@@ -3047,7 +2946,6 @@ async fn push_ending_marked_retained_rows_keeps_them_retained() {
     }
     adopt(&mut conn, AUTHOR, Some(3));
     let (mut conn, mut server) = attach(conn, true).await;
-    resync(&mut conn, &mut server).await;
     let ask = next_ask(&mut server).await;
     deliver_verdicts(
         &mut server,
@@ -3095,7 +2993,7 @@ async fn push_ending_marked_retained_rows_keeps_them_retained() {
     );
 }
 
-/// A courier answer Refused on a retained row the resync's ask answered Pending ends its candidacy and keeps the row retained (R78 decisions 45 and 49).
+/// A courier answer Refused on a retained row the session's ask answered Pending ends its candidacy and keeps the row retained (R78 decision 45).
 #[tokio::test]
 async fn courier_answer_refused_keeps_marked_retained_rows() {
     let mut conn = replica();
@@ -3117,7 +3015,6 @@ async fn courier_answer_refused_keeps_marked_retained_rows() {
     );
     adopt(&mut conn, AUTHOR, Some(2));
     let (mut conn, mut server) = attach(conn, true).await;
-    resync(&mut conn, &mut server).await;
     let ask = next_ask(&mut server).await;
     deliver_verdicts(
         &mut server,
@@ -3170,7 +3067,7 @@ async fn courier_answer_refused_keeps_marked_retained_rows() {
     }
 }
 
-/// A retention pass that takes a marked retained row drops the mark and restates the author's candidates (R78 decision 49).
+/// A retention pass that takes a marked retained row drops the mark and restates the author's candidates (R78 decision 17).
 #[tokio::test]
 async fn pruned_marked_retained_row_restates_candidates() {
     let mut conn = replica();
@@ -3193,7 +3090,6 @@ async fn pruned_marked_retained_row_restates_candidates() {
     adopt(&mut conn, AUTHOR, Some(1));
     adopt(&mut conn, OTHER, Some(1));
     let (mut conn, mut server) = attach(conn, true).await;
-    resync(&mut conn, &mut server).await;
     let first = next_ask(&mut server).await;
     deliver_verdicts(&mut server, &first.request_id, &[(1, Verdict::Pending)]).await;
     let event = conn.pump_one().await.expect("the ruling settles");
