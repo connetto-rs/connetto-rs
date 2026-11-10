@@ -6406,9 +6406,9 @@ where
     }
 
     /// Plan the session's provisional asks (R77 decision 11) for every author
-    /// its provisional records name and the replica holds a signed offer from,
-    /// the author's sequences in ascending chunks of one manifest frame, one
-    /// ask each.
+    /// whose provisional records or unretained entries the replica holds and
+    /// whose signed offer it stores, the author's sequences in ascending
+    /// chunks of one manifest frame, one ask each.
     ///
     /// An author the replica holds no stored offer from is never asked, its
     /// rows waiting for the author's frontier over a link.
@@ -6428,9 +6428,9 @@ where
                     .push(row.seq);
             }
         }
-        // The courier-only and digest-only entries await the same ruling
-        // (R78 held-row table), and a retained one is settled.
-        for (author, seq) in peer::unapplied(&mut self.db)? {
+        // Every stored entry but the retained awaits its ruling, a provisional
+        // one whose records a patch confirmed among them (R115 decision 1).
+        for (author, seq) in peer::unretained(&mut self.db)? {
             by_author.entry(author).or_default().push(seq);
         }
         for (author, seqs) in by_author {
@@ -6462,7 +6462,7 @@ where
     }
 
     /// Queue an author's provisional asks, one per manifest frame of its
-    /// sequences (R77).
+    /// sequences up to the stored offer's frontier (R77, R78 decision 52).
     ///
     /// # Errors
     ///
@@ -6480,11 +6480,20 @@ where
         let Some(offer) = exchange::offer_of(&mut self.db, &key)? else {
             return Ok(());
         };
+        // The server refuses a whole ask naming a sequence past the offer's
+        // frontier, so a later sequence waits for the author's next offer.
+        let Some(frontier) = rmp_serde::from_slice::<connetto_core::exchange::SignedOffer>(&offer)
+            .ok()
+            .and_then(|signed| signed.offer.frontier().map(|frontier| frontier.seq))
+        else {
+            return Ok(());
+        };
         seqs.sort_unstable();
         seqs.dedup();
         let seqs: Vec<u64> = seqs
             .into_iter()
             .map(|seq| u64::try_from(seq).unwrap_or(u64::MAX))
+            .filter(|seq| *seq <= frontier)
             .collect();
         for chunk in seqs.chunks(connetto_core::exchange::MAX_MANIFEST_ROWS) {
             self.provisional.pending.push_back(ProvisionalAsk {

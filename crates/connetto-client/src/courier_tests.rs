@@ -317,7 +317,7 @@ async fn range_carries_rows_and_declares_bodies_in_order() {
     adopt(&mut conn, AUTHOR, Some(4));
     let (mut conn, mut server) = attach(conn, true).await;
     let ask = next_ask(&mut server).await;
-    assert_eq!(ask.seqs, [2, 3], "the unapplied rows are asked");
+    assert_eq!(ask.seqs, [1, 2, 3, 4], "every unretained row is asked");
     let wait = conn.courier(AUTHOR).await.expect("send the range");
     let range = next_range(&mut server).await;
     assert_eq!(range.author, AUTHOR);
@@ -399,6 +399,7 @@ async fn range_stops_at_first_row_of_another_major() {
     );
     adopt(&mut conn, AUTHOR, Some(3));
     let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
     let wait = conn.courier(AUTHOR).await.expect("send the range");
     let range = next_range(&mut server).await;
     assert_eq!(
@@ -501,6 +502,7 @@ async fn second_call_for_open_author_answers_busy() {
     adopt(&mut conn, AUTHOR, Some(2));
     adopt(&mut conn, OTHER, Some(1));
     let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
     let _wait = conn.courier(AUTHOR).await.expect("send the first range");
     let _ = next_range(&mut server).await;
     let busy = conn
@@ -575,6 +577,7 @@ async fn range_for_other_author_queues_and_sends_after_answer() {
     adopt(&mut conn, AUTHOR, Some(1));
     adopt(&mut conn, OTHER, Some(1));
     let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
     let wait_a = conn.courier(AUTHOR).await.expect("send the first range");
     let range_a = next_range(&mut server).await;
     let _ = next_body(&mut server).await;
@@ -982,6 +985,7 @@ async fn disabled_refusal_enters_c0() {
     );
     adopt(&mut conn, AUTHOR, Some(1));
     let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
     let wait = conn.courier(AUTHOR).await.expect("send the range");
     let range = next_range(&mut server).await;
     let _ = next_body(&mut server).await;
@@ -1487,6 +1491,7 @@ async fn over_bound_wait_drops_and_late_answer_settles() {
     adopt(&mut conn, AUTHOR, Some(1));
     adopt(&mut conn, OTHER, Some(1));
     let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
     let wait_a = conn.courier(AUTHOR).await.expect("send the first range");
     let range_a = next_range(&mut server).await;
     let _ = next_body(&mut server).await;
@@ -1571,6 +1576,7 @@ async fn call_queued_behind_lapsed_range_answers_at_once() {
     adopt(&mut conn, AUTHOR, Some(1));
     adopt(&mut conn, OTHER, Some(1));
     let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
     let _wait = conn.courier(AUTHOR).await.expect("send the range");
     let _range = next_range(&mut server).await;
     conn.courier
@@ -1615,6 +1621,7 @@ async fn lost_session_ends_wait_keeps_rows() {
     adopt(&mut conn, AUTHOR, Some(1));
     adopt(&mut conn, OTHER, Some(1));
     let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
     let wait_a = conn.courier(AUTHOR).await.expect("send the first range");
     let _range_a = next_range(&mut server).await;
     let wait_b = conn.courier(OTHER).await.expect("queue the second range");
@@ -1767,6 +1774,7 @@ async fn the_pump_drops_the_lapsed_range_wait() {
     );
     adopt(&mut conn, AUTHOR, Some(1));
     let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
     let wait = conn.courier(AUTHOR).await.expect("send the range");
     let _range = next_range(&mut server).await;
     let _ = next_body(&mut server).await;
@@ -1839,6 +1847,7 @@ async fn a_queued_range_whose_rows_are_gone_hears_nothing_held() {
     adopt(&mut conn, AUTHOR, Some(1));
     adopt(&mut conn, OTHER, Some(1));
     let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
     let wait_a = conn.courier(AUTHOR).await.expect("send the first range");
     let range_a = next_range(&mut server).await;
     let _ = next_body(&mut server).await;
@@ -1899,6 +1908,7 @@ async fn a_queued_range_with_corrupt_rows_fails_the_flush() {
     adopt(&mut conn, AUTHOR, Some(1));
     adopt(&mut conn, OTHER, Some(1));
     let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
     let wait_a = conn.courier(AUTHOR).await.expect("send the first range");
     let range_a = next_range(&mut server).await;
     let _ = next_body(&mut server).await;
@@ -1953,6 +1963,7 @@ async fn a_flush_send_failure_requeues_the_range() {
     adopt(&mut conn, AUTHOR, Some(1));
     adopt(&mut conn, OTHER, Some(1));
     let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
     let wait_a = conn.courier(AUTHOR).await.expect("send the first range");
     let range_a = next_range(&mut server).await;
     let _ = next_body(&mut server).await;
@@ -2140,8 +2151,8 @@ async fn an_offer_newest_past_the_replica_reads_every_row() {
     assert_eq!(candidates[0].seqs, [1]);
 }
 
-/// A stored offer without a newest binds the range to its settled frontier,
-/// and a row past it stays held.
+/// A stored offer without a newest binds the ask and the range to its
+/// settled frontier, and a row past it stays held, unasked.
 #[tokio::test]
 async fn an_offer_without_a_newest_binds_the_range_to_the_settled_frontier() {
     let mut conn = replica();
@@ -2166,7 +2177,11 @@ async fn an_offer_without_a_newest_binds_the_range_to_the_settled_frontier() {
     adopt_settled(&mut conn, AUTHOR, 3);
     let (mut conn, mut server) = attach(conn, true).await;
     let ask = next_ask(&mut server).await;
-    assert_eq!(ask.seqs, [2, 3], "the unapplied rows are asked");
+    assert_eq!(
+        ask.seqs,
+        [1, 2, 3],
+        "the ask stops at the offer's frontier, which the server refuses past"
+    );
     let wait = conn.courier(AUTHOR).await.expect("send the range");
     let range = next_range(&mut server).await;
     let signed: SignedOffer =
@@ -2213,6 +2228,39 @@ async fn an_offer_without_a_newest_binds_the_range_to_the_settled_frontier() {
         ),
         "row 4 stays held"
     );
+}
+
+/// A stored offer that signs neither a settled nor a newest frontier covers
+/// no sequence, so the session asks nothing the server would refuse whole.
+#[tokio::test]
+async fn an_offer_without_a_frontier_asks_nothing() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::CourierOnly,
+        major(2),
+        Some(b"the held"),
+    );
+    adopt(&mut conn, AUTHOR, None);
+    let (mut conn, mut server) = attach(conn, true).await;
+    assert!(
+        timeout(Duration::from_millis(100), server.recv())
+            .await
+            .is_err(),
+        "no ask names a sequence the offer does not sign"
+    );
+    assert!(
+        matches!(
+            peer::state_of(&mut conn.db, &AUTHOR, 1),
+            Ok(Some(HeldState::CourierOnly))
+        ),
+        "the row stays held for the author's next offer"
+    );
+    server.close().await.expect("hang up");
+    let event = conn.pump_one().await.expect("the session ends");
+    assert!(matches!(event, ClientEvent::Closed));
 }
 
 /// A provisional ask that overran its bound keeps its author's candidates
@@ -2329,6 +2377,7 @@ async fn a_call_after_a_lapsed_range_hears_the_queue_at_once() {
     adopt(&mut conn, OTHER, Some(1));
     adopt(&mut conn, THIRD, Some(1));
     let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
     let wait_a = conn.courier(AUTHOR).await.expect("send the first range");
     let _range = next_range(&mut server).await;
     conn.courier
@@ -2379,6 +2428,7 @@ async fn a_lost_session_ends_a_wait_that_already_dropped() {
     adopt(&mut conn, AUTHOR, Some(1));
     adopt(&mut conn, OTHER, Some(1));
     let (mut conn, mut server) = attach(conn, true).await;
+    let _ask = next_ask(&mut server).await;
     let wait_a = conn.courier(AUTHOR).await.expect("send the first range");
     let _range = next_range(&mut server).await;
     conn.courier
@@ -3711,7 +3761,7 @@ mod r78_4c {
         );
         let (mut conn, mut server) = attach_device(conn, true).await;
         let ask = next_ask(&mut server).await;
-        assert_eq!(ask.seqs, [1, 2], "the unapplied rows are asked");
+        assert_eq!(ask.seqs, [1, 2, 3], "every unretained row is asked");
         // The keys arrive after the handshake: the dial certifies on its own
         // wire and the call rides it at once while the main wire's bind is
         // still owed.
@@ -3878,7 +3928,7 @@ mod r78_4c {
         );
         let (mut conn, mut server) = attach3(conn, true).await;
         let ask = next_ask(&mut server).await;
-        assert_eq!(ask.seqs, [1, 2], "the unapplied rows are asked");
+        assert_eq!(ask.seqs, [1, 2, 3], "every unretained row is asked");
         // The keys arrive after the handshake: each dial certifies on its
         // own wire and the call rides the first at once while the main
         // wire's bind is still owed.
@@ -4045,7 +4095,7 @@ mod r78_4c {
         adopt(&mut conn, AUTHOR, Some(2));
         let (mut conn, mut server) = attach(conn, true).await;
         let ask = next_ask(&mut server).await;
-        assert_eq!(ask.seqs, [1], "the unapplied row is asked");
+        assert_eq!(ask.seqs, [1, 2], "every unretained row is asked");
         let candidates = conn.courier_candidates().expect("the candidates read");
         assert_eq!(candidates.len(), 1);
         assert_eq!(
@@ -4205,7 +4255,7 @@ mod r78_4c {
         let (mut conn, mut server) = attach_device(conn, true).await;
         conn.writer_keys = Some(keys);
         let ask = next_ask(&mut server).await;
-        assert_eq!(ask.seqs, [1], "the older major's row is asked");
+        assert_eq!(ask.seqs, [1, 2], "every unretained row is asked");
         let wait = conn.courier(AUTHOR).await.expect("the call owes a dial");
         let timer = conn.courier_drain_timer().expect("major 1 owes a dial");
         let mut old = dial_courier_wire(&mut conn, timer, major(1), old_version()).await;

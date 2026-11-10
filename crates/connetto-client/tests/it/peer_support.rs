@@ -17,6 +17,7 @@ use connetto_core::exchange::ManifestRow;
 use connetto_core::{Cursor, Major};
 use diesel::prelude::*;
 use sha2::{Digest, Sha256};
+use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 use super::support::{self, Script};
 
@@ -310,6 +311,31 @@ pub fn provenance_of<'a>(
 /// A cursor of seven zero bytes and `byte`.
 pub fn cursor_byte(byte: u8) -> Cursor {
     Cursor::new(vec![0, 0, 0, 0, 0, 0, 0, byte])
+}
+
+/// An uncompressed insert patchset over `orders`.
+pub fn orders_patch(rows: &[(i64, &str, &str)]) -> Vec<u8> {
+    let mut patch = PatchSet::<SimpleTable, String, Vec<u8>>::new();
+    for (id, owner, status) in rows {
+        let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
+            "orders",
+            &[("id", ""), ("owner", ""), ("status", "")],
+            &[0],
+        ))
+        .set(0, Value::<String, Vec<u8>>::Integer(*id))
+        .expect("set the key")
+        .set(1, Value::<String, Vec<u8>>::Text(owner.to_string()))
+        .expect("set the owner")
+        .set(2, Value::<String, Vec<u8>>::Text(status.to_string()))
+        .expect("set the status");
+        patch = patch.insert(insert);
+    }
+    patch.build()
+}
+
+/// A compressed insert patchset over `orders`.
+pub fn orders_payload(rows: &[(i64, &str, &str)]) -> Vec<u8> {
+    zstd::encode_all(orders_patch(rows).as_slice(), 3).expect("compress the patch")
 }
 
 /// Pump until `pred` matches, refusing to outlive the wire.
