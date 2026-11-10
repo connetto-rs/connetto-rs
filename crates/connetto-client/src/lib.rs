@@ -4867,6 +4867,30 @@ struct CourierQueued {
     author: [u8; 32],
     /// The wait's reply, when the caller is still waiting.
     reply: Option<tokio::sync::oneshot::Sender<Result<CourierReport, CourierError>>>,
+    /// The report settled so far, when the call re-queued on an advance
+    /// whose next range holds for the device's bind.
+    report: Option<CourierReport>,
+    /// The call's whole sequences, beside the report.
+    seqs: Option<Vec<u64>>,
+}
+
+/// The stance a courier range takes against the session's device bind (R78
+/// decision 31 and its 2026-11-10 refinement): a range that rides the main
+/// wire waits for the main bind, one that rides a wire the device certifies
+/// there (the dial, its own drain) waits only for the keys, and a range the
+/// session cannot certify fails at once, no frame riding.
+#[cfg(feature = "peer")]
+enum CourierStance {
+    /// The range's wire certifies the device ahead of the range, or the
+    /// device is bound: the range rides.
+    Ride,
+    /// The range's wire still owes the device a bind (the main bind, owed
+    /// or deferring to the keys arriving, or the keys for the dial's own):
+    /// the call holds in the queue.
+    Hold,
+    /// No bind can come this session: the call fails at once without
+    /// sending, the author standing a candidate.
+    Uncertified,
 }
 
 /// Why an author's courier rows wait, cleared by the next offer (decisions 7
@@ -6994,15 +7018,22 @@ where
 
     /// Courier the author's held rows to the server on the main wire (R78
     /// decision 48): the range goes out when none is open, queues behind the
-    /// open one otherwise, and the wait resolves as the pump settles the
-    /// answer, the lapse or the session's end.
+    /// open one otherwise, holds in the queue while the wire the range
+    /// would ride still owes the device a bind (the main bind, owed or
+    /// deferring to the keys arriving, or the dial's own), and the wait
+    /// resolves as the pump settles the answer, the lapse or the session's
+    /// end.
     ///
     /// # Errors
     ///
     /// [`CourierError`] when the path is off (`Unavailable`), the author's
     /// range is outstanding or queued (`Busy`), it holds nothing to offer
     /// (`NothingHeld`), it is queued behind a late answer
-    /// (`QueuedBehindLateAnswer`), or a send fails.
+    /// (`QueuedBehindLateAnswer`), or a send fails. When no device bind can
+    /// come this session the call fails at once
+    /// `Refused(Uncertified)`, no frame riding and the author standing a
+    /// candidate. A held call ends `TimedOut` when its bound runs out and
+    /// `SessionLost` when the session ends before the bind answers.
     #[cfg(feature = "peer")]
     pub(crate) async fn courier(&mut self, author: [u8; 32]) -> Result<CourierWait, CourierError> {
         if self.wire.is_none() || !self.courier.enabled {
@@ -7054,20 +7085,75 @@ where
                 self.courier.queued.push_back(CourierQueued {
                     author,
                     reply: None,
+                    report: None,
+                    seqs: None,
                 });
                 return Err(CourierError::QueuedBehindLateAnswer);
             }
             self.courier.queued.push_back(CourierQueued {
                 author,
                 reply: Some(tx),
+                report: None,
+                seqs: None,
             });
             return Ok(CourierWait {
                 receiver: rx,
                 bound,
             });
         }
+        // No open range: ride the call's first range, or hold the call for
+        // the session's device bind (decision 48).
+        self.open_courier_range(author, plan, tx, rx).await
+    }
+
+    /// Ride `plan`'s first range as the open one (decision 48), hold the
+    /// call in the queue for the wire's device bind, or fail at once
+    /// `Refused(Uncertified)` when no bind can come this session, no frame
+    /// riding.
+    ///
+    /// # Errors
+    ///
+    /// [`CourierError::Client`] when the send fails, and
+    /// [`CourierError::Refused`] with `Uncertified` when no device bind can
+    /// come this session.
+    #[cfg(feature = "peer")]
+    async fn open_courier_range(
+        &mut self,
+        author: [u8; 32],
+        plan: CourierPlan,
+        tx: tokio::sync::oneshot::Sender<Result<CourierReport, CourierError>>,
+        rx: tokio::sync::oneshot::Receiver<Result<CourierReport, CourierError>>,
+    ) -> Result<CourierWait, CourierError> {
         let mut ranges = plan.ranges;
         let range = ranges.remove(0);
+        let stance = self.courier_stance(&range).map_err(CourierError::Client)?;
+        match stance {
+            CourierStance::Uncertified => {
+                // No bind can come this session, so the range would ride its
+                // wire uncertified: fail at once without sending, the author
+                // standing a candidate.
+                return Err(CourierError::Refused(
+                    connetto_core::exchange::CourierRefusal::Uncertified,
+                ));
+            }
+            CourierStance::Hold => {
+                // The wire still owes the device a bind, so the call waits
+                // in the queue for the bind's answer rather than ride
+                // uncertified.
+                self.courier.queued.push_back(CourierQueued {
+                    author,
+                    reply: Some(tx),
+                    report: None,
+                    seqs: None,
+                });
+                let bound = WRITER_ANSWER_WAIT + COURIER_RANGE_WAIT + COURIER_CALL_SLACK;
+                return Ok(CourierWait {
+                    receiver: rx,
+                    bound,
+                });
+            }
+            CourierStance::Ride => {}
+        }
         let mut seqs: Vec<u64> = range.rows.iter().map(|row| row.seq).collect();
         for pending in &ranges {
             seqs.extend(pending.rows.iter().map(|row| row.seq));
@@ -7096,7 +7182,7 @@ where
             range,
             next,
             report: CourierReport::default(),
-            deadline: now + COURIER_RANGE_WAIT,
+            deadline: crate::away::SystemClock.monotonic() + COURIER_RANGE_WAIT,
             wait_dropped: false,
             wire,
             #[cfg(feature = "device-identity")]
@@ -7134,6 +7220,70 @@ where
             });
         }
         CourierOpenWire::Courier
+    }
+
+    /// The stance `range` takes against the session's device bind (R78
+    /// decision 31 and its 2026-11-10 refinement): the range would ride its
+    /// wire uncertified, so the call holds for the bind the wire owes, or
+    /// fails at once when no bind can come this session, the author
+    /// standing a candidate.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the device's certificate cannot be read.
+    #[cfg(feature = "peer")]
+    fn courier_stance(&mut self, range: &PlannedRange) -> Result<CourierStance, ClientError> {
+        // The main wire stands certified by the session's writer: a
+        // bound number or device, or a device bind still owed.
+        if Some(range.major) == self.config.schema_major {
+            if matches!(
+                self.bound_writer,
+                Some(WriterRef::Number(_) | WriterRef::Device(_))
+            ) {
+                return Ok(CourierStance::Ride);
+            }
+            #[cfg(feature = "device-identity")]
+            {
+                // A bind owed, in flight or queued, will answer and flush
+                // the held call.
+                let owed = self
+                    .writer_tasks
+                    .iter()
+                    .chain(self.writer_in_flight.iter())
+                    .chain(self.pending_bind.iter())
+                    .any(|task| matches!(task.kind, WriterTaskKind::Bind { .. }));
+                if owed {
+                    return Ok(CourierStance::Hold);
+                }
+                // A stored certificate defers the bind to the keys
+                // arriving, so the session still owes a bound device.
+                if self.device_bindable()? && self.writer_keys.is_none() {
+                    return Ok(CourierStance::Hold);
+                }
+            }
+            return Ok(CourierStance::Uncertified);
+        }
+        // The device's own drain certifies the device on its own wire.
+        if self.drain.wire_mut().is_some() && self.draining_major() == Some(range.major) {
+            return Ok(CourierStance::Ride);
+        }
+        // The dial certifies the device on its own wire, once the
+        // certificate and keys stand.
+        #[cfg(feature = "device-identity")]
+        {
+            if !self.device_bindable()? {
+                return Ok(CourierStance::Uncertified);
+            }
+            if self.writer_keys.is_none() {
+                return Ok(CourierStance::Hold);
+            }
+        }
+        #[cfg(not(feature = "device-identity"))]
+        {
+            // A build without a device identity certifies no dial.
+            return Ok(CourierStance::Uncertified);
+        }
+        Ok(CourierStance::Ride)
     }
 
     /// Send one courier range and its declared bodies on `wire` (R78
@@ -7273,7 +7423,7 @@ where
             if self.courier.open.is_some() {
                 return Ok(());
             }
-            let Some(queued) = self.courier.queued.pop_front() else {
+            let Some(mut queued) = self.courier.queued.pop_front() else {
                 return Ok(());
             };
             let author = queued.author;
@@ -7289,10 +7439,33 @@ where
             };
             let mut ranges = plan.ranges;
             let range = ranges.remove(0);
-            let mut seqs: Vec<u64> = range.rows.iter().map(|row| row.seq).collect();
-            for pending in &ranges {
-                seqs.extend(pending.rows.iter().map(|row| row.seq));
+            let stance = self.courier_stance(&range)?;
+            match stance {
+                CourierStance::Uncertified => {
+                    // No bind can come this session: end the held call
+                    // without sending, the author standing a candidate.
+                    if let Some(reply) = queued.reply {
+                        let _ = reply.send(Err(CourierError::Refused(
+                            connetto_core::exchange::CourierRefusal::Uncertified,
+                        )));
+                    }
+                    continue;
+                }
+                CourierStance::Hold => {
+                    // The wire still owes the device a bind, so the call
+                    // stands queued for the bind's answer to flush it.
+                    self.courier.queued.push_front(queued);
+                    return Ok(());
+                }
+                CourierStance::Ride => {}
             }
+            let seqs = queued.seqs.take().unwrap_or_else(|| {
+                let mut seqs: Vec<u64> = range.rows.iter().map(|row| row.seq).collect();
+                for pending in &ranges {
+                    seqs.extend(pending.rows.iter().map(|row| row.seq));
+                }
+                seqs
+            });
             let next = VecDeque::from(ranges);
             let offer = plan.offer;
             let wire = self.courier_range_wire(&range);
@@ -7311,7 +7484,7 @@ where
                 offer,
                 range,
                 next,
-                report: CourierReport::default(),
+                report: queued.report.take().unwrap_or_default(),
                 deadline: crate::away::SystemClock.monotonic() + COURIER_RANGE_WAIT,
                 wait_dropped: false,
                 wire,
@@ -7915,6 +8088,33 @@ where
         author: [u8; 32],
         range: PlannedRange,
     ) -> Result<(), ClientError> {
+        let stance = self.courier_stance(&range)?;
+        match stance {
+            CourierStance::Uncertified => {
+                // No bind can come this session: end the call without
+                // sending the advance, the settled rows standing ruled.
+                return self
+                    .end_courier_call(
+                        open,
+                        CourierError::Refused(connetto_core::exchange::CourierRefusal::Uncertified),
+                    )
+                    .await;
+            }
+            CourierStance::Hold => {
+                // The wire still owes the device a bind: the settled rows
+                // stand ruled and the rest holds in the queue for the bind's
+                // answer.
+                self.courier.queued.push_back(CourierQueued {
+                    author,
+                    reply: open.reply,
+                    report: Some(open.report),
+                    seqs: Some(open.seqs),
+                });
+                self.raise_courier_candidates_if_changed(author)?;
+                return self.flush_courier_ranges().await;
+            }
+            CourierStance::Ride => {}
+        }
         let wire = self.courier_range_wire(&range);
         open.range = range;
         open.request_id = courier_request_id();
@@ -8178,6 +8378,9 @@ where
                 self.carry_writers(&stale, &writer, Carry::Named)?;
                 self.flush_writer_tasks().await?;
                 self.replay_pending().await?;
+                // A courier call that held for this bind rides the wire now.
+                #[cfg(feature = "peer")]
+                self.flush_courier_ranges().await?;
                 Ok(ClientEvent::NonFatal {
                     related_to: Some(request_id),
                     detail: "the device writer bind was answered".to_owned(),

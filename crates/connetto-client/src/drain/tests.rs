@@ -2013,35 +2013,104 @@ pub(crate) mod r78_4c {
         );
     }
 
-    /// R78 decision 47: an ack the device holds no writer keys for
-    /// uncertifies the range.
+    /// R78 decision 47: a call whose device holds no writer keys holds
+    /// before the dial, and the dial rides and settles once the keys arrive.
     #[tokio::test]
-    async fn a_courier_ack_with_no_writer_keys_uncertifies_the_range() {
-        let (cert, _keys) = device_identity().await;
-        let (mut conn, _main, seq) = author(Some(cert), None).await;
-        let wait = conn.courier(AUTHOR).await.expect("owe the dial");
+    async fn a_courier_dial_holds_for_the_writer_keys_and_rides_when_they_arrive() {
+        let (cert, keys) = device_identity().await;
+        // The writer stands under the certificate's key, not a test id.
+        let key_id = *cert.leaf.identity().key().as_bytes();
+        let (mut conn, mut main, seq) = author(Some(cert), None).await;
+        // The device holds a writer of the major the range rides, so the
+        // certificate stands a bind once the keys arrive.
+        queue(&mut conn, WriterRef::Device(key_id), 2, major(1));
+        let wait = conn.courier(AUTHOR).await.expect("the call holds");
+        assert!(
+            conn.courier.open.is_none(),
+            "the range does not ride before the keys arrive"
+        );
+        assert!(
+            conn.courier_drain_timer().is_none(),
+            "no dial is owed before the keys arrive"
+        );
+        // The keys arrive and the main wire's bind lands, flushing the held
+        // call.
+        let (steering, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        conn.with_device_writer(keys, steering)
+            .await
+            .expect("the keys arrive");
+        let frame = next(&mut main).await;
+        let IncomingFrame::Control(ControlMessage::ProvisionalStatus(ask)) = frame else {
+            panic!("the main wire asks the held row, not {frame:?}");
+        };
+        assert_eq!(ask.seqs, [1], "the unapplied row is asked");
+        let frame = next(&mut main).await;
+        let IncomingFrame::Control(ControlMessage::BindDevice(bind)) = frame else {
+            panic!("the main wire takes the device bind, not {frame:?}");
+        };
+        main.send_control(ControlMessage::WriterAnswer(WriterAnswer {
+            request_id: bind.request_id,
+            outcome: WriterOutcome::Bound { frontier: 0 },
+        }))
+        .await
+        .expect("the bind lands");
+        let event = conn.pump_one().await.expect("the bind settles");
+        assert!(matches!(event, ClientEvent::NonFatal { .. }));
         let timer = conn.courier_drain_timer().expect("the dial is owed");
         let (courier, mut old, _broken) = wire();
-        let reply = async {
-            let frame = next(&mut old).await;
-            let IncomingFrame::Control(ControlMessage::Handshake(_)) = frame else {
-                panic!("the courier wire opens with the handshake, not {frame:?}");
-            };
-            old.send_control(ControlMessage::Challenge(Challenge { nonce: [7; 32] }))
-                .await
-                .expect("the challenge");
-            old.send_control(handshake_ack("old", Some(old_version()), None, true))
-                .await
-                .expect("the handshake is answered");
-        };
+        let reply = bind_courier(&mut old);
         let (attached, ()) = tokio::join!(conn.attach_courier_drain(timer, courier), reply);
         attached.expect("the attach stands");
-        let err = wait_error(wait).await;
-        assert!(
-            matches!(err, CourierError::Refused(refusal) if matches!(refusal, CourierRefusal::Uncertified)),
-            "the range is uncertified"
+        assert_eq!(
+            conn.pump_one_or(core::future::pending::<()>())
+                .await
+                .expect("one step"),
+            None,
+            "the bind frees the range"
         );
-        assert_eq!(sent(&mut old).await, None, "no bind goes out");
+        let frame = next(&mut old).await;
+        let IncomingFrame::Control(ControlMessage::CourierRange(range)) = frame else {
+            panic!("the courier wire takes the range, not {frame:?}");
+        };
+        assert_eq!(
+            range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [seq]
+        );
+        let frame = next(&mut old).await;
+        let IncomingFrame::Bulk(BulkMessage::CourierBody(_)) = frame else {
+            panic!("the range declares one body, not {frame:?}");
+        };
+        old.send_control(ControlMessage::CourierAnswer(CourierAnswer {
+            request_id: range.request_id,
+            outcome: CourierOutcome::Entries(vec![(
+                seq,
+                CourierEntryOutcome::Ruled(Verdict::Applied),
+            )]),
+        }))
+        .await
+        .expect("answer the range");
+        loop {
+            match conn
+                .pump_one_or(core::future::pending::<()>())
+                .await
+                .unwrap()
+            {
+                Some(
+                    ClientEvent::Held(HeldWork::Applied { .. } | HeldWork::Drained { .. })
+                    | ClientEvent::CourierCandidates(_),
+                ) => {}
+                None => break,
+                other => panic!("the range settles, not {other:?}"),
+            }
+        }
+        let report = tokio::time::timeout(Duration::from_secs(5), wait.receiver)
+            .await
+            .expect("the call stands")
+            .expect("the answer lands")
+            .expect("the range settles");
+        assert_eq!(report.settled, [seq]);
+        assert_eq!(report.refused, [] as [u64; 0]);
+        assert_eq!(report.kept, [] as [u64; 0]);
         assert!(
             matches!(
                 peer::state_of(
@@ -2049,14 +2118,14 @@ pub(crate) mod r78_4c {
                     &AUTHOR,
                     i64::try_from(seq).expect("a test seq")
                 ),
-                Ok(Some(HeldState::CourierOnly))
+                Ok(Some(HeldState::Retained))
             ),
-            "the rows stay held"
+            "the row becomes retained"
         );
     }
 
-    /// R78 decision 47: an ack the device holds no certificate for
-    /// uncertifies the range.
+    /// R78 decision 47: a call whose session stands no device certificate
+    /// uncertifies the range at once, no dial owed.
     #[tokio::test]
     async fn a_courier_ack_with_no_certificate_uncertifies_the_range() {
         let (_cert, keys) = device_identity().await;
@@ -2105,29 +2174,18 @@ pub(crate) mod r78_4c {
         .await;
         let mut conn = conn;
         conn.writer_keys = Some(keys);
-        let wait = conn.courier(AUTHOR).await.expect("owe the dial");
-        let timer = conn.courier_drain_timer().expect("the dial is owed");
-        let (courier, mut old, _broken) = wire();
-        let reply = async {
-            let frame = next(&mut old).await;
-            let IncomingFrame::Control(ControlMessage::Handshake(_)) = frame else {
-                panic!("the courier wire opens with the handshake, not {frame:?}");
-            };
-            old.send_control(ControlMessage::Challenge(Challenge { nonce: [7; 32] }))
-                .await
-                .expect("the challenge");
-            old.send_control(handshake_ack("old", Some(old_version()), None, true))
-                .await
-                .expect("the handshake is answered");
-        };
-        let (attached, ()) = tokio::join!(conn.attach_courier_drain(timer, courier), reply);
-        attached.expect("the attach stands");
-        let err = wait_error(wait).await;
+        let err = conn
+            .courier(AUTHOR)
+            .await
+            .expect_err("the call fails at once");
         assert!(
             matches!(err, CourierError::Refused(refusal) if matches!(refusal, CourierRefusal::Uncertified)),
             "the range is uncertified"
         );
-        assert_eq!(sent(&mut old).await, None, "no bind goes out");
+        assert!(
+            conn.courier_drain_timer().is_none(),
+            "no dial is owed for a range that never rides"
+        );
         assert!(
             matches!(
                 peer::state_of(&mut conn.db, &AUTHOR, 1),
@@ -2180,14 +2238,16 @@ pub(crate) mod r78_4c {
         );
     }
 
-    /// R78 decision 47: a range whose major the device writes but whose
-    /// certificate stands no bind uncertifies the range, the wire going
-    /// before the handshake.
+    /// R78 decision 47: a range whose major a device writer writes whose
+    /// keys the certificate does not stand uncertifies the range, the wire
+    /// going before the handshake.
     #[tokio::test]
     async fn a_courier_dial_the_device_writer_cannot_bind_uncertifies_the_range() {
-        let (cert, _keys) = device_identity().await;
-        let (mut conn, _main, seq) = author(Some(cert), None).await;
-        queue(&mut conn, WriterRef::Device([1; 32]), 2, major(1));
+        let (cert, keys) = device_identity().await;
+        let (mut conn, _main, seq) = author(Some(cert), Some(keys)).await;
+        // The major's writer is another device the certificate stands no
+        // bind for.
+        queue(&mut conn, WriterRef::Device([9; 32]), 2, major(1));
         let wait = conn.courier(AUTHOR).await.expect("owe the dial");
         let timer = conn.courier_drain_timer().expect("the dial is owed");
         let (courier, mut old, _broken) = wire();

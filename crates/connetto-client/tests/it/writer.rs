@@ -2205,7 +2205,7 @@ diesel::table! {
 /// Issue a profile-valid device certificate for a fresh key, returning the
 /// leaf and issuer DER beside the key id a writer queue names.
 #[cfg(feature = "device-identity")]
-fn mint_device_certificate(account: &str) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
+pub(crate) fn mint_device_certificate(account: &str) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
     use connetto_core::device_cert::{
         AttestationLevel, CertificateRequest, CertificateSerial, DeploymentId, DeviceCertificate,
         DeviceIssuer, RootCa,

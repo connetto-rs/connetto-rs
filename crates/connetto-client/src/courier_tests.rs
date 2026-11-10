@@ -3229,6 +3229,67 @@ async fn pruned_marked_retained_row_restates_candidates() {
     assert!(matches!(event, ClientEvent::Closed));
 }
 
+/// A session riding under a number stands certified by the number, so its
+/// courier range rides the main wire at once, the scripted server settling
+/// it like any sent call.
+#[tokio::test]
+async fn a_number_session_couriers_under_its_number() {
+    let mut conn = replica();
+    hold(
+        &mut conn,
+        AUTHOR,
+        1,
+        HeldState::CourierOnly,
+        major(2),
+        Some(b"the only row"),
+    );
+    adopt(&mut conn, AUTHOR, Some(1));
+    let (mut conn, mut server) = attach(conn, true).await;
+    let ask = next_ask(&mut server).await;
+    assert_eq!(ask.seqs, [1], "the unapplied row is asked");
+    let wait = conn.courier(AUTHOR).await.expect("the call rides at once");
+    let range = next_range(&mut server).await;
+    assert_eq!(
+        range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        [1],
+        "the range rides the main wire at once"
+    );
+    let body = timeout(Duration::from_secs(5), next_body(&mut server))
+        .await
+        .expect("the body rides at once");
+    assert_eq!(
+        zstd::decode_all(&body.changeset_zstd[..]).expect("a body"),
+        b"the only row"
+    );
+    deliver_answer(
+        &mut server,
+        &range.request_id,
+        CourierOutcome::Entries(vec![(1, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+    )
+    .await;
+    // The answer settles the last range; no candidates event rests on the
+    // wire since the session never raised this author's set, so one step
+    // settles it and the call's own wait is the settlement.
+    conn.pump_one_or(std::future::pending::<()>())
+        .await
+        .expect("one step settles the answer");
+    let report = timeout(Duration::from_secs(5), wait.receiver)
+        .await
+        .expect("the call settles at once")
+        .expect("the call stands")
+        .expect("the range settles");
+    assert_eq!(report.settled, [1]);
+    let candidates = conn.courier_candidates().expect("the candidates stand");
+    assert!(
+        candidates.is_empty(),
+        "the settled row leaves no candidates"
+    );
+    assert!(
+        !conn.courier.excluded.contains_key(&AUTHOR),
+        "a settled call stands no exclusion"
+    );
+}
+
 #[cfg(feature = "device-identity")]
 mod r78_4c {
     use connetto_core::exchange::Verdict;
@@ -3282,6 +3343,370 @@ mod r78_4c {
             |event| matches!(event, ClientEvent::SyncStatus(_)),
         )
         .await
+    }
+
+    /// A `courier` call made before the session's device writer is bound
+    /// holds in the queue and goes out on the bind's answer, so the range
+    /// never rides a wire that would refuse it `Uncertified`.
+    #[tokio::test]
+    async fn a_call_before_the_bind_holds_until_the_bind_lands() {
+        let (cert, keys) = device_identity().await;
+        let mut conn = replica();
+        conn.store_device_certificate(&cert)
+            .await
+            .expect("the certificate stores");
+        hold(
+            &mut conn,
+            AUTHOR,
+            1,
+            HeldState::CourierOnly,
+            major(2),
+            Some(b"the only row"),
+        );
+        adopt(&mut conn, AUTHOR, Some(1));
+        conn.writer_keys = Some(keys);
+        let (mut conn, mut server) = attach_device(conn, true).await;
+        let frame = next(&mut server).await;
+        let IncomingFrame::Control(ControlMessage::BindDevice(bind)) = frame else {
+            panic!("the wire takes the device bind, not {frame:?}");
+        };
+        let ask = next_ask(&mut server).await;
+        deliver_verdicts(&mut server, &ask.request_id, &[(1, Verdict::Pending)]).await;
+        let event = conn.pump_one().await.expect("the ruling settles");
+        assert!(matches!(event, ClientEvent::NonFatal { .. }));
+        let _ = expect_candidates(conn.pump_one().await.expect("restate"));
+        let wait = conn.courier(AUTHOR).await.expect("the call holds");
+        // The call holds for the bind's answer, so no range rides the wire.
+        assert!(
+            conn.courier.open.is_none(),
+            "the range does not ride before the bind"
+        );
+        server
+            .send_control(ControlMessage::WriterAnswer(WriterAnswer {
+                request_id: bind.request_id,
+                outcome: WriterOutcome::Bound { frontier: 0 },
+            }))
+            .await
+            .expect("the bind lands");
+        let event = conn.pump_one().await.expect("the bind settles");
+        assert!(matches!(event, ClientEvent::NonFatal { .. }));
+        let range = next_range(&mut server).await;
+        assert_eq!(
+            range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [1],
+            "the held call's range rides after the bind"
+        );
+        let body = next_body(&mut server).await;
+        assert_eq!(
+            zstd::decode_all(&body.changeset_zstd[..]).expect("a body"),
+            b"the only row"
+        );
+        deliver_answer(
+            &mut server,
+            &range.request_id,
+            CourierOutcome::Entries(vec![(1, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+        )
+        .await;
+        let candidate = expect_candidates(conn.pump_one().await.expect("the range settles"));
+        assert!(
+            candidate.seqs.is_empty(),
+            "the settled row leaves the candidates"
+        );
+        let report = wait
+            .receiver
+            .await
+            .expect("the call stands")
+            .expect("the range settles");
+        assert_eq!(report.settled, [1]);
+        assert!(
+            !conn.courier.excluded.contains_key(&AUTHOR),
+            "a held call's refusal stands no exclusion"
+        );
+    }
+
+    /// A `courier` call made while the session's device bind defers to the
+    /// keys arriving holds in the queue, the keys arriving planning and
+    /// landing the bind, and the call's range goes out once.
+    #[tokio::test]
+    async fn a_call_held_while_the_bind_defers_to_the_keys_rides_when_they_arrive() {
+        let (cert, keys) = device_identity().await;
+        let mut conn = replica();
+        conn.store_device_certificate(&cert)
+            .await
+            .expect("the certificate stores");
+        hold(
+            &mut conn,
+            AUTHOR,
+            1,
+            HeldState::CourierOnly,
+            major(2),
+            Some(b"the only row"),
+        );
+        adopt(&mut conn, AUTHOR, Some(1));
+        // The keys are not handed over at the handshake, so the bind defers
+        // to their arrival.
+        let (mut conn, mut server) = attach_device(conn, true).await;
+        let ask = next_ask(&mut server).await;
+        assert_eq!(ask.seqs, [1], "the unapplied row is asked");
+        let wait = conn.courier(AUTHOR).await.expect("the call holds");
+        // The call holds for the deferred bind, so no frame rides the wire.
+        assert!(
+            conn.courier.open.is_none(),
+            "the range does not ride before the bind"
+        );
+        assert!(
+            timeout(Duration::ZERO, server.recv()).await.is_err(),
+            "no frame rides before the keys arrive"
+        );
+        // The keys arrive: the bind plans, rides the main wire, and lands.
+        let (steering, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        conn.with_device_writer(keys, steering)
+            .await
+            .expect("the keys arrive");
+        let frame = next(&mut server).await;
+        let IncomingFrame::Control(ControlMessage::BindDevice(bind)) = frame else {
+            panic!("the wire takes the device bind, not {frame:?}");
+        };
+        server
+            .send_control(ControlMessage::WriterAnswer(WriterAnswer {
+                request_id: bind.request_id,
+                outcome: WriterOutcome::Bound { frontier: 0 },
+            }))
+            .await
+            .expect("the bind lands");
+        let event = conn.pump_one().await.expect("the bind settles");
+        assert!(matches!(event, ClientEvent::NonFatal { .. }));
+        // The held call's range rides once.
+        let range = next_range(&mut server).await;
+        assert_eq!(
+            range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [1],
+            "the held call's range rides after the bind"
+        );
+        let body = timeout(Duration::from_secs(5), next_body(&mut server))
+            .await
+            .expect("the body rides at once");
+        assert_eq!(
+            zstd::decode_all(&body.changeset_zstd[..]).expect("a body"),
+            b"the only row"
+        );
+        deliver_answer(
+            &mut server,
+            &range.request_id,
+            CourierOutcome::Entries(vec![(1, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+        )
+        .await;
+        // The answer settles the last range; no candidates event rests on
+        // the wire since the session never raised this author's set, so one
+        // step settles it and the call's own wait is the settlement.
+        conn.pump_one_or(std::future::pending::<()>())
+            .await
+            .expect("one step settles the answer");
+        let report = timeout(Duration::from_secs(5), wait.receiver)
+            .await
+            .expect("the call settles at once")
+            .expect("the call stands")
+            .expect("the range settles");
+        assert_eq!(report.settled, [1]);
+        let candidates = conn.courier_candidates().expect("the candidates stand");
+        assert!(
+            candidates.is_empty(),
+            "the settled row leaves no candidates"
+        );
+        assert!(
+            timeout(Duration::ZERO, server.recv()).await.is_err(),
+            "the range rode once"
+        );
+        assert!(
+            !conn.courier.excluded.contains_key(&AUTHOR),
+            "a held call's refusal stands no exclusion"
+        );
+    }
+
+    /// A bind that is refused leaves the certificate retired and no bind
+    /// owed or planned while the fresh key is out, so the next call fails
+    /// at once with `Uncertified`, no frame riding and the author not
+    /// excluded, a later call still possible.
+    #[tokio::test]
+    async fn a_refused_bind_fails_the_next_call_uncertified_without_excluding() {
+        let (cert, keys) = device_identity().await;
+        let mut conn = replica();
+        conn.store_device_certificate(&cert)
+            .await
+            .expect("the certificate stores");
+        hold(
+            &mut conn,
+            AUTHOR,
+            1,
+            HeldState::CourierOnly,
+            major(2),
+            Some(b"the only row"),
+        );
+        adopt(&mut conn, AUTHOR, Some(1));
+        let (mut conn, mut server) = attach_device(conn, true).await;
+        let ask = next_ask(&mut server).await;
+        assert_eq!(ask.seqs, [1], "the unapplied row is asked");
+        let (steering, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        conn.with_device_writer(keys, steering)
+            .await
+            .expect("the keys arrive");
+        let frame = next(&mut server).await;
+        let IncomingFrame::Control(ControlMessage::BindDevice(bind)) = frame else {
+            panic!("the wire takes the device bind, not {frame:?}");
+        };
+        // The bind is refused: the device retires and a fresh key enrolls.
+        server
+            .send_control(ControlMessage::WriterAnswer(WriterAnswer {
+                request_id: bind.request_id,
+                outcome: WriterOutcome::NotEnrolled,
+            }))
+            .await
+            .expect("the bind is refused");
+        let event = conn.pump_one().await.expect("the refusal settles");
+        assert!(matches!(event, ClientEvent::NonFatal { .. }));
+        let err = conn.courier(AUTHOR).await.expect_err("no bind can come");
+        assert!(
+            matches!(err, CourierError::Refused(CourierRefusal::Uncertified)),
+            "the call stands uncertified at once"
+        );
+        assert!(
+            timeout(Duration::ZERO, server.recv()).await.is_err(),
+            "no frame rides the wire"
+        );
+        assert!(
+            !conn.courier.excluded.contains_key(&AUTHOR),
+            "the author is not excluded"
+        );
+        let candidates = conn.courier_candidates().expect("the candidates stand");
+        assert_eq!(candidates.len(), 1, "the author stands a candidate");
+        assert_eq!(
+            candidates[0].seqs,
+            [1],
+            "the author's row stands a candidate"
+        );
+        let err = conn
+            .courier(AUTHOR)
+            .await
+            .expect_err("a later call is possible");
+        assert!(
+            matches!(err, CourierError::Refused(CourierRefusal::Uncertified)),
+            "the later call stands the same refusal"
+        );
+    }
+
+    /// A dial range made while the keys are pending holds for the keys:
+    /// they arrive, the main bind lands, and exactly one dial rides, its
+    /// own `BindDevice` before the range, the author never excluded.
+    #[tokio::test]
+    async fn a_dial_range_holds_while_the_keys_are_pending() {
+        let (cert, keys) = device_identity().await;
+        let mut conn = replica();
+        conn.store_device_certificate(&cert)
+            .await
+            .expect("the certificate stores");
+        hold(
+            &mut conn,
+            AUTHOR,
+            1,
+            HeldState::CourierOnly,
+            major(1),
+            Some(b"the only row"),
+        );
+        store_offer(
+            &mut conn,
+            AUTHOR,
+            &offer_with(&[(major(1), old_version())], Some(1)),
+        );
+        // The keys are not handed over at the handshake, so the dial's
+        // bind defers to their arrival.
+        let (mut conn, mut server) = attach_device(conn, true).await;
+        let ask = next_ask(&mut server).await;
+        assert_eq!(ask.seqs, [1], "the unapplied row is asked");
+        let wait = conn.courier(AUTHOR).await.expect("the call holds");
+        // The call holds for the keys, so no range and no dial ride yet.
+        assert!(
+            conn.courier.open.is_none(),
+            "the range does not ride before the keys arrive"
+        );
+        assert!(
+            timeout(Duration::ZERO, server.recv()).await.is_err(),
+            "no frame rides before the keys arrive"
+        );
+        // The keys arrive: the main wire's bind rides and lands, and the
+        // held call dials.
+        let (steering, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        conn.with_device_writer(keys, steering)
+            .await
+            .expect("the keys arrive");
+        let frame = next(&mut server).await;
+        let IncomingFrame::Control(ControlMessage::BindDevice(bind)) = frame else {
+            panic!("the main wire takes the device bind, not {frame:?}");
+        };
+        server
+            .send_control(ControlMessage::WriterAnswer(WriterAnswer {
+                request_id: bind.request_id,
+                outcome: WriterOutcome::Bound { frontier: 0 },
+            }))
+            .await
+            .expect("the bind lands");
+        let event = conn.pump_one().await.expect("the bind settles");
+        assert!(matches!(event, ClientEvent::NonFatal { .. }));
+        let timer = conn.courier_drain_timer().expect("major 1 owes a dial");
+        let mut old = dial_courier_wire(&mut conn, timer, major(1), old_version()).await;
+        conn.pump_one_or(std::future::pending::<()>())
+            .await
+            .expect("one step");
+        let range = next_range(&mut old).await;
+        assert_eq!(
+            range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            [1],
+            "the held call's range rides the dial after the keys"
+        );
+        let body = next_body(&mut old).await;
+        assert_eq!(
+            zstd::decode_all(&body.changeset_zstd[..]).expect("a body"),
+            b"the only row"
+        );
+        deliver_answer(
+            &mut old,
+            &range.request_id,
+            CourierOutcome::Entries(vec![(1, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+        )
+        .await;
+        // The answer settles the last range; no candidates event rests on
+        // the wire since the session never raised this author's set, so one
+        // step settles it and the call's own wait is the settlement.
+        conn.pump_one_or(std::future::pending::<()>())
+            .await
+            .expect("one step settles the answer");
+        let report = timeout(Duration::from_secs(5), wait.receiver)
+            .await
+            .expect("the call settles within the bound")
+            .expect("the call stands")
+            .expect("the range settles");
+        assert_eq!(report.settled, [1]);
+        let candidates = conn.courier_candidates().expect("the candidates stand");
+        assert!(
+            candidates.is_empty(),
+            "the settled row leaves no candidates"
+        );
+        assert!(
+            matches!(
+                timeout(Duration::from_secs(5), old.recv())
+                    .await
+                    .expect("within the bound"),
+                Ok(None)
+            ),
+            "the courier wire closes behind its last answer"
+        );
+        assert!(
+            timeout(Duration::ZERO, server.recv()).await.is_err(),
+            "the main wire owes nothing more"
+        );
+        assert!(
+            !conn.courier.excluded.contains_key(&AUTHOR),
+            "the author is never excluded"
+        );
     }
 
     /// Dial the courier wire for `presented` against a scripted server: the
@@ -3378,13 +3803,30 @@ mod r78_4c {
             &offer_with(&[(major(1), old_version()), (major(2), version())], Some(3)),
         );
         let (mut conn, mut server) = attach_device(conn, true).await;
-        conn.writer_keys = Some(keys);
         let ask = next_ask(&mut server).await;
         assert_eq!(ask.seqs, [1, 2], "the unapplied rows are asked");
-        let wait = conn.courier(AUTHOR).await.expect("the call owes a dial");
+        // The keys arrive after the handshake: the dial certifies on its own
+        // wire and the call rides it at once while the main wire's bind is
+        // still owed.
+        let (steering, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        conn.with_device_writer(keys, steering)
+            .await
+            .expect("the keys arrive");
+        let frame = next(&mut server).await;
+        let IncomingFrame::Control(ControlMessage::BindDevice(bind)) = frame else {
+            panic!("the main wire takes the device bind, not {frame:?}");
+        };
+        let wait = conn
+            .courier(AUTHOR)
+            .await
+            .expect("the call rides the dial at once");
+        assert!(
+            conn.courier.open.is_some(),
+            "the dial range rides before the main bind"
+        );
         let timer = conn.courier_drain_timer().expect("major 1 owes a dial");
         let mut old = dial_courier_wire(&mut conn, timer, major(1), old_version()).await;
-        // The bound writer's answer frees the range for the courier wire.
+        // The dial's bound writer frees the range for the courier wire.
         conn.pump_one_or(std::future::pending::<()>())
             .await
             .expect("one step");
@@ -3421,6 +3863,17 @@ mod r78_4c {
             [3],
             "the remaining range keeps the author's candidates"
         );
+        // The advance to the main wire held for its bind, the settled rows
+        // standing ruled; the bind lands and the advance rides at last.
+        server
+            .send_control(ControlMessage::WriterAnswer(WriterAnswer {
+                request_id: bind.request_id,
+                outcome: WriterOutcome::Bound { frontier: 0 },
+            }))
+            .await
+            .expect("the bind lands");
+        let event = conn.pump_one().await.expect("the bind settles");
+        assert!(matches!(event, ClientEvent::NonFatal { .. }));
         let range = next_range(&mut server).await;
         assert_eq!(
             range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
@@ -3517,13 +3970,30 @@ mod r78_4c {
             ),
         );
         let (mut conn, mut server) = attach3(conn, true).await;
-        conn.writer_keys = Some(keys);
         let ask = next_ask(&mut server).await;
         assert_eq!(ask.seqs, [1, 2], "the unapplied rows are asked");
-        let wait = conn.courier(AUTHOR).await.expect("the call owes a dial");
+        // The keys arrive after the handshake: each dial certifies on its
+        // own wire and the call rides the first at once while the main
+        // wire's bind is still owed.
+        let (steering, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        conn.with_device_writer(keys, steering)
+            .await
+            .expect("the keys arrive");
+        let frame = next(&mut server).await;
+        let IncomingFrame::Control(ControlMessage::BindDevice(bind)) = frame else {
+            panic!("the main wire takes the device bind, not {frame:?}");
+        };
+        let wait = conn
+            .courier(AUTHOR)
+            .await
+            .expect("the call rides the first dial at once");
+        assert!(
+            conn.courier.open.is_some(),
+            "the first dial range rides before the main bind"
+        );
         let timer = conn.courier_drain_timer().expect("major 1 owes a dial");
         let mut old = dial_courier_wire(&mut conn, timer, major(1), old_version()).await;
-        // The bound writer's answer frees the range for the courier wire.
+        // The dial's bound writer frees the range for the courier wire.
         conn.pump_one_or(std::future::pending::<()>())
             .await
             .expect("one step");
@@ -3581,7 +4051,17 @@ mod r78_4c {
             [3],
             "the settled major leaves the build's row"
         );
-        // The build's major follows on the main wire.
+        // The advance to the main wire held for its bind; the bind lands
+        // and the build's major follows at last.
+        server
+            .send_control(ControlMessage::WriterAnswer(WriterAnswer {
+                request_id: bind.request_id,
+                outcome: WriterOutcome::Bound { frontier: 0 },
+            }))
+            .await
+            .expect("the bind lands");
+        let event = conn.pump_one().await.expect("the bind settles");
+        assert!(matches!(event, ClientEvent::NonFatal { .. }));
         let range = next_range(&mut server).await;
         assert_eq!(
             range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
@@ -3849,8 +4329,8 @@ mod r78_4c {
             .expect("the answer lands")
             .expect_err("the advance fails");
         assert!(
-            matches!(err, CourierError::Client(_)),
-            "the advance to the gone main wire fails"
+            matches!(err, CourierError::Refused(CourierRefusal::Uncertified)),
+            "the advance to the gone main wire stands uncertified"
         );
         assert!(
             matches!(

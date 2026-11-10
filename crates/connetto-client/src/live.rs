@@ -2558,14 +2558,19 @@ where
     }
 
     /// Courier the author's held rows to the server on the main wire (R78
-    /// decision 48), the range sent or queued by the connection and the
-    /// report settled by the pump.
+    /// decision 48), the range sent, queued or held for the wire's device
+    /// bind by the connection, and the report settled by the pump.
     ///
     /// # Errors
     ///
     /// [`crate::CourierError::Client`] while the gate is locked or the
-    /// author's key is not 32 bytes, and the [`crate::CourierError`] the range
-    /// or its settlement surfaces.
+    /// author's key is not 32 bytes,
+    /// [`crate::CourierError::Refused`] with `Uncertified` when no device
+    /// bind can come this session, no frame riding and the author standing
+    /// a candidate, [`crate::CourierError::TimedOut`] when a held call's
+    /// bound runs out, [`crate::CourierError::SessionLost`] when the session
+    /// ends before the bind answers, and the [`crate::CourierError`] the
+    /// range or its settlement surfaces.
     #[cfg(feature = "peer")]
     pub async fn courier(
         &self,
