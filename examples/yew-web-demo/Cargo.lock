@@ -206,7 +206,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn 3.0.9",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1900,7 +1900,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "libsqlite3-sys"
 version = "0.39.1"
-source = "git+https://github.com/LucaCappelletti94/rusqlite?branch=upstream%2Fsqlcipher-src-420#0f1ab7393ae5d62d44a94a5a5107c00b23d4ed58"
+source = "git+https://github.com/rusqlite/rusqlite#a5451b8b40593ba98ca495a2ab4b712ea8df3a14"
 dependencies = [
  "bindgen",
  "cc",

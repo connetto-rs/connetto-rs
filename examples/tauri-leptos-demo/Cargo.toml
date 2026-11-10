@@ -19,4 +19,4 @@ android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/and
 windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/windows-native-keyring-store", rev = "8a8ffde9913b36bd464c8cd5dd24bf80e39dce37" }
 sqlite-wasm-rs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
 rsqlite-vfs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
-libsqlite3-sys = { git = "https://github.com/LucaCappelletti94/rusqlite", branch = "upstream/sqlcipher-src-420" }
+libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite" }

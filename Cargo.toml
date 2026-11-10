@@ -178,8 +178,8 @@ windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/win
 sqlite-wasm-rs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
 rsqlite-vfs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
 sqlite-wasm-vfs = { git = "https://github.com/LucaCappelletti94/sqlite-wasm-rs", branch = "upstream/single-thread-safe-memvfs" }
-# R21, until rusqlite/rusqlite#1932 merges: the sqlcipher-src release the browser builds.
-libsqlite3-sys = { git = "https://github.com/LucaCappelletti94/rusqlite", branch = "upstream/sqlcipher-src-420" }
+# R21, until a libsqlite3-sys release carries rusqlite/rusqlite#1932: the sqlcipher-src release the browser builds.
+libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite" }
 
 [workspace.lints.rust]
 missing_docs = "forbid"
