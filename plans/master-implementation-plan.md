@@ -73,6 +73,7 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | [R111](#r111-a-durable-replica-where-opfs-is-refused) | blocked | the JSPI IndexedDB VFS upstream in `sqlite-wasm-rs` | A durable browser replica on IndexedDB through JSPI where OPFS is refused, memory kept only where JSPI is missing |  |  |
 | [R112](#r112-an-apple-peer-to-peer-link) | not started |  | A link between Apple devices over Apple's peer-to-peer Wi-Fi, for an all-Apple group with no hotspot host and no shared network, after its gate run and open points |  |  |
 | [R113](#r113-tests-that-wait-on-events) | blocked | Refreshed dependency graph | CI-backed sequential test and event-hook fixes, ranked by downstream impact and observed flakiness, with targeted repetition only | | |
+| [R114](#r114-retained-rows-asked-every-session) | not started |  | Every session asks the server about the retained rows, so a `Pending` candidacy outlives a restart and an `Abandoned` answer takes the row | | |
 | [R21](#r21-one-page-codec-on-both-backends) | in progress |  | Slices 2 to 5, the browser on `sqlite-wasm-rs` 0.6 and then on SQLCipher, one open contract, the capability and hardening proof, and SQLCipher 4.20.0 |  | [#402](https://github.com/connetto-rs/connetto-rs/pull/402) |
 | R0 | done | | The always-on change-path counters in `counters.rs` and the `fanout_load` harness that priced the dispatch loop, with the ceiling measured as one sequential visibility round trip per subscriber per event and the lock wait at zero | [fanout_counters.rs](../crates/connetto-test-harness/tests/it/fanout_counters.rs), [fanout_load.rs](../crates/connetto-test-harness/tests/it/fanout_load.rs) | |
 | R1 | done | | The three permissive stand-ins reachable from configuration alone are gone, and the reference binary refuses to start without a reader role and a recognised `CONNETTO_OIDC_PROVIDER` | [e2e.rs](../crates/connetto-server/tests/it/e2e.rs) | |
@@ -1484,6 +1485,60 @@ Use CI history as the source of flakiness evidence. After an edit, hammer only t
 ### Done when
 
 No wait in the workspace synchronises on a timer except sites carrying an `expect` and a reason, the clippy guard refuses a new one, and each converted test passes its targeted repetition run.
+
+## R114: retained rows asked every session
+
+**Status.** Designed with the maintainer on 2026-11-10. Not started.
+
+**Dependencies.** None. R113 stays out of the retired-writer proof until slice 1 merges.
+
+**Changes state.** Client tables, `_connetto_retained_ask` goes. Server tables, none. Wire messages, none, the retained rows riding the session's existing `ProvisionalStatus` asks. Archive format, none.
+
+### Purpose
+
+A receiver keeps a retained row so a courier can bring it back to a server restored from an earlier backup (R78 decision 17). It asks the server about its retained rows only when a full resync ends, and the `Pending` mark that makes a row a courier candidate lives in the session (R78 decision 49). Once that ask is answered, a restart loses the candidacy until the next full resync, so a device that heard `Pending` and restarted before its user tapped courier offers nothing the whole next session, though the server would still take the rows.
+
+The same gap hides a writer's retirement. A retired writer's retained rows can never be delivered, since the server refuses their courier `WriterRetired` (R78 decision 18) and answers an ask about one above the writer's frontier `Abandoned`. Any ruling leaves a retained row retained (R78 decision 45), so they sit until `prune_retained` deletes them once the author's certificate ended `DEVICE_SKEW` ago. The retired-writer proof on `main` stops at exactly this, bob holding alice's retained entries 1 and 2 and his courier answering `NothingHeld`.
+
+### Decisions
+
+1. **Every session asks about every retained row whose author's stored offer it holds** (amending R78 decisions 17 and 49). The attach plans these asks beside the provisional and courier-only ones it already sends, one per manifest frame of an author's sequences, and a full resync's end asks nothing more. `_connetto_retained_ask` and its owed row go, since the next attach asks again whatever the last session heard. Rejected: persisting the `Pending` mark and asking only the marked rows, a second stored copy of an answer the server holds, when an ask whose answer is `Settled` costs one manifest row and opens nothing on the server.
+2. **An `Abandoned` answer or push takes the retained rows it names** (amending R78 decision 45). The verdict carries the fact decision 18's refusals carry, that the writer can no longer deliver, so the entry is deleted, sequence by sequence, and the author's candidates restate under decision 46. Every other ruling ends a candidacy and leaves the row retained, as decision 45 says. Rejected: taking the author's every retained row on one `Abandoned`, since one answer can rule some sequences `Settled` or `Applied` from the writer's records and frontier and the rest `Abandoned`.
+3. **An ask about retained rows goes out whether or not the deployment's courier path is on.** An `Abandoned` answer takes a row the path could never use, and with the path off the candidates stay empty as R78 decision 16 says.
+
+### State table
+
+A retained row of an author whose stored offer the replica holds is in one of three situations. It is idle, retained with no ask and no candidacy, it is asked, retained with an ask in flight, or it is a candidate, retained with a `Pending` answer and the server's question open.
+
+| Event | Idle | Asked | Candidate |
+|---|---|---|---|
+| The session attaches | Asked | Asked anew, the earlier ask gone with its connection | Asked anew, the mark gone with its session |
+| The answer `Pending` | | Candidate, `CourierCandidates` raised when the set changed | |
+| The answer `Applied`, `Settled` or `Refused` | | Idle, staying retained | |
+| The answer `Abandoned` | | Deleted, `CourierCandidates` raised when the set changed | |
+| A pushed `Applied`, `Settled` or `Refused` | | | Idle, staying retained, `CourierCandidates` raised with the changed set |
+| A pushed `Abandoned`, the writer retired or its certificate's expiry timer firing | | | Deleted, `CourierCandidates` raised with the changed set |
+| The ask overruns its bound | | Idle for the session, asked at the next attach | |
+| The server refuses the ask whole, past its open-sequence bound or from a superseded connection, or defers it rate-limited | | Idle for the session, asked at the next attach | |
+| A full resync ends | Unchanged | Unchanged | Unchanged |
+| The courier call | Not offered | Not offered | Offered, its answer and refusals ruling it as R78 decisions 18, 33 and 44 say |
+| A new offer from the author over a link | Unchanged | Unchanged | Unchanged, the candidates restating |
+| The retention pass, the author's certificate ended `DEVICE_SKEW` ago | Deleted | Deleted | Deleted, `CourierCandidates` raised with the changed set |
+| The connection ends | Idle | Idle | Idle |
+| An archive import lands the row | Idle | | |
+
+### Slices
+
+1. **The ask and the drop.** `plan_provisional_asks` asks the retained rows at every attach, the resync's end and `_connetto_retained_ask` go, and `settle_verdict_row` deletes a retained row ruled `Abandoned`. The retired-writer proof moves with it, since bob's resumed session now hears `Abandoned` for alice's retained entries, so its last step waits for them to go and asserts `NothingHeld`.
+2. **The record.** Chapter 19's paragraph on the ask about retained rows states the per-session ask and the `Abandoned` drop, and the phase's row turns done.
+
+### Proof
+
+In-process tests in `courier_tests.rs`, one per transition that changes. A retained row answered `Pending` stands a candidate again after a restart. One answer ruling a retained row `Settled` and another `Abandoned` keeps the first and deletes the second. A pushed `Abandoned` deletes a candidate and raises `CourierCandidates` with the emptied set. A full resync's end sends no second ask. The Docker-gated retired-writer proof in `courier_restore.rs` sees bob's held copies of alice's entries 1 and 2 go at his resumed session and his courier answer `NothingHeld`.
+
+### Done when
+
+A restart keeps every candidacy the server still holds `Pending`, a retired or abandoned writer's retained rows go at the first session that asks about them, and chapter 19 states both.
 
 ---
 
