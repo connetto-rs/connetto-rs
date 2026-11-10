@@ -2407,14 +2407,15 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Locked`] while the gate is locked, and the
-    /// [`ClientError`] queueing the writes surfaces.
+    /// [`ClientError::Locked`] while the gate is locked, and a fault the
+    /// queueing or the send surfaces. A lost transport does not fail the
+    /// read, since the entry is durable and the pump's reconnect replays it.
     pub async fn unsynced(&self) -> Result<Vec<crate::UnsyncedWrite>, ClientError> {
         let mut state = self.shared.lock_interrupting().await;
         if self.shared.gate.is_locked() {
             return Err(ClientError::Locked);
         }
-        state.conn.flush().await?;
+        flush_before_read(&mut state.conn).await?;
         Ok(state.conn.unsynced())
     }
 
@@ -2490,14 +2491,15 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Locked`] while the gate is locked, and the
-    /// [`ClientError`] queueing the writes surfaces.
+    /// [`ClientError::Locked`] while the gate is locked, and a fault the
+    /// queueing or the send surfaces. A lost transport does not fail the
+    /// read, since the entry is durable and the pump's reconnect replays it.
     pub async fn pending_work(&self) -> Result<crate::PendingWork, ClientError> {
         let mut state = self.shared.lock_interrupting().await;
         if self.shared.gate.is_locked() {
             return Err(ClientError::Locked);
         }
-        state.conn.flush().await?;
+        flush_before_read(&mut state.conn).await?;
         Ok(crate::PendingWork {
             unsynced: state.conn.unsynced(),
             ..crate::PendingWork::default()
@@ -2961,6 +2963,21 @@ fn is_disconnect(err: &ClientError) -> bool {
     // died: there is a transport to go and find, and the run continues either
     // way. Anything else is a genuine fault and ends the pump.
     matches!(err, ClientError::Transport(_) | ClientError::NotConnected)
+}
+
+/// Auto-submit local writes before a queue read. A lost transport does not
+/// fail the read, since the entry is already durable, and the pump's
+/// reconnect replays it.
+async fn flush_before_read<T>(conn: &mut ConnettoConnection<T>) -> Result<(), ClientError>
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    match conn.flush().await {
+        Ok(_) => Ok(()),
+        Err(err) if is_disconnect(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Decrement one reference on the wire subscription `wire_id`. When the last
