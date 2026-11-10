@@ -260,13 +260,17 @@ async fn run_restore() {
 
     // The ask answers Pending, standing the rows as candidates from alice's
     // first entry on.
-    let candidate = wait_candidate_or_refusal(&bob2, &mut bob_events, &alice_key).await;
-    // Alice's two offline notes queue as one entry (the outbox builds one
-    // changeset under her writer), so the candidate offers her single entry.
-    assert_eq!(
-        candidate.seqs,
-        [1],
-        "alice's entry is offered from her first, the candidate is {candidate:?}"
+    let candidate = wait_pending_candidate(&bob2, &mut bob_events, &alice_key).await;
+    // Whether alice's two notes queued as one entry or two depends on when her
+    // pump flushed, so the candidate offers her entries from her first on.
+    assert!(
+        !candidate.seqs.is_empty()
+            && candidate.seqs.iter().copied().eq(1..=candidate
+                .seqs
+                .len()
+                .try_into()
+                .expect("a handful of entries fits a u64")),
+        "alice's entries are offered from her first, the candidate is {candidate:?}"
     );
     assert_eq!(
         candidate.account, alice_id,
@@ -275,11 +279,6 @@ async fn run_restore() {
     assert!(
         candidate.bytes > 0,
         "the candidate counts the bodies bob holds"
-    );
-    assert_eq!(
-        candidate.last,
-        Some(Verdict::Pending),
-        "the ask's Pending answer stands the rows, the candidate is {candidate:?}"
     );
 
     // The application asks bob's device to courier alice's notes.
@@ -388,58 +387,83 @@ async fn wait_adjudicated(
     }
 }
 
-/// Poll the candidates until `author` stands, bounded by `BOUND`, panicking
-/// on the ask refusal that keeps the retained rows out of candidacy.
-async fn wait_candidate_or_refusal(
+/// What bob's event stream says about `author`'s candidacy.
+enum Candidacy {
+    Pending(CourierCandidate),
+    Refused,
+    Lagged,
+}
+
+/// Wait for `author`'s candidate carrying the ask's `Pending` answer, from the
+/// state at hand once `events` is subscribed and then from `CourierCandidates`
+/// events, which also fire when only the verdict changes. Panics on the ask
+/// refusal that keeps the rows out of candidacy. `BOUND` only detects a run
+/// that never gets there.
+async fn wait_pending_candidate(
     client: &connetto_client::NativeClient<connetto_client::NativeTransport>,
     events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
     author: &[u8],
 ) -> CourierCandidate {
-    let until = Instant::now() + BOUND;
+    let pending = |candidate: &CourierCandidate| {
+        candidate.author == author && candidate.last == Some(Verdict::Pending)
+    };
+    let deadline = tokio::time::Instant::now() + BOUND;
     loop {
-        let candidate = client
+        if let Some(candidate) = client
             .courier_candidates()
             .await
             .expect("the candidates are read")
             .into_iter()
-            .find(|candidate| candidate.author == author);
-        if let Some(candidate) = candidate {
+            .find(|candidate| pending(candidate))
+        {
             return candidate;
         }
-        while let Ok(event) = events.try_recv() {
-            match &event {
-                ClientEvent::NonFatal { detail, .. } if detail == "provisional ask refused" => {
-                    let rows = client
-                        .provisional_rows()
-                        .await
-                        .expect("bob's rows are read");
-                    let candidates = client
-                        .courier_candidates()
-                        .await
-                        .expect("bob's candidates are read");
-                    panic!(
-                        "the restored server refused the retained ask, so the rows never \
-                         become candidates; bob holds {rows:?}, his candidates read {candidates:?}"
-                    );
+        let next = tokio::time::timeout_at(deadline, async {
+            loop {
+                match events.recv().await {
+                    Ok(ClientEvent::CourierCandidates(candidate)) if pending(&candidate) => {
+                        return Candidacy::Pending(candidate);
+                    }
+                    Ok(ClientEvent::NonFatal { detail, .. })
+                        if detail == "provisional ask refused" =>
+                    {
+                        return Candidacy::Refused;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        return Candidacy::Lagged;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("bob's event stream closed before the candidate stood");
+                    }
                 }
-                _ => {}
             }
-        }
-        if Instant::now() >= until {
-            let rows = client
-                .provisional_rows()
-                .await
-                .expect("bob's rows are read");
-            let candidates = client
-                .courier_candidates()
-                .await
-                .expect("bob's candidates are read");
-            panic!(
-                "the author never became a courier candidate and no ask was refused, \
-                 bob holds {rows:?}, his candidates read {candidates:?}"
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        })
+        .await;
+        let refused = match next {
+            Ok(Candidacy::Pending(candidate)) => return candidate,
+            // A lagged stream lost events, so the state is read again.
+            Ok(Candidacy::Lagged) => continue,
+            Ok(Candidacy::Refused) => true,
+            Err(_elapsed) => false,
+        };
+        let rows = client
+            .provisional_rows()
+            .await
+            .expect("bob's rows are read");
+        let candidates = client
+            .courier_candidates()
+            .await
+            .expect("bob's candidates are read");
+        assert!(
+            !refused,
+            "the restored server refused the retained ask, so the rows never \
+             become candidates; bob holds {rows:?}, his candidates read {candidates:?}"
+        );
+        panic!(
+            "no candidate for the author carried the Pending answer and no ask was \
+             refused, bob holds {rows:?}, his candidates read {candidates:?}"
+        );
     }
 }
 
