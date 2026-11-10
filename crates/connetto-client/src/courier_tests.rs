@@ -2405,11 +2405,12 @@ async fn a_lost_session_ends_a_wait_that_already_dropped() {
 }
 
 /// A taken row whose author key is not a device key stands its offer and
-/// entry, naming no candidate the key cannot carry.
+/// entry, naming no candidate the key cannot carry, and the next session
+/// asks nothing about it.
 #[tokio::test]
 async fn a_short_author_key_stands_its_offer_without_a_candidate() {
     let conn0 = replica();
-    let (mut conn, _server) = attach(conn0, true).await;
+    let (mut conn, mut server) = attach(conn0, true).await;
     let body = b"the taken row";
     let digest: [u8; 32] = Sha256::digest(body).into();
     let row = ManifestRow {
@@ -2451,6 +2452,16 @@ async fn a_short_author_key_stands_its_offer_without_a_candidate() {
             .iter()
             .all(|event| !matches!(event, ClientEvent::CourierCandidates(_))),
         "the short key names no candidate"
+    );
+    server.close().await.expect("hang up");
+    let event = conn.pump_one().await.expect("the session ends");
+    assert!(matches!(event, ClientEvent::Closed));
+    let (_conn, mut server) = attach(conn, true).await;
+    assert!(
+        timeout(Duration::from_millis(100), server.recv())
+            .await
+            .is_err(),
+        "no ask names a key the server cannot rule"
     );
 }
 
