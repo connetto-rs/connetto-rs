@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use connetto_core::auth::CapabilityKey;
 use connetto_core::messages::BulkMessage;
 use connetto_core::traits::IncomingFrame;
 use connetto_server::CallerMappings;
@@ -33,7 +32,6 @@ use diesel::sql_query;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
 use openfga_client::client::OpenFgaServiceClient;
-use pg2sqlite::prelude::SessionVariableMapping;
 use rls2fga::translator::Translator;
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaPolicy;
@@ -768,21 +766,14 @@ pub async fn term_over_owner_fixture(fixture: &Fixture) -> Server {
 
 /// The pairing every deployment build uses, `current_setting('app.user_id')`
 /// spelled `current_app_user()` on the replica with the subject set beside it.
+///
+/// # Panics
+///
+/// Never, since the fixture deployment's description holds.
 #[must_use]
 pub fn caller_mapping() -> CallerMappings {
-    CallerMappings {
-        identity: SessionVariableMapping::current_setting(
-            connetto_core::auth::DEFAULT_USER_SETTING,
-            "current_app_user",
-        ),
-        subjects: Some(
-            SessionVariableMapping::current_setting(
-                <String as CapabilityKey>::SETTING,
-                "current_app_subjects",
-            )
-            .holding_set(<String as CapabilityKey>::SEPARATOR),
-        ),
-    }
+    CallerMappings::of::<String>(crate::FIXTURE_READER)
+        .expect("the fixture deployment's description holds")
 }
 
 async fn provision(fixture: &Fixture, shape: PolicyShape) -> Server {
@@ -891,9 +882,12 @@ async fn fga_auth(
 ) -> (crate::HarnessFga, Arc<dyn StoreUpkeep>, Translator) {
     let (channel, store) = fixture.fga_store().await;
     let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-        shape.ddl(),
-        shape.policies(),
-        connetto_core::auth::DEFAULT_USER_SETTING,
+        connetto_schema::Documents::new(
+            shape.ddl(),
+            shape.policies(),
+            crate::FIXTURE_ROLES,
+            crate::FIXTURE_READER,
+        ),
         true,
     )
     .expect("the fixture's policy is one rls2fga classifies");
@@ -906,9 +900,9 @@ async fn fga_auth(
         translated.shapes_arc(),
         setup,
         store.clone(),
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     translated
         .load_into(&FactSource::owner(fixture.admin().clone()), &loader)
         .await
@@ -923,9 +917,9 @@ async fn fga_auth(
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
         store,
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
     // The store follows the change stream here exactly as it does in the
     // binary, so a row written after the load reaches the service before it

@@ -16,7 +16,6 @@ use connetto_server::{
     CallerMappings, Materializer, MaterializerError, NoConnector, ReadBudget, Registration,
     RuntimeWritableCatalog, SeedPlan, subject_set_reach,
 };
-use pg2sqlite::prelude::SessionVariableMapping;
 
 const PG_DDL: &str =
     "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, amount INT, price FLOAT, tag BYTEA);";
@@ -304,13 +303,10 @@ fn the_subject_set_reach_reverses_to_the_membership_it_came_from() {
     const DDL: &str = "CREATE TABLE members (member TEXT NOT NULL);";
     let materializer: Materializer<_, _, NoConnector> = Materializer::builder(DDL)
         .with_write_catalog(RuntimeWritableCatalog::default())
-        .with_caller(CallerMappings {
-            identity: SessionVariableMapping::current_setting("app.user_id", "current_app_user"),
-            subjects: Some(
-                SessionVariableMapping::current_setting("app.subjects", "current_app_subjects")
-                    .holding_set(','),
-            ),
-        })
+        .with_caller(
+            CallerMappings::of::<String>(connetto_test_harness::FIXTURE_READER)
+                .expect("the deployment description builds"),
+        )
         .with_read_connector(NoConnector)
         .build()
         .expect("the catalog parses");
@@ -319,7 +315,7 @@ fn the_subject_set_reach_reverses_to_the_membership_it_came_from() {
         .translate_subscription_sql(&format!("SELECT * FROM members WHERE {reach}"))
         .expect("the mirror's own spelling has to translate");
     assert!(
-        pg.contains("member = ANY(string_to_array(current_setting('app.subjects', true), ','))"),
+        pg.contains("member = ANY(string_to_array(current_setting('app.subjects'), ','))"),
         "the reach has to read back as the membership it stands for, got {pg}"
     );
 }

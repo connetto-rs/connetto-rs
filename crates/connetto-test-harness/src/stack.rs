@@ -23,8 +23,13 @@ const DEPLOYMENT_SQL: &str = include_str!("../../connetto-file-server/sql/schema
 pub struct Deployment {
     /// The Postgres schema, also served as `CONNETTO_PG_DDL`.
     pub schema: &'static str,
-    /// The non-owner reader role and its grants.
+    /// The roles document, creating the reader role and granting it the
+    /// synced tables, also served as `CONNETTO_PG_ROLES`.
     pub roles: &'static str,
+    /// The role `roles` creates, served as `CONNETTO_READER_ROLE`.
+    pub reader_role: &'static str,
+    /// The reader role's grants on connetto's bookkeeping tables.
+    pub bookkeeping: &'static str,
     /// The content columns and triggers the file server reads.
     pub content: &'static str,
     /// The row policies, also served as `CONNETTO_PG_POLICIES`.
@@ -42,6 +47,8 @@ pub struct Deployment {
 pub const DEMO_DEPLOYMENT: Deployment = Deployment {
     schema: include_str!("../../../examples/deployment/schema.sql"),
     roles: include_str!("../../../examples/deployment/roles.sql"),
+    reader_role: "connetto_reader",
+    bookkeeping: include_str!("../../../examples/deployment/bookkeeping.sql"),
     content: include_str!("../../../examples/deployment/content.sql"),
     policies: include_str!("../../../examples/deployment/policies.sql"),
     seed: include_str!("../../../examples/deployment/seed.sql"),
@@ -136,7 +143,8 @@ pub async fn provision(
     fixture.setup(&[DEPLOYMENT_SQL]).await;
     fixture.setup(&[connetto_server::epoch::EPOCH_DDL]).await;
     provision_auth_tables(&fixture).await;
-    fixture.setup(&[deployment.roles]).await;
+    fixture.setup_roles(deployment.roles).await;
+    fixture.setup(&[deployment.bookkeeping]).await;
     fixture.setup(&[deployment.content]).await;
     fixture.setup(&[deployment.policies]).await;
     // The server's startup check requires the cap on every synced table.
@@ -170,7 +178,7 @@ impl Provisioned {
             ("DATABASE_URL", admin.to_owned()),
             (
                 "CONNETTO_READER_URL",
-                with_user(admin, "connetto_reader", "connetto_reader"),
+                with_user(admin, deployment.reader_role, deployment.reader_role),
             ),
             ("CONNETTO_BIND", bind.to_owned()),
             ("CONNETTO_AUTH", "database".to_owned()),
@@ -186,6 +194,8 @@ impl Provisioned {
             ),
             ("CONNETTO_PG_DDL", deployment.schema.to_owned()),
             ("CONNETTO_PG_POLICIES", deployment.policies.to_owned()),
+            ("CONNETTO_PG_ROLES", deployment.roles.to_owned()),
+            ("CONNETTO_READER_ROLE", deployment.reader_role.to_owned()),
             ("CONNETTO_SLOT", SLOT.to_owned()),
             ("CONNETTO_PUBLICATION", PUBLICATION.to_owned()),
             ("CONNETTO_FGA_URL", self.fga_url.clone()),

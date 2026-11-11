@@ -71,7 +71,12 @@ pub(super) async fn builder_over(
     );
     let builder = ServerBuilder::new(
         Database::new(url, reader),
-        ServerSchema::new(PG_DDL, NO_POLICIES),
+        ServerSchema::new(
+            PG_DDL,
+            NO_POLICIES,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
         token,
         OpenFga::new(fixture.fga_url().await.to_owned(), store),
     )
@@ -111,7 +116,12 @@ pub(super) async fn builder_over_owned(
     );
     let builder = ServerBuilder::new(
         Database::new(url, reader),
-        ServerSchema::new(OWNED_PG_DDL, OWNED_POLICIES),
+        ServerSchema::new(
+            OWNED_PG_DDL,
+            OWNED_POLICIES,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
         token,
         OpenFga::new(fixture.fga_url().await.to_owned(), store),
     )

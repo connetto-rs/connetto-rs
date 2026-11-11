@@ -541,6 +541,11 @@ pub(super) fn spawn_server_cfg(
         .env("DATABASE_URL", database_url)
         .env("CONNETTO_BIND", bind)
         .env("CONNETTO_PG_DDL", pg_ddl)
+        .env("CONNETTO_PG_ROLES", connetto_test_harness::FIXTURE_ROLES)
+        .env(
+            "CONNETTO_READER_ROLE",
+            connetto_test_harness::FIXTURE_READER,
+        )
         .env("CONNETTO_WRITABLE", writable)
         .env("CONNETTO_SLOT", SLOT)
         .env("CONNETTO_PUBLICATION", PUBLICATION)
@@ -607,6 +612,11 @@ pub(super) fn spawn_client_env(
         // Beside it, because the server hashes both into the version it
         // advertises: a policy decides what the replica's own views admit.
         .env("CONNETTO_POLICIES_SQL", policies_sql)
+        .env("CONNETTO_ROLES_SQL", connetto_test_harness::FIXTURE_ROLES)
+        .env(
+            "CONNETTO_READER_ROLE",
+            connetto_test_harness::FIXTURE_READER,
+        )
         .env("CONNETTO_USER", user)
         .env("CONNETTO_TOKEN", token)
         .env("CONNETTO_SUB_ID", sub_id)
@@ -1312,6 +1322,11 @@ pub(super) async fn run_server_exit_output(
         .env("CONNETTO_BIND", bind)
         .env("CONNETTO_PG_DDL", PG_DDL)
         .env("CONNETTO_PG_POLICIES", NO_POLICIES)
+        .env("CONNETTO_PG_ROLES", connetto_test_harness::FIXTURE_ROLES)
+        .env(
+            "CONNETTO_READER_ROLE",
+            connetto_test_harness::FIXTURE_READER,
+        )
         .env("CONNETTO_WRITABLE", "orders")
         .env("CONNETTO_SLOT", SLOT)
         .env("CONNETTO_PUBLICATION", PUBLICATION)
@@ -1599,6 +1614,11 @@ async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
             .env("DATABASE_URL", &url)
             .env("CONNETTO_BIND", ports.bind())
             .env("CONNETTO_PG_DDL", PG_DDL)
+            .env("CONNETTO_PG_ROLES", connetto_test_harness::FIXTURE_ROLES)
+            .env(
+                "CONNETTO_READER_ROLE",
+                connetto_test_harness::FIXTURE_READER,
+            )
             .env("CONNETTO_WRITABLE", "orders")
             .env("CONNETTO_SLOT", SLOT)
             .env("CONNETTO_PUBLICATION", PUBLICATION)
@@ -1696,6 +1716,11 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
                 .env("DATABASE_URL", &url)
                 .env("CONNETTO_BIND", ports.bind())
                 .env("CONNETTO_PG_DDL", PG_DDL)
+                .env("CONNETTO_PG_ROLES", connetto_test_harness::FIXTURE_ROLES)
+                .env(
+                    "CONNETTO_READER_ROLE",
+                    connetto_test_harness::FIXTURE_READER,
+                )
                 .env("CONNETTO_WRITABLE", "orders")
                 .env("CONNETTO_SLOT", SLOT)
                 .env("CONNETTO_PUBLICATION", PUBLICATION)

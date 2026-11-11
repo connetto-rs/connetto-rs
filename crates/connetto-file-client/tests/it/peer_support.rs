@@ -124,8 +124,12 @@ pub async fn replica(
 ) -> (ConnettoClient<Scripted>, Device) {
     let schema = SyncSchema::new(
         connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            PHOTO_SCHEMA,
-            PHOTO_POLICIES,
+            connetto_schema::Documents::new(
+                PHOTO_SCHEMA,
+                PHOTO_POLICIES,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
         )
         .expect("translate the photo schema"),
     );

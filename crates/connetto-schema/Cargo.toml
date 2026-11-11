@@ -19,6 +19,8 @@ workspace = true
 connetto-core = { workspace = true, features = ["sqlite-shape"] }
 # Tracked on main, the same way the other root crates track it.
 pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
+# The deployment description both translators read, built once here.
+sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main", default-features = false }
 # Applies the translated DDL to a throwaway database so a bad translation fails the build.
 diesel = { workspace = true, features = ["returning_clauses_for_sqlite_3_35"] }
 # View names and policy reads are read off the AST, resolved by the root patch blocks.

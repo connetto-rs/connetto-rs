@@ -789,7 +789,7 @@ dependencies = [
 [[package]]
 name = "diesel"
 version = "2.3.14"
-source = "git+https://github.com/diesel-rs/diesel#c11c7e431b52c9f6f25207d6b5b005babc49f0d6"
+source = "git+https://github.com/diesel-rs/diesel#31afd783aeddb2471bba2bece823816fe4925fed"
 dependencies = [
  "bigdecimal",
  "bitflags",
@@ -804,6 +804,7 @@ dependencies = [
  "num-traits",
  "serde_json",
  "sqlite-wasm-rs",
+ "sqlstate",
  "time",
  "uuid",
 ]
@@ -811,7 +812,7 @@ dependencies = [
 [[package]]
 name = "diesel-sqlite-session"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/diesel-sqlite-session#78f4368142fb89fa83659f83d54497c0925a43dd"
+source = "git+https://github.com/connetto-rs/diesel-sqlite-session#befee4a5c501e69404f45ddaa94c5f00ba01d00a"
 dependencies = [
  "diesel",
  "libsqlite3-sys",
@@ -822,7 +823,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/diesel-rs/diesel#c11c7e431b52c9f6f25207d6b5b005babc49f0d6"
+source = "git+https://github.com/diesel-rs/diesel#31afd783aeddb2471bba2bece823816fe4925fed"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -832,7 +833,7 @@ dependencies = [
 [[package]]
 name = "diesel_derives"
 version = "2.3.10"
-source = "git+https://github.com/diesel-rs/diesel#c11c7e431b52c9f6f25207d6b5b005babc49f0d6"
+source = "git+https://github.com/diesel-rs/diesel#31afd783aeddb2471bba2bece823816fe4925fed"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -845,7 +846,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/diesel-rs/diesel#c11c7e431b52c9f6f25207d6b5b005babc49f0d6"
+source = "git+https://github.com/diesel-rs/diesel#31afd783aeddb2471bba2bece823816fe4925fed"
 dependencies = [
  "syn 3.0.9",
 ]
@@ -880,7 +881,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/diesel-rs/diesel#c11c7e431b52c9f6f25207d6b5b005babc49f0d6"
+source = "git+https://github.com/diesel-rs/diesel#31afd783aeddb2471bba2bece823816fe4925fed"
 dependencies = [
  "darling",
  "either",
@@ -921,7 +922,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1522,6 +1523,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jiff"
+version = "0.2.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fefca06093eeaed707a905795e68206da0edca4edef23d2a3997a3ddbee462aa"
+dependencies = [
+ "jiff-core",
+ "jiff-static",
+ "jiff-tzdb",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff-core"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77a24020db0ee88d1c681d677681bd31f9f4ea189a455425223d52ce4f1508aa"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "jiff-static"
+version = "0.2.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41d3213549742662eea1a18e6c5af9be5dfbabeb7611ab71356a54928ec398f0"
+dependencies = [
+ "jiff-core",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "jiff-tzdb"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa8377070c6bae868759445e5a77f66d84f0b72f3a054bfb00e6d038b8282da7"
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2006,7 +2048,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg_walstream"
 version = "0.10.0"
-source = "git+https://github.com/isdaniel/pg-walstream?branch=main#c4da9fc66e39df64b4017e6bfdb7ce0ba2d66d3a"
+source = "git+https://github.com/isdaniel/pg-walstream?branch=main#7e74fa892e4c815f701585113612ac4e03bb84e7"
 dependencies = [
  "bytes",
  "chrono",
@@ -2058,6 +2100,21 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+]
+
+[[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
+name = "portable-atomic-util"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
+dependencies = [
+ "portable-atomic",
 ]
 
 [[package]]
@@ -2188,7 +2245,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2436,13 +2493,13 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#24fbb4a60b99b6a13a390c2ce946b53b1529e397"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#b02206d881adda970c660f7630752274b00fc7b8"
 dependencies = [
  "rls2fga-types",
  "serde",
  "serde_json",
  "sql-traits",
- "sql-values",
+ "sql-values 0.5.1",
  "sqlparser",
  "thiserror 2.0.21",
 ]
@@ -2450,9 +2507,10 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#24fbb4a60b99b6a13a390c2ce946b53b1529e397"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#b02206d881adda970c660f7630752274b00fc7b8"
 dependencies = [
  "serde",
+ "sql-values 0.5.1",
  "thiserror 2.0.21",
 ]
 
@@ -2549,7 +2607,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2606,7 +2664,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2906,11 +2964,13 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#6b8fbf32239681ac857ff69b6b73e6ddf1c95177"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#fb373ef60a272672d59fd776a0b3df60894dea46"
 dependencies = [
  "geometric-traits",
+ "once_cell",
  "serde",
  "sha2",
+ "sql-values 0.5.1",
  "sqlparser",
  "sqlparser-plpgsql",
  "thiserror 2.0.21",
@@ -2926,6 +2986,15 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sql-values"
+version = "0.5.1"
+source = "git+https://github.com/connetto-rs/sql-values?branch=main#f651c6e1f713c693006ae5ecf64222df4a3e898f"
+dependencies = [
+ "jiff",
  "thiserror 2.0.21",
 ]
 
@@ -2980,7 +3049,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.64.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#ebb8b04a934420a56574b85f6573a846e4d753e2"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#8a176d98b37b361084c11f1b466fc3746c696594"
 dependencies = [
  "log",
  "recursive",
@@ -2991,7 +3060,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.2.1"
-source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#c27eb3b8be9a79b4a4580fd61e0b70e507d6cdd1"
+source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#be62ac98064b3b17f0479927d24df05c539dc96a"
 dependencies = [
  "seahash",
  "sqlparser",
@@ -3001,7 +3070,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#2b697edc4dfa03f4a328f680277916279211f12c"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#131423cdac80ceadb72f6a72c9f9faad291fc5d3"
 dependencies = [
  "sqlparser",
  "thiserror 2.0.21",
@@ -3010,12 +3079,17 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#ebb8b04a934420a56574b85f6573a846e4d753e2"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#8a176d98b37b361084c11f1b466fc3746c696594"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
 ]
+
+[[package]]
+name = "sqlstate"
+version = "0.2.0"
+source = "git+https://github.com/diesel-rs/diesel#31afd783aeddb2471bba2bece823816fe4925fed"
 
 [[package]]
 name = "stable_deref_trait"
@@ -3051,7 +3125,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#5561bcb6211ed91a93c59caeaaeb2e8ec9055337"
+source = "git+https://github.com/connetto-rs/subql?branch=main#935af060c57880b78787cad1ebc0d521581d2e4a"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -3076,7 +3150,7 @@ dependencies = [
  "serde_json",
  "slab",
  "sql-traits",
- "sql-values",
+ "sql-values 0.3.0",
  "sqlite-diff-rs",
  "sqlparser",
  "sqlparser-canonicalize",
@@ -3771,7 +3845,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

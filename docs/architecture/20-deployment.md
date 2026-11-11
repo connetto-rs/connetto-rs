@@ -9,6 +9,8 @@ A deployment holds state in three places. Its Postgres cluster, the stores besid
 | Artifact | Named by | In a Postgres backup | At startup when missing |
 |---|---|---|---|
 | Application tables | `CONNETTO_PG_DDL` | Yes | The deployment's own concern |
+| The reader role and its grants on the synced tables | `CONNETTO_PG_ROLES` and `CONNETTO_READER_ROLE`. The roles document holds plain `CREATE ROLE` and `GRANT` statements over the tables `CONNETTO_PG_DDL` declares, since the server and every client build parse it beside the schema and the policies through one [`connetto_schema::deployment`] description, and a migration applies it once | Yes | The server's translation refuses a roles document that never creates the reader role, before anything is written to OpenFGA |
+| The reader role's grants on connetto's bookkeeping tables | The deployment's migration, in a document no translation reads, since no caller kind is ever granted them | Yes | Not checked at startup |
 | `connetto_sessions`, `connetto_provider_tokens` | `ConnettoSchema::Auth`, emitted by `connetto_schema!` | Yes | Refused by [`connetto_server::preflight::require`] (`Artifact::Table`) |
 | `_connetto_writers`, `_connetto_settled`, `_connetto_session_writers` and `_connetto_courier_notices`, the per-writer applied frontier, each session's binds and the author's standing courier notices | `ConnettoSchema::Writers`, emitted by `connetto_schema!` | Yes | Refused by [`connetto_server::preflight::require`] (`Artifact::Table`) |
 | `connetto_bans`, only under `CONNETTO_BANS=database` | `ConnettoSchema::Bans` | Yes | Refused by [`connetto_server::preflight::require`] (`Artifact::Table`) when bans are on |

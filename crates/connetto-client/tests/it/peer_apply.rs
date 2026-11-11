@@ -1850,16 +1850,20 @@ async fn shared_receiver() -> (ConnettoConnection<Script>, Script) {
     script.say(support::handshake_ack());
     let schema = SyncSchema::new(
         connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(
-            "-- connetto:major 1\n \
-             CREATE TABLE orders (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
-             status TEXT NOT NULL); \
-             CREATE TABLE vocabulary (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
-             ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
-             ALTER TABLE vocabulary ENABLE ROW LEVEL SECURITY;",
-            "CREATE POLICY orders_read ON orders FOR SELECT USING (true); \
-             CREATE POLICY orders_insert ON orders FOR INSERT \
-             WITH CHECK (owner = current_setting('app.user_id', true)); \
-             CREATE POLICY vocabulary_open ON vocabulary FOR ALL USING (true) WITH CHECK (true);",
+            connetto_schema::Documents::new(
+                "-- connetto:major 1\n \
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
+         status TEXT NOT NULL); \
+         CREATE TABLE vocabulary (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
+         ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
+         ALTER TABLE vocabulary ENABLE ROW LEVEL SECURITY;",
+                "CREATE POLICY orders_read ON orders FOR SELECT USING (true); \
+         CREATE POLICY orders_insert ON orders FOR INSERT \
+         WITH CHECK (owner = current_setting('app.user_id', true)); \
+         CREATE POLICY vocabulary_open ON vocabulary FOR ALL USING (true) WITH CHECK (true);",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
             &["vocabulary"],
         )
         .expect("translate the shared vocabulary"),

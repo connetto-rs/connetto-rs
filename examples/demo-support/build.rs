@@ -1,8 +1,8 @@
 //! Build-time schema pipeline for the shared demo support crate.
 //!
-//! The crate shares the deployment's synced schema and policies and the
-//! demos' local tier, so its `client` feature runs the schema step over those
-//! three, with the public `products` catalogue in the device's shared store
+//! The crate shares the deployment's synced schema, policies and roles and
+//! the demos' local tier, so its `client` feature runs the schema step over
+//! those four, with the public `products` catalogue in the device's shared store
 //! (R11). A build without that feature holds no schema. The tier history in
 //! `tier_history` is written by `connetto-schema export-tier --schema
 //! examples/deployment/schema.sql --tier examples/demo-support/frontend.sql
@@ -13,6 +13,8 @@ fn main() {
     connetto_schema::emit::<String, connetto_schema::TextIds>(
         std::path::Path::new("../deployment/schema.sql"),
         std::path::Path::new("../deployment/policies.sql"),
+        std::path::Path::new("../deployment/roles.sql"),
+        "connetto_reader",
         Some(&connetto_schema::TierSource::new(
             "frontend.sql",
             "tier_history",

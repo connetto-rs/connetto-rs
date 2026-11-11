@@ -315,9 +315,13 @@ mod tests {
     #[test]
     fn an_archive_table_keeps_the_queried_columns_their_types_and_the_key() {
         let bundle = connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            "-- connetto:major 1\nCREATE TABLE t (a BIGINT NOT NULL, b TEXT NOT NULL, c BYTEA, \
-             d DOUBLE PRECISION, PRIMARY KEY (b, a));",
-            "",
+            connetto_schema::Documents::new(
+                "-- connetto:major 1\nCREATE TABLE t (a BIGINT NOT NULL, b TEXT NOT NULL, c BYTEA, \
+                 d DOUBLE PRECISION, PRIMARY KEY (b, a));",
+                "",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
         )
         .expect("the schema translates");
         assert!(

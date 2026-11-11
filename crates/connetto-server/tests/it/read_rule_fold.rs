@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use connetto_core::auth::{DEFAULT_USER_SETTING, Principal};
+use connetto_core::auth::Principal;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, Grant, Handshake, Subscribe, SubscriptionSpec,
 };
@@ -159,9 +159,12 @@ async fn connected_clients(
 ) {
     let translated =
         connetto_server::openfga::Translated::of::<String, connetto_core::bots::TextIds>(
-            PG_DDL,
-            POLICIES,
-            DEFAULT_USER_SETTING,
+            connetto_schema::Documents::new(
+                PG_DDL,
+                POLICIES,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
             true,
         )
         .expect("the policy translates");

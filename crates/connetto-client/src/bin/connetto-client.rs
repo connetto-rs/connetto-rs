@@ -9,6 +9,9 @@
 //!   `CONNETTO_POLICIES_SQL` or `CONNETTO_POLICIES_SQL_FILE` beside it (default
 //!   none), into its replica schema, so the replica and the handshake's schema
 //!   version are the ones the server derives from the same sources.
+//! - `CONNETTO_ROLES_SQL` or `CONNETTO_ROLES_SQL_FILE`: the roles document the
+//!   server reads beside the other two (required), and `CONNETTO_READER_ROLE`,
+//!   the reader role it creates (required).
 //! - `CONNETTO_TOKEN`: the login grant (default none, so no identity).
 //! - `CONNETTO_USER`: the user id `CONNETTO_TOKEN` stands for, which the
 //!   replica's policy views compare against (required with a token).
@@ -203,9 +206,10 @@ async fn run() -> Result<()> {
     let query = std::env::var("CONNETTO_QUERY").context("set CONNETTO_QUERY")?;
     let schema_sql = read_ddl("CONNETTO_SCHEMA_SQL").context("set CONNETTO_SCHEMA_SQL")?;
     let policies_sql = read_ddl("CONNETTO_POLICIES_SQL").unwrap_or_default();
+    let roles_sql = read_ddl("CONNETTO_ROLES_SQL").context("set CONNETTO_ROLES_SQL")?;
+    let reader_role = std::env::var("CONNETTO_READER_ROLE").context("set CONNETTO_READER_ROLE")?;
     let bundle = connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-        &schema_sql,
-        &policies_sql,
+        connetto_schema::Documents::new(&schema_sql, &policies_sql, &roles_sql, &reader_role),
     )
     .map_err(|err| anyhow!("translating CONNETTO_SCHEMA_SQL: {err}"))?;
 

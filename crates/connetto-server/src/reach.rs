@@ -329,7 +329,6 @@ fn walk_userset(
 mod tests {
     use super::GrantReach;
     use crate::openfga::Translated;
-    use connetto_core::auth::DEFAULT_USER_SETTING;
     use rls2fga::generator::json_model::Userset;
 
     /// The harness's own cross-table shape, which is what this phase exists
@@ -350,9 +349,12 @@ mod tests {
 
     fn reach(shape: (&str, &str)) -> GrantReach {
         Translated::of::<String, connetto_core::bots::TextIds>(
-            shape.0,
-            shape.1,
-            DEFAULT_USER_SETTING,
+            connetto_schema::Documents::new(
+                shape.0,
+                shape.1,
+                "CREATE ROLE app_reader LOGIN;",
+                "app_reader",
+            ),
             true,
         )
         .expect("the shape translates")
@@ -367,9 +369,12 @@ mod tests {
     #[test]
     fn a_membership_fact_reaches_the_guarded_table() {
         let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-            CROSS_TABLE.0,
-            CROSS_TABLE.1,
-            DEFAULT_USER_SETTING,
+            connetto_schema::Documents::new(
+                CROSS_TABLE.0,
+                CROSS_TABLE.1,
+                "CREATE ROLE app_reader LOGIN;",
+                "app_reader",
+            ),
             true,
         )
         .expect("the shape translates");
