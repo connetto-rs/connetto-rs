@@ -2826,24 +2826,37 @@ mod tests {
     async fn completion_observers_do_not_own_background_tasks() {
         use futures_util::FutureExt as _;
 
-        let (held, mut released) = tokio::sync::oneshot::channel::<()>();
-        let task = BackgroundTask::new(tokio::spawn(async move {
-            let _held = held;
-            std::future::pending::<()>().await;
-        }));
-        let completion = task.completion();
-        let owner = task.clone();
-        drop(task);
-        assert!(completion.clone().now_or_never().is_none());
-        drop(owner);
-        tokio::time::timeout(Duration::from_secs(10), completion.clone())
-            .await
-            .expect("the task finishes");
-        assert_eq!(
-            released.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
-        );
-        assert_eq!(completion.now_or_never(), Some(()));
+        for cancel in [false, true] {
+            let (held, mut released) = tokio::sync::oneshot::channel::<()>();
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let (finish, finish_rx) = tokio::sync::oneshot::channel::<()>();
+            let task = BackgroundTask::new(tokio::spawn(async move {
+                let _held = held;
+                started.send(()).expect("the startup observer remains");
+                let _ = finish_rx.await;
+            }));
+            tokio::time::timeout(Duration::from_secs(10), started_rx)
+                .await
+                .expect("the task starts within the bound")
+                .expect("the task started");
+            let completion = task.completion();
+            let owner = task.clone();
+            drop(task);
+            assert!(completion.clone().now_or_never().is_none());
+            if cancel {
+                drop(owner);
+            } else {
+                finish.send(()).expect("the task remains running");
+            }
+            tokio::time::timeout(Duration::from_secs(10), completion.clone())
+                .await
+                .expect("the task finishes");
+            assert_eq!(
+                released.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            );
+            assert_eq!(completion.now_or_never(), Some(()));
+        }
     }
 
     /// A caller carrying only an identity, which is what these mints exercise.
