@@ -2926,6 +2926,16 @@ where
         self.shared.events.subscribe()
     }
 
+    /// The attached connection's handshake identity, or `None` without a server transport.
+    #[cfg(feature = "device-identity")]
+    pub async fn connection_number(&self) -> Option<crate::ConnectionNumber> {
+        self.shared
+            .lock_interrupting()
+            .await
+            .conn
+            .connection_number()
+    }
+
     /// The client's event stream the background tasks publish into (R76),
     /// and the device wipe once the client closed (R105).
     #[cfg(feature = "device-identity")]

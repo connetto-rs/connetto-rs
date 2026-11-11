@@ -120,7 +120,7 @@ pub use bluetooth::{
     PromptOutcome,
 };
 #[cfg(feature = "device-identity")]
-pub use enrolment::{CertificateError, DeviceEntry};
+pub use enrolment::{CertificateError, DeviceEntry, EnrolmentDecision, EnrolmentOutcome};
 #[cfg(feature = "peer")]
 pub use hotspot::{HotspotError, HotspotOffer, HotspotSecurity, JoinError, WifiPayloadError};
 pub use presence::SharedDeparture;
@@ -4654,11 +4654,10 @@ struct Wire<T> {
     held_notices: Vec<CourierNotice>,
 }
 
-/// Which handshake of a [`ConnettoConnection`] a wire came from, counted from
-/// one, so no two wires of the same connection share a number.
+/// An opaque handshake identity, comparable only within the same client.
 #[cfg(feature = "device-identity")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ConnectionNumber(u64);
+pub struct ConnectionNumber(u64);
 
 #[cfg(all(test, feature = "device-identity"))]
 impl ConnectionNumber {
@@ -9757,10 +9756,9 @@ where
         self.wire.as_ref().map(|wire| wire.connection_id.as_str())
     }
 
-    /// The number of the handshake that attached the live wire, or `None`
-    /// while no server is reachable.
+    /// The attached connection's handshake identity, or `None` without a server transport.
     #[cfg(feature = "device-identity")]
-    pub(crate) fn connection_number(&self) -> Option<ConnectionNumber> {
+    pub fn connection_number(&self) -> Option<ConnectionNumber> {
         self.wire.as_ref().map(|wire| wire.number)
     }
 
