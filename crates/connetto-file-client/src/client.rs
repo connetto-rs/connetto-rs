@@ -97,7 +97,6 @@ pub enum ContentEvent {
     /// The number of linked devices reporting a copy in custody of one of
     /// this device's unsent files in a replicated column changed (R79
     /// decision 12).
-    #[cfg(feature = "peer")]
     Replicated {
         /// The file.
         file_id: FileId,
