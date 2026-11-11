@@ -8,10 +8,13 @@ use connetto_client::SyncSchema;
 use connetto_client::live::ConnettoClient;
 use connetto_client::media::{MediaEvent, MediaPort};
 use connetto_client::peer::PeerAuthor;
-use connetto_core::Major;
+use connetto_core::clock::DEVICE_SKEW;
 use connetto_core::device_cert::AttestationLevel;
 use connetto_core::exchange::ManifestRow;
+use connetto_core::messages::{BulkMessage, LivePatch};
 use connetto_core::schema::SchemaBundle;
+use connetto_core::traits::IncomingFrame;
+use connetto_core::{Cursor, Major};
 use connetto_exchange::media::{MAX_PIECE_BYTES, Media};
 use connetto_file_client::{ContentClient, FsStore, MimeClass};
 use connetto_file_core::{FileId, MemStore, encode_range, process_file_with_outboard};
@@ -20,6 +23,7 @@ use connetto_peer::{CloseReason, Node, PeerEvent};
 use diesel::prelude::*;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
+use sqlite_diff_rs::{DiffOps, PatchSet, PatchsetFormat, SimpleTable, Update, Value};
 use tokio::sync::mpsc;
 
 use crate::support::{RecordingHttp, Scripted, attach_content, cold_over, started};
@@ -198,8 +202,8 @@ pub async fn declare_replicated(
     (client, content)
 }
 
-/// Writes `state` into photo `id`'s state column, as the server's setter's
-/// change arriving through sync would.
+/// Writes `state` into photo `id`'s state column straight on the replica,
+/// for a proof that runs the retention pass itself.
 pub async fn set_state(client: &ConnettoClient<Scripted>, id: i64, state: &str) {
     let state = state.to_owned();
     client
@@ -213,17 +217,49 @@ pub async fn set_state(client: &ConnettoClient<Scripted>, id: i64, state: &str) 
         .expect("write the state");
 }
 
-/// Records that `author`'s certificate ended an hour ago, as a cursor stored
-/// from its last offer would say.
-pub async fn lapse(client: &ConnettoClient<Scripted>, author: &PeerAuthor) {
+/// Delivers the server setter's write of `state` into photo `id`'s state
+/// column as a live patch at `cursor`, the way sync carries it.
+pub fn deliver_state(server: &Scripted, cursor: u8, id: i64, state: &str) {
+    let schema = SimpleTable::new(
+        "photos",
+        &[
+            ("id", ""),
+            ("owner", ""),
+            ("content_id", ""),
+            ("thumb_id", ""),
+            ("content_state", ""),
+        ],
+        &[0],
+    );
+    let update = Update::<_, PatchsetFormat, String, Vec<u8>>::from(schema)
+        .set(0, Value::Integer(id))
+        .expect("set the key")
+        .set(4, Value::Text(state.to_owned()))
+        .expect("set the state");
+    let patch = PatchSet::<SimpleTable, String, Vec<u8>>::new()
+        .update(update)
+        .build();
+    server.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+        "custody".to_owned(),
+        Cursor::new(vec![cursor]),
+        zstd::encode_all(patch.as_slice(), 3).expect("compress the patch"),
+    ))));
+}
+
+/// Records a cursor for `author` whose certificate end puts its lapse,
+/// the end plus `DEVICE_SKEW`, `seconds` from now, negative for the past.
+pub async fn lapse_in(client: &ConnettoClient<Scripted>, author: &PeerAuthor, seconds: i64) {
     let author = author.clone();
     client
         .with_conn(move |conn| {
-            let expired = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("after the epoch")
-                .as_secs()
-                - 3600;
+            let now = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("after the epoch")
+                    .as_secs(),
+            )
+            .expect("a Unix time fits");
+            let skew = i64::try_from(DEVICE_SKEW.as_secs()).expect("the skew fits");
             diesel::replace_into(_connetto_peer_cursor::table)
                 .values((
                     _connetto_peer_cursor::author.eq(author.key_id),
@@ -231,14 +267,13 @@ pub async fn lapse(client: &ConnettoClient<Scripted>, author: &PeerAuthor) {
                     _connetto_peer_cursor::seq.eq(1),
                     _connetto_peer_cursor::head.eq(vec![0; 32]),
                     _connetto_peer_cursor::offer.eq(Vec::<u8>::new()),
-                    _connetto_peer_cursor::expires_at
-                        .eq(i64::try_from(expired).expect("a Unix time fits")),
+                    _connetto_peer_cursor::expires_at.eq(now + seconds - skew),
                 ))
                 .execute(conn.conn())
         })
         .await
         .expect("the replica is open")
-        .expect("store the lapsed cursor");
+        .expect("store the cursor");
 }
 
 /// Every media message a bare node receives, as it arrives.

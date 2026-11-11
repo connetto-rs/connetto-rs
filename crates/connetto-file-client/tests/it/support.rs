@@ -59,7 +59,7 @@ pub enum TicketAnswer {
 pub struct Scripted {
     greeted: Arc<AtomicBool>,
     answers: Arc<Mutex<VecDeque<TicketAnswer>>>,
-    queued: Arc<Mutex<VecDeque<ControlMessage>>>,
+    queued: Arc<Mutex<VecDeque<IncomingFrame>>>,
 }
 
 impl Scripted {
@@ -79,6 +79,12 @@ impl Scripted {
             TicketAnswer::Grant(url.to_owned()),
             64,
         ))
+    }
+
+    /// Queues `frame` as the server's next one, after the handshake.
+    #[cfg(feature = "peer")]
+    pub fn say(&self, frame: IncomingFrame) {
+        self.queued.lock().expect("queued lock").push_back(frame);
     }
 }
 
@@ -110,7 +116,10 @@ impl Transport for Scripted {
                     detail,
                 }),
             };
-            self.queued.lock().expect("queued lock").push_back(reply);
+            self.queued
+                .lock()
+                .expect("queued lock")
+                .push_back(IncomingFrame::Control(reply));
         }
         ready(Ok(()))
     }
@@ -148,7 +157,7 @@ impl Transport for Scripted {
         }
         loop {
             if let Some(next) = self.queued.lock().expect("queued lock").pop_front() {
-                return Ok(Some(IncomingFrame::Control(next)));
+                return Ok(Some(next));
             }
             tokio::time::sleep(core::time::Duration::from_millis(1)).await;
         }

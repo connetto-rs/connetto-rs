@@ -330,6 +330,35 @@ where
             .unwrap_or_default()
     }
 
+    /// Runs the custody pass of the C table's rows that need no ranking,
+    /// signalling the reports when custody changed, and answers the earliest
+    /// Unix second a custody author lapses, `None` when the pass could not
+    /// run or no custody copy waits on a courierable author.
+    async fn custody_refresh(&self) -> Option<i64> {
+        let declared = &self.peer_content;
+        let refreshed = self
+            .client
+            .with_conn(|conn| -> Result<_, ContentError> {
+                let named = custody::named(conn, declared, &mut custody::Reach::default())?;
+                let now = custody::unix_now();
+                let changed = conn
+                    .transact_with_bookkeeping(
+                        |c| custody::pass(c, declared, &named, now, &mut HashSet::new()),
+                        |_| Ok::<(), ContentError>(()),
+                    )
+                    .map(|(changed, ())| changed)?;
+                Ok((changed, custody::next_lapse(conn, declared)?))
+            })
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let (changed, lapse) = refreshed?;
+        if changed {
+            self.custody_changed.notify_one();
+        }
+        lapse
+    }
+
     /// The media driver. It answers every linked peer's `Want` with the
     /// manifest and every `Fetch` with the verified encoding of the range,
     /// each after the gate admits the requester, and `Refused` otherwise. It
@@ -345,6 +374,13 @@ where
     /// room and rates at most every 10 seconds when they changed, and raises
     /// [`ContentEvent::Replicated`] when the number of linked devices
     /// holding one of its own unsent replicated files changes.
+    ///
+    /// It runs the custody half of [`tidy_content`](Self::tidy_content) at
+    /// its start, on every sync change, on every peer row a server write
+    /// confirms, a verdict or frontier settles or a retraction removes, and
+    /// when a custody copy's author lapses, so a copy leaves custody once its
+    /// state column reads `available` and a cache copy returns on `lost`
+    /// without the application calling anything.
     ///
     /// A peer is served one request at a time and at most two peers at once,
     /// and a request beyond that is answered `Busy`. A stream stops when its
@@ -367,6 +403,8 @@ where
         let mut driver = Driver::new(self, sender.clone(), budget, move |job| {
             self.run_job(jobs_sender.clone(), job)
         });
+        let lapse = driver.beside_jobs(self.custody_refresh()).await;
+        driver.lapse_at = lapse.map(wake_at);
         let mut actions = Vec::new();
         for (peer, _) in sender.linked() {
             driver.links.linked(&peer);
@@ -374,11 +412,20 @@ where
             actions.extend(driver.prefetch(peer.key().as_bytes(), Instant::now()).await);
         }
         driver.act(actions, Instant::now()).await;
+        // Set by every event that can move a custody row, and cleared by one
+        // pass once the burst behind it is read.
+        let mut custody_due = false;
         loop {
             driver.launch();
             if let Some(done) = driver.finished.pop_front() {
                 let actions = driver.done(done, Instant::now()).await;
                 driver.act(actions, Instant::now()).await;
+                continue;
+            }
+            if custody_due && applied.is_empty() {
+                custody_due = false;
+                let lapse = driver.beside_jobs(self.custody_refresh()).await;
+                driver.lapse_at = lapse.map(wake_at);
                 continue;
             }
             let wake = driver.next_wake();
@@ -417,9 +464,10 @@ where
                         applies_open = false;
                         Vec::new()
                     }
-                    // A dropped apply is caught when the author's link comes
-                    // up again.
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => Vec::new(),
+                    other => {
+                        custody_due |= moves_custody(other.as_ref());
+                        Vec::new()
+                    }
                 },
                 Some(done) = driver.running.next(), if !driver.running.is_empty() => {
                     driver.done(done, Instant::now()).await
@@ -433,6 +481,10 @@ where
                     let mut actions = driver.links.timeout(now);
                     actions.extend(driver.retry_due(now).await);
                     driver.room_due(now).await;
+                    if driver.lapse_at.is_some_and(|at| at <= now) {
+                        driver.lapse_at = None;
+                        custody_due = true;
+                    }
                     actions
                 }
             };
@@ -534,6 +586,29 @@ where
 /// them.
 type RoomTold = (u64, Vec<([u8; 32], u64)>);
 
+/// Whether a client event can move a custody row, an event the broadcast
+/// dropped counting as one. A dropped apply is caught when its author's link
+/// comes up again.
+fn moves_custody(event: Result<&ClientEvent, &broadcast::error::RecvError>) -> bool {
+    matches!(
+        event,
+        Ok(ClientEvent::LivePatch { .. }
+            | ClientEvent::SnapshotEnd { .. }
+            | ClientEvent::FullResync { .. }
+            | ClientEvent::ProvisionalConfirmed { .. }
+            | ClientEvent::ProvisionalSettled { .. }
+            | ClientEvent::ProvisionalRetracted { .. })
+            | Err(broadcast::error::RecvError::Lagged(_))
+    )
+}
+
+/// The monotonic instant just past the Unix second `lapse`, so a pass then
+/// reads the author as lapsed.
+fn wake_at(lapse: i64) -> Instant {
+    let ahead = lapse.saturating_sub(custody::unix_now()).saturating_add(1);
+    Instant::now() + Duration::from_secs(u64::try_from(ahead).unwrap_or(0))
+}
+
 /// The entries of `list` within `window`, empty past its end.
 fn slice(list: &[[u8; 32]], window: &core::ops::Range<usize>) -> Vec<[u8; 32]> {
     let end = window.end.min(list.len());
@@ -592,6 +667,9 @@ struct Driver<'c, T: Transport, B: ChunkStore + Clone, H: ContentHttp, F, J> {
     /// The holders last heard of for each of this device's own replicated
     /// files.
     heard: HashMap<FileId, usize>,
+    /// When the earliest custody author's certificate lapses, which the
+    /// custody pass then acts on.
+    lapse_at: Option<Instant>,
 }
 
 impl<'c, T, B, H, F, J> Driver<'c, T, B, H, F, J>
@@ -628,6 +706,7 @@ where
             reports: HashMap::new(),
             reporting: HashSet::new(),
             heard: HashMap::new(),
+            lapse_at: None,
         }
     }
 
@@ -663,6 +742,7 @@ where
             .filter_map(|fetch| fetch.retry_at)
             .chain(self.links.next_deadline())
             .chain(self.room_at)
+            .chain(self.lapse_at)
             .min()
     }
 

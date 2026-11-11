@@ -1490,6 +1490,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlite-diff-rs",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1499,6 +1500,7 @@ dependencies = [
  "wasm-bindgen-test",
  "web-sys",
  "windows-sys 0.61.2",
+ "zstd",
 ]
 
 [[package]]

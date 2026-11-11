@@ -1772,6 +1772,16 @@ pub enum ClientEvent {
         /// The confirmed provenance rows, as stored.
         rows: Vec<provisional::ProvisionalRow>,
     },
+    /// A verdict or an author's frontier settled a peer entry whose rows
+    /// still awaited one, handing them to ordinary coverage (R79 decision
+    /// 15). Raised once per settled entry.
+    #[cfg(feature = "peer")]
+    ProvisionalSettled {
+        /// The author's key id.
+        author: Vec<u8>,
+        /// The author's queue sequence.
+        seq: i64,
+    },
     /// A peer entry's rows applied, its records written (R77), raised once
     /// per entry naming every record the apply wrote, the receiver's own
     /// keys it displaced among them.
@@ -3025,7 +3035,8 @@ fn land_peer_entry(
 }
 
 /// Move one provisional entry's records to adjudicated and release their
-/// holdings, the rows handing to ordinary coverage (R77).
+/// holdings, the rows handing to ordinary coverage (R77), answering whether
+/// a record still awaited its verdict.
 ///
 /// # Errors
 ///
@@ -3036,14 +3047,15 @@ fn adjudicate_provisional(
     config: &ClientConfig,
     author: &[u8],
     seq: i64,
-) -> Result<(), ClientError> {
+) -> Result<bool, ClientError> {
     let settled: Vec<(String, Vec<KeyValue>)> = provisional::records_of_entry(db, author, seq)?
         .into_iter()
         .filter(|record| record.state == provisional::ProvisionalState::Provisional)
         .map(|record| (record.table, record.key))
         .collect();
     provisional::adjudicate_entry(db, author, seq)?;
-    holdings::release_provisional(db, config, &settled)
+    holdings::release_provisional(db, config, &settled)?;
+    Ok(!settled.is_empty())
 }
 
 /// One re-applied entry's author, its sequence and the rows it lands, which
@@ -6696,18 +6708,25 @@ where
         let seq = i64::try_from(seq).unwrap_or(i64::MAX);
         let _exempt = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
-        self.db.transaction::<_, ClientError, _>(|db| {
-            match peer::state_of(db, author, seq)? {
+        let settled = self.db.transaction::<_, ClientError, _>(|db| {
+            let settled = match peer::state_of(db, author, seq)? {
                 // A record with no stored entry still moves, as R77 left it.
                 Some(peer::HeldState::Provisional) | None => {
-                    adjudicate_provisional(db, config, author, seq)?;
+                    adjudicate_provisional(db, config, author, seq)?
                 }
-                Some(peer::HeldState::CourierOnly | peer::HeldState::DigestOnly) => {}
-                Some(peer::HeldState::Retained) => return Ok(()),
-            }
+                Some(peer::HeldState::CourierOnly | peer::HeldState::DigestOnly) => false,
+                Some(peer::HeldState::Retained) => return Ok(false),
+            };
             peer::retain(db, author, seq)?;
-            peer::prune_retained(db)
+            peer::prune_retained(db)?;
+            Ok(settled)
         })?;
+        if settled {
+            self.notices.push_back(ClientEvent::ProvisionalSettled {
+                author: author.to_vec(),
+                seq,
+            });
+        }
         self.settle_pruned_marks()
     }
 
@@ -10003,6 +10022,19 @@ where
         exchange::courier_lapsed(&mut self.db, author)
     }
 
+    /// When, in Unix seconds, the certificate `author`'s cursor last carried
+    /// lies [`DEVICE_SKEW`](connetto_core::clock::DEVICE_SKEW) in the past,
+    /// the instant [`courier_lapsed`](Self::courier_lapsed) turns true,
+    /// `None` for an author this replica holds no cursor for.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the cursor cannot be read.
+    #[cfg(feature = "peer")]
+    pub fn courier_lapse_at(&mut self, author: &[u8]) -> Result<Option<i64>, ClientError> {
+        exchange::courier_lapse_at(&mut self.db, author)
+    }
+
     /// Whether `requester`, a linked peer, reads a row of `table` whose
     /// `column` names `value`, judged through the policy views with the
     /// requester's account, `NULL` subjects and the bot list its certificate
@@ -10400,15 +10432,25 @@ where
         let frontier = i64::try_from(frontier).unwrap_or(i64::MAX);
         let _exempt = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
-        self.db.transaction::<_, ClientError, _>(|db| {
+        let settled = self.db.transaction::<_, ClientError, _>(|db| {
+            let mut settled = Vec::new();
             for held in peer::unsettled_at_or_below(db, author, frontier)? {
-                if held.state == peer::HeldState::Provisional {
-                    adjudicate_provisional(db, config, &held.author, held.seq)?;
+                if held.state == peer::HeldState::Provisional
+                    && adjudicate_provisional(db, config, &held.author, held.seq)?
+                {
+                    settled.push(held.seq);
                 }
                 peer::retain(db, &held.author, held.seq)?;
             }
-            peer::prune_retained(db)
+            peer::prune_retained(db)?;
+            Ok(settled)
         })?;
+        for seq in settled {
+            self.notices.push_back(ClientEvent::ProvisionalSettled {
+                author: author.to_vec(),
+                seq,
+            });
+        }
         self.settle_pruned_marks()
     }
 

@@ -156,6 +156,10 @@ connetto-schema.workspace = true
 # The retention proofs apply a captured peer entry, whose manifest row names
 # the SHA-256 of its body.
 sha2 = "0.10"
+# The custody proofs deliver the server's state column change as a live
+# patch, compressed as bulk payloads ride the wire.
+sqlite-diff-rs = { version = "0.19", default-features = false }
+zstd = "0.13"
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "time"] }
 tempfile = "3"
 axum = { workspace = true }

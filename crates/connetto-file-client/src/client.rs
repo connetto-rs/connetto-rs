@@ -1223,11 +1223,7 @@ where
         )]
         let mut kept = self.pinned().await?;
         #[cfg(feature = "peer")]
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| {
-                i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
-            });
+        let now = peer::custody::unix_now();
         let _writing = self.content_writes.lock().await;
         let (evicted, referenced, changed) = self
             .client
@@ -1402,6 +1398,46 @@ mod tests {
         assert!(
             matches!(event, ContentEvent::UploadDeferred { file_id: f, .. } if f == file_id),
             "the driver must attempt the cleared entry and emit UploadDeferred, got {event:?}"
+        );
+    }
+
+    /// The room a device offers is what the budget leaves, never eating into
+    /// the free space the reserve keeps for the device (R79 decision 16).
+    #[cfg(feature = "peer")]
+    #[tokio::test]
+    async fn the_room_is_bounded_by_the_budget_and_by_the_reserve() {
+        const MIB: u64 = 1024 * 1024;
+        let store = connetto_file_core::MemStore::new();
+        let connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
+        let (client, pump) = ConnettoClient::with_pump(connection);
+        tokio::spawn(pump);
+        let content = ContentClient::attach(client, store.clone(), [1; 32], ReqwestHttp::default())
+            .await
+            .expect("content attaches");
+
+        store.set_free_bytes(600 * MIB);
+        assert_eq!(
+            content.room(50 * MIB, 10 * MIB),
+            40 * MIB,
+            "the budget binds"
+        );
+        assert_eq!(
+            content.room(1024 * MIB, 0),
+            88 * MIB,
+            "the 512 MiB reserve binds"
+        );
+        store.set_free_bytes(100 * MIB);
+        assert_eq!(
+            content.room(1024 * MIB, 0),
+            0,
+            "free space under the reserve"
+        );
+        let content = content.with_custody_reserve(0);
+        assert_eq!(content.room(1024 * MIB, 0), 100 * MIB);
+        assert_eq!(
+            content.room(10 * MIB, 20 * MIB),
+            0,
+            "a budget lowered below what custody holds"
         );
     }
 

@@ -1117,6 +1117,17 @@ A flagged file on a device other than its author is **C0** not held, **C1** bein
 | Import | n/a | n/a | restored in C2 | restored in C2 | restored in C2 |
 | Data wipe or destructive logout | n/a | the store goes with the replica | same | same | same |
 
+The custody pass carries out the C table's rows that need no ranking. It releases a copy whose row is gone, whose author lapsed or whose state reads `available`, takes a cache copy whose state reads `lost` back, and records when a row settled. The media driver runs it on every event that can move one of those, coalescing a burst into one pass, and reports what entered and left. The retention pass runs it too, before it evicts.
+
+| What moves | The event the media driver runs the pass on |
+|---|---|
+| A state column reads `available` or `lost`, a row settles arriving through sync, a row is deleted | `LivePatch`, `SnapshotEnd`, `FullResync` |
+| A server write confirms a peer-applied row | `ProvisionalConfirmed` |
+| A verdict or a frontier adjudicates a peer-applied row | `ProvisionalSettled`, raised by both adjudications |
+| A row is retracted, refused or abandoned | `ProvisionalRetracted` |
+| A custody author's certificate end plus `DEVICE_SKEW` passes | a wake at the earliest such instant, recomputed after every pass |
+| The driver starts, or custody changed while no driver ran | the start |
+
 ### Slices
 
 One pull request each, in this order, each green and useful on its own.

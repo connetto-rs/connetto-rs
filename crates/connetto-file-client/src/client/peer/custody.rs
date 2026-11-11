@@ -216,3 +216,48 @@ pub(in crate::client) fn own_replicated(
     }
     Ok(own)
 }
+
+/// The earliest instant, in Unix seconds, at which the author of a
+/// provisional row naming a file in custody stops being in courier reach,
+/// `None` when no custody copy hangs on a courierable author.
+///
+/// # Errors
+///
+/// [`ContentError::Client`] when the provisional records or a cursor cannot
+/// be read.
+pub(in crate::client) fn next_lapse<T>(
+    conn: &mut ConnettoConnection<T>,
+    declared: &[PeerColumn],
+) -> Result<Option<i64>, ContentError>
+where
+    T: Transport,
+    T::Error: Display,
+{
+    let named = named(conn, declared, &mut Reach::default())?;
+    let custody: HashSet<FileId> = db::custody(conn.conn())?.into_iter().collect();
+    let mut authors: Vec<&[u8]> = named
+        .provisional
+        .iter()
+        .filter(|(file_id, _)| custody.contains(file_id))
+        .map(|(_, author)| author.as_slice())
+        .collect();
+    authors.sort_unstable();
+    authors.dedup();
+    let mut earliest = None;
+    for author in authors {
+        if let Some(at) = conn.courier_lapse_at(author)? {
+            earliest = Some(earliest.map_or(at, |earliest: i64| earliest.min(at)));
+        }
+    }
+    Ok(earliest)
+}
+
+/// The wall clock in Unix seconds, which `settled_seen_at` and the cursors'
+/// certificate ends are kept in.
+pub(in crate::client) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
+}
