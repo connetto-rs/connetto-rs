@@ -446,6 +446,8 @@ struct FakeState {
     /// The number of the connection the fake stands on, moved by a test to
     /// stand for a new connection.
     connection: u64,
+    detached: bool,
+    connections: VecDeque<Option<ConnectionNumber>>,
     /// The device writer's offer the replica states, `None` for a retired
     /// writer.
     #[cfg(feature = "peer")]
@@ -528,8 +530,12 @@ impl Link for FakeLink {
     }
 
     fn connection(&self) -> impl Future<Output = Option<ConnectionNumber>> + Send {
-        let connection = self.state.lock().connection;
-        Box::pin(async move { Some(ConnectionNumber::new(connection)) })
+        let mut state = self.state.lock();
+        let connection = state
+            .connections
+            .pop_front()
+            .unwrap_or_else(|| (!state.detached).then(|| ConnectionNumber::new(state.connection)));
+        std::future::ready(connection)
     }
 
     fn ask(
@@ -738,6 +744,7 @@ struct Authority {
     root: Vec<u8>,
     issuer: DeviceIssuer,
     certificate: Vec<u8>,
+    root_ca: RootCa,
 }
 
 async fn authority(not_before: SystemTime) -> Authority {
@@ -775,6 +782,7 @@ async fn authority(not_before: SystemTime) -> Authority {
         root: root.certificate().to_vec(),
         issuer,
         certificate,
+        root_ca: root,
     }
 }
 
@@ -1017,7 +1025,7 @@ async fn a_clock_behind_grant_asks_again_only_on_the_next_connection() {
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     #[cfg(feature = "peer")]
     let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
-    let (enroller, _handle) = Enroller::new(
+    let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
         Vec::new(),
@@ -1032,9 +1040,14 @@ async fn a_clock_behind_grant_asks_again_only_on_the_next_connection() {
         #[cfg(feature = "peer")]
         bluetooth_tx,
     );
+    let mut decisions = handle.watch_enrolment();
+    let connection = ConnectionNumber::new(state.lock().connection);
     let run = tokio::spawn(run(link, enroller));
 
-    poll_until(|| state.lock().stored.len() == 1).await;
+    assert_enrolment_decision(&mut decisions, connection, |outcome| {
+        matches!(outcome, Ok(super::EnrolmentOutcome::Enrolled))
+    })
+    .await;
     assert!(
         state
             .lock()
@@ -1046,22 +1059,41 @@ async fn a_clock_behind_grant_asks_again_only_on_the_next_connection() {
     events_tx
         .send(ClientEvent::SyncStatus(SyncStatus::Connected))
         .expect("the run listens");
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    {
+        let decision = tokio::time::timeout(
+            HOUR + Duration::from_secs(10),
+            decisions.wait_for(|decision| {
+                decision.as_ref().is_some_and(|decision| {
+                    matches!(&decision.outcome, Ok(super::EnrolmentOutcome::Retained))
+                })
+            }),
+        )
+        .await
+        .expect("the hourly look completes")
+        .expect("the enrolment task stays alive");
+        assert_eq!(
+            decision.as_ref().expect("a decision").connection,
+            connection
+        );
+    }
     {
         let state = state.lock();
-        assert_eq!(
-            state.requests.len(),
-            1,
-            "a notice of the connection already asked on asks nothing"
-        );
+        assert_eq!(state.requests.len(), 1, "no duplicate enrolment");
         assert_eq!(state.stored.len(), 1, "no second certificate is kept");
     }
 
-    state.lock().connection += 1;
+    let reconnected = {
+        let mut state = state.lock();
+        state.connection += 1;
+        ConnectionNumber::new(state.connection)
+    };
     events_tx
         .send(ClientEvent::SyncStatus(SyncStatus::Connected))
         .expect("the run listens");
-    poll_until(|| state.lock().stored.len() == 2).await;
+    assert_enrolment_decision(&mut decisions, reconnected, |outcome| {
+        matches!(outcome, Ok(super::EnrolmentOutcome::Enrolled))
+    })
+    .await;
     assert_eq!(
         state.lock().requests.len(),
         2,
@@ -1305,6 +1337,80 @@ async fn a_grant_listing_its_own_certificate_revokes_the_device_unpublished() {
 
     end_tx.send(()).expect("the run ends");
     run.await.expect("the run ends");
+}
+
+#[tokio::test]
+async fn a_grant_with_a_revoked_issuer_completes_as_withdrawn() {
+    let (_, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    let list = authority
+        .root_ca
+        .sign_list(
+            1,
+            &[Revoked {
+                serial: positive_serial(2).as_bytes().to_vec(),
+                at: now,
+            }],
+            now,
+            now + 12 * HOUR,
+        )
+        .expect("the root list signs");
+    let state = Arc::new(Mutex::new(FakeState {
+        grant_lists: vec![SignedList {
+            list,
+            signer: authority.root.clone(),
+        }],
+        ..FakeState::default()
+    }));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Grant,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root],
+        None,
+        Vec::new(),
+        inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
+    );
+    let mut decisions = handle.watch_enrolment();
+    let connection = ConnectionNumber::new(state.lock().connection);
+    let run = tokio::spawn(run(link, enroller));
+    assert_enrolment_decision(&mut decisions, connection, |outcome| {
+        matches!(outcome, Ok(super::EnrolmentOutcome::Withdrawn))
+    })
+    .await;
+    assert!(handle.certificate().is_none());
+    assert!(state.lock().stored.is_empty());
+    assert_eq!(state.lock().lists.len(), 1);
+    end_tx.send(()).expect("the run ends");
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("the run stops")
+        .expect("the run succeeds");
 }
 
 /// A reissue refused as revoked deletes the device's key, says so, and the
@@ -1705,7 +1811,9 @@ async fn a_reissue_lost_on_the_wire_is_offline() {
     );
     let run = tokio::spawn(run(link, enroller));
 
-    let outcome = handle.reissue(HOUR).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(10), handle.reissue(HOUR))
+        .await
+        .expect("the offline reissue finishes");
     assert!(
         matches!(outcome, Err(CertificateError::Offline)),
         "a lost message reads as no server"
@@ -1714,7 +1822,70 @@ async fn a_reissue_lost_on_the_wire_is_offline() {
         state.lock().requests.is_empty(),
         "nothing reached the server"
     );
+    assert!(matches!(
+        handle
+            .watch_enrolment()
+            .borrow()
+            .as_ref()
+            .expect("automatic decision")
+            .outcome,
+        Err(CertificateError::Offline)
+    ));
 
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+#[tokio::test]
+async fn a_connection_lost_before_enrolment_publishes_no_decision() {
+    let (_, der) = attesting_key();
+    let authority = authority(SystemTime::now()).await;
+    let state = Arc::new(Mutex::new(FakeState {
+        detached: true,
+        connections: VecDeque::from([Some(ConnectionNumber::new(0))]),
+        ..FakeState::default()
+    }));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root],
+        None,
+        Vec::new(),
+        inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+    let outcome = tokio::time::timeout(Duration::from_secs(10), handle.reissue(HOUR))
+        .await
+        .expect("the offline reissue finishes after the automatic decision");
+    assert!(matches!(outcome, Err(CertificateError::Offline)));
+    assert!(handle.watch_enrolment().borrow().is_none());
+    assert!(handle.certificate().is_none());
+    assert!(state.lock().stored.is_empty());
     end_tx.send(()).expect("the run ends");
     run.await.expect("the run ends");
 }
