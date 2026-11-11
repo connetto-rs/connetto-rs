@@ -1,14 +1,16 @@
+-- The roles the deployment runs connetto as and their grants on the synced
+-- tables. The server and every client build read this file beside schema.sql
+-- and policies.sql, so it holds plain statements over the tables schema.sql
+-- declares and the bot registry tables connetto adds to it. Every client's
+-- replica holds a table to the reader's grants, leaving out one the reader
+-- cannot read. connetto's own bookkeeping tables are granted in
+-- bookkeeping.sql, which no translation reads. Apply after schema.sql and the
+-- registry tables. A migration runs it once, since PostgreSQL has no CREATE
+-- ROLE IF NOT EXISTS.
+
 -- The non-owner role the connetto-server runs reads and writes as, named by
--- CONNETTO_READER_URL. Kept apart from schema.sql because that file also
--- feeds CONNETTO_PG_DDL and the pg2sqlite translation in build.rs, which
--- expect pure table DDL. Apply after schema.sql and after creating the
--- _connetto_writers, _connetto_settled, _connetto_session_writers and
--- _connetto_courier_notices writer tables.
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'connetto_reader') THEN
-    CREATE ROLE connetto_reader LOGIN PASSWORD 'connetto_reader';
-  END IF;
-END $$;
+-- CONNETTO_READER_URL and CONNETTO_READER_ROLE.
+CREATE ROLE connetto_reader LOGIN PASSWORD 'connetto_reader';
 GRANT USAGE ON SCHEMA public TO connetto_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO connetto_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON order_lines TO connetto_reader;
@@ -23,6 +25,9 @@ GRANT SELECT ON products TO connetto_reader;
 -- rows the reader role only reads and the notes it writes like the orders.
 GRANT SELECT ON team_members TO connetto_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON team_notes TO connetto_reader;
-GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, _connetto_session_writers, _connetto_courier_notices TO connetto_reader;
--- A couriered entry writes its notice row in the transaction that settles it.
-GRANT USAGE ON SEQUENCE _connetto_courier_notices_id_seq TO connetto_reader;
+
+-- The bot registry. A person's app writes registration codes and the
+-- installations of the bots it adds, and reads the bots and their lists.
+GRANT SELECT ON connetto_bots, connetto_bot_lists TO connetto_reader;
+GRANT SELECT, INSERT, UPDATE, DELETE ON connetto_registration_codes, connetto_installations,
+    connetto_installation_optional_tables TO connetto_reader;

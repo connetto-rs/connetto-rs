@@ -120,6 +120,9 @@ async fn main() -> Result<()> {
     let schema = ServerSchema::new(
         read_ddl("CONNETTO_PG_DDL")?,
         read_ddl("CONNETTO_PG_POLICIES")?,
+        read_ddl("CONNETTO_PG_ROLES")?,
+        std::env::var("CONNETTO_READER_ROLE")
+            .context("set CONNETTO_READER_ROLE to the role the roles document creates")?,
     );
     let keys = jwt_keys()?;
     let openfga = OpenFga::new(

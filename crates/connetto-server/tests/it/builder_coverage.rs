@@ -23,7 +23,6 @@ use connetto_server::builder::{
     ServerBuilder, ServerParts, ServerSchema, StoreSpec, TokenKeys,
 };
 use connetto_server::device_cert::DeviceCertConfig;
-use connetto_server::openfga::SetupError;
 use connetto_server::portability::DataRequester;
 use connetto_server::{
     AbuseLimits, AuthConfig, ConnectionLimits, OidcProviderConfig, OplogConfig, PersonLimits,
@@ -162,7 +161,12 @@ fn builder_schema(
     );
     ServerBuilder::new(
         Database::new(url, reader),
-        ServerSchema::new(pg_ddl.to_owned(), pg_policies.to_owned()),
+        ServerSchema::new(
+            pg_ddl.to_owned(),
+            pg_policies.to_owned(),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
         token,
         OpenFga::new(fga.0.to_owned(), fga.1.to_owned()),
     )
@@ -1939,41 +1943,6 @@ async fn build_owned_with(policies: &str) -> (Result<ServerParts, BuildError>, (
     (built, store_contents(channel, &store).await)
 }
 
-/// A policy scoped to a role refuses the build naming the policy, its table
-/// and the role, before the authorization store holds a model or a fact.
-#[tokio::test]
-async fn a_role_scoped_policy_refuses_before_the_authorization_store() {
-    let _keyring = isolated_session_keyring();
-    let _serial = PG_SERIAL.lock().await;
-    let policies = format!(
-        "{OWNED_POLICIES}\nCREATE ROLE support_staff;\n\
-         CREATE POLICY owned_staff ON owned FOR SELECT TO support_staff USING (true);"
-    );
-    let (built, contents) = build_owned_with(&policies).await;
-    let err = refused(built, "a role-scoped policy refuses");
-    match &err {
-        BuildError::Authorization(SetupError::RoleScopedPolicy {
-            policy,
-            table,
-            roles,
-        }) => {
-            assert_eq!(policy, "owned_staff");
-            assert_eq!(table, "owned");
-            assert_eq!(roles, "support_staff");
-        }
-        other => panic!("the build answered {other:?}"),
-    }
-    assert!(
-        !err.to_string().contains("with_session_user_role"),
-        "the refusal names nothing a deployment author cannot act on: {err}"
-    );
-    assert_eq!(
-        contents,
-        (0, 0),
-        "the refused build wrote nothing to the store"
-    );
-}
-
 /// A policy only the replica translation refuses, a read policy reading its
 /// own table, refuses the build before the authorization store holds a model
 /// or a fact.
@@ -2013,7 +1982,12 @@ async fn no_providers_refuses_the_build_before_anything_runs() {
             "postgres://connetto:connetto@127.0.0.1:1/connetto",
             "postgres://connetto:connetto@127.0.0.1:1/connetto",
         ),
-        ServerSchema::new(T_DDL, ""),
+        ServerSchema::new(
+            T_DDL,
+            "",
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
         token,
         OpenFga::new("http://127.0.0.1:1", "store"),
     );
@@ -2041,7 +2015,12 @@ async fn a_zero_pool_or_an_overrun_reserve_refuses_before_anything_starts() {
                 "postgres://connetto:connetto@127.0.0.1:1/connetto",
                 "postgres://connetto:connetto@127.0.0.1:1/connetto",
             ),
-            ServerSchema::new(T_DDL, ""),
+            ServerSchema::new(
+                T_DDL,
+                "",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
             token,
             OpenFga::new("http://127.0.0.1:1", "store"),
         )

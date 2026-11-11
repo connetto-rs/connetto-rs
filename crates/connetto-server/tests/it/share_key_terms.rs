@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::PROTOCOL_VERSION;
-use connetto_core::auth::DEFAULT_USER_SETTING;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, Grant, Handshake, Ping, SUBSCRIPTION_REFUSED,
     Subscribe, SubscriptionSpec,
@@ -44,9 +43,12 @@ async fn manager(fixture: &Fixture, clock: &ExpiryClock) -> Manager {
         ])
         .await;
     let (_, translator, _) = Translated::of::<String, connetto_core::bots::TextIds>(
-        DDL,
-        POLICIES,
-        DEFAULT_USER_SETTING,
+        connetto_schema::Documents::new(
+            DDL,
+            POLICIES,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
         true,
     )
     .expect("the membership policy translates")

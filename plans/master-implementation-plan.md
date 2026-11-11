@@ -195,7 +195,7 @@ Taken by [R110](#r110-a-session-bound-by-provider-staleness).
 
 ### G7
 
-**Role-scoped policies cannot be served.** Every caller runs as the reader role, so connetto refuses at startup any policy whose `TO` clause names a role other than `PUBLIC` (`SetupError::RoleScopedPolicy`), naming the policy, its table and the roles, before anything reaches OpenFGA. Served as they stand, the two translators would disagree on such a policy. `rls2fga` turns every `TO` clause into `pg_role` facts nothing in connetto loads or watches, and a probe at `rls2fga` 3004d6b86, ahead of the pinned 40437eb and not yet reproduced at the pin, found that without those facts a permissive scope narrows and a restrictive one binds nobody, while `pg2sqlite` refuses any role-scoped policy because connetto names no session role.
+**Policies cannot tell kinds of caller apart.** Every caller acts as the reader role, so both translators settle a policy's `TO` clause against that one role. A policy the reader is subject to serves every caller, and one only other roles are subject to is logged at startup and left out of the model and the client copy. A deployment cannot scope a policy to anonymous callers, signed-in users or bots, and every caller holds the reader's table grants.
 
 Taken by [R108](#r108-caller-kinds-as-database-roles), whose decision 4 settles each `TO` clause against connetto's caller roles.
 
@@ -1242,7 +1242,7 @@ Completion requires native and headless-browser proof of encrypted replica opens
 
 ### Purpose
 
-Every caller reaches Postgres through connetto's one reader role, and a policy tells callers apart only through the settings connetto binds (`app.user_id`, `app.subjects`, `app.bot_list`). A policy written `TO app_admin` therefore means one thing to Postgres, which judges it by the reader role, and another to OpenFGA, which rls2fga gates on `pg_role` memberships nobody loads or watches. Such a deployment is refused at startup with `SetupError::RoleScopedPolicy`, naming the policy, its table and the roles, before anything reaches OpenFGA. This phase gives each kind of caller its own database role, so policies can name kinds and table grants can differ per kind.
+Every caller reaches Postgres through connetto's one reader role, and a policy tells callers apart only through the settings connetto binds (`app.user_id`, `app.subjects`, `app.bot_list`). Both translators settle a policy's `TO` clause against the reader role, so a policy written `TO app_admin` serves no connetto caller and is logged at startup and left out, while one the reader is subject to serves every caller alike. This phase gives each kind of caller its own database role, so policies can name kinds and table grants can differ per kind.
 
 ### Decisions, taken with the maintainer
 
@@ -1268,7 +1268,7 @@ Every caller reaches Postgres through connetto's one reader role, and a policy t
 ### Slices
 
 1. **Refusals before OpenFGA.** Step 1. Merged.
-2. **One deployment description.** Step 2. Blocked on sql-traits' deployment description, both translators adopting it, and rls2fga translating R107's live model.
+2. **One deployment description.** Step 2, in two pull requests. The first builds the description from the roles document and hands it to both translators, and waits on subql's follow-up to rls2fga's acting roles, which every check now states. The second is the preflight refusals of the reader role.
 3. **The kind roles.** Steps 3 to 5. Blocked on sql-traits' privileges and effective policies, both translators adopting them, and R107's live load and marker row.
 4. **The client copy per kind.** Step 6. Needs slice 3.
 5. **Refusing what a kind lacks.** Step 7. Needs slices 3 and 4.
@@ -1276,7 +1276,7 @@ Every caller reaches Postgres through connetto's one reader role, and a policy t
 ### Steps
 
 1. Every startup refusal runs before connetto first writes to OpenFGA, so a refused deployment leaves the store untouched, the replica translation's included. A refusal names the policy and the role it could not settle, never a translator's builder call. Every `rls2fga` note that leaves the boot running and asks something of the operator or names whom the rules do not reach is logged as a warning, apart from the check parameter connetto supplies itself.
-2. connetto builds sql-traits' deployment description once, with the reader role as the only acting role and its three settings declared always bound, and hands it to pg2sqlite at build time and to rls2fga at boot over the live model. A policy for a role outside connetto is then reported and left out on both sides instead of refusing startup through pg2sqlite. Preflight refuses a reader role that owns a table the schema declares or inherits its owner, as decision 5 refuses it for a kind role.
+2. connetto builds sql-traits' deployment description once, with the reader role as the only acting role and its three settings declared always bound, and hands it to pg2sqlite at build time and to rls2fga at boot. The reader role comes from the roles document, which the build and the server both parse and which must create it, while connetto's bookkeeping grants stay in a document neither translator reads. Every OpenFGA check states the reader role as the acting role, since rls2fga gates every relation on it. A policy for a role outside connetto is then reported and left out on both sides instead of refusing startup through pg2sqlite. In a second pull request, preflight refuses a reader URL that logs in as another role than the one the description names, and a reader role that owns a table the schema declares or inherits its owner, as decision 5 refuses it for a kind role.
 3. The server builder takes the four kind role names. Preflight reads the kind roles from the live model and refuses a missing one and the attributes of decision 5, and the four kinds become the description's acting roles.
 4. `CallerBinding` switches to the caller's kind role, and the write path resets to the reader role for connetto's bookkeeping.
 5. The server translates with each kind's live privileges, every check, remote and local, carries the caller's kind per decision 10, and a marker row reloads grants and memberships with the policies.

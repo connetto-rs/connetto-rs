@@ -65,6 +65,8 @@ sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", 
 # Until a pg_walstream release carries the startup metadata API subql main
 # uses (isdaniel/pg-walstream #141) and `ChangeEvent::xid`.
 pg_walstream = { git = "https://github.com/isdaniel/pg-walstream", branch = "main" }
+# Until a sql-values release carries PostgreSQL's bpchar, which rls2fga main uses.
+sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
 
 # Fast test iteration: release-grade optimization without the fat link.
 # Mirrors the root workspace profile of the same name.

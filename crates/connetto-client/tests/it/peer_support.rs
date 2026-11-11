@@ -118,8 +118,15 @@ pub async fn receiver_holding(
     let script = Script::default();
     script.say(support::handshake_ack());
     let schema = SyncSchema::new(
-        connetto_schema::translate::<String, connetto_core::bots::TextIds>(schema, policies)
-            .expect("translate the policy schema"),
+        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
+            connetto_schema::Documents::new(
+                schema,
+                policies,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+        )
+        .expect("translate the policy schema"),
     );
     let mut builder = ClientBuilder::new(schema, support::Once::new(script.clone()));
     if let Some((grant, subject)) = key {

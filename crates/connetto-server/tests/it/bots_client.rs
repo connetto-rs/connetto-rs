@@ -170,8 +170,12 @@ fn manager(
 fn bundle() -> SyncSchema {
     SyncSchema::new(
         connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            DEPLOYMENT_DDL,
-            MEMBERSHIP_POLICY,
+            connetto_schema::Documents::new(
+                DEPLOYMENT_DDL,
+                MEMBERSHIP_POLICY,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
         )
         .expect("translate the sources"),
     )
@@ -181,8 +185,15 @@ fn bundle() -> SyncSchema {
 /// so the row uploads and the fixture's rule is the one that refuses it.
 fn bundle_without_membership_rule() -> SyncSchema {
     SyncSchema::new(
-        connetto_schema::translate::<String, connetto_core::bots::TextIds>(DEPLOYMENT_DDL, "")
-            .expect("translate the sources"),
+        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
+            connetto_schema::Documents::new(
+                DEPLOYMENT_DDL,
+                "",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+        )
+        .expect("translate the sources"),
     )
 }
 

@@ -22,6 +22,11 @@
 //! - `CONNETTO_PG_POLICIES` or `CONNETTO_PG_POLICIES_FILE`: the read
 //!   policies. Both are translated and hashed into the schema version the
 //!   server presents at handshake.
+//! - `CONNETTO_PG_ROLES` or `CONNETTO_PG_ROLES_FILE`: the roles document,
+//!   creating the reader role and granting it the synced tables, which the
+//!   translations read beside the other two.
+//! - `CONNETTO_READER_ROLE`: the role the roles document creates and
+//!   `CONNETTO_READER_URL` logs in as.
 //! - `CONNETTO_WRITABLE`: the tables clients may write, one per entry, each
 //!   `table` or `table:version_column` for conflict-checked updates.
 //! - `CONNETTO_SLOT` (default `connetto_slot`), `CONNETTO_PUBLICATION`
@@ -566,6 +571,9 @@ async fn builder_from_env() -> Result<ServerBuilder> {
     let schema = ServerSchema::new(
         read_ddl("CONNETTO_PG_DDL")?,
         read_ddl("CONNETTO_PG_POLICIES")?,
+        read_ddl("CONNETTO_PG_ROLES")?,
+        std::env::var("CONNETTO_READER_ROLE")
+            .context("set CONNETTO_READER_ROLE to the role the roles document creates")?,
     );
     let providers = oidc_providers()?;
     let keys = jwt_keys()?;

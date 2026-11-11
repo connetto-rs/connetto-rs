@@ -37,7 +37,6 @@ use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};
 use diesel::{QueryableByName, SqliteConnection, sql_query};
 use pg2sqlite::options::{Pg2SqliteOptions, TranslationContext};
 use pg2sqlite::prelude::ReverseTranslator;
-use pg2sqlite::prelude::SessionVariableMapping;
 use rls2fga::translator::Translator;
 use sqlite_diff_rs::{
     ChangesetOp, DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK,
@@ -542,20 +541,39 @@ where
     scalar_rereads: HashSet<SubscriptionId>,
 }
 
-/// How a deployment's two caller settings reach the replica.
-///
-/// Two because the database holds them separately, one session value naming
-/// the caller and one holding the set of subjects it carries, and a filter
-/// reads one or the other rather than both.
+/// How the client's caller functions reverse translate into the session
+/// settings the server binds, under the deployment description the client
+/// build translated them with.
 #[derive(Clone, Debug)]
 pub struct CallerMappings {
-    /// The identity setting, which every caller-aware deployment binds.
-    pub identity: SessionVariableMapping,
-    /// The subject-set setting, when the deployment binds share keys. Its
-    /// mapping has to declare the delimiter with `holding_set`, or a
-    /// membership test over it reverse translates as one value against the
-    /// whole joined list and matches nobody.
-    pub subjects: Option<SessionVariableMapping>,
+    /// Boxed, since the options are some 650 bytes and every materializer
+    /// carries them inside the server's assembly future.
+    options: Box<Pg2SqliteOptions>,
+    subjects_setting: &'static str,
+}
+
+impl CallerMappings {
+    /// The caller functions of a deployment whose server reads as
+    /// `reader_role`, with the settings `Key` binds.
+    ///
+    /// # Errors
+    ///
+    /// As [`connetto_schema::deployment`].
+    pub fn of<Key: connetto_core::auth::CapabilityKey>(
+        reader_role: &str,
+    ) -> Result<Self, connetto_schema::SchemaError> {
+        Ok(Self {
+            options: Box::new(connetto_schema::query_options::<Key>(reader_role)?),
+            subjects_setting: Key::SETTING,
+        })
+    }
+
+    /// The replica function standing for `setting`.
+    fn function(&self, setting: &str) -> Option<&str> {
+        self.options
+            .find_session_variable(setting)
+            .map(|mapping| mapping.sqlite_function.as_str())
+    }
 }
 
 impl Materializer<ParserDB, RuntimeWritableCatalog> {
@@ -672,7 +690,7 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
     pub fn caller_function(&self) -> Option<&str> {
         self.caller
             .as_ref()
-            .map(|caller| caller.identity.sqlite_function.as_str())
+            .and_then(|caller| caller.function(connetto_core::auth::DEFAULT_USER_SETTING))
     }
 
     /// The client-dialect name of the deployment's subject-set function, or
@@ -681,8 +699,7 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
     pub fn subject_set_function(&self) -> Option<&str> {
         self.caller
             .as_ref()
-            .and_then(|caller| caller.subjects.as_ref())
-            .map(|mapping| mapping.sqlite_function.as_str())
+            .and_then(|caller| caller.function(caller.subjects_setting))
     }
 }
 
@@ -2291,14 +2308,14 @@ pub(crate) fn translate_select(
         ));
     }
     let statement = statements.remove(0);
-    let mut options = Pg2SqliteOptions::default();
-    if let Some(caller) = caller {
-        options = options.with_session_variable(caller.identity.clone());
-        if let Some(subjects) = &caller.subjects {
-            options = options.with_session_variable(subjects.clone());
-        }
-    }
-    let context = TranslationContext::new(&options);
+    let unmapped;
+    let options = if let Some(caller) = caller {
+        &caller.options
+    } else {
+        unmapped = Pg2SqliteOptions::default();
+        &unmapped
+    };
+    let context = TranslationContext::new(options);
     statement
         .reverse_translate(catalog, &context)
         .map_err(|err| MaterializerError::Translate(format!("{err}")))
@@ -2947,7 +2964,6 @@ mod membership_term_tests {
 
     use super::*;
     use crate::openfga::Translated;
-    use connetto_core::auth::DEFAULT_USER_SETTING;
     use std::sync::Arc;
     use subql::term::TermDescription;
 
@@ -2962,11 +2978,13 @@ mod membership_term_tests {
     /// The client's own SQLite spelling of the motivating filter.
     const CLIENT_SQL: &str = "SELECT * FROM docs WHERE project_id IN (SELECT project_id FROM project_members WHERE user_id = current_app_user())";
 
+    /// The reader role the test deployments create, and their roles document.
+    const READER: &str = "app_reader";
+    const ROLES: &str = "CREATE ROLE app_reader LOGIN;";
+
     fn materializer(caller: Option<CallerMappings>) -> Materializer {
         let translator = Translated::of::<String, connetto_core::bots::TextIds>(
-            SCHEMA,
-            POLICIES,
-            DEFAULT_USER_SETTING,
+            connetto_schema::Documents::new(SCHEMA, POLICIES, ROLES, READER),
             true,
         )
         .expect("the motivating policy translates")
@@ -2982,13 +3000,7 @@ mod membership_term_tests {
     }
 
     fn mapping() -> CallerMappings {
-        CallerMappings {
-            identity: SessionVariableMapping::current_setting(
-                DEFAULT_USER_SETTING,
-                "current_app_user",
-            ),
-            subjects: None,
-        }
+        CallerMappings::of::<String>(READER).expect("the test deployment's description holds")
     }
 
     // The whole happy path at this seam: the caller rewrites, the canonical
@@ -3155,9 +3167,7 @@ mod membership_term_tests {
 
     fn own_materializer() -> Materializer {
         let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-            OWN_DDL,
-            OWN_POLICIES,
-            DEFAULT_USER_SETTING,
+            connetto_schema::Documents::new(OWN_DDL, OWN_POLICIES, ROLES, READER),
             true,
         )
         .expect("the own-shape policy translates");
@@ -3165,19 +3175,7 @@ mod membership_term_tests {
         let catalog = format!("{OWN_DDL}\n{OWN_POLICIES}");
         Materializer::builder(&catalog)
             .with_translator(translator)
-            .with_caller(CallerMappings {
-                identity: SessionVariableMapping::current_setting(
-                    DEFAULT_USER_SETTING,
-                    "current_app_user",
-                ),
-                subjects: Some(
-                    SessionVariableMapping::current_setting(
-                        connetto_core::auth::DEFAULT_SUBJECTS_SETTING,
-                        "current_app_subjects",
-                    )
-                    .holding_set(','),
-                ),
-            })
+            .with_caller(mapping())
             .build()
             .expect("the catalog parses")
     }

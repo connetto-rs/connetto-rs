@@ -205,9 +205,18 @@ pub async fn run_leg() -> Result<()> {
     let policies_sql = tokio::fs::read_to_string(demo.join("policies.sql"))
         .await
         .context("reading the demo policies")?;
-    let bundle =
-        connetto_schema::translate::<String, connetto_schema::TextIds>(&schema_sql, &policies_sql)
-            .map_err(|err| anyhow!("the demo schema does not translate: {err}"))?;
+    let roles_sql = tokio::fs::read_to_string(demo.join("roles.sql"))
+        .await
+        .context("reading the demo roles")?;
+    let bundle = connetto_schema::translate::<String, connetto_schema::TextIds>(
+        connetto_schema::Documents::new(
+            &schema_sql,
+            &policies_sql,
+            &roles_sql,
+            crate::stack::DEMO_DEPLOYMENT.reader_role,
+        ),
+    )
+    .map_err(|err| anyhow!("the demo schema does not translate: {err}"))?;
 
     tokio::fs::create_dir_all(&data_dir)
         .await

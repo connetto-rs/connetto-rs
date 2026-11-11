@@ -72,6 +72,24 @@ pub use native::{POSTGRES_BIN_VAR, POSTGRES_TEMPLATE_VAR};
 
 pub use roster::{RosterAuth, WITHHELD_ID};
 
+/// The reader role the fixture deployments read and write as.
+pub const FIXTURE_READER: &str = "app_reader";
+
+/// The roles document a fixture deployment's translations read, creating
+/// [`FIXTURE_READER`] and granting it every table the fixture's documents
+/// declare, the grants the replica translation holds each table to.
+pub const FIXTURE_ROLES: &str = "CREATE ROLE app_reader LOGIN;\n\
+     GRANT USAGE ON SCHEMA public TO app_reader;\n\
+     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_reader;";
+
+diesel::table! {
+    /// The cluster's roles, read to skip a role a roles document creates twice.
+    pg_roles (rolname) {
+        /// The role's name.
+        rolname -> Text,
+    }
+}
+
 /// One proof step's line, which the proofs' summaries read off the log.
 pub fn step(name: &str) {
     eprintln!("== {name}");
@@ -1344,6 +1362,47 @@ impl Fixture {
     pub async fn setup(&self, statements: &[&str]) {
         for statement in statements {
             exec(&self.admin, statement).await;
+        }
+    }
+
+    /// Apply a deployment's roles document as admin, skipping a `CREATE
+    /// ROLE` whose role the cluster already holds.
+    ///
+    /// A role is cluster-wide while each fixture holds one database, so a
+    /// second provision on one cluster meets the roles the first created.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the document does not parse, when the admin connection is
+    /// unavailable, or when a statement fails.
+    pub async fn setup_roles(&self, roles: &str) {
+        use diesel::{ExpressionMethods as _, QueryDsl as _};
+        let statements = sqlparser::parser::Parser::parse_sql(&PostgreSqlDialect {}, roles)
+            .expect("the roles document parses");
+        let mut conn = self.admin.get().await.expect("admin connection");
+        for statement in statements {
+            if let sqlparser::ast::Statement::CreateRole(create) = &statement {
+                let mut held = false;
+                for name in &create.names {
+                    let Some(ident) = name.0.last().and_then(|part| part.as_ident()) else {
+                        panic!("role name {name} is no identifier");
+                    };
+                    let stored = sql_traits::utils::identifier_resolution::stored_ident_name(ident)
+                        .into_owned();
+                    held |= diesel::select(diesel::dsl::exists(
+                        pg_roles::table.filter(pg_roles::rolname.eq(stored)),
+                    ))
+                    .get_result::<bool>(&mut *conn)
+                    .await
+                    .expect("read the cluster's roles");
+                }
+                if held {
+                    continue;
+                }
+            }
+            conn.batch_execute(&statement.to_string())
+                .await
+                .unwrap_or_else(|err| panic!("apply {statement}: {err}"));
         }
     }
 

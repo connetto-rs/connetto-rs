@@ -299,7 +299,12 @@ async fn portability_builder_base(
     );
     let builder = ServerBuilder::new(
         Database::new(url, reader),
-        ServerSchema::new(PG_DDL, POLICIES),
+        ServerSchema::new(
+            PG_DDL,
+            POLICIES,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
         token,
         OpenFga::new(fixture.fga_url().await.to_owned(), store),
     )
@@ -925,7 +930,12 @@ fn unconnected_builder(list: PortabilityList, content: Option<ContentSettings>) 
             "postgres://connetto:connetto@127.0.0.1:1/connetto",
             "postgres://connetto:connetto@127.0.0.1:1/connetto",
         ),
-        ServerSchema::new(PG_DDL, ""),
+        ServerSchema::new(
+            PG_DDL,
+            "",
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
         TokenKeys::from_pem(
             std::fs::read(&private).expect("read the private half"),
             std::fs::read(&public).expect("read the public half"),

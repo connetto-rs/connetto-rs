@@ -10,8 +10,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use connetto_schema::TextIds;
-
 const USAGE: &str = "connetto-schema export-tier --schema <schema.sql> --tier <tier.sql> --dir <tier_history> [--check]";
 
 fn main() -> ExitCode {
@@ -45,7 +43,7 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::FAILURE;
     };
-    match connetto_schema::export_tier::<String, TextIds>(&schema, &tier, &dir, check) {
+    match connetto_schema::export_tier(&schema, &tier, &dir, check) {
         Ok(outcome) => {
             if !check {
                 println!("wrote {}", outcome.path.display());

@@ -1,7 +1,8 @@
 //! End-to-end proof for the demo's photos surface.
 //!
 //! Applies the shared deployment's own `schema.sql`, `policies.sql`,
-//! `roles.sql` and `content.sql` in the documented order, then proves:
+//! `roles.sql`, `bookkeeping.sql` and `content.sql` in the documented order,
+//! then proves:
 //!
 //! - stage (`orders` + `photos` row in one transaction), local resolve, upload,
 //!   `content_state` flip via `connetto_set_content_state`, signed-URL resolve,
@@ -31,7 +32,9 @@ use connetto_client::{
 };
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_core::transport::LoopbackTransport;
-use connetto_demo_deployment::{CONTENT_SQL, POLICIES_SQL, ROLES_SQL, SCHEMA_SQL, SEED_SQL};
+use connetto_demo_deployment::{
+    BOOKKEEPING_SQL, CONTENT_SQL, POLICIES_SQL, ROLES_SQL, SCHEMA_SQL, SEED_SQL,
+};
 use connetto_demo_support::{demo_schema, notes, photos, stage_photo_row};
 use connetto_file_client::{ContentClient, FsStore, MimeClass, ReqwestHttp, Resolved};
 use connetto_file_server::{
@@ -266,10 +269,10 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
 }
 
 /// Applies the deployment's `schema.sql`, the file server's `DEPLOYMENT_DDL`,
-/// the epoch DDL, `roles.sql`, `content.sql`, `policies.sql` and `seed.sql`,
-/// in the order the deployment documents. `provision_writers` runs before
-/// `roles.sql` because `roles.sql` grants on the writer tables, which the
-/// writer step creates.
+/// the epoch DDL, `roles.sql`, `bookkeeping.sql`, `content.sql`, `policies.sql`
+/// and `seed.sql`, in the order the deployment documents. `provision_writers`
+/// runs before `bookkeeping.sql` because it grants on the writer tables, which
+/// the writer step creates.
 async fn provision(fixture: &Fixture) {
     fixture
         .setup(&[
@@ -289,7 +292,8 @@ async fn provision(fixture: &Fixture) {
     }
     fixture.exec(EPOCH_DDL).await;
     connetto_test_harness::provision_writers(fixture.admin()).await;
-    fixture.exec(ROLES_SQL).await;
+    fixture.setup_roles(ROLES_SQL).await;
+    fixture.exec(BOOKKEEPING_SQL).await;
     fixture.exec(CONTENT_SQL).await;
     fixture.exec(POLICIES_SQL).await;
     fixture.exec(SEED_SQL).await;

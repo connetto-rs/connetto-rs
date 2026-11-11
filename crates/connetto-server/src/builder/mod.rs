@@ -54,17 +54,15 @@ use crate::session::{
 };
 use crate::throttle::{ThrottleConfig, Tier};
 use crate::writer_schema::ConnettoWriterSchema;
-use connetto_core::auth::{CapabilityKey, DEFAULT_USER_SETTING};
 use connetto_core::device_cert::KeyId;
 use connetto_core::messages::{ContentVerb, FatalErrorReason};
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority};
-use connetto_core::{CALLER_FUNCTION, Major, SUBJECTS_FUNCTION, SchemaVersion};
+use connetto_core::{Major, SchemaVersion};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use openfga_client::client::OpenFgaServiceClient;
 use openfga_client::tonic::transport::{Channel, Endpoint};
-use pg2sqlite::prelude::SessionVariableMapping;
 use rls2fga::translator::Translator;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
@@ -310,24 +308,46 @@ impl Database {
     }
 }
 
-/// The deployment schema, catalog DDL and read policies.
+/// The deployment's source documents, catalog DDL, read policies and roles,
+/// and the reader role the roles document creates.
 #[derive(Clone, Debug)]
 pub struct ServerSchema {
     pg_ddl: String,
     pg_policies: String,
+    pg_roles: String,
+    reader_role: String,
     devices: bool,
 }
 
 impl ServerSchema {
-    /// Name the catalog DDL and the policies that decide which view a logical
-    /// name resolves to.
+    /// Name the catalog DDL, the policies that decide which view a logical
+    /// name resolves to, the roles document creating the reader role and its
+    /// grants, and the reader role the server reads and writes as.
     #[must_use]
-    pub fn new(pg_ddl: impl Into<String>, pg_policies: impl Into<String>) -> Self {
+    pub fn new(
+        pg_ddl: impl Into<String>,
+        pg_policies: impl Into<String>,
+        pg_roles: impl Into<String>,
+        reader_role: impl Into<String>,
+    ) -> Self {
         Self {
             pg_ddl: pg_ddl.into(),
             pg_policies: pg_policies.into(),
+            pg_roles: pg_roles.into(),
+            reader_role: reader_role.into(),
             devices: false,
         }
+    }
+
+    /// The documents both translators read, as the client build reads them.
+    #[must_use]
+    pub fn documents(&self) -> connetto_schema::Documents<'_> {
+        connetto_schema::Documents::new(
+            &self.pg_ddl,
+            &self.pg_policies,
+            &self.pg_roles,
+            &self.reader_role,
+        )
     }
 
     /// Hold the device enrolment table in the catalog, the device identity
@@ -1678,13 +1698,20 @@ where
         let serves_content = cfg!(feature = "content") && content.is_some();
         let portability = portability
             .map(|list| {
-                let replica =
-                    connetto_schema::translate::<String, RegistryIds<D>>(&schema.pg_ddl, "")?;
+                let documents = schema.documents();
+                let replica = connetto_schema::translate::<String, RegistryIds<D>>(
+                    connetto_schema::Documents::new(
+                        documents.schema(),
+                        "",
+                        documents.roles(),
+                        documents.reader_role(),
+                    ),
+                )?;
                 crate::portability::validate(
                     list,
                     &schema.engine_ddl::<RegistryIds<D>>(),
                     &replica,
-                    &caller_mapping(),
+                    &CallerMappings::of::<String>(&schema.reader_role)?,
                     serves_content,
                 )
             })
@@ -1762,20 +1789,6 @@ where
         // The write side is the first to write the authorization service, so
         // every check that can refuse the deployment runs before it.
         preflight::require(&pool, &[Artifact::Table(crate::epoch::EPOCH_TABLE)]).await?;
-        // Boxed, since it carries every translation across the store writes.
-        let write_side = Box::pin(build_write_side::<D>(
-            Pools {
-                owner: pool.clone(),
-                reader: reader.pool,
-            },
-            &schema,
-            &publication,
-            &openfga,
-            second_opinion,
-            writable,
-            engine_connector,
-        ))
-        .await?;
         let feed = Feed {
             database_url: database.owner_url,
             slot,
@@ -1784,32 +1797,50 @@ where
         };
         let file_router = reader.file_router;
         let sweep = reader.sweep;
-        let manager = ManagerBuilder::new(
-            write_side.materializer,
-            reader.snapshot,
-            write_side.auth,
-            authority,
-            connector,
-            write_side.write,
-        )
-        .with_oplog(oplog)
-        .with_guard(Arc::clone(&guard))
-        .with_session(
-            session_config
-                .with_schema_version(Some(write_side.version))
-                .with_schema_major(Some(write_side.major))
-                .with_sunset(sunset)
-                .with_courier(courier),
-        )
-        .with_upkeep(write_side.upkeep)
-        .with_signer(reader.signer)
-        .with_withdrawal_source(write_side.withdrawals)
-        .with_bot_registry(pg_bot_registry::<D>(pool.clone()));
-        let manager = match write_side.second {
-            Some(second) => manager.with_second_opinion(Arc::new(second)),
-            None => manager,
-        }
-        .build();
+        // Scoped, so the write side's storage ends here rather than staying in
+        // the future across the wiring below.
+        let manager = {
+            // Boxed, since it carries every translation across the store writes.
+            let write_side = Box::pin(build_write_side::<D>(
+                Pools {
+                    owner: pool.clone(),
+                    reader: reader.pool,
+                },
+                &schema,
+                &feed.publication,
+                &openfga,
+                second_opinion,
+                writable,
+                engine_connector,
+            ))
+            .await?;
+            let manager = ManagerBuilder::new(
+                write_side.materializer,
+                reader.snapshot,
+                write_side.auth,
+                authority,
+                connector,
+                write_side.write,
+            )
+            .with_oplog(oplog)
+            .with_guard(Arc::clone(&guard))
+            .with_session(
+                session_config
+                    .with_schema_version(Some(write_side.version))
+                    .with_schema_major(Some(write_side.major))
+                    .with_sunset(sunset)
+                    .with_courier(courier),
+            )
+            .with_upkeep(write_side.upkeep)
+            .with_signer(reader.signer)
+            .with_withdrawal_source(write_side.withdrawals)
+            .with_bot_registry(pg_bot_registry::<D>(pool.clone()));
+            match write_side.second {
+                Some(second) => manager.with_second_opinion(Arc::new(second)),
+                None => manager,
+            }
+            .build()
+        };
         wire_manager(&manager, &service, &guard, &pool, &feed).await?;
         let status = device_identity.map(|config| {
             install_device_identity::<D>(&manager, &service, &pool, config, sign_in.clone())
@@ -2261,22 +2292,6 @@ fn is_loopback_origin(origin: &str) -> bool {
     url::Url::parse(origin).is_ok_and(|parsed| is_loopback_host(&parsed))
 }
 
-/// The deployment's caller pairing for reverse translation (R27), the
-/// SQLite functions the deployment named paired against the settings the
-/// server binds them to.
-fn caller_mapping() -> CallerMappings {
-    CallerMappings {
-        identity: SessionVariableMapping::current_setting(DEFAULT_USER_SETTING, CALLER_FUNCTION),
-        subjects: Some(
-            SessionVariableMapping::current_setting(
-                <String as CapabilityKey>::SETTING,
-                SUBJECTS_FUNCTION,
-            )
-            .holding_set(<String as CapabilityKey>::SEPARATOR),
-        ),
-    }
-}
-
 /// Refuse startup when the authorization model numbers any table differently
 /// from the catalog every other server part reads.
 ///
@@ -2303,12 +2318,7 @@ async fn translate_authorization<D: ConnettoSchema>(
     schema: &ServerSchema,
     publication: &str,
 ) -> Result<Translated, BuildError> {
-    let translated = Translated::of::<String, RegistryIds<D>>(
-        &schema.pg_ddl,
-        &schema.pg_policies,
-        DEFAULT_USER_SETTING,
-        schema.devices,
-    )?;
+    let translated = Translated::of::<String, RegistryIds<D>>(schema.documents(), schema.devices)?;
     let engine_ddl = schema.engine_ddl::<RegistryIds<D>>();
     require_one_numbering(translated.shapes_arc().catalog(), &engine_ddl)?;
     // A policy reading a table the change stream does not carry never hears
@@ -2357,9 +2367,9 @@ async fn install_authorization<D: ConnettoSchema>(
         translated.shapes_arc(),
         setup,
         openfga.store.clone(),
+        model.model(),
     )
-    .map_err(SetupError::from)?
-    .authorization_model_id(model.id().to_owned());
+    .map_err(SetupError::from)?;
     match &model {
         ModelState::Written(_) => {
             let n = translated.load_into(facts, &loader).await?;
@@ -2386,9 +2396,9 @@ async fn install_authorization<D: ConnettoSchema>(
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
         openfga.store.clone(),
+        model.model(),
     )
-    .map_err(SetupError::from)?
-    .authorization_model_id(model.id().to_owned());
+    .map_err(SetupError::from)?;
     Ok((FgaAuth::new(shapes, delegate, naming), translator, reach))
 }
 
@@ -2414,7 +2424,7 @@ async fn build_write_side<D: ConnettoSchema>(
     let materializer = Materializer::builder(&catalog)
         .with_write_catalog(writable)
         .with_translator(translated.translator().clone())
-        .with_caller(caller_mapping())
+        .with_caller(CallerMappings::of::<String>(&schema.reader_role)?)
         .with_read_connector(engine_connector)
         .build()?;
     // The second opinion reads as the reader role, so it takes its pool before the write target consumes it.
@@ -2435,8 +2445,7 @@ async fn build_write_side<D: ConnettoSchema>(
         PgSnapshotSource::from_ddl(pools.owner.clone(), &schema.engine_ddl::<RegistryIds<D>>())?;
     // A changed policy makes an existing replica stale, so a client holding one is told through the advertised version.
     let bundle = connetto_schema::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
-        &schema.pg_ddl,
-        &schema.pg_policies,
+        schema.documents(),
     )?;
     let facts = FactSource::owner(pools.owner);
     let (auth, translator, reach) = install_authorization::<D>(translated, &facts, openfga).await?;
@@ -2811,11 +2820,14 @@ mod tests {
     const NUMBERED: &str = "-- connetto:major 1\nCREATE TABLE items (id INT PRIMARY KEY, \
                             team INT); CREATE TABLE team_members (team INT, member TEXT);";
 
+    /// The roles document creating the reader role the tests read as.
+    const READER_ROLES: &str = "CREATE ROLE app_reader LOGIN;";
+
     /// The model's catalog read from the composed document and the server's
     /// read from the same text number every table alike, so startup goes on.
     #[test]
     fn one_document_numbers_every_table_alike() {
-        let schema = ServerSchema::new(NUMBERED, "");
+        let schema = ServerSchema::new(NUMBERED, "", READER_ROLES, "app_reader");
         let engine_ddl = schema.engine_ddl::<connetto_core::bots::TextIds>();
         let model =
             ParserDB::parse::<PostgreSqlDialect>(&engine_ddl).expect("the model catalog parses");
@@ -2827,7 +2839,7 @@ mod tests {
     /// startup refuses and names the table.
     #[test]
     fn a_catalog_without_the_registry_refuses_startup() {
-        let schema = ServerSchema::new(NUMBERED, "");
+        let schema = ServerSchema::new(NUMBERED, "", READER_ROLES, "app_reader");
         let model_ddl = schema.engine_ddl::<connetto_core::bots::TextIds>();
         let model =
             ParserDB::parse::<PostgreSqlDialect>(&model_ddl).expect("the model catalog parses");
@@ -2968,6 +2980,8 @@ mod tests {
             ServerSchema::new(
                 "-- connetto:major 1\nCREATE TABLE t (id INT PRIMARY KEY);",
                 "",
+                READER_ROLES,
+                "app_reader",
             ),
             keys,
             OpenFga::new("http://127.0.0.1:1", "store"),

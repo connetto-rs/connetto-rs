@@ -239,17 +239,13 @@ async fn connected_shared() -> (ConnettoConnection<Script>, Script) {
     let script = Script::default();
     script.say(support::handshake_ack());
     let schema = SyncSchema::new(
-        connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(
-            "-- connetto:major 1\nCREATE TABLE vocabulary (id INT PRIMARY KEY, label TEXT NOT NULL); \
-             CREATE TABLE notes (id INT PRIMARY KEY, vocabulary_id INT NOT NULL, \
-              owner TEXT NOT NULL); \
-             ALTER TABLE vocabulary ENABLE ROW LEVEL SECURITY; \
-             ALTER TABLE notes ENABLE ROW LEVEL SECURITY;",
-            "CREATE POLICY vocabulary_read ON vocabulary FOR SELECT USING (id > 0); \
-             CREATE POLICY notes_read ON notes FOR SELECT USING \
-             (owner = current_setting('app.user_id', true));",
-            &["vocabulary"],
-        )
+        connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(connetto_schema::Documents::new("-- connetto:major 1\nCREATE TABLE vocabulary (id INT PRIMARY KEY, label TEXT NOT NULL); \
+         CREATE TABLE notes (id INT PRIMARY KEY, vocabulary_id INT NOT NULL, \
+          owner TEXT NOT NULL); \
+         ALTER TABLE vocabulary ENABLE ROW LEVEL SECURITY; \
+         ALTER TABLE notes ENABLE ROW LEVEL SECURITY;", "CREATE POLICY vocabulary_read ON vocabulary FOR SELECT USING (id > 0); \
+         CREATE POLICY notes_read ON notes FOR SELECT USING \
+         (owner = current_setting('app.user_id', true));", connetto_test_harness::FIXTURE_ROLES, connetto_test_harness::FIXTURE_READER), &["vocabulary"])
         .expect("translate the shared vocabulary"),
     );
     let conn = ClientBuilder::new(schema, support::Once::new(script.clone()))

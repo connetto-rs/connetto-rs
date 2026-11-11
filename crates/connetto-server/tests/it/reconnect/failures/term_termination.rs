@@ -5,7 +5,6 @@ use std::future::{Future, ready};
 use connetto_core::messages::{BindValue, FatalErrorReason, Ping};
 use connetto_server::CallerMappings;
 use connetto_server::session::TermSeedRead;
-use pg2sqlite::prelude::SessionVariableMapping;
 use subql::backend::Value as PgValue;
 
 use super::*;
@@ -75,9 +74,12 @@ async fn term_manager(
     let ddl = format!("{PG_DDL} {MEMBER_DDL}");
     let translator =
         connetto_server::openfga::Translated::of::<String, connetto_core::bots::TextIds>(
-            &ddl,
-            POLICIES,
-            "app.user_id",
+            connetto_schema::Documents::new(
+                &ddl,
+                POLICIES,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
             true,
         )
         .expect("membership classifier")
@@ -87,13 +89,10 @@ async fn term_manager(
     let manager = ManagerBuilder::new(
         Materializer::builder(&ddl)
             .with_translator(translator)
-            .with_caller(CallerMappings {
-                identity: SessionVariableMapping::current_setting(
-                    "app.user_id",
-                    "current_app_user",
-                ),
-                subjects: None,
-            })
+            .with_caller(
+                CallerMappings::of::<String>(connetto_test_harness::FIXTURE_READER)
+                    .expect("the deployment description builds"),
+            )
             .build()
             .expect("materializer"),
         MembershipSeed,

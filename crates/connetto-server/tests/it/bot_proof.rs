@@ -109,9 +109,12 @@ async fn shipped_executor(
 ) {
     let (channel, store) = fixture.fga_store().await;
     let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-        PG_DDL,
-        NO_POLICIES,
-        connetto_core::auth::DEFAULT_USER_SETTING,
+        connetto_schema::Documents::new(
+            PG_DDL,
+            NO_POLICIES,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
         true,
     )
     .expect("the fixture's policies are one rls2fga classifies");
@@ -124,9 +127,9 @@ async fn shipped_executor(
         translated.shapes_arc(),
         setup,
         store.clone(),
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     translated
         .load_into(&FactSource::owner(fixture.admin().clone()), &loader)
         .await
@@ -137,9 +140,9 @@ async fn shipped_executor(
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
         store,
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     let fga = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
     let upkeep = fga.upkeep(
         reach,

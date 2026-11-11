@@ -58,8 +58,15 @@ diesel::table! {
     }
 }
 fn schema() -> connetto_core::schema::SchemaBundle {
-    connetto_schema::translate::<String, connetto_core::bots::TextIds>(PG_DDL, POLICIES)
-        .expect("translate the sources")
+    connetto_schema::translate::<String, connetto_core::bots::TextIds>(
+        connetto_schema::Documents::new(
+            PG_DDL,
+            POLICIES,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+    )
+    .expect("translate the sources")
 }
 
 async fn server(fixture: &Fixture) -> Server {

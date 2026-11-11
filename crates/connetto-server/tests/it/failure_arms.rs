@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use connetto_core::Cursor;
-use connetto_core::auth::{DEFAULT_USER_SETTING, Principal};
+use connetto_core::auth::Principal;
 use connetto_core::messages::{BulkMessage, ControlMessage, SUBSCRIPTION_REFUSED};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::IncomingFrame;
@@ -747,9 +747,12 @@ async fn flip_stack(fixture: &Fixture) -> Server {
     // The composition the shipped binary builds, over one fresh store.
     let (channel, store) = fixture.fga_store().await;
     let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-        FLIP_DDL,
-        &FLIP_POLICY_STATEMENTS.join(";\n"),
-        DEFAULT_USER_SETTING,
+        connetto_schema::Documents::new(
+            FLIP_DDL,
+            &FLIP_POLICY_STATEMENTS.join(";\n"),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
         true,
     )
     .expect("the membership policy translates");
@@ -762,9 +765,9 @@ async fn flip_stack(fixture: &Fixture) -> Server {
         translated.shapes_arc(),
         setup,
         store.clone(),
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     translated
         .load_into(&FactSource::owner(fixture.admin().clone()), &loader)
         .await
@@ -775,9 +778,9 @@ async fn flip_stack(fixture: &Fixture) -> Server {
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
         store,
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     let fga = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
     let upkeep = fga.upkeep(
         reach,

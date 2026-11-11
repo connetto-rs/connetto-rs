@@ -224,9 +224,18 @@ impl InProcServer {
             config: Arc::new(ServerConfig {
                 database: Database::new(
                     admin.clone(),
-                    with_user(&admin, "connetto_reader", "connetto_reader"),
+                    with_user(
+                        &admin,
+                        DEMO_DEPLOYMENT.reader_role,
+                        DEMO_DEPLOYMENT.reader_role,
+                    ),
                 ),
-                schema: ServerSchema::new(DEMO_DEPLOYMENT.schema, DEMO_DEPLOYMENT.policies),
+                schema: ServerSchema::new(
+                    DEMO_DEPLOYMENT.schema,
+                    DEMO_DEPLOYMENT.policies,
+                    DEMO_DEPLOYMENT.roles,
+                    DEMO_DEPLOYMENT.reader_role,
+                ),
                 keys: TokenKeys::from_pem(
                     fs::read(&keys.private)
                         .with_context(|| format!("reading {}", keys.private.display()))?,

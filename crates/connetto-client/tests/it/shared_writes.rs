@@ -22,8 +22,12 @@ CREATE TABLE notes (id INT PRIMARY KEY, body TEXT NOT NULL);";
 fn schema() -> SyncSchema {
     SyncSchema::new(
         connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(
-            SCHEMA,
-            "",
+            connetto_schema::Documents::new(
+                SCHEMA,
+                "",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
             &["tags", "colours"],
         )
         .expect("translate the shared tables"),
