@@ -1367,6 +1367,27 @@ async fn a_reissue_refused_as_revoked_deletes_the_key_and_reports_revoked() {
     run.await.expect("the run ends");
 }
 
+/// Await and check the automatic enrolment result for one connection.
+async fn assert_enrolment_decision(
+    decisions: &mut watch::Receiver<Option<super::EnrolmentDecision>>,
+    connection: ConnectionNumber,
+    matches: impl FnOnce(&Result<super::EnrolmentOutcome, CertificateError>) -> bool,
+) {
+    let decision = tokio::time::timeout(
+        Duration::from_secs(10),
+        decisions.wait_for(|decision| {
+            decision
+                .as_ref()
+                .is_some_and(|decision| decision.connection == connection)
+        }),
+    )
+    .await
+    .expect("the connection's enrolment decision completes")
+    .expect("the enrolment task stays alive");
+    let decision = decision.as_ref().expect("a completed decision");
+    assert!(matches(&decision.outcome), "{decision:?}");
+}
+
 /// Revocation prevents enrolment and key writes until the client is rebuilt.
 #[tokio::test]
 async fn a_revoked_device_stays_spectator_when_its_pump_says_connected_again() {
@@ -1413,17 +1434,19 @@ async fn a_revoked_device_stays_spectator_when_its_pump_says_connected_again() {
         .lock()
         .script
         .extend([Ask::Grant, Ask::Refused(EnrolRefusal::Revoked), Ask::Grant]);
+    let mut decisions = handle.watch_enrolment();
+    let initial_connection = ConnectionNumber::new(state.lock().connection);
     let run = tokio::spawn(run(link, enroller));
 
-    poll_until(|| state.lock().requests.len() == 1).await;
-    poll_until(|| !state.lock().stored.is_empty()).await;
+    assert_enrolment_decision(&mut decisions, initial_connection, |outcome| {
+        matches!(outcome, Ok(super::EnrolmentOutcome::Enrolled))
+    })
+    .await;
+    assert_eq!(state.lock().requests.len(), 1);
     assert!(records.0.lock().contains_key(&record));
 
     let outcome = handle.reissue(HOUR).await;
-    assert!(
-        matches!(outcome, Err(CertificateError::Revoked)),
-        "the caller gets the revocation"
-    );
+    assert!(matches!(outcome, Err(CertificateError::Revoked)));
     tokio::time::timeout(Duration::from_secs(10), handle.revoked())
         .await
         .expect("the task hands the device's wipe to the client");
@@ -1431,38 +1454,42 @@ async fn a_revoked_device_stays_spectator_when_its_pump_says_connected_again() {
     assert!(state.lock().stored.is_empty());
     assert!(handle.certificate().is_none());
 
-    // A new connection must remain revoked after generation deduplication.
-    state.lock().connection += 1;
+    let reconnected = {
+        let mut state = state.lock();
+        state.connection += 1;
+        ConnectionNumber::new(state.connection)
+    };
     events_tx
         .send(ClientEvent::SyncStatus(SyncStatus::Connected))
         .expect("the run listens");
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < deadline && state.lock().requests.len() < 3 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_enrolment_decision(&mut decisions, reconnected, |outcome| {
+        matches!(outcome, Err(CertificateError::Revoked))
+    })
+    .await;
+    {
+        let late = handle.watch_enrolment();
+        let retained = late.borrow();
+        let decision = retained
+            .as_ref()
+            .expect("late observers retain the decision");
+        assert_eq!(decision.connection, reconnected);
+        assert!(matches!(&decision.outcome, Err(CertificateError::Revoked)));
     }
-    assert_eq!(
-        state.lock().requests.len(),
-        2,
-        "a revoked device asks for no fresh enrolment"
-    );
+    assert_eq!(state.lock().requests.len(), 2);
     assert!(!records.0.lock().contains_key(&record));
     assert!(handle.certificate().is_none());
 
     let again = handle.reissue(HOUR).await;
-    assert!(
-        matches!(again, Err(CertificateError::Revoked)),
-        "a reissue of the same open keeps answering revoked"
-    );
-    assert_eq!(
-        state.lock().requests.len(),
-        2,
-        "the reissue sends no enrolment"
-    );
+    assert!(matches!(again, Err(CertificateError::Revoked)));
+    assert_eq!(state.lock().requests.len(), 2);
     assert!(!records.0.lock().contains_key(&record));
     assert!(handle.certificate().is_none());
 
     end_tx.send(()).expect("the run ends");
-    run.await.expect("the run ends");
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("the enrolment task stops")
+        .expect("the run ends");
 }
 
 /// A reissue refused over the ceiling keeps the ceiling the server named, so
