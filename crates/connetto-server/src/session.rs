@@ -6490,7 +6490,7 @@ where
         transport.send_control(answer).await.map_err(transport_err)
     }
 
-    /// Revoke one of the caller's devices, answering before its connection closes.
+    /// Await revocation and acknowledge it before closing the caller's own connection.
     async fn handle_revoke_request<T: Transport>(
         &self,
         transport: &mut T,
@@ -6516,13 +6516,13 @@ where
         };
         match revoked {
             Ok((enrolment, (_, session, lists))) => {
+                self.after_revocation(&enrolment, session, lists).await;
                 transport
                     .send_control(ControlMessage::DeviceRevokedAck(DeviceRevokedAck {
                         request_id,
                     }))
                     .await
                     .map_err(transport_err)?;
-                self.after_revocation(&enrolment, session, lists).await;
                 Ok(())
             }
             Err(reason) => transport
