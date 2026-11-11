@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use connetto_client::{
-    Auth, BrowserOpener, CertificateError, ClientEvent, Keyring, KeyringAuth, KeyringKeyStore,
-    KeyringStore, NativeClient, NativeClientBuilder, NativeDurable, REPLICA_PREFIX, SyncStatus,
-    WipePart, device_key_record, replica_db_name,
+    Auth, BrowserOpener, CertificateError, ClientEvent, EnrolmentOutcome, Keyring, KeyringAuth,
+    KeyringKeyStore, KeyringStore, NativeClient, NativeClientBuilder, NativeDurable,
+    REPLICA_PREFIX, SyncStatus, WipePart, device_key_record, replica_db_name,
 };
 use connetto_core::device_cert::{
     AttestationLevel, CertificateSerial, DeploymentId, DeviceCertificate, DeviceIssuer, KeyHome,
@@ -811,9 +811,22 @@ async fn first_connect() {
     .await
     .expect("the signed-in build connects");
 
-    let cert = wait_for_certificate(&client, BOUND)
-        .await
-        .expect("the enrolment grants");
+    let mut decisions = client
+        .watch_enrolment()
+        .expect("device identity is installed");
+    let connection = {
+        let decision = tokio::time::timeout(BOUND, decisions.wait_for(Option::is_some))
+            .await
+            .expect("enrolment completes")
+            .expect("the enrolment task stays alive");
+        let decision = decision.as_ref().expect("a completed decision");
+        assert!(matches!(&decision.outcome, Ok(EnrolmentOutcome::Enrolled)));
+        decision.connection
+    };
+    assert_eq!(client.client().connection_number().await, Some(connection));
+    let cert = client
+        .device_certificate()
+        .expect("the decision kept its certificate");
     let session = client
         .session()
         .expect("a provider build reports its session");
