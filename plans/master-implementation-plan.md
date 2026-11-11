@@ -73,7 +73,6 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | [R111](#r111-a-durable-replica-where-opfs-is-refused) | blocked | the JSPI IndexedDB VFS upstream in `sqlite-wasm-rs` | A durable browser replica on IndexedDB through JSPI where OPFS is refused, memory kept only where JSPI is missing |  |  |
 | [R112](#r112-an-apple-peer-to-peer-link) | not started |  | A link between Apple devices over Apple's peer-to-peer Wi-Fi, for an all-Apple group with no hotspot host and no shared network, after its gate run and open points |  |  |
 | [R113](#r113-tests-that-wait-on-events) | blocked | Refreshed dependency graph | CI-backed sequential test and event-hook fixes, ranked by downstream impact and observed flakiness, with targeted repetition only | | |
-| [R115](#r115-a-confirmed-provisional-entry-still-asked) | not started |  | Every session asks about every stored entry a verdict still reaches, so a provisional entry whose records a server patch confirmed is still ruled and retained | | |
 | [R21](#r21-one-page-codec-on-both-backends) | in progress |  | Slices 2 to 5, the browser on `sqlite-wasm-rs` 0.6 and then on SQLCipher, one open contract, the capability and hardening proof, and SQLCipher 4.20.0 |  | [#402](https://github.com/connetto-rs/connetto-rs/pull/402) |
 | R0 | done | | The always-on change-path counters in `counters.rs` and the `fanout_load` harness that priced the dispatch loop, with the ceiling measured as one sequential visibility round trip per subscriber per event and the lock wait at zero | [fanout_counters.rs](../crates/connetto-test-harness/tests/it/fanout_counters.rs), [fanout_load.rs](../crates/connetto-test-harness/tests/it/fanout_load.rs) | |
 | R1 | done | | The three permissive stand-ins reachable from configuration alone are gone, and the reference binary refuses to start without a reader role and a recognised `CONNETTO_OIDC_PROVIDER` | [e2e.rs](../crates/connetto-server/tests/it/e2e.rs) | |
@@ -170,6 +169,7 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | R105 | done |  | Answering a stolen account, the session record, the session surfaces, the revocation of a second session and the `auth_events` rows |  | [#262](https://github.com/connetto-rs/connetto-rs/pull/262), [#268](https://github.com/connetto-rs/connetto-rs/pull/268), [#274](https://github.com/connetto-rs/connetto-rs/pull/274), [#283](https://github.com/connetto-rs/connetto-rs/pull/283), [#287](https://github.com/connetto-rs/connetto-rs/pull/287), [#289](https://github.com/connetto-rs/connetto-rs/pull/289) |
 | R106 | done |  | Database failures classified by their SQLSTATE, the named transient list for reads, writes and the oplog, the `Deterministic` class and the `42501` refusal as `Unauthorized` | [reexec_failure.rs](../crates/connetto-server/tests/it/reexec_failure.rs) | [#343](https://github.com/connetto-rs/connetto-rs/pull/343), [#356](https://github.com/connetto-rs/connetto-rs/pull/356) |
 | R114 | done |  | Every session asks the server about its retained rows, so a `Pending` candidacy outlives a restart, and an `Abandoned` verdict deletes the retained rows it names | [courier_tests.rs](../crates/connetto-client/src/courier_tests.rs), [courier_restore.rs](../crates/connetto-test-harness/tests/it/courier_restore.rs) | [#492](https://github.com/connetto-rs/connetto-rs/pull/492), [#493](https://github.com/connetto-rs/connetto-rs/pull/493) |
+| R115 | done |  | Every session asks about provisional records and stored entries up to each author's signed offer frontier, including provisional entries with no records | [provisional_adjudication.rs](../crates/connetto-client/tests/it/provisional_adjudication.rs), [courier_tests.rs](../crates/connetto-client/src/courier_tests.rs), [courier_restore.rs](../crates/connetto-test-harness/tests/it/courier_restore.rs) | [#495](https://github.com/connetto-rs/connetto-rs/pull/495), [#496](https://github.com/connetto-rs/connetto-rs/pull/496) |
 
 ## Gaps
 
@@ -1486,60 +1486,6 @@ Use CI history as the source of flakiness evidence. After an edit, hammer only t
 ### Done when
 
 No wait in the workspace synchronises on a timer except sites carrying an `expect` and a reason, the clippy guard refuses a new one, and each converted test passes its targeted repetition run.
-
----
-
-## R115: a confirmed provisional entry still asked
-
-**Status.** Designed with the maintainer on 2026-11-10. Not started.
-
-**Dependencies.** None.
-
-**Changes state.** Client tables, none. Server tables, none. Wire messages, none, the entries riding the session's existing `ProvisionalStatus` asks. Archive format, none.
-
-### Purpose
-
-A live patch writing a key a provisional record names deletes the record and raises `ProvisionalConfirmed`, while the stored entry stays provisional until its own verdict. `plan_provisional_asks` enumerates provisional records and courier-only, digest-only and retained entries, so once a patch has confirmed an entry's last record no later session asks about it. The entry then stays provisional, never retained. A restore's full resync re-applies it and puts its records back, its courier candidate carries no ruling the session heard, and the redelivery proof fails whenever bob's session ends before his ask's ruling arrives, about once in fourteen runs on `main` at e0a3a5872.
-
-### Decisions
-
-1. **The session's asks cover every stored entry a verdict still reaches**, the set `seq_awaits_verdict` already defines. That is every stored entry that is not retained, provisional ones among them whatever their records, and a provisional record with no stored entry. Rejected: retaining the entry when a patch confirms its last record, since a patch writing a key is no ruling on the entry, another writer's write reaching the same key, and only the server's verdict settles the author's sequence. Rejected: a proof that waits for bob's ruling before closing him, which hides the gap from the proof and leaves it in every client.
-2. **An ask names no sequence past the author's stored offer's frontier** (R78 decision 52). The server refuses a whole ask naming one, so a session asks each author's awaiting sequences up to the higher of its stored offer's signed settled and newest, and a later sequence waits for the author's next offer over a link. A stored offer that does not decode asks nothing, as no stored offer does. Rejected: asking every awaiting sequence and letting the server refuse, which loses the ruling of the sequences the offer does cover.
-
-### State table
-
-An entry awaiting its verdict is in one of three situations. It is provisional with records, applied with at least one record still provisional, provisional with none, applied with every record confirmed by a patch or taken by a truncate or full resync, or unapplied, courier-only or digest-only.
-
-| Event | Provisional with records | Provisional with none | Unapplied |
-|---|---|---|---|
-| The session attaches, the sequence at or below the stored offer's frontier | Asked | Asked, where today nothing asks | Asked |
-| The session attaches, the sequence past the stored offer's frontier | Not asked, waiting for the author's next offer | Not asked, waiting for the author's next offer | Not asked, waiting for the author's next offer |
-| The author's next offer over a link, its frontier reaching the sequence | Asked at the next attach | Asked at the next attach | Asked at the next attach |
-| A ruling `Pending`, answered or pushed | Unchanged, a courier candidate | Unchanged, a courier candidate | Unchanged, a courier candidate |
-| A ruling `Applied` or `Settled` | Records adjudicated, retained | Retained | Retained |
-| A ruling `Refused` or `Abandoned` | The ops its provisional records name inverted, deleted | Deleted, no record naming an op to invert | Deleted |
-| A live patch writing a recorded key | Its record deleted, `ProvisionalConfirmed` raised, provisional with none once the last goes | Unchanged | Unchanged |
-| A resync's replacement snapshot | Unchanged, no verdict (R77 decision 13) | Unchanged | Unchanged |
-| A full resync's end | Re-applied | Re-applied, provisional with records again | Unchanged |
-| A truncate or full resync taking the row | Its record taken with the row, provisional with none once the last goes | Unchanged | Unchanged |
-| The author's frontier over a link | Records adjudicated, retained | Retained | Retained |
-| A retraction over a link | As a `Refused` ruling | As a `Refused` ruling | As a `Refused` ruling |
-| The ask overruns its bound, is refused whole or is deferred rate-limited | Asked at the next attach | Asked at the next attach | Asked at the next attach |
-| R31's rebuild at a newer major | Courier-only, its records going with the synced tables | Courier-only | Unchanged |
-| The connection ends | Unchanged | Unchanged | Unchanged |
-
-### Slices
-
-1. **The ask.** `plan_provisional_asks` takes the stored entries that are not retained in place of the courier-only and digest-only ones alone, and each author's ask stops at its stored offer's frontier, with an in-process test that a patch-confirmed entry is asked at the next attach and retained by its `Applied` ruling and one that a sequence past the offer's frontier is not asked.
-2. **The record.** Chapter 19's courier-hold paragraph names provisional entries among what every session asks about and the offer's frontier as the bound, and the phase's row turns done.
-
-### Proof
-
-The in-process tests of slice 1, and the Docker-gated redelivery proof in `courier_restore.rs` repeated on a native cluster with no failure, its bob now asking about the confirmed entry in the session after the restore.
-
-### Done when
-
-No stored entry awaiting a verdict at or below its author's stored offer's frontier goes unasked at a session's attach, no ask names a sequence past it, and chapter 19 says so.
 
 ---
 
