@@ -2781,6 +2781,9 @@ mod tests {
     /// than waiting without end.
     #[tokio::test]
     async fn a_stalled_authorization_service_fails_the_call_at_its_budget() {
+        use crate::session::FailedAuthorization as _;
+        use rls2fga::types::{Record, RelationName};
+
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a local port");
@@ -2793,25 +2796,55 @@ mod tests {
         });
         let budget = Duration::from_millis(200);
         let openfga = OpenFga::new(format!("http://{address}"), "store").with_call_budget(budget);
-        let mut client = OpenFgaServiceClient::new(
-            openfga
-                .endpoint()
-                .expect("the endpoint parses")
-                .connect_lazy(),
-        );
+        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+            connetto_schema::Documents::new(
+                "CREATE TABLE papers (id INTEGER PRIMARY KEY, owner TEXT); \
+                 ALTER TABLE papers ENABLE ROW LEVEL SECURITY;",
+                "CREATE POLICY papers_p ON papers FOR SELECT USING \
+                 (owner = current_setting('app.user_id', true))",
+                "CREATE ROLE app_reader LOGIN;",
+                "app_reader",
+            ),
+            true,
+        )
+        .expect("the policy translates");
+        // A write states the installed ID and nothing else of the model.
+        let installed = openfga_client::client::AuthorizationModel {
+            id: "model".to_owned(),
+            ..Default::default()
+        };
+        let policy = OpenFgaPolicy::<ParserDB, _, ModelSubject<String, String>, Postgres>::new(
+            translated.shapes_arc(),
+            OpenFgaServiceClient::new(
+                openfga
+                    .endpoint()
+                    .expect("the endpoint parses")
+                    .connect_lazy(),
+            ),
+            "store",
+            &installed,
+        )
+        .expect("the index is usable")
+        .connect_retries(1);
         let started = tokio::time::Instant::now();
-        let answer = client
-            .list_stores(openfga_client::client::ListStoresRequest::default())
+        let answer = policy
+            .write_records(&[Record {
+                object: "papers:1".to_owned(),
+                relation: RelationName::canonicalized("owner"),
+                subject: "user:alice".to_owned(),
+                context: None,
+            }])
             .await;
         let waited = started.elapsed();
         held.abort();
-        assert!(
-            answer.is_err(),
-            "a service that never answers gives no answer"
-        );
+        let failure = answer.expect_err("a service that never answers gives no answer");
         assert!(
             waited < budget * 10,
-            "the call ends at its budget, it waited {waited:?}"
+            "each call ends at its budget, it waited {waited:?}"
+        );
+        assert!(
+            failure.clears_by_itself(),
+            "a call that ran out of time is held and asked again, never refused for good: {failure}"
         );
     }
 
