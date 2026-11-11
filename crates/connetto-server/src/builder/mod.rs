@@ -2837,9 +2837,7 @@ mod tests {
             .await;
         let waited = started.elapsed();
         held.abort();
-        let Err(failure) = answer else {
-            panic!("a service that never answers gives no answer");
-        };
+        let failure = answer.expect_err("a service that never answers gives no answer");
         assert!(
             waited < budget * 10,
             "each call ends at its budget, it waited {waited:?}"
