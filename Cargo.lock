@@ -1715,6 +1715,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sql-traits",
  "sqlite-diff-rs",
  "sqlparser",
  "subql",

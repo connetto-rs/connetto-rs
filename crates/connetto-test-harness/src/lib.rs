@@ -1384,8 +1384,13 @@ impl Fixture {
             if let sqlparser::ast::Statement::CreateRole(create) = &statement {
                 let mut held = false;
                 for name in &create.names {
+                    let Some(ident) = name.0.last().and_then(|part| part.as_ident()) else {
+                        panic!("role name {name} is no identifier");
+                    };
+                    let stored = sql_traits::utils::identifier_resolution::stored_ident_name(ident)
+                        .into_owned();
                     held |= diesel::select(diesel::dsl::exists(
-                        pg_roles::table.filter(pg_roles::rolname.eq(name.to_string())),
+                        pg_roles::table.filter(pg_roles::rolname.eq(stored)),
                     ))
                     .get_result::<bool>(&mut *conn)
                     .await

@@ -37,6 +37,8 @@ mod provisional_adjudication;
 
 mod read_rule_fold;
 
+mod roles_document;
+
 mod session_handle;
 
 mod smoke;

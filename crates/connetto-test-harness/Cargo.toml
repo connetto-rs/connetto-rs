@@ -70,6 +70,9 @@ sqlite-diff-rs = { version = "0.19", default-features = false }
 zstd = "0.13"
 # Naming the Postgres dialect when parsing the catalog DDL for the CDC source.
 sqlparser = { version = "0.64", default-features = false }
+# The name PostgreSQL stores for a written role, so a roles document applied
+# twice finds the roles it created.
+sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main", default-features = false }
 # The fixture owns the services it needs, so a test provisions nothing by hand.
 # `GenericImage` for both Postgres and OpenFGA rather than `testcontainers-modules`:
 # that crate pins testcontainers 0.27, and neither image is served better by a
