@@ -2493,7 +2493,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#b02206d881adda970c660f7630752274b00fc7b8"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#e6b4f3cad7da4ca926b28e86ba43f25375b464d0"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -2507,7 +2507,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#b02206d881adda970c660f7630752274b00fc7b8"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#e6b4f3cad7da4ca926b28e86ba43f25375b464d0"
 dependencies = [
  "serde",
  "sql-values 0.5.1",

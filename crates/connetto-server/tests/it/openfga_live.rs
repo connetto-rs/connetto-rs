@@ -255,8 +255,11 @@ async fn a_reader_policy_decides_and_an_outside_role_policy_is_reported_and_left
                        USING (owner = current_setting('app.user_id', true));\n\
                      CREATE POLICY r5b_notes_staff ON r5b_notes FOR ALL TO support_staff \
                        USING (true);",
-                    "CREATE ROLE app_reader LOGIN; CREATE ROLE support_staff;",
-                    "app_reader",
+                    &format!(
+                        "{} CREATE ROLE support_staff;",
+                        connetto_test_harness::FIXTURE_ROLES
+                    ),
+                    connetto_test_harness::FIXTURE_READER,
                 ),
                 true,
             );
