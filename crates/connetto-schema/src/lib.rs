@@ -2219,6 +2219,53 @@ mod tests {
         assert!(matches!(err, SchemaError::Translate(_)));
     }
 
+    /// A share key bound to the identity's own setting refuses the
+    /// deployment description, and with it every translation built on it.
+    #[test]
+    fn a_share_key_on_the_identity_setting_refuses_the_description() {
+        #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+        struct OnIdentity(String);
+        impl std::fmt::Display for OnIdentity {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl CapabilityKey for OnIdentity {
+            const SETTING: &'static str = connetto_core::auth::DEFAULT_USER_SETTING;
+        }
+
+        assert!(matches!(
+            deployment::<OnIdentity>(READER),
+            Err(SchemaError::Deployment(_))
+        ));
+        assert!(matches!(
+            query_options::<OnIdentity>(READER),
+            Err(SchemaError::Deployment(_))
+        ));
+        assert!(matches!(
+            translate::<OnIdentity, TextIds>(documents(&majored("CREATE TABLE t (id INT);"), "")),
+            Err(SchemaError::Deployment(_))
+        ));
+    }
+
+    /// A build whose roles document is missing, or never creates the reader
+    /// role, refuses before it writes its bundle.
+    #[test]
+    fn emit_refuses_a_roles_document_that_is_missing_or_lacks_the_reader() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (sources, _, _) = emit_inputs(dir.path(), 1);
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        std::fs::write(&sources[2], "CREATE ROLE someone_else LOGIN;").expect("the roles write");
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, None, &[], &out)
+            .expect_err("a roles document without the reader refuses");
+        assert!(err.to_string().contains(READER), "{err}");
+        std::fs::remove_file(&sources[2]).expect("the roles source deletes");
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, None, &[], &out)
+            .expect_err("a missing roles document refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
+    }
+
     /// A build whose history directory it cannot read refuses with the
     /// error, not a missing directory.
     #[test]

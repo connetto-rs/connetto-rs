@@ -2582,6 +2582,34 @@ mod tests {
         );
     }
 
+    /// A share key bound to the identity's own setting refuses startup, in the
+    /// model's translation and in the reverse translation of client queries.
+    #[test]
+    fn a_share_key_on_the_identity_setting_refuses_startup() {
+        #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+        struct OnIdentity(String);
+        impl core::fmt::Display for OnIdentity {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl connetto_core::auth::CapabilityKey for OnIdentity {
+            const SETTING: &'static str = connetto_core::auth::DEFAULT_USER_SETTING;
+        }
+
+        let refused = Translated::of::<OnIdentity, connetto_core::bots::TextIds>(
+            connetto_schema::Documents::new(
+                "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT);",
+                "",
+                "CREATE ROLE app_reader LOGIN;",
+                "app_reader",
+            ),
+            true,
+        );
+        assert!(matches!(refused, Err(super::SetupError::Catalog(_))));
+        assert!(crate::CallerMappings::of::<OnIdentity>("app_reader").is_err());
+    }
+
     /// A share written as a row of a join table, whose facts travel as a query
     /// to re-run.
     ///

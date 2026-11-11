@@ -1315,6 +1315,15 @@ pub(super) async fn run_server_exit_output(
     reader_url: Option<&str>,
     extra_envs: &[(&str, &str)],
 ) -> std::process::Output {
+    let mut command = refusal_command(database_url, reader_url);
+    for (k, v) in extra_envs {
+        command.env(k, v);
+    }
+    exit_output(command).await
+}
+
+/// The server command every startup-refusal test starts from.
+fn refusal_command(database_url: &str, reader_url: Option<&str>) -> Command {
     let bind = format!("127.0.0.1:{}", free_port());
     let mut command = Command::new(server_bin());
     command
@@ -1337,9 +1346,11 @@ pub(super) async fn run_server_exit_output(
     } else {
         command.env_remove("CONNETTO_READER_URL");
     }
-    for (k, v) in extra_envs {
-        command.env(k, v);
-    }
+    command
+}
+
+/// Run `command` to its exit, bounded by 30 s, and return its output.
+async fn exit_output(mut command: Command) -> std::process::Output {
     let child = command.spawn().expect("spawn server for refusal test");
     tokio::time::timeout(
         Duration::from_secs(30),
@@ -1349,6 +1360,55 @@ pub(super) async fn run_server_exit_output(
     .expect("server refusal timed out after 30 s")
     .expect("spawn_blocking task panicked")
     .expect("wait_with_output failed")
+}
+
+/// A server started without its roles document or its reader role refuses
+/// the boot naming the missing setting.
+#[tokio::test]
+async fn e2e_startup_refuses_without_the_roles_document_or_reader_role() {
+    for missing in ["CONNETTO_PG_ROLES", "CONNETTO_READER_ROLE"] {
+        let mut command = refusal_command(
+            "postgres://nobody@127.0.0.1:9/none",
+            Some("postgres://nobody@127.0.0.1:9/none"),
+        );
+        command
+            .env("CONNETTO_AUTH", "database")
+            .env_remove(missing)
+            .env_remove(format!("{missing}_FILE"));
+        let output = exit_output(command).await;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(missing),
+            "a server without {missing} refuses naming it, got: {stderr}"
+        );
+    }
+}
+
+/// A client started without the roles document or the reader role refuses
+/// naming the missing setting, before it dials anything.
+#[tokio::test]
+async fn e2e_client_refuses_without_the_roles_document_or_reader_role() {
+    for missing in ["CONNETTO_ROLES_SQL", "CONNETTO_READER_ROLE"] {
+        let mut command = Command::new(client_bin());
+        command
+            .env("CONNETTO_QUERY", "SELECT * FROM orders")
+            .env("CONNETTO_SCHEMA_SQL", PG_DDL)
+            .env("CONNETTO_ROLES_SQL", connetto_test_harness::FIXTURE_ROLES)
+            .env(
+                "CONNETTO_READER_ROLE",
+                connetto_test_harness::FIXTURE_READER,
+            )
+            .env_remove(missing)
+            .env_remove(format!("{missing}_FILE"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let output = exit_output(command).await;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(missing),
+            "a client without {missing} refuses naming it, got: {stderr}"
+        );
+    }
 }
 
 #[tokio::test]
