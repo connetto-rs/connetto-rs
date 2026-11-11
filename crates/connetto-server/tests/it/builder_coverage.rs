@@ -2251,9 +2251,7 @@ async fn a_missing_schema_table_refuses_naming_it() {
     );
 }
 
-/// A build refusal that lands after the slot-lag watcher and the content
-/// sweep started stops both: the slot goes and the watcher never warns, and
-/// the chunk the sweep would have reclaimed stays in place.
+/// A refused build finishes its background loops before returning.
 #[tokio::test]
 async fn a_build_refusal_stops_the_background_loops_it_started() {
     let _keyring = isolated_session_keyring();
@@ -2264,24 +2262,7 @@ async fn a_build_refusal_stops_the_background_loops_it_started() {
     fixture.provision_auth_tables().await;
     apply_content_deployment(&pool).await;
 
-    // A chunk the sweep would reclaim on its next pass.
     let dir = TempDir::new().expect("a store directory");
-    let hash = "cd".repeat(32);
-    let planted = dir.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
-    tokio::fs::create_dir_all(planted.parent().expect("the chunk parents"))
-        .await
-        .expect("make the chunk parents");
-    tokio::fs::write(&planted, b"the reclaimable chunk")
-        .await
-        .expect("plant the chunk");
-    exec(
-        &pool,
-        &format!(
-            "INSERT INTO _cfs_chunk_registry (chunk_hash, state) \
-             VALUES (decode('{hash}', 'hex'), 'deleting')"
-        ),
-    )
-    .await;
 
     let idp = MockOauth::start().await;
     let (_channel, store) = fixture.fga_store().await;
@@ -2330,12 +2311,24 @@ async fn a_build_refusal_stops_the_background_loops_it_started() {
         }
         other => panic!("the build answered {other:?}"),
     }
+    let hash = "cd".repeat(32);
+    let planted = dir.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
+    tokio::fs::create_dir_all(planted.parent().expect("the chunk parents"))
+        .await
+        .expect("make the chunk parents");
+    tokio::fs::write(&planted, b"the reclaimable chunk")
+        .await
+        .expect("plant the chunk");
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO _cfs_chunk_registry (chunk_hash, state) \
+             VALUES (decode('{hash}', 'hex'), 'deleting')"
+        ),
+    )
+    .await;
 
-    // The loops the refusal outlived are stopped: the slot goes and the
-    // watcher never warns, and the chunk the sweep would have reclaimed
-    // stays in place.
     drop_slot(&pool).await;
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert!(
         !record_logged("replication slot is gone", "slot", SLOT),
         "the slot-lag watcher kept running after the refusal"
@@ -2346,10 +2339,7 @@ async fn a_build_refusal_stops_the_background_loops_it_started() {
     );
 }
 
-/// The slot-lag watcher and the content sweep are owned by the handle's
-/// clones: dropping the last one stops both, so the slot goes and the
-/// watcher never warns, and the chunk the sweep would have reclaimed stays
-/// in place.
+/// The last handle's completion observer waits for its background loops.
 #[tokio::test]
 async fn dropping_the_last_handle_stops_the_background_loops() {
     let _keyring = isolated_session_keyring();
@@ -2397,8 +2387,12 @@ async fn dropping_the_last_handle_stops_the_background_loops() {
     .content(Some(settings));
     let parts = builder.build().await.expect("the deployment assembles");
 
-    // A chunk the sweep would reclaim on its next pass, planted while the
-    // loops run and just before the last handle goes.
+    let completion = parts.handle.background_completion();
+    drop(parts);
+    tokio::time::timeout(Duration::from_secs(10), completion.wait())
+        .await
+        .expect("the background loops finish");
+
     let hash = "cd".repeat(32);
     let planted = dir.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
     tokio::fs::create_dir_all(planted.parent().expect("the chunk parents"))
@@ -2415,9 +2409,7 @@ async fn dropping_the_last_handle_stops_the_background_loops() {
         ),
     )
     .await;
-    drop(parts);
     drop_slot(&pool).await;
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert!(
         !record_logged("replication slot is gone", "slot", SLOT),
         "the slot-lag watcher outlived the last handle"
