@@ -3,7 +3,10 @@
 # Usage: run.sh PROBE OUT_DIR
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-docker build -q -t connetto-r71-flatpak "$here" >/dev/null
+if ! log="$(docker build --progress=plain -t connetto-r71-flatpak "$here" 2>&1)"; then
+  printf '%s\n' "$log" >&2
+  exit 1
+fi
 mkdir -p "$2"; chmod 777 "$2"
 # bubblewrap needs user namespaces, which Docker's default profile denies.
 # flatpak install reaches the system bus, so one runs before the tester's session.
