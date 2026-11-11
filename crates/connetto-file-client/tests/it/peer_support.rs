@@ -24,11 +24,12 @@ use tokio::sync::mpsc;
 
 use crate::support::{RecordingHttp, Scripted, attach_content, cold_over, started};
 
-/// A photo table with a thumbnail column, each person reading only their own
-/// rows, which the device, signed in as the suite's tester, curates whole.
+/// A photo table with a thumbnail column and the state column the server's
+/// setter writes, each person reading only their own rows, which the device,
+/// signed in as the suite's tester, curates whole.
 const PHOTO_SCHEMA: &str = "-- connetto:major 1\n \
                             CREATE TABLE photos (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
-                            content_id BYTEA NOT NULL, thumb_id BYTEA); \
+                            content_id BYTEA NOT NULL, thumb_id BYTEA, content_state TEXT); \
                             ALTER TABLE photos ENABLE ROW LEVEL SECURITY;";
 
 const PHOTO_POLICIES: &str = "CREATE POLICY photos_read ON photos FOR SELECT \
@@ -50,6 +51,27 @@ diesel::table! {
         content_id -> Binary,
         /// The photo's thumbnail, a file of its own.
         thumb_id -> Nullable<Binary>,
+        /// What the server holds of the file, written by its setter.
+        content_state -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    /// connetto's record of each peer author's last verified offer, whose
+    /// certificate end the custody proofs move into the past.
+    _connetto_peer_cursor (author) {
+        /// The author's key id.
+        author -> Binary,
+        /// The author's account.
+        account -> Text,
+        /// The last verified sequence.
+        seq -> BigInt,
+        /// The chain hash at it.
+        head -> Binary,
+        /// The author's verified offer.
+        offer -> Binary,
+        /// The author's certificate end, in Unix seconds.
+        expires_at -> BigInt,
     }
 }
 
@@ -161,6 +183,77 @@ pub async fn declare(
         .await
         .expect("declare the content column");
     (client, content)
+}
+
+/// `device` with `photos.content_id` declared and replicated to three
+/// copies, acknowledged by `photos.content_state`.
+pub async fn declare_replicated(
+    (client, content): (ConnettoClient<Scripted>, Device),
+) -> (ConnettoClient<Scripted>, Device) {
+    let content = content
+        .with_peer_content("photos", "content_id")
+        .replicate(3, "content_state")
+        .await
+        .expect("declare the replicated column");
+    (client, content)
+}
+
+/// Writes `state` into photo `id`'s state column, as the server's setter's
+/// change arriving through sync would.
+pub async fn set_state(client: &ConnettoClient<Scripted>, id: i64, state: &str) {
+    let state = state.to_owned();
+    client
+        .with_conn(move |conn| {
+            diesel::update(photos::table.filter(photos::id.eq(id)))
+                .set(photos::content_state.eq(state))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("write the state");
+}
+
+/// Records that `author`'s certificate ended an hour ago, as a cursor stored
+/// from its last offer would say.
+pub async fn lapse(client: &ConnettoClient<Scripted>, author: &PeerAuthor) {
+    let author = author.clone();
+    client
+        .with_conn(move |conn| {
+            let expired = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_secs()
+                - 3600;
+            diesel::replace_into(_connetto_peer_cursor::table)
+                .values((
+                    _connetto_peer_cursor::author.eq(author.key_id),
+                    _connetto_peer_cursor::account.eq(author.account),
+                    _connetto_peer_cursor::seq.eq(1),
+                    _connetto_peer_cursor::head.eq(vec![0; 32]),
+                    _connetto_peer_cursor::offer.eq(Vec::<u8>::new()),
+                    _connetto_peer_cursor::expires_at
+                        .eq(i64::try_from(expired).expect("a Unix time fits")),
+                ))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("store the lapsed cursor");
+}
+
+/// Every media message a bare node receives, as it arrives.
+pub fn listener(mut events: mpsc::UnboundedReceiver<PeerEvent>) -> mpsc::UnboundedReceiver<Media> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let PeerEvent::Media { message, .. } = event
+                && tx.send(message).is_err()
+            {
+                return;
+            }
+        }
+    });
+    rx
 }
 
 /// Stages `bytes` as photo `id` owned by `owner`.
@@ -388,7 +481,7 @@ pub fn fetches(asked: &Mutex<Vec<Media>>) -> Vec<(u64, u64)> {
 /// The photo table on an author's plain replica, the columns the policy
 /// table has.
 const PLAIN_PHOTOS: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
-                            content_id BLOB NOT NULL, thumb_id BLOB)";
+                            content_id BLOB NOT NULL, thumb_id BLOB, content_state TEXT)";
 
 /// One captured queue entry's body.
 #[derive(QueryableByName)]

@@ -1482,8 +1482,11 @@ dependencies = [
  "futures-util",
  "iroh-io",
  "js-sys",
+ "objc2",
+ "objc2-foundation",
  "parking_lot",
  "reqwest 0.12.28",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1495,6 +1498,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

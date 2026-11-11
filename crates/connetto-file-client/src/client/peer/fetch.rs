@@ -11,12 +11,15 @@ use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::traits::Transport;
 use connetto_exchange::media::Priority;
 use connetto_file_core::{
-    ChunkHash, ChunkMeta, ChunkStore, FileId, Manifest, MaybeSend, decode_range, outboard_of,
+    ChunkHash, ChunkMeta, ChunkStore, FileId, FreeSpace, Manifest, MaybeSend, decode_range,
+    outboard_of,
 };
 use iroh_io::AsyncStreamReader;
 use tokio::sync::{mpsc, oneshot};
 
 use super::super::{ContentClient, ContentEvent, FETCHED_CLASS};
+use super::custody;
+use crate::db;
 use crate::error::ContentError;
 use crate::http::ContentHttp;
 
@@ -182,7 +185,7 @@ impl<T, B, H> ContentClient<T, B, H>
 where
     T: Transport + MaybeSend + 'static,
     T::Error: Display,
-    B: ChunkStore + Clone + Sync + MaybeSend + 'static,
+    B: ChunkStore + FreeSpace + Clone + Sync + MaybeSend + 'static,
     H: ContentHttp,
 {
     /// The file's provisional authors, by key id, in the order their rows
@@ -299,9 +302,15 @@ where
         }
     }
 
-    /// Commits a peer-fetched file as cache once every chunk is in the store,
-    /// `false` when a chunk went missing before the commit could hold them.
-    pub(super) async fn commit_fetched(&self, manifest: &Manifest) -> Result<bool, ContentError> {
+    /// Commits a peer-fetched file once every chunk is in the store, `false`
+    /// when a chunk went missing before the commit could hold them. A file a
+    /// replicated column of a provisional row names enters custody when it
+    /// fits in the room `budget` leaves, and is cache otherwise.
+    pub(super) async fn commit_fetched(
+        &self,
+        manifest: &Manifest,
+        budget: u64,
+    ) -> Result<bool, ContentError> {
         let _writing = self.content_writes.lock().await;
         let store = self.store_for(FETCHED_CLASS);
         for chunk in manifest.chunks() {
@@ -317,11 +326,38 @@ where
             .await
             .map_err(|err| ContentError::Store(err.to_string()))?;
         let outboard = self.store_outboard(&outboard).await?;
-        self.commit_cached(manifest, outboard).await?;
+        let custody = self.custody_author(manifest, budget).await?;
+        self.commit_cached(manifest, outboard, custody.as_deref())
+            .await?;
+        if custody.is_some() {
+            self.custody_changed.notify_one();
+        }
         let _ = self.events.send(ContentEvent::Fetched {
             file_id: manifest.file_id(),
         });
         Ok(true)
+    }
+
+    /// The courierable author of a provisional row whose replicated column
+    /// names `manifest`'s file, when the file fits in the room `budget`
+    /// leaves.
+    async fn custody_author(
+        &self,
+        manifest: &Manifest,
+        budget: u64,
+    ) -> Result<Option<Vec<u8>>, ContentError> {
+        let declared = &self.peer_content;
+        let file_id = manifest.file_id();
+        let (author, held) = self
+            .client
+            .with_conn(|conn| -> Result<_, ContentError> {
+                let named = custody::named(conn, declared, &mut custody::Reach::default())?;
+                let author = named.author_of(file_id).map(<[u8]>::to_vec);
+                Ok((author, db::custody_bytes(conn.conn())?))
+            })
+            .await??;
+        let size: u64 = manifest.chunks().iter().map(|chunk| chunk.len).sum();
+        Ok(author.filter(|_| size <= self.room(budget, held)))
     }
 }
 

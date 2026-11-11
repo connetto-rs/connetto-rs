@@ -127,6 +127,15 @@ pub enum ContentError {
         /// The column the declaration named.
         column: String,
     },
+    /// A replicated peer content column asked for no copies.
+    #[cfg(feature = "peer")]
+    #[error("peer content column {table}.{column} is replicated to no copies")]
+    NoCopies {
+        /// The table the declaration named.
+        table: String,
+        /// The column the declaration named.
+        column: String,
+    },
 }
 
 /// Why a staged commit did not land, keeping the row's refusal distinguishable
@@ -180,7 +189,9 @@ impl ContentError {
             | Self::PinColumnMissing { .. }
             | Self::HealColumnMissing { .. } => AttemptOutcome::Refused,
             #[cfg(feature = "peer")]
-            Self::PeerContentColumnMissing { .. } => AttemptOutcome::Refused,
+            Self::PeerContentColumnMissing { .. } | Self::NoCopies { .. } => {
+                AttemptOutcome::Refused
+            }
             Self::Http { .. }
             | Self::Replica(_)
             | Self::Client(_)

@@ -9989,6 +9989,20 @@ where
         provisional::provisional_blobs(&mut self.db, backing.schema, &physical, column)
     }
 
+    /// Whether the certificate `author`'s cursor last carried ended
+    /// [`DEVICE_SKEW`](connetto_core::clock::DEVICE_SKEW) or more before now,
+    /// so its provisional rows can no longer reach the server through a
+    /// courier (R79 decision 15). An author this replica holds no cursor for
+    /// is not known to have lapsed.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the cursor or the clock cannot be read.
+    #[cfg(feature = "peer")]
+    pub fn courier_lapsed(&mut self, author: &[u8]) -> Result<bool, ClientError> {
+        exchange::courier_lapsed(&mut self.db, author)
+    }
+
     /// Whether `requester`, a linked peer, reads a row of `table` whose
     /// `column` names `value`, judged through the policy views with the
     /// requester's account, `NULL` subjects and the bot list its certificate
