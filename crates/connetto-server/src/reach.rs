@@ -352,8 +352,8 @@ mod tests {
             connetto_schema::Documents::new(
                 shape.0,
                 shape.1,
-                "CREATE ROLE app_reader LOGIN;",
-                "app_reader",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
             ),
             true,
         )
@@ -372,8 +372,8 @@ mod tests {
             connetto_schema::Documents::new(
                 CROSS_TABLE.0,
                 CROSS_TABLE.1,
-                "CREATE ROLE app_reader LOGIN;",
-                "app_reader",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
             ),
             true,
         )
