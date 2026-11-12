@@ -16,7 +16,7 @@
 //! then `chromedriver` on PATH, then the wasm-pack cache at
 //! `~/.cache/.wasm-pack/`.
 //!
-//! ChromeDriver and browser logs are written to `target/passkey-gate/`.
+//! ChromeDriver, browser and streaming network logs are written to `target/passkey-gate/`.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -25,7 +25,7 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use std::{
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
@@ -99,8 +99,8 @@ struct WebDriver {
 }
 
 impl WebDriver {
-    /// Create a headless Chrome session. `chromedriver_url` is already running.
-    async fn new(chromedriver_url: &str) -> Result<Self> {
+    /// Creates a headless Chrome session through the running driver.
+    async fn new(chromedriver_url: &str, diagnostics: &Path) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -117,12 +117,9 @@ impl WebDriver {
                             "--disable-dev-shm-usage",
                             "--disable-gpu",
                             "--enable-logging",
-                            // No --user-data-dir: chromedriver mints a fresh
-                            // temporary profile per session and removes it
-                            // afterwards, which is what "empty IndexedDB every
-                            // run" needs. A fixed path is the opposite, and a
-                            // profile left locked by an earlier run makes
-                            // Chrome exit at startup.
+                            format!("--log-net-log={}", diagnostics.join("network.jsonl").display()),
+                            "--net-log-file-format=ndjson",
+                            // ChromeDriver's fresh profile isolates IndexedDB between runs.
                             "--disable-search-engine-choice-screen"
                         ]
                     }
@@ -307,6 +304,7 @@ async fn start_file_server(port: u16) -> Result<()> {
 struct ChromeDriver {
     child: Child,
     url: String,
+    diagnostics: PathBuf,
 }
 
 impl ChromeDriver {
@@ -347,7 +345,11 @@ impl ChromeDriver {
             sleep(Duration::from_millis(100)).await;
         }
 
-        Ok(Self { child, url })
+        Ok(Self {
+            child,
+            url,
+            diagnostics,
+        })
     }
 }
 
@@ -383,7 +385,7 @@ async fn passkey_gate_enrol_use_and_lock() -> Result<()> {
     // domain`, and `localhost` is the one exempt name that is also a secure
     // context over plain HTTP.
     let page_url = format!("http://localhost:{page_port}/index.html");
-    let driver = WebDriver::new(&cd.url).await?;
+    let driver = WebDriver::new(&cd.url, &cd.diagnostics).await?;
 
     let auth_id = driver
         .add_authenticator()
