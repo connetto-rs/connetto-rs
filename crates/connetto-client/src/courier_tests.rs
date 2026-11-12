@@ -3251,14 +3251,14 @@ async fn a_number_session_couriers_under_its_number() {
 mod r78_4c {
     use connetto_core::exchange::Verdict;
     use connetto_core::messages::{
-        Challenge, ControlMessage, WriterAnswer, WriterOutcome, WriterRequest,
+        Challenge, ControlMessage, WriterAnswer, WriterOutcome, WriterRef, WriterRequest,
     };
     use connetto_core::{LoopbackTransport, SchemaVersion, loopback};
     use tokio::time::timeout;
 
     use super::*;
     use crate::drain::tests::r78_4c::device_identity;
-    use crate::drain::tests::{handshake_ack, old_version};
+    use crate::drain::tests::{granting, handshake_ack, hold_major_one, old_version, queue, sent};
     use crate::peer;
 
     /// The major 3 bundle hash a build standing at major 3 presents.
@@ -4356,5 +4356,79 @@ mod r78_4c {
             matches!(conn.courier(AUTHOR).await, Err(CourierError::NothingHeld)),
             "the plan it cannot stand names nothing"
         );
+    }
+
+    /// A courier completes beside an unfinished batch drain, with or without the main wire.
+    #[tokio::test]
+    async fn a_courier_completes_beside_a_batch_drain_with_or_without_the_main_wire() {
+        for keep_main in [true, false] {
+            timeout(BOUND, async {
+                let body = real_changeset(2);
+                let (cert, keys) = device_identity().await;
+                let mut conn = replica3();
+                conn.store_device_certificate(&cert)
+                    .await
+                    .expect("store the certificate");
+                hold(
+                    &mut conn,
+                    AUTHOR,
+                    2,
+                    HeldState::CourierOnly,
+                    major(2),
+                    Some(&body),
+                );
+                store_offer(
+                    &mut conn,
+                    AUTHOR,
+                    &offer_with(&[(major(2), version())], Some(2)),
+                );
+                let (mut conn, _main) = attach3(conn, true).await;
+                conn.writer_keys = Some(keys);
+                queue(&mut conn, WriterRef::Device([1; 32]), 3, major(1));
+                queue(&mut conn, WriterRef::Device([1; 32]), 4, major(1));
+                hold_major_one(&mut conn);
+                let (wire, mut drain) = loopback();
+                let timer = conn.drain_timer().expect("the batch owes a dial");
+                let handshake = async {
+                    assert!(matches!(sent(&mut drain).await, Some(ControlMessage::Handshake(_))));
+                    drain.send_control(granting(7)).await.expect("grant the drain writer");
+                };
+                let (attached, ()) = tokio::join!(conn.attach_drain(timer, wire), handshake);
+                attached.expect("attach the batch drain");
+                let wait = conn.courier(AUTHOR).await.expect("courier the held row");
+                let timer = conn.courier_drain_timer().expect("the range owes its own dial");
+                let mut courier = dial_courier_wire(&mut conn, timer, major(2), version()).await;
+                if !keep_main {
+                    conn.wire = None;
+                }
+                let finish = async {
+                    let mut receiver = wait.receiver;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            report = &mut receiver => break report.expect("the call stands").expect("the row settles"),
+                            event = conn.pump_one() => { event.expect("the pump stays connected"); }
+                        }
+                    }
+                };
+                let answer = async {
+                    let range = next_range(&mut courier).await;
+                    assert_eq!(range.rows.iter().map(|row| row.seq).collect::<Vec<_>>(), [2]);
+                    let received = next_body(&mut courier).await;
+                    assert_eq!(received.seq, 2);
+                    deliver_answer(
+                        &mut courier,
+                        &range.request_id,
+                        CourierOutcome::Entries(vec![(2, CourierEntryOutcome::Ruled(Verdict::Applied))]),
+                    )
+                    .await;
+                };
+                let (report, ()) = tokio::join!(finish, answer);
+                assert_eq!(report.settled, [2]);
+                assert!(report.refused.is_empty() && report.kept.is_empty());
+            })
+            .await
+            .expect("the courier completes within the bound");
+        }
     }
 }
