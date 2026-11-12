@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, SyncSchema};
 use connetto_core::traits::Transport;
-use connetto_server::{PgSnapshotSource, RlsAuth, SessionConfig};
+use connetto_server::{LoopbackTransport, PgSnapshotSource, RlsAuth, SessionConfig};
 use connetto_test_harness::{
     Fixture, HarnessAuth, Server, ServerConfig, engine_ddl, pool_for, spawn_server, with_user,
 };
@@ -140,14 +140,15 @@ where
 }
 
 async fn alice(server: &Server) -> ConnettoConnection<impl Transport<Error: core::fmt::Display>> {
-    ClientBuilder::new(
+    let mut conn = ClientBuilder::new(
         SyncSchema::new(schema()),
-        super::support::Once::new(server.attach()),
+        super::support::NeverDial::<LoopbackTransport>::default(),
     )
     .signed_in(super::support::held("alice"))
-    .connect_driven()
-    .await
-    .expect("connect")
+    .open_driven()
+    .expect("open replica");
+    conn.attach(server.attach()).await.expect("connect");
+    conn
 }
 
 /// A left-out nullable column holds the server's value, at the snapshot and

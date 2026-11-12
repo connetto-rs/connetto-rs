@@ -255,21 +255,15 @@ async fn handshake_with(token: &str) -> Result<String, ClientError> {
         .next()
         .unwrap_or(&url)
         .to_owned();
-    let tcp = TcpStream::connect(&authority)
-        .await
-        .expect("the sync endpoint must be up: see this file's header");
-    let transport = WebSocketTransport::connect(&url, tcp)
-        .await
-        .expect("websocket upgrade");
     let data_dir = tempfile::tempdir().expect("a temp data dir");
     // No subscription, so nothing past the handshake is under test, and the
     // replica takes the upstream bundle the server answers with.
     let credential = HeldCredential::new(Grant::new(token.to_owned()), token)
         .expect("a held credential serializes its id");
     let key_store = super::support::key_store(&credential).await;
-    ClientBuilder::new(
+    let mut conn = ClientBuilder::new(
         SyncSchema::new(upstream_bundle()),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(credential)
     .durable(
@@ -277,13 +271,19 @@ async fn handshake_with(token: &str) -> Result<String, ClientError> {
         key_store,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
-    .await
-    .map(|conn| {
-        conn.session_handle()
-            .expect("a connected run has a handle")
-            .to_owned()
-    })
+    .open_driven()
+    .await?;
+    let tcp = TcpStream::connect(&authority)
+        .await
+        .expect("the sync endpoint must be up: see this file's header");
+    let transport = WebSocketTransport::connect(&url, tcp)
+        .await
+        .expect("websocket upgrade");
+    conn.attach(transport).await?;
+    Ok(conn
+        .session_handle()
+        .expect("a connected run has a handle")
+        .to_owned())
 }
 
 #[tokio::test]

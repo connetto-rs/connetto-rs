@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, SyncSchema};
 use connetto_core::traits::Transport;
-use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog, SessionConfig};
+use connetto_server::{
+    LoopbackTransport, PgSnapshotSource, RlsAuth, RuntimeWritableCatalog, SessionConfig,
+};
 use connetto_test_harness::{
     Fixture, HarnessAuth, Server, ServerConfig, engine_ddl, pool_for, spawn_server, with_user,
 };
@@ -167,12 +169,12 @@ async fn a_child_whose_parent_is_invisible_lands_and_uploads() {
     let server = server(&fixture).await;
     let mut alice = ClientBuilder::new(
         SyncSchema::new(schema()),
-        super::support::Once::new(server.attach()),
+        super::support::NeverDial::<LoopbackTransport>::default(),
     )
     .signed_in(super::support::held("alice"))
-    .connect_driven()
-    .await
-    .expect("connect");
+    .open_driven()
+    .expect("open replica");
+    alice.attach(server.attach()).await.expect("connect");
 
     alice
         .subscribe("folders", "SELECT * FROM folders")
