@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use axum::Router;
+use futures_util::FutureExt as _;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowCredentials, AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
@@ -663,26 +664,68 @@ struct BackgroundTask {
     task: Arc<AbortOnDrop>,
 }
 
+type TaskCompletion = futures_util::future::Shared<
+    futures_util::future::Map<tokio::task::JoinHandle<()>, fn(Result<(), tokio::task::JoinError>)>,
+>;
+
+/// Completion of the server's background loops, independent of their owners.
+#[derive(Clone, Default)]
+pub struct BackgroundCompletion {
+    lag_watch: Option<TaskCompletion>,
+    sweep: Option<TaskCompletion>,
+    status: Option<TaskCompletion>,
+    writer_sweep: Option<TaskCompletion>,
+}
+
+impl BackgroundCompletion {
+    /// Wait until all observed tasks and their resources have been dropped.
+    pub async fn wait(&self) {
+        for completion in [
+            &self.lag_watch,
+            &self.sweep,
+            &self.status,
+            &self.writer_sweep,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            completion.clone().await;
+        }
+    }
+}
+
 /// The spawned loop, aborted when the last clone sharing it is dropped.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+struct AbortOnDrop {
+    abort: tokio::task::AbortHandle,
+    completion: TaskCompletion,
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        self.abort.abort();
     }
 }
 
 impl BackgroundTask {
     /// Own one spawned loop, so its stop follows the handle's clones.
     fn new(task: tokio::task::JoinHandle<()>) -> Self {
+        let abort = task.abort_handle();
+        let completion = task
+            .map(drop as fn(Result<(), tokio::task::JoinError>))
+            .shared();
         Self {
-            task: Arc::new(AbortOnDrop(task)),
+            task: Arc::new(AbortOnDrop { abort, completion }),
         }
     }
 
     /// Stop the loop now, idempotent, so an explicit stop and the last drop compose.
     fn stop(&self) {
-        self.task.0.abort();
+        self.task.abort.abort();
+    }
+
+    /// Observe termination without retaining ownership of the running loop.
+    fn completion(&self) -> TaskCompletion {
+        self.task.completion.clone()
     }
 }
 
@@ -829,6 +872,16 @@ impl<D> ServerHandle<D>
 where
     D: ConnettoSchema,
 {
+    /// Observe background-loop termination without keeping the server running.
+    pub fn background_completion(&self) -> BackgroundCompletion {
+        BackgroundCompletion {
+            lag_watch: self.lag_watch.as_ref().map(BackgroundTask::completion),
+            sweep: self.sweep.as_ref().map(BackgroundTask::completion),
+            status: self.status.as_ref().map(BackgroundTask::completion),
+            writer_sweep: Some(self.writer_sweep.completion()),
+        }
+    }
+
     /// Stop the background loops the build started, close every live session
     /// with `ServerShuttingDown` and wait up to [`SHUTDOWN_GRACE`] for their
     /// own close, so the close frame is delivered rather than raced. Returns
@@ -846,6 +899,7 @@ where
         }
         let told = self.manager.shutdown().await;
         await_sessions_drained(&self.manager).await;
+        self.background_completion().wait().await;
         told
     }
 
@@ -1608,11 +1662,24 @@ where
     /// # Errors
     ///
     /// [`BuildError`] when any collaborator refuses.
+    pub async fn build(self) -> Result<ServerParts<D>, BuildError> {
+        let mut completion = BackgroundCompletion::default();
+        let result = self.build_inner(&mut completion).await;
+        if result.is_err() {
+            completion.wait().await;
+        }
+        result
+    }
+
+    /// Assemble while retaining each started task's completion.
     #[expect(
         clippy::too_many_lines,
         reason = "startup reads as one straight deployment, in the order the checks must run"
     )]
-    pub async fn build(self) -> Result<ServerParts<D>, BuildError> {
+    async fn build_inner(
+        self,
+        completion: &mut BackgroundCompletion,
+    ) -> Result<ServerParts<D>, BuildError> {
         let Self {
             database,
             schema,
@@ -1730,6 +1797,7 @@ where
             device_identity.is_some(),
         )
         .await?;
+        completion.lag_watch = lag_watch.as_ref().map(BackgroundTask::completion);
         let reader_pool_size = reader_reserve.total();
         let reader_pool = build_pool(&database.reader_url, reader_pool_size).await?;
         if portability
@@ -1773,6 +1841,7 @@ where
             &schema,
             &publication,
             content,
+            &mut completion.sweep,
         )
         .await?;
         let portability = portability
@@ -2233,6 +2302,7 @@ async fn build_reader_side<D: ConnettoSchema>(
     schema: &ServerSchema,
     publication: &str,
     content: Option<ContentSettings>,
+    completion: &mut Option<TaskCompletion>,
 ) -> Result<ReaderSide, BuildError> {
     let content::FileHalf {
         signer,
@@ -2244,6 +2314,7 @@ async fn build_reader_side<D: ConnettoSchema>(
         &database.owner_url,
         &database.reader_url,
         reader_pool_size,
+        completion,
     )
     .await?;
     let snapshot =
@@ -2750,6 +2821,43 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use tower::{Layer, ServiceExt};
+
+    #[tokio::test]
+    async fn completion_observers_do_not_own_background_tasks() {
+        use futures_util::FutureExt as _;
+
+        for cancel in [false, true] {
+            let (held, mut released) = tokio::sync::oneshot::channel::<()>();
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let (finish, finish_rx) = tokio::sync::oneshot::channel::<()>();
+            let task = BackgroundTask::new(tokio::spawn(async move {
+                let _held = held;
+                started.send(()).expect("the startup observer remains");
+                let _ = finish_rx.await;
+            }));
+            tokio::time::timeout(Duration::from_secs(10), started_rx)
+                .await
+                .expect("the task starts within the bound")
+                .expect("the task started");
+            let completion = task.completion();
+            let owner = task.clone();
+            drop(task);
+            assert!(completion.clone().now_or_never().is_none());
+            if cancel {
+                drop(owner);
+            } else {
+                finish.send(()).expect("the task remains running");
+            }
+            tokio::time::timeout(Duration::from_secs(10), completion.clone())
+                .await
+                .expect("the task finishes");
+            assert_eq!(
+                released.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            );
+            assert_eq!(completion.now_or_never(), Some(()));
+        }
+    }
 
     /// A caller carrying only an identity, which is what these mints exercise.
     fn identified(user_id: &str) -> connetto_core::auth::ContentCaller {
