@@ -1452,6 +1452,7 @@ dependencies = [
 name = "connetto-exchange"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "connetto-core",
  "indexmap 2.14.2",
  "rmp-serde",

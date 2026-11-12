@@ -44,16 +44,23 @@ fn media_messages(request_id: u64) -> [Media; 9] {
             rates: vec![([4; 32], 2_000_000)],
             held: vec![[5; 32], [6; 32]],
             leaving: vec![[6; 32]],
+            number: 0,
+            seen: None,
             last: true,
         },
         Media::Held {
             added: vec![[7; 32]],
             removed: vec![[5; 32]],
+            staying: vec![[6; 32]],
             leaving: vec![],
+            number: 1,
+            seen: Some(0),
         },
         Media::Room {
             room: 0,
             rates: vec![([4; 32], 1_500_000)],
+            number: 2,
+            seen: Some(1),
         },
     ]
 }
@@ -95,12 +102,17 @@ async fn every_media_message_at_its_bounds_encodes_under_the_ceiling() {
             rates: vec![([0xff; 32], u64::MAX); MAX_REPORT_ENTRIES],
             held: entries.clone(),
             leaving: entries.clone(),
+            number: u64::MAX,
+            seen: Some(u64::MAX),
             last: true,
         }),
         PeerFrame::Media(Media::Held {
             added: entries.clone(),
             removed: entries.clone(),
+            staying: vec![[0xfe; 32]; MAX_REPORT_ENTRIES],
             leaving: entries,
+            number: u64::MAX,
+            seen: Some(u64::MAX),
         }),
     ];
     for frame in frames {

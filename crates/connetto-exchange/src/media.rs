@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::FRAME_BOUND;
 use crate::message::{BoundsError, MAX_MANIFEST_ROWS};
 
+pub mod placement;
+
 /// The most encoded bytes one [`Media::Piece`] carries.
 pub const MAX_PIECE_BYTES: usize = 1024 * 1024;
 
@@ -93,7 +95,8 @@ pub enum Media {
         request_id: u64,
     },
     /// One run of a holder's full report, sent when the link comes up, its
-    /// runs replacing the previous report once the last one arrives.
+    /// runs replacing the previous report once the last one arrives. Every
+    /// run counts as one report in the link's numbering.
     Holdings {
         /// The bytes the sender has left for copies held for others.
         room: u64,
@@ -104,17 +107,31 @@ pub enum Media {
         held: Vec<[u8; 32]>,
         /// Held files the sender wants another device to take over.
         leaving: Vec<[u8; 32]>,
+        /// This report's number, from a counter of the sender's that only
+        /// grows while it runs.
+        number: u64,
+        /// The number of the latest report the sender received over this
+        /// link, `None` before the first.
+        seen: Option<u64>,
         /// Whether this is the report's last run.
         last: bool,
     },
-    /// A change to the sender's custody since its last report.
+    /// A change to the sender's custody since its last report, applied as
+    /// `added` and `removed`, then `staying`, then `leaving`.
     Held {
         /// Files that entered custody.
         added: Vec<[u8; 32]>,
         /// Files that left custody.
         removed: Vec<[u8; 32]>,
+        /// Held files whose leaving mark the sender withdraws.
+        staying: Vec<[u8; 32]>,
         /// Held files the sender now wants another device to take over.
         leaving: Vec<[u8; 32]>,
+        /// This report's number.
+        number: u64,
+        /// The number of the latest report the sender received over this
+        /// link, `None` before the first.
+        seen: Option<u64>,
     },
     /// The sender's room and rates, replacing the ones it reported before.
     Room {
@@ -123,6 +140,11 @@ pub enum Media {
         /// The sender's measured rate from each linked device, by key id,
         /// in bytes per second.
         rates: Vec<([u8; 32], u64)>,
+        /// This report's number.
+        number: u64,
+        /// The number of the latest report the sender received over this
+        /// link, `None` before the first.
+        seen: Option<u64>,
     },
 }
 
@@ -186,8 +208,9 @@ impl Media {
     /// [`MAX_MANIFEST_ROWS`], [`BoundsError::PieceTooLong`] for a piece above
     /// [`MAX_PIECE_BYTES`], [`BoundsError::RangeOutOfBounds`] for a fetch of
     /// no bytes, of more than [`MAX_FETCH_LEN`], or past the largest offset,
-    /// and [`BoundsError::TooManyEntries`] for a report list above
-    /// [`MAX_REPORT_ENTRIES`].
+    /// [`BoundsError::TooManyEntries`] for a report list above
+    /// [`MAX_REPORT_ENTRIES`], and [`BoundsError::StayingAndLeaving`] for a
+    /// [`Media::Held`] naming one file both staying and leaving.
     pub fn within_bounds(&self) -> Result<(), BoundsError> {
         match self {
             Media::Manifest { chunks, .. } if chunks.len() > MAX_MANIFEST_ROWS => {
@@ -215,12 +238,21 @@ impl Media {
             Media::Held {
                 added,
                 removed,
+                staying,
                 leaving,
-            } if [added.len(), removed.len(), leaving.len()]
-                .into_iter()
-                .any(|len| len > MAX_REPORT_ENTRIES) =>
-            {
-                Err(BoundsError::TooManyEntries)
+                ..
+            } => {
+                if [added.len(), removed.len(), staying.len(), leaving.len()]
+                    .into_iter()
+                    .any(|len| len > MAX_REPORT_ENTRIES)
+                {
+                    return Err(BoundsError::TooManyEntries);
+                }
+                let staying: BTreeSet<&[u8; 32]> = staying.iter().collect();
+                if leaving.iter().any(|file| staying.contains(file)) {
+                    return Err(BoundsError::StayingAndLeaving);
+                }
+                Ok(())
             }
             Media::Room { rates, .. } if rates.len() > MAX_REPORT_ENTRIES => {
                 Err(BoundsError::TooManyEntries)
@@ -277,6 +309,7 @@ pub struct Report {
     rates: BTreeMap<[u8; 32], u64>,
     held: BTreeSet<[u8; 32]>,
     leaving: BTreeSet<[u8; 32]>,
+    seen: Option<u64>,
 }
 
 impl Report {
@@ -291,6 +324,20 @@ impl Report {
     #[must_use]
     pub fn rate_to(&self, key: &[u8; 32]) -> Option<u64> {
         self.rates.get(key).copied()
+    }
+
+    /// The peer's measured rate from each device it fetched from, by key id.
+    #[must_use]
+    pub fn rates(&self) -> &BTreeMap<[u8; 32], u64> {
+        &self.rates
+    }
+
+    /// The number of the latest report of this device's the peer had
+    /// received when it sent the latest report folded in here, `None` before
+    /// it received any.
+    #[must_use]
+    pub fn seen(&self) -> Option<u64> {
+        self.seen
     }
 
     /// Whether the peer holds `file` in custody.
@@ -310,11 +357,19 @@ impl Report {
         self.rates = rates.into_iter().collect();
     }
 
-    fn change(&mut self, added: Vec<[u8; 32]>, removed: &[[u8; 32]], leaving: Vec<[u8; 32]>) {
+    fn change(
+        &mut self,
+        added: Vec<[u8; 32]>,
+        removed: &[[u8; 32]],
+        staying: &[[u8; 32]],
+        leaving: Vec<[u8; 32]>,
+    ) {
         self.held.extend(added);
+        for file in removed.iter().chain(staying) {
+            self.leaving.remove(file);
+        }
         for file in removed {
             self.held.remove(file);
-            self.leaving.remove(file);
         }
         self.leaving
             .extend(leaving.into_iter().filter(|file| self.held.contains(file)));
@@ -412,6 +467,12 @@ pub enum MediaAction<P, T> {
     Reported {
         /// The reporting peer.
         peer: P,
+        /// The files the change newly marks leaving.
+        marked: Vec<[u8; 32]>,
+        /// Whether the report opens a full report from a peer that had
+        /// reported over this link before yet has received nothing, a peer
+        /// whose driver started again, which wants a full report back.
+        restarted: bool,
     },
 }
 
@@ -441,6 +502,12 @@ struct Link<T> {
     report: Option<Report>,
     /// A report whose last run has not arrived yet.
     incoming: Option<Report>,
+    /// The number of the latest report received from the peer over this
+    /// link.
+    latest: Option<u64>,
+    /// Whether the full report arriving comes from a peer whose driver
+    /// started again.
+    restarted: bool,
 }
 
 /// The media side of every link of one device, generic over the peer
@@ -486,6 +553,8 @@ impl<P: Clone + Eq + Hash, T: Clone> MediaLinks<P, T> {
                 serving: None,
                 report: None,
                 incoming: None,
+                latest: None,
+                restarted: false,
             },
         );
     }
@@ -583,11 +652,27 @@ impl<P: Clone + Eq + Hash, T: Clone> MediaLinks<P, T> {
             return Vec::new();
         };
         let Some(request_id) = message.request_id() else {
-            return if Self::take_report(link, message) {
-                vec![MediaAction::Reported { peer: peer.clone() }]
-            } else {
-                Vec::new()
+            let (number, restarted) = match &message {
+                Media::Holdings { number, seen, .. } => (
+                    *number,
+                    seen.is_none() && link.incoming.is_none() && link.latest.is_some(),
+                ),
+                Media::Held { number, .. } | Media::Room { number, .. } => (*number, false),
+                _ => return Vec::new(),
             };
+            link.latest = Some(number);
+            if restarted {
+                link.report = None;
+                link.restarted = true;
+            }
+            return Self::take_report(link, message)
+                .map(|marked| MediaAction::Reported {
+                    peer: peer.clone(),
+                    marked,
+                    restarted: core::mem::take(&mut link.restarted),
+                })
+                .into_iter()
+                .collect();
         };
         if let Some(ask) = message.ask() {
             if link.serving.is_some() || serving >= MAX_SERVING {
@@ -653,6 +738,39 @@ impl<P: Clone + Eq + Hash, T: Clone> MediaLinks<P, T> {
         }]
     }
 
+    /// Stamps `report`, a holder report to `peer`, with `number` and with
+    /// the number of the latest report received from `peer` over this link,
+    /// `false` for a peer not linked or a message that is no report. The
+    /// caller numbers its reports from a counter that only grows, and sends
+    /// them in the order numbered.
+    pub fn stamp(&mut self, peer: &P, report: &mut Media, number: u64) -> bool {
+        let Some(link) = self.peers.get(peer) else {
+            return false;
+        };
+        match report {
+            Media::Holdings {
+                number: stamped,
+                seen,
+                ..
+            }
+            | Media::Held {
+                number: stamped,
+                seen,
+                ..
+            }
+            | Media::Room {
+                number: stamped,
+                seen,
+                ..
+            } => {
+                *stamped = number;
+                *seen = link.latest;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// `peer`'s last complete report, `None` before its first.
     #[must_use]
     pub fn report(&self, peer: &P) -> Option<&Report> {
@@ -678,59 +796,74 @@ impl<P: Clone + Eq + Hash, T: Clone> MediaLinks<P, T> {
         Some(rate.round() as u64)
     }
 
-    /// Fold a holder report into `link`, answering whether its complete
-    /// report changed.
-    fn take_report(link: &mut Link<T>, message: Media) -> bool {
+    /// Fold a holder report into `link`, answering the files it newly marks
+    /// leaving when its complete report changed, `None` otherwise.
+    fn take_report(link: &mut Link<T>, message: Media) -> Option<Vec<[u8; 32]>> {
+        let before = link.report.as_ref().map(|report| report.leaving.clone());
         match message {
             Media::Holdings {
                 room,
                 rates,
                 held,
                 leaving,
+                seen,
                 last,
+                ..
             } => {
                 let incoming = link.incoming.get_or_insert_with(Report::default);
                 incoming.room = room;
                 incoming.rates.extend(rates);
                 incoming.held.extend(held);
                 incoming.leaving.extend(leaving);
+                incoming.seen = seen;
                 if !last {
-                    return false;
+                    return None;
                 }
                 let mut report = link.incoming.take().unwrap_or_default();
                 let held = &report.held;
                 report.leaving.retain(|file| held.contains(file));
                 link.report = Some(report);
-                true
             }
             Media::Held {
                 added,
                 removed,
+                staying,
                 leaving,
+                seen,
+                ..
             } => {
                 if let Some(incoming) = link.incoming.as_mut() {
-                    incoming.change(added, &removed, leaving);
-                    false
-                } else if let Some(report) = link.report.as_mut() {
-                    report.change(added, &removed, leaving);
-                    true
-                } else {
-                    false
+                    incoming.change(added, &removed, &staying, leaving);
+                    incoming.seen = seen;
+                    return None;
                 }
+                let report = link.report.as_mut()?;
+                report.change(added, &removed, &staying, leaving);
+                report.seen = seen;
             }
-            Media::Room { room, rates } => {
+            Media::Room {
+                room, rates, seen, ..
+            } => {
                 if let Some(incoming) = link.incoming.as_mut() {
                     incoming.replace_room(room, rates);
-                    false
-                } else if let Some(report) = link.report.as_mut() {
-                    report.replace_room(room, rates);
-                    true
-                } else {
-                    false
+                    incoming.seen = seen;
+                    return None;
                 }
+                let report = link.report.as_mut()?;
+                report.replace_room(room, rates);
+                report.seen = seen;
             }
-            _ => false,
+            _ => return None,
         }
+        let report = link.report.as_ref()?;
+        Some(
+            report
+                .leaving
+                .iter()
+                .filter(|file| before.as_ref().is_none_or(|before| !before.contains(*file)))
+                .copied()
+                .collect(),
+        )
     }
 
     /// The driver finished streaming `request_id` to `peer`. A stale id

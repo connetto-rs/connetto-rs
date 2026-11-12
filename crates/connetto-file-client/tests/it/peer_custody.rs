@@ -77,9 +77,22 @@ async fn next(inbox: &mut mpsc::UnboundedReceiver<Media>) -> Media {
             .expect("a report arrives")
             .expect("the listener runs");
         if !matches!(message, Media::Room { .. }) {
-            return message;
+            return unseen(message);
         }
     }
+}
+
+/// `report` with its number and `seen` cleared, since the tests compare
+/// what a report says of custody and the driver numbers its reports itself.
+fn unseen(mut report: Media) -> Media {
+    if let Media::Holdings { number, seen, .. }
+    | Media::Held { number, seen, .. }
+    | Media::Room { number, seen, .. } = &mut report
+    {
+        *number = 0;
+        *seen = None;
+    }
+    report
 }
 
 /// A receiver that applied anna's provisional photo row, row 7 naming a file
@@ -180,7 +193,10 @@ fn held_change(added: Vec<[u8; 32]>, removed: Vec<[u8; 32]>) -> Media {
     Media::Held {
         added,
         removed,
+        staying: Vec::new(),
         leaving: Vec::new(),
+        number: 0,
+        seen: None,
     }
 }
 

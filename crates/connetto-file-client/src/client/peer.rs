@@ -321,12 +321,16 @@ where
             .min(free.saturating_sub(self.custody_reserve))
     }
 
-    /// The files in custody and the bytes they take, nothing when the
+    /// The copies in custody and the bytes they take, nothing when the
     /// bookkeeping cannot be read.
-    async fn custody_held(&self) -> (Vec<FileId>, u64) {
+    async fn custody_held(&self) -> (Vec<CustodyCopy>, u64) {
         self.client
             .with_conn(|conn| -> Result<_, ContentError> {
-                Ok((db::custody(conn.conn())?, db::custody_bytes(conn.conn())?))
+                let copies = db::custody_states(conn.conn())?
+                    .into_iter()
+                    .map(|(file_id, state)| CustodyCopy { file_id, state })
+                    .collect();
+                Ok((copies, db::custody_bytes(conn.conn())?))
             })
             .await
             .ok()
@@ -585,6 +589,20 @@ where
 /// them.
 type RoomTold = (u64, Vec<([u8; 32], u64)>);
 
+/// One copy this device holds in custody.
+struct CustodyCopy {
+    file_id: FileId,
+    /// [`db::HELD`], or a state marking it leaving.
+    state: String,
+}
+
+impl CustodyCopy {
+    /// Whether the copy is marked leaving, as surplus or under pressure.
+    fn leaving(&self) -> bool {
+        self.state != db::HELD
+    }
+}
+
 /// Whether a client event can move a custody row, an event the broadcast
 /// dropped counting as one. A dropped apply is caught when its author's link
 /// comes up again.
@@ -656,7 +674,7 @@ struct Driver<'c, T: Transport, B: ChunkStore + Clone, H: ContentHttp, F, J> {
     /// whose messages alone the links read.
     link_of: HashMap<DeviceIdentity, u64>,
     /// The custody files each peer was last told of.
-    told: HashMap<DeviceIdentity, HashSet<[u8; 32]>>,
+    told: HashMap<DeviceIdentity, Told>,
     /// The room and rates each peer was last told.
     told_room: HashMap<DeviceIdentity, RoomTold>,
     /// When the room and rates are next checked for a change.
@@ -678,6 +696,15 @@ struct Driver<'c, T: Transport, B: ChunkStore + Clone, H: ContentHttp, F, J> {
     /// A peer whose link just came up, told everything once the fetches its
     /// link wakes went out.
     opening: Option<DeviceIdentity>,
+}
+
+/// What one peer was last told of this device's custody.
+#[derive(Default)]
+struct Told {
+    /// The files told held.
+    held: HashSet<[u8; 32]>,
+    /// The files told leaving.
+    leaving: HashSet<[u8; 32]>,
 }
 
 impl<'c, T, B, H, F, J> Driver<'c, T, B, H, F, J>
@@ -846,15 +873,19 @@ where
             .collect()
     }
 
-    /// The files of `custody` `peer`'s gate admits.
-    async fn admitted(&mut self, peer: &DeviceIdentity, custody: &[FileId]) -> HashSet<[u8; 32]> {
+    /// The files of `custody` `peer`'s gate admits, and those of them marked
+    /// leaving.
+    async fn admitted(&mut self, peer: &DeviceIdentity, custody: &[CustodyCopy]) -> Told {
         let content = self.content;
         let sender = self.sender.clone();
         self.beside_jobs(async move {
-            let mut admitted = HashSet::new();
-            for file_id in custody {
-                if content.admits(&sender, peer, file_id.as_bytes()).await {
-                    admitted.insert(*file_id.as_bytes());
+            let mut admitted = Told::default();
+            for copy in custody {
+                if content.admits(&sender, peer, copy.file_id.as_bytes()).await {
+                    admitted.held.insert(*copy.file_id.as_bytes());
+                    if copy.leaving() {
+                        admitted.leaving.insert(*copy.file_id.as_bytes());
+                    }
                 }
             }
             admitted
@@ -862,8 +893,9 @@ where
         .await
     }
 
-    /// Queues `messages` to `peer` behind its earlier reports, for its live
-    /// link.
+    /// Numbers `messages` for `peer`'s live link and queues them behind its
+    /// earlier reports, recording the number of the report that carries a
+    /// leaving attempt's mark to it.
     fn report(&mut self, peer: &DeviceIdentity, messages: Vec<Media>) {
         let Some(&link) = self.link_of.get(peer) else {
             return;
@@ -875,7 +907,16 @@ where
         if queued.0 != link {
             *queued = (link, Vec::new());
         }
-        queued.1.extend(messages);
+        for mut message in messages {
+            let number = self
+                .content
+                .next_report
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if !self.links.stamp(peer, &mut message, number) {
+                continue;
+            }
+            queued.1.push(message);
+        }
         self.send_reports(peer);
     }
 
@@ -907,61 +948,106 @@ where
         let admitted = self.admitted(peer, &custody).await;
         let room = self.content.room(self.budget, held);
         let rates = self.rates();
-        let files: Vec<[u8; 32]> = admitted.iter().copied().collect();
-        let mut runs: Vec<&[[u8; 32]]> = files.chunks(MAX_REPORT_ENTRIES).collect();
-        if runs.is_empty() {
-            runs.push(&[]);
-        }
-        let last = runs.len() - 1;
-        let messages = runs
-            .into_iter()
-            .enumerate()
-            .map(|(index, run)| Media::Holdings {
-                room,
-                rates: if index == 0 {
-                    rates.clone()
-                } else {
-                    Vec::new()
-                },
-                held: run.to_vec(),
-                leaving: Vec::new(),
-                last: index == last,
+        let files: Vec<[u8; 32]> = admitted.held.iter().copied().collect();
+        let leaving: Vec<[u8; 32]> = admitted.leaving.iter().copied().collect();
+        let runs = files
+            .len()
+            .max(leaving.len())
+            .div_ceil(MAX_REPORT_ENTRIES)
+            .max(1);
+        let messages = (0..runs)
+            .map(|run| {
+                let window = run * MAX_REPORT_ENTRIES..(run + 1) * MAX_REPORT_ENTRIES;
+                Media::Holdings {
+                    room,
+                    rates: if run == 0 { rates.clone() } else { Vec::new() },
+                    held: slice(&files, &window),
+                    leaving: slice(&leaving, &window),
+                    number: 0,
+                    seen: None,
+                    last: run + 1 == runs,
+                }
             })
             .collect();
-        self.report(peer, messages);
         self.told.insert(peer.clone(), admitted);
+        self.report(peer, messages);
         self.told_room.insert(peer.clone(), (room, rates));
         self.room_at.get_or_insert(now + ROOM_EVERY);
     }
 
     /// Custody changed, so every told peer hears what entered and left of
-    /// the files its gate admits.
+    /// the files its gate admits, and which of them were marked leaving or
+    /// had their mark withdrawn.
     async fn custody_changed(&mut self) {
         let content = self.content;
         let (custody, _) = self.beside_jobs(content.custody_held()).await;
-        let mut told = core::mem::take(&mut self.told);
-        for (peer, told_files) in &mut told {
-            let admitted = self.admitted(peer, &custody).await;
-            let added: Vec<[u8; 32]> = admitted.difference(told_files).copied().collect();
-            let removed: Vec<[u8; 32]> = told_files.difference(&admitted).copied().collect();
-            *told_files = admitted;
-            if added.is_empty() && removed.is_empty() {
+        let peers: Vec<DeviceIdentity> = self.told.keys().cloned().collect();
+        for peer in peers {
+            let now = self.admitted(&peer, &custody).await;
+            let Some(was) = self.told.insert(peer.clone(), now) else {
+                continue;
+            };
+            let now = &self.told[&peer];
+            let added: Vec<[u8; 32]> = now.held.difference(&was.held).copied().collect();
+            let removed: Vec<[u8; 32]> = was.held.difference(&now.held).copied().collect();
+            let staying: Vec<[u8; 32]> = was
+                .leaving
+                .intersection(&now.held)
+                .filter(|file| !now.leaving.contains(*file))
+                .copied()
+                .collect();
+            let leaving: Vec<[u8; 32]> = now.leaving.difference(&was.leaving).copied().collect();
+            let longest = [added.len(), removed.len(), staying.len(), leaving.len()]
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+            if longest == 0 {
                 continue;
             }
-            let runs = added.len().max(removed.len()).div_ceil(MAX_REPORT_ENTRIES);
-            let messages = (0..runs)
+            let messages = (0..longest.div_ceil(MAX_REPORT_ENTRIES))
                 .map(|run| {
                     let window = run * MAX_REPORT_ENTRIES..(run + 1) * MAX_REPORT_ENTRIES;
                     Media::Held {
                         added: slice(&added, &window),
                         removed: slice(&removed, &window),
-                        leaving: Vec::new(),
+                        staying: slice(&staying, &window),
+                        leaving: slice(&leaving, &window),
+                        number: 0,
+                        seen: None,
                     }
                 })
                 .collect();
-            self.report(peer, messages);
+            self.report(&peer, messages);
         }
-        self.told = told;
+    }
+
+    /// Answers `peer`, whose report newly marked leaving `marked`, at once
+    /// when this device holds one of them in custody, the custody it tells
+    /// brought up to date first so the answer shows it as it stands.
+    async fn acknowledge(&mut self, peer: &DeviceIdentity, marked: &[[u8; 32]]) {
+        if marked.is_empty() {
+            return;
+        }
+        let content = self.content;
+        let (custody, _) = self.beside_jobs(content.custody_held()).await;
+        if !custody
+            .iter()
+            .any(|copy| marked.contains(copy.file_id.as_bytes()))
+        {
+            return;
+        }
+        self.custody_changed().await;
+        self.report(
+            peer,
+            vec![Media::Held {
+                added: Vec::new(),
+                removed: Vec::new(),
+                staying: Vec::new(),
+                leaving: Vec::new(),
+                number: 0,
+                seen: None,
+            }],
+        );
     }
 
     /// Tells every linked peer the room and rates that changed since it was
@@ -979,7 +1065,15 @@ where
                 continue;
             }
             let (room, rates) = current.clone();
-            self.report(&peer, vec![Media::Room { room, rates }]);
+            self.report(
+                &peer,
+                vec![Media::Room {
+                    room,
+                    rates,
+                    number: 0,
+                    seen: None,
+                }],
+            );
             self.told_room.insert(peer, current.clone());
         }
         self.room_at = Some(now + ROOM_EVERY);
@@ -1081,7 +1175,15 @@ where
                         Vec::new()
                     }
                 }
-                MediaAction::Reported { .. } => {
+                MediaAction::Reported {
+                    peer,
+                    marked,
+                    restarted,
+                } => {
+                    if restarted {
+                        self.holdings(&peer, now).await;
+                    }
+                    self.acknowledge(&peer, &marked).await;
                     self.count_holders().await;
                     Vec::new()
                 }

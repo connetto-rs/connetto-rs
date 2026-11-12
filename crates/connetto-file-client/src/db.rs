@@ -490,7 +490,7 @@ pub(crate) fn all_manifests(conn: &mut SqliteConnection) -> Result<Vec<FileId>, 
 }
 
 /// The state of a copy held in custody and not marked leaving.
-const HELD: &str = "held";
+pub(crate) const HELD: &str = "held";
 
 /// Takes `file_id` into custody for `author`'s row, `None` for a copy a
 /// `lost` state returned. A file already in custody keeps its record.
@@ -535,6 +535,22 @@ pub(crate) fn custody_settled(
         .set(_connetto_content_custody::settled_seen_at.eq(now))
         .execute(conn)
         .map(|_| ())
+}
+
+/// Every custody copy with its state.
+#[cfg(feature = "peer")]
+pub(crate) fn custody_states(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<(FileId, String)>, ContentError> {
+    let rows: Vec<(Vec<u8>, String)> = _connetto_content_custody::table
+        .select((
+            _connetto_content_custody::file_id,
+            _connetto_content_custody::state,
+        ))
+        .load(conn)?;
+    rows.into_iter()
+        .map(|(id, state)| Ok((FileId::from_bytes(exactly_32(&id)?), state)))
+        .collect()
 }
 
 /// Every file this device holds in custody.
