@@ -1308,6 +1308,23 @@ enum ContentWalk {
     Prepare,
 }
 
+impl ContentWalk {
+    async fn wait(
+        state: &mut HubState,
+        events: &mut UnboundedReceiver<HubEvent>,
+        key_timer: Option<connetto_client::ShareKeyTimer>,
+    ) -> Self {
+        tokio::select! {
+            event = events.recv() => Self::Interrupted(event),
+            () = wait_share_keys(key_timer) => Self::Prepare,
+            completion = state.audits.next() => {
+                state.audits.complete(&state.tabs, completion);
+                Self::Prepare
+            }
+        }
+    }
+}
+
 /// Everything one hub task owns: the worker connection, tab state, the notice
 /// channel, the optional content archive and the transport its transfers run
 /// under, the event intake and the content retry schedule.
@@ -1977,14 +1994,7 @@ where
         let key_timer = worker.share_key_timer();
         let mut interrupted = None;
         let cancel = async {
-            interrupted = Some(tokio::select! {
-                event = events.recv() => ContentWalk::Interrupted(event),
-                () = wait_share_keys(key_timer) => ContentWalk::Prepare,
-                completion = state.audits.next() => {
-                    state.audits.complete(&state.tabs, completion);
-                    ContentWalk::Prepare
-                }
-            });
+            interrupted = Some(ContentWalk::wait(state, events, key_timer).await);
         };
         let (start, observed) = content
             .archive()
@@ -2045,14 +2055,7 @@ where
         let key_timer = worker.share_key_timer();
         let mut interrupted = None;
         let cancel = async {
-            interrupted = Some(tokio::select! {
-                event = events.recv() => ContentWalk::Interrupted(event),
-                () = wait_share_keys(key_timer) => ContentWalk::Prepare,
-                completion = state.audits.next() => {
-                    state.audits.complete(&state.tabs, completion);
-                    ContentWalk::Prepare
-                }
-            });
+            interrupted = Some(ContentWalk::wait(state, events, key_timer).await);
         };
         let (start, observed) = content
             .archive()
@@ -2866,7 +2869,7 @@ where
                 )
                 .await?;
                 attempt = if context.worker.is_connected() {
-                    finish_attached_during_recovery(context, upstream).await
+                    resume_during_recovery(context, None, upstream).await
                 } else {
                     recovery_attempt(context, factory, upstream).await?
                 };
@@ -2874,61 +2877,12 @@ where
             RecoveryAttempt::ShareKeys(timer) => {
                 idle_share_key_turn(context, timer).await?;
                 attempt = if context.worker.is_connected() {
-                    finish_attached_during_recovery(context, upstream).await
+                    resume_during_recovery(context, None, upstream).await
                 } else {
                     RecoveryAttempt::Failed
                 };
             }
             RecoveryAttempt::Closed => return Ok(RecoveryCycle::Closed),
-        }
-    }
-}
-
-async fn finish_attached_during_recovery<U>(
-    context: &mut RecoveryContext<'_, U>,
-    upstream: &[(String, SubscriptionSpec)],
-) -> RecoveryAttempt
-where
-    U: Transport + MaybeSend + 'static,
-    U::Error: core::fmt::Display,
-{
-    let key_timer = context.worker.share_key_timer();
-    let key_wait = sleep_or_park(fresh_key_wait_ms(key_timer, context.state.fired_key_timer));
-    let subscriptions = recovery_subscriptions(context.state, upstream);
-    let worker = &mut *context.worker;
-    let state = &mut *context.state;
-    let events = &mut *context.events;
-    let deferred = &mut *context.deferred;
-    let recovery = async {
-        worker.resume_attach().await?;
-        restore_recovery_subscriptions(worker, &subscriptions).await
-    };
-    tokio::pin!(recovery);
-    tokio::pin!(key_wait);
-    loop {
-        tokio::select! {
-            result = &mut recovery => {
-                return match result {
-                    Ok(()) => RecoveryAttempt::Connected,
-                    Err(err) if err.is_build_mismatch() => RecoveryAttempt::Mismatched(err),
-                    Err(err) => {
-                        context.min_wait = retry_after(&err);
-                        RecoveryAttempt::Failed
-                    }
-                };
-            }
-            () = &mut key_wait => return RecoveryAttempt::ShareKeys(key_timer),
-            completion = state.audits.next() => {
-                state.audits.complete(&state.tabs, completion);
-            }
-            event = events.recv() => match event {
-                Some(event) => {
-                    if let Some(local) = attach_during_recovery(state, deferred, event) {
-                        return RecoveryAttempt::Interrupted(local);
-                    }
-                }
-                None => return RecoveryAttempt::Closed,
-            },
         }
     }
 }
@@ -3040,7 +2994,7 @@ where
 {
     match connect_during_recovery(context, factory).await? {
         ConnectAttempt::Connected(transport) => {
-            Ok(resume_during_recovery(context, transport, upstream).await)
+            Ok(resume_during_recovery(context, Some(transport), upstream).await)
         }
         ConnectAttempt::Failed => Ok(RecoveryAttempt::Failed),
         ConnectAttempt::Closed => Ok(RecoveryAttempt::Closed),
@@ -3098,7 +3052,7 @@ where
 
 async fn resume_during_recovery<U>(
     context: &mut RecoveryContext<'_, U>,
-    transport: U,
+    transport: Option<U>,
     upstream: &[(String, SubscriptionSpec)],
 ) -> RecoveryAttempt
 where
@@ -3113,7 +3067,10 @@ where
     let events = &mut *context.events;
     let deferred = &mut *context.deferred;
     let recovery = async {
-        worker.attach(transport).await?;
+        match transport {
+            Some(transport) => worker.attach(transport).await?,
+            None => worker.resume_attach().await?,
+        }
         restore_recovery_subscriptions(worker, &subscriptions).await
     };
     tokio::pin!(recovery);
