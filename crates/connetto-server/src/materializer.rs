@@ -3470,71 +3470,39 @@ mod rows_update_merge_tests {
 #[cfg(test)]
 mod audit_privacy_tests {
     use super::*;
-    use crate::audit::{AuthEvent, ConnettoAuditSchema, MintedKey};
-    use crate::authn::schema::Statement;
+    use crate::audit::ConnettoAuditSchema;
     use crate::defaults::ConnettoAudit;
 
-    struct PrivateAudit;
+    const PRIVATE_DDL: &str = concat!(
+        crate::connetto_audit_ddl!("TEXT", "UUID"),
+        "CREATE TABLE private_receipts (id BIGINT PRIMARY KEY); \
+         CREATE SCHEMA \"Audit.Space\"; \
+         CREATE TABLE \"Audit.Space\".\"Receipt.Log\" (id BIGINT PRIMARY KEY);"
+    );
 
-    impl ConnettoAuditSchema for PrivateAudit {
-        type Id = String;
-        type RowKey = <ConnettoAudit as ConnettoAuditSchema>::RowKey;
-        type Insert = <ConnettoAudit as ConnettoAuditSchema>::Insert;
-        const TABLES: &'static [&'static str] = &[
-            "auth_events",
-            "private_receipts",
-            "\"Audit.Space\".\"Receipt.Log\"",
-        ];
-        const CATALOG_DDL: &'static str = concat!(
-            crate::connetto_audit_ddl!("TEXT", "UUID"),
-            "CREATE TABLE private_receipts (id BIGINT PRIMARY KEY); \
-             CREATE SCHEMA \"Audit.Space\"; \
-             CREATE TABLE \"Audit.Space\".\"Receipt.Log\" (id BIGINT PRIMARY KEY);"
-        );
-        const COURIER_RECEIPT_FILTER_SQL: &'static str =
-            <ConnettoAudit as ConnettoAuditSchema>::COURIER_RECEIPT_FILTER_SQL;
-
-        fn row_key(values: &[PgValue<Postgres>]) -> Option<Self::RowKey> {
-            ConnettoAudit::row_key(values)
-        }
-
-        fn audit_insert(event: AuthEvent<Self::Id>) -> Self::Insert {
-            ConnettoAudit::audit_insert(event)
-        }
-
-        fn minted_by(
-            conn: &mut AsyncPgConnection,
-            sessions: Vec<connetto_core::SessionId>,
-        ) -> Statement<'_, Vec<MintedKey<Self::RowKey>>> {
-            ConnettoAudit::minted_by(conn, sessions)
-        }
-
-        fn courier_receipts<'c>(
-            conn: &'c mut AsyncPgConnection,
-            viewer: &'c Self::Id,
-            writer: i64,
-            sequences: &'c [i64],
-        ) -> Statement<'c, Vec<i64>> {
-            ConnettoAudit::courier_receipts(conn, viewer, writer, sequences)
+    fn private_catalog(ddl: &str) -> MaterializerBuilder {
+        MaterializerBuilder {
+            audit_tables: &[
+                "auth_events",
+                "private_receipts",
+                "\"Audit.Space\".\"Receipt.Log\"",
+            ],
+            ..Materializer::builder(ddl)
         }
     }
 
     #[test]
     fn a_missing_audit_declaration_refuses_catalog_construction() {
-        let result = Materializer::builder(ConnettoAudit::CATALOG_DDL)
-            .with_audit_schema::<PrivateAudit>()
-            .build();
+        let result = private_catalog(ConnettoAudit::CATALOG_DDL).build();
         assert!(matches!(result, Err(MaterializerError::Catalog(_))));
     }
 
     #[test]
     fn audit_names_are_private_in_direct_and_nested_client_queries() {
-        let mut materializer = Materializer::builder(&format!(
+        let mut materializer = private_catalog(&format!(
             "CREATE TABLE docs (id BIGINT PRIMARY KEY); \
-             CREATE TABLE \"Receipt.Log\" (id BIGINT PRIMARY KEY); {}",
-            PrivateAudit::CATALOG_DDL
+             CREATE TABLE \"Receipt.Log\" (id BIGINT PRIMARY KEY); {PRIVATE_DDL}"
         ))
-        .with_audit_schema::<PrivateAudit>()
         .with_write_catalog(RuntimeWritableCatalog::default())
         .with_read_connector(crate::reexec::NoConnector)
         .build()
@@ -3576,6 +3544,17 @@ mod audit_privacy_tests {
         materializer
             .translate_subscription_sql("SELECT * FROM \"Receipt.Log\"")
             .expect("the same leaf in the application schema is public");
+        assert!(
+            materializer
+                .register_sqlite(
+                    2,
+                    "SELECT * FROM catalog.\"Audit.Space\".\"Receipt.Log\"",
+                    &[],
+                    ReadBudget::new(core::time::Duration::from_secs(5)),
+                )
+                .is_err(),
+            "a catalog qualifier cannot expose private audit rows"
+        );
     }
 
     #[test]
