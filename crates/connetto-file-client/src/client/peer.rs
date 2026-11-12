@@ -2,6 +2,7 @@
 //! this device's files to linked peers and fetches files from them, and the
 //! files the retention pass spares for provisional rows (R79).
 
+pub(super) mod custody;
 mod fetch;
 mod serve;
 
@@ -14,8 +15,10 @@ use connetto_client::{ClientEvent, ConnettoConnection};
 use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::traits::Transport;
 use connetto_exchange::MAX_MANIFEST_ROWS;
-use connetto_exchange::media::{Ask, Media, MediaAction, MediaLinks, Priority};
-use connetto_file_core::{ChunkHash, ChunkMeta, ChunkStore, FileId, Manifest, MaybeSend};
+use connetto_exchange::media::{Ask, MAX_REPORT_ENTRIES, Media, MediaAction, MediaLinks, Priority};
+use connetto_file_core::{
+    ChunkHash, ChunkMeta, ChunkStore, FileId, FreeSpace, Manifest, MaybeSend,
+};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use parking_lot::Mutex;
@@ -27,13 +30,21 @@ use fetch::{
     holders_manifest,
 };
 
-use super::ContentClient;
+use super::{ContentClient, ContentEvent};
+use crate::db;
 use crate::error::ContentError;
 use crate::http::ContentHttp;
 use crate::resolve::Resolved;
 
 /// What the links ask the driver, each fetch tagged by its own number.
 type Action = MediaAction<DeviceIdentity, u64>;
+
+/// The free space custody leaves to the device unless the application sets
+/// another reserve (R79 decision 16).
+pub(super) const CUSTODY_RESERVE: u64 = 512 * 1024 * 1024;
+
+/// How often a device reports its room and rates at most (R79 decision 13).
+const ROOM_EVERY: Duration = Duration::from_secs(10);
 
 /// One column declared to hold file ids for the peer links.
 pub(in crate::client) struct PeerColumn {
@@ -44,6 +55,18 @@ pub(in crate::client) struct PeerColumn {
     /// Whether a receiver fetches the files it names unasked, a thumbnail
     /// column.
     pub(super) prefetch: bool,
+    /// The copies linked devices keep of the files it names, `None` for a
+    /// column that is not replicated.
+    pub(super) replicate: Option<Replicate>,
+}
+
+/// How a column's files are replicated (R79 decision 12).
+pub(in crate::client) struct Replicate {
+    /// The devices other than the author that should hold each file.
+    pub(super) copies: u8,
+    /// The column of the same table the server's setter writes `available`
+    /// or `lost` into.
+    pub(super) state: String,
 }
 
 /// A column declaration [`ContentClient::with_peer_content`] starts, recorded
@@ -64,13 +87,31 @@ impl<T: Transport, B: ChunkStore + Clone, H: ContentHttp> PeerContent<T, B, H> {
         self.column.prefetch = true;
         self
     }
+
+    /// Replicates the files the column names to `copies` linked devices
+    /// other than the author, held in custody until `state`, a column of the
+    /// same table, reads `available` (R79 decisions 12 and 15).
+    ///
+    /// A device takes a file it fetched on demand into custody when it fits
+    /// in [`with_custody_budget`](ContentClient::with_custody_budget), keeps
+    /// it while the row is provisional and after it settles until `state`
+    /// reads `available`, drops it when the row is retracted or its author's
+    /// certificate lapsed, and takes a cache copy back when `state` reads
+    /// `lost`. Every build of the application declares the same replication.
+    pub fn replicate(mut self, copies: u8, state: &str) -> Self {
+        self.column.replicate = Some(Replicate {
+            copies,
+            state: state.to_owned(),
+        });
+        self
+    }
 }
 
 impl<T, B, H> IntoFuture for PeerContent<T, B, H>
 where
     T: Transport + MaybeSend + Send + 'static,
     T::Error: Display,
-    B: ChunkStore + Clone + Sync + MaybeSend + 'static,
+    B: ChunkStore + FreeSpace + Clone + Sync + MaybeSend + 'static,
     H: ContentHttp + Send + 'static,
 {
     type Output = Result<ContentClient<T, B, H>, ContentError>;
@@ -82,16 +123,19 @@ where
 }
 
 /// The files a declared column of a row whose peer apply still awaits a
-/// verdict names, which the retention pass keeps (R79 decision 6).
+/// verdict names, which the retention pass keeps (R79 decision 6), leaving
+/// out the rows of an author whose certificate lapsed, which no courier can
+/// carry any more (decision 15).
 ///
 /// # Errors
 ///
-/// [`ContentError::Client`] when the provisional records or a declared
-/// column cannot be read, so the pass evicts nothing rather than a file it
-/// should keep.
+/// [`ContentError::Client`] when the provisional records, a declared column
+/// or an author's cursor cannot be read, so the pass evicts nothing rather
+/// than a file it should keep.
 pub(super) fn provisionally_named<T>(
     conn: &mut ConnettoConnection<T>,
     declared: &[PeerColumn],
+    reach: &mut custody::Reach,
 ) -> Result<HashSet<FileId>, ContentError>
 where
     T: Transport,
@@ -100,7 +144,9 @@ where
     let mut named = HashSet::new();
     for declared in declared {
         for blob in conn.provisional_blobs(&declared.table, &declared.column)? {
-            if let Ok(id) = <[u8; 32]>::try_from(blob.value.as_slice()) {
+            if let Ok(id) = <[u8; 32]>::try_from(blob.value.as_slice())
+                && !reach.lapsed(conn, &blob.author)?
+            {
                 named.insert(FileId::from_bytes(id));
             }
         }
@@ -114,6 +160,11 @@ enum Job {
     Send {
         peer: DeviceIdentity,
         message: Media,
+    },
+    /// Holder reports to one peer, sent in order.
+    Report {
+        peer: DeviceIdentity,
+        messages: Vec<Media>,
     },
     /// The answer to a request the links admitted, until `stop` fires or
     /// drops.
@@ -133,13 +184,21 @@ enum Job {
         chunk: ChunkMeta,
         pieces: mpsc::UnboundedReceiver<Vec<u8>>,
     },
-    /// The commit of a fetch whose chunks are all in.
-    Commit { tag: u64, manifest: Manifest },
+    /// The commit of a fetch whose chunks are all in, taken into custody
+    /// when it fits in `budget`.
+    Commit {
+        tag: u64,
+        manifest: Manifest,
+        budget: u64,
+    },
 }
 
 /// What a job settled.
 enum Done {
     Sent,
+    Reported {
+        peer: DeviceIdentity,
+    },
     Served {
         peer: DeviceIdentity,
         request_id: u64,
@@ -160,7 +219,7 @@ impl<T, B, H> ContentClient<T, B, H>
 where
     T: Transport + MaybeSend + 'static,
     T::Error: Display,
-    B: ChunkStore + Clone + Sync + MaybeSend + 'static,
+    B: ChunkStore + FreeSpace + Clone + Sync + MaybeSend + 'static,
     H: ContentHttp,
 {
     /// Declares `column` of `table` as holding file ids a linked peer may be
@@ -172,12 +231,15 @@ where
     /// file. With nothing declared every request is refused. A fetch asks the
     /// authors of the provisional rows whose declared columns name the file
     /// first. Every build of the application declares the same columns.
-    /// [`PeerContent::prefetch`] marks a thumbnail column.
+    /// [`PeerContent::prefetch`] marks a thumbnail column, and
+    /// [`PeerContent::replicate`] a column whose files linked devices keep
+    /// until the server holds them.
     ///
     /// # Errors
     ///
     /// Awaiting answers [`ContentError::PeerContentColumnMissing`] when the
-    /// replica holds no such table or column.
+    /// replica holds no such table, column or state column, and
+    /// [`ContentError::NoCopies`] for a replication to no copies.
     pub fn with_peer_content(self, table: &str, column: &str) -> PeerContent<T, B, H> {
         PeerContent {
             content: self,
@@ -185,26 +247,116 @@ where
                 table: table.to_owned(),
                 column: column.to_owned(),
                 prefetch: false,
+                replicate: None,
             },
         }
     }
 
     /// Records `declared` once the replica is shown to hold it.
     async fn declare(mut self, declared: PeerColumn) -> Result<Self, ContentError> {
-        let query = format!("SELECT * FROM \"{}\"", declared.table.replace('"', "\"\""));
-        let probe = declared.column.clone();
-        if !self
-            .client
-            .with_conn(move |conn| crate::retain::answers_column(conn.conn(), &query, &probe))
-            .await?
+        if declared
+            .replicate
+            .as_ref()
+            .is_some_and(|replicate| replicate.copies == 0)
         {
-            return Err(ContentError::PeerContentColumnMissing {
+            return Err(ContentError::NoCopies {
                 table: declared.table,
                 column: declared.column,
             });
         }
+        let query = format!("SELECT * FROM \"{}\"", declared.table.replace('"', "\"\""));
+        let mut probes = vec![declared.column.clone()];
+        probes.extend(
+            declared
+                .replicate
+                .as_ref()
+                .map(|replicate| replicate.state.clone()),
+        );
+        let missing = self
+            .client
+            .with_conn(move |conn| {
+                probes
+                    .into_iter()
+                    .find(|probe| !crate::retain::answers_column(conn.conn(), &query, probe))
+            })
+            .await?;
+        if let Some(column) = missing {
+            return Err(ContentError::PeerContentColumnMissing {
+                table: declared.table,
+                column,
+            });
+        }
         self.peer_content.push(declared);
         Ok(self)
+    }
+
+    /// Sets the bytes the copies this device holds for others may take,
+    /// a quarter of the free space measured when the media driver starts
+    /// unless set (R79 decision 16).
+    #[must_use]
+    pub fn with_custody_budget(mut self, bytes: u64) -> Self {
+        self.custody_budget = Some(bytes);
+        self
+    }
+
+    /// Sets the free space custody always leaves to the device, 512 MiB
+    /// unless set (R79 decision 16).
+    #[must_use]
+    pub fn with_custody_reserve(mut self, bytes: u64) -> Self {
+        self.custody_reserve = bytes;
+        self
+    }
+
+    /// The bytes this device has left for copies held for others when
+    /// `held` are taken: what the budget leaves, never eating into the
+    /// reserve.
+    pub(super) fn room(&self, budget: u64, held: u64) -> u64 {
+        let free = self.store.free_bytes().unwrap_or(0);
+        budget
+            .saturating_sub(held)
+            .min(free.saturating_sub(self.custody_reserve))
+    }
+
+    /// The files in custody and the bytes they take, nothing when the
+    /// bookkeeping cannot be read.
+    async fn custody_held(&self) -> (Vec<FileId>, u64) {
+        self.client
+            .with_conn(|conn| -> Result<_, ContentError> {
+                Ok((db::custody(conn.conn())?, db::custody_bytes(conn.conn())?))
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+    }
+
+    /// Runs the custody pass of the C table's rows that need no ranking,
+    /// signalling the reports when custody changed, and answers the earliest
+    /// Unix second a custody author lapses, `None` when the pass could not
+    /// run or no custody copy waits on a courierable author.
+    async fn custody_refresh(&self) -> Option<i64> {
+        let declared = &self.peer_content;
+        let refreshed = self
+            .client
+            .with_conn(|conn| -> Result<_, ContentError> {
+                let named = custody::named(conn, declared, &mut custody::Reach::default())?;
+                let now = custody::unix_now();
+                let changed = conn
+                    .transact_with_bookkeeping(
+                        |c| custody::pass(c, declared, &named, now, &mut HashSet::new()),
+                        |_| Ok::<(), ContentError>(()),
+                    )
+                    .map(|(changed, ())| changed)?;
+                Ok((changed, custody::next_lapse(conn, declared)?))
+            })
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let (changed, lapse) = refreshed?;
+        if changed {
+            self.custody_changed.notify_one();
+        }
+        lapse
     }
 
     /// The media driver. It answers every linked peer's `Want` with the
@@ -215,6 +367,20 @@ where
     /// files a [`prefetch`](PeerContent::prefetch) column names on an author's
     /// provisional rows from that author, when its entry applies and when its
     /// link comes up.
+    ///
+    /// It also reports to every linked peer the files it holds in custody
+    /// that the peer's gate admits, its room and its measured rates, in full
+    /// when the link comes up, as a change whenever custody changes, and its
+    /// room and rates at most every 10 seconds when they changed, and raises
+    /// [`ContentEvent::Replicated`] when the number of linked devices
+    /// holding one of its own unsent replicated files changes.
+    ///
+    /// It runs the custody half of [`tidy_content`](Self::tidy_content) at
+    /// its start, on every sync change, on every peer row a server write
+    /// confirms, a verdict or frontier settles or a retraction removes, and
+    /// when a custody copy's author lapses, so a copy leaves custody once its
+    /// state column reads `available` and a cache copy returns on `lost`
+    /// without the application calling anything.
     ///
     /// A peer is served one request at a time and at most two peers at once,
     /// and a request beyond that is answered `Busy`. A stream stops when its
@@ -230,15 +396,35 @@ where
         let _orders = OrdersOpen::open(&self.peer_orders, orders_tx);
         let mut applied = self.client.events();
         let mut applies_open = true;
-        let mut driver = Driver::new(self);
+        let budget = self
+            .custody_budget
+            .unwrap_or_else(|| self.store.free_bytes().unwrap_or(0) / 4);
+        let jobs_sender = sender.clone();
+        let mut driver = Driver::new(self, sender.clone(), budget, move |job| {
+            self.run_job(jobs_sender.clone(), job)
+        });
+        let lapse = driver.beside_jobs(self.custody_refresh()).await;
+        driver.lapse_at = lapse.map(wake_at);
         let mut actions = Vec::new();
         for (peer, _) in sender.linked() {
             driver.links.linked(&peer);
+            driver.holdings(&peer, Instant::now()).await;
             actions.extend(driver.prefetch(peer.key().as_bytes(), Instant::now()).await);
         }
         driver.act(actions, Instant::now()).await;
-        let mut jobs = FuturesUnordered::new();
         loop {
+            driver.launch();
+            if let Some(done) = driver.finished.pop_front() {
+                let actions = driver.done(done, Instant::now()).await;
+                driver.act(actions, Instant::now()).await;
+                continue;
+            }
+            if driver.custody_due && applied.is_empty() {
+                driver.custody_due = false;
+                let lapse = driver.beside_jobs(self.custody_refresh()).await;
+                driver.lapse_at = lapse.map(wake_at);
+                continue;
+            }
             let wake = driver.next_wake();
             let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(
                 wake.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)),
@@ -251,11 +437,12 @@ where
                             driver.end();
                             return;
                         }
-                        Some(MediaEvent::Linked { peer, .. }) => {
-                            driver.linked(&peer, now);
-                            driver.prefetch(peer.key().as_bytes(), now).await
+                        Some(MediaEvent::Linked { peer, .. }) => driver.link_up(peer, now).await,
+                        Some(MediaEvent::Unlinked { peer }) => {
+                            let actions = driver.links.unlinked(&peer);
+                            driver.unlinked(&peer).await;
+                            actions
                         }
-                        Some(MediaEvent::Unlinked { peer }) => driver.links.unlinked(&peer),
                         Some(MediaEvent::Message { peer, message }) => {
                             driver.links.received(&peer, message, now)
                         }
@@ -270,49 +457,26 @@ where
                         applies_open = false;
                         Vec::new()
                     }
-                    // A dropped apply is caught when the author's link comes
-                    // up again.
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => Vec::new(),
+                    other => {
+                        driver.custody_due |= moves_custody(other.as_ref());
+                        Vec::new()
+                    }
                 },
-                Some(done) = jobs.next() => driver.done(done, Instant::now()).await,
-                () = sleep, if wake.is_some() => {
-                    let now = Instant::now();
-                    let mut actions = driver.links.timeout(now);
-                    actions.extend(driver.retry_due(now).await);
-                    actions
+                Some(done) = driver.running.next(), if !driver.running.is_empty() => {
+                    driver.done(done, Instant::now()).await
                 }
+                () = self.custody_changed.notified() => {
+                    driver.custody_changed().await;
+                    // A copy that entered custody since the last pass may
+                    // hang on an author who lapses before any other wake.
+                    driver.custody_due = true;
+                    Vec::new()
+                }
+                () = sleep, if wake.is_some() => driver.tick(Instant::now()).await,
             };
             driver.act(actions, Instant::now()).await;
-            for job in driver.jobs.drain(..) {
-                jobs.push(self.run_job(sender.clone(), job));
-            }
+            driver.open_link().await;
         }
-    }
-
-    /// The answer a linked peer's copy gives, `None` when no media driver
-    /// runs.
-    pub(super) async fn peer_stage(
-        &self,
-        file_id: FileId,
-    ) -> Result<Option<Resolved>, ContentError> {
-        let Some(orders) = self.peer_orders.lock().clone() else {
-            return Ok(None);
-        };
-        let (answer, answered) = oneshot::channel();
-        // A driver stopping now drops the order and its answer, which reads
-        // as unavailable below.
-        let _ = orders.send(Order { file_id, answer });
-        let Ok(fetched) = answered.await else {
-            return Ok(Some(Resolved::Unavailable));
-        };
-        if !fetched? {
-            return Ok(Some(Resolved::Unavailable));
-        }
-        Ok(Some(
-            self.local_answer(file_id)
-                .await?
-                .unwrap_or(Resolved::Unavailable),
-        ))
     }
 
     /// Runs `job` to its end.
@@ -321,6 +485,14 @@ where
             Job::Send { peer, message } => {
                 let _ = sender.send(&peer, message).await;
                 Done::Sent
+            }
+            Job::Report { peer, messages } => {
+                for message in messages {
+                    if sender.send(&peer, message).await.is_err() {
+                        break;
+                    }
+                }
+                Done::Reported { peer }
             }
             Job::Serve {
                 peer,
@@ -347,8 +519,12 @@ where
                 generation,
                 outcome: self.take_chunk(file_id, size, start, chunk, pieces).await,
             },
-            Job::Commit { tag, manifest } => {
-                let outcome = self.commit_fetched(&manifest).await;
+            Job::Commit {
+                tag,
+                manifest,
+                budget,
+            } => {
+                let outcome = self.commit_fetched(&manifest, budget).await;
                 Done::Committed {
                     tag,
                     manifest,
@@ -357,6 +533,74 @@ where
             }
         }
     }
+}
+
+impl<T, B, H> ContentClient<T, B, H>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: Display,
+    B: ChunkStore + Clone + Sync + MaybeSend + 'static,
+    H: ContentHttp,
+{
+    /// The answer a linked peer's copy gives, `None` when no media driver
+    /// runs.
+    pub(super) async fn peer_stage(
+        &self,
+        file_id: FileId,
+    ) -> Result<Option<Resolved>, ContentError> {
+        let Some(orders) = self.peer_orders.lock().clone() else {
+            return Ok(None);
+        };
+        let (answer, answered) = oneshot::channel();
+        // A driver stopping now drops the order and its answer, which reads
+        // as unavailable below.
+        let _ = orders.send(Order { file_id, answer });
+        let Ok(fetched) = answered.await else {
+            return Ok(Some(Resolved::Unavailable));
+        };
+        if !fetched? {
+            return Ok(Some(Resolved::Unavailable));
+        }
+        Ok(Some(
+            self.local_answer(file_id)
+                .await?
+                .unwrap_or(Resolved::Unavailable),
+        ))
+    }
+}
+
+/// A device's room and its measured rates by key id, as one report states
+/// them.
+type RoomTold = (u64, Vec<([u8; 32], u64)>);
+
+/// Whether a client event can move a custody row, an event the broadcast
+/// dropped counting as one. A dropped apply is caught when its author's link
+/// comes up again.
+fn moves_custody(event: Result<&ClientEvent, &broadcast::error::RecvError>) -> bool {
+    matches!(
+        event,
+        Ok(ClientEvent::LivePatch { .. }
+            | ClientEvent::SnapshotEnd { .. }
+            | ClientEvent::FullResync { .. }
+            | ClientEvent::ProvisionalConfirmed { .. }
+            | ClientEvent::ProvisionalSettled { .. }
+            | ClientEvent::ProvisionalRetracted { .. })
+            | Err(broadcast::error::RecvError::Lagged(_))
+    )
+}
+
+/// The monotonic instant just past the Unix second `lapse`, so a pass then
+/// reads the author as lapsed.
+fn wake_at(lapse: i64) -> Instant {
+    let ahead = lapse.saturating_sub(custody::unix_now()).saturating_add(1);
+    Instant::now() + Duration::from_secs(u64::try_from(ahead).unwrap_or(0))
+}
+
+/// The entries of `list` within `window`, empty past its end.
+fn slice(list: &[[u8; 32]], window: &core::ops::Range<usize>) -> Vec<[u8; 32]> {
+    let end = window.end.min(list.len());
+    list.get(window.start.min(end)..end)
+        .map_or_else(Vec::new, <[[u8; 32]]>::to_vec)
 }
 
 /// Keeps `resolve`'s way to the driver open while the driver runs.
@@ -378,43 +622,122 @@ impl Drop for OrdersOpen<'_> {
     }
 }
 
-/// The driver's state: the links, the fetches and the streams it serves.
-struct Driver<'c, T: Transport, B: ChunkStore + Clone, H: ContentHttp> {
+/// The driver's state: the links, the fetches and the streams it serves,
+/// and the jobs running beside its loop, which `spawn` starts.
+struct Driver<'c, T: Transport, B: ChunkStore + Clone, H: ContentHttp, F, J> {
     content: &'c ContentClient<T, B, H>,
+    sender: MediaSender,
     links: MediaLinks<DeviceIdentity, u64>,
     fetches: HashMap<u64, Fetch>,
     tags: HashMap<FileId, u64>,
     next_tag: u64,
     streams: HashMap<DeviceIdentity, (u64, oneshot::Sender<()>)>,
     jobs: Vec<Job>,
+    spawn: F,
+    running: FuturesUnordered<J>,
+    /// Jobs that ended while the driver awaited the connection, handled
+    /// before the next event.
+    finished: VecDeque<Done>,
+    /// The bytes custody may take.
+    budget: u64,
+    /// The custody files each peer was last told of.
+    told: HashMap<DeviceIdentity, HashSet<[u8; 32]>>,
+    /// The room and rates each peer was last told.
+    told_room: HashMap<DeviceIdentity, RoomTold>,
+    /// When the room and rates are next checked for a change.
+    room_at: Option<Instant>,
+    /// Reports waiting behind the one in flight to each peer, so they
+    /// arrive in order.
+    reports: HashMap<DeviceIdentity, Vec<Media>>,
+    /// The peers a report job is sending to now.
+    reporting: HashSet<DeviceIdentity>,
+    /// The holders last heard of for each of this device's own replicated
+    /// files.
+    heard: HashMap<FileId, usize>,
+    /// When the earliest custody author's certificate lapses, which the
+    /// custody pass then acts on.
+    lapse_at: Option<Instant>,
+    /// Set by every event that can move a custody row, and cleared by one
+    /// pass once the burst behind it is read.
+    custody_due: bool,
+    /// A peer whose link just came up, told everything once the fetches its
+    /// link wakes went out.
+    opening: Option<DeviceIdentity>,
 }
 
-impl<'c, T, B, H> Driver<'c, T, B, H>
+impl<'c, T, B, H, F, J> Driver<'c, T, B, H, F, J>
 where
     T: Transport + MaybeSend + 'static,
     T::Error: Display,
-    B: ChunkStore + Clone + Sync + MaybeSend + 'static,
+    B: ChunkStore + FreeSpace + Clone + Sync + MaybeSend + 'static,
     H: ContentHttp,
+    F: Fn(Job) -> J,
+    J: Future<Output = Done>,
 {
-    fn new(content: &'c ContentClient<T, B, H>) -> Self {
+    fn new(
+        content: &'c ContentClient<T, B, H>,
+        sender: MediaSender,
+        budget: u64,
+        spawn: F,
+    ) -> Self {
         Self {
             content,
+            sender,
             links: MediaLinks::new(),
             fetches: HashMap::new(),
             tags: HashMap::new(),
             next_tag: 0,
             streams: HashMap::new(),
             jobs: Vec::new(),
+            spawn,
+            running: FuturesUnordered::new(),
+            finished: VecDeque::new(),
+            budget,
+            told: HashMap::new(),
+            told_room: HashMap::new(),
+            room_at: None,
+            reports: HashMap::new(),
+            reporting: HashSet::new(),
+            heard: HashMap::new(),
+            lapse_at: None,
+            custody_due: false,
+            opening: None,
         }
     }
 
-    /// The earliest instant a request lapses or busy holders are asked
-    /// again.
+    /// Starts every queued job.
+    fn launch(&mut self) {
+        for job in self.jobs.drain(..) {
+            self.running.push((self.spawn)(job));
+        }
+    }
+
+    /// Awaits `work` while the running jobs go on. A job waiting on the
+    /// connection's lock holds its place in the lock's queue and makes
+    /// progress only while polled, so work queued behind it would otherwise
+    /// wait forever.
+    async fn beside_jobs<O>(&mut self, work: impl Future<Output = O>) -> O {
+        self.launch();
+        let mut work = core::pin::pin!(work);
+        loop {
+            tokio::select! {
+                out = &mut work => return out,
+                Some(done) = self.running.next(), if !self.running.is_empty() => {
+                    self.finished.push_back(done);
+                }
+            }
+        }
+    }
+
+    /// The earliest instant a request lapses, busy holders are asked again
+    /// or the room is checked.
     fn next_wake(&self) -> Option<Instant> {
         self.fetches
             .values()
             .filter_map(|fetch| fetch.retry_at)
             .chain(self.links.next_deadline())
+            .chain(self.room_at)
+            .chain(self.lapse_at)
             .min()
     }
 
@@ -432,10 +755,229 @@ where
         }
     }
 
+    /// `peer`'s link fell, taking what it was told and its report with it.
+    async fn unlinked(&mut self, peer: &DeviceIdentity) {
+        self.told.remove(peer);
+        self.told_room.remove(peer);
+        self.reports.remove(peer);
+        if self.links.linked_peers().next().is_none() {
+            self.room_at = None;
+        }
+        self.count_holders().await;
+    }
+
+    /// `peer`'s link came up: the fetches it wakes and the prefetches of its
+    /// rows go first, and its opening report follows, unless the driver found
+    /// the link at its start and told it then.
+    async fn link_up(&mut self, peer: DeviceIdentity, now: Instant) -> Vec<Action> {
+        self.linked(&peer, now);
+        let mut actions = self.retry_due(now).await;
+        actions.extend(self.prefetch(peer.key().as_bytes(), now).await);
+        if !self.told.contains_key(&peer) {
+            self.opening = Some(peer);
+        }
+        actions
+    }
+
+    /// Tells the peer whose link just came up everything it may know.
+    async fn open_link(&mut self) {
+        if let Some(peer) = self.opening.take() {
+            self.holdings(&peer, Instant::now()).await;
+        }
+    }
+
+    /// The driver's wake: requests that lapsed, busy holders due again, the
+    /// room check, and the custody pass once an author lapsed.
+    async fn tick(&mut self, now: Instant) -> Vec<Action> {
+        let mut actions = self.links.timeout(now);
+        actions.extend(self.retry_due(now).await);
+        self.room_due(now).await;
+        if self.lapse_at.is_some_and(|at| at <= now) {
+            self.lapse_at = None;
+            self.custody_due = true;
+        }
+        actions
+    }
+
     /// The port ended, so no fetch can finish.
     fn end(&mut self) {
         for (_, fetch) in self.fetches.drain() {
             fetch.answer(Ok(false));
+        }
+    }
+
+    /// This device's measured rate from each linked peer, by key id.
+    fn rates(&self) -> Vec<([u8; 32], u64)> {
+        self.links
+            .linked_peers()
+            .filter_map(|peer| Some((*peer.key().as_bytes(), self.links.rate(peer)?)))
+            .collect()
+    }
+
+    /// The files of `custody` `peer`'s gate admits.
+    async fn admitted(&mut self, peer: &DeviceIdentity, custody: &[FileId]) -> HashSet<[u8; 32]> {
+        let content = self.content;
+        let sender = self.sender.clone();
+        self.beside_jobs(async move {
+            let mut admitted = HashSet::new();
+            for file_id in custody {
+                if content.admits(&sender, peer, file_id.as_bytes()).await {
+                    admitted.insert(*file_id.as_bytes());
+                }
+            }
+            admitted
+        })
+        .await
+    }
+
+    /// Queues `messages` to `peer` behind its earlier reports.
+    fn report(&mut self, peer: &DeviceIdentity, messages: Vec<Media>) {
+        self.reports
+            .entry(peer.clone())
+            .or_default()
+            .extend(messages);
+        self.send_reports(peer);
+    }
+
+    /// Starts the job sending `peer`'s queued reports unless one runs.
+    fn send_reports(&mut self, peer: &DeviceIdentity) {
+        if self.reporting.contains(peer) {
+            return;
+        }
+        let Some(messages) = self
+            .reports
+            .remove(peer)
+            .filter(|queued| !queued.is_empty())
+        else {
+            return;
+        };
+        self.reporting.insert(peer.clone());
+        self.jobs.push(Job::Report {
+            peer: peer.clone(),
+            messages,
+        });
+    }
+
+    /// Tells `peer`, whose link came up, everything it may know of this
+    /// device's custody, room and rates.
+    async fn holdings(&mut self, peer: &DeviceIdentity, now: Instant) {
+        let content = self.content;
+        let (custody, held) = self.beside_jobs(content.custody_held()).await;
+        let admitted = self.admitted(peer, &custody).await;
+        let room = self.content.room(self.budget, held);
+        let rates = self.rates();
+        let files: Vec<[u8; 32]> = admitted.iter().copied().collect();
+        let mut runs: Vec<&[[u8; 32]]> = files.chunks(MAX_REPORT_ENTRIES).collect();
+        if runs.is_empty() {
+            runs.push(&[]);
+        }
+        let last = runs.len() - 1;
+        let messages = runs
+            .into_iter()
+            .enumerate()
+            .map(|(index, run)| Media::Holdings {
+                room,
+                rates: if index == 0 {
+                    rates.clone()
+                } else {
+                    Vec::new()
+                },
+                held: run.to_vec(),
+                leaving: Vec::new(),
+                last: index == last,
+            })
+            .collect();
+        self.report(peer, messages);
+        self.told.insert(peer.clone(), admitted);
+        self.told_room.insert(peer.clone(), (room, rates));
+        self.room_at.get_or_insert(now + ROOM_EVERY);
+    }
+
+    /// Custody changed, so every told peer hears what entered and left of
+    /// the files its gate admits.
+    async fn custody_changed(&mut self) {
+        let content = self.content;
+        let (custody, _) = self.beside_jobs(content.custody_held()).await;
+        let mut told = core::mem::take(&mut self.told);
+        for (peer, told_files) in &mut told {
+            let admitted = self.admitted(peer, &custody).await;
+            let added: Vec<[u8; 32]> = admitted.difference(told_files).copied().collect();
+            let removed: Vec<[u8; 32]> = told_files.difference(&admitted).copied().collect();
+            *told_files = admitted;
+            if added.is_empty() && removed.is_empty() {
+                continue;
+            }
+            let runs = added.len().max(removed.len()).div_ceil(MAX_REPORT_ENTRIES);
+            let messages = (0..runs)
+                .map(|run| {
+                    let window = run * MAX_REPORT_ENTRIES..(run + 1) * MAX_REPORT_ENTRIES;
+                    Media::Held {
+                        added: slice(&added, &window),
+                        removed: slice(&removed, &window),
+                        leaving: Vec::new(),
+                    }
+                })
+                .collect();
+            self.report(peer, messages);
+        }
+        self.told = told;
+    }
+
+    /// Tells every linked peer the room and rates that changed since it was
+    /// last told, once the check is due.
+    async fn room_due(&mut self, now: Instant) {
+        if self.room_at.is_none_or(|at| at > now) {
+            return;
+        }
+        let content = self.content;
+        let (_, held) = self.beside_jobs(content.custody_held()).await;
+        let current = (self.content.room(self.budget, held), self.rates());
+        let peers: Vec<DeviceIdentity> = self.told_room.keys().cloned().collect();
+        for peer in peers {
+            if self.told_room.get(&peer) == Some(&current) {
+                continue;
+            }
+            let (room, rates) = current.clone();
+            self.report(&peer, vec![Media::Room { room, rates }]);
+            self.told_room.insert(peer, current.clone());
+        }
+        self.room_at = Some(now + ROOM_EVERY);
+    }
+
+    /// Counts the linked devices reporting each of this device's own unsent
+    /// replicated files, raising [`ContentEvent::Replicated`] for each count
+    /// that changed.
+    async fn count_holders(&mut self) {
+        let content = self.content;
+        let declared = &content.peer_content;
+        let own = self
+            .beside_jobs(
+                content
+                    .client
+                    .with_conn(|conn| custody::own_replicated(conn.conn(), declared)),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        self.heard.retain(|file_id, _| own.contains(file_id));
+        for file_id in own {
+            let holders = self
+                .links
+                .linked_peers()
+                .filter(|peer| {
+                    self.links
+                        .report(peer)
+                        .is_some_and(|report| report.holds(file_id.as_bytes()))
+                })
+                .count();
+            if self.heard.get(&file_id).copied().unwrap_or(0) != holders {
+                self.heard.insert(file_id, holders);
+                let _ = self
+                    .content
+                    .events
+                    .send(ContentEvent::Replicated { file_id, holders });
+            }
         }
     }
 
@@ -487,9 +1029,10 @@ where
                         Vec::new()
                     }
                 }
-                // The links keep the report, which placement and the
-                // candidate order read when they next decide.
-                MediaAction::Reported { .. } => Vec::new(),
+                MediaAction::Reported { .. } => {
+                    self.count_holders().await;
+                    Vec::new()
+                }
             };
             queue.extend(more);
         }
@@ -507,7 +1050,10 @@ where
     /// its author is done.
     async fn order(&mut self, order: Order, now: Instant) -> Vec<Action> {
         if let Some(&tag) = self.tags.get(&order.file_id) {
-            let authors = self.content.provisional_authors(order.file_id).await;
+            let content = self.content;
+            let authors = self
+                .beside_jobs(content.provisional_authors(order.file_id))
+                .await;
             let linked = candidate_order(self.links.linked_peers(), &authors);
             if let Some(fetch) = self.fetches.get_mut(&tag) {
                 fetch.answers.push(order.answer);
@@ -543,7 +1089,8 @@ where
             return Vec::new();
         };
         let mut actions = Vec::new();
-        for file_id in self.content.prefetches_of(author).await {
+        let content = self.content;
+        for file_id in self.beside_jobs(content.prefetches_of(author)).await {
             if self.tags.contains_key(&file_id) {
                 continue;
             }
@@ -562,7 +1109,8 @@ where
     /// Lines up every linked holder for the fetch `tag` of `file_id` and asks
     /// the first.
     async fn start_round(&mut self, tag: u64, file_id: FileId, now: Instant) -> Vec<Action> {
-        let authors = self.content.provisional_authors(file_id).await;
+        let content = self.content;
+        let authors = self.beside_jobs(content.provisional_authors(file_id)).await;
         let candidates = candidate_order(self.links.linked_peers(), &authors);
         if let Some(fetch) = self.fetches.get_mut(&tag) {
             fetch.candidates = candidates;
@@ -755,7 +1303,11 @@ where
             }
             Ok(None) => {
                 fetch.stage = Stage::Committing;
-                self.jobs.push(Job::Commit { tag, manifest });
+                self.jobs.push(Job::Commit {
+                    tag,
+                    manifest,
+                    budget: self.budget,
+                });
                 None
             }
             Ok(Some((index, start))) => {
@@ -790,6 +1342,15 @@ where
     async fn done(&mut self, done: Done, now: Instant) -> Vec<Action> {
         match done {
             Done::Sent => Vec::new(),
+            Done::Reported { peer } => {
+                self.reporting.remove(&peer);
+                if self.links.linked_peers().any(|linked| *linked == peer) {
+                    self.send_reports(&peer);
+                } else {
+                    self.reports.remove(&peer);
+                }
+                Vec::new()
+            }
             Done::Served { peer, request_id } => {
                 self.links.served(&peer, request_id);
                 if self

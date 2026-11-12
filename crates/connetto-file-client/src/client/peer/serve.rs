@@ -140,7 +140,7 @@ where
 
     /// Whether `peer`, still linked, reads a row of a declared column naming
     /// `file_id`, judged under the bot list its certificate carries now.
-    async fn admits(
+    pub(super) async fn admits(
         &self,
         sender: &MediaSender,
         peer: &DeviceIdentity,

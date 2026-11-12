@@ -8,10 +8,13 @@ use connetto_client::SyncSchema;
 use connetto_client::live::ConnettoClient;
 use connetto_client::media::{MediaEvent, MediaPort};
 use connetto_client::peer::PeerAuthor;
-use connetto_core::Major;
+use connetto_core::clock::DEVICE_SKEW;
 use connetto_core::device_cert::AttestationLevel;
 use connetto_core::exchange::ManifestRow;
+use connetto_core::messages::{BulkMessage, LivePatch};
 use connetto_core::schema::SchemaBundle;
+use connetto_core::traits::IncomingFrame;
+use connetto_core::{Cursor, Major};
 use connetto_exchange::media::{MAX_PIECE_BYTES, Media};
 use connetto_file_client::{ContentClient, FsStore, MimeClass};
 use connetto_file_core::{FileId, MemStore, encode_range, process_file_with_outboard};
@@ -20,15 +23,17 @@ use connetto_peer::{CloseReason, Node, PeerEvent};
 use diesel::prelude::*;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
+use sqlite_diff_rs::{DiffOps, PatchSet, PatchsetFormat, SimpleTable, Update, Value};
 use tokio::sync::mpsc;
 
 use crate::support::{RecordingHttp, Scripted, attach_content, cold_over, started};
 
-/// A photo table with a thumbnail column, each person reading only their own
-/// rows, which the device, signed in as the suite's tester, curates whole.
+/// A photo table with a thumbnail column and the state column the server's
+/// setter writes, each person reading only their own rows, which the device,
+/// signed in as the suite's tester, curates whole.
 const PHOTO_SCHEMA: &str = "-- connetto:major 1\n \
                             CREATE TABLE photos (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
-                            content_id BYTEA NOT NULL, thumb_id BYTEA); \
+                            content_id BYTEA NOT NULL, thumb_id BYTEA, content_state TEXT); \
                             ALTER TABLE photos ENABLE ROW LEVEL SECURITY;";
 
 const PHOTO_POLICIES: &str = "CREATE POLICY photos_read ON photos FOR SELECT \
@@ -50,6 +55,27 @@ diesel::table! {
         content_id -> Binary,
         /// The photo's thumbnail, a file of its own.
         thumb_id -> Nullable<Binary>,
+        /// What the server holds of the file, written by its setter.
+        content_state -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    /// connetto's record of each peer author's last verified offer, whose
+    /// certificate end the custody proofs move into the past.
+    _connetto_peer_cursor (author) {
+        /// The author's key id.
+        author -> Binary,
+        /// The author's account.
+        account -> Text,
+        /// The last verified sequence.
+        seq -> BigInt,
+        /// The chain hash at it.
+        head -> Binary,
+        /// The author's verified offer.
+        offer -> Binary,
+        /// The author's certificate end, in Unix seconds.
+        expires_at -> BigInt,
     }
 }
 
@@ -163,6 +189,108 @@ pub async fn declare(
     (client, content)
 }
 
+/// `device` with `photos.content_id` declared and replicated to three
+/// copies, acknowledged by `photos.content_state`.
+pub async fn declare_replicated(
+    (client, content): (ConnettoClient<Scripted>, Device),
+) -> (ConnettoClient<Scripted>, Device) {
+    let content = content
+        .with_peer_content("photos", "content_id")
+        .replicate(3, "content_state")
+        .await
+        .expect("declare the replicated column");
+    (client, content)
+}
+
+/// Writes `state` into photo `id`'s state column straight on the replica,
+/// for a proof that runs the retention pass itself.
+pub async fn set_state(client: &ConnettoClient<Scripted>, id: i64, state: &str) {
+    let state = state.to_owned();
+    client
+        .with_conn(move |conn| {
+            diesel::update(photos::table.filter(photos::id.eq(id)))
+                .set(photos::content_state.eq(state))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("write the state");
+}
+
+/// Delivers the server setter's write of `state` into photo `id`'s state
+/// column as a live patch at `cursor`, the way sync carries it.
+pub fn deliver_state(server: &Scripted, cursor: u8, id: i64, state: &str) {
+    let schema = SimpleTable::new(
+        "photos",
+        &[
+            ("id", ""),
+            ("owner", ""),
+            ("content_id", ""),
+            ("thumb_id", ""),
+            ("content_state", ""),
+        ],
+        &[0],
+    );
+    let update = Update::<_, PatchsetFormat, String, Vec<u8>>::from(schema)
+        .set(0, Value::Integer(id))
+        .expect("set the key")
+        .set(4, Value::Text(state.to_owned()))
+        .expect("set the state");
+    let patch = PatchSet::<SimpleTable, String, Vec<u8>>::new()
+        .update(update)
+        .build();
+    server.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+        "custody".to_owned(),
+        Cursor::new(vec![cursor]),
+        zstd::encode_all(patch.as_slice(), 3).expect("compress the patch"),
+    ))));
+}
+
+/// Records a cursor for `author` whose certificate end puts its lapse,
+/// the end plus `DEVICE_SKEW`, `seconds` from now, negative for the past.
+pub async fn lapse_in(client: &ConnettoClient<Scripted>, author: &PeerAuthor, seconds: i64) {
+    let author = author.clone();
+    client
+        .with_conn(move |conn| {
+            let now = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("after the epoch")
+                    .as_secs(),
+            )
+            .expect("a Unix time fits");
+            let skew = i64::try_from(DEVICE_SKEW.as_secs()).expect("the skew fits");
+            diesel::replace_into(_connetto_peer_cursor::table)
+                .values((
+                    _connetto_peer_cursor::author.eq(author.key_id),
+                    _connetto_peer_cursor::account.eq(author.account),
+                    _connetto_peer_cursor::seq.eq(1),
+                    _connetto_peer_cursor::head.eq(vec![0; 32]),
+                    _connetto_peer_cursor::offer.eq(Vec::<u8>::new()),
+                    _connetto_peer_cursor::expires_at.eq(now + seconds - skew),
+                ))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("store the cursor");
+}
+
+/// Every media message a bare node receives, as it arrives.
+pub fn listener(mut events: mpsc::UnboundedReceiver<PeerEvent>) -> mpsc::UnboundedReceiver<Media> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let PeerEvent::Media { message, .. } = event
+                && tx.send(message).is_err()
+            {
+                return;
+            }
+        }
+    });
+    rx
+}
+
 /// Stages `bytes` as photo `id` owned by `owner`.
 pub async fn stage(content: &Device, id: i64, owner: &str, bytes: &[u8]) -> FileId {
     let owner = owner.to_owned();
@@ -218,21 +346,26 @@ pub async fn hand_over(client: &ConnettoClient<Scripted>, id: i64, owner: &str) 
     assert_eq!(now, owner);
 }
 
-/// Runs `proof` beside `device`'s media driver.
+/// Runs `proof` beside `device`'s media driver, the driver polled first so
+/// it is up before the proof's first step, which another worker thread can
+/// carry to its end within one poll.
 pub async fn beside(device: &Device, port: MediaPort, proof: impl Future<Output = ()>) {
     tokio::select! {
+        biased;
         () = device.drive_media(port) => panic!("the port ended under the proof"),
         () = proof => {}
     }
 }
 
-/// Runs `proof` beside the media drivers of two devices.
+/// Runs `proof` beside the media drivers of two devices, both polled before
+/// the proof as [`beside`] polls its one.
 pub async fn beside_both(
     (first, first_port): (&Device, MediaPort),
     (second, second_port): (&Device, MediaPort),
     proof: impl Future<Output = ()>,
 ) {
     tokio::select! {
+        biased;
         () = first.drive_media(first_port) => panic!("the first port ended under the proof"),
         () = second.drive_media(second_port) => panic!("the second port ended under the proof"),
         () = proof => {}
@@ -388,7 +521,7 @@ pub fn fetches(asked: &Mutex<Vec<Media>>) -> Vec<(u64, u64)> {
 /// The photo table on an author's plain replica, the columns the policy
 /// table has.
 const PLAIN_PHOTOS: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
-                            content_id BLOB NOT NULL, thumb_id BLOB)";
+                            content_id BLOB NOT NULL, thumb_id BLOB, content_state TEXT)";
 
 /// One captured queue entry's body.
 #[derive(QueryableByName)]
