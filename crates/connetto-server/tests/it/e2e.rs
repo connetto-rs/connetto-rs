@@ -1120,6 +1120,7 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     provision_cap_policies(&admin, OWNED_PG_DDL, OWNED_POLICIES).await;
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;
+    exec(&admin, "GRANT SELECT ON auth_events TO app_writer").await;
 
     let reader_url = with_user_url(&url, "app_writer", "app_writer");
 
