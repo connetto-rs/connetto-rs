@@ -872,6 +872,11 @@ impl<D> ServerHandle<D>
 where
     D: ConnettoSchema,
 {
+    /// Subscribe before writing to observe recorded and acknowledged commits through [`SessionManager::ingested_commits`].
+    pub fn ingested_commits(&self) -> tokio::sync::broadcast::Receiver<subql::PgCommit> {
+        self.manager.ingested_commits()
+    }
+
     /// Observe background-loop termination without keeping the server running.
     pub fn background_completion(&self) -> BackgroundCompletion {
         BackgroundCompletion {

@@ -1664,6 +1664,44 @@ async fn a_restored_cluster_revokes_every_login_session_at_boot() {
     handle.shutdown().await;
 }
 
+/// Insert an order and await its transaction's ingestion.
+async fn insert_ingested_order(
+    pool: &Pool<AsyncPgConnection>,
+    commits: &mut tokio::sync::broadcast::Receiver<subql::PgCommit>,
+    id: i32,
+) {
+    use super::e2e::orders;
+
+    let xid: i64 = {
+        let mut conn = pool.get().await.expect("a connection");
+        // The `xid` cast discards the epoch to match logical replication.
+        diesel::insert_into(orders::table)
+            .values((
+                orders::id.eq(id),
+                orders::price.eq(1.0),
+                orders::quantity.eq(1),
+                orders::status.eq("new"),
+            ))
+            .returning(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+                "pg_current_xact_id()::xid::text::bigint",
+            ))
+            .get_result(&mut *conn)
+            .await
+            .expect("insert the correlated transaction")
+    };
+    let xid = u32::try_from(xid).expect("a logical replication transaction id");
+    tokio::time::timeout(BOUND, async {
+        loop {
+            let commit = commits.recv().await.expect("ingestion notification");
+            if commit.position().xid().0 == xid {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("transaction {xid} was not ingested"));
+}
+
 /// A slot recreated past the reconnect log's last commit is a gap the boot
 /// must settle: the log is trimmed to the resume point, the boundary commit
 /// is recorded at the slot's position, and the gap is logged for the
@@ -1683,43 +1721,33 @@ async fn a_slot_recreated_past_the_log_trims_the_log_at_boot() {
     let port = listener.local_addr().expect("local address").port();
     let (builder, _idp, _keys) = builder_over(&fixture, port).await;
     let parts = builder.build().await.expect("the first boot assembles");
+    let mut commits = parts.handle.ingested_commits();
     let stream = tokio::spawn(parts.change_stream);
 
-    // Three ingested commits, then the log's last commit position.
-    let mut last: i64 = 0;
     for id in 101..=103 {
-        exec(
-            &pool,
-            &format!("INSERT INTO orders VALUES ({id}, 1.0, 1, 'new')"),
-        )
-        .await;
-        let mut conn = pool.get().await.expect("a connection");
-        let row: Vec<WalLsn> = diesel::sql_query(
-            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0'::pg_lsn)::bigint AS lsn",
-        )
-        .load(&mut *conn)
-        .await
-        .expect("read the write-ahead position");
-        last = row[0].lsn;
-    }
-    let deadline = Instant::now() + BOUND;
-    loop {
-        let mut conn = pool.get().await.expect("a connection");
-        let end: Option<i64> = connetto_oplog_commit::table
-            .select(connetto_oplog_commit::end_lsn)
-            .first(&mut *conn)
-            .await
-            .ok();
-        if end.is_some_and(|end| end >= last) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the stream never ingested the last commit"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        insert_ingested_order(&pool, &mut commits, id).await;
     }
     stream.abort();
+    tokio::time::timeout(BOUND, async {
+        assert!(
+            stream
+                .await
+                .expect_err("ingestion was aborted")
+                .is_cancelled()
+        );
+        parts.handle.shutdown().await;
+    })
+    .await
+    .expect("ingestion shutdown");
+    let last: i64 = {
+        let mut conn = pool.get().await.expect("a connection");
+        connetto_oplog_commit::table
+            .select(diesel::dsl::max(connetto_oplog_commit::end_lsn))
+            .first::<Option<i64>>(&mut *conn)
+            .await
+            .expect("read the last ingested commit")
+            .expect("the observed commits are recorded")
+    };
 
     // The slot is recreated at the write-ahead head, past the ingested
     // commits, so the boot's check finds the gap.
