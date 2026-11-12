@@ -23,7 +23,11 @@ async fn ask(
     request: Media,
 ) -> Vec<Media> {
     requester
-        .send_media(holder, request)
+        .send_media(
+            holder,
+            crate::peer_support::link_to(requester, holder),
+            request,
+        )
         .await
         .expect("the request queues");
     let mut replies = Vec::new();
@@ -275,6 +279,7 @@ async fn a_stream_whose_link_falls_stops_and_the_holder_serves_on() {
         leaving
             .send_media(
                 &holder,
+                crate::peer_support::link_to(&leaving, &holder),
                 Media::Fetch {
                     request_id: 1,
                     file_id: *file_id.as_bytes(),

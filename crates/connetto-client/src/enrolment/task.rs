@@ -1585,17 +1585,19 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 if let Some(event) = peer {
                     run.discovery.on_node_event(&event);
                     match event {
-                        PeerEvent::Linked { peer, public_key, bot_list, expires_at } => {
+                        PeerEvent::Linked { peer, link, public_key, bot_list, expires_at } => {
                             let _ = run.enroller.media.forward(crate::media::MediaEvent::Linked {
                                 peer: peer.clone(),
+                                link,
                                 bot_list: bot_list.clone(),
                             });
                             run.peer_linked(peer.clone(), public_key, bot_list, expires_at).await;
                             run.link.emit(ClientEvent::PeerLinked { peer });
                         }
-                        PeerEvent::LinkReplaced { peer, public_key, bot_list, expires_at } => {
+                        PeerEvent::LinkReplaced { peer, link, public_key, bot_list, expires_at } => {
                             let _ = run.enroller.media.forward(crate::media::MediaEvent::Linked {
                                 peer: peer.clone(),
+                                link,
                                 bot_list: bot_list.clone(),
                             });
                             run.peer_relink(&peer, public_key, bot_list, expires_at).await;
@@ -1620,8 +1622,8 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                         PeerEvent::Exchange { peer, message } => {
                             run.peer_message(&peer, message).await;
                         }
-                        PeerEvent::Media { peer, message } => {
-                            run.media_message(peer, message).await;
+                        PeerEvent::Media { peer, link, message } => {
+                            run.media_message(peer, link, message).await;
                         }
                     }
                 }
@@ -1663,17 +1665,30 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
 impl<L: Link> Run<L> {
     /// Hand a media frame to the live port, or answer a request `Refused`
     /// when none lives, as a holder answers for a file it lacks (R79).
-    async fn media_message(&self, peer: DeviceIdentity, message: connetto_exchange::media::Media) {
-        let Err(crate::media::MediaEvent::Message { peer, message }) = self
+    async fn media_message(
+        &self,
+        peer: DeviceIdentity,
+        link: u64,
+        message: connetto_exchange::media::Media,
+    ) {
+        let Err(crate::media::MediaEvent::Message {
+            peer,
+            link,
+            message,
+        }) = self
             .enroller
             .media
-            .forward(crate::media::MediaEvent::Message { peer, message })
+            .forward(crate::media::MediaEvent::Message {
+                peer,
+                link,
+                message,
+            })
         else {
             return;
         };
         if let (Some(_), Some(request_id)) = (message.ask(), message.request_id()) {
             let refused = connetto_exchange::media::Media::Refused { request_id };
-            if let Err(err) = self.peer.send_media(&peer, refused).await {
+            if let Err(err) = self.peer.send_media(&peer, link, refused).await {
                 tracing::debug!(error = %err, "a media refusal did not reach its peer");
             }
         }

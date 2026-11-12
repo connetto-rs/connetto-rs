@@ -84,7 +84,8 @@ pub enum PeerSendError<M = Message> {
         /// The message handed back to its sender.
         message: M,
     },
-    /// The peer holds no live link.
+    /// The peer holds no live link, or for a media send no live link by the
+    /// number it named.
     #[error("the peer holds no live link")]
     Unlinked {
         /// The message handed back to its sender.

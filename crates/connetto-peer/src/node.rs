@@ -64,6 +64,8 @@ pub(crate) const DIAL_NAME: &str = "connetto-peer";
 
 /// The two bounded queues of one live link, the exchange's and the media's.
 pub(crate) struct LinkSenders {
+    /// The link's number, the slot's `seq`.
+    pub(crate) link: u64,
     pub(crate) exchange: mpsc::Sender<Message>,
     pub(crate) media: mpsc::Sender<Media>,
 }
@@ -166,6 +168,9 @@ pub struct PeerLink {
     pub bot_list: Option<String>,
     /// The kept link's remote address, `None` while a duplicate close waits for its keeper.
     pub remote: Option<SocketAddr>,
+    /// The kept link's number, which a media send names, `None` while a
+    /// duplicate close waits for its keeper.
+    pub link: Option<u64>,
 }
 
 impl fmt::Debug for NodeState {
@@ -462,6 +467,7 @@ impl Node {
                     public_key: slot.public_key.clone(),
                     bot_list: slot.bot_list.clone(),
                     remote: Some(slot.remote),
+                    link: Some(slot.seq),
                 },
                 SlotState::AwaitingKeeper {
                     peer,
@@ -472,6 +478,7 @@ impl Node {
                     public_key: public_key.clone(),
                     bot_list: bot_list.clone(),
                     remote: None,
+                    link: None,
                 },
             })
             .collect()
@@ -508,32 +515,37 @@ impl Node {
         message: Message,
     ) -> Result<(), PeerSendError> {
         let bounds = message.within_bounds();
-        self.queue(peer, message, bounds, |senders| &senders.exchange)
+        self.queue(peer, None, message, bounds, |senders| &senders.exchange)
             .await
     }
 
-    /// Queue a media message on the link to `peer`, on the link's own media
-    /// queue, awaiting it as [`Node::send_exchange`] awaits the exchange's
-    /// (R79).
+    /// Queue a media message on the media queue of `peer`'s link numbered
+    /// `link`, awaiting it as [`Node::send_exchange`] awaits the exchange's
+    /// (R79). Naming the link keeps a message meant for one link off the
+    /// link that replaced it.
     ///
     /// # Errors
     ///
-    /// As [`Node::send_exchange`].
+    /// As [`Node::send_exchange`], [`PeerSendError::Unlinked`] also when the
+    /// peer's live link is another one.
     pub async fn send_media(
         &self,
         peer: &DeviceIdentity,
+        link: u64,
         message: Media,
     ) -> Result<(), PeerSendError<Media>> {
         let bounds = message.within_bounds();
-        self.queue(peer, message, bounds, |senders| &senders.media)
+        self.queue(peer, Some(link), message, bounds, |senders| &senders.media)
             .await
     }
 
     /// Queue `message` on the queue `pick` names of `peer`'s link, refused
-    /// before queueing when `bounds` failed.
+    /// before queueing when `bounds` failed or when the live link is not the
+    /// one `link` names.
     async fn queue<M>(
         &self,
         peer: &DeviceIdentity,
+        link: Option<u64>,
         message: M,
         bounds: Result<(), BoundsError>,
         pick: impl FnOnce(&LinkSenders) -> &mpsc::Sender<M>,
@@ -544,8 +556,8 @@ impl Node {
         let sender = {
             let senders = self.state.senders.read();
             match senders.get(&peer.key()) {
-                Some(link) => pick(link).clone(),
-                None => return Err(PeerSendError::Unlinked { message }),
+                Some(live) if link.is_none_or(|link| link == live.link) => pick(live).clone(),
+                _ => return Err(PeerSendError::Unlinked { message }),
             }
         };
         match sender.send(message).await {
@@ -1322,6 +1334,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             state.senders.write().insert(
                 peer_key,
                 LinkSenders {
+                    link: seq,
                     exchange: exchange_tx,
                     media: media_tx,
                 },
@@ -1338,6 +1351,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 Some(if fresh {
                     PeerEvent::Linked {
                         peer: slot.peer.clone(),
+                        link: slot.seq,
                         public_key: slot.public_key.clone(),
                         bot_list: slot.bot_list.clone(),
                         expires_at,
@@ -1345,6 +1359,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 } else {
                     PeerEvent::LinkReplaced {
                         peer: slot.peer.clone(),
+                        link: slot.seq,
                         public_key: slot.public_key.clone(),
                         bot_list: slot.bot_list.clone(),
                         expires_at,

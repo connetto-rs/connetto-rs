@@ -15,6 +15,9 @@ pub enum PeerEvent {
     Linked {
         /// The peer the link reached.
         peer: DeviceIdentity,
+        /// The link's number, unique within the node, which a media send
+        /// names so a report never crosses on a later link (R79).
+        link: u64,
         /// The peer's `SubjectPublicKeyInfo`, DER, which its offers verify
         /// against.
         public_key: Vec<u8>,
@@ -32,6 +35,8 @@ pub enum PeerEvent {
     LinkReplaced {
         /// The peer the re-link reached.
         peer: DeviceIdentity,
+        /// The new link's number.
+        link: u64,
         /// The peer's `SubjectPublicKeyInfo`, DER, which its offers verify
         /// against.
         public_key: Vec<u8>,
@@ -74,6 +79,8 @@ pub enum PeerEvent {
     Media {
         /// The peer the message crossed from.
         peer: DeviceIdentity,
+        /// The number of the link it crossed on.
+        link: u64,
         /// The message as it crossed.
         message: Media,
     },

@@ -22,6 +22,9 @@ pub enum MediaEvent {
     Linked {
         /// The linked peer.
         peer: DeviceIdentity,
+        /// The link's number, which every send to the peer names. A peer
+        /// already linked reports a new link, which replaced the old one.
+        link: u64,
         /// The certificate's bot list.
         bot_list: Option<String>,
     },
@@ -34,6 +37,9 @@ pub enum MediaEvent {
     Message {
         /// The peer it crossed from.
         peer: DeviceIdentity,
+        /// The number of the link it crossed on, which can be a link already
+        /// replaced.
+        link: u64,
         /// The message as it crossed.
         message: Media,
     },
@@ -109,29 +115,48 @@ pub struct MediaSender {
 }
 
 impl MediaSender {
-    /// Queue `message` on the media queue of the link to `peer`.
+    /// Queue `message` on the media queue of `peer`'s link numbered `link`.
     ///
     /// # Errors
     ///
     /// [`PeerSendError`] with the message handed back when it breaks the
-    /// wire's bounds, when the peer holds no live link, or when the link
-    /// closes while the send waits.
+    /// wire's bounds, when the peer's live link is not that one, or when the
+    /// link closes while the send waits.
     pub async fn send(
         &self,
         peer: &DeviceIdentity,
+        link: u64,
         message: Media,
     ) -> Result<(), PeerSendError<Media>> {
-        self.node.send_media(peer, message).await
+        self.node.send_media(peer, link, message).await
     }
 
-    /// The peers linked now, each with its certificate's bot list, in no
-    /// order, for a consumer that starts after links came up.
+    /// The peers with a live link now, in no order, for a consumer that
+    /// starts after links came up.
     #[must_use]
-    pub fn linked(&self) -> Vec<(DeviceIdentity, Option<String>)> {
+    pub fn linked(&self) -> Vec<LinkedPeer> {
         self.node
             .linked()
             .into_iter()
-            .map(|link| (link.peer, link.bot_list))
+            .filter_map(|link| {
+                Some(LinkedPeer {
+                    link: link.link?,
+                    peer: link.peer,
+                    bot_list: link.bot_list,
+                })
+            })
             .collect()
     }
+}
+
+/// One peer with a live link, as [`MediaSender::linked`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedPeer {
+    /// The peer.
+    pub peer: DeviceIdentity,
+    /// The link's number.
+    pub link: u64,
+    /// The bot list its certificate carries, `None` for a certificate
+    /// without one.
+    pub bot_list: Option<String>,
 }

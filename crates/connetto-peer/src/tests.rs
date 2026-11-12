@@ -101,14 +101,53 @@ pub(crate) async fn next_events(
 ) -> Vec<PeerEvent> {
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        out.push(
+        out.push(numberless(
             time::timeout(Duration::from_secs(10), rx.recv())
                 .await
                 .expect("the event arrives")
                 .expect("the channel stays open"),
-        );
+        ));
     }
     out
+}
+
+/// `event` with its link number zeroed, since a test compares what an
+/// event names and the node numbers its links itself.
+pub(crate) fn numberless(event: PeerEvent) -> PeerEvent {
+    match event {
+        PeerEvent::Linked {
+            peer,
+            public_key,
+            bot_list,
+            expires_at,
+            ..
+        } => PeerEvent::Linked {
+            peer,
+            link: 0,
+            public_key,
+            bot_list,
+            expires_at,
+        },
+        PeerEvent::LinkReplaced {
+            peer,
+            public_key,
+            bot_list,
+            expires_at,
+            ..
+        } => PeerEvent::LinkReplaced {
+            peer,
+            link: 0,
+            public_key,
+            bot_list,
+            expires_at,
+        },
+        PeerEvent::Media { peer, message, .. } => PeerEvent::Media {
+            peer,
+            link: 0,
+            message,
+        },
+        other => other,
+    }
 }
 
 /// Wait for one event matching `keep`, draining the ones that do not.
@@ -125,7 +164,7 @@ pub(crate) async fn await_event(
             () = &mut deadline => panic!("the expected event never arrived"),
         };
         if keep(&event) {
-            return event;
+            return numberless(event);
         }
     }
 }
@@ -2858,6 +2897,7 @@ async fn a_duplicate_close_holds_the_peer_in_the_link_read() {
             public_key: gone.public_key_info(),
             bot_list: Some(gone.bot_list.clone()),
             remote: None,
+            link: None,
         }],
         "the held peer stays in the read without an address"
     );
@@ -3031,6 +3071,7 @@ async fn the_hello_bound_drops_a_held_peer_in_the_link_read() {
             public_key: gone.public_key_info(),
             bot_list: Some(gone.bot_list.clone()),
             remote: None,
+            link: None,
         }],
         "the held peer stays in the read without an address"
     );
@@ -3819,6 +3860,7 @@ async fn closing_one_peer_ends_its_link_on_both_sides() {
 pub(crate) fn linked_event(peer: &Peer) -> PeerEvent {
     PeerEvent::Linked {
         peer: peer.identity.clone(),
+        link: 0,
         public_key: peer.public_key_info(),
         bot_list: Some(peer.bot_list.clone()),
         expires_at: peer.not_after(),
@@ -3830,6 +3872,7 @@ pub(crate) fn linked_event(peer: &Peer) -> PeerEvent {
 pub(crate) fn link_replaced_event(peer: &Peer) -> PeerEvent {
     PeerEvent::LinkReplaced {
         peer: peer.identity.clone(),
+        link: 0,
         public_key: peer.public_key_info(),
         bot_list: Some(peer.bot_list.clone()),
         expires_at: peer.not_after(),

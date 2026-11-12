@@ -222,6 +222,7 @@ async fn on_frame<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(Some(PeerFrame::Media(message))) => {
             emit_from(state, key, seq, last_seen, |peer| PeerEvent::Media {
                 peer,
+                link: seq,
                 message,
             });
             None

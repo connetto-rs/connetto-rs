@@ -9,7 +9,7 @@ use connetto_client::live::ConnettoClient;
 use connetto_client::media::{MediaEvent, MediaPort};
 use connetto_client::peer::PeerAuthor;
 use connetto_core::clock::DEVICE_SKEW;
-use connetto_core::device_cert::AttestationLevel;
+use connetto_core::device_cert::{AttestationLevel, DeviceIdentity};
 use connetto_core::exchange::ManifestRow;
 use connetto_core::messages::{BulkMessage, LivePatch};
 use connetto_core::schema::SchemaBundle;
@@ -122,19 +122,58 @@ impl Devices {
     }
 }
 
+/// The number of `node`'s live link to `peer`.
+pub fn link_to(node: &Node, peer: &DeviceIdentity) -> u64 {
+    node.linked()
+        .into_iter()
+        .find(|link| &link.peer == peer)
+        .and_then(|link| link.link)
+        .expect("the peer is linked")
+}
+
+/// The media event the enrolment task forwards for `event`, `None` for one
+/// it keeps to itself.
+fn forwarded(event: PeerEvent) -> Option<MediaEvent> {
+    Some(match event {
+        PeerEvent::Linked {
+            peer,
+            link,
+            bot_list,
+            ..
+        }
+        | PeerEvent::LinkReplaced {
+            peer,
+            link,
+            bot_list,
+            ..
+        } => MediaEvent::Linked {
+            peer,
+            link,
+            bot_list,
+        },
+        PeerEvent::Unlinked { peer, .. } => MediaEvent::Unlinked { peer },
+        PeerEvent::Media {
+            peer,
+            link,
+            message,
+        } => MediaEvent::Message {
+            peer,
+            link,
+            message,
+        },
+        _ => return None,
+    })
+}
+
 /// A media port over a bare node, fed the link events and media frames the
 /// enrolment task would forward.
 pub fn port(node: Node, mut events: mpsc::UnboundedReceiver<PeerEvent>) -> MediaPort {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
-            let forwarded = match event {
-                PeerEvent::Linked { peer, bot_list, .. } => MediaEvent::Linked { peer, bot_list },
-                PeerEvent::Unlinked { peer, .. } => MediaEvent::Unlinked { peer },
-                PeerEvent::Media { peer, message } => MediaEvent::Message { peer, message },
-                _ => continue,
-            };
-            if tx.send(forwarded).is_err() {
+            if let Some(event) = forwarded(event)
+                && tx.send(event).is_err()
+            {
                 return;
             }
         }
@@ -393,6 +432,18 @@ pub enum Fault {
     TooManyRows,
 }
 
+/// The peer, link and message of a media event, `None` for any other.
+fn media_of(event: PeerEvent) -> Option<(DeviceIdentity, u64, Media)> {
+    match event {
+        PeerEvent::Media {
+            peer,
+            link,
+            message,
+        } => Some((peer, link, message)),
+        _ => None,
+    }
+}
+
 /// A bare node serving `bytes` as a holder would, chunked as the generic
 /// class chunks it, with `fault`, answering the requests it records.
 pub fn bare_holder(
@@ -411,7 +462,7 @@ pub fn bare_holder(
                 .expect("chunk the file");
         let mut fetches = 0;
         while let Some(event) = events.recv().await {
-            let PeerEvent::Media { peer, message } = event else {
+            let Some((peer, link, message)) = media_of(event) else {
                 continue;
             };
             record.lock().push(message.clone());
@@ -421,7 +472,9 @@ pub fn bare_holder(
             match (fault, message) {
                 (Fault::Silent, _) => {}
                 (Fault::AlwaysBusy, _) => {
-                    let _ = node.send_media(&peer, Media::Busy { request_id }).await;
+                    let _ = node
+                        .send_media(&peer, link, Media::Busy { request_id })
+                        .await;
                 }
                 (Fault::TooManyRows, Media::Want { .. }) => {
                     for last in [false, true] {
@@ -430,7 +483,7 @@ pub fn bare_holder(
                             chunks: vec![([7; 32], 1); 5_000],
                             last,
                         };
-                        let _ = node.send_media(&peer, run).await;
+                        let _ = node.send_media(&peer, link, run).await;
                     }
                 }
                 (_, Media::Want { .. }) => {
@@ -455,7 +508,7 @@ pub fn bare_holder(
                         chunks,
                         last: true,
                     };
-                    let _ = node.send_media(&peer, run).await;
+                    let _ = node.send_media(&peer, link, run).await;
                 }
                 (
                     _,
@@ -487,7 +540,7 @@ pub fn bare_holder(
                             encoded: piece.to_vec(),
                             last: index == last,
                         };
-                        let _ = node.send_media(&peer, piece).await;
+                        let _ = node.send_media(&peer, link, piece).await;
                     }
                 }
                 _ => {}

@@ -156,20 +156,24 @@ where
 
 /// Work the driver runs beside its loop.
 enum Job {
-    /// One message, a `Busy` the links answered.
+    /// One message over the peer's link numbered `link`.
     Send {
         peer: DeviceIdentity,
+        link: u64,
         message: Media,
     },
-    /// Holder reports to one peer, sent in order.
+    /// Holder reports to one peer, sent in order over its link `link`
+    /// alone.
     Report {
         peer: DeviceIdentity,
+        link: u64,
         messages: Vec<Media>,
     },
     /// The answer to a request the links admitted, until `stop` fires or
     /// drops.
     Serve {
         peer: DeviceIdentity,
+        link: u64,
         request_id: u64,
         ask: Ask,
         stop: oneshot::Receiver<()>,
@@ -405,12 +409,7 @@ where
         });
         let lapse = driver.beside_jobs(self.custody_refresh()).await;
         driver.lapse_at = lapse.map(wake_at);
-        let mut actions = Vec::new();
-        for (peer, _) in sender.linked() {
-            driver.links.linked(&peer);
-            driver.holdings(&peer, Instant::now()).await;
-            actions.extend(driver.prefetch(peer.key().as_bytes(), Instant::now()).await);
-        }
+        let actions = driver.found_links().await;
         driver.act(actions, Instant::now()).await;
         loop {
             driver.launch();
@@ -437,14 +436,18 @@ where
                             driver.end();
                             return;
                         }
-                        Some(MediaEvent::Linked { peer, .. }) => driver.link_up(peer, now).await,
-                        Some(MediaEvent::Unlinked { peer }) => {
-                            let actions = driver.links.unlinked(&peer);
-                            driver.unlinked(&peer).await;
-                            actions
+                        Some(MediaEvent::Linked { peer, link, .. }) => {
+                            driver.link_up(peer, link, now).await
                         }
-                        Some(MediaEvent::Message { peer, message }) => {
-                            driver.links.received(&peer, message, now)
+                        Some(MediaEvent::Unlinked { peer }) => driver.link_down(&peer).await,
+                        // A message from a link already replaced is dropped
+                        // with the link.
+                        Some(MediaEvent::Message { peer, link, message }) => {
+                            if driver.link_of.get(&peer) == Some(&link) {
+                                driver.links.received(&peer, message, now)
+                            } else {
+                                Vec::new()
+                            }
                         }
                     }
                 }
@@ -482,13 +485,21 @@ where
     /// Runs `job` to its end.
     async fn run_job(&self, sender: MediaSender, job: Job) -> Done {
         match job {
-            Job::Send { peer, message } => {
-                let _ = sender.send(&peer, message).await;
+            Job::Send {
+                peer,
+                link,
+                message,
+            } => {
+                let _ = sender.send(&peer, link, message).await;
                 Done::Sent
             }
-            Job::Report { peer, messages } => {
+            Job::Report {
+                peer,
+                link,
+                messages,
+            } => {
                 for message in messages {
-                    if sender.send(&peer, message).await.is_err() {
+                    if sender.send(&peer, link, message).await.is_err() {
                         break;
                     }
                 }
@@ -496,12 +507,13 @@ where
             }
             Job::Serve {
                 peer,
+                link,
                 request_id,
                 ask,
                 stop,
             } => {
                 tokio::select! {
-                    () = self.serve(&sender, &peer, request_id, ask) => {}
+                    () = self.serve(&sender, &peer, link, request_id, ask) => {}
                     _ = stop => {}
                 }
                 Done::Served { peer, request_id }
@@ -640,15 +652,18 @@ struct Driver<'c, T: Transport, B: ChunkStore + Clone, H: ContentHttp, F, J> {
     finished: VecDeque<Done>,
     /// The bytes custody may take.
     budget: u64,
+    /// Each linked peer's live link, whose number every send names and
+    /// whose messages alone the links read.
+    link_of: HashMap<DeviceIdentity, u64>,
     /// The custody files each peer was last told of.
     told: HashMap<DeviceIdentity, HashSet<[u8; 32]>>,
     /// The room and rates each peer was last told.
     told_room: HashMap<DeviceIdentity, RoomTold>,
     /// When the room and rates are next checked for a change.
     room_at: Option<Instant>,
-    /// Reports waiting behind the one in flight to each peer, so they
-    /// arrive in order.
-    reports: HashMap<DeviceIdentity, Vec<Media>>,
+    /// Reports waiting behind the one in flight to each peer, with the link
+    /// they go out on, so they arrive in order.
+    reports: HashMap<DeviceIdentity, (u64, Vec<Media>)>,
     /// The peers a report job is sending to now.
     reporting: HashSet<DeviceIdentity>,
     /// The holders last heard of for each of this device's own replicated
@@ -693,6 +708,7 @@ where
             running: FuturesUnordered::new(),
             finished: VecDeque::new(),
             budget,
+            link_of: HashMap::new(),
             told: HashMap::new(),
             told_room: HashMap::new(),
             room_at: None,
@@ -741,22 +757,11 @@ where
             .min()
     }
 
-    /// `peer` linked, which also wakes every fetch waiting on busy holders.
-    /// A peer the driver already counts, from the links it found at its
-    /// start, keeps its state, so a request in flight to it stands.
-    fn linked(&mut self, peer: &DeviceIdentity, now: Instant) {
-        if !self.links.linked_peers().any(|linked| linked == peer) {
-            self.links.linked(peer);
-        }
-        for fetch in self.fetches.values_mut() {
-            if fetch.retry_at.is_some() {
-                fetch.retry_at = Some(now);
-            }
-        }
-    }
-
-    /// `peer`'s link fell, taking what it was told and its report with it.
-    async fn unlinked(&mut self, peer: &DeviceIdentity) {
+    /// `peer`'s link fell, or a new one replaced it: every ask on it is lost,
+    /// and what it was told and its report go with it.
+    async fn link_down(&mut self, peer: &DeviceIdentity) -> Vec<Action> {
+        let actions = self.links.unlinked(peer);
+        self.link_of.remove(peer);
         self.told.remove(peer);
         self.told_room.remove(peer);
         self.reports.remove(peer);
@@ -764,17 +769,44 @@ where
             self.room_at = None;
         }
         self.count_holders().await;
+        actions
     }
 
-    /// `peer`'s link came up: the fetches it wakes and the prefetches of its
-    /// rows go first, and its opening report follows, unless the driver found
-    /// the link at its start and told it then.
-    async fn link_up(&mut self, peer: DeviceIdentity, now: Instant) -> Vec<Action> {
-        self.linked(&peer, now);
-        let mut actions = self.retry_due(now).await;
+    /// `peer`'s link numbered `link` came up: the fetches it wakes and the
+    /// prefetches of its rows go first, and its opening report follows. The
+    /// link the driver found at its start changes nothing, and a new link
+    /// replacing one is a fall and a rise.
+    async fn link_up(&mut self, peer: DeviceIdentity, link: u64, now: Instant) -> Vec<Action> {
+        let mut actions = match self.link_of.get(&peer) {
+            Some(known) if *known == link => return Vec::new(),
+            Some(_) => self.link_down(&peer).await,
+            None => Vec::new(),
+        };
+        self.link_of.insert(peer.clone(), link);
+        self.links.linked(&peer);
+        for fetch in self.fetches.values_mut() {
+            if fetch.retry_at.is_some() {
+                fetch.retry_at = Some(now);
+            }
+        }
+        actions.extend(self.retry_due(now).await);
         actions.extend(self.prefetch(peer.key().as_bytes(), now).await);
-        if !self.told.contains_key(&peer) {
-            self.opening = Some(peer);
+        self.opening = Some(peer);
+        actions
+    }
+
+    /// Takes on the links that stood when the driver started, telling each
+    /// peer everything and prefetching from each.
+    async fn found_links(&mut self) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for linked in self.sender.linked() {
+            self.link_of.insert(linked.peer.clone(), linked.link);
+            self.links.linked(&linked.peer);
+            self.holdings(&linked.peer, Instant::now()).await;
+            actions.extend(
+                self.prefetch(linked.peer.key().as_bytes(), Instant::now())
+                    .await,
+            );
         }
         actions
     }
@@ -830,12 +862,20 @@ where
         .await
     }
 
-    /// Queues `messages` to `peer` behind its earlier reports.
+    /// Queues `messages` to `peer` behind its earlier reports, for its live
+    /// link.
     fn report(&mut self, peer: &DeviceIdentity, messages: Vec<Media>) {
-        self.reports
+        let Some(&link) = self.link_of.get(peer) else {
+            return;
+        };
+        let queued = self
+            .reports
             .entry(peer.clone())
-            .or_default()
-            .extend(messages);
+            .or_insert_with(|| (link, Vec::new()));
+        if queued.0 != link {
+            *queued = (link, Vec::new());
+        }
+        queued.1.extend(messages);
         self.send_reports(peer);
     }
 
@@ -844,16 +884,17 @@ where
         if self.reporting.contains(peer) {
             return;
         }
-        let Some(messages) = self
+        let Some((link, messages)) = self
             .reports
             .remove(peer)
-            .filter(|queued| !queued.is_empty())
+            .filter(|(_, queued)| !queued.is_empty())
         else {
             return;
         };
         self.reporting.insert(peer.clone());
         self.jobs.push(Job::Report {
             peer: peer.clone(),
+            link,
             messages,
         });
     }
@@ -987,7 +1028,13 @@ where
         while let Some(action) = queue.pop_front() {
             let more = match action {
                 MediaAction::Send { peer, message } => {
-                    self.jobs.push(Job::Send { peer, message });
+                    if let Some(&link) = self.link_of.get(&peer) {
+                        self.jobs.push(Job::Send {
+                            peer,
+                            link,
+                            message,
+                        });
+                    }
                     Vec::new()
                 }
                 MediaAction::Serve {
@@ -995,10 +1042,15 @@ where
                     request_id,
                     ask,
                 } => {
+                    let Some(&link) = self.link_of.get(&peer) else {
+                        self.links.served(&peer, request_id);
+                        continue;
+                    };
                     let (stop, stopped) = oneshot::channel();
                     self.streams.insert(peer.clone(), (request_id, stop));
                     self.jobs.push(Job::Serve {
                         peer,
+                        link,
                         request_id,
                         ask,
                         stop: stopped,
