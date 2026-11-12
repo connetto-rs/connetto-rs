@@ -74,7 +74,12 @@ pub(crate) fn replica_tuned(tuning: crate::SyncTuning) -> Conn {
 /// Queue a write of row `id` under `writer`, as the build at `captured`
 /// captured it. An issued number holds [`secret_of`] its number, as the grant
 /// that issued it leaves it.
-pub(crate) fn queue(conn: &mut Conn, writer: WriterRef, id: i32, captured: Major) -> u64 {
+pub(crate) fn queue<T: Transport>(
+    conn: &mut ConnettoConnection<T>,
+    writer: WriterRef,
+    id: i32,
+    captured: Major,
+) -> u64 {
     conn.db
         .batch_execute(&format!("INSERT INTO items (id) VALUES ({id})"))
         .expect("write locally");
@@ -118,7 +123,7 @@ pub(crate) fn number_request(number: u64) -> WriterRequest {
 }
 
 /// Record major 1 as held, as a rebuild leaves it, and owe its drain.
-pub(crate) fn hold_major_one(conn: &mut Conn) {
+pub(crate) fn hold_major_one<T: Transport>(conn: &mut ConnettoConnection<T>) {
     conn.db
         .batch_execute(crate::majors::HELD_DDL)
         .expect("the held batch table");
@@ -2539,6 +2544,29 @@ pub(crate) mod r78_4c {
         assert!(
             conn.drain.wire.is_some(),
             "the device's own drain keeps its wire"
+        );
+    }
+
+    /// A failed courier send on the batch's wire re-arms the batch drain.
+    #[tokio::test]
+    async fn a_range_the_drain_rides_whose_send_fails_drops_the_drain() {
+        let (mut conn, _main, _seq) = couriered_author().await;
+        queue(&mut conn, WriterRef::Device([1; 32]), 2, major(1));
+        queue(&mut conn, WriterRef::Device([1; 32]), 3, major(1));
+        hold_major_one(&mut conn);
+        let (_asked, mut old, _broken) = dial(&mut conn, vec![granting(7)], Then::Stay).await;
+        old.close().await.expect("the drain hangs up");
+        let err = conn.courier(AUTHOR).await.expect_err("the send fails");
+        assert!(
+            matches!(err, CourierError::Client(ClientError::Transport(_))),
+            "{err:?}"
+        );
+        assert!(conn.drain.wire.is_none());
+        assert!(
+            conn.drain_timer()
+                .map(|timer| timer.wait())
+                .is_some_and(|wait| wait > Duration::ZERO),
+            "the batch drain backs off"
         );
     }
 

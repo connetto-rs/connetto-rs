@@ -220,6 +220,43 @@ pub(crate) fn all_cursors(
         .collect::<Result<Vec<_>, _>>()
 }
 
+/// When, in Unix seconds, `author`'s stored cursor puts its certificate end
+/// [`DEVICE_SKEW`](connetto_core::clock::DEVICE_SKEW) in the past, after
+/// which no courier can deliver its entries (R79 decision 15), `None` for an
+/// author with no cursor, which is not known to lapse.
+///
+/// # Errors
+///
+/// When the cursor cannot be read.
+pub(crate) fn courier_lapse_at(
+    db: &mut SqliteConnection,
+    author: &[u8],
+) -> Result<Option<i64>, ClientError> {
+    let expires_at: Option<i64> = dsl::_connetto_peer_cursor
+        .filter(dsl::author.eq(author))
+        .select(dsl::expires_at)
+        .first(db)
+        .optional()?;
+    let skew = i64::try_from(connetto_core::clock::DEVICE_SKEW.as_secs()).unwrap_or(i64::MAX);
+    Ok(expires_at.map(|end| end.saturating_add(skew)))
+}
+
+/// Whether `author`'s certificate lapsed by [`courier_lapse_at`], by the
+/// wall clock the replica keeps its times in.
+///
+/// # Errors
+///
+/// When the cursor or the clock cannot be read.
+pub(crate) fn courier_lapsed(
+    db: &mut SqliteConnection,
+    author: &[u8],
+) -> Result<bool, ClientError> {
+    let Some(lapse_at) = courier_lapse_at(db, author)? else {
+        return Ok(false);
+    };
+    Ok(lapse_at <= crate::clock::now_secs(db)?)
+}
+
 /// Store or replace `author`'s cursor with `cursor` and its verified `offer`
 /// (R77 decision 16), the archive's import writing it where the receiver held
 /// none, its certificate end `expires_at` where the receiver held no cursor

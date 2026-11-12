@@ -14,7 +14,8 @@ use tokio::sync::mpsc;
 use crate::peer_support::{Devices, beside, declared, hand_over, name_file, port, replica, stage};
 use crate::retention::pseudorandom;
 
-/// The replies to `request` from `holder`, up to the last one, bounded.
+/// The replies to `request` from `holder`, up to the last one, bounded, the
+/// holder's custody reports left out.
 async fn ask(
     requester: &Node,
     events: &mut mpsc::UnboundedReceiver<PeerEvent>,
@@ -34,6 +35,9 @@ async fn ask(
         let PeerEvent::Media { message, .. } = event else {
             continue;
         };
+        if message.request_id().is_none() {
+            continue;
+        }
         let done = match &message {
             Media::Manifest { last, .. } | Media::Piece { last, .. } => *last,
             _ => true,
@@ -161,7 +165,7 @@ async fn a_refused_requester_and_an_absent_file_get_the_same_answer() {
                 len: 100,
             },
         ] {
-            let request_id = request.request_id();
+            let request_id = request.request_id().expect("a request carries its id");
             assert_eq!(
                 ask(&carl, &mut carl_events, &holder, request).await,
                 vec![Media::Refused { request_id }],
@@ -285,7 +289,7 @@ async fn a_stream_whose_link_falls_stops_and_the_holder_serves_on() {
                 .await
                 .expect("a piece within the bound")
                 .expect("the requester lives");
-            if matches!(event, PeerEvent::Media { .. }) {
+            if matches!(event, PeerEvent::Media { ref message, .. } if message.request_id().is_some()) {
                 break;
             }
         }
@@ -336,7 +340,7 @@ async fn a_file_a_readable_row_names_but_the_holder_lacks_is_refused() {
                 len: 100,
             },
         ] {
-            let request_id = request.request_id();
+            let request_id = request.request_id().expect("a request carries its id");
             assert_eq!(
                 ask(&anna, &mut anna_events, &holder, request).await,
                 vec![Media::Refused { request_id }],

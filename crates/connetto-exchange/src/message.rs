@@ -121,6 +121,10 @@ pub enum BoundsError {
     /// [`crate::media::MAX_FETCH_LEN`], or a range past the largest offset.
     #[error("the media fetch asks for a range outside the bound")]
     RangeOutOfBounds,
+    /// A holder report lists more than
+    /// [`crate::media::MAX_REPORT_ENTRIES`] entries in one list.
+    #[error("the holder report lists more entries than the bound")]
+    TooManyEntries,
 }
 
 /// The manifest messages of one range, `rows` cut into runs of at most

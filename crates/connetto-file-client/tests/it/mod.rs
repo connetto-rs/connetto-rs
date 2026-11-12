@@ -11,6 +11,8 @@ mod negotiation;
 mod offline_photo;
 mod outboards;
 #[cfg(feature = "peer")]
+mod peer_custody;
+#[cfg(feature = "peer")]
 mod peer_fetch;
 #[cfg(feature = "peer")]
 mod peer_holder;

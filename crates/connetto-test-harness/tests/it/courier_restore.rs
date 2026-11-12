@@ -832,7 +832,7 @@ async fn run_retired() {
         "the old writer never retired, so the fresh key enrolls over it"
     );
     let _fresh_key = wait_fresh_certificate(&alice2, &alice_key).await;
-    let old = wait_writer_retired(&provisioned.fixture, &alice_key).await;
+    let old = wait_writer_retired(&provisioned.fixture, &mut alice_events, &alice_key).await;
     assert_eq!(
         old.frontier, 0,
         "the restored server holds the old key at frontier 0"
@@ -1180,24 +1180,25 @@ async fn writer_row(
     .collect()
 }
 
-/// Poll the old key's writer row until it stands stamped retired, bounded by
-/// `BOUND`.
+/// Read the retired writer after the server answers its retirement request.
 async fn wait_writer_retired(
     fixture: &connetto_test_harness::Fixture,
+    events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
     device_key: &[u8],
 ) -> WriterFacts {
-    let until = Instant::now() + BOUND;
-    loop {
-        let rows = writer_row(fixture, device_key).await;
-        if let Some(row) = rows.first()
-            && row.retired
-        {
-            return row.clone();
-        }
-        assert!(
-            Instant::now() < until,
-            "the old key's writer row never stood stamped retired, the rows hold {rows:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    next_event(events, BOUND, |event| {
+        matches!(
+            event,
+            ClientEvent::NonFatal { detail, .. }
+                if detail == "a writer retirement was answered"
+        )
+    })
+    .await
+    .expect("the retirement request is answered");
+    let rows = writer_row(fixture, device_key).await;
+    let [row]: [WriterFacts; 1] = rows
+        .try_into()
+        .unwrap_or_else(|rows| panic!("one writer must name the retired device, got {rows:?}"));
+    assert!(row.retired, "the answered writer is retired");
+    row
 }

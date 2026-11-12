@@ -168,6 +168,10 @@ pub fn content_label(event: &ContentEvent) -> String {
         ContentEvent::Fetched { file_id } => {
             format!("fetched {}", crate::short_hex(file_id.as_bytes()))
         }
+        ContentEvent::Replicated { file_id, holders } => format!(
+            "{holders} devices hold {}",
+            crate::short_hex(file_id.as_bytes())
+        ),
         ContentEvent::LostRequeued { file_id } => {
             format!("re-uploading lost {}", crate::short_hex(file_id.as_bytes()))
         }

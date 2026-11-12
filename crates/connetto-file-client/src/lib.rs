@@ -13,6 +13,8 @@ mod import;
 pub mod resolve;
 mod retain;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod space;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod store;
 mod ticket;
 mod upload;

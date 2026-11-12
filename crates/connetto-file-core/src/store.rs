@@ -80,3 +80,19 @@ pub trait ChunkInventory: ChunkStore {
         &self,
     ) -> impl core::future::Future<Output = Result<Vec<ChunkHash>, Self::Error>> + MaybeSend;
 }
+
+/// A chunk store that can say how many bytes its volume has left.
+///
+/// A device sizes what it holds for other devices from this (R79 decision
+/// 16), so an implementation answers the space the platform sets aside for
+/// data the user did not ask for where the platform names one, and the space
+/// available to the process elsewhere, never space the platform would make
+/// by deleting other applications' caches.
+pub trait FreeSpace: ChunkStore {
+    /// The bytes the store's volume can take now.
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::Error`] when the volume cannot be measured.
+    fn free_bytes(&self) -> std::io::Result<u64>;
+}

@@ -42,9 +42,8 @@ openfga-client = { version = "0.6.1", default-features = false }
 pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
 # `DataTypeLike`, which subql does not re-export, from subql's own branch source.
 sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main", default-features = false }
-# `signal` is the binary's graceful shutdown: SIGINT and SIGTERM stop the
-# listener and close every live session with ServerShuttingDown.
-tokio = { workspace = true, features = ["signal"] }
+# Read local attestation status lists and handle process shutdown signals.
+tokio = { workspace = true, features = ["fs", "signal"] }
 thiserror.workspace = true
 diesel = { workspace = true, features = ["postgres_backend", "serde_json", "uuid", "chrono"] }
 # Session deadlines and provider-token expiries are zone-aware timestamp columns,

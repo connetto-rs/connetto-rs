@@ -1671,10 +1671,8 @@ impl<L: Link> Run<L> {
         else {
             return;
         };
-        if message.ask().is_some() {
-            let refused = connetto_exchange::media::Media::Refused {
-                request_id: message.request_id(),
-            };
+        if let (Some(_), Some(request_id)) = (message.ask(), message.request_id()) {
+            let refused = connetto_exchange::media::Media::Refused { request_id };
             if let Err(err) = self.peer.send_media(&peer, refused).await {
                 tracing::debug!(error = %err, "a media refusal did not reach its peer");
             }
