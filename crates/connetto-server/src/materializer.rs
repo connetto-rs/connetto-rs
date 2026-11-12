@@ -3239,7 +3239,7 @@ mod membership_term_tests {
             "{POLICIES}\nALTER TABLE project_members ENABLE ROW LEVEL SECURITY;\nCREATE POLICY project_members_open ON project_members FOR ALL USING (true) WITH CHECK (true);"
         );
         let unguarded = materializer_over(POLICIES);
-        let guarded = materializer_over(&open_members);
+        let mut guarded = materializer_over(&open_members);
         let pg_sql = guarded
             .translate_subscription_sql(CLIENT_SQL)
             .expect("the caller function reverse translates");
@@ -3250,6 +3250,25 @@ mod membership_term_tests {
             .describe_terms(1, &pg_sql, &[], None, Vec::new())
             .unwrap_or_else(|err| panic!("an open membership table must serve, got {err}"));
         assert_eq!(described, expected);
+        let seed = TermSeed {
+            subscriber: Some(PgValue::String("alice".to_owned())),
+            subjects: Vec::new(),
+            term_values: vec![(
+                vec!["project_id".to_owned()],
+                vec![(PgValue::String("alice".to_owned()), vec![PgValue::Int(7)])],
+            )],
+        };
+        let registration = guarded
+            .register_translated(
+                1,
+                &pg_sql,
+                &[],
+                Some(seed),
+                ReadBudget::new(core::time::Duration::from_secs(5)),
+                None,
+            )
+            .unwrap_or_else(|err| panic!("an open membership table must register, got {err}"));
+        assert!(matches!(registration, Registration::Row(_)));
     }
 
     // subql requires the subscriber for any filter naming a term, which is
