@@ -1022,7 +1022,19 @@ jobs:
 
       - name: Run the passkey gate driver
         working-directory: examples/webauthn-unlock
-        run: cargo +stable test --release --test webauthn_unlock
+        run: |
+          set -o pipefail
+          rm -rf target/passkey-gate
+          mkdir -p target/passkey-gate
+          cargo +stable test --release --test webauthn_unlock -- --nocapture 2>&1 | tee target/passkey-gate/test.log
+
+      - name: Upload passkey failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: passkey-gate-diagnostics
+          path: examples/webauthn-unlock/target/passkey-gate
+          retention-days: 7
 
       - name: Prune target cache
         if: always()
