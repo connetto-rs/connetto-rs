@@ -986,6 +986,7 @@ impl Oplog for ScriptedOplog {
     }
 
     async fn record_commit(&self, commit: PgCommit) -> Result<(), Refused> {
+        self.gate("record_commit").await?;
         self.inner
             .record_commit(commit)
             .await
@@ -2436,6 +2437,111 @@ impl CdcSource for Replay {
     async fn ack(&mut self, _upto: PgCommitPosition) -> Result<(), std::io::Error> {
         Ok(())
     }
+}
+
+struct RefusedAck(Replay);
+
+impl CdcSource for RefusedAck {
+    type Commit = PgCommit;
+    type Event = PgChangeEvent;
+    type Relation = PgRelation;
+    type Error = std::io::Error;
+
+    async fn next_item(
+        &mut self,
+    ) -> Result<Option<SourceItem<PgChangeEvent, PgCommit, PgRelation>>, Self::Error> {
+        self.0.next_item().await
+    }
+
+    fn ack(
+        &mut self,
+        _upto: PgCommitPosition,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        std::future::ready(Err(std::io::Error::other("acknowledgement refused")))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingested_commits_wait_for_the_commit_record() {
+    let fixture = Fixture::acquire().await;
+    let (manager, script, _, _) = scripted(&fixture, SessionConfig::default()).await;
+    let mut commits = manager.ingested_commits();
+    let commit = PgCommit::new(
+        PgCommitPosition::at_commit(PgLsn(0x1000), PgXid(100)),
+        PgLsn(0x1030),
+    );
+    arm(&script, &["record_commit"], false, None);
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.ingest(
+            &mut Replay([SourceItem::Commit(commit)].into()),
+            &mut |_| {},
+        ),
+    )
+    .await
+    .expect("ingest bound")
+    .expect_err("commit recording refused");
+    assert!(matches!(error, connetto_server::SessionError::Oplog(_)));
+    assert_eq!(
+        commits.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    );
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.ingest(
+            &mut Replay([SourceItem::Commit(commit)].into()),
+            &mut |_| {},
+        ),
+    )
+    .await
+    .expect("replay bound")
+    .expect("record replayed commit");
+    assert_eq!(commits.try_recv().expect("ingested commit"), commit);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingested_commits_wait_for_upstream_acknowledgement() {
+    let fixture = Fixture::acquire().await;
+    let manager = fenced_manager(
+        &fixture,
+        FencedSeed::default(),
+        PG_DDL,
+        RosterAuth::granting("client-a"),
+    );
+    let mut commits = manager.ingested_commits();
+    let commit = PgCommit::new(
+        PgCommitPosition::at_commit(PgLsn(0x1000), PgXid(100)),
+        PgLsn(0x1030),
+    );
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.ingest(
+            &mut RefusedAck(Replay([SourceItem::Commit(commit)].into())),
+            &mut |_| {},
+        ),
+    )
+    .await
+    .expect("ingest bound")
+    .expect_err("upstream acknowledgement refused");
+    assert!(matches!(
+        error,
+        connetto_server::SessionError::Transport(message) if message == "acknowledgement refused"
+    ));
+    assert_eq!(
+        commits.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    );
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.ingest(
+            &mut Replay([SourceItem::Commit(commit)].into()),
+            &mut |_| {},
+        ),
+    )
+    .await
+    .expect("replay bound")
+    .expect("acknowledge replayed commit");
+    assert_eq!(commits.try_recv().expect("ingested commit"), commit);
 }
 
 /// A fenced manager whose log keeps two entries, fed three single-row transactions through the change stream so each commit is recorded, returning their events.
