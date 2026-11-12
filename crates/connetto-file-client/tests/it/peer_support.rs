@@ -246,6 +246,11 @@ pub struct Relay {
 }
 
 impl Relay {
+    /// The node the relay feeds from.
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
     /// A fresh port, which takes the events from here on.
     pub fn port(&self) -> MediaPort {
         let (tx, rx) = mpsc::unbounded_channel();

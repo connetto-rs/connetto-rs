@@ -190,11 +190,13 @@ enum Job {
         pieces: mpsc::UnboundedReceiver<Vec<u8>>,
     },
     /// The commit of a fetch whose chunks are all in, taken into custody
-    /// when it fits in `budget`.
+    /// when it fits in `budget`, also for a settled row when the fetch
+    /// `takes_over` a leaving copy.
     Commit {
         tag: u64,
         manifest: Manifest,
         budget: u64,
+        takes_over: bool,
     },
 }
 
@@ -555,8 +557,9 @@ where
                 tag,
                 manifest,
                 budget,
+                takes_over,
             } => {
-                let outcome = self.commit_fetched(&manifest, budget).await;
+                let outcome = self.commit_fetched(&manifest, budget, takes_over).await;
                 Done::Committed {
                     tag,
                     manifest,
@@ -606,6 +609,7 @@ where
 type RoomTold = (u64, Vec<([u8; 32], u64)>);
 
 /// One copy this device holds in custody.
+#[derive(Clone)]
 struct CustodyCopy {
     file_id: FileId,
     /// [`db::HELD`], [`db::LEAVING`] or [`db::PRESSED`].
@@ -978,6 +982,36 @@ where
         });
     }
 
+    /// The copies this device tells its peers it holds: those in custody,
+    /// and its own unsent files of a replicated column, which it holds
+    /// without taking them into custody, so a settled row whose provisional
+    /// record is gone still counts its author's copy (R79 decision 13).
+    async fn told_copies(&mut self, custody: &[CustodyCopy]) -> Vec<CustodyCopy> {
+        let content = self.content;
+        let declared = &content.peer_content;
+        let own = self
+            .beside_jobs(
+                content
+                    .client
+                    .with_conn(|conn| custody::own_replicated(conn.conn(), declared)),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        let mut told = custody.to_vec();
+        told.extend(
+            own.into_iter()
+                .filter(|file_id| !custody.iter().any(|copy| copy.file_id == *file_id))
+                .map(|file_id| CustodyCopy {
+                    file_id,
+                    state: db::HELD.to_owned(),
+                    size: 0,
+                }),
+        );
+        told
+    }
+
     /// Keeps a leaving attempt for every copy marked leaving, one a driver
     /// started again found in the bookkeeping included, and none for any
     /// other.
@@ -998,7 +1032,8 @@ where
         let content = self.content;
         let (custody, held) = self.beside_jobs(content.custody_held()).await;
         self.track_marks(&custody);
-        let admitted = self.admitted(peer, &custody).await;
+        let told = self.told_copies(&custody).await;
+        let admitted = self.admitted(peer, &told).await;
         let room = self.content.room(self.budget, held);
         let rates = self.rates();
         let files: Vec<[u8; 32]> = admitted.held.iter().copied().collect();
@@ -1035,12 +1070,13 @@ where
         let content = self.content;
         let (custody, _) = self.beside_jobs(content.custody_held()).await;
         self.track_marks(&custody);
+        let told = self.told_copies(&custody).await;
         let peers: Vec<DeviceIdentity> = self.told.keys().cloned().collect();
         for peer in peers {
-            let now = self.admitted(&peer, &custody).await;
-            let told = self.told.entry(peer.clone()).or_default();
-            let was = core::mem::replace(told, now);
-            let now = &*told;
+            let now = self.admitted(&peer, &told).await;
+            let entry = self.told.entry(peer.clone()).or_default();
+            let was = core::mem::replace(entry, now);
+            let now = &*entry;
             let added: Vec<[u8; 32]> = now.held.difference(&was.held).copied().collect();
             let removed: Vec<[u8; 32]> = was.held.difference(&now.held).copied().collect();
             let staying: Vec<[u8; 32]> = was
@@ -1083,7 +1119,8 @@ where
         }
         let content = self.content;
         let (custody, _) = self.beside_jobs(content.custody_held()).await;
-        if !custody
+        let told = self.told_copies(&custody).await;
+        if !told
             .iter()
             .any(|copy| marked.contains(copy.file_id.as_bytes()))
         {
@@ -1523,10 +1560,12 @@ where
             }
             Ok(None) => {
                 fetch.stage = Stage::Committing;
+                let takes_over = fetch.purpose == Purpose::Custody;
                 self.jobs.push(Job::Commit {
                     tag,
                     manifest,
                     budget: self.budget,
+                    takes_over,
                 });
                 None
             }

@@ -111,6 +111,9 @@ pub(in crate::client) struct Placed {
     /// Whether a provisional row of an author in courier reach names it, so
     /// a device that lacks it pulls it.
     pub(in crate::client) pulled: bool,
+    /// Whether a settled row names it and no row's state reads `available`,
+    /// so the server may lack it and a copy handed on is kept in custody.
+    pub(in crate::client) settled: bool,
 }
 
 /// Reads every file a replicated column names with what placement needs.
@@ -130,20 +133,28 @@ where
 {
     let mut placed: HashMap<FileId, Placed> = HashMap::new();
     let mut reach = Reach::default();
+    let mut rows: HashMap<FileId, (usize, bool)> = HashMap::new();
+    let mut provisional_rows: HashMap<FileId, usize> = HashMap::new();
     for declared in declared {
         let Some(replicate) = &declared.replicate else {
             continue;
         };
         let copies = usize::from(replicate.copies);
-        for file_id in states(conn.conn(), core::slice::from_ref(declared))?.into_keys() {
+        for (file_id, states) in states(conn.conn(), core::slice::from_ref(declared))? {
             let entry = placed.entry(file_id).or_default();
             entry.copies = entry.copies.max(copies);
+            let (count, available) = rows.entry(file_id).or_default();
+            *count += states.len();
+            *available |= states
+                .iter()
+                .any(|state| state.as_deref() == Some(AVAILABLE));
         }
         for blob in conn.provisional_blobs(&declared.table, &declared.column)? {
             let Ok(id) = <[u8; 32]>::try_from(blob.value.as_slice()) else {
                 continue;
             };
             let lapsed = reach.lapsed(conn, &blob.author)?;
+            *provisional_rows.entry(FileId::from_bytes(id)).or_default() += 1;
             let entry = placed.entry(FileId::from_bytes(id)).or_default();
             entry.copies = entry.copies.max(copies);
             entry.pulled |= !lapsed;
@@ -152,7 +163,34 @@ where
             }
         }
     }
+    for (file_id, entry) in &mut placed {
+        let (count, available) = rows.get(file_id).copied().unwrap_or_default();
+        entry.settled = !available && count > provisional_rows.get(file_id).copied().unwrap_or(0);
+    }
     Ok(placed)
+}
+
+/// Whether a settled row names `file_id` and no row's state reads
+/// `available`, so a copy pulled to take a leaving one over is kept in
+/// custody with no provisional author.
+///
+/// # Errors
+///
+/// [`ContentError::Client`] when the provisional records or an author's
+/// cursor cannot be read, and [`ContentError::Replica`] when a replicated
+/// column cannot.
+pub(in crate::client) fn settled_open<T>(
+    conn: &mut ConnettoConnection<T>,
+    declared: &[PeerColumn],
+    file_id: FileId,
+) -> Result<bool, ContentError>
+where
+    T: Transport,
+    T::Error: Display,
+{
+    Ok(placing(conn, declared)?
+        .get(&file_id)
+        .is_some_and(|placed| placed.settled))
 }
 
 /// One replicated column's value and state on one row.

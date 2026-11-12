@@ -8,12 +8,14 @@ use std::time::Duration;
 
 use connetto_client::live::ConnettoClient;
 use connetto_client::peer::PeerAuthor;
+use connetto_exchange::media::Media;
 use connetto_file_client::{ContentEvent, FileId, Resolved};
-use tokio::sync::broadcast;
+use connetto_peer::{CloseReason, Node};
+use tokio::sync::{broadcast, mpsc};
 
 use crate::peer_support::{
     Device, Devices, Relay, apply_entry, beside_all, captured_photo, custody_state,
-    declare_replicated, held_chunks, relay, replica, stage,
+    declare_replicated, held_chunks, listener, relay, replica, stage,
 };
 use crate::retention::pseudorandom;
 use crate::support::Scripted;
@@ -42,6 +44,12 @@ struct Group {
     /// The author's relay first, then each member's.
     relays: Vec<Relay>,
     file_id: FileId,
+    /// The author's key id, which the members' provisional rows name.
+    author_key: Vec<u8>,
+    /// The deployment the devices were issued in.
+    devices: Devices,
+    /// Each member's listening address.
+    addrs: Vec<std::net::SocketAddr>,
 }
 
 impl Group {
@@ -87,6 +95,7 @@ impl Group {
                 node.link(*addr).await.expect("the link completes");
             }
         }
+        let addrs = nodes[1..].iter().map(|(_, addr, _)| *addr).collect();
         let relays = nodes
             .into_iter()
             .map(|(node, _, events)| relay(node, events))
@@ -97,6 +106,9 @@ impl Group {
             members,
             relays,
             file_id,
+            author_key: author_key.key_id,
+            devices,
+            addrs,
         }
     }
 
@@ -108,6 +120,61 @@ impl Group {
             drivers.push((&member.content, relay.port()));
         }
         beside_all(drivers, proof).await;
+    }
+
+    /// Runs `proof` beside the members' media drivers alone.
+    async fn run_members(&self, proof: impl Future<Output = ()>) {
+        let drivers = self
+            .members
+            .iter()
+            .zip(&self.relays[1..])
+            .map(|(member, relay)| (&member.content, relay.port()))
+            .collect();
+        beside_all(drivers, proof).await;
+    }
+
+    /// A bare device of the `tester` account linked to every member, with
+    /// the inbox that receives every report they send it.
+    async fn observer(&self) -> (Node, mpsc::UnboundedReceiver<Media>) {
+        let (node, _, events) = self.devices.node(&self.devices.device("tester", 9));
+        for addr in &self.addrs {
+            node.link(*addr).await.expect("the link completes");
+        }
+        (node, listener(events))
+    }
+
+    /// Waits until the members' custody states satisfy `settled`, read
+    /// again whenever a member reports to `inbox`.
+    async fn until_reported(
+        &self,
+        inbox: &mut mpsc::UnboundedReceiver<Media>,
+        settled: impl Fn(&[Option<String>]) -> bool,
+    ) -> Vec<Option<String>> {
+        tokio::time::timeout(BOUND, async {
+            loop {
+                let states = self.states().await;
+                if settled(&states) {
+                    return states;
+                }
+                inbox.recv().await.expect("the observer's links stand");
+            }
+        })
+        .await
+        .expect("placement settles within the bound")
+    }
+
+    /// Settles the author's entry on every member, as a courier's answer
+    /// or a verdict would, the server not holding the photo yet.
+    async fn settle(&self) {
+        for member in &self.members {
+            let author = self.author_key.clone();
+            member
+                .client
+                .with_conn(move |conn| conn.adjudicate_peer_frontier(&author, 1))
+                .await
+                .expect("the replica is open")
+                .expect("adjudicate the author's frontier");
+        }
     }
 
     /// Each member's custody state of the photo.
@@ -219,11 +286,13 @@ async fn a_copy_pressed_out_of_its_budget_is_handed_on_and_deleted() {
     let mut heard = group.author.events();
     group
         .run(async {
-            let states = group.until(&mut heard, |states| kept_by(states, 3)).await;
-            assert!(
-                states[3].is_some(),
-                "the only curator with room holds a copy"
-            );
+            // Each account's best device settles in, the only curator with
+            // room among them.
+            group
+                .until(&mut heard, |states| {
+                    kept_by(states, 3) && states[3].is_some()
+                })
+                .await;
         })
         .await;
 
@@ -240,6 +309,51 @@ async fn a_copy_pressed_out_of_its_budget_is_handed_on_and_deleted() {
         .run(async {
             let states = group
                 .until(&mut heard, |states| {
+                    states[3].is_none() && kept_by(states, 3)
+                })
+                .await;
+            assert_eq!(states[4], None, "the device without room takes nothing");
+            assert_eq!(
+                held_chunks(&group.members[3].client, group.file_id).await,
+                0,
+                "the pressed copy's bytes are gone once another device holds it"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_settled_copy_pressed_out_of_its_budget_is_handed_on_before_the_server_holds_it() {
+    let mut group = Group::new().await;
+    let mut heard = group.author.events();
+    group
+        .run(async {
+            group
+                .until(&mut heard, |states| {
+                    kept_by(states, 3) && states[3].is_some()
+                })
+                .await;
+        })
+        .await;
+    group.settle().await;
+    // The author leaves with its row settled and its file not yet on the
+    // server, so only the members hold it.
+    group.relays[0].node().stop(CloseReason::Closed);
+
+    // The curator starts again with a budget below what it holds.
+    let pressed = group.members.remove(3);
+    group.members.insert(
+        3,
+        Member {
+            content: pressed.content.with_custody_budget(1),
+            ..pressed
+        },
+    );
+    let (_observer, mut inbox) = group.observer().await;
+    group
+        .run_members(async {
+            let states = group
+                .until_reported(&mut inbox, |states| {
                     states[3].is_none() && kept_by(states, 3)
                 })
                 .await;

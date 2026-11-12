@@ -107,12 +107,11 @@ where
         };
         let content = self.content;
         let declared = &content.peer_content;
-        let Ok(Ok(placed)) = self
-            .beside_jobs(
-                content
-                    .client
-                    .with_conn(|conn| custody::placing(conn, declared)),
-            )
+        let Ok(Ok((placed, unsent))) = self
+            .beside_jobs(content.client.with_conn(|conn| -> Result<_, ContentError> {
+                let placed = custody::placing(conn, declared)?;
+                Ok((placed, custody::own_replicated(conn.conn(), declared)?))
+            }))
             .await
         else {
             return Vec::new();
@@ -122,18 +121,31 @@ where
         let own_key = *own.key().as_bytes();
         let mine: HashMap<FileId, &CustodyCopy> =
             custody.iter().map(|copy| (copy.file_id, copy)).collect();
+        let linked: Vec<DeviceIdentity> = self.links.linked_peers().cloned().collect();
+        // A settled row's file is pulled only to take over a copy a linked
+        // holder marks leaving, never on its own while the server may still
+        // be receiving it from its author.
+        let handed_on = |file_id: &FileId| {
+            linked.iter().any(|peer| {
+                self.links
+                    .report(peer)
+                    .is_some_and(|report| report.is_leaving(file_id.as_bytes()))
+            })
+        };
         let files: Vec<(FileId, &custody::Placed)> = placed
             .iter()
             .filter(|(file_id, info)| {
-                !info
-                    .authors
-                    .iter()
-                    .any(|author| author.as_slice() == own_key)
-                    && (info.pulled || mine.contains_key(*file_id))
+                !unsent.contains(*file_id)
+                    && !info
+                        .authors
+                        .iter()
+                        .any(|author| author.as_slice() == own_key)
+                    && (info.pulled
+                        || mine.contains_key(*file_id)
+                        || (info.settled && handed_on(file_id)))
             })
             .map(|(file_id, info)| (*file_id, info))
             .collect();
-        let linked: Vec<DeviceIdentity> = self.links.linked_peers().cloned().collect();
         let admitted = self.admitted_takers(&files, &mine, &linked).await;
 
         let my_rates: BTreeMap<[u8; 32], u64> = self.rates().into_iter().collect();
