@@ -324,6 +324,17 @@ where
         }
     }
 
+    /// Cancel the matching dial or attachment and back off its retained work.
+    ///
+    /// Stale timers leave the current attempt unchanged.
+    pub fn cancel_drain_dial(&mut self, timer: DrainTimer) {
+        if self.drain.batch.is_some() && self.drain.armed == timer.armed {
+            self.drain.wire = None;
+            self.drain.unbind();
+            self.drain.back_off();
+        }
+    }
+
     /// The writer the draining major's next write is queued under: the one
     /// holding its entry of the lowest append position.
     pub(crate) fn drain_writer(&self, major: Major) -> Option<WriterRef> {
@@ -505,6 +516,8 @@ where
     /// entries to a number the next dial is issued. A revoked session stops
     /// the drain and keeps the rows for teardown. Anything else backs off and
     /// dials again.
+    ///
+    /// After cancelling this future, call [`Self::cancel_drain_dial`] with its timer.
     ///
     /// # Errors
     ///

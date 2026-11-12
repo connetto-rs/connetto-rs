@@ -1,4 +1,4 @@
-//! Courier audit observers through the public builder and live pump.
+//! Courier audit observers through the public builder and connection drivers.
 
 mod transport;
 
@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_client::{
-    AccessTokenSource, ClientBuilder, ClientError, ClientEvent, ConnettoClient, CourierAuditError,
-    HeldCredential, ReconnectPolicy, SyncTuning, TransportFactory,
+    AccessTokenSource, ClientBuilder, ClientError, ClientEvent, Clock, ConnettoClient,
+    CourierAuditError, CourierAuditWait, HeldCredential, ReconnectPolicy, SyncTuning, SystemClock,
+    TransportFactory,
 };
 use connetto_core::messages::{
     BulkMessage, ControlMessage, CourierAuditAnswer, CourierAuditOutcome, CourierAuditRequest, Pong,
@@ -16,7 +17,7 @@ use connetto_core::messages::{
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{LoopbackTransport, loopback};
 use futures_util::FutureExt;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT);";
@@ -204,6 +205,97 @@ async fn reconnect(h: &mut Harness) {
     h.ports
         .try_send((2, port))
         .expect("reconnect dial response 2");
+}
+
+#[tokio::test]
+async fn manual_wait_expires_without_driver_maintenance() {
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<LoopbackTransport>::default(),
+    )
+    .signed_in(super::support::held("alice"))
+    .open_driven()
+    .expect("open manual connection");
+    let wake = Arc::new(Notify::new());
+    let deadline = SystemClock.monotonic() + Duration::from_secs(1);
+    let wait: CourierAuditWait = conn
+        .begin_courier_audit(&AUTHOR, &[1], deadline, Arc::clone(&wake))
+        .expect("register manual observation");
+
+    let result = bounded("manual audit expiry", wait.wait()).await;
+    assert!(matches!(result, Err(CourierAuditError::Expired)));
+    assert!(SystemClock.monotonic() >= deadline);
+    assert!(
+        wake.notified().now_or_never().is_some(),
+        "expiry wakes cancellation maintenance"
+    );
+}
+
+#[tokio::test]
+async fn a_settled_manual_receipt_survives_late_polling() {
+    let (mut server, transport) = accepting().await;
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(transport),
+    )
+    .signed_in(super::support::held("alice"))
+    .connect_driven()
+    .await
+    .expect("connect manual observer");
+    let wake = Arc::new(Notify::new());
+    let deadline = SystemClock.monotonic() + Duration::from_secs(1);
+    let confirmed = conn
+        .begin_courier_audit(&AUTHOR, &[1], deadline, Arc::clone(&wake))
+        .expect("register confirmed observation");
+    let expired = conn
+        .begin_courier_audit(&AUTHOR, &[2], deadline, wake)
+        .expect("register deadline observation");
+    conn.process_courier_audit()
+        .await
+        .expect("send observations");
+    for _ in 0..2 {
+        let ControlMessage::CourierAuditRequest(request) =
+            control(&mut server, "manual receipt").await
+        else {
+            panic!("expected audit request");
+        };
+        if request.seqs == [1] {
+            answer(
+                &mut server,
+                &request.request_id,
+                CourierAuditOutcome::Confirmed,
+            )
+            .await;
+        } else {
+            assert_eq!(request.seqs, [2]);
+        }
+    }
+    server
+        .send_control(ControlMessage::Pong(Pong { nonce: 321 }))
+        .await
+        .expect("receipt barrier");
+    bounded("receipt barrier 321", async {
+        loop {
+            if conn.pump_one().await.expect("process receipt") == (ClientEvent::Pong { nonce: 321 })
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        SystemClock.monotonic() < deadline,
+        "receipt settled before its deadline"
+    );
+    assert!(matches!(
+        bounded("deadline observation", expired.wait()).await,
+        Err(CourierAuditError::Expired)
+    ));
+    assert!(
+        bounded("already settled receipt", confirmed.wait())
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

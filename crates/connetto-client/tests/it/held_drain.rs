@@ -682,6 +682,33 @@ async fn a_failed_dial_backs_off_and_a_dropped_drain_redials() {
 }
 
 #[tokio::test]
+async fn a_cancelled_drain_handshake_can_be_redialed() {
+    let dir = tempdir().expect("temp dir");
+    let (mut conn, version) = held_under_number(&dir).await;
+    let timer = conn.drain_timer().expect("held write owes a dial");
+    let (transport, mut stalled) = loopback();
+    {
+        let attaching = conn.attach_drain(timer, transport);
+        tokio::pin!(attaching);
+        tokio::select! {
+            result = &mut attaching => panic!("unanswered attachment ended {result:?}"),
+            frame = next_frame(&mut stalled) => {
+                assert!(matches!(frame, Some(IncomingFrame::Control(ControlMessage::Handshake(_)))));
+            }
+        }
+    }
+    conn.cancel_drain_dial(timer);
+    let retry = conn
+        .drain_timer()
+        .expect("cancelled attachment owes a fresh dial");
+    assert_ne!(retry, timer);
+    conn.cancel_drain_dial(timer);
+    assert_eq!(conn.drain_timer(), Some(retry));
+    let mut server = bound(&mut conn, version, HELD_NUMBER).await;
+    assert_eq!(next_write(&mut server).await, 1);
+}
+
+#[tokio::test]
 async fn a_held_write_the_old_major_rate_limits_drains_over_the_redial() {
     let dir = tempdir().expect("temp dir");
     let (mut conn, old_version) = held_under_number(&dir).await;

@@ -44,15 +44,40 @@ pub enum CourierAuditError {
     Client(#[from] ClientError),
 }
 
-pub(crate) struct CourierAuditWait {
+/// An owned audit observation whose drop cancels it and wakes its connection driver.
+#[must_use = "dropping the wait cancels the observation"]
+pub struct CourierAuditWait {
     reply: oneshot::Receiver<Result<(), CourierAuditError>>,
+    deadline: Duration,
     active: Arc<AtomicBool>,
     cancellation_dirty: Arc<AtomicBool>,
     wake: Arc<Notify>,
 }
 
 impl CourierAuditWait {
-    pub(crate) async fn wait(mut self) -> Result<(), CourierAuditError> {
+    /// Await the outcome until the original deadline, independently of driver progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CourierAuditError`] for expiry, server refusal or failure, or session loss.
+    pub async fn wait(self) -> Result<(), CourierAuditError> {
+        let deadline = self.deadline;
+        let mut reply = core::pin::pin!(self.wait_reply());
+        loop {
+            let remaining = deadline.saturating_sub(SystemClock.monotonic());
+            tokio::select! {
+                biased;
+                result = &mut reply => return result,
+                () = crate::timer_wait(remaining) => {
+                    if SystemClock.monotonic() >= deadline {
+                        return Err(CourierAuditError::Expired);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn wait_reply(mut self) -> Result<(), CourierAuditError> {
         let result = (&mut self.reply)
             .await
             .unwrap_or(Err(CourierAuditError::SessionEnded));
@@ -147,7 +172,14 @@ where
     T: Transport,
     T::Error: core::fmt::Display,
 {
-    pub(crate) fn begin_courier_audit(
+    /// Register an observation with an absolute [`SystemClock::monotonic`] deadline.
+    ///
+    /// Drive [`Self::process_courier_audit`] after registration, reconnect and each `wake` notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CourierAuditError`] for invalid input, exhausted capacity, an elapsed deadline or an ended session.
+    pub fn begin_courier_audit(
         &mut self,
         author: &[u8],
         seqs: &[u64],
@@ -215,13 +247,21 @@ where
         state.pending.insert(id);
         Ok(CourierAuditWait {
             reply: receiver,
+            deadline,
             active,
             cancellation_dirty: Arc::clone(&state.cancellation_dirty),
             wake,
         })
     }
 
-    pub(crate) async fn process_courier_audit(&mut self) -> Result<(), ClientError> {
+    /// Reap cancelled or expired observations and send owed cancellations before pending requests.
+    ///
+    /// Keep receiving frames to settle answers, and service the registered wake even while sends are pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Transport`] when sending fails, retaining live observations for reconnect.
+    pub async fn process_courier_audit(&mut self) -> Result<(), ClientError> {
         self.courier_audit.reap(SystemClock.monotonic());
         loop {
             let Some(wire) = self.wire.as_mut() else {

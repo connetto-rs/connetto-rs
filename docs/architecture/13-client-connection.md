@@ -122,6 +122,12 @@ Rejection rolls back. Each pushed changeset is retained keyed by `client_seq` un
 
 A `MutationReject` carrying `Indeterminate` is not rolled back. The write stays pending, `ClientEvent::MutationDeferred` reports it, and `ConnettoConnection::resend_timer` arms a jittered resend of every pending write. A `RateLimited` naming a pending write arms the same resend at the wait the server named.
 
+## Manual courier audit observations
+
+`ConnettoConnection::begin_courier_audit(author, seqs, deadline, wake)` returns an owned `CourierAuditWait` using an absolute `SystemClock::monotonic()` deadline. Registration can fail with `CourierAuditError` for invalid input, exhausted capacity, an elapsed deadline or an ended session. `CourierAuditWait::wait()` expires without driver progress and reports server refusal, observation failure or session loss. An already-settled outcome takes precedence over expiry when the wait is first polled after its deadline.
+
+The driver calls `process_courier_audit()` after registration, reconnect and each notification on `wake`, while receiving frames to settle answers. Dropping the guard or its waiting future cancels ownership and wakes the driver, which reaps state and sends owed cancellations before pending requests. Maintenance can be interrupted to service that wake and returns `ClientError::Transport` on send failure, preserving live observations and their original deadlines across reconnect.
+
 ## The aggregate answer paths
 
 The delta aggregate family, `COUNT`, `COUNT(col)`, `SUM`, `AVG`, `VAR_POP`, `VAR_SAMP`, `STDDEV_POP` and `STDDEV_SAMP`, seeds once through the connector and then folds from subql's per-event deltas, arriving as `ClientEvent::Aggregate`. The `MIN`/`MAX` re-execution aggregates serve alongside, seeded under the caller's read tier. An aggregate on an RLS-protected table is refused at registration and surfaces as `ClientEvent::NonFatal` with the session intact.
