@@ -622,15 +622,11 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
 
     // Client: connect over the socket with a file-backed local replica.
     let db = tempfile::tempdir().expect("temp dir");
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
-        .await
-        .expect("ws connect");
     let credential = super::support::held("token");
     let store = super::support::key_store(&credential).await;
     let mut client = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(credential)
     .durable(
@@ -638,9 +634,14 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         store,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
+    .open_driven()
     .await
-    .expect("client connect");
+    .expect("client open");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    client.attach(transport).await.expect("client connect");
 
     // Subscribe and apply the initial snapshot.
     client.subscribe("orders", QUERY).await.expect("subscribe");
@@ -798,15 +799,11 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
     });
 
     let db = tempfile::tempdir().expect("temp dir");
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
-        .await
-        .expect("ws connect");
     let credential = super::support::held("token");
     let store = super::support::key_store(&credential).await;
     let mut client = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(credential)
     .durable(
@@ -814,9 +811,14 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
         store,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
+    .open_driven()
     .await
-    .expect("client connect");
+    .expect("client open");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    client.attach(transport).await.expect("client connect");
 
     // The snapshot arrives through next_event, which reports the changed table.
     client.subscribe("orders", QUERY).await.expect("subscribe");
@@ -962,15 +964,11 @@ async fn connection_is_a_diesel_connection() {
     });
 
     let db = tempfile::tempdir().expect("temp dir");
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
-        .await
-        .expect("ws connect");
     let credential = super::support::held("token");
     let store = super::support::key_store(&credential).await;
     let mut client = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(credential)
     .durable(
@@ -978,9 +976,14 @@ async fn connection_is_a_diesel_connection() {
         store,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
+    .open_driven()
     .await
-    .expect("client connect");
+    .expect("client open");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    client.attach(transport).await.expect("client connect");
 
     // Write through the diesel Connection impl: a typed insert runs on
     // `&mut client` directly, with no `.conn()` and no manual push.
@@ -1086,15 +1089,11 @@ async fn rejected_write_rolls_back_locally() {
     });
 
     let db = tempfile::tempdir().expect("temp dir");
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
-        .await
-        .expect("ws connect");
     let credential = super::support::held("token");
     let store = super::support::key_store(&credential).await;
     let mut client = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(credential)
     .durable(
@@ -1102,9 +1101,14 @@ async fn rejected_write_rolls_back_locally() {
         store,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
+    .open_driven()
     .await
-    .expect("client connect");
+    .expect("client open");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    client.attach(transport).await.expect("client connect");
 
     // Optimistic local write through the connection.
     diesel::insert_into(orders::table)
@@ -1225,15 +1229,11 @@ async fn a_withheld_write_is_refused_as_unauthorized() {
     });
 
     let db = tempfile::tempdir().expect("temp dir");
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
-        .await
-        .expect("ws connect");
     let credential = super::support::held("token");
     let store = super::support::key_store(&credential).await;
     let mut client = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(credential)
     .durable(
@@ -1241,9 +1241,14 @@ async fn a_withheld_write_is_refused_as_unauthorized() {
         store,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
+    .open_driven()
     .await
-    .expect("client connect");
+    .expect("client open");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    client.attach(transport).await.expect("client connect");
 
     diesel::insert_into(orders::table)
         .values((
@@ -1309,15 +1314,11 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
     });
 
     let db = tempfile::tempdir().expect("temp dir");
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
-        .await
-        .expect("ws connect");
     let credential = super::support::held("token");
     let store = super::support::key_store(&credential).await;
     let mut client = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(credential)
     .durable(
@@ -1325,9 +1326,14 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
         store,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
+    .open_driven()
     .await
-    .expect("client connect");
+    .expect("client open");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    client.attach(transport).await.expect("client connect");
 
     // Sync the seed row so the client has a local (stale) basis to update from.
     client.subscribe("orders", QUERY).await.expect("subscribe");
@@ -1425,10 +1431,6 @@ async fn connect_client(
     client_id: &str,
     dir: &Path,
 ) -> ConnettoConnection<WebSocketTransport<TcpStream>> {
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
-        .await
-        .expect("ws connect");
     // One user, one session per client. TestGrantChecker reads the part
     // between "user:" and "#" as the identity, so these stay the same caller
     // while holding distinct durable handles, which is what two devices of
@@ -1436,9 +1438,9 @@ async fn connect_client(
     let credential =
         super::support::held_grant(Grant::new(format!("user:token#{client_id}")), "token");
     let store = super::support::key_store(&credential).await;
-    ClientBuilder::new(
+    let mut client = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(credential)
     .durable(
@@ -1446,9 +1448,15 @@ async fn connect_client(
         store,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
+    .open_driven()
     .await
-    .expect("client connect")
+    .expect("client open");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    client.attach(transport).await.expect("client connect");
+    client
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3439,15 +3447,11 @@ async fn watch_fn_drives_a_boxed_row_query() {
     let db = tempfile::tempdir().expect("temp dir");
     // The replica needs the gadgets schema, so connect with that DDL rather than
     // the orders-shaped connect_client helper.
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
-        .await
-        .expect("ws connect");
     let credential = super::support::held("token");
     let store = super::support::key_store(&credential).await;
-    let conn = ClientBuilder::new(
+    let mut conn = ClientBuilder::new(
         super::support::bundle(GADGETS_SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(credential)
     .durable(
@@ -3455,9 +3459,14 @@ async fn watch_fn_drives_a_boxed_row_query() {
         store,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
+    .open_driven()
     .await
-    .expect("client connect");
+    .expect("client open");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    conn.attach(transport).await.expect("client connect");
     let (client, pump) = ConnettoClient::with_pump(conn);
     tokio::spawn(pump);
     let mut events = client.events();

@@ -78,15 +78,11 @@ async fn connect(
     addr: std::net::SocketAddr,
     dir: &std::path::Path,
 ) -> ConnettoConnection<WebSocketTransport<TcpStream>> {
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
-        .await
-        .expect("ws connect");
     let held = credential();
     let store = super::support::key_store(&held).await;
-    ClientBuilder::new(
+    let mut conn = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(held)
     .durable(
@@ -94,9 +90,15 @@ async fn connect(
         store,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
+    .open_driven()
     .await
-    .expect("client connect")
+    .expect("open replica");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    conn.attach(transport).await.expect("client connect");
+    conn
 }
 
 /// Open the durable replica in `dir` with no server reachable.

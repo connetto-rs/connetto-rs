@@ -209,10 +209,6 @@ async fn spawn_server(
 async fn connect_with_tier(
     addr: std::net::SocketAddr,
 ) -> ConnettoConnection<WebSocketTransport<TcpStream>> {
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
-        .await
-        .expect("ws connect");
     let bundle = SyncSchema::new(
         SchemaBundle::new(
             SOURCE,
@@ -224,11 +220,19 @@ async fn connect_with_tier(
         )
         .expect("the source declares major 1"),
     );
-    ClientBuilder::new(bundle, super::support::Once::new(transport))
-        .signed_in(super::support::held("token"))
-        .connect_driven()
+    let mut conn = ClientBuilder::new(
+        bundle,
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
+    )
+    .signed_in(super::support::held("token"))
+    .open_driven()
+    .expect("open replica");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
-        .expect("client connect")
+        .expect("ws connect");
+    conn.attach(transport).await.expect("client connect");
+    conn
 }
 
 /// Pump the broadcast stream until an event matches `pred`, failing fast on

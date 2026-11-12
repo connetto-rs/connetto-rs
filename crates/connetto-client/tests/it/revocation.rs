@@ -86,17 +86,18 @@ diesel::table! {
 
 /// Open a real client session for one person.
 async fn connect_as(
-    transport: LoopbackTransport,
+    server: &connetto_test_harness::Server,
     person: &str,
 ) -> ConnettoConnection<LoopbackTransport> {
-    ClientBuilder::new(
+    let mut conn = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<LoopbackTransport>::default(),
     )
     .signed_in(super::support::held(person))
-    .connect_driven()
-    .await
-    .expect("connect")
+    .open_driven()
+    .expect("open");
+    conn.attach(server.attach()).await.expect("connect");
+    conn
 }
 
 /// Every row the replica holds, by id.
@@ -115,35 +116,37 @@ where
 /// Open a real client session for a caller holding one share key and no
 /// identity, which is what a share link produces.
 async fn connect_with_key(
-    transport: LoopbackTransport,
+    server: &connetto_test_harness::Server,
     key: &str,
 ) -> ConnettoConnection<LoopbackTransport> {
-    ClientBuilder::new(
+    let mut conn = ClientBuilder::new(
         super::support::bundle(PAPERS_SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<LoopbackTransport>::default(),
     )
     .with_share_keys([(
         Grant::new(key.to_owned()),
         CapabilitySubject::<String>::new(key.to_owned()),
     )])
-    .connect_driven()
-    .await
-    .expect("connect")
+    .open_driven()
+    .expect("open");
+    conn.attach(server.attach()).await.expect("connect");
+    conn
 }
 
 /// Open a real client session for one person over the shared table.
 async fn connect_owner(
-    transport: LoopbackTransport,
+    server: &connetto_test_harness::Server,
     person: &str,
 ) -> ConnettoConnection<LoopbackTransport> {
-    ClientBuilder::new(
+    let mut conn = ClientBuilder::new(
         super::support::bundle(PAPERS_SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<LoopbackTransport>::default(),
     )
     .signed_in(super::support::held(person))
-    .connect_driven()
-    .await
-    .expect("connect")
+    .open_driven()
+    .expect("open");
+    conn.attach(server.attach()).await.expect("connect");
+    conn
 }
 
 /// Every paper the replica holds, by id.
@@ -279,7 +282,7 @@ async fn a_withdrawn_grant_takes_the_rows_off_the_device() {
         ))
         .await;
 
-    let mut withdrawn = connect_as(server.attach(), WITHDRAWN).await;
+    let mut withdrawn = connect_as(&server, WITHDRAWN).await;
     withdrawn.subscribe(SUB, QUERY).await.expect("subscribe");
     pump_to_snapshot_end(&mut withdrawn).await;
     pump_to_membership(&mut withdrawn, "team_members").await;
@@ -299,7 +302,7 @@ async fn a_withdrawn_grant_takes_the_rows_off_the_device() {
     );
 
     // A second member of the same team, whose own access nothing changes.
-    let mut settled = connect_as(server.attach(), SETTLED).await;
+    let mut settled = connect_as(&server, SETTLED).await;
     settled.subscribe(SUB, QUERY).await.expect("subscribe");
     pump_to_snapshot_end(&mut settled).await;
     pump_to_membership(&mut settled, "team_members").await;
@@ -363,7 +366,7 @@ async fn three_bearers(
     ConnettoConnection<LoopbackTransport>,
     ConnettoConnection<LoopbackTransport>,
 ) {
-    let mut bearer_a = connect_with_key(server.attach(), SHARE_KEY_A).await;
+    let mut bearer_a = connect_with_key(server, SHARE_KEY_A).await;
     bearer_a
         .subscribe(PAPERS_SUB, PAPERS_QUERY)
         .await
@@ -375,7 +378,7 @@ async fn three_bearers(
         "the key grants exactly the paper its share row names"
     );
 
-    let mut bearer_b = connect_with_key(server.attach(), SHARE_KEY_B).await;
+    let mut bearer_b = connect_with_key(server, SHARE_KEY_B).await;
     bearer_b
         .subscribe(PAPERS_SUB, PAPERS_QUERY)
         .await
@@ -387,7 +390,7 @@ async fn three_bearers(
         "the second key grants its own paper and nothing else"
     );
 
-    let mut owner = connect_owner(server.attach(), SETTLED).await;
+    let mut owner = connect_owner(server, SETTLED).await;
     owner
         .subscribe(PAPERS_SUB, PAPERS_QUERY)
         .await
