@@ -33,6 +33,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::ParserDB;
 use subql::patchset::{PgAdapter, apply_diffset_bytes_async_with_catalog};
 
+use crate::audit::ConnettoAuditSchema;
 use crate::capability::CallerBinding;
 use crate::schema::ConnettoSchema;
 use crate::writer_schema::{
@@ -319,6 +320,19 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
     ) -> Result<Option<WriterRow<D::Id>>, WriteError> {
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
         D::Writers::by_key(&mut conn, device_key)
+            .await
+            .map_err(WriteError::from)
+    }
+
+    /// Read committed courier receipts visible to the authenticated viewer.
+    pub(crate) async fn courier_audit_receipts(
+        &self,
+        viewer: &D::Id,
+        writer: i64,
+        sequences: &[i64],
+    ) -> Result<Vec<i64>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Audit::courier_receipts(&mut conn, viewer, writer, sequences)
             .await
             .map_err(WriteError::from)
     }

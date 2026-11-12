@@ -52,6 +52,10 @@ The relay-to-tab frames are never sent by a real server. The browser worker's hu
 
 `CourierAuditCancel` releases the named observation without acknowledging persistence. Reconnection retains the original caller deadline and authenticated account, then sends the remaining duration for a fresh read. A different account cannot inherit an observation, and courier settlement carries no audit-persistence guarantee.
 
+Each connection may retain at most 65,536 requested sequences. Repeating an open identifier with the same author and sequence set rereads evidence without extending its deadline. Different inputs refuse and close that identifier. Cancellation, expiry, failure and connection teardown release its private consumers.
+
+The server reads authorized evidence and registers missing observations under the dispatch gate. Private `subql` row, refusal and computed deliveries trigger a typed reread of the complete requested set. Only complete authorized evidence produces `Confirmed`, and transient read failures retain the delivery for the existing ingestion recovery.
+
 ## The opening challenge
 
 Every connection opens with the server's `Challenge` frame, the random bytes the first frame of the connection signs. The signatures over a connection nonce carry distinct domain separators, so a signature over one connection answers exactly one of the questions it could be asked. A bot registration spends its one-time code as the first frame of a fresh connection, signed over the nonce, and the server settles it with the bot id or refuses it without a reason. The bot entities are in [12](12-identity-session-capability.md), the bot login over the challenge is in [11](11-authentication.md), and a device key proves itself the same way, over its own message, in the writer section below.
