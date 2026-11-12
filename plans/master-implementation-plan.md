@@ -971,7 +971,7 @@ Making the demos runnable in CI, which `R55` settled, since they need a browser,
 
 ## R79: media over the peer link
 
-**Status.** IN PROGRESS. Steps 1 to 3 are built in slices 1 to 8 below. Step 4 is designed in decisions 12 to 18 and sliced as slices 9 to 14, of which slices 9 to 10c are built. Decisions 1 to 10 and 12 to 18 were taken with the maintainer, and decision 11 was settled on evidence.
+**Status.** IN PROGRESS. Steps 1 to 3 are built in slices 1 to 8 below. Step 4 is designed in decisions 12 to 18 and sliced as slices 9 to 14, of which slices 9 to 10d are built. Decisions 1 to 10 and 12 to 18 were taken with the maintainer, and decision 11 was settled on evidence.
 
 **Blocked on** nothing. Steps 1 to 3 build on R77 and on R64 to R67 for the chunk machinery, all merged.
 

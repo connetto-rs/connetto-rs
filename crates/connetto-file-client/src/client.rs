@@ -100,8 +100,19 @@ pub enum ContentEvent {
     Replicated {
         /// The file.
         file_id: FileId,
-        /// How many linked devices other than this one hold it.
+        /// How many linked devices other than this one hold it without
+        /// marking it leaving.
         holders: usize,
+        /// How many linked devices hold it marked leaving, handing their
+        /// copy to another device.
+        leaving: usize,
+    },
+    /// Copies this device holds for others are marked leaving under storage
+    /// pressure and no linked device can take one over, so they stay (R79
+    /// decision 16). Raised again whenever more copies are stranded.
+    CustodyPressed {
+        /// The bytes custody holds.
+        held_bytes: u64,
     },
     /// The boot integrity pass could not run, so no unsent file was checked
     /// this time. The walk went ahead: a pass that cannot read the outbox

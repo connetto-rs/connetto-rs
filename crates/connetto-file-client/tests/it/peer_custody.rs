@@ -607,10 +607,11 @@ async fn the_author_hears_how_many_devices_hold_its_file() {
                     if let ContentEvent::Replicated {
                         file_id: heard_of,
                         holders,
+                        leaving,
                     } = heard.recv().await.expect("the author's events run")
                     {
                         assert_eq!(heard_of, file_id);
-                        assert_eq!(holders, 1);
+                        assert_eq!((holders, leaving), (1, 0));
                         return;
                     }
                 }

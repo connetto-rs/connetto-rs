@@ -445,6 +445,15 @@ impl Node {
         *self.state.socket_prep.write() = prep;
     }
 
+    /// What the certificate the node presents names, `None` before it
+    /// serves.
+    #[must_use]
+    pub fn identity(&self) -> Option<DeviceIdentity> {
+        let identity = self.state.identity.read();
+        let certificate = DeviceCertificate::parse(&identity.as_ref()?.certificate).ok()?;
+        Some(certificate.identity().clone())
+    }
+
     /// The bound address, while the node serves.
     #[must_use]
     pub fn local_addr(&self) -> Option<SocketAddr> {

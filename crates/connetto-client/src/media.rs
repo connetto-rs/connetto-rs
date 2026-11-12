@@ -135,6 +135,13 @@ impl MediaSender {
         self.node.send_media(peer, link, message).await
     }
 
+    /// What this device's own certificate names, `None` before the node
+    /// serves.
+    #[must_use]
+    pub fn own(&self) -> Option<DeviceIdentity> {
+        self.node.identity()
+    }
+
     /// The peers with a live link now, in no order, for a consumer that
     /// starts after links came up.
     #[must_use]

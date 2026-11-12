@@ -69,9 +69,26 @@ pub(super) struct Fetch {
     pub(super) retry_at: Option<Instant>,
     /// The fetch's start, or its last verified chunk.
     pub(super) progress: Instant,
-    /// Whether nothing waits on the fetch, a thumbnail asked of its author
-    /// alone, behind every on-demand ask and dropped rather than retried.
-    pub(super) prefetch: bool,
+    /// What the fetch is for.
+    pub(super) purpose: Purpose,
+}
+
+/// What a fetch is for, which sets its queue, its holders and its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Purpose {
+    /// A resolve waits on it, every linked holder asked and busy ones
+    /// asked again within the on-demand bound.
+    OnDemand,
+    /// A thumbnail asked of its author alone, behind every on-demand ask and
+    /// dropped rather than retried.
+    Prefetch,
+    /// A copy placement takes into custody (R79 decision 14), behind every
+    /// on-demand ask and dropped rather than retried, since the next
+    /// evaluation asks again.
+    Custody,
+    /// Only the manifest, which tells placement the file's size, then
+    /// dropped.
+    Size,
 }
 
 impl Fetch {
@@ -88,16 +105,16 @@ impl Fetch {
             backoff: FIRST_BACKOFF,
             retry_at: None,
             progress: now,
-            prefetch: false,
+            purpose: Purpose::OnDemand,
         }
     }
 
     /// The priority its asks queue at.
     pub(super) fn priority(&self) -> Priority {
-        if self.prefetch {
-            Priority::Prefetch
-        } else {
+        if self.purpose == Purpose::OnDemand {
             Priority::OnDemand
+        } else {
+            Priority::Prefetch
         }
     }
 

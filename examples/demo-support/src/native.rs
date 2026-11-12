@@ -168,10 +168,17 @@ pub fn content_label(event: &ContentEvent) -> String {
         ContentEvent::Fetched { file_id } => {
             format!("fetched {}", crate::short_hex(file_id.as_bytes()))
         }
-        ContentEvent::Replicated { file_id, holders } => format!(
-            "{holders} devices hold {}",
+        ContentEvent::Replicated {
+            file_id,
+            holders,
+            leaving,
+        } => format!(
+            "{holders} devices hold {}, {leaving} handing it on",
             crate::short_hex(file_id.as_bytes())
         ),
+        ContentEvent::CustodyPressed { held_bytes } => {
+            format!("storage low, {held_bytes} bytes held for others with nobody to take them")
+        }
         ContentEvent::LostRequeued { file_id } => {
             format!("re-uploading lost {}", crate::short_hex(file_id.as_bytes()))
         }

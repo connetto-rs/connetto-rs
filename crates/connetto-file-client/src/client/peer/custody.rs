@@ -100,6 +100,61 @@ where
     Ok(named)
 }
 
+/// What placement reads of the replica for one file a replicated column
+/// names (R79 decisions 12 and 14).
+#[derive(Default)]
+pub(in crate::client) struct Placed {
+    /// The most copies any replicated column naming it declares.
+    pub(in crate::client) copies: usize,
+    /// The key ids of the authors of the provisional rows naming it.
+    pub(in crate::client) authors: Vec<Vec<u8>>,
+    /// Whether a provisional row of an author in courier reach names it, so
+    /// a device that lacks it pulls it.
+    pub(in crate::client) pulled: bool,
+}
+
+/// Reads every file a replicated column names with what placement needs.
+///
+/// # Errors
+///
+/// [`ContentError::Client`] when the provisional records or an author's
+/// cursor cannot be read, and [`ContentError::Replica`] when a replicated
+/// column cannot.
+pub(in crate::client) fn placing<T>(
+    conn: &mut ConnettoConnection<T>,
+    declared: &[PeerColumn],
+) -> Result<HashMap<FileId, Placed>, ContentError>
+where
+    T: Transport,
+    T::Error: Display,
+{
+    let mut placed: HashMap<FileId, Placed> = HashMap::new();
+    let mut reach = Reach::default();
+    for declared in declared {
+        let Some(replicate) = &declared.replicate else {
+            continue;
+        };
+        let copies = usize::from(replicate.copies);
+        for file_id in states(conn.conn(), core::slice::from_ref(declared))?.into_keys() {
+            let entry = placed.entry(file_id).or_default();
+            entry.copies = entry.copies.max(copies);
+        }
+        for blob in conn.provisional_blobs(&declared.table, &declared.column)? {
+            let Ok(id) = <[u8; 32]>::try_from(blob.value.as_slice()) else {
+                continue;
+            };
+            let lapsed = reach.lapsed(conn, &blob.author)?;
+            let entry = placed.entry(FileId::from_bytes(id)).or_default();
+            entry.copies = entry.copies.max(copies);
+            entry.pulled |= !lapsed;
+            if !entry.authors.contains(&blob.author) {
+                entry.authors.push(blob.author);
+            }
+        }
+    }
+    Ok(placed)
+}
+
 /// One replicated column's value and state on one row.
 #[derive(diesel::QueryableByName)]
 struct Row {
