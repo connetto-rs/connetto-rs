@@ -1,7 +1,8 @@
 //! The retention pass on a device holding a file a peer's provisional row
 //! names: spared until the row is settled, removed at once when the row is
-//! retracted, and caught at the driver's start when the retraction's event
-//! went unheard (R79 decisions 6 and 7).
+//! retracted, caught at the driver's start when the retraction's event went
+//! unheard, and no longer spared once the author's certificate lapsed (R79
+//! decisions 6, 7 and 15).
 
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use connetto_core::exchange::{RetractCause, Retraction};
 use connetto_file_client::{FileId, Resolved};
 
 use crate::peer_support::{
-    Device, Devices, apply_entry, beside_both, captured_photo, declared, port, stage,
+    Device, Devices, apply_entry, beside_both, captured_photo, declared, lapse_in, port, stage,
 };
 use crate::retention::pseudorandom;
 use crate::support::Scripted;
@@ -203,4 +204,15 @@ async fn a_retraction_no_driver_heard_is_caught_when_the_driver_starts() {
         () = camp.receiver.drive_outbox(never) => panic!("the outbox driver ended"),
         () = until_gone(&camp.receiver, camp.file_id) => {}
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_whose_author_lapsed_is_spared_no_longer() {
+    let camp = Camp::new().await;
+    lapse_in(&camp.client, &anna(), -3600).await;
+    assert_eq!(camp.receiver.tidy_content().await.expect("tidy"), 1);
+    assert!(
+        !held(&camp.receiver, camp.file_id).await,
+        "no courier can carry the row any more"
+    );
 }

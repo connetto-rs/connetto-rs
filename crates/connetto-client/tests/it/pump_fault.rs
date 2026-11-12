@@ -2,11 +2,12 @@
 //! everything waiting on it.
 
 use connetto_client::{
-    ClientBuilder, ClientError, ClientEvent, ConnettoClient, DataDir, MemoryRefreshStore,
-    SyncSchema, SyncStatus,
+    ClientBuilder, ClientError, ClientEvent, ConnettoClient, DataDir, FirstThen,
+    MemoryRefreshStore, SyncSchema, SyncStatus,
 };
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, FatalError, FatalErrorReason, LivePatch,
+    BulkMessage, ControlMessage, FatalError, FatalErrorReason, LivePatch, MutationApplied,
+    RateLimited,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -53,6 +54,9 @@ struct Script {
     subscribed: Arc<Mutex<Vec<String>>>,
     closed: Arc<AtomicBool>,
     dropped: Arc<AtomicBool>,
+    arrived: Arc<tokio::sync::Notify>,
+    uploaded: Arc<tokio::sync::Notify>,
+    headers: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
 }
 
 /// The failure a send reports once the socket is gone.
@@ -63,6 +67,7 @@ struct Gone;
 impl Script {
     fn say(&self, frame: IncomingFrame) {
         self.frames.lock().push_back(frame);
+        self.arrived.notify_one();
     }
 
     fn last_subscribed(&self) -> String {
@@ -90,6 +95,11 @@ impl Transport for Script {
         &mut self,
         message: ControlMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> {
+        if let ControlMessage::MutationHeader(header) = &message
+            && let Some(headers) = &self.headers
+        {
+            let _ = headers.send(header.client_seq);
+        }
         if let ControlMessage::Subscribe(subscribe) = message {
             self.subscribed.lock().push(subscribe.sub_id);
         }
@@ -100,17 +110,23 @@ impl Transport for Script {
         &mut self,
         _message: BulkMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> {
-        ready(self.sent())
+        let result = self.sent();
+        if result.is_ok() {
+            self.uploaded.notify_one();
+        }
+        ready(result)
     }
 
     fn recv(&mut self) -> impl Future<Output = Result<Option<IncomingFrame>, Self::Error>> {
         let frames = Arc::clone(&self.frames);
+        let arrived = Arc::clone(&self.arrived);
         async move {
             loop {
+                let notified = arrived.notified();
                 if let Some(frame) = frames.lock().pop_front() {
                     return Ok(Some(frame));
                 }
-                tokio::task::yield_now().await;
+                notified.await;
             }
         }
     }
@@ -398,6 +414,81 @@ async fn a_socket_lost_while_uploading_a_write_is_recovered() {
         seen.contains(&ClientEvent::SyncStatus(SyncStatus::Offline)),
         "the loss is announced before the redial, saw {seen:?}"
     );
+}
+
+/// A failed deferred-write resend reconnects and delivers the same pending write.
+#[tokio::test]
+async fn a_resend_due_over_a_dead_wire_reconnects_under_the_pump() {
+    tokio::time::timeout(BOUND, async {
+        let (first_headers, mut first_sent) = tokio::sync::mpsc::unbounded_channel();
+        let first = Script {
+            headers: Some(first_headers),
+            ..Script::default()
+        };
+        first.say(ack());
+        let (next_headers, mut next_sent) = tokio::sync::mpsc::unbounded_channel();
+        let next = Script {
+            headers: Some(next_headers),
+            ..Script::default()
+        };
+        next.say(ack());
+        let factory = FirstThen::new(first.clone(), {
+            let next = next.clone();
+            move || ready(Ok::<_, Gone>(next.clone()))
+        });
+        let (running, pump) = ClientBuilder::new(super::support::bundle(DDL), factory)
+            .with_sleeper(tokio::time::sleep)
+            .signed_in(super::support::held("tester"))
+            .connect_with_pump()
+            .await
+            .expect("the builder connects");
+        let pump = tokio::spawn(pump);
+        let client = running.client();
+        let mut events = client.events();
+        client
+            .with_conn(|conn| {
+                diesel::insert_into(items::table)
+                    .values((items::id.eq(1), items::label.eq("deferred")))
+                    .execute(conn.conn())
+                    .expect("write the row");
+            })
+            .await
+            .expect("the write lands locally");
+        let seq = first_sent.recv().await.expect("the first upload");
+        first.uploaded.notified().await;
+        first.dropped.store(true, Ordering::Release);
+        first.say(IncomingFrame::Control(ControlMessage::RateLimited(
+            RateLimited {
+                related_to: Some(seq.to_string()),
+                retry_after_ms: 1,
+            },
+        )));
+        assert_eq!(
+            first_sent.recv().await,
+            Some(seq),
+            "the resend reaches the dead wire"
+        );
+        assert_eq!(
+            next_sent.recv().await,
+            Some(seq),
+            "the new wire carries the pending write"
+        );
+        next.uploaded.notified().await;
+        next.say(IncomingFrame::Control(ControlMessage::MutationApplied(
+            MutationApplied { client_seq: seq },
+        )));
+        loop {
+            match events.recv().await.expect("the event stream stays open") {
+                ClientEvent::MutationApplied { client_seq } if client_seq == seq => break,
+                ClientEvent::Stopped { .. } | ClientEvent::Closed => panic!("the pump stopped"),
+                _ => {}
+            }
+        }
+        client.close().await;
+        pump.await.expect("the pump exits");
+    })
+    .await
+    .expect("the deferred write recovers within the bound");
 }
 
 /// The server ends the session as it shuts down for a restart, and the redial

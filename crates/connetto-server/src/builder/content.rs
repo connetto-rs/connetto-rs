@@ -264,6 +264,7 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     owner_url: &str,
     reader_url: &str,
     reader_pool_size: u32,
+    completion: &mut Option<super::TaskCompletion>,
 ) -> Result<FileHalf, ContentBuildError> {
     let Some(settings) = settings else {
         return Ok(FileHalf::none());
@@ -315,6 +316,7 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
         settings.grace,
         settings.cadence,
     );
+    *completion = sweep.as_ref().map(super::BackgroundTask::completion);
     tracing::info!(
         base = %settings.base_url,
         store = ?settings.store,
@@ -348,6 +350,7 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     _owner_url: &str,
     _reader_url: &str,
     _reader_pool_size: u32,
+    _completion: &mut Option<super::TaskCompletion>,
 ) -> Result<FileHalf, ContentBuildError> {
     if settings.is_some() {
         tracing::warn!(
@@ -472,6 +475,7 @@ mod tests {
             "postgres://unused",
             "postgres://unused",
             1,
+            &mut None,
         )
         .await
         .expect("no settings is a valid deployment");
@@ -558,10 +562,15 @@ mod tests {
             key: doc.as_ref().to_vec(),
         };
         // The sweep's guard stays alive until the tick below, then stops it.
-        let half =
-            build::<crate::defaults::ConnettoDefaults>(Some(settings), &admin_url, &reader_url, 2)
-                .await
-                .expect("a configured deployment builds");
+        let half = build::<crate::defaults::ConnettoDefaults>(
+            Some(settings),
+            &admin_url,
+            &reader_url,
+            2,
+            &mut None,
+        )
+        .await
+        .expect("a configured deployment builds");
         let url = ContentTicketSigner::mint(
             &half.signer,
             &identified("caller-9"),

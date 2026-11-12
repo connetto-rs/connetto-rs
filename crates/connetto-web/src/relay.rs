@@ -5932,17 +5932,13 @@ mod tests {
             .expect("the source declares major 1"),
         );
         let version = schema.version();
-        let expiry = (js_sys::Date::now() / 1000.0).floor() + 3.0;
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(format!("{{\"exp\":{expiry:.0}}}"));
         let store = Recording::default();
+        // Opened with no key, so loading the durable set at open cannot drop
+        // one that expired during a slow setup.
         let mut worker = ClientBuilder::new(schema, || async {
             Err::<LoopbackTransport, _>("no redial")
         })
-        .with_share_keys([(
-            Grant::new(format!("header.{payload}.signature")),
-            CapabilitySubject::<String>::new("gate-subject"),
-        )])
+        .with_share_keys(Vec::<(Grant, CapabilitySubject<String>)>::new())
         .signed_in(HeldCredential::new(Grant::new("user:gate"), "gate").expect("identity"))
         .durable(
             At(storage.db_url(name)),
@@ -5953,7 +5949,6 @@ mod tests {
         .open_driven()
         .await
         .expect("open the durable worker");
-        store.0.borrow_mut().clear();
         let (transport, mut server) = loopback();
         let answer = async {
             let hello = bounded(server.recv()).await.expect("read the handshake");
@@ -5981,6 +5976,19 @@ mod tests {
         };
         let (attached, ()) = tokio::join!(worker.attach(transport), answer);
         attached.expect("attach the worker");
+        // Only the hub's pump expires a key added now, and the pump first runs
+        // with the gate already locked, however long the setup took.
+        let expiry = (js_sys::Date::now() / 1000.0).floor() + 3.0;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("{{\"exp\":{expiry:.0}}}"));
+        worker
+            .add_share_key(
+                &Grant::new(format!("header.{payload}.signature")),
+                &CapabilitySubject::<String>::new("gate-subject"),
+            )
+            .await
+            .expect("hold the expiring key");
+        store.0.borrow_mut().clear();
         let (hub, pump, _notices) = super::RelayHub::new(worker, ":memory:").expect("open the hub");
         let (approve, reply) = futures_channel::oneshot::channel();
         hub.gate
@@ -5989,27 +5997,35 @@ mod tests {
         {
             tokio::pin!(pump);
             let observation = async {
-                let frame = bounded(server.recv())
-                    .await
-                    .expect("read the expiry replacement");
-                let Some(IncomingFrame::Control(ControlMessage::ReplaceShareKeys(request))) = frame
-                else {
-                    panic!("expiry sends its correlated replacement");
-                };
-                assert!(
-                    request.keys.is_empty(),
-                    "the expired grant is no longer authorized"
-                );
-                assert!(
-                    store.0.borrow().is_empty(),
-                    "a locked gate defers secret writes"
-                );
-                server
-                    .send_control(ControlMessage::ShareKeysReplaced(ShareKeysReplaced {
-                        request_id: request.request_id,
-                    }))
-                    .await
-                    .expect("settle the replacement");
+                // The added key's replacement comes first unless the key had
+                // already expired when the pump ran, so each is settled until
+                // the one dropping it.
+                loop {
+                    let frame = bounded(server.recv())
+                        .await
+                        .expect("read the expiry replacement");
+                    let Some(IncomingFrame::Control(ControlMessage::ReplaceShareKeys(request))) =
+                        frame
+                    else {
+                        panic!("expiry sends its correlated replacement");
+                    };
+                    let expired = request.keys.is_empty();
+                    if expired {
+                        assert!(
+                            store.0.borrow().is_empty(),
+                            "a locked gate defers secret writes"
+                        );
+                    }
+                    server
+                        .send_control(ControlMessage::ShareKeysReplaced(ShareKeysReplaced {
+                            request_id: request.request_id,
+                        }))
+                        .await
+                        .expect("settle the replacement");
+                    if expired {
+                        break;
+                    }
+                }
                 approve
                     .send(GateAskOutcome::Approved)
                     .expect("approve the held prompt");

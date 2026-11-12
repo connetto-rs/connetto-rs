@@ -113,7 +113,24 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// One row per file this device holds in custody for another device's
+    /// row, kept until the server acknowledges it (R79 decision 15).
+    _connetto_content_custody (file_id) {
+        /// BLAKE3 identity of the held file.
+        file_id -> Binary,
+        /// The key id of the provisional row's author, `NULL` for a copy a
+        /// `lost` state returned to custody.
+        author_key -> Nullable<Binary>,
+        /// Where the copy stands, `held` until placement marks one leaving.
+        state -> Text,
+        /// When this device learned the row settled, in Unix seconds.
+        settled_seen_at -> Nullable<BigInt>,
+    }
+}
+
 allow_tables_to_appear_in_same_query!(_connetto_content_chunks, _connetto_content_outbox);
+allow_tables_to_appear_in_same_query!(_connetto_content_chunks, _connetto_content_custody);
 
 /// The bookkeeping schema, applied on every open so a new replica gains all
 /// tables, the same way `_connetto_meta` arrives.
@@ -128,7 +145,10 @@ pub(crate) const CONTENT_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS _connetto_content_pins \
     (name TEXT NOT NULL PRIMARY KEY, query TEXT NOT NULL, file_id_column TEXT NOT NULL); \
     CREATE TABLE IF NOT EXISTS _connetto_content_outboard \
-    (file_id BLOB NOT NULL PRIMARY KEY, hash BLOB NOT NULL)";
+    (file_id BLOB NOT NULL PRIMARY KEY, hash BLOB NOT NULL); \
+    CREATE TABLE IF NOT EXISTS _connetto_content_custody \
+    (file_id BLOB NOT NULL PRIMARY KEY, author_key BLOB, state TEXT NOT NULL, \
+     settled_seen_at INTEGER)";
 
 /// The held-content half of the schema (R31), created by a rebuild inside
 /// the rebuild transaction and on every content attach.
@@ -467,6 +487,82 @@ pub(crate) fn all_manifests(conn: &mut SqliteConnection) -> Result<Vec<FileId>, 
     rows.into_iter()
         .map(|id| Ok(FileId::from_bytes(exactly_32(&id)?)))
         .collect()
+}
+
+/// The state of a copy held in custody and not marked leaving.
+const HELD: &str = "held";
+
+/// Takes `file_id` into custody for `author`'s row, `None` for a copy a
+/// `lost` state returned. A file already in custody keeps its record.
+pub(crate) fn enter_custody(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+    author: Option<&[u8]>,
+) -> Result<(), diesel::result::Error> {
+    diesel::insert_or_ignore_into(_connetto_content_custody::table)
+        .values((
+            _connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()),
+            _connetto_content_custody::author_key.eq(author),
+            _connetto_content_custody::state.eq(HELD),
+        ))
+        .execute(conn)
+        .map(|_| ())
+}
+
+/// Releases `file_id` from custody, which leaves its bytes ordinary cache.
+#[cfg(feature = "peer")]
+pub(crate) fn leave_custody(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<(), diesel::result::Error> {
+    diesel::delete(_connetto_content_custody::table)
+        .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
+        .execute(conn)
+        .map(|_| ())
+}
+
+/// Records `now` as when this device learned `file_id`'s row settled, unless
+/// it already knew.
+#[cfg(feature = "peer")]
+pub(crate) fn custody_settled(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+    now: i64,
+) -> Result<(), diesel::result::Error> {
+    diesel::update(_connetto_content_custody::table)
+        .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
+        .filter(_connetto_content_custody::settled_seen_at.is_null())
+        .set(_connetto_content_custody::settled_seen_at.eq(now))
+        .execute(conn)
+        .map(|_| ())
+}
+
+/// Every file this device holds in custody.
+#[cfg(feature = "peer")]
+pub(crate) fn custody(conn: &mut SqliteConnection) -> Result<Vec<FileId>, ContentError> {
+    let rows: Vec<Vec<u8>> = _connetto_content_custody::table
+        .select(_connetto_content_custody::file_id)
+        .load(conn)?;
+    rows.into_iter()
+        .map(|id| Ok(FileId::from_bytes(exactly_32(&id)?)))
+        .collect()
+}
+
+/// The bytes of every file held in custody, a chunk two of them share
+/// counted for each.
+#[cfg(feature = "peer")]
+pub(crate) fn custody_bytes(conn: &mut SqliteConnection) -> Result<u64, ContentError> {
+    let lens: Vec<i64> =
+        _connetto_content_chunks::table
+            .filter(_connetto_content_chunks::file_id.eq_any(
+                _connetto_content_custody::table.select(_connetto_content_custody::file_id),
+            ))
+            .select(_connetto_content_chunks::len)
+            .load(conn)?;
+    Ok(lens
+        .into_iter()
+        .map(|len| u64::try_from(len).unwrap_or(0))
+        .sum())
 }
 
 /// Every chunk hash some manifest still names.

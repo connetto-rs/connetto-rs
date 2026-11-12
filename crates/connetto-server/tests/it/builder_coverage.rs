@@ -1664,6 +1664,44 @@ async fn a_restored_cluster_revokes_every_login_session_at_boot() {
     handle.shutdown().await;
 }
 
+/// Insert an order and await its transaction's ingestion.
+async fn insert_ingested_order(
+    pool: &Pool<AsyncPgConnection>,
+    commits: &mut tokio::sync::broadcast::Receiver<subql::PgCommit>,
+    id: i32,
+) {
+    use super::e2e::orders;
+
+    let xid: i64 = {
+        let mut conn = pool.get().await.expect("a connection");
+        // The `xid` cast discards the epoch to match logical replication.
+        diesel::insert_into(orders::table)
+            .values((
+                orders::id.eq(id),
+                orders::price.eq(1.0),
+                orders::quantity.eq(1),
+                orders::status.eq("new"),
+            ))
+            .returning(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+                "pg_current_xact_id()::xid::text::bigint",
+            ))
+            .get_result(&mut *conn)
+            .await
+            .expect("insert the correlated transaction")
+    };
+    let xid = u32::try_from(xid).expect("a logical replication transaction id");
+    tokio::time::timeout(BOUND, async {
+        loop {
+            let commit = commits.recv().await.expect("ingestion notification");
+            if commit.position().xid().0 == xid {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("transaction {xid} was not ingested"));
+}
+
 /// A slot recreated past the reconnect log's last commit is a gap the boot
 /// must settle: the log is trimmed to the resume point, the boundary commit
 /// is recorded at the slot's position, and the gap is logged for the
@@ -1683,43 +1721,33 @@ async fn a_slot_recreated_past_the_log_trims_the_log_at_boot() {
     let port = listener.local_addr().expect("local address").port();
     let (builder, _idp, _keys) = builder_over(&fixture, port).await;
     let parts = builder.build().await.expect("the first boot assembles");
+    let mut commits = parts.handle.ingested_commits();
     let stream = tokio::spawn(parts.change_stream);
 
-    // Three ingested commits, then the log's last commit position.
-    let mut last: i64 = 0;
     for id in 101..=103 {
-        exec(
-            &pool,
-            &format!("INSERT INTO orders VALUES ({id}, 1.0, 1, 'new')"),
-        )
-        .await;
-        let mut conn = pool.get().await.expect("a connection");
-        let row: Vec<WalLsn> = diesel::sql_query(
-            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0'::pg_lsn)::bigint AS lsn",
-        )
-        .load(&mut *conn)
-        .await
-        .expect("read the write-ahead position");
-        last = row[0].lsn;
-    }
-    let deadline = Instant::now() + BOUND;
-    loop {
-        let mut conn = pool.get().await.expect("a connection");
-        let end: Option<i64> = connetto_oplog_commit::table
-            .select(connetto_oplog_commit::end_lsn)
-            .first(&mut *conn)
-            .await
-            .ok();
-        if end.is_some_and(|end| end >= last) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the stream never ingested the last commit"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        insert_ingested_order(&pool, &mut commits, id).await;
     }
     stream.abort();
+    tokio::time::timeout(BOUND, async {
+        assert!(
+            stream
+                .await
+                .expect_err("ingestion was aborted")
+                .is_cancelled()
+        );
+        parts.handle.shutdown().await;
+    })
+    .await
+    .expect("ingestion shutdown");
+    let last: i64 = {
+        let mut conn = pool.get().await.expect("a connection");
+        connetto_oplog_commit::table
+            .select(diesel::dsl::max(connetto_oplog_commit::end_lsn))
+            .first::<Option<i64>>(&mut *conn)
+            .await
+            .expect("read the last ingested commit")
+            .expect("the observed commits are recorded")
+    };
 
     // The slot is recreated at the write-ahead head, past the ingested
     // commits, so the boot's check finds the gap.
@@ -2251,9 +2279,7 @@ async fn a_missing_schema_table_refuses_naming_it() {
     );
 }
 
-/// A build refusal that lands after the slot-lag watcher and the content
-/// sweep started stops both: the slot goes and the watcher never warns, and
-/// the chunk the sweep would have reclaimed stays in place.
+/// A refused build finishes its background loops before returning.
 #[tokio::test]
 async fn a_build_refusal_stops_the_background_loops_it_started() {
     let _keyring = isolated_session_keyring();
@@ -2264,24 +2290,7 @@ async fn a_build_refusal_stops_the_background_loops_it_started() {
     fixture.provision_auth_tables().await;
     apply_content_deployment(&pool).await;
 
-    // A chunk the sweep would reclaim on its next pass.
     let dir = TempDir::new().expect("a store directory");
-    let hash = "cd".repeat(32);
-    let planted = dir.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
-    tokio::fs::create_dir_all(planted.parent().expect("the chunk parents"))
-        .await
-        .expect("make the chunk parents");
-    tokio::fs::write(&planted, b"the reclaimable chunk")
-        .await
-        .expect("plant the chunk");
-    exec(
-        &pool,
-        &format!(
-            "INSERT INTO _cfs_chunk_registry (chunk_hash, state) \
-             VALUES (decode('{hash}', 'hex'), 'deleting')"
-        ),
-    )
-    .await;
 
     let idp = MockOauth::start().await;
     let (_channel, store) = fixture.fga_store().await;
@@ -2330,12 +2339,24 @@ async fn a_build_refusal_stops_the_background_loops_it_started() {
         }
         other => panic!("the build answered {other:?}"),
     }
+    let hash = "cd".repeat(32);
+    let planted = dir.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
+    tokio::fs::create_dir_all(planted.parent().expect("the chunk parents"))
+        .await
+        .expect("make the chunk parents");
+    tokio::fs::write(&planted, b"the reclaimable chunk")
+        .await
+        .expect("plant the chunk");
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO _cfs_chunk_registry (chunk_hash, state) \
+             VALUES (decode('{hash}', 'hex'), 'deleting')"
+        ),
+    )
+    .await;
 
-    // The loops the refusal outlived are stopped: the slot goes and the
-    // watcher never warns, and the chunk the sweep would have reclaimed
-    // stays in place.
     drop_slot(&pool).await;
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert!(
         !record_logged("replication slot is gone", "slot", SLOT),
         "the slot-lag watcher kept running after the refusal"
@@ -2346,10 +2367,7 @@ async fn a_build_refusal_stops_the_background_loops_it_started() {
     );
 }
 
-/// The slot-lag watcher and the content sweep are owned by the handle's
-/// clones: dropping the last one stops both, so the slot goes and the
-/// watcher never warns, and the chunk the sweep would have reclaimed stays
-/// in place.
+/// The last handle's completion observer waits for its background loops.
 #[tokio::test]
 async fn dropping_the_last_handle_stops_the_background_loops() {
     let _keyring = isolated_session_keyring();
@@ -2397,8 +2415,12 @@ async fn dropping_the_last_handle_stops_the_background_loops() {
     .content(Some(settings));
     let parts = builder.build().await.expect("the deployment assembles");
 
-    // A chunk the sweep would reclaim on its next pass, planted while the
-    // loops run and just before the last handle goes.
+    let completion = parts.handle.background_completion();
+    drop(parts);
+    tokio::time::timeout(Duration::from_secs(10), completion.wait())
+        .await
+        .expect("the background loops finish");
+
     let hash = "cd".repeat(32);
     let planted = dir.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
     tokio::fs::create_dir_all(planted.parent().expect("the chunk parents"))
@@ -2415,9 +2437,7 @@ async fn dropping_the_last_handle_stops_the_background_loops() {
         ),
     )
     .await;
-    drop(parts);
     drop_slot(&pool).await;
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert!(
         !record_logged("replication slot is gone", "slot", SLOT),
         "the slot-lag watcher outlived the last handle"

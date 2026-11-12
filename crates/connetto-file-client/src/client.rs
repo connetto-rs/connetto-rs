@@ -94,6 +94,15 @@ pub enum ContentEvent {
         /// The file now held locally.
         file_id: FileId,
     },
+    /// The number of linked devices reporting a copy in custody of one of
+    /// this device's unsent files in a replicated column changed (R79
+    /// decision 12).
+    Replicated {
+        /// The file.
+        file_id: FileId,
+        /// How many linked devices other than this one hold it.
+        holders: usize,
+    },
     /// The boot integrity pass could not run, so no unsent file was checked
     /// this time. The walk went ahead: a pass that cannot read the outbox
     /// says nothing about the bytes, so refusing to upload on its word would
@@ -140,6 +149,17 @@ pub struct ContentClient<T: Transport, B: ChunkStore + Clone, H: ContentHttp> {
     /// while none runs.
     #[cfg(feature = "peer")]
     peer_orders: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<peer::Order>>>,
+    /// The bytes copies held for others may take, `None` for a quarter of
+    /// the free space measured when the media driver starts.
+    #[cfg(feature = "peer")]
+    custody_budget: Option<u64>,
+    /// The free space custody always leaves to the device.
+    #[cfg(feature = "peer")]
+    custody_reserve: u64,
+    /// Signalled when a file enters or leaves custody, so the media driver
+    /// reports the change to its linked peers.
+    #[cfg(feature = "peer")]
+    custody_changed: tokio::sync::Notify,
 }
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -190,6 +210,12 @@ where
             peer_content: Vec::new(),
             #[cfg(feature = "peer")]
             peer_orders: parking_lot::Mutex::new(None),
+            #[cfg(feature = "peer")]
+            custody_budget: None,
+            #[cfg(feature = "peer")]
+            custody_reserve: peer::CUSTODY_RESERVE,
+            #[cfg(feature = "peer")]
+            custody_changed: tokio::sync::Notify::new(),
         })
     }
 
@@ -993,16 +1019,18 @@ where
             });
         }
         let outboard = self.store_outboard(&outboard).await?;
-        self.commit_cached(&manifest, outboard).await
+        self.commit_cached(&manifest, outboard, None).await
     }
 
     /// Commits a fetched file's manifest and outboard rows in one
-    /// transaction, with no outbox row, which makes the file cache. The
-    /// caller holds `content_writes` from its chunk writes to here.
+    /// transaction, with no outbox row, which makes the file cache, or a copy
+    /// in custody for the row `custody` names the author of. The caller holds
+    /// `content_writes` from its chunk writes to here.
     async fn commit_cached(
         &self,
         manifest: &Manifest,
         outboard: Option<ChunkHash>,
+        custody: Option<&[u8]>,
     ) -> Result<(), ContentError> {
         let file_id = manifest.file_id();
         self.client
@@ -1010,8 +1038,11 @@ where
                 conn.transact_with_bookkeeping(
                     |c| {
                         db::put_manifest(c, manifest)?;
-                        match &outboard {
-                            Some(hash) => db::put_outboard(c, file_id, hash),
+                        if let Some(hash) = &outboard {
+                            db::put_outboard(c, file_id, hash)?;
+                        }
+                        match custody {
+                            Some(author) => db::enter_custody(c, file_id, Some(author)),
                             None => Ok(()),
                         }
                     },
@@ -1157,8 +1188,11 @@ where
     /// again, or when a pin names it. With the `peer` feature it also
     /// survives while a row whose peer apply still awaits a verdict names it
     /// in a column [`with_peer_content`](Self::with_peer_content) declared,
-    /// since a file fetched in camp may not be on the server yet. Everything
-    /// else is cache and goes.
+    /// unless the row's author lapsed, and while it is in custody for a
+    /// [`replicate`](PeerContent::replicate)d column, the custody half of the
+    /// pass releasing a copy whose row is gone, whose author lapsed or whose
+    /// state reads `available`, and taking back a cache copy whose state
+    /// reads `lost`. Everything else is cache and goes.
     ///
     /// Then every chunk file the store holds that no surviving manifest names
     /// is deleted. Enumerating the store rather than the hashes an eviction
@@ -1188,28 +1222,44 @@ where
             expect(unused_mut, reason = "only the peer build adds to the kept set")
         )]
         let mut kept = self.pinned().await?;
+        #[cfg(feature = "peer")]
+        let now = peer::custody::unix_now();
         let _writing = self.content_writes.lock().await;
-        let (evicted, referenced) = self
+        let (evicted, referenced, changed) = self
             .client
             .with_conn(|conn| {
-                // Read with the eviction under one hold of the connection,
-                // so a peer apply cannot land a provisional row between them.
+                // One hold of the connection, so a peer apply cannot land between the reads and the eviction.
                 #[cfg(feature = "peer")]
-                kept.extend(peer::provisionally_named(conn, &self.peer_content)?);
+                let mut reach = peer::custody::Reach::default();
+                #[cfg(feature = "peer")]
+                kept.extend(peer::provisionally_named(
+                    conn,
+                    &self.peer_content,
+                    &mut reach,
+                )?);
+                #[cfg(feature = "peer")]
+                let named = peer::custody::named(conn, &self.peer_content, &mut reach)?;
                 conn.transact_with_bookkeeping(
                     |c| {
+                        #[cfg(feature = "peer")]
+                        let changed =
+                            peer::custody::pass(c, &self.peer_content, &named, now, &mut kept)?;
+                        #[cfg(not(feature = "peer"))]
+                        let changed = false;
                         let evicted = crate::retain::evict_uncovered(c, &kept)?;
-                        Ok((evicted, db::referenced_hashes(c)?))
+                        Ok((evicted, db::referenced_hashes(c)?, changed))
                     },
                     |_| Ok::<(), ContentError>(()),
                 )
-                // The application half writes nothing here: eviction is
-                // entirely connetto's own bookkeeping, and using the same
-                // primitive keeps one transaction shape for every content
-                // write.
                 .map(|(counted, ())| counted)
             })
             .await??;
+        #[cfg(feature = "peer")]
+        if changed {
+            self.custody_changed.notify_one();
+        }
+        #[cfg(not(feature = "peer"))]
+        let _ = changed;
         self.delete_unreferenced(&referenced).await?;
         Ok(evicted)
     }
@@ -1348,6 +1398,46 @@ mod tests {
         assert!(
             matches!(event, ContentEvent::UploadDeferred { file_id: f, .. } if f == file_id),
             "the driver must attempt the cleared entry and emit UploadDeferred, got {event:?}"
+        );
+    }
+
+    /// The room a device offers is what the budget leaves, never eating into
+    /// the free space the reserve keeps for the device (R79 decision 16).
+    #[cfg(feature = "peer")]
+    #[tokio::test]
+    async fn the_room_is_bounded_by_the_budget_and_by_the_reserve() {
+        const MIB: u64 = 1024 * 1024;
+        let store = connetto_file_core::MemStore::new();
+        let connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
+        let (client, pump) = ConnettoClient::with_pump(connection);
+        tokio::spawn(pump);
+        let content = ContentClient::attach(client, store.clone(), [1; 32], ReqwestHttp::default())
+            .await
+            .expect("content attaches");
+
+        store.set_free_bytes(600 * MIB);
+        assert_eq!(
+            content.room(50 * MIB, 10 * MIB),
+            40 * MIB,
+            "the budget binds"
+        );
+        assert_eq!(
+            content.room(1024 * MIB, 0),
+            88 * MIB,
+            "the 512 MiB reserve binds"
+        );
+        store.set_free_bytes(100 * MIB);
+        assert_eq!(
+            content.room(1024 * MIB, 0),
+            0,
+            "free space under the reserve"
+        );
+        let content = content.with_custody_reserve(0);
+        assert_eq!(content.room(1024 * MIB, 0), 100 * MIB);
+        assert_eq!(
+            content.room(10 * MIB, 20 * MIB),
+            0,
+            "a budget lowered below what custody holds"
         );
     }
 

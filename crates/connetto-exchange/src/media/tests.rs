@@ -4,7 +4,8 @@
 use std::time::{Duration, Instant};
 
 use crate::media::{
-    Ask, MAX_FETCH_LEN, MAX_PIECE_BYTES, MAX_SERVING, Media, MediaAction, MediaLinks, Priority,
+    Ask, MAX_FETCH_LEN, MAX_PIECE_BYTES, MAX_REPORT_ENTRIES, MAX_SERVING, MIN_RATE_SAMPLE, Media,
+    MediaAction, MediaLinks, Priority, RATE_HALF_LIFE,
 };
 use crate::{BoundsError, MAX_MANIFEST_ROWS};
 
@@ -29,7 +30,7 @@ fn sent(actions: &[MediaAction<&'static str, u32>], peer: &str, ask: &Ask) -> u6
     };
     assert_eq!(*to, peer);
     assert_eq!(message.ask().as_ref(), Some(ask), "{message:?}");
-    message.request_id()
+    message.request_id().expect("a request carries its id")
 }
 
 fn linked(peers: &[&'static str]) -> MediaLinks<&'static str, u32> {
@@ -576,6 +577,324 @@ fn the_wire_bounds_hold() {
         file_id: FILE,
         start: 0,
         len: MAX_FETCH_LEN,
+    };
+    assert_eq!(fine.within_bounds(), Ok(()));
+}
+
+const A: [u8; 32] = [10; 32];
+const B: [u8; 32] = [11; 32];
+const C: [u8; 32] = [12; 32];
+const KEY: [u8; 32] = [20; 32];
+const OTHER_KEY: [u8; 32] = [21; 32];
+
+fn holdings(
+    held: &[[u8; 32]],
+    leaving: &[[u8; 32]],
+    rates: &[([u8; 32], u64)],
+    last: bool,
+) -> Media {
+    Media::Holdings {
+        room: 500,
+        rates: rates.to_vec(),
+        held: held.to_vec(),
+        leaving: leaving.to_vec(),
+        last,
+    }
+}
+
+fn reported(actions: &[MediaAction<&'static str, u32>]) -> bool {
+    matches!(actions, [MediaAction::Reported { peer: "bob" }])
+}
+
+#[test]
+fn a_holdings_snapshot_reports_once_its_last_frame_arrives() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    let first = links.received(&"bob", holdings(&[A], &[], &[(KEY, 7)], false), now);
+    assert!(first.is_empty(), "{first:?}");
+    assert!(
+        links.report(&"bob").is_none(),
+        "a partial snapshot reports nothing"
+    );
+    let last = links.received(&"bob", holdings(&[B], &[B], &[(OTHER_KEY, 9)], true), now);
+    assert!(reported(&last), "{last:?}");
+    let report = links.report(&"bob").expect("the snapshot completed");
+    assert!(report.holds(&A) && report.holds(&B) && !report.holds(&C));
+    assert!(report.is_leaving(&B) && !report.is_leaving(&A));
+    assert_eq!(report.room(), 500);
+    assert_eq!(report.rate_to(&KEY), Some(7));
+    assert_eq!(report.rate_to(&OTHER_KEY), Some(9));
+}
+
+#[test]
+fn a_new_snapshot_replaces_the_previous_report() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    links.received(&"bob", holdings(&[A], &[A], &[(KEY, 7)], true), now);
+    links.received(&"bob", holdings(&[B], &[], &[], true), now);
+    let report = links.report(&"bob").expect("reported");
+    assert!(!report.holds(&A) && !report.is_leaving(&A) && report.holds(&B));
+    assert_eq!(report.rate_to(&KEY), None);
+}
+
+#[test]
+fn held_deltas_add_remove_and_mark_leaving() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    links.received(&"bob", holdings(&[B, C], &[B], &[], true), now);
+    let delta = Media::Held {
+        added: vec![A],
+        removed: vec![B],
+        leaving: vec![C],
+    };
+    assert!(reported(&links.received(&"bob", delta, now)));
+    let report = links.report(&"bob").expect("reported");
+    assert!(report.holds(&A) && !report.holds(&B) && report.holds(&C));
+    assert!(
+        !report.is_leaving(&B),
+        "a removed file leaves nothing behind"
+    );
+    assert!(report.is_leaving(&C));
+}
+
+#[test]
+fn a_delta_crossing_during_a_snapshot_joins_it() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    links.received(&"bob", holdings(&[B], &[], &[], false), now);
+    let delta = Media::Held {
+        added: vec![A],
+        removed: vec![B],
+        leaving: vec![],
+    };
+    let during = links.received(&"bob", delta, now);
+    assert!(during.is_empty(), "{during:?}");
+    links.received(&"bob", holdings(&[C], &[], &[], true), now);
+    let report = links.report(&"bob").expect("reported");
+    assert!(report.holds(&A) && !report.holds(&B) && report.holds(&C));
+}
+
+#[test]
+fn a_delta_before_any_snapshot_is_ignored() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    let delta = Media::Held {
+        added: vec![A],
+        removed: vec![],
+        leaving: vec![],
+    };
+    let early = links.received(&"bob", delta, now);
+    assert!(early.is_empty(), "{early:?}");
+    assert!(links.report(&"bob").is_none());
+}
+
+#[test]
+fn room_replaces_the_room_and_the_rates() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    links.received(&"bob", holdings(&[A], &[], &[(KEY, 7)], true), now);
+    let room = Media::Room {
+        room: 3,
+        rates: vec![(OTHER_KEY, 11)],
+    };
+    assert!(reported(&links.received(&"bob", room, now)));
+    let report = links.report(&"bob").expect("reported");
+    assert_eq!(report.room(), 3);
+    assert_eq!(report.rate_to(&KEY), None);
+    assert_eq!(report.rate_to(&OTHER_KEY), Some(11));
+    assert!(report.holds(&A), "room leaves the holdings alone");
+}
+
+#[test]
+fn a_lost_link_drops_the_report_and_an_unlinked_peer_reports_nothing() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    links.received(&"bob", holdings(&[A], &[], &[], true), now);
+    links.unlinked(&"bob");
+    assert!(links.report(&"bob").is_none());
+    let stray = links.received(&"bob", holdings(&[A], &[], &[], true), now);
+    assert!(stray.is_empty(), "{stray:?}");
+    links.linked(&"bob");
+    assert!(
+        links.report(&"bob").is_none(),
+        "a relinked peer reports afresh"
+    );
+}
+
+#[test]
+fn reports_carry_no_request_id_and_make_no_request() {
+    for report in [
+        holdings(&[A], &[], &[], true),
+        Media::Held {
+            added: vec![],
+            removed: vec![],
+            leaving: vec![],
+        },
+        Media::Room {
+            room: 0,
+            rates: vec![],
+        },
+    ] {
+        assert_eq!(report.request_id(), None);
+        assert_eq!(report.ask(), None);
+    }
+}
+
+/// Fetch `len` bytes from bob at `at`, answered by one last piece after `took`.
+fn timed_fetch(links: &mut MediaLinks<&'static str, u32>, len: u64, at: Instant, took: Duration) {
+    let ask = Ask::Fetch {
+        file_id: FILE,
+        start: 0,
+        len,
+    };
+    let id = sent(
+        &links.ask(&"bob", ask.clone(), 1, Priority::OnDemand, at),
+        "bob",
+        &ask,
+    );
+    links.received(&"bob", piece(id, true), at + took);
+    links.proceed(&"bob", None, at + took);
+}
+
+#[test]
+fn a_fetch_of_the_sample_size_sets_the_rate() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    assert_eq!(
+        links.rate(&"bob"),
+        None,
+        "a peer never fetched from has no rate"
+    );
+    timed_fetch(&mut links, 1024 * 1024, now, Duration::from_secs(1));
+    assert_eq!(links.rate(&"bob"), Some(1024 * 1024));
+}
+
+#[test]
+fn a_short_fetch_and_a_want_leave_the_rate_alone() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    timed_fetch(
+        &mut links,
+        MIN_RATE_SAMPLE - 1,
+        now,
+        Duration::from_millis(1),
+    );
+    let id = sent(
+        &links.ask(&"bob", want(), 2, Priority::OnDemand, now),
+        "bob",
+        &want(),
+    );
+    links.received(&"bob", manifest(id, true), now + Duration::from_millis(1));
+    assert_eq!(links.rate(&"bob"), None);
+}
+
+#[test]
+fn a_refused_or_lapsed_fetch_leaves_the_rate_alone() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    let ask = Ask::Fetch {
+        file_id: FILE,
+        start: 0,
+        len: MIN_RATE_SAMPLE,
+    };
+    let id = sent(
+        &links.ask(&"bob", ask.clone(), 1, Priority::OnDemand, now),
+        "bob",
+        &ask,
+    );
+    links.received(&"bob", Media::Refused { request_id: id }, now);
+    links.proceed(&"bob", None, now);
+    sent(
+        &links.ask(&"bob", ask.clone(), 2, Priority::OnDemand, now),
+        "bob",
+        &ask,
+    );
+    links.timeout(now + Duration::from_secs(31));
+    assert_eq!(links.rate(&"bob"), None);
+}
+
+#[test]
+fn rates_smooth_with_a_thirty_second_half_life() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    timed_fetch(&mut links, 1024 * 1024, now, Duration::from_secs(1));
+    // The second sample ends one half-life after the first, so the 3 MiB/s
+    // sample and the 1 MiB/s rate weigh half each.
+    timed_fetch(
+        &mut links,
+        3 * 1024 * 1024,
+        now + RATE_HALF_LIFE,
+        Duration::from_secs(1),
+    );
+    let rate = links.rate(&"bob").expect("measured");
+    assert!(rate.abs_diff(2 * 1024 * 1024) <= 1, "{rate}");
+}
+
+#[test]
+fn the_rate_outlives_a_relink() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    timed_fetch(&mut links, 1024 * 1024, now, Duration::from_secs(1));
+    links.unlinked(&"bob");
+    links.linked(&"bob");
+    assert_eq!(links.rate(&"bob"), Some(1024 * 1024));
+}
+
+#[test]
+fn the_report_bounds_hold() {
+    let over = vec![[0; 32]; MAX_REPORT_ENTRIES + 1];
+    let rates = vec![([0; 32], 1); MAX_REPORT_ENTRIES + 1];
+    let reports = [
+        Media::Holdings {
+            room: 0,
+            rates: vec![],
+            held: over.clone(),
+            leaving: vec![],
+            last: true,
+        },
+        Media::Holdings {
+            room: 0,
+            rates: rates.clone(),
+            held: vec![],
+            leaving: vec![],
+            last: true,
+        },
+        Media::Holdings {
+            room: 0,
+            rates: vec![],
+            held: vec![],
+            leaving: over.clone(),
+            last: true,
+        },
+        Media::Held {
+            added: over.clone(),
+            removed: vec![],
+            leaving: vec![],
+        },
+        Media::Held {
+            added: vec![],
+            removed: over.clone(),
+            leaving: vec![],
+        },
+        Media::Held {
+            added: vec![],
+            removed: vec![],
+            leaving: over.clone(),
+        },
+        Media::Room { room: 0, rates },
+    ];
+    for report in reports {
+        assert_eq!(
+            report.within_bounds(),
+            Err(BoundsError::TooManyEntries),
+            "{}",
+            report.named()
+        );
+    }
+    let fine = Media::Held {
+        added: vec![[0; 32]; MAX_REPORT_ENTRIES],
+        removed: vec![],
+        leaving: vec![],
     };
     assert_eq!(fine.within_bounds(), Ok(()));
 }

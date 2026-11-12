@@ -2008,8 +2008,8 @@ mod tests {
             connetto_schema::Documents::new(
                 SCHEMA,
                 policies,
-                "CREATE ROLE app_reader LOGIN;",
-                "app_reader",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
             ),
             true,
         )
@@ -2259,8 +2259,8 @@ mod tests {
             connetto_schema::Documents::new(
                 SHARE_SCHEMA,
                 SHARE_POLICY,
-                "CREATE ROLE app_reader LOGIN;",
-                "app_reader",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
             ),
             true,
         )
@@ -2525,8 +2525,8 @@ mod tests {
             connetto_schema::Documents::new(
                 "CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);",
                 "",
-                "CREATE ROLE app_reader LOGIN;",
-                "app_reader",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
             ),
             true,
         )
@@ -2548,8 +2548,8 @@ mod tests {
             connetto_schema::Documents::new(
                 SCHEMA,
                 "CREATE POLICY notes_p ON notes FOR ALL USING (mystery_function(owner))",
-                "CREATE ROLE app_reader LOGIN;",
-                "app_reader",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
             ),
             true,
         );
@@ -2601,8 +2601,8 @@ mod tests {
             connetto_schema::Documents::new(
                 "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT);",
                 "",
-                "CREATE ROLE app_reader LOGIN;",
-                "app_reader",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
             ),
             true,
         );
@@ -2651,8 +2651,8 @@ mod tests {
             connetto_schema::Documents::new(
                 SHARE_SCHEMA,
                 SHARE_POLICY,
-                "CREATE ROLE app_reader LOGIN;",
-                "app_reader",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
             ),
             true,
         );
@@ -2689,8 +2689,8 @@ mod tests {
                 connetto_schema::Documents::new(
                     SCHEMA,
                     POLICY,
-                    "CREATE ROLE app_reader LOGIN;",
-                    "app_reader",
+                    connetto_test_harness::FIXTURE_ROLES,
+                    connetto_test_harness::FIXTURE_READER,
                 ),
                 true,
             )
@@ -2735,8 +2735,8 @@ mod tests {
             connetto_schema::Documents::new(
                 SCHEMA,
                 POLICY,
-                "CREATE ROLE app_reader LOGIN;",
-                "app_reader",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
             ),
             true,
         );
@@ -2768,8 +2768,8 @@ mod tests {
             connetto_schema::Documents::new(
                 SCHEMA,
                 POLICY,
-                "CREATE ROLE app_reader LOGIN;",
-                "app_reader",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
             ),
             true,
         )
@@ -2819,8 +2819,8 @@ mod tests {
                 connetto_schema::Documents::new(
                     SCHEMA,
                     POLICY,
-                    "CREATE ROLE app_reader LOGIN;",
-                    "app_reader",
+                    connetto_test_harness::FIXTURE_ROLES,
+                    connetto_test_harness::FIXTURE_READER,
                 ),
                 true,
             )
@@ -2861,8 +2861,8 @@ mod tests {
             connetto_schema::Documents::new(
                 SCHEMA,
                 POLICIES,
-                "CREATE ROLE app_reader LOGIN;",
-                "app_reader",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
             ),
             true,
         )

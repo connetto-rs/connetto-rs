@@ -2538,6 +2538,7 @@ pub struct SessionManager<
     history: parking_lot::RwLock<Option<TimelineHistory>>,
     /// Where a reconnect of the change feed resumes, the last row or commit the ingest finished handling.
     resume: ResumePoint,
+    ingested_commits: OnceLock<tokio::sync::broadcast::Sender<PgCommit>>,
     /// The ingest loop's unfinished event, kept across pause retries and stream reconnects so no stage runs twice.
     held: Mutex<Option<EventProgress>>,
     /// Run loops that have started and not yet ended, which the shutdown
@@ -2737,6 +2738,7 @@ where
         signer,
         history: parking_lot::RwLock::new(None),
         resume: ResumePoint::default(),
+        ingested_commits: OnceLock::new(),
         held: Mutex::new(None),
         open_sessions: Arc::new(AtomicUsize::new(0)),
         shutting_down: AtomicBool::new(false),
@@ -4595,6 +4597,13 @@ where
         }
     }
 
+    /// Subscribe to recorded and acknowledged commits through a 64-entry stream whose lag is explicit and whose replays may repeat.
+    pub fn ingested_commits(&self) -> tokio::sync::broadcast::Receiver<PgCommit> {
+        self.ingested_commits
+            .get_or_init(|| tokio::sync::broadcast::channel(64).0)
+            .subscribe()
+    }
+
     /// Drive a CDC source to completion, dispatching every row and, at each
     /// commit, recording it and acking it so the upstream can recycle its log.
     ///
@@ -4629,6 +4638,9 @@ where
                         .await
                         .map_err(|err| SessionError::Transport(err.to_string()))?;
                     self.resume.set(Some(commit.position()));
+                    if let Some(commits) = self.ingested_commits.get() {
+                        let _ = commits.send(commit);
+                    }
                 }
                 Ok(Some(SourceItem::Event(event))) => {
                     // One hold loop for both pause causes (R89 decision 2):
