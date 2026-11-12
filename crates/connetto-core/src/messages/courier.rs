@@ -71,3 +71,65 @@ pub struct CourierNoticeAck {
     /// The id of the notice acked.
     pub notice_id: String,
 }
+
+/// Observes committed courier audit receipts visible to the authenticated caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CourierAuditRequest {
+    /// A nonempty identifier of at most [`Self::MAX_REQUEST_ID_BYTES`] UTF-8 bytes.
+    pub request_id: String,
+    /// The author's device key identifier.
+    pub author: [u8; 32],
+    /// Positive `BIGINT` sequences in strictly increasing order, at most [`crate::exchange::MAX_MANIFEST_ROWS`].
+    pub seqs: Vec<u64>,
+    /// Positive milliseconds remaining on the caller's original monotonic deadline.
+    pub remaining_ms: u64,
+}
+
+impl CourierAuditRequest {
+    /// The maximum retained correlation identifier size in UTF-8 bytes.
+    pub const MAX_REQUEST_ID_BYTES: usize = 128;
+
+    /// Whether the request satisfies the wire bounds before authorization.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        !self.request_id.is_empty()
+            && self.request_id.len() <= Self::MAX_REQUEST_ID_BYTES
+            && self.remaining_ms > 0
+            && self.seqs.len() <= crate::exchange::MAX_MANIFEST_ROWS
+            && self.seqs.first().is_some_and(|seq| *seq > 0)
+            && self
+                .seqs
+                .last()
+                .is_some_and(|seq| i64::try_from(*seq).is_ok())
+            && self.seqs.windows(2).all(|pair| pair[0] < pair[1])
+    }
+}
+
+/// The terminal outcome of a courier audit observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CourierAuditOutcome {
+    /// Every requested receipt was committed and visible to the caller.
+    Confirmed,
+    /// The observation expired without confirming every receipt.
+    Expired,
+    /// The request was refused without disclosing audit evidence.
+    Refused,
+    /// An observation failure prevented confirmation.
+    Failed,
+}
+
+/// The correlated answer to a courier audit observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CourierAuditAnswer {
+    /// The identifier of the observation answered.
+    pub request_id: String,
+    /// Only `Confirmed` witnesses persistence, other outcomes prove no absence.
+    pub outcome: CourierAuditOutcome,
+}
+
+/// Cancels a courier audit observation without acknowledging persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CourierAuditCancel {
+    /// The identifier of the observation to release.
+    pub request_id: String,
+}

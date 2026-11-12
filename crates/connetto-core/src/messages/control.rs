@@ -84,7 +84,10 @@ pub struct TabIdentity {
 use super::{
     aggregate::AggregateUpdate,
     content::{ContentTicketGrant, ContentTicketRequest},
-    courier::{CourierAnswer, CourierNotice, CourierNoticeAck, CourierRange},
+    courier::{
+        CourierAnswer, CourierAuditAnswer, CourierAuditCancel, CourierAuditRequest, CourierNotice,
+        CourierNoticeAck, CourierRange,
+    },
     enrolment::{
         DeviceRevokedAck, DevicesList, DevicesRequest, EnrolChallenge, EnrolChallengeRequest,
         EnrolGrant, EnrolRefused, EnrolRequest, RevocationUpdate, RevokeDeviceRequest,
@@ -206,6 +209,13 @@ pub enum ControlMessage {
     CourierNotice(CourierNotice),
     /// Client receipt of a notice, which deletes its rows.
     CourierNoticeAck(CourierNoticeAck),
+
+    /// Client observes committed courier audit receipts separately from settlement.
+    CourierAuditRequest(CourierAuditRequest),
+    /// Server answers a courier audit observation without exposing audit fields.
+    CourierAuditAnswer(CourierAuditAnswer),
+    /// Client cancels a courier audit observation.
+    CourierAuditCancel(CourierAuditCancel),
 
     /// Client heartbeat probe.
     Ping(Ping),
