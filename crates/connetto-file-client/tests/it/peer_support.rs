@@ -346,21 +346,26 @@ pub async fn hand_over(client: &ConnettoClient<Scripted>, id: i64, owner: &str) 
     assert_eq!(now, owner);
 }
 
-/// Runs `proof` beside `device`'s media driver.
+/// Runs `proof` beside `device`'s media driver, the driver polled first so
+/// it is up before the proof's first step, which another worker thread can
+/// carry to its end within one poll.
 pub async fn beside(device: &Device, port: MediaPort, proof: impl Future<Output = ()>) {
     tokio::select! {
+        biased;
         () = device.drive_media(port) => panic!("the port ended under the proof"),
         () = proof => {}
     }
 }
 
-/// Runs `proof` beside the media drivers of two devices.
+/// Runs `proof` beside the media drivers of two devices, both polled before
+/// the proof as [`beside`] polls its one.
 pub async fn beside_both(
     (first, first_port): (&Device, MediaPort),
     (second, second_port): (&Device, MediaPort),
     proof: impl Future<Output = ()>,
 ) {
     tokio::select! {
+        biased;
         () = first.drive_media(first_port) => panic!("the first port ended under the proof"),
         () = second.drive_media(second_port) => panic!("the second port ended under the proof"),
         () = proof => {}

@@ -412,9 +412,6 @@ where
             actions.extend(driver.prefetch(peer.key().as_bytes(), Instant::now()).await);
         }
         driver.act(actions, Instant::now()).await;
-        // Set by every event that can move a custody row, and cleared by one
-        // pass once the burst behind it is read.
-        let mut custody_due = false;
         loop {
             driver.launch();
             if let Some(done) = driver.finished.pop_front() {
@@ -422,8 +419,8 @@ where
                 driver.act(actions, Instant::now()).await;
                 continue;
             }
-            if custody_due && applied.is_empty() {
-                custody_due = false;
+            if driver.custody_due && applied.is_empty() {
+                driver.custody_due = false;
                 let lapse = driver.beside_jobs(self.custody_refresh()).await;
                 driver.lapse_at = lapse.map(wake_at);
                 continue;
@@ -440,11 +437,7 @@ where
                             driver.end();
                             return;
                         }
-                        Some(MediaEvent::Linked { peer, .. }) => {
-                            driver.linked(&peer, now);
-                            driver.holdings(&peer, now).await;
-                            driver.prefetch(peer.key().as_bytes(), now).await
-                        }
+                        Some(MediaEvent::Linked { peer, .. }) => driver.link_up(peer, now).await,
                         Some(MediaEvent::Unlinked { peer }) => {
                             let actions = driver.links.unlinked(&peer);
                             driver.unlinked(&peer).await;
@@ -465,7 +458,7 @@ where
                         Vec::new()
                     }
                     other => {
-                        custody_due |= moves_custody(other.as_ref());
+                        driver.custody_due |= moves_custody(other.as_ref());
                         Vec::new()
                     }
                 },
@@ -476,19 +469,10 @@ where
                     driver.custody_changed().await;
                     Vec::new()
                 }
-                () = sleep, if wake.is_some() => {
-                    let now = Instant::now();
-                    let mut actions = driver.links.timeout(now);
-                    actions.extend(driver.retry_due(now).await);
-                    driver.room_due(now).await;
-                    if driver.lapse_at.is_some_and(|at| at <= now) {
-                        driver.lapse_at = None;
-                        custody_due = true;
-                    }
-                    actions
-                }
+                () = sleep, if wake.is_some() => driver.tick(Instant::now()).await,
             };
             driver.act(actions, Instant::now()).await;
+            driver.open_link().await;
         }
     }
 
@@ -670,6 +654,12 @@ struct Driver<'c, T: Transport, B: ChunkStore + Clone, H: ContentHttp, F, J> {
     /// When the earliest custody author's certificate lapses, which the
     /// custody pass then acts on.
     lapse_at: Option<Instant>,
+    /// Set by every event that can move a custody row, and cleared by one
+    /// pass once the burst behind it is read.
+    custody_due: bool,
+    /// A peer whose link just came up, told everything once the fetches its
+    /// link wakes went out.
+    opening: Option<DeviceIdentity>,
 }
 
 impl<'c, T, B, H, F, J> Driver<'c, T, B, H, F, J>
@@ -707,6 +697,8 @@ where
             reporting: HashSet::new(),
             heard: HashMap::new(),
             lapse_at: None,
+            custody_due: false,
+            opening: None,
         }
     }
 
@@ -769,6 +761,39 @@ where
             self.room_at = None;
         }
         self.count_holders().await;
+    }
+
+    /// `peer`'s link came up: the fetches it wakes and the prefetches of its
+    /// rows go first, and its opening report follows, unless the driver found
+    /// the link at its start and told it then.
+    async fn link_up(&mut self, peer: DeviceIdentity, now: Instant) -> Vec<Action> {
+        self.linked(&peer, now);
+        let mut actions = self.retry_due(now).await;
+        actions.extend(self.prefetch(peer.key().as_bytes(), now).await);
+        if !self.told.contains_key(&peer) {
+            self.opening = Some(peer);
+        }
+        actions
+    }
+
+    /// Tells the peer whose link just came up everything it may know.
+    async fn open_link(&mut self) {
+        if let Some(peer) = self.opening.take() {
+            self.holdings(&peer, Instant::now()).await;
+        }
+    }
+
+    /// The driver's wake: requests that lapsed, busy holders due again, the
+    /// room check, and the custody pass once an author lapsed.
+    async fn tick(&mut self, now: Instant) -> Vec<Action> {
+        let mut actions = self.links.timeout(now);
+        actions.extend(self.retry_due(now).await);
+        self.room_due(now).await;
+        if self.lapse_at.is_some_and(|at| at <= now) {
+            self.lapse_at = None;
+            self.custody_due = true;
+        }
+        actions
     }
 
     /// The port ended, so no fetch can finish.
@@ -870,15 +895,12 @@ where
     async fn custody_changed(&mut self) {
         let content = self.content;
         let (custody, _) = self.beside_jobs(content.custody_held()).await;
-        let peers: Vec<DeviceIdentity> = self.told.keys().cloned().collect();
-        for peer in peers {
-            let admitted = self.admitted(&peer, &custody).await;
-            let Some(told) = self.told.get_mut(&peer) else {
-                continue;
-            };
-            let added: Vec<[u8; 32]> = admitted.difference(told).copied().collect();
-            let removed: Vec<[u8; 32]> = told.difference(&admitted).copied().collect();
-            *told = admitted;
+        let mut told = core::mem::take(&mut self.told);
+        for (peer, told_files) in &mut told {
+            let admitted = self.admitted(peer, &custody).await;
+            let added: Vec<[u8; 32]> = admitted.difference(told_files).copied().collect();
+            let removed: Vec<[u8; 32]> = told_files.difference(&admitted).copied().collect();
+            *told_files = admitted;
             if added.is_empty() && removed.is_empty() {
                 continue;
             }
@@ -893,8 +915,9 @@ where
                     }
                 })
                 .collect();
-            self.report(&peer, messages);
+            self.report(peer, messages);
         }
+        self.told = told;
     }
 
     /// Tells every linked peer the room and rates that changed since it was

@@ -381,13 +381,25 @@ async fn a_copy_leaves_custody_when_its_author_lapses_under_a_running_driver() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_retraction_under_a_running_driver_reports_the_copy_removed() {
-    let camp = Camp::new(64 * 1024 * 1024).await;
+async fn a_retraction_under_a_running_driver_reports_the_copy_removed_and_the_room_back() {
+    let budget = 64 * 1024 * 1024;
+    let camp = Camp::new(budget).await;
     let (client, file) = (&camp.client, *camp.file_id.as_bytes());
     camp.with_reader(|mut inbox, held| async move {
         assert_eq!(held, [file]);
         retract(client).await;
         assert_eq!(next(&mut inbox).await, held_change(Vec::new(), vec![file]));
+        // The room is checked every 10 seconds, so the bound allows two checks.
+        let room = tokio::time::timeout(2 * BOUND, async {
+            loop {
+                if let Media::Room { room, .. } = inbox.recv().await.expect("the listener runs") {
+                    return room;
+                }
+            }
+        })
+        .await
+        .expect("the room is reported once it changed");
+        assert_eq!(room, budget, "the released copy no longer takes room");
     })
     .await;
 }
