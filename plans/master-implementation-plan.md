@@ -310,7 +310,7 @@ It does not foreclose the zero-copy send. `bytes::Bytes::from_owner` accepts any
 | One frame built per handle per event, cloned per socket | `session.rs` |
 | `tokio-tungstenite` from 0.24, and the frame handed over as `Bytes` | `connetto-core/Cargo.toml`, `transport.rs` |
 
-Nothing goes upstream. The frame split is a breaking framing change, and `PROTOCOL_VERSION` (currently 2, `crates/connetto-core/src/version.rs`) bumps on breaking changes to `ControlMessage`, `BulkMessage`, framing or compression, so the new wire takes a version bump rather than riding on a frozen one.
+Breaking changes to `ControlMessage`, `BulkMessage`, framing or compression require a `PROTOCOL_VERSION` bump.
 
 # Phases
 

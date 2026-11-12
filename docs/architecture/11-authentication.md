@@ -166,7 +166,7 @@ A passkey verified by connetto-server as a login credential is rejected, not def
 
 ## Protocol impact
 
-The wire changes the authentication boundary makes are recorded in [02-protocol.md](02-protocol.md), the grant list and the session token, and in [06-reconnect.md](06-reconnect.md), the `FullResyncReason` variant for an authorization change. `PROTOCOL_VERSION` stays frozen until the first release, with one deliberate bump then, per the version-bump decision in [02-protocol.md](02-protocol.md).
+The wire changes the authentication boundary makes are recorded in [02-protocol.md](02-protocol.md), the grant list and the session token, and in [06-reconnect.md](06-reconnect.md), the `FullResyncReason` variant for an authorization change. Breaking changes increment `PROTOCOL_VERSION` as defined in [02-protocol.md](02-protocol.md#the-wire-version).
 
 ## Deployment shape
 
