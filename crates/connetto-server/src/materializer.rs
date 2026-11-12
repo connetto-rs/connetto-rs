@@ -585,6 +585,9 @@ pub struct CallerMappings {
     /// carries them inside the server's assembly future.
     options: Box<Pg2SqliteOptions>,
     subjects_setting: &'static str,
+    /// The role every caller's reads run as, which subql plans each
+    /// membership term for.
+    reader_role: String,
 }
 
 impl CallerMappings {
@@ -600,6 +603,7 @@ impl CallerMappings {
         Ok(Self {
             options: Box::new(connetto_schema::query_options::<Key>(reader_role)?),
             subjects_setting: Key::SETTING,
+            reader_role: reader_role.to_owned(),
         })
     }
 
@@ -1059,6 +1063,16 @@ where
         &self.catalog
     }
 
+    /// A request for `sql`, planned for the reader role every caller's reads
+    /// run as, or for no role when the deployment maps no caller.
+    fn request(&self, consumer_id: u64, sql: &str) -> SubscriptionRequest<DefaultIds, Postgres> {
+        let request = SubscriptionRequest::new(consumer_id, sql);
+        match &self.caller {
+            Some(caller) => request.acting_role(caller.reader_role.as_str()),
+            None => request,
+        }
+    }
+
     /// Register a subscription for `consumer_id` from a SQL `SELECT`, with a
     /// generous default read budget. Tests and doc examples only: a session
     /// registers through [`Self::register_translated`] with its caller's tier
@@ -1079,7 +1093,7 @@ where
     ) -> Result<Registration, MaterializerError> {
         self.register_request(
             consumer_id,
-            SubscriptionRequest::new(consumer_id, select_sql),
+            self.request(consumer_id, select_sql),
             ReadBudget::new(core::time::Duration::from_secs(5)),
         )
     }
@@ -2179,7 +2193,7 @@ where
         subscriber: Option<PgValue<Postgres>>,
         subjects: Vec<PgValue<Postgres>>,
     ) -> Result<Vec<subql::term::TermDescription>, MaterializerError> {
-        let mut request = SubscriptionRequest::new(consumer_id, pg_sql).binds(wire_binds(binds));
+        let mut request = self.request(consumer_id, pg_sql).binds(wire_binds(binds));
         if subscriber.is_some() || !subjects.is_empty() {
             if let Some(subscriber) = subscriber {
                 request = request.subscriber(subscriber);
@@ -2228,9 +2242,8 @@ where
         budget: ReadBudget,
         viewer: Option<crate::reexec::ConnettoReadSetup>,
     ) -> Result<Registration, MaterializerError> {
-        let build = |seed: Option<TermSeed>| {
-            let mut request =
-                SubscriptionRequest::new(consumer_id, pg_sql).binds(wire_binds(binds));
+        let seeded = |mut request: SubscriptionRequest<DefaultIds, Postgres>,
+                      seed: Option<TermSeed>| {
             if let Some(seed) = seed {
                 if let Some(subscriber) = seed.subscriber {
                     request = request.subscriber(subscriber);
@@ -2243,14 +2256,16 @@ where
             request
         };
         let retry_seed = viewer.as_ref().and_then(|_| seed.clone());
-        match self.register_request(consumer_id, build(seed), budget) {
+        let request = self.request(consumer_id, pg_sql).binds(wire_binds(binds));
+        match self.register_request(consumer_id, seeded(request, seed), budget) {
             Err(MaterializerError::Register(subql::RegisterError::AggregatorOnRlsTable {
                 ..
             })) if viewer.is_some() => {
                 let setup = viewer.expect("matched Some above");
+                let request = self.request(consumer_id, pg_sql).binds(wire_binds(binds));
                 let mut registered = self.register_request_with(
                     consumer_id,
-                    build(retry_seed).database_reads_per_consumer(),
+                    seeded(request, retry_seed).database_reads_per_consumer(),
                     setup,
                 )?;
                 if let Registration::Computed(capture) = &mut registered {
@@ -3130,6 +3145,23 @@ mod membership_term_tests {
         .expect("the schema parses")
     }
 
+    /// A materializer whose engine reads `policies` and the roles document
+    /// beside the schema, as the server's own catalog does.
+    fn materializer_over(policies: &str) -> Materializer {
+        let translator = Translated::of::<String, crate::defaults::ConnettoDefaults>(
+            connetto_schema::Documents::new(SCHEMA, policies, ROLES, READER),
+            true,
+        )
+        .expect("the policies translate")
+        .into_parts()
+        .1;
+        Materializer::builder(&format!("{SCHEMA}\n{policies}\n{ROLES}"))
+            .with_translator(translator)
+            .with_caller(mapping())
+            .build()
+            .expect("the catalog parses")
+    }
+
     fn mapping() -> CallerMappings {
         CallerMappings::of::<String>(READER).expect("the test deployment's description holds")
     }
@@ -3196,6 +3228,28 @@ mod membership_term_tests {
             Err(err) => panic!("the seeded term must register, got {err}"),
         };
         assert!(matches!(registration, Registration::Row(_)));
+    }
+
+    // The term is planned for the reader role every caller acts as, so a
+    // membership table whose read rules leave that role every row serves the
+    // term as a table without row-level security does.
+    #[test]
+    fn a_membership_table_open_to_the_reader_serves_the_term() {
+        let open_members = format!(
+            "{POLICIES}\nALTER TABLE project_members ENABLE ROW LEVEL SECURITY;\nCREATE POLICY project_members_open ON project_members FOR ALL USING (true) WITH CHECK (true);"
+        );
+        let unguarded = materializer_over(POLICIES);
+        let guarded = materializer_over(&open_members);
+        let pg_sql = guarded
+            .translate_subscription_sql(CLIENT_SQL)
+            .expect("the caller function reverse translates");
+        let expected = unguarded
+            .describe_terms(1, &pg_sql, &[], None, Vec::new())
+            .expect("the term describes without row-level security");
+        let described = guarded
+            .describe_terms(1, &pg_sql, &[], None, Vec::new())
+            .unwrap_or_else(|err| panic!("an open membership table must serve, got {err}"));
+        assert_eq!(described, expected);
     }
 
     // subql requires the subscriber for any filter naming a term, which is
