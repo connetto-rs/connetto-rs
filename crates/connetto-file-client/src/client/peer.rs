@@ -467,6 +467,9 @@ where
                 }
                 () = self.custody_changed.notified() => {
                     driver.custody_changed().await;
+                    // A copy that entered custody since the last pass may
+                    // hang on an author who lapses before any other wake.
+                    driver.custody_due = true;
                     Vec::new()
                 }
                 () = sleep, if wake.is_some() => driver.tick(Instant::now()).await,

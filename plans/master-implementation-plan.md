@@ -1125,7 +1125,7 @@ The custody pass carries out the C table's rows that need no ranking. It release
 | A server write confirms a peer-applied row | `ProvisionalConfirmed` |
 | A verdict or a frontier adjudicates a peer-applied row | `ProvisionalSettled`, raised by both adjudications |
 | A row is retracted, refused or abandoned | `ProvisionalRetracted` |
-| A custody author's certificate end plus `DEVICE_SKEW` passes | a wake at the earliest such instant, recomputed after every pass |
+| A custody author's certificate end plus `DEVICE_SKEW` passes | a wake at the earliest such instant, recomputed after every pass and every change to custody |
 | The driver starts, or custody changed while no driver ran | the start |
 
 ### Slices

@@ -381,6 +381,65 @@ async fn a_copy_leaves_custody_when_its_author_lapses_under_a_running_driver() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_fetched_under_a_running_driver_leaves_custody_when_its_author_lapses() {
+    let dirs = [
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+    ];
+    let (_, holder) = declare_replicated(replica(dirs[0].path(), None).await).await;
+    let file_id = stage(&holder, 1, "anna", &pseudorandom(63, 300_000)).await;
+    let (client, receiver) = replica(dirs[1].path(), None).await;
+    let receiver = receiver.with_custody_reserve(0);
+    let (client, receiver) = declare_replicated((client, receiver)).await;
+    apply_entry(
+        &client,
+        &anna(),
+        1,
+        captured_photo(dirs[2].path(), 7, file_id.as_bytes().to_vec(), None).await,
+    )
+    .await;
+    // Far enough out that the fetch lands first, near enough for the bound.
+    lapse_in(&client, &anna(), 6).await;
+
+    let devices = Devices::new();
+    let (holder_node, holder_addr, holder_events) = devices.node(&devices.device("r77", 2));
+    let (receiver_node, receiver_addr, receiver_events) = devices.node(&devices.device("anna", 3));
+    let (reader, _, reader_events) = devices.node(&devices.device("anna", 4));
+    let mut inbox = listener(reader_events);
+    receiver_node
+        .link(holder_addr)
+        .await
+        .expect("the link completes");
+    let file = *file_id.as_bytes();
+    beside_both(
+        (&holder, port(holder_node, holder_events)),
+        (&receiver, port(receiver_node, receiver_events)),
+        async {
+            reader
+                .link(receiver_addr)
+                .await
+                .expect("the link completes");
+            let Media::Holdings { held, .. } = next(&mut inbox).await else {
+                panic!("a report opens the link");
+            };
+            assert!(held.is_empty(), "nothing is in custody yet");
+            assert!(matches!(
+                receiver.resolve(file_id).await.expect("resolve"),
+                Resolved::Local { .. }
+            ));
+            assert_eq!(next(&mut inbox).await, held_change(vec![file], Vec::new()));
+            assert_eq!(
+                next(&mut inbox).await,
+                held_change(Vec::new(), vec![file]),
+                "the same driver wakes at the lapse of custody it took after starting"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_retraction_under_a_running_driver_reports_the_copy_removed_and_the_room_back() {
     let budget = 64 * 1024 * 1024;
     let camp = Camp::new(budget).await;
