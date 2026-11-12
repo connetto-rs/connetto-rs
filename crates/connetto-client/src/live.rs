@@ -52,7 +52,10 @@ use sqlparser::parser::Parser;
 use subql::backend::Value as SqliteValue;
 use tokio::sync::{Mutex, Notify, broadcast, watch};
 
-use crate::away::{GateAskFuture, GateAskOutcome, GateController, GateMechanism, GateSink, Moment};
+use crate::away::{
+    Clock, GateAskFuture, GateAskOutcome, GateController, GateMechanism, GateSink, Moment,
+    SystemClock,
+};
 use crate::reconnect::{NoReconnect, NoSleep, ReconnectPolicy, Sleeper, TransportFactory};
 use crate::{
     ClientError, ClientEvent, ConnettoConnection, DrainTimer, KeepaliveTimer, ResendTimer,
@@ -2598,6 +2601,57 @@ where
             .unwrap_or_else(|_| Err(crate::CourierError::SessionLost))
     }
 
+    /// Await committed courier audit receipts within one monotonic bound across reconnects.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CourierAuditError`] distinguishes invalid input, capacity, expiry, refusal, observation failure and session loss.
+    pub async fn observe_courier_audit(
+        &self,
+        author: &[u8],
+        seqs: &[u64],
+        within: Duration,
+    ) -> Result<(), crate::CourierAuditError> {
+        let deadline = SystemClock
+            .monotonic()
+            .checked_add(within)
+            .filter(|_| !within.is_zero())
+            .ok_or(crate::CourierAuditError::InvalidInput)?;
+        let observe = async {
+            let wait = {
+                let mut state = self.shared.lock_interrupting().await;
+                if self.shared.gate.is_locked() {
+                    return Err(crate::CourierAuditError::Client(ClientError::Locked));
+                }
+                if self.shared.close_requested.load(Ordering::Acquire)
+                    || self.shared.pump_done.done.load(Ordering::Acquire)
+                {
+                    return Err(crate::CourierAuditError::SessionEnded);
+                }
+                state.conn.begin_courier_audit(
+                    author,
+                    seqs,
+                    deadline,
+                    Arc::clone(&self.shared.wake),
+                )?
+            };
+            self.shared.wake.notify_one();
+            wait.wait().await
+        };
+        let mut observe = core::pin::pin!(observe);
+        loop {
+            let remaining = deadline.saturating_sub(SystemClock.monotonic());
+            if remaining.is_zero() {
+                return Err(crate::CourierAuditError::Expired);
+            }
+            tokio::select! {
+                biased;
+                result = &mut observe => return result,
+                () = crate::timer_wait(remaining) => {}
+            }
+        }
+    }
+
     /// Run a closure against the shared connection: one-off diesel reads and
     /// captured writes. Local writes committed here are auto-submitted by the
     /// pump's next flush, and any live query reading the written tables
@@ -3216,10 +3270,12 @@ async fn pump<T, F, S>(
                 // The top of the loop ends the pump through the close path.
                 Recovered::Closing => continue,
                 Recovered::Ended(event) => {
-                    // Recovery gave up, so the writes made meanwhile are
-                    // queued for the next run before the pump ends.
-                    if let Err(err) = shared.state.lock().await.conn.flush().await {
-                        tracing::warn!(error = %err, "queueing the last writes at exit failed");
+                    {
+                        let mut state = shared.state.lock().await;
+                        state.conn.finish_courier_audit();
+                        if let Err(err) = state.conn.flush().await {
+                            tracing::warn!(error = %err, "queueing the last writes at exit failed");
+                        }
                     }
                     let _ = shared.events.send(event);
                     pump_finished(&shared);
@@ -3236,6 +3292,7 @@ async fn pump<T, F, S>(
 
         match drain_and_flush(&mut state, &shared, reconnect.is_some()).await {
             Drained::Step => {}
+            Drained::Interrupted => continue,
             Drained::Recover => {
                 needs_recovery = true;
                 continue;
@@ -3711,6 +3768,8 @@ enum PumpFlow {
 enum Drained {
     /// Take the pump step.
     Step,
+    /// Release the connection lock for the caller that woke the driver.
+    Interrupted,
     /// The transport is gone. Recover at the top of the next iteration.
     Recover,
     /// A fault no reconnect can cure ended the pump.
@@ -3724,6 +3783,7 @@ where
     T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
 {
+    state.conn.finish_courier_audit();
     if let Err(err) = state.conn.flush().await {
         tracing::warn!(error = %err, "queueing the last writes at exit failed");
     }
@@ -3743,6 +3803,7 @@ where
     // Set before the senders drop, so a woken handle reads the fault.
     let _ = shared.reaper.stopped.set(detail.clone());
     let mut state = shared.state.lock().await;
+    state.conn.finish_courier_audit();
     if let Err(err) = state.conn.flush().await {
         tracing::warn!(error = %err, "queueing the last writes at the fault failed");
     }
@@ -3767,6 +3828,7 @@ where
     T::Error: core::fmt::Display,
 {
     let mut state = shared.state.lock().await;
+    state.conn.finish_courier_audit();
     // A write made just before the close is queued before the socket goes.
     if let Err(err) = state.conn.flush().await {
         tracing::warn!(error = %err, "queueing the last writes at close failed");
@@ -3841,6 +3903,18 @@ where
     T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
 {
+    let maintenance = tokio::select! {
+        biased;
+        result = state.conn.process_courier_audit() => result,
+        () = shared.wake.notified() => return Drained::Interrupted,
+    };
+    if let Err(err) = maintenance {
+        return if is_disconnect(&err) {
+            Drained::Recover
+        } else {
+            Drained::Fail(err)
+        };
+    }
     match state
         .conn
         .process_share_keys(!shared.gate.is_locked())
@@ -4271,6 +4345,11 @@ where
             return Ok(Offline::Closing);
         }
         let mut state = shared.state.lock().await;
+        tokio::select! {
+            biased;
+            result = state.conn.process_courier_audit() => result?,
+            () = shared.wake.notified() => continue,
+        }
         state
             .conn
             .process_share_keys(!shared.gate.is_locked())

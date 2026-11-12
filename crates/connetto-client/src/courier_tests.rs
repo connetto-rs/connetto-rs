@@ -1200,7 +1200,7 @@ async fn writer_refusal_takes_rows(refusal: CourierRefusal) {
         Some(b"the retained"),
     );
     adopt(&mut conn, AUTHOR, Some(3));
-    let (mut conn, mut server) = attach(conn, true).await;
+    let (mut conn, mut server) = Box::pin(attach(conn, true)).await;
     let ask = next_ask(&mut server).await;
     let wait = conn.courier(AUTHOR).await.expect("send the range");
     let range = next_range(&mut server).await;

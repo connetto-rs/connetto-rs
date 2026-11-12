@@ -56,6 +56,10 @@ Each connection may retain at most 65,536 requested sequences. Repeating an open
 
 The server reads authorized evidence and registers missing observations under the dispatch gate. Private `subql` row, refusal and computed deliveries trigger a typed reread of the complete requested set. Only complete authorized evidence produces `Confirmed`, and transient read failures retain the delivery for the existing ingestion recovery.
 
+`ConnettoClient::observe_courier_audit(author, seqs, within)` and `NativeClient::observe_courier_audit` sort and deduplicate sequences and bound both registration and the answer. Dropping the wait releases its request and schedules cancellation even while the application gate is locked. Answers resolve the owning wait without entering `ClientEvent`.
+
+`CourierAuditError` distinguishes invalid input, capacity exhaustion, expiry, server refusal, observation failure, terminal session loss and client errors. A new observation is refused while the application gate is locked or the client is closing.
+
 ## The opening challenge
 
 Every connection opens with the server's `Challenge` frame, the random bytes the first frame of the connection signs. The signatures over a connection nonce carry distinct domain separators, so a signature over one connection answers exactly one of the questions it could be asked. A bot registration spends its one-time code as the first frame of a fresh connection, signed over the nonce, and the server settles it with the bot id or refuses it without a reason. The bot entities are in [12](12-identity-session-capability.md), the bot login over the challenge is in [11](11-authentication.md), and a device key proves itself the same way, over its own message, in the writer section below.

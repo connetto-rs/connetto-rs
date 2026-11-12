@@ -1681,6 +1681,22 @@ where
         self.client().courier(author).await
     }
 
+    /// Await committed courier audit receipts within one monotonic bound across reconnects.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`crate::CourierAuditError`] reported by the observer.
+    pub async fn observe_courier_audit(
+        &self,
+        author: &[u8],
+        seqs: &[u64],
+        within: core::time::Duration,
+    ) -> Result<(), crate::CourierAuditError> {
+        self.client()
+            .observe_courier_audit(author, seqs, within)
+            .await
+    }
+
     /// Dial `addr`, refusing by this device's standing before any socket
     /// opens and handing back the peer's identity once the link is live
     /// (R76).
