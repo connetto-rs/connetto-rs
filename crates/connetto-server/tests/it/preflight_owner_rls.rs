@@ -31,7 +31,7 @@ const SETUP: [&str; 8] = [
 const TABLE: &str = "frls_members";
 
 fn refusal_names_the_table(refused: &PreflightError) {
-    let PreflightError::OwnerFiltered { table } = refused else {
+    let PreflightError::ReadFiltered { table, .. } = refused else {
         panic!("the wrong refusal: {refused}");
     };
     assert_eq!(table, TABLE, "the refusal names the filtered table");
@@ -79,4 +79,45 @@ async fn an_owner_pool_that_row_level_security_filters_refuses_the_boot() {
             .await
             .expect_err("a role that does not own the table is filtered by its policies"),
     );
+}
+
+#[tokio::test]
+async fn an_audit_reader_requires_select_and_unfiltered_access() {
+    let fixture = Fixture::acquire().await;
+    fixture.setup(&SETUP).await;
+    let reader = pool_for(&with_user_url(
+        fixture.admin_url(),
+        "frls_other",
+        "frls_other",
+    ))
+    .await;
+    let required = [Artifact::ReadInFull(TABLE)];
+    let refused = preflight::require(&reader, &required)
+        .await
+        .expect_err("the reader is filtered");
+    assert!(matches!(
+        refused,
+        PreflightError::ReadFiltered { ref table, ref role }
+            if table == TABLE && role == "frls_other"
+    ));
+    fixture
+        .exec("ALTER TABLE frls_members DISABLE ROW LEVEL SECURITY")
+        .await;
+    fixture
+        .exec("REVOKE SELECT ON frls_members FROM frls_other")
+        .await;
+    let refused = preflight::require(&reader, &required)
+        .await
+        .expect_err("the reader lacks SELECT");
+    assert!(matches!(
+        refused,
+        PreflightError::ReadDenied { ref table, ref role }
+            if table == TABLE && role == "frls_other"
+    ));
+    fixture
+        .exec("GRANT SELECT ON frls_members TO frls_other")
+        .await;
+    preflight::require(&reader, &required)
+        .await
+        .expect("the reader sees every audit row");
 }

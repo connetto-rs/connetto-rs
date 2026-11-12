@@ -187,6 +187,7 @@ async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, user_id: &str) {
         OWNED_PG_DDL,
         "GRANT USAGE ON SCHEMA public TO app_reader",
         "GRANT SELECT ON owned TO app_reader",
+        "GRANT SELECT ON auth_events TO app_reader",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
          _connetto_session_writers TO app_reader",
     ] {
@@ -1429,6 +1430,7 @@ async fn seed_no_rls_orders(pool: &Pool<AsyncPgConnection>) {
         PG_DDL,
         "GRANT USAGE ON SCHEMA public TO app_reader",
         "GRANT SELECT ON orders TO app_reader",
+        "GRANT SELECT ON auth_events TO app_reader",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
          _connetto_session_writers TO app_reader",
     ] {
@@ -2277,6 +2279,70 @@ async fn a_missing_schema_table_refuses_naming_it() {
         auth.starts_with("table connetto_provider_tokens does not exist"),
         "{auth}"
     );
+}
+
+#[tokio::test]
+async fn an_audit_table_outside_the_publication_refuses_startup() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    exec(
+        &pool,
+        &format!("ALTER PUBLICATION {PUBLICATION} DROP TABLE auth_events"),
+    )
+    .await;
+    let (builder, _idp, _keys) = builder_over(&fixture, 0).await;
+    match refused(builder.build().await, "audit changes must be published") {
+        BuildError::Preflight(PreflightError::Missing { noun, name }) => {
+            assert_eq!(noun, "replicated table");
+            assert_eq!(name, "auth_events");
+        }
+        other => panic!("unexpected startup result {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_audit_reader_without_select_refuses_startup() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    exec(&pool, "REVOKE SELECT ON auth_events FROM app_reader").await;
+    let (builder, _idp, _keys) = builder_over(&fixture, 0).await;
+    match refused(builder.build().await, "the audit reader requires SELECT") {
+        BuildError::Preflight(PreflightError::ReadDenied { table, role }) => {
+            assert_eq!(table, "auth_events");
+            assert_eq!(role, "app_reader");
+        }
+        other => panic!("unexpected startup result {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_audit_reader_filtered_by_row_security_refuses_startup() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    exec(&pool, "ALTER TABLE auth_events ENABLE ROW LEVEL SECURITY").await;
+    let (builder, _idp, _keys) = builder_over(&fixture, 0).await;
+    match refused(
+        builder.build().await,
+        "the audit reader must see every receipt",
+    ) {
+        BuildError::Preflight(PreflightError::ReadFiltered { table, role }) => {
+            assert_eq!(table, "auth_events");
+            assert_eq!(role, "app_reader");
+        }
+        other => panic!("unexpected startup result {other:?}"),
+    }
 }
 
 /// A refused build finishes its background loops before returning.

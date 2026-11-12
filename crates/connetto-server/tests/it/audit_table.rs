@@ -28,8 +28,7 @@ static PG_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 // The default schema over `Id = String`, matching `authn_db.rs`.
 use connetto_server::defaults::{ConnettoAudit, auth_events};
 
-/// Create the deployment-owned audit table. connetto emits no DDL, so the test
-/// owns it, and the SQL mirrors `docs/architecture/08-authorization.md`.
+/// Recreates the reference audit enum and table.
 async fn reset_audit_table(pool: &Pool<AsyncPgConnection>) {
     let mut conn = pool.get().await.expect("connection");
     for stmt in [
@@ -71,6 +70,7 @@ async fn every_auth_op_round_trips_through_postgres() {
         AuthOp::BanLifted,
         AuthOp::WriteForked,
         AuthOp::WriteRedelivered,
+        AuthOp::WriteCouriered,
         AuthOp::DataDownloaded,
         AuthOp::DataErased,
     ];
@@ -93,6 +93,57 @@ async fn every_auth_op_round_trips_through_postgres() {
         .unwrap_or_else(|err| panic!("read back {}: {err}", op.label()));
         assert_eq!(read, op, "{} did not round trip", op.label());
     }
+}
+
+#[tokio::test]
+async fn courier_receipts_are_visible_only_to_the_author_and_actual_courier() {
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    reset_audit_table(fixture.admin()).await;
+    let mut conn = fixture.admin().get().await.expect("connection");
+    let author = "alice".to_owned();
+    let courier = "bob".to_owned();
+    let unrelated = "mallory".to_owned();
+    for (op, writer, seq) in [
+        (AuthOp::WriteCouriered, 7, 8),
+        (AuthOp::WriteCouriered, 7, 8),
+        (AuthOp::WriteCouriered, 7, 9),
+        (AuthOp::WriteCouriered, 7, 10),
+        (AuthOp::WriteCouriered, 17, 11),
+        (AuthOp::WriteRedelivered, 7, 12),
+    ] {
+        let mut event = AuthEvent::new(
+            SessionId::from_uuid(uuid::Uuid::new_v4()),
+            Some(author.clone()),
+            op,
+        )
+        .about_courier(courier.clone());
+        event.writer = Some(writer);
+        event.seq = Some(seq);
+        diesel_async::RunQueryDsl::execute(ConnettoAudit::audit_insert(event), &mut conn)
+            .await
+            .expect("insert audit event");
+    }
+    let requested = [8, 8, 9, 11, 12, 99];
+    for viewer in [&author, &courier] {
+        let mut receipts = ConnettoAudit::courier_receipts(&mut conn, viewer, 7, &requested)
+            .await
+            .expect("read courier receipts");
+        receipts.sort_unstable();
+        assert_eq!(receipts, vec![8, 9]);
+    }
+    assert_eq!(
+        ConnettoAudit::courier_receipts(&mut conn, &author, 7, &[])
+            .await
+            .expect("read empty request"),
+        [] as [i64; 0]
+    );
+    assert_eq!(
+        ConnettoAudit::courier_receipts(&mut conn, &unrelated, 7, &requested)
+            .await
+            .expect("read unrelated account"),
+        [] as [i64; 0]
+    );
 }
 
 /// A label Postgres does not declare must be refused rather than stored.

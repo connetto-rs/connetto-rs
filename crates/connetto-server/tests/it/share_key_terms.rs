@@ -42,7 +42,7 @@ async fn manager(fixture: &Fixture, clock: &ExpiryClock) -> Manager {
             "CREATE PUBLICATION share_key_terms_pub FOR TABLE items, team_members",
         ])
         .await;
-    let (_, translator, _) = Translated::of::<String, connetto_core::bots::TextIds>(
+    let (_, translator, _) = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
         connetto_schema::Documents::new(
             DDL,
             POLICIES,

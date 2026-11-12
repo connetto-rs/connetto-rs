@@ -669,6 +669,7 @@ pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixt
     )
     .await;
     exec(pool, "GRANT USAGE ON SCHEMA public TO app_reader").await;
+    exec(pool, "GRANT SELECT ON auth_events TO app_reader").await;
     exec(
         pool,
         "GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO app_reader",

@@ -73,6 +73,7 @@ impl Replica {
             // patch's table numbers line up with the replica's (R77
             // decision 11).
             applier: Materializer::builder(&engine_ddl(FANOUT_PG_DDL))
+                .with_audit_schema::<connetto_server::defaults::ConnettoAudit>()
                 .build()
                 .expect("applier"),
         }

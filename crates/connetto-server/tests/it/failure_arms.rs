@@ -124,6 +124,7 @@ where
     let engine_ddl = engine_ddl(schema_ddl);
     ManagerBuilder::new(
         Materializer::builder(&engine_ddl)
+            .with_audit_schema::<connetto_server::defaults::ConnettoAudit>()
             .with_write_catalog(RuntimeWritableCatalog::default())
             .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
             .build()
@@ -272,6 +273,7 @@ async fn a_withdrawal_after_a_primary_key_change_uses_the_old_key() {
     client.subscribe("notes", "SELECT * FROM notes").await;
 
     let applier = Materializer::builder(&engine_ddl(PG))
+        .with_audit_schema::<connetto_server::defaults::ConnettoAudit>()
         .build()
         .expect("build applier");
     let mut replica = client_replica(SQLITE);
@@ -379,6 +381,7 @@ async fn a_withdrawal_from_a_wire_unencodable_old_value_must_not_kill_the_stream
     client.subscribe("notes", "SELECT * FROM notes").await;
 
     let applier = Materializer::builder(&engine_ddl(INSTANTS_PG))
+        .with_audit_schema::<connetto_server::defaults::ConnettoAudit>()
         .build()
         .expect("build applier");
     let mut replica = client_replica(INSTANTS_SQLITE);
@@ -594,6 +597,7 @@ async fn an_unencodable_event_must_refuse_the_subscriber_on_catchup() {
     // the subscription the unencodable event matched. The replica starts
     // empty, since the client's snapshots were.
     let applier = Materializer::builder(&engine_ddl(INSTANTS_PG))
+        .with_audit_schema::<connetto_server::defaults::ConnettoAudit>()
         .build()
         .expect("build applier");
     let mut replica = client_replica(INSTANTS_SQLITE);
@@ -746,7 +750,7 @@ async fn flip_stack(fixture: &Fixture) -> Server {
 
     // The composition the shipped binary builds, over one fresh store.
     let (channel, store) = fixture.fga_store().await;
-    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+    let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
         connetto_schema::Documents::new(
             FLIP_DDL,
             &FLIP_POLICY_STATEMENTS.join(";\n"),
@@ -952,6 +956,7 @@ async fn flip_scenario(label: &str, statements: &[FlipStatement]) {
     // The same engine catalog the server classifies with, so the patch's
     // table numbers line up with the replica's (R77 decision 11).
     let applier = Materializer::builder(&engine_ddl(FLIP_DDL))
+        .with_audit_schema::<connetto_server::defaults::ConnettoAudit>()
         .build()
         .expect("build the applier");
     let mut replica = client_replica(FLIP_SQLITE);

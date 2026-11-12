@@ -348,7 +348,7 @@ mod tests {
     );
 
     fn reach(shape: (&str, &str)) -> GrantReach {
-        Translated::of::<String, connetto_core::bots::TextIds>(
+        Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 shape.0,
                 shape.1,
@@ -368,7 +368,7 @@ mod tests {
     /// to, and the withdrawal then reaches nobody.
     #[test]
     fn a_membership_fact_reaches_the_guarded_table() {
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 CROSS_TABLE.0,
                 CROSS_TABLE.1,

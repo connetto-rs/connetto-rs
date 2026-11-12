@@ -15,10 +15,7 @@
 //! imposed, a person's data was downloaded or erased. The split is normative
 //! in `08-authorization.md` and `denials_never_reach_the_audit_table` pins it.
 //!
-//! The insert is laundered as an associated type, and one read is a
-//! statement function: the keys a set of sessions minted, which ending those
-//! sessions hands back so the application can withdraw them (R105 decision
-//! 5). Every other row is written once and never read back by connetto.
+//! Typed reads return minted keys and courier receipt sequences.
 
 use crate::writer_schema::SettlePath;
 use connetto_core::SessionId;
@@ -352,11 +349,7 @@ pub struct MintedKey<RowKey> {
     pub row: Option<RowKey>,
 }
 
-/// The `auth_events` table, the pre-built insert connetto appends through,
-/// and the one read connetto makes, the keys a set of sessions minted.
-///
-/// connetto reads nothing else back, so the application is free to index
-/// and query it however it likes.
+/// The deployment's audit catalog, insertion and authorized reads.
 pub trait ConnettoAuditSchema: Send + Sync + 'static {
     /// The deployment's typed distributed user id, the same one
     /// [`ConnettoStoreSchema`](crate::authn::schema::ConnettoStoreSchema)
@@ -366,6 +359,12 @@ pub trait ConnettoAuditSchema: Send + Sync + 'static {
     /// The tables this member reads and writes, by name, which startup
     /// requires to exist (R98 decision 5).
     const TABLES: &'static [&'static str];
+
+    /// The audit enum and table declarations used by the server catalog.
+    const CATALOG_DDL: &'static str;
+
+    /// Selects `writer, seq` for `write_couriered` at writer `$1` and sequence `$2`.
+    const COURIER_RECEIPT_FILTER_SQL: &'static str;
 
     /// The type this table stores a shared row's key as.
     ///
@@ -398,6 +397,14 @@ pub trait ConnettoAuditSchema: Send + Sync + 'static {
         conn: &mut AsyncPgConnection,
         sessions: Vec<SessionId>,
     ) -> crate::authn::schema::Statement<'_, Vec<MintedKey<Self::RowKey>>>;
+
+    /// Distinct requested sequences couriered by or authored by `viewer`.
+    fn courier_receipts<'c>(
+        conn: &'c mut AsyncPgConnection,
+        viewer: &'c Self::Id,
+        writer: i64,
+        sequences: &'c [i64],
+    ) -> crate::authn::schema::Statement<'c, Vec<i64>>;
 }
 
 /// Records one change to who can reach what.
@@ -511,6 +518,52 @@ pub enum AuditWriteError {
     Insert(#[source] diesel::result::Error),
 }
 
+/// Returns reference audit declarations or idempotent provisioning SQL.
+#[macro_export]
+macro_rules! connetto_audit_ddl {
+    ($id:literal, $pk:literal) => {
+        $crate::connetto_audit_ddl!(@ddl $id, $pk, "", "", "")
+    };
+    (provision, $id:literal, $pk:literal) => {
+        $crate::connetto_audit_ddl!(
+            @ddl $id, $pk,
+            "DO $$ BEGIN ",
+            " EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+            "IF NOT EXISTS "
+        )
+    };
+    (@ddl $id:literal, $pk:literal, $before:literal, $after:literal, $guard:literal) => {
+        concat!(
+            $before,
+            "CREATE TYPE connetto_auth_op AS ENUM (",
+            "'logged_in', 'logged_out', 'session_revoked', 'token_replayed', ",
+            "'ended_by_owner', 'ended_all', 'ended_others', 'ended_by_ban', ",
+            "'capability_minted', 'permission_change', 'model_change', ",
+            "'banned', 'ban_lifted', 'write_forked', 'write_redelivered', ",
+            "'write_couriered', 'data_downloaded', 'data_erased');",
+            $after,
+            " CREATE TABLE ", $guard, "auth_events (",
+            "at TIMESTAMPTZ NOT NULL DEFAULT now(), ",
+            "session UUID, ",
+            "user_id ", $id, ", ",
+            "op connetto_auth_op NOT NULL, ",
+            "table_name TEXT, ",
+            "pk ", $pk, ", ",
+            "subject TEXT, ",
+            "writer BIGINT, ",
+            "seq BIGINT, ",
+            "path connetto_settle_path, ",
+            "other_path connetto_settle_path, ",
+            "courier_user_id ", $id, ", ",
+            "provider TEXT, ",
+            "issuer TEXT, ",
+            "query_list_hash TEXT, ",
+            "archive_bytes BIGINT, ",
+            "acted_by TEXT);"
+        )
+    };
+}
+
 /// Generate the default `auth_events` table and its [`ConnettoAuditSchema`]
 /// impl, parameterized by the deployment's `Id` type and the type it stores a
 /// shared row's key as, each with the diesel SQL type it maps to.
@@ -529,17 +582,17 @@ pub enum AuditWriteError {
 /// an insertable row struct, and a unit struct `ConnettoAudit` implementing the
 /// trait. The caller needs `diesel` in scope.
 ///
-/// ```ignore
+/// ```
 /// connetto_server::connetto_audit_table!(
 ///     String, diesel::sql_types::Text,
 ///     uuid::Uuid, diesel::sql_types::Uuid,
+///     connetto_server::connetto_audit_ddl!("TEXT", "UUID"),
 /// );
-/// // now `ConnettoAudit` implements `ConnettoAuditSchema`.
 /// ```
 #[doc(hidden)]
 #[macro_export]
 macro_rules! connetto_audit_table {
-    ($id:ty, $id_sql:ty, $pk:ty, $pk_sql:ty $(,)?) => {
+    ($id:ty, $id_sql:ty, $pk:ty, $pk_sql:ty, $ddl:expr $(,)?) => {
         diesel::table! {
             /// The durable record of changes to who can reach what. Holds state
             /// changes only: denials go to structured logging.
@@ -614,6 +667,9 @@ macro_rules! connetto_audit_table {
         impl $crate::audit::ConnettoAuditSchema for ConnettoAudit {
             type Id = $id;
             const TABLES: &'static [&'static str] = &["auth_events"];
+            const CATALOG_DDL: &'static str = $ddl;
+            const COURIER_RECEIPT_FILTER_SQL: &'static str = "SELECT writer, seq FROM auth_events \
+                 WHERE op = 'write_couriered' AND writer = $1 AND seq = $2";
             type RowKey = $pk;
             type Insert = diesel::query_builder::InsertStatement<
                 auth_events::table,
@@ -693,6 +749,38 @@ macro_rules! connetto_audit_table {
                             })
                         })
                         .collect())
+                })
+            }
+
+            fn courier_receipts<'c>(
+                conn: &'c mut diesel_async::AsyncPgConnection,
+                viewer: &'c Self::Id,
+                writer: i64,
+                sequences: &'c [i64],
+            ) -> $crate::authn::schema::Statement<'c, Vec<i64>> {
+                Box::pin(async move {
+                    use diesel::BoolExpressionMethods as _;
+                    use diesel::ExpressionMethods as _;
+                    use diesel::NullableExpressionMethods as _;
+                    diesel_async::RunQueryDsl::load(
+                        diesel::QueryDsl::distinct(diesel::QueryDsl::select(
+                            diesel::QueryDsl::filter(
+                                auth_events::table,
+                                auth_events::op
+                                    .eq($crate::audit::AuthOp::WriteCouriered)
+                                    .and(auth_events::writer.eq(writer))
+                                    .and(auth_events::seq.eq_any(sequences))
+                                    .and(
+                                        auth_events::user_id
+                                            .eq(viewer)
+                                            .or(auth_events::courier_user_id.eq(viewer)),
+                                    ),
+                            ),
+                            auth_events::seq.assume_not_null(),
+                        )),
+                        conn,
+                    )
+                    .await
                 })
             }
         }

@@ -359,22 +359,10 @@ impl ServerSchema {
         self
     }
 
-    /// The deployment's DDL with connetto's bot registry tables appended, the
-    /// one document every server catalog parses.
-    ///
-    /// A catalog numbers its tables by position, so two catalogs read from
-    /// different documents give one table two ids, and a changed row named in
-    /// one cannot be found in the other. Every catalog the server builds, the
-    /// change stream's, the snapshot's, the write target's, the engine's and
-    /// the authorization model's, reads this text.
+    /// The deployment's application, registry, bookkeeping and audit catalog.
     #[must_use]
-    pub fn engine_ddl<Id: connetto_core::bots::BotRegistryIdSql>(&self) -> String {
-        // Bookkeeping appends after the registry, so every catalog numbers the
-        // tables in the one fixed order `require_one_numbering` compares.
-        connetto_schema::with_bookkeeping::<Id>(
-            &connetto_schema::with_registry::<Id>(&self.pg_ddl),
-            self.devices,
-        )
+    pub fn engine_ddl<D: ConnettoSchema>(&self) -> String {
+        crate::schema::engine_ddl::<D>(&self.pg_ddl, self.devices)
     }
 
     /// The one catalog the engine classifies, the policies beside
@@ -388,13 +376,11 @@ impl ServerSchema {
     ///
     /// [`connetto_schema::SchemaError::Translate`] when either document does
     /// not parse.
-    pub fn catalog<Id: connetto_core::bots::BotRegistryIdSql>(
-        &self,
-    ) -> Result<String, connetto_schema::SchemaError> {
-        let cap = connetto_schema::cap_policies::<Id>(&self.pg_ddl, &self.pg_policies)?;
+    pub fn catalog<D: ConnettoSchema>(&self) -> Result<String, connetto_schema::SchemaError> {
+        let cap = connetto_schema::cap_policies::<RegistryIds<D>>(&self.pg_ddl, &self.pg_policies)?;
         Ok(format!(
             "{}\n{}\n{}",
-            self.engine_ddl::<Id>(),
+            self.engine_ddl::<D>(),
             self.pg_policies,
             cap
         ))
@@ -1781,7 +1767,7 @@ where
                 )?;
                 crate::portability::validate(
                     list,
-                    &schema.engine_ddl::<RegistryIds<D>>(),
+                    &schema.engine_ddl::<D>(),
                     &replica,
                     &CallerMappings::of::<String>(&schema.reader_role)?,
                     serves_content,
@@ -1820,6 +1806,11 @@ where
         // re-execution hold out of the gated reader pool the reader reserve
         // splits (R39).
         let reexec_pool = build_pool(&database.reader_url, owner_pool_size).await?;
+        let audit_reads: Vec<_> = D::Audit::TABLES
+            .iter()
+            .map(|table| Artifact::ReadInFull(table))
+            .collect();
+        preflight::require(&reexec_pool, &audit_reads).await?;
         let connector = PgReadConnector::with_session_setup(reexec_pool.clone());
         let engine_connector = PgReadConnector::with_session_setup(reexec_pool.clone());
         let guard = build_guard::<D>(&pool, reader_reserve.gate(), &throttle, abuse, bans);
@@ -1867,7 +1858,7 @@ where
             database_url: database.owner_url,
             slot,
             publication,
-            pg_ddl: schema.engine_ddl::<RegistryIds<D>>(),
+            pg_ddl: schema.engine_ddl::<D>(),
         };
         let file_router = reader.file_router;
         let sweep = reader.sweep;
@@ -2322,9 +2313,8 @@ async fn build_reader_side<D: ConnettoSchema>(
         completion,
     )
     .await?;
-    let snapshot =
-        PgSnapshotSource::from_ddl(pool.clone(), &schema.engine_ddl::<RegistryIds<D>>())?
-            .with_publication(publication);
+    let snapshot = PgSnapshotSource::from_ddl(pool.clone(), &schema.engine_ddl::<D>())?
+        .with_publication(publication);
     Ok(ReaderSide {
         pool,
         signer,
@@ -2394,8 +2384,8 @@ async fn translate_authorization<D: ConnettoSchema>(
     schema: &ServerSchema,
     publication: &str,
 ) -> Result<Translated, BuildError> {
-    let translated = Translated::of::<String, RegistryIds<D>>(schema.documents(), schema.devices)?;
-    let engine_ddl = schema.engine_ddl::<RegistryIds<D>>();
+    let translated = Translated::of::<String, D>(schema.documents(), schema.devices)?;
+    let engine_ddl = schema.engine_ddl::<D>();
     require_one_numbering(translated.shapes_arc().catalog(), &engine_ddl)?;
     // A policy reading a table the change stream does not carry never hears
     // of a grant given or taken, so the store goes stale and then answers
@@ -2405,6 +2395,11 @@ async fn translate_authorization<D: ConnettoSchema>(
         .iter()
         .map(|table| Artifact::PublishedTable { publication, table })
         .collect();
+    required.extend(
+        D::Audit::TABLES
+            .iter()
+            .map(|table| Artifact::PublishedTable { publication, table }),
+    );
     // The owner pool reads the facts off the tables the policies read, and
     // the withdrawals and the bot registry off the synced tables, each for
     // every caller at once, so row-level security must filter none of them.
@@ -2495,9 +2490,10 @@ async fn build_write_side<D: ConnettoSchema>(
     engine_connector: PgReadConnector,
 ) -> Result<WriteSide<D>, BuildError> {
     let translated = translate_authorization::<D>(&pools.owner, schema, publication).await?;
-    let catalog = schema.catalog::<RegistryIds<D>>()?;
+    let catalog = schema.catalog::<D>()?;
     // The engine and the upkeep each classify membership against the deployment's policies, so each takes a translator.
     let materializer = Materializer::builder(&catalog)
+        .with_audit_schema::<D::Audit>()
         .with_write_catalog(writable)
         .with_translator(translated.translator().clone())
         .with_caller(CallerMappings::of::<String>(&schema.reader_role)?)
@@ -2506,19 +2502,15 @@ async fn build_write_side<D: ConnettoSchema>(
     // The second opinion reads as the reader role, so it takes its pool before the write target consumes it.
     let second = if second_opinion {
         Some(
-            RlsAuth::<D::Id, String>::from_ddl(
-                pools.reader.clone(),
-                &schema.engine_ddl::<RegistryIds<D>>(),
-            )
-            .map_err(|err| BuildError::SecondOpinion(err.to_string()))?,
+            RlsAuth::<D::Id, String>::from_ddl(pools.reader.clone(), &schema.engine_ddl::<D>())
+                .map_err(|err| BuildError::SecondOpinion(err.to_string()))?,
         )
     } else {
         None
     };
-    let write = pg_write_target::<D>(pools.reader, &schema.engine_ddl::<RegistryIds<D>>())?;
+    let write = pg_write_target::<D>(pools.reader, &schema.engine_ddl::<D>())?;
     // Move-out withdrawals read on the owner pool, where the membership that ended no longer hides the rows (R27 decision 6).
-    let withdrawals =
-        PgSnapshotSource::from_ddl(pools.owner.clone(), &schema.engine_ddl::<RegistryIds<D>>())?;
+    let withdrawals = PgSnapshotSource::from_ddl(pools.owner.clone(), &schema.engine_ddl::<D>())?;
     // A changed policy makes an existing replica stale, so a client holding one is told through the advertised version.
     let bundle = connetto_schema::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
         schema.documents(),
@@ -2909,7 +2901,7 @@ mod tests {
         });
         let budget = Duration::from_millis(200);
         let openfga = OpenFga::new(format!("http://{address}"), "store").with_call_budget(budget);
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 "CREATE TABLE papers (id INTEGER PRIMARY KEY, owner TEXT); \
                  ALTER TABLE papers ENABLE ROW LEVEL SECURITY;",
@@ -2969,12 +2961,29 @@ mod tests {
     /// The roles document creating the reader role the tests read as.
     const READER_ROLES: &str = "CREATE ROLE app_reader LOGIN;";
 
+    #[test]
+    fn the_server_catalog_accepts_a_private_courier_audit_observation() {
+        let schema = ServerSchema::new(NUMBERED, "", READER_ROLES, "app_reader");
+        let mut materializer =
+            crate::Materializer::builder(&schema.engine_ddl::<crate::defaults::ConnettoDefaults>())
+                .build()
+                .expect("the server catalog builds");
+        let receipt = materializer
+            .register(
+                1,
+                "SELECT writer, seq FROM auth_events \
+                 WHERE op = 'write_couriered' AND writer = 7 AND seq = 8",
+            )
+            .expect("the deployment audit table supports private observations");
+        assert!(matches!(receipt, crate::Registration::Computed(_)));
+    }
+
     /// The model's catalog read from the composed document and the server's
     /// read from the same text number every table alike, so startup goes on.
     #[test]
     fn one_document_numbers_every_table_alike() {
         let schema = ServerSchema::new(NUMBERED, "", READER_ROLES, "app_reader");
-        let engine_ddl = schema.engine_ddl::<connetto_core::bots::TextIds>();
+        let engine_ddl = schema.engine_ddl::<crate::defaults::ConnettoDefaults>();
         let model =
             ParserDB::parse::<PostgreSqlDialect>(&engine_ddl).expect("the model catalog parses");
         require_one_numbering(&model, &engine_ddl).expect("one document numbers its tables once");
@@ -2986,7 +2995,7 @@ mod tests {
     #[test]
     fn a_catalog_without_the_registry_refuses_startup() {
         let schema = ServerSchema::new(NUMBERED, "", READER_ROLES, "app_reader");
-        let model_ddl = schema.engine_ddl::<connetto_core::bots::TextIds>();
+        let model_ddl = schema.engine_ddl::<crate::defaults::ConnettoDefaults>();
         let model =
             ParserDB::parse::<PostgreSqlDialect>(&model_ddl).expect("the model catalog parses");
         let refused =

@@ -141,3 +141,45 @@ async fn the_database_wide_audit_would_refuse_a_correct_deployment() {
         .await;
     fixture.exec("DROP TABLE IF EXISTS r6_full CASCADE").await;
 }
+
+#[tokio::test]
+async fn publication_membership_resolves_the_qualified_relation() {
+    let fixture = Fixture::acquire().await;
+    fixture
+        .setup(&[
+            "CREATE SCHEMA \"Audit.Space\"",
+            "CREATE TABLE \"Audit.Space\".\"Receipt.Log\" (seq BIGINT)",
+            "CREATE TABLE public.\"Receipt.Log\" (seq BIGINT)",
+            "CREATE PUBLICATION qualified_audit_pub FOR TABLE public.\"Receipt.Log\"",
+        ])
+        .await;
+    let required = [Artifact::PublishedTable {
+        publication: "qualified_audit_pub",
+        table: "\"Audit.Space\".\"Receipt.Log\"",
+    }];
+    assert!(matches!(
+        preflight::require(fixture.admin(), &required).await,
+        Err(PreflightError::Missing { name, .. })
+            if name == "\"Audit.Space\".\"Receipt.Log\""
+    ));
+    fixture
+        .exec("ALTER PUBLICATION qualified_audit_pub ADD TABLE \"Audit.Space\".\"Receipt.Log\"")
+        .await;
+    preflight::require(fixture.admin(), &required)
+        .await
+        .expect("the exact qualified audit relation is published");
+    fixture
+        .exec("ALTER PUBLICATION qualified_audit_pub DROP TABLE public.\"Receipt.Log\"")
+        .await;
+    assert!(matches!(
+        preflight::require(
+            fixture.admin(),
+            &[Artifact::PublishedTable {
+                publication: "qualified_audit_pub",
+                table: "\"Receipt.Log\"",
+            }],
+        )
+        .await,
+        Err(PreflightError::Missing { .. })
+    ));
+}

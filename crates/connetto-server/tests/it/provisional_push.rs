@@ -141,6 +141,7 @@ fn manager(
     let ddl = engine_ddl(PG_DDL);
     let manager = ManagerBuilder::new(
         Materializer::builder(&ddl)
+            .with_audit_schema::<connetto_server::defaults::ConnettoAudit>()
             .with_write_catalog(writable_catalog())
             .build()
             .expect("build materializer"),

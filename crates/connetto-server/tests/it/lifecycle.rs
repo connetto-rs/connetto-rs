@@ -427,6 +427,7 @@ async fn an_unusable_change_stream_on_a_model_table_refuses_to_serve() {
          THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
         "GRANT USAGE ON SCHEMA public TO app_reader",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON owned TO app_reader",
+        "GRANT SELECT ON auth_events TO app_reader",
     ] {
         exec(&pool, stmt).await;
     }
