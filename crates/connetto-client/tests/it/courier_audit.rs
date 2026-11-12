@@ -1,5 +1,7 @@
 //! Courier audit observers through the public builder and live pump.
 
+mod transport;
+
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -293,6 +295,7 @@ async fn malformed_inputs_are_rejected_without_poisoning_the_next_observation() 
         (&AUTHOR, &[1_u64 << 63], WITHIN),
         (&AUTHOR, &[u64::MAX], WITHIN),
         (&AUTHOR, &[1], Duration::ZERO),
+        (&AUTHOR, &[1], Duration::from_secs(u64::MAX / 1000 + 1)),
         (&AUTHOR, &[1], Duration::MAX),
     ];
     for (index, &(author, seqs, within)) in cases.iter().enumerate() {
@@ -436,6 +439,10 @@ async fn caller_drop_and_local_expiry_cancel_while_the_gate_is_locked() {
         bounded("locked application access", client.with_conn(|_| ())).await,
         Err(ClientError::Locked)
     ));
+    assert!(matches!(
+        bounded("locked observation", observe(&client, &[53], WITHIN)).await,
+        Err(CourierAuditError::Client(ClientError::Locked))
+    ));
     drop(dropped);
     cancelled(&mut h.server, &drop_request.request_id).await;
     assert!(matches!(
@@ -444,6 +451,56 @@ async fn caller_drop_and_local_expiry_cancel_while_the_gate_is_locked() {
     ));
     cancelled(&mut h.server, &expiry_request.request_id).await;
     bounded("close locked client", client.close()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_expires_an_observer_whose_caller_is_not_polling() {
+    let mut h = running("alice").await;
+    let client = h.client.clone();
+    let mut dormant = observe(&client, &[54], Duration::from_secs(1));
+    let first = request(&mut h.server, &mut dormant).await;
+    let mut driven = observe(&client, &[55], Duration::from_secs(1));
+    let second = request(&mut h.server, &mut driven).await;
+    assert!(matches!(
+        bounded(&second.request_id, driven).await,
+        Err(CourierAuditError::Expired)
+    ));
+    let messages = [
+        control(&mut h.server, "expired observation cancellation").await,
+        control(&mut h.server, "expired observation cancellation").await,
+    ];
+    let mut cancelled = messages.each_ref().map(|message| {
+        let ControlMessage::CourierAuditCancel(cancel) = message else {
+            panic!("expired observation must cancel its request");
+        };
+        cancel.request_id.as_str()
+    });
+    cancelled.sort_unstable();
+    let mut expected = [first.request_id.as_str(), second.request_id.as_str()];
+    expected.sort_unstable();
+    assert_eq!(cancelled, expected);
+    answer(
+        &mut h.server,
+        &first.request_id,
+        CourierAuditOutcome::Confirmed,
+    )
+    .await;
+    assert!(matches!(
+        bounded(&first.request_id, dormant).await,
+        Err(CourierAuditError::Expired)
+    ));
+    let mut next = observe(&client, &[54], WITHIN);
+    let sent = request(&mut h.server, &mut next).await;
+    answer(
+        &mut h.server,
+        &sent.request_id,
+        CourierAuditOutcome::Confirmed,
+    )
+    .await;
+    bounded(&sent.request_id, next)
+        .await
+        .expect("a fresh observer owns its confirmation");
+    bounded("close maintenance-expiry client", client.close()).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
