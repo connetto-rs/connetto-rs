@@ -329,6 +329,119 @@ async fn builder_held_credential_reads_the_callers_own_row() {
     );
 }
 
+async fn insert_courier_receipt(fixture: &Fixture, author: &[u8; 32]) {
+    use connetto_core::SessionId;
+    use connetto_server::audit::{AuthEvent, AuthOp, ConnettoAuditSchema};
+    use connetto_server::defaults::{_connetto_writers, ConnettoAudit};
+
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    let insert = diesel::insert_into(_connetto_writers::table)
+        .values((
+            _connetto_writers::user_id.eq("alice"),
+            _connetto_writers::device_key.eq(author.as_slice()),
+            _connetto_writers::frontier.eq(0_i64),
+        ))
+        .returning(_connetto_writers::writer);
+    let writer: i64 = diesel_async::RunQueryDsl::get_result(insert, &mut *conn)
+        .await
+        .expect("insert author writer");
+    let mut receipt = AuthEvent::new(
+        SessionId::from_uuid(uuid::Uuid::new_v4()),
+        Some("alice".to_owned()),
+        AuthOp::WriteCouriered,
+    )
+    .about_courier("bob".to_owned());
+    receipt.writer = Some(writer);
+    receipt.seq = Some(1);
+    assert_eq!(
+        diesel_async::RunQueryDsl::execute(ConnettoAudit::audit_insert(receipt), &mut *conn)
+            .await
+            .expect("commit courier receipt"),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn builder_observes_only_committed_courier_receipts_visible_to_its_identity() {
+    use connetto_client::CourierAuditError;
+
+    const AUTHOR: [u8; 32] = [41; 32];
+    const WITHIN: Duration = Duration::from_secs(10);
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let fixture = Fixture::acquire().await;
+        fixture
+            .setup(&[
+                "DROP TABLE IF EXISTS orders CASCADE",
+                "DROP TABLE IF EXISTS _connetto_writers, _connetto_settled CASCADE",
+                PG_DDL,
+            ])
+            .await;
+        connetto_test_harness::provision_writers(fixture.admin()).await;
+        connetto_test_harness::provision_audit(fixture.admin()).await;
+        insert_courier_receipt(&fixture, &AUTHOR).await;
+        let schema = SyncSchema::new(
+            connetto_schema::translate::<String, connetto_core::bots::TextIds>(
+                connetto_schema::Documents::new(
+                    PG_DDL,
+                    "",
+                    connetto_test_harness::FIXTURE_ROLES,
+                    connetto_test_harness::FIXTURE_READER,
+                ),
+            )
+            .expect("translate the sources"),
+        );
+        let snapshot = PgSnapshotSource::from_ddl(fixture.admin().clone(), &engine_ddl(PG_DDL))
+            .expect("snapshot source");
+        let server = spawn_server(
+            ServerConfig::new(PG_DDL, fixture.admin_url()).with_replication(["orders"]),
+            snapshot,
+            HarnessAuth::roster(RosterAuth::granting("alice").and("bob").and("mallory")),
+            fixture.admin().clone(),
+            fixture.admin().clone(),
+        )
+        .await;
+
+        for account in ["alice", "bob", "mallory"] {
+            let client = Box::pin(
+                NativeClientBuilder::new("ws://127.0.0.1:1", schema.clone())
+                    .with_dialer(OneShot {
+                        transport: Some(server.attach()),
+                    })
+                    .signed_in(
+                        HeldCredential::new(Grant::new(format!("user:{account}")), account)
+                            .expect("the credential holds"),
+                    )
+                    .connect(),
+            )
+            .await
+            .expect("the signed-in observer connects");
+            if account == "mallory" {
+                assert!(matches!(
+                    client
+                        .observe_courier_audit(&AUTHOR, &[1], Duration::from_secs(1))
+                        .await,
+                    Err(CourierAuditError::Expired)
+                ));
+            } else {
+                client
+                    .observe_courier_audit(&AUTHOR, &[1], WITHIN)
+                    .await
+                    .unwrap_or_else(|error| panic!("{account} receipt 1 failed with {error}"));
+                assert!(matches!(
+                    client
+                        .observe_courier_audit(&AUTHOR, &[1, 2], Duration::from_secs(1))
+                        .await,
+                    Err(CourierAuditError::Expired)
+                ));
+            }
+            client.close().await;
+        }
+    })
+    .await
+    .expect("NATIVE-AUDIT-COVERAGE-522 completes within its bound");
+}
+
 const NOTES_DDL: &str = "-- connetto:major 1
 CREATE TABLE notes (id INT PRIMARY KEY, label TEXT);";
 

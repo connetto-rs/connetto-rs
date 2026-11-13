@@ -1200,7 +1200,7 @@ async fn writer_refusal_takes_rows(refusal: CourierRefusal) {
         Some(b"the retained"),
     );
     adopt(&mut conn, AUTHOR, Some(3));
-    let (mut conn, mut server) = attach(conn, true).await;
+    let (mut conn, mut server) = Box::pin(attach(conn, true)).await;
     let ask = next_ask(&mut server).await;
     let wait = conn.courier(AUTHOR).await.expect("send the range");
     let range = next_range(&mut server).await;
@@ -4363,7 +4363,6 @@ mod r78_4c {
     async fn a_courier_completes_beside_a_batch_drain_with_or_without_the_main_wire() {
         for keep_main in [true, false] {
             timeout(BOUND, async {
-                let body = real_changeset(2);
                 let (cert, keys) = device_identity().await;
                 let mut conn = replica3();
                 conn.store_device_certificate(&cert)
@@ -4375,7 +4374,7 @@ mod r78_4c {
                     2,
                     HeldState::CourierOnly,
                     major(2),
-                    Some(&body),
+                    Some(&real_changeset(2)),
                 );
                 store_offer(
                     &mut conn,

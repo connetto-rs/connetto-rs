@@ -78,6 +78,7 @@ pub mod bots;
 pub mod builder;
 pub mod cipher;
 mod clock;
+mod courier_audit;
 #[cfg(feature = "device-identity")]
 pub mod device_key;
 mod drain;
@@ -119,6 +120,7 @@ pub use bluetooth::{
     BeaconState, BluetoothError, BluetoothState, HostId, Hosted, JoinNearbyError, NearbyHost,
     PromptOutcome,
 };
+pub use courier_audit::CourierAuditError;
 #[cfg(feature = "device-identity")]
 pub use enrolment::{CertificateError, DeviceEntry};
 #[cfg(feature = "peer")]
@@ -5000,6 +5002,7 @@ const MEMBERSHIP_LABEL_PREFIX: &str = "connetto-membership:";
 pub struct ConnettoConnection<T: Transport> {
     /// The live socket, absent when no server is reachable.
     wire: Option<Wire<T>>,
+    courier_audit: courier_audit::CourierAuditState,
     /// The second wire draining an older major's held work, boxed since it is idle nearly always (R31).
     drain: Box<drain::Drain<T>>,
     /// The run this caller's work belongs to, absent until a first handshake
@@ -5580,6 +5583,7 @@ where
 
         let mut conn = Self {
             wire: None,
+            courier_audit: courier_audit::CourierAuditState::default(),
             run: None,
             attach_replay: AttachReplay::Idle,
             notices: VecDeque::new(),
@@ -5914,6 +5918,7 @@ where
         {
             self.handshakes += 1;
         }
+        self.courier_audit.disconnected();
         self.wire = Some(Wire {
             transport,
             connection_id: ack.connection_id,
@@ -9030,6 +9035,7 @@ where
 
     /// Drop the live socket and announce it, once.
     fn disconnected(&mut self) {
+        self.courier_audit.disconnected();
         self.attach_replay = AttachReplay::Idle;
         // A fresh transport replays every pending write, so no resend stays owed.
         self.resend = Resend::Idle;
@@ -11626,6 +11632,10 @@ where
                 self.settle_relay_storage(answer);
                 return Ok(None);
             }
+            Some(IncomingFrame::Control(ControlMessage::CourierAuditAnswer(answer))) => {
+                self.settle_courier_audit(&answer);
+                return Ok(None);
+            }
             Some(IncomingFrame::Control(msg)) => {
                 #[cfg(feature = "device-identity")]
                 if enrolment::Answer::is_answer(&msg) {
@@ -12053,6 +12063,7 @@ where
     ///
     /// [`ClientError::Transport`] when the close fails.
     pub async fn close(&mut self) -> Result<(), ClientError> {
+        self.finish_courier_audit();
         self.wire()?
             .transport
             .close()

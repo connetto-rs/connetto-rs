@@ -29,6 +29,8 @@ mod column_subset;
 
 mod changed_signal;
 
+mod courier_audit;
+
 mod courier_notice;
 
 mod coverage_resync;
