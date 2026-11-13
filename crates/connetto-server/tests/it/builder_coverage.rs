@@ -3092,7 +3092,7 @@ async fn a_sweep_tick_reclaims_a_chunk_marked_deleting() {
     parts.handle.shutdown().await;
 }
 
-/// The photo table and the two contract functions a configured deployment
+/// The photo table and the three contract functions a configured deployment
 /// applies, from a clean slate.
 pub(super) async fn apply_content_deployment(pool: &Pool<AsyncPgConnection>) {
     const DEPLOYMENT_SQL: &[&str] = &[
@@ -3107,6 +3107,8 @@ pub(super) async fn apply_content_deployment(pool: &Pool<AsyncPgConnection>) {
          LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' \
          AS $$ BEGIN UPDATE public.photos SET content_state = p_new_state \
          WHERE content_id = p_file_id; RETURN p_file_id; END; $$",
+        "CREATE OR REPLACE FUNCTION connetto_file_owner(p_file_id BYTEA) RETURNS TEXT \
+         LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ SELECT NULL::text $$",
     ];
     for stmt in [
         "DROP TABLE IF EXISTS photos CASCADE",
@@ -3116,6 +3118,7 @@ pub(super) async fn apply_content_deployment(pool: &Pool<AsyncPgConnection>) {
         "DROP TABLE IF EXISTS _cfs_traffic CASCADE",
         "DROP FUNCTION IF EXISTS connetto_visible_files(BYTEA[])",
         "DROP FUNCTION IF EXISTS connetto_set_content_state(BYTEA, TEXT, TEXT)",
+        "DROP FUNCTION IF EXISTS connetto_file_owner(BYTEA)",
     ] {
         exec(pool, stmt).await;
     }

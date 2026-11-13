@@ -1852,14 +1852,16 @@ const CONTENT_DROP_STATEMENTS: &[&str] = &[
     "DROP TABLE IF EXISTS photos CASCADE",
     "DROP FUNCTION IF EXISTS connetto_visible_files(BYTEA[])",
     "DROP FUNCTION IF EXISTS connetto_set_content_state(BYTEA, TEXT, TEXT)",
+    "DROP FUNCTION IF EXISTS connetto_file_owner(BYTEA)",
     "DROP TABLE IF EXISTS _cfs_manifest_chunks",
     "DROP TABLE IF EXISTS _cfs_manifests",
     "DROP TABLE IF EXISTS _cfs_chunk_registry",
 ];
 
 /// The file-serving deployment contract, the same shape `content.sql` ships
-/// in the demos: the metadata table the two contract functions consult and
-/// the functions themselves.
+/// in the demos: the metadata table the three contract functions consult and
+/// the functions themselves. Its photos carry no owner, so the owner
+/// function names nobody.
 #[cfg(feature = "content")]
 const CONTENT_CONTRACT_STATEMENTS: &[&str] = &[
     "CREATE TABLE photos (content_id BYTEA PRIMARY KEY, content_state TEXT NOT NULL \
@@ -1872,6 +1874,8 @@ const CONTENT_CONTRACT_STATEMENTS: &[&str] = &[
      p_caller TEXT) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' \
      AS $$ BEGIN UPDATE public.photos SET content_state = p_new_state \
      WHERE content_id = p_file_id; RETURN p_file_id; END; $$",
+    "CREATE OR REPLACE FUNCTION connetto_file_owner(p_file_id BYTEA) RETURNS TEXT \
+     LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ SELECT NULL::text $$",
 ];
 
 /// Brings the database to a content-ready deployment, or to none at all.
@@ -2309,6 +2313,7 @@ async fn e2e_content_ticket_round_trips_over_a_live_session() {
                         request_id: "probe-ghost".to_owned(),
                         file_id: [0x5cu8; 32],
                         verb: ContentVerb::Read,
+                        for_owner: None,
                     }))
                     .await
                     .expect("post the ghost request");
@@ -2334,6 +2339,7 @@ async fn e2e_content_ticket_round_trips_over_a_live_session() {
                             request_id: "probe-visible".to_owned(),
                             file_id,
                             verb: ContentVerb::Read,
+                            for_owner: None,
                         }))
                         .await
                         .expect("post the visible request");

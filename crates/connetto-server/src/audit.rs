@@ -100,6 +100,11 @@ pub enum AuthOp {
     /// (R61). connetto deletes nothing itself, so this records the
     /// application's act.
     DataErased,
+    /// A device of another account uploaded a file for its owner and the
+    /// commit is durable (R79 decision 17). The row names the owner in
+    /// `user_id`, the carrier's account in `courier_user_id` and the file id
+    /// in `subject`, under the carrier's minting session.
+    ContentCarried,
 }
 
 impl AuthOp {
@@ -126,6 +131,7 @@ impl AuthOp {
             Self::WriteCouriered => "write_couriered",
             Self::DataDownloaded => "data_downloaded",
             Self::DataErased => "data_erased",
+            Self::ContentCarried => "content_carried",
         }
     }
 }
@@ -158,6 +164,7 @@ impl FromSql<AuthOpSql, Pg> for AuthOp {
             b"write_couriered" => Ok(Self::WriteCouriered),
             b"data_downloaded" => Ok(Self::DataDownloaded),
             b"data_erased" => Ok(Self::DataErased),
+            b"content_carried" => Ok(Self::ContentCarried),
             other => Err(format!(
                 "unrecognised connetto_auth_op label {:?}",
                 String::from_utf8_lossy(other)
@@ -318,10 +325,24 @@ impl<Id> AuthEvent<Id> {
     }
 
     /// Name the courier's account a couriered write came through, the shape a
-    /// `write_couriered` row carries.
+    /// `write_couriered` row carries, or the carrier's account a
+    /// `content_carried` row names.
     #[must_use]
     pub fn about_courier(mut self, courier_user_id: Id) -> Self {
         self.courier_user_id = Some(courier_user_id);
+        self
+    }
+
+    /// Name the file a `content_carried` row concerns, as its id in lowercase
+    /// hex.
+    #[must_use]
+    pub fn about_file(mut self, file_id: &[u8; 32]) -> Self {
+        use core::fmt::Write as _;
+        let mut hex = String::with_capacity(64);
+        for byte in file_id {
+            let _ = write!(hex, "{byte:02x}");
+        }
+        self.subject = Some(hex);
         self
     }
 
@@ -522,17 +543,19 @@ pub enum AuditWriteError {
 #[macro_export]
 macro_rules! connetto_audit_ddl {
     ($id:literal, $pk:literal) => {
-        $crate::connetto_audit_ddl!(@ddl $id, $pk, "", "", "")
+        $crate::connetto_audit_ddl!(@ddl $id, $pk, "", "", "", "")
     };
     (provision, $id:literal, $pk:literal) => {
         $crate::connetto_audit_ddl!(
             @ddl $id, $pk,
             "DO $$ BEGIN ",
             " EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
-            "IF NOT EXISTS "
+            "IF NOT EXISTS ",
+            // A type made before an operation joined the set gains it here.
+            " ALTER TYPE connetto_auth_op ADD VALUE IF NOT EXISTS 'content_carried';"
         )
     };
-    (@ddl $id:literal, $pk:literal, $before:literal, $after:literal, $guard:literal) => {
+    (@ddl $id:literal, $pk:literal, $before:literal, $after:literal, $guard:literal, $upgrade:literal) => {
         concat!(
             $before,
             "CREATE TYPE connetto_auth_op AS ENUM (",
@@ -540,8 +563,9 @@ macro_rules! connetto_audit_ddl {
             "'ended_by_owner', 'ended_all', 'ended_others', 'ended_by_ban', ",
             "'capability_minted', 'permission_change', 'model_change', ",
             "'banned', 'ban_lifted', 'write_forked', 'write_redelivered', ",
-            "'write_couriered', 'data_downloaded', 'data_erased');",
+            "'write_couriered', 'data_downloaded', 'data_erased', 'content_carried');",
             $after,
+            $upgrade,
             " CREATE TABLE ", $guard, "auth_events (",
             "at TIMESTAMPTZ NOT NULL DEFAULT now(), ",
             "session UUID, ",

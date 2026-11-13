@@ -160,7 +160,7 @@ Every session asks the server about each retained row whose author's stored offe
 
 ## Planned
 
-The rest of R79's step 4, as [R79](../../plans/master-implementation-plan.md#r79-media-over-the-peer-link) decisions 12 to 18 lay out, keeps a photo alive when its author's device is lost before it reaches the server. A receiver asks reported holders before other peers, by its measured rate. A holder uploads a settled row's file the server still lacks, a courier at once and the other holders after a wait staggered by their rank, and the server credits the upload to the row's owner through a deployment function. The device archive carries custody copies. Peer sync in every demo is planned in [R80](../../plans/master-implementation-plan.md#r80-peer-sync-in-every-demo).
+The rest of R79's step 4, as [R79](../../plans/master-implementation-plan.md#r79-media-over-the-peer-link) decisions 12 to 18 lay out, keeps a photo alive when its author's device is lost before it reaches the server. A receiver asks reported holders before other peers, by its measured rate. A holder uploads a settled row's file the server still lacks, a courier at once and the other holders after a wait staggered by their rank, through the server's credit to the file's owner that [18-file-handling.md](18-file-handling.md#upload-and-the-availability-signal) describes. The device archive carries custody copies. Peer sync in every demo is planned in [R80](../../plans/master-implementation-plan.md#r80-peer-sync-in-every-demo).
 
 ## The archive
 

@@ -16,10 +16,14 @@ CREATE TABLE IF NOT EXISTS _cfs_manifests (
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     -- Set at boot when the store lost chunks this manifest names, until a re-upload.
     lost           BOOLEAN      NOT NULL DEFAULT FALSE,
+    -- The carrier's key when another account's device uploaded the file for
+    -- uploaded_by (R79 decision 17), NULL for the uploader's own upload.
+    carried_by     TEXT,
     PRIMARY KEY (file_id, uploaded_by)
 );
--- A deployment created before the lost column gains it when this file is applied again.
+-- A deployment created before these columns gains them when this file is applied again.
 ALTER TABLE _cfs_manifests ADD COLUMN IF NOT EXISTS lost BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE _cfs_manifests ADD COLUMN IF NOT EXISTS carried_by TEXT;
 
 -- Per-chunk records: ordered, referencing the manifest row by composite key.
 CREATE TABLE IF NOT EXISTS _cfs_manifest_chunks (

@@ -8,11 +8,11 @@ use axum::{
 use bytes::Bytes;
 use chrono::Utc;
 use connetto_file_core::{ChunkHash, ChunkMeta, FileId};
-use diesel_async::{AsyncConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    caller::{attributions, manifest_key},
+    caller::{manifest_key, upload_attributions, upload_key},
     db,
     error::ServerError,
     needed,
@@ -110,7 +110,7 @@ pub(crate) async fn post_intent<S: ConnettoFileSchema>(
     }
     let total_len = i64::try_from(body.total_len)
         .map_err(|_| ServerError::BadParam("total_len overflows i64".into()))?;
-    let key = manifest_key(&state.caller_settings, &ticket.caller)?;
+    let key = upload_key(&state.caller_settings, &ticket)?;
     let mut admin_conn = state.pools.admin.get().await?;
     match db::insert_manifest::<S>(&mut admin_conn, &file_id, total_len, &key, &chunks).await? {
         db::InsertManifestOutcome::RegistryConflict => return Err(ServerError::RegistryConflict),
@@ -140,7 +140,7 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
     let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
     let chunk_hash = parse_chunk_hash(&hash_hex)?;
     let file_id = FileId::from_bytes(ticket.file_id);
-    let caller = manifest_key(&state.caller_settings, &ticket.caller)?;
+    let caller = upload_key(&state.caller_settings, &ticket)?;
     let body_len = u64::try_from(body.len())
         .map_err(|_| ServerError::BadParam("body length overflows u64".into()))?;
     // A ceiling above i64::MAX cannot be exceeded by any real upload; clamp once
@@ -210,11 +210,12 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
     let file_id = parse_file_id(&id)?;
     check_ids_match(&file_id, &ticket.file_id)?;
-    let key = manifest_key(&state.caller_settings, &ticket.caller)?;
-    let attributions: Vec<String> = attributions(&ticket.caller)?
+    let key = upload_key(&state.caller_settings, &ticket)?;
+    let attributions: Vec<String> = upload_attributions(&ticket)?
         .into_iter()
         .map(ToOwned::to_owned)
         .collect();
+    let (carried, carried_by) = carried_commit(&state.caller_settings, &ticket, &file_id)?;
     let store = &state.store;
     let settings = state.caller_settings.clone();
     let ceilings = state.ceilings.clone();
@@ -245,36 +246,22 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
         return Err(ServerError::CommitRefused);
     }
     let mut admin_conn = state.pools.admin.get().await?;
-    // What this commit would actually add to the deployment's stored
-    // bytes: the distinct declared chunks that no committed manifest
-    // visible to this caller already carries. The ceiling judges this
-    // margin rather than the declared size, so a commit whose bulk
-    // deduplicates against committed content still settles whenever its
-    // new bytes fit the headroom. The measurement runs on the reader
-    // connection because the visibility predicate is the caller's. It
-    // can only over-count, a chunk can become committed between this
-    // read and the flip but never un-committed, the same conservative
-    // direction as the refresh staleness of the cached total it joins.
-    // Zero cost when no ceiling is configured.
-    let storage_new_bytes: u64 = if quota_settings.storage_ceiling > 0 {
-        let pairs = db::manifest_chunk_pairs::<S>(&mut admin_conn, &file_id, &key).await?;
-        needed::new_declared_bytes::<S>(
-            &mut reader_conn,
-            &state.caller_settings,
-            &ticket.caller,
-            &pairs,
-        )
-        .await?
-    } else {
-        0
-    };
-    admin_conn
-        .transaction::<StatusCode, ServerError, _>(async move |conn| {
+    let storage_new_bytes = storage_new_bytes::<S>(
+        &state,
+        &mut admin_conn,
+        &mut reader_conn,
+        &file_id,
+        &ticket,
+        &key,
+    )
+    .await?;
+    let outcome = admin_conn
+        .transaction::<db::CommitOutcome, ServerError, _>(async move |conn| {
             let (manifest, declared) =
                 match db::load_manifest_locked::<S>(conn, &file_id, &key).await? {
                     // A heal for others deletes the healer's manifest, so its retry finds only the committed file.
                     None if db::file_committed::<S>(conn, &file_id).await? => {
-                        return Ok(StatusCode::OK);
+                        return Ok(db::CommitOutcome::AlreadyCommitted);
                     }
                     None => return Err(ServerError::NotFound),
                     Some(db::ManifestState::Committed) => {
@@ -282,16 +269,8 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                         // setter so metadata rows inserted since the first commit are
                         // updated. The setter is UPDATE ... WHERE content_id = $1 and
                         // is idempotent for rows already at the target state.
-                        for attribution in &attributions {
-                            diesel::select(crate::functions::connetto_set_content_state(
-                                file_id.as_bytes().to_vec().as_slice(),
-                                "available",
-                                attribution.as_str(),
-                            ))
-                            .get_result::<Option<Vec<u8>>>(conn)
-                            .await?;
-                        }
-                        return Ok(StatusCode::OK);
+                        db::set_available(conn, &file_id, &attributions).await?;
+                        return Ok(db::CommitOutcome::AlreadyCommitted);
                     }
                     Some(db::ManifestState::Uncommitted(manifest)) => {
                         // R87's checks guard new bytes only: an already-committed
@@ -332,24 +311,88 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                 }
             }
             let attributions: Vec<&str> = attributions.iter().map(String::as_str).collect();
-            db::commit_manifest_atomic::<S>(
+            let outcome = db::commit_manifest_atomic::<S>(
                 conn,
                 &settings,
                 &file_id,
-                &key,
+                db::ManifestKeys {
+                    key: &key,
+                    carried_by,
+                },
                 &attributions,
                 lost,
                 manifest.chunks(),
             )
             .await?;
-            Ok(StatusCode::OK)
+            Ok(outcome)
         })
-        .await
+        .await?;
+    if let (db::CommitOutcome::Committed, Some(commit), Some(observer)) =
+        (outcome, carried, state.on_carried.as_ref())
+    {
+        observer(commit);
+    }
+    Ok(StatusCode::OK)
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The carried commit a carried upload's durable commit is heard as, and
+/// the carrier's key its manifest records beside the owner's (R79 decision
+/// 17). Both are `None` for an upload the caller makes for itself.
+fn carried_commit(
+    settings: &crate::caller::CallerSettings,
+    ticket: &crate::ticket::TicketPayload,
+    file_id: &FileId,
+) -> Result<(Option<crate::router::CarriedCommit>, Option<String>), ServerError> {
+    let Some(carry) = &ticket.carry else {
+        return Ok((None, None));
+    };
+    let carrier = ticket.caller.identity().ok_or(ServerError::NotFound)?;
+    let commit = crate::router::CarriedCommit {
+        file_id: *file_id.as_bytes(),
+        owner: carry.owner.clone(),
+        carrier: carrier.to_owned(),
+        session: carry.session,
+    };
+    Ok((Some(commit), Some(manifest_key(settings, &ticket.caller)?)))
+}
+
+/// What a commit would add to the deployment's stored bytes, the distinct
+/// declared chunks no committed manifest visible to the caller already
+/// carries, or zero when no storage ceiling is configured.
+///
+/// The ceiling judges this margin rather than the declared size, so a
+/// commit whose bulk deduplicates against committed content still settles
+/// whenever its new bytes fit the headroom. The measurement runs on the
+/// reader connection because the visibility predicate is the caller's. It
+/// can only over-count, a chunk can become committed between this read and
+/// the flip but never un-committed, the same conservative direction as the
+/// refresh staleness of the cached total it joins.
+async fn storage_new_bytes<S: ConnettoFileSchema>(
+    state: &AppState<S>,
+    admin_conn: &mut AsyncPgConnection,
+    reader_conn: &mut AsyncPgConnection,
+    file_id: &FileId,
+    ticket: &crate::ticket::TicketPayload,
+    key: &str,
+) -> Result<u64, ServerError> {
+    if state.quotas.storage_ceiling == 0 {
+        return Ok(0);
+    }
+    let pairs = db::manifest_chunk_pairs::<S>(admin_conn, file_id, key).await?;
+    Ok(
+        needed::new_declared_bytes::<S>(
+            reader_conn,
+            &state.caller_settings,
+            &ticket.caller,
+            &pairs,
+        )
+        .await?,
+    )
+}
 
 /// The metered commit check, taken under the manifest lock. The deployment
 /// numbers are the cached totals shared by every replica, so the overshoot

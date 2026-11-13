@@ -19,9 +19,12 @@ use core::marker::PhantomData;
 /// admin's. `set_config` threads that identity in just before the call, inside
 /// the same transaction so the setting stays in scope.
 mod visibility {
-    use diesel::sql_types::{Array, Bytea};
+    use diesel::sql_types::{Array, Bytea, Nullable, Text};
     diesel::define_sql_function! {
         fn connetto_visible_files(file_ids: Array<Bytea>) -> Array<Bytea>;
+    }
+    diesel::define_sql_function! {
+        fn connetto_file_owner(file_id: Bytea) -> Nullable<Text>;
     }
 }
 
@@ -790,6 +793,31 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                     .await?;
             let expected = file_id.to_vec();
             Ok(visible.into_iter().any(|v| v == expected))
+        })
+        .await
+        .map_err(WriteError::from)
+    }
+
+    /// The account the deployment's `connetto_file_owner` answers for
+    /// `file_id` as `caller`'s own rights read it, `None` when it answers
+    /// nobody (R79 decision 17).
+    ///
+    /// Bound and pooled as [`Self::file_visible_to_caller`] is, so the
+    /// function, `SECURITY INVOKER`, never names the owner of a row the
+    /// caller cannot read.
+    pub(crate) async fn file_owner_for_caller<Key: CapabilityKey>(
+        &self,
+        file_id: [u8; 32],
+        caller: &Principal<D::Id, Key>,
+    ) -> Result<Option<String>, WriteError> {
+        use visibility::connetto_file_owner;
+        let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        conn.transaction::<Option<String>, diesel::result::Error, _>(async move |c| {
+            binding.apply(c).await?;
+            diesel::select(connetto_file_owner(file_id.to_vec()))
+                .get_result(c)
+                .await
         })
         .await
         .map_err(WriteError::from)

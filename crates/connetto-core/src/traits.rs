@@ -318,7 +318,8 @@ pub trait ContentTicketSigner {
     ///
     /// `caller` is what the ticket binds to, not whoever presents it. Both of
     /// its halves ride, so a caller whose rights come from a share key rather
-    /// than a login is served.
+    /// than a login is served. `carry` rides on a write the caller uploads
+    /// for another account, which the server established before minting.
     ///
     /// # Errors
     ///
@@ -328,6 +329,7 @@ pub trait ContentTicketSigner {
         caller: &crate::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
+        carry: Option<&crate::auth::ContentCarry>,
     ) -> impl core::future::Future<Output = Result<String, Self::Error>> + MaybeSend;
 }
 

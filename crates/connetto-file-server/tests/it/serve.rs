@@ -20,6 +20,7 @@ async fn absent_file_answers_404() {
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let id_hex = connetto_file_server::hex_32(&file_id);
@@ -58,6 +59,7 @@ async fn bad_ticket_answers_404() {
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -79,6 +81,7 @@ async fn bad_ticket_answers_404() {
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -118,6 +121,7 @@ async fn expired_ticket_answers_404() {
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -139,6 +143,7 @@ async fn expired_ticket_answers_404() {
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() - 120,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -178,6 +183,7 @@ async fn write_ticket_on_read_endpoint_answers_404() {
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -199,6 +205,7 @@ async fn write_ticket_on_read_endpoint_answers_404() {
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -261,6 +268,7 @@ async fn empty_file_serves_200_with_empty_body() {
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -318,6 +326,7 @@ async fn empty_file_range_request_answers_416() {
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -382,6 +391,7 @@ async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: std::marker::PhantomData,
     })
     .await
@@ -411,6 +421,7 @@ async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
             ceiling: 128,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
 
@@ -490,6 +501,7 @@ async fn content_length_present_on_full_response() {
             ceiling: total + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -555,6 +567,7 @@ async fn content_length_present_on_partial_response() {
             ceiling: total + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     // Request bytes 0-4 (5 bytes).
@@ -629,6 +642,7 @@ async fn content_length_present_on_empty_file_response() {
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -701,6 +715,7 @@ async fn suffix_byte_range_serves_206() {
             ceiling: total,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     // Request the last 4 bytes via suffix range.
@@ -767,6 +782,7 @@ async fn short_store_read_terminates_stream_with_error() {
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: std::marker::PhantomData,
     })
     .await
@@ -786,6 +802,7 @@ async fn short_store_read_terminates_stream_with_error() {
             ceiling: 64,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -855,6 +872,7 @@ async fn cross_caller_read_with_visible_file_serves_200() {
             ceiling: total + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("bob"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -906,6 +924,7 @@ async fn unauthorized_caller_gets_404_even_with_own_manifest_row() {
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("dave"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -955,6 +974,7 @@ async fn a_key_only_ticket_serves() {
             ceiling: u64::MAX,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::keyed([SUBJECT]),
+            carry: None,
         })
         .unwrap();
     let id_hex = connetto_file_server::hex_32(file_id.as_bytes());
@@ -1012,6 +1032,7 @@ async fn a_renamed_identity_setting_serves() {
             ceiling: u64::MAX,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let id_hex = connetto_file_server::hex_32(file_id.as_bytes());
@@ -1074,6 +1095,7 @@ async fn a_capped_table_is_served_to_a_person_and_to_a_bot_that_lists_it() {
                 ceiling: u64::MAX,
                 expiry: chrono::Utc::now().timestamp() + 3600,
                 caller,
+                carry: None,
             })
             .unwrap()
     };

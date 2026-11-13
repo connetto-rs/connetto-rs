@@ -34,7 +34,7 @@ use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
+use connetto_core::auth::{AuthContext, ContentCarry, Principal, Subject, VerifiedSession};
 use connetto_core::chain::{self, GENESIS};
 use connetto_core::device_cert::{KeyId, spki_point};
 use connetto_core::exchange::{
@@ -1166,6 +1166,21 @@ fn transport_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Transport(err.to_string())
 }
 
+/// Refuse the content ticket `request_id` asked for with `detail`.
+async fn refuse_ticket<T: Transport>(
+    transport: &mut T,
+    request_id: String,
+    detail: &str,
+) -> Result<(), SessionError> {
+    transport
+        .send_control(ControlMessage::NonFatalError(NonFatalError {
+            related_to: Some(request_id),
+            detail: detail.to_owned(),
+        }))
+        .await
+        .map_err(transport_err)
+}
+
 fn oplog_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Oplog(err.to_string())
 }
@@ -1261,6 +1276,7 @@ impl ContentTicketSigner for NoSigner {
         _caller: &connetto_core::auth::ContentCaller,
         _file_id: [u8; 32],
         _verb: ContentVerb,
+        _carry: Option<&connetto_core::auth::ContentCarry>,
     ) -> impl core::future::Future<Output = Result<String, Self::Error>> + Send {
         core::future::ready(Err(NoSignerConfigured))
     }
@@ -6402,6 +6418,12 @@ where
     /// detail because it discloses nothing about data and a retry is
     /// meaningful. The budget is charged after a successful mint, so a signer
     /// failure never consumes the caller's upload window.
+    ///
+    /// A request naming `for_owner` carries the file for that account (R79
+    /// decision 17). It is minted only for a write by a caller holding an
+    /// account, and only when the deployment's `connetto_file_owner`, read
+    /// with the caller's own rights, answers that account. Every other answer
+    /// is refused with the invisible file's detail.
     async fn handle_content_ticket<T: Transport>(
         &self,
         transport: &mut T,
@@ -6431,37 +6453,30 @@ where
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!(request_id, ?err, "content ticket visibility check failed");
-                return transport
-                    .send_control(ControlMessage::NonFatalError(NonFatalError {
-                        related_to: Some(request_id),
-                        detail: CONTENT_TICKET_SIGNER_ERROR.to_owned(),
-                    }))
-                    .await
-                    .map_err(transport_err);
+                return refuse_ticket(transport, request_id, CONTENT_TICKET_SIGNER_ERROR).await;
             }
         };
         if !visible {
-            return transport
-                .send_control(ControlMessage::NonFatalError(NonFatalError {
-                    related_to: Some(request_id),
-                    detail: CONTENT_TICKET_REFUSED.to_owned(),
-                }))
-                .await
-                .map_err(transport_err);
+            return refuse_ticket(transport, request_id, CONTENT_TICKET_REFUSED).await;
         }
+        let carry = match self
+            .ticket_carry(req.for_owner, req.file_id, req.verb, &request_id, state)
+            .await
+        {
+            Ok(carry) => carry,
+            Err(detail) => return refuse_ticket(transport, request_id, detail).await,
+        };
 
         // Mint before charging so a signer failure costs the caller nothing.
-        let url = match self.signer.mint(&caller, req.file_id, req.verb).await {
+        let url = match self
+            .signer
+            .mint(&caller, req.file_id, req.verb, carry.as_ref())
+            .await
+        {
             Ok(url) => url,
             Err(err) => {
                 tracing::warn!(request_id, %err, "content ticket signing failed");
-                return transport
-                    .send_control(ControlMessage::NonFatalError(NonFatalError {
-                        related_to: Some(request_id),
-                        detail: CONTENT_TICKET_SIGNER_ERROR.to_owned(),
-                    }))
-                    .await
-                    .map_err(transport_err);
+                return refuse_ticket(transport, request_id, CONTENT_TICKET_SIGNER_ERROR).await;
             }
         };
 
@@ -6473,13 +6488,7 @@ where
                 .bytes()
                 .allow_content_bytes(&budget_key, declared_len)
         {
-            return transport
-                .send_control(ControlMessage::NonFatalError(NonFatalError {
-                    related_to: Some(request_id),
-                    detail: CONTENT_TICKET_REFUSED.to_owned(),
-                }))
-                .await
-                .map_err(transport_err);
+            return refuse_ticket(transport, request_id, CONTENT_TICKET_REFUSED).await;
         }
 
         transport
@@ -6489,6 +6498,43 @@ where
             }))
             .await
             .map_err(transport_err)
+    }
+
+    /// What a content ticket carries for the account `for_owner` names,
+    /// `None` when it names none, or the refusal detail to answer.
+    ///
+    /// Only a write by a caller holding an account may carry, and only when
+    /// the deployment's `connetto_file_owner`, read with the caller's own
+    /// rights, answers that account (R79 decision 17).
+    async fn ticket_carry(
+        &self,
+        for_owner: Option<String>,
+        file_id: [u8; 32],
+        verb: ContentVerb,
+        request_id: &str,
+        state: &SessionState<Id, Key>,
+    ) -> Result<Option<ContentCarry>, &'static str> {
+        let Some(for_owner) = for_owner else {
+            return Ok(None);
+        };
+        if !matches!(verb, ContentVerb::Write { .. }) || state.principal.identity().is_none() {
+            return Err(CONTENT_TICKET_REFUSED);
+        }
+        let answered = self
+            .target
+            .file_owner_for_caller(file_id, &state.principal)
+            .await
+            .map_err(|err| {
+                tracing::warn!(request_id, ?err, "content ticket owner check failed");
+                CONTENT_TICKET_SIGNER_ERROR
+            })?;
+        if answered.as_deref() != Some(for_owner.as_str()) {
+            return Err(CONTENT_TICKET_REFUSED);
+        }
+        Ok(Some(ContentCarry {
+            owner: for_owner,
+            session: state.session_id,
+        }))
     }
 
     /// Answer a device list request with the caller's devices.

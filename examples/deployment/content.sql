@@ -1,4 +1,4 @@
--- The two contracts the file server asks of this deployment, with the grants
+-- The three contracts the file server asks of this deployment, with the grants
 -- its reader role needs. Apply after this file and after roles.sql:
 --
 --   schema.sql, connetto_file_server::DEPLOYMENT_DDL,
@@ -15,13 +15,20 @@
 -- thumbnail's upload leaves the photo's state alone. The writer grants on
 -- photos live in roles.sql beside the other tables, because the demo's own
 -- write path applies client mutations as connetto_reader.
+-- connetto_file_owner is SECURITY INVOKER with a pinned search_path so it
+-- names only an owner the caller can already read. It answers the one
+-- account owning the readable rows whose photo or thumbnail column names the
+-- file, and nobody when no such row or more than one account matches. A
+-- device uploading a file another account owns is credited to that owner.
 CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[]) RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ SELECT ARRAY(SELECT f FROM UNNEST(p_file_ids) AS f WHERE EXISTS (SELECT 1 FROM public.photos p WHERE p.content_id = f OR p.thumb_id = f)) $$;
 CREATE OR REPLACE FUNCTION connetto_set_content_state(p_file_id BYTEA, p_new_state TEXT, p_caller TEXT) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' AS $$ BEGIN UPDATE public.photos SET content_state = p_new_state WHERE content_id = p_file_id; RETURN p_file_id; END; $$;
+CREATE OR REPLACE FUNCTION connetto_file_owner(p_file_id BYTEA) RETURNS TEXT LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ SELECT CASE WHEN count(DISTINCT p.owner_id) = 1 THEN min(p.owner_id) END FROM public.photos p WHERE p.content_id = p_file_id OR p.thumb_id = p_file_id $$;
 GRANT SELECT ON _cfs_manifests TO connetto_reader;
 GRANT SELECT ON _cfs_manifest_chunks TO connetto_reader;
 GRANT SELECT, UPDATE ON photos TO connetto_reader;
 GRANT EXECUTE ON FUNCTION connetto_visible_files TO connetto_reader;
 GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_reader;
+GRANT EXECUTE ON FUNCTION connetto_file_owner TO connetto_reader;
 
 -- Full previous images for the photos table. The commit flips content_state
 -- with an update and the change path needs the row as it was. It is a

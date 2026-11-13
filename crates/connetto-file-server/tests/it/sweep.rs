@@ -37,6 +37,7 @@ async fn sweep_removes_orphaned_upload_and_its_chunks() {
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("sweeptest"),
+            carry: None,
         })
         .unwrap();
 
@@ -98,6 +99,7 @@ async fn sweep_removes_orphaned_upload_and_its_chunks() {
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("sweeptest"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -146,6 +148,7 @@ async fn sweep_fail_once_delete_keeps_candidate_retry_succeeds() {
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("sweepretry"),
+            carry: None,
         })
         .unwrap();
 
@@ -241,6 +244,7 @@ async fn sweep_does_not_collect_committed_manifest() {
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("committer"),
+            carry: None,
         })
         .unwrap();
 
@@ -303,6 +307,7 @@ async fn sweep_does_not_collect_committed_manifest() {
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("committer"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -356,6 +361,7 @@ async fn deleting_hash_blocks_new_intent_with_503() {
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("racer"),
+            carry: None,
         })
         .unwrap();
 
@@ -421,6 +427,7 @@ async fn deleting_hash_blocks_new_intent_with_503() {
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("racer"),
+            carry: None,
         })
         .unwrap();
     let chunks_json2 = manifest
@@ -506,6 +513,7 @@ async fn deleting_hash_blocks_put_with_503() {
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("putter"),
+            carry: None,
         })
         .unwrap();
     let chunk_data = mem.read_chunk(&chunk_hash).await.unwrap();
@@ -739,6 +747,7 @@ async fn sweep_waits_for_overlapping_intent_before_marking_deleting() {
             ceiling: u64::try_from(data.len()).unwrap(),
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let intent = axum::http::Request::builder()
@@ -873,6 +882,7 @@ async fn sweep_waits_for_overlapping_put_before_deleting_bytes() {
             ceiling: u64::try_from(data.len()).unwrap(),
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let chunks_json = vec![serde_json::json!({
@@ -996,6 +1006,7 @@ async fn sweep_waits_for_overlapping_commit_verification() {
             ceiling: u64::try_from(data.len()).unwrap(),
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let chunks_json = vec![serde_json::json!({
@@ -1113,6 +1124,7 @@ async fn sweep_does_not_lock_live_content_held_by_an_active_put() {
             ceiling: u64::try_from(data.len()).unwrap(),
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let intent = axum::http::Request::builder()

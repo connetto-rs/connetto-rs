@@ -125,6 +125,9 @@ pub enum PreflightError {
     /// `connetto_set_content_state(bytea, text, text)` is absent.
     #[error("function connetto_set_content_state(bytea, text, text) is missing")]
     MissingSetterFunction,
+    /// `connetto_file_owner(bytea) RETURNS text` is absent.
+    #[error("function connetto_file_owner(bytea) is missing")]
+    MissingOwnerFunction,
     /// An index the sweep's anti-join depends on is absent.
     #[error("table {table}: no index leads with column {column}")]
     MissingIndex {
@@ -227,6 +230,7 @@ const MANIFESTS_COLS: &[(&str, &str)] = &[
     ("uploaded_by", "text"),
     ("created_at", "timestamp with time zone"),
     ("lost", "boolean"),
+    ("carried_by", "text"),
 ];
 
 const CHUNKS_COLS: &[(&str, &str)] = &[
@@ -258,6 +262,7 @@ pub async fn preflight<S: ConnettoFileSchema>(
     check_own_tables::<S>(conn).await?;
     check_visible_files_fn(conn).await?;
     check_setter_fn(conn).await?;
+    check_owner_fn(conn).await?;
     Ok(())
 }
 
@@ -541,6 +546,35 @@ async fn check_setter_fn(conn: &mut AsyncPgConnection) -> Result<(), PreflightEr
     if !row.has_search_path {
         return Err(PreflightError::UnpinnedSearchPath {
             function: "connetto_set_content_state",
+        });
+    }
+    Ok(())
+}
+
+/// Checks `connetto_file_owner`:
+/// - argument: `bytea`
+/// - return: `text`
+/// - security: SECURITY INVOKER (prosecdef = false)
+/// - `search_path`: must be pinned in proconfig
+///
+/// A DEFINER function would read every row as its owner and name the owner of
+/// a file the caller cannot read (R79 decision 17).
+async fn check_owner_fn(conn: &mut AsyncPgConnection) -> Result<(), PreflightError> {
+    let row = fn_meta(conn, "connetto_file_owner", 1).await?;
+    let Some(row) = row else {
+        return Err(PreflightError::MissingOwnerFunction);
+    };
+    if row.prosecdef {
+        return Err(PreflightError::WrongSecurityMode {
+            function: "connetto_file_owner",
+            expected_mode: "SECURITY INVOKER",
+        });
+    }
+    check_arg_type(&row, "connetto_file_owner", 0, "bytea")?;
+    check_return_type(&row, "connetto_file_owner", "text")?;
+    if !row.has_search_path {
+        return Err(PreflightError::UnpinnedSearchPath {
+            function: "connetto_file_owner",
         });
     }
     Ok(())

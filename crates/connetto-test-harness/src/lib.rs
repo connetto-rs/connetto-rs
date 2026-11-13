@@ -1649,6 +1649,7 @@ trait SignerInner: Send + Sync {
         caller: &'a connetto_core::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
+        carry: Option<&'a connetto_core::auth::ContentCarry>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, BoxSignerError>> + Send + 'a>>;
 }
 
@@ -1663,10 +1664,11 @@ where
         caller: &'a connetto_core::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
+        carry: Option<&'a connetto_core::auth::ContentCarry>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, BoxSignerError>> + Send + 'a>> {
         Box::pin(async move {
             self.0
-                .mint(caller, file_id, verb)
+                .mint(caller, file_id, verb, carry)
                 .await
                 .map_err(|e| BoxSignerError(format!("{e}")))
         })
@@ -1702,10 +1704,16 @@ impl ContentTicketSigner for BoxSigner {
         caller: &connetto_core::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
+        carry: Option<&connetto_core::auth::ContentCarry>,
     ) -> impl Future<Output = Result<String, Self::Error>> + MaybeSend {
         let inner = Arc::clone(&self.0);
         let caller = caller.clone();
-        async move { inner.mint_boxed(&caller, file_id, verb).await }
+        let carry = carry.cloned();
+        async move {
+            inner
+                .mint_boxed(&caller, file_id, verb, carry.as_ref())
+                .await
+        }
     }
 }
 

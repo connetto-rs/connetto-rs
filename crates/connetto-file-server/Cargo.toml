@@ -58,3 +58,5 @@ http-body-util = "0.1"
 axum = { workspace = true }
 diesel-async = { version = "0.10", default-features = false, features = ["postgres", "bb8"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# The carried-commit test collects what its observer hears.
+parking_lot = "0.12"

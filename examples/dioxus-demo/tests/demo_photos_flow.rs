@@ -347,6 +347,7 @@ async fn start_file_server(
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: PhantomData,
     })
     .await

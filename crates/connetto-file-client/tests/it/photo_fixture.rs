@@ -77,6 +77,13 @@ pub const DEPLOYMENT: &[&str] = &[
        UPDATE public.photos SET content_state = p_new_state WHERE content_id = p_file_id; \
        RETURN p_file_id; END; $$",
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO file_reader",
+    "CREATE OR REPLACE FUNCTION connetto_file_owner(p_file_id BYTEA) \
+     RETURNS TEXT LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ \
+       SELECT CASE WHEN count(DISTINCT p.owner) = 1 THEN min(p.owner) END \
+       FROM public.photos p WHERE p.content_id = p_file_id \
+     $$",
+    "GRANT EXECUTE ON FUNCTION connetto_file_owner TO file_reader",
+    "GRANT EXECUTE ON FUNCTION connetto_file_owner TO app_writer",
 ];
 
 /// One device of alice's at `path`, presenting `grant` and dialing through
@@ -176,6 +183,7 @@ pub async fn start_file_server(
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: PhantomData,
     })
     .await
