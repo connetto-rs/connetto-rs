@@ -1,12 +1,15 @@
 //! A content client fetching a file from linked holders on loopback: every
 //! piece verified against the file id, a forged piece and a lying manifest
 //! refused, a fetch resumed at the next chunk after a lost link, busy and
-//! silent holders bounded in time (R79 decisions 1, 3, 4, 5 and 10).
+//! silent holders bounded in time, and reporting holders asked fastest
+//! first once measured, an unmeasured one given its turn (R79 decisions 1,
+//! 3, 4, 5, 10 and 13).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_client::media::{MediaEvent, MediaPort};
+use connetto_core::device_cert::DeviceIdentity;
 use connetto_exchange::media::Media;
 use connetto_file_client::{ContentEvent, FileId, Resolved};
 use connetto_peer::Node;
@@ -14,8 +17,8 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::peer_support::{
-    Device, Devices, Fault, bare_holder, beside, beside_both, declare, declared, fetches, port,
-    replica, stage, wants,
+    Device, Devices, Fault, bare_holder, bare_holder_of, beside, beside_both, declare, declared,
+    fetches, link_to, port, replica, stage, wants,
 };
 use crate::retention::pseudorandom;
 use crate::support::Scripted;
@@ -467,4 +470,131 @@ async fn a_resolve_waiting_when_the_driver_stops_answers_unavailable() {
         Resolved::Unavailable,
         "with no driver running an offline device asks nobody"
     );
+}
+
+/// The next `Room` a bare holder's inbox receives whose rates name every
+/// key of `measured` and whose `seen` acknowledges report `seen`.
+async fn room_rating(
+    inbox: &mut mpsc::UnboundedReceiver<Media>,
+    measured: &[&DeviceIdentity],
+    seen: u64,
+) -> Vec<([u8; 32], u64)> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(Media::Room {
+                rates,
+                seen: Some(acknowledged),
+                ..
+            }) = inbox.recv().await
+                && acknowledged >= seen
+                && measured
+                    .iter()
+                    .all(|peer| rates.iter().any(|(key, _)| key == peer.key().as_bytes()))
+            {
+                return rates;
+            }
+        }
+    })
+    .await
+    .expect("the room check reports the rates")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reporting_holders_are_asked_fastest_first_once_each_had_its_turn() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (_, receiver) = declared(dir.path()).await;
+    // Odd seeds, since `pseudorandom` sets the low bit and 30 and 31 collide.
+    let files: Vec<Vec<u8>> = [41, 43, 45]
+        .into_iter()
+        .map(|seed| pseudorandom(seed, 600_000))
+        .collect();
+    let mut ids = Vec::new();
+    for bytes in &files {
+        ids.push(crate::support::learn_file_id(bytes).await);
+    }
+    let devices = Devices::new();
+    let anna = devices.device("anna", 3);
+    let (anna_node, _, anna_events) = devices.node(&anna);
+    let anna_port = port(anna_node.clone(), anna_events);
+    let mut holders = Vec::new();
+    for (serial, fault) in [(11, Fault::Slow), (12, Fault::None)] {
+        let device = devices.device("r77", serial);
+        let (node, addr, events) = devices.node(&device);
+        let (asked, inbox) = bare_holder_of(node.clone(), events, files.clone(), fault);
+        anna_node.link(addr).await.expect("the link completes");
+        holders.push((node, device.identity, asked, inbox));
+    }
+    let held: Vec<[u8; 32]> = ids.iter().map(|id| *id.as_bytes()).collect();
+    let Ok(
+        [
+            (slow_node, slow, slow_asked, mut slow_inbox),
+            (fast_node, fast, fast_asked, mut fast_inbox),
+        ],
+    ) = <[_; 2]>::try_from(holders)
+    else {
+        unreachable!("two holders");
+    };
+
+    beside(&receiver, anna_port, async {
+        // Each holder reports what it holds once the receiver's own opening
+        // report shows the link is up on both ends.
+        for (node, inbox) in [(&slow_node, &mut slow_inbox), (&fast_node, &mut fast_inbox)] {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match inbox.recv().await {
+                        Some(Media::Holdings { .. }) => break,
+                        Some(_) => {}
+                        None => panic!("the holder stopped"),
+                    }
+                }
+            })
+            .await
+            .expect("the receiver reports on the new link");
+            let report = Media::Holdings {
+                room: 0,
+                rates: Vec::new(),
+                held: held.clone(),
+                leaving: Vec::new(),
+                number: 1,
+                seen: None,
+                last: true,
+            };
+            node.send_media(&anna.identity, link_to(node, &anna.identity), report)
+                .await
+                .expect("the report queues");
+        }
+
+        // Which holder takes the first turn follows the order the links
+        // came up in, which the two connections race for.
+        assert_local(&receiver.resolve(ids[0]).await.expect("resolve"), &files[0]);
+        let first = match (wants(&slow_asked), wants(&fast_asked)) {
+            (1, 0) => &slow,
+            (0, 1) => &fast,
+            asked => panic!("with neither measured one holder has the turn, not {asked:?}"),
+        };
+
+        room_rating(&mut slow_inbox, &[first], 1).await;
+        assert_local(&receiver.resolve(ids[1]).await.expect("resolve"), &files[1]);
+        assert_eq!(
+            (wants(&slow_asked), wants(&fast_asked)),
+            (1, 1),
+            "the holder still unmeasured goes ahead of the measured one"
+        );
+
+        let rates = room_rating(&mut fast_inbox, &[&slow, &fast], 1).await;
+        let rate = |peer: &DeviceIdentity| {
+            rates
+                .iter()
+                .find(|(key, _)| key == peer.key().as_bytes())
+                .map(|(_, rate)| *rate)
+        };
+        assert!(rate(&slow) < rate(&fast), "the slow holder measures slower");
+        assert_local(&receiver.resolve(ids[2]).await.expect("resolve"), &files[2]);
+        assert_eq!(
+            (wants(&slow_asked), wants(&fast_asked)),
+            (1, 2),
+            "with both measured the faster holder is asked, whichever had the first turn"
+        );
+    })
+    .await;
 }

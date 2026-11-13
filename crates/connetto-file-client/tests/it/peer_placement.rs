@@ -329,13 +329,24 @@ async fn a_copy_above_the_count_is_released() {
                     .expect("resolve"),
                 Resolved::Local { .. }
             ));
-            assert_eq!(
-                custody_state(&group.members[extra].client, group.file_id)
-                    .await
-                    .as_deref(),
-                Some("held"),
-                "the copy fetched on demand fits, so it enters custody as a fourth"
-            );
+            // The author hears four holders, placement marking the fourth
+            // leaving as surplus at any moment after it entered custody.
+            tokio::time::timeout(BOUND, async {
+                loop {
+                    if let Ok(ContentEvent::Replicated {
+                        file_id,
+                        holders,
+                        leaving,
+                    }) = heard.recv().await
+                        && file_id == group.file_id
+                        && holders + leaving == 4
+                    {
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("the copy fetched on demand fits, so it enters custody as a fourth");
             group.until(&mut heard, |states| kept_by(states, 3)).await;
         })
         .await;

@@ -2,7 +2,9 @@
 //! client over, minted devices on loopback nodes, and a media port over a
 //! bare node.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use connetto_client::SyncSchema;
 use connetto_client::live::ConnettoClient;
@@ -17,7 +19,7 @@ use connetto_core::traits::IncomingFrame;
 use connetto_core::{Cursor, Major};
 use connetto_exchange::media::{MAX_PIECE_BYTES, Media};
 use connetto_file_client::{ContentClient, FsStore, MimeClass};
-use connetto_file_core::{FileId, MemStore, encode_range, process_file_with_outboard};
+use connetto_file_core::{FileId, Manifest, MemStore, encode_range, process_file_with_outboard};
 use connetto_peer::test_support::{DAY, Deployment, Issuer, Peer, node, serve, whole_second};
 use connetto_peer::{CloseReason, Node, PeerEvent};
 use diesel::prelude::*;
@@ -542,7 +544,13 @@ pub enum Fault {
     EmptyChunk,
     /// It sends more manifest rows than a manifest may hold, in two runs.
     TooManyRows,
+    /// It waits [`SLOW_PIECE`] before sending each encoded range, a link
+    /// far slower than loopback.
+    Slow,
 }
+
+/// How long a [`Fault::Slow`] holder takes over each range it sends.
+pub const SLOW_PIECE: Duration = Duration::from_millis(250);
 
 /// The peer, link and message of a media event, `None` for any other.
 fn media_of(event: PeerEvent) -> Option<(DeviceIdentity, u64, Media)> {
@@ -560,18 +568,36 @@ fn media_of(event: PeerEvent) -> Option<(DeviceIdentity, u64, Media)> {
 /// class chunks it, with `fault`, answering the requests it records.
 pub fn bare_holder(
     node: Node,
-    mut events: mpsc::UnboundedReceiver<PeerEvent>,
+    events: mpsc::UnboundedReceiver<PeerEvent>,
     bytes: Vec<u8>,
     fault: Fault,
 ) -> Arc<Mutex<Vec<Media>>> {
+    bare_holder_of(node, events, vec![bytes], fault).0
+}
+
+/// A bare node serving each of `files` as a holder would, chunked as the
+/// generic class chunks it, with `fault`, answering the requests it records
+/// and refusing one naming a file it lacks, with the inbox every message it
+/// receives also arrives in.
+pub fn bare_holder_of(
+    node: Node,
+    mut events: mpsc::UnboundedReceiver<PeerEvent>,
+    files: Vec<Vec<u8>>,
+    fault: Fault,
+) -> (Arc<Mutex<Vec<Media>>>, mpsc::UnboundedReceiver<Media>) {
     let asked = Arc::new(Mutex::new(Vec::new()));
     let record = Arc::clone(&asked);
+    let (inbox, received) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let store = MemStore::new();
-        let (manifest, outboard) =
-            process_file_with_outboard(bytes.as_slice(), MimeClass::Generic, &store)
-                .await
-                .expect("chunk the file");
+        let mut held = HashMap::new();
+        for bytes in files {
+            let (manifest, outboard) =
+                process_file_with_outboard(bytes.as_slice(), MimeClass::Generic, &store)
+                    .await
+                    .expect("chunk the file");
+            held.insert(*manifest.file_id().as_bytes(), (manifest, outboard));
+        }
         let mut fetches = 0;
         let mut busy = fault == Fault::AlwaysBusy || fault == Fault::BusyFirst;
         while let Some(event) = events.recv().await {
@@ -579,11 +605,23 @@ pub fn bare_holder(
                 continue;
             };
             record.lock().push(message.clone());
+            let _ = inbox.send(message.clone());
             let Some(request_id) = message.request_id() else {
                 continue;
             };
+            let lacks = match &message {
+                Media::Want { file_id, .. } | Media::Fetch { file_id, .. } => {
+                    !held.contains_key(file_id)
+                }
+                _ => false,
+            };
             match (fault, message) {
                 (Fault::Silent, _) => {}
+                _ if lacks => {
+                    let _ = node
+                        .send_media(&peer, link, Media::Refused { request_id })
+                        .await;
+                }
                 _ if busy => {
                     busy = fault == Fault::AlwaysBusy;
                     let _ = node
@@ -600,26 +638,10 @@ pub fn bare_holder(
                         let _ = node.send_media(&peer, link, run).await;
                     }
                 }
-                (_, Media::Want { .. }) => {
-                    let chunks = manifest
-                        .chunks()
-                        .iter()
-                        .map(|chunk| {
-                            let mut hash = *chunk.hash.as_bytes();
-                            if fault == Fault::LieInManifest {
-                                hash[0] ^= 1;
-                            }
-                            let len = if fault == Fault::EmptyChunk {
-                                0
-                            } else {
-                                chunk.len
-                            };
-                            (hash, len)
-                        })
-                        .collect();
+                (_, Media::Want { file_id, .. }) => {
                     let run = Media::Manifest {
                         request_id,
-                        chunks,
+                        chunks: manifest_rows(&held[&file_id].0, fault),
                         last: true,
                     };
                     let _ = node.send_media(&peer, link, run).await;
@@ -628,9 +650,9 @@ pub fn bare_holder(
                     _,
                     Media::Fetch {
                         request_id,
+                        file_id,
                         start,
                         len,
-                        ..
                     },
                 ) => {
                     fetches += 1;
@@ -638,30 +660,67 @@ pub fn bare_holder(
                         node.stop(CloseReason::Closed);
                         return;
                     }
+                    let (manifest, outboard) = &held[&file_id];
                     let mut encoded = Vec::new();
-                    encode_range(&manifest, &store, &outboard, start, len, &mut encoded)
+                    encode_range(manifest, &store, outboard, start, len, &mut encoded)
                         .await
                         .expect("encode the range");
                     if fault == Fault::ForgePiece {
                         let middle = encoded.len() / 2;
                         encoded[middle] ^= 1;
                     }
-                    let pieces: Vec<&[u8]> = encoded.chunks(MAX_PIECE_BYTES).collect();
-                    let last = pieces.len() - 1;
-                    for (index, piece) in pieces.into_iter().enumerate() {
-                        let piece = Media::Piece {
-                            request_id,
-                            encoded: piece.to_vec(),
-                            last: index == last,
-                        };
-                        let _ = node.send_media(&peer, link, piece).await;
+                    if fault == Fault::Slow {
+                        // The delay is the slow link the receiver measures.
+                        tokio::time::sleep(SLOW_PIECE).await;
                     }
+                    send_pieces(&node, &peer, link, request_id, &encoded).await;
                 }
                 _ => {}
             }
         }
     });
-    asked
+    (asked, received)
+}
+
+/// Sends `encoded` to `peer` over `link` as the pieces answering
+/// `request_id`.
+async fn send_pieces(
+    node: &Node,
+    peer: &DeviceIdentity,
+    link: u64,
+    request_id: u64,
+    encoded: &[u8],
+) {
+    let pieces: Vec<&[u8]> = encoded.chunks(MAX_PIECE_BYTES).collect();
+    let last = pieces.len() - 1;
+    for (index, piece) in pieces.into_iter().enumerate() {
+        let piece = Media::Piece {
+            request_id,
+            encoded: piece.to_vec(),
+            last: index == last,
+        };
+        let _ = node.send_media(peer, link, piece).await;
+    }
+}
+
+/// The manifest rows a bare holder with `fault` sends for `manifest`.
+fn manifest_rows(manifest: &Manifest, fault: Fault) -> Vec<([u8; 32], u64)> {
+    manifest
+        .chunks()
+        .iter()
+        .map(|chunk| {
+            let mut hash = *chunk.hash.as_bytes();
+            if fault == Fault::LieInManifest {
+                hash[0] ^= 1;
+            }
+            let len = if fault == Fault::EmptyChunk {
+                0
+            } else {
+                chunk.len
+            };
+            (hash, len)
+        })
+        .collect()
 }
 
 /// How many `Want` requests a bare holder saw.
