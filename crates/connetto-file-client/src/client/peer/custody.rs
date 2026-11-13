@@ -158,14 +158,16 @@ where
             let entry = placed.entry(FileId::from_bytes(id)).or_default();
             entry.copies = entry.copies.max(copies);
             entry.pulled |= !lapsed;
-            if !entry.authors.contains(&blob.author) {
-                entry.authors.push(blob.author);
-            }
+            entry.authors.push(blob.author);
         }
     }
     for (file_id, entry) in &mut placed {
         let (count, available) = rows.get(file_id).copied().unwrap_or_default();
         entry.settled = !available && count > provisional_rows.get(file_id).copied().unwrap_or(0);
+        // One author's several rows naming the file count once, in the order
+        // their rows came.
+        let mut seen = HashSet::new();
+        entry.authors.retain(|author| seen.insert(author.clone()));
     }
     Ok(placed)
 }

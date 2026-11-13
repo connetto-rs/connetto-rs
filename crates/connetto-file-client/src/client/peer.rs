@@ -822,16 +822,16 @@ where
     }
 
     /// `peer`'s link fell, or a new one replaced it: every ask on it is lost,
-    /// and what it was told, its report and the marks it carried go with it.
+    /// and what it was told and its report go with it. A leaving mark it
+    /// carried is numbered again by the next link's opening report, and
+    /// since reports are numbered from one growing counter, nothing the peer
+    /// acknowledges over a new link can predate that report.
     async fn link_down(&mut self, peer: &DeviceIdentity) -> Vec<Action> {
         let actions = self.links.unlinked(peer);
         self.link_of.remove(peer);
         self.told.remove(peer);
         self.told_room.remove(peer);
         self.reports.remove(peer);
-        for marks in self.marks.values_mut() {
-            marks.remove(peer.key().as_bytes());
-        }
         if self.links.linked_peers().next().is_none() {
             self.room_at = None;
         }
@@ -999,16 +999,14 @@ where
             .ok()
             .and_then(Result::ok)
             .unwrap_or_default();
+        // A file both in custody and unsent shows twice, which the sets the
+        // reports are built from fold into one.
         let mut told = custody.to_vec();
-        told.extend(
-            own.into_iter()
-                .filter(|file_id| !custody.iter().any(|copy| copy.file_id == *file_id))
-                .map(|file_id| CustodyCopy {
-                    file_id,
-                    state: db::HELD.to_owned(),
-                    size: 0,
-                }),
-        );
+        told.extend(own.into_iter().map(|file_id| CustodyCopy {
+            file_id,
+            state: db::HELD.to_owned(),
+            size: 0,
+        }));
         told
     }
 

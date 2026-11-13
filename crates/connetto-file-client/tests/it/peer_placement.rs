@@ -1,7 +1,9 @@
 //! Placement among linked devices running their media drivers: an author's
 //! replicated photo pulled by three devices of three accounts with a device
-//! without room left out, a copy above the count released, and a copy
-//! marked leaving under pressure handed to another device and deleted (R79
+//! without room left out, a copy above the count released, a copy marked
+//! leaving under pressure handed to another device and deleted, only as many
+//! copies leaving as the shortfall needs, a pressed copy nobody can take
+//! raising `CustodyPressed`, and a mark nobody can answer withdrawn (R79
 //! decisions 12 to 16).
 
 use std::time::Duration;
@@ -15,7 +17,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::peer_support::{
     Device, Devices, Relay, apply_entry, beside_all, captured_photo, custody_state,
-    declare_replicated, held_chunks, listener, relay, replica, stage,
+    declare_replicated, held_chunks, listener, relay, replica, set_custody_state, stage,
 };
 use crate::retention::pseudorandom;
 use crate::support::Scripted;
@@ -27,6 +29,27 @@ const BOUND: Duration = Duration::from_secs(60);
 /// The room the members with room have for custody.
 const ROOMY: u64 = 64 * 1024 * 1024;
 
+/// The size of every photo the author stages.
+const PHOTO: usize = 300_000;
+
+/// Five devices of three accounts, the last without room.
+const FIVE: [(&str, u64); 5] = [
+    ("anna", ROOMY),
+    ("tester", ROOMY),
+    ("tester", ROOMY),
+    ("curator", ROOMY),
+    ("curator", 0),
+];
+
+/// One device of each account with room and one without, so a copy the
+/// three hold has nobody else to go to.
+const THREE: [(&str, u64); 4] = [
+    ("anna", ROOMY),
+    ("tester", ROOMY),
+    ("curator", ROOMY),
+    ("curator", 0),
+];
+
 /// One device other than the author.
 struct Member {
     account: &'static str,
@@ -34,16 +57,18 @@ struct Member {
     content: Device,
 }
 
-/// An author holding a replicated photo, five devices of three accounts
-/// that applied its provisional row, the last without room, every device
-/// linked to every other on loopback.
+/// An author holding replicated photos and devices that applied their
+/// provisional rows, every device linked to every other on loopback.
 struct Group {
     _dirs: Vec<tempfile::TempDir>,
     author: Device,
     members: Vec<Member>,
     /// The author's relay first, then each member's.
     relays: Vec<Relay>,
+    /// The first photo.
     file_id: FileId,
+    /// Every photo, the first one first.
+    files: Vec<FileId>,
     /// The author's key id, which the members' provisional rows name.
     author_key: Vec<u8>,
     /// The deployment the devices were issued in.
@@ -53,19 +78,24 @@ struct Group {
 }
 
 impl Group {
+    /// One photo among the [`FIVE`].
     async fn new() -> Self {
-        let roster: [(&'static str, u64); 5] = [
-            ("anna", ROOMY),
-            ("tester", ROOMY),
-            ("tester", ROOMY),
-            ("curator", ROOMY),
-            ("curator", 0),
-        ];
-        let dirs: Vec<tempfile::TempDir> = (0..roster.len() + 2)
+        Self::with(&FIVE, 1).await
+    }
+
+    /// `photos` photos among the devices of `roster`, each an account and
+    /// the custody budget its device has.
+    async fn with(roster: &[(&'static str, u64)], photos: usize) -> Self {
+        let dirs: Vec<tempfile::TempDir> = (0..roster.len() + 1 + photos)
             .map(|_| tempfile::tempdir().expect("temp dir"))
             .collect();
         let (_, author) = declare_replicated(replica(dirs[0].path(), None).await).await;
-        let file_id = stage(&author, 1, "anna", &pseudorandom(71, 300_000)).await;
+        let mut files = Vec::new();
+        for photo in 0..photos {
+            let id = i64::try_from(photo).expect("few photos");
+            let seed = u32::try_from(71 + photo).expect("few photos");
+            files.push(stage(&author, id + 1, "anna", &pseudorandom(seed, PHOTO)).await);
+        }
         let devices = Devices::new();
         let author_peer = devices.device("anna", 1);
         let author_key = PeerAuthor {
@@ -73,15 +103,22 @@ impl Group {
             account: "anna".to_owned(),
             bot_list: Some("*".to_owned()),
         };
-        let body = captured_photo(dirs[1].path(), 7, file_id.as_bytes().to_vec(), None).await;
+        let mut bodies = Vec::new();
+        for (photo, file_id) in files.iter().enumerate() {
+            let row = 7 + i64::try_from(photo).expect("few photos");
+            let dir = dirs[1 + photo].path();
+            bodies.push(captured_photo(dir, row, file_id.as_bytes().to_vec(), None).await);
+        }
 
         let mut members = Vec::new();
         let mut nodes = vec![devices.node(&author_peer)];
-        for (index, (account, budget)) in roster.into_iter().enumerate() {
-            let (client, content) = replica(dirs[index + 2].path(), None).await;
+        for (index, &(account, budget)) in roster.iter().enumerate() {
+            let (client, content) = replica(dirs[index + 1 + photos].path(), None).await;
             let content = content.with_custody_budget(budget).with_custody_reserve(0);
             let (client, content) = declare_replicated((client, content)).await;
-            apply_entry(&client, &author_key, 1, body.clone()).await;
+            for (seq, body) in (1..).zip(&bodies) {
+                apply_entry(&client, &author_key, seq, body.clone()).await;
+            }
             members.push(Member {
                 account,
                 client,
@@ -105,7 +142,8 @@ impl Group {
             author,
             members,
             relays,
-            file_id,
+            file_id: files[0],
+            files,
             author_key: author_key.key_id,
             devices,
             addrs,
@@ -166,43 +204,65 @@ impl Group {
     /// Settles the author's entry on every member, as a courier's answer
     /// or a verdict would, the server not holding the photo yet.
     async fn settle(&self) {
+        let last = u64::try_from(self.files.len()).expect("few photos");
         for member in &self.members {
             let author = self.author_key.clone();
             member
                 .client
-                .with_conn(move |conn| conn.adjudicate_peer_frontier(&author, 1))
+                .with_conn(move |conn| conn.adjudicate_peer_frontier(&author, last))
                 .await
                 .expect("the replica is open")
                 .expect("adjudicate the author's frontier");
         }
     }
 
-    /// Each member's custody state of the photo.
+    /// Each member's custody state of the first photo.
     async fn states(&self) -> Vec<Option<String>> {
+        self.states_of(self.file_id).await
+    }
+
+    /// Each member's custody state of `file_id`.
+    async fn states_of(&self, file_id: FileId) -> Vec<Option<String>> {
         let mut states = Vec::new();
         for member in &self.members {
-            states.push(custody_state(&member.client, self.file_id).await);
+            states.push(custody_state(&member.client, file_id).await);
         }
         states
     }
 
-    /// Waits until the members' custody states satisfy `settled`, read
-    /// again whenever the author hears the count of devices keeping its
-    /// photo change.
+    /// Waits until the members' custody states of the first photo satisfy
+    /// `settled`, as [`Self::until_all`] does.
     async fn until(
         &self,
         heard: &mut broadcast::Receiver<ContentEvent>,
         settled: impl Fn(&[Option<String>]) -> bool,
     ) -> Vec<Option<String>> {
+        let mut all = self.until_all(heard, |all| settled(&all[0])).await;
+        all.swap_remove(0)
+    }
+
+    /// Waits until the members' custody states of every photo, one list per
+    /// photo, satisfy `settled`, read again whenever the author hears the
+    /// count of devices keeping one of its photos change.
+    async fn until_all(
+        &self,
+        heard: &mut broadcast::Receiver<ContentEvent>,
+        settled: impl Fn(&[Vec<Option<String>>]) -> bool,
+    ) -> Vec<Vec<Option<String>>> {
         tokio::time::timeout(BOUND, async {
             loop {
-                let states = self.states().await;
-                if settled(&states) {
-                    return states;
+                let mut all = Vec::new();
+                for file_id in &self.files {
+                    all.push(self.states_of(*file_id).await);
+                }
+                if settled(&all) {
+                    return all;
                 }
                 loop {
                     match heard.recv().await {
-                        Ok(ContentEvent::Replicated { file_id, .. }) if file_id == self.file_id => {
+                        Ok(ContentEvent::Replicated { file_id, .. })
+                            if self.files.contains(&file_id) =>
+                        {
                             break;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => break,
@@ -297,14 +357,7 @@ async fn a_copy_pressed_out_of_its_budget_is_handed_on_and_deleted() {
         .await;
 
     // The curator starts again with a budget below what it holds.
-    let pressed = group.members.remove(3);
-    group.members.insert(
-        3,
-        Member {
-            content: pressed.content.with_custody_budget(1),
-            ..pressed
-        },
-    );
+    restart(&mut group, 3, 1);
     group
         .run(async {
             let states = group
@@ -341,14 +394,7 @@ async fn a_settled_copy_pressed_out_of_its_budget_is_handed_on_before_the_server
     group.relays[0].node().stop(CloseReason::Closed);
 
     // The curator starts again with a budget below what it holds.
-    let pressed = group.members.remove(3);
-    group.members.insert(
-        3,
-        Member {
-            content: pressed.content.with_custody_budget(1),
-            ..pressed
-        },
-    );
+    restart(&mut group, 3, 1);
     let (_observer, mut inbox) = group.observer().await;
     group
         .run_members(async {
@@ -363,6 +409,105 @@ async fn a_settled_copy_pressed_out_of_its_budget_is_handed_on_before_the_server
                 0,
                 "the pressed copy's bytes are gone once another device holds it"
             );
+        })
+        .await;
+}
+
+/// A member started again with `budget` bytes for custody, keeping its
+/// replica and its links.
+fn restart(group: &mut Group, member: usize, budget: u64) {
+    let started = group.members.remove(member);
+    group.members.insert(
+        member,
+        Member {
+            content: started.content.with_custody_budget(budget),
+            ..started
+        },
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mark_nobody_can_answer_is_withdrawn() {
+    let group = Group::with(&THREE, 1).await;
+    let mut heard = group.author.events();
+    group
+        .run(async {
+            group.until(&mut heard, |states| kept_by(states, 3)).await;
+        })
+        .await;
+    // The tester's copy is marked leaving as surplus, yet nobody else has
+    // room to take it and the count needs all three.
+    set_custody_state(&group.members[1].client, group.file_id, "leaving").await;
+    group
+        .run(async {
+            group.until(&mut heard, |states| kept_by(states, 3)).await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pressed_copy_nobody_can_take_stays_and_raises_custody_pressed() {
+    let mut group = Group::with(&THREE, 1).await;
+    let mut heard = group.author.events();
+    group
+        .run(async {
+            group.until(&mut heard, |states| kept_by(states, 3)).await;
+        })
+        .await;
+
+    restart(&mut group, 0, 1);
+    let mut pressed = group.members[0].content.events();
+    group
+        .run(async {
+            let held_bytes = tokio::time::timeout(BOUND, async {
+                loop {
+                    if let Ok(ContentEvent::CustodyPressed { held_bytes }) = pressed.recv().await {
+                        return held_bytes;
+                    }
+                }
+            })
+            .await
+            .expect("the stranded copy raises CustodyPressed");
+            assert_eq!(held_bytes, u64::try_from(PHOTO).expect("fits"));
+            assert_eq!(
+                custody_state(&group.members[0].client, group.file_id)
+                    .await
+                    .as_deref(),
+                Some("pressed"),
+                "the copy stays, marked leaving"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pressure_hands_on_only_as_many_copies_as_the_shortfall_needs() {
+    let mut group = Group::with(&FIVE, 2).await;
+    let mut heard = group.author.events();
+    let mut both = None;
+    group
+        .run(async {
+            let all = group
+                .until_all(&mut heard, |all| {
+                    all.iter().all(|states| kept_by(states, 3))
+                })
+                .await;
+            both = (0..4).find(|member| all.iter().all(|states| states[*member].is_some()));
+        })
+        .await;
+    let member = both.expect("with three copies each among four, a member holds both");
+
+    // A budget of one photo leaves the member one photo over.
+    restart(&mut group, member, u64::try_from(PHOTO).expect("fits"));
+    group
+        .run(async {
+            let all = group
+                .until_all(&mut heard, |all| {
+                    all.iter().all(|states| kept_by(states, 3))
+                        && all.iter().filter(|states| states[member].is_some()).count() == 1
+                })
+                .await;
+            assert_eq!(all.len(), 2);
         })
         .await;
 }

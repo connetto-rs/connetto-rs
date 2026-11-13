@@ -702,7 +702,9 @@ async fn a_peer_whose_driver_starts_again_is_told_everything_again() {
 async fn a_copy_marked_leaving_is_reported_so_and_its_withdrawal_as_staying() {
     let camp = Camp::new(64 * 1024 * 1024).await;
     let (client, file_id, file) = (&camp.client, camp.file_id, *camp.file_id.as_bytes());
-    set_custody_state(client, file_id, "leaving").await;
+    // Pressed rather than surplus, since placement withdraws a surplus mark
+    // that nobody can answer at once.
+    set_custody_state(client, file_id, "pressed").await;
     camp.with_reader(|mut reader| async move {
         assert_eq!(
             (&reader.held[..], &reader.leaving[..]),
