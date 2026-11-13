@@ -28,6 +28,8 @@ mod audit_producers;
 
 mod audit_table;
 
+mod courier_audit;
+
 mod auth_retry;
 
 mod authorization_facts;

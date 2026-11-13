@@ -21,8 +21,10 @@
 #[cfg(test)]
 mod cursor_lock_tests;
 
+mod courier_audit;
 mod input;
 
+use courier_audit::AuditState;
 use input::HeldInput;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -2477,6 +2479,7 @@ pub struct SessionManager<
     /// The internal row filters those questions watch, the consumer id to the
     /// connection and author key that owns it.
     provisional_consumers: Mutex<HashMap<u64, (SessionId, Vec<u8>)>>,
+    courier_audit: Mutex<AuditState<Id>>,
     snapshot_source: Snap,
     auth: Auth,
     /// Checks the grants a handshake presents and signs the resume credential
@@ -2718,6 +2721,7 @@ where
         sessions: Mutex::new(HashMap::new()),
         provisional_questions: Mutex::new(HashMap::new()),
         provisional_consumers: Mutex::new(HashMap::new()),
+        courier_audit: Mutex::new(AuditState::default()),
         snapshot_source,
         auth,
         authority,
@@ -3913,6 +3917,12 @@ where
         // A bookkeeping row an open question watches wakes it (R77 decision
         // 11), collected before the fan-out drains the patches.
         let provisional_targets = self.provisional_targets_of(applied).await;
+        for patch in &applied.patches {
+            self.wake_courier_audit_locked(patch.consumer_id).await?;
+        }
+        for consumer_id in &applied.refused {
+            self.wake_courier_audit_locked(*consumer_id).await?;
+        }
         // Every patch still owed, paired with the route it goes to now.
         // Collected before the visibility question because that question names
         // every watcher at once.
@@ -3982,7 +3992,7 @@ where
             self.fan_out_moves(event, narrowings, &progress.grant_moves)
                 .await;
         }
-        self.deliver_owed(applied).await;
+        self.deliver_owed(applied).await?;
         // The gate is held here, so the questions an event woke revalidate
         // in place rather than re-taking it.
         for (session_id, key) in provisional_targets {
@@ -4052,19 +4062,19 @@ where
             applied.drain_due = false;
             applied.computed.extend(drained.computed);
             applied.failure = drained.failure;
-            self.deliver_owed(applied).await;
+            self.deliver_owed(applied).await?;
         }
     }
 
-    /// Deliver every computed change an applied event still owes.
-    ///
-    /// Computed results are global by construction (subql refuses shared state
-    /// on RLS tables), so no per-row read filter applies: each change goes
-    /// unconditionally to its owning session.
-    async fn deliver_owed(&self, applied: &mut Applied) {
-        while let Some(change) = applied.computed.pop_front() {
-            self.deliver_computed(change).await;
+    /// Revalidate private audit observers before consuming each computed delivery.
+    async fn deliver_owed(&self, applied: &mut Applied) -> Result<(), SessionError> {
+        while let Some(change) = applied.computed.front() {
+            self.wake_courier_audit_locked(change.consumer_id).await?;
+            if let Some(change) = applied.computed.pop_front() {
+                self.deliver_computed(change).await;
+            }
         }
+        Ok(())
     }
 
     /// Decide what one event does to every matched caller's copy of the row, and
@@ -4861,6 +4871,9 @@ where
         attempts: u32,
         cause: &E,
     ) {
+        if self.fail_courier_audit_locked(subscription_id).await {
+            return;
+        }
         let route = { self.computed_routes.lock().await.remove(&subscription_id) };
         self.materializer.lock().await.unregister(subscription_id);
         let Some(route) = route else { return };
@@ -5928,6 +5941,7 @@ where
         // ends with the connection (R77 decision 11).
         self.drop_provisional_questions(session_id, connection_num)
             .await;
+        self.drop_courier_audit(session_id, connection_num).await;
         self.unregister_writer_session(&state).await;
         // The connection is the window for a caller with no identity, so its
         // tallies die here and nothing else expires them.
@@ -6790,6 +6804,22 @@ where
         transport.send_control(answer).await.map_err(transport_err)
     }
 
+    /// Remove row and computed subscriptions owned by the client label.
+    async fn handle_unsubscribe(&self, sub_id: &str, state: &mut SessionState<Id, Key>) {
+        for (consumer_id, sub_id) in take_row_subscription(state, sub_id) {
+            self.remove_route(consumer_id).await;
+            self.materializer.lock().await.unregister(sub_id);
+        }
+        if let Some(ComputedSub {
+            id: subscription_id,
+            ..
+        }) = state.computed_subs.remove(sub_id)
+        {
+            self.remove_computed_route(subscription_id).await;
+            self.materializer.lock().await.unregister(subscription_id);
+        }
+    }
+
     async fn handle_control<T: Transport>(
         self: &Arc<Self>,
         transport: &mut T,
@@ -6806,18 +6836,7 @@ where
         match msg {
             ControlMessage::Subscribe(sub) => self.handle_subscribe(transport, sub, state).await,
             ControlMessage::Unsubscribe(unsub) => {
-                for (consumer_id, sub_id) in take_row_subscription(state, &unsub.sub_id) {
-                    self.remove_route(consumer_id).await;
-                    self.materializer.lock().await.unregister(sub_id);
-                }
-                if let Some(ComputedSub {
-                    id: subscription_id,
-                    ..
-                }) = state.computed_subs.remove(&unsub.sub_id)
-                {
-                    self.remove_computed_route(subscription_id).await;
-                    self.materializer.lock().await.unregister(subscription_id);
-                }
+                self.handle_unsubscribe(&unsub.sub_id, state).await;
                 Ok(())
             }
             ControlMessage::Ping(ping) => transport
@@ -6903,6 +6922,14 @@ where
             }
             ControlMessage::CourierNoticeAck(ack) => {
                 self.handle_courier_notice_ack(ack, state).await
+            }
+            ControlMessage::CourierAuditRequest(request) => {
+                self.handle_courier_audit(request, state).await;
+                Ok(())
+            }
+            ControlMessage::CourierAuditCancel(cancel) => {
+                self.cancel_courier_audit(&cancel.request_id, state).await;
+                Ok(())
             }
             // Server-origin frames received from a client are ignored.
             _ => Ok(()),
