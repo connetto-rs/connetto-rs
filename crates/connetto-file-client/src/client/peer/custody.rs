@@ -311,7 +311,7 @@ pub(in crate::client) fn pass(
         {
             continue;
         }
-        db::enter_custody(conn, *file_id, None)?;
+        db::enter_custody(conn, *file_id, None, None)?;
         kept.insert(*file_id);
         changed = true;
     }
@@ -430,7 +430,7 @@ mod tests {
             len: 10,
         };
         db::put_manifest(&mut conn, &Manifest::new(file_id, vec![chunk])).expect("the manifest");
-        db::enter_custody(&mut conn, file_id, Some(&[7; 32])).expect("the custody record");
+        db::enter_custody(&mut conn, file_id, Some(&[7; 32]), None).expect("the custody record");
         conn
     }
 

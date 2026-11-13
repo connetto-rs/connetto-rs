@@ -122,8 +122,13 @@ diesel::table! {
         /// BLAKE3 identity of the held file.
         file_id -> Binary,
         /// The key id of the provisional row's author, `NULL` for a copy a
-        /// `lost` state returned to custody.
+        /// `lost` state returned to custody or one taken over after its row
+        /// settled.
         author_key -> Nullable<Binary>,
+        /// The account a carried upload of the copy credits, from the
+        /// author's cursor or the holder it was taken over from (R79
+        /// decision 17).
+        owner -> Nullable<Text>,
         /// Where the copy stands, `held` until placement marks one leaving.
         state -> Text,
         /// When this device learned the row settled, in Unix seconds.
@@ -153,7 +158,7 @@ pub(crate) const CONTENT_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS _connetto_content_outboard \
     (file_id BLOB NOT NULL PRIMARY KEY, hash BLOB NOT NULL); \
     CREATE TABLE IF NOT EXISTS _connetto_content_custody \
-    (file_id BLOB NOT NULL PRIMARY KEY, author_key BLOB, state TEXT NOT NULL, \
+    (file_id BLOB NOT NULL PRIMARY KEY, author_key BLOB, owner TEXT, state TEXT NOT NULL, \
      settled_seen_at INTEGER, uploaded BOOLEAN NOT NULL DEFAULT FALSE)";
 
 /// The held-content half of the schema (R31), created by a rebuild inside
@@ -511,21 +516,39 @@ pub(crate) const LEAVING: &str = "leaving";
 #[cfg(feature = "peer")]
 pub(crate) const PRESSED: &str = "pressed";
 
-/// Takes `file_id` into custody for `author`'s row, `None` for a copy a
-/// `lost` state returned. A file already in custody keeps its record.
+/// Takes `file_id` into custody for `author`'s row, credited to `owner`,
+/// `None` authors for a copy a `lost` state returned or one taken over
+/// after its row settled. A file already in custody keeps its record.
 pub(crate) fn enter_custody(
     conn: &mut SqliteConnection,
     file_id: FileId,
     author: Option<&[u8]>,
+    owner: Option<&str>,
 ) -> Result<(), diesel::result::Error> {
     diesel::insert_or_ignore_into(_connetto_content_custody::table)
         .values((
             _connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()),
             _connetto_content_custody::author_key.eq(author),
+            _connetto_content_custody::owner.eq(owner),
             _connetto_content_custody::state.eq(HELD),
         ))
         .execute(conn)
         .map(|_| ())
+}
+
+/// The account a carried upload of custody copy `file_id` credits, `None`
+/// when the copy is not in custody or names none.
+#[cfg(feature = "peer")]
+pub(crate) fn custody_owner(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<Option<String>, diesel::result::Error> {
+    Ok(_connetto_content_custody::table
+        .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
+        .select(_connetto_content_custody::owner)
+        .first::<Option<String>>(conn)
+        .optional()?
+        .flatten())
 }
 
 /// Releases `file_id` from custody, which leaves its bytes ordinary cache,
@@ -609,8 +632,10 @@ pub(crate) struct CustodyRow {
     /// The file's size in bytes.
     pub(crate) size: u64,
     /// The key id of the provisional row's author, `None` for a copy a
-    /// `lost` state returned.
+    /// `lost` state returned or one taken over after its row settled.
     pub(crate) author: Option<Vec<u8>>,
+    /// The account a carried upload credits, `None` when not yet known.
+    pub(crate) owner: Option<String>,
     /// When this device learned the row settled, in Unix seconds.
     pub(crate) settled_seen_at: Option<i64>,
     /// Where the copy's upload stands.
@@ -625,21 +650,30 @@ impl CustodyRow {
     }
 }
 
-/// Every custody copy with its state, size, author, settling and upload.
+/// Every custody copy with its state, size, author, owner, settling and
+/// upload.
 #[cfg(feature = "peer")]
 pub(crate) fn custody_states(conn: &mut SqliteConnection) -> Result<Vec<CustodyRow>, ContentError> {
-    type Stored = (Vec<u8>, String, Option<Vec<u8>>, Option<i64>, bool);
+    type Stored = (
+        Vec<u8>,
+        String,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<i64>,
+        bool,
+    );
     let rows: Vec<Stored> = _connetto_content_custody::table
         .select((
             _connetto_content_custody::file_id,
             _connetto_content_custody::state,
             _connetto_content_custody::author_key,
+            _connetto_content_custody::owner,
             _connetto_content_custody::settled_seen_at,
             _connetto_content_custody::uploaded,
         ))
         .load(conn)?;
     rows.into_iter()
-        .map(|(id, state, author, settled_seen_at, uploaded)| {
+        .map(|(id, state, author, owner, settled_seen_at, uploaded)| {
             let file_id = FileId::from_bytes(exactly_32(&id)?);
             let queued: Option<Option<String>> = _connetto_content_outbox::table
                 .filter(_connetto_content_outbox::file_id.eq(id))
@@ -657,6 +691,7 @@ pub(crate) fn custody_states(conn: &mut SqliteConnection) -> Result<Vec<CustodyR
                 state,
                 size: manifest_size(conn, file_id)?,
                 author,
+                owner,
                 settled_seen_at,
                 upload,
             })

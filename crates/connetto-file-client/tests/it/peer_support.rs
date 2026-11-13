@@ -638,6 +638,7 @@ pub fn bare_holder_of(
                             request_id,
                             chunks: vec![([7; 32], 1); 5_000],
                             last,
+                            owner: None,
                         };
                         let _ = node.send_media(&peer, link, run).await;
                     }
@@ -647,6 +648,7 @@ pub fn bare_holder_of(
                         request_id,
                         chunks: manifest_rows(&held[&file_id].0, fault),
                         last: true,
+                        owner: None,
                     };
                     let _ = node.send_media(&peer, link, run).await;
                 }

@@ -4,8 +4,8 @@
 use std::time::{Duration, Instant};
 
 use crate::media::{
-    Ask, MAX_FETCH_LEN, MAX_PIECE_BYTES, MAX_REPORT_ENTRIES, MAX_SERVING, MIN_RATE_SAMPLE, Media,
-    MediaAction, MediaLinks, Priority, RATE_HALF_LIFE,
+    Ask, MAX_FETCH_LEN, MAX_OWNER_BYTES, MAX_PIECE_BYTES, MAX_REPORT_ENTRIES, MAX_SERVING,
+    MIN_RATE_SAMPLE, Media, MediaAction, MediaLinks, Priority, RATE_HALF_LIFE,
 };
 use crate::{BoundsError, MAX_MANIFEST_ROWS};
 
@@ -46,6 +46,7 @@ fn manifest(request_id: u64, last: bool) -> Media {
         request_id,
         chunks: vec![([1; 32], 1024)],
         last,
+        owner: None,
     }
 }
 
@@ -548,8 +549,16 @@ fn the_wire_bounds_hold() {
         request_id: 1,
         chunks: rows,
         last: true,
+        owner: None,
     };
     assert_eq!(over.within_bounds(), Err(BoundsError::TooManyRows));
+    let named = Media::Manifest {
+        request_id: 1,
+        chunks: Vec::new(),
+        last: true,
+        owner: Some("a".repeat(MAX_OWNER_BYTES + 1)),
+    };
+    assert_eq!(named.within_bounds(), Err(BoundsError::OwnerTooLong));
     let big = Media::Piece {
         request_id: 1,
         encoded: vec![0; MAX_PIECE_BYTES + 1],

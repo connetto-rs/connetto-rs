@@ -193,12 +193,14 @@ enum Job {
     },
     /// The commit of a fetch whose chunks are all in, taken into custody
     /// when it fits in `budget`, also for a settled row when the fetch
-    /// `takes_over` a leaving copy.
+    /// `takes_over` a leaving copy, credited to `owner` when its holder
+    /// named one.
     Commit {
         tag: u64,
         manifest: Manifest,
         budget: u64,
         takes_over: bool,
+        owner: Option<String>,
     },
 }
 
@@ -573,8 +575,11 @@ where
                 manifest,
                 budget,
                 takes_over,
+                owner,
             } => {
-                let outcome = self.commit_fetched(&manifest, budget, takes_over).await;
+                let outcome = self
+                    .commit_fetched(&manifest, budget, takes_over, owner)
+                    .await;
                 Done::Committed {
                     tag,
                     manifest,
@@ -1036,6 +1041,7 @@ where
             state: db::HELD.to_owned(),
             size: 0,
             author: None,
+            owner: None,
             settled_seen_at: None,
             upload: db::Upload::None,
         }));
@@ -1501,7 +1507,16 @@ where
             return self.release(&peer, done, now);
         }
         match message {
-            Media::Manifest { chunks, last, .. } => {
+            Media::Manifest {
+                chunks,
+                last,
+                owner,
+                ..
+            } => {
+                // The last run names the owner of the holder's custody copy.
+                if last && let Some(fetch) = self.fetches.get_mut(&tag) {
+                    fetch.owner = owner;
+                }
                 self.manifest_run(peer, tag, chunks, last, done, now).await
             }
             Media::Piece { encoded, last, .. } => {
@@ -1625,6 +1640,7 @@ where
                     manifest,
                     budget: self.budget,
                     takes_over,
+                    owner: fetch.owner.take(),
                 });
                 None
             }

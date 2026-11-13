@@ -1318,6 +1318,7 @@ fn every_frame_names_itself_and_only_the_offer_hides_a_field() {
                 request_id: 4,
                 chunks: vec![([2; 32], 3)],
                 last: false,
+                owner: None,
             },
             "a Media::Manifest",
         ),

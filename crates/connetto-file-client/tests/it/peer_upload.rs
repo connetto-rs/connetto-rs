@@ -1,8 +1,9 @@
 //! The holder's upload: a custody copy whose row settled while the server
 //! lacks the file goes up credited to the row's owner, at once on the
 //! device whose courier call settled it and after the holder's wait
-//! otherwise, and a copy whose state reads `available` drops its upload,
-//! a refused one or one a running walk had listed (R79 decision 17).
+//! otherwise, also on a device that took the copy over from a leaving
+//! holder, and a copy whose state reads `available` drops its upload, a
+//! refused one or one a running walk had listed (R79 decision 17).
 
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use tokio::sync::broadcast;
 
 use crate::peer_support::{
     Device, Devices, apply_entry, beside_both, captured_photo, declare_replicated, port, replica,
-    replica_with, set_state, stage,
+    replica_with, set_custody_state, set_state, stage,
 };
 use crate::retention::pseudorandom;
 use crate::support::{RecordingHttp, Scripted, TicketAnswer, learn_file_id};
@@ -151,6 +152,37 @@ impl Holder {
                     "the device fetches the photo from the holder into custody"
                 );
             },
+        )
+        .await;
+        Self {
+            _dirs: dirs,
+            client,
+            server,
+            device,
+            file_id,
+        }
+    }
+
+    /// A device whose replica holds anna's photo row naming `file_id` but no
+    /// copy of it and no cursor of hers, so only a holder can tell it whom
+    /// to credit.
+    async fn taker(server: Scripted, file_id: FileId) -> Self {
+        let dirs = [
+            tempfile::tempdir().expect("temp dir"),
+            tempfile::tempdir().expect("temp dir"),
+            tempfile::tempdir().expect("temp dir"),
+        ];
+        let http = RecordingHttp::new([(200_u16, br#"{"needed":[]}"#.to_vec()), (200_u16, vec![])]);
+        let (client, device) = replica_with(dirs[1].path(), Some(server.clone()), http).await;
+        let device = device
+            .with_custody_budget(64 * 1024 * 1024)
+            .with_custody_reserve(0);
+        let (client, device) = declare_replicated((client, device)).await;
+        apply_entry(
+            &client,
+            &anna(),
+            1,
+            captured_photo(dirs[2].path(), 7, file_id.as_bytes().to_vec(), None).await,
         )
         .await;
         Self {
@@ -454,5 +486,66 @@ async fn an_upload_cancelled_while_a_walk_runs_never_goes_up() {
         holder.writes(),
         [None],
         "the cancelled copy asked for no ticket, under any account"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_taken_over_after_its_row_settled_uploads_for_the_same_owner() {
+    let leaving = Holder::new(Scripted::new([TicketAnswer::Refuse(
+        CONTENT_TICKET_REFUSED.to_owned(),
+    )]))
+    .await;
+    leaving.settle().await;
+    // Pressed, the holder hands its copy on and never withdraws the mark.
+    set_custody_state(&leaving.client, leaving.file_id, "pressed").await;
+    let taker = Holder::taker(
+        Scripted::new([TicketAnswer::Grant(INTENT_URL.to_owned())]),
+        leaving.file_id,
+    )
+    .await;
+    taker.settle().await;
+
+    let devices = Devices::new();
+    let (leaving_node, leaving_addr, leaving_events) = devices.node(&devices.device("r77", 4));
+    let (taker_node, _, taker_events) = devices.node(&devices.device("curator", 5));
+    taker_node
+        .link(leaving_addr)
+        .await
+        .expect("the link completes");
+    let mut fetched = taker.device.events();
+    beside_both(
+        (&leaving.device, port(leaving_node, leaving_events)),
+        (&taker.device, port(taker_node, taker_events)),
+        async {
+            tokio::time::timeout(BOUND, async {
+                loop {
+                    if let ContentEvent::Fetched { file_id } =
+                        fetched.recv().await.expect("the content events run")
+                        && file_id == taker.file_id
+                    {
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("the taker pulls the leaving copy");
+        },
+    )
+    .await;
+
+    taker.settled_ago(PAST_THE_WAIT).await;
+    let mut events = taker.device.events();
+    taker
+        .driven(async {
+            next_about(&mut events, taker.file_id, |event| {
+                matches!(event, ContentEvent::Uploaded { .. })
+            })
+            .await;
+        })
+        .await;
+    assert_eq!(
+        taker.writes(),
+        [Some("anna".to_owned())],
+        "the taker credits the owner the leaving holder named"
     );
 }

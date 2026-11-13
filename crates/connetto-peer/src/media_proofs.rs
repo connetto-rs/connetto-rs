@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use connetto_core::device_cert::{AttestationLevel, DeviceIdentity};
 use connetto_exchange::MAX_MANIFEST_ROWS;
-use connetto_exchange::media::{MAX_PIECE_BYTES, MAX_REPORT_ENTRIES, Media};
+use connetto_exchange::media::{MAX_OWNER_BYTES, MAX_PIECE_BYTES, MAX_REPORT_ENTRIES, Media};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
@@ -25,6 +25,7 @@ fn media_messages(request_id: u64) -> [Media; 9] {
             request_id,
             chunks: vec![([2; 32], 6_291_456), ([3; 32], 17)],
             last: true,
+            owner: Some("anna".to_owned()),
         },
         Media::Fetch {
             request_id,
@@ -91,6 +92,7 @@ async fn every_media_message_at_its_bounds_encodes_under_the_ceiling() {
             request_id: 1,
             chunks: vec![([0xff; 32], u64::MAX); MAX_MANIFEST_ROWS],
             last: true,
+            owner: Some("\u{10ffff}".repeat(MAX_OWNER_BYTES / 4)),
         }),
         PeerFrame::Media(Media::Piece {
             request_id: 2,

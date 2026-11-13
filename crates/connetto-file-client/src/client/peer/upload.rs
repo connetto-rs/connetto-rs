@@ -54,9 +54,9 @@ where
 {
     /// Queues the upload of every settled custody copy whose wait ended,
     /// marking it queued in `custody`, and sets the wake for the earliest
-    /// wait still running. A copy of an author this replica knows no
-    /// account for, or one a `lost` state returned, is left to the heal
-    /// path.
+    /// wait still running. The upload credits the owner the copy entered
+    /// custody with, else the account its author's cursor names. A copy
+    /// with neither, one a `lost` state returned, is left to the heal path.
     pub(super) async fn queue_uploads(
         &mut self,
         custody: &mut [CustodyCopy],
@@ -67,14 +67,16 @@ where
         let mut next: Option<i64> = None;
         let mut due = Vec::new();
         for copy in custody.iter() {
-            let (db::Upload::None, Some(settled), Some(author)) =
-                (copy.upload, copy.settled_seen_at, &copy.author)
-            else {
+            let (db::Upload::None, Some(settled)) = (copy.upload, copy.settled_seen_at) else {
                 continue;
             };
+            if copy.owner.is_none() && copy.author.is_none() {
+                continue;
+            }
+            let author = copy.author.as_deref();
             let holders: Vec<Candidate<'_>> = linked
                 .iter()
-                .filter(|peer| peer.key().as_bytes() != author.as_slice())
+                .filter(|peer| Some(peer.key().as_bytes().as_slice()) != author)
                 .filter_map(|peer| {
                     let report = self.links.report(peer)?;
                     report.holds(copy.file_id.as_bytes()).then(|| Candidate {
@@ -86,9 +88,10 @@ where
                 })
                 .collect();
             let rank = holder_rank(copy.file_id.as_bytes(), me, &holders);
-            let at = upload_due(settled, rank, self.couriered.contains(author));
+            let couriered = author.is_some_and(|author| self.couriered.contains(author));
+            let at = upload_due(settled, rank, couriered);
             if at <= now {
-                due.push((copy.file_id, author.clone()));
+                due.push((copy.file_id, copy.owner.clone(), copy.author.clone()));
             } else {
                 next = Some(next.map_or(at, |next: i64| next.min(at)));
             }
@@ -102,9 +105,14 @@ where
         let queued: Vec<FileId> = self
             .beside_jobs(content.client.with_conn(move |conn| {
                 let mut queued = Vec::new();
-                for (file_id, author) in due {
-                    let Some(owner) = conn.author_account(&author)? else {
-                        continue;
+                for (file_id, owner, author) in due {
+                    let owner = match (owner, author) {
+                        (Some(owner), _) => owner,
+                        (None, Some(author)) => match conn.author_account(&author)? {
+                            Some(owner) => owner,
+                            None => continue,
+                        },
+                        (None, None) => continue,
                     };
                     db::enqueue_carried(conn.conn(), file_id, &owner)?;
                     queued.push(file_id);

@@ -1081,10 +1081,12 @@ where
                             db::put_outboard(c, file_id, hash)?;
                         }
                         match custody {
-                            Some(Keeper::Author(author)) => {
-                                db::enter_custody(c, file_id, Some(author.as_slice()))
-                            }
-                            Some(Keeper::Settled) => db::enter_custody(c, file_id, None),
+                            Some(keeper) => db::enter_custody(
+                                c,
+                                file_id,
+                                keeper.author.as_deref(),
+                                keeper.owner.as_deref(),
+                            ),
                             None => Ok(()),
                         }
                     },
@@ -1105,11 +1107,12 @@ where
         reason = "only the peer link's fetches take copies into custody"
     )
 )]
-pub(crate) enum Keeper {
-    /// The provisional row of the author with this key id.
-    Author(Vec<u8>),
-    /// A settled row whose state column does not read `available` yet.
-    Settled,
+pub(crate) struct Keeper {
+    /// The key id of the provisional row's author, `None` for a settled
+    /// row whose state column does not read `available` yet.
+    pub(crate) author: Option<Vec<u8>>,
+    /// The account a carried upload credits, `None` when not known.
+    pub(crate) owner: Option<String>,
 }
 
 impl<T, B, H> ContentClient<T, B, H>
