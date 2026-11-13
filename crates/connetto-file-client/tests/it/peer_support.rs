@@ -283,6 +283,15 @@ pub async fn replica(
     dir: &std::path::Path,
     transport: Option<Scripted>,
 ) -> (ConnettoClient<Scripted>, Device) {
+    replica_with(dir, transport, RecordingHttp::default()).await
+}
+
+/// [`replica`] whose content client speaks HTTP through `http`.
+pub async fn replica_with(
+    dir: &std::path::Path,
+    transport: Option<Scripted>,
+    http: RecordingHttp,
+) -> (ConnettoClient<Scripted>, Device) {
     let schema = SyncSchema::new(
         connetto_schema::translate::<String, connetto_core::bots::TextIds>(
             connetto_schema::Documents::new(
@@ -299,12 +308,7 @@ pub async fn replica(
         conn.attach(transport).await.expect("attach the transport");
     }
     let client = started(conn);
-    let content = attach_content(
-        client.clone(),
-        &dir.join("chunks"),
-        RecordingHttp::default(),
-    )
-    .await;
+    let content = attach_content(client.clone(), &dir.join("chunks"), http).await;
     (client, content)
 }
 

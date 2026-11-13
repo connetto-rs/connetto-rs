@@ -11,7 +11,6 @@ use connetto_client::{
     SyncStatus,
 };
 use connetto_core::Major;
-use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
 use connetto_file_core::{
     ChunkHash, ChunkInventory, ChunkStore, EncryptingStore, FileId, Manifest, MaybeSend, MimeClass,
@@ -645,10 +644,20 @@ where
             .await??;
         let mut sent = 0;
         for file_id in waiting {
-            match self.upload_one(file_id, None).await {
+            // A carried entry the walk listed may have been cancelled since,
+            // so membership and owner are read together as the attempt
+            // starts.
+            let Some(entry) = self
+                .client
+                .with_conn(move |conn| db::sendable_entry(conn.conn(), file_id))
+                .await??
+            else {
+                continue;
+            };
+            match self.upload_one(file_id, None, entry.carried_for).await {
                 Ok(()) => {
                     self.client
-                        .with_conn(|conn| db::dequeue(conn.conn(), file_id))
+                        .with_conn(|conn| db::upload_committed(conn.conn(), file_id))
                         .await??;
                     sent += 1;
                     let _ = self.events.send(ContentEvent::Uploaded { file_id });
@@ -674,14 +683,14 @@ where
                     // identical whichever pass reached the fact first.
                     AttemptOutcome::Lost => match self.unreadable_chunks(file_id).await? {
                         Some(unreadable) => {
-                            let heal = self
+                            let authored = self
                                 .client
-                                .with_conn(move |conn| db::is_heal(conn.conn(), file_id))
+                                .with_conn(move |conn| db::is_authored(conn.conn(), file_id))
                                 .await??;
                             self.client
                                 .with_conn(move |conn| retire(conn.conn(), file_id))
                                 .await??;
-                            if !heal {
+                            if authored {
                                 let _ = self.events.send(ContentEvent::BytesLost {
                                     file_id,
                                     unreadable,
@@ -702,8 +711,15 @@ where
     }
 
     /// One file: a write ticket, then the whole negotiation under it. A file
-    /// held from an older major (R31) asks on that major's drain wire.
-    async fn upload_one(&self, file_id: FileId, held: Option<Major>) -> Result<(), ContentError> {
+    /// held from an older major (R31) asks on that major's drain wire, and a
+    /// carried one names `for_owner`, the account it credits (R79 decision
+    /// 17).
+    async fn upload_one(
+        &self,
+        file_id: FileId,
+        held: Option<Major>,
+        for_owner: Option<String>,
+    ) -> Result<(), ContentError> {
         let (manifest, wire) = match held {
             None => (
                 self.client
@@ -723,7 +739,7 @@ where
         let url = ticket::request(
             &self.client,
             file_id,
-            ContentVerb::Write { declared_len },
+            ticket::TicketAsk::write(declared_len, for_owner),
             wire,
         )
         .await?;
@@ -750,7 +766,7 @@ where
             if self.client.held_files_ready().await? != Some(major) {
                 break;
             }
-            match self.upload_one(file_id, Some(major)).await {
+            match self.upload_one(file_id, Some(major), None).await {
                 Ok(()) => {
                     self.forget_held(major, file_id).await?;
                     self.client.held_file_settled().await?;
@@ -822,7 +838,7 @@ where
         let ticket = ticket::request(
             &self.client,
             file_id,
-            ContentVerb::Read,
+            ticket::TicketAsk::read(),
             ticket::TicketWire::Main,
         )
         .await;
@@ -1024,7 +1040,7 @@ where
         let url = ticket::request(
             &self.client,
             file_id,
-            ContentVerb::Read,
+            ticket::TicketAsk::read(),
             ticket::TicketWire::Main,
         )
         .await?;
