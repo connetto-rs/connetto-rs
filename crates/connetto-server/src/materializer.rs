@@ -346,6 +346,8 @@ pub(crate) struct PlannedConflict {
     pub table: String,
     /// Version column name.
     pub version_column: String,
+    /// The version column's catalog id, which the probe reads.
+    pub version_id: ColumnId,
     /// The prior version value the client based its edit on.
     pub basis: WireValue,
     /// Primary-key column names, in order.
@@ -2015,15 +2017,7 @@ where
     ) -> Result<Vec<ColumnId>, MaterializerError> {
         let mut read = catalog_helpers::primary_key_columns(&self.catalog, table_id)
             .map_err(|err| MaterializerError::Catalog(err.to_string()))?;
-        if let Some(conflict) = conflict {
-            let version = catalog_helpers::column_id::<Postgres, _>(
-                &self.catalog,
-                table_id,
-                &conflict.version_column,
-            )
-            .ok_or_else(|| MaterializerError::SchemaMismatch(conflict.version_column.clone()))?;
-            read.push(version);
-        }
+        read.extend(conflict.map(|conflict| conflict.version_id));
         Ok(read)
     }
 
@@ -2057,6 +2051,7 @@ where
         Ok(Some(PlannedConflict {
             table: table.to_owned(),
             version_column,
+            version_id: version_idx,
             basis,
             pk_columns,
             pk_values: pk_values.to_vec(),
