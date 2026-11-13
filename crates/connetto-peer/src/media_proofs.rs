@@ -116,6 +116,15 @@ async fn every_media_message_at_its_bounds_encodes_under_the_ceiling() {
     }
 }
 
+/// The number of `node`'s live link to `peer`.
+fn link_to(node: &Node, peer: &DeviceIdentity) -> u64 {
+    node.linked()
+        .into_iter()
+        .find(|link| &link.peer == peer)
+        .and_then(|link| link.link)
+        .expect("the peer is linked")
+}
+
 /// Send `messages` from `sender` to `to` and see each reach `rx` in send
 /// order, naming `from`.
 async fn media_reaches_in_order(
@@ -125,9 +134,10 @@ async fn media_reaches_in_order(
     rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
     messages: [Media; 9],
 ) {
+    let link = link_to(sender, to);
     for message in &messages {
         sender
-            .send_media(to, message.clone())
+            .send_media(to, link, message.clone())
             .await
             .expect("the queue takes it");
     }
@@ -140,6 +150,7 @@ async fn media_reaches_in_order(
             event,
             PeerEvent::Media {
                 peer: from.clone(),
+                link: 0,
                 message
             }
         );
@@ -187,6 +198,12 @@ async fn linked_nodes_deliver_each_media_message_in_order_naming_the_sender() {
         media_messages(7),
     )
     .await;
+    let stale = link_to(&a, &bob.identity) + 1;
+    let err = a
+        .send_media(&bob.identity, stale, media_messages(9)[0].clone())
+        .await
+        .expect_err("a send naming another link is refused");
+    assert!(matches!(err, PeerSendError::Unlinked { .. }));
     media_reaches_in_order(
         &b,
         &bob.identity,
@@ -217,7 +234,7 @@ async fn a_media_send_to_an_unlinked_peer_hands_the_message_back() {
     let a = node(deployment.root_der(), a_tx);
     let message = media_messages(1)[0].clone();
     let err = a
-        .send_media(&bob.identity, message.clone())
+        .send_media(&bob.identity, 1, message.clone())
         .await
         .expect_err("no link stands");
     assert!(
@@ -258,7 +275,7 @@ async fn a_media_message_over_the_bounds_is_refused_both_ways() {
     };
 
     let err = host_node
-        .send_media(&over.identity, piece.clone())
+        .send_media(&over.identity, 1, piece.clone())
         .await
         .expect_err("the bound holds");
     assert!(matches!(err, PeerSendError::FrameAboveBounds { .. }));

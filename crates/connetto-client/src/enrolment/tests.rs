@@ -3090,6 +3090,16 @@ async fn media_received(
     }
 }
 
+/// The number of `far`'s live link to `device`.
+#[cfg(feature = "peer")]
+fn far_link(far: &connetto_peer::Node, device: &connetto_core::device_cert::DeviceIdentity) -> u64 {
+    far.linked()
+        .into_iter()
+        .find(|link| &link.peer == device)
+        .and_then(|link| link.link)
+        .expect("the device is linked")
+}
+
 /// The next event a media port hands over, bounded.
 #[cfg(feature = "peer")]
 async fn port_event(port: &mut crate::media::MediaPort) -> crate::media::MediaEvent {
@@ -3120,6 +3130,7 @@ async fn a_media_request_with_no_port_is_refused_at_once() {
         .expect("the link completes");
     far.send_media(
         &device,
+        far_link(&far, &device),
         Media::Want {
             request_id: 4,
             file_id: [1; 32],
@@ -3159,28 +3170,41 @@ async fn a_media_port_takes_the_links_and_frames_and_answers_through_the_link() 
         .link(handle.peer_address().expect("the listener"))
         .await
         .expect("the link completes");
-    let MediaEvent::Linked { peer, bot_list } = port_event(&mut port).await else {
+    let MediaEvent::Linked {
+        peer,
+        link,
+        bot_list,
+    } = port_event(&mut port).await
+    else {
         panic!("the link comes first");
     };
     assert_eq!(bot_list.as_deref(), Some(connetto_core::BOT_LIST_WILDCARD));
-    assert_eq!(port.sender().linked().len(), 1);
+    assert_eq!(
+        port.sender()
+            .linked()
+            .into_iter()
+            .map(|linked| linked.link)
+            .collect::<Vec<_>>(),
+        vec![link]
+    );
 
     let want = Media::Want {
         request_id: 4,
         file_id: [1; 32],
     };
-    far.send_media(&device, want.clone())
+    far.send_media(&device, far_link(&far, &device), want.clone())
         .await
         .expect("the request queues");
     assert_eq!(
         port_event(&mut port).await,
         MediaEvent::Message {
             peer: peer.clone(),
+            link,
             message: want
         }
     );
     port.sender()
-        .send(&peer, Media::Busy { request_id: 4 })
+        .send(&peer, link, Media::Busy { request_id: 4 })
         .await
         .expect("the answer queues");
     assert_eq!(
@@ -3191,6 +3215,7 @@ async fn a_media_port_takes_the_links_and_frames_and_answers_through_the_link() 
     drop(port);
     far.send_media(
         &device,
+        far_link(&far, &device),
         Media::Want {
             request_id: 5,
             file_id: [1; 32],
