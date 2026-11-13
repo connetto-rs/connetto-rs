@@ -1,8 +1,8 @@
 //! The receiver's side: the candidate order, the prefetch reading, the
-//! verified chunk writes and the commit (R79 decisions 3, 4, 5, 8 and 10).
+//! verified chunk writes and the commit (R79 decisions 3, 4, 5, 8, 10 and 13).
 
 use core::fmt::Display;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -165,30 +165,70 @@ pub(super) enum ChunkOutcome {
     Store(String),
 }
 
-/// The holders to ask for a file, the linked authors of the provisional rows
-/// naming it first in their rows' order, then every other linked peer in the
-/// order its link came up.
-pub(super) fn candidate_order<'a>(
-    linked: impl IntoIterator<Item = &'a DeviceIdentity>,
-    authors: &[Vec<u8>],
-) -> VecDeque<DeviceIdentity> {
-    let linked: Vec<&DeviceIdentity> = linked.into_iter().collect();
-    let mut order = VecDeque::with_capacity(linked.len());
-    for author in authors {
-        if let Some(peer) = linked
+/// The rates a device ranks the holders it asks by, frozen between room
+/// checks so the order changes at most every 10 seconds, and the turn that
+/// lets one holder not yet measured go ahead of the measured ones, which is
+/// [BitTorrent's choking](https://www.bittorrent.org/beps/bep_0003.html)
+/// with its optimistic unchoke applied to a candidate order (R79 decision
+/// 13's amendment of decision 3).
+#[derive(Default)]
+pub(super) struct HolderRanking {
+    /// The measured rate to each peer as of the last refresh.
+    rates: HashMap<DeviceIdentity, u64>,
+    /// How many refreshes ran, which picks the unmeasured holder whose
+    /// turn it is.
+    turn: usize,
+}
+
+impl HolderRanking {
+    /// Ranks by `rates` until the next refresh and passes the turn on.
+    pub(super) fn refresh(&mut self, rates: HashMap<DeviceIdentity, u64>) {
+        self.rates = rates;
+        self.turn = self.turn.wrapping_add(1);
+    }
+
+    /// The peers to ask for a file. The linked authors of the provisional
+    /// rows naming it come first in their rows' order, then the linked
+    /// peers `holds` names, the unmeasured one whose turn it is ahead of the
+    /// measured ones fastest first and the other unmeasured ones after them
+    /// in link order, then every other linked peer in the order its link
+    /// came up.
+    pub(super) fn order<'a>(
+        &self,
+        linked: impl IntoIterator<Item = &'a DeviceIdentity>,
+        authors: &[Vec<u8>],
+        holds: impl Fn(&DeviceIdentity) -> bool,
+    ) -> VecDeque<DeviceIdentity> {
+        let linked: Vec<&DeviceIdentity> = linked.into_iter().collect();
+        let mut order = VecDeque::with_capacity(linked.len());
+        for author in authors {
+            if let Some(peer) = linked
+                .iter()
+                .find(|peer| peer.key().as_bytes().as_slice() == author.as_slice())
+                && !order.contains(*peer)
+            {
+                order.push_back((*peer).clone());
+            }
+        }
+        let (mut measured, mut unmeasured): (Vec<&DeviceIdentity>, Vec<&DeviceIdentity>) = linked
             .iter()
-            .find(|peer| peer.key().as_bytes().as_slice() == author.as_slice())
-            && !order.contains(*peer)
-        {
-            order.push_back((*peer).clone());
+            .copied()
+            .filter(|peer| !order.contains(*peer) && holds(peer))
+            .partition(|peer| self.rates.contains_key(*peer));
+        measured.sort_by_key(|peer| core::cmp::Reverse(self.rates.get(*peer).copied()));
+        if !unmeasured.is_empty() {
+            let turn = unmeasured.remove(self.turn % unmeasured.len());
+            order.push_back(turn.clone());
         }
-    }
-    for peer in linked {
-        if !order.contains(peer) {
-            order.push_back(peer.clone());
+        order.extend(measured.into_iter().cloned());
+        order.extend(unmeasured.into_iter().cloned());
+        for peer in linked {
+            if !order.contains(peer) {
+                order.push_back(peer.clone());
+            }
         }
+        order
     }
-    order
 }
 
 /// A manifest a holder sent, `None` when a row cannot be a chunk.
@@ -447,9 +487,11 @@ impl AsyncStreamReader for Arriving {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use connetto_core::device_cert::DeviceIdentity;
 
-    use super::candidate_order;
+    use super::HolderRanking;
 
     fn peer(key: u8) -> DeviceIdentity {
         DeviceIdentity::from_uri(&format!(
@@ -459,12 +501,16 @@ mod tests {
         .expect("a canonical identity")
     }
 
+    fn holding(keys: &'static [u8]) -> impl Fn(&DeviceIdentity) -> bool {
+        |peer: &DeviceIdentity| keys.contains(&peer.key().as_bytes()[0])
+    }
+
     #[test]
     fn linked_authors_go_first_in_row_order_then_every_link_in_link_order() {
         let linked = [peer(1), peer(2), peer(3), peer(4)];
         let authors = [vec![3; 32], vec![9; 32], vec![2; 32], vec![3; 32]];
         assert_eq!(
-            candidate_order(&linked, &authors),
+            HolderRanking::default().order(&linked, &authors, holding(&[])),
             [peer(3), peer(2), peer(1), peer(4)]
         );
     }
@@ -472,6 +518,67 @@ mod tests {
     #[test]
     fn with_no_author_linked_the_link_order_stands() {
         let linked = [peer(1), peer(2)];
-        assert_eq!(candidate_order(&linked, &[vec![7; 32]]), [peer(1), peer(2)]);
+        assert_eq!(
+            HolderRanking::default().order(&linked, &[vec![7; 32]], holding(&[])),
+            [peer(1), peer(2)]
+        );
+    }
+
+    #[test]
+    fn holders_go_after_the_authors_the_unmeasured_turn_first_then_fastest_first() {
+        let linked = [peer(1), peer(2), peer(3), peer(4), peer(5), peer(6)];
+        let mut ranking = HolderRanking::default();
+        ranking.refresh(HashMap::from([
+            (peer(3), 10),
+            (peer(5), 900),
+            (peer(6), 50),
+        ]));
+        // Peer 1 authors, peers 2 to 5 hold, peer 6 holds nothing.
+        let order = ranking.order(&linked, &[vec![1; 32]], holding(&[1, 2, 3, 4, 5]));
+        let turn = order[1].clone();
+        assert!(
+            turn == peer(2) || turn == peer(4),
+            "an unmeasured holder's turn"
+        );
+        let other = if turn == peer(2) { peer(4) } else { peer(2) };
+        assert_eq!(
+            order,
+            [peer(1), turn, peer(5), peer(3), other, peer(6)],
+            "the measured holders fastest first, the other unmeasured holder after them, \
+             a peer holding nothing last even when measured"
+        );
+    }
+
+    #[test]
+    fn each_refresh_passes_the_turn_to_the_next_unmeasured_holder() {
+        let linked = [peer(1), peer(2), peer(3)];
+        let mut ranking = HolderRanking::default();
+        let mut firsts = Vec::new();
+        for _ in 0..3 {
+            firsts.push(ranking.order(&linked, &[], holding(&[1, 2, 3]))[0].clone());
+            ranking.refresh(HashMap::new());
+        }
+        firsts.sort_by_key(|peer| peer.key().as_bytes()[0]);
+        assert_eq!(
+            firsts,
+            [peer(1), peer(2), peer(3)],
+            "three refreshes give each of three unmeasured holders one turn"
+        );
+        assert_eq!(
+            ranking.order(&linked, &[], holding(&[1, 2, 3])),
+            ranking.order(&linked, &[], holding(&[1, 2, 3])),
+            "between refreshes the order stays put"
+        );
+    }
+
+    #[test]
+    fn with_every_holder_measured_none_is_moved_ahead_of_a_faster_one() {
+        let linked = [peer(1), peer(2)];
+        let mut ranking = HolderRanking::default();
+        ranking.refresh(HashMap::from([(peer(1), 5), (peer(2), 500)]));
+        assert_eq!(
+            ranking.order(&linked, &[], holding(&[1, 2])),
+            [peer(2), peer(1)]
+        );
     }
 }

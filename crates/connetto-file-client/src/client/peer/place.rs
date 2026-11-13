@@ -13,7 +13,7 @@ use connetto_exchange::media::placement::{
 };
 use connetto_file_core::{ChunkInventory, FileId, FreeSpace, MaybeSend};
 
-use super::fetch::{Fetch, Purpose, candidate_order};
+use super::fetch::{Fetch, Purpose};
 use super::{Action, ContentClient, ContentEvent, CustodyCopy, Done, Driver, Job, custody};
 use crate::db;
 use crate::error::ContentError;
@@ -322,7 +322,7 @@ where
             match verdict {
                 Verdict::Pull => {
                     if !self.tags.contains_key(&file_id) {
-                        let candidates = candidate_order(self.links.linked_peers(), &authors);
+                        let candidates = self.candidates(file_id, &authors);
                         actions.extend(self.start(file_id, Purpose::Custody, candidates, now));
                     }
                 }

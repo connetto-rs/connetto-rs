@@ -27,8 +27,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 pub(super) use fetch::Order;
 use fetch::{
-    ChunkOutcome, FIRST_BACKOFF, Fetch, LAST_BACKOFF, MAX_PREFETCH_BYTES, ON_DEMAND_BOUND, Purpose,
-    Stage, candidate_order, holders_manifest,
+    ChunkOutcome, FIRST_BACKOFF, Fetch, HolderRanking, LAST_BACKOFF, MAX_PREFETCH_BYTES,
+    ON_DEMAND_BOUND, Purpose, Stage, holders_manifest,
 };
 
 use super::{ContentClient, ContentEvent};
@@ -722,6 +722,9 @@ struct Driver<'c, T: Transport, B: ChunkStore + Clone, H: ContentHttp, F, J> {
     /// Each leaving attempt's marks, by file, the number of the report that
     /// carried the mark to each peer by key id (R79 decision 16).
     marks: HashMap<FileId, BTreeMap<[u8; 32], u64>>,
+    /// The rates the holders of a fetch are ordered by, refreshed with
+    /// every room check (R79 decision 13).
+    ranking: HolderRanking,
     /// The sizes of files this device holds no manifest of, learned from a
     /// holder's manifest.
     sizes: HashMap<FileId, u64>,
@@ -785,6 +788,7 @@ where
             custody_due: false,
             opening: None,
             marks: HashMap::new(),
+            ranking: HolderRanking::default(),
             sizes: HashMap::new(),
             placement_due: false,
             place_again_at: None,
@@ -1151,12 +1155,19 @@ where
         );
     }
 
-    /// Tells every linked peer the room and rates that changed since it was
-    /// last told, once the check is due.
+    /// Reorders the holders a fetch asks by the rates measured since the last
+    /// check and tells every linked peer the room and rates that changed
+    /// since it was last told, once the check is due.
     async fn room_due(&mut self, now: Instant) {
         if self.room_at.is_none_or(|at| at > now) {
             return;
         }
+        let rates = self
+            .links
+            .linked_peers()
+            .filter_map(|peer| Some((peer.clone(), self.links.rate(peer)?)))
+            .collect();
+        self.ranking.refresh(rates);
         self.press().await;
         let content = self.content;
         let (_, held) = self.beside_jobs(content.custody_held()).await;
@@ -1317,7 +1328,7 @@ where
             let authors = self
                 .beside_jobs(content.provisional_authors(order.file_id))
                 .await;
-            let linked = candidate_order(self.links.linked_peers(), &authors);
+            let linked = self.candidates(order.file_id, &authors);
             if let Some(fetch) = self.fetches.get_mut(&tag) {
                 fetch.answers.push(order.answer);
                 if fetch.purpose != Purpose::OnDemand {
@@ -1369,12 +1380,24 @@ where
         actions
     }
 
+    /// The peers to ask for `file_id`, the linked `authors` of the rows
+    /// naming it first, then the linked peers reporting it held in the
+    /// ranking's order, then every other linked peer.
+    fn candidates(&self, file_id: FileId, authors: &[Vec<u8>]) -> VecDeque<DeviceIdentity> {
+        self.ranking
+            .order(self.links.linked_peers(), authors, |peer| {
+                self.links
+                    .report(peer)
+                    .is_some_and(|report| report.holds(file_id.as_bytes()))
+            })
+    }
+
     /// Lines up every linked holder for the fetch `tag` of `file_id` and asks
     /// the first.
     async fn start_round(&mut self, tag: u64, file_id: FileId, now: Instant) -> Vec<Action> {
         let content = self.content;
         let authors = self.beside_jobs(content.provisional_authors(file_id)).await;
-        let candidates = candidate_order(self.links.linked_peers(), &authors);
+        let candidates = self.candidates(file_id, &authors);
         if let Some(fetch) = self.fetches.get_mut(&tag) {
             fetch.candidates = candidates;
             fetch.round_busy = None;
