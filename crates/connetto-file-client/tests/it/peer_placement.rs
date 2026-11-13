@@ -3,8 +3,8 @@
 //! without room left out, a copy above the count released, a copy marked
 //! leaving under pressure handed to another device and deleted, only as many
 //! copies leaving as the shortfall needs, a pressed copy nobody can take
-//! raising `CustodyPressed`, and a mark nobody can answer withdrawn (R79
-//! decisions 12 to 16).
+//! raising `CustodyPressed`, a mark nobody can answer withdrawn, and a pull
+//! a busy author turned away placed again (R79 decisions 12 to 16).
 
 use std::time::Duration;
 
@@ -16,11 +16,12 @@ use connetto_peer::{CloseReason, Node};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::peer_support::{
-    Device, Devices, Relay, apply_entry, beside_all, captured_photo, custody_state,
-    declare_replicated, held_chunks, listener, relay, replica, set_custody_state, stage,
+    Device, Devices, Fault, Relay, apply_entry, bare_holder, beside, beside_all, captured_photo,
+    custody_state, declare_replicated, held_chunks, listener, port, relay, replica,
+    set_custody_state, stage,
 };
 use crate::retention::pseudorandom;
-use crate::support::Scripted;
+use crate::support::{Scripted, learn_file_id};
 
 /// How long placement may take to settle, a few of the 10 second room
 /// checks a pressed copy waits for.
@@ -510,4 +511,50 @@ async fn pressure_hands_on_only_as_many_copies_as_the_shortfall_needs() {
             assert_eq!(all.len(), 2);
         })
         .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pull_a_busy_author_turned_away_is_placed_again() {
+    let dirs = [
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+    ];
+    let bytes = pseudorandom(77, PHOTO);
+    let file_id = learn_file_id(&bytes).await;
+    let devices = Devices::new();
+    let author_device = devices.device("anna", 1);
+    let (author_node, author_addr, author_events) = devices.node(&author_device);
+    let _author = bare_holder(author_node, author_events, bytes, Fault::BusyFirst);
+    let author = PeerAuthor {
+        key_id: author_device.identity.key().as_bytes().to_vec(),
+        account: "anna".to_owned(),
+        bot_list: Some("*".to_owned()),
+    };
+    let (client, content) = replica(dirs[0].path(), None).await;
+    let content = content.with_custody_budget(ROOMY).with_custody_reserve(0);
+    let (client, content) = declare_replicated((client, content)).await;
+    let body = captured_photo(dirs[1].path(), 7, file_id.as_bytes().to_vec(), None).await;
+    apply_entry(&client, &author, 1, body).await;
+    let (node, _, events) = devices.node(&devices.device("tester", 2));
+    node.link(author_addr).await.expect("the link completes");
+
+    let mut fetched = content.events();
+    beside(&content, port(node, events), async {
+        tokio::time::timeout(BOUND, async {
+            loop {
+                if let Ok(ContentEvent::Fetched { file_id: got }) = fetched.recv().await
+                    && got == file_id
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the pull is placed again once the author is free");
+        assert_eq!(
+            custody_state(&client, file_id).await.as_deref(),
+            Some("held")
+        );
+    })
+    .await;
 }

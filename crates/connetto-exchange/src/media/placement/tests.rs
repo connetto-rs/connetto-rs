@@ -1,7 +1,7 @@
 //! Placement's ranking and verdicts, and the leaving handover run between
 //! devices over [`MediaLinks`] in every delivery order (R79 decision 16).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
 use super::{Candidate, Mine, Peer, Placement, Verdict, View, decide, hash_term, rank, takers};
@@ -36,12 +36,12 @@ fn equal_rooms_rank_by_the_hash_and_more_room_ranks_higher() {
         .collect();
     let mut by_hash: Vec<u8> = (1..=6).collect();
     by_hash.sort_by_key(|key| core::cmp::Reverse(hash_term(&FILE, &[*key; 32])));
-    assert_eq!(keys(&rank(&FILE, &devices)), by_hash);
+    assert_eq!(keys(&rank(&FILE, &devices, &BTreeSet::new())), by_hash);
     let last = *by_hash.last().expect("six devices");
     let mut grown = devices.clone();
     grown[usize::from(last - 1)].room = 1 << 40;
     assert_eq!(
-        keys(&rank(&FILE, &grown))[0],
+        keys(&rank(&FILE, &grown, &BTreeSet::new()))[0],
         last,
         "a far larger room outweighs any hash"
     );
@@ -54,7 +54,7 @@ fn an_accounts_best_device_ranks_before_any_second_device() {
         candidate(2, "alice", 1 << 30),
         candidate(3, "bob", 1),
     ];
-    let ranked = keys(&rank(&FILE, &devices));
+    let ranked = keys(&rank(&FILE, &devices, &BTreeSet::new()));
     assert_eq!(ranked.len(), 3);
     assert_eq!(
         ranked[1], 3,
@@ -65,7 +65,10 @@ fn an_accounts_best_device_ranks_before_any_second_device() {
 #[test]
 fn a_taker_needs_room_for_the_file() {
     let devices = [candidate(1, "a", 99), candidate(2, "b", 100)];
-    assert_eq!(keys(&takers(&FILE, 100, &devices, &[])), vec![2]);
+    assert_eq!(
+        keys(&takers(&FILE, 100, &devices, &[], &BTreeSet::new())),
+        vec![2]
+    );
 }
 
 #[test]
@@ -89,7 +92,7 @@ fn a_taker_far_slower_to_every_source_than_the_median_is_left_out() {
         candidate(4, "d", 100),
     ];
     let left: Vec<u8> = {
-        let mut left = keys(&takers(&FILE, 1, &devices, &[source]));
+        let mut left = keys(&takers(&FILE, 1, &devices, &[source], &BTreeSet::new()));
         left.sort_unstable();
         left
     };
@@ -103,12 +106,12 @@ fn a_taker_far_slower_to_every_source_than_the_median_is_left_out() {
         },
     ];
     assert_eq!(
-        takers(&FILE, 1, &devices, &[source]).len(),
+        takers(&FILE, 1, &devices, &[source], &BTreeSet::new()).len(),
         2,
         "a rate at a quarter of the median stays"
     );
     assert_eq!(
-        takers(&FILE, 1, &devices, &[[8; 32]]).len(),
+        takers(&FILE, 1, &devices, &[[8; 32]], &BTreeSet::new()).len(),
         2,
         "rates to a device holding nothing do not count"
     );
@@ -190,6 +193,49 @@ fn a_device_pulls_when_it_ranks_among_the_copies_missing() {
         decide(&placement(1, Mine::Absent, vec![refused])),
         Verdict::Pull,
         "a device the gate refuses never pulls"
+    );
+}
+
+#[test]
+fn an_account_already_holding_the_file_yields_to_one_that_does_not() {
+    let held = |key, account| Peer {
+        candidate: candidate(key, account, 100),
+        admitted: true,
+        view: View::Held,
+        seen: None,
+    };
+    let curator = Peer {
+        candidate: candidate(4, "curator", 100),
+        admitted: true,
+        view: View::Absent,
+        seen: None,
+    };
+    let second_tester = |peers| Placement {
+        me: candidate(1, "tester", 1 << 40),
+        ..placement(3, Mine::Absent, peers)
+    };
+    assert_eq!(
+        decide(&second_tester(vec![
+            held(2, "tester"),
+            held(3, "anna"),
+            curator
+        ])),
+        Verdict::Nothing,
+        "the curator takes the last copy however roomy a second tester is"
+    );
+    assert_eq!(
+        decide(&second_tester(vec![held(2, "tester"), held(3, "anna")])),
+        Verdict::Pull,
+        "with no other account to take it, a second device does"
+    );
+    let leaving = Peer {
+        view: View::Leaving,
+        ..held(2, "tester")
+    };
+    assert_eq!(
+        decide(&second_tester(vec![leaving, held(3, "anna"), curator])),
+        Verdict::Pull,
+        "an account whose copy is leaving holds nothing"
     );
 }
 

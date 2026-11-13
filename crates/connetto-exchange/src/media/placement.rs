@@ -133,9 +133,15 @@ pub fn score(file: &[u8; 32], key: &[u8; 32], room: u64) -> f64 {
 }
 
 /// `candidates` best first by [`score`], ties broken by [`hash_term`] and
-/// then the key, each account's best device ahead of any second device.
+/// then the key, each account's best device ahead of any second device, a
+/// device of an account in `covered`, which already holds a copy, counting
+/// as a second device.
 #[must_use]
-pub fn rank<'a>(file: &[u8; 32], candidates: &[Candidate<'a>]) -> Vec<Candidate<'a>> {
+pub fn rank<'a>(
+    file: &[u8; 32],
+    candidates: &[Candidate<'a>],
+    covered: &BTreeSet<&str>,
+) -> Vec<Candidate<'a>> {
     let mut scored: Vec<(f64, u64, Candidate<'a>)> = candidates
         .iter()
         .map(|candidate| {
@@ -157,7 +163,9 @@ pub fn rank<'a>(file: &[u8; 32], candidates: &[Candidate<'a>]) -> Vec<Candidate<
     let (first, second): (Vec<_>, Vec<_>) = scored
         .into_iter()
         .map(|(_, _, candidate)| candidate)
-        .partition(|candidate| accounts.insert(candidate.account));
+        .partition(|candidate| {
+            !covered.contains(candidate.account) && accounts.insert(candidate.account)
+        });
     first.into_iter().chain(second).collect()
 }
 
@@ -171,6 +179,7 @@ pub fn takers<'a>(
     size: u64,
     candidates: &[Candidate<'a>],
     sources: &[[u8; 32]],
+    covered: &BTreeSet<&str>,
 ) -> Vec<Candidate<'a>> {
     let roomy: Vec<Candidate<'a>> = candidates
         .iter()
@@ -205,7 +214,7 @@ pub fn takers<'a>(
         })
         .map(|(_, (candidate, _))| *candidate)
         .collect();
-    rank(file, &eligible)
+    rank(file, &eligible, covered)
 }
 
 /// The median of `rates`, the mean of the two middle ones for an even count,
@@ -245,9 +254,12 @@ pub fn decide(placement: &Placement<'_>) -> Verdict {
     match placement.mine {
         Mine::Absent => {
             let missing = placement.copies.saturating_sub(unmarked);
+            let covered = holding(View::Held)
+                .map(|peer| peer.candidate.account)
+                .collect();
             let mut candidates = others;
             candidates.push(placement.me);
-            let pulls = takers(file, placement.size, &candidates, &sources)
+            let pulls = takers(file, placement.size, &candidates, &sources, &covered)
                 .into_iter()
                 .take(missing)
                 .any(|candidate| candidate.key == placement.me.key);
@@ -264,7 +276,7 @@ pub fn decide(placement: &Placement<'_>) -> Verdict {
             let mut holders: Vec<Candidate<'_>> =
                 holding(View::Held).map(|peer| peer.candidate).collect();
             holders.push(placement.me);
-            let kept = rank(file, &holders)
+            let kept = rank(file, &holders, &BTreeSet::new())
                 .into_iter()
                 .take(placement.copies)
                 .any(|candidate| candidate.key == placement.me.key);
@@ -286,7 +298,9 @@ pub fn decide(placement: &Placement<'_>) -> Verdict {
                 return Verdict::Release;
             }
             if pressed {
-                return if takers(file, placement.size, &others, &sources).is_empty() {
+                return if takers(file, placement.size, &others, &sources, &BTreeSet::new())
+                    .is_empty()
+                {
                     Verdict::Stranded
                 } else {
                     Verdict::Nothing

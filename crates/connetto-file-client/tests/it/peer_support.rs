@@ -534,6 +534,8 @@ pub enum Fault {
     DropAtSecondFetch,
     /// It answers every request `Busy`.
     AlwaysBusy,
+    /// It answers its first request `Busy` and serves the file after.
+    BusyFirst,
     /// It answers nothing.
     Silent,
     /// It names a chunk of no bytes.
@@ -571,6 +573,7 @@ pub fn bare_holder(
                 .await
                 .expect("chunk the file");
         let mut fetches = 0;
+        let mut busy = fault == Fault::AlwaysBusy || fault == Fault::BusyFirst;
         while let Some(event) = events.recv().await {
             let Some((peer, link, message)) = media_of(event) else {
                 continue;
@@ -581,7 +584,8 @@ pub fn bare_holder(
             };
             match (fault, message) {
                 (Fault::Silent, _) => {}
-                (Fault::AlwaysBusy, _) => {
+                _ if busy => {
+                    busy = fault == Fault::AlwaysBusy;
                     let _ = node
                         .send_media(&peer, link, Media::Busy { request_id })
                         .await;

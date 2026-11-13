@@ -27,8 +27,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 pub(super) use fetch::Order;
 use fetch::{
-    ChunkOutcome, Fetch, LAST_BACKOFF, MAX_PREFETCH_BYTES, ON_DEMAND_BOUND, Purpose, Stage,
-    candidate_order, holders_manifest,
+    ChunkOutcome, FIRST_BACKOFF, Fetch, LAST_BACKOFF, MAX_PREFETCH_BYTES, ON_DEMAND_BOUND, Purpose,
+    Stage, candidate_order, holders_manifest,
 };
 
 use super::{ContentClient, ContentEvent};
@@ -727,6 +727,12 @@ struct Driver<'c, T: Transport, B: ChunkStore + Clone, H: ContentHttp, F, J> {
     sizes: HashMap<FileId, u64>,
     /// Set by every event that can move a placement, cleared by one pass.
     placement_due: bool,
+    /// When placement runs again on its own, set once a pull for custody or
+    /// a size request ended with no holder serving it.
+    place_again_at: Option<Instant>,
+    /// The wait before the next such pass, doubling up to [`LAST_BACKOFF`]
+    /// and back to [`FIRST_BACKOFF`] once a pull or a size request succeeds.
+    place_again_after: Duration,
     /// The pressed copies no linked device can take over.
     stranded: HashSet<FileId>,
 }
@@ -781,6 +787,8 @@ where
             marks: HashMap::new(),
             sizes: HashMap::new(),
             placement_due: false,
+            place_again_at: None,
+            place_again_after: FIRST_BACKOFF,
             stranded: HashSet::new(),
         }
     }
@@ -809,8 +817,8 @@ where
         }
     }
 
-    /// The earliest instant a request lapses, busy holders are asked again
-    /// or the room is checked.
+    /// The earliest instant a request lapses, busy holders are asked again,
+    /// the room is checked or placement runs again.
     fn next_wake(&self) -> Option<Instant> {
         self.fetches
             .values()
@@ -818,6 +826,7 @@ where
             .chain(self.links.next_deadline())
             .chain(self.room_at)
             .chain(self.lapse_at)
+            .chain(self.place_again_at)
             .min()
     }
 
@@ -897,6 +906,10 @@ where
         if self.lapse_at.is_some_and(|at| at <= now) {
             self.lapse_at = None;
             self.custody_due = true;
+        }
+        if self.place_again_at.is_some_and(|at| at <= now) {
+            self.place_again_at = None;
+            self.placement_due = true;
         }
         actions
     }
@@ -1416,6 +1429,12 @@ where
             fetch.backoff = (fetch.backoff * 2).min(LAST_BACKOFF);
             return Vec::new();
         }
+        if matches!(fetch.purpose, Purpose::Custody | Purpose::Size)
+            && self.place_again_at.is_none()
+        {
+            self.place_again_at = Some(now + self.place_again_after);
+            self.place_again_after = (self.place_again_after * 2).min(LAST_BACKOFF);
+        }
         self.finish(tag, Ok(false));
         Vec::new()
     }
@@ -1423,6 +1442,9 @@ where
     /// Ends the fetch `tag`, answering every resolve waiting on it.
     fn finish(&mut self, tag: u64, outcome: Result<bool, ContentError>) {
         if let Some(fetch) = self.fetches.remove(&tag) {
+            if fetch.purpose == Purpose::Custody && matches!(outcome, Ok(true)) {
+                self.place_again_after = FIRST_BACKOFF;
+            }
             self.tags.remove(&fetch.file_id);
             fetch.answer(outcome);
         }
@@ -1526,6 +1548,7 @@ where
         if purpose == Purpose::Size {
             self.sizes.insert(manifest.file_id(), size);
             self.placement_due = true;
+            self.place_again_after = FIRST_BACKOFF;
             self.finish(tag, Ok(false));
             return self.release(&peer, done, now);
         }
