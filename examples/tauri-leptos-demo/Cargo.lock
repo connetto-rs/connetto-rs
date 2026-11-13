@@ -1080,7 +1080,10 @@ dependencies = [
  "diesel",
  "futures-util",
  "js-sys",
+ "objc2",
+ "objc2-foundation",
  "reqwest 0.12.28",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -1089,6 +1092,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1647,7 +1651,7 @@ dependencies = [
 [[package]]
 name = "diesel"
 version = "2.3.14"
-source = "git+https://github.com/diesel-rs/diesel#31afd783aeddb2471bba2bece823816fe4925fed"
+source = "git+https://github.com/diesel-rs/diesel#8d40b0a3f4164866b27464fa435d07842e2075f2"
 dependencies = [
  "bigdecimal",
  "bitflags 2.13.2",
@@ -1695,7 +1699,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/diesel-rs/diesel#31afd783aeddb2471bba2bece823816fe4925fed"
+source = "git+https://github.com/diesel-rs/diesel#8d40b0a3f4164866b27464fa435d07842e2075f2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1705,7 +1709,7 @@ dependencies = [
 [[package]]
 name = "diesel_derives"
 version = "2.3.10"
-source = "git+https://github.com/diesel-rs/diesel#31afd783aeddb2471bba2bece823816fe4925fed"
+source = "git+https://github.com/diesel-rs/diesel#8d40b0a3f4164866b27464fa435d07842e2075f2"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -1718,7 +1722,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/diesel-rs/diesel#31afd783aeddb2471bba2bece823816fe4925fed"
+source = "git+https://github.com/diesel-rs/diesel#8d40b0a3f4164866b27464fa435d07842e2075f2"
 dependencies = [
  "syn 3.0.9",
 ]
@@ -1846,7 +1850,7 @@ dependencies = [
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/diesel-rs/diesel#31afd783aeddb2471bba2bece823816fe4925fed"
+source = "git+https://github.com/diesel-rs/diesel#8d40b0a3f4164866b27464fa435d07842e2075f2"
 dependencies = [
  "darling 0.24.1",
  "either",
@@ -5894,7 +5898,7 @@ dependencies = [
 [[package]]
 name = "sqlstate"
 version = "0.2.0"
-source = "git+https://github.com/diesel-rs/diesel#31afd783aeddb2471bba2bece823816fe4925fed"
+source = "git+https://github.com/diesel-rs/diesel#8d40b0a3f4164866b27464fa435d07842e2075f2"
 
 [[package]]
 name = "stable_deref_trait"

@@ -178,7 +178,7 @@ fn busy_handler(
 /// Replace the probe's handler with a plain timeout, so the open's later statements wait the same way.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 fn keep_waiting(conn: &mut SqliteConnection, wait: core::time::Duration) {
-    conn.set_busy_timeout(i32::try_from(wait.as_millis()).unwrap_or(i32::MAX));
+    conn.set_busy_timeout(wait);
 }
 
 /// Drop the probe's handler, since a browser worker cannot block on a lock.

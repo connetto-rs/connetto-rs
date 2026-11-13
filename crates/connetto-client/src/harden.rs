@@ -48,17 +48,17 @@ pub fn harden_replica_connection(conn: &mut SqliteConnection) -> QueryResult<()>
     conn.set_limit(
         SqliteLimit::FunctionArg,
         SqliteLimit::SAFE_FUNCTION_ARG_LIMIT,
-    );
+    )?;
     // Bounds one statement's compiled program, which is what a giant expression
     // inside an attached database's view would otherwise buy cheaply. Measured
     // to accept a five-thousand-bind key list and a three-way join with a
     // subquery, a group by and an order by.
-    conn.set_limit(SqliteLimit::VdbeOp, SqliteLimit::SAFE_VDBE_OP_LIMIT);
+    conn.set_limit(SqliteLimit::VdbeOp, SqliteLimit::SAFE_VDBE_OP_LIMIT)?;
     // SQLite's default too, set rather than inherited so the value is pinned.
     conn.set_limit(
         SqliteLimit::WorkerThreads,
         SqliteLimit::SAFE_WORKER_THREADS_LIMIT,
-    );
+    )?;
     seal_attaches(conn)
 }
 
@@ -128,7 +128,7 @@ fn open_window(conn: &mut SqliteConnection, permits: AttachPermits) -> QueryResu
     }
     conn.set_attach_write_enabled(true)?;
     let room = attached_count(conn)?.saturating_add(1);
-    conn.set_limit(SqliteLimit::Attached, room);
+    conn.set_limit(SqliteLimit::Attached, room)?;
     Ok(())
 }
 
@@ -142,7 +142,7 @@ pub(crate) fn seal_attaches(conn: &mut SqliteConnection) -> QueryResult<()> {
     conn.set_attach_create_enabled(false)?;
     conn.set_attach_write_enabled(false)?;
     let live = attached_count(conn)?;
-    conn.set_limit(SqliteLimit::Attached, live);
+    conn.set_limit(SqliteLimit::Attached, live)?;
     Ok(())
 }
 
@@ -151,7 +151,7 @@ pub(crate) fn seal_attaches(conn: &mut SqliteConnection) -> QueryResult<()> {
 /// Read back from SQLite rather than tracked in Rust, so the ceiling cannot
 /// drift from what is actually attached, and so a caller holding only the
 /// connection (the browser relay) needs no bookkeeping of its own.
-fn attached_count(conn: &mut SqliteConnection) -> QueryResult<i32> {
+fn attached_count(conn: &mut SqliteConnection) -> QueryResult<u32> {
     #[derive(diesel::QueryableByName)]
     struct Entry {
         /// One schema name from `PRAGMA database_list`.
@@ -169,5 +169,5 @@ fn attached_count(conn: &mut SqliteConnection) -> QueryResult<i32> {
         attached <= 125,
         "more attached databases than SQLite permits"
     );
-    Ok(i32::try_from(attached).unwrap_or(i32::MAX))
+    Ok(u32::try_from(attached).unwrap_or(u32::MAX))
 }
