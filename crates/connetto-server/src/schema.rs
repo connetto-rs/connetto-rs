@@ -128,11 +128,14 @@ use crate::writer_schema::ConnettoWriterSchema;
 /// Every deployment-owned table set connetto reads through a trait, under one
 /// identity type.
 pub trait ConnettoSchema: Send + Sync + 'static {
-    /// The deployment's typed user id, the one every member carries.
+    /// The deployment's typed user id, the one every member carries. It
+    /// parses from the text a deployment's SQL functions answer with, such as
+    /// a file's owner (R79 decision 17).
     type Id: serde::Serialize
         + serde::de::DeserializeOwned
         + Clone
         + core::fmt::Display
+        + core::str::FromStr
         + Send
         + Sync
         + 'static;

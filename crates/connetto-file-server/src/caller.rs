@@ -13,6 +13,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
 use crate::error::ServerError;
 use crate::functions;
+use crate::ticket::TicketPayload;
 
 /// The session settings this deployment's policies read the caller from.
 ///
@@ -86,6 +87,36 @@ pub(crate) fn manifest_key(
     caller
         .storage_key(settings.separator)
         .ok_or(ServerError::NotFound)
+}
+
+/// The key a write ticket's upload is recorded and metered under: the
+/// owner's for a carried upload (R79 decision 17), else the caller's own as
+/// [`manifest_key`] renders it.
+///
+/// # Errors
+///
+/// As [`manifest_key`] for an upload the caller makes for itself.
+pub(crate) fn upload_key(
+    settings: &CallerSettings,
+    ticket: &TicketPayload,
+) -> Result<String, ServerError> {
+    ticket.carry.as_ref().map_or_else(
+        || manifest_key(settings, &ticket.caller),
+        |carry| Ok(carry.storage_key()),
+    )
+}
+
+/// Everyone the setter is told a write ticket's commit belongs to: the owner
+/// of a carried upload, else the caller as [`attributions`] names it.
+///
+/// # Errors
+///
+/// As [`attributions`] for an upload the caller makes for itself.
+pub(crate) fn upload_attributions(ticket: &TicketPayload) -> Result<Vec<&str>, ServerError> {
+    match &ticket.carry {
+        Some(carry) => Ok(vec![carry.owner.as_str()]),
+        None => attributions(&ticket.caller),
+    }
 }
 
 /// Everyone the deployment's content-state setter is told the commit belongs

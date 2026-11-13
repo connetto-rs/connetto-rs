@@ -57,9 +57,29 @@ pub struct Config<S: ConnettoFileSchema> {
     /// The cached deployment totals behind the ceiling checks, refreshed by
     /// the task `serve` spawns whenever any ceiling is configured.
     pub ceilings: crate::quotas::CeilingCache,
+    /// Hears every carried upload once its commit is durable (R79 decision
+    /// 17), `None` to record nothing.
+    pub on_carried: Option<CarriedObserver>,
     /// Carries the schema type without a runtime value.
     pub _schema: PhantomData<fn() -> S>,
 }
+
+/// One carried upload whose commit is durable: a device of another account
+/// uploaded the file for its owner (R79 decision 17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarriedCommit {
+    /// The committed file.
+    pub file_id: [u8; 32],
+    /// The account the file was uploaded for, which the manifest records.
+    pub owner: String,
+    /// The carrier's account.
+    pub carrier: String,
+    /// The carrier's session at the mint.
+    pub session: connetto_core::SessionId,
+}
+
+/// What a deployment hears each [`CarriedCommit`] through.
+pub type CarriedObserver = Arc<dyn Fn(CarriedCommit) + Send + Sync>;
 
 /// Shared state pointer passed to every axum handler.
 pub type AppState<S> = Arc<Config<S>>;

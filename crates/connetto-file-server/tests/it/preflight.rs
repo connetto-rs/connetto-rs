@@ -211,6 +211,80 @@ async fn preflight_refuses_definer_without_search_path() {
     }
 }
 
+/// Startup refuses a deployment with no `connetto_file_owner`, which every
+/// carried upload asks (R79 decision 17).
+#[tokio::test]
+async fn preflight_refuses_a_missing_owner_function() {
+    let pg = Pg::start().await;
+    let mut conn = connect_admin(&pg.url_admin).await;
+    setup_with(
+        &mut conn,
+        &["DROP FUNCTION IF EXISTS connetto_file_owner(BYTEA)"],
+    )
+    .await;
+    let err = preflight::<DefaultFileSchema>(&mut conn)
+        .await
+        .expect_err("a missing owner function must be refused");
+    assert!(
+        matches!(err, PreflightError::MissingOwnerFunction),
+        "expected MissingOwnerFunction, got {err}"
+    );
+}
+
+/// An owner function running as its definer would name the owner of a row
+/// the caller cannot read, so startup refuses it.
+#[tokio::test]
+async fn preflight_refuses_an_owner_function_running_as_definer() {
+    let pg = Pg::start().await;
+    let mut conn = connect_admin(&pg.url_admin).await;
+    setup_with(
+        &mut conn,
+        &[
+            "CREATE OR REPLACE FUNCTION connetto_file_owner(p_file_id BYTEA)
+             RETURNS TEXT LANGUAGE sql SECURITY DEFINER SET search_path TO '' AS $$
+             SELECT NULL::text $$",
+        ],
+    )
+    .await;
+    let err = preflight::<DefaultFileSchema>(&mut conn)
+        .await
+        .expect_err("a DEFINER owner function must be refused");
+    match err {
+        PreflightError::WrongSecurityMode {
+            function,
+            expected_mode,
+        } => {
+            assert_eq!(function, "connetto_file_owner");
+            assert!(expected_mode.contains("INVOKER"));
+        }
+        other => panic!("expected WrongSecurityMode, got {other}"),
+    }
+}
+
+/// Startup refuses an owner function whose `search_path` is not pinned.
+#[tokio::test]
+async fn preflight_refuses_an_owner_function_without_search_path() {
+    let pg = Pg::start().await;
+    let mut conn = connect_admin(&pg.url_admin).await;
+    setup_with(
+        &mut conn,
+        &[
+            "CREATE OR REPLACE FUNCTION connetto_file_owner(p_file_id BYTEA)
+             RETURNS TEXT LANGUAGE sql SECURITY INVOKER AS $$ SELECT NULL::text $$",
+        ],
+    )
+    .await;
+    let err = preflight::<DefaultFileSchema>(&mut conn)
+        .await
+        .expect_err("an unpinned owner function must be refused");
+    match err {
+        PreflightError::UnpinnedSearchPath { function } => {
+            assert_eq!(function, "connetto_file_owner");
+        }
+        other => panic!("expected UnpinnedSearchPath, got {other}"),
+    }
+}
+
 /// Startup refuses a SECURITY INVOKER function with no pinned `search_path`.
 #[tokio::test]
 async fn preflight_refuses_invoker_without_search_path() {
@@ -344,6 +418,7 @@ async fn serve_refuses_when_chunk_registry_absent() {
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -387,6 +462,7 @@ async fn serve_refuses_when_sweep_index_absent() {
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -428,6 +504,7 @@ async fn serve_refuses_when_grace_index_absent() {
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -476,6 +553,7 @@ async fn serve_refuses_a_degenerate_partial_grace_index() {
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -511,6 +589,7 @@ async fn serve_refuses_superuser_reader_role() {
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -570,6 +649,7 @@ async fn serve_refuses_bypassrls_reader_role() {
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -633,6 +713,7 @@ async fn serve_refuses_table_owner_reader_role() {
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -665,6 +746,7 @@ async fn serve_accepts_correctly_configured_reader_role() {
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: std::marker::PhantomData,
     };
     let _router = serve(cfg)
@@ -702,6 +784,7 @@ async fn serve_refuses_when_content_state_fn_absent() {
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -734,6 +817,7 @@ async fn serve_accepts_when_content_state_fn_valid() {
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
         _schema: std::marker::PhantomData,
     };
     let _router = serve(cfg)

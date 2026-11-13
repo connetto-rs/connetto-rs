@@ -23,7 +23,7 @@ pub use error::ServerError;
 pub use preflight::{PreflightError, preflight, preflight_reader};
 pub use quotas::{CeilingCache, CeilingTotals, Crossing, QuotaSettings};
 pub use reconcile::{ReconcileError, StoreReconciled, reconcile_store};
-pub use router::{AppPools, Config, DbPool, serve};
+pub use router::{AppPools, CarriedCommit, CarriedObserver, Config, DbPool, serve};
 pub use schema::{ConnettoFileSchema, DefaultFileSchema};
 pub use store::{AnyStore, CustomStore, FsStore, ObjectStoreBackend, StoreError, StoredChunk};
 pub use sweep::{SweepError, sweep};

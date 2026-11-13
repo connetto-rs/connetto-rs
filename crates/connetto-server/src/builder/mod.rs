@@ -153,14 +153,15 @@ impl ContentTicketSigner for ContentSigner {
         caller: &connetto_core::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
+        carry: Option<&connetto_core::auth::ContentCarry>,
     ) -> Result<String, Self::Error> {
         // The no-content build has no file arm, so keep the parameters used.
-        let _ = (caller, file_id, verb);
+        let _ = (caller, file_id, verb, carry);
         match self {
             Self::None => Err(ContentSignerError::NotConfigured),
             #[cfg(feature = "content")]
             Self::Files(signer) => {
-                ContentTicketSigner::mint(signer.as_ref(), caller, file_id, verb)
+                ContentTicketSigner::mint(signer.as_ref(), caller, file_id, verb, carry)
                     .await
                     .map_err(ContentSignerError::Ticket)
             }
@@ -1290,6 +1291,9 @@ impl<Id, Desc> fmt::Debug for OnSignIn<Id, Desc> {
 struct AuthHooks<D: ConnettoSchema> {
     describer: Option<Describer<Desc<D>>>,
     sign_in: Option<SignInHook<D::Id, Desc<D>>>,
+    /// The server's one audit sink, so every recorder's rows land in the
+    /// order the server emitted them.
+    audit: crate::audit::AuditHook<D::Id>,
 }
 
 impl ServerBuilder {
@@ -1816,6 +1820,7 @@ where
         let guard = build_guard::<D>(&pool, reader_reserve.gate(), &throttle, abuse, bans);
         let sign_in = sign_in.map(|OnSignIn(hook)| hook);
         let download_reader = reader_pool.clone();
+        let audit = pg_audit_hook::<D>(pool.clone());
         let (service, registry) = build_auth::<D>(
             &pool,
             resolver.0,
@@ -1826,6 +1831,7 @@ where
             AuthHooks {
                 describer,
                 sign_in: sign_in.clone(),
+                audit: Arc::clone(&audit),
             },
         )
         .await?;
@@ -1837,9 +1843,10 @@ where
             &schema,
             &publication,
             content,
-            &mut completion.sweep,
+            audit,
         )
         .await?;
+        completion.sweep = reader.sweep.as_ref().map(BackgroundTask::completion);
         let portability = portability
             .map(|list| {
                 list.serve(
@@ -2264,9 +2271,8 @@ async fn build_auth<D: ConnettoSchema>(
     }
     // The same sink on both, because a ban is detected in the guard and
     // every other access change is produced here.
-    let audit = pg_audit_hook::<D>(pool.clone());
-    service.guard().set_audit_hook(Arc::clone(&audit));
-    service.set_audit_hook(audit);
+    service.guard().set_audit_hook(Arc::clone(&hooks.audit));
+    service.set_audit_hook(hooks.audit);
     // A ban ends every session of the banned identity (R105 decision 8). The
     // guard holds the hook and the service holds the guard, so the hook
     // reaches the service through a weak handle rather than a cycle.
@@ -2298,7 +2304,7 @@ async fn build_reader_side<D: ConnettoSchema>(
     schema: &ServerSchema,
     publication: &str,
     content: Option<ContentSettings>,
-    completion: &mut Option<TaskCompletion>,
+    audit: crate::audit::AuditHook<D::Id>,
 ) -> Result<ReaderSide, BuildError> {
     let content::FileHalf {
         signer,
@@ -2310,7 +2316,7 @@ async fn build_reader_side<D: ConnettoSchema>(
         &database.owner_url,
         &database.reader_url,
         reader_pool_size,
-        completion,
+        audit,
     )
     .await?;
     let snapshot = PgSnapshotSource::from_ddl(pool.clone(), &schema.engine_ddl::<D>())?
@@ -3013,6 +3019,7 @@ mod tests {
             &identified("u-1"),
             [0u8; 32],
             ContentVerb::Read,
+            None,
         )
         .await
         .expect_err("no signer is configured");

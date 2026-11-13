@@ -25,6 +25,7 @@ fn write_payload(
             ceiling,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap()
 }
@@ -42,6 +43,7 @@ fn read_payload(
             ceiling,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified(caller),
+            carry: None,
         })
         .unwrap()
 }
@@ -227,6 +229,7 @@ async fn a_caller_b_sees_all_needed_while_caller_a_sees_none() {
             ceiling: 1024 * 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("bob"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -463,6 +466,7 @@ async fn mid_stream_ceiling_crossing_refused() {
             ceiling: 120,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
 
@@ -549,6 +553,7 @@ async fn re_put_does_not_double_count() {
             ceiling: 200,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
 
@@ -1564,6 +1569,7 @@ async fn commit_without_put_refused_same_as_chunk_never_stored() {
             ceiling: chunk_a.len + chunk_b.len + 256,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let body_x = serde_json::json!({
@@ -1633,6 +1639,7 @@ async fn commit_without_put_refused_same_as_chunk_never_stored() {
             ceiling: chunk_a.len + 256,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("bob"),
+            carry: None,
         })
         .unwrap();
     let body_b = serde_json::json!({
@@ -1697,6 +1704,7 @@ async fn commit_without_put_refused_same_as_chunk_never_stored() {
             ceiling: 1024 * 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("carol"),
+            carry: None,
         })
         .unwrap();
     let carol_hex = "03".repeat(32);
@@ -1824,6 +1832,7 @@ async fn commit_by_non_declarer_refused() {
             ceiling: u64::try_from(data.len()).unwrap() + 256,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("dave"),
+            carry: None,
         })
         .unwrap();
     let resp = app
@@ -1964,6 +1973,7 @@ async fn dedup_commit_round_trip() {
             ceiling: target_ceiling,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
 
@@ -2150,6 +2160,7 @@ async fn dedup_commit_rejected_for_invisible_file() {
             ceiling: bob_ceiling,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("bob"),
+            carry: None,
         })
         .unwrap();
 
@@ -2363,6 +2374,7 @@ async fn intent_refuses_too_many_chunks() {
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let file_hex = format!("{file_id}");
@@ -2514,6 +2526,7 @@ async fn dedup_commit_rejected_for_invisible_file_rls_only() {
             ceiling: bob_ceiling,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("bob"),
+            carry: None,
         })
         .unwrap();
 
@@ -2800,6 +2813,7 @@ async fn two_callers_identical_content_both_commit() {
             ceiling: u64::try_from(data.len()).unwrap() + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let bob_ticket = signer
@@ -2809,6 +2823,7 @@ async fn two_callers_identical_content_both_commit() {
             ceiling: u64::try_from(data.len()).unwrap() + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("bob"),
+            carry: None,
         })
         .unwrap();
 
@@ -3003,6 +3018,7 @@ async fn non_declarer_cannot_commit_after_composite_key_fix() {
             ceiling: u64::try_from(data.len()).unwrap() + 256,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("dave"),
+            carry: None,
         })
         .unwrap();
     let resp = app
@@ -3047,6 +3063,7 @@ async fn get_file_scoped_to_committed_caller() {
             ceiling: u64::try_from(data.len()).unwrap() + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("bob"),
+            carry: None,
         })
         .unwrap();
 
@@ -3112,6 +3129,7 @@ async fn get_file_scoped_to_committed_caller() {
             ceiling: u64::try_from(data.len()).unwrap() + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
     let resp = app
@@ -3143,6 +3161,7 @@ async fn get_file_scoped_to_committed_caller() {
             ceiling: u64::try_from(data.len()).unwrap() + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("bob"),
+            carry: None,
         })
         .unwrap();
     let resp = app
@@ -3174,6 +3193,7 @@ async fn get_file_scoped_to_committed_caller() {
             ceiling: u64::try_from(data.len()).unwrap() + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("charlie"),
+            carry: None,
         })
         .unwrap();
     let resp = app
@@ -3316,6 +3336,7 @@ async fn put_chunk_with_u64_max_ceiling_succeeds() {
             ceiling: u64::MAX,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: crate::fixture::identified("alice"),
+            carry: None,
         })
         .unwrap();
 
@@ -3393,6 +3414,7 @@ async fn intent_and_commit_under_a_key_only_caller() {
                 ceiling: 1 << 20,
                 expiry: chrono::Utc::now().timestamp() + 3600,
                 caller: crate::fixture::keyed([SUBJECT]),
+                carry: None,
             })
             .unwrap()
     };
@@ -3446,6 +3468,7 @@ async fn an_unnamed_caller_cannot_declare_a_manifest() {
             ceiling: 1 << 20,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: connetto_file_server::ContentCaller::default(),
+            carry: None,
         })
         .unwrap();
     let chunks_json: Vec<serde_json::Value> = manifest
@@ -3578,6 +3601,7 @@ fn write_ticket(
             ceiling: 1 << 20,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: caller.clone(),
+            carry: None,
         })
         .unwrap()
 }
@@ -3661,6 +3685,7 @@ async fn a_caller_holding_two_keys_sees_its_own_upload() {
             ceiling: 1 << 20,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: both,
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -3684,6 +3709,7 @@ async fn a_caller_holding_two_keys_sees_its_own_upload() {
                 ceiling: 1 << 20,
                 expiry: chrono::Utc::now().timestamp() + 3600,
                 caller: keyed([key]),
+                carry: None,
             })
             .unwrap();
         let req = axum::http::Request::builder()

@@ -78,6 +78,7 @@ async fn every_auth_op_round_trips_through_postgres() {
         AuthOp::WriteCouriered,
         AuthOp::DataDownloaded,
         AuthOp::DataErased,
+        AuthOp::ContentCarried,
     ];
     for op in all {
         let session = SessionId::from_uuid(uuid::Uuid::new_v4());

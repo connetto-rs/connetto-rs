@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use connetto_core::auth::ContentCaller;
+use connetto_core::auth::{ContentCaller, ContentCarry};
 use connetto_core::messages::ContentVerb;
 use connetto_core::traits::ContentTicketSigner;
 use postcard;
@@ -41,6 +41,9 @@ pub struct TicketPayload {
     pub expiry: i64,
     /// The caller this ticket binds to, both halves of it.
     pub caller: ContentCaller,
+    /// The account a write uploads the file for and the session that minted
+    /// it, when the caller carries another account's file (R79 decision 17).
+    pub carry: Option<ContentCarry>,
 }
 
 /// Error produced by ticket operations.
@@ -239,6 +242,7 @@ impl ContentTicketSigner for TicketSigner {
         caller: &ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
+        carry: Option<&ContentCarry>,
     ) -> impl core::future::Future<Output = Result<String, Self::Error>> + Send {
         let result: Result<String, TicketError> = (|| {
             let ttl_secs = i64::try_from(self.ticket_ttl.as_secs())
@@ -257,6 +261,7 @@ impl ContentTicketSigner for TicketSigner {
                 ceiling,
                 expiry,
                 caller: caller.clone(),
+                carry: carry.cloned(),
             };
             let token = TicketSigner::mint(self, &payload)?;
             let hex_id = crate::hex_32(&file_id);

@@ -9,13 +9,15 @@ Content bytes never enter Postgres. Chunks live in a local filesystem directory 
 
 ## Deployment contracts
 
-The server relies on two SQL artifacts the deployment provisions before startup.
+The server relies on three SQL artifacts the deployment provisions before startup.
 
 `connetto_visible_files(file_ids BYTEA[]) RETURNS BYTEA[]` runs with caller rights (SECURITY INVOKER) and requires `SET search_path` so the deployment's own row-level security applies. It answers which of the supplied file ids the current caller may see and drives the upload dedup oracle prevention.
 
 `connetto_set_content_state(file_id BYTEA, new_state TEXT, caller TEXT)` is a SECURITY DEFINER setter that writes `content_state` on the deployment's metadata table after a successful commit, requires `SET search_path`, and triggers the CDC availability signal without requiring a direct UPDATE grant for the file server role.
 
-`preflight()` verifies both functions exist with the correct signatures before the server accepts any request, and names exactly what is missing when one is absent.
+`connetto_file_owner(file_id BYTEA) RETURNS TEXT` runs with caller rights (SECURITY INVOKER) and requires `SET search_path`. It names the one account owning the file as the caller can see it, or `NULL`, so a device can upload a file for its owner, recorded and metered under the owner and naming its carrier.
+
+`preflight()` verifies all three functions exist with the correct signatures before the server accepts any request, and names exactly what is missing when one is absent.
 
 ## Upload flow
 

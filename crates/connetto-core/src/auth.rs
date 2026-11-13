@@ -259,6 +259,32 @@ impl<Id, Key> Principal<Id, Key> {
     }
 }
 
+/// What a write ticket carries when its caller uploads another account's
+/// file (R79 decision 17): the account the manifest is recorded for, and the
+/// session that minted the ticket, under which the carry is audited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentCarry {
+    /// The account the deployment's `connetto_file_owner` answered for the
+    /// file, which the manifest records as its uploader.
+    pub owner: String,
+    /// The carrier's session at the mint.
+    pub session: SessionId,
+}
+
+impl ContentCarry {
+    /// The key the carried upload is recorded and metered under, the owner's
+    /// own, as [`ContentCaller::storage_key`] renders an identity.
+    #[must_use]
+    pub fn storage_key(&self) -> String {
+        identity_key(&self.owner)
+    }
+}
+
+/// The key an identity owns rows and meters under.
+fn identity_key(identity: &str) -> String {
+    format!("user:{identity}")
+}
+
 /// The caller a content ticket carries: the identity, the capability
 /// subjects it holds, and the bot list a login bound on the run.
 ///
@@ -361,12 +387,10 @@ impl ContentCaller {
     /// A caller holding neither half has no key, so it owns nothing.
     #[must_use]
     pub fn storage_key(&self, separator: char) -> Option<String> {
-        self.identity()
-            .map(|identity| format!("user:{identity}"))
-            .or_else(|| {
-                self.packed_subjects(separator)
-                    .map(|subjects| format!("keys:{subjects}"))
-            })
+        self.identity().map(identity_key).or_else(|| {
+            self.packed_subjects(separator)
+                .map(|subjects| format!("keys:{subjects}"))
+        })
     }
 }
 

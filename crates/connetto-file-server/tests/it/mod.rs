@@ -5,6 +5,7 @@
 //! RLS policy, `connetto_file_server` reader role, visibility view, and
 //! the content-state setter) before each test.
 
+mod carried;
 mod fixture;
 mod macro_hygiene;
 mod preflight;

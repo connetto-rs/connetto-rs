@@ -1540,6 +1540,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "object_store",
+ "parking_lot",
  "postcard",
  "reqwest 0.12.28",
  "ring",

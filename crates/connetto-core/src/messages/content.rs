@@ -29,6 +29,13 @@ pub struct ContentTicketRequest {
     pub file_id: [u8; 32],
     /// What the caller intends to do.
     pub verb: ContentVerb,
+    /// The account a write uploads the file for, when the caller carries
+    /// another account's file to the server (R79 decision 17). The server
+    /// mints such a ticket only for the write verb and only when the
+    /// deployment's `connetto_file_owner` answers this account for the file.
+    /// Absent from older clients, which upload under their own account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_owner: Option<String>,
 }
 
 /// Server hands back an address the caller may fetch or upload to.

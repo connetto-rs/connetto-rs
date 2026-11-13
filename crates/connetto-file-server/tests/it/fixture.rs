@@ -20,6 +20,20 @@ use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
+/// The owner function every fixture installs: the account of the metadata
+/// row naming the file, as the caller's own rights read it, `NULL` when
+/// those rows name none or more than one (R79 decision 17).
+pub const OWNER_FN: &str = "CREATE OR REPLACE FUNCTION connetto_file_owner(p_file_id BYTEA)
+     RETURNS TEXT LANGUAGE sql SECURITY INVOKER
+         SET search_path TO '' AS $$
+         SELECT CASE WHEN count(DISTINCT m.uploaded_by) = 1 THEN min(m.uploaded_by) END
+         FROM public.test_file_metadata m WHERE m.file_id = p_file_id
+     $$";
+
+/// The reader's grant on [`OWNER_FN`].
+pub const OWNER_GRANT: &str =
+    "GRANT EXECUTE ON FUNCTION connetto_file_owner TO connetto_file_server";
+
 /// Individual DDL statements applied by tests (not part of the shipped DDL const).
 ///
 /// Each entry is a complete Postgres statement. Using a slice avoids splitting
@@ -74,6 +88,8 @@ pub const FIXTURE_STMTS: &[&str] = &[
      END;
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+    OWNER_FN,
+    OWNER_GRANT,
 ];
 
 /// DDL statements for a deployment whose `connetto_visible_files` relies on RLS
@@ -130,6 +146,8 @@ pub const FIXTURE_STMTS_RLS_ONLY: &[&str] = &[
      END;
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+    OWNER_FN,
+    OWNER_GRANT,
 ];
 
 /// DDL for a deployment whose policy and visibility function read the packed
@@ -180,6 +198,8 @@ pub const FIXTURE_STMTS_SUBJECTS: &[&str] = &[
      END;
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+    OWNER_FN,
+    OWNER_GRANT,
 ];
 
 /// DDL for a deployment that named its own identity setting, `app.who`.
@@ -226,6 +246,8 @@ pub const FIXTURE_STMTS_OWN_SETTING: &[&str] = &[
      END;
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+    OWNER_FN,
+    OWNER_GRANT,
 ];
 
 /// DDL for the deployment whose metadata table the bot cap holds (R91).
@@ -283,6 +305,8 @@ pub const FIXTURE_STMTS_BOT_LIST: &[&str] = &[
      END;
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+    OWNER_FN,
+    OWNER_GRANT,
 ];
 
 pub struct Pg {
@@ -711,6 +735,7 @@ pub async fn build_router_with_quotas(
         caller_settings,
         quotas,
         ceilings,
+        on_carried: None,
         _schema: std::marker::PhantomData,
     };
     (

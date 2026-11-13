@@ -151,8 +151,9 @@ impl ContentTicketSigner for Signer {
         caller: &ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
+        carry: Option<&connetto_core::auth::ContentCarry>,
     ) -> impl core::future::Future<Output = Result<String, Self::Error>> + Send {
-        ContentTicketSigner::mint(&*self.0, caller, file_id, verb)
+        ContentTicketSigner::mint(&*self.0, caller, file_id, verb, carry)
     }
 }
 

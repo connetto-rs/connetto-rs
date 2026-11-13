@@ -172,6 +172,7 @@ fn ticket(signer: &TicketSigner, file_id: &FileId, verb: Verb, who: &str) -> Str
             ceiling: 64 * 1024 * 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: identified(who),
+            carry: None,
         })
         .unwrap()
 }
