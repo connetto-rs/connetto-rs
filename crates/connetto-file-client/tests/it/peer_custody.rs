@@ -654,6 +654,32 @@ async fn a_holder_answers_a_newly_marked_file_at_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mark_on_a_file_the_holder_lacks_gets_no_answer() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    let file = *camp.file_id.as_bytes();
+    camp.with_reader(|mut reader| async move {
+        reader
+            .send(Reader::holdings(&[[3; 32]], &[[3; 32]], 7))
+            .await;
+        reader
+            .send(Media::Held {
+                added: vec![file],
+                removed: Vec::new(),
+                staying: Vec::new(),
+                leaving: vec![file],
+                number: 8,
+                seen: None,
+            })
+            .await;
+        let Media::Held { seen, .. } = reader.next_numbered().await else {
+            panic!("the receiver answers the mark on its own copy");
+        };
+        assert_eq!(seen, Some(8), "the mark on a file it lacks went unanswered");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_whose_driver_starts_again_is_told_everything_again() {
     let camp = Camp::new(64 * 1024 * 1024).await;
     let file = *camp.file_id.as_bytes();

@@ -112,6 +112,19 @@ fn a_taker_far_slower_to_every_source_than_the_median_is_left_out() {
         2,
         "rates to a device holding nothing do not count"
     );
+    let crawl = rates(1);
+    let devices = [
+        Candidate {
+            rates: &crawl,
+            ..candidate(1, "a", 100)
+        },
+        candidate(2, "b", 100),
+    ];
+    assert_eq!(
+        takers(&FILE, 1, &devices, &[source]).len(),
+        2,
+        "a lone measured rate has no median to fall under"
+    );
 }
 
 /// One placement of `FILE` with a count of `copies`, this device keyed 1.
@@ -341,9 +354,9 @@ impl World {
                 world.devices[from].links.linked(&key);
             }
         }
-        for from in 0..count {
+        for (from, &claimed) in claims.iter().enumerate() {
             for to in (0..count).filter(|to| *to != from) {
-                let (holding, claimed) = (world.devices[from].holding, claims[from]);
+                let holding = world.devices[from].holding;
                 let held = if holding == Holding::Absent {
                     vec![]
                 } else {
