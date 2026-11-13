@@ -24,6 +24,7 @@ use connetto_core::auth::{
 };
 use diesel::sql_types::{Bool, Text};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use subql::ColumnId;
 use subql::backend::{Postgres, Value};
 use subql::visibility::{RowWrite, Verdict, VisibilityPolicy, WriteOp};
 
@@ -292,11 +293,16 @@ impl ShareLevel {
     /// [`RowWrite::UpdateUsing`], which is subql's question for exactly this
     /// case: whether the row as it stands may be replaced at all. It is the
     /// weaker half of the full replacement question, and it is the half a
-    /// delegated permission over a row needs.
-    fn writes<R: ?Sized>(self, row: &R) -> impl Iterator<Item = RowWrite<'_, R>> {
+    /// delegated permission over a row needs. `read` is what both verbs read,
+    /// the key a shared write names the row by.
+    fn writes<'a, R: ?Sized>(
+        self,
+        row: &'a R,
+        read: &'a [ColumnId],
+    ) -> impl Iterator<Item = RowWrite<'a, R>> {
         [
-            (self.update, RowWrite::UpdateUsing { old: row }),
-            (self.delete, RowWrite::Delete { old: row }),
+            (self.update, RowWrite::UpdateUsing { old: row, read }),
+            (self.delete, RowWrite::Delete { old: row, read }),
         ]
         .into_iter()
         .filter_map(|(named, write)| named.then_some(write))
@@ -309,7 +315,7 @@ impl ShareLevel {
     /// and never the row, which keeps one ordered list rather than two that
     /// can drift.
     pub fn verbs(self) -> impl Iterator<Item = WriteOp> {
-        self.writes(&()).map(|write| write.op())
+        self.writes(&(), &[]).map(|write| write.op())
     }
 }
 
@@ -560,7 +566,7 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
         // words: no database write follows a mint, so this loop is the only gate
         // there is, and reporting an unanswered question as a denial would tell
         // an operator the row is unwritable when the truth is that nothing knew.
-        for write in level.writes(&view) {
+        for write in level.writes(&view, &row.key) {
             let op = write.op();
             let verdict = self
                 .policy

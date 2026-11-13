@@ -506,6 +506,7 @@ impl RowSource for AlwaysFound {
         Ok(Some(SourceRow {
             table_id: 0,
             values: Vec::new(),
+            key: Vec::new(),
         }))
     }
 }
@@ -526,6 +527,7 @@ impl RowSource for FixedRow {
         std::future::ready(Ok(Some(SourceRow {
             table_id: 0,
             values: vec![Value::Int(self.0)],
+            key: vec![0],
         })))
     }
 }

@@ -24,7 +24,7 @@ connetto-demo-support = { path = "../../demo-support", default-features = false,
 # The content lane the photos stage through and the export and import name.
 connetto-file-client = { path = "../../../crates/connetto-file-client" }
 diesel = { version = "2", features = ["sqlite", "chrono"] }
-diesel-async = { version = "0.9", default-features = false, features = ["postgres", "bb8"] }
+diesel-async = { version = "0.10", default-features = false, features = ["postgres", "bb8"] }
 parking_lot = "0.12"
 rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "postgres"] }
 serde = { version = "1", features = ["derive"] }

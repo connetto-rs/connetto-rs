@@ -191,9 +191,9 @@ impl VisibilityPolicy for RosterAuth {
         R: RowView<Backend = Postgres> + Sync + ?Sized,
     {
         let touches_withheld = match write {
-            RowWrite::Insert { new } => self.withholds(new),
-            RowWrite::Update { old, new } => self.withholds(old) || self.withholds(new),
-            RowWrite::UpdateUsing { old } | RowWrite::Delete { old } => self.withholds(old),
+            RowWrite::Insert { new, .. } => self.withholds(new),
+            RowWrite::Update { old, new, .. } => self.withholds(old) || self.withholds(new),
+            RowWrite::UpdateUsing { old, .. } | RowWrite::Delete { old, .. } => self.withholds(old),
             // The question learned a verb this does not know, so it refuses
             // rather than guessing which version it should have looked at.
             _ => true,
@@ -348,22 +348,40 @@ mod tests {
         let own = Row(1);
         let withheld = Row(WITHHELD_ID);
         assert_eq!(
-            auth.may_write(RowWrite::Insert { new: &own }, &alice)
-                .await
-                .expect("infallible"),
+            auth.may_write(
+                RowWrite::Insert {
+                    new: &own,
+                    assigned: &[0]
+                },
+                &alice
+            )
+            .await
+            .expect("infallible"),
             Verdict::Allow
         );
         assert_eq!(
-            auth.may_write(RowWrite::Insert { new: &own }, &mallory)
-                .await
-                .expect("infallible"),
+            auth.may_write(
+                RowWrite::Insert {
+                    new: &own,
+                    assigned: &[0]
+                },
+                &mallory
+            )
+            .await
+            .expect("infallible"),
             Verdict::Deny,
             "a caller the roster does not name writes nothing"
         );
         assert_eq!(
-            auth.may_write(RowWrite::Delete { old: &withheld }, &alice)
-                .await
-                .expect("infallible"),
+            auth.may_write(
+                RowWrite::Delete {
+                    old: &withheld,
+                    read: &[0]
+                },
+                &alice
+            )
+            .await
+            .expect("infallible"),
             Verdict::Deny,
             "the withheld row cannot be written either"
         );
@@ -372,6 +390,8 @@ mod tests {
                 RowWrite::Update {
                     old: &own,
                     new: &withheld,
+                    assigned: &[0],
+                    read: &[0],
                 },
                 &alice,
             )

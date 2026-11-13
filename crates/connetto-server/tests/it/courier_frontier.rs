@@ -794,7 +794,7 @@ impl VisibilityPolicy for Faulting {
     where
         R: RowView<Backend = PgBackend> + Sync + ?Sized,
     {
-        if let RowWrite::Insert { new } = &write
+        if let RowWrite::Insert { new, .. } = &write
             && matches!(new.value_at(0), Ok(Value::Int(FAULTED)))
         {
             return Err(std::io::Error::other("the policy store did not answer"));
