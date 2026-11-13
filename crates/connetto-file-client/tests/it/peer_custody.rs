@@ -11,14 +11,16 @@ use std::time::Duration;
 use connetto_client::ClientEvent;
 use connetto_client::live::ConnettoClient;
 use connetto_client::peer::PeerAuthor;
+use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::exchange::{RetractCause, Retraction};
 use connetto_exchange::media::Media;
 use connetto_file_client::{ContentError, ContentEvent, FileId, Resolved};
+use connetto_peer::Node;
 use tokio::sync::mpsc;
 
 use crate::peer_support::{
     Device, Devices, apply_entry, beside, beside_both, captured_photo, declare_replicated,
-    deliver_state, lapse_in, listener, port, replica, set_state, stage,
+    deliver_state, lapse_in, link_to, listener, port, replica, set_custody_state, set_state, stage,
 };
 use crate::retention::pseudorandom;
 use crate::support::Scripted;
@@ -77,9 +79,22 @@ async fn next(inbox: &mut mpsc::UnboundedReceiver<Media>) -> Media {
             .expect("a report arrives")
             .expect("the listener runs");
         if !matches!(message, Media::Room { .. }) {
-            return message;
+            return unseen(message);
         }
     }
+}
+
+/// `report` with its number and `seen` cleared, since the tests compare
+/// what a report says of custody and the driver numbers its reports itself.
+fn unseen(mut report: Media) -> Media {
+    if let Media::Holdings { number, seen, .. }
+    | Media::Held { number, seen, .. }
+    | Media::Room { number, seen, .. } = &mut report
+    {
+        *number = 0;
+        *seen = None;
+    }
+    report
 }
 
 /// A receiver that applied anna's provisional photo row, row 7 naming a file
@@ -146,32 +161,85 @@ impl Camp {
     }
 
     /// Runs `proof` beside the receiver's media driver with a reader in
-    /// anna's account linked to it, handing the proof the reader's inbox
-    /// once its opening report arrived, with the files it named.
-    async fn with_reader<F: Future<Output = ()>>(
-        &self,
-        proof: impl FnOnce(mpsc::UnboundedReceiver<Media>, Vec<[u8; 32]>) -> F,
-    ) {
+    /// anna's account linked to it, handing the proof the reader once its
+    /// opening report arrived.
+    async fn with_reader<F: Future<Output = ()>>(&self, proof: impl FnOnce(Reader) -> F) {
         let devices = Devices::new();
-        let (receiver_node, receiver_addr, receiver_events) =
-            devices.node(&devices.device("r77", 3));
-        let (reader, _, reader_events) = devices.node(&devices.device("anna", 4));
+        let receiver = devices.device("r77", 3);
+        let (receiver_node, receiver_addr, receiver_events) = devices.node(&receiver);
+        let (node, _, reader_events) = devices.node(&devices.device("anna", 4));
         let mut inbox = listener(reader_events);
         beside(
             &self.receiver,
             port(receiver_node, receiver_events),
             async {
-                reader
-                    .link(receiver_addr)
-                    .await
-                    .expect("the link completes");
-                let Media::Holdings { held, .. } = next(&mut inbox).await else {
+                node.link(receiver_addr).await.expect("the link completes");
+                let Media::Holdings { held, leaving, .. } = next(&mut inbox).await else {
                     panic!("a report opens the link");
                 };
-                proof(inbox, held).await;
+                proof(Reader {
+                    inbox,
+                    held,
+                    leaving,
+                    node,
+                    receiver: receiver.identity,
+                })
+                .await;
             },
         )
         .await;
+    }
+}
+
+/// A bare device in anna's account linked to the receiver.
+struct Reader {
+    /// Every media message the receiver sends it.
+    inbox: mpsc::UnboundedReceiver<Media>,
+    /// The files the receiver's opening report named held.
+    held: Vec<[u8; 32]>,
+    /// The files it named leaving.
+    leaving: Vec<[u8; 32]>,
+    /// The reader's node.
+    node: Node,
+    /// The receiver.
+    receiver: DeviceIdentity,
+}
+
+impl Reader {
+    /// Sends `report` to the receiver over the live link.
+    async fn send(&self, report: Media) {
+        self.node
+            .send_media(&self.receiver, link_to(&self.node, &self.receiver), report)
+            .await
+            .expect("the report queues");
+    }
+
+    /// The reader's full report holding `held` and marking `leaving`, as
+    /// report `number` of a driver that has received nothing yet.
+    fn holdings(held: &[[u8; 32]], leaving: &[[u8; 32]], number: u64) -> Media {
+        Media::Holdings {
+            room: 0,
+            rates: Vec::new(),
+            held: held.to_vec(),
+            leaving: leaving.to_vec(),
+            number,
+            seen: None,
+            last: true,
+        }
+    }
+
+    /// The next custody report, its number and `seen` kept, room reports
+    /// skipped.
+    async fn next_numbered(&mut self) -> Media {
+        loop {
+            let message = tokio::time::timeout(BOUND, self.inbox.recv())
+                .await
+                .expect("a report arrives")
+                .expect("the listener runs");
+            if !matches!(message, Media::Room { .. }) {
+                return message;
+            }
+        }
     }
 }
 
@@ -180,7 +248,10 @@ fn held_change(added: Vec<[u8; 32]>, removed: Vec<[u8; 32]>) -> Media {
     Media::Held {
         added,
         removed,
+        staying: Vec::new(),
         leaving: Vec::new(),
+        number: 0,
+        seen: None,
     }
 }
 
@@ -324,7 +395,15 @@ async fn a_settled_copy_leaves_custody_when_sync_says_available() {
     let camp = Camp::new(64 * 1024 * 1024).await;
     let (client, server, file) = (&camp.client, &camp.server, *camp.file_id.as_bytes());
     let mut events = client.events();
-    camp.with_reader(|mut inbox, held| async move {
+    camp.with_reader(|reader| async move {
+        // Binding the node keeps it, and the reader's link, alive through the
+        // proof.
+        let Reader {
+            mut inbox,
+            held,
+            node: _node,
+            ..
+        } = reader;
         assert_eq!(held, [file]);
         settle(client).await;
         tokio::time::timeout(BOUND, async {
@@ -356,7 +435,15 @@ async fn a_cache_copy_returns_to_custody_when_sync_says_lost() {
     let camp = Camp::new(1000).await;
     settle(&camp.client).await;
     let (server, file) = (&camp.server, *camp.file_id.as_bytes());
-    camp.with_reader(|mut inbox, held| async move {
+    camp.with_reader(|reader| async move {
+        // Binding the node keeps it, and the reader's link, alive through the
+        // proof.
+        let Reader {
+            mut inbox,
+            held,
+            node: _node,
+            ..
+        } = reader;
         assert!(held.is_empty(), "the copy did not fit, so it is cache");
         deliver_state(server, 1, 7, "lost");
         assert_eq!(next(&mut inbox).await, held_change(vec![file], Vec::new()));
@@ -369,7 +456,15 @@ async fn a_copy_leaves_custody_when_its_author_lapses_under_a_running_driver() {
     let camp = Camp::new(64 * 1024 * 1024).await;
     lapse_in(&camp.client, &anna(), 2).await;
     let file = *camp.file_id.as_bytes();
-    camp.with_reader(|mut inbox, held| async move {
+    camp.with_reader(|reader| async move {
+        // Binding the node keeps it, and the reader's link, alive through the
+        // proof.
+        let Reader {
+            mut inbox,
+            held,
+            node: _node,
+            ..
+        } = reader;
         assert_eq!(held, [file]);
         assert_eq!(
             next(&mut inbox).await,
@@ -444,7 +539,15 @@ async fn a_retraction_under_a_running_driver_reports_the_copy_removed_and_the_ro
     let budget = 64 * 1024 * 1024;
     let camp = Camp::new(budget).await;
     let (client, file) = (&camp.client, *camp.file_id.as_bytes());
-    camp.with_reader(|mut inbox, held| async move {
+    camp.with_reader(|reader| async move {
+        // Binding the node keeps it, and the reader's link, alive through the
+        // proof.
+        let Reader {
+            mut inbox,
+            held,
+            node: _node,
+            ..
+        } = reader;
         assert_eq!(held, [file]);
         retract(client).await;
         assert_eq!(next(&mut inbox).await, held_change(Vec::new(), vec![file]));
@@ -516,5 +619,112 @@ async fn the_author_hears_how_many_devices_hold_its_file() {
             .expect("the author hears the receiver's custody");
         },
     )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_holder_answers_a_newly_marked_file_at_once() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    let file = *camp.file_id.as_bytes();
+    camp.with_reader(|mut reader| async move {
+        assert_eq!(reader.held, [file]);
+        reader.send(Reader::holdings(&[file], &[file], 7)).await;
+        let Media::Held {
+            added,
+            removed,
+            staying,
+            leaving,
+            seen,
+            ..
+        } = reader.next_numbered().await
+        else {
+            panic!("the receiver answers with a custody change");
+        };
+        assert!(
+            added.is_empty() && removed.is_empty() && staying.is_empty() && leaving.is_empty(),
+            "an idle holder's answer changes nothing"
+        );
+        assert_eq!(
+            seen,
+            Some(7),
+            "and acknowledges the report that marked the file"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mark_on_a_file_the_holder_lacks_gets_no_answer() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    let file = *camp.file_id.as_bytes();
+    camp.with_reader(|mut reader| async move {
+        reader
+            .send(Reader::holdings(&[[3; 32]], &[[3; 32]], 7))
+            .await;
+        reader
+            .send(Media::Held {
+                added: vec![file],
+                removed: Vec::new(),
+                staying: Vec::new(),
+                leaving: vec![file],
+                number: 8,
+                seen: None,
+            })
+            .await;
+        let Media::Held { seen, .. } = reader.next_numbered().await else {
+            panic!("the receiver answers the mark on its own copy");
+        };
+        assert_eq!(seen, Some(8), "the mark on a file it lacks went unanswered");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_whose_driver_starts_again_is_told_everything_again() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    let file = *camp.file_id.as_bytes();
+    camp.with_reader(|mut reader| async move {
+        reader.send(Reader::holdings(&[], &[], 0)).await;
+        // A driver started again on the same link numbers on and has
+        // received nothing.
+        reader.send(Reader::holdings(&[], &[], 1)).await;
+        let Media::Holdings { held, seen, .. } = reader.next_numbered().await else {
+            panic!("the receiver reports in full again");
+        };
+        assert_eq!(held, [file]);
+        assert_eq!(seen, Some(1));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_marked_leaving_is_reported_so_and_its_withdrawal_as_staying() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    let (client, file_id, file) = (&camp.client, camp.file_id, *camp.file_id.as_bytes());
+    set_custody_state(client, file_id, "leaving").await;
+    camp.with_reader(|mut reader| async move {
+        assert_eq!(
+            (&reader.held[..], &reader.leaving[..]),
+            (&[file][..], &[file][..])
+        );
+        set_custody_state(client, file_id, "held").await;
+        // The reader marking the file makes the receiver bring its custody
+        // up to date before it answers.
+        reader.send(Reader::holdings(&[file], &[file], 0)).await;
+        let Media::Held {
+            staying, leaving, ..
+        } = reader.next_numbered().await
+        else {
+            panic!("the withdrawal is reported");
+        };
+        assert_eq!((staying, leaving), (vec![file], Vec::new()));
+        assert!(
+            matches!(
+                reader.next_numbered().await,
+                Media::Held { seen: Some(0), .. }
+            ),
+            "then the answer follows"
+        );
+    })
     .await;
 }

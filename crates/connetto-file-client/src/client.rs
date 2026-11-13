@@ -160,6 +160,12 @@ pub struct ContentClient<T: Transport, B: ChunkStore + Clone, H: ContentHttp> {
     /// reports the change to its linked peers.
     #[cfg(feature = "peer")]
     custody_changed: tokio::sync::Notify,
+    /// The number the media driver gives its next holder report, which only
+    /// grows while the client lives, so a driver started again on a link
+    /// that stayed up never reuses a number its peers acknowledge (R79
+    /// decision 16).
+    #[cfg(feature = "peer")]
+    next_report: core::sync::atomic::AtomicU64,
 }
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -216,6 +222,8 @@ where
             custody_reserve: peer::CUSTODY_RESERVE,
             #[cfg(feature = "peer")]
             custody_changed: tokio::sync::Notify::new(),
+            #[cfg(feature = "peer")]
+            next_report: core::sync::atomic::AtomicU64::new(0),
         })
     }
 

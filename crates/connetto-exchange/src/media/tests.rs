@@ -598,12 +598,42 @@ fn holdings(
         rates: rates.to_vec(),
         held: held.to_vec(),
         leaving: leaving.to_vec(),
+        number: 0,
+        seen: None,
         last,
     }
 }
 
-fn reported(actions: &[MediaAction<&'static str, u32>]) -> bool {
-    matches!(actions, [MediaAction::Reported { peer: "bob" }])
+fn delta(
+    added: &[[u8; 32]],
+    removed: &[[u8; 32]],
+    staying: &[[u8; 32]],
+    leaving: &[[u8; 32]],
+) -> Media {
+    Media::Held {
+        added: added.to_vec(),
+        removed: removed.to_vec(),
+        staying: staying.to_vec(),
+        leaving: leaving.to_vec(),
+        number: 0,
+        seen: None,
+    }
+}
+
+/// The files newly marked leaving that the one `Reported` in `actions`
+/// names.
+fn reported(actions: &[MediaAction<&'static str, u32>]) -> Vec<[u8; 32]> {
+    let [
+        MediaAction::Reported {
+            peer: "bob",
+            marked,
+            restarted: false,
+        },
+    ] = actions
+    else {
+        panic!("expected one report from bob, got {actions:?}");
+    };
+    marked.clone()
 }
 
 #[test]
@@ -617,7 +647,7 @@ fn a_holdings_snapshot_reports_once_its_last_frame_arrives() {
         "a partial snapshot reports nothing"
     );
     let last = links.received(&"bob", holdings(&[B], &[B], &[(OTHER_KEY, 9)], true), now);
-    assert!(reported(&last), "{last:?}");
+    assert_eq!(reported(&last), vec![B], "the first report marks B newly");
     let report = links.report(&"bob").expect("the snapshot completed");
     assert!(report.holds(&A) && report.holds(&B) && !report.holds(&C));
     assert!(report.is_leaving(&B) && !report.is_leaving(&A));
@@ -630,10 +660,16 @@ fn a_holdings_snapshot_reports_once_its_last_frame_arrives() {
 fn a_new_snapshot_replaces_the_previous_report() {
     let now = Instant::now();
     let mut links = linked(&["bob"]);
-    links.received(&"bob", holdings(&[A], &[A], &[(KEY, 7)], true), now);
-    links.received(&"bob", holdings(&[B], &[], &[], true), now);
+    links.received(&"bob", holdings(&[A, C], &[A], &[(KEY, 7)], true), now);
+    let again = links.received(
+        &"bob",
+        from_bob(holdings(&[B, C], &[C], &[], true), 1, Some(0)),
+        now,
+    );
+    assert_eq!(reported(&again), vec![C], "only C is newly leaving");
     let report = links.report(&"bob").expect("reported");
     assert!(!report.holds(&A) && !report.is_leaving(&A) && report.holds(&B));
+    assert!(report.is_leaving(&C));
     assert_eq!(report.rate_to(&KEY), None);
 }
 
@@ -642,12 +678,8 @@ fn held_deltas_add_remove_and_mark_leaving() {
     let now = Instant::now();
     let mut links = linked(&["bob"]);
     links.received(&"bob", holdings(&[B, C], &[B], &[], true), now);
-    let delta = Media::Held {
-        added: vec![A],
-        removed: vec![B],
-        leaving: vec![C],
-    };
-    assert!(reported(&links.received(&"bob", delta, now)));
+    let marked = reported(&links.received(&"bob", delta(&[A], &[B], &[], &[C, [0; 32]]), now));
+    assert_eq!(marked, vec![C], "a file bob does not hold is never marked");
     let report = links.report(&"bob").expect("reported");
     assert!(report.holds(&A) && !report.holds(&B) && report.holds(&C));
     assert!(
@@ -655,6 +687,53 @@ fn held_deltas_add_remove_and_mark_leaving() {
         "a removed file leaves nothing behind"
     );
     assert!(report.is_leaving(&C));
+    let again = reported(&links.received(&"bob", delta(&[C], &[], &[], &[C]), now));
+    assert_eq!(
+        again,
+        Vec::<[u8; 32]>::new(),
+        "a mark already read is not new"
+    );
+    assert!(
+        links
+            .report(&"bob")
+            .is_some_and(|report| report.is_leaving(&C)),
+        "adding a held file keeps its mark"
+    );
+}
+
+#[test]
+fn staying_withdraws_a_mark_and_keeps_the_file_held() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    links.received(&"bob", holdings(&[A, B], &[A], &[], true), now);
+    reported(&links.received(&"bob", delta(&[], &[], &[A, B, C], &[]), now));
+    let report = links.report(&"bob").expect("reported");
+    assert!(report.holds(&A) && !report.is_leaving(&A));
+    assert!(report.holds(&B) && !report.is_leaving(&B));
+    assert!(!report.holds(&C), "staying names no file into custody");
+    let marked = reported(&links.received(&"bob", delta(&[], &[], &[], &[A]), now));
+    assert_eq!(marked, vec![A], "a mark after a withdrawal is new again");
+}
+
+#[test]
+fn a_file_removed_and_added_again_comes_back_unmarked() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    links.received(&"bob", holdings(&[A], &[A], &[], true), now);
+    links.received(&"bob", delta(&[], &[A], &[], &[]), now);
+    links.received(&"bob", delta(&[A], &[], &[], &[]), now);
+    let report = links.report(&"bob").expect("reported");
+    assert!(report.holds(&A) && !report.is_leaving(&A));
+}
+
+#[test]
+fn a_snapshot_not_listing_a_file_drops_it_and_its_mark() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    links.received(&"bob", holdings(&[A], &[A], &[], true), now);
+    links.received(&"bob", holdings(&[B], &[], &[], true), now);
+    let report = links.report(&"bob").expect("reported");
+    assert!(!report.holds(&A) && !report.is_leaving(&A));
 }
 
 #[test]
@@ -662,12 +741,7 @@ fn a_delta_crossing_during_a_snapshot_joins_it() {
     let now = Instant::now();
     let mut links = linked(&["bob"]);
     links.received(&"bob", holdings(&[B], &[], &[], false), now);
-    let delta = Media::Held {
-        added: vec![A],
-        removed: vec![B],
-        leaving: vec![],
-    };
-    let during = links.received(&"bob", delta, now);
+    let during = links.received(&"bob", delta(&[A], &[B], &[], &[]), now);
     assert!(during.is_empty(), "{during:?}");
     links.received(&"bob", holdings(&[C], &[], &[], true), now);
     let report = links.report(&"bob").expect("reported");
@@ -678,12 +752,7 @@ fn a_delta_crossing_during_a_snapshot_joins_it() {
 fn a_delta_before_any_snapshot_is_ignored() {
     let now = Instant::now();
     let mut links = linked(&["bob"]);
-    let delta = Media::Held {
-        added: vec![A],
-        removed: vec![],
-        leaving: vec![],
-    };
-    let early = links.received(&"bob", delta, now);
+    let early = links.received(&"bob", delta(&[A], &[], &[], &[]), now);
     assert!(early.is_empty(), "{early:?}");
     assert!(links.report(&"bob").is_none());
 }
@@ -696,8 +765,13 @@ fn room_replaces_the_room_and_the_rates() {
     let room = Media::Room {
         room: 3,
         rates: vec![(OTHER_KEY, 11)],
+        number: 0,
+        seen: None,
     };
-    assert!(reported(&links.received(&"bob", room, now)));
+    assert_eq!(
+        reported(&links.received(&"bob", room, now)),
+        Vec::<[u8; 32]>::new()
+    );
     let report = links.report(&"bob").expect("reported");
     assert_eq!(report.room(), 3);
     assert_eq!(report.rate_to(&KEY), None);
@@ -725,19 +799,232 @@ fn a_lost_link_drops_the_report_and_an_unlinked_peer_reports_nothing() {
 fn reports_carry_no_request_id_and_make_no_request() {
     for report in [
         holdings(&[A], &[], &[], true),
-        Media::Held {
-            added: vec![],
-            removed: vec![],
-            leaving: vec![],
-        },
+        delta(&[], &[], &[], &[]),
         Media::Room {
             room: 0,
             rates: vec![],
+            number: 0,
+            seen: None,
         },
     ] {
         assert_eq!(report.request_id(), None);
         assert_eq!(report.ask(), None);
     }
+}
+
+/// `report` from bob numbered `number` and carrying `seen`.
+fn from_bob(mut report: Media, number: u64, seen: Option<u64>) -> Media {
+    if let Media::Holdings {
+        number: stamped,
+        seen: carried,
+        ..
+    }
+    | Media::Held {
+        number: stamped,
+        seen: carried,
+        ..
+    }
+    | Media::Room {
+        number: stamped,
+        seen: carried,
+        ..
+    } = &mut report
+    {
+        *stamped = number;
+        *carried = seen;
+    }
+    report
+}
+
+/// The number and `seen` `report` carries once stamped as report 99 with
+/// what bob was last heard to send.
+fn stamped(links: &MediaLinks<&'static str, u32>, mut report: Media) -> (u64, Option<u64>) {
+    report.stamp(99, links.seen(&"bob"));
+    let (Media::Holdings { number, seen, .. }
+    | Media::Held { number, seen, .. }
+    | Media::Room { number, seen, .. }) = report
+    else {
+        panic!("a report");
+    };
+    (number, seen)
+}
+
+#[test]
+fn a_report_is_stamped_with_the_latest_number_received_over_the_link() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    assert_eq!(stamped(&links, delta(&[], &[], &[], &[])), (99, None));
+    links.received(
+        &"bob",
+        from_bob(holdings(&[A], &[], &[], false), 40, None),
+        now,
+    );
+    assert_eq!(
+        stamped(&links, delta(&[], &[], &[], &[])),
+        (99, Some(40)),
+        "a run counts as a report"
+    );
+    links.received(
+        &"bob",
+        from_bob(holdings(&[A], &[], &[], true), 41, None),
+        now,
+    );
+    links.received(&"bob", from_bob(delta(&[B], &[], &[], &[]), 45, None), now);
+    assert_eq!(stamped(&links, delta(&[], &[], &[], &[])), (99, Some(45)));
+    assert_eq!(
+        links.seen(&"carl"),
+        None,
+        "an unlinked peer was heard from never"
+    );
+    links.unlinked(&"bob");
+    links.linked(&"bob");
+    assert_eq!(
+        stamped(&links, holdings(&[], &[], &[], true)),
+        (99, None),
+        "a new link has received nothing"
+    );
+}
+
+#[test]
+fn stamping_leaves_a_request_or_a_reply_as_it_is() {
+    for message in [
+        Media::Want {
+            request_id: 1,
+            file_id: FILE,
+        },
+        manifest(1, true),
+        Media::Fetch {
+            request_id: 1,
+            file_id: FILE,
+            start: 0,
+            len: 1,
+        },
+        piece(1, true),
+        Media::Refused { request_id: 1 },
+        Media::Busy { request_id: 1 },
+    ] {
+        let mut stamped = message.clone();
+        stamped.stamp(7, Some(3));
+        assert_eq!(stamped, message);
+    }
+}
+
+#[test]
+fn room_crossing_during_a_snapshot_joins_it_and_room_before_any_is_dropped() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    let room = |room| Media::Room {
+        room,
+        rates: vec![(KEY, 5)],
+        number: 0,
+        seen: None,
+    };
+    let early = links.received(&"bob", room(1), now);
+    assert!(early.is_empty(), "{early:?}");
+    assert!(links.report(&"bob").is_none());
+    links.received(&"bob", holdings(&[A], &[], &[], false), now);
+    let during = links.received(&"bob", room(9), now);
+    assert!(during.is_empty(), "{during:?}");
+    links.received(&"bob", holdings(&[B], &[], &[], true), now);
+    let report = links.report(&"bob").expect("reported");
+    assert_eq!(report.room(), 500, "the last run's room is the report's");
+    assert_eq!(
+        report.rate_to(&KEY),
+        Some(5),
+        "the room's rates joined the runs"
+    );
+}
+
+#[test]
+fn a_report_records_the_seen_it_carries() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    links.received(
+        &"bob",
+        from_bob(holdings(&[A], &[], &[], false), 0, Some(3)),
+        now,
+    );
+    links.received(&"bob", from_bob(delta(&[], &[], &[], &[]), 1, Some(4)), now);
+    links.received(
+        &"bob",
+        from_bob(holdings(&[], &[], &[], true), 2, None),
+        now,
+    );
+    assert_eq!(
+        links.report(&"bob").and_then(super::Report::seen),
+        None,
+        "the last report folded in carried none"
+    );
+    links.received(&"bob", from_bob(delta(&[], &[], &[], &[]), 3, Some(5)), now);
+    assert_eq!(links.report(&"bob").and_then(super::Report::seen), Some(5));
+}
+
+#[test]
+fn a_full_report_from_a_peer_that_received_nothing_after_reporting_asks_for_one_back() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    let first = links.received(
+        &"bob",
+        from_bob(holdings(&[A], &[], &[], true), 0, None),
+        now,
+    );
+    assert!(
+        matches!(
+            first.as_slice(),
+            [MediaAction::Reported {
+                restarted: false,
+                ..
+            }]
+        ),
+        "the opening report of a link"
+    );
+    links.received(
+        &"bob",
+        from_bob(delta(&[], &[A], &[], &[]), 1, Some(0)),
+        now,
+    );
+    let again = links.received(
+        &"bob",
+        from_bob(holdings(&[B], &[], &[], false), 9, None),
+        now,
+    );
+    assert!(again.is_empty(), "{again:?}");
+    assert!(
+        links.report(&"bob").is_none(),
+        "a restarted peer's report starts over"
+    );
+    let last = links.received(
+        &"bob",
+        from_bob(holdings(&[C], &[], &[], true), 10, None),
+        now,
+    );
+    assert!(
+        matches!(
+            last.as_slice(),
+            [MediaAction::Reported {
+                restarted: true,
+                ..
+            }]
+        ),
+        "the completed report asks for one back"
+    );
+    let report = links.report(&"bob").expect("reported");
+    assert!(report.holds(&B) && report.holds(&C) && !report.holds(&A));
+    let later = links.received(
+        &"bob",
+        from_bob(holdings(&[C], &[], &[], true), 11, None),
+        now,
+    );
+    assert!(
+        matches!(
+            later.as_slice(),
+            [MediaAction::Reported {
+                restarted: true,
+                ..
+            }]
+        ),
+        "a peer that still received nothing asks again"
+    );
 }
 
 /// Fetch `len` bytes from bob at `at`, answered by one last piece after `took`.
@@ -845,43 +1132,27 @@ fn the_report_bounds_hold() {
     let over = vec![[0; 32]; MAX_REPORT_ENTRIES + 1];
     let rates = vec![([0; 32], 1); MAX_REPORT_ENTRIES + 1];
     let reports = [
-        Media::Holdings {
-            room: 0,
-            rates: vec![],
-            held: over.clone(),
-            leaving: vec![],
-            last: true,
-        },
+        holdings(&over, &[], &[], true),
         Media::Holdings {
             room: 0,
             rates: rates.clone(),
             held: vec![],
             leaving: vec![],
+            number: 0,
+            seen: None,
             last: true,
         },
-        Media::Holdings {
+        holdings(&[], &over, &[], true),
+        delta(&over, &[], &[], &[]),
+        delta(&[], &over, &[], &[]),
+        delta(&[], &[], &over, &[]),
+        delta(&[], &[], &[], &over),
+        Media::Room {
             room: 0,
-            rates: vec![],
-            held: vec![],
-            leaving: over.clone(),
-            last: true,
+            rates,
+            number: 0,
+            seen: None,
         },
-        Media::Held {
-            added: over.clone(),
-            removed: vec![],
-            leaving: vec![],
-        },
-        Media::Held {
-            added: vec![],
-            removed: over.clone(),
-            leaving: vec![],
-        },
-        Media::Held {
-            added: vec![],
-            removed: vec![],
-            leaving: over.clone(),
-        },
-        Media::Room { room: 0, rates },
     ];
     for report in reports {
         assert_eq!(
@@ -891,10 +1162,14 @@ fn the_report_bounds_hold() {
             report.named()
         );
     }
-    let fine = Media::Held {
-        added: vec![[0; 32]; MAX_REPORT_ENTRIES],
-        removed: vec![],
-        leaving: vec![],
-    };
+    let fine = delta(&vec![[0; 32]; MAX_REPORT_ENTRIES], &[], &[A], &[B]);
     assert_eq!(fine.within_bounds(), Ok(()));
+}
+
+#[test]
+fn a_held_naming_one_file_staying_and_leaving_breaks_the_bounds() {
+    assert_eq!(
+        delta(&[], &[], &[B, A], &[C, A]).within_bounds(),
+        Err(BoundsError::StayingAndLeaving)
+    );
 }

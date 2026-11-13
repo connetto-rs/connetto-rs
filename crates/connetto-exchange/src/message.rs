@@ -125,6 +125,9 @@ pub enum BoundsError {
     /// [`crate::media::MAX_REPORT_ENTRIES`] entries in one list.
     #[error("the holder report lists more entries than the bound")]
     TooManyEntries,
+    /// A holder report names one file both staying and leaving.
+    #[error("the holder report names a file both staying and leaving")]
+    StayingAndLeaving,
 }
 
 /// The manifest messages of one range, `rows` cut into runs of at most

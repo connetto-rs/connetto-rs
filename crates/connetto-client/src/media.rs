@@ -122,6 +122,10 @@ impl MediaSender {
     /// [`PeerSendError`] with the message handed back when it breaks the
     /// wire's bounds, when the peer's live link is not that one, or when the
     /// link closes while the send waits.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the refusal hands the message back to its sender by value"
+    )]
     pub async fn send(
         &self,
         peer: &DeviceIdentity,
