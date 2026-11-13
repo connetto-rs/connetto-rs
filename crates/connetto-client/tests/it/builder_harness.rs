@@ -405,9 +405,7 @@ async fn builder_observes_only_committed_courier_receipts_visible_to_its_identit
         for account in ["alice", "bob", "mallory"] {
             let client = Box::pin(
                 NativeClientBuilder::new("ws://127.0.0.1:1", schema.clone())
-                    .with_dialer(OneShot {
-                        transport: Some(server.attach()),
-                    })
+                    .with_dialer(server_dialer(&server))
                     .signed_in(
                         HeldCredential::new(Grant::new(format!("user:{account}")), account)
                             .expect("the credential holds"),
