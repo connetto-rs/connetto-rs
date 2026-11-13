@@ -27,7 +27,7 @@ use crate::import::{
     ContentImportPlan, apply_content_import, prepare_content_import, write_import_chunks,
 };
 use crate::resolve::{BoxedSource, ChunkStoreSource, Resolved};
-use crate::worker::{outbox_manifests, retire, unreadable_chunk_count, write_content_entries};
+use crate::worker::{archived_files, retire, unreadable_chunk_count, write_content_entries};
 use crate::{ticket, upload};
 
 #[cfg(feature = "peer")]
@@ -237,7 +237,8 @@ where
         })
     }
 
-    /// Exports unsent content and replica data to `sink`.
+    /// Exports unsent content, the copies held in custody for other
+    /// devices' rows with their custody records, and replica data to `sink`.
     ///
     /// The sink is written through as each chunk is read from the store, so
     /// one chunk is in memory at a time. Returns the sink once the archive is
@@ -252,8 +253,8 @@ where
         sink: W,
     ) -> Result<W, ContentError> {
         let _writing = self.content_writes.lock().await;
-        let manifests = self.client.with_conn(outbox_manifests).await??;
-        let declaration = crate::archive::declare_content(&manifests)?;
+        let files = self.client.with_conn(archived_files).await??;
+        let declaration = crate::archive::declare_content(&files)?;
         let export = self
             .client
             .with_conn(|conn| {
@@ -1252,7 +1253,9 @@ where
     /// [`replicate`](PeerContent::replicate)d column, the custody half of the
     /// pass releasing a copy whose row is gone, whose author lapsed or whose
     /// state reads `available`, and taking back a cache copy whose state
-    /// reads `lost`. Everything else is cache and goes.
+    /// reads `lost`. A copy whose row this device saw settle is not released
+    /// for a missing row before the replica first syncs, the state of a
+    /// device restored from an archive. Everything else is cache and goes.
     ///
     /// Then every chunk file the store holds that no surviving manifest names
     /// is deleted. Enumerating the store rather than the hashes an eviction
@@ -1299,10 +1302,12 @@ where
                 )?);
                 #[cfg(feature = "peer")]
                 let named = peer::custody::named(conn, &self.peer_content, &mut reach)?;
+                #[cfg(feature = "peer")]
+                let synced = conn.has_synced();
                 conn.transact_with_bookkeeping(
                     |c| {
                         #[cfg(feature = "peer")]
-                        peer::custody::pass(c, &self.peer_content, &named, now, &mut kept)?;
+                        peer::custody::pass(c, &self.peer_content, &named, now, synced, &mut kept)?;
                         let evicted = crate::retain::evict_uncovered(c, &kept)?;
                         Ok((evicted, db::referenced_hashes(c)?))
                     },

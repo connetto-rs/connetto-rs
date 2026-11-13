@@ -10024,6 +10024,14 @@ where
         provisional::provisional_blobs(&mut self.db, backing.schema, &physical, column)
     }
 
+    /// Whether this replica has applied a server patch, so a synced row
+    /// missing from it is gone rather than not yet delivered, as on a device
+    /// restored from an archive that has not synced (R79 decision 18).
+    #[must_use]
+    pub fn has_synced(&mut self) -> bool {
+        load_cursor_and_subjects(&mut self.db).is_some()
+    }
+
     /// Whether the certificate `author`'s cursor last carried ended
     /// [`DEVICE_SKEW`](connetto_core::clock::DEVICE_SKEW) or more before now,
     /// so its provisional rows can no longer reach the server through a

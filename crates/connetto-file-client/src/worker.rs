@@ -1277,7 +1277,8 @@ where
             .map_err(ContentError::Replica)
     }
 
-    /// Exports unsent content and replica data to `sink`.
+    /// Exports unsent content, the copies held in custody for other
+    /// devices' rows with their custody records, and replica data to `sink`.
     ///
     /// The sink is written through as each chunk is read from the store, so
     /// one chunk is in memory at a time. Returns the sink once the archive is
@@ -1292,8 +1293,8 @@ where
         scope: ExportScope,
         sink: W,
     ) -> Result<W, ContentError> {
-        let manifests = outbox_manifests(connection)?;
-        let declaration = crate::archive::declare_content(&manifests)?;
+        let files = archived_files(connection)?;
+        let declaration = crate::archive::declare_content(&files)?;
         let export =
             connection.export_local_data_with_attachments(scope, &declaration.attachments, sink)?;
         write_content_entries(&self.store, &self.root_key, &declaration, export).await
@@ -1329,6 +1330,39 @@ pub(crate) fn outbox_manifests<T: Transport>(
                 .ok_or(ContentError::NoManifest { file_id })
         })
         .collect()
+}
+
+/// The files an export carries, in both scopes: every unsent file this
+/// device authored, then every copy it holds in custody with its record
+/// (R79 decision 18). Other cache stays behind.
+pub(crate) fn archived_files<T: Transport>(
+    connection: &mut ConnettoConnection<T>,
+) -> Result<Vec<crate::archive::Carried>, ContentError> {
+    let mut files: Vec<crate::archive::Carried> = outbox_manifests(connection)?
+        .into_iter()
+        .map(|manifest| crate::archive::Carried {
+            manifest,
+            custody: None,
+        })
+        .collect();
+    for record in db::custody_records(connection.conn())? {
+        if files
+            .iter()
+            .any(|carried| carried.manifest.file_id() == record.file_id)
+        {
+            continue;
+        }
+        let manifest = db::load_manifest(connection.conn(), record.file_id)?.ok_or(
+            ContentError::NoManifest {
+                file_id: record.file_id,
+            },
+        )?;
+        files.push(crate::archive::Carried {
+            manifest,
+            custody: Some(record.custody),
+        });
+    }
+    Ok(files)
 }
 
 /// Writes the content index entry and then one entry per distinct chunk.

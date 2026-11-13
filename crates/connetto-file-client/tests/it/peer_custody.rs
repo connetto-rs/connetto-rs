@@ -2,25 +2,28 @@
 //! author: an on-demand copy entering custody within the budget, kept after
 //! its row settles until the state column reads `available`, released on a
 //! retraction or once its author lapsed, returning on `lost`, the media
-//! driver acting on each as the event behind it arrives, and the reports
-//! naming a copy only to peers the gate admits (R79 decisions 12, 13, 15 and
-//! 16).
+//! driver acting on each as the event behind it arrives, the reports naming
+//! a copy only to peers the gate admits, and the device archive carrying a
+//! copy with its record (R79 decisions 12, 13, 15, 16 and 18).
 
 use std::time::Duration;
 
 use connetto_client::ClientEvent;
 use connetto_client::live::ConnettoClient;
 use connetto_client::peer::PeerAuthor;
+use connetto_client::{ExportScope, ImportChoices};
 use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::exchange::{RetractCause, Retraction};
 use connetto_exchange::media::Media;
 use connetto_file_client::{ContentError, ContentEvent, FileId, Resolved};
 use connetto_peer::Node;
+use diesel::prelude::*;
 use tokio::sync::mpsc;
 
 use crate::peer_support::{
-    Device, Devices, apply_entry, beside, beside_both, captured_photo, declare_replicated,
-    deliver_state, lapse_in, link_to, listener, port, replica, set_custody_state, set_state, stage,
+    Device, Devices, apply_entry, beside, beside_both, captured_photo, custody_state,
+    declare_replicated, deliver_state, lapse_in, link_to, listener, port, replica,
+    set_custody_state, set_state, stage,
 };
 use crate::retention::pseudorandom;
 use crate::support::Scripted;
@@ -730,4 +733,113 @@ async fn a_copy_marked_leaving_is_reported_so_and_its_withdrawal_as_staying() {
         );
     })
     .await;
+}
+
+diesel::table! {
+    /// The custody record fields an archive carries.
+    _connetto_content_custody (file_id) {
+        /// The held file.
+        file_id -> Binary,
+        /// The provisional row author's key id.
+        author_key -> Nullable<Binary>,
+    }
+}
+
+/// The author key `client`'s custody record of `file_id` names.
+async fn custody_author(client: &ConnettoClient<Scripted>, file_id: FileId) -> Option<Vec<u8>> {
+    client
+        .with_conn(move |conn| {
+            _connetto_content_custody::table
+                .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
+                .select(_connetto_content_custody::author_key)
+                .first::<Option<Vec<u8>>>(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("read the custody record")
+}
+
+/// Exports `camp`'s receiver in `scope` and imports the archive into a fresh
+/// device declaring the same replication, which `dir` holds.
+async fn round_trip(
+    camp: &Camp,
+    scope: ExportScope,
+    dir: &std::path::Path,
+) -> (ConnettoClient<Scripted>, Device) {
+    let archive = camp
+        .receiver
+        .export_local_data(scope, Vec::new())
+        .await
+        .expect("export the device");
+    let (client, restored) = declare_replicated(replica(dir, None).await).await;
+    let mut plan = restored
+        .prepare_local_data_import(std::io::Cursor::new(archive))
+        .await
+        .expect("verify the archive");
+    assert_eq!(
+        (plan.content_files(), plan.custody_files()),
+        (0, 1),
+        "{scope:?} carries the custody copy"
+    );
+    restored
+        .apply_local_data_import(&mut plan, &ImportChoices::keeping_the_file())
+        .await
+        .expect("restore the archive");
+    (client, restored)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_custody_copy_travels_in_both_export_scopes_and_returns_held() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    // A copy leaving under pressure comes back held, in C2.
+    set_custody_state(&camp.client, camp.file_id, "pressed").await;
+    for scope in [ExportScope::Everything, ExportScope::Unsynced] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (client, restored) = round_trip(&camp, scope, dir.path()).await;
+        assert_eq!(
+            custody_state(&client, camp.file_id).await.as_deref(),
+            Some("held"),
+            "{scope:?} restores the copy held"
+        );
+        assert_eq!(
+            custody_author(&client, camp.file_id).await,
+            Some(anna().key_id),
+            "{scope:?} keeps the copy's author"
+        );
+        assert_eq!(
+            restored
+                .pending_work()
+                .await
+                .expect("read the pending work")
+                .content_files,
+            0,
+            "a copy held for another device is no unsent file of this one"
+        );
+        assert_eq!(restored.tidy_content().await.expect("tidy"), 0);
+        assert!(
+            held(&restored, camp.file_id).await,
+            "{scope:?} keeps the bytes through the first retention pass"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_custody_copy_survives_the_first_retention_pass_after_import() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    settle(&camp.client).await;
+    assert_eq!(camp.receiver.tidy_content().await.expect("tidy"), 0);
+    for scope in [ExportScope::Everything, ExportScope::Unsynced] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (client, restored) = round_trip(&camp, scope, dir.path()).await;
+        assert_eq!(restored.tidy_content().await.expect("tidy"), 0);
+        assert!(
+            held(&restored, camp.file_id).await,
+            "{scope:?} keeps the copy the server may still lack"
+        );
+        assert_eq!(
+            custody_state(&client, camp.file_id).await.as_deref(),
+            Some("held"),
+            "{scope:?} keeps the copy in custody"
+        );
+    }
 }
