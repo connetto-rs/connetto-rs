@@ -124,7 +124,7 @@ fn a_taker_far_slower_to_every_source_than_the_median_is_left_out() {
         candidate(2, "b", 100),
     ];
     assert_eq!(
-        takers(&FILE, 1, &devices, &[source]).len(),
+        takers(&FILE, 1, &devices, &[source], &BTreeSet::new()).len(),
         2,
         "a lone measured rate has no median to fall under"
     );
