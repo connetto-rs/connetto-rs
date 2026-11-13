@@ -182,6 +182,9 @@ pub struct SourceRow {
     pub table_id: TableId,
     /// The row's values, in catalog column order.
     pub values: Vec<Value<Postgres>>,
+    /// The table's primary-key columns, the ones a write naming this row
+    /// by its key reads.
+    pub key: Vec<subql::ColumnId>,
 }
 
 /// Reads one row of the source database, completely, as the caller.
@@ -673,9 +676,12 @@ mod pg {
                     "the row encoder produced no insert".into(),
                 ));
             };
+            let key = catalog_helpers::primary_key_columns(&self.catalog, table_id)
+                .map_err(|err| SnapshotError::Backend(err.to_string()))?;
             Ok(Some(SourceRow {
                 table_id,
                 values: crate::pk::row_from_wire(&self.catalog, table_id, values),
+                key,
             }))
         }
     }

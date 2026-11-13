@@ -40,8 +40,8 @@ use pg2sqlite::prelude::ReverseTranslator;
 use rls2fga::translator::Translator;
 use sql_traits::structs::TargetName;
 use sqlite_diff_rs::{
-    ChangesetOp, DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK,
-    TableSchema, Value,
+    ChangesetOp, ChangesetUpdatePairExt, DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet,
+    PatchsetOp, SchemaWithPK, TableSchema, Value,
 };
 use sqlparser::ast::{
     BinaryOperator, Distinct, Expr, GroupByExpr, SelectItem, SetExpr, Statement,
@@ -62,9 +62,10 @@ use subql::reexec::{
 };
 use subql::{
     AggValue, AggregateBootstrap, AggregateResultValue, AggregateValueChange, AggregateValueUpdate,
-    AsyncSubscriptionDispatch, Checkpoint, DatabaseLike, DefaultIds, MaintenanceTransition,
-    NumericValue, OpaqueCheckpoint, ParserDB, PgChangeEvent, SubscriptionEngine, SubscriptionId,
-    SubscriptionRequest, TableId, TableLike, Tier, catalog_helpers,
+    AsyncSubscriptionDispatch, Checkpoint, ColumnId, DatabaseLike, DefaultIds,
+    MaintenanceTransition, NoRefusals, NumericValue, OpaqueCheckpoint, ParserDB, PgChangeEvent,
+    SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableId, TableLike, Tier,
+    catalog_helpers,
 };
 
 use crate::reexec::ReadBudget;
@@ -131,6 +132,10 @@ pub enum MaterializerError {
     /// Applying an inbound diffset against the target failed.
     #[error(transparent)]
     Apply(#[from] diesel::result::Error),
+    /// The apply refused the upload before any op ran, a drift-refused table
+    /// among the ones it names.
+    #[error(transparent)]
+    Refused(subql::patchset::ApplyError),
     /// Zstd compression or decompression of a bulk payload failed.
     #[error(transparent)]
     Compression(#[from] std::io::Error),
@@ -160,6 +165,15 @@ pub enum MaterializerError {
     /// A seed or re-read result the engine refused to install.
     #[error("result installation refused: {0}")]
     Install(String),
+}
+
+impl From<subql::patchset::ApplyError> for MaterializerError {
+    fn from(err: subql::patchset::ApplyError) -> Self {
+        match err {
+            subql::patchset::ApplyError::Diesel(err) => Self::Apply(err),
+            refused => Self::Refused(refused),
+        }
+    }
 }
 
 /// One matched, folded patch produced by [`Materializer::dispatch`].
@@ -271,12 +285,20 @@ impl RuntimeWritableCatalogBuilder {
 /// shaped the same way for the same reason: a replacement is judged on two
 /// versions, and pairing a verb with the wrong number of images is not
 /// representable.
+///
+/// The column sets are the ones the statements the write runs name, so a
+/// policy answering column privileges answers what the database will check.
+/// The apply's `INSERT` names every column and its `UPDATE` sets only the
+/// columns that change. Its `WHERE` reads the key, and the conflict probe
+/// reads the version column beside it.
 #[derive(Debug, Clone)]
 pub(crate) enum PlannedWrite {
     /// Creating the row.
     Insert {
         /// The row as it will be.
         new: Vec<PgValue<Postgres>>,
+        /// The columns the `INSERT` names.
+        assigned: Vec<ColumnId>,
     },
     /// Replacing the row.
     ///
@@ -290,11 +312,17 @@ pub(crate) enum PlannedWrite {
         old: Vec<PgValue<Postgres>>,
         /// The row as it will be, the changed columns over the old ones.
         new: Vec<PgValue<Postgres>>,
+        /// The columns the `SET` assigns.
+        assigned: Vec<ColumnId>,
+        /// The columns the write reads.
+        read: Vec<ColumnId>,
     },
     /// Removing the row.
     Delete {
         /// The row as it is.
         old: Vec<PgValue<Postgres>>,
+        /// The columns the write reads.
+        read: Vec<ColumnId>,
     },
 }
 
@@ -1873,6 +1901,7 @@ where
             ChangesetOp::Insert { values, .. } => (
                 PlannedWrite::Insert {
                     new: crate::pk::row_from_wire(db, table_id, values),
+                    assigned: column_ids(&table, 0..values.len())?,
                 },
                 None,
             ),
@@ -1909,14 +1938,33 @@ where
                         },
                     )
                     .collect();
-                (PlannedWrite::Update { old, new }, conflict)
+                let assigned = column_ids(
+                    &table,
+                    values
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, pair)| pair.is_changed())
+                        .map(|(ordinal, _)| ordinal),
+                )?;
+                let read = self.read_columns(table_id, conflict.as_ref())?;
+                (
+                    PlannedWrite::Update {
+                        old,
+                        new,
+                        assigned,
+                        read,
+                    },
+                    conflict,
+                )
             }
             ChangesetOp::Delete { old_values, .. } => {
                 let conflict =
                     self.plan_conflict(schema, &pk_values, |idx| old_values.get(idx).cloned())?;
+                let read = self.read_columns(table_id, conflict.as_ref())?;
                 (
                     PlannedWrite::Delete {
                         old: crate::pk::row_from_wire(db, table_id, old_values),
+                        read,
                     },
                     conflict,
                 )
@@ -1944,6 +1992,7 @@ where
                     table_id,
                     write: PlannedWrite::Insert {
                         new: crate::pk::row_from_wire(self.catalog(), table_id, values),
+                        assigned: column_ids(&table, 0..values.len())?,
                     },
                     conflict: None,
                 })
@@ -1954,6 +2003,28 @@ where
                 Err(MaterializerError::MissingVersion(table))
             }
         }
+    }
+
+    /// The columns an update or delete reads, the catalog key its `WHERE`
+    /// matches and, when the op is conflict-checked, the version column the
+    /// probe compares.
+    fn read_columns(
+        &self,
+        table_id: TableId,
+        conflict: Option<&PlannedConflict>,
+    ) -> Result<Vec<ColumnId>, MaterializerError> {
+        let mut read = catalog_helpers::primary_key_columns(&self.catalog, table_id)
+            .map_err(|err| MaterializerError::Catalog(err.to_string()))?;
+        if let Some(conflict) = conflict {
+            let version = catalog_helpers::column_id::<Postgres, _>(
+                &self.catalog,
+                table_id,
+                &conflict.version_column,
+            )
+            .ok_or_else(|| MaterializerError::SchemaMismatch(conflict.version_column.clone()))?;
+            read.push(version);
+        }
+        Ok(read)
     }
 
     /// Build the conflict read for a version-bearing op, or `None` when the
@@ -2031,9 +2102,11 @@ where
         let bytes = decompress(payload_zstd)?;
         let adapter = SqliteAdapter::new(&self.catalog)
             .map_err(|e| MaterializerError::Catalog(e.to_string()))?;
+        // No drift guard refuses tables on this path, so the view refuses none.
         Ok(subql::patchset::apply_diffset_bytes_with_catalog(
             &self.catalog,
             &bytes,
+            &NoRefusals,
             conn,
             &adapter,
         )?)
@@ -2077,6 +2150,7 @@ where
         Ok(subql::patchset::apply_diffset_bytes_async_with_catalog(
             &self.catalog,
             &bytes,
+            &NoRefusals,
             conn,
             &adapter,
         )
@@ -2672,6 +2746,20 @@ fn column_name_at<DB: DatabaseLike>(
         u16::try_from(index).map_err(|_| MaterializerError::SchemaMismatch(index.to_string()))?;
     catalog_helpers::column_name(db, table_id, column_id)
         .ok_or_else(|| MaterializerError::SchemaMismatch(format!("column {index}")))
+}
+
+/// The catalog column ids of `table`'s columns at `ordinals`.
+fn column_ids(
+    table: &str,
+    ordinals: impl IntoIterator<Item = usize>,
+) -> Result<Vec<ColumnId>, MaterializerError> {
+    ordinals
+        .into_iter()
+        .map(|ordinal| {
+            ColumnId::try_from(ordinal)
+                .map_err(|_| MaterializerError::SchemaMismatch(format!("{table} column {ordinal}")))
+        })
+        .collect()
 }
 
 /// Zstd-compress a raw bulk payload at the materializer's standard level.
@@ -3584,5 +3672,113 @@ mod audit_privacy_tests {
                 .expect("internal observation registers"),
             Registration::Computed(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod write_column_tests {
+    use sqlite_diff_rs::{ChangeDelete, ChangeSet, ChangesetFormat, SimpleTable, Update};
+
+    use super::*;
+
+    const DDL: &str = "CREATE TABLE notes (id BIGINT PRIMARY KEY, body TEXT, edited_at TEXT);\n\
+         CREATE TABLE tags (id BIGINT PRIMARY KEY, label TEXT);";
+
+    fn materializer() -> Materializer {
+        Materializer::builder(DDL)
+            .with_write_catalog(
+                RuntimeWritableCatalog::builder()
+                    .versioned("notes", "edited_at")
+                    .writable("tags")
+                    .build(),
+            )
+            .build()
+            .expect("the catalog parses")
+    }
+
+    fn table(name: &str, columns: &[(&str, &str)]) -> SimpleTable {
+        SimpleTable::new(name, columns, &[0])
+    }
+
+    fn text(value: &str) -> WireValue {
+        Value::Text(value.to_owned())
+    }
+
+    fn plan(bytes: &[u8]) -> PlannedWrite {
+        let payload = compress(bytes).expect("compress");
+        let mut plan = materializer()
+            .plan_write(&payload)
+            .expect("the upload plans");
+        assert_eq!(plan.ops.len(), 1);
+        plan.ops.remove(0).write
+    }
+
+    fn notes() -> SimpleTable {
+        table("notes", &[("id", ""), ("body", ""), ("edited_at", "")])
+    }
+
+    #[test]
+    fn an_update_assigns_what_changes_and_reads_the_key_and_the_version() {
+        let update = Update::<_, ChangesetFormat, String, Vec<u8>>::from(notes())
+            .set(0, Value::Integer(1), Value::Integer(1))
+            .expect("id")
+            .set(1, text("old"), text("new"))
+            .expect("body")
+            .set(2, text("t0"), text("t1"))
+            .expect("edited_at");
+        let bytes = ChangeSet::<SimpleTable, String, Vec<u8>>::new()
+            .update(update)
+            .build();
+        let PlannedWrite::Update { assigned, read, .. } = plan(&bytes) else {
+            panic!("an update plans as an update");
+        };
+        assert_eq!(
+            assigned,
+            [1, 2],
+            "the key did not move, so the SET leaves it out"
+        );
+        assert_eq!(
+            read,
+            [0, 2],
+            "the WHERE reads the key and the probe the version"
+        );
+    }
+
+    #[test]
+    fn a_delete_reads_the_key_and_the_version() {
+        let delete = ChangeDelete::from(notes())
+            .set(0, Value::Integer(1))
+            .expect("id")
+            .set(1, text("body"))
+            .expect("body")
+            .set(2, text("t0"))
+            .expect("edited_at");
+        let bytes = ChangeSet::<SimpleTable, String, Vec<u8>>::new()
+            .delete(delete)
+            .build();
+        let PlannedWrite::Delete { read, .. } = plan(&bytes) else {
+            panic!("a delete plans as a delete");
+        };
+        assert_eq!(read, [0, 2]);
+    }
+
+    #[test]
+    fn an_unversioned_update_reads_only_the_key() {
+        let update = Update::<_, ChangesetFormat, String, Vec<u8>>::from(table(
+            "tags",
+            &[("id", ""), ("label", "")],
+        ))
+        .set(0, Value::Integer(1), Value::Integer(1))
+        .expect("id")
+        .set(1, text("a"), text("b"))
+        .expect("label");
+        let bytes = ChangeSet::<SimpleTable, String, Vec<u8>>::new()
+            .update(update)
+            .build();
+        let PlannedWrite::Update { assigned, read, .. } = plan(&bytes) else {
+            panic!("an update plans as an update");
+        };
+        assert_eq!(assigned, [1]);
+        assert_eq!(read, [0], "no conflict probe runs without a version column");
     }
 }

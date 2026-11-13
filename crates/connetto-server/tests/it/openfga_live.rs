@@ -858,7 +858,9 @@ async fn a_withdrawn_grant_is_refused_at_once_for_both_questions() {
         auth.may_write(
             RowWrite::Update {
                 old: &view,
-                new: &view
+                new: &view,
+                assigned: &[1],
+                read: &[0],
             },
             &alice[0]
         )
@@ -906,7 +908,9 @@ async fn a_withdrawn_grant_is_refused_at_once_for_both_questions() {
             .may_write(
                 RowWrite::Update {
                     old: &view,
-                    new: &view
+                    new: &view,
+                    assigned: &[1],
+                    read: &[0],
                 },
                 &alice[0]
             )
@@ -1026,10 +1030,16 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
     let typed: [Value<Postgres>; 2] = [Value::Uuid(id), Value::String("alice".to_owned())];
     let typed_view = ValuesRow::new(orders, &typed);
     assert!(
-        auth.may_write(RowWrite::Insert { new: &typed_view }, &alice)
-            .await
-            .expect("the composition answered")
-            .allowed(),
+        auth.may_write(
+            RowWrite::Insert {
+                new: &typed_view,
+                assigned: &[0, 1],
+            },
+            &alice
+        )
+        .await
+        .expect("the composition answered")
+        .allowed(),
         "alice inserting a row she owns, keyed by a UUID, must be allowed"
     );
 
@@ -1042,7 +1052,13 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
     ];
     let untyped_view = ValuesRow::new(orders, &untyped);
     let refused = auth
-        .may_write(RowWrite::Insert { new: &untyped_view }, &alice)
+        .may_write(
+            RowWrite::Insert {
+                new: &untyped_view,
+                assigned: &[0, 1],
+            },
+            &alice,
+        )
         .await;
     assert!(
         !matches!(&refused, Ok(verdict) if verdict.allowed()),
@@ -1233,7 +1249,9 @@ async fn a_replayed_share_is_withdrawn_when_its_row_goes() {
             .may_write(
                 RowWrite::Update {
                     old: &view,
-                    new: &view
+                    new: &view,
+                    assigned: &[1],
+                    read: &[0],
                 },
                 &alice[0]
             )

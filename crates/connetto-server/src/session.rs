@@ -8205,13 +8205,24 @@ where
     ) -> WriteVerdict {
         for op in &plan.ops {
             let answer = match &op.write {
-                PlannedWrite::Insert { new } => {
+                PlannedWrite::Insert { new, assigned } => {
                     let new = ValuesRow::new(op.table_id, new);
                     self.auth
-                        .may_write(RowWrite::Insert { new: &new }, caller)
+                        .may_write(
+                            RowWrite::Insert {
+                                new: &new,
+                                assigned,
+                            },
+                            caller,
+                        )
                         .await
                 }
-                PlannedWrite::Update { old, new } => {
+                PlannedWrite::Update {
+                    old,
+                    new,
+                    assigned,
+                    read,
+                } => {
                     let old = ValuesRow::new(op.table_id, old);
                     let new = ValuesRow::new(op.table_id, new);
                     self.auth
@@ -8219,15 +8230,17 @@ where
                             RowWrite::Update {
                                 old: &old,
                                 new: &new,
+                                assigned,
+                                read,
                             },
                             caller,
                         )
                         .await
                 }
-                PlannedWrite::Delete { old } => {
+                PlannedWrite::Delete { old, read } => {
                     let old = ValuesRow::new(op.table_id, old);
                     self.auth
-                        .may_write(RowWrite::Delete { old: &old }, caller)
+                        .may_write(RowWrite::Delete { old: &old, read }, caller)
                         .await
                 }
             };

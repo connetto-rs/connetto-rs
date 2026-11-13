@@ -158,12 +158,12 @@ connetto-schema.workspace = true
 sha2 = "0.10"
 # The custody proofs deliver the server's state column change as a live
 # patch, compressed as bulk payloads ride the wire.
-sqlite-diff-rs = { version = "0.19", default-features = false }
+sqlite-diff-rs = { version = "0.20", default-features = false }
 zstd = "0.13"
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "time"] }
 tempfile = "3"
 axum = { workspace = true }
-diesel-async = { version = "0.9", default-features = false, features = ["postgres", "bb8"] }
+diesel-async = { version = "0.10", default-features = false, features = ["postgres", "bb8"] }
 bb8 = "0.9"
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dev-dependencies]

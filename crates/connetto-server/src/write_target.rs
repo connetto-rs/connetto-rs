@@ -30,8 +30,8 @@ use connetto_core::messages::{ConflictRow, WriterSecret};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::ParserDB;
-use subql::patchset::{PgAdapter, apply_diffset_bytes_async_with_catalog};
+use subql::patchset::{ApplyError, PgAdapter, apply_diffset_bytes_async_with_catalog};
+use subql::{NoRefusals, ParserDB};
 
 use crate::audit::ConnettoAuditSchema;
 use crate::capability::CallerBinding;
@@ -246,6 +246,28 @@ impl From<diesel::result::Error> for CommitError {
     fn from(err: diesel::result::Error) -> Self {
         Self::Db(err)
     }
+}
+
+impl From<ApplyError> for CommitError {
+    fn from(err: ApplyError) -> Self {
+        match err {
+            ApplyError::Diesel(err) => Self::Db(err),
+            refused => Self::Probe(MaterializerError::Refused(refused)),
+        }
+    }
+}
+
+/// Apply an upload's diffset bytes on `conn`, counting the rows it changed.
+///
+/// No drift guard refuses tables on this path, so the view refuses none.
+async fn apply_upload(
+    catalog: &ParserDB,
+    bytes: &[u8],
+    conn: &mut AsyncPgConnection,
+) -> Result<usize, CommitError> {
+    let adapter = PgAdapter::new(catalog)
+        .map_err(|e| CommitError::Probe(MaterializerError::Catalog(e.to_string())))?;
+    Ok(apply_diffset_bytes_async_with_catalog(catalog, bytes, &NoRefusals, conn, &adapter).await?)
 }
 
 /// Whether Postgres refused a statement with `42501` (`insufficient_privilege`).
@@ -570,10 +592,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                         return Ok(conflict_outcome(conflict, row));
                     }
                 }
-                let adapter = PgAdapter::new(catalog)
-                    .map_err(|e| CommitError::Probe(MaterializerError::Catalog(e.to_string())))?;
-                let affected =
-                    apply_diffset_bytes_async_with_catalog(catalog, &bytes, c, &adapter).await?;
+                let affected = apply_upload(catalog, &bytes, c).await?;
                 if affected < expected {
                     return Err(CommitError::Denied);
                 }
