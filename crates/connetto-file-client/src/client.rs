@@ -1082,6 +1082,13 @@ where
 }
 
 /// Whom a copy taken into custody is kept for.
+#[cfg_attr(
+    not(feature = "peer"),
+    expect(
+        dead_code,
+        reason = "only the peer link's fetches take copies into custody"
+    )
+)]
 pub(crate) enum Keeper {
     /// The provisional row of the author with this key id.
     Author(Vec<u8>),
