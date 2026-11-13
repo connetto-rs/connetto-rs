@@ -36,6 +36,10 @@ use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::{DedicatedWorkerGlobalScope, FileReaderSync};
 
+#[expect(
+    dead_code,
+    reason = "shared transfer events are consumed by the courier audit browser suite"
+)]
 #[path = "content_archive/support.rs"]
 mod support;
 

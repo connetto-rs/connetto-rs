@@ -56,6 +56,10 @@
 //! one control frame that still waits its turn in the queue, because it
 //! describes rows the tab has not received yet.
 
+mod audit;
+
+use audit::{AuditRequests, Completion as AuditCompletion};
+
 use core::time::Duration;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
@@ -80,12 +84,12 @@ use connetto_client::{
     replay_aborting, replica_schema, subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
-    AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, CourierNotice, FatalError,
-    FatalErrorReason, FullResyncReason, FullResyncRequired, GateState, HandshakeAck, LivePatch,
-    MutationApplied, MutationConflict, MutationReject, MutationRejectReason, NonFatalError, Pong,
-    RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
-    SubscriptionSpec, SyncStatus, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome,
-    TabStorageAnswer, TabStorageOutcome, TabStorageUse,
+    AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, CourierAuditRequest, CourierNotice,
+    FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired, GateState, HandshakeAck,
+    LivePatch, MutationApplied, MutationConflict, MutationReject, MutationRejectReason,
+    NonFatalError, Pong, RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd,
+    SnapshotPatch, Subscribe, SubscriptionSpec, SyncStatus, TabShareKeyAnswer, TabShareKeyChange,
+    TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Major, Transport};
@@ -260,6 +264,8 @@ enum HubEvent {
     Attached(TabId, UnboundedSender<TabOut>),
     /// One inbound frame from a tab.
     Frame(TabId, IncomingFrame),
+    /// An audit request with its deadline captured at transport intake.
+    AuditRequest(TabId, CourierAuditRequest, Duration),
     /// The tab's shovel ended (transport closed or failed).
     Gone(TabId),
     /// The owner wants this tab disconnected (a liveness watcher fired).
@@ -311,6 +317,20 @@ enum HubEvent {
     Gate(GateState),
 }
 
+impl HubEvent {
+    fn from_frame(id: TabId, frame: IncomingFrame) -> Self {
+        match frame {
+            IncomingFrame::Control(ControlMessage::CourierAuditRequest(request)) => {
+                let deadline = SystemClock
+                    .monotonic()
+                    .saturating_add(Duration::from_millis(request.remaining_ms));
+                Self::AuditRequest(id, request, deadline)
+            }
+            frame => Self::Frame(id, frame),
+        }
+    }
+}
+
 /// One outbound frame toward a tab. Dropping a tab's sender closes it: the
 /// shovel answers the closed channel by closing the transport.
 enum TabOut {
@@ -343,6 +363,7 @@ impl From<RelayError> for TabFault {
 struct TabState {
     out: UnboundedSender<TabOut>,
     handshaken: bool,
+    audit_closed: bool,
     subs: Vec<TabSub>,
     /// Sequence number announced by a `MutationHeader`, awaiting its bulk
     /// patchset frame.
@@ -519,6 +540,7 @@ const HUB_SCHEMA: &str = "connetto_hub";
 #[derive(Default)]
 struct HubState {
     tabs: HashMap<TabId, TabState>,
+    audits: AuditRequests,
     /// Upstream push sequence to the owning tab and its sequence, for mapping
     /// the server's answer back. An entry leaves when the server settles its
     /// write, like the worker's own pending record, so none is dropped early.
@@ -1182,7 +1204,7 @@ async fn shovel<D>(
             },
             frame = tab.recv() => match frame {
                 Ok(Some(frame)) => {
-                    if events.send(HubEvent::Frame(id, frame)).is_err() {
+                    if events.send(HubEvent::from_frame(id, frame)).is_err() {
                         break;
                     }
                 }
@@ -1286,6 +1308,23 @@ enum ContentWalk {
     Prepare,
 }
 
+impl ContentWalk {
+    async fn wait(
+        state: &mut HubState,
+        events: &mut UnboundedReceiver<HubEvent>,
+        key_timer: Option<connetto_client::ShareKeyTimer>,
+    ) -> Self {
+        tokio::select! {
+            event = events.recv() => Self::Interrupted(event),
+            () = wait_share_keys(key_timer) => Self::Prepare,
+            completion = state.audits.next() => {
+                state.audits.complete(&state.tabs, completion);
+                Self::Prepare
+            }
+        }
+    }
+}
+
 /// Everything one hub task owns: the worker connection, tab state, the notice
 /// channel, the optional content archive and the transport its transfers run
 /// under, the event intake and the content retry schedule.
@@ -1347,6 +1386,78 @@ enum Wake {
     Gate(Option<GateAskOutcome>),
     /// The worker's share-key work fell due.
     ShareKeys,
+    /// An owned audit wait completed or was cancelled.
+    Audit(AuditCompletion),
+}
+
+enum AuditTurn {
+    Ready,
+    Event(Option<HubEvent>),
+}
+
+/// Releases completed waits while keeping a blocked audit send interruptible.
+async fn maintain_audits<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    events: &mut UnboundedReceiver<HubEvent>,
+) -> Result<AuditTurn, ClientError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    state.audits.reap(&state.tabs);
+    loop {
+        tokio::select! {
+            biased;
+            result = worker.process_courier_audit() => {
+                result?;
+                return Ok(AuditTurn::Ready);
+            }
+            completion = state.audits.next() => {
+                state.audits.complete(&state.tabs, completion);
+            }
+            event = events.recv() => return Ok(AuditTurn::Event(event)),
+        }
+    }
+}
+
+enum DrainStep {
+    Finished(Result<(), ClientError>),
+    Interrupted(Option<HubEvent>),
+    Closed,
+}
+
+/// Audit work can release the worker borrowed by a drain handshake.
+async fn wait_drain_attempt(
+    attempt: impl Future<Output = Result<(), ClientError>>,
+    state: &mut HubState,
+    events: &mut UnboundedReceiver<HubEvent>,
+    deferred: &mut VecDeque<HubEvent>,
+) -> DrainStep {
+    tokio::pin!(attempt);
+    loop {
+        tokio::select! {
+            result = &mut attempt => return DrainStep::Finished(result),
+            completion = state.audits.next() => {
+                state.audits.complete(&state.tabs, completion);
+                return DrainStep::Interrupted(None);
+            }
+            event = events.recv() => {
+                let Some(event) = event else {
+                    return DrainStep::Closed;
+                };
+                release_departed_audits(state, &event);
+                if audit_bypasses_queue(state, &event) {
+                    return DrainStep::Interrupted(Some(event));
+                }
+                let departed = matches!(&event, HubEvent::Gone(_) | HubEvent::Kill(_));
+                deferred.push_back(event);
+                if departed {
+                    return DrainStep::Interrupted(None);
+                }
+            }
+        }
+    }
 }
 
 impl<U> HubRuntime<U>
@@ -1386,6 +1497,11 @@ where
         S: Sleeper,
         CS: Sleeper,
     {
+        match maintain_audits(&mut self.worker, &mut self.state, &mut self.events).await {
+            Ok(AuditTurn::Ready) => {}
+            Ok(AuditTurn::Event(event)) => return self.serve_local(event).await,
+            Err(error) => return self.serve_upstream(reconnect, Err(error)).await,
+        }
         if let Err(error) = self.worker.process_share_keys(!self.gate.is_locked()).await {
             return self.serve_upstream(reconnect, Err(error)).await;
         }
@@ -1455,6 +1571,7 @@ where
                 worker,
                 events,
                 retry,
+                state,
                 ..
             } = self;
             let prompting = ask.is_some();
@@ -1484,6 +1601,7 @@ where
                 () = &mut drain_wait, if drain_ms.is_some() => Wake::Drain,
                 outcome = &mut ask_wait, if prompting => Wake::Gate(Some(outcome)),
                 () = &mut key_wait, if key_ms.is_some() => Wake::ShareKeys,
+                completion = state.audits.next() => Wake::Audit(completion),
             }
         };
         // A losing wake keeps the prompt for the next cycle.
@@ -1517,6 +1635,10 @@ where
             Wake::Drain => self.dial_drain(reconnect).await,
             Wake::Keepalive(timer) => self.fire_keepalive(reconnect, timer).await,
             Wake::ShareKeys => self.serve_share_keys(key_timer).await,
+            Wake::Audit(completion) => {
+                self.state.audits.complete(&self.state.tabs, completion);
+                Ok(true)
+            }
         };
         // Any wake may have moved the keys, an expiry inside a pump step
         // included, so the tabs hear about it once here.
@@ -1566,16 +1688,38 @@ where
         let Some(driver) = reconnect else {
             return Ok(true);
         };
-        match driver.factory.connect().await {
-            Ok(transport) => {
-                if let Err(err) = self.worker.attach_drain(timer, transport).await {
-                    tracing::warn!(error = %err, "attaching the drain failed");
-                }
-            }
-            Err(err) => {
-                tracing::debug!(error = %err, "dialing the drain failed, backing off");
+        let mut deferred = VecDeque::new();
+        let result = {
+            let worker = &mut self.worker;
+            let attempt = async {
+                let transport = driver
+                    .factory
+                    .connect()
+                    .await
+                    .map_err(|error| ClientError::Transport(error.to_string()))?;
+                worker.attach_drain(timer, transport).await
+            };
+            wait_drain_attempt(attempt, &mut self.state, &mut self.events, &mut deferred).await
+        };
+        match result {
+            DrainStep::Finished(Ok(())) => {}
+            DrainStep::Finished(Err(error)) => {
+                tracing::warn!(%error, "drain attempt failed");
                 self.worker.drain_dial_failed(timer);
             }
+            DrainStep::Interrupted(event) => {
+                self.worker.cancel_drain_dial(timer);
+                if let Some(event) = event {
+                    self.serve(event).await?;
+                }
+            }
+            DrainStep::Closed => {
+                self.worker.cancel_drain_dial(timer);
+                return Ok(false);
+            }
+        }
+        while let Some(event) = deferred.pop_front() {
+            self.serve(event).await?;
         }
         // The drain wire is now up, so the content walk may owe a turn (R31).
         self.wake_content()?;
@@ -1850,10 +1994,7 @@ where
         let key_timer = worker.share_key_timer();
         let mut interrupted = None;
         let cancel = async {
-            interrupted = Some(tokio::select! {
-                event = events.recv() => ContentWalk::Interrupted(event),
-                () = wait_share_keys(key_timer) => ContentWalk::Prepare,
-            });
+            interrupted = Some(ContentWalk::wait(state, events, key_timer).await);
         };
         let (start, observed) = content
             .archive()
@@ -1914,10 +2055,7 @@ where
         let key_timer = worker.share_key_timer();
         let mut interrupted = None;
         let cancel = async {
-            interrupted = Some(tokio::select! {
-                event = events.recv() => ContentWalk::Interrupted(event),
-                () = wait_share_keys(key_timer) => ContentWalk::Prepare,
-            });
+            interrupted = Some(ContentWalk::wait(state, events, key_timer).await);
         };
         let (start, observed) = content
             .archive()
@@ -2134,7 +2272,8 @@ where
 /// One granted upload, run to completion while local and authorization work keep progressing.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the signed transfer borrows independent hub state"
+    clippy::too_many_lines,
+    reason = "the signed transfer retains its borrowed hub state across every control turn"
 )]
 async fn finish_content_upload<U>(
     worker: &mut ConnettoConnection<U>,
@@ -2159,6 +2298,24 @@ where
     // A started upload is never cancelled: a failing local event only stops
     // the service loop, and the transfer plus its bookkeeping still finish.
     let result = loop {
+        let audit_event = if background {
+            match maintain_audits(worker, state, events).await {
+                Ok(AuditTurn::Ready) => None,
+                Ok(AuditTurn::Event(event)) => Some(event),
+                Err(ClientError::Transport(_) | ClientError::NotConnected) => {
+                    worker.disconnect();
+                    None
+                }
+                Err(error) => {
+                    event_error = Some(error.into());
+                    serving = false;
+                    background = false;
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if background {
             match worker.process_share_keys(!gate.is_locked()).await {
                 Ok(_) => {}
@@ -2174,7 +2331,9 @@ where
         let connected = background && worker.is_connected();
         let mut ask = if background { gate.take_ask() } else { None };
         let prompting = ask.is_some();
-        let step = {
+        let step = if let Some(event) = audit_event {
+            TransferStep::Event(event)
+        } else {
             let ask_wait = async {
                 match ask.as_mut() {
                     Some(prompt) => prompt.await,
@@ -2187,6 +2346,7 @@ where
                 () = wait_share_keys(timer), if background => TransferStep::Key,
                 event = worker.pump_one(), if connected => TransferStep::Upstream(event),
                 outcome = &mut ask_wait, if prompting => TransferStep::Gate(Some(outcome)),
+                completion = state.audits.next() => TransferStep::Audit(completion),
             }
         };
         if !matches!(step, TransferStep::Gate(_))
@@ -2211,6 +2371,7 @@ where
                 }
             }
             TransferStep::Key => {}
+            TransferStep::Audit(completion) => state.audits.complete(&state.tabs, completion),
             TransferStep::Gate(outcome) => {
                 gate.apply_outcome(&mut ask, outcome);
             }
@@ -2257,6 +2418,7 @@ enum TransferStep {
     Key,
     Upstream(Result<ClientEvent, ClientError>),
     Gate(Option<GateAskOutcome>),
+    Audit(AuditCompletion),
 }
 
 /// Serves a queued local event before the transfer, or the transfer alone once local
@@ -2342,6 +2504,21 @@ where
         HubEvent::Frame(id, frame) => {
             handle_tab_frame(worker, state, notices, content, walk, id, frame).await?;
         }
+        HubEvent::AuditRequest(id, request, deadline) => {
+            state.audits.reap(&state.tabs);
+            let outcome = match state.tabs.get(&id) {
+                Some(tab) if tab.audit_closed => Ok(()),
+                Some(tab) if tab.handshaken => {
+                    state
+                        .audits
+                        .request(worker, id, &tab.out, request, deadline);
+                    Ok(())
+                }
+                Some(_) => Err(TabFault::Close("audit request before handshake".to_owned())),
+                None => Ok(()),
+            };
+            finish_tab_frame(state, id, outcome)?;
+        }
         HubEvent::Internal(id, frame, blob) => {
             handle_tab_internal(worker, state, content, walk, id, frame, blob).await?;
         }
@@ -2358,7 +2535,11 @@ where
             let _ = reply.send(pending);
         }
         HubEvent::LeaveShared(discard_unsent, reply) => {
-            let _ = reply.send(worker.leave_shared_store(discard_unsent));
+            let outcome = worker.leave_shared_store(discard_unsent);
+            if outcome.is_ok() {
+                state.audits.end(&state.tabs);
+            }
+            let _ = reply.send(outcome);
         }
         HubEvent::ForgetRetired(files, reply) => {
             let answer = match content {
@@ -2429,6 +2610,7 @@ fn attach_tab(state: &mut HubState, id: TabId, out: UnboundedSender<TabOut>) {
         TabState {
             out,
             handshaken: false,
+            audit_closed: false,
             subs: Vec::new(),
             pending_write: None,
             client_id: None,
@@ -2499,6 +2681,8 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
+    state.audits.remove_tab(id);
+    state.audits.reap(&state.tabs);
     state.tabs.remove(&id);
     state.pending_resolve.retain(|resolve| resolve.tab != id);
     state.pending_fetch.retain(|fetch| fetch.tab != id);
@@ -2685,7 +2869,7 @@ where
                 )
                 .await?;
                 attempt = if context.worker.is_connected() {
-                    finish_attached_during_recovery(context, upstream).await
+                    resume_during_recovery(context, None, upstream).await
                 } else {
                     recovery_attempt(context, factory, upstream).await?
                 };
@@ -2693,58 +2877,12 @@ where
             RecoveryAttempt::ShareKeys(timer) => {
                 idle_share_key_turn(context, timer).await?;
                 attempt = if context.worker.is_connected() {
-                    finish_attached_during_recovery(context, upstream).await
+                    resume_during_recovery(context, None, upstream).await
                 } else {
                     RecoveryAttempt::Failed
                 };
             }
             RecoveryAttempt::Closed => return Ok(RecoveryCycle::Closed),
-        }
-    }
-}
-
-async fn finish_attached_during_recovery<U>(
-    context: &mut RecoveryContext<'_, U>,
-    upstream: &[(String, SubscriptionSpec)],
-) -> RecoveryAttempt
-where
-    U: Transport + MaybeSend + 'static,
-    U::Error: core::fmt::Display,
-{
-    let key_timer = context.worker.share_key_timer();
-    let key_wait = sleep_or_park(fresh_key_wait_ms(key_timer, context.state.fired_key_timer));
-    let subscriptions = recovery_subscriptions(context.state, upstream);
-    let worker = &mut *context.worker;
-    let state = &mut *context.state;
-    let events = &mut *context.events;
-    let deferred = &mut *context.deferred;
-    let recovery = async {
-        worker.resume_attach().await?;
-        restore_recovery_subscriptions(worker, &subscriptions).await
-    };
-    tokio::pin!(recovery);
-    tokio::pin!(key_wait);
-    loop {
-        tokio::select! {
-            result = &mut recovery => {
-                return match result {
-                    Ok(()) => RecoveryAttempt::Connected,
-                    Err(err) if err.is_build_mismatch() => RecoveryAttempt::Mismatched(err),
-                    Err(err) => {
-                        context.min_wait = retry_after(&err);
-                        RecoveryAttempt::Failed
-                    }
-                };
-            }
-            () = &mut key_wait => return RecoveryAttempt::ShareKeys(key_timer),
-            event = events.recv() => match event {
-                Some(event) => {
-                    if let Some(local) = attach_during_recovery(state, deferred, event) {
-                        return RecoveryAttempt::Interrupted(local);
-                    }
-                }
-                None => return RecoveryAttempt::Closed,
-            },
         }
     }
 }
@@ -2762,6 +2900,8 @@ where
     let sleep = sleeper.sleep(backoff);
     tokio::pin!(sleep);
     loop {
+        context.state.audits.reap(&context.state.tabs);
+        context.worker.process_courier_audit().await?;
         let owes = walk_owes(context.walk);
         // Keys expire offline too, and the tabs hear it from here.
         let key_timer = context.worker.share_key_timer();
@@ -2775,6 +2915,7 @@ where
                 // where it belongs rather than a pause until the server returns.
                 () = core::future::ready(()), if owes => IdleWake::Walk,
                 () = key_wait => IdleWake::ShareKeys,
+                completion = context.state.audits.next() => IdleWake::Audit(completion),
             }
         };
         match wake {
@@ -2784,6 +2925,12 @@ where
                 walk_recovery_turn(context).await;
             }
             IdleWake::ShareKeys => idle_share_key_turn(context, key_timer).await?,
+            IdleWake::Audit(completion) => {
+                context
+                    .state
+                    .audits
+                    .complete(&context.state.tabs, completion);
+            }
         }
     }
 }
@@ -2796,6 +2943,7 @@ enum IdleWake {
     Walk,
     /// The worker's share-key work fell due.
     ShareKeys,
+    Audit(AuditCompletion),
 }
 
 /// One walk turn while the connection is idle.
@@ -2846,7 +2994,7 @@ where
 {
     match connect_during_recovery(context, factory).await? {
         ConnectAttempt::Connected(transport) => {
-            Ok(resume_during_recovery(context, transport, upstream).await)
+            Ok(resume_during_recovery(context, Some(transport), upstream).await)
         }
         ConnectAttempt::Failed => Ok(RecoveryAttempt::Failed),
         ConnectAttempt::Closed => Ok(RecoveryAttempt::Closed),
@@ -2865,6 +3013,8 @@ where
     let connect = factory.connect();
     tokio::pin!(connect);
     loop {
+        context.state.audits.reap(&context.state.tabs);
+        context.worker.process_courier_audit().await?;
         let owes = walk_owes(context.walk);
         let key_timer = context.worker.share_key_timer();
         let key_wait = sleep_or_park(fresh_key_wait_ms(key_timer, context.state.fired_key_timer));
@@ -2880,6 +3030,7 @@ where
                 event = events.recv() => IdleWake::Event(event),
                 () = core::future::ready(()), if owes => IdleWake::Walk,
                 () = key_wait => IdleWake::ShareKeys,
+                completion = context.state.audits.next() => IdleWake::Audit(completion),
             }
         };
         match wake {
@@ -2889,13 +3040,19 @@ where
                 walk_recovery_turn(context).await;
             }
             IdleWake::ShareKeys => idle_share_key_turn(context, key_timer).await?,
+            IdleWake::Audit(completion) => {
+                context
+                    .state
+                    .audits
+                    .complete(&context.state.tabs, completion);
+            }
         }
     }
 }
 
 async fn resume_during_recovery<U>(
     context: &mut RecoveryContext<'_, U>,
-    transport: U,
+    transport: Option<U>,
     upstream: &[(String, SubscriptionSpec)],
 ) -> RecoveryAttempt
 where
@@ -2910,7 +3067,10 @@ where
     let events = &mut *context.events;
     let deferred = &mut *context.deferred;
     let recovery = async {
-        worker.attach(transport).await?;
+        match transport {
+            Some(transport) => worker.attach(transport).await?,
+            None => worker.resume_attach().await?,
+        }
         restore_recovery_subscriptions(worker, &subscriptions).await
     };
     tokio::pin!(recovery);
@@ -2928,6 +3088,9 @@ where
                 };
             }
             () = &mut key_wait => return RecoveryAttempt::ShareKeys(key_timer),
+            completion = state.audits.next() => {
+                state.audits.complete(&state.tabs, completion);
+            }
             event = events.recv() => match event {
                 Some(event) => {
                     if let Some(local) = attach_during_recovery(state, deferred, event) {
@@ -2950,6 +3113,10 @@ fn attach_during_recovery(
     deferred: &mut VecDeque<HubEvent>,
     event: HubEvent,
 ) -> Option<HubEvent> {
+    release_departed_audits(state, &event);
+    if audit_bypasses_queue(state, &event) {
+        return Some(event);
+    }
     if deferred.is_empty()
         && let HubEvent::Attached(id, out) = event
     {
@@ -2957,6 +3124,30 @@ fn attach_during_recovery(
         return None;
     }
     schedule_recovery_event(deferred, event, recovery_interrupts_attach)
+}
+
+/// Audit ownership ends independently of deferred application teardown.
+fn release_departed_audits(state: &mut HubState, event: &HubEvent) {
+    if let HubEvent::Gone(id) | HubEvent::Kill(id) = event {
+        if let Some(tab) = state.tabs.get_mut(id) {
+            tab.audit_closed = true;
+        }
+        state.audits.remove_tab(*id);
+        state.audits.reap(&state.tabs);
+    }
+}
+
+/// An audit control cannot overtake its own tab's handshake.
+fn audit_bypasses_queue(state: &HubState, event: &HubEvent) -> bool {
+    let (HubEvent::AuditRequest(id, _, _)
+    | HubEvent::Frame(id, IncomingFrame::Control(ControlMessage::CourierAuditCancel(_)))) = event
+    else {
+        return false;
+    };
+    state
+        .tabs
+        .get(id)
+        .is_some_and(|tab| tab.handshaken && !tab.audit_closed)
 }
 
 /// Every subscription the replay puts back, taken before the attach starts so the attach
@@ -2999,8 +3190,15 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
-    let Some(local) = schedule_recovery_event(context.deferred, event, recovery_serves_idle) else {
-        return Ok(());
+    release_departed_audits(context.state, &event);
+    let local = if audit_bypasses_queue(context.state, &event) {
+        event
+    } else {
+        let Some(local) = schedule_recovery_event(context.deferred, event, recovery_serves_idle)
+        else {
+            return Ok(());
+        };
+        local
     };
     handle_hub_event(
         context.worker,
@@ -3050,6 +3248,7 @@ fn recovery_serves_idle(event: &HubEvent) -> bool {
             | HubEvent::RefusedContent(_)
             | HubEvent::RetryRefused(_, _)
             | HubEvent::Frame(_, _)
+            | HubEvent::AuditRequest(_, _, _)
             | HubEvent::Internal(_, _, _)
     )
 }
@@ -3131,6 +3330,14 @@ where
         }
         IncomingFrame::Bulk(bulk) => handle_tab_bulk(worker, state, content, walk, id, bulk).await,
     };
+    finish_tab_frame(state, id, outcome)
+}
+
+fn finish_tab_frame(
+    state: &mut HubState,
+    id: TabId,
+    outcome: Result<(), TabFault>,
+) -> Result<(), RelayError> {
     let reason = match outcome {
         Ok(()) => return Ok(()),
         Err(TabFault::Hub(err)) => return Err(err),
@@ -3138,6 +3345,8 @@ where
         Err(TabFault::Refuse(reason)) => reason,
     };
     tracing::warn!(tab = %id, reason = ?reason, "relay hub closed a tab");
+    state.audits.remove_tab(id);
+    state.audits.reap(&state.tabs);
     if let Some(tab) = state.tabs.remove(&id) {
         // The shovel delivers this before it sees the dropped sender and closes the tab.
         let _ = tab.out.send(TabOut::Control(ControlMessage::FatalError(
@@ -3492,6 +3701,11 @@ where
             if let Err(err) = worker.ack_courier_notice(&ack.notice_id).await {
                 tracing::warn!(error = %err, "acking a courier notice upstream failed");
             }
+            Ok(())
+        }
+        ControlMessage::CourierAuditCancel(cancel) if tab.handshaken => {
+            state.audits.cancel(id, &cancel.request_id);
+            state.audits.reap(&state.tabs);
             Ok(())
         }
         ControlMessage::BindDevice(_) | ControlMessage::RetireWriter(_) => {
@@ -5811,6 +6025,156 @@ mod tests {
 
     #[expect(
         clippy::too_many_lines,
+        reason = "keeps the worker, locked gate and both wire endpoints within one bounded proof"
+    )]
+    #[wasm_bindgen_test]
+    async fn a_locked_gate_keeps_tab_audit_receipts_live() {
+        use connetto_client::{
+            ClientBuilder, GateAskFuture, GateMechanism, Grant, HeldCredential, SyncSchema,
+        };
+        use connetto_core::messages::{
+            ControlMessage, CourierAuditAnswer, CourierAuditOutcome, CourierAuditRequest,
+            Handshake, HandshakeAck, WriterGrant,
+        };
+        use connetto_core::schema::SchemaBundle;
+        use connetto_core::traits::IncomingFrame;
+        use connetto_core::{
+            Cursor, LoopbackTransport, Major, PROTOCOL_VERSION, Transport, loopback,
+        };
+        use std::sync::Arc;
+
+        struct Locked;
+        impl GateMechanism for Locked {
+            fn lock(&self) {}
+            fn ask(&self) -> GateAskFuture {
+                panic!("a receipt observation must not prompt for the replica key")
+            }
+        }
+
+        let proof = async {
+            let schema = SyncSchema::new(
+                SchemaBundle::new(
+                    SOURCE,
+                    "",
+                    DDL,
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                    None::<&str>,
+                )
+                .expect("audit schema"),
+            );
+            let mut worker = ClientBuilder::new(schema, || async {
+                Err::<LoopbackTransport, _>("no redial")
+            })
+            .signed_in(
+                HeldCredential::new(Grant::new("user:audit-gate"), "audit-gate").expect("identity"),
+            )
+            .open_driven()
+            .expect("open audit worker");
+            let (transport, mut server) = loopback();
+            let answer = async {
+                assert!(matches!(
+                    server.recv().await.expect("handshake"),
+                    Some(IncomingFrame::Control(ControlMessage::Handshake(_)))
+                ));
+                server
+                    .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                        connection_id: "audit-gate".to_owned(),
+                        session_token: "audit-gate".to_owned(),
+                        resume_token: "audit-gate".to_owned(),
+                        current_cursor: Cursor::new(Vec::new()),
+                        schema_version: None,
+                        sunset_at_secs: None,
+                        courier: false,
+                        initial_credits: 64,
+                        writer: Some(WriterGrant {
+                            number: 7,
+                            frontier: 0,
+                        }),
+                    }))
+                    .await
+                    .expect("acknowledge worker");
+            };
+            let (attached, ()) = tokio::join!(worker.attach(transport), answer);
+            attached.expect("attach worker");
+            let (hub, pump, _notices) =
+                super::RelayHub::new(worker, ":memory:").expect("audit hub");
+            hub.gate.enable(None, Arc::new(Locked));
+            assert!(hub.gate.is_locked());
+            let channel = web_sys::MessageChannel::new().expect("audit channel");
+            hub.attach(crate::MessageTransport::<web_sys::MessagePort>::new(
+                channel.port1(),
+            ));
+            let mut tab = crate::MessageTransport::<web_sys::MessagePort>::new(channel.port2());
+            let observation = async {
+                tab.send_control(ControlMessage::Handshake(
+                    Handshake::new(PROTOCOL_VERSION, "locked-audit")
+                        .with_major(Major::new(1).expect("major")),
+                ))
+                .await
+                .expect("tab handshake");
+                while !matches!(
+                    tab.recv()
+                        .await
+                        .expect("tab frame")
+                        .expect("tab remains open"),
+                    IncomingFrame::Control(ControlMessage::HandshakeAck(_))
+                ) {}
+                tab.send_control(ControlMessage::CourierAuditRequest(CourierAuditRequest {
+                    request_id: "locked-receipt".to_owned(),
+                    author: [7; 32],
+                    seqs: vec![91],
+                    remaining_ms: 5_000,
+                }))
+                .await
+                .expect("observe receipt");
+                let request = loop {
+                    if let IncomingFrame::Control(ControlMessage::CourierAuditRequest(request)) =
+                        server
+                            .recv()
+                            .await
+                            .expect("audit request")
+                            .expect("upstream remains open")
+                    {
+                        break request;
+                    }
+                };
+                assert_eq!(request.author, [7; 32]);
+                assert_eq!(request.seqs, vec![91]);
+                server
+                    .send_control(ControlMessage::CourierAuditAnswer(CourierAuditAnswer {
+                        request_id: request.request_id,
+                        outcome: CourierAuditOutcome::Confirmed,
+                    }))
+                    .await
+                    .expect("answer receipt");
+                loop {
+                    if let IncomingFrame::Control(ControlMessage::CourierAuditAnswer(answer)) = tab
+                        .recv()
+                        .await
+                        .expect("audit answer")
+                        .expect("tab remains open")
+                    {
+                        assert_eq!(answer.request_id, "locked-receipt");
+                        assert_eq!(answer.outcome, CourierAuditOutcome::Confirmed);
+                        break;
+                    }
+                }
+                assert!(hub.gate.is_locked());
+            };
+            tokio::select! {
+                result = pump => panic!("hub ended before locked-receipt {result:?}"),
+                () = observation => {}
+            }
+        };
+        tokio::select! {
+            () = proof => {}
+            () = crate::workers::helpers::sleep_ms(8_000) => panic!("locked-receipt exceeded its bound"),
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
         reason = "keeps the durable worker, gate and secret-store lifetimes in one scope"
     )]
     #[wasm_bindgen_test]
@@ -6494,6 +6858,7 @@ mod tests {
         let mut tab = super::TabState {
             out: out_tx,
             handshaken: true,
+            audit_closed: false,
             subs: Vec::new(),
             pending_write: None,
             client_id: None,
@@ -6774,6 +7139,7 @@ mod tests {
         let mut tab = super::TabState {
             out: out_tx,
             handshaken: true,
+            audit_closed: false,
             subs: Vec::new(),
             pending_write: None,
             client_id: None,

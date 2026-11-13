@@ -2636,7 +2636,7 @@ where
                 )?
             };
             self.shared.wake.notify_one();
-            wait.wait().await
+            wait.wait_reply().await
         };
         let mut observe = core::pin::pin!(observe);
         loop {

@@ -120,7 +120,7 @@ pub use bluetooth::{
     BeaconState, BluetoothError, BluetoothState, HostId, Hosted, JoinNearbyError, NearbyHost,
     PromptOutcome,
 };
-pub use courier_audit::CourierAuditError;
+pub use courier_audit::{CourierAuditError, CourierAuditWait};
 #[cfg(feature = "device-identity")]
 pub use enrolment::{CertificateError, DeviceEntry};
 #[cfg(feature = "peer")]
@@ -4513,10 +4513,8 @@ async fn timer_wait(remaining: Duration) {
     use js_sys::wasm_bindgen::JsValue;
     use js_sys::wasm_bindgen::closure::Closure;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    // The u32 clamp keeps the JS delay finite, so `try_from` cannot fail.
-    let ms = f64::from(
-        u32::try_from(remaining.as_millis().min(u128::from(u32::MAX))).unwrap_or(u32::MAX),
-    );
+    // Browser timers use a signed 32-bit millisecond delay.
+    let ms = f64::from(i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX));
     // The sender sits in a shared cell so the callback stays `Fn` (it takes
     // the sender at most once) and the fallback below can still settle a
     // page with no `setTimeout`.

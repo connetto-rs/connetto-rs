@@ -25,6 +25,8 @@ A tab holds no connection to the replica. It runs its own [`connetto_client::Con
 
 The worker's connection relays courier notices, [`connetto_client::ConnettoConnection::relay_courier_notices`], switched on by the boot before it first connects. It holds each [`connetto_core::messages::CourierNotice`] it receives on its current transport unacked, the hub sends the frame under the server's id to every handshaken tab and to every tab that handshakes while it is held, and the first tab's `CourierNoticeAck` is the one [`connetto_client::ConnettoConnection::ack_courier_notice`] sends upstream, a later tab's naming a frame no longer held and sending nothing. A dropped transport takes the held frames with it, and the server sends their rows again at the next handshake.
 
+Courier receipt observations belong to the requesting tab. The hub maps each tab's `CourierAuditRequest` ID to a connection-owned observation and returns its `CourierAuditAnswer` only to that tab. Equal IDs in different tabs remain independent. An identical duplicate retains its deadline, and changed inputs cancel and refuse that ID. `CourierAuditCancel` and tab departure release the observation and its shared capacity. A same-account reconnect assigns a fresh upstream route while preserving the intake deadline. These read-only controls remain live with the gate locked and during content uploads.
+
 [`connetto_core::messages::SyncStatus`] carries `Connected` or `Offline`. A reconnect attempt in progress is indistinguishable to an application from being offline, and both mean the same thing, that what is being read may be stale. The status rides `ControlMessage::SyncStatus`, so the hub forwards it to the tabs on the same channel as every other control frame. It defaults to `Offline`, because claiming a server is reachable before one has answered is the one answer that is certainly wrong.
 
 ## The worker hub
@@ -35,8 +37,9 @@ The hub's core is the `HubEvent` select in [relay.rs](../../crates/connetto-web/
 |---|---|---|---|---|---|---|
 | `Attached` | Served | Served | Served | Served if nothing is queued, else held | Served if nothing is queued, else held | Refused |
 | `Frame` | Served | Served | Served | Interrupts on `TabShareKeyChange` and `TabStorageUse`, else held | Interrupts on `TabShareKeyChange` and `TabStorageUse`, else held | Refused |
-| `Gone` | Served | Served | Served | Held | Held | Refused |
-| `Kill` | Served | Served | Served | Held | Held | Refused |
+| `CourierAuditRequest` and `CourierAuditCancel` after handshake | Served | Served | Served | Served independently | Served independently | Refused |
+| `Gone` | Served | Served | Served | Audit ownership released, application teardown held | Audit ownership released, application teardown held | Refused |
+| `Kill` | Served | Served | Served | Audit ownership released, application teardown held | Audit ownership released, application teardown held | Refused |
 | `Unsynced` | Served | Served | Served | Interrupts | Interrupts | Refused |
 | `LeaveShared` | Served | Served | Served | Interrupts | Interrupts | Refused |
 | `Export` | Served | Served | Served | Interrupts | Interrupts | Refused |
@@ -48,9 +51,9 @@ The hub's core is the `HubEvent` select in [relay.rs](../../crates/connetto-web/
 
 An offline stage is a tab completing its full protocol, handshake, subscribe and mutation, against the relay while the upstream is absent. Every `Frame` the relay receives during idle recovery can be answered from local state. A handshake reads the tab's watermark from the replica, a subscribe reads the snapshot from the replica, and a mutation commits to the replica and to `_connetto_pending`, then replays exactly once when the upstream first attaches, under the exactly-once watermark. This is the same contract as the native client's offline write path, and serving frames during idle recovery makes the browser relay a true local peer rather than a proxy that requires a reachable server. The `with_connect_gate` default of `None` does not change any other row of the table.
 
-A frame is held while the attach or the subscription replay owns the connection unless it is one the replica answers, because those phases replay the full upstream state and a concurrent frame would race their ordering. A departure and a kill unsubscribe through the connection the attach owns and nothing waits on them, so they keep their place in the queue. Every request answered from the replica interrupts an attach rather than wait for it, and the interrupted attach resumes on the installed transport afterwards.
+A frame is held while attachment or subscription replay owns the connection unless it is one the replica answers or an audit control from a handshaken tab with live audit ownership. Application departure and kill teardown keep their queue positions because they unsubscribe through that connection. Audit controls from departed tabs leave connection and drain attempts unchanged. An interruption before the worker handshake acknowledgement drops the pending transport and redials. After acknowledgement, attachment resumes on the installed transport. Existing audit observations can expire without interrupting the handshake.
 
-One order rule covers every served cell. A request that would be served where it arrives is queued instead while any older request is already queued, and the queue drains in arrival order once the upstream is back, so a kill can never overtake a frame of the tab it kills. Refused means the intake has closed and the hub has ended, so every waiting reply sender drops and its caller reads the hub as gone.
+Application requests preserve arrival order. A serviceable application request is queued while an older application request is queued, and that queue drains in order once the upstream is back. After a tab's handshake, audit controls use an independent lane with per-tab ordering and can pass deferred application frames. Audit expiry and ownership cleanup continue while attachment or replay is stalled. Before the handshake, audit controls retain their place behind it. Refused means the intake has closed and the hub has ended, so every waiting reply sender drops and its caller reads the hub as gone.
 
 | Background job | Runs while | Held while | One turn is | Interrupted by |
 |---|---|---|---|---|
@@ -58,6 +61,8 @@ One order rule covers every served cell. A request that would be served where it
 | Content ticket retry | Connected | Sleeping, connecting, attaching, replaying | One ticket request for the deferred entry | Queued local work, which takes the turn |
 | Integrity walk | Connected, sleeping, connecting | Attaching, replaying | Eight chunks of the head file | Every other source, because the walk is one branch of the same wait |
 | Orphan sweep | Connected, sleeping, connecting | Attaching, replaying | One listing, then eight deletions | Every other source, and a failure waits for the retry timer |
+| Audit completion and expiry | Connected, sleeping, connecting, attaching, replaying, content transfer | Never | One tab-owned outcome or cancellation | Hub teardown |
+| Drain dial and attachment | Held work owes a dial | Existing drain backoff | One correlated drain attempt | Audit controls, audit completion and tab departure cancel the attempt and reschedule retained work |
 
 The upload and the ticket retry need a ticket the server mints, so they cannot run while the upstream is down and the table states that rather than leaving it to be rediscovered. The walk and the sweep read only the replica and the chunk store, so they run through the retry sleep and the connect, which is when a device is most likely to sit for a long time. They stop while the attach and the subscription replay own the connection, because the walk reads the replica through it.
 
@@ -79,7 +84,7 @@ The replica's key and the share-key set are the one use of IndexedDB in the topo
 
 ## Transport
 
-The browser client speaks `web-sys::WebSocket`, and the same [`connetto_core::traits::Transport`] the native client implements backs it, with the same reconnect and keepalive logic and only the socket and the timer different. The relay hub fires the worker connection's keepalive deadline beside its other wakes.
+The browser client speaks `web-sys::WebSocket`, and the same [`connetto_core::traits::Transport`] the native client implements backs it, with the same reconnect and keepalive logic and only the socket and the timer different. The relay hub fires the worker connection's keepalive deadline beside its other wakes. Individual browser waits fit the signed `i32` millisecond range, and callers retain their original monotonic deadline across waits.
 
 The per-origin connection limit is why the topology is one connection. The elected worker holds the one upstream socket across all the tabs of the origin, and a browser that caps concurrent connections per origin never sees its limit, since the tabs share the worker's connection over the relay.
 

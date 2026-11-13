@@ -29,7 +29,7 @@ enum Kept {
     /// The `fetch` answering the intent and the commit.
     Fetch(Closure<dyn FnMut(JsValue) -> Promise>),
     /// The upload's body recorder and its start signal.
-    Upload(Closure<dyn FnMut(JsValue)>, Closure<dyn FnMut()>),
+    Upload(Closure<dyn FnMut(JsValue)>, Closure<dyn FnMut(String)>),
 }
 
 /// The two transports a content transfer uses, `fetch` for the intent and the
@@ -43,10 +43,20 @@ pub(super) struct ContentStubs {
 pub(super) struct BlockedUpload {
     _stubs: ContentStubs,
     pub(super) started: Rc<Cell<bool>>,
+    starts: tokio::sync::mpsc::UnboundedReceiver<String>,
+    commits: tokio::sync::mpsc::UnboundedReceiver<String>,
     release: Function,
 }
 
 impl BlockedUpload {
+    pub(super) async fn next_started(&mut self) -> Option<String> {
+        self.starts.recv().await
+    }
+
+    pub(super) async fn next_committed(&mut self) -> Option<String> {
+        self.commits.recv().await
+    }
+
     pub(super) fn release(&self) {
         self.release
             .call0(&JsValue::UNDEFINED)
@@ -55,8 +65,9 @@ impl BlockedUpload {
 }
 
 pub(super) fn install_content_transport(uploaded: &Rc<RefCell<Vec<Vec<u8>>>>) -> ContentStubs {
+    let (fetch, _commits) = replace_content_fetch();
     ContentStubs {
-        _fetch: replace_content_fetch(),
+        _fetch: fetch,
         _upload: replace_content_upload(uploaded, None),
     }
 }
@@ -71,13 +82,17 @@ pub(super) fn install_blocked_content_transport(
     });
     let release = resolver.borrow_mut().take().expect("upload gate resolver");
     let started = Rc::new(Cell::new(false));
+    let (started_tx, starts) = tokio::sync::mpsc::unbounded_channel();
+    let (fetch, commits) = replace_content_fetch();
     let stubs = ContentStubs {
-        _fetch: replace_content_fetch(),
-        _upload: replace_content_upload(uploaded, Some((Rc::clone(&started), gate))),
+        _fetch: fetch,
+        _upload: replace_content_upload(uploaded, Some((Rc::clone(&started), gate, started_tx))),
     };
     BlockedUpload {
         _stubs: stubs,
         started,
+        starts,
+        commits,
         release,
     }
 }
@@ -87,7 +102,11 @@ pub(super) fn install_blocked_content_transport(
 /// and waiting on `gate` before answering when the test holds one.
 pub(super) fn replace_content_upload(
     uploaded: &Rc<RefCell<Vec<Vec<u8>>>>,
-    gate: Option<(Rc<Cell<bool>>, Promise)>,
+    gate: Option<(
+        Rc<Cell<bool>>,
+        Promise,
+        tokio::sync::mpsc::UnboundedSender<String>,
+    )>,
 ) -> Replaced {
     let captured = Rc::clone(uploaded);
     let record = Closure::<dyn FnMut(JsValue)>::new(move |body: JsValue| {
@@ -96,13 +115,16 @@ pub(super) fn replace_content_upload(
             .expect("the upload body is a byte array");
         captured.borrow_mut().push(bytes.to_vec());
     });
-    let (started_flag, held) = match gate {
-        Some((started, gate)) => (Some(started), gate.into()),
-        None => (None, JsValue::NULL),
+    let (started_flag, held, starts) = match gate {
+        Some((started, gate, starts)) => (Some(started), gate.into(), Some(starts)),
+        None => (None, JsValue::NULL, None),
     };
-    let started = Closure::<dyn FnMut()>::new(move || {
+    let started = Closure::<dyn FnMut(String)>::new(move |url: String| {
         if let Some(flag) = started_flag.as_ref() {
             flag.set(true);
+        }
+        if let Some(starts) = starts.as_ref() {
+            let _ = starts.send(url);
         }
     });
     let factory = js_sys::eval(UPLOAD_STUB).expect("evaluate the upload replacement");
@@ -152,7 +174,7 @@ const UPLOAD_STUB: &str = "(record, started, gate) => class ScriptedUpload {
             if (this.onload) { this.onload(); }
         };
         if (gate) {
-            started();
+            started(this.url);
             gate.then(answer);
         } else {
             answer();
@@ -175,14 +197,20 @@ fn replace_global(name: &str, replacement: &JsValue, kept: Kept) -> Replaced {
 }
 
 /// Answers the intent with every declared hash and the commit with `200`.
-fn replace_content_fetch() -> Replaced {
-    install_fetch(|request, body| async move {
-        if request.url().contains("/intent?") {
-            intent_answer(&body)
-        } else {
-            response(None, 200)
+fn replace_content_fetch() -> (Replaced, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    let (committed, commits) = tokio::sync::mpsc::unbounded_channel();
+    let fetch = install_fetch(move |request, body| {
+        let committed = committed.clone();
+        async move {
+            if request.url().contains("/intent?") {
+                intent_answer(&body)
+            } else {
+                let _ = committed.send(request.url());
+                response(None, 200)
+            }
         }
-    })
+    });
+    (fetch, commits)
 }
 
 /// Replaces `fetch` with `answer`, called with each request and its body.
