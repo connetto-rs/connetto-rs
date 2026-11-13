@@ -39,7 +39,7 @@ const PHOTO_SCHEMA: &str = "-- connetto:major 1\n \
 const PHOTO_POLICIES: &str = "CREATE POLICY photos_read ON photos FOR SELECT \
                               USING (owner = current_setting('app.user_id', true)); \
                               CREATE POLICY photos_curate ON photos FOR SELECT \
-                              USING (current_setting('app.user_id', true) = 'tester'); \
+                              USING (current_setting('app.user_id', true) IN ('tester', 'curator')); \
                               CREATE POLICY photos_insert ON photos FOR INSERT WITH CHECK (true); \
                               CREATE POLICY photos_update ON photos FOR UPDATE USING (true) \
                               WITH CHECK (true);";
@@ -65,7 +65,7 @@ diesel::table! {
     _connetto_content_custody (file_id) {
         /// The held file.
         file_id -> Binary,
-        /// `held`, or a state marking the copy leaving.
+        /// `held`, or `leaving` or `pressed` for a copy marked leaving.
         state -> Text,
     }
 }
@@ -85,6 +85,45 @@ pub async fn set_custody_state(client: &ConnettoClient<Scripted>, file_id: FileI
         .expect("the replica is open")
         .expect("write the custody state");
     assert_eq!(written, 1, "the file is in custody");
+}
+
+/// The state of `file_id`'s custody copy on `client`, `None` for none.
+pub async fn custody_state(client: &ConnettoClient<Scripted>, file_id: FileId) -> Option<String> {
+    client
+        .with_conn(move |conn| {
+            _connetto_content_custody::table
+                .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
+                .select(_connetto_content_custody::state)
+                .first::<String>(conn.conn())
+                .optional()
+        })
+        .await
+        .expect("the replica is open")
+        .expect("read the custody record")
+}
+
+diesel::table! {
+    /// The chunk rows of every manifest a device holds.
+    _connetto_content_chunks (file_id, ordinal) {
+        /// The file.
+        file_id -> Binary,
+        /// The chunk's place in the file.
+        ordinal -> BigInt,
+    }
+}
+
+/// How many chunk rows of `file_id`'s manifest `client` holds.
+pub async fn held_chunks(client: &ConnettoClient<Scripted>, file_id: FileId) -> i64 {
+    client
+        .with_conn(move |conn| {
+            _connetto_content_chunks::table
+                .filter(_connetto_content_chunks::file_id.eq(file_id.as_bytes().to_vec()))
+                .count()
+                .get_result(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("count the chunk rows")
 }
 
 diesel::table! {
@@ -194,18 +233,46 @@ fn forwarded(event: PeerEvent) -> Option<MediaEvent> {
 
 /// A media port over a bare node, fed the link events and media frames the
 /// enrolment task would forward.
-pub fn port(node: Node, mut events: mpsc::UnboundedReceiver<PeerEvent>) -> MediaPort {
-    let (tx, rx) = mpsc::unbounded_channel();
+pub fn port(node: Node, events: mpsc::UnboundedReceiver<PeerEvent>) -> MediaPort {
+    relay(node, events).port()
+}
+
+/// Media ports over one bare node, the latest taken fed what the enrolment
+/// task would forward, so a proof can start a device's media driver again
+/// on links that stay up.
+pub struct Relay {
+    node: Node,
+    to: Arc<Mutex<Option<mpsc::UnboundedSender<MediaEvent>>>>,
+}
+
+impl Relay {
+    /// The node the relay feeds from.
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
+    /// A fresh port, which takes the events from here on.
+    pub fn port(&self) -> MediaPort {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.to.lock() = Some(tx);
+        MediaPort::over(self.node.clone(), rx)
+    }
+}
+
+/// A relay over `node` and its `events`.
+pub fn relay(node: Node, mut events: mpsc::UnboundedReceiver<PeerEvent>) -> Relay {
+    let to: Arc<Mutex<Option<mpsc::UnboundedSender<MediaEvent>>>> = Arc::default();
+    let feeding = Arc::clone(&to);
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             if let Some(event) = forwarded(event)
-                && tx.send(event).is_err()
+                && let Some(port) = feeding.lock().as_ref()
             {
-                return;
+                let _ = port.send(event);
             }
         }
     });
-    MediaPort::over(node, rx)
+    Relay { node, to }
 }
 
 /// A replica over the photo policies, with `transport` attached when one is
@@ -423,6 +490,22 @@ pub async fn beside(device: &Device, port: MediaPort, proof: impl Future<Output 
     }
 }
 
+/// Runs `proof` beside the media drivers of every device in `drivers`,
+/// each polled before the proof as [`beside`] polls its one.
+pub async fn beside_all(drivers: Vec<(&Device, MediaPort)>, proof: impl Future<Output = ()>) {
+    let mut running: futures_util::stream::FuturesUnordered<_> = drivers
+        .into_iter()
+        .map(|(device, port)| device.drive_media(port))
+        .collect();
+    tokio::select! {
+        biased;
+        Some(()) = futures_util::StreamExt::next(&mut running) => {
+            panic!("a port ended under the proof")
+        }
+        () = proof => {}
+    }
+}
+
 /// Runs `proof` beside the media drivers of two devices, both polled before
 /// the proof as [`beside`] polls its one.
 pub async fn beside_both(
@@ -451,6 +534,8 @@ pub enum Fault {
     DropAtSecondFetch,
     /// It answers every request `Busy`.
     AlwaysBusy,
+    /// It answers its first request `Busy` and serves the file after.
+    BusyFirst,
     /// It answers nothing.
     Silent,
     /// It names a chunk of no bytes.
@@ -488,6 +573,7 @@ pub fn bare_holder(
                 .await
                 .expect("chunk the file");
         let mut fetches = 0;
+        let mut busy = fault == Fault::AlwaysBusy || fault == Fault::BusyFirst;
         while let Some(event) = events.recv().await {
             let Some((peer, link, message)) = media_of(event) else {
                 continue;
@@ -498,7 +584,8 @@ pub fn bare_holder(
             };
             match (fault, message) {
                 (Fault::Silent, _) => {}
-                (Fault::AlwaysBusy, _) => {
+                _ if busy => {
+                    busy = fault == Fault::AlwaysBusy;
                     let _ = node
                         .send_media(&peer, link, Media::Busy { request_id })
                         .await;

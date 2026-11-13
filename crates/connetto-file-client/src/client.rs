@@ -100,8 +100,19 @@ pub enum ContentEvent {
     Replicated {
         /// The file.
         file_id: FileId,
-        /// How many linked devices other than this one hold it.
+        /// How many linked devices other than this one hold it without
+        /// marking it leaving.
         holders: usize,
+        /// How many linked devices hold it marked leaving, handing their
+        /// copy to another device.
+        leaving: usize,
+    },
+    /// Copies this device holds for others are marked leaving under storage
+    /// pressure and no linked device can take one over, so they stay (R79
+    /// decision 16). Raised again whenever more copies are stranded.
+    CustodyPressed {
+        /// The bytes custody holds.
+        held_bytes: u64,
     },
     /// The boot integrity pass could not run, so no unsent file was checked
     /// this time. The walk went ahead: a pass that cannot read the outbox
@@ -417,6 +428,10 @@ where
                 .map(|((), out)| out)
             })
             .await??;
+        // A staged file of a replicated column is reported held to linked
+        // peers (R79 decision 13).
+        #[cfg(feature = "peer")]
+        self.custody_changed.notify_one();
         Ok((file_id, out))
     }
 
@@ -1032,13 +1047,13 @@ where
 
     /// Commits a fetched file's manifest and outboard rows in one
     /// transaction, with no outbox row, which makes the file cache, or a copy
-    /// in custody for the row `custody` names the author of. The caller holds
+    /// in custody for whom `custody` names. The caller holds
     /// `content_writes` from its chunk writes to here.
     async fn commit_cached(
         &self,
         manifest: &Manifest,
         outboard: Option<ChunkHash>,
-        custody: Option<&[u8]>,
+        custody: Option<&Keeper>,
     ) -> Result<(), ContentError> {
         let file_id = manifest.file_id();
         self.client
@@ -1050,7 +1065,10 @@ where
                             db::put_outboard(c, file_id, hash)?;
                         }
                         match custody {
-                            Some(author) => db::enter_custody(c, file_id, Some(author)),
+                            Some(Keeper::Author(author)) => {
+                                db::enter_custody(c, file_id, Some(author.as_slice()))
+                            }
+                            Some(Keeper::Settled) => db::enter_custody(c, file_id, None),
                             None => Ok(()),
                         }
                     },
@@ -1061,6 +1079,21 @@ where
             .map_err(ContentError::Replica)
             .map(|_| ())
     }
+}
+
+/// Whom a copy taken into custody is kept for.
+#[cfg_attr(
+    not(feature = "peer"),
+    expect(
+        dead_code,
+        reason = "only the peer link's fetches take copies into custody"
+    )
+)]
+pub(crate) enum Keeper {
+    /// The provisional row of the author with this key id.
+    Author(Vec<u8>),
+    /// A settled row whose state column does not read `available` yet.
+    Settled,
 }
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -1233,7 +1266,7 @@ where
         #[cfg(feature = "peer")]
         let now = peer::custody::unix_now();
         let _writing = self.content_writes.lock().await;
-        let (evicted, referenced, changed) = self
+        let (evicted, referenced) = self
             .client
             .with_conn(|conn| {
                 // One hold of the connection, so a peer apply cannot land between the reads and the eviction.
@@ -1250,24 +1283,19 @@ where
                 conn.transact_with_bookkeeping(
                     |c| {
                         #[cfg(feature = "peer")]
-                        let changed =
-                            peer::custody::pass(c, &self.peer_content, &named, now, &mut kept)?;
-                        #[cfg(not(feature = "peer"))]
-                        let changed = false;
+                        peer::custody::pass(c, &self.peer_content, &named, now, &mut kept)?;
                         let evicted = crate::retain::evict_uncovered(c, &kept)?;
-                        Ok((evicted, db::referenced_hashes(c)?, changed))
+                        Ok((evicted, db::referenced_hashes(c)?))
                     },
                     |_| Ok::<(), ContentError>(()),
                 )
                 .map(|(counted, ())| counted)
             })
             .await??;
+        // Besides custody, an upload since the last pass may have taken a file
+        // out of the unsent ones the reports list as held (R79 decision 13).
         #[cfg(feature = "peer")]
-        if changed {
-            self.custody_changed.notify_one();
-        }
-        #[cfg(not(feature = "peer"))]
-        let _ = changed;
+        self.custody_changed.notify_one();
         self.delete_unreferenced(&referenced).await?;
         Ok(evicted)
     }

@@ -492,6 +492,15 @@ pub(crate) fn all_manifests(conn: &mut SqliteConnection) -> Result<Vec<FileId>, 
 /// The state of a copy held in custody and not marked leaving.
 pub(crate) const HELD: &str = "held";
 
+/// The state of a copy above the count, marked leaving (R79 decision 15).
+#[cfg(feature = "peer")]
+pub(crate) const LEAVING: &str = "leaving";
+
+/// The state of a copy marked leaving under storage pressure (R79 decision
+/// 16).
+#[cfg(feature = "peer")]
+pub(crate) const PRESSED: &str = "pressed";
+
 /// Takes `file_id` into custody for `author`'s row, `None` for a copy a
 /// `lost` state returned. A file already in custody keeps its record.
 pub(crate) fn enter_custody(
@@ -537,11 +546,26 @@ pub(crate) fn custody_settled(
         .map(|_| ())
 }
 
-/// Every custody copy with its state.
+/// Sets the state of `file_id`'s custody copy, [`HELD`], [`LEAVING`] or
+/// [`PRESSED`].
+#[cfg(feature = "peer")]
+pub(crate) fn set_custody_state(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+    state: &str,
+) -> Result<(), diesel::result::Error> {
+    diesel::update(_connetto_content_custody::table)
+        .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
+        .set(_connetto_content_custody::state.eq(state))
+        .execute(conn)
+        .map(|_| ())
+}
+
+/// Every custody copy with its state and its file's size in bytes.
 #[cfg(feature = "peer")]
 pub(crate) fn custody_states(
     conn: &mut SqliteConnection,
-) -> Result<Vec<(FileId, String)>, ContentError> {
+) -> Result<Vec<(FileId, String, u64)>, ContentError> {
     let rows: Vec<(Vec<u8>, String)> = _connetto_content_custody::table
         .select((
             _connetto_content_custody::file_id,
@@ -549,8 +573,27 @@ pub(crate) fn custody_states(
         ))
         .load(conn)?;
     rows.into_iter()
-        .map(|(id, state)| Ok((FileId::from_bytes(exactly_32(&id)?), state)))
+        .map(|(id, state)| {
+            let file_id = FileId::from_bytes(exactly_32(&id)?);
+            Ok((file_id, state, manifest_size(conn, file_id)?))
+        })
         .collect()
+}
+
+/// The size in bytes of the file `file_id`'s held manifest names, 0 for none.
+#[cfg(feature = "peer")]
+pub(crate) fn manifest_size(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<u64, diesel::result::Error> {
+    let lens: Vec<i64> = _connetto_content_chunks::table
+        .filter(_connetto_content_chunks::file_id.eq(file_id.as_bytes().to_vec()))
+        .select(_connetto_content_chunks::len)
+        .load(conn)?;
+    Ok(lens
+        .into_iter()
+        .map(|len| u64::try_from(len).unwrap_or(0))
+        .sum())
 }
 
 /// Every file this device holds in custody.

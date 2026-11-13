@@ -4,10 +4,11 @@
 
 pub(super) mod custody;
 mod fetch;
+mod place;
 mod serve;
 
 use core::fmt::Display;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use connetto_client::media::{MediaEvent, MediaPort, MediaSender};
@@ -17,7 +18,7 @@ use connetto_core::traits::Transport;
 use connetto_exchange::MAX_MANIFEST_ROWS;
 use connetto_exchange::media::{Ask, MAX_REPORT_ENTRIES, Media, MediaAction, MediaLinks, Priority};
 use connetto_file_core::{
-    ChunkHash, ChunkMeta, ChunkStore, FileId, FreeSpace, Manifest, MaybeSend,
+    ChunkHash, ChunkInventory, ChunkMeta, ChunkStore, FileId, FreeSpace, Manifest, MaybeSend,
 };
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -26,8 +27,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 pub(super) use fetch::Order;
 use fetch::{
-    ChunkOutcome, Fetch, LAST_BACKOFF, MAX_PREFETCH_BYTES, ON_DEMAND_BOUND, Stage, candidate_order,
-    holders_manifest,
+    ChunkOutcome, FIRST_BACKOFF, Fetch, LAST_BACKOFF, MAX_PREFETCH_BYTES, ON_DEMAND_BOUND, Purpose,
+    Stage, candidate_order, holders_manifest,
 };
 
 use super::{ContentClient, ContentEvent};
@@ -162,8 +163,8 @@ enum Job {
         link: u64,
         message: Media,
     },
-    /// Holder reports to one peer, sent in order over its link `link`
-    /// alone.
+    /// Holder reports to one peer, numbered for its link `link` and sent in
+    /// order over it alone.
     Report {
         peer: DeviceIdentity,
         link: u64,
@@ -189,11 +190,13 @@ enum Job {
         pieces: mpsc::UnboundedReceiver<Vec<u8>>,
     },
     /// The commit of a fetch whose chunks are all in, taken into custody
-    /// when it fits in `budget`.
+    /// when it fits in `budget`, also for a settled row when the fetch
+    /// `takes_over` a leaving copy.
     Commit {
         tag: u64,
         manifest: Manifest,
         budget: u64,
+        takes_over: bool,
     },
 }
 
@@ -328,7 +331,11 @@ where
             .with_conn(|conn| -> Result<_, ContentError> {
                 let copies = db::custody_states(conn.conn())?
                     .into_iter()
-                    .map(|(file_id, state)| CustodyCopy { file_id, state })
+                    .map(|(file_id, state, size)| CustodyCopy {
+                        file_id,
+                        state,
+                        size,
+                    })
                     .collect();
                 Ok((copies, db::custody_bytes(conn.conn())?))
             })
@@ -398,7 +405,10 @@ where
     /// Returned as a future rather than spawned, the shape
     /// [`drive_outbox`](Self::drive_outbox) has. It ends when the port's
     /// client ends, answering every fetch still waiting as unavailable.
-    pub async fn drive_media(&self, mut port: MediaPort) {
+    pub async fn drive_media(&self, mut port: MediaPort)
+    where
+        B: ChunkInventory,
+    {
         let sender = port.sender().clone();
         let (orders_tx, mut orders) = mpsc::unbounded_channel();
         let _orders = OrdersOpen::open(&self.peer_orders, orders_tx);
@@ -426,6 +436,13 @@ where
                 driver.custody_due = false;
                 let lapse = driver.beside_jobs(self.custody_refresh()).await;
                 driver.lapse_at = lapse.map(wake_at);
+                driver.placement_due = true;
+                continue;
+            }
+            if driver.placement_due && applied.is_empty() {
+                driver.placement_due = false;
+                let actions = driver.place(Instant::now()).await;
+                driver.act(actions, Instant::now()).await;
                 continue;
             }
             let wake = driver.next_wake();
@@ -444,8 +461,8 @@ where
                             driver.link_up(peer, link, now).await
                         }
                         Some(MediaEvent::Unlinked { peer }) => driver.link_down(&peer).await,
-                        // A message from a link already replaced is dropped
-                        // with the link.
+                        // A message from a link already replaced belongs to
+                        // a report numbering that ended with it.
                         Some(MediaEvent::Message { peer, link, message }) => {
                             if driver.link_of.get(&peer) == Some(&link) {
                                 driver.links.received(&peer, message, now)
@@ -474,6 +491,7 @@ where
                 }
                 () = self.custody_changed.notified() => {
                     driver.custody_changed().await;
+                    driver.placement_due = true;
                     // A copy that entered custody since the last pass may
                     // hang on an author who lapses before any other wake.
                     driver.custody_due = true;
@@ -539,8 +557,9 @@ where
                 tag,
                 manifest,
                 budget,
+                takes_over,
             } => {
-                let outcome = self.commit_fetched(&manifest, budget).await;
+                let outcome = self.commit_fetched(&manifest, budget, takes_over).await;
                 Done::Committed {
                     tag,
                     manifest,
@@ -590,10 +609,13 @@ where
 type RoomTold = (u64, Vec<([u8; 32], u64)>);
 
 /// One copy this device holds in custody.
+#[derive(Clone)]
 struct CustodyCopy {
     file_id: FileId,
-    /// [`db::HELD`], or a state marking it leaving.
+    /// [`db::HELD`], [`db::LEAVING`] or [`db::PRESSED`].
     state: String,
+    /// The file's size in bytes.
+    size: u64,
 }
 
 impl CustodyCopy {
@@ -685,9 +707,9 @@ struct Driver<'c, T: Transport, B: ChunkStore + Clone, H: ContentHttp, F, J> {
     reports: HashMap<DeviceIdentity, Vec<Media>>,
     /// The peers a report job is sending to now.
     reporting: HashSet<DeviceIdentity>,
-    /// The holders last heard of for each of this device's own replicated
-    /// files.
-    heard: HashMap<FileId, usize>,
+    /// The devices last heard of keeping and leaving each of this device's
+    /// own replicated files.
+    heard: HashMap<FileId, (usize, usize)>,
     /// When the earliest custody author's certificate lapses, which the
     /// custody pass then acts on.
     lapse_at: Option<Instant>,
@@ -697,6 +719,22 @@ struct Driver<'c, T: Transport, B: ChunkStore + Clone, H: ContentHttp, F, J> {
     /// A peer whose link just came up, told everything once the fetches its
     /// link wakes went out.
     opening: Option<DeviceIdentity>,
+    /// Each leaving attempt's marks, by file, the number of the report that
+    /// carried the mark to each peer by key id (R79 decision 16).
+    marks: HashMap<FileId, BTreeMap<[u8; 32], u64>>,
+    /// The sizes of files this device holds no manifest of, learned from a
+    /// holder's manifest.
+    sizes: HashMap<FileId, u64>,
+    /// Set by every event that can move a placement, cleared by one pass.
+    placement_due: bool,
+    /// When placement runs again on its own, set once a pull for custody or
+    /// a size request ended with no holder serving it.
+    place_again_at: Option<Instant>,
+    /// The wait before the next such pass, doubling up to [`LAST_BACKOFF`]
+    /// and back to [`FIRST_BACKOFF`] once a pull or a size request succeeds.
+    place_again_after: Duration,
+    /// The pressed copies no linked device can take over.
+    stranded: HashSet<FileId>,
 }
 
 /// What one peer was last told of this device's custody.
@@ -712,7 +750,7 @@ impl<'c, T, B, H, F, J> Driver<'c, T, B, H, F, J>
 where
     T: Transport + MaybeSend + 'static,
     T::Error: Display,
-    B: ChunkStore + FreeSpace + Clone + Sync + MaybeSend + 'static,
+    B: ChunkInventory + FreeSpace + Clone + Sync + MaybeSend + 'static,
     H: ContentHttp,
     F: Fn(Job) -> J,
     J: Future<Output = Done>,
@@ -746,6 +784,12 @@ where
             lapse_at: None,
             custody_due: false,
             opening: None,
+            marks: HashMap::new(),
+            sizes: HashMap::new(),
+            placement_due: false,
+            place_again_at: None,
+            place_again_after: FIRST_BACKOFF,
+            stranded: HashSet::new(),
         }
     }
 
@@ -773,8 +817,8 @@ where
         }
     }
 
-    /// The earliest instant a request lapses, busy holders are asked again
-    /// or the room is checked.
+    /// The earliest instant a request lapses, busy holders are asked again,
+    /// the room is checked or placement runs again.
     fn next_wake(&self) -> Option<Instant> {
         self.fetches
             .values()
@@ -782,11 +826,15 @@ where
             .chain(self.links.next_deadline())
             .chain(self.room_at)
             .chain(self.lapse_at)
+            .chain(self.place_again_at)
             .min()
     }
 
     /// `peer`'s link fell, or a new one replaced it: every ask on it is lost,
-    /// and what it was told and its report go with it.
+    /// and what it was told and its report go with it. A leaving mark it
+    /// carried is numbered again by the next link's opening report, and
+    /// since reports are numbered from one growing counter, nothing the peer
+    /// acknowledges over a new link can predate that report.
     async fn link_down(&mut self, peer: &DeviceIdentity) -> Vec<Action> {
         let actions = self.links.unlinked(peer);
         self.link_of.remove(peer);
@@ -796,6 +844,7 @@ where
         if self.links.linked_peers().next().is_none() {
             self.room_at = None;
         }
+        self.placement_due = true;
         self.count_holders().await;
         actions
     }
@@ -820,6 +869,7 @@ where
         actions.extend(self.retry_due(now).await);
         actions.extend(self.prefetch(peer.key().as_bytes(), now).await);
         self.opening = Some(peer);
+        self.placement_due = true;
         actions
     }
 
@@ -836,6 +886,7 @@ where
                     .await,
             );
         }
+        self.placement_due = true;
         actions
     }
 
@@ -855,6 +906,10 @@ where
         if self.lapse_at.is_some_and(|at| at <= now) {
             self.lapse_at = None;
             self.custody_due = true;
+        }
+        if self.place_again_at.is_some_and(|at| at <= now) {
+            self.place_again_at = None;
+            self.placement_due = true;
         }
         actions
     }
@@ -895,7 +950,8 @@ where
     }
 
     /// Numbers `messages`, stamps each with the latest report heard from
-    /// `peer` over its link, and queues them behind its earlier reports.
+    /// `peer` over its link, records the number of the report that carries
+    /// each leaving mark to it, and queues them behind its earlier reports.
     fn report(&mut self, peer: &DeviceIdentity, messages: Vec<Media>) {
         let seen = self.links.seen(peer);
         let queued = self.reports.entry(peer.clone()).or_default();
@@ -905,6 +961,14 @@ where
                 .next_report
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             message.stamp(number, seen);
+            if let Media::Holdings { leaving, .. } | Media::Held { leaving, .. } = &message {
+                for file in leaving {
+                    self.marks
+                        .entry(FileId::from_bytes(*file))
+                        .or_default()
+                        .insert(*peer.key().as_bytes(), number);
+                }
+            }
             queued.push(message);
         }
         self.send_reports(peer);
@@ -931,12 +995,56 @@ where
         });
     }
 
+    /// The copies this device tells its peers it holds: those in custody,
+    /// and its own unsent files of a replicated column, which it holds
+    /// without taking them into custody, so a settled row whose provisional
+    /// record is gone still counts its author's copy (R79 decision 13).
+    async fn told_copies(&mut self, custody: &[CustodyCopy]) -> Vec<CustodyCopy> {
+        let content = self.content;
+        let declared = &content.peer_content;
+        let own = self
+            .beside_jobs(
+                content
+                    .client
+                    .with_conn(|conn| custody::own_replicated(conn.conn(), declared)),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        // A file both in custody and unsent shows twice, which the sets the
+        // reports are built from fold into one.
+        let mut told = custody.to_vec();
+        told.extend(own.into_iter().map(|file_id| CustodyCopy {
+            file_id,
+            state: db::HELD.to_owned(),
+            size: 0,
+        }));
+        told
+    }
+
+    /// Keeps a leaving attempt for every copy marked leaving, one a driver
+    /// started again found in the bookkeeping included, and none for any
+    /// other.
+    fn track_marks(&mut self, custody: &[CustodyCopy]) {
+        self.marks.retain(|file_id, _| {
+            custody
+                .iter()
+                .any(|copy| copy.file_id == *file_id && copy.leaving())
+        });
+        for copy in custody.iter().filter(|copy| copy.leaving()) {
+            self.marks.entry(copy.file_id).or_default();
+        }
+    }
+
     /// Tells `peer`, whose link came up, everything it may know of this
     /// device's custody, room and rates.
     async fn holdings(&mut self, peer: &DeviceIdentity, now: Instant) {
         let content = self.content;
         let (custody, held) = self.beside_jobs(content.custody_held()).await;
-        let admitted = self.admitted(peer, &custody).await;
+        self.track_marks(&custody);
+        let told = self.told_copies(&custody).await;
+        let admitted = self.admitted(peer, &told).await;
         let room = self.content.room(self.budget, held);
         let rates = self.rates();
         let files: Vec<[u8; 32]> = admitted.held.iter().copied().collect();
@@ -972,12 +1080,14 @@ where
     async fn custody_changed(&mut self) {
         let content = self.content;
         let (custody, _) = self.beside_jobs(content.custody_held()).await;
+        self.track_marks(&custody);
+        let told = self.told_copies(&custody).await;
         let peers: Vec<DeviceIdentity> = self.told.keys().cloned().collect();
         for peer in peers {
-            let now = self.admitted(&peer, &custody).await;
-            let told = self.told.entry(peer.clone()).or_default();
-            let was = core::mem::replace(told, now);
-            let now = &*told;
+            let now = self.admitted(&peer, &told).await;
+            let entry = self.told.entry(peer.clone()).or_default();
+            let was = core::mem::replace(entry, now);
+            let now = &*entry;
             let added: Vec<[u8; 32]> = now.held.difference(&was.held).copied().collect();
             let removed: Vec<[u8; 32]> = was.held.difference(&now.held).copied().collect();
             let staying: Vec<[u8; 32]> = was
@@ -1020,7 +1130,8 @@ where
         }
         let content = self.content;
         let (custody, _) = self.beside_jobs(content.custody_held()).await;
-        if !custody
+        let told = self.told_copies(&custody).await;
+        if !told
             .iter()
             .any(|copy| marked.contains(copy.file_id.as_bytes()))
         {
@@ -1046,6 +1157,7 @@ where
         if self.room_at.is_none_or(|at| at > now) {
             return;
         }
+        self.press().await;
         let content = self.content;
         let (_, held) = self.beside_jobs(content.custody_held()).await;
         let current = (self.content.room(self.budget, held), self.rates());
@@ -1070,8 +1182,8 @@ where
     }
 
     /// Counts the linked devices reporting each of this device's own unsent
-    /// replicated files, raising [`ContentEvent::Replicated`] for each count
-    /// that changed.
+    /// replicated files held, apart from those marking it leaving, raising
+    /// [`ContentEvent::Replicated`] for each count that changed.
     async fn count_holders(&mut self) {
         let content = self.content;
         let declared = &content.peer_content;
@@ -1087,21 +1199,27 @@ where
             .unwrap_or_default();
         self.heard.retain(|file_id, _| own.contains(file_id));
         for file_id in own {
-            let holders = self
+            let mut counts = (0, 0);
+            for report in self
                 .links
                 .linked_peers()
-                .filter(|peer| {
-                    self.links
-                        .report(peer)
-                        .is_some_and(|report| report.holds(file_id.as_bytes()))
-                })
-                .count();
-            if self.heard.get(&file_id).copied().unwrap_or(0) != holders {
-                self.heard.insert(file_id, holders);
-                let _ = self
-                    .content
-                    .events
-                    .send(ContentEvent::Replicated { file_id, holders });
+                .filter_map(|peer| self.links.report(peer))
+                .filter(|report| report.holds(file_id.as_bytes()))
+            {
+                if report.is_leaving(file_id.as_bytes()) {
+                    counts.1 += 1;
+                } else {
+                    counts.0 += 1;
+                }
+            }
+            if self.heard.get(&file_id).copied().unwrap_or_default() != counts {
+                self.heard.insert(file_id, counts);
+                let (holders, leaving) = counts;
+                let _ = self.content.events.send(ContentEvent::Replicated {
+                    file_id,
+                    holders,
+                    leaving,
+                });
             }
         }
     }
@@ -1174,6 +1292,7 @@ where
                         self.holdings(&peer, now).await;
                     }
                     self.acknowledge(&peer, &marked).await;
+                    self.placement_due = true;
                     self.count_holders().await;
                     Vec::new()
                 }
@@ -1190,8 +1309,8 @@ where
     }
 
     /// `resolve` asked for a file, which joins a fetch of it already running.
-    /// A prefetch it joins turns on demand, asking every linked holder once
-    /// its author is done.
+    /// A prefetch, custody pull or size probe it joins turns on demand,
+    /// asking every linked holder once the holder asked now is done.
     async fn order(&mut self, order: Order, now: Instant) -> Vec<Action> {
         if let Some(&tag) = self.tags.get(&order.file_id) {
             let content = self.content;
@@ -1201,8 +1320,8 @@ where
             let linked = candidate_order(self.links.linked_peers(), &authors);
             if let Some(fetch) = self.fetches.get_mut(&tag) {
                 fetch.answers.push(order.answer);
-                if fetch.prefetch {
-                    fetch.prefetch = false;
+                if fetch.purpose != Purpose::OnDemand {
+                    fetch.purpose = Purpose::OnDemand;
                     fetch.candidates = linked
                         .into_iter()
                         .filter(|peer| fetch.holder.as_ref() != Some(peer))
@@ -1241,7 +1360,7 @@ where
             let tag = self.next_tag;
             self.next_tag += 1;
             let mut fetch = Fetch::new(file_id, now);
-            fetch.prefetch = true;
+            fetch.purpose = Purpose::Prefetch;
             fetch.candidates = VecDeque::from([peer.clone()]);
             self.fetches.insert(tag, fetch);
             self.tags.insert(file_id, tag);
@@ -1302,13 +1421,19 @@ where
                 return self.links.ask(&peer, want, tag, priority, now);
             }
         }
-        if !fetch.prefetch
+        if fetch.purpose == Purpose::OnDemand
             && fetch.round_busy == Some(true)
             && now + fetch.backoff <= fetch.progress + ON_DEMAND_BOUND
         {
             fetch.retry_at = Some(now + fetch.backoff);
             fetch.backoff = (fetch.backoff * 2).min(LAST_BACKOFF);
             return Vec::new();
+        }
+        if matches!(fetch.purpose, Purpose::Custody | Purpose::Size)
+            && self.place_again_at.is_none()
+        {
+            self.place_again_at = Some(now + self.place_again_after);
+            self.place_again_after = (self.place_again_after * 2).min(LAST_BACKOFF);
         }
         self.finish(tag, Ok(false));
         Vec::new()
@@ -1317,6 +1442,9 @@ where
     /// Ends the fetch `tag`, answering every resolve waiting on it.
     fn finish(&mut self, tag: u64, outcome: Result<bool, ContentError>) {
         if let Some(fetch) = self.fetches.remove(&tag) {
+            if fetch.purpose == Purpose::Custody && matches!(outcome, Ok(true)) {
+                self.place_again_after = FIRST_BACKOFF;
+            }
             self.tags.remove(&fetch.file_id);
             fetch.answer(outcome);
         }
@@ -1415,18 +1543,24 @@ where
             more.extend(self.next_holder(tag, now));
             return more;
         };
-        let prefetch = fetch.prefetch;
-        if prefetch
-            && manifest.chunks().iter().map(|chunk| chunk.len).sum::<u64>() > MAX_PREFETCH_BYTES
-        {
+        let purpose = fetch.purpose;
+        let size: u64 = manifest.chunks().iter().map(|chunk| chunk.len).sum();
+        if purpose == Purpose::Size {
+            self.sizes.insert(manifest.file_id(), size);
+            self.placement_due = true;
+            self.place_again_after = FIRST_BACKOFF;
+            self.finish(tag, Ok(false));
+            return self.release(&peer, done, now);
+        }
+        if purpose == Purpose::Prefetch && size > MAX_PREFETCH_BYTES {
             self.finish(tag, Ok(false));
             return self.release(&peer, done, now);
         }
         let next = self.chunk_or_commit(tag, manifest, 0).await;
-        if !prefetch {
+        if purpose == Purpose::OnDemand {
             return self.links.proceed(&peer, next.map(|ask| (ask, tag)), now);
         }
-        // A prefetch's next ask queues behind every on-demand one.
+        // Any other fetch's next ask queues behind every on-demand one.
         let mut more = self.links.proceed(&peer, None, now);
         if let Some(ask) = next {
             more.extend(self.links.ask(&peer, ask, tag, Priority::Prefetch, now));
@@ -1447,10 +1581,12 @@ where
             }
             Ok(None) => {
                 fetch.stage = Stage::Committing;
+                let takes_over = fetch.purpose == Purpose::Custody;
                 self.jobs.push(Job::Commit {
                     tag,
                     manifest,
                     budget: self.budget,
+                    takes_over,
                 });
                 None
             }

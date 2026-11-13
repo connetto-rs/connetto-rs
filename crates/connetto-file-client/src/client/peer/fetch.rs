@@ -17,7 +17,7 @@ use connetto_file_core::{
 use iroh_io::AsyncStreamReader;
 use tokio::sync::{mpsc, oneshot};
 
-use super::super::{ContentClient, ContentEvent, FETCHED_CLASS};
+use super::super::{ContentClient, ContentEvent, FETCHED_CLASS, Keeper};
 use super::custody;
 use crate::db;
 use crate::error::ContentError;
@@ -69,9 +69,26 @@ pub(super) struct Fetch {
     pub(super) retry_at: Option<Instant>,
     /// The fetch's start, or its last verified chunk.
     pub(super) progress: Instant,
-    /// Whether nothing waits on the fetch, a thumbnail asked of its author
-    /// alone, behind every on-demand ask and dropped rather than retried.
-    pub(super) prefetch: bool,
+    /// What the fetch is for.
+    pub(super) purpose: Purpose,
+}
+
+/// What a fetch is for, which sets its queue, its holders and its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Purpose {
+    /// A resolve waits on it, every linked holder asked and busy ones
+    /// asked again within the on-demand bound.
+    OnDemand,
+    /// A thumbnail asked of its author alone, behind every on-demand ask and
+    /// dropped rather than retried.
+    Prefetch,
+    /// A copy placement takes into custody (R79 decision 14), behind every
+    /// on-demand ask and dropped rather than retried, since the next
+    /// evaluation asks again.
+    Custody,
+    /// Only the manifest, which tells placement the file's size, then
+    /// dropped.
+    Size,
 }
 
 impl Fetch {
@@ -88,16 +105,16 @@ impl Fetch {
             backoff: FIRST_BACKOFF,
             retry_at: None,
             progress: now,
-            prefetch: false,
+            purpose: Purpose::OnDemand,
         }
     }
 
     /// The priority its asks queue at.
     pub(super) fn priority(&self) -> Priority {
-        if self.prefetch {
-            Priority::Prefetch
-        } else {
+        if self.purpose == Purpose::OnDemand {
             Priority::OnDemand
+        } else {
+            Priority::Prefetch
         }
     }
 
@@ -305,11 +322,14 @@ where
     /// Commits a peer-fetched file once every chunk is in the store, `false`
     /// when a chunk went missing before the commit could hold them. A file a
     /// replicated column of a provisional row names enters custody when it
-    /// fits in the room `budget` leaves, and is cache otherwise.
+    /// fits in the room `budget` leaves, and is cache otherwise. A fetch that
+    /// `takes_over` a leaving copy also keeps a file a settled row names
+    /// while no state reads `available`.
     pub(super) async fn commit_fetched(
         &self,
         manifest: &Manifest,
         budget: u64,
+        takes_over: bool,
     ) -> Result<bool, ContentError> {
         let _writing = self.content_writes.lock().await;
         let store = self.store_for(FETCHED_CLASS);
@@ -326,8 +346,8 @@ where
             .await
             .map_err(|err| ContentError::Store(err.to_string()))?;
         let outboard = self.store_outboard(&outboard).await?;
-        let custody = self.custody_author(manifest, budget).await?;
-        self.commit_cached(manifest, outboard, custody.as_deref())
+        let custody = self.custody_author(manifest, budget, takes_over).await?;
+        self.commit_cached(manifest, outboard, custody.as_ref())
             .await?;
         if custody.is_some() {
             self.custody_changed.notify_one();
@@ -338,21 +358,33 @@ where
         Ok(true)
     }
 
-    /// The courierable author of a provisional row whose replicated column
-    /// names `manifest`'s file, when the file fits in the room `budget`
-    /// leaves.
+    /// Whom custody keeps `manifest`'s file for when it fits in the room
+    /// `budget` leaves, the courierable author of a provisional row whose
+    /// replicated column names it, or a settled row when the fetch
+    /// `takes_over` a leaving copy of a file no state reads `available` for,
+    /// `None` for cache.
     async fn custody_author(
         &self,
         manifest: &Manifest,
         budget: u64,
-    ) -> Result<Option<Vec<u8>>, ContentError> {
+        takes_over: bool,
+    ) -> Result<Option<Keeper>, ContentError> {
         let declared = &self.peer_content;
         let file_id = manifest.file_id();
         let (author, held) = self
             .client
             .with_conn(|conn| -> Result<_, ContentError> {
                 let named = custody::named(conn, declared, &mut custody::Reach::default())?;
-                let author = named.author_of(file_id).map(<[u8]>::to_vec);
+                let author = match named.author_of(file_id) {
+                    Some(author) => Some(Keeper::Author(author.to_vec())),
+                    None if takes_over
+                        && !db::is_unsent(conn.conn(), file_id)?
+                        && custody::settled_open(conn, declared, file_id)? =>
+                    {
+                        Some(Keeper::Settled)
+                    }
+                    None => None,
+                };
                 Ok((author, db::custody_bytes(conn.conn())?))
             })
             .await??;

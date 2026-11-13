@@ -17,6 +17,8 @@ mod peer_fetch;
 #[cfg(feature = "peer")]
 mod peer_holder;
 #[cfg(feature = "peer")]
+mod peer_placement;
+#[cfg(feature = "peer")]
 mod peer_prefetch;
 #[cfg(feature = "peer")]
 mod peer_retention;
