@@ -17,7 +17,7 @@ mod task;
 
 #[cfg(feature = "peer")]
 pub(crate) use task::Peer;
-pub use task::{CertificateError, DeviceEntry};
+pub use task::{CertificateError, DeviceEntry, EnrolmentDecision, EnrolmentOutcome};
 pub(crate) use task::{Command, DeviceKeys, EnrolHandle, Enroller, Link, PlatformKeys, run};
 #[cfg(test)]
 use task::{Intake, intake};

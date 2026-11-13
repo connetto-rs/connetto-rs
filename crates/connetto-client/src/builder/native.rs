@@ -1550,6 +1550,18 @@ where
         self.device.as_ref().and_then(EnrolHandle::certificate)
     }
 
+    /// Watch completed automatic enrolment decisions, or return `None` without a device identity.
+    ///
+    /// The initial value is `None` until a decision completes, and late observers receive the latest result.
+    /// Updates may coalesce, and the watch closes when the enrolment task ends.
+    #[cfg(feature = "device-identity")]
+    #[must_use]
+    pub fn watch_enrolment(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<Option<crate::EnrolmentDecision>>> {
+        self.device.as_ref().map(EnrolHandle::watch_enrolment)
+    }
+
     /// The account's devices, for the lost-device list, each descriptor read
     /// as the application's `D` (R74 step 5).
     ///

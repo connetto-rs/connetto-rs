@@ -84,6 +84,26 @@ pub enum CertificateError {
     Device(ClientError),
 }
 
+/// A completed automatic enrolment decision for one connection.
+#[derive(Debug)]
+pub struct EnrolmentDecision {
+    /// The connection captured before the decision began.
+    pub connection: ConnectionNumber,
+    /// The result after certificate, revocation-list and peer work completed.
+    pub outcome: Result<EnrolmentOutcome, CertificateError>,
+}
+
+/// A completed automatic decision that was neither refused nor failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrolmentOutcome {
+    /// A granted certificate was kept after processing its revocation lists.
+    Enrolled,
+    /// The existing certificate was kept without requesting a replacement.
+    Retained,
+    /// The granted certificate's issuer was revoked, leaving no certificate.
+    Withdrawn,
+}
+
 /// Where a device's key is opened and deleted.
 pub(crate) trait DeviceKeys: Send + Sync {
     /// Open the key, creating one when none is held.
@@ -363,6 +383,7 @@ pub(crate) struct Enroller {
     descriptor: Vec<u8>,
     commands: mpsc::UnboundedReceiver<Command>,
     published: watch::Sender<Option<DeviceCertificate>>,
+    decisions: watch::Sender<Option<EnrolmentDecision>>,
     home: watch::Sender<Option<KeyHome>>,
     /// Raised once this device's own key is revoked, so the client wipes
     /// (R105 decision 10).
@@ -388,6 +409,7 @@ pub(crate) struct EnrolHandle {
     keys: Arc<dyn DeviceKeys>,
     commands: mpsc::UnboundedSender<Command>,
     published: watch::Receiver<Option<DeviceCertificate>>,
+    decisions: watch::Receiver<Option<EnrolmentDecision>>,
     home: watch::Receiver<Option<KeyHome>>,
     /// Set once the task found this device's own key revoked (R105).
     revoked: watch::Receiver<bool>,
@@ -438,6 +460,7 @@ impl Enroller {
     ) -> (Self, EnrolHandle) {
         let (sender, commands) = mpsc::unbounded_channel();
         let (published, observed) = watch::channel(held.as_ref().map(|held| held.leaf.clone()));
+        let (decisions, decided) = watch::channel(None);
         let (home, homed) = watch::channel(None);
         let (revoked, revoked_rx) = watch::channel(false);
         let clock_off = Arc::new(AtomicBool::new(false));
@@ -458,6 +481,7 @@ impl Enroller {
                 descriptor,
                 commands,
                 published,
+                decisions,
                 home,
                 revoked,
                 clock_off: Arc::clone(&clock_off),
@@ -472,6 +496,7 @@ impl Enroller {
                 keys,
                 commands: sender,
                 published: observed,
+                decisions: decided,
                 home: homed,
                 revoked: revoked_rx,
                 #[cfg(feature = "peer")]
@@ -539,6 +564,11 @@ impl EnrolHandle {
     /// The certificate this device holds.
     pub(crate) fn certificate(&self) -> Option<DeviceCertificate> {
         self.published.borrow().clone()
+    }
+
+    /// The latest completed automatic enrolment decision, retained for late observers.
+    pub(crate) fn watch_enrolment(&self) -> watch::Receiver<Option<EnrolmentDecision>> {
+        self.decisions.clone()
     }
 
     /// Where the device key lives, once it is open.
@@ -1393,26 +1423,37 @@ impl<L: Link> Run<L> {
         self.discovery.set_peer_links(on);
     }
 
-    /// Act on a live connection as the certificate's standing says
-    /// (lifecycle rows "Connected and signed in", "Half-life crossed" and
-    /// "Wall clock changes, or the hourly look"). The hourly look never
-    /// renews a certificate the local clock puts outside its window.
+    /// Publish the completed automatic enrolment decision for its captured connection.
     async fn on_connected(&mut self, by_look: bool) {
+        let connection = self.link.connection().await;
         if !by_look {
-            self.acted = self.link.connection().await;
+            self.acted = connection;
         }
-        // A refused level cannot change, so a refused device asks again only
-        // on its next connection, never on the hourly look (lifecycle row
-        // "Refused as attestation required").
+        let outcome = self.decide_enrolment(by_look).await;
+        if let Some(connection) = connection {
+            self.enroller
+                .decisions
+                .send_replace(Some(EnrolmentDecision {
+                    connection,
+                    outcome,
+                }));
+        }
+    }
+
+    /// Apply the certificate lifecycle without renewing a clock-off certificate on an hourly look.
+    async fn decide_enrolment(
+        &mut self,
+        by_look: bool,
+    ) -> Result<EnrolmentOutcome, CertificateError> {
         if self.attestation_refused {
-            return;
+            return Err(CertificateError::Refused(EnrolRefusal::AttestationRequired));
         }
         if self.revoked {
-            return;
+            return Err(CertificateError::Revoked);
         }
         let outcome = match self.stand_by().await {
-            Standing::Fresh => return,
-            Standing::ClockOff if by_look => return,
+            Standing::Fresh => return Ok(EnrolmentOutcome::Retained),
+            Standing::ClockOff if by_look => return Ok(EnrolmentOutcome::Retained),
             Standing::NoKey => {
                 let lifetime = self
                     .withdrawn
@@ -1425,8 +1466,16 @@ impl<L: Link> Run<L> {
                 self.request(lifetime, true).await
             }
         };
-        if let Err(err) = outcome {
+        if let Err(err) = &outcome {
             tracing::warn!(error = %err, "the device certificate was not issued");
+        }
+        outcome?;
+        if self.revoked {
+            Err(CertificateError::Revoked)
+        } else if self.held.is_none() {
+            Ok(EnrolmentOutcome::Withdrawn)
+        } else {
+            Ok(EnrolmentOutcome::Enrolled)
         }
     }
 }
