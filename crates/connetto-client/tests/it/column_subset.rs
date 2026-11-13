@@ -151,8 +151,7 @@ async fn alice(server: &Server) -> ConnettoConnection<impl Transport<Error: core
     conn
 }
 
-/// A left-out nullable column holds the server's value, at the snapshot and
-/// after a change to that column alone.
+/// A left-out nullable column matches the server at snapshot completion and after its live-patch event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_left_out_column_matches_the_server() {
     let fixture = Fixture::acquire().await;
@@ -180,20 +179,25 @@ async fn a_left_out_column_matches_the_server() {
         .await;
     let deadline = tokio::time::Instant::now() + DELIVERY;
     loop {
-        let body: Option<String> = notes::table
-            .find(1)
-            .select(notes::body)
-            .first(alice.conn())
-            .expect("the row stays in the replica");
-        if body.as_deref() == Some("changed") {
-            break;
+        let event = tokio::time::timeout_at(deadline, alice.pump_one())
+            .await
+            .expect("the live patch arrives within the deadline")
+            .expect("the live patch applies");
+        match event {
+            ClientEvent::LivePatch { sub_id, .. } if sub_id == "titles" => break,
+            ClientEvent::NonFatal {
+                related_to: Some(sub_id),
+                detail,
+            } if sub_id == "titles" => panic!("the column subset was refused: {detail}"),
+            _ => {}
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a change to the left-out column never reached the replica, which holds {body:?}"
-        );
-        let _ = tokio::time::timeout(Duration::from_millis(500), alice.pump_one()).await;
     }
+    let body: Option<String> = notes::table
+        .find(1)
+        .select(notes::body)
+        .first(alice.conn())
+        .expect("the updated row is in the replica");
+    assert_eq!(body.as_deref(), Some("changed"));
 }
 
 /// A left-out required column lands with its row.
