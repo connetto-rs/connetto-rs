@@ -298,6 +298,9 @@ async fn run_restore() {
     // The server holds both notes under alice's account, each audited as
     // couriered by bob.
     assert_server_notes(&provisioned.fixture, &alice_id).await;
+    bob2.observe_courier_audit(&alice_key, &report.settled, BOUND)
+        .await
+        .expect("the couriered audit receipts commit");
     let mut conn = provisioned
         .fixture
         .admin()
