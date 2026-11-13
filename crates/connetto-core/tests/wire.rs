@@ -804,3 +804,68 @@ fn courier_notice_frames_round_trip() {
         notice_id: "n1".into(),
     }));
 }
+
+#[test]
+fn courier_audit_frames_round_trip() {
+    use connetto_core::messages::{
+        CourierAuditAnswer, CourierAuditCancel, CourierAuditOutcome, CourierAuditRequest,
+    };
+
+    round_trip_control(&ControlMessage::CourierAuditRequest(CourierAuditRequest {
+        request_id: "audit-1".into(),
+        author: [7; 32],
+        seqs: vec![1, i64::MAX.unsigned_abs()],
+        remaining_ms: u64::MAX,
+    }));
+    for outcome in [
+        CourierAuditOutcome::Confirmed,
+        CourierAuditOutcome::Expired,
+        CourierAuditOutcome::Refused,
+        CourierAuditOutcome::Failed,
+    ] {
+        round_trip_control(&ControlMessage::CourierAuditAnswer(CourierAuditAnswer {
+            request_id: "audit-1".into(),
+            outcome,
+        }));
+    }
+    round_trip_control(&ControlMessage::CourierAuditCancel(CourierAuditCancel {
+        request_id: "audit-1".into(),
+    }));
+}
+
+#[test]
+fn courier_audit_requests_enforce_their_wire_bounds() {
+    use connetto_core::exchange::MAX_MANIFEST_ROWS;
+    use connetto_core::messages::CourierAuditRequest;
+
+    let sequence_count = u64::try_from(MAX_MANIFEST_ROWS).expect("the manifest bound fits");
+    let mut request = CourierAuditRequest {
+        request_id: "é".repeat(64),
+        author: [7; 32],
+        seqs: (1..=sequence_count).collect(),
+        remaining_ms: u64::MAX,
+    };
+    assert!(request.is_well_formed());
+    request.request_id.push('a');
+    assert!(!request.is_well_formed());
+    request.request_id.clear();
+    assert!(!request.is_well_formed());
+    request.request_id = "audit-1".into();
+    request.seqs.push(sequence_count + 1);
+    assert!(!request.is_well_formed());
+    for seqs in [
+        vec![],
+        vec![0],
+        vec![2, 1],
+        vec![1, 1],
+        vec![i64::MAX.unsigned_abs() + 1],
+    ] {
+        request.seqs = seqs;
+        assert!(!request.is_well_formed(), "{:?}", request.seqs);
+    }
+    request.seqs = vec![i64::MAX.unsigned_abs()];
+    request.remaining_ms = 0;
+    assert!(!request.is_well_formed());
+    request.remaining_ms = 1;
+    assert!(request.is_well_formed());
+}

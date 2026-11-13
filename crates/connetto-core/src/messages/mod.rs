@@ -28,7 +28,10 @@ pub use aggregate::AggregateUpdate;
 pub use bulk::{BulkMessage, CourierBody, LivePatch, MutationPatch, SnapshotPatch};
 pub use content::{ContentTicketGrant, ContentTicketRequest, ContentVerb};
 pub use control::{ControlMessage, GateState, PauseCause, SyncStatus, TabIdentity};
-pub use courier::{CourierAnswer, CourierNotice, CourierNoticeAck, CourierNoticeRow, CourierRange};
+pub use courier::{
+    CourierAnswer, CourierAuditAnswer, CourierAuditCancel, CourierAuditOutcome,
+    CourierAuditRequest, CourierNotice, CourierNoticeAck, CourierNoticeRow, CourierRange,
+};
 pub use enrolment::{
     DeviceAttestation, DeviceRevokedAck, DeviceSummary, DevicesList, DevicesRequest,
     EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest,

@@ -129,8 +129,7 @@ pub struct SignedOffer {
     pub signature: Vec<u8>,
 }
 
-/// The rows one manifest frame carries, the bound a manifest over is refused
-/// on both ends of the link and the sequences one provisional ask carries.
+/// The maximum rows in a manifest frame, provisional ask or courier audit observation.
 pub const MAX_MANIFEST_ROWS: usize = 8192;
 
 /// How the server ruled on one asked sequence of a verified provisional ask

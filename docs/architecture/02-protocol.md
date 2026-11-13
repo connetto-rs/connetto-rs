@@ -33,6 +33,7 @@ Planned in [the shared frame design](../../plans/master-implementation-plan.md#s
 - Mutation. [`connetto_core::messages::MutationHeader`], [`connetto_core::messages::MutationPatch`] on the bulk plane, [`connetto_core::messages::MutationApplied`], [`connetto_core::messages::MutationReject`], [`connetto_core::messages::MutationConflict`]
 - Writer. [`connetto_core::messages::BindDevice`], [`connetto_core::messages::RetireWriter`], [`connetto_core::messages::WriterAnswer`], [`connetto_core::messages::Provenance`]
 - Courier. [`connetto_core::messages::CourierRange`], [`connetto_core::messages::CourierBody`] on the bulk plane, [`connetto_core::messages::CourierAnswer`], [`connetto_core::messages::CourierNotice`], [`connetto_core::messages::CourierNoticeAck`]
+- Courier audit observation. [`connetto_core::messages::CourierAuditRequest`], [`connetto_core::messages::CourierAuditAnswer`], [`connetto_core::messages::CourierAuditCancel`]
 - Device enrolment. [`connetto_core::messages::EnrolChallengeRequest`], [`connetto_core::messages::EnrolChallenge`], [`connetto_core::messages::EnrolRequest`], [`connetto_core::messages::EnrolGrant`], [`connetto_core::messages::EnrolRefused`], [`connetto_core::messages::RevocationUpdate`], [`connetto_core::messages::DevicesRequest`], [`connetto_core::messages::DevicesList`], [`connetto_core::messages::RevokeDeviceRequest`], [`connetto_core::messages::DeviceRevokedAck`]
 - Content tickets. [`connetto_core::messages::ContentTicketRequest`], [`connetto_core::messages::ContentTicketGrant`]
 - Share keys. [`connetto_core::messages::ReplaceShareKeys`], [`connetto_core::messages::ShareKeysReplaced`], [`connetto_core::messages::TabShareKeyChange`], [`connetto_core::messages::TabShareKeyAnswer`]
@@ -42,6 +43,14 @@ Planned in [the shared frame design](../../plans/master-implementation-plan.md#s
 The relay-to-tab frames are never sent by a real server. The browser worker's hub states them to the tabs it serves, and [09](09-wasm.md) owns the semantics.
 
 `DeliveryPaused` and `DeliveryResumed` carry the outage signal. When the authorization service is unreachable connetto fails closed, delivering no patch, and a caller must be able to tell that from nothing changing. [`connetto_core::messages::PauseCause`] names the cause, the authorization-service outage, the stalled change stream, and the unreachable database. Snapshots are unaffected, because they run under Postgres RLS. [08](08-authorization.md) owns the fail-closed rule.
+
+## Courier audit observation
+
+`CourierAuditRequest` names one author's device key and a nonempty, strictly increasing list of positive `BIGINT` sequences, bounded by `MAX_MANIFEST_ROWS`. Its `request_id` is nonempty and at most 128 UTF-8 bytes. `remaining_ms` carries the positive time left on the caller's original monotonic deadline, without a deployment maximum.
+
+`CourierAuditAnswer` quotes the request identifier and carries a `CourierAuditOutcome`. Only `Confirmed` witnesses every requested committed receipt visible to its author or actual courier. `Expired`, `Refused` and `Failed` provide no proof that an audit row did not commit.
+
+`CourierAuditCancel` releases the named observation without acknowledging persistence. Reconnection retains the original caller deadline and authenticated account, then sends the remaining duration for a fresh read. A different account cannot inherit an observation, and courier settlement carries no audit-persistence guarantee.
 
 ## The opening challenge
 
