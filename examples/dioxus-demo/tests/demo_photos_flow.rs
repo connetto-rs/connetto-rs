@@ -43,7 +43,7 @@ use connetto_file_server::{
 use connetto_server::epoch::EPOCH_DDL;
 use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog};
 use connetto_test_harness::{
-    Fixture, HarnessAuth, Server, ServerConfig, pool_for, spawn_server, with_user,
+    Fixture, HarnessAuth, Server, ServerConfig, engine_ddl, pool_for, spawn_server, with_user,
 };
 use diesel::prelude::*;
 use tempfile::tempdir;
@@ -56,21 +56,6 @@ const PHOTO: &[u8] = b"JPEG bytes representing a photo staged through the demo U
 /// `current_setting('app.user_id')`, which the server binds from the
 /// credential's user id.
 const OWNER: &str = "alice";
-
-/// Simplified DDL for the server's internal catalog (`PgSnapshotSource`,
-/// `RlsAuth`). The actual Postgres tables are created from the deployment's
-/// `schema.sql`; this version omits the `gen_random_uuid()` defaults and
-/// foreign-key references that the `subql` parser does not need and may not
-/// handle.
-const CATALOG_DDL: &str = concat!(
-    "CREATE TABLE orders (id UUID PRIMARY KEY, owner_id TEXT NOT NULL,",
-    " quantity BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL);",
-    "CREATE TABLE order_lines (order_id UUID NOT NULL, line_no INTEGER NOT NULL,",
-    " owner_id TEXT NOT NULL, quantity BIGINT NOT NULL,",
-    " PRIMARY KEY (order_id, line_no));",
-    "CREATE TABLE photos (id UUID PRIMARY KEY, order_id UUID NOT NULL,",
-    " owner_id TEXT NOT NULL, content_id BYTEA NOT NULL, content_state TEXT)"
-);
 
 /// Stage, upload, flip, resolve, fetch, and archive round trip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -151,7 +136,9 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
             break sent;
         }
         while let Ok(ev) = a_client_events.try_recv() {
-            let _ = ev;
+            if let connetto_client::ClientEvent::MutationRejected { reason, .. } = ev {
+                panic!("the server refused the staged photo: {reason:?}");
+            }
         }
         assert!(tokio::time::Instant::now() < deadline, "upload timeout");
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -297,25 +284,6 @@ async fn provision(fixture: &Fixture) {
     fixture.exec(CONTENT_SQL).await;
     fixture.exec(POLICIES_SQL).await;
     fixture.exec(SEED_SQL).await;
-    // `app_writer` is a test-infrastructure writer role; not part of the
-    // deployment's SQL files. The server's mutation path uses it to apply
-    // changesets, and it is subject to the row-level security that
-    // `policies.sql` enables.
-    fixture
-        .setup(&[
-            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
-             THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
-            "GRANT USAGE ON SCHEMA public TO app_writer",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO app_writer",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON order_lines TO app_writer",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON photos TO app_writer",
-            "GRANT SELECT ON products TO app_writer",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
-             _connetto_session_writers TO app_writer",
-            "GRANT SELECT ON _cfs_manifests TO app_writer",
-            "GRANT SELECT ON _cfs_manifest_chunks TO app_writer",
-        ])
-        .await;
 }
 
 async fn start_file_server(
@@ -358,13 +326,24 @@ async fn start_file_server(
 }
 
 async fn spawn_sync_server(fixture: &Fixture, signer: TicketSigner) -> Server {
-    let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
+    // The role the demo's own write path applies client mutations as, with
+    // the grants `roles.sql`, `bookkeeping.sql` and `content.sql` give it.
+    let writer_pool = pool_for(&with_user(
+        fixture.admin_url(),
+        "connetto_reader",
+        "connetto_reader",
+    ))
+    .await;
+    // The deployment's own schema, so the server's catalog cannot drift from
+    // the tables the clients' bundle was translated from, with the engine
+    // tables the harness appends inside `spawn_server` (R77 decision 11).
+    let engine_ddl = engine_ddl(SCHEMA_SQL);
     let snapshot =
-        PgSnapshotSource::from_ddl(writer_pool.clone(), CATALOG_DDL).expect("snapshot source");
+        PgSnapshotSource::from_ddl(writer_pool.clone(), &engine_ddl).expect("snapshot source");
     let auth =
-        HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), CATALOG_DDL).expect("rls auth"));
+        HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), &engine_ddl).expect("rls auth"));
     spawn_server(
-        ServerConfig::new(CATALOG_DDL, fixture.admin_url())
+        ServerConfig::new(SCHEMA_SQL, fixture.admin_url())
             .with_writable(
                 RuntimeWritableCatalog::builder()
                     .writable("orders")
