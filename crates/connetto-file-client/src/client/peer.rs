@@ -679,9 +679,10 @@ struct Driver<'c, T: Transport, B: ChunkStore + Clone, H: ContentHttp, F, J> {
     told_room: HashMap<DeviceIdentity, RoomTold>,
     /// When the room and rates are next checked for a change.
     room_at: Option<Instant>,
-    /// Reports waiting behind the one in flight to each peer, with the link
-    /// they go out on, so they arrive in order.
-    reports: HashMap<DeviceIdentity, (u64, Vec<Media>)>,
+    /// Reports waiting behind the one in flight to each peer, numbered for
+    /// its live link, so they arrive in order. A link that falls takes its
+    /// queue with it.
+    reports: HashMap<DeviceIdentity, Vec<Media>>,
     /// The peers a report job is sending to now.
     reporting: HashSet<DeviceIdentity>,
     /// The holders last heard of for each of this device's own replicated
@@ -893,29 +894,18 @@ where
         .await
     }
 
-    /// Numbers `messages` for `peer`'s live link and queues them behind its
-    /// earlier reports, recording the number of the report that carries a
-    /// leaving attempt's mark to it.
+    /// Numbers `messages`, stamps each with the latest report heard from
+    /// `peer` over its link, and queues them behind its earlier reports.
     fn report(&mut self, peer: &DeviceIdentity, messages: Vec<Media>) {
-        let Some(&link) = self.link_of.get(peer) else {
-            return;
-        };
-        let queued = self
-            .reports
-            .entry(peer.clone())
-            .or_insert_with(|| (link, Vec::new()));
-        if queued.0 != link {
-            *queued = (link, Vec::new());
-        }
+        let seen = self.links.seen(peer);
+        let queued = self.reports.entry(peer.clone()).or_default();
         for mut message in messages {
             let number = self
                 .content
                 .next_report
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if !self.links.stamp(peer, &mut message, number) {
-                continue;
-            }
-            queued.1.push(message);
+            message.stamp(number, seen);
+            queued.push(message);
         }
         self.send_reports(peer);
     }
@@ -925,11 +915,12 @@ where
         if self.reporting.contains(peer) {
             return;
         }
-        let Some((link, messages)) = self
-            .reports
-            .remove(peer)
-            .filter(|(_, queued)| !queued.is_empty())
-        else {
+        let (Some(&link), Some(messages)) = (
+            self.link_of.get(peer),
+            self.reports
+                .remove(peer)
+                .filter(|queued| !queued.is_empty()),
+        ) else {
             return;
         };
         self.reporting.insert(peer.clone());
@@ -960,7 +951,7 @@ where
                 let window = run * MAX_REPORT_ENTRIES..(run + 1) * MAX_REPORT_ENTRIES;
                 Media::Holdings {
                     room,
-                    rates: if run == 0 { rates.clone() } else { Vec::new() },
+                    rates: rates.clone(),
                     held: slice(&files, &window),
                     leaving: slice(&leaving, &window),
                     number: 0,
@@ -984,10 +975,9 @@ where
         let peers: Vec<DeviceIdentity> = self.told.keys().cloned().collect();
         for peer in peers {
             let now = self.admitted(&peer, &custody).await;
-            let Some(was) = self.told.insert(peer.clone(), now) else {
-                continue;
-            };
-            let now = &self.told[&peer];
+            let told = self.told.entry(peer.clone()).or_default();
+            let was = core::mem::replace(told, now);
+            let now = &*told;
             let added: Vec<[u8; 32]> = now.held.difference(&was.held).copied().collect();
             let removed: Vec<[u8; 32]> = was.held.difference(&now.held).copied().collect();
             let staying: Vec<[u8; 32]> = was

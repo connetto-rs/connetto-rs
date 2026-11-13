@@ -836,32 +836,32 @@ fn from_bob(mut report: Media, number: u64, seen: Option<u64>) -> Media {
     report
 }
 
-/// The `seen` stamping `report` for bob carries.
-fn stamped_seen(links: &mut MediaLinks<&'static str, u32>, mut report: Media) -> Option<u64> {
-    assert!(links.stamp(&"bob", &mut report, 99));
+/// The number and `seen` `report` carries once stamped as report 99 with
+/// what bob was last heard to send.
+fn stamped(links: &MediaLinks<&'static str, u32>, mut report: Media) -> (u64, Option<u64>) {
+    report.stamp(99, links.seen(&"bob"));
     let (Media::Holdings { number, seen, .. }
     | Media::Held { number, seen, .. }
     | Media::Room { number, seen, .. }) = report
     else {
         panic!("a report");
     };
-    assert_eq!(number, 99);
-    seen
+    (number, seen)
 }
 
 #[test]
 fn a_report_is_stamped_with_the_latest_number_received_over_the_link() {
     let now = Instant::now();
     let mut links = linked(&["bob"]);
-    assert_eq!(stamped_seen(&mut links, delta(&[], &[], &[], &[])), None);
+    assert_eq!(stamped(&links, delta(&[], &[], &[], &[])), (99, None));
     links.received(
         &"bob",
         from_bob(holdings(&[A], &[], &[], false), 40, None),
         now,
     );
     assert_eq!(
-        stamped_seen(&mut links, delta(&[], &[], &[], &[])),
-        Some(40),
+        stamped(&links, delta(&[], &[], &[], &[])),
+        (99, Some(40)),
         "a run counts as a report"
     );
     links.received(
@@ -870,21 +870,68 @@ fn a_report_is_stamped_with_the_latest_number_received_over_the_link() {
         now,
     );
     links.received(&"bob", from_bob(delta(&[B], &[], &[], &[]), 45, None), now);
+    assert_eq!(stamped(&links, delta(&[], &[], &[], &[])), (99, Some(45)));
     assert_eq!(
-        stamped_seen(&mut links, delta(&[], &[], &[], &[])),
-        Some(45)
+        links.seen(&"carl"),
+        None,
+        "an unlinked peer was heard from never"
     );
-    assert!(
-        !links.stamp(&"bob", &mut Media::Busy { request_id: 1 }, 1),
-        "a reply is no report"
-    );
-    assert!(!links.stamp(&"carl", &mut delta(&[], &[], &[], &[]), 1));
     links.unlinked(&"bob");
     links.linked(&"bob");
     assert_eq!(
-        stamped_seen(&mut links, holdings(&[], &[], &[], true)),
-        None,
+        stamped(&links, holdings(&[], &[], &[], true)),
+        (99, None),
         "a new link has received nothing"
+    );
+}
+
+#[test]
+fn stamping_leaves_a_request_or_a_reply_as_it_is() {
+    for message in [
+        Media::Want {
+            request_id: 1,
+            file_id: FILE,
+        },
+        manifest(1, true),
+        Media::Fetch {
+            request_id: 1,
+            file_id: FILE,
+            start: 0,
+            len: 1,
+        },
+        piece(1, true),
+        Media::Refused { request_id: 1 },
+        Media::Busy { request_id: 1 },
+    ] {
+        let mut stamped = message.clone();
+        stamped.stamp(7, Some(3));
+        assert_eq!(stamped, message);
+    }
+}
+
+#[test]
+fn room_crossing_during_a_snapshot_joins_it_and_room_before_any_is_dropped() {
+    let now = Instant::now();
+    let mut links = linked(&["bob"]);
+    let room = |room| Media::Room {
+        room,
+        rates: vec![(KEY, 5)],
+        number: 0,
+        seen: None,
+    };
+    let early = links.received(&"bob", room(1), now);
+    assert!(early.is_empty(), "{early:?}");
+    assert!(links.report(&"bob").is_none());
+    links.received(&"bob", holdings(&[A], &[], &[], false), now);
+    let during = links.received(&"bob", room(9), now);
+    assert!(during.is_empty(), "{during:?}");
+    links.received(&"bob", holdings(&[B], &[], &[], true), now);
+    let report = links.report(&"bob").expect("reported");
+    assert_eq!(report.room(), 500, "the last run's room is the report's");
+    assert_eq!(
+        report.rate_to(&KEY),
+        Some(5),
+        "the room's rates joined the runs"
     );
 }
 

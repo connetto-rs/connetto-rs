@@ -9,6 +9,7 @@
 //! the [`MediaAction`]s it returns, judges each request with its gate and
 //! checks every piece against the file id.
 
+use core::ops::ControlFlow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::Hash;
 use std::time::{Duration, Instant};
@@ -197,6 +198,39 @@ impl Media {
             Media::Holdings { .. } => "a Media::Holdings",
             Media::Held { .. } => "a Media::Held",
             Media::Room { .. } => "a Media::Room",
+        }
+    }
+
+    /// Stamps a holder report with its `number` and the `seen` its link
+    /// answers with [`MediaLinks::seen`], leaving a request or a reply as it
+    /// is. The sender numbers its reports from a counter that only grows,
+    /// and sends them in the order numbered.
+    pub fn stamp(&mut self, number: u64, seen: Option<u64>) {
+        match self {
+            Media::Holdings {
+                number: stamped,
+                seen: carried,
+                ..
+            }
+            | Media::Held {
+                number: stamped,
+                seen: carried,
+                ..
+            }
+            | Media::Room {
+                number: stamped,
+                seen: carried,
+                ..
+            } => {
+                *stamped = number;
+                *carried = seen;
+            }
+            Media::Want { .. }
+            | Media::Manifest { .. }
+            | Media::Fetch { .. }
+            | Media::Piece { .. }
+            | Media::Refused { .. }
+            | Media::Busy { .. } => {}
         }
     }
 
@@ -651,28 +685,9 @@ impl<P: Clone + Eq + Hash, T: Clone> MediaLinks<P, T> {
         let Some(link) = self.peers.get_mut(peer) else {
             return Vec::new();
         };
-        let Some(request_id) = message.request_id() else {
-            let (number, restarted) = match &message {
-                Media::Holdings { number, seen, .. } => (
-                    *number,
-                    seen.is_none() && link.incoming.is_none() && link.latest.is_some(),
-                ),
-                Media::Held { number, .. } | Media::Room { number, .. } => (*number, false),
-                _ => return Vec::new(),
-            };
-            link.latest = Some(number);
-            if restarted {
-                link.report = None;
-                link.restarted = true;
-            }
-            return Self::take_report(link, message)
-                .map(|marked| MediaAction::Reported {
-                    peer: peer.clone(),
-                    marked,
-                    restarted: core::mem::take(&mut link.restarted),
-                })
-                .into_iter()
-                .collect();
+        let (request_id, message) = match Self::report_or_request(peer, link, message) {
+            ControlFlow::Break(actions) => return actions,
+            ControlFlow::Continue(request) => request,
         };
         if let Some(ask) = message.ask() {
             if link.serving.is_some() || serving >= MAX_SERVING {
@@ -738,37 +753,12 @@ impl<P: Clone + Eq + Hash, T: Clone> MediaLinks<P, T> {
         }]
     }
 
-    /// Stamps `report`, a holder report to `peer`, with `number` and with
-    /// the number of the latest report received from `peer` over this link,
-    /// `false` for a peer not linked or a message that is no report. The
-    /// caller numbers its reports from a counter that only grows, and sends
-    /// them in the order numbered.
-    pub fn stamp(&mut self, peer: &P, report: &mut Media, number: u64) -> bool {
-        let Some(link) = self.peers.get(peer) else {
-            return false;
-        };
-        match report {
-            Media::Holdings {
-                number: stamped,
-                seen,
-                ..
-            }
-            | Media::Held {
-                number: stamped,
-                seen,
-                ..
-            }
-            | Media::Room {
-                number: stamped,
-                seen,
-                ..
-            } => {
-                *stamped = number;
-                *seen = link.latest;
-                true
-            }
-            _ => false,
-        }
+    /// The number of the latest report received from `peer` over its link,
+    /// the `seen` every report to it carries, `None` before the first or for
+    /// a peer not linked.
+    #[must_use]
+    pub fn seen(&self, peer: &P) -> Option<u64> {
+        self.peers.get(peer)?.latest
     }
 
     /// `peer`'s last complete report, `None` before its first.
@@ -796,74 +786,162 @@ impl<P: Clone + Eq + Hash, T: Clone> MediaLinks<P, T> {
         Some(rate.round() as u64)
     }
 
-    /// Fold a holder report into `link`, answering the files it newly marks
-    /// leaving when its complete report changed, `None` otherwise.
-    fn take_report(link: &mut Link<T>, message: Media) -> Option<Vec<[u8; 32]>> {
-        let before = link.report.as_ref().map(|report| report.leaving.clone());
+    /// Fold `message` from `peer` into `link` when it is a holder report,
+    /// breaking with the actions it leads to, and hand a request or a reply
+    /// back with the id it names.
+    fn report_or_request(
+        peer: &P,
+        link: &mut Link<T>,
+        message: Media,
+    ) -> ControlFlow<Vec<MediaAction<P, T>>, (u64, Media)> {
         match message {
             Media::Holdings {
                 room,
                 rates,
                 held,
                 leaving,
+                number,
                 seen,
                 last,
-                ..
             } => {
-                let incoming = link.incoming.get_or_insert_with(Report::default);
-                incoming.room = room;
-                incoming.rates.extend(rates);
-                incoming.held.extend(held);
-                incoming.leaving.extend(leaving);
-                incoming.seen = seen;
-                if !last {
-                    return None;
-                }
-                let mut report = link.incoming.take().unwrap_or_default();
-                let held = &report.held;
-                report.leaving.retain(|file| held.contains(file));
-                link.report = Some(report);
+                // A full report that has received nothing over a link it
+                // reported on before comes from a driver that started again.
+                let restarts = seen.is_none() && link.incoming.is_none() && link.latest.is_some();
+                ControlFlow::Break(Self::fold_report(peer, link, number, restarts, |link| {
+                    Self::take_holdings(link, room, rates, held, leaving, seen, last)
+                }))
             }
             Media::Held {
                 added,
                 removed,
                 staying,
                 leaving,
+                number,
                 seen,
-                ..
-            } => {
-                if let Some(incoming) = link.incoming.as_mut() {
-                    incoming.change(added, &removed, &staying, leaving);
-                    incoming.seen = seen;
-                    return None;
-                }
-                let report = link.report.as_mut()?;
-                report.change(added, &removed, &staying, leaving);
-                report.seen = seen;
-            }
+            } => ControlFlow::Break(Self::fold_report(peer, link, number, false, |link| {
+                Self::take_held(link, added, &removed, &staying, leaving, seen)
+            })),
             Media::Room {
-                room, rates, seen, ..
-            } => {
-                if let Some(incoming) = link.incoming.as_mut() {
-                    incoming.replace_room(room, rates);
-                    incoming.seen = seen;
-                    return None;
-                }
-                let report = link.report.as_mut()?;
-                report.replace_room(room, rates);
-                report.seen = seen;
-            }
-            _ => return None,
+                room,
+                rates,
+                number,
+                seen,
+            } => ControlFlow::Break(Self::fold_report(peer, link, number, false, |link| {
+                Self::take_room(link, room, rates, seen)
+            })),
+            message @ (Media::Want { request_id, .. }
+            | Media::Manifest { request_id, .. }
+            | Media::Fetch { request_id, .. }
+            | Media::Piece { request_id, .. }
+            | Media::Refused { request_id }
+            | Media::Busy { request_id }) => ControlFlow::Continue((request_id, message)),
         }
-        let report = link.report.as_ref()?;
-        Some(
-            report
-                .leaving
-                .iter()
-                .filter(|file| before.as_ref().is_none_or(|before| !before.contains(*file)))
-                .copied()
-                .collect(),
-        )
+    }
+
+    /// Record report `number` from `peer` and fold the report in with
+    /// `fold`, which answers whether the peer's complete report changed,
+    /// answering the files it newly marks leaving when it did. A peer whose
+    /// driver `restarts` has its report started over.
+    fn fold_report(
+        peer: &P,
+        link: &mut Link<T>,
+        number: u64,
+        restarts: bool,
+        fold: impl FnOnce(&mut Link<T>) -> bool,
+    ) -> Vec<MediaAction<P, T>> {
+        link.latest = Some(number);
+        if restarts {
+            link.report = None;
+            link.restarted = true;
+        }
+        let before = link.report.as_ref().map(|report| report.leaving.clone());
+        if !fold(link) {
+            return Vec::new();
+        }
+        let marked = link
+            .report
+            .iter()
+            .flat_map(|report| &report.leaving)
+            .filter(|file| before.as_ref().is_none_or(|before| !before.contains(*file)))
+            .copied()
+            .collect();
+        vec![MediaAction::Reported {
+            peer: peer.clone(),
+            marked,
+            restarted: core::mem::take(&mut link.restarted),
+        }]
+    }
+
+    /// Fold a `Holdings` run into `link`, answering whether it completed the
+    /// report.
+    fn take_holdings(
+        link: &mut Link<T>,
+        room: u64,
+        rates: Vec<([u8; 32], u64)>,
+        held: Vec<[u8; 32]>,
+        leaving: Vec<[u8; 32]>,
+        seen: Option<u64>,
+        last: bool,
+    ) -> bool {
+        let incoming = link.incoming.get_or_insert_with(Report::default);
+        incoming.room = room;
+        incoming.rates.extend(rates);
+        incoming.held.extend(held);
+        incoming.leaving.extend(leaving);
+        incoming.seen = seen;
+        if !last {
+            return false;
+        }
+        let mut report = link.incoming.take().unwrap_or_default();
+        let held = &report.held;
+        report.leaving.retain(|file| held.contains(file));
+        link.report = Some(report);
+        true
+    }
+
+    /// Fold a `Held` change into `link`, answering whether it changed the
+    /// complete report. A change crossing during a `Holdings` run joins the
+    /// run, and one before any report is dropped.
+    fn take_held(
+        link: &mut Link<T>,
+        added: Vec<[u8; 32]>,
+        removed: &[[u8; 32]],
+        staying: &[[u8; 32]],
+        leaving: Vec<[u8; 32]>,
+        seen: Option<u64>,
+    ) -> bool {
+        if let Some(incoming) = link.incoming.as_mut() {
+            incoming.change(added, removed, staying, leaving);
+            incoming.seen = seen;
+            return false;
+        }
+        let Some(report) = link.report.as_mut() else {
+            return false;
+        };
+        report.change(added, removed, staying, leaving);
+        report.seen = seen;
+        true
+    }
+
+    /// Fold a `Room` into `link`, answering whether it changed the complete
+    /// report, as [`Self::take_held`] does.
+    fn take_room(
+        link: &mut Link<T>,
+        room: u64,
+        rates: Vec<([u8; 32], u64)>,
+        seen: Option<u64>,
+    ) -> bool {
+        if let Some(incoming) = link.incoming.as_mut() {
+            incoming.replace_room(room, rates);
+            incoming.seen = seen;
+            return false;
+        }
+        let Some(report) = link.report.as_mut() else {
+            return false;
+        };
+        report.replace_room(room, rates);
+        report.seen = seen;
+        true
     }
 
     /// The driver finished streaming `request_id` to `peer`. A stale id

@@ -385,7 +385,7 @@ impl World {
         let device = &mut self.devices[from];
         let number = device.next_report;
         device.next_report += 1;
-        assert!(device.links.stamp(&to_key, &mut report, number), "linked");
+        report.stamp(number, device.links.seen(&to_key));
         let marks = match &report {
             Media::Holdings { leaving, .. } | Media::Held { leaving, .. } => {
                 leaving.contains(&FILE)

@@ -61,6 +61,33 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// The copies a device holds in custody for another device's rows.
+    _connetto_content_custody (file_id) {
+        /// The held file.
+        file_id -> Binary,
+        /// `held`, or a state marking the copy leaving.
+        state -> Text,
+    }
+}
+
+/// Writes `state` into `file_id`'s custody record on `client`, as placement
+/// does when it marks the copy leaving or withdraws the mark.
+pub async fn set_custody_state(client: &ConnettoClient<Scripted>, file_id: FileId, state: &str) {
+    let state = state.to_owned();
+    let written = client
+        .with_conn(move |conn| {
+            diesel::update(_connetto_content_custody::table)
+                .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
+                .set(_connetto_content_custody::state.eq(state))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("write the custody state");
+    assert_eq!(written, 1, "the file is in custody");
+}
+
+diesel::table! {
     /// connetto's record of each peer author's last verified offer, whose
     /// certificate end the custody proofs move into the past.
     _connetto_peer_cursor (author) {
