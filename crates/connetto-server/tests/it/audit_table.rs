@@ -5,17 +5,22 @@
 //! every `op` value survives a round trip through the Postgres enum, and that
 //! the row a share mint names and the provider a login names are preserved.
 
+use std::time::Duration;
+
 use connetto_core::SessionId;
 use connetto_server::audit::{
     AUTH_OP_TYPE, AuthEvent, AuthOp, ConnettoAuditSchema, pg_audit_hook, record_awaited,
 };
 use connetto_server::defaults::ConnettoDefaults;
-use connetto_test_harness::Fixture;
+use connetto_test_harness::{Fixture, PUBLICATION, SLOT, engine_ddl, start_replication_on};
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use pg_walstream::{ColumnValue, EventType};
+use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Value;
+use subql::{CdcSource, ParserDB, PgStreamingCdcSource, PgStreamingConfig, SourceItem};
 
 use super::logging::{LogCapture, with_capture};
 
@@ -28,8 +33,7 @@ static PG_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 // The default schema over `Id = String`, matching `authn_db.rs`.
 use connetto_server::defaults::{ConnettoAudit, auth_events};
 
-/// Create the deployment-owned audit table. connetto emits no DDL, so the test
-/// owns it, and the SQL mirrors `docs/architecture/08-authorization.md`.
+/// Recreates the reference audit enum and table.
 async fn reset_audit_table(pool: &Pool<AsyncPgConnection>) {
     let mut conn = pool.get().await.expect("connection");
     for stmt in [
@@ -71,6 +75,7 @@ async fn every_auth_op_round_trips_through_postgres() {
         AuthOp::BanLifted,
         AuthOp::WriteForked,
         AuthOp::WriteRedelivered,
+        AuthOp::WriteCouriered,
         AuthOp::DataDownloaded,
         AuthOp::DataErased,
     ];
@@ -93,6 +98,120 @@ async fn every_auth_op_round_trips_through_postgres() {
         .unwrap_or_else(|err| panic!("read back {}: {err}", op.label()));
         assert_eq!(read, op, "{} did not round trip", op.label());
     }
+}
+
+#[tokio::test]
+async fn courier_receipts_are_visible_only_to_the_author_and_actual_courier() {
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    reset_audit_table(fixture.admin()).await;
+    let mut conn = fixture.admin().get().await.expect("connection");
+    let author = "alice".to_owned();
+    let courier = "bob".to_owned();
+    let unrelated = "mallory".to_owned();
+    for (op, writer, seq) in [
+        (AuthOp::WriteCouriered, 7, 8),
+        (AuthOp::WriteCouriered, 7, 8),
+        (AuthOp::WriteCouriered, 7, 9),
+        (AuthOp::WriteCouriered, 7, 10),
+        (AuthOp::WriteCouriered, 17, 11),
+        (AuthOp::WriteRedelivered, 7, 12),
+    ] {
+        let mut event = AuthEvent::new(
+            SessionId::from_uuid(uuid::Uuid::new_v4()),
+            Some(author.clone()),
+            op,
+        )
+        .about_courier(courier.clone());
+        event.writer = Some(writer);
+        event.seq = Some(seq);
+        diesel_async::RunQueryDsl::execute(ConnettoAudit::audit_insert(event), &mut conn)
+            .await
+            .expect("insert audit event");
+    }
+    let requested = [8, 8, 9, 11, 12, 99];
+    for viewer in [&author, &courier] {
+        let mut receipts = ConnettoAudit::courier_receipts(&mut conn, viewer, 7, &requested)
+            .await
+            .expect("read courier receipts");
+        receipts.sort_unstable();
+        assert_eq!(receipts, vec![8, 9]);
+    }
+    assert_eq!(
+        ConnettoAudit::courier_receipts(&mut conn, &author, 7, &[])
+            .await
+            .expect("read empty request"),
+        [] as [i64; 0]
+    );
+    assert_eq!(
+        ConnettoAudit::courier_receipts(&mut conn, &unrelated, 7, &requested)
+            .await
+            .expect("read unrelated account"),
+        [] as [i64; 0]
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_audit_publication_member_streams_committed_rows() {
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        start_replication_on(fixture.admin(), &["auth_events"]).await;
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(&engine_ddl(""))
+            .expect("parse the deployment catalog");
+        let config = PgStreamingConfig::new(fixture.admin_url(), SLOT, PUBLICATION);
+        let mut source = PgStreamingCdcSource::connect(config, catalog)
+            .await
+            .expect("connect to the audit publication");
+        let session = SessionId::from_uuid(uuid::Uuid::new_v4());
+        let mut conn = fixture.admin().get().await.expect("connection");
+        diesel_async::RunQueryDsl::execute(
+            ConnettoAudit::audit_insert(login(session, "audit-publication-reader")),
+            &mut conn,
+        )
+        .await
+        .expect("commit an audit event");
+
+        let relation = source
+            .next_item()
+            .await
+            .expect("read the audit relation")
+            .and_then(SourceItem::into_relation)
+            .expect("the publication describes its audit table");
+        assert_eq!(relation.table(), "auth_events");
+        let event = source
+            .next_item()
+            .await
+            .expect("read the audit insert")
+            .and_then(SourceItem::into_event)
+            .expect("the audit row follows its relation");
+        let EventType::Insert { table, data, .. } = &event.change().event_type else {
+            panic!("the audit publication must deliver an insert");
+        };
+        assert_eq!(table.as_ref(), "auth_events");
+        assert_eq!(
+            data.get("user_id").and_then(ColumnValue::as_str),
+            Some("audit-publication-reader")
+        );
+        assert_eq!(
+            data.get("op").and_then(ColumnValue::as_str),
+            Some("logged_in")
+        );
+        let session_text = session.to_string();
+        assert_eq!(
+            data.get("session").and_then(ColumnValue::as_str),
+            Some(session_text.as_str())
+        );
+        let commit = source
+            .next_item()
+            .await
+            .expect("read the audit commit")
+            .and_then(SourceItem::into_commit)
+            .expect("the audit insert belongs to a committed transaction");
+        assert_eq!(commit.position().xid(), event.position().xid());
+    })
+    .await
+    .expect("the explicit audit publication delivers its committed row");
 }
 
 /// A label Postgres does not declare must be refused rather than stored.

@@ -26,8 +26,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::bots::ConnettoBotSchema;
+use crate::schema::ConnettoSchema;
 use connetto_core::auth::Principal;
-use connetto_core::bots::BotRegistryIdSql;
 use diesel::QueryableByName;
 use diesel::pg::Pg;
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
@@ -632,19 +633,17 @@ impl Translated {
     /// [`SetupError::Unplannable`] when the roles document never creates the
     /// reader role, and [`SetupError::Untranslated`] naming every expression
     /// left unhandled.
-    pub fn of<Key: CapabilityKey, Id: BotRegistryIdSql>(
+    pub fn of<Key: CapabilityKey, D: ConnettoSchema>(
         documents: connetto_schema::Documents<'_>,
         devices: bool,
     ) -> Result<Self, SetupError> {
         let (schema_sql, policy_sql) = (documents.schema(), documents.policies());
         // The model holds a bot to its list exactly as Postgres does.
-        let cap = connetto_schema::cap_policies::<Id>(schema_sql, policy_sql)
-            .map_err(|err| SetupError::Catalog(err.to_string()))?;
-        // The cap names the registry tables, and the engine's catalog holds the bookkeeping too.
-        let schema_sql = connetto_schema::with_bookkeeping::<Id>(
-            &connetto_schema::with_registry::<Id>(schema_sql),
-            devices,
-        );
+        let cap = connetto_schema::cap_policies::<<D::Bots as ConnettoBotSchema>::IdSql>(
+            schema_sql, policy_sql,
+        )
+        .map_err(|err| SetupError::Catalog(err.to_string()))?;
+        let schema_sql = crate::schema::engine_ddl::<D>(schema_sql, devices);
         // In the order a migration applies them: a role exists before a
         // policy names it, and a grant follows the tables it names.
         let mut sql = schema_sql;
@@ -2004,7 +2003,7 @@ mod tests {
     ";
 
     fn translated(policies: &str) -> Translated {
-        Translated::of::<String, connetto_core::bots::TextIds>(
+        Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 SCHEMA,
                 policies,
@@ -2191,10 +2190,7 @@ mod tests {
         // The naming the row is judged against was built through `of`, which
         // appends the bookkeeping tables, so the engine catalog must carry
         // them too or its table numbering will not line up with the naming.
-        let engine = connetto_schema::with_bookkeeping::<connetto_core::bots::TextIds>(
-            &connetto_schema::with_registry::<connetto_core::bots::TextIds>(SCHEMA),
-            true,
-        );
+        let engine = crate::schema::engine_ddl::<crate::defaults::ConnettoDefaults>(SCHEMA, true);
         let session = subql::ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&engine)
             .expect("the engine catalog parses");
         let notes = catalog_helpers::table_id::<Postgres, _>(&session, "notes")
@@ -2255,7 +2251,7 @@ mod tests {
     /// or name is what keeps this asserting about the tuples a deployment
     /// really writes.
     fn share_records(viewer: &'static str) -> (Arc<SubjectNaming>, Vec<Record>) {
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 SHARE_SCHEMA,
                 SHARE_POLICY,
@@ -2521,7 +2517,7 @@ mod tests {
     /// none.
     #[test]
     fn a_table_with_no_policy_at_all_grants_everybody_without_a_round_trip() {
-        let shapes = Translated::of::<String, connetto_core::bots::TextIds>(
+        let shapes = Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 "CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);",
                 "",
@@ -2544,7 +2540,7 @@ mod tests {
     /// Step 6's refusal, which is absolute rather than degrading per table.
     #[test]
     fn a_policy_with_no_translation_refuses_startup() {
-        let refused = Translated::of::<String, connetto_core::bots::TextIds>(
+        let refused = Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 SCHEMA,
                 "CREATE POLICY notes_p ON notes FOR ALL USING (mystery_function(owner))",
@@ -2565,7 +2561,7 @@ mod tests {
     /// otherwise describe requests no declared role runs.
     #[test]
     fn a_reader_role_the_roles_document_never_creates_refuses_startup() {
-        let refused = Translated::of::<String, connetto_core::bots::TextIds>(
+        let refused = Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT);",
                 "",
@@ -2597,7 +2593,7 @@ mod tests {
             const SETTING: &'static str = connetto_core::auth::DEFAULT_USER_SETTING;
         }
 
-        let refused = Translated::of::<OnIdentity, connetto_core::bots::TextIds>(
+        let refused = Translated::of::<OnIdentity, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT);",
                 "",
@@ -2647,7 +2643,7 @@ mod tests {
     /// phase along with the replay coverage its D4 deleted.
     #[test]
     fn a_share_written_as_a_join_table_row_boots_since_the_upstream_repair() {
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 SHARE_SCHEMA,
                 SHARE_POLICY,
@@ -2685,7 +2681,7 @@ mod tests {
             current_setting('app.user_id', true) = ANY(viewers))";
 
         let Err(super::SetupError::Unwithdrawable(named)) =
-            Translated::of::<String, connetto_core::bots::TextIds>(
+            Translated::of::<String, crate::defaults::ConnettoDefaults>(
                 connetto_schema::Documents::new(
                     SCHEMA,
                     POLICY,
@@ -2731,7 +2727,7 @@ mod tests {
               AND s.viewer = current_setting('app.user_id', true) \
               AND s.weight > (SELECT avg(weight) FROM paper_shares)))";
 
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 SCHEMA,
                 POLICY,
@@ -2764,7 +2760,7 @@ mod tests {
             EXISTS (SELECT 1 FROM item_share s WHERE s.item_id = item.id \
               AND s.viewer = current_setting('app.user_id', true) \
               AND s.weight > (SELECT avg(weight) FROM item_share)))";
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 SCHEMA,
                 POLICY,
@@ -2815,7 +2811,7 @@ mod tests {
             owner = current_setting('app.user_id', true))";
 
         let Err(super::SetupError::Unplannable(detail)) =
-            Translated::of::<String, connetto_core::bots::TextIds>(
+            Translated::of::<String, crate::defaults::ConnettoDefaults>(
                 connetto_schema::Documents::new(
                     SCHEMA,
                     POLICY,
@@ -2857,7 +2853,7 @@ mod tests {
             CREATE POLICY journal_p ON journal FOR SELECT USING (\
             author = current_setting('app.user_id', true))";
 
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 SCHEMA,
                 POLICIES,

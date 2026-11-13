@@ -881,7 +881,7 @@ async fn fga_auth(
     shape: PolicyShape,
 ) -> (crate::HarnessFga, Arc<dyn StoreUpkeep>, Translator) {
     let (channel, store) = fixture.fga_store().await;
-    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+    let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
         connetto_schema::Documents::new(
             shape.ddl(),
             shape.policies(),

@@ -157,17 +157,19 @@ async fn connected_clients(
         tokio::task::JoinHandle<Result<(), SessionError>>,
     )>,
 ) {
-    let translated =
-        connetto_server::openfga::Translated::of::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
-                PG_DDL,
-                POLICIES,
-                connetto_test_harness::FIXTURE_ROLES,
-                connetto_test_harness::FIXTURE_READER,
-            ),
-            true,
-        )
-        .expect("the policy translates");
+    let translated = connetto_server::openfga::Translated::of::<
+        String,
+        connetto_server::defaults::ConnettoDefaults,
+    >(
+        connetto_schema::Documents::new(
+            PG_DDL,
+            POLICIES,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
+    )
+    .expect("the policy translates");
     let (_, translator, _) = translated.into_parts();
     let materializer = Materializer::builder(&format!("{PG_DDL}\n{POLICIES}"))
         .with_write_catalog(RuntimeWritableCatalog::default())

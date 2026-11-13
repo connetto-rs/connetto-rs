@@ -38,6 +38,7 @@ use diesel::{QueryableByName, SqliteConnection, sql_query};
 use pg2sqlite::options::{Pg2SqliteOptions, TranslationContext};
 use pg2sqlite::prelude::ReverseTranslator;
 use rls2fga::translator::Translator;
+use sql_traits::structs::TargetName;
 use sqlite_diff_rs::{
     ChangesetOp, DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK,
     TableSchema, Value,
@@ -141,6 +142,9 @@ pub enum MaterializerError {
     /// writes into, which no client may read (R77 decision 11).
     #[error("subscription reads the server's bookkeeping table `{0}`")]
     BookkeepingRead(String),
+    /// A client subscription names a deployment-private audit table.
+    #[error("subscription reads the server's audit table `{0}`")]
+    AuditRead(String),
     /// A database read the engine drove through its connector failed for one
     /// subscription, carrying the class the session's three dispositions act
     /// on (R89 decision 1).
@@ -536,6 +540,7 @@ where
     /// Postgres as SQL the classifier reads. `None` for a deployment serving no
     /// membership term, where a subscription never names the caller.
     caller: Option<CallerMappings>,
+    audit_tables: Vec<(TableId, &'static str)>,
     /// Per-viewer re-reads of an ungrouped aggregate, whose one-cell answer
     /// goes on the wire as that value, the shape a client reads a scalar in.
     scalar_rereads: HashSet<SubscriptionId>,
@@ -600,6 +605,7 @@ impl Materializer<ParserDB, RuntimeWritableCatalog> {
             translator: None,
             caller: None,
             connector: crate::reexec::NoConnector,
+            audit_tables: &[],
         }
     }
 }
@@ -611,9 +617,17 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
         translator: Option<Translator>,
         caller: Option<CallerMappings>,
         connector: C,
+        audit_tables: &'static [&'static str],
     ) -> Result<Self, MaterializerError> {
         let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
             .map_err(|err| MaterializerError::Catalog(format!("{err:?}")))?;
+        let mut private_tables = Vec::with_capacity(audit_tables.len());
+        for name in audit_tables {
+            let id = catalog_helpers::table_id::<Postgres, _>(&catalog, name).ok_or_else(|| {
+                MaterializerError::Catalog(format!("audit table {name} has no catalog declaration"))
+            })?;
+            private_tables.push((id, *name));
+        }
         let mut engine = SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
         if let Some(translator) = translator {
             engine = engine.with_translator(translator);
@@ -623,6 +637,7 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             catalog,
             write,
             caller,
+            audit_tables: private_tables,
             scalar_rereads: HashSet::new(),
         })
     }
@@ -676,10 +691,10 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
         &self,
         sqlite_sql: &str,
     ) -> Result<String, MaterializerError> {
-        if let Some(table) = bookkeeping_read(sqlite_sql) {
-            return Err(MaterializerError::BookkeepingRead(table));
-        }
         let mut pg = translate_select(&self.catalog, self.caller.as_ref(), sqlite_sql)?;
+        if let Some(error) = private_relations(&pg, &self.catalog, &self.audit_tables) {
+            return Err(error);
+        }
         widen_column_subset(&mut pg);
         Ok(pg.to_string())
     }
@@ -716,6 +731,7 @@ where
     translator: Option<Translator>,
     caller: Option<CallerMappings>,
     connector: C,
+    audit_tables: &'static [&'static str],
 }
 
 impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
@@ -727,6 +743,7 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
             translator,
             caller,
             connector,
+            audit_tables,
             ..
         } = self;
         MaterializerBuilder {
@@ -735,6 +752,7 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
             translator,
             caller,
             connector,
+            audit_tables,
         }
     }
 
@@ -754,6 +772,13 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
         self
     }
 
+    /// Keep the deployment's audit tables private to internal registrations.
+    #[must_use]
+    pub fn with_audit_schema<A: crate::audit::ConnettoAuditSchema>(mut self) -> Self {
+        self.audit_tables = A::TABLES;
+        self
+    }
+
     /// The connector the engine's computed tiers read through.
     #[must_use]
     pub fn with_read_connector<T: ReadConnector>(self, connector: T) -> MaterializerBuilder<W, T> {
@@ -762,6 +787,7 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
             write,
             translator,
             caller,
+            audit_tables,
             ..
         } = self;
         MaterializerBuilder {
@@ -770,6 +796,7 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
             translator,
             caller,
             connector,
+            audit_tables,
         }
     }
 
@@ -785,6 +812,7 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
             self.translator,
             self.caller,
             self.connector,
+            self.audit_tables,
         )
     }
 }
@@ -2266,19 +2294,39 @@ fn answers_one_value(pg_sql: &str) -> bool {
             if exprs.is_empty() && mods.is_empty())
 }
 
-/// The bookkeeping table a client subscription names, to refuse it (R77
-/// decision 11). The server settles writes into these tables and they carry
-/// no application policy, so a client reading one would receive its rows
-/// through the change fan-out. `None` when the query parses and names none.
-fn bookkeeping_read(sqlite_sql: &str) -> Option<String> {
-    let statements = Parser::parse_sql(&SQLiteDialect {}, sqlite_sql).ok()?;
-    match visit_relations(&statements, |name| {
-        if let Some(ident) = name.0.last().and_then(|part| part.as_ident())
-            && let Some(table) = connetto_schema::BOOKKEEPING_TABLES
-                .iter()
-                .find(|table| ident.value.eq_ignore_ascii_case(table))
+/// Resolve private reads to catalog identities, preserving schema and quoting.
+fn private_relations<DB: DatabaseLike, V: sqlparser::ast::Visit>(
+    statements: &V,
+    catalog: &DB,
+    audit_tables: &[(TableId, &'static str)],
+) -> Option<MaterializerError> {
+    match visit_relations(statements, |name| {
+        let Some(ident) = name.0.last().and_then(|part| part.as_ident()) else {
+            return core::ops::ControlFlow::Continue(());
+        };
+        if let Some(table) = connetto_schema::BOOKKEEPING_TABLES
+            .iter()
+            .find(|table| ident.value.eq_ignore_ascii_case(table))
         {
-            return core::ops::ControlFlow::Break(table.to_string());
+            return core::ops::ControlFlow::Break(MaterializerError::BookkeepingRead(
+                table.to_string(),
+            ));
+        }
+        let mut target = TargetName::new(&ident.value, ident.quote_style.is_some());
+        match name.0.as_slice() {
+            [_] => {}
+            [schema, _] => {
+                let Some(schema) = schema.as_ident() else {
+                    return core::ops::ControlFlow::Continue(());
+                };
+                target = target.with_schema(&schema.value, schema.quote_style.is_some());
+            }
+            _ => return core::ops::ControlFlow::Continue(()),
+        }
+        if let Some(id) = catalog_helpers::table_id_for_name::<Postgres, _>(catalog, target)
+            && let Some(table) = audit_tables.iter().find(|(audit_id, _)| *audit_id == id)
+        {
+            return core::ops::ControlFlow::Break(MaterializerError::AuditRead(table.1.to_owned()));
         }
         core::ops::ControlFlow::Continue(())
     }) {
@@ -2983,7 +3031,7 @@ mod membership_term_tests {
     const ROLES: &str = "CREATE ROLE app_reader LOGIN;";
 
     fn materializer(caller: Option<CallerMappings>) -> Materializer {
-        let translator = Translated::of::<String, connetto_core::bots::TextIds>(
+        let translator = Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(SCHEMA, POLICIES, ROLES, READER),
             true,
         )
@@ -3166,7 +3214,7 @@ mod membership_term_tests {
     const OWN_QUERY: &str = "SELECT * FROM items";
 
     fn own_materializer() -> Materializer {
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(OWN_DDL, OWN_POLICIES, ROLES, READER),
             true,
         )
@@ -3416,5 +3464,125 @@ mod rows_update_merge_tests {
             changes.is_empty(),
             "the retry delivers the higher generation that supersedes it"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_privacy_tests {
+    use super::*;
+    use crate::audit::ConnettoAuditSchema;
+    use crate::defaults::ConnettoAudit;
+
+    const PRIVATE_DDL: &str = concat!(
+        crate::connetto_audit_ddl!("TEXT", "UUID"),
+        "CREATE TABLE private_receipts (id BIGINT PRIMARY KEY); \
+         CREATE SCHEMA \"Audit.Space\"; \
+         CREATE TABLE \"Audit.Space\".\"Receipt.Log\" (id BIGINT PRIMARY KEY);"
+    );
+
+    fn private_catalog(ddl: &str) -> MaterializerBuilder {
+        MaterializerBuilder {
+            audit_tables: &[
+                "auth_events",
+                "private_receipts",
+                "\"Audit.Space\".\"Receipt.Log\"",
+            ],
+            ..Materializer::builder(ddl)
+        }
+    }
+
+    #[test]
+    fn a_missing_audit_declaration_refuses_catalog_construction() {
+        let result = private_catalog(ConnettoAudit::CATALOG_DDL).build();
+        assert!(matches!(result, Err(MaterializerError::Catalog(_))));
+    }
+
+    #[test]
+    fn audit_names_are_private_in_direct_and_nested_client_queries() {
+        let mut materializer = private_catalog(&format!(
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY); \
+             CREATE TABLE \"Receipt.Log\" (id BIGINT PRIMARY KEY); {PRIVATE_DDL}"
+        ))
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(crate::reexec::NoConnector)
+        .build()
+        .expect("the catalog builds");
+        for sql in [
+            "SELECT * FROM private_receipts",
+            "SELECT * FROM public.PRIVATE_RECEIPTS",
+            "SELECT * FROM docs WHERE id IN (SELECT id FROM private_receipts)",
+            "WITH receipts AS (SELECT * FROM private_receipts) SELECT * FROM receipts",
+        ] {
+            assert!(matches!(
+                materializer.translate_subscription_sql(sql),
+                Err(MaterializerError::AuditRead(table)) if table == "private_receipts"
+            ));
+        }
+        materializer
+            .translate_subscription_sql("SELECT * FROM docs")
+            .expect("application tables remain readable");
+        materializer
+            .register_translated(
+                1,
+                "SELECT * FROM private_receipts",
+                &[],
+                None,
+                ReadBudget::new(core::time::Duration::from_secs(5)),
+                None,
+            )
+            .expect("internal registrations may read audit tables");
+        for sql in [
+            "SELECT * FROM \"Audit.Space\".\"Receipt.Log\"",
+            "SELECT * FROM docs WHERE id IN (SELECT id FROM \"Audit.Space\".\"Receipt.Log\")",
+        ] {
+            assert!(matches!(
+                materializer.translate_subscription_sql(sql),
+                Err(MaterializerError::AuditRead(table))
+                    if table == "\"Audit.Space\".\"Receipt.Log\""
+            ));
+        }
+        materializer
+            .translate_subscription_sql("SELECT * FROM \"Receipt.Log\"")
+            .expect("the same leaf in the application schema is public");
+        assert!(
+            materializer
+                .register_sqlite(
+                    2,
+                    "SELECT * FROM catalog.\"Audit.Space\".\"Receipt.Log\"",
+                    &[],
+                    ReadBudget::new(core::time::Duration::from_secs(5)),
+                )
+                .is_err(),
+            "a catalog qualifier cannot expose private audit rows"
+        );
+    }
+
+    #[test]
+    fn default_audit_observations_are_internal_only() {
+        let ddl = crate::schema::engine_ddl::<crate::defaults::ConnettoDefaults>(
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY);",
+            false,
+        );
+        let mut materializer = Materializer::builder(&ddl)
+            .with_audit_schema::<ConnettoAudit>()
+            .build()
+            .expect("the catalog builds");
+        let sql = "SELECT writer, seq FROM auth_events \
+                   WHERE op = 'write_couriered' AND writer = 7 AND seq = 8";
+        assert!(matches!(
+            materializer.register_sqlite(
+                1,
+                sql,
+                &[],
+                ReadBudget::new(core::time::Duration::from_secs(5)),
+            ),
+            Err(MaterializerError::AuditRead(table)) if table == "auth_events"
+        ));
+        assert!(matches!(
+            materializer
+                .register(2, sql)
+                .expect("internal observation registers"),
+            Registration::Computed(_)
+        ));
     }
 }

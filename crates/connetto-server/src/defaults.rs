@@ -7,4 +7,5 @@ crate::connetto_schema! {
     pub struct ConnettoDefaults;
     id: String => diesel::sql_types::Text,
     audit_row_key: uuid::Uuid => diesel::sql_types::Uuid,
+    audit_ddl: crate::connetto_audit_ddl!("TEXT", "UUID"),
 }

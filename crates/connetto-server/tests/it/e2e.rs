@@ -669,6 +669,7 @@ pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixt
     )
     .await;
     exec(pool, "GRANT USAGE ON SCHEMA public TO app_reader").await;
+    exec(pool, "GRANT SELECT ON auth_events TO app_reader").await;
     exec(
         pool,
         "GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO app_reader",
@@ -1119,6 +1120,7 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     provision_cap_policies(&admin, OWNED_PG_DDL, OWNED_POLICIES).await;
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;
+    exec(&admin, "GRANT SELECT ON auth_events TO app_writer").await;
 
     let reader_url = with_user_url(&url, "app_writer", "app_writer");
 

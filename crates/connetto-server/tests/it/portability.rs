@@ -196,6 +196,7 @@ async fn reset_portability_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fix
     )
     .await;
     exec(pool, "GRANT USAGE ON SCHEMA public TO app_reader").await;
+    exec(pool, "GRANT SELECT ON auth_events TO app_reader").await;
     exec(
         pool,
         "GRANT SELECT ON records, mod_notes, stamps, amounts, media TO app_reader",

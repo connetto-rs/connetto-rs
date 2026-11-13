@@ -778,32 +778,7 @@ pub async fn provision_writers(pool: &Pool<AsyncPgConnection>) {
 /// (R105 decision 5), matching `docs/architecture/08-authorization.md` and the
 /// default schema's audit member, created only where missing. It names the
 /// settle-path enum, so [`WRITERS_DDL`] runs first.
-pub const AUDIT_DDL: &str = "DO $$ BEGIN \
-    CREATE TYPE connetto_auth_op AS ENUM (\
-    'logged_in', 'logged_out', 'session_revoked', 'token_replayed', \
-    'ended_by_owner', 'ended_all', 'ended_others', 'ended_by_ban', \
-    'capability_minted', 'permission_change', 'model_change', \
-    'banned', 'ban_lifted', 'write_forked', 'write_redelivered', \
-    'write_couriered', 'data_downloaded', 'data_erased'); \
-    EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
-    CREATE TABLE IF NOT EXISTS auth_events \
-    (at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-     session UUID, \
-     user_id TEXT, \
-     op connetto_auth_op NOT NULL, \
-     table_name TEXT, \
-     pk UUID, \
-     subject TEXT, \
-     writer BIGINT, \
-     seq BIGINT, \
-     path connetto_settle_path, \
-     other_path connetto_settle_path, \
-     courier_user_id TEXT, \
-     provider TEXT, \
-     issuer TEXT, \
-     query_list_hash TEXT, \
-     archive_bytes BIGINT, \
-     acted_by TEXT)";
+pub const AUDIT_DDL: &str = connetto_server::connetto_audit_ddl!(provision, "TEXT", "UUID");
 
 /// Create the reference audit enum and table if missing, as admin.
 pub async fn provision_audit(pool: &Pool<AsyncPgConnection>) {
@@ -961,6 +936,13 @@ pub async fn start_replication_on(pool: &Pool<AsyncPgConnection>, tables: &[&str
         }
     }
     for table in connetto_schema::BOOKKEEPING_TABLES {
+        if !published.contains(table) {
+            published.push(table);
+        }
+    }
+    for table in <connetto_server::defaults::ConnettoAudit as
+        connetto_server::audit::ConnettoAuditSchema>::TABLES
+    {
         if !published.contains(table) {
             published.push(table);
         }
@@ -1928,18 +1910,10 @@ impl Server {
     }
 }
 
-/// The catalog DDL the server's engine classifies, the deployment's `pg_ddl`
-/// with the bot registry and the bookkeeping tables the server settles into,
-/// the way the production build appends them (R77 decision 11). A publication
-/// row for a table outside the catalog wedges the change stream, so every
-/// catalog the server parts read, the ingest's, the materializer's, the
-/// snapshot's and the write target's, must be this one text.
+/// The default deployment's complete server catalog.
 #[must_use]
 pub fn engine_ddl(pg_ddl: &str) -> String {
-    connetto_schema::with_bookkeeping::<connetto_core::bots::TextIds>(
-        &connetto_schema::with_registry::<connetto_core::bots::TextIds>(pg_ddl),
-        true,
-    )
+    connetto_server::schema::engine_ddl::<ConnettoDefaults>(pg_ddl, true)
 }
 
 /// Wire a harness server: build the materializer, write target, and re-execution
@@ -1990,6 +1964,7 @@ pub async fn spawn_server(
         None => std::borrow::Cow::Borrowed(&base_ddl),
     };
     let mut materializer_builder = Materializer::builder(&materializer_ddl)
+        .with_audit_schema::<connetto_server::defaults::ConnettoAudit>()
         .with_write_catalog(writable)
         .with_read_connector(engine_connector);
     if let Some(translator) = translator {

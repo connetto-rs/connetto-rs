@@ -12,6 +12,7 @@
 //!     pub struct AppSchema;
 //!     id: String => diesel::sql_types::Text,
 //!     audit_row_key: uuid::Uuid => diesel::sql_types::Uuid,
+//!     audit_ddl: connetto_server::connetto_audit_ddl!("TEXT", "UUID"),
 //! }
 //! ```
 //!
@@ -30,6 +31,7 @@
 //!     pub struct AppSchema;
 //!     id: String => diesel::sql_types::Text,
 //!     audit_row_key: uuid::Uuid => diesel::sql_types::Uuid,
+//!     audit_ddl: connetto_server::connetto_audit_ddl!("TEXT", "UUID"),
 //!     device_descriptor: AppDevice {
 //!         name: diesel::sql_types::Text,
 //!         model: diesel::sql_types::Nullable<diesel::sql_types::Text>,
@@ -51,6 +53,7 @@
 //!     pub struct AppSchema;
 //!     id: String => diesel::sql_types::Text,
 //!     audit_row_key: uuid::Uuid => diesel::sql_types::Uuid,
+//!     audit_ddl: connetto_server::connetto_audit_ddl!("TEXT", "UUID"),
 //!     session_descriptor: AppSession { place: diesel::sql_types::Text },
 //! }
 //! ```
@@ -67,6 +70,7 @@
 //!     pub struct AppSchema;
 //!     id: String => diesel::sql_types::Text,
 //!     audit_row_key: uuid::Uuid => diesel::sql_types::Uuid,
+//!     audit_ddl: connetto_server::connetto_audit_ddl!("TEXT", "UUID"),
 //!     device_descriptor: AppDevice { nickname: diesel::sql_types::Text },
 //! }
 //! ```
@@ -151,10 +155,22 @@ pub trait ConnettoSchema: Send + Sync + 'static {
     type Files: connetto_file_server::ConnettoFileSchema;
 }
 
-/// The default tables of every member and a unit struct `$name` naming them
-/// as a [`ConnettoSchema`], over the identity `id` and the audit log's row key
-/// `audit_row_key`, each with its SQL type, and optionally the application's
-/// device descriptor and session descriptor with each field's SQL type.
+/// Composes the application, registry, bookkeeping and private audit catalog.
+#[must_use]
+pub fn engine_ddl<D: ConnettoSchema>(pg_ddl: &str, devices: bool) -> String {
+    let mut ddl = connetto_schema::with_bookkeeping::<<D::Bots as ConnettoBotSchema>::IdSql>(
+        &connetto_schema::with_registry::<<D::Bots as ConnettoBotSchema>::IdSql>(pg_ddl),
+        devices,
+    );
+    ddl.push('\n');
+    ddl.push_str(D::Audit::CATALOG_DDL);
+    if !ddl.trim_end().ends_with(';') {
+        ddl.push_str("\n;");
+    }
+    ddl
+}
+
+/// Generates the deployment schema from identity types and `audit_ddl`, with optional device and session descriptors.
 ///
 /// Invoked at module scope with `diesel` and `diesel_async` in scope. The
 /// member structs it emits are `ConnettoAuthSchema`, `ConnettoWriters`,
@@ -167,14 +183,15 @@ macro_rules! connetto_schema {
     (
         $vis:vis struct $name:ident;
         id: $id:ty => $id_sql:ty,
-        audit_row_key: $pk:ty => $pk_sql:ty
+        audit_row_key: $pk:ty => $pk_sql:ty,
+        audit_ddl: $ddl:expr
         $(, device_descriptor: $($desc:ident)::+ { $($field:ident : $field_sql:ty),* $(,)? })?
         $(, session_descriptor: $($sdesc:ident)::+ { $($sfield:ident : $sfield_sql:ty),* $(,)? })?
         $(,)?
     ) => {
         $crate::connetto_auth_tables!($id, $id_sql; $($($sdesc)::+ { $($sfield : $sfield_sql),* })?);
         $crate::connetto_writers_table!($id, $id_sql);
-        $crate::connetto_audit_table!($id, $id_sql, $pk, $pk_sql);
+        $crate::connetto_audit_table!($id, $id_sql, $pk, $pk_sql, $ddl);
         $crate::connetto_ban_table!($id, $id_sql);
         $crate::connetto_enrolment_tables!($id, $id_sql; $($($desc)::+ { $($field : $field_sql),* })?);
         $crate::connetto_bots_tables!($id, $id_sql);

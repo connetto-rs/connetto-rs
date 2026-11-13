@@ -72,19 +72,21 @@ async fn term_manager(
     fixture: &Fixture,
 ) -> (Arc<TermManager>, Arc<Mutex<Script>>, Vec<PgChangeEvent>) {
     let ddl = format!("{PG_DDL} {MEMBER_DDL}");
-    let translator =
-        connetto_server::openfga::Translated::of::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
-                &ddl,
-                POLICIES,
-                connetto_test_harness::FIXTURE_ROLES,
-                connetto_test_harness::FIXTURE_READER,
-            ),
-            true,
-        )
-        .expect("membership classifier")
-        .into_parts()
-        .1;
+    let translator = connetto_server::openfga::Translated::of::<
+        String,
+        connetto_server::defaults::ConnettoDefaults,
+    >(
+        connetto_schema::Documents::new(
+            &ddl,
+            POLICIES,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
+    )
+    .expect("membership classifier")
+    .into_parts()
+    .1;
     let script = Arc::new(Mutex::new(Script::default()));
     let manager = ManagerBuilder::new(
         Materializer::builder(&ddl)

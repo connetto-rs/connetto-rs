@@ -33,6 +33,7 @@ mod app {
         pub struct UuidDefaults;
         id: uuid::Uuid => diesel::sql_types::Uuid,
         audit_row_key: uuid::Uuid => diesel::sql_types::Uuid,
+        audit_ddl: connetto_server::connetto_audit_ddl!("UUID", "UUID"),
     }
 
     diesel::table! {
@@ -716,6 +717,9 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
          session_id UUID PRIMARY KEY REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
          issuer TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, \
          expires_at TIMESTAMPTZ)",
+        "ALTER TABLE auth_events \
+         ALTER COLUMN user_id TYPE UUID USING user_id::uuid, \
+         ALTER COLUMN courier_user_id TYPE UUID USING courier_user_id::uuid",
         "DROP TABLE connetto_installation_optional_tables",
         "DROP TABLE connetto_installations",
         "DROP TABLE connetto_bot_lists",

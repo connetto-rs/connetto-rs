@@ -33,6 +33,7 @@ mod app {
         pub struct Described;
         id: String => diesel::sql_types::Text,
         audit_row_key: uuid::Uuid => diesel::sql_types::Uuid,
+        audit_ddl: connetto_server::connetto_audit_ddl!("TEXT", "UUID"),
         session_descriptor: Place { place: diesel::sql_types::Text },
     }
 }

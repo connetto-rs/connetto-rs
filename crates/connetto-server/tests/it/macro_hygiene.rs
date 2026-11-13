@@ -13,6 +13,7 @@ mod colliding {
         pub struct HygieneSchema;
         id: String => diesel::sql_types::Text,
         audit_row_key: uuid::Uuid => diesel::sql_types::Uuid,
+        audit_ddl: connetto_server::connetto_audit_ddl!("TEXT", "UUID"),
     }
 
     /// A query the caller builds through its own named imports.

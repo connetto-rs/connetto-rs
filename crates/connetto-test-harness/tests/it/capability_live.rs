@@ -66,6 +66,7 @@ fn ids_in(patchset_zstd: &[u8]) -> Vec<i32> {
     // The one catalog the server classifies with, so the patch's table
     // numbers line up with the replica's (R77 decision 11).
     Materializer::builder(&engine_ddl(PG_DDL))
+        .with_audit_schema::<connetto_server::defaults::ConnettoAudit>()
         .build()
         .expect("applier")
         .apply_diffset(patchset_zstd, &mut replica)
