@@ -43,7 +43,7 @@ use connetto_file_server::{
 use connetto_server::epoch::EPOCH_DDL;
 use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog};
 use connetto_test_harness::{
-    Fixture, HarnessAuth, Server, ServerConfig, pool_for, spawn_server, with_user,
+    Fixture, HarnessAuth, Server, ServerConfig, engine_ddl, pool_for, spawn_server, with_user,
 };
 use diesel::prelude::*;
 use tempfile::tempdir;
@@ -51,26 +51,26 @@ use tempfile::tempdir;
 /// The bytes staged and verified through the full flow.
 const PHOTO: &[u8] = b"JPEG bytes representing a photo staged through the demo UI";
 
+/// The thumbnail staged beside the photo, a file of its own.
+const THUMB: &[u8] = b"a smaller JPEG standing in for the photo's thumbnail";
+
+/// The thumbnail columns of `photos`, which the demo's panes do not read.
+mod thumbnails {
+    diesel::table! {
+        photos (id) {
+            id -> rosetta_uuid::sql_types::Uuid,
+            content_id -> diesel::sql_types::Binary,
+            thumb_id -> Nullable<diesel::sql_types::Binary>,
+            thumb_state -> Nullable<diesel::sql_types::Text>,
+        }
+    }
+}
+
 /// The user the test's devices sign in as, and the `owner_id` every row names.
 /// The deployment's visibility policies compare `owner_id` against
 /// `current_setting('app.user_id')`, which the server binds from the
 /// credential's user id.
 const OWNER: &str = "alice";
-
-/// Simplified DDL for the server's internal catalog (`PgSnapshotSource`,
-/// `RlsAuth`). The actual Postgres tables are created from the deployment's
-/// `schema.sql`; this version omits the `gen_random_uuid()` defaults and
-/// foreign-key references that the `subql` parser does not need and may not
-/// handle.
-const CATALOG_DDL: &str = concat!(
-    "CREATE TABLE orders (id UUID PRIMARY KEY, owner_id TEXT NOT NULL,",
-    " quantity BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL);",
-    "CREATE TABLE order_lines (order_id UUID NOT NULL, line_no INTEGER NOT NULL,",
-    " owner_id TEXT NOT NULL, quantity BIGINT NOT NULL,",
-    " PRIMARY KEY (order_id, line_no));",
-    "CREATE TABLE photos (id UUID PRIMARY KEY, order_id UUID NOT NULL,",
-    " owner_id TEXT NOT NULL, content_id BYTEA NOT NULL, content_state TEXT)"
-);
 
 /// Stage, upload, flip, resolve, fetch, and archive round trip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -117,13 +117,12 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
 
     // Stage using the demo pattern: orders row + photos row in one
     // transaction, the same row the pick handler writes.
-    let file_id = a_content
+    let (file_id, photo_id) = a_content
         .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
             stage_photo_row(conn, file_id, OWNER)
         })
         .await
-        .expect("stage demo photo")
-        .0;
+        .expect("stage demo photo");
 
     // Bytes resolve locally before any upload.
     assert!(
@@ -151,7 +150,9 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
             break sent;
         }
         while let Ok(ev) = a_client_events.try_recv() {
-            let _ = ev;
+            if let connetto_client::ClientEvent::MutationRejected { reason, .. } = ev {
+                panic!("the server refused the staged photo: {reason:?}");
+            }
         }
         assert!(tokio::time::Instant::now() < deadline, "upload timeout");
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -165,6 +166,81 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
         Some("available"),
         "content_state flipped in Postgres"
     );
+
+    // The photo's upload names no thumbnail, so the setter left thumb_state alone.
+    let mut admin = fixture.admin().get().await.expect("admin connection");
+    let thumb_state: Option<String> = diesel_async::RunQueryDsl::get_result(
+        thumbnails::photos::table
+            .filter(thumbnails::photos::content_id.eq(file_id.as_bytes().to_vec()))
+            .select(thumbnails::photos::thumb_state),
+        &mut *admin,
+    )
+    .await
+    .expect("read thumb_state from Postgres");
+    assert_eq!(
+        thumb_state, None,
+        "the photo's upload leaves thumb_state alone"
+    );
+    drop(admin);
+
+    // The thumbnail is a file of its own, and its upload flips the row's own
+    // thumbnail state column (R79 decisions 15 and 17). The watch subscribes
+    // before the write that leads to the flip, so the flip cannot be missed.
+    let mut thumb_watch: connetto_client::live::LiveQuery<Option<String>> = a
+        .watch(
+            thumbnails::photos::table
+                .filter(thumbnails::photos::content_id.eq(file_id.as_bytes().to_vec()))
+                .select(thumbnails::photos::thumb_state),
+        )
+        .await
+        .expect("watch the thumbnail state");
+    // Every event so far is about the photo's own write, which the server
+    // applied before its upload could pass the visibility check.
+    while !matches!(
+        a_client_events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty
+            | tokio::sync::broadcast::error::TryRecvError::Closed)
+    ) {}
+    a_content
+        .stage(THUMB, MimeClass::Jpeg, |conn, thumb_id| {
+            diesel::update(thumbnails::photos::table.filter(thumbnails::photos::id.eq(photo_id)))
+                .set(thumbnails::photos::thumb_id.eq(Some(thumb_id.as_bytes().to_vec())))
+                .execute(conn)
+                .map(|_| ())
+        })
+        .await
+        .expect("stage the thumbnail");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match a_client_events.recv().await {
+                Ok(connetto_client::ClientEvent::MutationApplied { .. }) => break,
+                Ok(connetto_client::ClientEvent::MutationRejected { reason, .. }) => {
+                    panic!("the server refused the thumbnail's row: {reason:?}");
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("the event stream closed before the thumbnail's row landed")
+                }
+            }
+        }
+    })
+    .await
+    .expect("the thumbnail's row lands on the server");
+    assert_eq!(
+        a_content.flush_outbox().await.expect("flush"),
+        1,
+        "the thumbnail uploads from the outbox"
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while thumb_watch.rows() != [Some("available".to_owned())] {
+            thumb_watch
+                .changed()
+                .await
+                .expect("the thumbnail state stays watched");
+        }
+    })
+    .await
+    .expect("the thumbnail's state flips on its own upload");
 
     // Device B connects and sees the flip via replication.
     let (b, b_content) =
@@ -297,25 +373,6 @@ async fn provision(fixture: &Fixture) {
     fixture.exec(CONTENT_SQL).await;
     fixture.exec(POLICIES_SQL).await;
     fixture.exec(SEED_SQL).await;
-    // `app_writer` is a test-infrastructure writer role; not part of the
-    // deployment's SQL files. The server's mutation path uses it to apply
-    // changesets, and it is subject to the row-level security that
-    // `policies.sql` enables.
-    fixture
-        .setup(&[
-            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
-             THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
-            "GRANT USAGE ON SCHEMA public TO app_writer",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO app_writer",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON order_lines TO app_writer",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON photos TO app_writer",
-            "GRANT SELECT ON products TO app_writer",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
-             _connetto_session_writers TO app_writer",
-            "GRANT SELECT ON _cfs_manifests TO app_writer",
-            "GRANT SELECT ON _cfs_manifest_chunks TO app_writer",
-        ])
-        .await;
 }
 
 async fn start_file_server(
@@ -359,13 +416,24 @@ async fn start_file_server(
 }
 
 async fn spawn_sync_server(fixture: &Fixture, signer: TicketSigner) -> Server {
-    let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
+    // The role the demo's own write path applies client mutations as, with
+    // the grants `roles.sql`, `bookkeeping.sql` and `content.sql` give it.
+    let writer_pool = pool_for(&with_user(
+        fixture.admin_url(),
+        "connetto_reader",
+        "connetto_reader",
+    ))
+    .await;
+    // The deployment's own schema, so the server's catalog cannot drift from
+    // the tables the clients' bundle was translated from, with the engine
+    // tables the harness appends inside `spawn_server` (R77 decision 11).
+    let engine_ddl = engine_ddl(SCHEMA_SQL);
     let snapshot =
-        PgSnapshotSource::from_ddl(writer_pool.clone(), CATALOG_DDL).expect("snapshot source");
+        PgSnapshotSource::from_ddl(writer_pool.clone(), &engine_ddl).expect("snapshot source");
     let auth =
-        HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), CATALOG_DDL).expect("rls auth"));
+        HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), &engine_ddl).expect("rls auth"));
     spawn_server(
-        ServerConfig::new(CATALOG_DDL, fixture.admin_url())
+        ServerConfig::new(SCHEMA_SQL, fixture.admin_url())
             .with_writable(
                 RuntimeWritableCatalog::builder()
                     .writable("orders")
