@@ -416,7 +416,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn 2.0.119",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -1423,7 +1423,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 2.0.119",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -1977,7 +1977,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3048,6 +3048,7 @@ checksum = "fefca06093eeaed707a905795e68206da0edca4edef23d2a3997a3ddbee462aa"
 dependencies = [
  "jiff-core",
  "jiff-static",
+ "jiff-tzdb",
  "jiff-tzdb-platform",
  "log",
  "portable-atomic",
@@ -4271,7 +4272,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#f85296b4c87590ad6abeb2a09d560eff2a84e1d4"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#ffbdfde88d51088d9c11baeff919835f44eaefef"
 dependencies = [
  "recursive",
  "sql-traits",
@@ -4675,7 +4676,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5041,13 +5042,13 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#29ac7711e4b66e4f8ed7efa8b3272aba37903b6f"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#c5ec02a44a646384dedb8b2db911e2e175109535"
 dependencies = [
  "rls2fga-types",
  "serde",
  "serde_json",
  "sql-traits",
- "sql-values 0.5.1",
+ "sql-values 0.6.0",
  "sqlparser",
  "thiserror 2.0.21",
 ]
@@ -5055,10 +5056,10 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#29ac7711e4b66e4f8ed7efa8b3272aba37903b6f"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#c5ec02a44a646384dedb8b2db911e2e175109535"
 dependencies = [
  "serde",
- "sql-values 0.5.1",
+ "sql-values 0.6.0",
  "thiserror 2.0.21",
 ]
 
@@ -5163,7 +5164,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5220,7 +5221,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys 2.17.0",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5789,7 +5790,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#21561a875fd34368f9863986257bcd9bfde147d5"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#bd46e442317851b0af5362a0578f6c8d83660883"
 dependencies = [
  "geometric-traits",
  "once_cell",
@@ -5817,8 +5818,19 @@ dependencies = [
 [[package]]
 name = "sql-values"
 version = "0.5.1"
-source = "git+https://github.com/connetto-rs/sql-values?branch=main#8207674b24768b1f654b9f7129de22b5059a63d4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa63391be723434747b0c2ffc2e7270f4a7a476d083b55cdda961c4773d1d5e4"
 dependencies = [
+ "jiff",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sql-values"
+version = "0.6.0"
+source = "git+https://github.com/connetto-rs/sql-values?branch=main#adc5e8cfa0436f5f96c39b391946b8e99d856e41"
+dependencies = [
+ "jiff",
  "thiserror 2.0.21",
 ]
 
@@ -6002,7 +6014,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#2bd6552d2ee09e6106c269eca725117c3837dd49"
+source = "git+https://github.com/connetto-rs/subql?branch=main#0e88d7b01bc40e1ff854a5af713b2796fea8779f"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -6466,10 +6478,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7450,7 +7462,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

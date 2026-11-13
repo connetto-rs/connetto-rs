@@ -197,7 +197,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn 2.0.119",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -1494,6 +1494,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jiff"
+version = "0.2.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26699905cc795a23e3949585cc7ba3ee8ade090872a27e4316304a777297894a"
+dependencies = [
+ "jiff-core",
+ "jiff-static",
+ "jiff-tzdb",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff-core"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffe6854081f5ac0a3046a9b223729ccd7a20b1e0e8277e44dc0660eedf67dfe2"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "jiff-static"
+version = "0.2.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b4ff49b2887190c760b86207b55cdcaabbdecaf7a0660d68aa2ed6f652abf0a"
+dependencies = [
+ "jiff-core",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "jiff-tzdb"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa8377070c6bae868759445e5a77f66d84f0b72f3a054bfb00e6d038b8282da7"
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2006,7 +2047,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#f85296b4c87590ad6abeb2a09d560eff2a84e1d4"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#ffbdfde88d51088d9c11baeff919835f44eaefef"
 dependencies = [
  "recursive",
  "sql-traits",
@@ -2071,6 +2112,21 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+]
+
+[[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
+name = "portable-atomic-util"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
+dependencies = [
+ "portable-atomic",
 ]
 
 [[package]]
@@ -2449,13 +2505,13 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#29ac7711e4b66e4f8ed7efa8b3272aba37903b6f"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#c5ec02a44a646384dedb8b2db911e2e175109535"
 dependencies = [
  "rls2fga-types",
  "serde",
  "serde_json",
  "sql-traits",
- "sql-values 0.5.1",
+ "sql-values 0.6.0",
  "sqlparser",
  "thiserror 2.0.21",
 ]
@@ -2463,10 +2519,10 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#29ac7711e4b66e4f8ed7efa8b3272aba37903b6f"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#c5ec02a44a646384dedb8b2db911e2e175109535"
 dependencies = [
  "serde",
- "sql-values 0.5.1",
+ "sql-values 0.6.0",
  "thiserror 2.0.21",
 ]
 
@@ -2918,7 +2974,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#21561a875fd34368f9863986257bcd9bfde147d5"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#bd46e442317851b0af5362a0578f6c8d83660883"
 dependencies = [
  "geometric-traits",
  "once_cell",
@@ -2946,8 +3002,19 @@ dependencies = [
 [[package]]
 name = "sql-values"
 version = "0.5.1"
-source = "git+https://github.com/connetto-rs/sql-values?branch=main#8207674b24768b1f654b9f7129de22b5059a63d4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa63391be723434747b0c2ffc2e7270f4a7a476d083b55cdda961c4773d1d5e4"
 dependencies = [
+ "jiff",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sql-values"
+version = "0.6.0"
+source = "git+https://github.com/connetto-rs/sql-values?branch=main#adc5e8cfa0436f5f96c39b391946b8e99d856e41"
+dependencies = [
+ "jiff",
  "thiserror 2.0.21",
 ]
 
@@ -3078,7 +3145,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#2bd6552d2ee09e6106c269eca725117c3837dd49"
+source = "git+https://github.com/connetto-rs/subql?branch=main#0e88d7b01bc40e1ff854a5af713b2796fea8779f"
 dependencies = [
  "arc-swap",
  "async-lock",
