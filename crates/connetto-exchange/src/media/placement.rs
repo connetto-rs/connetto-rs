@@ -254,14 +254,24 @@ pub fn decide(placement: &Placement<'_>) -> Verdict {
     match placement.mine {
         Mine::Absent => {
             let missing = placement.copies.saturating_sub(unmarked);
-            let covered = holding(View::Held)
+            let covered: BTreeSet<&str> = holding(View::Held)
                 .map(|peer| peer.candidate.account)
                 .collect();
             let mut candidates = others;
             candidates.push(placement.me);
-            let pulls = takers(file, placement.size, &candidates, &sources, &covered)
+            let ranked = takers(file, placement.size, &candidates, &sources, &covered);
+            // With the count met and one account holding two copies, the best
+            // taker of an account holding none pulls one more, and the
+            // surplus handover then releases the account's second copy.
+            let spread = missing == 0
+                && unmarked == placement.copies
+                && covered.len() < unmarked
+                && ranked
+                    .first()
+                    .is_some_and(|candidate| !covered.contains(candidate.account));
+            let pulls = ranked
                 .into_iter()
-                .take(missing)
+                .take(missing + usize::from(spread))
                 .any(|candidate| candidate.key == placement.me.key);
             if pulls {
                 Verdict::Pull

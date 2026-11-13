@@ -240,6 +240,63 @@ fn an_account_already_holding_the_file_yields_to_one_that_does_not() {
 }
 
 #[test]
+fn a_device_reporting_after_one_account_took_two_copies_pulls_one_more() {
+    let peer_of = |key, account, view| Peer {
+        candidate: candidate(key, account, 100),
+        admitted: true,
+        view,
+        seen: None,
+    };
+    let doubled = vec![
+        peer_of(2, "anna", View::Held),
+        peer_of(3, "tester", View::Held),
+        peer_of(4, "tester", View::Held),
+    ];
+    let curator = |peers| Placement {
+        me: candidate(1, "curator", 100),
+        ..placement(3, Mine::Absent, peers)
+    };
+    assert_eq!(
+        decide(&curator(doubled.clone())),
+        Verdict::Pull,
+        "the count holds yet the curator's account holds no copy"
+    );
+    let mut roomier = doubled.clone();
+    roomier.push(Peer {
+        candidate: candidate(5, "curator", 1 << 40),
+        ..peer_of(5, "curator", View::Absent)
+    });
+    assert_eq!(
+        decide(&curator(roomier)),
+        Verdict::Nothing,
+        "only the account's best device pulls"
+    );
+    let mut spread = doubled.clone();
+    spread.push(peer_of(5, "dave", View::Held));
+    assert_eq!(
+        decide(&curator(spread)),
+        Verdict::Nothing,
+        "with the extra copy already taken, no other follows"
+    );
+    let fourth_held = |me: Candidate<'static>| {
+        let mut peers = doubled.clone();
+        peers.retain(|peer| peer.candidate.key != me.key);
+        peers.push(peer_of(1, "curator", View::Held));
+        Placement {
+            me,
+            ..placement(3, Mine::Held, peers)
+        }
+    };
+    let mut by_score = [3_u8, 4];
+    by_score.sort_by_key(|key| core::cmp::Reverse(hash_term(&FILE, &[*key; 32])));
+    assert_eq!(
+        decide(&fourth_held(candidate(by_score[1], "tester", 100))),
+        Verdict::Surplus,
+        "the account's second copy leaves once the curator holds one"
+    );
+}
+
+#[test]
 fn a_holder_below_the_best_copies_leaves_as_surplus() {
     assert_eq!(
         decide(&placement(
