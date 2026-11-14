@@ -3,8 +3,9 @@
 //! without room left out, a copy above the count released, a copy marked
 //! leaving under pressure handed to another device and deleted, only as many
 //! copies leaving as the shortfall needs, a pressed copy nobody can take
-//! raising `CustodyPressed`, a mark nobody can answer withdrawn, and a pull
-//! a busy author turned away placed again (R79 decisions 12 to 16).
+//! raising `CustodyPressed`, a mark nobody can answer withdrawn, a pull a
+//! busy author turned away placed again, and a row applied after the
+//! driver's last pass placed (R79 decisions 12 to 16).
 
 use std::time::Duration;
 
@@ -16,8 +17,8 @@ use connetto_peer::{CloseReason, Node};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::peer_support::{
-    Device, Devices, Fault, Relay, apply_entry, bare_holder, beside, beside_all, captured_photo,
-    custody_state, declare_replicated, held_chunks, listener, port, relay, replica,
+    Device, Devices, Fault, Relay, apply_entry, bare_holder, bare_holder_of, beside, beside_all,
+    captured_photo, custody_state, declare_replicated, held_chunks, listener, port, relay, replica,
     set_custody_state, stage,
 };
 use crate::retention::pseudorandom;
@@ -567,5 +568,60 @@ async fn a_pull_a_busy_author_turned_away_is_placed_again() {
             Some("held")
         );
     })
+    .await;
+}
+
+/// A device whose driver already placed with nothing to rank pulls the
+/// photo of a peer entry applied afterwards, with no other event between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_applied_after_the_last_pass_is_placed() {
+    let dirs = [
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+    ];
+    let bytes = pseudorandom(78, PHOTO);
+    let file_id = learn_file_id(&bytes).await;
+    let devices = Devices::new();
+    let author_device = devices.device("anna", 1);
+    let (author_node, author_addr, author_events) = devices.node(&author_device);
+    let (_asked, mut inbox) = bare_holder_of(author_node, author_events, vec![bytes], Fault::None);
+    let author = PeerAuthor {
+        key_id: author_device.identity.key().as_bytes().to_vec(),
+        account: "anna".to_owned(),
+        bot_list: Some("*".to_owned()),
+    };
+    let (client, content) = replica(dirs[0].path(), None).await;
+    let content = content.with_custody_budget(ROOMY).with_custody_reserve(0);
+    let (client, content) = declare_replicated((client, content)).await;
+    let (node, _, events) = devices.node(&devices.device("tester", 2));
+    node.link(author_addr).await.expect("the link completes");
+
+    let mut fetched = content.events();
+    Box::pin(beside(&content, port(node, events), async {
+        // The opening report leaves once the driver queued its first pass,
+        // whose read of the replica holds the connection ahead of the apply.
+        tokio::time::timeout(BOUND, async {
+            while !matches!(inbox.recv().await, Some(Media::Holdings { .. }) | None) {}
+        })
+        .await
+        .expect("the driver opens the link");
+        let body = captured_photo(dirs[1].path(), 7, file_id.as_bytes().to_vec(), None).await;
+        apply_entry(&client, &author, 1, body).await;
+        tokio::time::timeout(BOUND, async {
+            loop {
+                if let Ok(ContentEvent::Fetched { file_id: got }) = fetched.recv().await
+                    && got == file_id
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the applied row is placed");
+        assert_eq!(
+            custody_state(&client, file_id).await.as_deref(),
+            Some("held")
+        );
+    }))
     .await;
 }

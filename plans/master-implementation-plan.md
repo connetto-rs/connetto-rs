@@ -971,7 +971,7 @@ Making the demos runnable in CI, which `R55` settled, since they need a browser,
 
 ## R79: media over the peer link
 
-**Status.** IN PROGRESS. Steps 1 to 3 are built in slices 1 to 8 below. Step 4 is designed in decisions 12 to 18 and sliced as slices 9 to 14, of which slices 9 to 10d are built. Decisions 1 to 10 and 12 to 18 were taken with the maintainer, and decision 11 was settled on evidence.
+**Status.** IN PROGRESS. Steps 1 to 3 are built in slices 1 to 8 below, and step 4, designed in decisions 12 to 18, in slices 9 to 14, of which slices 11 to 14 are in review. Decisions 1 to 10 and 12 to 18 were taken with the maintainer, and decision 11 was settled on evidence.
 
 **Blocked on** nothing. Steps 1 to 3 build on R77 and on R64 to R67 for the chunk machinery, all merged.
 
@@ -1020,7 +1020,7 @@ Sample photos in camp. This is the join point with chapter 18's identity, chunki
 ```rust
 // connetto-exchange::media::Media, carried as PeerFrame::Media on its own queue
 Want { request_id: u64, file_id: [u8; 32] }
-Manifest { request_id: u64, chunks: Vec<([u8; 32], u64)>, last: bool }
+Manifest { request_id: u64, chunks: Vec<([u8; 32], u64)>, last: bool, owner: Option<String> }
 Fetch { request_id: u64, file_id: [u8; 32], start: u64, len: u64 }
 Piece { request_id: u64, encoded: Vec<u8>, last: bool }
 Refused { request_id: u64 }
@@ -1041,10 +1041,10 @@ Room { room: u64, rates: Vec<([u8; 32], u64)>, number: u64, seen: Option<u64> }
 ```
 
 ```sql
-CREATE TABLE _connetto_content_custody (file_id BLOB PRIMARY KEY, author_key BLOB, state TEXT NOT NULL, settled_seen_at INTEGER);
+CREATE TABLE _connetto_content_custody (file_id BLOB PRIMARY KEY, author_key BLOB, owner TEXT, state TEXT NOT NULL, settled_seen_at INTEGER, uploaded BOOLEAN NOT NULL DEFAULT FALSE);
 ```
 
-`rates` pairs a linked device's key id with the reporting device's measured bytes per second to it. A `Held` applies `added` and `removed` first, then `staying`, then `leaving`, and one naming a file in both `staying` and `leaving` is above the bounds, closing the link. `state` is `held`, `leaving` for a copy above the count or `pressed` for one leaving under pressure (decision 16), kept across a restart so the next `Holdings` sends the mark again. `author_key` is `NULL` for a cache copy a `lost` state returned to custody, whose settled row has no provisional author. `settled_seen_at` is the wall-clock time this device learned the row settled, which only places decision 17's wait, so a wrong clock moves an upload earlier or later and loses nothing.
+`rates` pairs a linked device's key id with the reporting device's measured bytes per second to it. A `Held` applies `added` and `removed` first, then `staying`, then `leaving`, and one naming a file in both `staying` and `leaving` is above the bounds, closing the link. `state` is `held`, `leaving` for a copy above the count or `pressed` for one leaving under pressure (decision 16), kept across a restart so the next `Holdings` sends the mark again. `author_key` is `NULL` for a cache copy a `lost` state returned to custody and for a copy taken over after its row settled, neither having a provisional author. `owner` is the account a carried upload credits, the author's cursor account or the one the leaving holder named on its `Manifest`'s last run, at most 1024 bytes. `settled_seen_at` is the wall-clock time this device learned the row settled, which only places decision 17's wait, so a wrong clock moves an upload earlier or later and loses nothing. `uploaded` marks a copy whose carried upload committed, which waits in C5 for the state column.
 
 ### Every event in every situation
 
@@ -1090,7 +1090,7 @@ A held peer-fetched manifest is **K1** spared, a declared column of a provisiona
 | Export | not carried | not carried | unsent carried with its chunks, pinned not |
 | Truncate of the naming table or R31's rebuild dropping the records | moves to K2 | nothing | nothing |
 
-A flagged file on a device other than its author is **C0** not held, **C1** being pulled for custody, **C2** in custody, **C3** in custody and leaving as a copy above the count, **C4** in custody and leaving under pressure, **C5** in custody with its upload queued, a leaving mark it had kept. A copy that leaves custody becomes K1 or K2 above, or goes where a row says so. Placement is evaluated for every file decision 14 ranks on every report, link change, custody change, custody pass and room check, one pass for a burst. `m` is the count less the holders without a leaving mark, and a leaving device's attempt counts a holder as decision 16 states, through the P table below.
+A flagged file on a device other than its author is **C0** not held, **C1** being pulled for custody, **C2** in custody, **C3** in custody and leaving as a copy above the count, **C4** in custody and leaving under pressure, **C5** in custody with its upload queued, a leaving mark it had kept. A copy that leaves custody becomes K1 or K2 above, or goes where a row says so. Placement is evaluated for every file decision 14 ranks on every report, link change, peer apply, custody change, custody pass and room check, one pass for a burst. `m` is the count less the holders without a leaving mark, and a leaving device's attempt counts a holder as decision 16 states, through the P table below.
 
 | Event | C0 | C1 | C2 | C3 | C4 | C5 |
 |---|---|---|---|---|---|---|
