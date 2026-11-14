@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use connetto_core::SessionId;
+use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::bb8::Pool;
 
 use crate::abuse::{
     AbuseConfig, Caller, Crossing, Enforcement, EnforcementPolicy, Reaction, Signal,
@@ -111,6 +113,39 @@ impl ConnectionTallies {
     }
 }
 
+/// The ban list and the owner pool its reads and writes run on.
+struct BanList<Id> {
+    pool: Pool<AsyncPgConnection>,
+    store: Arc<dyn BanStore<Id>>,
+}
+
+impl<Id> Clone for BanList<Id> {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            store: Arc::clone(&self.store),
+        }
+    }
+}
+
+impl<Id: 'static> BanList<Id> {
+    /// An owner connection for one read or write of the list.
+    async fn connection(
+        &self,
+    ) -> Result<
+        diesel_async::pooled_connection::bb8::PooledConnection<'_, AsyncPgConnection>,
+        BanError,
+    > {
+        self.pool.get().await.map_err(BanError::new)
+    }
+
+    /// Write `ban` on an owner connection of its own.
+    async fn impose(&self, ban: NewBan<Id>) -> Result<(), BanError> {
+        let mut connection = self.connection().await?;
+        self.store.impose(&mut connection, ban).await
+    }
+}
+
 /// Owns every counter connetto keeps about a caller.
 ///
 /// Built before the session manager and the auth service and handed to both.
@@ -128,7 +163,7 @@ pub struct RequestGuard<Id> {
     key_cap: usize,
     person: PersonTallies,
     connection: ConnectionTallies,
-    bans: Option<Arc<dyn BanStore<Id>>>,
+    bans: Option<BanList<Id>>,
     enforcement: Option<Arc<dyn EnforcementPolicy<Id>>>,
     audit: OnceLock<AuditHook<Id>>,
     close: OnceLock<PersonCloseHook>,
@@ -193,11 +228,12 @@ where
         &self.bytes
     }
 
-    /// Attach the ban list. Without one connetto cannot ban and cannot refuse a
-    /// banned caller at the handshake, so a crossing is only logged.
+    /// Attach the ban list, read and written on `pool`, the owner pool. Without
+    /// one connetto cannot ban and cannot refuse a banned caller at the
+    /// handshake, so a crossing is only logged.
     #[must_use]
-    pub fn with_bans(mut self, bans: Arc<dyn BanStore<Id>>) -> Self {
-        self.bans = Some(bans);
+    pub fn with_bans(mut self, pool: Pool<AsyncPgConnection>, bans: Arc<dyn BanStore<Id>>) -> Self {
+        self.bans = Some(BanList { pool, store: bans });
         self
     }
 
@@ -386,7 +422,18 @@ where
         let Some(bans) = self.bans.as_ref() else {
             return Ok(None);
         };
-        Ok(bans.check(user_id).await?.filter(|ban| ban.applies))
+        let mut connection = bans.connection().await?;
+        Ok(bans
+            .store
+            .check(&mut connection, user_id)
+            .await?
+            .filter(|ban| ban.applies))
+    }
+
+    /// The ban list a sign-in reads inside its own transaction, `None` when
+    /// none is attached.
+    pub(crate) fn ban_store(&self) -> Option<&dyn BanStore<Id>> {
+        self.bans.as_ref().map(|bans| &*bans.store)
     }
 
     /// Lift the ban on `user_id`, recording it, and report whether there was one.
@@ -402,10 +449,11 @@ where
         let Some(bans) = self.bans.as_ref() else {
             return Ok(false);
         };
-        let Some(ban) = bans.check(user_id).await? else {
+        let mut connection = bans.connection().await?;
+        let Some(ban) = bans.store.check(&mut connection, user_id).await? else {
             return Ok(false);
         };
-        if !bans.lift(user_id).await? {
+        if !bans.store.lift(&mut connection, user_id).await? {
             return Ok(false);
         }
         tracing::info!(user = %user_id, reason = %ban.reason, "ban lifted");

@@ -10,8 +10,9 @@ use connetto_core::messages::{
     EnrolRefusal, EnrolRequest,
 };
 use connetto_core::traits::Transport;
+use connetto_server::defaults::ConnettoDefaults;
 use connetto_server::device_cert::{AndroidStatus, DeviceCertConfig};
-use connetto_server::{SignInNotice, WebSocketTransport};
+use connetto_server::{CommittedNotice, WebSocketTransport};
 use connetto_test_harness::{Fixture, isolated_session_keyring};
 use diesel::QueryableByName;
 use diesel::{ExpressionMethods as _, OptionalExtension as _, QueryDsl as _};
@@ -214,11 +215,10 @@ async fn a_built_server_tells_the_application_of_a_first_enrolment() {
     let port = listener.local_addr().expect("local address").port();
     let (builder, _idp, _keys) = builder_over(&fixture, port).await;
     let (_, _, issuer) = rooted_issuer();
-    let told = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let sink = std::sync::Arc::clone(&told);
+    let (told, mut notices) = crate::auth_hooks::Told::<ConnettoDefaults>::channel();
     let parts = builder
         .device_identity(Some(DeviceCertConfig::new(issuer)))
-        .on_sign_in(move |notice| sink.lock().push(notice))
+        .auth_hooks(told)
         .build()
         .await
         .expect("the deployment with device identity assembles");
@@ -234,28 +234,30 @@ async fn a_built_server_tells_the_application_of_a_first_enrolment() {
     let reply = enrol_request(&mut client, &key, nonce, None).await;
     assert!(matches!(reply, ControlMessage::EnrolGrant(_)), "{reply:?}");
 
-    // The enrolment notice reads the session on a spawned task.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while told.lock().len() < 2 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the first enrolment went untold: {:?}",
-            told.lock()
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    let told = told.lock().clone();
-    let [
-        SignInNotice::SignedIn(signed_in),
-        SignInNotice::DeviceEnrolled {
-            session,
-            key: enrolled,
-            device,
-            ..
-        },
-    ] = told.as_slice()
+    let bound = std::time::Duration::from_secs(10);
+    let signed_in = tokio::time::timeout(bound, notices.recv())
+        .await
+        .expect("the sign-in is told within the bound")
+        .expect("the server keeps its hooks");
+    let CommittedNotice::SignedIn {
+        session: signed_in, ..
+    } = signed_in
     else {
-        panic!("expected the sign-in and then the enrolment, got {told:?}");
+        panic!("expected the sign-in first");
+    };
+    // The enrolment notice reads the session on a spawned task.
+    let enrolled = tokio::time::timeout(bound, notices.recv())
+        .await
+        .expect("the first enrolment is told within the bound")
+        .expect("the server keeps its hooks");
+    let CommittedNotice::DeviceEnrolled {
+        session,
+        key: enrolled,
+        device,
+        ..
+    } = enrolled
+    else {
+        panic!("expected the enrolment after the sign-in");
     };
     assert_eq!(
         session, signed_in,
@@ -263,11 +265,11 @@ async fn a_built_server_tells_the_application_of_a_first_enrolment() {
     );
     assert_eq!(session.user_id, user_id);
     assert_eq!(
-        *enrolled,
+        enrolled,
         KeyId::of_public_key(&key.subject_public_key_info())
     );
     assert_eq!(
-        *device,
+        device,
         rmp_serde::to_vec_named(&()).expect("encode"),
         "the device's own descriptor"
     );

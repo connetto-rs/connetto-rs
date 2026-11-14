@@ -231,13 +231,12 @@ async fn a_ban_in_the_store_alone_refuses_refresh_sign_in_and_liveness() {
         .await
         .expect("live")
         .session_id;
-    pg_ban_store::<ConnettoDefaults>(served.pool.clone())
-        .impose(NewBan::starting_now(
-            user,
-            session,
-            "the operator's call",
-            None,
-        ))
+    let mut owner = served.pool.get().await.expect("owner connection");
+    pg_ban_store::<ConnettoDefaults>()
+        .impose(
+            &mut owner,
+            NewBan::starting_now(user, session, "the operator's call", None),
+        )
         .await
         .expect("impose a ban");
 

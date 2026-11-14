@@ -24,10 +24,11 @@ use connetto_core::traits::{
     GrantRefused, HandshakeAuthority, RefreshFuture, RefreshTokenStore, ReplicaKeyStore,
 };
 use connetto_server::{
-    AuthConfig, AuthService, DbAuthStore, GenericOidcProvider, IdentityResolver, ProviderRegistry,
-    RedirectPolicy, RequestGuard, ResolveFuture, TokenAuthority, VerifiedClaims, auth_router,
+    AuthConfig, AuthHooks, AuthService, DbAuthStore, GenericOidcProvider, HookFuture,
+    ProviderRegistry, RedirectPolicy, RequestGuard, TokenAuthority, VerifiedClaims, auth_router,
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture, MOCK_OAUTH_PROVIDER, MockOauth};
+use diesel_async::AsyncPgConnection;
 use openidconnect::reqwest;
 use rosetta_uuid::Uuid;
 
@@ -39,23 +40,25 @@ connetto_server::connetto_schema! {
 }
 
 /// A fixed namespace for the deterministic `subject` to `Uuid` mapping,
-/// standing in for an app's own [`IdentityResolver`].
+/// standing in for an app's own [`AuthHooks::user_for`].
 const NS: uuid::Uuid = uuid::Uuid::from_u128(0x2b7e_1516_28ae_d2a6_abf7_1588_09cf_4f3c);
 
-/// The typed id the resolver below mints for `subject`.
+/// The typed id the hooks below answer for `subject`.
 ///
 /// Keys on the subject alone because the test idp mints a fresh issuer per run.
 fn typed_id(subject: &str) -> Uuid {
     uuid::Uuid::new_v5(&NS, subject.as_bytes()).into()
 }
 
-/// A resolver mapping verified claims to its own typed id.
-struct TypedResolver;
+/// Hooks mapping verified claims to their own typed id.
+struct TypedHooks;
 
-impl IdentityResolver for TypedResolver {
-    type Id = Uuid;
-
-    fn resolve<'a>(&'a self, claims: &'a VerifiedClaims) -> ResolveFuture<'a, Uuid> {
+impl AuthHooks<TypedAuthSchema> for TypedHooks {
+    fn user_for<'a>(
+        &'a self,
+        _transaction: &'a mut AsyncPgConnection,
+        claims: &'a VerifiedClaims,
+    ) -> HookFuture<'a, Uuid> {
         // The test provider mints a fresh issuer per run.
         let id = typed_id(&claims.subject);
         Box::pin(async move { Ok(id) })
@@ -134,7 +137,7 @@ async fn spawn_typed_auth_server() -> (String, MockOauth, Fixture) {
     let store = Arc::new(DbAuthStore::<TypedAuthSchema>::new(
         fixture.admin().clone(),
         config.refresh_lifetimes(),
-        Arc::new(TypedResolver),
+        Arc::new(TypedHooks),
     ));
     let service = Arc::new(AuthService::new(
         authority,

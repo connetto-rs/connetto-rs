@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use connetto_core::messages::{BulkMessage, ControlMessage, MutationHeader, MutationPatch};
 use connetto_core::traits::Transport;
-use connetto_server::{IdentityResolver, ResolveFuture, VerifiedClaims};
+use connetto_server::{AuthHooks, HookFuture, VerifiedClaims};
 use connetto_test_harness::{Fixture, RowValue, insert_changeset, isolated_session_keyring};
 use diesel::QueryDsl;
 use diesel_async::AsyncPgConnection;
@@ -654,13 +654,15 @@ mod app {
 /// A fixed namespace for the deployment's `(issuer, subject)` to `Uuid` map.
 const NS: uuid::Uuid = uuid::Uuid::from_u128(0x7c1e_0a52_93d4_4b8f_a6e1_5d2c_0f9b_3e47);
 
-/// The deployment's resolver, a deterministic `Uuid` per verified identity.
-struct UuidResolver;
+/// The deployment's hooks, a deterministic `Uuid` per verified identity.
+struct UuidHooks;
 
-impl IdentityResolver for UuidResolver {
-    type Id = uuid::Uuid;
-
-    fn resolve<'a>(&'a self, claims: &'a VerifiedClaims) -> ResolveFuture<'a, uuid::Uuid> {
+impl AuthHooks<app::AppSchema> for UuidHooks {
+    fn user_for<'a>(
+        &'a self,
+        _transaction: &'a mut AsyncPgConnection,
+        claims: &'a VerifiedClaims,
+    ) -> HookFuture<'a, uuid::Uuid> {
         let id = uuid::Uuid::new_v5(
             &NS,
             format!("{}|{}", claims.issuer, claims.subject).as_bytes(),
@@ -739,7 +741,7 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
     let (builder, _idp, _keys) = builder_over(&fixture, port).await;
     let base = format!("http://127.0.0.1:{port}");
     let parts = builder
-        .deployment_schema::<app::AppSchema>(Arc::new(UuidResolver))
+        .deployment_schema::<app::AppSchema>(Arc::new(UuidHooks))
         .build()
         .await
         .expect("the deployment's own schema assembles");

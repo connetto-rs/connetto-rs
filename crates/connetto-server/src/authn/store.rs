@@ -15,7 +15,9 @@ use connetto_core::auth::AuthContext;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::authn::identity::{ResolveError, VerifiedClaims};
+use crate::authn::hooks::HookError;
+use crate::authn::identity::VerifiedClaims;
+use crate::ban::BanError;
 
 /// A caller identity resolved from a verified credential, ready to mint a
 /// session for. Human-readable fields never serve as identity: only the
@@ -37,8 +39,8 @@ pub struct ResolvedIdentity {
 }
 
 impl ResolvedIdentity {
-    /// The verified provider claims to hand the
-    /// [`IdentityResolver`](crate::authn::identity::IdentityResolver).
+    /// The verified provider claims to hand
+    /// [`AuthHooks::user_for`](crate::authn::hooks::AuthHooks::user_for).
     #[must_use]
     pub fn verified_claims(&self) -> VerifiedClaims {
         VerifiedClaims {
@@ -118,9 +120,17 @@ pub enum AuthStoreError {
         /// The session the replayed token named, now revoked.
         session_id: SessionId,
     },
-    /// The identity resolver failed to map the verified claims to a user id.
+    /// The application's hook refused the sign-in or failed, which rolled it
+    /// back.
     #[error(transparent)]
-    Resolve(#[from] ResolveError),
+    Hook(#[from] HookError),
+    /// The identity is banned, read inside the sign-in's transaction.
+    #[error("the identity is banned")]
+    Banned,
+    /// The ban list could not be read, so the sign-in is refused rather than
+    /// let through.
+    #[error("the ban list could not be read: {0}")]
+    BanList(#[from] BanError),
     /// The backing store failed.
     #[error("auth store backend error: {0}")]
     Backend(String),
@@ -193,12 +203,13 @@ mod db {
         format_refresh, hash_secret, hashes_match, new_refresh_secret, new_session_id,
         split_refresh,
     };
-    use crate::authn::identity::IdentityResolver;
+    use crate::authn::hooks::{AuthHooks, SignedIn};
     use crate::authn::provider::RetainedProviderToken;
     use crate::authn::schema::{
         ConnettoStoreSchema, Desc, NewSession, SessionRecord, SessionRow, SessionStamps,
     };
     use crate::authn::token::RefreshLifetimes;
+    use crate::ban::{BanStore, lock_account};
     use crate::schema::ConnettoSchema;
 
     /// The Postgres auth store, generic over the deployment's schema. Durable
@@ -206,22 +217,30 @@ mod db {
     pub struct DbAuthStore<D: ConnettoSchema> {
         pool: Pool<AsyncPgConnection>,
         lifetimes: RefreshLifetimes,
-        resolver: Arc<dyn IdentityResolver<Id = <D::Auth as ConnettoStoreSchema>::Id>>,
+        hooks: Arc<dyn AuthHooks<D>>,
     }
 
     impl<D: ConnettoSchema> DbAuthStore<D> {
-        /// Build over a connection pool, resolving identity through `resolver`.
+        /// Build over a connection pool, running the application's `hooks`
+        /// inside the transactions that record its auth events.
         #[must_use]
         pub fn new(
             pool: Pool<AsyncPgConnection>,
             lifetimes: RefreshLifetimes,
-            resolver: Arc<dyn IdentityResolver<Id = <D::Auth as ConnettoStoreSchema>::Id>>,
+            hooks: Arc<dyn AuthHooks<D>>,
         ) -> Self {
             Self {
                 pool,
                 lifetimes,
-                resolver,
+                hooks,
             }
+        }
+
+        /// The application's hooks, which a caller tells once an event's
+        /// transaction committed.
+        #[must_use]
+        pub fn hooks(&self) -> &dyn AuthHooks<D> {
+            &*self.hooks
         }
 
         /// Delete the retained provider tokens of `sessions`, which were just
@@ -248,74 +267,102 @@ mod db {
             <D::Auth as ConnettoStoreSchema>::undescribed()
         }
 
-        /// Resolve `identity` to the deployment's `user_id`, which sign-in
-        /// reads the ban list for before any session exists (R105 decision 8).
+        /// Sign `identity` in as one transaction: the application's
+        /// [`user_for`](AuthHooks::user_for) answers the user id, the account's
+        /// lock is taken, `bans` is read, the session row and `retained` are
+        /// written, and [`signed_in`](AuthHooks::signed_in) runs. Any error
+        /// rolls every write back, the hooks' own included.
+        ///
+        /// Answers the session with its first refresh token, and its row.
         ///
         /// # Errors
         ///
-        /// [`AuthStoreError::Resolve`] when the resolver refuses the identity.
-        pub async fn resolve(&self, identity: &ResolvedIdentity) -> Result<D::Id, AuthStoreError> {
-            Ok(self.resolver.resolve(&identity.verified_claims()).await?)
-        }
-
-        /// Resolve `identity` and create a session for it.
-        ///
-        /// # Errors
-        ///
-        /// [`AuthStoreError`] when resolution or the session insert fails.
-        pub async fn create_session(
+        /// [`AuthStoreError::Hook`] when a hook refuses or fails,
+        /// [`AuthStoreError::Banned`] when `bans` holds a ban that applies,
+        /// [`AuthStoreError::BanList`] when it cannot be read, and
+        /// [`AuthStoreError::Backend`] when a write fails.
+        pub async fn sign_in(
             &self,
             identity: &ResolvedIdentity,
             origin: SessionOrigin<Desc<D>>,
-        ) -> Result<IssuedSession<D::Id>, AuthStoreError> {
-            let user_id = self.resolve(identity).await?;
-            self.create_session_for(user_id, identity, origin).await
-        }
-
-        /// Create a session for `user_id`, the person `identity` resolved to,
-        /// recording where it came from, and return it with its first refresh
-        /// token.
-        ///
-        /// # Errors
-        ///
-        /// [`AuthStoreError::Backend`] when the insert fails.
-        pub async fn create_session_for(
-            &self,
-            user_id: D::Id,
-            identity: &ResolvedIdentity,
-            origin: SessionOrigin<Desc<D>>,
-        ) -> Result<IssuedSession<D::Id>, AuthStoreError> {
+            retained: Option<&RetainedProviderToken>,
+            bans: Option<&dyn BanStore<D::Id>>,
+        ) -> Result<(IssuedSession<D::Id>, SessionRecord<D::Id, Desc<D>>), AuthStoreError> {
+            let claims = &identity.verified_claims();
             let secret = new_refresh_secret();
+            let current_refresh_hash = hash_secret(&secret).to_vec();
             let session_id = new_session_id();
+            let hooks = &*self.hooks;
+            let lifetimes = &self.lifetimes;
             let mut conn = self.pool.get().await.map_err(backend)?;
-            // The creation time and the deadlines are stamped by the
-            // database's clock, not this process's (chapter 21).
-            let SessionStamps {
-                created_at,
-                idle_deadline,
-                absolute_deadline,
-            } = <D::Auth as ConnettoStoreSchema>::new_session(
-                &mut conn,
-                NewSession {
-                    session_id,
-                    user_id: user_id.clone(),
-                    current_refresh_hash: hash_secret(&secret).to_vec(),
-                    idle_window: self.lifetimes.idle_window(),
-                    absolute_ceiling: self.lifetimes.absolute_ceiling(),
-                    provider: origin.provider,
-                    issuer: identity.issuer.clone(),
-                    description: origin.description,
-                },
-            )
-            .await
-            .map_err(backend)?;
-            Ok(IssuedSession {
+            let (record, expires_at) = conn
+                .transaction::<_, AuthStoreError, _>(async move |conn| {
+                    let user_id = hooks.user_for(conn, claims).await?;
+                    lock_account(conn, &user_id).await?;
+                    if let Some(bans) = bans
+                        && bans
+                            .check(conn, &user_id)
+                            .await?
+                            .is_some_and(|ban| ban.applies)
+                    {
+                        return Err(AuthStoreError::Banned);
+                    }
+                    // The creation time and the deadlines are stamped by the
+                    // database's clock, not this process's (chapter 21).
+                    let SessionStamps {
+                        created_at,
+                        idle_deadline,
+                        absolute_deadline,
+                    } = <D::Auth as ConnettoStoreSchema>::new_session(
+                        conn,
+                        NewSession {
+                            session_id,
+                            user_id: user_id.clone(),
+                            current_refresh_hash,
+                            idle_window: lifetimes.idle_window(),
+                            absolute_ceiling: lifetimes.absolute_ceiling(),
+                            provider: origin.provider.clone(),
+                            issuer: identity.issuer.clone(),
+                            description: origin.description.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(backend)?;
+                    if let Some(token) = retained {
+                        Self::retain(conn, session_id, token).await?;
+                    }
+                    let record = SessionRecord {
+                        session_id,
+                        user_id,
+                        provider: origin.provider,
+                        issuer: identity.issuer.clone(),
+                        description: origin.description,
+                        created_at: created_at.into(),
+                        refreshed_at: None,
+                    };
+                    hooks
+                        .signed_in(
+                            conn,
+                            &SignedIn {
+                                user_id: &record.user_id,
+                                claims,
+                                session: &record,
+                            },
+                        )
+                        .await?;
+                    Ok((record, idle_deadline.min(absolute_deadline)))
+                })
+                .await?;
+            let issued = IssuedSession {
                 session_id,
-                context: AuthContext { user_id },
+                context: AuthContext {
+                    user_id: record.user_id.clone(),
+                },
                 refresh_token: format_refresh(session_id, &secret),
-                session_expires_at: idle_deadline.min(absolute_deadline).into(),
-                created_at: created_at.into(),
-            })
+                session_expires_at: expires_at.into(),
+                created_at: record.created_at,
+            };
+            Ok((issued, record))
         }
 
         /// How the session began and when it last refreshed, `None` when the
@@ -583,8 +630,18 @@ mod db {
             token: &RetainedProviderToken,
         ) -> Result<(), AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
+            Self::retain(&mut conn, session_id, token).await
+        }
+
+        /// Write `session_id`'s retained provider tokens on `conn`, replacing
+        /// any existing.
+        async fn retain(
+            conn: &mut AsyncPgConnection,
+            session_id: SessionId,
+            token: &RetainedProviderToken,
+        ) -> Result<(), AuthStoreError> {
             <D::Auth as ConnettoStoreSchema>::set_provider_token(
-                &mut conn,
+                conn,
                 session_id,
                 token.issuer.clone(),
                 token.access_token.clone(),
@@ -592,8 +649,7 @@ mod db {
                 token.expires_in,
             )
             .await
-            .map_err(backend)?;
-            Ok(())
+            .map_err(backend)
         }
 
         /// Read a session's retained provider tokens, if any were stored, with

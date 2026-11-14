@@ -8,10 +8,12 @@ use connetto_core::Subject;
 use connetto_core::messages::Grant;
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
 use connetto_server::{
-    AuthConfig, AuthService, RequestGuard, ResolvedIdentity, SessionOrigin, SignInNotice,
-    TokenAuthority, TokenPair,
+    AuthConfig, AuthHooks, AuthService, CommittedNotice, DefaultAuthHooks, RequestGuard,
+    ResolvedIdentity, SessionOrigin, TokenAuthority, TokenPair,
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture};
+
+use crate::auth_hooks::Told;
 
 /// Collects what connetto emitted, in order.
 #[derive(Clone, Default)]
@@ -50,10 +52,24 @@ async fn service() -> (
     Captured,
     Fixture,
 ) {
+    service_with(Arc::new(DefaultAuthHooks)).await
+}
+
+/// [`service`] over a store running `hooks`.
+async fn service_with(
+    hooks: Arc<dyn AuthHooks<ConnettoDefaults>>,
+) -> (
+    Arc<TokenAuthority>,
+    Arc<AuthService<ConnettoDefaults>>,
+    Captured,
+    Fixture,
+) {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("generate keypair"));
     let fixture = Fixture::acquire().await;
-    let store = fixture.auth_store(config.refresh_lifetimes()).await;
+    let store = fixture
+        .auth_store_with(config.refresh_lifetimes(), hooks)
+        .await;
     let svc = Arc::new(AuthService::new(
         Arc::clone(&authority),
         store,
@@ -123,28 +139,33 @@ async fn a_login_records_its_provider_and_issuer() {
     assert_eq!(event.issuer.as_deref(), Some("https://issuer.example"));
 }
 
-/// The application's sign-in callback hears of each sign-in with the
-/// session it created, so it can tell the person.
+/// The application's hooks hear of each committed sign-in with the session it
+/// created and the claims it verified, so it can tell the person.
 #[tokio::test]
 async fn a_sign_in_tells_the_application() {
-    let (authority, svc, _captured, _fixture) = service().await;
-    let told = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&told);
-    svc.set_sign_in_hook(Arc::new(move |notice| {
-        sink.lock().expect("sink").push(notice);
-    }));
+    let (told, mut notices) = Told::<ConnettoDefaults>::channel();
+    let (authority, svc, _captured, _fixture) = service_with(told).await;
     let before = std::time::SystemTime::now();
     let pair = login(&svc, "frank").await;
 
-    let told = told.lock().expect("sink").clone();
-    let [SignInNotice::SignedIn(session)] = told.as_slice() else {
-        panic!("expected one sign-in notice, got {told:?}");
+    // The notice is told before the login returns.
+    let notice = notices.try_recv().expect("the sign-in was told");
+    let CommittedNotice::SignedIn {
+        user_id,
+        claims,
+        session,
+    } = notice
+    else {
+        panic!("expected a sign-in notice");
     };
+    assert!(notices.try_recv().is_err(), "one sign-in, one notice");
     assert_eq!(
         session.session_id,
         session_of(&authority, &pair.access_token)
     );
+    assert_eq!(user_id, pair.user_id);
     assert_eq!(session.user_id, pair.user_id);
+    assert_eq!(claims.subject, "frank");
     assert_eq!(session.provider, "google");
     assert_eq!(session.issuer, "https://issuer.example");
     assert!(

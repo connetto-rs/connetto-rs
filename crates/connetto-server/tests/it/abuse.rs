@@ -268,7 +268,7 @@ fn throttled_guard(
     policy: Option<Arc<dyn EnforcementPolicy<String>>>,
 ) -> Arc<RequestGuard<String>> {
     let mut built = RequestGuard::new(*throttle, abuse)
-        .with_bans(pg_ban_store::<ConnettoDefaults>(fixture.admin().clone()));
+        .with_bans(fixture.admin().clone(), pg_ban_store::<ConnettoDefaults>());
     if let Some(policy) = policy {
         built = built.with_enforcement(policy);
     }
@@ -648,15 +648,19 @@ async fn an_expiry_lapses_silently_and_only_a_lift_is_recorded() {
     reset_tables(&fixture).await;
     let guard = guard(&fixture, limits(2, 1), None);
     let manager = manager(&fixture, silent_policy(), &guard);
-    let bans = pg_ban_store::<ConnettoDefaults>(fixture.admin().clone());
+    let bans = pg_ban_store::<ConnettoDefaults>();
     let session = connetto_core::SessionId::from_uuid(uuid::Uuid::new_v4());
+    let mut owner = fixture.admin().get().await.expect("owner connection");
 
-    bans.impose(NewBan::starting_now(
-        "erin".to_owned(),
-        session,
-        "unresolvable_subscription 2 per 300s",
-        Some(Duration::from_secs(3600)),
-    ))
+    bans.impose(
+        &mut owner,
+        NewBan::starting_now(
+            "erin".to_owned(),
+            session,
+            "unresolvable_subscription 2 per 300s",
+            Some(Duration::from_secs(3600)),
+        ),
+    )
     .await
     .expect("impose the live ban");
     // A backdated ban that already lapsed by the database clock. The clock
@@ -834,13 +838,17 @@ async fn a_ban_applies_under_row_level_security_with_no_policy_admitting_anyone(
 
     let guard = guard(&fixture, limits(2, 1), None);
     let manager = manager(&fixture, silent_policy(), &guard);
-    let bans = pg_ban_store::<ConnettoDefaults>(fixture.admin().clone());
-    bans.impose(NewBan::starting_now(
-        "heidi".to_owned(),
-        connetto_core::SessionId::from_uuid(uuid::Uuid::new_v4()),
-        "unresolvable_subscription 2 per 300s",
-        None,
-    ))
+    let bans = pg_ban_store::<ConnettoDefaults>();
+    let mut owner = fixture.admin().get().await.expect("owner connection");
+    bans.impose(
+        &mut owner,
+        NewBan::starting_now(
+            "heidi".to_owned(),
+            connetto_core::SessionId::from_uuid(uuid::Uuid::new_v4()),
+            "unresolvable_subscription 2 per 300s",
+            None,
+        ),
+    )
     .await
     .expect("impose the ban");
 
