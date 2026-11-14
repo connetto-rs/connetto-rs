@@ -760,6 +760,76 @@ pub(crate) fn custody_bytes(conn: &mut SqliteConnection) -> Result<u64, ContentE
         .sum())
 }
 
+/// One custody record as the device archive carries it.
+pub(crate) struct ArchivedCustody {
+    pub(crate) file_id: FileId,
+    pub(crate) custody: crate::archive::Custody,
+}
+
+/// Every custody record with what the device archive keeps of it, in
+/// identity order (R79 decision 18).
+pub(crate) fn custody_records(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<ArchivedCustody>, ContentError> {
+    type Stored = (Vec<u8>, Option<Vec<u8>>, Option<String>, Option<i64>);
+    let rows: Vec<Stored> = _connetto_content_custody::table
+        .order(_connetto_content_custody::file_id.asc())
+        .select((
+            _connetto_content_custody::file_id,
+            _connetto_content_custody::author_key,
+            _connetto_content_custody::owner,
+            _connetto_content_custody::settled_seen_at,
+        ))
+        .load(conn)?;
+    rows.into_iter()
+        .map(|(id, author, owner, settled_seen_at)| {
+            Ok(ArchivedCustody {
+                file_id: FileId::from_bytes(exactly_32(&id)?),
+                custody: crate::archive::Custody {
+                    author_key: author.as_deref().map(exactly_32).transpose()?,
+                    owner,
+                    settled_seen_at,
+                },
+            })
+        })
+        .collect()
+}
+
+/// Restores an archived custody record held, in C2, with its author, owner
+/// and settling. A file already in custody keeps its record.
+pub(crate) fn restore_custody(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+    author: Option<&[u8]>,
+    owner: Option<&str>,
+    settled_seen_at: Option<i64>,
+) -> Result<(), diesel::result::Error> {
+    diesel::insert_or_ignore_into(_connetto_content_custody::table)
+        .values((
+            _connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()),
+            _connetto_content_custody::author_key.eq(author),
+            _connetto_content_custody::owner.eq(owner),
+            _connetto_content_custody::state.eq(HELD),
+            _connetto_content_custody::settled_seen_at.eq(settled_seen_at),
+        ))
+        .execute(conn)
+        .map(|_| ())
+}
+
+/// Whether this device learned the row of custody copy `file_id` settled.
+#[cfg(feature = "peer")]
+pub(crate) fn seen_settled(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<bool, diesel::result::Error> {
+    _connetto_content_custody::table
+        .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
+        .filter(_connetto_content_custody::settled_seen_at.is_not_null())
+        .count()
+        .get_result::<i64>(conn)
+        .map(|n| n > 0)
+}
+
 /// Every chunk hash some manifest still names.
 ///
 /// The set a sweep keeps. Asking the replica what is referenced, rather than

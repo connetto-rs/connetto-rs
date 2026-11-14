@@ -4,9 +4,9 @@ use std::io::{Read, Seek};
 
 use connetto_client::{ClientError, ConnettoConnection, ImportChoices, ImportOutcome, ImportPlan};
 use connetto_core::traits::Transport;
-use connetto_file_core::{ChunkHash, ChunkStore, EncryptingStore, Manifest, MaybeSend};
+use connetto_file_core::{ChunkHash, ChunkStore, EncryptingStore, MaybeSend};
 
-use crate::archive::{CHUNK_PREFIX, validate_import};
+use crate::archive::{CHUNK_PREFIX, Carried, validate_import};
 use crate::db;
 use crate::error::ContentError;
 
@@ -18,7 +18,7 @@ use crate::error::ContentError;
 #[derive(Debug)]
 pub struct ContentImportPlan<R> {
     pub(crate) replica: ImportPlan<R>,
-    pub(crate) manifests: Vec<Manifest>,
+    pub(crate) files: Vec<Carried>,
     pub(crate) chunks: Vec<ChunkHash>,
 }
 
@@ -31,7 +31,20 @@ impl<R> ContentImportPlan<R> {
     /// How many unsent content files the archive restores.
     #[must_use]
     pub fn content_files(&self) -> usize {
-        self.manifests.len()
+        self.files
+            .iter()
+            .filter(|carried| carried.custody.is_none())
+            .count()
+    }
+
+    /// How many copies held in custody for other devices' rows the archive
+    /// restores (R79 decision 18).
+    #[must_use]
+    pub fn custody_files(&self) -> usize {
+        self.files
+            .iter()
+            .filter(|carried| carried.custody.is_some())
+            .count()
     }
 }
 
@@ -40,10 +53,10 @@ pub(crate) fn prepare_content_import<T: Transport, R: Read + Seek>(
     source: R,
 ) -> Result<ContentImportPlan<R>, ContentError> {
     let mut replica = connection.import_local_data(source)?;
-    let (manifests, chunks) = validate_import(&mut replica)?;
+    let (files, chunks) = validate_import(&mut replica)?;
     Ok(ContentImportPlan {
         replica,
-        manifests,
+        files,
         chunks,
     })
 }
@@ -91,6 +104,9 @@ where
     Ok(())
 }
 
+/// Applies the replica import and, in the same transaction, the manifests:
+/// an unsent file queued for upload again, a custody copy restored held, in
+/// C2, with its author, owner and settling (R79 decision 18).
 pub(crate) fn apply_content_import<T: Transport, R>(
     connection: &mut ConnettoConnection<T>,
     plan: &ContentImportPlan<R>,
@@ -98,9 +114,19 @@ pub(crate) fn apply_content_import<T: Transport, R>(
 ) -> Result<ImportOutcome, ContentError> {
     connection
         .apply_import_with_bookkeeping(&plan.replica, choices, |database| {
-            for manifest in &plan.manifests {
-                db::put_manifest(database, manifest)?;
-                db::enqueue(database, manifest.file_id())?;
+            for carried in &plan.files {
+                let file_id = carried.manifest.file_id();
+                db::put_manifest(database, &carried.manifest)?;
+                match &carried.custody {
+                    None => db::enqueue(database, file_id)?,
+                    Some(custody) => db::restore_custody(
+                        database,
+                        file_id,
+                        custody.author_key.as_ref().map(<[u8; 32]>::as_slice),
+                        custody.owner.as_deref(),
+                        custody.settled_seen_at,
+                    )?,
+                }
             }
             Ok::<(), ClientError>(())
         })

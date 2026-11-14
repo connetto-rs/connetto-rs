@@ -10024,6 +10024,18 @@ where
         provisional::provisional_blobs(&mut self.db, backing.schema, &physical, column)
     }
 
+    /// Whether this replica holds a completed delivery, every snapshot and
+    /// resync of its subscriptions ended and fenced, so a synced row missing
+    /// from it is gone rather than not yet delivered, as on a device restored
+    /// from an archive that has not synced (R79 decision 18). A resume cursor
+    /// alone does not count, since a sibling's snapshot stamps one while
+    /// another still owes its rows, and an authorization change reads as not
+    /// synced until its replacement snapshots end.
+    #[must_use]
+    pub fn has_synced(&mut self) -> bool {
+        matches!(load_cursor_and_subjects(&mut self.db), Some((_, Some(_))))
+    }
+
     /// Whether the certificate `author`'s cursor last carried ended
     /// [`DEVICE_SKEW`](connetto_core::clock::DEVICE_SKEW) or more before now,
     /// so its provisional rows can no longer reach the server through a

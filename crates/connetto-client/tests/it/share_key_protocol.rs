@@ -3,7 +3,8 @@
 //! A replacement answer alone never publishes durable coverage, a known empty
 //! checkpoint stays distinct from unknown, a change back to the starting set
 //! still replaces, every open delivery keeps coverage unknown until it ends,
-//! a replay fence is what lets coverage publish after a declaration, and a
+//! the replica reading as synced only once coverage publishes, a replay
+//! fence is what lets coverage publish after a declaration, and a
 //! rate-limited replacement arms the server's delay without losing the
 //! accepted set.
 
@@ -1175,4 +1176,32 @@ async fn the_pump_closes_the_wire_on_an_unanswered_expiry_deadline() {
         .await
         .expect("the pump terminates")
         .expect("the pump does not panic");
+}
+
+/// A sibling's snapshot ending first stamps a resume cursor, and the replica
+/// still reads as not synced while another initial snapshot owes its rows, so
+/// a row missing from it is undelivered rather than gone (R79 decision 18).
+#[tokio::test]
+async fn a_replica_reads_as_synced_only_once_every_initial_snapshot_ends() {
+    let (mut conn, script) = client(vec![(mint(None), "a".to_owned())]).await;
+    for sub_id in ["s1", "s2"] {
+        conn.subscribe(sub_id, "SELECT * FROM notes")
+            .await
+            .expect("declare the row subscription");
+    }
+    for frame in [
+        snapshot_begin("s1"),
+        snapshot_begin("s2"),
+        snapshot_end("s2"),
+    ] {
+        script.say(frame);
+        pump(&mut conn, Duration::from_secs(5)).await;
+    }
+    assert!(
+        !conn.has_synced(),
+        "s1's snapshot is still open, so its rows are not yet delivered"
+    );
+    script.say(snapshot_end("s1"));
+    pump(&mut conn, Duration::from_secs(5)).await;
+    assert!(conn.has_synced(), "every initial snapshot ended");
 }

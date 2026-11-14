@@ -11,7 +11,7 @@ use crate::ContentError;
 
 pub(crate) const MANIFESTS_PATH: &str = "content/manifests.json";
 pub(crate) const CHUNK_PREFIX: &str = "content/chunks/";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +25,10 @@ struct ContentIndex {
 struct FileRecord {
     file_id: String,
     chunks: Vec<ChunkRecord>,
+    /// Set for a copy held in custody for another device's row, absent for
+    /// an unsent file this device authored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custody: Option<CustodyRecord>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -32,6 +36,36 @@ struct FileRecord {
 struct ChunkRecord {
     hash: String,
     len: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustodyRecord {
+    /// The provisional row author's key id in lowercase hex.
+    author_key: Option<String>,
+    owner: Option<String>,
+    settled_seen_at: Option<i64>,
+}
+
+/// One file an archive carries (R79 decision 18).
+#[derive(Debug)]
+pub(crate) struct Carried {
+    pub(crate) manifest: Manifest,
+    /// The custody record of a copy held for another device's row, `None`
+    /// for an unsent file this device authored.
+    pub(crate) custody: Option<Custody>,
+}
+
+/// What an archive keeps of a custody record. The copy's state and upload
+/// stay behind, so an import restores it held, in C2.
+#[derive(Debug)]
+pub(crate) struct Custody {
+    /// The key id of the provisional row's author.
+    pub(crate) author_key: Option<[u8; 32]>,
+    /// The account a carried upload credits.
+    pub(crate) owner: Option<String>,
+    /// When the exporting device learned the row settled, in Unix seconds.
+    pub(crate) settled_seen_at: Option<i64>,
 }
 
 /// Everything an export needs before it writes one byte of content.
@@ -48,12 +82,13 @@ pub(crate) struct ContentDeclaration {
 /// Declares the content entries of one export.
 ///
 /// Every length comes from the manifests, so no chunk is read here.
-pub(crate) fn declare_content(manifests: &[Manifest]) -> Result<ContentDeclaration, ContentError> {
-    let files = manifests
+pub(crate) fn declare_content(files: &[Carried]) -> Result<ContentDeclaration, ContentError> {
+    let records = files
         .iter()
-        .map(|manifest| FileRecord {
-            file_id: manifest.file_id().to_string(),
-            chunks: manifest
+        .map(|carried| FileRecord {
+            file_id: carried.manifest.file_id().to_string(),
+            chunks: carried
+                .manifest
                 .chunks()
                 .iter()
                 .map(|chunk| ChunkRecord {
@@ -61,11 +96,16 @@ pub(crate) fn declare_content(manifests: &[Manifest]) -> Result<ContentDeclarati
                     len: chunk.len,
                 })
                 .collect(),
+            custody: carried.custody.as_ref().map(|custody| CustodyRecord {
+                author_key: custody.author_key.as_ref().map(hex),
+                owner: custody.owner.clone(),
+                settled_seen_at: custody.settled_seen_at,
+            }),
         })
         .collect();
     let manifest_bytes = serde_json::to_vec_pretty(&ContentIndex {
         version: VERSION,
-        files,
+        files: records,
     })
     .map_err(|error| archive_error(format!("encode content manifests: {error}")))?;
 
@@ -76,7 +116,7 @@ pub(crate) fn declare_content(manifests: &[Manifest]) -> Result<ContentDeclarati
     // Hex is monotonic in the bytes it spells, so the byte order is the order
     // the entry names sort in, without a string per comparison.
     let mut seen: HashMap<ChunkHash, u64> = HashMap::new();
-    for manifest in manifests {
+    for manifest in files.iter().map(|carried| &carried.manifest) {
         for chunk in manifest.chunks() {
             seen.entry(chunk.hash).or_insert(chunk.len);
         }
@@ -104,11 +144,11 @@ pub(crate) fn declare_content(manifests: &[Manifest]) -> Result<ContentDeclarati
 
 /// Validates every content attachment the plan names and writes nothing.
 ///
-/// Returns the manifests and the distinct chunk hashes in the order
-/// [`declare_content`] writes them.
+/// Returns the files with their custody records and the distinct chunk
+/// hashes in the order [`declare_content`] writes them.
 pub(crate) fn validate_import<R: Read + Seek>(
     plan: &mut ImportPlan<R>,
-) -> Result<(Vec<Manifest>, Vec<ChunkHash>), ContentError> {
+) -> Result<(Vec<Carried>, Vec<ChunkHash>), ContentError> {
     let attachments = plan.attachments();
 
     if let Some(bad) = attachments
@@ -154,17 +194,27 @@ pub(crate) fn validate_import<R: Read + Seek>(
     // The identity hashes the bytes in manifest order, not in entry order.
     let mut file_ids = HashSet::new();
     let mut referenced = HashSet::new();
-    let mut manifests = Vec::with_capacity(index.files.len());
+    let mut files = Vec::with_capacity(index.files.len());
 
-    for file in &index.files {
-        let manifest = validate_file_record(file, &chunk_decls, plan, &mut buf, &mut referenced)?;
+    for file in index.files {
+        let manifest = validate_file_record(&file, &chunk_decls, plan, &mut buf, &mut referenced)?;
         if !file_ids.insert(manifest.file_id()) {
             return Err(archive_error(format!(
                 "content file {} is repeated",
                 manifest.file_id()
             )));
         }
-        manifests.push(manifest);
+        let custody = file
+            .custody
+            .map(|record| -> Result<Custody, ContentError> {
+                Ok(Custody {
+                    author_key: record.author_key.as_deref().map(decode_hash).transpose()?,
+                    owner: record.owner,
+                    settled_seen_at: record.settled_seen_at,
+                })
+            })
+            .transpose()?;
+        files.push(Carried { manifest, custody });
     }
 
     if let Some(extra) = chunk_decls.keys().find(|hash| !referenced.contains(*hash)) {
@@ -176,7 +226,7 @@ pub(crate) fn validate_import<R: Read + Seek>(
     let mut distinct: Vec<ChunkHash> = referenced.into_iter().collect();
     distinct.sort_unstable_by_key(|hash| *hash.as_bytes());
 
-    Ok((manifests, distinct))
+    Ok((files, distinct))
 }
 
 /// Validates one file record against the entries the archive declares and the
@@ -251,6 +301,16 @@ pub(crate) fn decode_hash(value: &str) -> Result<[u8; 32], ContentError> {
             | nibble(pair[1]).ok_or_else(|| invalid_hash(value))?;
     }
     Ok(decoded)
+}
+
+/// `bytes` in lowercase hex, the spelling [`decode_hash`] reads.
+fn hex(bytes: &[u8; 32]) -> String {
+    use core::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 const fn nibble(byte: u8) -> Option<u8> {

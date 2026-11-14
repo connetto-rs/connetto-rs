@@ -355,9 +355,10 @@ where
             .with_conn(|conn| -> Result<_, ContentError> {
                 let named = custody::named(conn, declared, &mut custody::Reach::default())?;
                 let now = custody::unix_now();
+                let synced = conn.has_synced();
                 let changed = conn
                     .transact_with_bookkeeping(
-                        |c| custody::pass(c, declared, &named, now, &mut HashSet::new()),
+                        |c| custody::pass(c, declared, &named, now, synced, &mut HashSet::new()),
                         |_| Ok::<(), ContentError>(()),
                     )
                     .map(|(changed, ())| changed)?;
