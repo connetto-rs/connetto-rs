@@ -26,7 +26,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::bots::ConnettoBotSchema;
 use crate::schema::ConnettoSchema;
 use connetto_core::auth::Principal;
 use diesel::QueryableByName;
@@ -637,26 +636,10 @@ impl Translated {
         documents: connetto_schema::Documents<'_>,
         devices: bool,
     ) -> Result<Self, SetupError> {
-        let (schema_sql, policy_sql) = (documents.schema(), documents.policies());
-        // The model holds a bot to its list exactly as Postgres does.
-        let cap = connetto_schema::cap_policies::<<D::Bots as ConnettoBotSchema>::IdSql>(
-            schema_sql, policy_sql,
-        )
-        .map_err(|err| SetupError::Catalog(err.to_string()))?;
-        let schema_sql = crate::schema::engine_ddl::<D>(schema_sql, devices);
-        // In the order a migration applies them: a role exists before a
-        // policy names it, and a grant follows the tables it names.
-        let mut sql = schema_sql;
-        for document in [documents.roles(), policy_sql, cap.as_str()] {
-            if document.trim().is_empty() {
-                continue;
-            }
-            if !sql.trim_end().ends_with(';') {
-                sql.push(';');
-            }
-            sql.push('\n');
-            sql.push_str(document);
-        }
+        // The model holds a bot to its list exactly as Postgres does, over the
+        // same text the engine classifies.
+        let sql = crate::schema::catalog::<D>(documents, devices)
+            .map_err(|err| SetupError::Catalog(err.to_string()))?;
         let catalog = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&sql)
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
         let deployment = connetto_schema::deployment::<Key>(documents.reader_role())
