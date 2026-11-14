@@ -1100,13 +1100,6 @@ where
 }
 
 /// Whom a copy taken into custody is kept for.
-#[cfg_attr(
-    not(feature = "peer"),
-    expect(
-        dead_code,
-        reason = "only the peer link's fetches take copies into custody"
-    )
-)]
 pub(crate) struct Keeper {
     /// The key id of the provisional row's author, `None` for a settled
     /// row whose state column does not read `available` yet.
