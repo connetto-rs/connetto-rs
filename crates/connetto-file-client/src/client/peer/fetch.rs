@@ -71,6 +71,9 @@ pub(super) struct Fetch {
     pub(super) progress: Instant,
     /// What the fetch is for.
     pub(super) purpose: Purpose,
+    /// The account the holder's last manifest run named its custody copy
+    /// uploaded for.
+    pub(super) owner: Option<String>,
 }
 
 /// What a fetch is for, which sets its queue, its holders and its end.
@@ -106,6 +109,7 @@ impl Fetch {
             retry_at: None,
             progress: now,
             purpose: Purpose::OnDemand,
+            owner: None,
         }
     }
 
@@ -364,12 +368,14 @@ where
     /// replicated column of a provisional row names enters custody when it
     /// fits in the room `budget` leaves, and is cache otherwise. A fetch that
     /// `takes_over` a leaving copy also keeps a file a settled row names
-    /// while no state reads `available`.
+    /// while no state reads `available`, credited to the `owner` its holder
+    /// named.
     pub(super) async fn commit_fetched(
         &self,
         manifest: &Manifest,
         budget: u64,
         takes_over: bool,
+        owner: Option<String>,
     ) -> Result<bool, ContentError> {
         let _writing = self.content_writes.lock().await;
         let store = self.store_for(FETCHED_CLASS);
@@ -386,7 +392,9 @@ where
             .await
             .map_err(|err| ContentError::Store(err.to_string()))?;
         let outboard = self.store_outboard(&outboard).await?;
-        let custody = self.custody_author(manifest, budget, takes_over).await?;
+        let custody = self
+            .custody_author(manifest, budget, takes_over, owner)
+            .await?;
         self.commit_cached(manifest, outboard, custody.as_ref())
             .await?;
         if custody.is_some() {
@@ -402,34 +410,42 @@ where
     /// `budget` leaves, the courierable author of a provisional row whose
     /// replicated column names it, or a settled row when the fetch
     /// `takes_over` a leaving copy of a file no state reads `available` for,
-    /// `None` for cache.
+    /// `None` for cache. The owner is the account the author's cursor names,
+    /// else the `owner` the holder named.
     async fn custody_author(
         &self,
         manifest: &Manifest,
         budget: u64,
         takes_over: bool,
+        owner: Option<String>,
     ) -> Result<Option<Keeper>, ContentError> {
         let declared = &self.peer_content;
         let file_id = manifest.file_id();
-        let (author, held) = self
+        let (keeper, held) = self
             .client
             .with_conn(|conn| -> Result<_, ContentError> {
                 let named = custody::named(conn, declared, &mut custody::Reach::default())?;
-                let author = match named.author_of(file_id) {
-                    Some(author) => Some(Keeper::Author(author.to_vec())),
+                let keeper = match named.author_of(file_id) {
+                    Some(author) => Some(Keeper {
+                        owner: conn.author_account(author)?.or(owner),
+                        author: Some(author.to_vec()),
+                    }),
                     None if takes_over
                         && !db::is_unsent(conn.conn(), file_id)?
                         && custody::settled_open(conn, declared, file_id)? =>
                     {
-                        Some(Keeper::Settled)
+                        Some(Keeper {
+                            author: None,
+                            owner,
+                        })
                     }
                     None => None,
                 };
-                Ok((author, db::custody_bytes(conn.conn())?))
+                Ok((keeper, db::custody_bytes(conn.conn())?))
             })
             .await??;
         let size: u64 = manifest.chunks().iter().map(|chunk| chunk.len).sum();
-        Ok(author.filter(|_| size <= self.room(budget, held)))
+        Ok(keeper.filter(|_| size <= self.room(budget, held)))
     }
 }
 

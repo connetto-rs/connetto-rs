@@ -128,6 +128,10 @@ pub enum BoundsError {
     /// A holder report names one file both staying and leaving.
     #[error("the holder report names a file both staying and leaving")]
     StayingAndLeaving,
+    /// A media manifest names an owner longer than
+    /// [`crate::media::MAX_OWNER_BYTES`].
+    #[error("the media manifest names an owner longer than the bound")]
+    OwnerTooLong,
 }
 
 /// The manifest messages of one range, `rows` cut into runs of at most

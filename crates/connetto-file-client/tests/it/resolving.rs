@@ -388,3 +388,70 @@ async fn a_started_resolve_on_a_cold_connection_answers_unavailable() {
         "no transport means Unavailable at once"
     );
 }
+
+#[tokio::test]
+async fn a_connection_resolve_returns_the_grant_or_unavailable_after_refusal() {
+    use connetto_core::messages::{CONTENT_TICKET_REFUSED, ContentVerb};
+    use connetto_file_client::{ContentArchive, FsStore};
+    use connetto_file_core::FileId;
+
+    let dir = tempdir().expect("temp dir");
+    let transport = Scripted::new([
+        TicketAnswer::Grant(READ_URL.to_owned()),
+        TicketAnswer::Refuse(CONTENT_TICKET_REFUSED.to_owned()),
+    ]);
+    let mut conn =
+        connected_connection(&dir.path().join("replica.sqlite"), transport.clone()).await;
+    let archive = ContentArchive::new(FsStore::new(dir.path().join("chunks")), ROOT_KEY);
+    archive.install(&mut conn).expect("install content");
+
+    for (file_id, expected) in [
+        (
+            FileId::from_bytes([7; 32]),
+            Resolved::Remote {
+                url: READ_URL.to_owned(),
+            },
+        ),
+        (FileId::from_bytes([8; 32]), Resolved::Unavailable),
+    ] {
+        let (resolved, _) = tokio::time::timeout(
+            core::time::Duration::from_secs(10),
+            archive.resolve_connection(&mut conn, file_id, core::future::pending()),
+        )
+        .await
+        .expect("the matching ticket settles the resolve");
+        assert_eq!(resolved, expected);
+    }
+
+    let requests = transport.tickets();
+    assert_eq!(requests.len(), 2);
+    for (request, file_id) in requests.iter().zip([[7; 32], [8; 32]]) {
+        assert_eq!(request.file_id, file_id);
+        assert_eq!(request.verb, ContentVerb::Read);
+        assert_eq!(request.for_owner, None);
+    }
+    assert_ne!(requests[0].request_id, requests[1].request_id);
+}
+
+#[tokio::test]
+async fn a_refused_pinned_fetch_keeps_the_pin_without_caching_bytes() {
+    let dir = tempdir().expect("temp dir");
+    let file_id = learn_file_id(PHOTO).await;
+    let http = RecordingHttp::default();
+    let (client, content) = connected_content(
+        dir.path(),
+        Scripted::new([TicketAnswer::Refuse(
+            connetto_core::messages::CONTENT_TICKET_REFUSED.to_owned(),
+        )]),
+        http.clone(),
+    )
+    .await;
+    insert_row_and_pin_album(&client, &content, file_id).await;
+    assert!(matches!(
+        content.fetch_pinned().await,
+        Err(ContentError::TicketRefused { file_id: refused }) if refused == file_id
+    ));
+    assert!(content.pinned().await.expect("pins").contains(&file_id));
+    assert_eq!(content.outboard(file_id).await.expect("outboard"), None);
+    assert_eq!(http.sent(), Vec::<crate::support::Sent>::new());
+}

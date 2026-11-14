@@ -445,6 +445,20 @@ async fn coverage_waits_for_every_owed_resend() {
     assert_eq!(coverage(&mut conn), Some(known(&["a"])));
 }
 
+#[tokio::test]
+async fn an_application_ping_reports_a_failed_send() {
+    let (mut conn, script) = client(Vec::new()).await;
+    script.hang_up();
+
+    let error = conn.ping(42).await.expect_err("the socket is gone");
+    assert!(
+        matches!(&error, connetto_client::ClientError::Transport(detail)
+            if detail == "the scripted socket is gone"),
+        "{error}"
+    );
+    assert_eq!(script.pings(), vec![42]);
+}
+
 /// A computed declaration rests its bootstrap behind an ordered fence, and
 /// the matching Pong is what lets coverage publish.
 #[tokio::test]

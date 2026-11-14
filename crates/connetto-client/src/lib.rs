@@ -1783,6 +1783,10 @@ pub enum ClientEvent {
         author: Vec<u8>,
         /// The author's queue sequence.
         seq: i64,
+        /// Whether this device's courier call carried the entry to the
+        /// server, so a holder of its files uploads them at once (R79
+        /// decision 17).
+        by_courier: bool,
     },
     /// A peer entry's rows applied, its records written (R77), raised once
     /// per entry naming every record the apply wrote, the receiver's own
@@ -6634,7 +6638,7 @@ where
         let retained = sent.retained;
         let mut applied = false;
         for (seq, verdict) in &answer.verdicts {
-            if self.settle_verdict_row(&author, *seq, verdict)? {
+            if self.settle_verdict_row(&author, *seq, verdict, false)? {
                 applied = true;
                 if matches!(verdict, connetto_core::exchange::Verdict::Pending) {
                     self.courier.heard.entry(author).or_default().insert(*seq);
@@ -6700,14 +6704,20 @@ where
     /// Adjudicate one held peer entry on a verdict (R77): a provisional
     /// entry's records move to adjudicated, the rows handing to ordinary
     /// coverage, and the entry is retained until its author's certificate
-    /// ends (R78 decision 17).
+    /// ends (R78 decision 17). `by_courier` says this device's courier call
+    /// carried the verdict.
     ///
     /// # Errors
     ///
     /// [`ClientError`] when the entry or the records cannot be read or
     /// written.
     #[cfg(feature = "peer")]
-    fn adjudicate_peer_seq(&mut self, author: &[u8], seq: u64) -> Result<(), ClientError> {
+    fn adjudicate_peer_seq(
+        &mut self,
+        author: &[u8],
+        seq: u64,
+        by_courier: bool,
+    ) -> Result<(), ClientError> {
         let seq = i64::try_from(seq).unwrap_or(i64::MAX);
         let _exempt = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
@@ -6728,6 +6738,7 @@ where
             self.notices.push_back(ClientEvent::ProvisionalSettled {
                 author: author.to_vec(),
                 seq,
+                by_courier,
             });
         }
         self.settle_pruned_marks()
@@ -6801,6 +6812,7 @@ where
         author: &[u8],
         seq: u64,
         verdict: &connetto_core::exchange::Verdict,
+        by_courier: bool,
     ) -> Result<bool, ClientError> {
         let seq_db = i64::try_from(seq).unwrap_or(i64::MAX);
         let abandoned = matches!(verdict, connetto_core::exchange::Verdict::Abandoned);
@@ -6833,7 +6845,7 @@ where
         match verdict {
             connetto_core::exchange::Verdict::Applied
             | connetto_core::exchange::Verdict::Settled => {
-                self.adjudicate_peer_seq(author, seq)?;
+                self.adjudicate_peer_seq(author, seq, by_courier)?;
             }
             cause @ (connetto_core::exchange::Verdict::Refused(_)
             | connetto_core::exchange::Verdict::Abandoned) => {
@@ -8057,7 +8069,7 @@ where
                 for (seq, entry) in outcomes {
                     match entry {
                         connetto_core::exchange::CourierEntryOutcome::Ruled(verdict) => {
-                            self.settle_verdict_row(&author, *seq, verdict)?;
+                            self.settle_verdict_row(&author, *seq, verdict, true)?;
                             if matches!(
                                 verdict,
                                 connetto_core::exchange::Verdict::Applied
@@ -10039,6 +10051,19 @@ where
         exchange::courier_lapse_at(&mut self.db, author)
     }
 
+    /// The account `author`'s certificate named when this replica last
+    /// stored its cursor, the owner a carried upload of its files credits
+    /// (R79 decision 17), `None` for an author this replica holds no cursor
+    /// for.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the cursor cannot be read.
+    #[cfg(feature = "peer")]
+    pub fn author_account(&mut self, author: &[u8]) -> Result<Option<String>, ClientError> {
+        Ok(exchange::offer_and_account(&mut self.db, author)?.map(|(_, account)| account))
+    }
+
     /// Whether `requester`, a linked peer, reads a row of `table` whose
     /// `column` names `value`, judged through the policy views with the
     /// requester's account, `NULL` subjects and the bot list its certificate
@@ -10453,6 +10478,7 @@ where
             self.notices.push_back(ClientEvent::ProvisionalSettled {
                 author: author.to_vec(),
                 seq,
+                by_courier: false,
             });
         }
         self.settle_pruned_marks()
@@ -11667,7 +11693,9 @@ where
             .map_err(|e| ClientError::Transport(e.to_string()))
     }
 
-    /// Ask the server for a content ticket naming one file and one verb.
+    /// Ask the server for a content ticket naming one file and one verb,
+    /// with `for_owner` naming the account a carried upload credits (R79
+    /// decision 17).
     ///
     /// The answer arrives on a later [`pump_one`](Self::pump_one) as
     /// [`ClientEvent::ContentTicket`] carrying `request_id`, or as a refusal
@@ -11684,6 +11712,7 @@ where
         request_id: String,
         file_id: [u8; 32],
         verb: ContentVerb,
+        for_owner: Option<String>,
     ) -> Result<(), ClientError> {
         self.wire()?
             .transport
@@ -11691,7 +11720,7 @@ where
                 request_id,
                 file_id,
                 verb,
-                for_owner: None,
+                for_owner,
             }))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))

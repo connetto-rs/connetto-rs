@@ -41,7 +41,7 @@ diesel::table! {
 }
 
 diesel::table! {
-    /// One row per file this device must upload, authored here or healing a file the server lost, and `outbox` and `outbox_count` read only the authored rows.
+    /// One row per file this device must upload, authored here, healing a file the server lost, or carried for another account's settled row, and `outbox` and `outbox_count` read only the authored rows.
     _connetto_content_outbox (file_id) {
         /// BLAKE3 identity of the file awaiting upload.
         file_id -> Binary,
@@ -49,6 +49,8 @@ diesel::table! {
         refused -> Nullable<Text>,
         /// Whether the entry heals a file the server lost rather than sending one this device authored.
         heal -> Bool,
+        /// The account a carried upload credits, set for a custody copy whose row settled while the server lacked it (R79 decision 17).
+        carried_for -> Nullable<Text>,
     }
 }
 
@@ -120,12 +122,20 @@ diesel::table! {
         /// BLAKE3 identity of the held file.
         file_id -> Binary,
         /// The key id of the provisional row's author, `NULL` for a copy a
-        /// `lost` state returned to custody.
+        /// `lost` state returned to custody or one taken over after its row
+        /// settled.
         author_key -> Nullable<Binary>,
+        /// The account a carried upload of the copy credits, from the
+        /// author's cursor or the holder it was taken over from (R79
+        /// decision 17).
+        owner -> Nullable<Text>,
         /// Where the copy stands, `held` until placement marks one leaving.
         state -> Text,
         /// When this device learned the row settled, in Unix seconds.
         settled_seen_at -> Nullable<BigInt>,
+        /// Whether this device's carried upload of the file committed, so
+        /// the copy waits for the state column (R79 decision 17).
+        uploaded -> Bool,
     }
 }
 
@@ -139,7 +149,8 @@ pub(crate) const CONTENT_DDL: &str = "\
     (file_id BLOB NOT NULL, ordinal INTEGER NOT NULL, hash BLOB NOT NULL, \
      len BIGINT NOT NULL, PRIMARY KEY (file_id, ordinal)); \
     CREATE TABLE IF NOT EXISTS _connetto_content_outbox \
-    (file_id BLOB NOT NULL PRIMARY KEY, refused TEXT, heal BOOLEAN NOT NULL DEFAULT FALSE); \
+    (file_id BLOB NOT NULL PRIMARY KEY, refused TEXT, heal BOOLEAN NOT NULL DEFAULT FALSE, \
+     carried_for TEXT); \
     CREATE TABLE IF NOT EXISTS _connetto_content_retired \
     (file_id BLOB NOT NULL PRIMARY KEY); \
     CREATE TABLE IF NOT EXISTS _connetto_content_pins \
@@ -147,8 +158,8 @@ pub(crate) const CONTENT_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS _connetto_content_outboard \
     (file_id BLOB NOT NULL PRIMARY KEY, hash BLOB NOT NULL); \
     CREATE TABLE IF NOT EXISTS _connetto_content_custody \
-    (file_id BLOB NOT NULL PRIMARY KEY, author_key BLOB, state TEXT NOT NULL, \
-     settled_seen_at INTEGER)";
+    (file_id BLOB NOT NULL PRIMARY KEY, author_key BLOB, owner TEXT, state TEXT NOT NULL, \
+     settled_seen_at INTEGER, uploaded BOOLEAN NOT NULL DEFAULT FALSE)";
 
 /// The held-content half of the schema (R31), created by a rebuild inside
 /// the rebuild transaction and on every content attach.
@@ -159,7 +170,7 @@ pub(crate) const HELD_CONTENT_DDL: &str = "\
     (major INTEGER NOT NULL, file_id BLOB NOT NULL, ordinal INTEGER NOT NULL, \
      hash BLOB NOT NULL, len BIGINT NOT NULL, PRIMARY KEY (major, file_id, ordinal))";
 
-/// Adds the `refused` and `heal` columns to an existing outbox table that predates them.
+/// Adds the `refused`, `heal` and `carried_for` columns to an existing outbox table that predates them.
 ///
 /// Run as separate statements after `CONTENT_DDL` because `batch_execute`
 /// aborts the whole batch on the first error, and each statement is expected
@@ -176,6 +187,10 @@ pub(crate) fn add_outbox_columns(conn: &mut SqliteConnection) -> Result<(), dies
     add_column(
         conn,
         "ALTER TABLE _connetto_content_outbox ADD COLUMN heal BOOLEAN NOT NULL DEFAULT FALSE",
+    )?;
+    add_column(
+        conn,
+        "ALTER TABLE _connetto_content_outbox ADD COLUMN carried_for TEXT",
     )
 }
 
@@ -501,29 +516,51 @@ pub(crate) const LEAVING: &str = "leaving";
 #[cfg(feature = "peer")]
 pub(crate) const PRESSED: &str = "pressed";
 
-/// Takes `file_id` into custody for `author`'s row, `None` for a copy a
-/// `lost` state returned. A file already in custody keeps its record.
+/// Takes `file_id` into custody for `author`'s row, credited to `owner`,
+/// `None` authors for a copy a `lost` state returned or one taken over
+/// after its row settled. A file already in custody keeps its record.
 pub(crate) fn enter_custody(
     conn: &mut SqliteConnection,
     file_id: FileId,
     author: Option<&[u8]>,
+    owner: Option<&str>,
 ) -> Result<(), diesel::result::Error> {
     diesel::insert_or_ignore_into(_connetto_content_custody::table)
         .values((
             _connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()),
             _connetto_content_custody::author_key.eq(author),
+            _connetto_content_custody::owner.eq(owner),
             _connetto_content_custody::state.eq(HELD),
         ))
         .execute(conn)
         .map(|_| ())
 }
 
-/// Releases `file_id` from custody, which leaves its bytes ordinary cache.
+/// The account a carried upload of custody copy `file_id` credits, `None`
+/// when the copy is not in custody or names none.
 #[cfg(feature = "peer")]
+pub(crate) fn custody_owner(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<Option<String>, diesel::result::Error> {
+    Ok(_connetto_content_custody::table
+        .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
+        .select(_connetto_content_custody::owner)
+        .first::<Option<String>>(conn)
+        .optional()?
+        .flatten())
+}
+
+/// Releases `file_id` from custody, which leaves its bytes ordinary cache,
+/// and cancels its carried upload when one waits (R79 decision 17).
 pub(crate) fn leave_custody(
     conn: &mut SqliteConnection,
     file_id: FileId,
 ) -> Result<(), diesel::result::Error> {
+    diesel::delete(_connetto_content_outbox::table)
+        .filter(_connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()))
+        .filter(_connetto_content_outbox::carried_for.is_not_null())
+        .execute(conn)?;
     diesel::delete(_connetto_content_custody::table)
         .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
         .execute(conn)
@@ -561,23 +598,122 @@ pub(crate) fn set_custody_state(
         .map(|_| ())
 }
 
-/// Every custody copy with its state and its file's size in bytes.
+/// Where a custody copy's upload stands (R79 decision 17).
 #[cfg(feature = "peer")]
-pub(crate) fn custody_states(
-    conn: &mut SqliteConnection,
-) -> Result<Vec<(FileId, String, u64)>, ContentError> {
-    let rows: Vec<(Vec<u8>, String)> = _connetto_content_custody::table
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Upload {
+    /// No upload of the file is queued here.
+    None,
+    /// An upload of the file waits in the outbox, the copy in C5.
+    Queued,
+    /// The upload was refused permanently and waits for the application.
+    Refused,
+    /// This device's upload committed, the copy in C5 until the state column
+    /// reads `available`.
+    Committed,
+}
+
+#[cfg(feature = "peer")]
+impl Upload {
+    /// Whether the copy is in C5, where the upload decides and placement
+    /// leaves it be.
+    pub(crate) fn decides(self) -> bool {
+        matches!(self, Self::Queued | Self::Committed)
+    }
+}
+
+/// One custody copy as the media driver reads it.
+#[cfg(feature = "peer")]
+#[derive(Clone)]
+pub(crate) struct CustodyRow {
+    pub(crate) file_id: FileId,
+    /// [`HELD`], [`LEAVING`] or [`PRESSED`].
+    pub(crate) state: String,
+    /// The file's size in bytes.
+    pub(crate) size: u64,
+    /// The key id of the provisional row's author, `None` for a copy a
+    /// `lost` state returned or one taken over after its row settled.
+    pub(crate) author: Option<Vec<u8>>,
+    /// The account a carried upload credits, `None` when not yet known.
+    pub(crate) owner: Option<String>,
+    /// When this device learned the row settled, in Unix seconds.
+    pub(crate) settled_seen_at: Option<i64>,
+    /// Where the copy's upload stands.
+    pub(crate) upload: Upload,
+}
+
+#[cfg(feature = "peer")]
+impl CustodyRow {
+    /// Whether the copy is marked leaving, as surplus or under pressure.
+    pub(crate) fn leaving(&self) -> bool {
+        self.state != HELD
+    }
+}
+
+/// Every custody copy with its state, size, author, owner, settling and
+/// upload.
+#[cfg(feature = "peer")]
+pub(crate) fn custody_states(conn: &mut SqliteConnection) -> Result<Vec<CustodyRow>, ContentError> {
+    type Stored = (
+        Vec<u8>,
+        String,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<i64>,
+        bool,
+    );
+    let rows: Vec<Stored> = _connetto_content_custody::table
         .select((
             _connetto_content_custody::file_id,
             _connetto_content_custody::state,
+            _connetto_content_custody::author_key,
+            _connetto_content_custody::owner,
+            _connetto_content_custody::settled_seen_at,
+            _connetto_content_custody::uploaded,
         ))
         .load(conn)?;
     rows.into_iter()
-        .map(|(id, state)| {
+        .map(|(id, state, author, owner, settled_seen_at, uploaded)| {
             let file_id = FileId::from_bytes(exactly_32(&id)?);
-            Ok((file_id, state, manifest_size(conn, file_id)?))
+            let queued: Option<Option<String>> = _connetto_content_outbox::table
+                .filter(_connetto_content_outbox::file_id.eq(id))
+                .select(_connetto_content_outbox::refused)
+                .first(conn)
+                .optional()?;
+            let upload = match queued {
+                Some(None) => Upload::Queued,
+                Some(Some(_)) => Upload::Refused,
+                None if uploaded => Upload::Committed,
+                None => Upload::None,
+            };
+            Ok(CustodyRow {
+                file_id,
+                state,
+                size: manifest_size(conn, file_id)?,
+                author,
+                owner,
+                settled_seen_at,
+                upload,
+            })
         })
         .collect()
+}
+
+/// Queues the upload of custody copy `file_id` credited to `owner` (R79
+/// decision 17). A file already queued keeps its entry.
+#[cfg(feature = "peer")]
+pub(crate) fn enqueue_carried(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+    owner: &str,
+) -> Result<(), diesel::result::Error> {
+    diesel::insert_or_ignore_into(_connetto_content_outbox::table)
+        .values((
+            _connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()),
+            _connetto_content_outbox::carried_for.eq(owner),
+        ))
+        .execute(conn)
+        .map(|_| ())
 }
 
 /// The size in bytes of the file `file_id`'s held manifest names, 0 for none.
@@ -680,20 +816,57 @@ pub(crate) fn heal_entries(conn: &mut SqliteConnection) -> Result<Vec<FileId>, C
         .collect()
 }
 
-/// Whether this file's outbox entry is a heal.
-pub(crate) fn is_heal(
+/// Whether this file's outbox entry is one this device authored, neither a
+/// heal nor a carried upload.
+pub(crate) fn is_authored(
     conn: &mut SqliteConnection,
     file_id: FileId,
 ) -> Result<bool, diesel::result::Error> {
     _connetto_content_outbox::table
         .filter(_connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()))
-        .filter(_connetto_content_outbox::heal.eq(true))
+        .filter(_connetto_content_outbox::heal.eq(false))
+        .filter(_connetto_content_outbox::carried_for.is_null())
         .count()
         .get_result::<i64>(conn)
         .map(|n| n > 0)
 }
 
-/// Records that a file is authored here and not yet uploaded, turning a queued heal of it authored.
+/// The account this file's queued upload credits, `None` for an upload
+/// under this device's own account (R79 decision 17).
+pub(crate) fn carried_for(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<Option<String>, diesel::result::Error> {
+    Ok(_connetto_content_outbox::table
+        .filter(_connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()))
+        .select(_connetto_content_outbox::carried_for)
+        .first::<Option<String>>(conn)
+        .optional()?
+        .flatten())
+}
+
+/// A file still waiting for upload and not refused.
+pub(crate) struct Sendable {
+    /// The account its upload credits, `None` for this device's own.
+    pub(crate) carried_for: Option<String>,
+}
+
+/// The file's entry when it is still sendable, `None` when it is no longer
+/// queued or was refused since (R79 decision 17).
+pub(crate) fn sendable_entry(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<Option<Sendable>, diesel::result::Error> {
+    Ok(_connetto_content_outbox::table
+        .filter(_connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()))
+        .filter(_connetto_content_outbox::refused.is_null())
+        .select(_connetto_content_outbox::carried_for)
+        .first::<Option<String>>(conn)
+        .optional()?
+        .map(|carried_for| Sendable { carried_for }))
+}
+
+/// Records that a file is authored here and not yet uploaded, turning a queued heal or carried upload of it authored.
 pub(crate) fn enqueue(
     conn: &mut SqliteConnection,
     file_id: FileId,
@@ -702,7 +875,10 @@ pub(crate) fn enqueue(
         .values(_connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()))
         .on_conflict(_connetto_content_outbox::file_id)
         .do_update()
-        .set(_connetto_content_outbox::heal.eq(false))
+        .set((
+            _connetto_content_outbox::heal.eq(false),
+            _connetto_content_outbox::carried_for.eq::<Option<String>>(None),
+        ))
         .execute(conn)
         .map(|_| ())
 }
@@ -716,6 +892,21 @@ pub(crate) fn dequeue(
         .filter(_connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()))
         .execute(conn)
         .map(|_| ())
+}
+
+/// Retires the outbox entry of a file whose upload committed, a custody
+/// copy of it then waiting for the state column (R79 decision 17).
+pub(crate) fn upload_committed(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<(), diesel::result::Error> {
+    conn.transaction(|conn| {
+        diesel::update(_connetto_content_custody::table)
+            .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
+            .set(_connetto_content_custody::uploaded.eq(true))
+            .execute(conn)?;
+        dequeue(conn, file_id)
+    })
 }
 
 /// Records that a file's unsent bytes were unreadable, so the loss survives a restart.
@@ -755,6 +946,7 @@ pub(crate) fn forget_retired(
 pub(crate) fn outbox(conn: &mut SqliteConnection) -> Result<Vec<FileId>, ContentError> {
     let rows: Vec<Vec<u8>> = _connetto_content_outbox::table
         .filter(_connetto_content_outbox::heal.eq(false))
+        .filter(_connetto_content_outbox::carried_for.is_null())
         .order(_connetto_content_outbox::file_id.asc())
         .select(_connetto_content_outbox::file_id)
         .load(conn)?;
@@ -767,6 +959,7 @@ pub(crate) fn outbox(conn: &mut SqliteConnection) -> Result<Vec<FileId>, Content
 pub(crate) fn outbox_count(conn: &mut SqliteConnection) -> Result<u64, ContentError> {
     let count = _connetto_content_outbox::table
         .filter(_connetto_content_outbox::heal.eq(false))
+        .filter(_connetto_content_outbox::carried_for.is_null())
         .count()
         .get_result::<i64>(conn)?;
     Ok(u64::try_from(count).expect("SQLite COUNT is non-negative"))

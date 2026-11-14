@@ -160,6 +160,9 @@ sha2 = "0.10"
 # patch, compressed as bulk payloads ride the wire.
 sqlite-diff-rs = { version = "0.20", default-features = false }
 zstd = "0.13"
+# The holder upload proofs store an author's offer, which a courier call
+# reads back as MessagePack.
+rmp-serde.workspace = true
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "time"] }
 tempfile = "3"
 axum = { workspace = true }

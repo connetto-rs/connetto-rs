@@ -13,7 +13,8 @@ use connetto_client::{
 };
 use connetto_core::Cursor;
 use connetto_core::messages::{
-    BulkMessage, ContentTicketGrant, ControlMessage, HandshakeAck, NonFatalError,
+    BulkMessage, ContentTicketGrant, ContentTicketRequest, ControlMessage, HandshakeAck,
+    NonFatalError,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
@@ -53,13 +54,16 @@ pub enum TicketAnswer {
 /// A transport that completes a handshake and answers ticket requests from a
 /// script, so a test drives the whole content path with no server.
 ///
-/// Everything else it is sent is discarded: a mutation upload has nowhere to
-/// go here, and the content tests never assert on one.
+/// Everything else it is sent is discarded, apart from a courier range a
+/// couriering transport rules applied: a mutation upload has nowhere to go
+/// here, and the content tests never assert on one.
 #[derive(Clone)]
 pub struct Scripted {
     greeted: Arc<AtomicBool>,
     answers: Arc<Mutex<VecDeque<TicketAnswer>>>,
     queued: Arc<Mutex<VecDeque<IncomingFrame>>>,
+    tickets: Arc<Mutex<Vec<ContentTicketRequest>>>,
+    courier: bool,
 }
 
 impl Scripted {
@@ -70,6 +74,8 @@ impl Scripted {
             greeted: Arc::new(AtomicBool::new(false)),
             answers: Arc::new(Mutex::new(answers.into_iter().collect())),
             queued: Arc::new(Mutex::new(VecDeque::new())),
+            tickets: Arc::new(Mutex::new(Vec::new())),
+            courier: false,
         }
     }
 
@@ -81,11 +87,41 @@ impl Scripted {
         ))
     }
 
+    /// This transport with the courier path granted at the handshake and
+    /// every courier range ruled applied, entry by entry.
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn couriering(mut self) -> Self {
+        self.courier = true;
+        self
+    }
+
     /// Queues `frame` as the server's next one, after the handshake.
     #[cfg(feature = "peer")]
     pub fn say(&self, frame: IncomingFrame) {
         self.queued.lock().expect("queued lock").push_back(frame);
     }
+
+    /// Every ticket request sent so far.
+    pub fn tickets(&self) -> Vec<ContentTicketRequest> {
+        self.tickets.lock().expect("tickets lock").clone()
+    }
+}
+
+/// The server's ruling of every entry of `range` as applied.
+#[cfg(feature = "peer")]
+fn applied(range: &connetto_core::messages::CourierRange) -> ControlMessage {
+    use connetto_core::exchange::{CourierEntryOutcome, CourierOutcome, Verdict};
+    ControlMessage::CourierAnswer(connetto_core::messages::CourierAnswer {
+        request_id: range.request_id.clone(),
+        outcome: CourierOutcome::Entries(
+            range
+                .rows
+                .iter()
+                .map(|row| (row.seq, CourierEntryOutcome::Ruled(Verdict::Applied)))
+                .collect(),
+        ),
+    })
 }
 
 impl Transport for Scripted {
@@ -95,6 +131,15 @@ impl Transport for Scripted {
         &mut self,
         message: ControlMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> {
+        #[cfg(feature = "peer")]
+        if let ControlMessage::CourierRange(range) = &message
+            && self.courier
+        {
+            self.queued
+                .lock()
+                .expect("queued lock")
+                .push_back(IncomingFrame::Control(applied(range)));
+        }
         if let ControlMessage::ContentTicketRequest(request) = message {
             let answer = self
                 .answers
@@ -107,15 +152,16 @@ impl Transport for Scripted {
             let reply = match answer {
                 TicketAnswer::Grant(url) => {
                     ControlMessage::ContentTicketGrant(ContentTicketGrant {
-                        request_id: request.request_id,
+                        request_id: request.request_id.clone(),
                         url,
                     })
                 }
                 TicketAnswer::Refuse(detail) => ControlMessage::NonFatalError(NonFatalError {
-                    related_to: Some(request.request_id),
+                    related_to: Some(request.request_id.clone()),
                     detail,
                 }),
             };
+            self.tickets.lock().expect("tickets lock").push(request);
             self.queued
                 .lock()
                 .expect("queued lock")
@@ -146,7 +192,7 @@ impl Transport for Scripted {
                     current_cursor: Cursor::new(Vec::new()),
                     schema_version: None,
                     sunset_at_secs: None,
-                    courier: false,
+                    courier: self.courier,
                     initial_credits: 64,
                     writer: Some(connetto_core::messages::WriterGrant {
                         number: 1,
@@ -204,6 +250,28 @@ pub struct Sent {
 pub struct RecordingHttp {
     sent: Arc<Mutex<Vec<Sent>>>,
     replies: Arc<Mutex<VecDeque<HttpReply>>>,
+    hold: Option<Arc<Hold>>,
+}
+
+/// A hold on a fake's first `POST`, which answers only once released.
+#[derive(Default)]
+pub struct Hold {
+    armed: AtomicBool,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "peer")]
+impl Hold {
+    /// Waits until the held `POST` arrived.
+    pub async fn arrived(&self) {
+        self.arrived.notified().await;
+    }
+
+    /// Lets the held `POST` answer.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl RecordingHttp {
@@ -217,7 +285,21 @@ impl RecordingHttp {
                     .map(|(status, body)| HttpReply { status, body })
                     .collect(),
             )),
+            hold: None,
         }
+    }
+
+    /// This fake with its first `POST` held until the returned hold
+    /// releases it.
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn holding_first(mut self) -> (Self, Arc<Hold>) {
+        let hold = Arc::new(Hold {
+            armed: AtomicBool::new(true),
+            ..Hold::default()
+        });
+        self.hold = Some(Arc::clone(&hold));
+        (self, hold)
     }
 
     /// Everything sent so far.
@@ -251,7 +333,18 @@ impl ContentHttp for RecordingHttp {
         url: &str,
         json: Option<Vec<u8>>,
     ) -> impl Future<Output = Result<HttpReply, HttpFailure<Self::Error>>> {
-        ready(Ok(self.answer("POST", url, json.unwrap_or_default())))
+        let reply = self.answer("POST", url, json.unwrap_or_default());
+        let hold = self
+            .hold
+            .clone()
+            .filter(|hold| hold.armed.swap(false, Ordering::Relaxed));
+        async move {
+            if let Some(hold) = hold {
+                hold.arrived.notify_one();
+                hold.release.notified().await;
+            }
+            Ok(reply)
+        }
     }
 
     fn put(

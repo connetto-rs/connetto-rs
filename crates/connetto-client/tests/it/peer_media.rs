@@ -1,10 +1,11 @@
 //! The media gate and the provisional values a holder and a receiver read
 //! (R79 decisions 2 and 6).
 
-use connetto_client::{ClientBuilder, ConnettoConnection, SyncSchema};
+use connetto_client::{ClientBuilder, ClientError, ConnettoConnection, SyncSchema};
+use connetto_core::messages::{ContentTicketRequest, ContentVerb, ControlMessage};
 use diesel::prelude::*;
 
-use super::peer_support::{author, captured, manifest, receiver};
+use super::peer_support::{author, captured, manifest, plain_author, receiver};
 use super::support::{self, Script};
 
 /// A photo table each person reads only their own rows of, writable by
@@ -198,5 +199,39 @@ async fn provisional_values_name_each_provisional_rows_file_and_author() {
             .expect("read the provisional values"),
         Vec::new(),
         "an adjudicated row names no provisional file"
+    );
+}
+
+#[tokio::test]
+async fn a_content_ticket_request_reports_a_failed_send() {
+    let (mut conn, script) = plain_author(PLAIN_PHOTOS).await;
+    script.hang_up();
+    let request = ContentTicketRequest {
+        request_id: "carried-upload".to_owned(),
+        file_id: ANNAS_FILE,
+        verb: ContentVerb::Write { declared_len: 73 },
+        for_owner: Some("anna".to_owned()),
+    };
+
+    let error = conn
+        .request_content_ticket(
+            request.request_id.clone(),
+            request.file_id,
+            request.verb,
+            request.for_owner.clone(),
+        )
+        .await
+        .expect_err("the socket is gone");
+    assert!(
+        matches!(&error, ClientError::Transport(detail)
+            if detail == "the scripted socket is gone"),
+        "{error}"
+    );
+    assert_eq!(
+        script.sent(|message| match message {
+            ControlMessage::ContentTicketRequest(request) => Some(request.clone()),
+            _ => None,
+        }),
+        vec![request]
     );
 }

@@ -100,7 +100,9 @@ where
     /// the count is marked leaving, a leaving mark is withdrawn, an
     /// acknowledged copy is released, and stranded pressed copies raise
     /// [`ContentEvent::CustodyPressed`]. A file whose size is unknown has
-    /// its manifest asked for first.
+    /// its manifest asked for first. A settled copy whose upload wait ended
+    /// is queued first, and a copy whose upload is queued or committed is
+    /// left to it (R79 decision 17).
     pub(super) async fn place(&mut self, now: Instant) -> Vec<Action> {
         let Some(own) = self.sender.own() else {
             return Vec::new();
@@ -116,12 +118,20 @@ where
         else {
             return Vec::new();
         };
-        let (custody, held_bytes) = self.beside_jobs(content.custody_held()).await;
+        let (mut custody, held_bytes) = self.beside_jobs(content.custody_held()).await;
         let room = content.room(self.budget, held_bytes);
         let own_key = *own.key().as_bytes();
+        let linked: Vec<DeviceIdentity> = self.links.linked_peers().cloned().collect();
+        let my_rates: BTreeMap<[u8; 32], u64> = self.rates().into_iter().collect();
+        let me = Candidate {
+            key: own_key,
+            account: own.account(),
+            room,
+            rates: &my_rates,
+        };
+        self.queue_uploads(&mut custody, me, &linked).await;
         let mine: HashMap<FileId, &CustodyCopy> =
             custody.iter().map(|copy| (copy.file_id, copy)).collect();
-        let linked: Vec<DeviceIdentity> = self.links.linked_peers().cloned().collect();
         // A settled row's file is pulled only to take over a copy a linked
         // holder marks leaving, never on its own while the server may still
         // be receiving it from its author.
@@ -136,6 +146,7 @@ where
             .iter()
             .filter(|(file_id, info)| {
                 !unsent.contains(*file_id)
+                    && !mine.get(*file_id).is_some_and(|copy| copy.upload.decides())
                     && !info
                         .authors
                         .iter()
@@ -148,13 +159,6 @@ where
             .collect();
         let admitted = self.admitted_takers(&files, &mine, &linked).await;
 
-        let my_rates: BTreeMap<[u8; 32], u64> = self.rates().into_iter().collect();
-        let me = Candidate {
-            key: own_key,
-            account: own.account(),
-            room,
-            rates: &my_rates,
-        };
         let mut decided = Vec::new();
         let mut probes = Vec::new();
         for (file_id, info) in &files {
@@ -442,9 +446,10 @@ where
         let Some(own) = self.sender.own().filter(|_| owed > 0) else {
             return;
         };
+        // A copy whose upload is queued or committed finishes it instead.
         let mut order: Vec<&CustodyCopy> = custody
             .iter()
-            .filter(|copy| copy.state != db::PRESSED)
+            .filter(|copy| copy.state != db::PRESSED && !copy.upload.decides())
             .collect();
         order.sort_by_key(|copy| {
             (

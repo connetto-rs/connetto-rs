@@ -24,6 +24,8 @@ mod peer_prefetch;
 mod peer_retention;
 #[cfg(feature = "peer")]
 mod peer_support;
+#[cfg(feature = "peer")]
+mod peer_upload;
 mod photo_fixture;
 mod resolving;
 mod retention;

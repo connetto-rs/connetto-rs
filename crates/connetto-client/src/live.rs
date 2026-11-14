@@ -2947,7 +2947,9 @@ where
         state.conn.ping(nonce).await
     }
 
-    /// Ask the server for a content ticket naming one file and one verb.
+    /// Ask the server for a content ticket naming one file and one verb,
+    /// with `for_owner` naming the account a carried upload credits (R79
+    /// decision 17).
     ///
     /// The answer arrives on [`events`](Self::events) as
     /// [`ClientEvent::ContentTicket`] carrying `request_id`, or as a refusal
@@ -2964,11 +2966,12 @@ where
         request_id: String,
         file_id: [u8; 32],
         verb: connetto_core::messages::ContentVerb,
+        for_owner: Option<String>,
     ) -> Result<(), ClientError> {
         let mut state = self.shared.lock_interrupting().await;
         state
             .conn
-            .request_content_ticket(request_id, file_id, verb)
+            .request_content_ticket(request_id, file_id, verb, for_owner)
             .await
     }
 

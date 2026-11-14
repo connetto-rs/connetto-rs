@@ -16,6 +16,7 @@ use iroh_io::AsyncStreamWriter;
 
 use super::super::{ContentClient, FETCHED_CLASS};
 use crate::db;
+use crate::error::ContentError;
 use crate::http::ContentHttp;
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -53,8 +54,9 @@ where
         }
     }
 
-    /// Streams the manifest of `file_id`, `false` to refuse `peer`, whom the
-    /// gate refuses, or a file the device holds no manifest for.
+    /// Streams the manifest of `file_id`, its last run naming the owner of
+    /// the device's custody copy, `false` to refuse `peer`, whom the gate
+    /// refuses, or a file the device holds no manifest for.
     async fn serve_manifest(
         &self,
         sender: &MediaSender,
@@ -65,9 +67,15 @@ where
         if !self.admits(sender, to.peer, &file_id).await {
             return false;
         }
-        let Ok(Ok(Some(manifest))) = self
+        let file_id = FileId::from_bytes(file_id);
+        let Ok(Ok((Some(manifest), mut owner))) = self
             .client
-            .with_conn(|conn| db::load_manifest(conn.conn(), FileId::from_bytes(file_id)))
+            .with_conn(|conn| -> Result<_, ContentError> {
+                Ok((
+                    db::load_manifest(conn.conn(), file_id)?,
+                    db::custody_owner(conn.conn(), file_id)?,
+                ))
+            })
             .await
         else {
             return false;
@@ -87,6 +95,7 @@ where
                 request_id,
                 chunks: run.to_vec(),
                 last: index == last,
+                owner: if index == last { owner.take() } else { None },
             };
             // A send fails only once the link is gone, which takes the
             // refusal with it.

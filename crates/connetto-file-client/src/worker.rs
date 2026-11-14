@@ -6,7 +6,6 @@ use std::io::Read;
 
 use connetto_client::{ClientEvent, ConnettoConnection, ExportScope, ImportChoices, ImportOutcome};
 use connetto_core::Major;
-use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
 use connetto_file_core::{
     ChunkHash, ChunkStore, EncryptStoreError, EncryptingStore, FileId, Manifest, MaybeSend,
@@ -108,15 +107,20 @@ fn next_after(waiting: &[FileId], last: Option<FileId>) -> Option<FileId> {
 ///
 /// Split apart, an entry could leave the outbox with nothing recording that
 /// this device ever declared the file while an application row still names it.
-/// A heal entry leaves quietly, since a cache copy lost is no authored data lost.
+/// A heal or carried entry leaves quietly, since a cache or custody copy lost
+/// is no authored data lost, and a carried copy leaves custody with it.
 pub(crate) fn retire(
     conn: &mut diesel::SqliteConnection,
     file_id: FileId,
 ) -> Result<(), ContentError> {
     conn.transaction(|conn| {
-        let heal = db::is_heal(conn, file_id)?;
+        let authored = db::is_authored(conn, file_id)?;
+        let carried = db::carried_for(conn, file_id)?.is_some();
         db::dequeue(conn, file_id)?;
-        if heal {
+        if carried {
+            db::leave_custody(conn, file_id)?;
+        }
+        if !authored {
             return Ok(());
         }
         db::record_retired(conn, file_id)
@@ -541,7 +545,7 @@ where
         ticket::ensure_pending_request(
             connection,
             file_id,
-            ContentVerb::Read,
+            ticket::TicketAsk::read(),
             &mut pending,
             ticket::TicketWire::Main,
         )
@@ -572,7 +576,7 @@ where
         let url = ticket::request_connection_or(
             connection,
             file_id,
-            ContentVerb::Read,
+            ticket::TicketAsk::read(),
             observed,
             cancel,
             &mut pending,
@@ -971,11 +975,12 @@ where
             ManifestStart::Ready(manifest) => manifest,
             ManifestStart::Complete(flush) => return Ok(ContentFlushStart::Complete(flush)),
         };
+        let for_owner = db::carried_for(cursor.connection.conn(), file_id)?;
         let declared_len = manifest.chunks().iter().map(|chunk| chunk.len).sum();
         let upload_url = match ticket::request_connection_or(
             cursor.connection,
             file_id,
-            ContentVerb::Write { declared_len },
+            ticket::TicketAsk::write(declared_len, for_owner),
             observed,
             cancel,
             &mut cursor.state.pending_ticket,
@@ -1096,7 +1101,7 @@ where
     ) -> Result<ContentFlush, ContentError> {
         match result {
             Ok(()) => {
-                db::dequeue(connection.conn(), file_id)?;
+                db::upload_committed(connection.conn(), file_id)?;
                 Ok(ContentFlush::Progressed)
             }
             Err(error) => match error.outcome() {
@@ -1193,7 +1198,7 @@ where
         let upload_url = match ticket::request_connection_or(
             cursor.connection,
             file_id,
-            ContentVerb::Write { declared_len },
+            ticket::TicketAsk::write(declared_len, None),
             observed,
             cancel,
             &mut cursor.state.pending_ticket,
@@ -2578,7 +2583,7 @@ mod tests {
         db::refuse(connection.conn(), file_id, "over the quota").expect("refuse the heal");
         db::enqueue(connection.conn(), file_id).expect("author the same file");
 
-        assert!(!db::is_heal(connection.conn(), file_id).expect("read the kind"));
+        assert!(db::is_authored(connection.conn(), file_id).expect("read the kind"));
         assert_eq!(db::outbox_count(connection.conn()).expect("count"), 1);
         assert!(
             db::sendable(connection.conn())
