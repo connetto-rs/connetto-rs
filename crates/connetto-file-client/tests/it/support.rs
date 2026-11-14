@@ -262,6 +262,7 @@ pub struct Hold {
     release: tokio::sync::Notify,
 }
 
+#[cfg(feature = "peer")]
 impl Hold {
     /// Waits until the held `POST` arrived.
     pub async fn arrived(&self) {
