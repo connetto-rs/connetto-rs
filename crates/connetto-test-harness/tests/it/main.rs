@@ -33,6 +33,8 @@ mod peer_exchange;
 
 mod peer_media;
 
+mod peer_loss;
+
 mod provisional_adjudication;
 
 mod read_rule_fold;

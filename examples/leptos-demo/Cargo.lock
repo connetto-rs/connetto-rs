@@ -2575,7 +2575,7 @@ dependencies = [
 [[package]]
 name = "pg_walstream"
 version = "0.10.0"
-source = "git+https://github.com/isdaniel/pg-walstream?branch=main#c0a309d959584f4b907e344af6cb997ad333a253"
+source = "git+https://github.com/isdaniel/pg-walstream?branch=main#bf98459624e43ff353716e4284a750e29b823a97"
 dependencies = [
  "bytes",
  "chrono",

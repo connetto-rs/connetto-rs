@@ -482,28 +482,10 @@ where
                     }
                 }
                 Some(order) = orders.recv() => driver.order(order, Instant::now()).await,
-                event = applied.recv(), if applies_open => match event {
-                    Ok(ClientEvent::ProvisionalApplied { author, .. }) => {
-                        driver.prefetch(&author, Instant::now()).await
-                    }
-                    Ok(ClientEvent::ProvisionalSettled {
-                        author,
-                        by_courier: true,
-                        ..
-                    }) => {
-                        driver.couriered.insert(author);
-                        driver.custody_due = true;
-                        Vec::new()
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        applies_open = false;
-                        Vec::new()
-                    }
-                    other => {
-                        driver.custody_due |= moves_custody(other.as_ref());
-                        Vec::new()
-                    }
-                },
+                event = applied.recv(), if applies_open => {
+                    applies_open = !matches!(event, Err(broadcast::error::RecvError::Closed));
+                    driver.replica_event(event, Instant::now()).await
+                }
                 Some(done) = driver.running.next(), if !driver.running.is_empty() => {
                     driver.done(done, Instant::now()).await
                 }
@@ -845,6 +827,36 @@ where
             .chain(self.place_again_at)
             .chain(self.upload_at)
             .min()
+    }
+
+    /// An event of the replica: an applied peer entry places again and
+    /// prefetches its author's files, a row this device's courier call
+    /// settled queues its copy's upload, and any other event that can move
+    /// a custody row runs the custody pass.
+    async fn replica_event(
+        &mut self,
+        event: Result<ClientEvent, broadcast::error::RecvError>,
+        now: Instant,
+    ) -> Vec<Action> {
+        match event {
+            Ok(ClientEvent::ProvisionalApplied { author, .. }) => {
+                self.placement_due = true;
+                self.prefetch(&author, now).await
+            }
+            Ok(ClientEvent::ProvisionalSettled {
+                author,
+                by_courier: true,
+                ..
+            }) => {
+                self.couriered.insert(author);
+                self.custody_due = true;
+                Vec::new()
+            }
+            other => {
+                self.custody_due |= moves_custody(other.as_ref());
+                Vec::new()
+            }
+        }
     }
 
     /// `peer`'s link fell, or a new one replaced it: every ask on it is lost,
