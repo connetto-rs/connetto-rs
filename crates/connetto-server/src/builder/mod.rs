@@ -366,25 +366,21 @@ impl ServerSchema {
         crate::schema::engine_ddl::<D>(&self.pg_ddl, self.devices)
     }
 
-    /// The one catalog the engine classifies, the policies beside
-    /// [`engine_ddl`](Self::engine_ddl) and the cap document the pair
-    /// generates, because a folded read rule reads the policy text the engine
-    /// must hold. The cap is live beside the deployment's own rules, so a
-    /// table it secures refuses a shared fold and answers through the
-    /// per-viewer reads that bind the caller the way a live read does.
+    /// The one catalog the engine classifies, the text the authorization
+    /// model is translated from ([`crate::schema::catalog`]). A
+    /// folded read rule reads the policy text the engine must hold. The cap
+    /// is live beside the deployment's own rules, so a table it secures
+    /// refuses a shared fold and answers through the per-viewer reads that
+    /// bind the caller the way a live read does. A membership term is planned
+    /// for the reader role, whose policies the engine settles from the roles
+    /// the catalog creates.
     ///
     /// # Errors
     ///
     /// [`connetto_schema::SchemaError::Translate`] when either document does
     /// not parse.
     pub fn catalog<D: ConnettoSchema>(&self) -> Result<String, connetto_schema::SchemaError> {
-        let cap = connetto_schema::cap_policies::<RegistryIds<D>>(&self.pg_ddl, &self.pg_policies)?;
-        Ok(format!(
-            "{}\n{}\n{}",
-            self.engine_ddl::<D>(),
-            self.pg_policies,
-            cap
-        ))
+        crate::schema::catalog::<D>(self.documents(), self.devices)
     }
 }
 
