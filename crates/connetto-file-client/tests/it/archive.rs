@@ -3,7 +3,7 @@
 use connetto_client::live::ConnettoClient;
 use connetto_client::{ArchiveAttachment, ExportScope, ImportChoices};
 use connetto_file_client::{
-    ContentClient, ContentError, ContentEvent, FsStore, FsStoreError, Resolved,
+    ContentArchive, ContentClient, ContentError, ContentEvent, FsStore, FsStoreError, Resolved,
 };
 use connetto_file_core::{ChunkHash, ChunkStore, FileId, MimeClass};
 use core::fmt::Write as FmtWrite;
@@ -15,8 +15,9 @@ use tempfile::tempdir;
 use tokio::sync::broadcast;
 
 use crate::support::{
-    RecordingHttp, Scripted, attach_content, connected_client, connected_content_bulk_failing,
-    insert_row_and_pin_album, learn_file_id, offline_client, offline_content, photos, stage_photo,
+    ROOT_KEY, RecordingHttp, Scripted, attach_content, cold_connection, connected_client,
+    connected_content_bulk_failing, insert_row_and_pin_album, learn_file_id, offline_client,
+    offline_content, photos, stage_photo,
 };
 
 const PHOTO: &[u8] = b"an offline photograph that must survive a device replacement";
@@ -240,6 +241,149 @@ async fn unsent_content_restores_under_the_receiving_key_with_its_row_and_outbox
     assert_ne!(target_ciphertext, PHOTO);
 }
 
+#[tokio::test]
+async fn raw_connection_export_restores_every_pending_file_and_row() {
+    let source_dir = tempdir().expect("source directory");
+    let mut source = cold_connection(&source_dir.path().join("replica.sqlite")).await;
+    let archive = ContentArchive::new(FsStore::new(source_dir.path().join("chunks")), ROOT_KEY);
+    archive.install(&mut source).expect("install content");
+    let mut files = Vec::new();
+    for (id, bytes) in [(1, PHOTO), (2, CACHE)] {
+        let manifest = archive
+            .chunk_file(bytes, MimeClass::Jpeg)
+            .await
+            .expect("store content");
+        archive
+            .commit_staged(&mut source, &manifest, |conn, file_id| {
+                diesel::insert_into(photos::table)
+                    .values((
+                        photos::id.eq(id),
+                        photos::content_id.eq(file_id.as_bytes().to_vec()),
+                    ))
+                    .execute(conn)?;
+                Ok(())
+            })
+            .expect("commit photo");
+        files.push(manifest.file_id());
+    }
+    for scope in [ExportScope::Everything, ExportScope::Unsynced] {
+        let bytes = archive
+            .export_local_data(&mut source, scope, Vec::new())
+            .await
+            .expect("export raw connection");
+        let target_dir = tempdir().expect("target directory");
+        let (client, content) = offline_content(target_dir.path()).await;
+        let mut plan = content
+            .prepare_local_data_import(std::io::Cursor::new(bytes))
+            .await
+            .expect("validate every file");
+        assert_eq!((plan.content_files(), plan.custody_files()), (2, 0));
+        content
+            .apply_local_data_import(&mut plan, &ImportChoices::keeping_the_file())
+            .await
+            .expect("restore every file");
+        for (&file_id, expected) in files.iter().zip([PHOTO, CACHE]) {
+            let Resolved::Local { bytes, .. } = content.resolve(file_id).await.expect("resolve")
+            else {
+                panic!("imported content must resolve locally");
+            };
+            assert_eq!(bytes, expected);
+        }
+        let rows: Vec<Vec<u8>> = client
+            .with_conn(|conn| {
+                photos::table
+                    .order(photos::id)
+                    .select(photos::content_id)
+                    .load(conn.conn())
+            })
+            .await
+            .expect("replica is open")
+            .expect("read imported photos");
+        assert_eq!(
+            rows,
+            files
+                .iter()
+                .map(|file| file.as_bytes().to_vec())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            content
+                .pending_work()
+                .await
+                .expect("pending files")
+                .content_files,
+            2
+        );
+    }
+}
+
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_locked_device_refuses_export_without_writing_the_sink() {
+    use connetto_client::{ClientError, ClientEvent};
+    use connetto_core::messages::{ControlMessage, GateState};
+    use connetto_core::traits::IncomingFrame;
+
+    let dir = tempdir().expect("directory");
+    let server = Scripted::new([]);
+    let client = connected_client(&dir.path().join("replica.sqlite"), server.clone()).await;
+    let content = attach_content(
+        client.clone(),
+        &dir.path().join("chunks"),
+        RecordingHttp::default(),
+    )
+    .await;
+    stage_photo(&content, 1, PHOTO, MimeClass::Jpeg).await;
+    let mut events = client.events();
+    server.say(IncomingFrame::Control(ControlMessage::GateState(
+        GateState::Locked,
+    )));
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                events.recv().await.expect("client events"),
+                ClientEvent::Locked
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the relay locks the device");
+    let mut sink = Vec::new();
+    assert!(matches!(
+        content
+            .export_local_data(ExportScope::Everything, &mut sink)
+            .await,
+        Err(ContentError::Client(ClientError::Locked))
+    ));
+    assert_eq!(sink, Vec::<u8>::new());
+    server.say(IncomingFrame::Control(ControlMessage::GateState(
+        GateState::Unlocked,
+    )));
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                events.recv().await.expect("client events"),
+                ClientEvent::Unlocked
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the relay unlocks the device");
+    content
+        .export_local_data(ExportScope::Everything, &mut sink)
+        .await
+        .expect("export unlocked device");
+    let plan = content
+        .prepare_local_data_import(std::io::Cursor::new(sink))
+        .await
+        .expect("validate unlocked export");
+    assert_eq!(plan.content_files(), 1);
+}
+
 async fn export_source(base: &std::path::Path) -> (Vec<u8>, FileId, Vec<u8>) {
     let client = offline_client(&base.join("replica.sqlite")).await;
     let chunks = base.join("chunks");
@@ -431,6 +575,91 @@ async fn corrupt_lengths_hashes_and_file_identities_are_refused_before_apply() {
     )
     .await;
     assert_archive_error(&content, &wrong_identity, "reconstructs as").await;
+}
+
+#[tokio::test]
+async fn duplicate_files_and_invalid_custody_authors_are_refused_before_storage() {
+    let dir = tempdir().expect("directory");
+    let (client, content) = offline_content(dir.path()).await;
+    let file_id = FileId::from_chunks([PHOTO]);
+    let hash = ChunkHash::from_data(PHOTO);
+    let file = serde_json::json!({
+        "file_id": file_id.to_string(),
+        "chunks": [{"hash": hash.to_string(), "len": PHOTO.len()}],
+    });
+    let mut bad_author = file.clone();
+    bad_author["custody"] = serde_json::json!({
+        "author_key": "not-a-device-key",
+        "owner": "anna",
+        "settled_seen_at": null,
+    });
+    for (files, expected) in [
+        (serde_json::json!([file.clone(), file]), "is repeated"),
+        (
+            serde_json::json!([bad_author]),
+            "not 64 lowercase hexadecimal",
+        ),
+    ] {
+        let mut entries = content_attachments(file_id, hash, PHOTO.len(), PHOTO);
+        let index = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "files": files,
+        }))
+        .expect("encode malformed manifest");
+        entries[0] = (
+            ArchiveAttachment::new(
+                "content/manifests.json",
+                u64::try_from(index.len()).expect("index fits"),
+            )
+            .expect("index declaration"),
+            index,
+        );
+        let bytes = raw_archive(&client, entries).await;
+        assert_archive_error(&content, &bytes, expected).await;
+        assert!(
+            !FsStore::new(dir.path().join("chunks"))
+                .has_chunk(&hash)
+                .await
+                .expect("check chunk storage")
+        );
+        assert_eq!(
+            content
+                .pending_work()
+                .await
+                .expect("pending files")
+                .content_files,
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn truncated_device_archive_is_refused_before_content_is_written() {
+    let source_dir = tempdir().expect("source directory");
+    let (mut archive, _, _) = export_source(source_dir.path()).await;
+    archive.truncate(archive.len() / 2);
+    let target_dir = tempdir().expect("target directory");
+    let (_, content) = offline_content(target_dir.path()).await;
+    assert!(
+        content
+            .prepare_local_data_import(std::io::Cursor::new(archive))
+            .await
+            .is_err()
+    );
+    assert!(
+        !FsStore::new(target_dir.path().join("chunks"))
+            .has_chunk(&ChunkHash::from_data(PHOTO))
+            .await
+            .expect("check chunk storage")
+    );
+    assert_eq!(
+        content
+            .pending_work()
+            .await
+            .expect("pending files")
+            .content_files,
+        0
+    );
 }
 
 #[tokio::test]

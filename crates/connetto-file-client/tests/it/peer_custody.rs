@@ -843,3 +843,108 @@ async fn a_settled_custody_copy_survives_the_first_retention_pass_after_import()
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authored_and_custody_content_export_without_duplicate_files() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    let Resolved::Local { bytes, .. } = camp.receiver.resolve(camp.file_id).await.expect("resolve")
+    else {
+        panic!("the custody copy must be local");
+    };
+    let own_bytes = b"a different photograph authored on the holder";
+    let own_file = stage(&camp.receiver, 8, "tester", own_bytes).await;
+    for authored in [false, true] {
+        if authored {
+            assert_eq!(
+                stage(&camp.receiver, 9, "tester", &bytes).await,
+                camp.file_id
+            );
+        }
+        assert_eq!(
+            custody_state(&camp.client, camp.file_id).await.as_deref(),
+            Some("held")
+        );
+        let (pending, custody) = if authored { (2, 0) } else { (1, 1) };
+        for scope in [ExportScope::Everything, ExportScope::Unsynced] {
+            let archive = camp
+                .receiver
+                .export_local_data(scope, Vec::new())
+                .await
+                .expect("export shared content");
+            let dir = tempfile::tempdir().expect("target directory");
+            let (client, restored) = declare_replicated(replica(dir.path(), None).await).await;
+            let mut plan = restored
+                .prepare_local_data_import(std::io::Cursor::new(archive))
+                .await
+                .expect("validate unique content records");
+            assert_eq!(
+                (plan.content_files(), plan.custody_files()),
+                (pending, custody)
+            );
+            restored
+                .apply_local_data_import(&mut plan, &ImportChoices::keeping_the_file())
+                .await
+                .expect("restore content");
+            assert_eq!(
+                restored
+                    .pending_work()
+                    .await
+                    .expect("pending files")
+                    .content_files,
+                u64::try_from(pending).expect("file count fits")
+            );
+            assert_eq!(
+                custody_state(&client, camp.file_id).await.as_deref(),
+                if authored { None } else { Some("held") }
+            );
+            assert_eq!(restored.tidy_content().await.expect("tidy"), 0);
+            for (file_id, expected) in [(camp.file_id, bytes.as_slice()), (own_file, own_bytes)] {
+                let Resolved::Local {
+                    bytes: restored_bytes,
+                    ..
+                } = restored.resolve(file_id).await.expect("resolve restored")
+                else {
+                    panic!("archived content must survive retention");
+                };
+                assert_eq!(restored_bytes, expected);
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_custody_copy_without_a_provisional_author_survives_an_archive() {
+    let camp = Camp::new(1000).await;
+    settle(&camp.client).await;
+    set_state(&camp.client, 7, "lost").await;
+    assert_eq!(
+        camp.receiver.tidy_content().await.expect("adopt lost copy"),
+        0
+    );
+    assert_eq!(
+        camp.receiver
+            .tidy_content()
+            .await
+            .expect("observe settled row"),
+        0
+    );
+    assert_eq!(custody_author(&camp.client, camp.file_id).await, None);
+    for scope in [ExportScope::Everything, ExportScope::Unsynced] {
+        let dir = tempfile::tempdir().expect("target directory");
+        let (client, restored) = round_trip(&camp, scope, dir.path()).await;
+        assert_eq!(custody_author(&client, camp.file_id).await, None);
+        assert_eq!(
+            restored.tidy_content().await.expect("tidy restored copy"),
+            0
+        );
+        assert!(held(&restored, camp.file_id).await);
+        assert_eq!(
+            restored
+                .pending_work()
+                .await
+                .expect("pending files")
+                .content_files,
+            0
+        );
+    }
+}
