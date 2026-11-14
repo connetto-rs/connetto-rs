@@ -14,6 +14,7 @@ use connetto_core::messages::{
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, Major, SchemaVersion, loopback};
 use core::time::Duration;
+use diesel::RunQueryDsl as _;
 use diesel::connection::SimpleConnection as _;
 use sha2::{Digest, Sha256};
 use tokio::time::timeout;
@@ -624,6 +625,129 @@ async fn range_for_other_author_queues_and_sends_after_answer() {
         .expect("the second call stands")
         .expect("the second range settles");
     assert_eq!(report_b.settled, [1]);
+}
+
+/// A provisional application row whose guard refuses its undo.
+fn guarded_entry() -> Conn {
+    let body = real_changeset(1);
+    let mut conn = replica();
+    let row = ManifestRow {
+        seq: 1,
+        major: major(2),
+        origin: None,
+        digest: Sha256::digest(&body).into(),
+    };
+    assert!(matches!(
+        conn.apply_peer_entry(&author_of(AUTHOR), &row, &body)
+            .expect("apply the author's row"),
+        peer::PeerApplyOutcome::Applied { .. }
+    ));
+    adopt(&mut conn, AUTHOR, Some(1));
+    conn.conn()
+        .batch_execute(
+            "CREATE TEMP TRIGGER keep_items BEFORE DELETE ON main.items \
+             BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .expect("guard the application row");
+    conn
+}
+
+#[tokio::test]
+async fn a_store_refused_undo_fails_provisional_and_courier_rulings() {
+    use diesel::{ExpressionMethods as _, QueryDsl as _};
+
+    diesel::table! {
+        items (id) {
+            id -> BigInt,
+        }
+    }
+
+    Box::pin(timeout(BOUND, async {
+        for by_courier in [false, true] {
+            let mut conn = guarded_entry();
+            let records = conn.provisional_rows().expect("read the provenance");
+            assert_eq!(records.len(), 1);
+            let (mut conn, mut server) = attach(conn, true).await;
+            let ask = next_ask(&mut server).await;
+            let _wait = if by_courier {
+                let wait = conn.courier(AUTHOR).await.expect("send the range");
+                let range = next_range(&mut server).await;
+                let _ = next_body(&mut server).await;
+                deliver_answer(
+                    &mut server,
+                    &range.request_id,
+                    CourierOutcome::Entries(vec![(
+                        1,
+                        CourierEntryOutcome::Ruled(Verdict::Abandoned),
+                    )]),
+                )
+                .await;
+                Some(wait)
+            } else {
+                deliver_verdicts(&mut server, &ask.request_id, &[(1, Verdict::Abandoned)]).await;
+                None
+            };
+            let error = loop {
+                match conn.pump_one().await {
+                    Err(error) => break error,
+                    Ok(event) => assert!(
+                        !matches!(
+                            event,
+                            ClientEvent::ProvisionalRetracted { .. } | ClientEvent::Closed
+                        ),
+                        "the failed ruling must preserve the row, got {event:?}"
+                    ),
+                }
+            };
+            assert!(
+                matches!(&error, crate::ClientError::Apply(detail)
+                    if detail.contains("refused putting back")),
+                "courier={by_courier}, {error}"
+            );
+            assert_eq!(
+                items::table
+                    .filter(items::id.eq(1_i64))
+                    .count()
+                    .get_result::<i64>(conn.conn())
+                    .expect("read the guarded row"),
+                1
+            );
+            assert_eq!(
+                conn.provisional_rows().expect("read the provenance"),
+                records
+            );
+            assert!(matches!(
+                peer::state_of(&mut conn.db, &AUTHOR, 1),
+                Ok(Some(HeldState::Provisional))
+            ));
+
+            conn.conn()
+                .batch_execute("DROP TRIGGER keep_items")
+                .expect("release the row guard");
+            conn.retract_peer_entry(
+                &author_of(AUTHOR),
+                &connetto_core::exchange::Retraction {
+                    seq: 1,
+                    cause: connetto_core::exchange::RetractCause::Abandoned,
+                },
+            )
+            .expect("retry the retraction");
+            assert_eq!(
+                items::table
+                    .count()
+                    .get_result::<i64>(conn.conn())
+                    .expect("read the application rows"),
+                0
+            );
+            assert_eq!(
+                conn.provisional_rows().expect("read the provenance"),
+                Vec::new()
+            );
+            assert!(matches!(peer::state_of(&mut conn.db, &AUTHOR, 1), Ok(None)));
+        }
+    }))
+    .await
+    .expect("both ruling failures arrive within the bound");
 }
 
 /// A ruled answer settles its rows the way a ruling would: the provisional
