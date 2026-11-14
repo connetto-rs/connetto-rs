@@ -4,8 +4,8 @@
 //! adds its own local tier, so it runs the shared schema step over those four. The
 //! tier history lives in `tier_history` beside the source, and the build
 //! step only reads that directory. Its exports are written by
-//! `connetto-schema export-tier`, run from the workspace root as `cargo run
-//! -p connetto-schema --bin connetto-schema -- export-tier --schema
+//! `demo-schema export-tier`, run from the workspace root as `cargo run
+//! -p connetto-demo-tools --bin demo-schema -- export-tier --schema
 //! examples/deployment/schema.sql --tier examples/wasm-smoke/frontend.sql
 //! --dir examples/wasm-smoke/tier_history`.
 

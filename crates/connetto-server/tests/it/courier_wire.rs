@@ -42,9 +42,9 @@ use rcgen::{KeyPair, PublicKeyData as _};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::device_identity::{challenge_nonce, enrol_request, reply};
-use super::e2e::{PG_SERIAL, mint_tokens, reset_fixture};
 use super::enrolment::{device_key, rooted_issuer};
-use super::lifecycle::{admin_pool, builder_over, next_control, served_major, wait_ready};
+use super::lifecycle::{admin_pool, builder_over, next_control, wait_ready};
+use connetto_test_harness::server_fixture::{PG_SERIAL, mint_tokens, reset_fixture, served_major};
 
 /// The manager every stream test drives, the courier path switched on.
 fn courier_on(fixture: &Fixture, store: &Enrolments) -> Manager {
@@ -1048,36 +1048,6 @@ async fn a_store_failure_in_a_range_ends_the_connection() {
     fixture
         .setup(&["DROP FUNCTION refuse_writer_rows() CASCADE"])
         .await;
-}
-
-/// The binary refuses to boot on a `CONNETTO_COURIER` that is neither `on`
-/// nor `off`, naming it.
-#[tokio::test]
-async fn the_binary_refuses_an_unknown_courier_switch() {
-    use super::e2e::{build_auth_stack, run_server_exit_output, with_user_url};
-
-    let _keyring = isolated_session_keyring();
-    let _serial = PG_SERIAL.lock().await;
-    let fixture = Fixture::acquire().await;
-    let url = fixture.admin_url().to_owned();
-    let reader_url = with_user_url(&url, "app_reader", "app_reader");
-    let auth_stack = build_auth_stack().await;
-    let auth_env = auth_stack.env_pairs("http://127.0.0.1:0");
-    let mut envs: Vec<(&str, &str)> = auth_env
-        .iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
-    envs.push(("CONNETTO_COURIER", "yes"));
-    let output = run_server_exit_output(&url, Some(&reader_url), &envs).await;
-    assert!(
-        !output.status.success(),
-        "the unknown switch refuses the boot"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("unknown CONNETTO_COURIER \"yes\""),
-        "the refusal names the value, got: {stderr}"
-    );
 }
 
 /// A manager whose courier bucket holds `limit` bytes a minute.

@@ -1,6 +1,6 @@
 //! R79 slice 8 proof, the camp shape in one process. Three signed-in native
-//! clients of different accounts run against the demo deployment the real
-//! `connetto-server` binary serves, each with a content client over its
+//! clients of different accounts run against the demo deployment the demo's
+//! `demo-server` serves, each with a content client over its
 //! replica, and the peer link carries a photo while the server is away.
 //!
 //! Alice and bob sit in a team the photo is posted to, and carl does not.

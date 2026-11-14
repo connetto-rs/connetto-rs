@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! CONNETTO_ASC_KEY_ID=… CONNETTO_ASC_ISSUER=… CONNETTO_ASC_KEY=AuthKey_….p8 \
-//!   cargo run -p connetto-test-harness --bin connetto-ios-signing
+//!   cargo run -p connetto-demo-stack --bin connetto-ios-signing
 //! ```
 //!
 //! Every step reuses what already exists. The signing key and certificate

@@ -165,7 +165,7 @@ pub async fn provision(
 }
 
 impl Provisioned {
-    /// The environment `connetto-server` runs this deployment with, serving
+    /// The environment `demo-server` runs this deployment with, serving
     /// sync, login and file routes on `bind`.
     pub fn server_env(
         &self,
@@ -421,7 +421,7 @@ impl Drop for TaskGuard {
     }
 }
 
-/// Spawn `connetto-server` with `envs` and wait until its listener accepts.
+/// Spawn `demo-server` with `envs` and wait until its listener accepts.
 /// Dropping the returned child, or any error on the way, kills the server.
 ///
 /// # Errors
@@ -439,12 +439,12 @@ pub async fn spawn_server(
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .context("spawning connetto-server")?;
-    wait_for_child_port(&mut child, bind, "connetto-server").await?;
+        .context("spawning demo-server")?;
+    wait_for_child_port(&mut child, bind, "demo-server").await?;
     Ok(child)
 }
 
-/// Build `connetto-server` in the [`test_profile`] unless `CONNETTO_SERVER_BIN`
+/// Build `demo-server` in the [`test_profile`] unless `CONNETTO_SERVER_BIN`
 /// names one, and return its path.
 ///
 /// # Errors
@@ -461,7 +461,7 @@ pub async fn ensure_server_bin() -> Result<PathBuf> {
     let profile = test_profile();
     // Cargo writes the dev profile to target/debug and every other profile under its own name.
     let output = if profile == "dev" { "debug" } else { &profile };
-    let candidate = target_dir()?.join(output).join(exe_name("connetto-server"));
+    let candidate = target_dir()?.join(output).join(exe_name("demo-server"));
     // The build runs even when the binary exists. A cached tree can hold a
     // server from another commit, and cargo's fingerprinting makes the warm
     // case a no-op while a stale exists() shortcut cannot.
@@ -470,17 +470,16 @@ pub async fn ensure_server_bin() -> Result<PathBuf> {
         "build",
         "--profile",
         &profile,
-        "--all-features",
         "-p",
-        "connetto-server",
+        "connetto-demo-tools",
         "--bin",
-        "connetto-server",
+        "demo-server",
     ]);
     run_process(OsStr::new("cargo"), &args, &[]).await?;
     if candidate.exists() {
         Ok(candidate)
     } else {
-        Err(anyhow!("connetto-server was not found after the build"))
+        Err(anyhow!("demo-server was not found after the build"))
     }
 }
 

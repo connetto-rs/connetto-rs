@@ -14,7 +14,7 @@ use std::time::Duration;
 use connetto_server::preflight::{self, Artifact, PreflightError};
 use connetto_test_harness::{Fixture, pool_for};
 
-use super::e2e::with_user_url;
+use connetto_test_harness::server_fixture::with_user_url;
 
 /// A membership table under a policy that binds a setting, owned by a role
 /// that is neither a superuser nor `BYPASSRLS`, and readable by a second role.

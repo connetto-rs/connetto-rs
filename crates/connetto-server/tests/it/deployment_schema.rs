@@ -17,8 +17,8 @@ use diesel_async::RunQueryDsl as _;
 use diesel_async::pooled_connection::bb8::Pool;
 use tokio::net::TcpListener;
 
-use super::e2e::{PG_SERIAL, exec, mint_tokens, reset_fixture};
 use super::lifecycle::{admin_pool, builder_over, live_session, next_control, wait_ready};
+use connetto_test_harness::server_fixture::{PG_SERIAL, exec, mint_tokens, reset_fixture};
 
 /// The deployment's schema, every default member over a `Uuid` id but the
 /// writers, which live in tables of its own.

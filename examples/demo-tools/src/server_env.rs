@@ -1,13 +1,5 @@
-//! The connetto sync server as a runnable process.
-//!
-//! The binary is a translation from its environment into a
-//! [`ServerBuilder`], which owns the assembly, and from its signal surface
-//! into the process outcome. It reads every setting, hands over the named
-//! collaborators, binds the one listener, and serves through the builder's
-//! own lifecycle. It owns what a process owns and a library must not own:
-//! the logging, the shutdown signal, and the exit code.
-//!
-//! Configuration comes from the environment:
+//! The demo server's settings, read from the environment into a
+//! [`ServerBuilder`] by [`builder_from_env`]:
 //!
 //! - `CONNETTO_BIND` (default `127.0.0.1:8080`): the one listener that
 //!   serves the `/sync` WebSocket route, the login endpoints, and the file
@@ -88,7 +80,7 @@
 //!   `CONNETTO_CONTENT_WARN_FRACTION` (default `0.8`) and
 //!   `CONNETTO_CONTENT_CEILING_REFRESH_SECS` (default `10`).
 //! - `CONNETTO_DEVICE_ISSUER_DIR` (unset, devices cannot enrol): a directory
-//!   `connetto-ca issuer` wrote, holding `issuer.der` and `issuer.key` (R74).
+//!   `demo-ca issuer` wrote, holding `issuer.der` and `issuer.key` (R74).
 //!   Set, the deployment's enrolment tables are required, and the server
 //!   refuses to start when the root did not sign the issuer or the issuer has
 //!   expired, and warns when it has less than sixty days left. Every other
@@ -99,7 +91,7 @@
 //!   directories of issuers the current one replaced, which keep signing the
 //!   lists of their own certificates until they expire.
 //! - `CONNETTO_DEVICE_ROOT_LIST`: the path of the `root-list.der`
-//!   `connetto-ca revoke-issuer` wrote, published beside the issuers' lists.
+//!   `demo-ca revoke-issuer` wrote, published beside the issuers' lists.
 //! - `CONNETTO_DEVICE_CERT_DEFAULT_SECS`: a device certificate's lifetime when
 //!   the application requests none (default 86400).
 //! - `CONNETTO_DEVICE_CERT_CEILING_SECS`: the longest lifetime granted, a
@@ -116,10 +108,6 @@
 //! - `CONNETTO_DEVICE_ANDROID_STATUS`: the source of the Android attestation
 //!   status list, a `http` or `https` URL (Google's by default) or a path
 //!   to a local file.
-//!
-//! The process exits `1` when the change stream cannot answer what a row
-//! looked like before it changed, or gives up reconnecting, and returns its
-//! build or HTTP errors as failures.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -127,17 +115,17 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use connetto_core::device_cert::layout::{ISSUER_CERTIFICATE, ISSUER_KEY};
 use connetto_core::device_cert::{AttestationLevel, DeviceIssuer};
-use connetto_core::env::{read_ddl, var_or};
 use connetto_core::messages::SignedList;
 use connetto_server::builder::{
-    ContentSettings, Database, OidcProvider, OpenFga, ServeError, ServerBuilder, ServerSchema,
-    StoreSpec, TokenKeys,
+    ContentSettings, Database, OidcProvider, OpenFga, ServerBuilder, ServerSchema, StoreSpec,
+    TokenKeys,
 };
 use connetto_server::device_cert::{AndroidStatus, AppAttestEnvironment, DeviceCertConfig};
 use connetto_server::{
     AuthConfig, CookieSameSite, OidcProviderConfig, ReaderReserve, RuntimeWritableCatalog,
 };
-use tokio::net::TcpListener;
+
+use crate::env::{read_ddl, var_or};
 
 /// Read a `u32` from `<key>`, or `default` when unset.
 fn env_u32(key: &str, default: u32) -> Result<u32> {
@@ -461,7 +449,7 @@ fn read_file(what: &str, path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("reading {what} at {}", path.display()))
 }
 
-/// The issuer `connetto-ca issuer` wrote into `dir`, which `root` signed.
+/// The issuer `demo-ca issuer` wrote into `dir`, which `root` signed.
 fn issuer_in(dir: &str, root: &[u8]) -> Result<DeviceIssuer> {
     let dir = Path::new(dir);
     let certificate = read_file("the issuer certificate", &dir.join(ISSUER_CERTIFICATE))?;
@@ -541,7 +529,13 @@ fn device_certs() -> Result<Option<DeviceCertConfig>> {
     Ok(Some(config))
 }
 
-async fn builder_from_env() -> Result<ServerBuilder> {
+/// A [`ServerBuilder`] configured by every setting the module names.
+///
+/// # Errors
+///
+/// When a required setting is unset, or a setting or a file it names cannot be
+/// read or parsed. The error names the setting.
+pub async fn builder_from_env() -> Result<ServerBuilder> {
     let auth = var_or("CONNETTO_AUTH", "");
     match auth.as_str() {
         "database" => {}
@@ -607,58 +601,6 @@ async fn builder_from_env() -> Result<ServerBuilder> {
         .device_identity(device_identity)
         .sunset(sunset)
         .courier(courier))
-}
-
-/// Resolve on the first SIGINT or SIGTERM. On a platform without SIGTERM only
-/// the interrupt arm can fire.
-async fn shutdown_signal() {
-    let interrupt = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "no SIGTERM handler, interrupt only");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        () = interrupt => {}
-        () = terminate => {}
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // `pg_walstream` reports every standby status update at `info`, which is
-    // one line per ten seconds whether or not anything happened, and it
-    // buries this server's own events. `RUST_LOG` brings it back.
-    connetto_core::logging::init_stdout_with_default("info,pg_walstream=warn");
-    let builder = builder_from_env().await?;
-    let bind = var_or("CONNETTO_BIND", "127.0.0.1:8080");
-    let listener = TcpListener::bind(&bind)
-        .await
-        .with_context(|| format!("binding {bind}"))?;
-    tracing::info!(bind = %bind, "serving the sync, login and file routes");
-    match builder.serve(listener, shutdown_signal()).await {
-        Ok(()) => Ok(()),
-        Err(err @ ServeError::ChangeStreamUnusable(_)) => {
-            tracing::error!(error = %err, "the change stream cannot answer, refusing to serve");
-            std::process::exit(1);
-        }
-        Err(err @ ServeError::ChangeStreamStopped(_)) => {
-            tracing::error!(error = %err, "the change stream stopped, refusing to serve");
-            std::process::exit(1);
-        }
-        Err(err) => Err(err.into()),
-    }
 }
 
 #[cfg(test)]

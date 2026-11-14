@@ -41,9 +41,11 @@ use uuid::Uuid;
 
 use super::builder_coverage::apply_content_deployment;
 use super::device_identity::{challenge_nonce, enrol_request};
-use super::e2e::{PG_SERIAL, exec, mint_tokens, reset_audit_table, signing_keys, with_user_url};
 use super::enrolment::{device_key, rooted_issuer};
 use super::lifecycle::{admin_pool, next_control, wait_ready};
+use connetto_test_harness::server_fixture::{
+    PG_SERIAL, exec, mint_tokens, reset_audit_table, signing_keys, with_user_url,
+};
 
 /// The schema document declares no RLS, the policies document carries it.
 const PG_DDL: &str = "-- connetto:major 1\n\

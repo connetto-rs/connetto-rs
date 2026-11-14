@@ -1,7 +1,7 @@
 //! Docker-gated multi-process end-to-end tests.
 //!
-//! Spawn the real `connetto-server` and `connetto-client` binaries as separate
-//! OS processes and drive a full sync loop over real Postgres logical
+//! Spawn the real `demo-server` and `demo-client` binaries as separate OS
+//! processes and drive a full sync loop over real Postgres logical
 //! replication. The suite starts its own containerised OIDC provider, so every
 //! spawned server carries a real OIDC configuration and every spawned client
 //! carries a minted connetto access token. One test covers the read direction:
@@ -13,19 +13,10 @@
 //! end to end, unlike the in-process session tests.
 //!
 //! Needs Docker: the fixture starts its own Postgres, its own `OpenFGA`, and
-//! its own OIDC provider, and both binaries must be built in the same profile
-//! as the test. Run it with:
-//!
-//! ```text
-//! cargo build --release -p connetto-server --bin connetto-server
-//! cargo build --release -p connetto-client --bin connetto-client --all-features
-//! cargo test --release -p connetto-server --test e2e
-//! ```
-//!
+//! its own OIDC provider. Cargo builds both binaries for this target.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use diesel::sql_query;
@@ -37,6 +28,11 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use tempfile::TempDir;
 
 use connetto_client::{ReplicaKey, cipher};
+use connetto_test_harness::server_fixture::{
+    Authorization, NO_POLICIES, OWNED_PG_DDL, OWNED_POLICIES, PG_DDL, PG_SERIAL, QUERY, audit_ops,
+    exec, mint_refresh_token, mint_token, orders, reset_fixture, served_major, signing_keys,
+    with_user_url,
+};
 use connetto_test_harness::{
     Fixture, MOCK_OAUTH_PROVIDER, MockOauth, PUBLICATION, SLOT, provision_cap_policies,
 };
@@ -44,63 +40,14 @@ use keyring_core::Entry;
 use openidconnect::reqwest;
 use serde_json::json;
 
-pub(super) const PG_DDL: &str = "-- connetto:major 1\nCREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, \
-    status TEXT);";
-pub(super) const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
-pub(super) const OWNED_PG_DDL: &str =
-    "-- connetto:major 1\nCREATE TABLE owned (id INT PRIMARY KEY, owner TEXT, body TEXT);";
 const OWNED_QUERY: &str = "SELECT * FROM owned";
-/// The policy document the `owned` fixture's server derives its model from.
-///
-/// The schema and the policies reach the binary as two documents, so the
-/// statement enabling row-level security belongs here beside the policy rather
-/// than in [`OWNED_PG_DDL`], which is what clients sync.
-pub(super) const OWNED_POLICIES: &str = "ALTER TABLE owned ENABLE ROW LEVEL SECURITY;\n\
-     CREATE POLICY owned_p ON owned USING (owner = current_setting('app.user_id', true));";
-
-/// `orders` carries no policy at all, so its document is empty.
-///
-/// The database filters none of its rows and the model has to agree, which the
-/// translator reports and the change path answers with no round trip.
-pub(super) const NO_POLICIES: &str = "";
-
-// The client replica's `orders` table, typed for the poller's count query.
-diesel::table! {
-    /// Row from the orders test fixture.
-    orders (id) {
-        /// Order identifier, the primary key.
-        id -> Integer,
-        /// Unit price.
-        price -> Nullable<Double>,
-        /// Number of units.
-        quantity -> Nullable<Integer>,
-        /// Order status.
-        status -> Nullable<Text>,
-    }
-}
-
-/// Serializes the Docker-gated tests. They reset the same Postgres and share one
-/// replication slot and publication name, so they must not run concurrently.
-pub(super) static PG_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 fn server_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_connetto-server"))
+    PathBuf::from(env!("CARGO_BIN_EXE_demo-server"))
 }
 
-/// The client binary is a sibling of the server binary in the same target
-/// profile directory. It is built by a separate crate, so it must already
-/// exist here. CI builds it before this suite (the `server` shard compiles
-/// both `connetto-server` and `connetto-client`), so the staleness is a
-/// local-only trap, and a change to `connetto-client` is not picked up by a bare
-/// `cargo test -p connetto-server --test it`. Rebuild it with
-/// `cargo build -p connetto-client --features="native-transport native-auth"`
-/// before re-running these tests after a client change.
-pub(super) fn client_bin() -> PathBuf {
-    server_bin()
-        .parent()
-        .expect("target profile directory")
-        .join("connetto-client")
+fn client_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_demo-client"))
 }
 
 /// Kills its child on drop so a panicking assertion never leaks a process.
@@ -451,82 +398,6 @@ async fn await_serving(
     }
 }
 
-/// What a spawned server needs to build its change-path executor: the policy
-/// text its authorization model is derived from, and the store it writes that
-/// model into.
-///
-/// A store per server rather than one shared, so two tests in one run cannot
-/// read each other's rules or facts.
-pub(super) struct Authorization {
-    policies: String,
-    pub(super) endpoint: String,
-    pub(super) store: String,
-}
-
-impl Authorization {
-    pub(super) async fn provision(fixture: &Fixture, policies: &str) -> Self {
-        let endpoint = fixture.fga_url().await.to_owned();
-        let (_channel, store) = fixture.fga_store().await;
-        Self {
-            policies: policies.to_owned(),
-            endpoint,
-            store,
-        }
-    }
-
-    pub(super) fn env_pairs(&self) -> [(&str, &str); 3] {
-        [
-            ("CONNETTO_PG_POLICIES", self.policies.as_str()),
-            ("CONNETTO_FGA_URL", self.endpoint.as_str()),
-            ("CONNETTO_FGA_STORE", self.store.as_str()),
-        ]
-    }
-
-    /// Every tuple in the store whose user names `who`.
-    pub(super) async fn tuples_naming(&self, who: &str) -> Vec<String> {
-        use openfga_client::client::{OpenFgaServiceClient, ReadRequest};
-        let mut client = OpenFgaServiceClient::connect(self.endpoint.clone())
-            .await
-            .expect("connect to the authorization service");
-        let mut found = Vec::new();
-        let mut continuation_token = String::new();
-        loop {
-            let page = client
-                .read(ReadRequest {
-                    store_id: self.store.clone(),
-                    continuation_token,
-                    ..ReadRequest::default()
-                })
-                .await
-                .expect("read the store")
-                .into_inner();
-            found.extend(
-                page.tuples
-                    .into_iter()
-                    .filter_map(|tuple| tuple.key)
-                    .filter(|key| key.user.contains(who))
-                    .map(|key| format!("{} {} {}", key.user, key.relation, key.object)),
-            );
-            if page.continuation_token.is_empty() {
-                return found;
-            }
-            continuation_token = page.continuation_token;
-        }
-    }
-
-    /// Poll the store until a tuple names `who`, or 30 seconds pass.
-    pub(super) async fn await_tuples(&self, who: &str) -> Vec<String> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let found = self.tuples_naming(who).await;
-            if !found.is_empty() || std::time::Instant::now() >= deadline {
-                return found;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-}
-
 pub(super) fn spawn_server_cfg(
     database_url: &str,
     bind: &str,
@@ -632,72 +503,6 @@ pub(super) fn spawn_client_env(
     ChildGuard::terminating(child)
 }
 
-/// Run a single DDL/DML statement in its own transaction (autocommit).
-pub(super) async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
-    let mut conn = pool.get().await.expect("admin connection");
-    sql_query(sql)
-        .execute(&mut *conn)
-        .await
-        .unwrap_or_else(|err| panic!("statement failed ({sql}): {err}"));
-}
-
-/// Drop and recreate the audit table every server appends access changes to,
-/// so each run reads its own rows.
-pub(super) async fn reset_audit_table(pool: &Pool<AsyncPgConnection>) {
-    exec(pool, "DROP TABLE IF EXISTS auth_events").await;
-    exec(pool, "DROP TYPE IF EXISTS connetto_auth_op").await;
-    connetto_test_harness::provision_audit(pool).await;
-}
-
-/// Reset the orders fixture, auth tables and reader role for one server run.
-pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixture) {
-    exec(pool, "DROP TABLE IF EXISTS orders CASCADE").await;
-    // Stale writer state from a previous run would suppress replayed
-    // mutations, so recreate the writer tables fresh.
-    exec(pool, "DROP TABLE IF EXISTS _connetto_settled").await;
-    exec(pool, "DROP TABLE IF EXISTS _connetto_writers").await;
-    exec(pool, "DROP TABLE IF EXISTS _connetto_session_writers").await;
-    exec(pool, "DROP TABLE IF EXISTS _connetto_courier_notices").await;
-    connetto_test_harness::provision_writers(pool).await;
-    reset_audit_table(pool).await;
-    exec(pool, PG_DDL).await;
-    provision_cap_policies(pool, PG_DDL, NO_POLICIES).await;
-    exec(
-        pool,
-        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
-         THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
-    )
-    .await;
-    exec(pool, "GRANT USAGE ON SCHEMA public TO app_reader").await;
-    exec(pool, "GRANT SELECT ON auth_events TO app_reader").await;
-    exec(
-        pool,
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO app_reader",
-    )
-    .await;
-    exec(
-        pool,
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
-         _connetto_session_writers, _connetto_courier_notices TO app_reader",
-    )
-    .await;
-    exec(
-        pool,
-        "GRANT USAGE ON SEQUENCE _connetto_courier_notices_id_seq TO app_reader",
-    )
-    .await;
-    exec(pool, "INSERT INTO orders VALUES (1, 1.0, 3, 'seed')").await;
-    fixture.start_replication(&["orders"]).await;
-}
-
-/// Rewrite a Postgres URL's user info, keeping host, port, and database. Used to
-/// point the server's write target at a non-superuser role subject to RLS.
-pub(super) fn with_user_url(url: &str, user: &str, password: &str) -> String {
-    let (scheme, rest) = url.split_once("://").expect("url has a scheme");
-    let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
-    format!("{scheme}://{user}:{password}@{host}")
-}
-
 /// The `(id, owner)` rows in `owned`, read through the admin pool so RLS hides
 /// none.
 async fn pg_owned_rows(pool: &Pool<AsyncPgConnection>) -> Vec<(i32, String)> {
@@ -785,27 +590,6 @@ impl AuthStack {
     }
 }
 
-/// A token signing key pair on disk, so an access token outlives the server
-/// restart the way it does in a deployment that supplies its keys.
-pub(super) fn signing_keys(dir: &TempDir) -> (String, String) {
-    let private = dir.path().join("jwt.pem");
-    let public = dir.path().join("jwt.pub.pem");
-    let run = |args: &[&str]| {
-        let status = Command::new("openssl")
-            .args(args)
-            .status()
-            .expect("run openssl");
-        assert!(status.success(), "openssl {args:?} failed");
-    };
-    let (private, public) = (
-        private.to_string_lossy().into_owned(),
-        public.to_string_lossy().into_owned(),
-    );
-    run(&["genpkey", "-algorithm", "ed25519", "-out", &private]);
-    run(&["pkey", "-in", &private, "-pubout", "-out", &public]);
-    (private, public)
-}
-
 /// Start the mock OAuth provider and mint the JWT key files it signs with.
 pub(super) async fn build_auth_stack() -> AuthStack {
     let idp = MockOauth::start().await;
@@ -819,106 +603,9 @@ pub(super) async fn build_auth_stack() -> AuthStack {
     }
 }
 
-/// Drive the login dance through the server binary's auth endpoints and return
-/// the callback JSON body.
-pub(super) async fn token_body(auth_base: &str, subject: &str) -> serde_json::Value {
-    let agent = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("build token-mint HTTP client");
-
-    let login = agent
-        .get(format!("{auth_base}/auth/login"))
-        .query(&[("provider", MOCK_OAUTH_PROVIDER)])
-        .send()
-        .await
-        .expect("GET /auth/login");
-    assert!(
-        login.status().is_redirection(),
-        "login must redirect, got {}",
-        login.status()
-    );
-    let authorize_url = login
-        .headers()
-        .get("location")
-        .expect("location on login redirect")
-        .to_str()
-        .expect("utf-8 location")
-        .to_owned();
-
-    let authorized = agent
-        .post(&authorize_url)
-        .form(&[("username", subject)])
-        .send()
-        .await
-        .expect("POST idp authorize");
-    assert!(
-        authorized.status().is_redirection(),
-        "idp authorize must redirect, got {}",
-        authorized.status()
-    );
-    let callback_url = authorized
-        .headers()
-        .get("location")
-        .expect("location on authorize redirect")
-        .to_str()
-        .expect("utf-8 location")
-        .to_owned();
-
-    let callback = agent
-        .get(&callback_url)
-        .send()
-        .await
-        .expect("GET /auth/callback");
-    let body = callback.text().await.expect("callback body");
-    serde_json::from_str(&body).expect("callback JSON body")
-}
-
-/// Drive the login dance through the server's auth endpoints for `subject`
-/// and return the minted `(access_token, user_id, refresh_token)` triple.
-pub(super) async fn mint_tokens(auth_base: &str, subject: &str) -> (String, String, String) {
-    let body = token_body(auth_base, subject).await;
-    let access_token = body["access_token"]
-        .as_str()
-        .expect("access_token in callback JSON")
-        .to_owned();
-    let user_id = body["user_id"]
-        .as_str()
-        .expect("user_id in callback JSON")
-        .to_owned();
-    let refresh_token = body["refresh_token"]
-        .as_str()
-        .expect("refresh_token in callback JSON")
-        .to_owned();
-    (access_token, user_id, refresh_token)
-}
-
-/// Drive the login dance through the server binary's auth endpoints and return
-/// the minted `(access_token, user_id)` pair.
-pub(super) async fn mint_token(auth_base: &str) -> (String, String) {
-    let (access_token, user_id, _refresh) = mint_tokens(auth_base, "e2e-user").await;
-    (access_token, user_id)
-}
-
-/// The refresh token from the same login dance, which `mint_token` discards.
-///
-/// Only the audit test needs it, because logging out is the one producer
-/// reachable from outside the process.
-pub(super) async fn mint_refresh_token(auth_base: &str) -> String {
-    let (_access, _user, refresh) = mint_tokens(auth_base, "e2e-user").await;
-    refresh
-}
-
 #[tokio::test]
 async fn e2e_two_clients_snapshot_live_and_reconnect() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    assert!(
-        client_bin().exists(),
-        "client binary missing at {}: build it with the same profile, \
-         `cargo build --release -p connetto-client --bin connetto-client`",
-        client_bin().display()
-    );
-
     let _serial = PG_SERIAL.lock().await;
 
     let fixture = Fixture::acquire().await;
@@ -999,13 +686,6 @@ async fn e2e_two_clients_snapshot_live_and_reconnect() {
 #[tokio::test]
 async fn e2e_client_write_lands_in_pg_and_fans_out() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    assert!(
-        client_bin().exists(),
-        "client binary missing at {}: build it with the same profile, \
-         `cargo build --release -p connetto-client --bin connetto-client`",
-        client_bin().display()
-    );
-
     let _serial = PG_SERIAL.lock().await;
 
     let fixture = Fixture::acquire().await;
@@ -1079,13 +759,6 @@ async fn e2e_client_write_lands_in_pg_and_fans_out() {
 #[tokio::test]
 async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    assert!(
-        client_bin().exists(),
-        "client binary missing at {}: build it with the same profile, \
-         `cargo build --release -p connetto-client --bin connetto-client`",
-        client_bin().display()
-    );
-
     let fixture = Fixture::acquire().await;
     let url = fixture.admin_url().to_owned();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
@@ -1261,13 +934,6 @@ async fn e2e_a_taken_port_starts_the_server_again_on_fresh_ports() {
 #[tokio::test]
 async fn e2e_unrestricted_table_delivers_without_policy() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    assert!(
-        client_bin().exists(),
-        "client binary missing at {}: build it with the same profile, \
-         `cargo build --release -p connetto-client --bin connetto-client`",
-        client_bin().display()
-    );
-
     let _serial = PG_SERIAL.lock().await;
 
     let fixture = Fixture::acquire().await;
@@ -1651,12 +1317,6 @@ async fn e2e_startup_refuses_without_an_auth_store() {
 #[tokio::test]
 async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    assert!(
-        client_bin().exists(),
-        "client binary missing at {}: build it with the same profile, \
-         `cargo build --release -p connetto-client --bin connetto-client --all-features`",
-        client_bin().display()
-    );
     let _serial = PG_SERIAL.lock().await;
 
     let fixture = Fixture::acquire().await;
@@ -1828,26 +1488,9 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
     );
 }
 
-/// Every `op` recorded so far, in order.
-pub(super) async fn audit_ops(pool: &Pool<AsyncPgConnection>) -> Vec<String> {
-    #[derive(QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        op: String,
-    }
-    let mut conn = pool.get().await.expect("connection");
-    let rows: Vec<Row> =
-        sql_query("SELECT CAST(op AS TEXT) AS op FROM auth_events ORDER BY at, op")
-            .get_results(&mut conn)
-            .await
-            .expect("read auth_events");
-    rows.into_iter().map(|row| row.op).collect()
-}
-
 /// Removes every artifact the content tests create, so each run starts from
 /// the deployment state its name describes. One statement per entry because
 /// diesel sends each query prepared, and Postgres refuses a batch there.
-#[cfg(feature = "content")]
 const CONTENT_DROP_STATEMENTS: &[&str] = &[
     "DROP TABLE IF EXISTS photos CASCADE",
     "DROP FUNCTION IF EXISTS connetto_visible_files(BYTEA[])",
@@ -1862,7 +1505,6 @@ const CONTENT_DROP_STATEMENTS: &[&str] = &[
 /// in the demos: the metadata table the three contract functions consult and
 /// the functions themselves. Its photos carry no owner, so the owner
 /// function names nobody.
-#[cfg(feature = "content")]
 const CONTENT_CONTRACT_STATEMENTS: &[&str] = &[
     "CREATE TABLE photos (content_id BYTEA PRIMARY KEY, content_state TEXT NOT NULL \
      DEFAULT 'staged')",
@@ -1882,7 +1524,6 @@ const CONTENT_CONTRACT_STATEMENTS: &[&str] = &[
 ///
 /// The shipped [`connetto_file_server::DEPLOYMENT_DDL`] is one text of several
 /// statements; comment-only fragments carry no statement to send.
-#[cfg(feature = "content")]
 async fn apply_content_deployment(pool: &Pool<AsyncPgConnection>, ready: bool) {
     for stmt in CONTENT_DROP_STATEMENTS {
         exec(pool, stmt).await;
@@ -1904,14 +1545,12 @@ async fn apply_content_deployment(pool: &Pool<AsyncPgConnection>, ready: bool) {
 }
 
 /// One file id of the shape the routes parse.
-#[cfg(feature = "content")]
 fn sample_file_id() -> String {
     "ab".repeat(32)
 }
 
 /// Writes a PKCS#8 v1 ed25519 document, the shape `CONNETTO_CONTENT_KEY`
 /// loads, through the same ring keypair the signer parses.
-#[cfg(feature = "content")]
 fn generate_ticket_key(path: &std::path::Path) {
     let keypair = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
         .expect("generate the content ticket key");
@@ -1926,7 +1565,6 @@ fn generate_ticket_key(path: &std::path::Path) {
 /// 400 naming the missing `t` query parameter), which distinguishes them
 /// from the bare 404 of an unmounted path. A bad ticket answers 404, the
 /// same code the router itself emits, so the 400 is what proves the mount.
-#[cfg(feature = "content")]
 #[tokio::test]
 async fn e2e_content_routes_mount_on_the_auth_listener() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
@@ -2007,7 +1645,6 @@ async fn e2e_content_routes_mount_on_the_auth_listener() {
 
 /// With content configured but the file server's tables absent, startup
 /// refuses naming the preflight that failed.
-#[cfg(feature = "content")]
 #[tokio::test]
 async fn e2e_content_startup_refuses_a_deployment_without_the_file_tables() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
@@ -2061,7 +1698,6 @@ async fn e2e_content_startup_refuses_a_deployment_without_the_file_tables() {
 
 /// A `CONNETTO_CONTENT_STORE` the parser rejects names the variable in the
 /// refusal.
-#[cfg(feature = "content")]
 #[tokio::test]
 async fn e2e_content_startup_refuses_an_unparsable_store_spec() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
@@ -2101,7 +1737,6 @@ async fn e2e_content_startup_refuses_an_unparsable_store_spec() {
 /// Every remaining way the content settings can be wrong, each refused with
 /// a message naming the setting or the file at fault. One boot per case
 /// because the refusals are what the case is, not a fixture to reuse.
-#[cfg(feature = "content")]
 #[tokio::test]
 async fn e2e_content_startup_names_each_refused_setting() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
@@ -2208,7 +1843,6 @@ async fn e2e_content_startup_names_each_refused_setting() {
 /// URL that rides the query, and that URL answers its download route.
 ///
 /// A generated ticket keypair signs the ticket the bare download verifies.
-#[cfg(feature = "content")]
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
@@ -2278,7 +1912,7 @@ async fn e2e_content_ticket_round_trips_over_a_live_session() {
     client
         .send_control(ControlMessage::Handshake(
             Handshake::new(PROTOCOL_VERSION, "ticket-probe")
-                .with_major(super::lifecycle::served_major())
+                .with_major(served_major())
                 .with_grant(Grant::new(token)),
         ))
         .await

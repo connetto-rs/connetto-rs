@@ -1,4 +1,4 @@
-//! The built binary, driven the way the operator runs it, always under a
+//! The `demo-ca` binary, driven the way the operator runs it, always under a
 //! passphrase file so no terminal prompt runs.
 
 use std::path::Path;
@@ -15,7 +15,7 @@ use uuid::Uuid;
 const PASSPHRASE: &str = "correct horse battery staple";
 
 fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_connetto-ca")
+    env!("CARGO_BIN_EXE_demo-ca")
 }
 
 /// Run the binary with `args` under a passphrase file at `file`, returning
@@ -228,10 +228,7 @@ fn a_malformed_invocation_prints_the_usage() {
         invoke(&["issuer", dir], PASSPHRASE),
     ] {
         assert_ne!(code, 0, "malformed arguments refuse to run: {err}");
-        assert!(
-            err.contains("usage: connetto-ca"),
-            "the usage prints: {err}"
-        );
+        assert!(err.contains("usage: demo-ca"), "the usage prints: {err}");
     }
 
     let out = Command::new(binary())
@@ -245,7 +242,7 @@ fn a_malformed_invocation_prints_the_usage() {
         "a dangling flag refuses to run: {stderr}"
     );
     assert!(
-        stderr.contains("usage: connetto-ca"),
+        stderr.contains("usage: demo-ca"),
         "the usage prints: {stderr}"
     );
 }

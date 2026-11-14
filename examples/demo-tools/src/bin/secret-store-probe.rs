@@ -1,9 +1,9 @@
 //! Writes, then in a later run reads back, a replica key and a refresh token
 //! through one Linux store, for R71's container and desktop custody runs.
 //!
-//! Usage: `secret_store_probe write|read key-file KEY_FILE STATE_DIR`,
-//! `secret_store_probe write|read secret-service`, or
-//! `secret_store_probe write|read detected`.
+//! Usage: `secret-store-probe write|read key-file KEY_FILE STATE_DIR`,
+//! `secret-store-probe write|read secret-service`, or
+//! `secret-store-probe write|read detected`.
 
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]
@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
         [_, phase, kind] if kind == "secret-service" => (phase, Some(LinuxStore::SecretService)),
         [_, phase, kind] if kind == "detected" => (phase, None),
         _ => bail!(
-            "usage: secret_store_probe write|read key-file KEY_FILE STATE_DIR | secret-service | detected"
+            "usage: secret-store-probe write|read key-file KEY_FILE STATE_DIR | secret-service | detected"
         ),
     };
     let (tokens, keys) = match store {

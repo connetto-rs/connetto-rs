@@ -1,12 +1,12 @@
 //! Runs the dev stack the Dioxus and Tauri demos sign in and sync
 //! against, which is Postgres, the authorization service, the dev identity
-//! provider and `connetto-server`, provisioned with `examples/deployment`,
+//! provider and `demo-server`, provisioned with `examples/deployment`,
 //! the deployment the browser demos share.
 //!
 //! ```text
-//! cargo run -p connetto-test-harness --bin connetto-demo-stack
-//! cargo run -p connetto-test-harness --bin connetto-demo-stack -- <program> [args]
-//! cargo run -p connetto-test-harness --bin connetto-demo-stack -- --mint-device-ca
+//! cargo run -p connetto-demo-stack --bin connetto-demo-stack
+//! cargo run -p connetto-demo-stack --bin connetto-demo-stack -- <program> [args]
+//! cargo run -p connetto-demo-stack --bin connetto-demo-stack -- --mint-device-ca
 //! ```
 //!
 //! Bare, it serves until interrupted and prints the environment a desktop run

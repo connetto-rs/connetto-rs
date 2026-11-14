@@ -57,10 +57,6 @@ test-support = []
 # library emits through `tracing` and installs nothing, so only a program pays
 # for a subscriber. Browser programs install `connetto_web::logging` instead.
 logging = ["dep:tracing-subscriber"]
-# Program configuration read from the environment, for the reference binaries.
-# Off by default for the same reason `logging` is: a library reads no
-# environment and opens no file, so only a program pays for it.
-env = []
 # Device certificates (R74): the identity a native device proves to its peers,
 # issued by the server and checked by every native side. Native only, since
 # browsers never enrol, so the browser build never links `ring` through it.

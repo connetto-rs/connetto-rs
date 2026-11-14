@@ -54,6 +54,7 @@ jobs:
               -p connetto-schema
               -p connetto-ca
               -p connetto-test-harness
+              -p connetto-demo-stack
               -p connetto-dioxus
               -p connetto-yew
               -p connetto-file-core
@@ -104,11 +105,11 @@ jobs:
       - name: Run Rust suite under coverage
         run: |
           source <(cargo +stable llvm-cov show-env --sh)
-          # The offline-exchange proof spawns the server binary, built here
+          # The offline-exchange proof spawns the demo server, built here
           # with the same instrumentation so the report counts it too.
           if [ "${{ matrix.name }}" = rest ]; then
-            cargo +stable build --profile testfast --all-features -p connetto-server --bin connetto-server
-            export CONNETTO_SERVER_BIN="$PWD/target/testfast/connetto-server"
+            cargo +stable build --profile testfast -p connetto-demo-tools --bin demo-server
+            export CONNETTO_SERVER_BIN="$PWD/target/testfast/demo-server"
           fi
           keyctl session -- cargo +stable nextest run \
             --cargo-profile testfast \
@@ -186,20 +187,18 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
 
-      # The binaries the e2e tests spawn carry the same instrumentation, so
-      # the report counts what the child processes execute too.
+      # The demo processes the e2e tests spawn are archived beside them with
+      # the same instrumentation, so the report counts what they execute too.
       - name: Build and archive the instrumented server suite
         run: |
           source <(cargo +stable llvm-cov show-env --sh)
-          cargo +stable build --profile testfast --all-features --bins -p connetto-server -p connetto-client
           mkdir coverage-server
           cargo +stable nextest archive \
             --cargo-profile testfast \
             --all-features \
             -p connetto-server \
+            -p connetto-demo-tools \
             --archive-file coverage-server/suite.tar.zst
-          # The archive carries the server's own binary but not the client's.
-          cp target/testfast/connetto-client coverage-server/
 
       - uses: $/.github/actions/put-files
         with:
@@ -252,8 +251,6 @@ jobs:
           SUITE: ${{ runner.temp }}/coverage-server
         run: |
           source <(cargo +stable llvm-cov show-env --sh)
-          mkdir -p target/testfast
-          install -m 0755 "$SUITE/connetto-client" target/testfast/connetto-client
           keyctl session -- cargo +stable nextest run \
             --archive-file "$SUITE/suite.tar.zst" \
             --workspace-remap "$GITHUB_WORKSPACE" \

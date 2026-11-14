@@ -21,10 +21,8 @@
 //!   feature.
 //! * The serving lifecycle closes every session when the shutdown signal or a
 //!   terminal change-stream outcome arrives, and the library never ends the
-//!   process, installs no signal handler and initializes no logging. The
-//!   binary is a translation from its environment into the builder, and its
-//!   contract is documented in `src/bin/connetto-server.rs`. A program that
-//!   embeds the server follows `examples/embed.rs`.
+//!   process, installs no signal handler and initializes no logging. Those
+//!   belong to the program that embeds the [`ServerBuilder`].
 //! * [`materializer`] holds the session-agnostic [`Materializer`] core that
 //!   wraps one `subql` engine.
 //! * the native [`Transport`](connetto_core::traits::Transport) implementations

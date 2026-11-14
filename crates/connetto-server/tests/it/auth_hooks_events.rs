@@ -349,12 +349,12 @@ enum HandlePath {
 
 /// Exercise the built handle over live session and device rows.
 async fn handle_path(path: HandlePath, cause: EndCause) {
-    use super::e2e::{PG_SERIAL, reset_fixture};
     use super::enrolment::rooted_issuer;
     use super::lifecycle::{admin_pool, builder_over};
     use connetto_server::defaults::connetto_device_enrolments;
     use connetto_server::device_cert::DeviceCertConfig;
     use connetto_test_harness::isolated_session_keyring;
+    use connetto_test_harness::server_fixture::{PG_SERIAL, reset_fixture};
 
     let _keyring = isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
@@ -516,9 +516,9 @@ async fn erasure_refusal_restores_every_session_and_key() {
 
 #[tokio::test]
 async fn guard_ban_and_session_ends_share_the_transaction() {
-    use super::e2e::{PG_SERIAL, mint_tokens, reset_fixture};
     use super::lifecycle::{admin_pool, builder_over, live_session};
     use connetto_test_harness::isolated_session_keyring;
+    use connetto_test_harness::server_fixture::{PG_SERIAL, mint_tokens, reset_fixture};
 
     let _keyring = isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;

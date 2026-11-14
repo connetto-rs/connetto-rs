@@ -1,4 +1,4 @@
-//! The `connetto-schema` binary over a throwaway history directory: its
+//! The `demo-schema` binary over a throwaway history directory: its
 //! exit codes, its output, and the exports it writes or refuses.
 
 use std::path::{Path, PathBuf};
@@ -6,7 +6,7 @@ use std::process::Command;
 
 /// The binary under test.
 fn command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_connetto-schema"))
+    Command::new(env!("CARGO_BIN_EXE_demo-schema"))
 }
 
 /// The schema and tier sources the command translates, written under `dir`.
@@ -30,7 +30,7 @@ fn a_run_without_a_command_prints_the_usage_and_fails() {
     assert_eq!(out.status.code(), Some(1), "FAILURE is exit code 1");
     let stderr = String::from_utf8(out.stderr).expect("utf-8");
     assert!(
-        stderr.contains("connetto-schema export-tier --schema"),
+        stderr.contains("demo-schema export-tier --schema"),
         "the usage names the command: {stderr}"
     );
     assert!(out.stdout.is_empty(), "the failure says nothing to stdout");
@@ -50,7 +50,7 @@ fn a_run_with_an_unknown_command_prints_the_name_and_fails() {
         "the unknown command is named: {stderr}"
     );
     assert!(
-        stderr.contains("connetto-schema export-tier --schema"),
+        stderr.contains("demo-schema export-tier --schema"),
         "the usage follows the refusal: {stderr}"
     );
 }
@@ -86,7 +86,7 @@ fn a_run_missing_a_required_flag_prints_the_usage_and_fails() {
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8(out.stderr).expect("utf-8");
     assert!(
-        stderr.contains("connetto-schema export-tier --schema"),
+        stderr.contains("demo-schema export-tier --schema"),
         "the usage names every required flag: {stderr}"
     );
 }
@@ -189,7 +189,7 @@ fn a_check_run_over_a_drifted_export_fails() {
     );
     let stderr = String::from_utf8(out.stderr).expect("utf-8");
     assert!(
-        stderr.starts_with("connetto-schema:"),
+        stderr.starts_with("demo-schema:"),
         "the failure names the error: {stderr}"
     );
     assert!(out.stdout.is_empty(), "the failure says nothing to stdout");
@@ -214,7 +214,7 @@ fn a_run_over_a_missing_schema_file_fails() {
     assert_eq!(out.status.code(), Some(1), "a missing source fails the run");
     let stderr = String::from_utf8(out.stderr).expect("utf-8");
     assert!(
-        stderr.starts_with("connetto-schema:"),
+        stderr.starts_with("demo-schema:"),
         "the failure names the error: {stderr}"
     );
 }
