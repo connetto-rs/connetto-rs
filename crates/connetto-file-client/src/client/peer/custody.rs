@@ -267,7 +267,10 @@ fn hold(file_id: FileId, rows: &[Option<String>], named: &Named) -> Hold {
 /// whose row is gone or whose author lapsed leaves, one a settled row names
 /// stays until the state reads `available` and learns when it settled, and a
 /// cache copy whose state reads `lost` returns when the same rule would keep
-/// it. Every file left in custody joins `kept`, and the answer says whether
+/// it. A copy this device saw settle stays while no row names it and the
+/// replica has not `synced`, since a device restored from an archive holds
+/// the rows of a settled write only once sync delivers them (R79 decision
+/// 18). Every file left in custody joins `kept`, and the answer says whether
 /// custody changed.
 ///
 /// # Errors
@@ -279,6 +282,7 @@ pub(in crate::client) fn pass(
     declared: &[PeerColumn],
     named: &Named,
     now: i64,
+    synced: bool,
     kept: &mut HashSet<FileId>,
 ) -> Result<bool, ContentError> {
     let states = states(conn, declared)?;
@@ -287,12 +291,16 @@ pub(in crate::client) fn pass(
     let custody = db::custody(conn)?;
     for &file_id in &custody {
         let rows = states.get(&file_id).map_or(&[][..], Vec::as_slice);
+        let awaiting_sync = rows.is_empty() && !synced && db::seen_settled(conn, file_id)?;
         match (held.contains(&file_id), hold(file_id, rows, named)) {
             (true, Hold::Provisional) => {
                 kept.insert(file_id);
             }
             (true, Hold::Settled) => {
                 db::custody_settled(conn, file_id, now)?;
+                kept.insert(file_id);
+            }
+            (true, Hold::Release) if awaiting_sync => {
                 kept.insert(file_id);
             }
             _ => {
@@ -449,7 +457,9 @@ mod tests {
     /// Runs the pass four times, answering whether each changed custody.
     fn passes(conn: &mut SqliteConnection, named: &Named) -> Vec<bool> {
         (0..4)
-            .map(|_| pass(conn, &declared(), named, 0, &mut HashSet::new()).expect("the pass"))
+            .map(|_| {
+                pass(conn, &declared(), named, 0, true, &mut HashSet::new()).expect("the pass")
+            })
             .collect()
     }
 

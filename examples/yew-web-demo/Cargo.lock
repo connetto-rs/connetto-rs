@@ -3339,7 +3339,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#3ec3562be01c43b432526b20259b2078a11589e6"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#e90af0deb343c1a7bcd46cba5eab0466d87894b3"
 dependencies = [
  "geometric-traits",
  "once_cell",

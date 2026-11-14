@@ -468,7 +468,7 @@ fn content_attachments(
     bytes: &[u8],
 ) -> Vec<(ArchiveAttachment, Vec<u8>)> {
     let index = serde_json::to_vec(&serde_json::json!({
-        "version": 1,
+        "version": 2,
         "files": [{
             "file_id": file_id.to_string(),
             "chunks": [{"hash": hash.to_string(), "len": len}],
@@ -705,7 +705,7 @@ async fn refused_import_leaves_chunk_store_empty() {
     let bad_id = FileId::from_bytes([0xff; 32]);
 
     let index = serde_json::to_vec(&serde_json::json!({
-        "version": 1,
+        "version": 2,
         "files": [
             {
                 "file_id": file_id_a.to_string(),
@@ -786,7 +786,7 @@ async fn a_source_that_changes_between_the_passes_is_refused() {
     let hash = ChunkHash::from_data(CHUNK);
     let file_id = FileId::from_chunks([CHUNK]);
     let index = serde_json::to_vec(&serde_json::json!({
-        "version": 1,
+        "version": 2,
         "files": [{
             "file_id": file_id.to_string(),
             "chunks": [{"hash": hash.to_string(), "len": CHUNK.len()}],
