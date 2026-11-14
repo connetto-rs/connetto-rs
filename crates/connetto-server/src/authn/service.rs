@@ -21,7 +21,7 @@ use connetto_core::traits::{
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::authn::hooks::{AuthHooks, CommittedNotice, HookError};
+use crate::authn::hooks::{CommittedNotice, EndCause, HookError};
 use crate::authn::provider::{
     ProviderError, ProviderRegistry, RetainedProviderToken, VerifiedLogin,
 };
@@ -233,11 +233,6 @@ impl<D: ConnettoSchema> AuthService<D> {
         &self.guard
     }
 
-    /// The application's hooks, told once an event's transaction committed.
-    pub(crate) fn hooks(&self) -> &dyn AuthHooks<D> {
-        self.store.hooks()
-    }
-
     /// Attach the revocation observer, once, after construction. A second call
     /// is ignored, which suits the one startup wiring point this exists for.
     pub fn set_revocation_hook(&self, hook: SessionRevocationHook) {
@@ -274,15 +269,6 @@ impl<D: ConnettoSchema> AuthService<D> {
             Some(describer) => Ok(describer(request).await),
             None => DbAuthStore::<D>::undescribed().ok_or(AuthError::Undescribed),
         }
-    }
-
-    /// How `session_id` began and when it last refreshed, `None` when it
-    /// names no session.
-    pub(crate) async fn session_record(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<SessionRecord<D::Id, Desc<D>>>, AuthError> {
-        Ok(self.store.session_record(session_id).await?)
     }
 
     /// Create a session for a verified identity and mint its first token pair.
@@ -440,7 +426,11 @@ impl<D: ConnettoSchema> AuthService<D> {
             match self.refuse_banned(&record.user_id).await {
                 Ok(()) => {}
                 Err(AuthError::Banned) => {
-                    if self.store.end_owned(&record.user_id, session_id).await? {
+                    if self
+                        .store
+                        .end_owned(&record.user_id, session_id, EndCause::Banned)
+                        .await?
+                    {
                         self.ended(
                             &record.user_id,
                             session_id,
@@ -515,8 +505,12 @@ impl<D: ConnettoSchema> AuthService<D> {
     ///
     /// [`AuthError`] if the store fails.
     pub async fn revoke(&self, session_id: SessionId) -> Result<(), AuthError> {
-        self.revoke_as(session_id, crate::audit::AuthOp::SessionRevoked)
-            .await
+        self.revoke_as(
+            session_id,
+            crate::audit::AuthOp::SessionRevoked,
+            EndCause::Revoked,
+        )
+        .await
     }
 
     /// Revoke every live session, returning how many were live.
@@ -547,7 +541,11 @@ impl<D: ConnettoSchema> AuthService<D> {
         user: &D::Id,
         session: SessionId,
     ) -> Result<bool, AuthError> {
-        if !self.store.end_owned(user, session).await? {
+        if !self
+            .store
+            .end_owned(user, session, EndCause::EndedByOwner)
+            .await?
+        {
             return Ok(false);
         }
         self.ended(user, session, crate::audit::AuthOp::EndedByOwner);
@@ -562,26 +560,33 @@ impl<D: ConnettoSchema> AuthService<D> {
         user: &D::Id,
         keep: Option<SessionId>,
     ) -> Result<Vec<SessionId>, AuthError> {
-        let op = if keep.is_some() {
-            crate::audit::AuthOp::EndedOthers
+        let (op, cause) = if keep.is_some() {
+            (crate::audit::AuthOp::EndedOthers, EndCause::EndedOthers)
         } else {
-            crate::audit::AuthOp::EndedAll
+            (crate::audit::AuthOp::EndedAll, EndCause::EndedAll)
         };
-        let ended = self.store.end_all_of(user, keep).await?;
+        let ended = self.store.end_all_of(user, keep, cause).await?;
         for session in &ended {
             self.ended(user, *session, op);
         }
         Ok(ended)
     }
 
-    /// End every session of the banned identity `user`, recording
-    /// `ended_by_ban` for each (R105 decision 8).
-    pub(crate) async fn end_banned(&self, user: &D::Id) -> Result<Vec<SessionId>, AuthError> {
-        let ended = self.store.end_all_of(user, None).await?;
-        for session in &ended {
-            self.ended(user, *session, crate::audit::AuthOp::EndedByBan);
+    /// Close each live connection of `sessions` of `user`, ended with `cause`
+    /// in a transaction another owner committed (a ban, an erasure, an owner
+    /// ending a session that enrolled a device), record `op` for each and
+    /// tell the hooks.
+    pub(crate) fn ended_elsewhere(
+        &self,
+        user: &D::Id,
+        sessions: &[SessionId],
+        op: crate::audit::AuthOp,
+        cause: EndCause,
+    ) {
+        for session in sessions {
+            self.ended(user, *session, op);
         }
-        Ok(ended)
+        self.store.tell_ended(user, sessions, cause);
     }
 
     /// Refuse `user` when the ban list holds a ban on it, and when the list
@@ -594,16 +599,23 @@ impl<D: ConnettoSchema> AuthService<D> {
         }
     }
 
-    /// Revoke every live session of `user` for the application's own
-    /// reasons, closing each live connection and recording
-    /// `session_revoked`, the sign-out an erasure runs first. Answers the
-    /// sessions it revoked.
-    pub(crate) async fn revoke_person(&self, user: &D::Id) -> Result<Vec<SessionId>, AuthError> {
-        let revoked = self.store.end_all_of(user, None).await?;
-        for session in &revoked {
-            self.ended(user, *session, crate::audit::AuthOp::SessionRevoked);
-        }
-        Ok(revoked)
+    /// Close the live connection of `session`, revoked in a device
+    /// revocation's transaction, and record `session_revoked`.
+    pub(crate) fn ended_with_device(&self, user: &D::Id, session: SessionId) {
+        tracing::info!(session = %session, "the revoked device's session ended");
+        self.notify_revoked(session);
+        self.record(crate::audit::AuthEvent::new(
+            session,
+            None,
+            crate::audit::AuthOp::SessionRevoked,
+        ));
+        self.store.tell_ended(user, &[session], EndCause::Revoked);
+    }
+
+    /// The store, whose transactions an erasure, a ban and a device
+    /// revocation join.
+    pub(crate) fn store(&self) -> &DbAuthStore<D> {
+        &self.store
     }
 
     /// Close an ended session's live connection and record why it ended.
@@ -672,8 +684,9 @@ impl<D: ConnettoSchema> AuthService<D> {
         &self,
         session_id: SessionId,
         op: crate::audit::AuthOp,
+        cause: EndCause,
     ) -> Result<(), AuthError> {
-        self.store.revoke_session(session_id).await?;
+        self.store.revoke_session(session_id, cause).await?;
         tracing::info!(session = %session_id, cause = op.label(), "session revoked");
         self.notify_revoked(session_id);
         self.record(crate::audit::AuthEvent::new(session_id, None, op));
@@ -715,8 +728,12 @@ impl<D: ConnettoSchema> AuthService<D> {
         let Some(session_id) = self.store.session_for_refresh(refresh_token).await? else {
             return Ok(false);
         };
-        self.revoke_as(session_id, crate::audit::AuthOp::LoggedOut)
-            .await?;
+        self.revoke_as(
+            session_id,
+            crate::audit::AuthOp::LoggedOut,
+            EndCause::LoggedOut,
+        )
+        .await?;
         Ok(true)
     }
 

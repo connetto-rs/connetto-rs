@@ -73,6 +73,12 @@ pub enum CertificateError {
     /// This device's key was revoked, so it and its certificate are deleted.
     #[error("this device's key was revoked")]
     Revoked,
+    /// The deployment's application refused the enrolment or the revocation.
+    #[error("the application refused: {reason}")]
+    ApplicationRefused {
+        /// The application's reason, as it gave it.
+        reason: String,
+    },
     /// The server refused for another reason.
     #[error("the server refused the certificate: {0:?}")]
     Refused(EnrolRefusal),
@@ -805,6 +811,9 @@ impl From<Failed> for CertificateError {
                 ceiling: Duration::from_secs(ceiling_secs),
             },
             Failed::Refused(EnrolRefusal::Revoked) => Self::Revoked,
+            Failed::Refused(EnrolRefusal::Refused { reason }) => {
+                Self::ApplicationRefused { reason }
+            }
             Failed::Refused(reason) => Self::Refused(reason),
             Failed::Device(err) => Self::Device(err),
         }

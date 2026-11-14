@@ -476,7 +476,7 @@ fn unreadable() -> ClientError {
 }
 
 /// How the fake link drives one enrolment.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Ask {
     /// Grant the enrolment.
     Grant,
@@ -540,10 +540,10 @@ impl Link for FakeLink {
         let state = Arc::clone(&self.state);
         let issuer = Arc::clone(&self.issuer);
         let certificate = self.certificate.clone();
-        let ask = self.ask;
+        let ask = self.ask.clone();
         let gate = self.gate.clone();
         Box::pin(async move {
-            match (ask, msg) {
+            match (&ask, msg) {
                 (Ask::Lost, _) => Err(ClientError::NotConnected),
                 (Ask::Violated, _) => Err(ClientError::Protocol("the fake transport fails".into())),
                 (_, ControlMessage::EnrolChallengeRequest(_)) => {

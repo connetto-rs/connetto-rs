@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use connetto_core::SessionId;
 use connetto_core::auth::Principal;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, Grant, Handshake, SUBSCRIPTION_REFUSED, Subscribe,
@@ -39,10 +40,11 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::audit::{AUTH_OP_TYPE, AuthOp, pg_audit_hook};
 use connetto_server::ban::Instant;
 use connetto_server::{
-    AbuseConfig, AbuseLimits, ConnectionLimits, Crossing, Enforcement, EnforcementFuture,
-    EnforcementPolicy, LoopbackTransport, ManagerBuilder, Materializer, NewBan, NoConnector,
-    PageSpec, PersonLimits, RequestGuard, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, ThrottleConfig, TierLimits, loopback, pg_ban_store, pg_write_target,
+    AbuseConfig, AbuseLimits, BanFuture, BannedSessions, ConnectionLimits, Crossing, Enforcement,
+    EnforcementFuture, EnforcementPolicy, LoopbackTransport, ManagerBuilder, Materializer, NewBan,
+    NoConnector, PageSpec, PersonLimits, RequestGuard, SessionManager, SnapshotEstimate,
+    SnapshotPage, SnapshotSource, ThrottleConfig, TierLimits, loopback, pg_ban_store,
+    pg_write_target,
 };
 use connetto_test_harness::{
     ConnettoDefaults, Fixture, RosterAuth, RowValue, WITHHELD_ID, insert_changeset,
@@ -559,32 +561,47 @@ async fn a_crossed_threshold_bans_the_person_and_refuses_the_next_handshake() {
     );
 }
 
-/// The guard tells its ban hook which identity it banned, once the ban is
-/// written, which is how the server ends every session of that identity
+/// Banned sessions that end none and send each banned identity to the test
+/// once the ban commits.
+struct TellingBans(tokio::sync::mpsc::UnboundedSender<String>);
+
+impl BannedSessions<String> for TellingBans {
+    fn end<'a>(
+        &'a self,
+        _transaction: &'a mut AsyncPgConnection,
+        _user_id: &'a String,
+    ) -> BanFuture<'a, Vec<SessionId>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn ended(&self, user_id: &String, _sessions: &[SessionId]) {
+        self.0
+            .send(user_id.clone())
+            .expect("the test keeps the receiver");
+    }
+}
+
+/// The guard tells its banned sessions which identity it banned, once the
+/// ban commits, which is how the server ends every session of that identity
 /// (R105 decision 8).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_ban_tells_its_hook_the_banned_identity() {
+async fn a_ban_tells_its_banned_sessions_the_banned_identity() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
     let guard = guard(&fixture, limits(2, 1), None);
-    let told = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let sink = Arc::clone(&told);
-    guard.set_ban_hook(Arc::new(move |user: String| sink.lock().push(user)));
+    let (sender, mut told) = tokio::sync::mpsc::unbounded_channel();
+    guard.set_banned_sessions(Arc::new(TellingBans(sender)));
     let manager = manager(&fixture, silent_policy(), &guard);
 
     let mut live = connect(&manager, "prober", &["user:alice#one"]).await;
     probe(&mut live.client, "ghost-0").await;
     probe(&mut live.client, "ghost-1").await;
-    await_ban(fixture.admin(), "alice").await;
-    let deadline = tokio::time::Instant::now() + SETTLE;
-    while told.lock().is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the hook was never told"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(*told.lock(), vec!["alice".to_owned()]);
+    let banned = tokio::time::timeout(SETTLE, told.recv())
+        .await
+        .expect("the banned sessions are told within the bound")
+        .expect("the guard keeps the sender");
+    assert_eq!(banned, "alice");
+    assert!(told.try_recv().is_err(), "one ban tells once");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

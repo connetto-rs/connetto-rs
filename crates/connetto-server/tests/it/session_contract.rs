@@ -1,6 +1,6 @@
 //! The database auth store's list-and-end contract for string and typed user ids.
 
-use connetto_server::{ConnettoSchema, DbAuthStore, SessionId};
+use connetto_server::{ConnettoSchema, DbAuthStore, EndCause, SessionId};
 
 /// `ids` sorted, so two answers compare whatever order a store gives.
 fn sorted(ids: impl IntoIterator<Item = SessionId>) -> Vec<SessionId> {
@@ -36,24 +36,38 @@ pub(super) async fn ends_only_the_persons_sessions<D: ConnettoSchema>(
         "the person's live sessions and nobody else's"
     );
     assert!(
-        !store.end_owned(user, other).await.expect("end"),
+        !store
+            .end_owned(user, other, EndCause::EndedByOwner)
+            .await
+            .expect("end"),
         "another person's session ends nothing"
     );
-    assert!(store.end_owned(user, own[0]).await.expect("end"));
     assert!(
-        !store.end_owned(user, own[0]).await.expect("end"),
+        store
+            .end_owned(user, own[0], EndCause::EndedByOwner)
+            .await
+            .expect("end")
+    );
+    assert!(
+        !store
+            .end_owned(user, own[0], EndCause::EndedByOwner)
+            .await
+            .expect("end"),
         "an ended session ends once"
     );
     assert_eq!(
         store
-            .end_all_of(user, Some(own[2]))
+            .end_all_of(user, Some(own[2]), EndCause::EndedOthers)
             .await
             .expect("end the others"),
         vec![own[1]]
     );
     assert_eq!(listed(store, user).await, vec![own[2]]);
     assert_eq!(
-        store.end_all_of(user, None).await.expect("end all"),
+        store
+            .end_all_of(user, None, EndCause::EndedAll)
+            .await
+            .expect("end all"),
         vec![own[2]]
     );
     assert_eq!(listed(store, user).await, Vec::new());

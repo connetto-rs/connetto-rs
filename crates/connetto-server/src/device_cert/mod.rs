@@ -29,17 +29,16 @@ pub use attestation::{
 };
 #[doc(hidden)]
 pub use connetto_core::device_cert::{KeyId, Revoked};
-pub(crate) use enrolment::PendingChallenge;
 pub use enrolment::{
-    Device, DeviceEnrolment, Enrolment, EnrolmentError, EnrolmentFuture, EnrolmentStore,
-    FirstEnrolment, FirstEnrolmentHook, KeyRecord, MemoryEnrolments, RandomSource, Recorded,
-    Revocation, RevokeError, SessionRevoker,
+    Device, DeviceEnrolment, Enrolment, EnrolmentError, KeyRecord, RandomSource, Recorded,
+    Revocation, RevokeError,
 };
+pub(crate) use enrolment::{KeyRevoked, PendingChallenge};
 #[doc(hidden)]
 pub use schema::__key_id;
 pub use schema::{
-    ConnettoEnrolmentSchema, DeviceRow, KeyFacts, NewCertificate, NewEnrolment, Renewal, Statement,
-    pg_enrolment_store,
+    ConnettoEnrolmentSchema, DeviceRow, EnrolmentStore, KeyFacts, NewCertificate, NewEnrolment,
+    Renewal, Statement,
 };
 
 /// The issuer, the lifetimes it grants, and the attestation the server

@@ -2547,7 +2547,7 @@ pub struct SessionManager<
     withdrawal_source: OnceLock<Snap>,
     /// Issues device certificates (R74). Without one, every enrolment is
     /// refused as [`EnrolRefusal::IssuerUnavailable`].
-    device_enrolment: OnceLock<Arc<crate::device_cert::DeviceEnrolment<Id>>>,
+    device_enrolment: OnceLock<Arc<crate::device_cert::DeviceEnrolment<D>>>,
     /// The deployment's content ticket signer, called after a successful
     /// visibility check to mint a signed URL the caller may use at the file
     /// server. Generic rather than boxed so a deployment wires it at compile
@@ -2851,8 +2851,8 @@ where
     /// The enrolment handed over, when one is already installed.
     pub fn install_device_enrolment(
         &self,
-        enrolment: Arc<crate::device_cert::DeviceEnrolment<Id>>,
-    ) -> Result<(), Arc<crate::device_cert::DeviceEnrolment<Id>>> {
+        enrolment: Arc<crate::device_cert::DeviceEnrolment<D>>,
+    ) -> Result<(), Arc<crate::device_cert::DeviceEnrolment<D>>> {
         self.device_enrolment.set(enrolment)
     }
 
@@ -6579,6 +6579,7 @@ where
                 .map_err(|err| match err {
                     RevokeError::NotFound => EnrolRefusal::InvalidRequest,
                     RevokeError::NotInstalled => EnrolRefusal::IssuerUnavailable,
+                    RevokeError::Refused(reason) => EnrolRefusal::Refused { reason },
                     RevokeError::Unavailable(source) => {
                         tracing::warn!(error = %source, "a device could not be revoked");
                         EnrolRefusal::IssuerUnavailable
@@ -6587,14 +6588,14 @@ where
             Err(refusal) => Err(refusal),
         };
         match revoked {
-            Ok((enrolment, (_, session, lists))) => {
+            Ok((enrolment, revoked)) => {
                 transport
                     .send_control(ControlMessage::DeviceRevokedAck(DeviceRevokedAck {
                         request_id,
                     }))
                     .await
                     .map_err(transport_err)?;
-                self.after_revocation(&enrolment, session, lists).await;
+                self.after_revocation(&enrolment, revoked).await;
                 Ok(())
             }
             Err(reason) => transport
@@ -6710,20 +6711,23 @@ where
     }
 
     /// Close the revoked device's connection, push the new lists to every
-    /// identified connection, and revoke the auth-store session.
+    /// identified connection, then close and record the auth-store session
+    /// the revocation ended.
     async fn after_revocation(
         &self,
-        enrolment: &crate::device_cert::DeviceEnrolment<Id>,
-        session: SessionId,
-        lists: Vec<SignedList>,
+        enrolment: &crate::device_cert::DeviceEnrolment<D>,
+        revoked: crate::device_cert::KeyRevoked<Id>,
     ) {
-        self.announce_revocation(session, lists).await;
-        enrolment.revoke_session(session).await;
+        self.announce_revocation(revoked.session, revoked.lists)
+            .await;
+        if let Some(user) = &revoked.ended {
+            enrolment.session_ended(user, revoked.session);
+        }
     }
 
     /// Close the revoked device's connection with `DeviceRevoked` and push
     /// the new lists to every identified connection.
-    async fn announce_revocation(&self, session: SessionId, lists: Vec<SignedList>) {
+    pub(crate) async fn announce_revocation(&self, session: SessionId, lists: Vec<SignedList>) {
         self.close_session(session, FatalErrorReason::DeviceRevoked)
             .await;
         let update = ControlMessage::RevocationUpdate(RevocationUpdate { lists });
@@ -6742,48 +6746,30 @@ where
     /// # Errors
     ///
     /// [`RevokeError::NotFound`] for a key never enrolled,
-    /// [`RevokeError::NotInstalled`] when no enrolment is installed, and
+    /// [`RevokeError::NotInstalled`] when no enrolment is installed,
+    /// [`RevokeError::Refused`] when the application's hook refuses, and
     /// [`RevokeError::Unavailable`] when the table or the issuer fails.
     pub async fn revoke_device(&self, key: KeyId) -> Result<bool, RevokeError> {
         let enrolment = self
             .device_enrolment
             .get()
             .ok_or(RevokeError::NotInstalled)?;
-        let (fresh, session, lists) = enrolment.revoke(None, key).await?;
-        self.after_revocation(enrolment, session, lists).await;
+        let revoked = enrolment.revoke(None, key).await?;
+        let fresh = revoked.fresh;
+        self.after_revocation(enrolment, revoked).await;
         Ok(fresh)
     }
 
-    /// `user`'s enrolled devices with the session each last enrolled under,
-    /// none when no enrolment is installed.
-    pub(crate) async fn devices_of(
-        &self,
-        user: &Id,
-    ) -> Result<Vec<crate::device_cert::Device>, crate::device_cert::EnrolmentError> {
-        match self.device_enrolment.get() {
-            Some(enrolment) => enrolment.enrolled(user).await,
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// Revoke `user`'s device key `key`, publishing the list and closing its
-    /// connection with `DeviceRevoked`, and leave its auth-store session to
-    /// the caller, which ends it with its own cause.
-    pub(crate) async fn revoke_device_of(&self, user: &Id, key: KeyId) -> Result<(), RevokeError> {
-        let enrolment = self
-            .device_enrolment
-            .get()
-            .ok_or(RevokeError::NotInstalled)?;
-        let (_, session, lists) = enrolment.revoke(Some(user), key).await?;
-        self.announce_revocation(session, lists).await;
-        Ok(())
+    /// The installed device enrolment, none when device identity is off.
+    pub(crate) fn device_enrolment(&self) -> Option<&Arc<crate::device_cert::DeviceEnrolment<D>>> {
+        self.device_enrolment.get()
     }
 
     /// The installed enrolment and the account enrolling, or why this session cannot enrol.
     fn enrolling(
         &self,
         state: &SessionState<Id, Key>,
-    ) -> Result<(Arc<crate::device_cert::DeviceEnrolment<Id>>, Id), EnrolRefusal> {
+    ) -> Result<(Arc<crate::device_cert::DeviceEnrolment<D>>, Id), EnrolRefusal> {
         let user = state
             .principal
             .identity()

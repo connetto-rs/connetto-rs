@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use connetto_server::{
-    AuthConfig, AuthStoreError, DbAuthStore, DefaultAuthHooks, IssuedSession, ResolvedIdentity,
-    RetainedProviderToken, SessionOrigin,
+    AuthConfig, AuthStoreError, DbAuthStore, DefaultAuthHooks, EndCause, IssuedSession,
+    ResolvedIdentity, RetainedProviderToken, SessionOrigin,
 };
 use connetto_test_harness::Fixture;
 use diesel::sql_query;
@@ -106,18 +106,22 @@ async fn db_store_forgets_the_provider_tokens_of_every_revoked_session() {
     };
 
     store
-        .revoke_session(revoked.session_id)
+        .revoke_session(revoked.session_id, EndCause::Revoked)
         .await
         .expect("revoke");
     assert!(
         store
-            .end_owned(&owned.context.user_id, owned.session_id)
+            .end_owned(
+                &owned.context.user_id,
+                owned.session_id,
+                EndCause::EndedByOwner
+            )
             .await
             .expect("end")
     );
     assert_eq!(
         store
-            .end_all_of(&others.context.user_id, None)
+            .end_all_of(&others.context.user_id, None, EndCause::EndedAll)
             .await
             .expect("end all"),
         vec![others.session_id]
@@ -300,7 +304,7 @@ async fn db_store_creates_resolves_rotates_and_revokes() {
             .expect("live")
     );
     store
-        .revoke_session(second.session_id)
+        .revoke_session(second.session_id, EndCause::Revoked)
         .await
         .expect("revoke");
     assert!(

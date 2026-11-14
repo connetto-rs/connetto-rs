@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use connetto_server::{
-    AuthConfig, AuthHooks, DbAuthStore, HookFuture, IssuedSession, ResolvedIdentity, VerifiedClaims,
+    AuthConfig, AuthHooks, DbAuthStore, EndCause, HookFuture, IssuedSession, ResolvedIdentity,
+    VerifiedClaims,
 };
 use connetto_test_harness::Fixture;
 use diesel_async::AsyncPgConnection;
@@ -124,7 +125,7 @@ async fn typed_id_survives_rotation_and_revocation() {
     assert_ne!(rotated.refresh_token, issued.refresh_token, "token rotates");
 
     store
-        .revoke_session(issued.session_id)
+        .revoke_session(issued.session_id, EndCause::Revoked)
         .await
         .expect("revoke");
     assert!(

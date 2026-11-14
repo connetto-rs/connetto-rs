@@ -166,7 +166,7 @@ impl AuthHooks<ConnettoDefaults> for Gate {
     }
 }
 
-fn identity(subject: &str) -> ResolvedIdentity {
+pub(super) fn identity(subject: &str) -> ResolvedIdentity {
     ResolvedIdentity {
         issuer: ISSUER.to_owned(),
         subject: subject.to_owned(),
@@ -177,7 +177,7 @@ fn identity(subject: &str) -> ResolvedIdentity {
     }
 }
 
-fn origin() -> SessionOrigin<()> {
+pub(super) fn origin() -> SessionOrigin<()> {
     SessionOrigin {
         provider: "google".to_owned(),
         description: (),
@@ -186,7 +186,7 @@ fn origin() -> SessionOrigin<()> {
 
 /// An auth service over a store running `hooks`, refusing what the ban table
 /// holds.
-async fn service(
+pub(super) async fn service(
     fixture: &Fixture,
     hooks: Arc<dyn AuthHooks<ConnettoDefaults>>,
 ) -> Arc<AuthService<ConnettoDefaults>> {
@@ -214,7 +214,7 @@ async fn service(
 }
 
 /// The single count `query` answers on an owner connection.
-async fn count<Q>(fixture: &Fixture, query: Q) -> i64
+pub(super) async fn count<Q>(fixture: &Fixture, query: Q) -> i64
 where
     Q: diesel_async::RunQueryDsl<AsyncPgConnection>
         + diesel_async::methods::LoadQuery<'static, AsyncPgConnection, i64>

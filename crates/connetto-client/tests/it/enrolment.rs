@@ -28,19 +28,16 @@ use connetto_core::messages::{EnrolRefusal, WriterAnswer, WriterOutcome, WriterR
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::ReplicaKeyStore as _;
 use connetto_core::traits::{HandshakeAuthority, RefreshTokenStore};
-use connetto_server::device_cert::{
-    DeviceCertConfig, DeviceEnrolment, Enrolment, MemoryEnrolments,
-};
+use connetto_server::device_cert::{DeviceCertConfig, DeviceEnrolment, EnrolmentStore};
 use connetto_server::{
-    AbuseConfig, AuthConfig, AuthService, GenericOidcProvider, ManagerBuilder, Materializer,
-    PgReadConnector, PgSnapshotSource, ProviderRegistry, RedirectPolicy, RequestGuard,
-    RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, TokenAuthority,
-    WebSocketTransport, auth_router, loopback, pg_write_target,
+    AbuseConfig, AuthConfig, AuthHooks, AuthService, DbAuthStore, DefaultAuthHooks, DeviceEnrolled,
+    GenericOidcProvider, HookError, HookFuture, ManagerBuilder, Materializer, PgReadConnector,
+    PgSnapshotSource, ProviderRegistry, RedirectPolicy, RequestGuard, RuntimeWritableCatalog,
+    SessionManager, ThrottleConfig, TierLimits, TokenAuthority, VerifiedClaims, WebSocketTransport,
+    auth_router, loopback, pg_write_target,
 };
 use connetto_test_harness::native_client;
-use connetto_test_harness::{
-    Client, ConnettoDefaults, Fixture, MOCK_OAUTH_PROVIDER, MockOauth, RosterAuth,
-};
+use connetto_test_harness::{Client, Fixture, MOCK_OAUTH_PROVIDER, MockOauth, RosterAuth};
 use diesel::insert_into;
 use diesel::prelude::*;
 use openidconnect::reqwest;
@@ -70,7 +67,7 @@ const PG_DDL: &str = "-- connetto:major 1\nCREATE TABLE devices (id INT PRIMARY 
 const SQLITE_DDL: &str = "CREATE TABLE IF NOT EXISTS devices (id INTEGER PRIMARY KEY, label TEXT);";
 
 /// A manager whose computed subscriptions read through connetto's connector.
-type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults, PgReadConnector>;
+type Manager = SessionManager<PgSnapshotSource, RosterAuth, EnrolmentSchema, PgReadConnector>;
 
 /// One keyring service per scenario, so a shared store never crosses two.
 const APP_ENROL: &str = "r74-enrolment";
@@ -101,12 +98,26 @@ const APP_PEER_B: &str = "r76-peer-b";
 #[cfg(feature = "peer")]
 const APP_PEER_C: &str = "r76-peer-c";
 
-/// What the lost-device list shows about these test devices.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct Descriptor {
-    name: String,
-    city: String,
+mod schema {
+    #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Descriptor {
+        pub name: String,
+        pub city: String,
+    }
+
+    connetto_server::connetto_schema! {
+        pub struct EnrolmentSchema;
+        id: String => diesel::sql_types::Text,
+        audit_row_key: uuid::Uuid => diesel::sql_types::Uuid,
+        audit_ddl: connetto_server::connetto_audit_ddl!("TEXT", "UUID"),
+        device_descriptor: Descriptor {
+            name: diesel::sql_types::Text,
+            city: diesel::sql_types::Text,
+        },
+    }
 }
+
+use schema::{Descriptor, EnrolmentSchema};
 
 /// Re-run `phase` in a child process whose keyring auto-detection resolves to
 /// sealed files, and fail this test, with the child's output, unless it
@@ -152,6 +163,7 @@ async fn enrolment_phase() {
     };
     match phase.as_str() {
         "first" => Box::pin(first_connect()).await,
+        "application-refused" => Box::pin(application_refused()).await,
         "renewal" => Box::pin(renewal()).await,
         "reissue" => Box::pin(reissue()).await,
         "cap" => Box::pin(cap()).await,
@@ -264,7 +276,15 @@ fn root() -> Vec<u8> {
 
 /// Serve the auth router with one containerised provider, returning the base
 /// URL, the service and the provider guard.
-async fn spawn_auth(fixture: &Fixture) -> (String, Arc<AuthService<ConnettoDefaults>>, MockOauth) {
+async fn spawn_auth(fixture: &Fixture) -> (String, Arc<AuthService<EnrolmentSchema>>, MockOauth) {
+    spawn_auth_with(fixture, Arc::new(DefaultAuthHooks)).await
+}
+
+/// Serve the provider login with the supplied transactional hooks.
+async fn spawn_auth_with(
+    fixture: &Fixture,
+    hooks: Arc<dyn AuthHooks<EnrolmentSchema>>,
+) -> (String, Arc<AuthService<EnrolmentSchema>>, MockOauth) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind the auth listener");
@@ -280,10 +300,19 @@ async fn spawn_auth(fixture: &Fixture) -> (String, Arc<AuthService<ConnettoDefau
     .await
     .expect("discover the provider");
 
+    fixture.provision_auth_tables().await;
+    connetto_test_harness::stack::provision_enrolment_tables(fixture).await;
+    fixture
+        .exec("ALTER TABLE connetto_device_enrolments ADD COLUMN name TEXT NOT NULL DEFAULT '', ADD COLUMN city TEXT NOT NULL DEFAULT ''")
+        .await;
     let config = AuthConfig::default();
     let service = Arc::new(AuthService::new(
         Arc::new(TokenAuthority::generate(&config).expect("token authority")),
-        fixture.auth_store(config.refresh_lifetimes()).await,
+        Arc::new(DbAuthStore::new(
+            fixture.admin().clone(),
+            config.refresh_lifetimes(),
+            hooks,
+        )),
         Arc::new(RequestGuard::default()),
     ));
     let mut registry = ProviderRegistry::new();
@@ -303,7 +332,7 @@ async fn spawn_auth(fixture: &Fixture) -> (String, Arc<AuthService<ConnettoDefau
 }
 
 /// A manager whose handshake authority verifies `service`'s tokens.
-fn manager(fixture: &Fixture, service: &Arc<AuthService<ConnettoDefaults>>) -> Arc<Manager> {
+fn manager(fixture: &Fixture, service: &Arc<AuthService<EnrolmentSchema>>) -> Arc<Manager> {
     let guard = Arc::new(RequestGuard::new(
         ThrottleConfig::default()
             .with_identified(TierLimits::identified().with_read_timeout(Duration::from_secs(30))),
@@ -322,7 +351,7 @@ fn manager(fixture: &Fixture, service: &Arc<AuthService<ConnettoDefaults>>) -> A
         RosterAuth::granting_nobody(),
         authority,
         PgReadConnector::with_session_setup(pool.clone()),
-        pg_write_target::<ConnettoDefaults>(pool, PG_DDL).expect("build write target"),
+        pg_write_target::<EnrolmentSchema>(pool, PG_DDL).expect("build write target"),
     )
     .with_guard(guard)
     .build()
@@ -358,25 +387,21 @@ async fn spawn_server(
     (addr, server)
 }
 
-/// Serve a manager that verifies `service`'s tokens and enrols through
-/// `config` into `store`, returning the WebSocket address and the server
-/// guard.
+/// Serve a manager with transactional device enrolment.
 async fn sync_server(
     fixture: &Fixture,
-    service: &Arc<AuthService<ConnettoDefaults>>,
+    service: &Arc<AuthService<EnrolmentSchema>>,
     config: DeviceCertConfig,
-    store: Arc<MemoryEnrolments<String>>,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let (addr, server, _) = sync_server_with_manager(fixture, service, config, store).await;
+    let (addr, server, _) = sync_server_with_manager(fixture, service, config).await;
     (addr, server)
 }
 
 /// As [`sync_server`], also handing back the manager an operator revokes through.
 async fn sync_server_with_manager(
     fixture: &Fixture,
-    service: &Arc<AuthService<ConnettoDefaults>>,
+    service: &Arc<AuthService<EnrolmentSchema>>,
     config: DeviceCertConfig,
-    store: Arc<MemoryEnrolments<String>>,
 ) -> (
     std::net::SocketAddr,
     tokio::task::JoinHandle<()>,
@@ -385,7 +410,7 @@ async fn sync_server_with_manager(
     let manager = manager(fixture, service);
     assert!(
         manager
-            .install_device_enrolment(Arc::new(DeviceEnrolment::new(config, store)))
+            .install_device_enrolment(Arc::new(DeviceEnrolment::new(config, Arc::clone(service))))
             .is_ok(),
         "installs once"
     );
@@ -397,13 +422,12 @@ async fn sync_server_with_manager(
 /// a device whose clock differs from the server's.
 async fn skewed_server(
     fixture: &Fixture,
-    service: &Arc<AuthService<ConnettoDefaults>>,
-    store: Arc<MemoryEnrolments<String>>,
+    service: &Arc<AuthService<EnrolmentSchema>>,
     clock: fn() -> SystemTime,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let manager = manager(fixture, service);
-    let enrolment =
-        DeviceEnrolment::new(DeviceCertConfig::new(issuer()), store).with_issue_clock(clock);
+    let enrolment = DeviceEnrolment::new(DeviceCertConfig::new(issuer()), Arc::clone(service))
+        .with_issue_clock(clock);
     assert!(
         manager
             .install_device_enrolment(Arc::new(enrolment))
@@ -442,6 +466,7 @@ fn signed_in(
         dir,
         vec![root()],
     )
+    .with_device_descriptor(&Descriptor::default())
 }
 
 /// Await an event matching `is` within `deadline`, skipping every other event.
@@ -486,24 +511,65 @@ async fn wait_for_fresh_certificate(
     }
 }
 
-/// Poll the enrolment store until it holds at least `count` records, bounded
-/// by `deadline`.
-async fn wait_for_records(
-    store: &MemoryEnrolments<String>,
-    count: usize,
-    deadline: Duration,
-) -> Option<Vec<Enrolment<String>>> {
-    let until = Instant::now() + deadline;
-    loop {
-        let records = store.records();
-        if records.len() >= count {
-            return Some(records);
-        }
-        if Instant::now() >= until {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+#[derive(Debug, PartialEq)]
+struct RecordedCertificate {
+    user: String,
+    key: KeyId,
+    serial: Vec<u8>,
+    issuer: KeyId,
+    descriptor: Vec<u8>,
+}
+
+/// One issued certificate as Postgres holds it, with the account, the key, the
+/// serial, the issuer, and the device's name and city.
+type CertificateRow = (String, Vec<u8>, Vec<u8>, Vec<u8>, String, String);
+
+/// Read issued certificates and their device descriptors from Postgres.
+async fn records(fixture: &Fixture) -> Vec<RecordedCertificate> {
+    use schema::{
+        connetto_device_certificates as certificates, connetto_device_enrolments as devices,
+    };
+
+    let mut connection = fixture.admin().get().await.expect("admin connection");
+    let query = certificates::table
+        .inner_join(devices::table.on(devices::key_id.eq(certificates::key_id)))
+        .order(certificates::expires_at.asc())
+        .select((
+            devices::user_id,
+            devices::key_id,
+            certificates::serial,
+            certificates::issuer,
+            devices::name,
+            devices::city,
+        ));
+    let rows: Vec<CertificateRow> = diesel_async::RunQueryDsl::load(query, &mut *connection)
+        .await
+        .expect("read issued certificates");
+    rows.into_iter()
+        .map(
+            |(user, key, serial, issuer, name, city)| RecordedCertificate {
+                user,
+                key: KeyId::from_bytes(key.try_into().expect("device key")),
+                serial,
+                issuer: KeyId::from_bytes(issuer.try_into().expect("issuer key")),
+                descriptor: rmp_serde::to_vec_named(&Descriptor { name, city })
+                    .expect("descriptor"),
+            },
+        )
+        .collect()
+}
+
+/// Mark a key revoked without pushing a notification to its connected device.
+async fn revoke_key(fixture: &Fixture, key: KeyId) {
+    let mut connection = fixture.admin().get().await.expect("admin connection");
+    let revoked = EnrolmentStore::<EnrolmentSchema>::default()
+        .revoke(&mut connection, None, key, SystemTime::now())
+        .await
+        .expect("revoke the key");
+    assert!(matches!(
+        revoked,
+        connetto_server::device_cert::Revocation::Revoked { .. }
+    ));
 }
 
 /// The validity span a certificate holds. The issuer writes X.509 times at
@@ -692,7 +758,7 @@ fn retiree_manager(fixture: &Fixture) -> Arc<Manager> {
         RosterAuth::granting_nobody(),
         authority,
         PgReadConnector::with_session_setup(pool.clone()),
-        pg_write_target::<ConnettoDefaults>(pool, PG_DDL).expect("build the write target"),
+        pg_write_target::<EnrolmentSchema>(pool, PG_DDL).expect("build the write target"),
     )
     .with_guard(guard)
     .build()
@@ -726,14 +792,7 @@ fn a_first_connect_enrols_and_records_the_descriptor() {
 async fn first_connect() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server) = sync_server(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server) = sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("a data directory");
     let descriptor = Descriptor {
         name: "pippo".into(),
@@ -758,9 +817,7 @@ async fn first_connect() {
     let session = client
         .session()
         .expect("a provider build reports its session");
-    let records = wait_for_records(&store, 1, BOUND)
-        .await
-        .expect("the record lands");
+    let records = records(&fixture).await;
     assert_eq!(records.len(), 1, "one certificate is issued");
     assert_eq!(records[0].user, session.user_id());
     assert_eq!(records[0].key, cert.identity().key());
@@ -778,6 +835,76 @@ async fn first_connect() {
     client.close().await;
 }
 
+struct RefuseEnrolment;
+
+impl AuthHooks<EnrolmentSchema> for RefuseEnrolment {
+    fn user_for<'a>(
+        &'a self,
+        transaction: &'a mut diesel_async::AsyncPgConnection,
+        claims: &'a VerifiedClaims,
+    ) -> HookFuture<'a, String> {
+        <DefaultAuthHooks as AuthHooks<EnrolmentSchema>>::user_for(
+            &DefaultAuthHooks,
+            transaction,
+            claims,
+        )
+    }
+
+    fn device_enrolled<'a>(
+        &'a self,
+        _transaction: &'a mut diesel_async::AsyncPgConnection,
+        _enrolled: &'a DeviceEnrolled<'a, String, ()>,
+    ) -> HookFuture<'a, ()> {
+        Box::pin(async { Err(HookError::Refused("device registration is closed".into())) })
+    }
+}
+
+/// An application refusal reaches the client with its reason.
+#[test]
+fn a_refused_enrolment_carries_the_application_reason() {
+    run_phase("application-refused");
+}
+
+/// Request enrolment against a refusing transactional hook.
+async fn application_refused() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _provider) = spawn_auth_with(&fixture, Arc::new(RefuseEnrolment)).await;
+    let (address, _server) = sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
+    let directory = tempdir().expect("a data directory");
+    let (client, pump) = Box::pin(
+        signed_in(
+            address,
+            fresh_login(&base, "auth-hooks-refused", "enrol-user"),
+            directory.path(),
+        )
+        .connect_with_pump(),
+    )
+    .await
+    .expect("the signed-in build connects");
+    let mut events = client.client().events();
+    tokio::spawn(pump);
+    assert!(
+        next_event(&mut events, BOUND, |event| matches!(
+            event,
+            ClientEvent::SyncStatus(SyncStatus::Connected)
+        ))
+        .await
+        .is_some()
+    );
+    let refusal =
+        tokio::time::timeout(BOUND, client.reissue_certificate(Duration::from_secs(3600)))
+            .await
+            .expect("the enrolment request answers");
+    assert!(matches!(
+        refusal,
+        Err(CertificateError::ApplicationRefused { reason })
+            if reason == "device registration is closed"
+    ));
+    assert!(client.device_certificate().is_none());
+    assert_eq!(records(&fixture).await.len(), 0, "no certificate recorded");
+    client.close().await;
+}
+
 /// Past half-life the client renews on its own, at the stored lifetime, and
 /// the server records the new serial under the same key.
 #[test]
@@ -788,14 +915,7 @@ fn a_renewal_past_half_life_replaces_the_certificate() {
 async fn renewal() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server) = sync_server(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server) = sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("a data directory");
     let lifetime = Duration::from_secs(4);
 
@@ -819,25 +939,12 @@ async fn renewal() {
         lifetime,
         "the enrolment takes the builder lifetime"
     );
-    let records = wait_for_records(&store, 2, BOUND)
-        .await
-        .expect("the renewal records");
-    assert_eq!(
-        records.len(),
-        2,
-        "the refusal records nothing, the grant does"
-    );
-    assert_ne!(
-        records[0].serial, records[1].serial,
-        "a new serial is issued"
-    );
-    assert_eq!(records[0].key, records[1].key, "the renewal keeps the key");
 
     let until = Instant::now() + BOUND;
     let mut renewed = None;
     loop {
         if let Some(cert) = client.device_certificate()
-            && &records[1].serial[..] == cert.serial()
+            && first.serial() != cert.serial()
         {
             renewed = Some(cert);
             break;
@@ -848,6 +955,18 @@ async fn renewal() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let renewed = renewed.expect("the client holds the renewed certificate");
+    let records = records(&fixture).await;
+    assert_eq!(records.len(), 2, "the renewal records another certificate");
+    assert_ne!(
+        records[0].serial, records[1].serial,
+        "a new serial is issued"
+    );
+    assert_eq!(records[0].key, records[1].key, "the renewal keeps the key");
+    assert!(
+        records
+            .iter()
+            .any(|record| record.serial == renewed.serial())
+    );
     assert_eq!(
         span(&renewed),
         lifetime,
@@ -867,11 +986,10 @@ fn a_reissue_grants_the_asked_lifetime_and_refuses_over_the_ceiling() {
 async fn reissue() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
     let config = DeviceCertConfig::new(issuer())
         .with_default_lifetime(Duration::from_secs(30))
         .with_lifetime_ceiling(Duration::from_secs(60));
-    let (addr, _server) = sync_server(&fixture, &service, config, Arc::clone(&store)).await;
+    let (addr, _server) = sync_server(&fixture, &service, config).await;
     let dir = tempdir().expect("a data directory");
 
     let client = Box::pin(
@@ -921,9 +1039,7 @@ async fn reissue() {
         Duration::from_secs(45),
         "the asked lifetime is granted"
     );
-    let records = wait_for_records(&store, 2, BOUND)
-        .await
-        .expect("the reissue records");
+    let records = records(&fixture).await;
     assert!(
         records
             .iter()
@@ -943,11 +1059,10 @@ fn a_builder_lifetime_over_the_ceiling_enrols_at_the_ceiling_and_says_so() {
 async fn cap() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
     let config = DeviceCertConfig::new(issuer())
         .with_default_lifetime(Duration::from_secs(3600))
         .with_lifetime_ceiling(Duration::from_secs(3600));
-    let (addr, _server) = sync_server(&fixture, &service, config, Arc::clone(&store)).await;
+    let (addr, _server) = sync_server(&fixture, &service, config).await;
     let dir = tempdir().expect("a data directory");
     let requested = Duration::from_hours(24);
 
@@ -983,9 +1098,7 @@ async fn cap() {
         Duration::from_secs(3600),
         "the renewal retries at the ceiling"
     );
-    let records = wait_for_records(&store, 1, BOUND)
-        .await
-        .expect("the record lands");
+    let records = records(&fixture).await;
     assert_eq!(records.len(), 1, "the refusal records nothing");
     client.close().await;
 }
@@ -1071,14 +1184,7 @@ async fn asks_for_login(addr: std::net::SocketAddr, base: &str, app_id: &str, di
 async fn revoke() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server) = sync_server(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server) = sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("a data directory");
     let (wiped, hook) = wipe_hook(false);
 
@@ -1107,7 +1213,7 @@ async fn revoke() {
         .await
         .expect("the enrolment grants");
     let key = first.identity().key();
-    store.revoke_key(key);
+    revoke_key(&fixture, key).await;
 
     let mut events = client.client().events();
     assert!(
@@ -1161,11 +1267,13 @@ async fn revoke() {
         key,
         "the next open made a different key"
     );
-    let records = wait_for_records(&store, 2, BOUND)
-        .await
-        .expect("the fresh enrolment records");
-    assert_eq!(records[1].key, second_cert.identity().key());
-    assert_eq!(&records[1].serial[..], second_cert.serial());
+    let records = records(&fixture).await;
+    assert_eq!(records.len(), 2);
+    let fresh_record = records
+        .iter()
+        .find(|record| record.serial == second_cert.serial())
+        .expect("the fresh certificate is recorded");
+    assert_eq!(fresh_record.key, second_cert.identity().key());
     second.close().await;
 }
 
@@ -1181,14 +1289,7 @@ fn a_start_after_a_crash_mid_wipe_finishes_it() {
 async fn revoke_crashed() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server) = sync_server(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server) = sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("a data directory");
 
     let client = Box::pin(
@@ -1255,14 +1356,7 @@ fn a_failed_wipe_part_is_reported_and_completed_by_the_next_start() {
 async fn revoke_retry() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server) = sync_server(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server) = sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("a data directory");
 
     let (failed_once, hook) = wipe_hook(true);
@@ -1280,7 +1374,7 @@ async fn revoke_retry() {
     let first = wait_for_certificate(&client, BOUND)
         .await
         .expect("the enrolment grants");
-    store.revoke_key(first.identity().key());
+    revoke_key(&fixture, first.identity().key()).await;
     let mut events = client.client().events();
     let _ = client.reissue_certificate(Duration::from_secs(3600)).await;
     assert_eq!(
@@ -1398,14 +1492,7 @@ fn a_restarted_build_sees_its_certificate_before_the_connect() {
 async fn restart() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server) = sync_server(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server) = sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("a data directory");
 
     let client = Box::pin(
@@ -1442,9 +1529,7 @@ async fn restart() {
         first.identity().key(),
         "the same key is held"
     );
-    let records = wait_for_records(&store, 1, BOUND)
-        .await
-        .expect("the record is held");
+    let records = records(&fixture).await;
     assert_eq!(records.len(), 1, "the restart re-enrols nothing");
     second.close().await;
 }
@@ -1491,14 +1576,7 @@ fn a_forget_deletes_the_device_key_record() {
 async fn forget() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server) = sync_server(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server) = sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("a data directory");
 
     let client = Box::pin(
@@ -1594,18 +1672,10 @@ fn reporting_a_device_lost_revokes_it_everywhere() {
     run_phase("report");
 }
 
-#[expect(clippy::too_many_lines, reason = "one phase scenario per body")]
 async fn report() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server) = sync_server(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server) = sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let (phone_dir, laptop_dir) = (tempdir().expect("dir"), tempdir().expect("dir"));
     let phone_name = Descriptor {
         name: "phone".into(),
@@ -1702,8 +1772,9 @@ async fn report() {
     laptop.close().await;
 }
 
-/// A device revoked while it was away finds its own serial in the list its
-/// next handshake hands over, and deletes its key.
+/// A device revoked while it was away, whose session the revocation ended,
+/// signs in again and finds its own serial in the list its next handshake
+/// hands over, and deletes its key.
 #[test]
 fn a_device_revoked_while_away_learns_it_at_connect() {
     run_phase("learned");
@@ -1712,14 +1783,8 @@ fn a_device_revoked_while_away_learns_it_at_connect() {
 async fn learned_at_connect() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server, manager) = sync_server_with_manager(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server, manager) =
+        sync_server_with_manager(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("dir");
     let first = Box::pin(
         signed_in(
@@ -1742,10 +1807,16 @@ async fn learned_at_connect() {
             .expect("revoke")
     );
 
-    let (second, pump) =
-        Box::pin(signed_in(addr, last_used(&base, APP_LEARNED), dir.path()).connect_with_pump())
-            .await
-            .expect("signs back in");
+    let (second, pump) = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_LEARNED, "enrol-user"),
+            dir.path(),
+        )
+        .connect_with_pump(),
+    )
+    .await
+    .expect("signs back in");
     let mut events = second.client().events();
     tokio::spawn(pump);
     assert!(
@@ -1770,14 +1841,7 @@ fn a_grant_outside_the_roots_is_refused() {
 async fn untrusted() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server) = sync_server(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server) = sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("dir");
     let stranger = RootCa::create(
         DeploymentId::from_uuid(uuid::Uuid::from_u128(0xbad)),
@@ -1789,6 +1853,7 @@ async fn untrusted() {
         NativeClientBuilder::new(format!("ws://{addr}/"), super::support::bundle(SQLITE_DDL))
             .signed_in(fresh_login(&base, APP_UNTRUSTED, "enrol-user"))
             .durable(dir.path())
+            .with_device_descriptor(&Descriptor::default())
             .with_deployment_roots([stranger.certificate().to_vec()])
             .connect(),
     )
@@ -1853,14 +1918,8 @@ fn a_root_revoking_the_issuer_withdraws_and_re_enrols_the_key() {
 async fn rotation_withdraws() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (old_addr, _old_server) = sync_server(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (old_addr, _old_server) =
+        sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("dir");
     let first = Box::pin(
         signed_in(
@@ -1886,7 +1945,6 @@ async fn rotation_withdraws() {
                 list: root_list.clone(),
                 signer: root.clone(),
             }),
-        Arc::clone(&store),
     )
     .await;
     let (second, pump) = Box::pin(
@@ -1927,11 +1985,13 @@ async fn rotation_withdraws() {
         old_cert.identity().key(),
         "the same key"
     );
-    let records = wait_for_records(&store, 2, BOUND)
-        .await
-        .expect("both grants recorded");
+    let records = records(&fixture).await;
+    let renewed_record = records
+        .iter()
+        .find(|record| record.serial == renewed.serial())
+        .expect("the renewed certificate is recorded");
     assert_eq!(
-        records[1].issuer,
+        renewed_record.issuer,
         connetto_core::device_cert::certificate_key_id(new_issuer).expect("key id"),
         "the key re-enrols under the new issuer"
     );
@@ -1960,8 +2020,7 @@ fn a_clock_behind_the_server_is_told_and_recovers_on_renewal() {
 async fn clock_behind() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (ahead, _ahead) = skewed_server(&fixture, &service, Arc::clone(&store), || {
+    let (ahead, _ahead) = skewed_server(&fixture, &service, || {
         SystemTime::now() + Duration::from_hours(2)
     })
     .await;
@@ -1989,13 +2048,8 @@ async fn clock_behind() {
         .expect("the grant is kept all the same");
     client.close().await;
 
-    let (agreeing, _server) = sync_server(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (agreeing, _server) =
+        sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let (second, pump) = Box::pin(
         signed_in(agreeing, last_used(&base, APP_CLOCK_BEHIND), dir.path()).connect_with_pump(),
     )
@@ -2039,8 +2093,7 @@ fn a_clock_ahead_of_the_server_is_told() {
 async fn clock_ahead() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (behind, _server) = skewed_server(&fixture, &service, store, || {
+    let (behind, _server) = skewed_server(&fixture, &service, || {
         SystemTime::now() - Duration::from_hours(3)
     })
     .await;
@@ -2077,14 +2130,7 @@ fn a_lost_key_enrols_again_under_a_fresh_key() {
 async fn lost_key() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server) = sync_server(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server) = sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("a data directory");
 
     let client = Box::pin(
@@ -2121,13 +2167,17 @@ async fn lost_key() {
             _ => tokio::time::sleep(Duration::from_millis(20)).await,
         }
     };
-    let records = wait_for_records(&store, 2, BOUND)
-        .await
-        .expect("the fresh key is recorded");
-    assert_eq!(
-        records.iter().map(|record| record.key).collect::<Vec<_>>(),
-        vec![first.identity().key(), fresh.identity().key()],
-        "the old enrolment stays until it expires, beside the fresh one"
+    let records = records(&fixture).await;
+    assert_eq!(records.len(), 2, "both enrolments remain recorded");
+    assert!(
+        records
+            .iter()
+            .any(|record| record.key == first.identity().key())
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.key == fresh.identity().key())
     );
     second.close().await;
 }
@@ -2144,10 +2194,9 @@ fn a_refused_attestation_is_raised_and_the_device_asks_again_on_the_next_connect
 async fn attestation() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
     let config =
         DeviceCertConfig::new(issuer()).with_accepted_attestation([AttestationLevel::ChipProven]);
-    let (addr, _server) = sync_server(&fixture, &service, config, Arc::clone(&store)).await;
+    let (addr, _server) = sync_server(&fixture, &service, config).await;
     let dir = tempdir().expect("a data directory");
 
     let (client, pump) = Box::pin(
@@ -2175,7 +2224,10 @@ async fn attestation() {
         client.device_certificate().is_none(),
         "the device holds no certificate"
     );
-    assert!(store.records().is_empty(), "the server recorded nothing");
+    assert!(
+        records(&fixture).await.is_empty(),
+        "the server recorded nothing"
+    );
     client.close().await;
 
     // The next connection over the same dir asks again, and is refused again.
@@ -2196,7 +2248,7 @@ async fn attestation() {
         "the next connection asks again"
     );
     assert!(second.device_certificate().is_none());
-    assert_eq!(store.records(), Vec::new());
+    assert_eq!(records(&fixture).await.len(), 0, "no certificate recorded");
     second.close().await;
 }
 
@@ -2218,14 +2270,7 @@ fn a_reported_device_is_refused_by_a_peer_that_learned_it_from_a_peer() {
 async fn peer_report() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, server) = sync_server(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, server) = sync_server(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let (dir_a, dir_b, dir_c) = (
         tempdir().expect("a dir"),
         tempdir().expect("b dir"),
@@ -2371,13 +2416,18 @@ async fn peer_report() {
         "b's app hears the apply while no server is reachable"
     );
 
-    // C reopens with the server still down and dials b, whose handshake
-    // refuses it, since b learned c's revocation from a.
+    // C, whose session the revocation ended, signs in again with the sync
+    // server still down, so it keeps its certificate, and dials b, whose
+    // handshake refuses it, since b learned c's revocation from a.
     let (c2, c2_pump) = Box::pin(
-        signed_in(addr, last_used(&base, APP_PEER_C), dir_c.path())
-            .with_peer_listener(listener)
-            .with_peer_autolink(false)
-            .connect_with_pump(),
+        signed_in(
+            addr,
+            fresh_login(&base, APP_PEER_C, "peer-user"),
+            dir_c.path(),
+        )
+        .with_peer_listener(listener)
+        .with_peer_autolink(false)
+        .connect_with_pump(),
     )
     .await
     .expect("c reopens");
@@ -2439,14 +2489,8 @@ fn a_number_tail_then_binds_the_key() {
 async fn wd_tail_bind() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server, _manager) = sync_server_with_manager(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server, _manager) =
+        sync_server_with_manager(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("dir");
     let (client, pump) = Box::pin(
         signed_in(
@@ -2504,14 +2548,8 @@ fn a_device_only_bind_reconciles() {
 async fn wd_device_bind() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server, _manager) = sync_server_with_manager(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server, _manager) =
+        sync_server_with_manager(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("dir");
     // The first run enrols the device. The build holds the key but is not
     // bound yet, so it writes nothing.
@@ -2604,14 +2642,8 @@ fn a_first_certificate_becomes_the_device() {
 async fn wd_first_cert() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server, _manager) = sync_server_with_manager(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server, _manager) =
+        sync_server_with_manager(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("dir");
     let (client, pump) = Box::pin(
         signed_in(
@@ -2668,14 +2700,8 @@ fn a_number_tail_settles_into_the_device() {
 async fn wd_tail_settles() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server, _manager) = sync_server_with_manager(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server, _manager) =
+        sync_server_with_manager(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("dir");
     let (client, pump) = Box::pin(
         signed_in(
@@ -2730,18 +2756,11 @@ fn a_retired_device_writer_reenrols_with_provenance() {
     run_phase("wd-retiring");
 }
 
-#[expect(clippy::too_many_lines, reason = "one phase scenario per body")]
 async fn wd_retiring() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server, _manager) = sync_server_with_manager(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server, _manager) =
+        sync_server_with_manager(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("dir");
     // The first run enrols the device. The build holds the key but is not
     // bound yet, so it writes nothing.
@@ -2853,14 +2872,8 @@ fn a_device_revoked_while_away_loses_its_tail_with_the_replica() {
 async fn wd_revoked() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth(&fixture).await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let (addr, _server, manager) = sync_server_with_manager(
-        &fixture,
-        &service,
-        DeviceCertConfig::new(issuer()),
-        Arc::clone(&store),
-    )
-    .await;
+    let (addr, _server, manager) =
+        sync_server_with_manager(&fixture, &service, DeviceCertConfig::new(issuer())).await;
     let dir = tempdir().expect("dir");
     // The first run enrols the device. The build holds the key but is not
     // bound yet, so it writes nothing.
@@ -2910,12 +2923,19 @@ async fn wd_revoked() {
         manager.revoke_device(old_key).await.expect("revoke"),
         "the operator revokes the key"
     );
-    // The third run signs back in, learns its key was revoked and wipes the
-    // device, the unsent tail with the replica (R105 decision 10).
-    let (third, pump) =
-        Box::pin(signed_in(addr, last_used(&base, APP_WD_REVOKED), dir.path()).connect_with_pump())
-            .await
-            .expect("signs back in again");
+    // The third run, whose session the revocation ended, signs in again,
+    // learns its key was revoked and wipes the device, the unsent tail with
+    // the replica (R105 decision 10).
+    let (third, pump) = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_WD_REVOKED, "wd-revoked"),
+            dir.path(),
+        )
+        .connect_with_pump(),
+    )
+    .await
+    .expect("signs back in again");
     let replica = replica_db_name(
         REPLICA_PREFIX,
         third.session().expect("a provider build").user_id(),

@@ -23,7 +23,10 @@ pub mod sign_in;
 pub mod store;
 pub mod token;
 
-pub use hooks::{AuthHooks, CommittedNotice, DefaultAuthHooks, HookError, HookFuture, SignedIn};
+pub use hooks::{
+    AuthHooks, CommittedNotice, DefaultAuthHooks, DeviceEnrolled, DeviceRevoked, EndCause,
+    HookError, HookFuture, SessionsEnded, SignedIn,
+};
 pub use identity::{VerifiedClaims, deterministic_uuid};
 pub use provider::{
     AssuranceRequirement, AuthCodes, IdentityProvider, IssuedAuthCode, LoginRedirect, PendingLogin,

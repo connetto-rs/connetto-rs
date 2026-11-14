@@ -18,7 +18,7 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 
 use axum::Router;
@@ -33,8 +33,7 @@ use crate::ban::ConnettoBanSchema;
 use crate::bots::{ConnettoBotSchema, InstalledApp, pg_bot_registry};
 use crate::defaults::ConnettoDefaults;
 use crate::device_cert::{
-    ConnettoEnrolmentSchema, Device, DeviceCertConfig, DeviceEnrolment, FirstEnrolment,
-    FirstEnrolmentHook, StatusList, pg_enrolment_store,
+    ConnettoEnrolmentSchema, Device, DeviceCertConfig, DeviceEnrolment, EnrolmentError, StatusList,
 };
 use crate::manager_builder::ManagerBuilder;
 use crate::materializer::Materializer;
@@ -59,6 +58,7 @@ use connetto_core::device_cert::KeyId;
 use connetto_core::messages::{ContentVerb, FatalErrorReason};
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority};
 use connetto_core::{Major, SchemaVersion};
+use diesel_async::AsyncConnection as _;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
@@ -72,12 +72,13 @@ use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::io::AsyncWrite;
 
 use crate::{
-    AbuseConfig, Artifact, AuthConfig, AuthHooks, AuthService, CallerMappings, CommittedNotice,
-    CookieSameSite, DbAuthStore, DefaultAuthHooks, GenericOidcProvider, LivenessError,
-    LoginRequest, OidcProviderConfig, PgReadConnector, PgSnapshotSource, PgWriteTarget,
-    ProviderRegistry, RedirectPolicy, RequestGuard, RlsAuth, RuntimeWritableCatalog,
-    SessionDescriber, SessionId, SessionRecord, TokenAuthority, VerifiedSession, auth_router,
-    is_loopback_host, pg_ban_store, pg_write_target, preflight,
+    AbuseConfig, Artifact, AuthConfig, AuthHooks, AuthService, AuthStoreError, BanError, BanFuture,
+    BannedSessions, CallerMappings, CommittedNotice, CookieSameSite, DbAuthStore, DefaultAuthHooks,
+    EndCause, GenericOidcProvider, LivenessError, LoginRequest, OidcProviderConfig,
+    PgReadConnector, PgSnapshotSource, PgWriteTarget, ProviderRegistry, RedirectPolicy,
+    RequestGuard, RlsAuth, RuntimeWritableCatalog, SessionDescriber, SessionId, SessionRecord,
+    TokenAuthority, VerifiedSession, auth_router, is_loopback_host, pg_ban_store, pg_write_target,
+    preflight,
 };
 
 /// The id-type marker a deployment's bot registry tables are declared with.
@@ -844,6 +845,17 @@ pub enum SessionsError {
     Writers(String),
 }
 
+impl SessionsError {
+    /// The error of a transaction joining the auth store and the enrolment
+    /// table, the auth store's own when it or a hook failed.
+    fn of_transaction(err: EnrolmentError) -> Self {
+        match err {
+            EnrolmentError::Auth(err) => Self::Auth(err.into()),
+            other => Self::Devices(other),
+        }
+    }
+}
+
 impl<D> ServerHandle<D>
 where
     D: ConnettoSchema,
@@ -935,40 +947,57 @@ where
     }
 
     /// End `user`'s session `session`, recording `ended_by_owner`, and answer
-    /// what it left behind. When a device enrolled during it, its key is
-    /// revoked first and the device is closed with `DeviceRevoked`. A session
-    /// that is not `user`'s or not live ends nothing, and the answer is
-    /// empty.
+    /// what it left behind. Every device key enrolled during it is revoked in
+    /// the same transaction, and each such device is closed with
+    /// `DeviceRevoked`. A session that is not `user`'s or not live ends
+    /// nothing, and the answer is empty.
     ///
     /// # Errors
     ///
-    /// [`SessionsError`] when the auth store, the enrolment table, the issuer
-    /// or the audit and registry tables fail.
+    /// [`SessionsError`] when the auth store, the application's hooks, the
+    /// enrolment table, the issuer or the audit and registry tables fail.
     pub async fn end_session(
         &self,
         user: &D::Id,
         session: SessionId,
     ) -> Result<Ended<D::Id, RowKey<D>>, SessionsError> {
-        let owned = self
-            .service
-            .sessions_of(user)
-            .await?
-            .iter()
-            .any(|record| record.session_id == session);
-        if !owned {
+        let Some(enrolment) = self.manager.device_enrolment() else {
+            let ended = if self.service.end_session(user, session).await? {
+                vec![session]
+            } else {
+                Vec::new()
+            };
+            return self.left_behind(user, ended).await;
+        };
+        let store = self.service.store();
+        let mut conn = store.pool().get().await.map_err(EnrolmentError::Pool)?;
+        let (ended, keys) = conn
+            .transaction::<_, EnrolmentError, _>(async move |transaction| {
+                if !store
+                    .end_owned_in(transaction, user, session, EndCause::EndedByOwner)
+                    .await?
+                {
+                    return Ok((false, Vec::new()));
+                }
+                let keys = enrolment
+                    .revoke_keys_in(transaction, user, Some(session))
+                    .await?;
+                Ok((true, keys))
+            })
+            .await
+            .map_err(SessionsError::of_transaction)?;
+        if !ended {
             return Ok(Ended::nothing());
         }
-        for device in self.live_devices_of(user).await? {
-            if device.session == session {
-                self.manager.revoke_device_of(user, device.key).await?;
-            }
-        }
-        let ended = if self.service.end_session(user, session).await? {
-            vec![session]
-        } else {
-            Vec::new()
-        };
-        self.left_behind(user, ended).await
+        let announced = self.announce_keys(enrolment, user, &keys).await;
+        self.service.ended_elsewhere(
+            user,
+            &[session],
+            AuthOp::EndedByOwner,
+            EndCause::EndedByOwner,
+        );
+        announced?;
+        self.left_behind(user, vec![session]).await
     }
 
     /// End every session of `user`, recording `ended_all`, and answer what
@@ -1080,11 +1109,36 @@ where
         })
     }
 
-    /// `user`'s devices whose keys are not revoked.
+    /// `user`'s devices whose keys are not revoked, none when no enrolment is
+    /// installed.
     async fn live_devices_of(&self, user: &D::Id) -> Result<Vec<Device>, SessionsError> {
-        let mut devices = self.manager.devices_of(user).await?;
+        let Some(enrolment) = self.manager.device_enrolment() else {
+            return Ok(Vec::new());
+        };
+        let mut devices = enrolment.enrolled(user).await?;
         devices.retain(|device| device.revoked_at.is_none());
         Ok(devices)
+    }
+
+    /// Publish the list naming `keys` of `user`, revoked in a committed
+    /// transaction, close each one's device with `DeviceRevoked` and tell
+    /// [`committed`](crate::AuthHooks::committed) of each.
+    async fn announce_keys(
+        &self,
+        enrolment: &DeviceEnrolment<D>,
+        user: &D::Id,
+        keys: &[(KeyId, SessionId)],
+    ) -> Result<(), SessionsError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let lists = enrolment.after_keys_revoked(user, keys).await?;
+        for (_, session) in keys {
+            self.manager
+                .announce_revocation(*session, lists.clone())
+                .await;
+        }
+        Ok(())
     }
 
     /// Record that the application erased `person`'s data, once its erasure
@@ -1167,25 +1221,53 @@ where
     /// Sign the person out everywhere, the step the erasure recipe runs
     /// before it deletes the person's rows (chapter 20).
     ///
-    /// Every live session the person holds is revoked first, each live
-    /// connection closed with `SessionRevoked` and each revocation recorded as
-    /// `session_revoked`, and then every device key the person's account
-    /// enrolled, which publishes the revocation and closes that device's
-    /// connection.
+    /// One transaction ends every live session the person holds, revokes
+    /// every device key the person's account enrolled and runs
+    /// [`person_erased`](crate::AuthHooks::person_erased). Once it commits,
+    /// each live connection is closed with `SessionRevoked` and each
+    /// revocation recorded as `session_revoked`, and the revocation list is
+    /// published, closing each revoked device's connection.
     ///
     /// # Errors
     ///
-    /// [`SessionsError`] when the auth store, the enrolment table or the
-    /// issuer fails.
+    /// [`SessionsError`] when the auth store, the application's hooks, the
+    /// enrolment table or the issuer fails. A hook's error leaves every
+    /// session and key standing.
     pub async fn end_person(&self, person: &D::Id) -> Result<PersonEnded, SessionsError> {
-        let sessions = self.service.revoke_person(person).await?;
-        let devices = self.live_devices_of(person).await?;
-        for device in &devices {
-            self.manager.revoke_device_of(person, device.key).await?;
-        }
+        let store = self.service.store();
+        let enrolment = self.manager.device_enrolment();
+        let mut conn = store.pool().get().await.map_err(EnrolmentError::Pool)?;
+        let (sessions, keys) = conn
+            .transaction::<_, EnrolmentError, _>(async move |transaction| {
+                let sessions = store
+                    .end_all_of_in(transaction, person, None, EndCause::Erased)
+                    .await?;
+                let keys = match enrolment {
+                    Some(enrolment) => enrolment.revoke_keys_in(transaction, person, None).await?,
+                    None => Vec::new(),
+                };
+                store
+                    .hooks()
+                    .person_erased(transaction, person)
+                    .await
+                    .map_err(AuthStoreError::Hook)?;
+                Ok((sessions, keys))
+            })
+            .await
+            .map_err(SessionsError::of_transaction)?;
+        self.service
+            .ended_elsewhere(person, &sessions, AuthOp::SessionRevoked, EndCause::Erased);
+        let announced = match enrolment {
+            Some(enrolment) => self.announce_keys(enrolment, person, &keys).await,
+            None => Ok(()),
+        };
+        store.hooks().committed(CommittedNotice::PersonErased {
+            person: person.clone(),
+        });
+        announced?;
         Ok(PersonEnded {
             sessions: u64::try_from(sessions.len()).unwrap_or(u64::MAX),
-            devices: u64::try_from(devices.len()).unwrap_or(u64::MAX),
+            devices: u64::try_from(keys.len()).unwrap_or(u64::MAX),
         })
     }
 }
@@ -1874,8 +1956,8 @@ where
             .build()
         };
         wire_manager(&manager, &service, &guard, &pool, &feed).await?;
-        let status = device_identity
-            .map(|config| install_device_identity::<D>(&manager, &service, &pool, config));
+        let status =
+            device_identity.map(|config| install_device_identity::<D>(&manager, &service, config));
 
         Ok(assemble_parts(
             Arc::clone(&manager),
@@ -2032,62 +2114,21 @@ async fn require_cap_policies<D: ConnettoSchema>(
     Ok(())
 }
 
-/// Enrol devices under `config` into the deployment's enrolment tables on the
-/// owner pool, and revoke in the auth store the session a revoked device last
-/// enrolled with, so its live connection closes and it cannot enrol again.
+/// Enrol devices under `config` into the deployment's enrolment tables,
+/// whose writes join the auth store's transactions and run the application's
+/// hooks.
 fn install_device_identity<D: ConnettoSchema>(
     manager: &ServerManager<D>,
     service: &Arc<AuthService<D>>,
-    pool: &PgPool,
     config: DeviceCertConfig,
 ) -> BackgroundTask {
-    let revoking = Arc::clone(service);
     // The status list's fetch task starts with the server and stops with it.
     let list = StatusList::new(config.android_status().clone());
     let status = BackgroundTask::new(list.spawn());
-    let enrolment = DeviceEnrolment::new(config, pg_enrolment_store::<D>(pool.clone()))
-        .with_session_revoker(Arc::new(move |session| {
-            let service = Arc::clone(&revoking);
-            Box::pin(async move {
-                if let Err(err) = service.revoke(session).await {
-                    tracing::warn!(error = %err, "a revoked device's session was not revoked");
-                }
-            })
-        }));
-    let enrolment = enrolment
-        .with_first_enrolment_hook(tell_first_enrolment(service))
-        .with_status_list(list);
+    let enrolment = DeviceEnrolment::new(config, Arc::clone(service)).with_status_list(list);
     // The manager was built a moment ago, so nothing installed one before.
     let _ = manager.install_device_enrolment(Arc::new(enrolment));
     status
-}
-
-/// Tell the application of a key's first enrolment with the session it
-/// enrolled during, read on a spawned task since the hook fires inside the
-/// enrolment.
-fn tell_first_enrolment<D: ConnettoSchema>(
-    service: &Arc<AuthService<D>>,
-) -> FirstEnrolmentHook<D::Id> {
-    let service = Arc::clone(service);
-    Arc::new(move |first: FirstEnrolment<D::Id>| {
-        let service = Arc::clone(&service);
-        tokio::spawn(async move {
-            match service.session_record(first.session).await {
-                Ok(Some(session)) => service.hooks().committed(CommittedNotice::DeviceEnrolled {
-                    session,
-                    key: first.key,
-                    device: first.descriptor,
-                    at: first.at,
-                }),
-                Ok(None) => {
-                    tracing::warn!("a device enrolled during a session the store does not hold");
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "a first enrolment went untold");
-                }
-            }
-        });
-    })
 }
 
 /// Check what the change stream needs, then set up the reconnect log and the
@@ -2223,26 +2264,49 @@ async fn build_auth<D: ConnettoSchema>(
     // every other access change is produced here.
     service.guard().set_audit_hook(Arc::clone(&wiring.audit));
     service.set_audit_hook(wiring.audit);
-    // A ban ends every session of the banned identity (R105 decision 8). The
-    // guard holds the hook and the service holds the guard, so the hook
-    // reaches the service through a weak handle rather than a cycle.
-    let banned = Arc::downgrade(&service);
-    service.guard().set_ban_hook(Arc::new(move |user: D::Id| {
-        let Some(service) = banned.upgrade() else {
-            return;
-        };
-        tokio::spawn(async move {
-            match service.end_banned(&user).await {
-                Ok(ended) => {
-                    tracing::warn!(user = %user, ended = ended.len(), "the ban ended every session");
-                }
-                Err(error) => {
-                    tracing::error!(%error, user = %user, "the ban's sessions could not be ended");
-                }
-            }
-        });
-    }));
+    // A ban ends every session of the banned identity in its own transaction
+    // (R105 decision 8). The guard holds the sessions' ender and the service
+    // holds the guard, so the ender reaches the service through a weak handle
+    // rather than a cycle.
+    service
+        .guard()
+        .set_banned_sessions(Arc::new(ServiceBans(Arc::downgrade(&service))));
     Ok((service, registry))
+}
+
+/// Ends a banned identity's sessions through the auth service, held weakly
+/// since the service holds the guard that holds this.
+struct ServiceBans<D: ConnettoSchema>(Weak<AuthService<D>>);
+
+impl<D: ConnettoSchema> BannedSessions<D::Id> for ServiceBans<D> {
+    fn end<'a>(
+        &'a self,
+        transaction: &'a mut AsyncPgConnection,
+        user_id: &'a D::Id,
+    ) -> BanFuture<'a, Vec<SessionId>> {
+        Box::pin(async move {
+            let Some(service) = self.0.upgrade() else {
+                return Ok(Vec::new());
+            };
+            service
+                .store()
+                .end_all_of_in(transaction, user_id, None, EndCause::Banned)
+                .await
+                .map_err(BanError::new)
+        })
+    }
+
+    fn ended(&self, user_id: &D::Id, sessions: &[SessionId]) {
+        if let Some(service) = self.0.upgrade() {
+            service.ended_elsewhere(
+                user_id,
+                sessions,
+                crate::audit::AuthOp::EndedByBan,
+                EndCause::Banned,
+            );
+        }
+        tracing::warn!(user = %user_id, ended = sessions.len(), "the ban ended every session");
+    }
 }
 
 /// The reader pool's consumers: the file half, its sweep and the snapshot
