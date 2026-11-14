@@ -6,6 +6,7 @@ pub(super) mod custody;
 mod fetch;
 mod place;
 mod serve;
+mod upload;
 
 use core::fmt::Display;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -33,6 +34,7 @@ use fetch::{
 
 use super::{ContentClient, ContentEvent};
 use crate::db;
+use crate::db::CustodyRow as CustodyCopy;
 use crate::error::ContentError;
 use crate::http::ContentHttp;
 use crate::resolve::Resolved;
@@ -191,12 +193,14 @@ enum Job {
     },
     /// The commit of a fetch whose chunks are all in, taken into custody
     /// when it fits in `budget`, also for a settled row when the fetch
-    /// `takes_over` a leaving copy.
+    /// `takes_over` a leaving copy, credited to `owner` when its holder
+    /// named one.
     Commit {
         tag: u64,
         manifest: Manifest,
         budget: u64,
         takes_over: bool,
+        owner: Option<String>,
     },
 }
 
@@ -329,15 +333,10 @@ where
     async fn custody_held(&self) -> (Vec<CustodyCopy>, u64) {
         self.client
             .with_conn(|conn| -> Result<_, ContentError> {
-                let copies = db::custody_states(conn.conn())?
-                    .into_iter()
-                    .map(|(file_id, state, size)| CustodyCopy {
-                        file_id,
-                        state,
-                        size,
-                    })
-                    .collect();
-                Ok((copies, db::custody_bytes(conn.conn())?))
+                Ok((
+                    db::custody_states(conn.conn())?,
+                    db::custody_bytes(conn.conn())?,
+                ))
             })
             .await
             .ok()
@@ -396,6 +395,15 @@ where
     /// when a custody copy's author lapses, so a copy leaves custody once its
     /// state column reads `available` and a cache copy returns on `lost`
     /// without the application calling anything.
+    ///
+    /// A custody copy whose row settled while its state column does not read
+    /// `available` is queued for [`drive_outbox`](Self::drive_outbox) to
+    /// upload, credited to the row's author's account: at once when this
+    /// device's courier call settled the row, and otherwise `k` times 10
+    /// minutes after this device learned the row settled, `k` its rank from
+    /// 1 among the linked holders. The upload is cancelled with the copy
+    /// once the state reads `available`, and a refused one waits for
+    /// [`retry_refused`](Self::retry_refused).
     ///
     /// A peer is served one request at a time and at most two peers at once,
     /// and a request beyond that is answered `Busy`. A stream stops when its
@@ -476,6 +484,15 @@ where
                 event = applied.recv(), if applies_open => match event {
                     Ok(ClientEvent::ProvisionalApplied { author, .. }) => {
                         driver.prefetch(&author, Instant::now()).await
+                    }
+                    Ok(ClientEvent::ProvisionalSettled {
+                        author,
+                        by_courier: true,
+                        ..
+                    }) => {
+                        driver.couriered.insert(author);
+                        driver.custody_due = true;
+                        Vec::new()
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         applies_open = false;
@@ -558,8 +575,11 @@ where
                 manifest,
                 budget,
                 takes_over,
+                owner,
             } => {
-                let outcome = self.commit_fetched(&manifest, budget, takes_over).await;
+                let outcome = self
+                    .commit_fetched(&manifest, budget, takes_over, owner)
+                    .await;
                 Done::Committed {
                     tag,
                     manifest,
@@ -607,23 +627,6 @@ where
 /// A device's room and its measured rates by key id, as one report states
 /// them.
 type RoomTold = (u64, Vec<([u8; 32], u64)>);
-
-/// One copy this device holds in custody.
-#[derive(Clone)]
-struct CustodyCopy {
-    file_id: FileId,
-    /// [`db::HELD`], [`db::LEAVING`] or [`db::PRESSED`].
-    state: String,
-    /// The file's size in bytes.
-    size: u64,
-}
-
-impl CustodyCopy {
-    /// Whether the copy is marked leaving, as surplus or under pressure.
-    fn leaving(&self) -> bool {
-        self.state != db::HELD
-    }
-}
 
 /// Whether a client event can move a custody row, an event the broadcast
 /// dropped counting as one. A dropped apply is caught when its author's link
@@ -738,6 +741,12 @@ struct Driver<'c, T: Transport, B: ChunkStore + Clone, H: ContentHttp, F, J> {
     place_again_after: Duration,
     /// The pressed copies no linked device can take over.
     stranded: HashSet<FileId>,
+    /// The authors whose rows this device's courier call settled since the
+    /// last placement pass, whose custody copies it uploads at once (R79
+    /// decision 17).
+    couriered: HashSet<Vec<u8>>,
+    /// When the earliest staggered upload wait ends.
+    upload_at: Option<Instant>,
 }
 
 /// What one peer was last told of this device's custody.
@@ -794,6 +803,8 @@ where
             place_again_at: None,
             place_again_after: FIRST_BACKOFF,
             stranded: HashSet::new(),
+            couriered: HashSet::new(),
+            upload_at: None,
         }
     }
 
@@ -822,7 +833,7 @@ where
     }
 
     /// The earliest instant a request lapses, busy holders are asked again,
-    /// the room is checked or placement runs again.
+    /// the room is checked, placement runs again or an upload wait ends.
     fn next_wake(&self) -> Option<Instant> {
         self.fetches
             .values()
@@ -831,6 +842,7 @@ where
             .chain(self.room_at)
             .chain(self.lapse_at)
             .chain(self.place_again_at)
+            .chain(self.upload_at)
             .min()
     }
 
@@ -902,7 +914,8 @@ where
     }
 
     /// The driver's wake: requests that lapsed, busy holders due again, the
-    /// room check, and the custody pass once an author lapsed.
+    /// room check, the custody pass once an author lapsed, and placement
+    /// again once a backoff or an upload wait ended.
     async fn tick(&mut self, now: Instant) -> Vec<Action> {
         let mut actions = self.links.timeout(now);
         actions.extend(self.retry_due(now).await);
@@ -913,6 +926,10 @@ where
         }
         if self.place_again_at.is_some_and(|at| at <= now) {
             self.place_again_at = None;
+            self.placement_due = true;
+        }
+        if self.upload_at.is_some_and(|at| at <= now) {
+            self.upload_at = None;
             self.placement_due = true;
         }
         actions
@@ -1023,6 +1040,10 @@ where
             file_id,
             state: db::HELD.to_owned(),
             size: 0,
+            author: None,
+            owner: None,
+            settled_seen_at: None,
+            upload: db::Upload::None,
         }));
         told
     }
@@ -1486,7 +1507,16 @@ where
             return self.release(&peer, done, now);
         }
         match message {
-            Media::Manifest { chunks, last, .. } => {
+            Media::Manifest {
+                chunks,
+                last,
+                owner,
+                ..
+            } => {
+                // The last run names the owner of the holder's custody copy.
+                if last && let Some(fetch) = self.fetches.get_mut(&tag) {
+                    fetch.owner = owner;
+                }
                 self.manifest_run(peer, tag, chunks, last, done, now).await
             }
             Media::Piece { encoded, last, .. } => {
@@ -1610,6 +1640,7 @@ where
                     manifest,
                     budget: self.budget,
                     takes_over,
+                    owner: fetch.owner.take(),
                 });
                 None
             }

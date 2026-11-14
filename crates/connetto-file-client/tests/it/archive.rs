@@ -23,6 +23,210 @@ const PHOTO: &[u8] = b"an offline photograph that must survive a device replacem
 const CACHE: &[u8] = b"a fetched photograph the server can provide again";
 
 #[tokio::test]
+async fn split_uploads_credit_the_owner_and_persist_outbox_removal() {
+    use connetto_core::messages::ContentVerb;
+    use connetto_file_client::{
+        ContentArchive, ContentFlush, ContentFlushStart, ContentFlushState,
+    };
+
+    use crate::support::{ROOT_KEY, connected_connection};
+
+    diesel::table! {
+        _connetto_content_outbox (file_id) {
+            file_id -> Binary,
+            carried_for -> Nullable<Text>,
+        }
+    }
+
+    const INTENT: &str = "https://files.test/files/ab/intent?t=TOKEN";
+    for owner in [None, Some("anna")] {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("replica.sqlite");
+        let transport = Scripted::granting(INTENT);
+        let mut conn = connected_connection(&path, transport.clone()).await;
+        let archive = ContentArchive::new(FsStore::new(dir.path().join("chunks")), ROOT_KEY);
+        archive.install(&mut conn).expect("install content");
+        let manifest = archive
+            .chunk_file(PHOTO, MimeClass::Jpeg)
+            .await
+            .expect("store the photo");
+        let file_id = manifest.file_id();
+        if let Some(owner) = owner {
+            archive
+                .record_fetched(&mut conn, &manifest)
+                .expect("record the held copy");
+            diesel::insert_into(_connetto_content_outbox::table)
+                .values((
+                    _connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()),
+                    _connetto_content_outbox::carried_for.eq(owner),
+                ))
+                .execute(conn.conn())
+                .expect("queue the carried copy");
+        } else {
+            archive
+                .commit_staged(&mut conn, &manifest, |_, _| Ok(()))
+                .expect("queue the authored photo");
+        }
+        let needed: Vec<_> = manifest
+            .chunks()
+            .iter()
+            .map(|chunk| chunk.hash.to_string())
+            .collect();
+        let http = RecordingHttp::new([
+            (
+                200,
+                serde_json::to_vec(&serde_json::json!({ "needed": needed }))
+                    .expect("encode needed chunks"),
+            ),
+            (204, Vec::new()),
+            (200, Vec::new()),
+        ]);
+        let mut state = ContentFlushState::default();
+        let (start, _) = tokio::time::timeout(
+            core::time::Duration::from_secs(10),
+            archive.begin_flush_next_or(&mut conn, &mut state, core::future::pending()),
+        )
+        .await
+        .expect("the upload ticket settles");
+        let ContentFlushStart::Upload(upload) = start.expect("start upload") else {
+            panic!("the queued photo needs an upload");
+        };
+        let requests = transport.tickets();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].file_id, *file_id.as_bytes());
+        assert_eq!(
+            requests[0].verb,
+            ContentVerb::Write {
+                declared_len: u64::try_from(PHOTO.len()).expect("photo length"),
+            }
+        );
+        assert_eq!(requests[0].for_owner.as_deref(), owner);
+
+        upload.transfer(&http).await.expect("upload the bytes");
+        assert_eq!(archive.sendable_files(&mut conn).expect("queued upload"), 1);
+        assert_eq!(
+            archive
+                .finish_upload(&mut conn, &upload, Ok(()))
+                .await
+                .expect("commit upload"),
+            ContentFlush::Progressed
+        );
+        let sent = http.sent();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[1].method, "PUT");
+        assert_eq!(sent[1].body, PHOTO);
+        assert_eq!(sent[2].method, "POST");
+        assert!(sent[2].url.ends_with("/commit?t=TOKEN"));
+
+        drop(conn);
+        assert_uploaded_after_reopen(&archive, &path, file_id).await;
+    }
+}
+
+/// An uploaded file stays local with no queued upload or loss after reopening.
+async fn assert_uploaded_after_reopen(
+    archive: &connetto_file_client::ContentArchive<FsStore>,
+    path: &std::path::Path,
+    file_id: FileId,
+) {
+    let mut reopened = crate::support::cold_connection(path).await;
+    archive.install(&mut reopened).expect("reopen content");
+    assert_eq!(
+        archive
+            .sendable_files(&mut reopened)
+            .expect("durable dequeue"),
+        0
+    );
+    assert_eq!(
+        archive.pending_files(&mut reopened).expect("pending files"),
+        0
+    );
+    assert_eq!(
+        archive.retired_content(&mut reopened).expect("losses"),
+        Vec::<FileId>::new()
+    );
+    let Some(Resolved::Local { bytes, .. }) = archive
+        .resolve_local(&mut reopened, file_id)
+        .await
+        .expect("resolve uploaded content")
+    else {
+        panic!("upload completion keeps the local bytes");
+    };
+    assert_eq!(bytes, PHOTO);
+}
+
+#[tokio::test]
+async fn a_missing_manifest_retires_the_authored_file_without_a_ticket() {
+    use connetto_file_client::{
+        ContentArchive, ContentFlush, ContentFlushStart, ContentFlushState,
+    };
+
+    use crate::support::{ROOT_KEY, cold_connection, connected_connection};
+
+    diesel::table! {
+        _connetto_content_chunks (file_id, ordinal) {
+            file_id -> Binary,
+            ordinal -> Integer,
+        }
+    }
+
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("replica.sqlite");
+    let transport = Scripted::new([]);
+    let mut conn = connected_connection(&path, transport.clone()).await;
+    let archive = ContentArchive::new(FsStore::new(dir.path().join("chunks")), ROOT_KEY);
+    archive.install(&mut conn).expect("install content");
+    let manifest = archive
+        .chunk_file(PHOTO, MimeClass::Jpeg)
+        .await
+        .expect("store the photo");
+    let file_id = manifest.file_id();
+    archive
+        .commit_staged(&mut conn, &manifest, |_, _| Ok(()))
+        .expect("queue the photo");
+    diesel::delete(_connetto_content_chunks::table)
+        .filter(_connetto_content_chunks::file_id.eq(file_id.as_bytes().to_vec()))
+        .execute(conn.conn())
+        .expect("lose the manifest");
+
+    let mut state = ContentFlushState::default();
+    let (start, _) = tokio::time::timeout(
+        core::time::Duration::from_secs(10),
+        archive.begin_flush_next_or(&mut conn, &mut state, core::future::pending()),
+    )
+    .await
+    .expect("the missing manifest settles locally");
+    assert!(matches!(
+        start.expect("retire the lost file"),
+        ContentFlushStart::Complete(ContentFlush::Progressed)
+    ));
+    assert_eq!(
+        transport.tickets(),
+        Vec::<connetto_core::messages::ContentTicketRequest>::new()
+    );
+
+    drop(conn);
+    let mut reopened = cold_connection(&path).await;
+    archive.install(&mut reopened).expect("reopen content");
+    assert_eq!(
+        archive.pending_files(&mut reopened).expect("pending files"),
+        0
+    );
+    assert_eq!(
+        archive
+            .sendable_files(&mut reopened)
+            .expect("sendable files"),
+        0
+    );
+    assert_eq!(
+        archive
+            .retired_content(&mut reopened)
+            .expect("durable loss"),
+        [file_id]
+    );
+}
+
+#[tokio::test]
 async fn unsent_content_restores_under_the_receiving_key_with_its_row_and_outbox() {
     let source_dir = tempdir().expect("source directory");
     let (archive, file_id, source_ciphertext) = export_source(source_dir.path()).await;

@@ -408,7 +408,7 @@ async fn a_settled_copy_leaves_custody_when_sync_says_available() {
         settle(client).await;
         tokio::time::timeout(BOUND, async {
             loop {
-                if let ClientEvent::ProvisionalSettled { author, seq } =
+                if let ClientEvent::ProvisionalSettled { author, seq, .. } =
                     events.recv().await.expect("the client's events run")
                 {
                     assert_eq!((author, seq), (anna().key_id, 1));

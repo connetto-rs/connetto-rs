@@ -34,6 +34,9 @@ pub const MAX_SERVING: usize = 2;
 /// The most entries one list of a holder report carries.
 pub const MAX_REPORT_ENTRIES: usize = 8192;
 
+/// The longest owner account one [`Media::Manifest`] names, in bytes.
+pub const MAX_OWNER_BYTES: usize = 1024;
+
 /// The shortest fetch that samples a peer's rate, since a shorter one's time
 /// is mostly the round trip.
 pub const MIN_RATE_SAMPLE: u64 = 256 * 1024;
@@ -61,6 +64,10 @@ pub enum Media {
         chunks: Vec<([u8; 32], u64)>,
         /// Whether this is the manifest's last run.
         last: bool,
+        /// The account the holder's custody copy is uploaded for, at most
+        /// [`MAX_OWNER_BYTES`], set on the last run alone, so a device taking
+        /// the copy over credits the same owner (R79 decision 17).
+        owner: Option<String>,
     },
     /// A request for the verified-streaming encoding of `len` bytes of a
     /// file from `start`.
@@ -243,8 +250,10 @@ impl Media {
     /// [`MAX_PIECE_BYTES`], [`BoundsError::RangeOutOfBounds`] for a fetch of
     /// no bytes, of more than [`MAX_FETCH_LEN`], or past the largest offset,
     /// [`BoundsError::TooManyEntries`] for a report list above
-    /// [`MAX_REPORT_ENTRIES`], and [`BoundsError::StayingAndLeaving`] for a
-    /// [`Media::Held`] naming one file both staying and leaving.
+    /// [`MAX_REPORT_ENTRIES`], [`BoundsError::StayingAndLeaving`] for a
+    /// [`Media::Held`] naming one file both staying and leaving, and
+    /// [`BoundsError::OwnerTooLong`] for a manifest owner above
+    /// [`MAX_OWNER_BYTES`].
     pub fn within_bounds(&self) -> Result<(), BoundsError> {
         match self {
             Media::Manifest { chunks, .. } if chunks.len() > MAX_MANIFEST_ROWS => {
@@ -291,6 +300,9 @@ impl Media {
             Media::Room { rates, .. } if rates.len() > MAX_REPORT_ENTRIES => {
                 Err(BoundsError::TooManyEntries)
             }
+            Media::Manifest {
+                owner: Some(owner), ..
+            } if owner.len() > MAX_OWNER_BYTES => Err(BoundsError::OwnerTooLong),
             _ => Ok(()),
         }
     }
