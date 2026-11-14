@@ -1,6 +1,6 @@
 //! Runs the dev stack the Dioxus and Tauri demos sign in and sync
 //! against, which is Postgres, the authorization service, the dev identity
-//! provider and `connetto-server`, provisioned with `examples/deployment`,
+//! provider and `demo-server`, provisioned with `examples/deployment`,
 //! the deployment the browser demos share.
 //!
 //! ```text

@@ -135,7 +135,7 @@ One Cargo workspace holds the crates, and each publishes independently so a down
 |---|---|
 | `connetto-core` | The wire types, the framing and codec, and the traits every side agrees on. Both `connetto-server` and `connetto-client` depend on it, and neither depends on the other |
 | `connetto-schema` | The build step that translates a deployment's Postgres sources into the bundle the client and server share |
-| `connetto-server` | The server library and binary. Sessions, CDC ingest, the materializer, the auth stack, the mutation handler, and the server builder |
+| `connetto-server` | The server library. Sessions, CDC ingest, the materializer, the auth stack, the mutation handler, and the server builder |
 | `connetto-client` | The native client. The Diesel connection, its builder, the background sync, the live queries, and the archives |
 | `connetto-dioxus` | The Dioxus hooks that bind live queries to component scope |
 | `connetto-yew` | The same hooks for Yew, with the abort-on-unmount lifecycle suited to Yew's task model |
@@ -153,6 +153,7 @@ One Cargo workspace holds the crates, and each publishes independently so a down
 | `connetto-architecture` | The architecture chapters as rustdoc, so the docs build checks every symbol a chapter cites |
 | `examples/deployment` | The deployment the browser demos share, and the build-time translation behind them |
 | `examples/demo-support` | The schema rows, wording and browser pieces the browser demos share |
+| `examples/demo-tools` | The demo's executables over the libraries, the sync server and client, the schema, certificate authority and identity provider tools, and the custody probe |
 
 Planned in [R103](../../plans/master-implementation-plan.md#r103-the-bot-runtime-and-template), the bot runtime and template, and in [R104](../../plans/master-implementation-plan.md#r104-the-demos-for-apps-and-bots) the two demo bots built from it.
 

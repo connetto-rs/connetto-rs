@@ -1,9 +1,9 @@
-//! `connetto-ca`, run on the operator's offline machine.
+//! `demo-ca`, run on the operator's offline machine over [`connetto_ca`].
 //!
 //! ```text
-//! connetto-ca init <ca-dir> [--passphrase-file PATH]
-//! connetto-ca issuer <ca-dir> <out-dir> [--passphrase-file PATH]
-//! connetto-ca revoke-issuer <ca-dir> <issuer.der> [--passphrase-file PATH]
+//! demo-ca init <ca-dir> [--passphrase-file PATH]
+//! demo-ca issuer <ca-dir> <out-dir> [--passphrase-file PATH]
+//! demo-ca revoke-issuer <ca-dir> <issuer.der> [--passphrase-file PATH]
 //! ```
 //!
 //! `init` creates the deployment's root in `<ca-dir>` and prints the
@@ -36,13 +36,13 @@ enum CommandError {
     Ca(#[from] connetto_ca::CaError),
 }
 
-const USAGE: &str = "usage: connetto-ca init <ca-dir> [--passphrase-file PATH]\n       connetto-ca issuer <ca-dir> <out-dir> [--passphrase-file PATH]\n       connetto-ca revoke-issuer <ca-dir> <issuer.der> [--passphrase-file PATH]";
+const USAGE: &str = "usage: demo-ca init <ca-dir> [--passphrase-file PATH]\n       demo-ca issuer <ca-dir> <out-dir> [--passphrase-file PATH]\n       demo-ca revoke-issuer <ca-dir> <issuer.der> [--passphrase-file PATH]";
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("connetto-ca: {err}");
+            eprintln!("demo-ca: {err}");
             let mut source = std::error::Error::source(&err);
             while let Some(cause) = source {
                 eprintln!("  caused by: {cause}");

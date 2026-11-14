@@ -17,7 +17,7 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 
-use super::e2e::exec;
+use connetto_test_harness::server_fixture::exec;
 
 const HOUR: Duration = Duration::from_hours(1);
 

@@ -4,7 +4,7 @@
 //! the demos' local tier, so its `client` feature runs the schema step over
 //! those four, with the public `products` catalogue in the device's shared store
 //! (R11). A build without that feature holds no schema. The tier history in
-//! `tier_history` is written by `connetto-schema export-tier --schema
+//! `tier_history` is written by `demo-schema export-tier --schema
 //! examples/deployment/schema.sql --tier examples/demo-support/frontend.sql
 //! --dir examples/demo-support/tier_history`.
 

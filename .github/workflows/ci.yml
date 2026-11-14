@@ -339,10 +339,8 @@ jobs:
       matrix:
         include:
           - name: server
-            packages: -p connetto-server
-            # The e2e tests spawn both binaries from the test profile's target dir,
-            # and neither cargo test nor nextest builds another package's bin.
-            bins: -p connetto-server -p connetto-client
+            packages: -p connetto-server -p connetto-demo-tools
+            bins: ''
           - name: client
             packages: -p connetto-client
             bins: ''
@@ -364,9 +362,9 @@ jobs:
               -p connetto-peer
               -p connetto-exchange
               -p connetto-demo-support
-            # The offline-exchange proof names the server binary, so the rest
+            # The offline-exchange proof names the demo server, so the rest
             # shard compiles it beside its test binaries.
-            bins: -p connetto-server
+            bins: -p connetto-demo-tools
     steps:
       - uses: actions/checkout@v7
 
@@ -422,7 +420,7 @@ jobs:
         env:
           # The offline-exchange proof reads the binary the build step
           # compiled, so the test does not build a server of its own.
-          CONNETTO_SERVER_BIN: ${{ matrix.name == 'rest' && format('{0}/target/{1}/connetto-server', github.workspace, github.event_name == 'pull_request' && 'testfast' || 'release') || '' }}
+          CONNETTO_SERVER_BIN: ${{ matrix.name == 'rest' && format('{0}/target/{1}/demo-server', github.workspace, github.event_name == 'pull_request' && 'testfast' || 'release') || '' }}
         run: keyctl session -- cargo +stable nextest run --cargo-profile "$CARGO_TEST_PROFILE" --all-features --test-threads 4 ${{ matrix.packages }}
 
       - name: Prune target cache
@@ -740,7 +738,7 @@ jobs:
 
       - name: Run browser suites
         env:
-          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/connetto-server
+          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/demo-server
           CONNETTO_TOPOLOGY_BIN: ${{ github.workspace }}/browser-bins/verified-topology
         run: browser-bins/connetto-browser-stack --shard ${{ matrix.shard }}/4
 
@@ -873,7 +871,7 @@ jobs:
       # The Keystore gate (R52) needs a secure lock screen, so the run sets a throwaway PIN and types it.
       - name: Walk the proof on the emulator
         env:
-          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/connetto-server
+          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/demo-server
         run: |
           adb -s emulator-5554 shell locksettings set-pin 2580
           android-bins/connetto-demo-stack android-bins/connetto-android-proof --serial emulator-5554 --unlock-pin 2580 --app tauri --apk examples/tauri-leptos-demo/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk

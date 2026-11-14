@@ -5,7 +5,7 @@
 //! router by hand and never open a sync connection, and the browser ones run the
 //! login against a fixture stack whose session store the sync side cannot see, so
 //! the handshake there accepts the token without checking it. This closes that gap:
-//! the token is minted by the running `connetto-server`, the session lands in
+//! the token is minted by the running `demo-server`, the session lands in
 //! Postgres, and the same process verifies it when the client connects.
 //!
 //! The negative case is the load-bearing one. A passing positive is equally
@@ -63,12 +63,12 @@ async fn wait_for_child_port(child: &mut Child, bind: &str) {
         if TcpStream::connect(bind).await.is_ok() {
             return;
         }
-        if let Some(status) = child.try_wait().expect("check connetto-server status") {
-            panic!("connetto-server exited before opening {bind}: {status}");
+        if let Some(status) = child.try_wait().expect("check demo-server status") {
+            panic!("demo-server exited before opening {bind}: {status}");
         }
         assert!(
             Instant::now() < deadline,
-            "connetto-server did not open {bind}"
+            "demo-server did not open {bind}"
         );
         sleep(Duration::from_millis(100)).await;
     }
@@ -92,7 +92,7 @@ async fn maybe_spawn_server() -> Option<ServerGuard> {
     }
     let mut child = command
         .spawn()
-        .unwrap_or_else(|err| panic!("spawning connetto-server at {bin}: {err}"));
+        .unwrap_or_else(|err| panic!("spawning demo-server at {bin}: {err}"));
     wait_for_child_port(&mut child, &bind).await;
     Some(ServerGuard(child))
 }

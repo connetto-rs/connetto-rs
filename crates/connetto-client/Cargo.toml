@@ -16,12 +16,10 @@ workspace = true
 
 [features]
 default = ["native-transport"]
-# The native WebSocket transport plus the tokio conveniences built on it:
-# NativeClientBuilder and the client binary. Wasm builds leave this off,
-# inject their own transport, and drive the pump with spawn_local.
+# The native WebSocket transport plus the tokio conveniences built on it,
+# `NativeClientBuilder` among them. Wasm builds leave this off, inject their
+# own transport, and drive the pump with spawn_local.
 native-transport = [
-  "connetto-core/env",
-  "connetto-core/logging",
   "connetto-core/native-transport",
   "tokio/rt",
   "tokio/rt-multi-thread",
@@ -75,21 +73,10 @@ native-auth = [
   "dep:open",
   "dep:connetto-schema",
   "dep:getrandom",
-  "tokio/signal",
 ]
 # A media port over a bare peer node, for the proofs of a media consumer
 # that runs without an enrolled client. Test builds only.
 test-support = ["peer"]
-
-[[bin]]
-name = "connetto-client"
-path = "src/bin/connetto-client.rs"
-required-features = ["native-transport", "native-auth"]
-
-# The container custody test runs this against a mounted wrap-key file (R71).
-[[example]]
-name = "secret_store_probe"
-required-features = ["native-auth"]
 
 [dependencies]
 # Wire types and framing. The native transports ride the feature above. The
@@ -148,10 +135,8 @@ tokio = { version = "1", default-features = false, features = [
 thiserror.workspace = true
 # The hotspot machine's answer, waited on by the API methods (R76).
 parking_lot = "0.12"
-# Binary error handling (connetto-client bin).
-anyhow.workspace = true
 # Structured logging (R12). The facade only: a library emits and installs no
-# destination, and the binary installs `connetto_core::logging`.
+# destination, and each program installs `connetto_core::logging`.
 tracing = { version = "0.1", default-features = false, features = [
   "std",
   "attributes",

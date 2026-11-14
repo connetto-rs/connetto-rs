@@ -1,8 +1,4 @@
-//! Program configuration read from the environment, shared by the reference
-//! binaries.
-//!
-//! Off by default for the same reason the stdout log destination is: a library
-//! reads no environment and opens no file, so only a program pays for this.
+//! The settings every demo process reads from its environment.
 
 /// The value of `key`, or `default` when it is unset or not UTF-8.
 #[must_use]

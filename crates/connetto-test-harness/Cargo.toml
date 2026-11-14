@@ -113,6 +113,9 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 # The standby switchboard's target and open flows, locked briefly and never
 # across an await. Already in the graph through connetto-server.
 parking_lot = "0.12"
+# The JWT key files `server_fixture::signing_keys` writes, and the stand-in
+# adb the Android proof's offline-recovery tests run.
+tempfile = "3"
 
 [dev-dependencies]
 # The peer exchange proof names a timestamptz value for the order it writes.
@@ -124,8 +127,6 @@ tokio = { workspace = true, features = ["test-util"] }
 diesel = { workspace = true, features = ["postgres_backend"] }
 # Building the row a mutation uploads, in the outage proof.
 sqlite-diff-rs = { version = "0.20", default-features = false }
-# A stand-in adb for the Android proof's offline-recovery tests.
-tempfile = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Joining a fresh anonymous session keyring in-process, replacing the external

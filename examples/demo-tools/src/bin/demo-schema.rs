@@ -1,6 +1,6 @@
 //! The build host that writes and checks the tier exports a history holds.
 //!
-//! `connetto-schema export-tier` translates the local tier exactly the way
+//! `demo-schema export-tier` translates the local tier exactly the way
 //! the build translates it and writes the export for the schema source's
 //! major into the history directory, so a build that runs over the same
 //! sources finds its current export already there. `--check` writes nothing
@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "connetto-schema export-tier --schema <schema.sql> --tier <tier.sql> --dir <tier_history> [--check]";
+const USAGE: &str = "demo-schema export-tier --schema <schema.sql> --tier <tier.sql> --dir <tier_history> [--check]";
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -50,7 +50,7 @@ fn main() -> ExitCode {
             }
         }
         Err(err) => {
-            eprintln!("connetto-schema: {err}");
+            eprintln!("demo-schema: {err}");
             return ExitCode::FAILURE;
         }
     }

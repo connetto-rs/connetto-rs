@@ -1285,7 +1285,6 @@ dependencies = [
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
  "rcgen",
- "rpassword",
  "tempfile",
  "thiserror 2.0.21",
  "uuid",
@@ -1298,7 +1297,6 @@ version = "0.0.0"
 dependencies = [
  "android-native-keyring-store",
  "android_system_properties",
- "anyhow",
  "apple-native-keyring-store",
  "axum",
  "base64 0.22.1",
@@ -1451,6 +1449,38 @@ dependencies = [
  "tracing",
  "wasm-bindgen",
  "web-sys",
+]
+
+[[package]]
+name = "connetto-demo-tools"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "connetto-ca",
+ "connetto-client",
+ "connetto-core",
+ "connetto-file-server",
+ "connetto-schema",
+ "connetto-server",
+ "connetto-test-harness",
+ "diesel",
+ "diesel-async",
+ "keyring-core",
+ "linux-keyutils-keyring-store",
+ "openfga-client",
+ "openidconnect",
+ "rcgen",
+ "ring",
+ "rpassword",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1659,7 +1689,6 @@ dependencies = [
 name = "connetto-server"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "axum",
  "axum-extra",
  "base64 0.22.1",
@@ -1679,8 +1708,6 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "jsonwebtoken",
- "keyring-core",
- "linux-keyutils-keyring-store",
  "openfga-client",
  "openidconnect",
  "parking_lot",

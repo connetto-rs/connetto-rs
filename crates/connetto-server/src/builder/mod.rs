@@ -1748,7 +1748,7 @@ where
         {
             tracing::warn!(
                 days_left = expiring.left.as_secs() / 86_400,
-                "the device certificate issuer expires soon, sign a new one with connetto-ca"
+                "the device certificate issuer expires soon, sign a new one with connetto_ca::sign_issuer"
             );
         }
 

@@ -18,8 +18,8 @@ use diesel_async::RunQueryDsl as _;
 use diesel_async::pooled_connection::bb8::Pool;
 use tokio::net::TcpListener;
 
-use super::e2e::{PG_SERIAL, exec, mint_tokens, reset_fixture};
 use super::lifecycle::{admin_pool, builder_over, wait_ready};
+use connetto_test_harness::server_fixture::{PG_SERIAL, exec, mint_tokens, reset_fixture};
 
 /// A deployment whose sessions carry where each sign-in came from.
 mod app {

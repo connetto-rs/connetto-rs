@@ -1,6 +1,6 @@
 //! R77 slice 6d proof, the handheld shape in one process. Two signed-in
 //! native clients of different accounts run against the demo deployment the
-//! real `connetto-server` binary serves, and the peer link carries what the
+//! demo's `demo-server` serves, and the peer link carries what the
 //! server cannot while it is away.
 //!
 //! Both accounts sit in two teams whose roster the server gates the note

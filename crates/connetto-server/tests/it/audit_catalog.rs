@@ -12,8 +12,10 @@ use connetto_test_harness::{
 };
 use tempfile::TempDir;
 
-use super::e2e::{PG_DDL, PG_SERIAL, reset_fixture, signing_keys, with_user_url};
 use super::lifecycle::BOUND;
+use connetto_test_harness::server_fixture::{
+    PG_DDL, PG_SERIAL, reset_fixture, signing_keys, with_user_url,
+};
 
 mod unterminated {
     const AUDIT_DDL: &str = connetto_server::connetto_audit_ddl!("TEXT", "UUID");
