@@ -84,13 +84,14 @@ diesel::table! {
     }
 }
 
-/// Open a real client session for one person.
+/// Open a real client session for one person over the replica schema `ddl`.
 async fn connect_as(
     server: &connetto_test_harness::Server,
+    ddl: &str,
     person: &str,
 ) -> ConnettoConnection<LoopbackTransport> {
     let mut conn = ClientBuilder::new(
-        super::support::bundle(SQLITE_DDL),
+        super::support::bundle(ddl),
         super::support::NeverDial::<LoopbackTransport>::default(),
     )
     .signed_in(super::support::held(person))
@@ -127,22 +128,6 @@ async fn connect_with_key(
         Grant::new(key.to_owned()),
         CapabilitySubject::<String>::new(key.to_owned()),
     )])
-    .open_driven()
-    .expect("open");
-    conn.attach(server.attach()).await.expect("connect");
-    conn
-}
-
-/// Open a real client session for one person over the shared table.
-async fn connect_owner(
-    server: &connetto_test_harness::Server,
-    person: &str,
-) -> ConnettoConnection<LoopbackTransport> {
-    let mut conn = ClientBuilder::new(
-        super::support::bundle(PAPERS_SQLITE_DDL),
-        super::support::NeverDial::<LoopbackTransport>::default(),
-    )
-    .signed_in(super::support::held(person))
     .open_driven()
     .expect("open");
     conn.attach(server.attach()).await.expect("connect");
@@ -282,7 +267,7 @@ async fn a_withdrawn_grant_takes_the_rows_off_the_device() {
         ))
         .await;
 
-    let mut withdrawn = connect_as(&server, WITHDRAWN).await;
+    let mut withdrawn = connect_as(&server, SQLITE_DDL, WITHDRAWN).await;
     withdrawn.subscribe(SUB, QUERY).await.expect("subscribe");
     pump_to_snapshot_end(&mut withdrawn).await;
     pump_to_membership(&mut withdrawn, "team_members").await;
@@ -302,7 +287,7 @@ async fn a_withdrawn_grant_takes_the_rows_off_the_device() {
     );
 
     // A second member of the same team, whose own access nothing changes.
-    let mut settled = connect_as(&server, SETTLED).await;
+    let mut settled = connect_as(&server, SQLITE_DDL, SETTLED).await;
     settled.subscribe(SUB, QUERY).await.expect("subscribe");
     pump_to_snapshot_end(&mut settled).await;
     pump_to_membership(&mut settled, "team_members").await;
@@ -390,7 +375,7 @@ async fn three_bearers(
         "the second key grants its own paper and nothing else"
     );
 
-    let mut owner = connect_owner(server, SETTLED).await;
+    let mut owner = connect_as(server, PAPERS_SQLITE_DDL, SETTLED).await;
     owner
         .subscribe(PAPERS_SUB, PAPERS_QUERY)
         .await

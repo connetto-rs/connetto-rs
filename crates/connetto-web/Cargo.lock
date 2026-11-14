@@ -2450,7 +2450,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#c5ec02a44a646384dedb8b2db911e2e175109535"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#bc05696fa09c7405d6db7e5a2c640e260080060d"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -2464,7 +2464,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#c5ec02a44a646384dedb8b2db911e2e175109535"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#bc05696fa09c7405d6db7e5a2c640e260080060d"
 dependencies = [
  "serde",
  "sql-values 0.6.0",
@@ -2910,7 +2910,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#8ee4b07c29bf1226b4e2b4abfd1b0dae7637de75"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#e90af0deb343c1a7bcd46cba5eab0466d87894b3"
 dependencies = [
  "geometric-traits",
  "once_cell",

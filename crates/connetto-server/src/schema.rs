@@ -173,6 +173,36 @@ pub fn engine_ddl<D: ConnettoSchema>(pg_ddl: &str, devices: bool) -> String {
     ddl
 }
 
+/// The one Postgres catalog the engine classifies and the authorization model
+/// is translated from: [`engine_ddl`], then the roles, the policies and the
+/// cap they generate, in the order a migration applies them, so a role exists
+/// before a policy names it and a grant follows the tables it names.
+///
+/// # Errors
+///
+/// As [`connetto_schema::cap_policies`].
+pub fn catalog<D: ConnettoSchema>(
+    documents: connetto_schema::Documents<'_>,
+    devices: bool,
+) -> Result<String, connetto_schema::SchemaError> {
+    let cap = connetto_schema::cap_policies::<<D::Bots as ConnettoBotSchema>::IdSql>(
+        documents.schema(),
+        documents.policies(),
+    )?;
+    let mut sql = engine_ddl::<D>(documents.schema(), devices);
+    for document in [documents.roles(), documents.policies(), cap.as_str()] {
+        if document.trim().is_empty() {
+            continue;
+        }
+        if !sql.trim_end().ends_with(';') {
+            sql.push(';');
+        }
+        sql.push('\n');
+        sql.push_str(document);
+    }
+    Ok(sql)
+}
+
 /// Generates the deployment schema from identity types and `audit_ddl`, with optional device and session descriptors.
 ///
 /// Invoked at module scope with `diesel` and `diesel_async` in scope. The
