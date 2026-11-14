@@ -51,6 +51,21 @@ use tempfile::tempdir;
 /// The bytes staged and verified through the full flow.
 const PHOTO: &[u8] = b"JPEG bytes representing a photo staged through the demo UI";
 
+/// The thumbnail staged beside the photo, a file of its own.
+const THUMB: &[u8] = b"a smaller JPEG standing in for the photo's thumbnail";
+
+/// The thumbnail columns of `photos`, which the demo's panes do not read.
+mod thumbnails {
+    diesel::table! {
+        photos (id) {
+            id -> rosetta_uuid::sql_types::Uuid,
+            content_id -> diesel::sql_types::Binary,
+            thumb_id -> Nullable<diesel::sql_types::Binary>,
+            thumb_state -> Nullable<diesel::sql_types::Text>,
+        }
+    }
+}
+
 /// The user the test's devices sign in as, and the `owner_id` every row names.
 /// The deployment's visibility policies compare `owner_id` against
 /// `current_setting('app.user_id')`, which the server binds from the
@@ -102,13 +117,12 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
 
     // Stage using the demo pattern: orders row + photos row in one
     // transaction, the same row the pick handler writes.
-    let file_id = a_content
+    let (file_id, photo_id) = a_content
         .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
             stage_photo_row(conn, file_id, OWNER)
         })
         .await
-        .expect("stage demo photo")
-        .0;
+        .expect("stage demo photo");
 
     // Bytes resolve locally before any upload.
     assert!(
@@ -152,6 +166,81 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
         Some("available"),
         "content_state flipped in Postgres"
     );
+
+    // The photo's upload names no thumbnail, so the setter left thumb_state alone.
+    let mut admin = fixture.admin().get().await.expect("admin connection");
+    let thumb_state: Option<String> = diesel_async::RunQueryDsl::get_result(
+        thumbnails::photos::table
+            .filter(thumbnails::photos::content_id.eq(file_id.as_bytes().to_vec()))
+            .select(thumbnails::photos::thumb_state),
+        &mut *admin,
+    )
+    .await
+    .expect("read thumb_state from Postgres");
+    assert_eq!(
+        thumb_state, None,
+        "the photo's upload leaves thumb_state alone"
+    );
+    drop(admin);
+
+    // The thumbnail is a file of its own, and its upload flips the row's own
+    // thumbnail state column (R79 decisions 15 and 17). The watch subscribes
+    // before the write that leads to the flip, so the flip cannot be missed.
+    let mut thumb_watch: connetto_client::live::LiveQuery<Option<String>> = a
+        .watch(
+            thumbnails::photos::table
+                .filter(thumbnails::photos::content_id.eq(file_id.as_bytes().to_vec()))
+                .select(thumbnails::photos::thumb_state),
+        )
+        .await
+        .expect("watch the thumbnail state");
+    // Every event so far is about the photo's own write, which the server
+    // applied before its upload could pass the visibility check.
+    while !matches!(
+        a_client_events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty
+            | tokio::sync::broadcast::error::TryRecvError::Closed)
+    ) {}
+    a_content
+        .stage(THUMB, MimeClass::Jpeg, |conn, thumb_id| {
+            diesel::update(thumbnails::photos::table.filter(thumbnails::photos::id.eq(photo_id)))
+                .set(thumbnails::photos::thumb_id.eq(Some(thumb_id.as_bytes().to_vec())))
+                .execute(conn)
+                .map(|_| ())
+        })
+        .await
+        .expect("stage the thumbnail");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match a_client_events.recv().await {
+                Ok(connetto_client::ClientEvent::MutationApplied { .. }) => break,
+                Ok(connetto_client::ClientEvent::MutationRejected { reason, .. }) => {
+                    panic!("the server refused the thumbnail's row: {reason:?}");
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("the event stream closed before the thumbnail's row landed")
+                }
+            }
+        }
+    })
+    .await
+    .expect("the thumbnail's row lands on the server");
+    assert_eq!(
+        a_content.flush_outbox().await.expect("flush"),
+        1,
+        "the thumbnail uploads from the outbox"
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while thumb_watch.rows() != [Some("available".to_owned())] {
+            thumb_watch
+                .changed()
+                .await
+                .expect("the thumbnail state stays watched");
+        }
+    })
+    .await
+    .expect("the thumbnail's state flips on its own upload");
 
     // Device B connects and sees the flip via replication.
     let (b, b_content) =

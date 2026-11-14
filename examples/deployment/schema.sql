@@ -37,10 +37,13 @@ CREATE TABLE order_lines (order_id UUID NOT NULL REFERENCES orders(id), line_no 
 -- repeats from the parent order as it does on order_lines, so the visibility
 -- policy settles from the row itself. thumb_id names the photo's thumbnail,
 -- an ordinary file of its own that a device in camp fetches from the author
--- unasked, and stays null for a photo staged without one. team_id names the
--- team a photo is posted to, whose members read it, and stays null for a
--- photo only its owner sees.
-CREATE TABLE photos (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), order_id UUID NOT NULL REFERENCES orders(id), owner_id TEXT NOT NULL, content_id BYTEA NOT NULL, content_state TEXT, thumb_id BYTEA, team_id TEXT);
+-- unasked, and stays null for a photo staged without one. thumb_state is the
+-- thumbnail's own availability, which the commit of the thumbnail's upload
+-- writes as content_state is written for the photo, so a holder of either
+-- file reads its own acknowledgement. team_id names the team a photo is
+-- posted to, whose members read it, and stays null for a photo only its
+-- owner sees.
+CREATE TABLE photos (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), order_id UUID NOT NULL REFERENCES orders(id), owner_id TEXT NOT NULL, content_id BYTEA NOT NULL, content_state TEXT, thumb_id BYTEA, team_id TEXT, thumb_state TEXT);
 
 -- The catalogue the demo sells from. It has no policy of its own, so every
 -- account reads every row, and it is read-only, since no grant on it admits a
