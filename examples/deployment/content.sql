@@ -10,18 +10,20 @@
 -- the mint and the serving check consult. It admits a file that either the
 -- photo column or the thumbnail column of a readable row names.
 -- connetto_set_content_state is SECURITY DEFINER with a pinned search_path
--- so the file server's commit can write content_state without owning the
--- photos table. It marks the row whose photo column names the file, so a
--- thumbnail's upload leaves the photo's state alone. The writer grants on
--- photos live in roles.sql beside the other tables, because the demo's own
--- write path applies client mutations as connetto_reader.
+-- so the file server's commit can write the state columns without owning the
+-- photos table. Each file column has its own state, so it marks content_state
+-- on the rows whose photo column names the file and thumb_state on the rows
+-- whose thumbnail column names it, and a thumbnail's upload leaves the
+-- photo's state alone. The writer grants on photos live in roles.sql beside
+-- the other tables, because the demo's own write path applies client
+-- mutations as connetto_reader.
 -- connetto_file_owner is SECURITY INVOKER with a pinned search_path so it
 -- names only an owner the caller can already read. It answers the one
 -- account owning the readable rows whose photo or thumbnail column names the
 -- file, and nobody when no such row or more than one account matches. A
 -- device uploading a file another account owns is credited to that owner.
 CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[]) RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ SELECT ARRAY(SELECT f FROM UNNEST(p_file_ids) AS f WHERE EXISTS (SELECT 1 FROM public.photos p WHERE p.content_id = f OR p.thumb_id = f)) $$;
-CREATE OR REPLACE FUNCTION connetto_set_content_state(p_file_id BYTEA, p_new_state TEXT, p_caller TEXT) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' AS $$ BEGIN UPDATE public.photos SET content_state = p_new_state WHERE content_id = p_file_id; RETURN p_file_id; END; $$;
+CREATE OR REPLACE FUNCTION connetto_set_content_state(p_file_id BYTEA, p_new_state TEXT, p_caller TEXT) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' AS $$ BEGIN UPDATE public.photos SET content_state = p_new_state WHERE content_id = p_file_id; UPDATE public.photos SET thumb_state = p_new_state WHERE thumb_id = p_file_id; RETURN p_file_id; END; $$;
 CREATE OR REPLACE FUNCTION connetto_file_owner(p_file_id BYTEA) RETURNS TEXT LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ SELECT CASE WHEN count(DISTINCT p.owner_id) = 1 THEN min(p.owner_id) END FROM public.photos p WHERE p.content_id = p_file_id OR p.thumb_id = p_file_id $$;
 GRANT SELECT ON _cfs_manifests TO connetto_reader;
 GRANT SELECT ON _cfs_manifest_chunks TO connetto_reader;
@@ -30,7 +32,7 @@ GRANT EXECUTE ON FUNCTION connetto_visible_files TO connetto_reader;
 GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_reader;
 GRANT EXECUTE ON FUNCTION connetto_file_owner TO connetto_reader;
 
--- Full previous images for the photos table. The commit flips content_state
+-- Full previous images for the photos table. The commit flips a state column
 -- with an update and the change path needs the row as it was. It is a
 -- Postgres-only property with no SQLite equivalent, so the pg2sqlite
 -- translation of schema.sql refuses it, and this file is the one deployment
