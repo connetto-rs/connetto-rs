@@ -46,10 +46,10 @@ const PHASE: &str = "R79_PEER_MEDIA_PHASE";
 const APP_CARL: &str = "r79-peer-media-carl";
 
 /// The team the photo is posted to.
-const TEAM: &str = "T1";
+pub(crate) const TEAM: &str = "T1";
 
 /// The key the content stores encrypt under, one per device in the proof.
-const ROOT_KEY: [u8; 32] = [79; 32];
+pub(crate) const ROOT_KEY: [u8; 32] = [79; 32];
 
 diesel::table! {
     /// The photo rows, the view the client writes through.
@@ -71,7 +71,7 @@ diesel::table! {
     }
 }
 
-type Content = ContentClient<NativeTransport, FsStore, ReqwestHttp>;
+pub(crate) type Content = ContentClient<NativeTransport, FsStore, ReqwestHttp>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_photo_crosses_the_camp_and_its_retraction_sweeps_it() {
@@ -141,7 +141,7 @@ async fn content_for(client: &ConnettoClient<NativeTransport>, dir: &Path) -> Co
 }
 
 /// Whether `content` holds a manifest for `file_id`, read without fetching.
-async fn holds(content: &Content, file_id: FileId) -> bool {
+pub(crate) async fn holds(content: &Content, file_id: FileId) -> bool {
     content
         .outboard(file_id)
         .await
@@ -166,7 +166,7 @@ fn chunk_files(dir: &Path) -> usize {
 }
 
 /// Waits for `content` to announce `file_id` fetched, bounded.
-async fn fetched(events: &mut broadcast::Receiver<ContentEvent>, file_id: FileId) {
+pub(crate) async fn fetched(events: &mut broadcast::Receiver<ContentEvent>, file_id: FileId) {
     tokio::time::timeout(BOUND, async {
         loop {
             if let Ok(ContentEvent::Fetched { file_id: got }) = events.recv().await
@@ -181,7 +181,7 @@ async fn fetched(events: &mut broadcast::Receiver<ContentEvent>, file_id: FileId
 }
 
 /// Alice's order id, the parent her photo names.
-async fn order_of(client: &NativeClient<NativeTransport>) -> Vec<u8> {
+pub(crate) async fn order_of(client: &NativeClient<NativeTransport>) -> Vec<u8> {
     client
         .client()
         .with_conn(|conn| {
@@ -227,7 +227,7 @@ async fn take_photo(
 }
 
 /// Deterministic bytes that do not compress, `seed` choosing the stream.
-fn photo_bytes(seed: u32, len: usize) -> Vec<u8> {
+pub(crate) fn photo_bytes(seed: u32, len: usize) -> Vec<u8> {
     let mut state = seed | 1;
     let mut out = Vec::with_capacity(len + 4);
     while out.len() < len {
