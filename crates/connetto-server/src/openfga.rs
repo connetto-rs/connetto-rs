@@ -2521,12 +2521,16 @@ mod tests {
     }
 
     /// Step 6's refusal, which is absolute rather than degrading per table.
+    /// The function exists, so PostgreSQL accepts the policy, but its
+    /// PL/pgSQL body is opaque to rls2fga.
     #[test]
     fn a_policy_with_no_translation_refuses_startup() {
         let refused = Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_schema::Documents::new(
                 SCHEMA,
-                "CREATE POLICY notes_p ON notes FOR ALL USING (mystery_function(owner))",
+                "CREATE FUNCTION mystery_function(who TEXT) RETURNS BOOLEAN LANGUAGE plpgsql \
+                 AS $$ BEGIN RETURN who IS NOT NULL; END $$; \
+                 CREATE POLICY notes_p ON notes FOR ALL USING (mystery_function(owner))",
                 connetto_test_harness::FIXTURE_ROLES,
                 connetto_test_harness::FIXTURE_READER,
             ),
