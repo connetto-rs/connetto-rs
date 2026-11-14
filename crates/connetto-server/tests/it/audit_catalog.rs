@@ -158,6 +158,8 @@ async fn an_unsupported_policy_refuses_server_startup() {
     let (builder, _idp) = refusal_builder(
         &fixture,
         "ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
+         CREATE FUNCTION mystery_function(what TEXT) RETURNS BOOLEAN LANGUAGE plpgsql \
+         AS $$ BEGIN RETURN what IS NOT NULL; END $$; \
          CREATE POLICY orders_p ON orders FOR ALL USING (mystery_function(status));",
     )
     .await;
