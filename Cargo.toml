@@ -23,6 +23,8 @@ members = [
   # The documents and the build-time translation every browser demo shares.
   # A member rather than an exclusion, so the root gate lints it with the rest.
   "examples/deployment",
+  # The demo launchers and device proofs.
+  "examples/demo-stack",
   # The schema rows, wording and browser pieces the browser demos share.
   "examples/demo-support",
 ]

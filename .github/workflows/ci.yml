@@ -358,6 +358,7 @@ jobs:
               -p connetto-schema
               -p connetto-ca
               -p connetto-test-harness
+              -p connetto-demo-stack
               -p connetto-dioxus
               -p connetto-yew
               -p connetto-peer
@@ -610,7 +611,7 @@ jobs:
         run: |
           cargo +stable run \
             --profile "$CARGO_TEST_PROFILE" \
-            -p connetto-test-harness \
+            -p connetto-demo-stack \
             --bin connetto-browser-stack \
             -- \
             --build-only browser-bins
@@ -620,7 +621,7 @@ jobs:
         run: |
           cargo +stable build \
             --profile "$CARGO_TEST_PROFILE" \
-            -p connetto-test-harness \
+            -p connetto-demo-stack \
             --bin connetto-demo-stack \
             --bin connetto-android-proof
           mkdir android-bins

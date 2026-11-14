@@ -1,0 +1,52 @@
+[package]
+name = "connetto-demo-stack"
+description = "Demo launchers and device proofs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+connetto-test-harness = { path = "../../crates/connetto-test-harness" }
+connetto-core = { workspace = true, features = [
+  "native-transport",
+  "test-support",
+  "logging",
+  "device-cert",
+] }
+connetto-server = { path = "../../crates/connetto-server", features = ["test-seams"] }
+connetto-client = { path = "../../crates/connetto-client", features = ["peer"] }
+connetto-file-core = { path = "../../crates/connetto-file-core" }
+connetto-file-server = { path = "../../crates/connetto-file-server" }
+anyhow.workspace = true
+tokio = { workspace = true, features = ["process", "io-std"] }
+diesel = { workspace = true, features = ["postgres_backend"] }
+diesel-async = { version = "0.10", default-features = false, features = [
+  "postgres",
+  "bb8",
+] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+serde_json = "1"
+axum = { workspace = true }
+openidconnect = { version = "4.0.1", default-features = false, features = [
+  "reqwest",
+  "rustls-tls",
+] }
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+ring = "0.17"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+connetto-peer-apple = { path = "../../crates/connetto-peer-apple" }

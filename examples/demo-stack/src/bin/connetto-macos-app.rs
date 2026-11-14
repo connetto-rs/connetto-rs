@@ -4,7 +4,7 @@
 //! carries the peer link and the hotspot it joins (R76).
 //!
 //! ```text
-//! cargo run -p connetto-test-harness --bin connetto-macos-app
+//! cargo run -p connetto-demo-stack --bin connetto-macos-app
 //! ```
 //!
 //! The data protection keychain answers only an app carrying the

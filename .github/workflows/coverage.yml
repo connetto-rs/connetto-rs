@@ -54,6 +54,7 @@ jobs:
               -p connetto-schema
               -p connetto-ca
               -p connetto-test-harness
+              -p connetto-demo-stack
               -p connetto-dioxus
               -p connetto-yew
               -p connetto-file-core

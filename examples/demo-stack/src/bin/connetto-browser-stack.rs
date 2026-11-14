@@ -10,10 +10,10 @@
 //! credentials.
 //!
 //! ```text
-//! cargo run -p connetto-test-harness --bin connetto-browser-stack
-//! cargo run -p connetto-test-harness --bin connetto-browser-stack --shard I/N
-//! cargo run -p connetto-test-harness --bin connetto-browser-stack --build-only DIR
-//! cargo run -p connetto-test-harness --bin connetto-browser-stack -- <program> [args]
+//! cargo run -p connetto-demo-stack --bin connetto-browser-stack
+//! cargo run -p connetto-demo-stack --bin connetto-browser-stack --shard I/N
+//! cargo run -p connetto-demo-stack --bin connetto-browser-stack --build-only DIR
+//! cargo run -p connetto-demo-stack --bin connetto-browser-stack -- <program> [args]
 //! ```
 //!
 //! Bare, it runs the verified-topology step and then the default suites, one

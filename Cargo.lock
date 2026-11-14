@@ -1400,6 +1400,33 @@ name = "connetto-demo-deployment"
 version = "0.0.0"
 
 [[package]]
+name = "connetto-demo-stack"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "connetto-client",
+ "connetto-core",
+ "connetto-file-core",
+ "connetto-file-server",
+ "connetto-peer-apple",
+ "connetto-server",
+ "connetto-test-harness",
+ "diesel",
+ "diesel-async",
+ "openidconnect",
+ "parking_lot",
+ "reqwest 0.13.5",
+ "ring",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower-http",
+ "uuid",
+]
+
+[[package]]
 name = "connetto-demo-support"
 version = "0.0.0"
 dependencies = [
@@ -1697,15 +1724,11 @@ name = "connetto-test-harness"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "axum",
- "base64 0.22.1",
  "chrono",
  "connetto-ca",
  "connetto-client",
  "connetto-core",
  "connetto-file-client",
- "connetto-file-core",
- "connetto-file-server",
  "connetto-peer-apple",
  "connetto-schema",
  "connetto-server",
@@ -1734,7 +1757,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.24.0",
- "tower-http",
  "tracing-subscriber",
  "uuid",
  "zstd",

@@ -4,9 +4,9 @@
 //! the deployment the browser demos share.
 //!
 //! ```text
-//! cargo run -p connetto-test-harness --bin connetto-demo-stack
-//! cargo run -p connetto-test-harness --bin connetto-demo-stack -- <program> [args]
-//! cargo run -p connetto-test-harness --bin connetto-demo-stack -- --mint-device-ca
+//! cargo run -p connetto-demo-stack --bin connetto-demo-stack
+//! cargo run -p connetto-demo-stack --bin connetto-demo-stack -- <program> [args]
+//! cargo run -p connetto-demo-stack --bin connetto-demo-stack -- --mint-device-ca
 //! ```
 //!
 //! Bare, it serves until interrupted and prints the environment a desktop run
