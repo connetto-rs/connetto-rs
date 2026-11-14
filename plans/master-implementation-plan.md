@@ -971,7 +971,7 @@ Making the demos runnable in CI, which `R55` settled, since they need a browser,
 
 ## R80: peer sync in every demo
 
-**Status.** NOT STARTED. Designed with the maintainer on 2026-11-14, decisions 1 to 5 below, in five slices.
+**Status.** IN PROGRESS. Designed with the maintainer on 2026-11-14, decisions 1 to 5 below, in five slices. Slice 1, the builder's media driver (decision 2), is in review.
 
 **Blocked on** nothing.
 
