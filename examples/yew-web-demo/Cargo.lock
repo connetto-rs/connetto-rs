@@ -2346,7 +2346,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#ffbdfde88d51088d9c11baeff919835f44eaefef"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#cd342e97a387b780fbff3822d52a7f3e6cbad2ff"
 dependencies = [
  "recursive",
  "sql-traits",
@@ -3339,7 +3339,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#bd46e442317851b0af5362a0578f6c8d83660883"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#8ee4b07c29bf1226b4e2b4abfd1b0dae7637de75"
 dependencies = [
  "geometric-traits",
  "once_cell",
@@ -3377,7 +3377,7 @@ dependencies = [
 [[package]]
 name = "sql-values"
 version = "0.6.0"
-source = "git+https://github.com/connetto-rs/sql-values?branch=main#adc5e8cfa0436f5f96c39b391946b8e99d856e41"
+source = "git+https://github.com/connetto-rs/sql-values?branch=main#7c18726d135c2f8d685d3d89915bf6d228d84351"
 dependencies = [
  "jiff",
  "thiserror 2.0.21",
@@ -3510,7 +3510,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#0e88d7b01bc40e1ff854a5af713b2796fea8779f"
+source = "git+https://github.com/connetto-rs/subql?branch=main#c78ce999e477ba1be3c2869338f98cc282776fd1"
 dependencies = [
  "arc-swap",
  "async-lock",
