@@ -103,7 +103,6 @@ impl Scripted {
     }
 
     /// Every ticket request sent so far.
-    #[cfg(feature = "peer")]
     pub fn tickets(&self) -> Vec<ContentTicketRequest> {
         self.tickets.lock().expect("tickets lock").clone()
     }

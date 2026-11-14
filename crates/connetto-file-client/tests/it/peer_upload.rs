@@ -50,6 +50,8 @@ diesel::table! {
         file_id -> Binary,
         /// When the device learned the row settled, in Unix seconds.
         settled_seen_at -> Nullable<BigInt>,
+        /// The account credited by a carried upload.
+        owner -> Nullable<Text>,
     }
 }
 
@@ -95,7 +97,7 @@ fn unix_now() -> i64 {
 /// to `server`, which the proof scripts after a first refused read so the
 /// device fetched the photo from a linked holder.
 struct Holder {
-    _dirs: [tempfile::TempDir; 3],
+    dirs: [tempfile::TempDir; 3],
     client: ConnettoClient<Scripted>,
     server: Scripted,
     device: Device,
@@ -155,7 +157,7 @@ impl Holder {
         )
         .await;
         Self {
-            _dirs: dirs,
+            dirs,
             client,
             server,
             device,
@@ -186,7 +188,7 @@ impl Holder {
         )
         .await;
         Self {
-            _dirs: dirs,
+            dirs,
             client,
             server,
             device,
@@ -233,6 +235,49 @@ impl Holder {
             .expect("the replica is open")
             .expect("move the settling");
         assert_eq!(moved, 1, "the copy is in custody");
+    }
+
+    /// Runs a proof after a linked reader receives this holder's manifest.
+    async fn reported(&self, proof: impl Future<Output = ()>) {
+        let devices = Devices::new();
+        let (node, addr, events) = devices.node(&devices.device("curator", 3));
+        let (reader, _, mut replies) = devices.node(&devices.device("anna", 4));
+        let identity = reader.link(addr).await.expect("link the reader");
+        crate::peer_support::beside(&self.device, port(node, events), async {
+            let replies = crate::peer_holder::ask(
+                &reader,
+                &mut replies,
+                &identity,
+                connetto_exchange::media::Media::Want {
+                    request_id: 1,
+                    file_id: *self.file_id.as_bytes(),
+                },
+            )
+            .await;
+            assert!(matches!(
+                replies.last(),
+                Some(connetto_exchange::media::Media::Manifest { last: true, .. })
+            ));
+            proof.await;
+        })
+        .await;
+    }
+
+    /// Queues this copy for its original owner's upload.
+    async fn queue_carried(&self) {
+        let file_id = self.file_id;
+        self.client
+            .with_conn(move |conn| {
+                diesel::insert_into(_connetto_content_outbox::table)
+                    .values((
+                        _connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()),
+                        _connetto_content_outbox::carried_for.eq("anna"),
+                    ))
+                    .execute(conn.conn())
+            })
+            .await
+            .expect("the replica is open")
+            .expect("queue the carried copy");
     }
 
     /// The write tickets the device asked for.
@@ -364,6 +409,20 @@ async fn a_holder_uploads_once_its_wait_ran_out_credited_to_the_author() {
         })
         .await;
     assert_eq!(holder.writes(), [Some("anna".to_owned())]);
+    holder
+        .reported(async {
+            assert_eq!(holder.device.flush_outbox().await.expect("flush again"), 0);
+            assert_eq!(holder.writes(), [Some("anna".to_owned())]);
+            assert!(matches!(
+                holder
+                    .device
+                    .resolve(holder.file_id)
+                    .await
+                    .expect("resolve"),
+                Resolved::Local { .. }
+            ));
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -398,6 +457,20 @@ async fn a_refused_upload_goes_with_the_copy_once_the_state_reads_available() {
         1,
         "the refused upload waits for the application"
     );
+    holder
+        .reported(async {
+            assert_eq!(holder.device.flush_outbox().await.expect("flush"), 0);
+            assert_eq!(holder.writes(), [Some("anna".to_owned())]);
+            assert!(matches!(
+                holder
+                    .device
+                    .resolve(holder.file_id)
+                    .await
+                    .expect("resolve"),
+                Resolved::Local { .. }
+            ));
+        })
+        .await;
 
     set_state(&holder.client, 7, "available").await;
     assert_eq!(
@@ -548,4 +621,192 @@ async fn a_copy_taken_over_after_its_row_settled_uploads_for_the_same_owner() {
         [Some("anna".to_owned())],
         "the taker credits the owner the leaving holder named"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_holder_uploads_each_copy_when_its_stagger_expires() {
+    let holder = Holder::with_http(
+        Scripted::new([
+            TicketAnswer::Refuse(CONTENT_TICKET_REFUSED.to_owned()),
+            TicketAnswer::Refuse(CONTENT_TICKET_REFUSED.to_owned()),
+            TicketAnswer::Grant(INTENT_URL.to_owned()),
+            TicketAnswer::Grant(INTENT_URL.to_owned()),
+        ]),
+        RecordingHttp::new([
+            (200, br#"{"needed":[]}"#.to_vec()),
+            (200, vec![]),
+            (200, br#"{"needed":[]}"#.to_vec()),
+            (200, vec![]),
+        ]),
+    )
+    .await;
+    let source_dir = tempfile::tempdir().expect("source");
+    let row_dir = tempfile::tempdir().expect("row");
+    let (_, source) = declare_replicated(replica(source_dir.path(), None).await).await;
+    let second = stage(&source, 1, "anna", &pseudorandom(62, 300_000)).await;
+    apply_entry(
+        &holder.client,
+        &anna(),
+        2,
+        captured_photo(row_dir.path(), 8, second.as_bytes().to_vec(), None).await,
+    )
+    .await;
+    let devices = Devices::new();
+    let (source_node, source_addr, source_events) = devices.node(&devices.device("r77", 2));
+    let (node, _, events) = devices.node(&devices.device("curator", 3));
+    node.link(source_addr).await.expect("link the source");
+    beside_both(
+        (&source, port(source_node, source_events)),
+        (&holder.device, port(node, events)),
+        async {
+            assert!(matches!(
+                holder
+                    .device
+                    .resolve(second)
+                    .await
+                    .expect("fetch the second photo"),
+                Resolved::Local { .. }
+            ));
+        },
+    )
+    .await;
+    holder
+        .client
+        .with_conn(|conn| conn.adjudicate_peer_frontier(&anna().key_id, 2))
+        .await
+        .expect("the replica is open")
+        .expect("settle both photos");
+    holder.device.tidy_content().await.expect("tidy");
+    let earliest = unix_now() - 10 * 60 + 2;
+    holder
+        .client
+        .with_conn(|conn| {
+            diesel::update(_connetto_content_custody::table)
+                .set(_connetto_content_custody::settled_seen_at.eq(earliest))
+                .execute(conn.conn())?;
+            diesel::update(_connetto_content_custody::table)
+                .filter(_connetto_content_custody::file_id.eq(second.as_bytes().as_slice()))
+                .set(_connetto_content_custody::settled_seen_at.eq(earliest + 2))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("place both waits near their ends");
+    let mut events = holder.device.events();
+    holder
+        .driven(async {
+            next_about(&mut events, holder.file_id, |event| {
+                matches!(event, ContentEvent::Uploaded { .. })
+            })
+            .await;
+            assert_eq!(holder.writes(), [Some("anna".to_owned())]);
+            next_about(&mut events, second, |event| {
+                matches!(event, ContentEvent::Uploaded { .. })
+            })
+            .await;
+        })
+        .await;
+    assert_eq!(
+        holder.writes(),
+        [Some("anna".to_owned()), Some("anna".to_owned())]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custody_without_an_owner_waits_for_its_authors_cursor() {
+    let holder = Holder::new(Scripted::new([
+        TicketAnswer::Refuse(CONTENT_TICKET_REFUSED.to_owned()),
+        TicketAnswer::Grant(INTENT_URL.to_owned()),
+    ]))
+    .await;
+    holder.settled_ago(PAST_THE_WAIT).await;
+    holder
+        .client
+        .with_conn(|conn| {
+            conn.conn()
+                .transaction::<_, diesel::result::Error, _>(|db| {
+                    diesel::update(_connetto_content_custody::table)
+                        .set(_connetto_content_custody::owner.eq(None::<String>))
+                        .execute(db)?;
+                    diesel::delete(_connetto_peer_cursor::table).execute(db)
+                })
+        })
+        .await
+        .expect("the replica is open")
+        .expect("restore custody without its cursor");
+    holder
+        .reported(async {
+            assert_eq!(holder.device.flush_outbox().await.expect("flush"), 0);
+            assert_eq!(holder.writes(), Vec::<Option<String>>::new());
+            assert_eq!(
+                holder.device.bytes(holder.file_id).await.expect("read"),
+                Some(pseudorandom(61, 300_000))
+            );
+        })
+        .await;
+    store_offer(&holder.client).await;
+    let mut events = holder.device.events();
+    holder
+        .driven(async {
+            next_about(&mut events, holder.file_id, |event| {
+                matches!(event, ContentEvent::Uploaded { .. })
+            })
+            .await;
+        })
+        .await;
+    assert_eq!(holder.writes(), [Some("anna".to_owned())]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn losing_a_carried_copy_releases_custody_without_reporting_authored_loss() {
+    use connetto_file_core::{MemStore, MimeClass, process_file};
+
+    let manifest = process_file(
+        pseudorandom(61, 300_000).as_slice(),
+        MimeClass::Generic,
+        &MemStore::new(),
+    )
+    .await
+    .expect("chunk the photo");
+    let needed: Vec<String> = manifest
+        .chunks()
+        .iter()
+        .map(|chunk| chunk.hash.to_string())
+        .collect();
+    let http = RecordingHttp::new([(
+        200,
+        serde_json::to_vec(&serde_json::json!({ "needed": needed })).expect("encode the intent"),
+    )]);
+    let holder = Holder::with_http(
+        Scripted::new([
+            TicketAnswer::Refuse(CONTENT_TICKET_REFUSED.to_owned()),
+            TicketAnswer::Grant(INTENT_URL.to_owned()),
+        ]),
+        http.clone(),
+    )
+    .await;
+    holder.queue_carried().await;
+    let mut events = holder.device.events();
+    std::fs::remove_dir_all(holder.dirs[1].path().join("chunks")).expect("lose the stored bytes");
+
+    assert_eq!(holder.device.flush_outbox().await.expect("flush"), 0);
+    assert_eq!(
+        crate::peer_support::custody_state(&holder.client, holder.file_id).await,
+        None
+    );
+    assert_eq!(
+        holder.device.retired_content().await.expect("losses"),
+        Vec::<FileId>::new()
+    );
+    assert_eq!(
+        holder.device.refused_content().await.expect("refusals"),
+        Vec::<(FileId, String)>::new()
+    );
+    assert!(
+        events.try_recv().is_err(),
+        "custody loss is not authored loss"
+    );
+    assert_eq!(holder.device.flush_outbox().await.expect("flush again"), 0);
+    assert_eq!(holder.writes(), [Some("anna".to_owned())]);
+    assert_eq!(http.sent().len(), 1, "no incomplete upload is committed");
 }

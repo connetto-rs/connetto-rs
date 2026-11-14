@@ -536,6 +536,8 @@ pub enum Fault {
     ForgePiece,
     /// It names every chunk by a hash the chunk does not have.
     LieInManifest,
+    /// It answers with another file's genuine chunks.
+    WrongFileManifest,
     /// It closes every link at its second `Fetch`.
     DropAtSecondFetch,
     /// It answers every request `Busy`.
@@ -546,7 +548,7 @@ pub enum Fault {
     Silent,
     /// It names a chunk of no bytes.
     EmptyChunk,
-    /// It sends more manifest rows than a manifest may hold, in two runs.
+    /// It exceeds the manifest bound before sending its final run.
     TooManyRows,
     /// It waits [`SLOW_PIECE`] before sending each encoded range, a link
     /// far slower than loopback.
@@ -633,7 +635,7 @@ pub fn bare_holder_of(
                         .await;
                 }
                 (Fault::TooManyRows, Media::Want { .. }) => {
-                    for last in [false, true] {
+                    for last in [false, false, true] {
                         let run = Media::Manifest {
                             request_id,
                             chunks: vec![([7; 32], 1); 5_000],
@@ -644,9 +646,10 @@ pub fn bare_holder_of(
                     }
                 }
                 (_, Media::Want { file_id, .. }) => {
+                    let manifest = requested_manifest(&held, &file_id, fault);
                     let run = Media::Manifest {
                         request_id,
-                        chunks: manifest_rows(&held[&file_id].0, fault),
+                        chunks: manifest_rows(manifest, fault),
                         last: true,
                         owner: None,
                     };
@@ -727,6 +730,24 @@ fn manifest_rows(manifest: &Manifest, fault: Fault) -> Vec<([u8; 32], u64)> {
             (hash, len)
         })
         .collect()
+}
+
+/// The requested file's manifest, or another file's under the substitution fault.
+fn requested_manifest<'a>(
+    held: &'a HashMap<[u8; 32], (Manifest, connetto_file_core::Outboard)>,
+    file_id: &[u8; 32],
+    fault: Fault,
+) -> &'a Manifest {
+    if fault == Fault::WrongFileManifest {
+        &held
+            .iter()
+            .find(|(id, _)| *id != file_id)
+            .expect("another file")
+            .1
+            .0
+    } else {
+        &held[file_id].0
+    }
 }
 
 /// How many `Want` requests a bare holder saw.

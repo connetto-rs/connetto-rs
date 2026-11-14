@@ -21,7 +21,7 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, MAJOR_DIRECTIVE, Major, SchemaVersion, loopback};
 use connetto_file_client::{
     ContentArchive, ContentClient, ContentError, ContentEvent, ContentFlush, ContentFlushStart,
-    ContentFlushState, ContentUpload, FsStore, held_content,
+    ContentFlushState, ContentHttp, ContentUpload, FsStore, HttpFailure, HttpReply, held_content,
 };
 use connetto_file_core::{FileId, MimeClass};
 use tempfile::{TempDir, tempdir};
@@ -145,6 +145,12 @@ fn recorded(rx: &mut mpsc::UnboundedReceiver<String>) -> Option<String> {
 /// A replica at major 1 with one staged file and no transport, closed so a
 /// reopen at major 2 holds it. Returns the replica directory and the file.
 async fn held_file_offline() -> (TempDir, FileId) {
+    let (dir, files) = held_files_offline(&[BYTES]).await;
+    (dir, files[0])
+}
+
+/// Stages each file before a major-changing reopen.
+async fn held_files_offline(files: &[&[u8]]) -> (TempDir, Vec<FileId>) {
     let dir = tempdir().expect("temp dir");
     let credential =
         HeldCredential::new(Grant::new("user:tester"), "tester").expect("a string identity");
@@ -174,11 +180,15 @@ async fn held_file_offline() -> (TempDir, FileId) {
         .expect("attach content");
         (client, content)
     };
-    let (file_id, ()) = content
-        .stage(BYTES, MimeClass::Jpeg, |_, _| Ok(()))
-        .await
-        .expect("stage the file with no row");
-    (dir, file_id)
+    let mut staged = Vec::new();
+    for bytes in files {
+        let (file_id, ()) = content
+            .stage(*bytes, MimeClass::Jpeg, |_, _| Ok(()))
+            .await
+            .expect("stage the file with no row");
+        staged.push(file_id);
+    }
+    (dir, staged)
 }
 
 /// Reopens the replica at major 2, so the rebuild holds the staged file.
@@ -1037,4 +1047,266 @@ async fn the_native_pump_bounds_a_held_key_replacement_without_another_wake() {
         "the native pump must bound held replacement {} without an external wake",
         pending.request_id,
     );
+}
+
+struct PausedCommit {
+    http: RecordingHttp,
+    gate: std::sync::Mutex<Option<(oneshot::Sender<String>, oneshot::Receiver<String>)>>,
+}
+
+impl ContentHttp for PausedCommit {
+    type Error = core::convert::Infallible;
+
+    async fn post(
+        &self,
+        url: &str,
+        json: Option<Vec<u8>>,
+    ) -> Result<HttpReply, HttpFailure<Self::Error>> {
+        let commit = json.is_none();
+        let reply = self.http.post(url, json).await?;
+        let gate = if commit {
+            self.gate.lock().expect("commit gate").take()
+        } else {
+            None
+        };
+        if let Some((arrived, release)) = gate {
+            arrived.send(url.to_owned()).expect("report the commit");
+            let released = tokio::time::timeout(Duration::from_secs(10), release)
+                .await
+                .expect("the commit is released")
+                .expect("the commit gate remains open");
+            assert_eq!(released, url);
+        }
+        Ok(reply)
+    }
+
+    fn put(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+    ) -> impl Future<Output = Result<HttpReply, HttpFailure<Self::Error>>> {
+        self.http.put(url, body)
+    }
+
+    fn get(
+        &self,
+        url: &str,
+        range: Option<(u64, u64)>,
+    ) -> impl Future<Output = Result<HttpReply, HttpFailure<Self::Error>>> {
+        self.http.get(url, range)
+    }
+}
+
+struct Redialled {
+    client: ConnettoClient<LoopbackTransport>,
+    pump: tokio::task::JoinHandle<()>,
+    main_server: LoopbackTransport,
+    first_server: LoopbackTransport,
+    second_server: LoopbackTransport,
+    redial: oneshot::Sender<&'static str>,
+}
+
+/// A pumped client whose second drain connection waits for permission.
+async fn redialled(dir: &TempDir) -> Redialled {
+    let (main, mut main_server) = loopback();
+    let (first, mut first_server) = loopback();
+    let (second, mut second_server) = loopback();
+    for (server, major) in [
+        (&mut main_server, 2),
+        (&mut first_server, 1),
+        (&mut second_server, 1),
+    ] {
+        server
+            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id: format!("major-{major}"),
+                session_token: "held-walk".to_owned(),
+                resume_token: "held-walk".to_owned(),
+                current_cursor: Cursor::new(Vec::new()),
+                schema_version: Some(schema(major).version()),
+                sunset_at_secs: None,
+                courier: false,
+                initial_credits: 64,
+                writer: (major == 2).then_some(connetto_core::messages::WriterGrant {
+                    number: 1,
+                    frontier: 0,
+                }),
+            }))
+            .await
+            .expect("queue the handshake answer");
+    }
+    let (redial, redial_gate) = oneshot::channel();
+    let mut transports = std::collections::VecDeque::from([
+        (main, None),
+        (first, None),
+        (second, Some(redial_gate)),
+    ]);
+    let factory = move || {
+        let next = transports.pop_front();
+        async move {
+            let (transport, gate) = next.ok_or("no further wire")?;
+            if let Some(gate) = gate {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(10), gate)
+                        .await
+                        .expect("the redial is released")
+                        .expect("the redial gate remains open"),
+                    "second-drain"
+                );
+            }
+            Ok::<_, &'static str>(transport)
+        }
+    };
+    let (core, pump) = ClientBuilder::new(schema(2), factory)
+        .with_held_content(held_content())
+        .signed_in(
+            HeldCredential::new(Grant::new("user:tester"), "tester").expect("a string identity"),
+        )
+        .durable(
+            At(dir.path().join("replica.sqlite")),
+            FixedKey,
+            MemoryRefreshStore::default(),
+        )
+        .with_gate(Gate::off())
+        .connect_with_pump()
+        .await
+        .expect("reopen at the current major");
+    let client = core.client().clone();
+    let pump = tokio::spawn(pump);
+    assert!(matches!(
+        control(&mut first_server).await,
+        ControlMessage::Handshake(_)
+    ));
+    assert_eq!(
+        client.held_files_ready().await.expect("first drain"),
+        Some(one())
+    );
+    Redialled {
+        client,
+        pump,
+        main_server,
+        first_server,
+        second_server,
+        redial,
+    }
+}
+
+/// Grants the next ticket only if it names the expected file.
+async fn grant_file(server: &mut LoopbackTransport, file: FileId) {
+    let ControlMessage::ContentTicketRequest(request) = control(server).await else {
+        panic!("the held file asks for its ticket");
+    };
+    assert_eq!(request.file_id, *file.as_bytes());
+    server
+        .send_control(ControlMessage::ContentTicketGrant(ContentTicketGrant {
+            request_id: request.request_id,
+            url: GRANT_URL.to_owned(),
+        }))
+        .await
+        .expect("grant the upload");
+}
+
+#[tokio::test]
+async fn the_content_driver_stops_between_held_files_until_the_drain_redials() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (dir, mut files) = held_files_offline(&[BYTES, b"another held photo"]).await;
+        files.sort_by_key(|file| *file.as_bytes());
+        let Redialled {
+            client,
+            pump,
+            main_server: _main_server,
+            mut first_server,
+            mut second_server,
+            redial,
+        } = redialled(&dir).await;
+
+        let http = RecordingHttp::new([
+            (200, br#"{"needed":[]}"#.to_vec()),
+            (200, Vec::new()),
+            (200, br#"{"needed":[]}"#.to_vec()),
+            (200, Vec::new()),
+        ]);
+        let (arrived, committed) = oneshot::channel();
+        let (release_commit, release) = oneshot::channel();
+        let content = ContentClient::attach(
+            client.clone(),
+            FsStore::new(dir.path().join("chunks")),
+            ROOT_KEY,
+            PausedCommit {
+                http: http.clone(),
+                gate: std::sync::Mutex::new(Some((arrived, release))),
+            },
+        )
+        .await
+        .expect("attach content");
+        let mut events = content.events();
+        let mut connection_events = client.events();
+        let (sleeping, mut slept) = mpsc::channel(1);
+        let wake = tokio::sync::Notify::new();
+        let scenario = async {
+            grant_file(&mut first_server, files[0]).await;
+            let commit_url = committed.await.expect("the first upload commits");
+            drop(first_server);
+            loop {
+                if matches!(
+                    connection_events.recv().await.expect("connection event"),
+                    ClientEvent::Held(HeldWork::WireLost { major }) if major == one()
+                ) {
+                    break;
+                }
+            }
+            release_commit
+                .send(commit_url)
+                .expect("finish the first upload");
+            assert!(matches!(
+                events.recv().await.expect("the first file uploads"),
+                ContentEvent::Uploaded { file_id } if file_id == files[0]
+            ));
+            assert_eq!(slept.recv().await, Some("held-walk"));
+            assert!(matches!(
+                events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+            assert!(
+                client
+                    .held_files_pending()
+                    .await
+                    .expect("the second file stays held")
+            );
+            assert_eq!(http.sent().len(), 2);
+
+            redial.send("second-drain").expect("allow the drain redial");
+            assert!(matches!(
+                control(&mut second_server).await,
+                ControlMessage::Handshake(_)
+            ));
+            assert_eq!(
+                client.held_files_ready().await.expect("redial"),
+                Some(one())
+            );
+            wake.notify_one();
+            grant_file(&mut second_server, files[1]).await;
+            assert!(matches!(
+                events.recv().await.expect("the second file uploads"),
+                ContentEvent::Uploaded { file_id } if file_id == files[1]
+            ));
+            assert!(
+                !client
+                    .held_files_pending()
+                    .await
+                    .expect("both files drained")
+            );
+            assert_eq!(http.sent().len(), 4);
+        };
+        tokio::select! {
+            () = content.drive_outbox(|_| async {
+                sleeping.send("held-walk").await.expect("report the stopped walk");
+                wake.notified().await;
+            }) => panic!("the driver ended before the drain completed"),
+            () = scenario => {}
+        }
+        client.close().await;
+        pump.await.expect("the pump exits");
+    })
+    .await
+    .expect("the held walk and redial finish within the bound");
 }

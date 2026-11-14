@@ -210,6 +210,53 @@ async fn a_manifest_naming_chunks_the_file_lacks_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manifest_reusing_cached_chunks_of_another_file_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (_, receiver) = declared(dir.path()).await;
+    let cached = pseudorandom(18, 300_000);
+    let cached_id = stage(&receiver, 1, "anna", &cached).await;
+    let requested = pseudorandom(20, 300_000);
+    let file_id = crate::support::learn_file_id(&requested).await;
+    assert_ne!(file_id, cached_id);
+    let mut events = receiver.events();
+    let devices = Devices::new();
+    let (liar, addr, liar_events) = devices.node(&devices.device("mallory", 4));
+    let (reader, _, reader_events) = devices.node(&devices.device("anna", 3));
+    let (asked, _) = bare_holder_of(
+        liar,
+        liar_events,
+        vec![requested, cached.clone()],
+        Fault::WrongFileManifest,
+    );
+    reader.link(addr).await.expect("link the holder");
+
+    beside(&receiver, port(reader, reader_events), async {
+        let result = tokio::time::timeout(Duration::from_secs(10), receiver.resolve(file_id))
+            .await
+            .expect("the fetch finishes");
+        assert!(
+            matches!(&result, Err(connetto_file_client::ContentError::Store(detail))
+                if detail.contains("do not hash to the file id")),
+            "{result:?}"
+        );
+        assert!(
+            fetches(&asked).is_empty(),
+            "the named chunks were already cached"
+        );
+        assert_eq!(receiver.outboard(file_id).await.expect("outboard"), None);
+        assert!(
+            events.try_recv().is_err(),
+            "a forged file is not announced fetched"
+        );
+        assert_local(
+            &receiver.resolve(cached_id).await.expect("cached file"),
+            &cached,
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fetch_resumes_at_the_next_chunk_after_a_lost_link() {
     let receiver_dir = tempfile::tempdir().expect("temp dir");
     let (_, receiver) = declared(receiver_dir.path()).await;
@@ -417,6 +464,14 @@ async fn a_manifest_no_file_can_have_is_refused_before_any_fetch() {
                 Resolved::Unavailable
             );
             assert_eq!(fetches(&holder), Vec::new());
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(10), camp.receiver.resolve(camp.file_id))
+                    .await
+                    .expect("the trailing reply releases the request slot")
+                    .expect("resolve again"),
+                Resolved::Unavailable
+            );
+            assert_eq!(wants(&holder), 2);
         })
         .await;
     }
