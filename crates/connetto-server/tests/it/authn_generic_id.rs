@@ -1,16 +1,21 @@
-//! The in-memory auth store is generic over the developer's distributed id
-//! type. This drives it with `rosetta_uuid::Uuid` (the demo id) to prove the
-//! resolved `AuthContext::user_id` is the typed value, not a string, and that
-//! the same verified identity resolves to one id across logins while rotation
-//! and revocation carry the typed id through.
+//! The database auth store preserves a typed `rosetta_uuid::Uuid` user id, the
+//! id type the demos share between the client's SQLite replica and the
+//! server's Postgres tables, across login, rotation, and revocation.
 
 use std::sync::Arc;
 
 use connetto_server::{
-    AuthConfig, AuthStore, IdentityResolver, InMemoryAuthStore, ResolveFuture, ResolvedIdentity,
-    VerifiedClaims,
+    AuthConfig, DbAuthStore, IdentityResolver, ResolveFuture, ResolvedIdentity, VerifiedClaims,
 };
+use connetto_test_harness::Fixture;
 use rosetta_uuid::Uuid;
+
+connetto_server::connetto_schema! {
+    pub struct TypedSchema;
+    id: Uuid => rosetta_uuid::sql_types::Uuid,
+    audit_row_key: Uuid => rosetta_uuid::sql_types::Uuid,
+    audit_ddl: connetto_server::connetto_audit_ddl!("UUID", "UUID"),
+}
 
 /// A fixed namespace for the deterministic `(issuer, subject)` to `Uuid`
 /// mapping, standing in for the developer's `IdentityResolver`.
@@ -35,14 +40,12 @@ fn origin() -> connetto_server::SessionOrigin<()> {
     }
 }
 
-/// The deterministic v5 uuid over `issuer|subject`, mapped into the demo
-/// `rosetta_uuid::Uuid`.
+/// The deterministic v5 UUID over `issuer|subject`.
 fn expected_id(subject: &str) -> Uuid {
     uuid::Uuid::new_v5(&NS, format!("https://issuer.example|{subject}").as_bytes()).into()
 }
 
-/// The typed resolver: the in-memory stand-in for a developer's
-/// [`IdentityResolver`] over a typed distributed id.
+/// Resolves verified identities to typed UUIDs.
 struct TypedResolver;
 
 impl IdentityResolver for TypedResolver {
@@ -58,14 +61,20 @@ impl IdentityResolver for TypedResolver {
     }
 }
 
-fn store() -> InMemoryAuthStore<Uuid> {
-    let config = AuthConfig::default();
-    InMemoryAuthStore::<Uuid>::with_resolver(config.refresh_lifetimes(), Arc::new(TypedResolver))
+async fn store() -> (Fixture, DbAuthStore<TypedSchema>) {
+    let fixture = Fixture::acquire().await;
+    fixture.provision_auth_tables_over("UUID").await;
+    let store = DbAuthStore::new(
+        fixture.admin().clone(),
+        AuthConfig::default().refresh_lifetimes(),
+        Arc::new(TypedResolver),
+    );
+    (fixture, store)
 }
 
 #[tokio::test]
-async fn in_memory_store_carries_a_typed_user_id() {
-    let store = store();
+async fn database_store_carries_a_typed_user_id() {
+    let (_fixture, store) = store().await;
 
     let first = store
         .create_session(&identity("dave"), origin())
@@ -93,7 +102,7 @@ async fn in_memory_store_carries_a_typed_user_id() {
 
 #[tokio::test]
 async fn typed_id_survives_rotation_and_revocation() {
-    let store = store();
+    let (_fixture, store) = store().await;
 
     let issued = store
         .create_session(&identity("frank"), origin())
@@ -125,11 +134,10 @@ async fn typed_id_survives_rotation_and_revocation() {
     );
 }
 
-/// The in-memory store records how a session began and stamps each refresh,
-/// as the database store does.
+/// The database store records how a session began and stamps each refresh.
 #[tokio::test]
-async fn in_memory_store_records_how_a_session_began() {
-    let store = store();
+async fn database_store_records_how_a_session_began() {
+    let (_fixture, store) = store().await;
     let issued = store
         .create_session(&identity("gina"), origin())
         .await
@@ -160,11 +168,10 @@ async fn in_memory_store_records_how_a_session_began() {
     assert!(refreshed >= began.created_at);
 }
 
-/// The in-memory store keeps the list-and-end contract the database store
-/// keeps.
+/// The database store lists and ends only the typed user's sessions.
 #[tokio::test]
-async fn in_memory_store_lists_and_ends_one_persons_sessions() {
-    let store = store();
+async fn database_store_lists_and_ends_one_persons_sessions() {
+    let (_fixture, store) = store().await;
     let mut hana = Vec::new();
     for _ in 0..3 {
         hana.push(

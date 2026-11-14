@@ -1374,6 +1374,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rmp-serde",
+ "rosetta-uuid",
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",

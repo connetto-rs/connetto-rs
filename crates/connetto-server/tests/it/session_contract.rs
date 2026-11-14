@@ -1,8 +1,6 @@
-//! The list-and-end contract every auth store keeps (R105 decision 3),
-//! checked against the in-memory store in `authn_generic_id.rs` and the
-//! database store in `authn_db.rs`.
+//! The database auth store's list-and-end contract for string and typed user ids.
 
-use connetto_server::{AuthStore, SessionId};
+use connetto_server::{ConnettoSchema, DbAuthStore, SessionId};
 
 /// `ids` sorted, so two answers compare whatever order a store gives.
 fn sorted(ids: impl IntoIterator<Item = SessionId>) -> Vec<SessionId> {
@@ -12,7 +10,7 @@ fn sorted(ids: impl IntoIterator<Item = SessionId>) -> Vec<SessionId> {
 }
 
 /// The ids of `user`'s live sessions, sorted.
-async fn listed<S: AuthStore>(store: &S, user: &S::Id) -> Vec<SessionId> {
+async fn listed<D: ConnettoSchema>(store: &DbAuthStore<D>, user: &D::Id) -> Vec<SessionId> {
     sorted(
         store
             .sessions_of(user)
@@ -26,9 +24,9 @@ async fn listed<S: AuthStore>(store: &S, user: &S::Id) -> Vec<SessionId> {
 /// `store` lists exactly `own`, `user`'s three live sessions, and ends one
 /// of them, then all but one, then all, never touching `other`, another
 /// person's session.
-pub(super) async fn ends_only_the_persons_sessions<S: AuthStore>(
-    store: &S,
-    user: &S::Id,
+pub(super) async fn ends_only_the_persons_sessions<D: ConnettoSchema>(
+    store: &DbAuthStore<D>,
+    user: &D::Id,
     own: [SessionId; 3],
     other: SessionId,
 ) {

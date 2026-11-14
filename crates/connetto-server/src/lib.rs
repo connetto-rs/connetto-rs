@@ -16,9 +16,9 @@
 //! * The assembled server authorizes every row through OpenFGA. Row-level
 //!   security stays available as the optional second opinion that counts and
 //!   names divergences.
-//! * The production build takes the database auth store and the persisted JWT
-//!   keypair. The in-memory store and ephemeral key generation exist only
-//!   behind the `test-seams` feature.
+//! * The production build takes the Postgres auth store and the persisted JWT
+//!   keypair. Ephemeral key generation exists only behind the `test-seams`
+//!   feature.
 //! * The serving lifecycle closes every session when the shutdown signal or a
 //!   terminal change-stream outcome arrives, and the library never ends the
 //!   process, installs no signal handler and initializes no logging. The
@@ -101,14 +101,14 @@ pub use authn::http::{
     is_loopback_host,
 };
 pub use authn::{
-    AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
+    AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthService, AuthStoreError,
     ConnettoHandshakeAuthority, DefaultUuidResolver, GenericOidcProvider, IdentityProvider,
-    IdentityResolver, InMemoryAuthStore, IssuedAuthCode, IssuedSession, LivenessError,
-    LoginRedirect, LoginRequest, OidcProviderConfig, PendingLogin, PendingLogins, ProviderError,
-    ProviderRegistry, RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture,
-    ResolvedIdentity, RetainedProviderToken, SessionDescriber, SessionOrigin, SessionRecord,
-    SessionRow, SignInHook, SignInNotice, StoredProviderToken, TokenAuthority, TokenError,
-    TokenPair, VerifiedClaims, VerifiedLogin, VerifiedSession,
+    IdentityResolver, IssuedAuthCode, IssuedSession, LivenessError, LoginRedirect, LoginRequest,
+    OidcProviderConfig, PendingLogin, PendingLogins, ProviderError, ProviderRegistry,
+    RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture, ResolvedIdentity,
+    RetainedProviderToken, SessionDescriber, SessionOrigin, SessionRecord, SessionRow, SignInHook,
+    SignInNotice, StoredProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedClaims,
+    VerifiedLogin, VerifiedSession,
 };
 pub use authn::{ConnettoStoreSchema, DbAuthStore};
 pub use bots::InstalledApp;

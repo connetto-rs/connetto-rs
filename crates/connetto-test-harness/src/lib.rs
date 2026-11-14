@@ -18,9 +18,10 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::CallerMappings;
 use connetto_server::openfga::{Counted, FgaAuth, StoreUpkeep};
 use connetto_server::{
-    InMemoryOplog, LoopbackTransport, ManagerBuilder, Materializer, NoSigner, OidcProviderConfig,
-    PgReadConnector, PgSnapshotSource, ReconnectEvent, ReconnectPolicy, RequestGuard, RlsAuth,
-    RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager, loopback, pg_write_target,
+    DbAuthStore, DefaultUuidResolver, InMemoryOplog, LoopbackTransport, ManagerBuilder,
+    Materializer, NoSigner, OidcProviderConfig, PgReadConnector, PgSnapshotSource, ReconnectEvent,
+    ReconnectPolicy, RefreshLifetimes, RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog,
+    SessionConfig, SessionManager, loopback, pg_write_target,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -1391,19 +1392,50 @@ impl Fixture {
     /// Create the database auth store's tables in the reference shape
     /// (`11-authentication.md`), for a server run with `CONNETTO_AUTH=database`.
     pub async fn provision_auth_tables(&self) {
-        self.setup(&[
+        self.provision_auth_tables_over("TEXT").await;
+    }
+
+    /// Create the auth tables in the reference shape with `user_id` of the
+    /// Postgres type `user_id_type`, for a schema whose `Id` maps to it.
+    pub async fn provision_auth_tables_over(&self, user_id_type: &str) {
+        let sessions = format!(
             "CREATE TABLE connetto_sessions (\
-             session_id UUID PRIMARY KEY, user_id TEXT NOT NULL, \
+             session_id UUID PRIMARY KEY, user_id {user_id_type} NOT NULL, \
              current_refresh_hash BYTEA NOT NULL, idle_deadline TIMESTAMPTZ NOT NULL, \
              absolute_deadline TIMESTAMPTZ NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE, \
              created_at TIMESTAMPTZ NOT NULL, refreshed_at TIMESTAMPTZ, \
-             provider TEXT NOT NULL, issuer TEXT NOT NULL)",
+             provider TEXT NOT NULL, issuer TEXT NOT NULL)"
+        );
+        self.setup(&[
+            sessions.as_str(),
             "CREATE TABLE connetto_provider_tokens (\
              session_id UUID PRIMARY KEY REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
              issuer TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, \
              expires_at TIMESTAMPTZ)",
         ])
         .await;
+    }
+
+    /// Create the auth tables and build the database auth store over them in
+    /// the default schema, enforcing `lifetimes` and resolving identity to a
+    /// deterministic UUID v5 string over `(issuer, subject)`.
+    pub async fn auth_store(
+        &self,
+        lifetimes: RefreshLifetimes,
+    ) -> Arc<DbAuthStore<ConnettoDefaults>> {
+        self.provision_auth_tables().await;
+        Arc::new(DbAuthStore::new(
+            self.admin.clone(),
+            lifetimes,
+            Arc::new(DefaultUuidResolver),
+        ))
+    }
+
+    /// Fail every later statement of the auth store, the way a database
+    /// outage does, by moving its sessions table out of reach.
+    pub async fn break_auth_store(&self) {
+        self.exec("ALTER TABLE connetto_sessions RENAME TO connetto_sessions_unreachable")
+            .await;
     }
 
     /// Put each published table in full previous-image mode, then create the publication, slot and oplog table.

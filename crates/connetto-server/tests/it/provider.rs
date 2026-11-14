@@ -1,4 +1,4 @@
-//! Phase 3 provider verification and token-retention tests (Docker-free).
+//! Provider verification and token-retention tests.
 //!
 //! A locally minted, locally signed ID token exercises the real verification
 //! path: the mapping to a [`ResolvedIdentity`](connetto_server::ResolvedIdentity), the nonce and audience checks,
@@ -13,10 +13,10 @@ use connetto_core::Subject;
 use connetto_core::messages::Grant;
 use connetto_server::{
     AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, IdentityProvider,
-    InMemoryAuthStore, OidcProviderConfig, ProviderError, ProviderRegistry, RequestGuard,
-    TokenAuthority, VerifiedLogin,
+    OidcProviderConfig, ProviderError, ProviderRegistry, RequestGuard, TokenAuthority,
+    VerifiedLogin,
 };
-use connetto_test_harness::{MOCK_OAUTH_PROVIDER, MockOauth};
+use connetto_test_harness::{ConnettoDefaults, Fixture, MOCK_OAUTH_PROVIDER, MockOauth};
 use openidconnect::core::{
     CoreIdToken, CoreIdTokenClaims, CoreJsonWebKeySet, CoreJwsSigningAlgorithm,
     CoreRsaPrivateSigningKey,
@@ -178,9 +178,10 @@ fn mfa_assurance_requires_the_configured_amr() {
 
 async fn service_with_real_provider() -> (
     Arc<TokenAuthority>,
-    AuthService<InMemoryAuthStore>,
+    AuthService<ConnettoDefaults>,
     VerifiedLogin,
     MockOauth,
+    Fixture,
 ) {
     const CALLBACK: &str = "http://127.0.0.1:1/auth/callback";
     let idp = MockOauth::start().await;
@@ -220,7 +221,8 @@ async fn service_with_real_provider() -> (
     let provider: Arc<dyn IdentityProvider> = Arc::new(provider);
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let fixture = Fixture::acquire().await;
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::clone(&provider));
     let service = AuthService::new(
@@ -229,12 +231,12 @@ async fn service_with_real_provider() -> (
         Arc::new(RequestGuard::default()),
     )
     .with_registry(Arc::new(registry));
-    (authority, service, login, idp)
+    (authority, service, login, idp, fixture)
 }
 
 #[tokio::test]
 async fn accessor_refreshes_an_expired_provider_token() {
-    let (authority, service, mut login, _idp) = service_with_real_provider().await;
+    let (authority, service, mut login, _idp, _fixture) = service_with_real_provider().await;
     login.retained.access_token = "stale".to_owned();
     login.retained.expires_in = Some(Duration::ZERO);
     let pair = service
@@ -276,7 +278,7 @@ async fn accessor_refreshes_an_expired_provider_token() {
 
 #[tokio::test]
 async fn accessor_returns_a_still_valid_token_unrefreshed() {
-    let (authority, service, mut login, _idp) = service_with_real_provider().await;
+    let (authority, service, mut login, _idp, _fixture) = service_with_real_provider().await;
     login.retained.access_token = "still-good".to_owned();
     login.retained.expires_in = Some(Duration::from_secs(3600));
     let pair = service

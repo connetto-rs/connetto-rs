@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use connetto_server::{
-    AuthConfig, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver, ResolvedIdentity,
+    AuthConfig, AuthStoreError, DbAuthStore, DefaultUuidResolver, ResolvedIdentity,
     RetainedProviderToken, SessionOrigin,
 };
 use connetto_test_harness::Fixture;
@@ -41,8 +41,7 @@ async fn reset_auth_tables(pool: &Pool<AsyncPgConnection>) {
     }
 }
 
-/// Build the database store over the default schema, resolving identity to a
-/// deterministic UUID v5 (the in-memory default resolver, run against Postgres).
+/// Build the default-schema store with deterministic UUID v5 identity resolution.
 fn build_store(pool: &Pool<AsyncPgConnection>) -> DbAuthStore<ConnettoDefaults> {
     DbAuthStore::new(
         pool.clone(),

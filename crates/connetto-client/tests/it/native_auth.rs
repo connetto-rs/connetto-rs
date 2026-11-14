@@ -7,10 +7,9 @@
 //! authenticator exchanges the code with its PKCE verifier, stores the refresh
 //! token, and silently refreshes.
 //!
-//! It also proves the typed `user_id` boundary: a project whose id is a
-//! `rosetta_uuid::Uuid` gets that value back from the token endpoint as its own
-//! type, with no `Display` or `FromStr` anywhere on the path, and the replica
-//! file the client opens is named from it.
+//! It also proves that a typed `rosetta_uuid::Uuid` identity, the one id type
+//! the server's Postgres tables and the client's SQLite replica share, crosses
+//! the token endpoint as itself and names the client's replica file.
 
 use std::sync::Arc;
 
@@ -25,13 +24,19 @@ use connetto_core::traits::{
     GrantRefused, HandshakeAuthority, RefreshFuture, RefreshTokenStore, ReplicaKeyStore,
 };
 use connetto_server::{
-    AuthConfig, AuthService, GenericOidcProvider, IdentityResolver, InMemoryAuthStore,
-    ProviderRegistry, RedirectPolicy, RequestGuard, ResolveFuture, TokenAuthority, VerifiedClaims,
-    auth_router,
+    AuthConfig, AuthService, DbAuthStore, GenericOidcProvider, IdentityResolver, ProviderRegistry,
+    RedirectPolicy, RequestGuard, ResolveFuture, TokenAuthority, VerifiedClaims, auth_router,
 };
-use connetto_test_harness::{MOCK_OAUTH_PROVIDER, MockOauth};
+use connetto_test_harness::{ConnettoDefaults, Fixture, MOCK_OAUTH_PROVIDER, MockOauth};
 use openidconnect::reqwest;
 use rosetta_uuid::Uuid;
+
+connetto_server::connetto_schema! {
+    struct TypedAuthSchema;
+    id: Uuid => rosetta_uuid::sql_types::Uuid,
+    audit_row_key: Uuid => rosetta_uuid::sql_types::Uuid,
+    audit_ddl: connetto_server::connetto_audit_ddl!("UUID", "UUID"),
+}
 
 /// A fixed namespace for the deterministic `subject` to `Uuid` mapping,
 /// standing in for an app's own [`IdentityResolver`].
@@ -51,24 +56,29 @@ impl IdentityResolver for TypedResolver {
     type Id = Uuid;
 
     fn resolve<'a>(&'a self, claims: &'a VerifiedClaims) -> ResolveFuture<'a, Uuid> {
-        // Key on the subject alone: the test idp mints a fresh issuer per run.
-        let id: Uuid = uuid::Uuid::new_v5(&NS, claims.subject.as_bytes()).into();
+        // The test provider mints a fresh issuer per run.
+        let id = typed_id(&claims.subject);
         Box::pin(async move { Ok(id) })
     }
 }
 
-/// Serve the auth router on an ephemeral port and return the base URL and idp
-/// guard.
-async fn spawn_auth_server() -> (String, MockOauth) {
-    let (base, _service, idp) = spawn_auth_server_with_service(Vec::new()).await;
-    (base, idp)
+/// Serve the auth router and retain its provider and database fixtures.
+async fn spawn_auth_server() -> (String, MockOauth, Fixture) {
+    let (base, _service, idp, fixture) = spawn_auth_server_with_service(Vec::new()).await;
+    (base, idp, fixture)
 }
 
 /// As [`spawn_auth_server`], also handing back the service so a test can ask the
 /// real handshake verifier what it makes of a token.
 async fn spawn_auth_server_with_service(
     redirect_allowlist: Vec<String>,
-) -> (String, Arc<AuthService<InMemoryAuthStore>>, MockOauth) {
+) -> (
+    String,
+    Arc<AuthService<ConnettoDefaults>>,
+    MockOauth,
+    Fixture,
+) {
+    let fixture = Fixture::acquire().await;
     // Bind connetto's listener first so the callback URL is known.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -87,7 +97,7 @@ async fn spawn_auth_server_with_service(
 
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let service = Arc::new(AuthService::new(
         authority,
         store,
@@ -104,12 +114,14 @@ async fn spawn_auth_server_with_service(
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("serve");
     });
-    (base, service, idp)
+    (base, service, idp, fixture)
 }
 
-/// Serve an auth router whose store resolves identity to a typed
-/// `rosetta_uuid::Uuid`, with one containerised provider.
-async fn spawn_typed_auth_server() -> (String, MockOauth) {
+/// Serve an auth router with `rosetta_uuid::Uuid` identities and retain its
+/// fixtures.
+async fn spawn_typed_auth_server() -> (String, MockOauth, Fixture) {
+    let fixture = Fixture::acquire().await;
+    fixture.provision_auth_tables_over("UUID").await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind typed auth server");
@@ -119,7 +131,8 @@ async fn spawn_typed_auth_server() -> (String, MockOauth) {
 
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let store = Arc::new(InMemoryAuthStore::<Uuid>::with_resolver(
+    let store = Arc::new(DbAuthStore::<TypedAuthSchema>::new(
+        fixture.admin().clone(),
         config.refresh_lifetimes(),
         Arc::new(TypedResolver),
     ));
@@ -148,7 +161,7 @@ async fn spawn_typed_auth_server() -> (String, MockOauth) {
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("serve");
     });
-    (base, idp)
+    (base, idp, fixture)
 }
 
 /// Drive the full loopback login against `base` as `subject`.
@@ -215,7 +228,7 @@ fn fake_browser(subject: &str) -> BrowserOpener {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_login_refreshes_and_silently_reacquires() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _idp) = spawn_auth_server().await;
+    let (base, _idp, _fixture) = spawn_auth_server().await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
 
     // Interactive login: no account stored yet, so nothing to try silently.
@@ -297,7 +310,7 @@ async fn native_login_refreshes_and_silently_reacquires() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_first_login_refreshes_for_its_own_reconnect() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _idp) = spawn_auth_server().await;
+    let (base, _idp, _fixture) = spawn_auth_server().await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let authenticator = Arc::new(
         NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, Arc::clone(&store), None)
@@ -325,13 +338,11 @@ async fn a_first_login_refreshes_for_its_own_reconnect() {
     assert_ne!(issued, rotated, "the refresh rotated that account's token");
 }
 
-/// A project whose `Id` is a typed uuid, not a string. The token endpoint
-/// serializes that id and the client deserializes it straight back into the
-/// same type, so nothing on the `user_id` path is text.
+/// A typed `rosetta_uuid::Uuid` identity round-trips from server to client.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_typed_user_id_round_trips_and_names_the_replica() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _idp) = spawn_typed_auth_server().await;
+    let (base, _idp, _fixture) = spawn_typed_auth_server().await;
 
     let alice = login_as(&base, "alice").await;
     let bob = login_as(&base, "bob").await;
@@ -367,7 +378,7 @@ async fn a_typed_user_id_round_trips_and_names_the_replica() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _idp) = spawn_typed_auth_server().await;
+    let (base, _idp, _fixture) = spawn_typed_auth_server().await;
     let keys = MemoryKeyStore::default();
 
     let alice = login_as(&base, "alice").await;
@@ -432,7 +443,7 @@ async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, service, _idp) = spawn_auth_server_with_service(Vec::new()).await;
+    let (base, service, _idp, _fixture) = spawn_auth_server_with_service(Vec::new()).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
 
     let login =
@@ -521,7 +532,7 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_first_login_logout_revokes_its_own_session() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, service, _idp) = spawn_auth_server_with_service(Vec::new()).await;
+    let (base, service, _idp, _fixture) = spawn_auth_server_with_service(Vec::new()).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let authenticator =
         NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, Arc::clone(&store), None)
@@ -714,7 +725,7 @@ fn claimed(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_claimed_redirect_login_completes_through_the_apps_session() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let authenticator = Arc::new(claimed(
@@ -749,7 +760,7 @@ async fn a_claimed_redirect_login_completes_through_the_apps_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_claimed_redirect_with_a_foreign_state_is_refused() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let mut session = ScriptedSession::new("mobile-user");
@@ -771,7 +782,7 @@ async fn a_claimed_redirect_with_a_foreign_state_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_login_finishes_in_the_process_its_redirect_restarts() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let mut dying = ScriptedSession::new("mobile-user");
@@ -817,7 +828,7 @@ async fn a_login_finishes_in_the_process_its_redirect_restarts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_process_starts_over_on_a_foreign_redirect() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let mut dying = ScriptedSession::new("mobile-user");
@@ -847,7 +858,7 @@ async fn a_restarted_process_starts_over_on_a_foreign_redirect() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_process_starts_over_when_the_resumed_code_is_refused() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let mut dying = ScriptedSession::new("mobile-user");
@@ -885,7 +896,7 @@ async fn a_restarted_process_starts_over_when_the_resumed_code_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_process_without_a_redirect_starts_over() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let mut dying = ScriptedSession::new("mobile-user");
@@ -992,7 +1003,7 @@ async fn builder_login(base: &str, store: &SharedRefreshStore, subject: &str) ->
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_provider_build_reports_its_session_and_forgets_its_device() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _idp) = spawn_auth_server().await;
+    let (base, _idp, _fixture) = spawn_auth_server().await;
     let store = SharedRefreshStore::default();
     let dir = tempfile::tempdir().expect("a temporary directory");
 
@@ -1073,7 +1084,7 @@ async fn a_provider_build_reports_its_session_and_forgets_its_device() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_last_used_build_signs_back_in_without_a_browser() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _idp) = spawn_auth_server().await;
+    let (base, _idp, _fixture) = spawn_auth_server().await;
     let store = SharedRefreshStore::default();
     let account = Box::pin(builder_login(&base, &store, "returning-user")).await;
 
@@ -1100,7 +1111,7 @@ async fn a_last_used_build_signs_back_in_without_a_browser() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ask_build_signs_in_as_the_account_the_chooser_picks() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store = SharedRefreshStore::default();
     let first = Box::pin(builder_login(&base, &store, "first-user")).await;

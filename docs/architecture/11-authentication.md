@@ -55,14 +55,7 @@ The enabled providers are held in a runtime collection, [`connetto_server::Provi
 
 The globally unique identifier for a user is the pair of the issuer claim and the subject claim, per OpenID Connect Core section 5.7. The subject alone is only locally unique within the issuer, and human-readable fields (email, phone, username) are never used as identity, because they change and are reused.
 
-The identity mapping, connetto's own sessions and refresh tokens, and the user's retained provider tokens all live in one pluggable store, [`connetto_server::AuthStore`].
-
-| | In-memory | Database |
-|---|---|---|
-| Symbol | [`connetto_server::InMemoryAuthStore`] | [`connetto_server::DbAuthStore`] |
-| Identity resolution | Deterministic version-5 UUID over `(iss, sub)`, no lookup | A deployment-supplied [`connetto_server::IdentityResolver`] into the deployment's own users table, creating or linking the row so the `sessions.user_id` target exists |
-| Durability | Ephemeral. A restart drops the sessions and tokens | Durable and replicated, and one human may hold several linked logins |
-| Availability | Behind the `test-seams` feature, which no production build enables | The production build serves this variant alone, and the builder takes no store variant |
+The identity mapping, connetto's own sessions and refresh tokens, and the user's retained provider tokens all live in Postgres, in the deployment's own tables, through [`connetto_server::DbAuthStore`]. A deployment-supplied [`connetto_server::IdentityResolver`] maps each verified identity into the deployment's users table, creating or linking the row so the `sessions.user_id` target exists, and one human may hold several linked logins. [`connetto_server::DefaultUuidResolver`] is the resolver with no lookup, a deterministic version-5 UUID over `(iss, sub)`. There is one store, so a sign-in runs in one Postgres transaction with the deployment's own tables, and tests run it against their own Postgres.
 
 Each deadline is judged on the database's clock ([21-clocks.md](21-clocks.md)). connetto keeps every security decision, rotation, reuse-is-theft, liveness, and emits no schema.
 

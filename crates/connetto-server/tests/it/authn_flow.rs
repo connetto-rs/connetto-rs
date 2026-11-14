@@ -1,11 +1,7 @@
 //! Phase 2 authentication authority acceptance tests.
 //!
-//! These exercise the whole in-memory path: minting and verifying connetto's
-//! own access token, the rotating refresh token with reuse detection, the
-//! handshake liveness check that makes revocation authoritative, and the login
-//! and refresh HTTP endpoints backed by a containerised OIDC provider.
+//! These exercise token rotation, revocation, and HTTP authentication with Postgres and OIDC.
 
-use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -17,10 +13,10 @@ use connetto_core::messages::{ControlMessage, FatalErrorReason, Grant, Handshake
 use connetto_core::traits::{GrantRefused, HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{PROTOCOL_VERSION, Principal, Subject};
 use connetto_server::{
-    AuthConfig, AuthService, CookieSameSite, GenericOidcProvider, InMemoryAuthStore,
-    ManagerBuilder, Materializer, NoConnector, PageSpec, ProviderRegistry, RedirectPolicy,
-    RefreshLifetimes, RequestGuard, ResolvedIdentity, SessionManager, SnapshotEstimate,
-    SnapshotPage, SnapshotSource, TokenAuthority, auth_router, loopback, pg_write_target,
+    AuthConfig, AuthService, CookieSameSite, GenericOidcProvider, ManagerBuilder, Materializer,
+    NoConnector, PageSpec, ProviderRegistry, RedirectPolicy, RefreshLifetimes, RequestGuard,
+    ResolvedIdentity, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
+    TokenAuthority, auth_router, loopback, pg_write_target,
 };
 use connetto_test_harness::{
     ConnettoDefaults, Fixture, MOCK_OAUTH_PROVIDER, MockOauth, RosterAuth, WITHHELD_ID,
@@ -106,10 +102,10 @@ fn origin() -> connetto_server::SessionOrigin<()> {
     }
 }
 
-fn service() -> (Arc<TokenAuthority>, Arc<AuthService<InMemoryAuthStore>>) {
+async fn service(fixture: &Fixture) -> (Arc<TokenAuthority>, Arc<AuthService<ConnettoDefaults>>) {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("generate keypair"));
-    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let svc = Arc::new(AuthService::new(
         Arc::clone(&authority),
         store,
@@ -145,7 +141,7 @@ fn manager_with(
 )]
 async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     let fixture = Fixture::acquire().await;
-    let (authority, svc) = service();
+    let (authority, svc) = service(&fixture).await;
     let pair = svc
         .login(&identity("alice"), origin())
         .await
@@ -273,7 +269,7 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn logout_closes_the_live_connection_it_revoked() {
     let fixture = Fixture::acquire().await;
-    let (_authority, svc) = service();
+    let (_authority, svc) = service(&fixture).await;
     let pair = svc.login(&identity("dave"), origin()).await.expect("login");
     let manager = manager_with(
         Arc::new(svc.handshake_authority()),
@@ -345,7 +341,7 @@ async fn logout_closes_the_live_connection_it_revoked() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_reuse_closes_the_live_connection_it_revoked() {
     let fixture = Fixture::acquire().await;
-    let (_authority, svc) = service();
+    let (_authority, svc) = service(&fixture).await;
     let pair = svc
         .login(&identity("mallory"), origin())
         .await
@@ -408,7 +404,8 @@ async fn token_reuse_closes_the_live_connection_it_revoked() {
 
 #[tokio::test]
 async fn refresh_rotates_and_reusing_the_old_token_revokes_the_session() {
-    let (authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (authority, svc) = service(&fixture).await;
     let pair = svc.login(&identity("bob"), origin()).await.expect("login");
 
     let rotated = svc.refresh(&pair.refresh_token).await.expect("refresh");
@@ -449,13 +446,17 @@ async fn refresh_rotates_and_reusing_the_old_token_revokes_the_session() {
 /// access token still verifies, as a refresh of it would be.
 #[tokio::test]
 async fn a_session_past_its_idle_window_is_refused_at_the_handshake() {
+    use connetto_server::defaults::connetto_sessions;
+    use diesel::ExpressionMethods as _;
+    use diesel_async::RunQueryDsl as _;
+
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let idle = Duration::from_millis(50);
-    let store = Arc::new(InMemoryAuthStore::new(RefreshLifetimes::new(
-        idle,
-        Duration::from_secs(3600),
-    )));
+    let idle = Duration::from_secs(3600);
+    let fixture = Fixture::acquire().await;
+    let store = fixture
+        .auth_store(RefreshLifetimes::new(idle, Duration::from_secs(3600)))
+        .await;
     let svc = AuthService::new(authority, store, Arc::new(RequestGuard::default()));
     let pair = svc.login(&identity("dana"), origin()).await.expect("login");
     let handshake: &dyn connetto_core::traits::HandshakeAuthority = &svc.handshake_authority();
@@ -467,7 +468,15 @@ async fn a_session_past_its_idle_window_is_refused_at_the_handshake() {
         "a session inside its idle window opens a handshake"
     );
 
-    tokio::time::sleep(idle * 3).await;
+    let mut connection = fixture.admin().get().await.expect("connection");
+    diesel::update(connetto_sessions::table)
+        .set(
+            connetto_sessions::idle_deadline
+                .eq(connetto_server::authn::schema::Instant::UNIX_EPOCH),
+        )
+        .execute(&mut connection)
+        .await
+        .expect("expire the session idle deadline");
     assert_eq!(
         handshake.check_grant(&Grant::new(&pair.access_token)).await,
         Err(GrantRefused::Revoked),
@@ -483,7 +492,8 @@ async fn a_session_past_its_idle_window_is_refused_at_the_handshake() {
 async fn expired_access_token_is_refused() {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let fixture = Fixture::acquire().await;
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let svc = AuthService::new(
         Arc::clone(&authority),
         Arc::clone(&store),
@@ -521,7 +531,8 @@ async fn expired_access_token_is_refused() {
 async fn an_access_token_within_server_skew_of_expiry_verifies() {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let fixture = Fixture::acquire().await;
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let svc = AuthService::new(
         Arc::clone(&authority),
         Arc::clone(&store),
@@ -553,7 +564,8 @@ async fn an_access_token_within_server_skew_of_expiry_verifies() {
 async fn an_access_token_beyond_server_skew_of_expiry_is_refused() {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let fixture = Fixture::acquire().await;
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let svc = AuthService::new(
         Arc::clone(&authority),
         Arc::clone(&store),
@@ -584,7 +596,8 @@ async fn an_access_token_beyond_server_skew_of_expiry_is_refused() {
 #[tokio::test]
 async fn a_token_from_another_key_is_refused() {
     let config = AuthConfig::default();
-    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let fixture = Fixture::acquire().await;
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair a"));
     let svc = AuthService::new(
         Arc::clone(&authority),
@@ -688,7 +701,8 @@ async fn authorize_hop(authorize_url: &str, subject: &str) -> (String, String) {
 
 #[tokio::test]
 async fn http_oauth_flow_then_refresh_roundtrip() {
-    let (_authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service(&fixture).await;
     let (_idp, registry) = oidc_registry().await;
     let router = auth_router(
         svc,
@@ -841,7 +855,8 @@ async fn loopback_code(router: &axum::Router, subject: &str) -> String {
 
 #[tokio::test]
 async fn loopback_code_exchange_with_pkce() {
-    let (_authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service(&fixture).await;
     let (_idp, registry) = oidc_registry().await;
     let router = auth_router(
         svc,
@@ -897,7 +912,8 @@ async fn loopback_code_exchange_with_pkce() {
 
 #[tokio::test]
 async fn redirect_policy_gates_the_client_redirect() {
-    let (_authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service(&fixture).await;
     let (_idp, registry) = oidc_registry().await;
     let router = auth_router(
         svc,
@@ -945,7 +961,8 @@ async fn redirect_policy_gates_the_client_redirect() {
 
 #[tokio::test]
 async fn redirect_policy_admits_an_allowlisted_https_callback() {
-    let (_authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service(&fixture).await;
     let (_idp, registry) = oidc_registry().await;
     let policy = RedirectPolicy::new(vec!["https://app.example/cb".to_owned()]);
     let router = auth_router(svc, registry, policy, CookieSameSite::default());
@@ -1027,7 +1044,8 @@ async fn marked_login(router: &axum::Router, subject: &str) -> (String, String) 
 
 #[tokio::test]
 async fn marked_login_sets_the_prefixed_cookie_and_hides_the_body_token() {
-    let (_authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service(&fixture).await;
     let (_idp, registry) = oidc_registry().await;
     let router = auth_router(
         svc,
@@ -1079,7 +1097,8 @@ async fn marked_login_sets_the_prefixed_cookie_and_hides_the_body_token() {
 
 #[tokio::test]
 async fn native_paths_never_see_a_set_cookie() {
-    let (_authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service(&fixture).await;
     let (_idp, registry) = oidc_registry().await;
     let router = auth_router(
         svc,
@@ -1113,7 +1132,8 @@ async fn native_paths_never_see_a_set_cookie() {
 
 #[tokio::test]
 async fn marked_refresh_rotates_through_the_cookie() {
-    let (_authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service(&fixture).await;
     let (_idp, registry) = oidc_registry().await;
     let router = auth_router(
         svc,
@@ -1152,7 +1172,8 @@ async fn marked_refresh_rotates_through_the_cookie() {
 
 #[tokio::test]
 async fn marked_requests_without_the_cookie_are_401() {
-    let (_authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service(&fixture).await;
     let (_idp, registry) = oidc_registry().await;
     let router = auth_router(
         svc,
@@ -1177,7 +1198,8 @@ async fn marked_requests_without_the_cookie_are_401() {
 
 #[tokio::test]
 async fn mixed_contracts_are_400() {
-    let (_authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service(&fixture).await;
     let (_idp, registry) = oidc_registry().await;
     let router = auth_router(
         svc,
@@ -1242,7 +1264,8 @@ async fn mixed_contracts_are_400() {
 
 #[tokio::test]
 async fn marked_logout_revokes_and_clears_only_that_cookie() {
-    let (_authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service(&fixture).await;
     let (_idp, registry) = oidc_registry().await;
     let router = auth_router(
         svc,
@@ -1293,7 +1316,8 @@ async fn marked_logout_revokes_and_clears_only_that_cookie() {
 
 #[tokio::test]
 async fn cookie_name_mismatch_revokes_the_borrowed_session() {
-    let (_authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service(&fixture).await;
     let (_idp, registry) = oidc_registry().await;
     let router = auth_router(
         svc,
@@ -1348,7 +1372,8 @@ async fn cookie_name_mismatch_revokes_the_borrowed_session() {
 
 #[tokio::test]
 async fn samesite_none_setting_renders_none() {
-    let (_authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service(&fixture).await;
     let (_idp, registry) = oidc_registry().await;
     let router = auth_router(
         svc,
@@ -1373,150 +1398,6 @@ async fn samesite_none_setting_renders_none() {
     );
 }
 
-/// A store whose refresh lookup breaks mid-test, the way a database outage
-/// breaks it after a login already landed.
-struct LookupOutageStore {
-    inner: InMemoryAuthStore,
-    down: std::sync::atomic::AtomicBool,
-}
-
-impl connetto_server::AuthStore for LookupOutageStore {
-    type Id = String;
-    type Descriptor = ();
-
-    fn undescribed() -> Option<()> {
-        Some(())
-    }
-
-    fn resolve(
-        &self,
-        identity: &ResolvedIdentity,
-    ) -> impl Future<Output = Result<String, connetto_server::AuthStoreError>> + Send {
-        self.inner.resolve(identity)
-    }
-
-    fn create_session_for(
-        &self,
-        user_id: String,
-        identity: &ResolvedIdentity,
-        origin: connetto_server::SessionOrigin<()>,
-    ) -> impl Future<
-        Output = Result<connetto_server::IssuedSession<Self::Id>, connetto_server::AuthStoreError>,
-    > + Send {
-        self.inner.create_session_for(user_id, identity, origin)
-    }
-
-    fn session_record(
-        &self,
-        session_id: connetto_server::SessionId,
-    ) -> impl Future<
-        Output = Result<
-            Option<connetto_server::SessionRecord<Self::Id, ()>>,
-            connetto_server::AuthStoreError,
-        >,
-    > + Send {
-        self.inner.session_record(session_id)
-    }
-
-    fn sessions_of(
-        &self,
-        user: &Self::Id,
-    ) -> impl Future<
-        Output = Result<
-            Vec<connetto_server::SessionRecord<Self::Id, ()>>,
-            connetto_server::AuthStoreError,
-        >,
-    > + Send {
-        self.inner.sessions_of(user)
-    }
-
-    fn end_owned(
-        &self,
-        user: &Self::Id,
-        session: connetto_server::SessionId,
-    ) -> impl Future<Output = Result<bool, connetto_server::AuthStoreError>> + Send {
-        self.inner.end_owned(user, session)
-    }
-
-    fn end_all_of(
-        &self,
-        user: &Self::Id,
-        keep: Option<connetto_server::SessionId>,
-    ) -> impl Future<
-        Output = Result<Vec<connetto_server::SessionId>, connetto_server::AuthStoreError>,
-    > + Send {
-        self.inner.end_all_of(user, keep)
-    }
-
-    fn session_is_live(
-        &self,
-        session_id: connetto_server::SessionId,
-    ) -> impl Future<Output = Result<bool, connetto_server::AuthStoreError>> + Send {
-        self.inner.session_is_live(session_id)
-    }
-
-    fn rotate_refresh(
-        &self,
-        refresh_token: &str,
-    ) -> impl Future<
-        Output = Result<connetto_server::RefreshOutcome<Self::Id>, connetto_server::AuthStoreError>,
-    > + Send {
-        self.inner.rotate_refresh(refresh_token)
-    }
-
-    fn revoke_session(
-        &self,
-        session_id: connetto_server::SessionId,
-    ) -> impl Future<Output = Result<(), connetto_server::AuthStoreError>> + Send {
-        self.inner.revoke_session(session_id)
-    }
-
-    fn revoke_every_session(
-        &self,
-    ) -> impl Future<Output = Result<u64, connetto_server::AuthStoreError>> + Send {
-        self.inner.revoke_every_session()
-    }
-
-    fn session_for_refresh(
-        &self,
-        refresh_token: &str,
-    ) -> impl Future<
-        Output = Result<Option<connetto_server::SessionId>, connetto_server::AuthStoreError>,
-    > + Send {
-        let down = self.down.load(std::sync::atomic::Ordering::SeqCst);
-        let lookup = self.inner.session_for_refresh(refresh_token);
-        async move {
-            if down {
-                Err(connetto_server::AuthStoreError::Backend(
-                    "connection refused".to_owned(),
-                ))
-            } else {
-                lookup.await
-            }
-        }
-    }
-
-    fn set_retained_provider_token(
-        &self,
-        session_id: connetto_server::SessionId,
-        token: &connetto_server::RetainedProviderToken,
-    ) -> impl Future<Output = Result<(), connetto_server::AuthStoreError>> + Send {
-        self.inner.set_retained_provider_token(session_id, token)
-    }
-
-    fn retained_provider_token(
-        &self,
-        session_id: connetto_server::SessionId,
-    ) -> impl Future<
-        Output = Result<
-            Option<connetto_server::StoredProviderToken>,
-            connetto_server::AuthStoreError,
-        >,
-    > + Send {
-        self.inner.retained_provider_token(session_id)
-    }
-}
-
 /// A logout whose revoke fails still clears the cookie. The worker drops its
 /// index row whatever the answer, so a cookie left behind would be a live
 /// credential for an account the device believes it signed out of.
@@ -1524,10 +1405,8 @@ impl connetto_server::AuthStore for LookupOutageStore {
 async fn a_failed_marked_revoke_still_clears_the_cookie() {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("generate keypair"));
-    let store = Arc::new(LookupOutageStore {
-        inner: InMemoryAuthStore::new(config.refresh_lifetimes()),
-        down: std::sync::atomic::AtomicBool::new(false),
-    });
+    let fixture = Fixture::acquire().await;
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let svc = Arc::new(AuthService::new(
         authority,
         Arc::clone(&store),
@@ -1542,7 +1421,7 @@ async fn a_failed_marked_revoke_still_clears_the_cookie() {
     );
     let (cookie, user_id) = marked_login(&router, "ines").await;
 
-    store.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    fixture.break_auth_store().await;
     let response = post_marked(
         router,
         "/auth/logout",
@@ -1613,7 +1492,8 @@ fn assert_lives_until(max_age: u64, lapses_at: u64, what: &str) {
 /// login and set again by every rotation as the idle window slides.
 #[tokio::test]
 async fn the_refresh_cookie_lives_until_the_session_lapses() {
-    let (_authority, svc) = service();
+    let fixture = Fixture::acquire().await;
+    let (_authority, svc) = service(&fixture).await;
     let (_idp, registry) = oidc_registry().await;
     let router = auth_router(
         svc,
@@ -1658,42 +1538,4 @@ async fn the_refresh_cookie_lives_until_the_session_lapses() {
     assert_eq!(rotated.status(), StatusCode::OK, "marked refresh");
     let (_, max_age, lapses_at) = cookie_lifetime(rotated).await;
     assert_lives_until(max_age, lapses_at, "rotation");
-}
-
-/// The in-memory store spends a retained provider token once less than the
-/// margin of its lifetime remains, as the database store does.
-#[tokio::test]
-async fn in_memory_store_spends_a_provider_token_inside_the_margin() {
-    use connetto_server::authn::provider::PROVIDER_TOKEN_MARGIN;
-    use connetto_server::{AuthStore as _, RetainedProviderToken};
-
-    let store = InMemoryAuthStore::new(AuthConfig::default().refresh_lifetimes());
-    let issued = store
-        .create_session(&identity("ines"), origin())
-        .await
-        .expect("create");
-    for (lifetime, usable) in [
-        (
-            PROVIDER_TOKEN_MARGIN.saturating_sub(Duration::from_secs(1)),
-            false,
-        ),
-        (PROVIDER_TOKEN_MARGIN + Duration::from_secs(60), true),
-    ] {
-        let token = RetainedProviderToken {
-            issuer: "https://issuer.example".to_owned(),
-            access_token: "provider-access".to_owned(),
-            refresh_token: None,
-            expires_in: Some(lifetime),
-        };
-        store
-            .set_retained_provider_token(issued.session_id, &token)
-            .await
-            .expect("store");
-        let read = store
-            .retained_provider_token(issued.session_id)
-            .await
-            .expect("read")
-            .expect("present");
-        assert_eq!(read.still_valid, usable, "lifetime {lifetime:?}");
-    }
 }

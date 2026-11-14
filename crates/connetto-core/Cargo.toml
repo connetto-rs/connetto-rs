@@ -42,6 +42,10 @@ native-transport = [
 # dependency, because that line carries the `sqlite` backend the core must not
 # require.
 diesel-pg = ["dep:diesel"]
+# The bot registry DDL over `rosetta_uuid::sql_types::Uuid`, so a deployment
+# whose `Id` is `rosetta_uuid::Uuid` declares its server schema with the same
+# SQL type its client replica uses.
+rosetta-uuid = ["diesel-pg", "dep:rosetta-uuid"]
 # The R31 tier shape reader, on the SQLite backend. Off by default so the
 # core stays dependency-light for the browser build, the way `diesel-pg` is,
 # and on for the build step and the client's post-migration DDL check.
@@ -87,6 +91,7 @@ rustls-platform-verifier = { workspace = true, optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"], optional = true }
 url = { version = "2", optional = true }
 diesel = { version = "2", default-features = false, features = ["postgres_backend"], optional = true }
+rosetta-uuid = { version = "0.2.0", default-features = false, features = ["postgres"], optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"], optional = true }
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "x509-parser"], optional = true }
 x509-parser = { version = "0.18", features = ["verify"], optional = true }

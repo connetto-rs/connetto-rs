@@ -4,7 +4,7 @@
 //! `provider_tokens` tables (see `docs/architecture/11-authentication.md`) and
 //! implements [`ConnettoStoreSchema`] for them, either by hand or through
 //! [`connetto_schema!`](crate::connetto_schema), and names it as the `Auth`
-//! member of its [`ConnettoSchema`](crate::schema::ConnettoSchema).
+//! member of its [`ConnettoSchema`].
 //! [`DbAuthStore`](super::store::DbAuthStore) is generic over this trait and
 //! keeps every decision (identity resolution, refresh-token rotation,
 //! reuse-is-theft, deadline capping); the trait runs one statement per
@@ -25,6 +25,10 @@ use diesel::QueryResult;
 use diesel_async::AsyncPgConnection;
 
 use crate::authn::provider::StoredProviderToken;
+use crate::schema::ConnettoSchema;
+
+/// The application's session descriptor the deployment's schema declares.
+pub(crate) type Desc<D> = <<D as ConnettoSchema>::Auth as ConnettoStoreSchema>::Descriptor;
 
 /// The zone-aware instant a `Timestamptz` column carries.
 ///

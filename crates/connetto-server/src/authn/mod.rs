@@ -8,7 +8,7 @@
 //! building the [`AuthContext`](connetto_core::auth::AuthContext) that RLS
 //! consumes. See `docs/architecture/11-authentication.md`.
 //!
-//! This module holds the token authority ([`token`]), the pluggable auth store
+//! This module holds the token authority ([`token`]), the Postgres auth store
 //! ([`store`]), the login and refresh service plus the real session verifier
 //! ([`service`]), and the HTTP endpoints ([`http`]).
 
@@ -33,10 +33,7 @@ pub use provider::{
 pub use provider_oidc::{GenericOidcProvider, OidcProviderConfig};
 pub use service::{AuthError, AuthService, ConnettoHandshakeAuthority, LivenessError, TokenPair};
 pub use sign_in::{LoginRequest, SessionDescriber, SignInHook, SignInNotice};
-pub use store::{
-    AuthStore, AuthStoreError, InMemoryAuthStore, IssuedSession, RefreshOutcome, ResolvedIdentity,
-    SessionOrigin,
-};
+pub use store::{AuthStoreError, IssuedSession, RefreshOutcome, ResolvedIdentity, SessionOrigin};
 pub use token::{AuthConfig, RefreshLifetimes, TokenAuthority, TokenError, VerifiedSession};
 
 pub use schema::{ConnettoStoreSchema, SessionRecord, SessionRow};
