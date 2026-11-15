@@ -66,10 +66,7 @@ async fn wait_for_child_port(child: &mut Child, bind: &str) {
         if let Some(status) = child.try_wait().expect("check demo-server status") {
             panic!("demo-server exited before opening {bind}: {status}");
         }
-        assert!(
-            Instant::now() < deadline,
-            "demo-server did not open {bind}"
-        );
+        assert!(Instant::now() < deadline, "demo-server did not open {bind}");
         sleep(Duration::from_millis(100)).await;
     }
 }
