@@ -213,7 +213,7 @@ async fn main() -> Result<()> {
         Ok(()) => {
             let apk = match apk {
                 Some(apk) => apk,
-                None => build_apk(&device.rust_target().await?).await?,
+                None => build_apk(&device.rust_target().await?, &stack).await?,
             };
             let started = Instant::now();
             let outcome = prove(&device, &apk, &stack, &evidence, unlock).await;
@@ -316,6 +316,8 @@ struct Stack {
     pg_url: String,
     reverse: Vec<(u16, u16)>,
     issuer: String,
+    /// The sync and login addresses an APK built here bakes in.
+    endpoints: [(&'static str, String); 2],
 }
 
 impl Stack {
@@ -328,6 +330,13 @@ impl Stack {
             pg_url: var("CONNETTO_DEMO_PG")?,
             reverse: parse_reverse(&var("CONNETTO_DEMO_ADB_REVERSE")?)?,
             issuer: var("CONNETTO_DEMO_ISSUER")?,
+            endpoints: [
+                ("CONNETTO_DEMO_BUILD_WS", var("CONNETTO_DEMO_WS")?),
+                (
+                    "CONNETTO_DEMO_BUILD_AUTH_ORIGIN",
+                    var("CONNETTO_DEMO_AUTH_ORIGIN")?,
+                ),
+            ],
         })
     }
 
@@ -2262,13 +2271,15 @@ fn validate_arguments(arguments: &Arguments) -> Result<()> {
     Ok(())
 }
 
-async fn build_apk(target: &str) -> Result<PathBuf> {
+/// Build the demo's debug APK for `target`, dialing `stack`.
+async fn build_apk(target: &str, stack: &Stack) -> Result<PathBuf> {
     step("build");
     if let Demo::Tauri = demo_app() {
-        return build_tauri_apk(target).await;
+        return build_tauri_apk(target, stack).await;
     }
     let demo = repo_path(&["examples", "dioxus-demo"])?;
     let status = Command::new("dx")
+        .envs(stack.endpoints.iter().map(|(name, value)| (name, value)))
         .args([
             "build",
             "--android",
@@ -2290,10 +2301,10 @@ async fn build_apk(target: &str) -> Result<PathBuf> {
     ))
 }
 
-/// Build the Tauri demo's debug APK for the one ABI of `target`, with the
-/// NDK's `clang` archives for its vendored `OpenSSL` when `NDK_HOME` or
-/// `ANDROID_NDK_HOME` names the NDK.
-async fn build_tauri_apk(target: &str) -> Result<PathBuf> {
+/// Build the Tauri demo's debug APK for the one ABI of `target`, dialing
+/// `stack`, with the NDK's `clang` archives for its vendored `OpenSSL` when
+/// `NDK_HOME` or `ANDROID_NDK_HOME` names the NDK.
+async fn build_tauri_apk(target: &str, stack: &Stack) -> Result<PathBuf> {
     let abi = match target {
         "aarch64-linux-android" => "aarch64",
         "x86_64-linux-android" => "x86_64",
@@ -2301,9 +2312,12 @@ async fn build_tauri_apk(target: &str) -> Result<PathBuf> {
     };
     let demo = repo_path(&["examples", "tauri-leptos-demo", "src-tauri"])?;
     let mut cargo = Command::new("cargo");
-    cargo.current_dir(&demo).args([
-        "tauri", "android", "build", "--debug", "--apk", "--target", abi,
-    ]);
+    cargo
+        .current_dir(&demo)
+        .envs(stack.endpoints.iter().map(|(name, value)| (name, value)))
+        .args([
+            "tauri", "android", "build", "--debug", "--apk", "--target", abi,
+        ]);
     let features = tauri_mobile_features();
     if !features.is_empty() {
         cargo.args(["--features", features]);
