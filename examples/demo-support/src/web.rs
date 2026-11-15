@@ -51,6 +51,10 @@ pub fn demo_builder() -> WebClientBuilder {
             "SELECT content_id FROM photos WHERE content_state = 'lost'",
             "content_id",
         )
+        .with_content_heal_lost(
+            "SELECT thumb_id FROM photos WHERE thumb_state = 'lost'",
+            "thumb_id",
+        )
 }
 
 /// Ask the page which OIDC provider to use for this boot, falling back to [`AUTH_PROVIDER`] after 200 ms of silence.
@@ -603,6 +607,10 @@ pub async fn boot_with(db_prefix: &'static str, auth_db: &'static str) -> Result
             "SELECT content_id FROM photos WHERE content_state = 'lost'",
             "content_id",
         )
+        .with_content_heal_lost(
+            "SELECT thumb_id FROM photos WHERE thumb_state = 'lost'",
+            "thumb_id",
+        )
         .signed_in(Auth::new(crate::AUTH_BASE, AUTH_PROVIDER))
         .with_redirect_uri(crate::auth_landing())
         .with_auth_db_name(auth_db)
@@ -612,4 +620,49 @@ pub async fn boot_with(db_prefix: &'static str, auth_db: &'static str) -> Result
         .await
         .map(drop)
         .map_err(JsValue::from)
+}
+
+/// Stages a thumbnail before its full photo and the row naming both.
+///
+/// # Errors
+///
+/// Returns the blob read or staging error if either file cannot be stored.
+pub async fn stage_photo(
+    content: &connetto_web::TabContent<BroadcastChannel>,
+    client: &connetto_client::ConnettoClient<connetto_web::MessageTransport<BroadcastChannel>>,
+    blob: &web_sys::Blob,
+    mime: connetto_file_core::MimeClass,
+    identity: &str,
+    team: Option<&str>,
+) -> Result<
+    (connetto_file_core::FileId, rosetta_uuid::Uuid),
+    connetto_web::TabStageError<diesel::result::Error>,
+> {
+    let buffer = wasm_bindgen_futures::JsFuture::from(blob.array_buffer())
+        .await
+        .map_err(|error| connetto_web::TabStageError::Read(format!("{error:?}")))?;
+    let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+    let thumb_id = if let Some(thumbnail) = crate::make_photo_thumbnail(&bytes) {
+        let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(thumbnail.as_slice()));
+        let thumbnail = web_sys::Blob::new_with_u8_array_sequence(&parts)
+            .map_err(|error| connetto_web::TabStageError::Read(format!("{error:?}")))?;
+        Some(
+            content
+                .stage(
+                    &thumbnail,
+                    connetto_file_core::MimeClass::Jpeg,
+                    client,
+                    |_, _| Ok(()),
+                )
+                .await?
+                .0,
+        )
+    } else {
+        None
+    };
+    content
+        .stage(blob, mime, client, |conn, file_id| {
+            crate::stage_photo_row(conn, file_id, identity, thumb_id, team)
+        })
+        .await
 }

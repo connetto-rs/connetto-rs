@@ -971,9 +971,9 @@ Making the demos runnable in CI, which `R55` settled, since they need a browser,
 
 ## R80: peer sync in every demo
 
-**Status.** IN PROGRESS. Designed with the maintainer on 2026-11-14, decisions 1 to 5 below, in five slices. Slice 1, the builder's media driver (decision 2), is in review.
+**Status.** IN PROGRESS. Designed with the maintainer on 2026-11-14, decisions 1 to 6 below, in six slices, and placed on the tabbed demo UI of `plans/demo-account-badges.md` on 2026-11-15. Slice 1, the builder's media driver (decision 2), is in review. Slice 2 is built on it. A retraction undoes a peer entry in the views' backing tables, since the receiver may be unable to read a row the author wrote, which slice 2's proof met when a teammate's order was retracted.
 
-**Blocked on** nothing.
+**Blocked on** the demo UI's slices 5 to 7 (navigator, Connectivity tab, Log tab) for R80 slices 3 and 4, which put the photos and the courier offer into those tabs. Slices 1 and 2 are blocked on nothing.
 
 **Out of scope.** Windows. The camp flow serves handhelds where the network is poor or absent, and a Windows desktop rarely if ever needs it, so R76's slice 9d blocks nothing here.
 
@@ -987,9 +987,10 @@ R76 to R79 built the camp in the library and proved it in the harness and on pho
 
 1. **R80 adds no stored or wire format.** A fetched file is R79's manifest and outboard rows, announced by `ContentEvent::Fetched`, and who holds what is R79's holder reports and `_connetto_content_custody`, so a table of completed media or a completed-media entry on the link would record what already stands.
 2. **The content piece carries the peer declarations, and the native client runs the media driver.** `Content::with_peer_content(table, column)` takes R79's declaration with its `prefetch` and `replicate`, applied to the content client before it is shared, and a native client built with the `peer` feature takes its device's media port at connect and runs `drive_media` on it beside the outbox driver the piece already runs, so an application declares its columns and writes no driver code. A build that declares no peer content takes no port, and a port some other caller took first leaves the driver unstarted, which `NativeClient::media_port` already reports by answering `None`. Rejected: each application taking the port and spawning the driver, the same wiring copied into every application.
-3. **The demos declare both photo columns, each replicated to three devices.** `photos.content_id` with `content_state`, and `photos.thumb_id` with `thumb_state` and `prefetch`, both `replicate(3, ...)`, declared once in `examples/demo-support` so every native demo carries them. A peer shows a teammate's thumbnail at once and fetches the full photo on tap through `resolve`, and a lost author's photo and thumbnail both reach the server, the thumbnail costing little budget.
-4. **The courier offer lists each author with one call.** The peer panel lists `ClientEvent::CourierCandidates` by account, sequences held and bytes, with the last verdict heard, each with a button calling `courier` for that author, and prints the report as a `courier:` line naming the settled, refused and kept counts and any retry wait, plus every `CourierNotices` entry, so the phone runners read the outcome off the page as they read `linked:` and `nearby:`.
+3. **The demos declare both photo columns, each replicated to three devices.** `photos.content_id` with `content_state`, and `photos.thumb_id` with `thumb_state` and `prefetch`, both `replicate(3, ...)`, declared once in `examples/demo-support`. A peer shows a teammate's thumbnail at once and fetches the full photo on tap through `resolve`, and a lost author's photo and thumbnail both reach the server, the thumbnail costing little budget. Every demo, native and browser, makes the thumbnail at stage with the `image` crate in `examples/demo-support`, JPEG and PNG decoding only, scaled to 256 px on the longest side and encoded as JPEG, staged before the full photo whose row names it. A photo is posted to the team picked in the Photos tab, so the account's teammates read it and an account with no team keeps it private (decided with the maintainer on 2026-11-14). The Photos tab shows each photo with its author's account badge and the sync mark of the demo UI's C1.
+4. **The courier offer sits in the Connectivity tab, and its outcome in the Log tab.** The Connectivity tab lists `ClientEvent::CourierCandidates` as one row per author, the author's account badge with the sequences held, the bytes and the last verdict heard, each row with a Courier button calling `courier` for that author. The report and every `CourierNotices` entry become Log tab entries naming the settled, refused and kept counts and any retry wait, so the phone runners read the outcome from the Log tab.
 5. **Each platform keeps the role the demos already enforce.** Linux and Android host and join, and the iPhone, the iPad and the Mac only join (R77 decision 23, R76 decision 1).
+6. **The Tauri demo with the Leptos front end carries R80's demo work.** The Dioxus and Yew demos keep building and follow where the shared `View` lets them, with no work of their own (demo UI decision B11).
 
 ### Every event in every situation
 
@@ -1003,25 +1004,43 @@ The media driver of one native client is **D0** not wanted, no peer content decl
 | A link comes up, falls or is replaced | nothing | nothing | `drive_media` handles it (R79's Q, H and C tables) |
 | A later connect after the client closed | n/a | as the first two rows | n/a |
 
+The Photos tab holds rows and display sources while subscribed. Thumbnail resolution runs serially with row refreshes. Opening a full photo runs independently.
+
+| Event or job | Subscribed | Ended |
+|---|---|---|
+| Initial snapshot or changed photo rows | Publish rows, then resolve each row's thumbnail | Nothing |
+| `ContentEvent::Fetched` | Refresh thumbnail sources | Nothing |
+| Other content event | Preserve sources and process status or refusal information | Nothing |
+| Tauri content receiver lag | Refresh sources from the current snapshot | Nothing |
+| Photo subscription closes | End subscription | Nothing |
+| Content receiver closes | End content subscription | Nothing |
+| Thumbnail resolution completes | Publish sources while the session still stands | Nothing |
+| Full photo tap | Resolve `content_id` in an independent job | Nothing |
+| Full photo resolution completes | Publish full preview | Nothing |
+| Tab or session drops | Cancel owned jobs and subscriptions | Nothing |
+
+Browser object URLs remain owned by the displayed sources.
+
 ### Steps
 
-1. Every native-capable demo carries the camp flow per R54's rule, on Android, iOS, iPadOS, macOS and Linux, meaning hosting or joining a hotspot, discovery, exchange, provisional display with provenance, retraction display, the courier offer, and photos over the link with their thumbnails prefetched and both replicated.
+1. The Tauri demo carries the camp flow per R54's rule, on Android, iOS, iPadOS, macOS and Linux, meaning hosting or joining a hotspot, discovery, exchange, provisional display with provenance, retraction display, the courier offer, and photos over the link with their thumbnails prefetched and both replicated, each in its tab of the demo UI.
 2. The on-demand phone run grows to the full camp flow, and a recorded home run exercises it before the phase closes, R76 decision 4's mesh over pippo on Linux, the Mac, the iPhone, the iPad and the Galaxy M52.
 3. The gate section and CI gain whatever new legs the peer crates added.
 
 ### Slices
 
-One pull request each, in this order, each green and useful on its own.
+One pull request each, in this order, each green and useful on its own. Slices 3 and 4 follow the demo UI's slices 5 to 7.
 
 1. **The builder's media driver** (decision 2). `Content::with_peer_content` with its `prefetch` and `replicate`, and the native client taking the media port at connect and running `drive_media`, with the event table above, proven Docker-gated in the harness by two builder-built clients on loopback, one fetching the other's photo through `resolve` with no driver code of its own.
-2. **The demos' photos over the link** (decision 3). The declarations in `examples/demo-support` and both native demos, proven by the on-demand run's two phones, a photo taken offline on one showing its thumbnail on the other at once and its full image on tap.
-3. **The courier offer** (decision 4). The candidate list, the call and the `courier:` line in `examples/demo-support` and both native demos, proven by the on-demand run, one phone's offline note reaching the server through the other.
-4. **The grown runs** (step 2). `connetto-android-proof`'s on-demand run and `connetto-ios-proof`'s star gain the photo and courier legs, and the recorded home run over the five machines closes the phase.
-5. **The CI legs** (step 3). The emulator leg runs the grown camp walk on the Tauri demo, and the gate section names every new leg.
+2. **The demos' photo declarations and thumbnails** (decision 3, no screen). The two declarations and the thumbnail made at stage in `examples/demo-support`, proven Docker-gated in the harness by two clients built with the demo's declarations on loopback, a photo staged offline on one reaching the other's thumbnail through `ContentEvent::Fetched` with no server.
+3. **The Photos tab over the link** (decisions 3 and 6). The tab with its badges, sync marks and the event table above, proven by the on-demand run's two phones, a photo taken offline on one showing its thumbnail on the other at once and its full image on tap.
+4. **The courier offer** (decision 4). The candidate rows in the Connectivity tab and the Log tab entries, proven by the on-demand run, one phone's offline note reaching the server through the other.
+5. **The grown runs** (step 2). `connetto-android-proof`'s on-demand run and `connetto-ios-proof`'s star walk the Photos, Connectivity and Log tabs for the photo and courier legs, and the recorded home run over the five machines closes the phase.
+6. **The CI legs** (step 3). The emulator leg runs the grown camp walk on the Tauri demo, and the gate section names every new leg.
 
 ### Done when
 
-The camp flow runs through a demo on pippo, the Mac, the iPhone, the iPad and the M52 in the recorded home run, and in the on-demand run on two attached phones, a photo authored offline showing on a teammate's device in camp and reaching the server through a teammate's courier.
+The camp flow runs through the Tauri demo on pippo, the Mac, the iPhone, the iPad and the M52 in the recorded home run, and in the on-demand run on two attached phones, a photo authored offline showing on a teammate's device in camp and reaching the server through a teammate's courier.
 
 ---
 

@@ -58,6 +58,7 @@ web-sys = { version = "0.3", features = [
 connetto-schema = { path = "../../crates/connetto-schema" }
 
 [dev-dependencies]
+connetto-demo-support = { path = "../demo-support", features = ["web"] }
 wasm-bindgen-test = "0.3"
 # The logged-in startup test plays the tab, so it decodes the login-channel
 # message the worker broadcasts.

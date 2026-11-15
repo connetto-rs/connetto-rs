@@ -67,6 +67,12 @@ diesel::table! {
         content_id -> diesel::sql_types::Binary,
         /// `NULL` until the file server commit writes `available`.
         content_state -> Nullable<diesel::sql_types::Text>,
+        /// The preview's content identity.
+        thumb_id -> Nullable<diesel::sql_types::Binary>,
+        /// The preview's upload state.
+        thumb_state -> Nullable<diesel::sql_types::Text>,
+        /// The team allowed to read the photo.
+        team_id -> Nullable<diesel::sql_types::Text>,
     }
 }
 
@@ -153,6 +159,12 @@ pub struct Photo {
     pub content_id: Vec<u8>,
     /// The row's content state, absent while the bytes are pending.
     pub content_state: Option<String>,
+    /// The preview's content identity.
+    pub thumb_id: Option<Vec<u8>>,
+    /// The preview's upload state.
+    pub thumb_state: Option<String>,
+    /// The team allowed to read the photo.
+    pub team_id: Option<String>,
 }
 
 /// One row of the shared `products` catalogue.
@@ -429,6 +441,22 @@ fn current_millis() -> u64 {
     }
 }
 
+/// Encodes a JPEG preview within 256 pixels per side without enlarging the image.
+#[must_use]
+pub fn make_photo_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let thumbnail = if decoded.width() > 256 || decoded.height() > 256 {
+        decoded.thumbnail(256, 256)
+    } else {
+        decoded
+    };
+    let mut output = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut output)
+        .encode_image(&thumbnail.into_rgb8())
+        .ok()?;
+    Some(output)
+}
+
 /// Inserts one orders row and a photos row referencing it in one transaction, answering with the photo id.
 ///
 /// The inserts name their `id` and `owner_id` and omit `created_at`, which the orders table's `now()` default mints.
@@ -440,6 +468,8 @@ pub fn stage_photo_row(
     conn: &mut diesel::SqliteConnection,
     file_id: FileId,
     owner_id: &str,
+    thumb_id: Option<FileId>,
+    team_id: Option<&str>,
 ) -> Result<Uuid, diesel::result::Error> {
     conn.transaction(|conn| {
         let order_id = Uuid::new_v4();
@@ -456,7 +486,9 @@ pub fn stage_photo_row(
                 photos::id.eq(photo_id),
                 photos::order_id.eq(order_id),
                 photos::owner_id.eq(owner_id),
-                photos::content_id.eq(file_id.as_bytes().to_vec()),
+                photos::content_id.eq(file_id.as_bytes().as_slice()),
+                photos::thumb_id.eq(thumb_id.as_ref().map(|id| id.as_bytes().as_slice())),
+                photos::team_id.eq(team_id),
             ))
             .execute(conn)?;
         Ok(photo_id)
@@ -985,5 +1017,65 @@ mod team_lines_tests {
         assert!(provisional_event_lines(&ClientEvent::Reconnected).is_empty());
         assert_eq!(tidy_line(0), "tidy: 0 provisional row(s) remain");
         assert_eq!(tidy_line(3), "tidy: 3 provisional row(s) remain");
+    }
+}
+
+#[cfg(test)]
+mod photo_tests {
+    use super::*;
+    use diesel::connection::SimpleConnection;
+    use image::{DynamicImage, GenericImageView, ImageFormat};
+    use std::io::Cursor;
+
+    #[test]
+    fn thumbnails_are_jpeg_and_preserve_dimensions_without_upscaling() {
+        for format in [ImageFormat::Png, ImageFormat::Jpeg] {
+            for (width, height, expected) in [
+                (640, 320, (256, 128)),
+                (320, 640, (128, 256)),
+                (32, 16, (32, 16)),
+            ] {
+                let mut input = Cursor::new(Vec::new());
+                DynamicImage::new_rgb8(width, height)
+                    .write_to(&mut input, format)
+                    .expect("encode fixture");
+                let bytes = make_photo_thumbnail(input.get_ref()).expect("thumbnail");
+                assert_eq!(image::guess_format(&bytes).unwrap(), ImageFormat::Jpeg);
+                assert_eq!(
+                    image::load_from_memory(&bytes).unwrap().dimensions(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn undecodable_photo_has_no_thumbnail() {
+        assert!(make_photo_thumbnail(b"unsupported image").is_none());
+    }
+
+    #[test]
+    fn staged_photo_names_thumbnail_and_team() {
+        let mut conn = diesel::SqliteConnection::establish(":memory:").unwrap();
+        conn.batch_execute(
+            "CREATE TABLE orders (id BLOB PRIMARY KEY, owner_id TEXT NOT NULL, quantity INTEGER NOT NULL);
+             CREATE TABLE photos (id BLOB PRIMARY KEY, order_id BLOB NOT NULL, owner_id TEXT NOT NULL,
+                 content_id BLOB NOT NULL, content_state TEXT, thumb_id BLOB, thumb_state TEXT, team_id TEXT);",
+        )
+        .unwrap();
+        let full = FileId::from_bytes([1; 32]);
+        let thumb = FileId::from_bytes([2; 32]);
+        for (thumbnail, team) in [(Some(thumb), Some("team")), (None, None)] {
+            let id = stage_photo_row(&mut conn, full, "author", thumbnail, team).unwrap();
+            let row = photos::table.find(id).first::<Photo>(&mut conn).unwrap();
+            assert_eq!(row.content_id, full.as_bytes());
+            assert_eq!(
+                row.thumb_id.as_deref(),
+                thumbnail.as_ref().map(|id| id.as_bytes().as_slice())
+            );
+            assert_eq!(row.team_id.as_deref(), team);
+            assert_eq!(row.thumb_state, None);
+            assert_eq!(row.content_state, None);
+        }
     }
 }
