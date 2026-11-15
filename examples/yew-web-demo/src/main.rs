@@ -1177,11 +1177,9 @@ fn dashboard(props: &DashboardProps) -> Html {
                         return;
                     };
                     let blob: web_sys::Blob = file.into();
-                    let result = content
-                        .stage(&blob, mime, &client, move |conn, file_id| {
-                            support::stage_photo_row(conn, file_id, &identity)
-                        })
-                        .await;
+                    let result =
+                        support::web::stage_photo(&content, &client, &blob, mime, &identity, None)
+                            .await;
                     match result {
                         Ok(_) => {
                             client.replay_pending().await.ok();

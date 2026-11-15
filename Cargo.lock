@@ -1414,6 +1414,7 @@ dependencies = [
  "connetto-schema",
  "connetto-web",
  "diesel",
+ "image",
  "js-sys",
  "manganis",
  "qrcode",
@@ -1423,6 +1424,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
@@ -1703,6 +1705,7 @@ dependencies = [
  "connetto-ca",
  "connetto-client",
  "connetto-core",
+ "connetto-demo-support",
  "connetto-file-client",
  "connetto-file-core",
  "connetto-file-server",
@@ -1713,6 +1716,7 @@ dependencies = [
  "diesel-async",
  "dispatch2",
  "futures-util",
+ "image",
  "keyutils",
  "openfga-client",
  "openidconnect",

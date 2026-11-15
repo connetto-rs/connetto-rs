@@ -23,9 +23,9 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use connetto_client::{ClientEvent, NativeClient, NativeTransport};
+use connetto_demo_support::native::{photo_content, stage_photo};
 use connetto_file_client::{
-    Content as ContentPiece, ContentClient, ContentEvent, ContentHandle, FileId, FsStore,
-    MimeClass, PeerDeclaration, ReqwestHttp, Resolved,
+    ContentClient, ContentEvent, ContentHandle, FileId, FsStore, MimeClass, ReqwestHttp, Resolved,
 };
 use connetto_server::authn::identity::deterministic_uuid;
 use connetto_test_harness::stack::{
@@ -120,13 +120,6 @@ async fn a_photo_crosses_the_camp_phase() {
     run_camp().await;
 }
 
-/// The peer columns each camp device declares.
-fn content_piece() -> ContentPiece {
-    ContentPiece::new()
-        .with_peer_content(PeerDeclaration::new("photos", "content_id"))
-        .with_peer_content(PeerDeclaration::new("photos", "thumb_id").prefetch())
-}
-
 /// The durable content client attached by the builder.
 fn content_for(
     client: &NativeClient<NativeTransport, ContentHandle<NativeTransport>>,
@@ -196,36 +189,36 @@ pub(crate) async fn order_of<C>(client: &NativeClient<NativeTransport, C>) -> Ve
         .expect("alice holds her order")
 }
 
-/// Stages the thumbnail, then the full image with the photo row posted to
-/// the team, answering both file ids.
-async fn take_photo(
-    content: &Content,
-    order_id: Vec<u8>,
-    owner: &str,
-    full: &[u8],
-    thumb: &[u8],
-) -> (FileId, FileId) {
-    let (thumb_id, ()) = content
-        .stage(thumb, MimeClass::Jpeg, |_, _| Ok(()))
-        .await
-        .expect("stage the thumbnail");
-    let owner = owner.to_owned();
-    let (full_id, ()) = content
-        .stage(full, MimeClass::Jpeg, move |conn, full_id| {
-            diesel::insert_into(photos::table)
-                .values((
-                    photos::order_id.eq(order_id),
-                    photos::owner_id.eq(owner),
-                    photos::content_id.eq(full_id.as_bytes().to_vec()),
-                    photos::thumb_id.eq(Some(thumb_id.as_bytes().to_vec())),
-                    photos::team_id.eq(Some(TEAM)),
-                ))
-                .execute(conn)
-                .map(|_| ())
+/// The thumbnail id the photo row of `full_id` names.
+async fn thumb_of<C>(client: &NativeClient<NativeTransport, C>, full_id: FileId) -> FileId {
+    let thumb = client
+        .client()
+        .with_conn(move |conn| {
+            photos::table
+                .filter(photos::content_id.eq(full_id.as_bytes().as_slice()))
+                .select(photos::thumb_id)
+                .first::<Option<Vec<u8>>>(conn.conn())
         })
         .await
-        .expect("stage the photo");
-    (full_id, thumb_id)
+        .expect("the replica is open")
+        .expect("alice holds her photo row")
+        .expect("the row names a thumbnail");
+    FileId::from_bytes(thumb.try_into().expect("a 32-byte file id"))
+}
+
+/// A PNG of `width` by `height` pixels that does not compress, `seed`
+/// choosing the stream.
+fn photo_png(seed: u32, width: u32, height: u32) -> Vec<u8> {
+    let pixels = photo_bytes(
+        seed,
+        3 * usize::try_from(width * height).expect("pixel count"),
+    );
+    let image = image::RgbImage::from_raw(width, height, pixels).expect("one byte per channel");
+    let mut png = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("encode the photo");
+    png.into_inner()
 }
 
 /// Deterministic bytes that do not compress, `seed` choosing the stream.
@@ -313,7 +306,7 @@ async fn run_camp() {
         dir_a.path(),
         &root,
         peer_listener,
-        content_piece(),
+        photo_content(),
     )
     .await;
     let bob = connect_client_with_content(
@@ -322,7 +315,7 @@ async fn run_camp() {
         dir_b.path(),
         &root,
         peer_listener,
-        content_piece(),
+        photo_content(),
     )
     .await;
     let carl = connect_client_with_content(
@@ -331,7 +324,7 @@ async fn run_camp() {
         dir_c.path(),
         &root,
         peer_listener,
-        content_piece(),
+        photo_content(),
     )
     .await;
     assert_eq!(
@@ -368,12 +361,13 @@ async fn run_camp() {
     drop(server);
     wait_until_closed(&bind, BOUND).await;
 
-    // Alice takes the photo offline, in the team, on an order of hers.
-    write_order(&alice, &alice_id, 1).await;
-    let order_id = order_of(&alice).await;
-    let full = photo_bytes(1, 3 * 1024 * 1024 + 17);
-    let thumb = photo_bytes(2, 40_000);
-    let (full_id, thumb_id) = take_photo(&alice_content, order_id, &alice_id, &full, &thumb).await;
+    // Alice takes the photo offline, in the team, through the demo's staging,
+    // which makes the thumbnail and posts the row naming both files.
+    let full = photo_png(1, 1024, 1024);
+    let (full_id, _) = stage_photo(&alice_content, &full, MimeClass::Png, &alice_id, Some(TEAM))
+        .await
+        .expect("stage the photo");
+    let thumb_id = thumb_of(&alice, full_id).await;
 
     let alice_addr = wait_peer_address(&alice, BOUND)
         .await
@@ -384,6 +378,21 @@ async fn run_camp() {
     // thumbnail comes with the apply, before he asks for anything.
     bob.link_peer(alice_addr).await.expect("bob links alice");
     fetched(&mut bob_files, thumb_id).await;
+    match bob_content
+        .resolve(thumb_id)
+        .await
+        .expect("bob shows the thumbnail")
+    {
+        Resolved::Local { bytes, .. } => {
+            let thumbnail = image::load_from_memory(&bytes).expect("a decodable thumbnail");
+            assert_eq!(
+                (thumbnail.width(), thumbnail.height()),
+                (256, 256),
+                "the thumbnail alice made at stage"
+            );
+        }
+        other => panic!("the thumbnail is on bob's device, not {other:?}"),
+    }
     assert!(
         !holds(&bob_content, full_id).await,
         "the full image waits until bob opens it"
@@ -452,7 +461,7 @@ async fn run_camp() {
         dir_b.path(),
         &root,
         peer_listener,
-        content_piece(),
+        photo_content(),
     )
     .await;
     let mut bob_events = bob2.client().events();
@@ -473,7 +482,7 @@ async fn run_camp() {
         dir_a.path(),
         &root,
         peer_listener,
-        content_piece(),
+        photo_content(),
     )
     .await;
     wait_for_certificate(&alice2, BOUND)
