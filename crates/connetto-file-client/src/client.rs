@@ -185,6 +185,12 @@ where
     B: ChunkStore + Clone + Sync + MaybeSend + 'static,
     H: ContentHttp,
 {
+    /// Whether this client declares any peer media columns.
+    #[cfg(feature = "peer")]
+    pub(crate) fn has_peer_content(&self) -> bool {
+        !self.peer_content.is_empty()
+    }
+
     /// Attaches file handling to a running client.
     ///
     /// `store` holds the ciphertext and knows nothing of keys: the encrypting

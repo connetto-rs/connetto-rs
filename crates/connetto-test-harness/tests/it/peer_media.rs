@@ -22,10 +22,10 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use connetto_client::live::ConnettoClient;
 use connetto_client::{ClientEvent, NativeClient, NativeTransport};
 use connetto_file_client::{
-    ContentClient, ContentEvent, FileId, FsStore, MimeClass, ReqwestHttp, Resolved,
+    Content as ContentPiece, ContentClient, ContentEvent, ContentHandle, FileId, FsStore,
+    MimeClass, PeerDeclaration, ReqwestHttp, Resolved,
 };
 use connetto_server::authn::identity::deterministic_uuid;
 use connetto_test_harness::stack::{
@@ -120,24 +120,21 @@ async fn a_photo_crosses_the_camp_phase() {
     run_camp().await;
 }
 
-/// A content client over `client`'s replica and the chunk store in `dir`,
-/// serving and fetching the demo's photo and thumbnail columns.
-async fn content_for(client: &ConnettoClient<NativeTransport>, dir: &Path) -> Content {
-    ContentClient::attach(
-        client.clone(),
-        FsStore::new(dir.join("chunks")),
-        ROOT_KEY,
-        ReqwestHttp::new(),
-    )
-    .await
-    .expect("attach the content client")
-    .with_peer_content("photos", "content_id")
-    .await
-    .expect("declare the photo column")
-    .with_peer_content("photos", "thumb_id")
-    .prefetch()
-    .await
-    .expect("declare the thumbnail column")
+/// The peer columns each camp device declares.
+fn content_piece() -> ContentPiece {
+    ContentPiece::new()
+        .with_peer_content(PeerDeclaration::new("photos", "content_id"))
+        .with_peer_content(PeerDeclaration::new("photos", "thumb_id").prefetch())
+}
+
+/// The durable content client attached by the builder.
+fn content_for(
+    client: &NativeClient<NativeTransport, ContentHandle<NativeTransport>>,
+) -> std::sync::Arc<Content> {
+    match client.content().expect("the build attached content") {
+        ContentHandle::Durable(content) => std::sync::Arc::clone(content),
+        ContentHandle::InMemory(_) => panic!("the camp uses durable content"),
+    }
 }
 
 /// Whether `content` holds a manifest for `file_id`, read without fetching.
@@ -162,7 +159,12 @@ fn chunk_files(dir: &Path) -> usize {
                 .sum()
         })
     }
-    walk(&dir.join("chunks"))
+    std::fs::read_dir(dir)
+        .expect("the data directory exists")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with("-content"))
+        .map(|entry| walk(&entry.path()))
+        .sum()
 }
 
 /// Waits for `content` to announce `file_id` fetched, bounded.
@@ -181,7 +183,7 @@ pub(crate) async fn fetched(events: &mut broadcast::Receiver<ContentEvent>, file
 }
 
 /// Alice's order id, the parent her photo names.
-pub(crate) async fn order_of(client: &NativeClient<NativeTransport>) -> Vec<u8> {
+pub(crate) async fn order_of<C>(client: &NativeClient<NativeTransport, C>) -> Vec<u8> {
     client
         .client()
         .with_conn(|conn| {
@@ -305,28 +307,31 @@ async fn run_camp() {
         )
         .await;
     }
-    let alice = connect_client(
+    let alice = connect_client_with_content(
         addr,
         last_used(&base, APP_ALICE),
         dir_a.path(),
         &root,
         peer_listener,
+        content_piece(),
     )
     .await;
-    let bob = connect_client(
+    let bob = connect_client_with_content(
         addr,
         last_used(&base, APP_BOB),
         dir_b.path(),
         &root,
         peer_listener,
+        content_piece(),
     )
     .await;
-    let carl = connect_client(
+    let carl = connect_client_with_content(
         addr,
         fresh_login(&base, APP_CARL, "carl"),
         dir_c.path(),
         &root,
         peer_listener,
+        content_piece(),
     )
     .await;
     assert_eq!(
@@ -355,9 +360,9 @@ async fn run_camp() {
     assert!(wait_roster(&alice, &all).await, "alice synced the roster");
     assert!(wait_roster(&bob, &all).await, "bob synced the roster");
 
-    let alice_content = content_for(alice.client(), dir_a.path()).await;
-    let bob_content = content_for(bob.client(), dir_b.path()).await;
-    let carl_content = content_for(carl.client(), dir_c.path()).await;
+    let alice_content = content_for(&alice);
+    let bob_content = content_for(&bob);
+    let carl_content = content_for(&carl);
 
     // The server goes away for all three.
     drop(server);
@@ -373,49 +378,50 @@ async fn run_camp() {
     let alice_addr = wait_peer_address(&alice, BOUND)
         .await
         .expect("alice serves her peer listener");
-    let ports = [&alice, &bob, &carl].map(|client| client.media_port().expect("one media port"));
-    let [alice_port, bob_port, carl_port] = ports;
     let mut bob_files = bob_content.events();
 
-    tokio::select! {
-        () = alice_content.drive_media(alice_port) => panic!("alice's media driver ended"),
-        () = bob_content.drive_media(bob_port) => panic!("bob's media driver ended"),
-        () = carl_content.drive_media(carl_port) => panic!("carl's media driver ended"),
-        () = async {
-            // Bob links alice and applies her order and photo, and the
-            // thumbnail comes with the apply, before he asks for anything.
-            bob.link_peer(alice_addr).await.expect("bob links alice");
-            fetched(&mut bob_files, thumb_id).await;
-            assert!(
-                !holds(&bob_content, full_id).await,
-                "the full image waits until bob opens it"
-            );
+    // Bob links alice and applies her order and photo, and the
+    // thumbnail comes with the apply, before he asks for anything.
+    bob.link_peer(alice_addr).await.expect("bob links alice");
+    fetched(&mut bob_files, thumb_id).await;
+    assert!(
+        !holds(&bob_content, full_id).await,
+        "the full image waits until bob opens it"
+    );
 
-            // He opens it and the full image comes from alice.
-            match bob_content.resolve(full_id).await.expect("bob opens the photo") {
-                Resolved::Local { bytes, .. } => {
-                    assert!(bytes == full, "bob gets the photo alice took");
-                }
-                other => panic!("the photo reaches bob in camp, not {other:?}"),
-            }
-
-            // Carl, outside the team, links alice and gets nothing.
-            carl.link_peer(alice_addr).await.expect("carl links alice");
-            for file_id in [full_id, thumb_id] {
-                assert_eq!(
-                    carl_content.resolve(file_id).await.expect("carl asks"),
-                    Resolved::Unavailable,
-                    "alice refuses a requester outside the team"
-                );
-                assert!(!holds(&carl_content, file_id).await);
-            }
-
-            // The provisional row spares both files through a tidy.
-            bob_content.tidy_content().await.expect("bob tidies");
-            assert!(holds(&bob_content, full_id).await, "the full image is spared");
-            assert!(holds(&bob_content, thumb_id).await, "the thumbnail is spared");
-        } => {}
+    // He opens it and the full image comes from alice.
+    match bob_content
+        .resolve(full_id)
+        .await
+        .expect("bob opens the photo")
+    {
+        Resolved::Local { bytes, .. } => {
+            assert!(bytes == full, "bob gets the photo alice took");
+        }
+        other => panic!("the photo reaches bob in camp, not {other:?}"),
     }
+
+    // Carl, outside the team, links alice and gets nothing.
+    carl.link_peer(alice_addr).await.expect("carl links alice");
+    for file_id in [full_id, thumb_id] {
+        assert_eq!(
+            carl_content.resolve(file_id).await.expect("carl asks"),
+            Resolved::Unavailable,
+            "alice refuses a requester outside the team"
+        );
+        assert!(!holds(&carl_content, file_id).await);
+    }
+
+    // The provisional row spares both files through a tidy.
+    bob_content.tidy_content().await.expect("bob tidies");
+    assert!(
+        holds(&bob_content, full_id).await,
+        "the full image is spared"
+    );
+    assert!(
+        holds(&bob_content, thumb_id).await,
+        "the thumbnail is spared"
+    );
     assert!(
         chunk_files(dir_b.path()) > 0,
         "bob holds the photo's chunks"
@@ -440,19 +446,20 @@ async fn run_camp() {
     let _server = spawn_server(&server_bin, &envs, &bind)
         .await
         .expect("server two");
-    let bob2 = connect_client(
+    let bob2 = connect_client_with_content(
         addr,
         last_used(&base, APP_BOB),
         dir_b.path(),
         &root,
         peer_listener,
+        content_piece(),
     )
     .await;
     let mut bob_events = bob2.client().events();
     wait_for_certificate(&bob2, BOUND)
         .await
         .expect("bob holds his device");
-    let bob_content = content_for(bob2.client(), dir_b.path()).await;
+    let bob_content = content_for(&bob2);
     assert!(
         holds(&bob_content, full_id).await,
         "bob still holds the photo before the verdict"
@@ -460,12 +467,13 @@ async fn run_camp() {
 
     // Alice reconnects and pushes her queue, and the server refuses the
     // photo she posted to a team she has left.
-    let alice2 = connect_client(
+    let alice2 = connect_client_with_content(
         addr,
         last_used(&base, APP_ALICE),
         dir_a.path(),
         &root,
         peer_listener,
+        content_piece(),
     )
     .await;
     wait_for_certificate(&alice2, BOUND)
@@ -475,36 +483,30 @@ async fn run_camp() {
         .await
         .expect("alice serves her peer listener again");
 
-    let never = |_: Duration| std::future::pending::<()>();
-    tokio::select! {
-        () = bob_content.drive_outbox(never) => panic!("bob's outbox driver ended"),
-        () = async {
-            bob2.link_peer(alice_addr).await.expect("bob re-links alice");
-            let retracted = next_event(&mut bob_events, BOUND, |event| {
-                matches!(event, ClientEvent::ProvisionalRetracted { rows, .. }
-                    if rows.iter().any(|(table, _)| table.contains("photos")))
-            })
-            .await;
-            assert!(retracted.is_some(), "the photo's retraction reaches bob");
-            // The pass removes the manifests before their chunks, so the driver
-            // keeps running until the chunk files are gone too. Dropping it
-            // earlier would cut the pass short and leave chunks behind.
-            let until = Instant::now() + BOUND;
-            loop {
-                let left = chunk_files(dir_b.path());
-                if left == 0
-                    && !holds(&bob_content, full_id).await
-                    && !holds(&bob_content, thumb_id).await
-                {
-                    break;
-                }
-                assert!(
-                    Instant::now() < until,
-                    "the retraction left the photo on bob's device, {left} chunk files"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        } => {}
+    bob2.link_peer(alice_addr)
+        .await
+        .expect("bob re-links alice");
+    let retracted = next_event(&mut bob_events, BOUND, |event| {
+        matches!(event, ClientEvent::ProvisionalRetracted { rows, .. }
+            if rows.iter().any(|(table, _)| table.contains("photos")))
+    })
+    .await;
+    assert!(retracted.is_some(), "the photo's retraction reaches bob");
+    // The pass removes the manifests before their chunks, so the driver
+    // keeps running until the chunk files are gone too. Dropping it
+    // earlier would cut the pass short and leave chunks behind.
+    let until = Instant::now() + BOUND;
+    loop {
+        let left = chunk_files(dir_b.path());
+        if left == 0 && !holds(&bob_content, full_id).await && !holds(&bob_content, thumb_id).await
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "the retraction left the photo on bob's device, {left} chunk files"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     drop(bob_content);
