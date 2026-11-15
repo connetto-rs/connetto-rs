@@ -1,12 +1,11 @@
 //! The demo's sync server, a process around [`ServerBuilder`].
 //!
-//! It reads its settings through
-//! [`builder_from_env`](connetto_demo_tools::server_env::builder_from_env),
-//! binds the one listener, and serves through the builder's own lifecycle. It
-//! owns what a process owns: the logging, the shutdown signal, and the exit
-//! code. It exits `1` when the change stream cannot answer what a row looked
-//! like before it changed, or gives up reconnecting, and returns its build or
-//! HTTP errors as failures.
+//! It reads its settings through [`builder_from_env`], binds the one listener,
+//! and serves through the builder's own lifecycle. It owns what a process
+//! owns: the logging, the shutdown signal, and the exit code. It exits `1`
+//! when the change stream cannot answer what a row looked like before it
+//! changed, or gives up reconnecting, and returns its build or HTTP errors as
+//! failures.
 //!
 //! [`ServerBuilder`]: connetto_server::builder::ServerBuilder
 
