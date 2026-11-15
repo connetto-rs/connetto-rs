@@ -55,6 +55,9 @@
 //!   with everything outside letters and digits turned into underscores.
 //! - `CONNETTO_BANS`: set to `database` to ban identities that cross an
 //!   abuse threshold.
+//! - `CONNETTO_USERS`: set to `database` to register each account in the
+//!   demo deployment's `users` table, inside its sign-in's transaction,
+//!   through [`DemoHooks`].
 //! - `CONNETTO_FGA_URL` (default `http://127.0.0.1:8081`): the
 //!   authorization endpoint.
 //! - `CONNETTO_FGA_STORE`: required. The authorization store the deployment
@@ -110,6 +113,7 @@
 //!   to a local file.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -126,6 +130,7 @@ use connetto_server::{
 };
 
 use crate::env::{read_ddl, var_or};
+use crate::users::DemoHooks;
 
 /// Read a `u32` from `<key>`, or `default` when unset.
 fn env_u32(key: &str, default: u32) -> Result<u32> {
@@ -553,6 +558,7 @@ pub async fn builder_from_env() -> Result<ServerBuilder> {
         }
     }
     let bans = database_toggle("CONNETTO_BANS")?;
+    let users = database_toggle("CONNETTO_USERS")?;
     let database = Database::new(
         std::env::var("DATABASE_URL").context("set DATABASE_URL")?,
         std::env::var("CONNETTO_READER_URL").map_err(|_| {
@@ -581,7 +587,7 @@ pub async fn builder_from_env() -> Result<ServerBuilder> {
             anyhow!("set CONNETTO_FGA_STORE to the authorization store this deployment owns")
         })?,
     );
-    Ok(ServerBuilder::new(database, schema, keys, openfga)
+    let builder = ServerBuilder::new(database, schema, keys, openfga)
         .slot(var_or("CONNETTO_SLOT", "connetto_slot"))
         .publication(var_or("CONNETTO_PUBLICATION", "connetto_pub"))
         .oplog_table(var_or("CONNETTO_OPLOG_TABLE", "connetto_oplog"))
@@ -600,7 +606,12 @@ pub async fn builder_from_env() -> Result<ServerBuilder> {
         .content(content)
         .device_identity(device_identity)
         .sunset(sunset)
-        .courier(courier))
+        .courier(courier);
+    Ok(if users {
+        builder.auth_hooks(Arc::new(DemoHooks))
+    } else {
+        builder
+    })
 }
 
 #[cfg(test)]

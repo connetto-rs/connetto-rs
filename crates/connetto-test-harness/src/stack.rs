@@ -40,6 +40,9 @@ pub struct Deployment {
     pub published: &'static [&'static str],
     /// The tables clients may write, as `CONNETTO_WRITABLE` lists them.
     pub writable: &'static str,
+    /// Whether the schema holds the `users` table the demo server registers
+    /// each account in at sign-in, served as `CONNETTO_USERS=database`.
+    pub users: bool,
 }
 
 /// The demo deployment in `examples/deployment`, which the demo stacks serve
@@ -57,10 +60,13 @@ pub const DEMO_DEPLOYMENT: Deployment = Deployment {
         "order_lines",
         "photos",
         "products",
+        "teams",
         "team_members",
         "team_notes",
+        "users",
     ],
     writable: "orders,photos,team_notes",
+    users: true,
 };
 
 /// A temporary directory removed on drop.
@@ -209,8 +215,12 @@ impl Provisioned {
                 self.keys.public.display().to_string(),
             ),
         ];
+        let users = deployment
+            .users
+            .then(|| ("CONNETTO_USERS", "database".to_owned()));
         pairs
             .into_iter()
+            .chain(users)
             .map(|(key, value)| (key.to_owned(), value))
             .collect()
     }

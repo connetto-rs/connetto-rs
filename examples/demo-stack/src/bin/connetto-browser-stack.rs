@@ -42,6 +42,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use connetto_core::auth::CapabilitySubject;
+use connetto_demo_tools::users::DemoHooks;
 use connetto_server::builder::{
     ContentSettings, Database, OidcProvider, OpenFga, ServerBuilder, ServerHandle, ServerSchema,
     StoreSpec, TokenKeys,
@@ -174,6 +175,7 @@ impl ServerConfig {
         // `SameSite: Strict`, so a null-origin request carries none.
         .cors_origins(vec![self.page_origin.clone(), "null".to_owned()])
         .cookie_same_site(CookieSameSite::Strict)
+        .auth_hooks(Arc::new(DemoHooks))
     }
 }
 

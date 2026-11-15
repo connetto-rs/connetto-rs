@@ -4,3 +4,4 @@ mod authorization_facts;
 mod boot_refusals;
 mod e2e;
 mod restore;
+mod users;

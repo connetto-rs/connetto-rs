@@ -2,7 +2,8 @@
 //! share.
 //!
 //! - `demo-server` serves sync, login and files, configured by
-//!   [`server_env`].
+//!   [`server_env`], and under `CONNETTO_USERS=database` registers each
+//!   account in the demo's `users` table through [`users::DemoHooks`].
 //! - `demo-embed` mounts the same server in an application's own router.
 //! - `demo-client` syncs one subscription and pushes optional writes.
 //! - `demo-schema` writes and checks the tier exports a history holds.
@@ -14,3 +15,4 @@
 
 pub mod env;
 pub mod server_env;
+pub mod users;

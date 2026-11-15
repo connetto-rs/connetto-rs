@@ -25,6 +25,9 @@ connetto-server = { path = "../../crates/connetto-server", features = ["test-sea
 connetto-client = { path = "../../crates/connetto-client", features = ["peer"] }
 connetto-file-core = { path = "../../crates/connetto-file-core" }
 connetto-file-server = { path = "../../crates/connetto-file-server" }
+# The sign-in hooks that register each account in the deployment's `users`
+# table, which the browser stack's in-process server runs as `demo-server` does.
+connetto-demo-tools = { path = "../demo-tools" }
 anyhow.workspace = true
 tokio = { workspace = true, features = ["process", "io-std", "signal"] }
 diesel = { workspace = true, features = ["postgres_backend"] }

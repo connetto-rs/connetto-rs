@@ -22,7 +22,9 @@ connetto-ca = { path = "../../crates/connetto-ca" }
 # The mock identity provider `demo-idp` starts, the one the test stacks use.
 connetto-test-harness = { path = "../../crates/connetto-test-harness" }
 axum = { workspace = true }
-diesel = { workspace = true, features = ["sqlite"] }
+# `postgres_backend` for the `users` row the sign-in hooks write.
+diesel = { workspace = true, features = ["sqlite", "postgres_backend"] }
+diesel-async = { version = "0.10", default-features = false, features = ["postgres"] }
 tokio = { workspace = true, features = ["fs", "signal"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 # `CONNETTO_SUNSET` is an RFC 3339 instant the server validates at boot (R107).

@@ -615,7 +615,8 @@ async fn run_retired() {
     provisioned
         .fixture
         .exec(&format!(
-            "INSERT INTO team_members (team_id, member_id) VALUES ('T3', '{alice_id}')"
+            "INSERT INTO teams (id) VALUES ('T3'); \
+             INSERT INTO team_members (team_id, member_id) VALUES ('T3', '{alice_id}')"
         ))
         .await;
 

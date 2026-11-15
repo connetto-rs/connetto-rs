@@ -20,6 +20,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// The demo's teams, the rows a membership names.
+    teams (id) {
+        /// The team's name.
+        id -> diesel::sql_types::Text,
+    }
+}
+
+diesel::table! {
     /// The demo's team membership, as far as the R77 walk seeds and reads it.
     team_members (team_id, member_id) {
         /// The team the account belongs to.
@@ -84,16 +92,23 @@ pub async fn remove_team_member(pg_url: &str, team: &str, member: &str) -> Resul
 
 /// Seed the R77 walk's one team, every account a member, the `member_id`s
 /// being the deterministic UUIDs the `team_notes` policy compares against
-/// `app.user_id`. A row an earlier run left already stands, so a rerun seeds
-/// no duplicate.
+/// `app.user_id`. The team row goes first, since every membership names it. A
+/// row an earlier run left already stands, so a rerun seeds no duplicate.
 ///
 /// # Errors
 ///
-/// When Postgres cannot be reached or the membership rows cannot be inserted.
+/// When Postgres cannot be reached or the team or membership rows cannot be
+/// inserted.
 pub async fn seed_team_members(pg_url: &str, team: &str, members: &[&str]) -> Result<()> {
     let pool = pool_for(pg_url).await;
+    let mut conn = pool.get().await.context("a Postgres connection")?;
+    diesel::insert_into(teams::table)
+        .values(teams::id.eq(team))
+        .on_conflict_do_nothing()
+        .execute(&mut conn)
+        .await
+        .context("seeding the team's row")?;
     for member in members {
-        let mut conn = pool.get().await.context("a Postgres connection")?;
         diesel::insert_into(team_members::table)
             .values((
                 team_members::team_id.eq(team),
