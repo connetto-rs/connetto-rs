@@ -39,6 +39,16 @@ pub trait AttachContent<T: Transport> {
         place: ContentPlace,
     ) -> impl Future<Output = Result<Self::Handle, ClientError>> + MaybeSend;
 
+    /// The media driver for `handle`, `None` when it declares no peer content
+    /// or `take_port` finds the port taken. `take_port` runs only for declared content.
+    #[cfg(feature = "peer")]
+    fn media_driver(
+        _handle: &Self::Handle,
+        _take_port: impl FnOnce() -> Option<crate::media::MediaPort>,
+    ) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>> {
+        None
+    }
+
     /// What a rebuild holds of an older major's unsent files (R31).
     fn held_content() -> HeldContent {
         HeldContent::NONE

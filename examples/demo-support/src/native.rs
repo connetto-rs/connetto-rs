@@ -268,6 +268,34 @@ pub struct Connected {
     pub authenticator: Option<NativeAuthenticator>,
 }
 
+/// The content piece every native demo builds with, healing a lost photo or
+/// thumbnail and, with the `peer` feature, declaring both columns to peers,
+/// the thumbnail prefetched and each replicated to three devices.
+#[must_use]
+pub fn photo_content() -> ContentPiece {
+    let content = ContentPiece::new()
+        .with_heal_lost(
+            "SELECT content_id FROM photos WHERE content_state = 'lost'",
+            "content_id",
+        )
+        .with_heal_lost(
+            "SELECT thumb_id FROM photos WHERE thumb_state = 'lost'",
+            "thumb_id",
+        );
+    #[cfg(feature = "peer")]
+    let content = content
+        .with_peer_content(
+            connetto_file_client::PeerDeclaration::new("photos", "content_id")
+                .replicate(3, "content_state"),
+        )
+        .with_peer_content(
+            connetto_file_client::PeerDeclaration::new("photos", "thumb_id")
+                .prefetch()
+                .replicate(3, "thumb_state"),
+        );
+    content
+}
+
 /// Connect the demo's native client with the shared chain, and answer with
 /// the session pieces and the pump the caller drives.
 ///
@@ -295,10 +323,7 @@ pub async fn connect(
     // while offline upload once the server is reachable again.
     let base_builder = NativeClientBuilder::new(server, crate::demo_schema())
         .with_tuning(SyncTuning::default().with_trim_threshold(5))
-        .with_content(ContentPiece::new().with_heal_lost(
-            "SELECT content_id FROM photos WHERE content_state = 'lost'",
-            "content_id",
-        ))
+        .with_content(photo_content())
         .signed_in(sign_in)
         .durable(data_dir)
         .with_gate(demo_gate());
@@ -362,4 +387,37 @@ pub async fn switch_account_guard(client: &ConnettoClient<NativeTransport>) -> O
         )),
         Err(err) => Some(format!("Cannot change account: {err}")),
     }
+}
+
+/// Stages a thumbnail before its full photo and the row naming both.
+///
+/// # Errors
+///
+/// Returns the content staging error if either file cannot be stored.
+pub async fn stage_photo(
+    content: &ContentClient<NativeTransport, FsStore, ReqwestHttp>,
+    bytes: &[u8],
+    mime: connetto_file_core::MimeClass,
+    identity: &str,
+    team: Option<&str>,
+) -> Result<(connetto_file_core::FileId, rosetta_uuid::Uuid), connetto_file_client::ContentError> {
+    let thumb_id = if let Some(thumbnail) = crate::make_photo_thumbnail(bytes) {
+        Some(
+            content
+                .stage(
+                    thumbnail.as_slice(),
+                    connetto_file_core::MimeClass::Jpeg,
+                    |_, _| Ok(()),
+                )
+                .await?
+                .0,
+        )
+    } else {
+        None
+    };
+    content
+        .stage(bytes, mime, |conn, file_id| {
+            crate::stage_photo_row(conn, file_id, identity, thumb_id, team)
+        })
+        .await
 }
