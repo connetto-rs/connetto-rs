@@ -648,6 +648,63 @@ async fn the_last_handle_dropping_raises_watch_released_for_its_watch() {
     );
 }
 
+/// A release the replica refuses fails the call that drains it, and the watch
+/// is not reported released, since its grace never started.
+#[tokio::test]
+async fn a_release_the_replica_refuses_fails_the_drain_and_raises_nothing() {
+    use diesel::connection::SimpleConnection;
+
+    let dir = tempdir().expect("temp dir");
+    let credential = super::support::held("tester");
+    let store = super::support::key_store(&credential).await;
+
+    let conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<Script>::default(),
+    )
+    .signed_in(credential)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
+    .open_driven()
+    .await
+    .expect("open with no server");
+    // The pump is never run, so the ping below is the only drain and the
+    // refusal surfaces there.
+    let (client, _pump) = ConnettoClient::with_pump(conn);
+    let mut events = client.events();
+
+    let watch = client
+        .watch::<_, Item>(items::table.order(items::id))
+        .await
+        .expect("watch");
+    client
+        .with_conn(|conn| {
+            conn.conn()
+                .batch_execute(
+                    "CREATE TEMP TRIGGER refuse_release BEFORE UPDATE ON main._connetto_subscription \
+                     BEGIN SELECT RAISE(ABORT, 'the replica refuses'); END",
+                )
+                .expect("install the refusal");
+        })
+        .await
+        .expect("gate not locked");
+    drop(watch);
+
+    let refused = client.ping(1).await.expect_err("the release is refused");
+    assert!(
+        refused.to_string().contains("the replica refuses"),
+        "the drain fails on the refused release, not on the missing server: {refused:?}"
+    );
+    assert!(
+        !core::iter::from_fn(|| events.try_recv().ok())
+            .any(|event| matches!(event, ClientEvent::WatchReleased { .. })),
+        "a release that did not happen is not reported"
+    );
+}
+
 /// The ids of every declared subscription, sorted.
 async fn declared_ids(client: &ConnettoClient<Script>) -> Vec<String> {
     let mut ids: Vec<String> = client
