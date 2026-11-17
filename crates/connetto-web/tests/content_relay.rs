@@ -140,6 +140,134 @@ async fn a_staged_file_and_its_row_reach_the_hub_as_one_mutation() {
 }
 
 #[wasm_bindgen_test]
+async fn one_mutation_commits_and_queues_both_staged_files() {
+    use diesel::connection::SimpleConnection;
+    use diesel::prelude::*;
+    use diesel_sqlite_session::SqliteSessionExt;
+
+    diesel::table! {
+        photos (id) {
+            id -> Integer,
+            content_id -> Binary,
+        }
+    }
+
+    let serial = locks::hold_lock(TEST_LOCK).await;
+    let _alive = locks::hold_lock(DB_ALIVE_LOCK).await;
+    let bytes = [
+        b"batch relay thumbnail".as_slice(),
+        b"batch relay original".as_slice(),
+    ];
+    let ids = bytes.map(declared_id);
+    let (observed, mut requests) = mpsc::unbounded();
+    let (_hub, _mutations, mut tab, _answers, _store) =
+        relay_tab("r80-staged-batch", [21; 32], Tickets::Observed(observed)).await;
+    let mut inbox = tab.take_internal_inbox().expect("content lane");
+    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("open");
+    conn.batch_execute("CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)")
+        .expect("schema");
+    let mut session = conn.create_session().expect("session");
+    session.attach_all().expect("attach");
+    for (index, (id, bytes)) in ids.iter().zip(bytes).enumerate() {
+        stage(&tab, *id, &blob_of(bytes));
+        diesel::insert_into(photos::table)
+            .values((
+                photos::id.eq(i32::try_from(index).expect("row id")),
+                photos::content_id.eq(id.as_bytes().as_slice()),
+            ))
+            .execute(&mut conn)
+            .expect("insert");
+    }
+    send_mutation(&mut tab, 1, &session.changeset().expect("changeset")).await;
+    let queued = async {
+        let mut seen = std::collections::HashSet::new();
+        while seen.len() < ids.len() {
+            let id = requests.next().await.expect("ticket observer");
+            assert!(ids.contains(&id));
+            seen.insert(id);
+        }
+    };
+    tokio::select! {
+        () = queued => {},
+        () = timeout_ms(3_000) => panic!("both staged files must request upload tickets"),
+    }
+    for (index, (id, bytes)) in ids.iter().zip(bytes).enumerate() {
+        let request_id = 80 + u64::try_from(index).expect("request id");
+        resolve(&tab, request_id, *id);
+        let (reply_id, answer, blob) = next_reply(&mut inbox).await;
+        assert_eq!(reply_id, request_id);
+        assert!(matches!(answer, WireResolve::Local), "{answer:?}");
+        assert_eq!(blob_bytes(&blob.expect("committed bytes")), bytes);
+    }
+    serial.release();
+}
+
+#[wasm_bindgen_test]
+async fn a_bad_second_staged_file_refuses_the_whole_mutation() {
+    use diesel::connection::SimpleConnection;
+    use diesel::prelude::*;
+    use diesel_sqlite_session::SqliteSessionExt;
+
+    diesel::table! {
+        photos (id) {
+            id -> Integer,
+            content_id -> Binary,
+        }
+    }
+
+    let serial = locks::hold_lock(TEST_LOCK).await;
+    let _alive = locks::hold_lock(DB_ALIVE_LOCK).await;
+    let bytes = [
+        b"atomic relay thumbnail".as_slice(),
+        b"atomic relay original".as_slice(),
+    ];
+    let ids = [declared_id(bytes[0]), FileId::from_bytes([92; 32])];
+    let (_hub, mutations, mut tab) =
+        relay_with_tab("r80-staged-batch-refusal", [22; 32], false).await;
+    let mut inbox = tab.take_internal_inbox().expect("content lane");
+    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("open");
+    conn.batch_execute("CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)")
+        .expect("schema");
+    let mut session = conn.create_session().expect("session");
+    session.attach_all().expect("attach");
+    for (index, (id, bytes)) in ids.iter().zip(bytes).enumerate() {
+        stage(&tab, *id, &blob_of(bytes));
+        diesel::insert_into(photos::table)
+            .values((
+                photos::id.eq(i32::try_from(index).expect("row id")),
+                photos::content_id.eq(id.as_bytes().as_slice()),
+            ))
+            .execute(&mut conn)
+            .expect("insert");
+    }
+    send_mutation(&mut tab, 1, &session.changeset().expect("changeset")).await;
+    let rejection = async {
+        loop {
+            if let Some(IncomingFrame::Control(ControlMessage::MutationReject(rejection))) =
+                tab.recv().await.expect("transport")
+            {
+                assert_eq!(rejection.client_seq, 1);
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        () = rejection => {},
+        () = timeout_ms(3_000) => panic!("the invalid second file must reject the mutation"),
+    }
+    assert_eq!(mutations.get(), 0);
+    for (index, id) in ids.iter().enumerate() {
+        let request_id = 90 + u64::try_from(index).expect("request id");
+        resolve(&tab, request_id, *id);
+        let (reply_id, answer, blob) = next_reply(&mut inbox).await;
+        assert_eq!(reply_id, request_id);
+        assert!(matches!(answer, WireResolve::Unavailable), "{answer:?}");
+        assert!(blob.is_none());
+    }
+    serial.release();
+}
+
+#[wasm_bindgen_test]
 async fn a_declaration_that_is_not_the_blob_is_refused_and_uploads_nothing() {
     let serial = locks::hold_lock(TEST_LOCK).await;
     let _alive = locks::hold_lock(DB_ALIVE_LOCK).await;

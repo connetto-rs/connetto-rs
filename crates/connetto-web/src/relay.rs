@@ -3943,11 +3943,11 @@ where
 /// leaves the replica untouched, since the abort policy rolls the whole
 /// apply back.
 ///
-/// When the changeset paired with staged content, the file is chunked into
-/// the encrypted store and its manifest and upload entry commit in the same
-/// transaction as the rows, with the declared identity checked against what
-/// the bytes actually hash to. A chunking, identity or apply failure all
-/// reject the mutation with nothing committed.
+/// When the changeset paired with staged content, every named file is chunked
+/// into the encrypted store and their manifests and upload entries commit in
+/// the same transaction as the rows, each declared identity checked against
+/// what its bytes actually hash to. A chunking, identity or apply failure on
+/// any file rejects the mutation with nothing committed.
 #[expect(
     clippy::too_many_arguments,
     reason = "the mutation needs its tab, its content archive and the walk to wake, none of which belongs on another's struct"
@@ -3958,7 +3958,7 @@ async fn handle_synced_mutation<U>(
     id: TabId,
     tab_seq: u64,
     changeset: &[u8],
-    staged: Option<StagedContent>,
+    staged: Vec<StagedContent>,
     content: Option<&ContentArchive<BrowserStore>>,
     walk: &mut WalkState,
 ) -> Result<(), TabFault>
@@ -3993,21 +3993,7 @@ where
     let Ok(seq) = i64::try_from(tab_seq) else {
         return Err(TabFault::Close("sequence overflows storage".to_owned()));
     };
-    if let Some(staged) = staged {
-        match commit_staged_mutation(worker, content, staged, &changeset, &shared, client_id, seq)
-            .await
-        {
-            Ok(()) => {
-                // The commit left an outbox entry the driver has not been
-                // told about, and no upstream event may arrive to tell it.
-                walk.outbox_wake = true;
-            }
-            Err(detail) => {
-                reject_mutation(&out, tab_seq, detail);
-                return Ok(());
-            }
-        }
-    } else {
+    if staged.is_empty() {
         let applied = worker.conn().transaction::<_, TabApplyError, _>(|conn| {
             // One replay keeps the tab's first-write order across both schemas.
             replay_aborting(conn, &changeset, &|table| replica_schema(&shared, table))?;
@@ -4029,6 +4015,20 @@ where
                 return Err(RelayError::Session(detail).into());
             }
         }
+    } else {
+        match commit_staged_mutation(worker, content, staged, &changeset, &shared, client_id, seq)
+            .await
+        {
+            Ok(()) => {
+                // The commit left an outbox entry the driver has not been
+                // told about, and no upstream event may arrive to tell it.
+                walk.outbox_wake = true;
+            }
+            Err(detail) => {
+                reject_mutation(&out, tab_seq, detail);
+                return Ok(());
+            }
+        }
     }
     if let Some(tab) = state.tabs.get_mut(&id) {
         tab.applied_watermark = Some(tab_seq);
@@ -4039,14 +4039,14 @@ where
     Ok(())
 }
 
-/// Chunk a staged blob and commit its manifest, outbox entry, watermark and
-/// row change in one transaction.
+/// Chunk the staged blobs and commit their manifests, outbox entries, the
+/// watermark and the row change in one transaction.
 ///
 /// The error is the refusal detail for the tab, never a hub fault.
 async fn commit_staged_mutation<U>(
     worker: &mut ConnettoConnection<U>,
     content: Option<&ContentArchive<BrowserStore>>,
-    staged: StagedContent,
+    staged: Vec<StagedContent>,
     changeset: &[u8],
     shared: &HashSet<String>,
     client_id: rosetta_uuid::Uuid,
@@ -4059,24 +4059,29 @@ where
     let Some(content) = content else {
         return Err("this worker holds no content archive".to_owned());
     };
-    let Ok(reader) = BlobSource::new(staged.blob) else {
-        return Err("staged content could not be opened for reading".to_owned());
-    };
-    // Chunking runs outside the transaction: a large blob must not hold the
+    let mut manifests = Vec::with_capacity(staged.len());
+    // Chunking runs outside the transaction so a large blob never holds the
     // write lock, and bytes chunked for a commit that never lands are orphans
-    // the next sweep collects, exactly as with the native client's staging.
-    let manifest = content
-        .chunk_file(reader, staged.mime)
-        .await
-        .map_err(|err| format!("staged content could not be chunked: {err}"))?;
-    let declared = staged.file_id;
+    // the next sweep collects, as with the native client's staging.
+    for staged in staged {
+        let Ok(reader) = BlobSource::new(staged.blob) else {
+            return Err("staged content could not be opened for reading".to_owned());
+        };
+        let manifest = content
+            .chunk_file(reader, staged.mime)
+            .await
+            .map_err(|err| format!("staged content could not be chunked: {err}"))?;
+        let worker_id = manifest.file_id();
+        let declared = staged.file_id;
+        if worker_id != declared {
+            return Err(format!(
+                "staged bytes hash to {worker_id}, the mutation names {declared}"
+            ));
+        }
+        manifests.push(manifest);
+    }
     content
-        .commit_staged(worker, &manifest, |conn, worker_id| {
-            if worker_id != declared {
-                return Err(StageCommitError::Row(format!(
-                    "staged bytes hash to {worker_id}, the mutation names {declared}"
-                )));
-            }
+        .commit_staged_batch(worker, &manifests, |conn| {
             replay_aborting(conn, changeset, &|table| replica_schema(shared, table)).map_err(
                 |err| StageCommitError::Row(format!("worker replica apply failed: {err}")),
             )?;
@@ -4122,25 +4127,38 @@ fn record_tab_watermark(
     Ok(())
 }
 
-/// Take the staged blob a synced changeset names, if this tab holds one,
-/// dropping entries that went stale waiting for a mutation that never came.
-fn take_staged(state: &mut HubState, id: TabId, changeset: &[u8]) -> Option<StagedContent> {
-    let tab = state.tabs.get_mut(&id)?;
+/// Take the staged blobs a synced changeset names, one per named identity and
+/// oldest first, dropping entries that went stale waiting for a mutation.
+fn take_staged(state: &mut HubState, id: TabId, changeset: &[u8]) -> Vec<StagedContent> {
+    let Some(tab) = state.tabs.get_mut(&id) else {
+        return Vec::new();
+    };
     if tab.staged.is_empty() {
-        return None;
+        return Vec::new();
     }
     let now = SystemClock.monotonic();
     tab.staged
         .retain(|staged| now.saturating_sub(staged.taken) < STALE_CONTENT);
     let named = changeset_blob_values(changeset);
     if named.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let index = tab
-        .staged
-        .iter()
-        .position(|staged| named.contains(&staged.file_id))?;
-    tab.staged.remove(index)
+    let mut selected = Vec::new();
+    for _ in 0..tab.staged.len() {
+        let Some(staged) = tab.staged.pop_front() else {
+            break;
+        };
+        if named.contains(&staged.file_id)
+            && !selected
+                .iter()
+                .any(|taken: &StagedContent| taken.file_id == staged.file_id)
+        {
+            selected.push(staged);
+        } else {
+            tab.staged.push_back(staged);
+        }
+    }
+    selected
 }
 
 /// The file identities a changeset could be naming: every 32-byte blob value
