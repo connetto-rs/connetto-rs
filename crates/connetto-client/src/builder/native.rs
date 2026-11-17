@@ -997,6 +997,10 @@ where
                     #[cfg(feature = "peer")]
                     bluetooth_tx,
                 );
+                #[cfg(feature = "peer")]
+                let media = core
+                    .content()
+                    .and_then(|content| C::media_driver(content, || handle.media_port()));
                 core.client()
                     .with_device_writer(keys, handle.steering())
                     .await?;
@@ -1204,7 +1208,11 @@ where
                 let pump: CorePump = Box::pin(with_device_tasks(
                     pump,
                     async move {
-                        tokio::join!(enrolment, runner);
+                        tokio::join!(enrolment, runner, async {
+                            if let Some(media) = media {
+                                media.await;
+                            }
+                        });
                     },
                     revoked,
                     close,

@@ -136,8 +136,8 @@ pub async fn next_event(
 
 /// Poll `device_certificate` until it holds a certificate, bounded by
 /// `deadline`.
-pub async fn wait_for_certificate(
-    client: &NativeClient<NativeTransport>,
+pub async fn wait_for_certificate<C>(
+    client: &NativeClient<NativeTransport, C>,
     deadline: Duration,
 ) -> Option<DeviceCertificate> {
     let until = Instant::now() + deadline;
@@ -153,8 +153,8 @@ pub async fn wait_for_certificate(
 }
 
 /// Poll `unsynced` until it holds nothing, bounded by `deadline`.
-pub async fn wait_unsynced_empty(
-    client: &NativeClient<NativeTransport>,
+pub async fn wait_unsynced_empty<C>(
+    client: &NativeClient<NativeTransport, C>,
     deadline: Duration,
 ) -> bool {
     let until = Instant::now() + deadline;

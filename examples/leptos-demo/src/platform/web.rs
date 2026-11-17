@@ -1516,12 +1516,7 @@ async fn stage_picked(
     mime: MimeClass,
     identity: &str,
 ) -> String {
-    match content
-        .stage(blob, mime, client, move |conn, file_id| {
-            support::stage_photo_row(conn, file_id, identity)
-        })
-        .await
-    {
+    match support::web::stage_photo(content, client, blob, mime, identity, None).await {
         Ok(_) => {
             // Push the staged mutation up now, as the browser builds always have.
             client.replay_pending().await.ok();
