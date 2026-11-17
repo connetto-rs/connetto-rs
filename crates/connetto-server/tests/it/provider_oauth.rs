@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use connetto_server::{
     AuthConfig, AuthService, AuthStore as _, CookieSameSite, IdentityProvider as _,
     InMemoryAuthStore, OAuthProvider, ProviderError, ProviderRegistry, RedirectPolicy,
-    RequestGuard, auth_router,
+    RequestGuard, VerifiedLogin, auth_router,
 };
 use connetto_test_harness::{Fixture, MockOauth};
 use openidconnect::reqwest;
@@ -258,44 +258,98 @@ async fn the_email_and_name_come_from_the_user_endpoint() {
     assert_eq!(login.identity.name.as_deref(), Some("The Octocat"));
 }
 
-/// An email list that answers 403 or 404 to the token, as GitHub's does to a
-/// GitHub App without the email permission, costs the email and keeps the
-/// login.
-#[tokio::test]
-async fn an_unreadable_email_list_signs_in_without_an_email() {
-    let idp = MockOauth::start().await;
-    let lists = TcpListener::bind("127.0.0.1:0")
+/// A loopback server standing in for an email list and for a user endpoint
+/// that answers no JSON. Any other path answers 404.
+async fn stand_in() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind the list server");
-    let lists_at = lists.local_addr().expect("local address");
-    let refusing = axum::Router::new().route(
-        "/forbidden",
-        axum::routing::get(|| async { StatusCode::FORBIDDEN }),
-    );
-    let server = tokio::spawn(async move { axum::serve(lists, refusing).await });
+        .expect("bind the stand-in");
+    let at = listener.local_addr().expect("local address");
+    let routes = axum::Router::new()
+        .route(
+            "/emails",
+            axum::routing::get(|| async {
+                axum::Json(json!([
+                    { "email": "old@example.com", "primary": false, "verified": true },
+                    { "email": "main@example.com", "primary": true, "verified": true },
+                ]))
+            }),
+        )
+        .route(
+            "/forbidden",
+            axum::routing::get(|| async { StatusCode::FORBIDDEN }),
+        )
+        .route("/not-json", axum::routing::get(|| async { "plain text" }));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, routes)
+            .await
+            .expect("serve the stand-in");
+    });
+    (at, server)
+}
 
-    for list in ["forbidden", "missing"] {
+/// Sign in at `provider` as a user whose user endpoint reports `claims`.
+async fn log_in(
+    provider: &OAuthProvider,
+    claims: &serde_json::Value,
+) -> Result<VerifiedLogin, ProviderError> {
+    let redirect = provider.begin_login().expect("begin the login");
+    let code = authorize(&redirect.authorize_url, "octocat", claims).await;
+    provider
+        .complete_login(&code, &redirect.pkce_verifier, &redirect.nonce)
+        .await
+}
+
+/// The email list's entry both primary and verified is the email, and a list
+/// that answers 403 or 404 to the token, as GitHub's does to a GitHub App
+/// without the email permission, costs the email and keeps the login.
+#[tokio::test]
+async fn the_email_list_decides_the_email_and_never_the_login() {
+    let idp = MockOauth::start().await;
+    let (at, server) = stand_in().await;
+
+    for (list, expected) in [
+        ("emails", Some("main@example.com")),
+        ("forbidden", None),
+        ("missing", None),
+    ] {
         let provider = OAuthProvider::new(
             idp.oauth_config(PROVIDER, ISSUER_LABEL, CALLBACK, idp.user_url(), "/id")
-                .with_verified_email_list(format!("http://{lists_at}/{list}")),
+                .with_verified_email_list(format!("http://{at}/{list}")),
         )
         .expect("build the provider");
-        let redirect = provider.begin_login().expect("begin the login");
-        let code = authorize(
-            &redirect.authorize_url,
-            "octocat",
-            &json!({ "id": 583_231 }),
-        )
-        .await;
-
-        let login = provider
-            .complete_login(&code, &redirect.pkce_verifier, &redirect.nonce)
+        let login = log_in(&provider, &json!({ "id": 583_231 }))
             .await
             .unwrap_or_else(|err| panic!("the {list} list is no refusal: {err}"));
         assert_eq!(login.identity.subject, "583231");
         assert_eq!(
-            login.identity.email, None,
-            "the {list} list held the only email"
+            login.identity.email.as_deref(),
+            expected,
+            "the email the {list} list yields"
+        );
+    }
+    server.abort();
+}
+
+/// A user endpoint that answers no JSON, or cannot be reached at all,
+/// refuses the login as a failed exchange naming the endpoint.
+#[tokio::test]
+async fn a_user_endpoint_answering_nothing_usable_refuses_the_login() {
+    let idp = MockOauth::start().await;
+    let (at, server) = stand_in().await;
+
+    for (user_url, detail) in [
+        (format!("http://{at}/not-json"), "answered no JSON"),
+        ("http://127.0.0.1:1/user".to_owned(), "reading"),
+    ] {
+        let provider = provider(&idp, user_url.clone());
+        let refused = log_in(&provider, &json!({ "id": 583_231 }))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{user_url} identifies nobody"));
+        assert!(
+            matches!(&refused, ProviderError::Exchange(text) if text.contains(detail) && text.contains(&user_url)),
+            "the refusal names {user_url} and {detail:?}: {refused}"
         );
     }
     server.abort();
@@ -307,15 +361,7 @@ async fn an_unreadable_email_list_signs_in_without_an_email() {
 async fn the_retained_refresh_token_buys_a_fresh_access_token() {
     let idp = MockOauth::start().await;
     let provider = provider(&idp, idp.user_url());
-    let redirect = provider.begin_login().expect("begin the login");
-    let code = authorize(
-        &redirect.authorize_url,
-        "octocat",
-        &json!({ "id": 583_231 }),
-    )
-    .await;
-    let login = provider
-        .complete_login(&code, &redirect.pkce_verifier, &redirect.nonce)
+    let login = log_in(&provider, &json!({ "id": 583_231 }))
         .await
         .expect("the login completes");
     let refresh_token = login
@@ -332,6 +378,32 @@ async fn the_retained_refresh_token_buys_a_fresh_access_token() {
     assert!(
         refreshed.refresh_token.is_some(),
         "a refresh token to reuse"
+    );
+}
+
+/// A code or a refresh token the token endpoint refuses is a failed exchange
+/// or a failed refresh, never an identity.
+#[tokio::test]
+async fn a_code_or_refresh_token_the_provider_refuses_is_an_error() {
+    let idp = MockOauth::start().await;
+    let provider = provider(&idp, idp.user_url());
+    let redirect = provider.begin_login().expect("begin the login");
+
+    let refused = provider
+        .complete_login("not-a-code", &redirect.pkce_verifier, &redirect.nonce)
+        .await
+        .expect_err("an unknown code identifies nobody");
+    assert!(
+        matches!(refused, ProviderError::Exchange(_)),
+        "an unknown code is a failed exchange: {refused}"
+    );
+    let refused = provider
+        .refresh_provider_token("not-a-refresh-token")
+        .await
+        .expect_err("an unknown refresh token buys nothing");
+    assert!(
+        matches!(refused, ProviderError::Refresh(_)),
+        "an unknown refresh token is a failed refresh: {refused}"
     );
 }
 
