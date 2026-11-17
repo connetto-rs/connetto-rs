@@ -119,6 +119,10 @@ parking_lot = "0.12"
 chrono = "0.4"
 # The camp media proof runs a content client over each device's replica.
 connetto-file-client = { path = "../connetto-file-client", features = ["peer"] }
+# The camp media proof builds and stages through the demo's own photo
+# declarations and thumbnail, and encodes the photo it takes.
+connetto-demo-support = { path = "../../examples/demo-support", default-features = false, features = ["native", "peer"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 tokio = { workspace = true, features = ["test-util"] }
 # The smoke test reads a table back through the admin pool with a typed row.
 diesel = { workspace = true, features = ["postgres_backend"] }

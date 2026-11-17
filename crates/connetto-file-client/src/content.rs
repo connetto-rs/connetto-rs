@@ -9,7 +9,7 @@ use connetto_client::live::ConnettoClient;
 use connetto_client::{AttachContent, ClientError, ContentPlace, TokioSleeper};
 use connetto_core::Transport;
 use connetto_core::traits::MaybeSend;
-use connetto_file_core::{ChunkInventory, MemStore};
+use connetto_file_core::{ChunkInventory, FreeSpace, MemStore};
 
 use crate::http::{DEFAULT_IDLE_BOUND, ReqwestHttp};
 use crate::{ContentClient, FsStore};
@@ -21,6 +21,8 @@ use crate::{ContentClient, FsStore};
 pub struct Content {
     idle_bound: Duration,
     heal_queries: Vec<(String, String)>,
+    #[cfg(feature = "peer")]
+    peer_columns: Vec<PeerDeclaration>,
 }
 
 impl Default for Content {
@@ -28,6 +30,8 @@ impl Default for Content {
         Self {
             idle_bound: DEFAULT_IDLE_BOUND,
             heal_queries: Vec::new(),
+            #[cfg(feature = "peer")]
+            peer_columns: Vec::new(),
         }
     }
 }
@@ -53,6 +57,52 @@ impl Content {
         self.heal_queries.push((query.into(), column.into()));
         self
     }
+
+    /// Adds a peer column declaration to this content piece.
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn with_peer_content(mut self, declaration: PeerDeclaration) -> Self {
+        self.peer_columns.push(declaration);
+        self
+    }
+}
+
+/// A column whose files the native client's media driver serves and fetches.
+#[cfg(feature = "peer")]
+#[derive(Clone, Debug)]
+pub struct PeerDeclaration {
+    table: String,
+    column: String,
+    prefetch: bool,
+    replicate: Option<(u8, String)>,
+}
+
+#[cfg(feature = "peer")]
+impl PeerDeclaration {
+    /// Declares a file-id column for peer media.
+    #[must_use]
+    pub fn new(table: impl Into<String>, column: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            column: column.into(),
+            prefetch: false,
+            replicate: None,
+        }
+    }
+
+    /// Fetches provisional files up to 1 MiB without an application request.
+    #[must_use]
+    pub fn prefetch(mut self) -> Self {
+        self.prefetch = true;
+        self
+    }
+
+    /// Keeps `copies` on linked devices until the state column reads `available`.
+    #[must_use]
+    pub fn replicate(mut self, copies: u8, state: impl Into<String>) -> Self {
+        self.replicate = Some((copies, state.into()));
+        self
+    }
 }
 
 /// The running content client a piece builds, placed durable or in memory.
@@ -73,6 +123,26 @@ where
         crate::db::held_content()
     }
 
+    #[cfg(feature = "peer")]
+    fn media_driver(
+        handle: &Self::Handle,
+        take_port: impl FnOnce() -> Option<connetto_client::media::MediaPort>,
+    ) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>> {
+        match handle {
+            ContentHandle::Durable(content) if content.has_peer_content() => {
+                let port = take_port()?;
+                let content = Arc::clone(content);
+                Some(Box::pin(async move { content.drive_media(port).await }))
+            }
+            ContentHandle::InMemory(content) if content.has_peer_content() => {
+                let port = take_port()?;
+                let content = Arc::clone(content);
+                Some(Box::pin(async move { content.drive_media(port).await }))
+            }
+            _ => None,
+        }
+    }
+
     async fn attach(
         self,
         client: ConnettoClient<T>,
@@ -80,38 +150,49 @@ where
         place: ContentPlace,
     ) -> Result<ContentHandle<T>, ClientError> {
         let http = ReqwestHttp::new().with_idle_bound(self.idle_bound);
-        let heal = &self.heal_queries;
         Ok(match place {
             ContentPlace::Durable(dir) => ContentHandle::Durable(
-                running(client, FsStore::new(dir), root_key, http, heal).await?,
+                running(client, FsStore::new(dir), root_key, http, &self).await?,
             ),
             ContentPlace::InMemory => ContentHandle::InMemory(
-                running(client, MemStore::new(), root_key, http, heal).await?,
+                running(client, MemStore::new(), root_key, http, &self).await?,
             ),
         })
     }
 }
 
-/// A content client over `store`, healing through `heal`, with its outbox
-/// driven on the tokio runtime.
+/// Attaches the piece's declarations before sharing the client with its outbox driver.
 async fn running<T, B>(
     client: ConnettoClient<T>,
     store: B,
     root_key: [u8; 32],
     http: ReqwestHttp,
-    heal: &[(String, String)],
+    piece: &Content,
 ) -> Result<Arc<ContentClient<T, B, ReqwestHttp>>, ClientError>
 where
     T: Transport + MaybeSend + 'static,
     T::Error: Display,
-    B: ChunkInventory + Clone + Sync + MaybeSend + 'static,
+    B: ChunkInventory + FreeSpace + Clone + Sync + MaybeSend + 'static,
 {
     let mut content = ContentClient::attach(client, store, root_key, http)
         .await
         .map_err(|err| ClientError::Content(err.to_string()))?;
-    for (query, column) in heal {
+    for (query, column) in &piece.heal_queries {
         content = content
             .heal_lost(query, column)
+            .await
+            .map_err(|err| ClientError::Content(err.to_string()))?;
+    }
+    #[cfg(feature = "peer")]
+    for declaration in &piece.peer_columns {
+        let mut peer = content.with_peer_content(&declaration.table, &declaration.column);
+        if declaration.prefetch {
+            peer = peer.prefetch();
+        }
+        if let Some((copies, state)) = &declaration.replicate {
+            peer = peer.replicate(*copies, state);
+        }
+        content = peer
             .await
             .map_err(|err| ClientError::Content(err.to_string()))?;
     }

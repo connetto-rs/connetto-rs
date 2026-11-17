@@ -828,7 +828,10 @@ pub(crate) fn apply_peer_op(
     write_through_view(conn, &target, table, backing, op.table().pk_flags(), &write)
 }
 
-/// Put back the row one peer op changed, through the view `table` (R77).
+/// Put back the row one peer op changed, in the view `table`'s backing table
+/// (R77). The undo restores the receiver's own store, so the view's read
+/// filter does not hide a row the receiver may not read, and the exempt
+/// writes the caller raised pass the backing table's write guards.
 #[cfg(feature = "peer")]
 pub(crate) fn undo_peer_op(
     conn: &mut SqliteConnection,
@@ -836,9 +839,19 @@ pub(crate) fn undo_peer_op(
     backing: Backing<'_>,
     op: &PeerOp,
 ) -> Result<PeerVerdict, ClientError> {
-    let target = view_target(conn, backing.schema, table)?;
+    let target = Target {
+        schema: backing.schema,
+        shape: view_target(conn, backing.schema, table)?.shape,
+    };
     let write = ViewWrite::undoing(op);
-    write_through_view(conn, &target, table, backing, op.table().pk_flags(), &write)
+    write_through_view(
+        conn,
+        &target,
+        backing.table,
+        backing,
+        op.table().pk_flags(),
+        &write,
+    )
 }
 
 /// Whether the view `table` shows a row whose `column` is `value` to the

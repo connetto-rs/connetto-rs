@@ -849,10 +849,14 @@ jobs:
       # The same command the proof runs without --apk, built before the
       # emulator boots so the emulator's time goes to the proof. Line tables
       # keep a panic's file and line and halve the APK and the cached tree.
+      # The emulator reaches the stack over adb reverse, at the loopback
+      # addresses the build bakes in.
       - name: Build the demo's APK
         working-directory: examples/tauri-leptos-demo/src-tauri
         env:
           CARGO_PROFILE_DEV_DEBUG: line-tables-only
+          CONNETTO_DEMO_BUILD_WS: ws://127.0.0.1:7777/sync
+          CONNETTO_DEMO_BUILD_AUTH_ORIGIN: http://127.0.0.1:7777
         run: cargo tauri android build --debug --apk --target x86_64 --features device-identity
 
       - uses: $/.github/actions/pull-test-images

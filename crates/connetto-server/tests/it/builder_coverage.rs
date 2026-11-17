@@ -101,13 +101,6 @@ diesel::table! {
 
 connetto_file_server::connetto_file_tables!();
 
-/// A catalog read the DSL cannot name, one column per field.
-#[derive(QueryableByName)]
-struct WalLsn {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    lsn: i64,
-}
-
 /// The slot's confirmed position, null until a stream confirms one.
 #[derive(QueryableByName)]
 struct ConfirmedLsn {
@@ -1092,42 +1085,12 @@ async fn the_oplog_config_bounds_the_reconnect_log() {
     let builder = builder.oplog_config(OplogConfig::new().with_max_entries(2));
 
     let parts = builder.build().await.expect("the deployment assembles");
+    let mut commits = parts.handle.ingested_commits();
     let stream = tokio::spawn(parts.change_stream);
 
     // Five changes, one commit each. The log may hold two of them.
-    let mut last: i64 = 0;
     for id in 101..=105 {
-        exec(
-            &pool,
-            &format!("INSERT INTO orders VALUES ({id}, 1.0, 1, 'new')"),
-        )
-        .await;
-        let mut conn = pool.get().await.expect("a connection");
-        let row: Vec<WalLsn> = diesel::sql_query(
-            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0'::pg_lsn)::bigint AS lsn",
-        )
-        .load(&mut *conn)
-        .await
-        .expect("read the write-ahead position");
-        last = row[0].lsn;
-    }
-
-    let deadline = Instant::now() + BOUND;
-    loop {
-        let mut conn = pool.get().await.expect("a connection");
-        let end: Option<i64> = connetto_oplog_commit::table
-            .select(connetto_oplog_commit::end_lsn)
-            .first(&mut *conn)
-            .await
-            .ok();
-        if end.is_some_and(|end| end >= last) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the stream never ingested the last commit"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        insert_ingested_order(&pool, &mut commits, id).await;
     }
     let mut conn = pool.get().await.expect("a connection");
     let kept: i64 = connetto_oplog::table
