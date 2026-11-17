@@ -119,7 +119,7 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
     // transaction, the same row the pick handler writes.
     let (file_id, photo_id) = a_content
         .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
-            stage_photo_row(conn, file_id, OWNER)
+            stage_photo_row(conn, file_id, OWNER, None, None)
         })
         .await
         .expect("stage demo photo");

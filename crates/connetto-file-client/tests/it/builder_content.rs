@@ -254,3 +254,112 @@ async fn a_closed_client_with_unsent_content_reopens_at_once() {
         drop(client);
     }
 }
+
+/// An in-memory build attaching `piece`.
+#[cfg(feature = "peer")]
+async fn in_memory(
+    piece: Content,
+) -> Result<
+    connetto_client::NativeClient<FakeTransport, ContentHandle<FakeTransport>>,
+    connetto_client::ClientError,
+> {
+    NativeClientBuilder::new("ws://127.0.0.1:1", schema())
+        .with_dialer(OneShot {
+            transport: Some(FakeTransport::accepting_but_silent()),
+        })
+        .with_content(piece)
+        .connect()
+        .await
+}
+
+/// The photo column declared for prefetch and replication on its state column.
+#[cfg(feature = "peer")]
+fn declared_piece() -> Content {
+    Content::new().with_peer_content(
+        connetto_file_client::PeerDeclaration::new("photos", "content_id")
+            .prefetch()
+            .replicate(3, "content_state"),
+    )
+}
+
+/// A piece declaring no peer content never asks for the media port, which
+/// stays free for whatever else the application runs on it.
+#[cfg(feature = "peer")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_piece_without_peer_content_takes_no_media_port() {
+    use connetto_client::AttachContent;
+
+    let client = in_memory(Content::default())
+        .await
+        .expect("the build connects");
+    let handle = client.content().expect("the build attached content");
+    let mut asked = false;
+    let driver = <Content as AttachContent<FakeTransport>>::media_driver(handle, || {
+        asked = true;
+        None
+    });
+    assert!(driver.is_none(), "nothing declared runs no media driver");
+    assert!(!asked, "nothing declared leaves the media port untaken");
+}
+
+/// A declared piece whose port another caller already took starts no driver.
+#[cfg(feature = "peer")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_piece_with_the_port_taken_starts_no_driver() {
+    use connetto_client::AttachContent;
+
+    let client = in_memory(declared_piece())
+        .await
+        .expect("the build connects");
+    let handle = client.content().expect("the build attached content");
+    let mut asked = false;
+    let driver = <Content as AttachContent<FakeTransport>>::media_driver(handle, || {
+        asked = true;
+        None
+    });
+    assert!(asked, "declared content asks for the media port");
+    assert!(driver.is_none(), "a taken port starts no media driver");
+}
+
+/// A declared piece with the port free runs the driver, which returns once
+/// the port's events end, as they do when the client closes.
+#[cfg(feature = "peer")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_piece_runs_its_driver_until_the_port_ends() {
+    use connetto_client::AttachContent;
+    use connetto_client::media::MediaPort;
+    use connetto_peer::test_support::{Deployment, node, whole_second};
+
+    let client = in_memory(declared_piece())
+        .await
+        .expect("the build connects");
+    let handle = client.content().expect("the build attached content");
+    let deployment = Deployment::new(80, whole_second());
+    let (node_events, _node_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (media_tx, media_rx) = tokio::sync::mpsc::unbounded_channel();
+    let port = MediaPort::over(node(deployment.root_der(), node_events), media_rx);
+    let driver = <Content as AttachContent<FakeTransport>>::media_driver(handle, || Some(port))
+        .expect("declared content with a free port runs the media driver");
+    drop(media_tx);
+    tokio::time::timeout(std::time::Duration::from_secs(10), driver)
+        .await
+        .expect("the driver returns once its port's events end");
+}
+
+/// A replication naming a state column the table lacks fails the build,
+/// naming the column, so the piece applied the replication.
+#[cfg(feature = "peer")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replication_on_a_missing_state_column_fails_the_build() {
+    let piece = Content::new().with_peer_content(
+        connetto_file_client::PeerDeclaration::new("photos", "content_id")
+            .replicate(3, "no_such_state"),
+    );
+    let Err(err) = in_memory(piece).await else {
+        panic!("a replication on a missing column builds");
+    };
+    assert!(
+        err.to_string().contains("no_such_state"),
+        "the refusal names the missing column, got {err}"
+    );
+}

@@ -866,6 +866,70 @@ async fn a_retraction_of_an_insert_takes_the_row_away() {
     assert_eq!(rows, vec![("orders".to_owned(), vec![KeyValue::Int(1)])]);
 }
 
+/// The receiver's source for an `orders` table each person reads and
+/// writes only their own rows of.
+const OWNED_ORDERS_SCHEMA: &str = "-- connetto:major 1\n \
+                                   CREATE TABLE orders (id INTEGER PRIMARY KEY, \
+                                   owner TEXT NOT NULL, status TEXT NOT NULL); \
+                                   ALTER TABLE orders ENABLE ROW LEVEL SECURITY;";
+
+/// Each person reads and writes only the orders they own.
+const OWNED_ORDERS_POLICIES: &str = "CREATE POLICY orders_owned ON orders \
+                                     USING (owner = current_setting('app.user_id', true)) \
+                                     WITH CHECK (owner = current_setting('app.user_id', true));";
+
+/// A retraction of a person's insert takes the row away on a receiver that
+/// cannot read it, since the author's own policies judged the insert.
+#[tokio::test]
+async fn a_retraction_takes_away_a_row_the_receiver_cannot_read() {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+    /// The rows the backing table stores, whoever may read them.
+    fn stored_orders<T>(conn: &mut ConnettoConnection<T>) -> i64
+    where
+        T: connetto_core::traits::Transport,
+        T::Error: core::fmt::Display,
+    {
+        diesel::sql_query("SELECT COUNT(*) AS count FROM orders_rls")
+            .get_result::<Count>(conn.conn())
+            .expect("count the stored orders")
+            .count
+    }
+
+    let [body] = captured(
+        PLAIN_DDL,
+        [&|conn| insert_order(conn, 1, "peer-anna", "open")],
+    )
+    .await;
+    let (mut recv, _) = receiver(OWNED_ORDERS_SCHEMA, OWNED_ORDERS_POLICIES).await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    let outcome = recv
+        .apply_peer_entry(&a, &manifest(7, &body), &body)
+        .expect("apply the insert");
+    assert!(
+        matches!(outcome, PeerApplyOutcome::Applied { .. }),
+        "the author may insert its own order: {outcome:?}"
+    );
+    assert_eq!(stored_orders(&mut recv), 1, "the author's order lands");
+    recv.retract_peer_entry(
+        &a,
+        &Retraction {
+            seq: 7,
+            cause: RetractCause::Abandoned,
+        },
+    )
+    .expect("retract the insert");
+    assert_eq!(stored_orders(&mut recv), 0, "the retraction takes it away");
+    assert_eq!(
+        recv.provisional_rows().expect("read the records"),
+        Vec::new()
+    );
+    assert_eq!(stored_entries(&mut recv), Vec::new());
+}
+
 /// An author may neither update nor delete a row another person owns, and
 /// the owner's row and record stand as they were.
 #[tokio::test]
