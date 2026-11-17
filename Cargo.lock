@@ -1418,6 +1418,7 @@ dependencies = [
  "js-sys",
  "manganis",
  "qrcode",
+ "rmp-serde",
  "rosetta-uuid",
  "serde",
  "thiserror 2.0.21",
