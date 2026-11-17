@@ -1518,9 +1518,60 @@ async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
         stderr.contains("\"frobnicate\""),
         "expected Debug-quoted provider name in stderr, got: {stderr}"
     );
+    for kind in ["microsoft", "oauth", "github"] {
+        assert!(
+            stderr.contains(kind),
+            "expected {kind} in the recognised provider list in stderr, got: {stderr}"
+        );
+    }
+}
+
+/// A plain OAuth provider cannot be discovered, so every endpoint is a
+/// setting, and one left unset refuses boot naming it.
+#[tokio::test]
+async fn e2e_startup_refuses_a_plain_oauth_provider_without_its_user_endpoint() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let output = run_server_exit_output(
+        &url,
+        Some(&reader_url),
+        &[
+            ("CONNETTO_AUTH", "database"),
+            ("CONNETTO_OIDC_PROVIDERS", "myprovider"),
+            ("CONNETTO_OIDC_MYPROVIDER_KIND", "oauth"),
+            ("CONNETTO_OIDC_MYPROVIDER_CLIENT_ID", "unused"),
+            (
+                "CONNETTO_OIDC_MYPROVIDER_REDIRECT_URL",
+                "http://127.0.0.1/callback",
+            ),
+            ("CONNETTO_OIDC_MYPROVIDER_ISSUER", "https://idp.example"),
+            (
+                "CONNETTO_OIDC_MYPROVIDER_AUTHORIZE_URL",
+                "https://idp.example/authorize",
+            ),
+            (
+                "CONNETTO_OIDC_MYPROVIDER_TOKEN_URL",
+                "https://idp.example/token",
+            ),
+            ("CONNETTO_OIDC_MYPROVIDER_SUBJECT_POINTER", "/id"),
+        ],
+    )
+    .await;
     assert!(
-        stderr.contains("microsoft"),
-        "expected recognised provider list in stderr, got: {stderr}"
+        !output.status.success(),
+        "expected nonzero exit for a provider without its user endpoint"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("CONNETTO_OIDC_MYPROVIDER_USER_URL"),
+        "expected the refusal to name the missing setting, got: {stderr}"
     );
 }
 
