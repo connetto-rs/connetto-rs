@@ -536,9 +536,14 @@ async fn stage_photo(
     let line = match support::mime_from_extension(std::path::Path::new(&name)) {
         None => "not an image: only .jpg .jpeg .png are accepted".to_owned(),
         Some(mime) => {
-            let outcome =
-                support::native::stage_photo(&session.content, bytes.as_slice(), mime, &identity, None)
-                    .await;
+            let outcome = support::native::stage_photo(
+                &session.content,
+                bytes.as_slice(),
+                mime,
+                &identity,
+                None,
+            )
+            .await;
             match outcome {
                 Ok(_) => format!("staged: {name}"),
                 Err(err) => format!("stage failed: {err}"),
