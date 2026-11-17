@@ -17,15 +17,6 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope, Response};
 
 diesel::table! {
-    orders (id) {
-        id -> rosetta_uuid::sql_types::Uuid,
-        owner_id -> diesel::sql_types::Text,
-        quantity -> diesel::sql_types::BigInt,
-        created_at -> diesel::sql_types::Timestamp,
-    }
-}
-
-diesel::table! {
     photos (id) {
         id -> rosetta_uuid::sql_types::Uuid,
         order_id -> rosetta_uuid::sql_types::Uuid,
@@ -124,56 +115,16 @@ pub async fn stage_photo(
     identity: &str,
     bytes: &[u8],
 ) -> (FileId, rosetta_uuid::Uuid) {
-    let staged = content
-        .stage(
-            &blob_of(bytes),
-            MimeClass::Jpeg,
-            client,
-            |connection, file_id| {
-                connection.transaction(|connection| {
-                    let before_orders: std::collections::HashSet<rosetta_uuid::Uuid> =
-                        orders::table
-                            .select(orders::id)
-                            .load::<rosetta_uuid::Uuid>(connection)?
-                            .into_iter()
-                            .collect();
-                    diesel::insert_into(orders::table)
-                        .values((orders::owner_id.eq(identity), orders::quantity.eq(5_i64)))
-                        .execute(connection)?;
-                    let order_id = orders::table
-                        .select(orders::id)
-                        .load::<rosetta_uuid::Uuid>(connection)?
-                        .into_iter()
-                        .find(|id| !before_orders.contains(id))
-                        .expect("minted order id");
-
-                    let before_photos: std::collections::HashSet<rosetta_uuid::Uuid> =
-                        photos::table
-                            .select(photos::id)
-                            .load::<rosetta_uuid::Uuid>(connection)?
-                            .into_iter()
-                            .collect();
-                    diesel::insert_into(photos::table)
-                        .values((
-                            photos::order_id.eq(order_id),
-                            photos::owner_id.eq(identity),
-                            photos::content_id.eq(file_id.as_bytes().to_vec()),
-                            photos::content_state.eq::<Option<String>>(None),
-                        ))
-                        .execute(connection)?;
-                    Ok::<rosetta_uuid::Uuid, diesel::result::Error>(
-                        photos::table
-                            .select(photos::id)
-                            .load::<rosetta_uuid::Uuid>(connection)?
-                            .into_iter()
-                            .find(|id| !before_photos.contains(id))
-                            .expect("minted photo id"),
-                    )
-                })
-            },
-        )
-        .await
-        .expect("stage photo and write rows");
+    let staged = connetto_demo_support::web::stage_photo(
+        content,
+        client,
+        &blob_of(bytes),
+        MimeClass::Jpeg,
+        identity,
+        None,
+    )
+    .await
+    .expect("stage photo and write rows");
     client.replay_pending().await.expect("send photo mutation");
     assert_eq!(staged.0, FileId::from_chunks([bytes]));
     staged

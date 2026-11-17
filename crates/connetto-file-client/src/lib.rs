@@ -26,6 +26,11 @@ pub use browser_store::{BrowserStore, BrowserStoreError};
 pub use client::PeerContent;
 pub use client::{ContentClient, ContentEvent};
 pub use connetto_file_core::{ChunkHash, FileId, FileIdHasher, MimeClass};
+#[cfg(all(
+    feature = "peer",
+    not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub use content::PeerDeclaration;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use content::{Content, ContentHandle};
 pub use db::held_content;

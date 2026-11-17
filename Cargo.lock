@@ -1441,6 +1441,7 @@ dependencies = [
  "connetto-schema",
  "connetto-web",
  "diesel",
+ "image",
  "js-sys",
  "manganis",
  "qrcode",
@@ -1450,6 +1451,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
@@ -1757,6 +1759,7 @@ dependencies = [
  "connetto-ca",
  "connetto-client",
  "connetto-core",
+ "connetto-demo-support",
  "connetto-file-client",
  "connetto-peer-apple",
  "connetto-schema",
@@ -1765,6 +1768,7 @@ dependencies = [
  "diesel-async",
  "dispatch2",
  "futures-util",
+ "image",
  "keyutils",
  "openfga-client",
  "openidconnect",
@@ -9113,7 +9117,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9174,7 +9178,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#907f4d059b7abb2cd3028c0dd8af24d83f30784b"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#42605ce3fb54e013338a32393e7cb82ea0d4acce"
 dependencies = [
  "geometric-traits",
  "once_cell",
@@ -9336,7 +9340,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10326,7 +10330,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
