@@ -983,6 +983,7 @@ dependencies = [
  "pg2sqlite",
  "reqwest 0.12.28",
  "ring",
+ "rmp",
  "rmp-serde",
  "rustix",
  "security-framework",
