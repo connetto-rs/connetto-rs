@@ -801,6 +801,17 @@ impl<S: AuthStore> ConnettoHandshakeAuthority<S> {
     }
 }
 
+impl<S: AuthStore + 'static> connetto_core::SessionLiveness for ConnettoHandshakeAuthority<S> {
+    fn session_is_live(&self, session_id: SessionId) -> connetto_core::LivenessFuture<'_> {
+        Box::pin(async move {
+            self.store
+                .session_is_live(session_id)
+                .await
+                .map_err(|err| connetto_core::LivenessUnknown(err.to_string()))
+        })
+    }
+}
+
 impl<S, Key> HandshakeAuthority<S::Id, Key> for ConnettoHandshakeAuthority<S>
 where
     S: AuthStore + 'static,

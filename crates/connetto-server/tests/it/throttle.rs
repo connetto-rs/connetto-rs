@@ -449,6 +449,16 @@ async fn an_anonymous_caller_cannot_reconnect_past_its_connection_limit() {
 /// Counts how many grants it was asked to check, and refuses every one.
 struct CountingAuthority(Arc<std::sync::atomic::AtomicUsize>);
 
+/// It resolves no login, so it keeps no session live.
+impl connetto_core::SessionLiveness for CountingAuthority {
+    fn session_is_live(
+        &self,
+        _session_id: connetto_core::SessionId,
+    ) -> connetto_core::LivenessFuture<'_> {
+        Box::pin(core::future::ready(Ok(false)))
+    }
+}
+
 impl HandshakeAuthority for CountingAuthority {
     fn check_grant<'a>(&'a self, _grant: &'a Grant) -> GrantCheckFuture<'a> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
