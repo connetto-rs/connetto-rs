@@ -61,13 +61,21 @@ impl Hub {
         let starting = (self.start)(&request.name, &request.descriptor)?;
         let (acks, acknowledged) = mpsc::unbounded_channel();
         held.running.insert(request.id, acks);
-        tauri::async_runtime::spawn(forward(starting, outlet, acknowledged));
+        tracing::debug!(target: "tauri_plugin_connetto", subscription = request.id, webview = page, spec = request.name, "subscription starting");
+        tauri::async_runtime::spawn(forward(
+            starting,
+            outlet,
+            acknowledged,
+            request.id,
+            page.to_owned(),
+        ));
         Ok(())
     }
 
     /// End the subscription `id` of the webview `page` in `window`, or
     /// remember it when its subscribe has not arrived.
     pub(crate) fn stop(&self, page: &str, window: &str, id: u64) {
+        tracing::debug!(target: "tauri_plugin_connetto", subscription = id, webview = page, "stop command received");
         let mut pages = self.pages();
         let held = pages.entry(page.to_owned()).or_insert_with(|| Page {
             window: window.to_owned(),

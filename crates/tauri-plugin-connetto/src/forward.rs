@@ -14,6 +14,8 @@ pub(crate) type Outlet = Box<dyn Fn(FeedMessage) + Send + Sync>;
 /// The messages one subscription has sent, and the one in flight.
 struct Sent {
     outlet: Outlet,
+    subscription: u64,
+    webview: String,
     seq: u64,
     /// The answer the webview acknowledged last.
     base: Option<Answer>,
@@ -38,6 +40,13 @@ impl Sent {
             (_, Answer::Whole(bytes)) => FeedBody::Whole(ByteBuf::from(bytes.clone())),
         };
         self.seq += 1;
+        let kind = match &body {
+            FeedBody::Whole(_) => "whole",
+            FeedBody::Keyed(_) => "keyed",
+            FeedBody::Diff(_) => "diff",
+            FeedBody::Failed(_) => "failed",
+        };
+        tracing::debug!(target: "tauri_plugin_connetto", subscription = self.subscription, webview = self.webview, seq = self.seq, kind, "message sent");
         (self.outlet)(FeedMessage {
             seq: self.seq,
             body,
@@ -48,6 +57,8 @@ impl Sent {
     /// Send the error that ends the subscription.
     fn fail(&mut self, failure: &ClientError) {
         self.seq += 1;
+        tracing::debug!(target: "tauri_plugin_connetto", subscription = self.subscription, webview = self.webview, seq = self.seq, kind = "failed", "message sent");
+        tracing::debug!(target: "tauri_plugin_connetto", subscription = self.subscription, webview = self.webview, error = %failure, "subscription ending");
         (self.outlet)(FeedMessage {
             seq: self.seq,
             body: FeedBody::Failed(failure.to_string()),
@@ -65,9 +76,13 @@ pub(crate) async fn forward(
     starting: Starting,
     outlet: Outlet,
     mut acks: mpsc::UnboundedReceiver<u64>,
+    subscription: u64,
+    webview: String,
 ) {
     let mut sent = Sent {
         outlet,
+        subscription,
+        webview,
         seq: 0,
         base: None,
         in_flight: None,
@@ -80,6 +95,7 @@ pub(crate) async fn forward(
                 Err(failure) => return sent.fail(&failure),
             },
             ack = acks.recv() => if ack.is_none() {
+                tracing::debug!(target: "tauri_plugin_connetto", subscription, webview = sent.webview, "subscription ending");
                 return;
             },
         }
@@ -96,6 +112,7 @@ pub(crate) async fn forward(
                     return sent.fail(&failure);
                 }
                 if sent.in_flight.is_some() {
+                    tracing::debug!(target: "tauri_plugin_connetto", subscription, webview = sent.webview, "change held");
                     behind = true;
                     continue;
                 }
@@ -105,11 +122,15 @@ pub(crate) async fn forward(
                 }
             }
             ack = acks.recv() => {
-                let Some(seq) = ack else { return };
+                let Some(seq) = ack else {
+                    tracing::debug!(target: "tauri_plugin_connetto", subscription, webview = sent.webview, "subscription ending");
+                    return;
+                };
                 if sent.in_flight.as_ref().is_none_or(|(sent_seq, _)| *sent_seq != seq) {
                     continue;
                 }
                 sent.base = sent.in_flight.take().map(|(_, answer)| answer);
+                tracing::debug!(target: "tauri_plugin_connetto", subscription, webview = sent.webview, seq, "acknowledgement taken");
                 if core::mem::take(&mut behind) {
                     match feed.answer() {
                         Ok(answer) => sent.send(answer),

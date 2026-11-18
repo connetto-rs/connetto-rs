@@ -648,6 +648,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "connetto-leptos"
+version = "0.0.0"
+dependencies = [
+ "connetto-client",
+ "reactive_graph",
+]
+
+[[package]]
 name = "connetto-leptos-demo"
 version = "0.0.0"
 dependencies = [
@@ -655,10 +663,11 @@ dependencies = [
  "connetto-client",
  "connetto-demo-support",
  "connetto-file-core",
+ "connetto-leptos",
+ "connetto-tauri-page",
  "connetto-web",
  "diesel",
  "futures-channel",
- "futures-lite",
  "js-sys",
  "leptos",
  "rosetta-uuid",
@@ -684,6 +693,21 @@ dependencies = [
  "sqlparser",
  "thiserror 2.0.21",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "connetto-tauri-page"
+version = "0.0.0"
+dependencies = [
+ "connetto-client",
+ "connetto-core",
+ "futures-channel",
+ "futures-util",
+ "js-sys",
+ "send_wrapper",
+ "serde_bytes",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]

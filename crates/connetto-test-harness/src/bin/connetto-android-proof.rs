@@ -104,6 +104,9 @@ use connetto_test_harness::stack::{
     demo_has_device_identity, dioxus_mobile_features, now_millis, repo_path, tauri_mobile_features,
 };
 use connetto_test_harness::step;
+
+#[path = "../android_phone/live.rs"]
+mod live;
 use std::ffi::OsString;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -413,7 +416,12 @@ async fn prove(
     .await?;
     device.screenshot(evidence, "synced").await?;
 
-    second_account_shares_catalogue(device, stack, evidence, &mut app).await?;
+    let mut live_trace = if matches!(demo_app(), Demo::Tauri) {
+        Some(live::prove(device, &mut app, &stack.pg_url, evidence).await?)
+    } else {
+        None
+    };
+    second_account_shares_catalogue(device, stack, evidence, &mut app, live_trace.as_mut()).await?;
 
     step("write offline");
     device.drop_sync_link(&stack.reverse).await?;
@@ -532,6 +540,7 @@ async fn second_account_shares_catalogue(
     stack: &Stack,
     evidence: &Path,
     app: &mut PageSession,
+    live_trace: Option<&mut live::LiveTrace>,
 ) -> Result<()> {
     if !matches!(demo_app(), Demo::Tauri) {
         return Ok(());
@@ -564,8 +573,13 @@ async fn second_account_shares_catalogue(
     device
         .screenshot(evidence, "catalogue-two-accounts")
         .await?;
+    let trace = live_trace.context("Tauri live trace")?;
+    step("an account switch releases the old subscriptions before the new panes subscribe");
+    let before = trace.before_switch(device).await?;
     app.switch_to_account(&first).await?;
     app.wait_for_text(&first, Duration::from_secs(90)).await?;
+    live::equal_rows(app, &stack.pg_url).await?;
+    trace.after_switch(device, before).await?;
     device.screenshot(evidence, "back-to-first-account").await
 }
 
