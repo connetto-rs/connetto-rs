@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use connetto_client::LiveSpec;
 use connetto_client::teardown::{ForgetError, ForgetRefusal};
 use connetto_client::{
     AccountChoice, AccountChooser, Auth, ClientError, ClientEvent, ConnettoClient, ExportScope,
@@ -1429,7 +1430,7 @@ async fn feed_events(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>
 
 /// The server-pushed count.
 async fn feed_count(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>) {
-    let mut handle = match support::orders_count::<Ws>().live(&client).await {
+    let mut handle = match support::OrdersCount.query::<Ws>().live(&client).await {
         Ok(handle) => handle,
         Err(err) => {
             tracing::warn!(error = %err, "the order count subscription stopped");
@@ -1448,7 +1449,8 @@ async fn feed_count(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>)
 
 /// The server-pushed grouped count.
 async fn feed_grouped(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>) {
-    let mut handle = match support::orders_counts_by_quantity::<Ws>()
+    let mut handle = match support::OrdersCountsByQuantity
+        .query::<Ws>()
         .live(&client)
         .await
     {
@@ -1475,7 +1477,7 @@ async fn feed_orders(
     client: ConnettoClient<Ws>,
     holds: Arc<Holds>,
 ) {
-    let mut handle = match support::orders_newest_first::<Ws>().live(&client).await {
+    let mut handle = match support::OrdersNewestFirst.query::<Ws>().live(&client).await {
         Ok(handle) => handle,
         Err(err) => {
             tracing::warn!(error = %err, "the orders list stopped");
@@ -1508,7 +1510,7 @@ async fn feed_notes(
     client: ConnettoClient<Ws>,
     holds: Arc<Holds>,
 ) {
-    let mut handle = match support::notes_rows::<Ws>().live(&client).await {
+    let mut handle = match support::NotesRows.query::<Ws>().live(&client).await {
         Ok(handle) => handle,
         Err(err) => {
             tracing::warn!(error = %err, "the notes list stopped");
@@ -1542,7 +1544,7 @@ async fn feed_photos(
     content: Content,
     holds: Arc<Holds>,
 ) {
-    let mut handle = match support::photos_rows::<Ws>().live(&client).await {
+    let mut handle = match support::PhotosRows.query::<Ws>().live(&client).await {
         Ok(handle) => handle,
         Err(err) => {
             tracing::warn!(error = %err, "the photos list stopped");
@@ -1590,7 +1592,7 @@ async fn feed_products(
     client: ConnettoClient<Ws>,
     holds: Arc<Holds>,
 ) {
-    let mut handle = match support::products_by_name::<Ws>().live(&client).await {
+    let mut handle = match support::ProductsByName.query::<Ws>().live(&client).await {
         Ok(handle) => handle,
         Err(err) => {
             tracing::warn!(error = %err, "the catalogue list stopped");
@@ -1755,7 +1757,7 @@ async fn feed_peer_events(
 /// The team roster and the picked team's notes, whose peer rows re-read their
 /// provenance every second, since the provenance moves without a row change.
 async fn feed_team(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>) {
-    let mut roster = match support::teams_of_account::<Ws>().live(&client).await {
+    let mut roster = match support::TeamsOfAccount.query::<Ws>().live(&client).await {
         Ok(handle) => handle,
         Err(err) => {
             tracing::warn!(error = %err, "the team roster subscription stopped");
@@ -1802,9 +1804,12 @@ async fn feed_team(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>) 
                 subscribed = None;
             } else {
                 subscribed = Some(picked.clone());
-                match support::team_members_of::<Ws>(picked.clone())
-                    .live(&client)
-                    .await
+                match (support::TeamMembersOf {
+                    team: picked.clone(),
+                })
+                .query::<Ws>()
+                .live(&client)
+                .await
                 {
                     Ok(handle) => members = Some(handle),
                     Err(err) => {
@@ -1816,7 +1821,11 @@ async fn feed_team(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>) 
                         });
                     }
                 }
-                match support::team_notes_for::<Ws>(picked).live(&client).await {
+                match (support::TeamNotesFor { team: picked })
+                    .query::<Ws>()
+                    .live(&client)
+                    .await
+                {
                     Ok(handle) => notes = Some(handle),
                     Err(err) => {
                         tracing::warn!(error = %err, "the team notes subscription stopped");
