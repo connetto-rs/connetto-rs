@@ -6,8 +6,8 @@ use std::time::SystemTime;
 
 use connetto_client::teardown::ExpiryWarning;
 use connetto_client::{
-    ClientError, ClientEvent, ConnettoClient, LiveGroups, LiveQuery, LiveValue, StorageUse,
-    SyncSchema, Watchable,
+    ClientError, ClientEvent, ConnettoClient, KeyedSpec, LiveGroups, LiveQuery, LiveSpec,
+    LiveValue, StorageUse, SyncSchema, Watchable,
 };
 use connetto_core::messages::{FatalErrorReason, FullResyncReason, SyncStatus};
 use connetto_core::traits::{MaybeSend, Transport};
@@ -119,7 +119,7 @@ diesel::define_sql_function! {
 }
 
 /// One row of the synced `orders` table.
-#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Order {
@@ -134,7 +134,7 @@ pub struct Order {
 }
 
 /// One row of the device-private `notes` table.
-#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = notes)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Note {
@@ -145,7 +145,7 @@ pub struct Note {
 }
 
 /// One row of the synced `photos` table.
-#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = photos)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Photo {
@@ -168,7 +168,7 @@ pub struct Photo {
 }
 
 /// One row of the shared `products` catalogue.
-#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = products)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Product {
@@ -192,7 +192,7 @@ pub struct TeamMember {
 }
 
 /// One row of the synced `team_notes` table.
-#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = team_notes)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct TeamNote {
@@ -495,106 +495,223 @@ pub fn stage_photo_row(
     })
 }
 
-/// The visible orders rows, newest first, the pane's list subscription.
-#[must_use]
-pub fn orders_newest_first<T>() -> impl Watchable<T, Order, Handle = LiveQuery<Order>>
-where
-    T: Transport + MaybeSend + 'static,
-    T::Error: core::fmt::Display,
-{
-    orders::table.order((orders::created_at.desc(), orders::id.desc()))
+/// The visible orders rows, newest first.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OrdersNewestFirst;
+
+impl LiveSpec for OrdersNewestFirst {
+    const NAME: &'static str = "orders_newest_first";
+    type Row = Order;
+    type Handle = LiveQuery<Order>;
+
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: core::fmt::Display,
+    {
+        orders::table.order((orders::created_at.desc(), orders::id.desc()))
+    }
 }
 
-/// The orders `COUNT(*)` the server pushes.
-#[must_use]
-pub fn orders_count<T>() -> impl Watchable<T, i64, Handle = LiveValue<i64>>
-where
-    T: Transport + MaybeSend + 'static,
-    T::Error: core::fmt::Display,
-{
-    orders::table.count()
+impl KeyedSpec for OrdersNewestFirst {
+    type Key = Uuid;
+
+    fn key(row: &Order) -> Uuid {
+        row.id
+    }
+}
+
+/// The orders `COUNT(*)`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OrdersCount;
+
+impl LiveSpec for OrdersCount {
+    const NAME: &'static str = "orders_count";
+    type Row = i64;
+    type Handle = LiveValue<i64>;
+
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: core::fmt::Display,
+    {
+        orders::table.count()
+    }
 }
 
 /// The orders `COUNT(*)` grouped by quantity.
-#[must_use]
-pub fn orders_counts_by_quantity<T>() -> impl Watchable<T, (i64, i64), Handle = LiveGroups<i64, i64>>
-where
-    T: Transport + MaybeSend + 'static,
-    T::Error: core::fmt::Display,
-{
-    orders::table
-        .group_by(orders::quantity)
-        .select((orders::quantity, diesel::dsl::count_star()))
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OrdersCountsByQuantity;
+
+impl LiveSpec for OrdersCountsByQuantity {
+    const NAME: &'static str = "orders_counts_by_quantity";
+    type Row = (i64, i64);
+    type Handle = LiveGroups<i64, i64>;
+
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: core::fmt::Display,
+    {
+        orders::table
+            .group_by(orders::quantity)
+            .select((orders::quantity, diesel::dsl::count_star()))
+    }
 }
 
-/// The notes rows, oldest first, the pane's list subscription.
-#[must_use]
-pub fn notes_rows<T>() -> impl Watchable<T, Note, Handle = LiveQuery<Note>>
-where
-    T: Transport + MaybeSend + 'static,
-    T::Error: core::fmt::Display,
-{
-    notes::table.order(notes::id.asc())
+/// The notes rows, oldest first.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NotesRows;
+
+impl LiveSpec for NotesRows {
+    const NAME: &'static str = "notes_rows";
+    type Row = Note;
+    type Handle = LiveQuery<Note>;
+
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: core::fmt::Display,
+    {
+        notes::table.order(notes::id.asc())
+    }
 }
 
-/// The photos rows, oldest first, the pane's list subscription.
-#[must_use]
-pub fn photos_rows<T>() -> impl Watchable<T, Photo, Handle = LiveQuery<Photo>>
-where
-    T: Transport + MaybeSend + 'static,
-    T::Error: core::fmt::Display,
-{
-    photos::table.order(photos::id.asc())
+impl KeyedSpec for NotesRows {
+    type Key = i64;
+
+    fn key(row: &Note) -> i64 {
+        row.id
+    }
 }
 
-/// The catalogue, by name.
-#[must_use]
-pub fn products_by_name<T>() -> impl Watchable<T, Product, Handle = LiveQuery<Product>>
-where
-    T: Transport + MaybeSend + 'static,
-    T::Error: core::fmt::Display,
-{
-    products::table.order(products::name.asc())
+/// The photos rows, oldest first.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PhotosRows;
+
+impl LiveSpec for PhotosRows {
+    const NAME: &'static str = "photos_rows";
+    type Row = Photo;
+    type Handle = LiveQuery<Photo>;
+
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: core::fmt::Display,
+    {
+        photos::table.order(photos::id.asc())
+    }
 }
 
-/// The teams the signed-in account's roster names, from the synced
-/// membership rows, the team picker's subscription.
-#[must_use]
-pub fn teams_of_account<T>() -> impl Watchable<T, String, Handle = LiveQuery<String>>
-where
-    T: Transport + MaybeSend + 'static,
-    T::Error: core::fmt::Display,
-{
-    team_members::table
-        .filter(team_members::member_id.eq(current_app_user()))
-        .select(team_members::team_id)
+impl KeyedSpec for PhotosRows {
+    type Key = Uuid;
+
+    fn key(row: &Photo) -> Uuid {
+        row.id
+    }
+}
+
+/// The catalogue ordered by name.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProductsByName;
+
+impl LiveSpec for ProductsByName {
+    const NAME: &'static str = "products_by_name";
+    type Row = Product;
+    type Handle = LiveQuery<Product>;
+
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: core::fmt::Display,
+    {
+        products::table.order(products::name.asc())
+    }
+}
+
+impl KeyedSpec for ProductsByName {
+    type Key = Uuid;
+
+    fn key(row: &Product) -> Uuid {
+        row.id
+    }
+}
+
+/// The teams in the signed-in account's roster.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TeamsOfAccount;
+
+impl LiveSpec for TeamsOfAccount {
+    const NAME: &'static str = "teams_of_account";
+    type Row = String;
+    type Handle = LiveQuery<String>;
+
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: core::fmt::Display,
+    {
+        team_members::table
+            .filter(team_members::member_id.eq(current_app_user()))
+            .select(team_members::team_id)
+    }
 }
 
 /// The picked team's members, the subscription that syncs the roster rows a
 /// peer's note settles against, since the note policy reads the author's
 /// membership on the replica that applies it.
-#[must_use]
-pub fn team_members_of<T>(team: String) -> impl Watchable<T, String, Handle = LiveQuery<String>>
-where
-    T: Transport + MaybeSend + 'static,
-    T::Error: core::fmt::Display,
-{
-    team_members::table
-        .filter(team_members::team_id.eq(team))
-        .select(team_members::member_id)
-        .order(team_members::member_id.asc())
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TeamMembersOf {
+    /// The team whose roster is watched.
+    pub team: String,
+}
+
+impl LiveSpec for TeamMembersOf {
+    const NAME: &'static str = "team_members_of";
+    type Row = String;
+    type Handle = LiveQuery<String>;
+
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: core::fmt::Display,
+    {
+        team_members::table
+            .filter(team_members::team_id.eq(self.team.clone()))
+            .select(team_members::member_id)
+            .order(team_members::member_id.asc())
+    }
 }
 
 /// One team's notes, the pane's list subscription.
-#[must_use]
-pub fn team_notes_for<T>(team: String) -> impl Watchable<T, TeamNote, Handle = LiveQuery<TeamNote>>
-where
-    T: Transport + MaybeSend + 'static,
-    T::Error: core::fmt::Display,
-{
-    team_notes::table
-        .filter(team_notes::team_id.eq(team))
-        .order(team_notes::id.asc())
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TeamNotesFor {
+    /// The team whose notes are watched.
+    pub team: String,
+}
+
+impl LiveSpec for TeamNotesFor {
+    const NAME: &'static str = "team_notes_for";
+    type Row = TeamNote;
+    type Handle = LiveQuery<TeamNote>;
+
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: core::fmt::Display,
+    {
+        team_notes::table
+            .filter(team_notes::team_id.eq(self.team.clone()))
+            .order(team_notes::id.asc())
+    }
+}
+
+impl KeyedSpec for TeamNotesFor {
+    type Key = Uuid;
+
+    fn key(row: &TeamNote) -> Uuid {
+        row.id
+    }
 }
 
 /// Insert one team note the pane's add button names, the replica minting its
@@ -1077,5 +1194,40 @@ mod photo_tests {
             assert_eq!(row.thumb_state, None);
             assert_eq!(row.content_state, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod live_spec_tests {
+    use super::*;
+
+    /// A row read natively crosses to the page as MessagePack, the codec a
+    /// descriptor's snapshot travels in, and decodes to the same row.
+    #[test]
+    fn rows_cross_messagepack_unchanged() {
+        let order = Order {
+            id: Uuid::new_v4(),
+            owner_id: "alice".to_owned(),
+            quantity: 7,
+            created_at: chrono::NaiveDate::from_ymd_opt(2026, 11, 17)
+                .and_then(|day| day.and_hms_micro_opt(12, 34, 56, 789))
+                .expect("a valid instant"),
+        };
+        let photo = Photo {
+            id: Uuid::new_v4(),
+            order_id: order.id,
+            owner_id: "alice".to_owned(),
+            content_id: vec![0, 1, 254, 255],
+            content_state: None,
+            thumb_id: Some(vec![9; 32]),
+            thumb_state: Some("uploaded".to_owned()),
+            team_id: None,
+        };
+        let encoded = rmp_serde::to_vec_named(&vec![order.clone()]).expect("encode orders");
+        let decoded: Vec<Order> = rmp_serde::from_slice(&encoded).expect("decode orders");
+        assert_eq!(decoded, vec![order]);
+        let encoded = rmp_serde::to_vec_named(&vec![photo.clone()]).expect("encode photos");
+        let decoded: Vec<Photo> = rmp_serde::from_slice(&encoded).expect("decode photos");
+        assert_eq!(decoded, vec![photo]);
     }
 }

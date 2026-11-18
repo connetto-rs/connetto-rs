@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 
 use base64::Engine;
+use connetto_client::LiveSpec;
 use connetto_client::{
     AccountChoice, Auth, ClientError, ClientEvent, ConnettoClient, Custody, LiveHandle, LiveQuery,
     NoGate, Watchable,
@@ -514,7 +515,7 @@ fn refresh_footprint(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: &Clie
 fn spawn_products(view: &RwSignal<View>, client: Client) {
     let view = *view;
     spawn_local(async move {
-        let Ok(mut handle) = support::products_by_name().live(&client).await else {
+        let Ok(mut handle) = support::ProductsByName.query().live(&client).await else {
             return;
         };
         let mut rows: Vec<support::Product> = handle.snapshot();
@@ -537,7 +538,7 @@ fn spawn_team(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: Client) {
     let holds = Rc::clone(holds);
     let view = *view;
     spawn_local(async move {
-        let mut roster = match support::teams_of_account().live(&client).await {
+        let mut roster = match support::TeamsOfAccount.query().live(&client).await {
             Ok(roster) => roster,
             Err(err) => {
                 view.update(|v| {
@@ -585,7 +586,11 @@ fn spawn_team(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: Client) {
                 members_rows.clear();
                 members = None;
                 if !team.is_empty() {
-                    match support::team_members_of(team.clone()).live(&client).await {
+                    match (support::TeamMembersOf { team: team.clone() })
+                        .query()
+                        .live(&client)
+                        .await
+                    {
                         Ok(handle) => {
                             members_rows = handle.snapshot();
                             members = Some(handle);
@@ -598,7 +603,11 @@ fn spawn_team(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: Client) {
                             });
                         }
                     }
-                    match support::team_notes_for(team.clone()).live(&client).await {
+                    match (support::TeamNotesFor { team: team.clone() })
+                        .query()
+                        .live(&client)
+                        .await
+                    {
                         Ok(handle) => {
                             notes_rows = handle.snapshot();
                             notes = Some(handle);
@@ -693,7 +702,7 @@ fn spawn_orders(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: Client) {
     let holds = Rc::clone(holds);
     let view = *view;
     spawn_local(async move {
-        let Ok(mut handle) = support::orders_newest_first().live(&client).await else {
+        let Ok(mut handle) = support::OrdersNewestFirst.query().live(&client).await else {
             return;
         };
         let mut rows: Vec<support::Order> = handle.snapshot();
@@ -723,7 +732,7 @@ fn spawn_orders(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: Client) {
 fn spawn_count(view: &RwSignal<View>, client: Client) {
     let view = *view;
     spawn_local(async move {
-        let Ok(mut handle) = support::orders_count().live(&client).await else {
+        let Ok(mut handle) = support::OrdersCount.query().live(&client).await else {
             return;
         };
         let mut value: Option<i64> = handle.snapshot();
@@ -741,7 +750,7 @@ fn spawn_count(view: &RwSignal<View>, client: Client) {
 fn spawn_grouped(view: &RwSignal<View>, client: Client) {
     let view = *view;
     spawn_local(async move {
-        let Ok(mut handle) = support::orders_counts_by_quantity().live(&client).await else {
+        let Ok(mut handle) = support::OrdersCountsByQuantity.query().live(&client).await else {
             return;
         };
         let mut counts: HashMap<i64, i64> = handle.snapshot();
@@ -760,7 +769,7 @@ fn spawn_notes(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: Client) {
     let holds = Rc::clone(holds);
     let view = *view;
     spawn_local(async move {
-        let Ok(mut handle) = support::notes_rows().live(&client).await else {
+        let Ok(mut handle) = support::NotesRows.query().live(&client).await else {
             return;
         };
         let mut rows: Vec<support::Note> = handle.snapshot();
@@ -795,7 +804,7 @@ fn spawn_photos(
     let holds = Rc::clone(holds);
     let view = *view;
     spawn_local(async move {
-        let Ok(mut handle) = support::photos_rows().live(&client).await else {
+        let Ok(mut handle) = support::PhotosRows.query().live(&client).await else {
             return;
         };
         let mut rows: Vec<support::Photo> = handle.snapshot();
