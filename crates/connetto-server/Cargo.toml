@@ -111,6 +111,10 @@ serde.workspace = true
 # crypto. It pulls oauth2 5 and drives every request through reqwest (native,
 # rustls), the blocking client stripped. Backend only, no wasm (BFF).
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
+# The plain OAuth 2.0 provider (GitHub and the like, no ID token) drives the
+# code flow through the same oauth2 5 openidconnect pulls, sharing its
+# reqwest client implementation.
+oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "rustls-tls"] }
 # Verifying the client PKCE S256 challenge at the native loopback token
 # exchange: base64url-nopad(sha256(verifier)) compared to the stored challenge.
 base64 = "0.22"

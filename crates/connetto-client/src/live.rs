@@ -2943,7 +2943,7 @@ where
     /// [`ClientError::Transport`] when the ping cannot be sent.
     pub async fn ping(&self, nonce: u64) -> Result<(), ClientError> {
         let mut state = self.shared.lock_interrupting().await;
-        drain_dropped(&mut state, &self.shared.reaper).await?;
+        drain_dropped(&mut state, &self.shared.reaper, &self.shared.events).await?;
         state.conn.ping(nonce).await
     }
 
@@ -3099,8 +3099,14 @@ where
 /// Drain the reaper queue: remove each dropped handle's driver-side entry,
 /// then cancel the wire subscriptions that backed it. A local tier handle has
 /// none, so its retirement is purely local. Entries are removed before any
-/// send, so a transport failure can never resurrect a dropped handle.
-async fn drain_dropped<T>(state: &mut State<T>, reaper: &Reaper) -> Result<(), ClientError>
+/// send, so a transport failure can never resurrect a dropped handle. Each
+/// watch whose last handle went raises [`ClientEvent::WatchReleased`] once its
+/// grace has started.
+async fn drain_dropped<T>(
+    state: &mut State<T>,
+    reaper: &Reaper,
+    events: &broadcast::Sender<ClientEvent>,
+) -> Result<(), ClientError>
 where
     T: Transport,
     T::Error: core::fmt::Display,
@@ -3133,8 +3139,9 @@ where
     // subscription. Navigating away and back inside the grace re-claims the
     // record and pays no fresh snapshot, which is the whole point of the
     // grace. A pin ignores this: it has no handle to drop.
-    for wire_id in released {
-        state.conn.release_subscription(&wire_id)?;
+    for sub_id in released {
+        state.conn.release_subscription(&sub_id)?;
+        let _ = events.send(ClientEvent::WatchReleased { sub_id });
     }
     // Anything whose grace has since run out ends here, which is the only
     // place a watch is ever unsubscribed. Nothing runs on a timer: the pass
@@ -3940,7 +3947,7 @@ where
     // transport for recovery, because the server-side subscription dies with
     // the session either way, and the entry is already out of the registry, so
     // nothing re-declares it.
-    if let Err(err) = drain_dropped(&mut *state, &shared.reaper).await {
+    if let Err(err) = drain_dropped(&mut *state, &shared.reaper, &shared.events).await {
         if is_disconnect(&err) {
             return Drained::Recover;
         }

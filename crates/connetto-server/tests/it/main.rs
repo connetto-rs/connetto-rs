@@ -106,6 +106,8 @@ mod preflight_oplog_payload;
 
 mod provider;
 
+mod provider_oauth;
+
 mod one_event;
 
 mod read_ceiling;

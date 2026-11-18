@@ -8,6 +8,7 @@
 //! the binary translates its environment, so the proof goes through the one
 //! construction path.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use connetto_core::PROTOCOL_VERSION;
@@ -25,9 +26,9 @@ use connetto_server::builder::{
 use connetto_server::device_cert::DeviceCertConfig;
 use connetto_server::portability::DataRequester;
 use connetto_server::{
-    AbuseLimits, AuthConfig, ConnectionLimits, OidcProviderConfig, OplogConfig, PersonLimits,
-    PreflightError, ReaderReserve, ReconnectPolicy, RuntimeWritableCatalog, SessionConfig,
-    ThrottleConfig, TierLimits, WebSocketTransport,
+    AbuseLimits, AuthConfig, ConnectionLimits, OAuthEndpoints, OAuthProvider, OAuthProviderConfig,
+    OidcProviderConfig, OplogConfig, PersonLimits, PreflightError, ReaderReserve, ReconnectPolicy,
+    RuntimeWritableCatalog, SessionConfig, ThrottleConfig, TierLimits, WebSocketTransport,
 };
 use connetto_test_harness::{
     Fixture, MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET, MOCK_OAUTH_PROVIDER, MockOauth,
@@ -1959,17 +1960,16 @@ async fn a_replica_refusal_comes_before_the_authorization_store() {
     );
 }
 
-/// No identity provider is configured, so no client can log in, and the build
-/// says so before it touches a pool.
-#[tokio::test]
-async fn no_providers_refuses_the_build_before_anything_runs() {
+/// A builder over a database and an authorization endpoint nothing listens
+/// on, for a refusal the build makes before it reaches either.
+fn unreachable_builder() -> ServerBuilder {
     let keys = TempDir::new().expect("a key dir");
     let (private, public) = signing_keys(&keys);
     let token = TokenKeys::from_pem(
         std::fs::read(&private).expect("read the private half"),
         std::fs::read(&public).expect("read the public half"),
     );
-    let builder = ServerBuilder::new(
+    ServerBuilder::new(
         Database::new(
             "postgres://connetto:connetto@127.0.0.1:1/connetto",
             "postgres://connetto:connetto@127.0.0.1:1/connetto",
@@ -1982,11 +1982,139 @@ async fn no_providers_refuses_the_build_before_anything_runs() {
         ),
         token,
         OpenFga::new("http://127.0.0.1:1", "store"),
+    )
+}
+
+/// No identity provider is configured, so no client can log in, and the build
+/// says so before it touches a pool.
+#[tokio::test]
+async fn no_providers_refuses_the_build_before_anything_runs() {
+    let err = refused(
+        unreachable_builder().build().await,
+        "no provider is a refusal",
     );
-    let err = refused(builder.build().await, "no provider is a refusal");
     assert!(
         matches!(err, BuildError::NoProviders),
         "the refusal names the absence: {err}"
+    );
+}
+
+/// A provider the deployment built itself shares the one namespace with the
+/// discovered ones, so a name both carry refuses the build, naming it, before
+/// anything runs.
+#[tokio::test]
+async fn a_provider_name_given_twice_refuses_the_build() {
+    let github = OAuthProvider::new(OAuthProviderConfig::github(
+        "dev",
+        "github-client",
+        "https://app.example/auth/callback",
+    ))
+    .expect("build the GitHub provider");
+    let builder = unreachable_builder()
+        .oidc_providers(vec![OidcProvider::Generic(OidcProviderConfig::new(
+            "dev",
+            "oidc-client",
+            "https://idp.example",
+            "https://app.example/auth/callback",
+        ))])
+        .identity_provider(Arc::new(github));
+    let err = refused(builder.build().await, "a shared name is a refusal");
+    assert!(
+        matches!(&err, BuildError::DuplicateProvider { name } if name == "dev"),
+        "the refusal names the shared name: {err}"
+    );
+}
+
+/// A provider the deployment built that names an issuer another provider
+/// verifies would key its users onto that provider's, so the build refuses
+/// it, for an OIDC issuer exact or any Microsoft tenant's, and for two
+/// GitHub apps that share GitHub's label.
+#[tokio::test]
+async fn a_built_provider_naming_a_claimed_issuer_refuses_the_build() {
+    let impostor = |issuer: &str| {
+        OAuthProvider::new(OAuthProviderConfig::new(
+            "impostor",
+            "client",
+            issuer,
+            "https://app.example/auth/callback",
+            OAuthEndpoints {
+                authorize_url: "https://idp.example/authorize".to_owned(),
+                token_url: "https://idp.example/token".to_owned(),
+                user_url: "https://idp.example/user".to_owned(),
+            },
+            "/id",
+        ))
+        .expect("build the provider")
+    };
+    let oidc = |preset: fn(OidcProviderConfig) -> OidcProvider| {
+        preset(OidcProviderConfig::new(
+            "oidc",
+            "oidc-client",
+            "https://idp.example",
+            "https://app.example/auth/callback",
+        ))
+    };
+    for (discovered, issuer) in [
+        (oidc(OidcProvider::Google), "https://accounts.google.com"),
+        (
+            oidc(OidcProvider::Microsoft),
+            "https://login.microsoftonline.com/some-tenant/v2.0",
+        ),
+        (oidc(OidcProvider::Generic), "https://idp.example"),
+    ] {
+        let builder = unreachable_builder()
+            .oidc_providers(vec![discovered])
+            .identity_provider(Arc::new(impostor(issuer)));
+        let err = refused(builder.build().await, "a claimed issuer is a refusal");
+        assert!(
+            matches!(&err, BuildError::ClaimedIssuer { name, issuer: named } if name == "impostor" && named == issuer),
+            "the refusal names the provider and the issuer: {err}"
+        );
+    }
+
+    let github = |name: &str| {
+        OAuthProvider::new(OAuthProviderConfig::github(
+            name,
+            "github-client",
+            "https://app.example/auth/callback",
+        ))
+        .expect("build the GitHub provider")
+    };
+    let builder = unreachable_builder()
+        .identity_provider(Arc::new(github("web")))
+        .identity_provider(Arc::new(github("native")));
+    let err = refused(builder.build().await, "a shared label is a refusal");
+    assert!(
+        matches!(&err, BuildError::ClaimedIssuer { name, issuer } if name == "native" && issuer == "https://github.com"),
+        "the refusal names the later provider and the label: {err}"
+    );
+}
+
+/// An OIDC provider whose issuer answers no discovery document refuses the
+/// build rather than assemble a deployment nobody can log in through.
+#[tokio::test]
+async fn an_undiscoverable_oidc_provider_refuses_the_build() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+
+    let (builder, _idp, _keys) = builder_over(&fixture, 1).await;
+    let builder = builder.oidc_providers(vec![OidcProvider::Generic(OidcProviderConfig::new(
+        "unreachable",
+        "client",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1/auth/callback",
+    ))]);
+    let err = refused(
+        builder.build().await,
+        "an undiscoverable provider is a refusal",
+    );
+    assert!(
+        matches!(&err, BuildError::Providers(_)),
+        "the refusal is the provider set's: {err}"
     );
 }
 

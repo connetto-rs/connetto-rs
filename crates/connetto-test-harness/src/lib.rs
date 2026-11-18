@@ -19,10 +19,10 @@ use connetto_server::CallerMappings;
 use connetto_server::openfga::{Counted, FgaAuth, StoreUpkeep};
 use connetto_server::{
     AuthConfig, AuthHooks, AuthService, DbAuthStore, DefaultAuthHooks, InMemoryOplog,
-    LoopbackTransport, ManagerBuilder, Materializer, NoSigner, OidcProviderConfig, PgReadConnector,
-    PgSnapshotSource, ReconnectEvent, ReconnectPolicy, RefreshLifetimes, RequestGuard, RlsAuth,
-    RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager, TokenAuthority, loopback,
-    pg_write_target,
+    LoopbackTransport, ManagerBuilder, Materializer, NoSigner, OAuthEndpoints, OAuthProviderConfig,
+    OidcProviderConfig, PgReadConnector, PgSnapshotSource, ReconnectEvent, ReconnectPolicy,
+    RefreshLifetimes, RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, TokenAuthority, loopback, pg_write_target,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -642,6 +642,45 @@ impl MockOauth {
             redirect_url,
         )
         .with_client_secret(Some(MOCK_OAUTH_CLIENT_SECRET.to_owned()))
+    }
+
+    /// The provider's user endpoint, which answers the claims of the access
+    /// token it is shown, the login form's own claims among them.
+    #[must_use]
+    pub fn user_url(&self) -> String {
+        format!("{}/userinfo", self.issuer)
+    }
+
+    /// Build connetto's plain OAuth 2.0 configuration for this provider, which
+    /// ignores the ID token the provider also returns and reads the user from
+    /// `user_url` at `subject_pointer`, labelled `issuer_label`. The provider
+    /// refuses an authorize request without the `openid` scope, so it is the
+    /// one scope requested.
+    #[must_use]
+    pub fn oauth_config(
+        &self,
+        name: &str,
+        issuer_label: &str,
+        redirect_url: &str,
+        user_url: String,
+        subject_pointer: &str,
+    ) -> OAuthProviderConfig {
+        OAuthProviderConfig::new(
+            name,
+            MOCK_OAUTH_CLIENT_ID,
+            issuer_label,
+            redirect_url,
+            OAuthEndpoints {
+                authorize_url: format!("{}/authorize", self.issuer),
+                token_url: format!("{}/token", self.issuer),
+                user_url,
+            },
+            subject_pointer,
+        )
+        .with_client_secret(Some(MOCK_OAUTH_CLIENT_SECRET.to_owned()))
+        .with_scopes(["openid"])
+        .with_email_pointer("/email")
+        .with_name_pointer("/name")
     }
 
     /// Environment variables consumed by `demo-server`.
