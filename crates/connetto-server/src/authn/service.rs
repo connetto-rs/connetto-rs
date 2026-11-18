@@ -409,9 +409,11 @@ impl<S: AuthStore> AuthService<S> {
     /// which would break the Backend-For-Frontend boundary. Concurrent callers
     /// on one node are serialized per session. There is no background refresh.
     ///
-    /// Returns `None` when the session retained no provider token. When no
-    /// registry is attached or the issuer routes to no provider, the stored
-    /// token is returned unrefreshed.
+    /// Returns `None` when the session retained no provider token. The refresh
+    /// goes through the provider the session signed in with, by name, because
+    /// two clients of one issuer each refuse the other's refresh token. When no
+    /// registry is attached or no provider carries that name any longer, the
+    /// stored token is returned unrefreshed.
     ///
     /// # Errors
     ///
@@ -434,7 +436,10 @@ impl<S: AuthStore> AuthService<S> {
         else {
             return Ok(Some(retained.access_token));
         };
-        let Some(provider) = registry.by_issuer(&retained.issuer) else {
+        let Some(record) = self.store.session_record(session_id).await? else {
+            return Ok(Some(retained.access_token));
+        };
+        let Some(provider) = registry.by_name(&record.provider) else {
             return Ok(Some(retained.access_token));
         };
         let refreshed = provider.refresh_provider_token(refresh_token).await?;

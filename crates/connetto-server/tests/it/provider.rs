@@ -13,8 +13,8 @@ use connetto_core::Subject;
 use connetto_core::messages::Grant;
 use connetto_server::{
     AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, IdentityProvider,
-    InMemoryAuthStore, OidcProviderConfig, ProviderError, ProviderRegistry, RequestGuard,
-    TokenAuthority, VerifiedLogin,
+    InMemoryAuthStore, LoginRedirect, OidcProviderConfig, ProviderError, ProviderRegistry,
+    RequestGuard, ResolvedIdentity, RetainedProviderToken, TokenAuthority, VerifiedLogin,
 };
 use connetto_test_harness::{MOCK_OAUTH_PROVIDER, MockOauth};
 use openidconnect::core::{
@@ -64,10 +64,10 @@ fn signing_key() -> CoreRsaPrivateSigningKey {
     CoreRsaPrivateSigningKey::from_pem(TEST_RSA_PEM, None).expect("load test key")
 }
 
-/// A sign-in through the provider configured as `test`.
+/// A sign-in through the mock identity provider.
 fn origin() -> connetto_server::SessionOrigin<()> {
     connetto_server::SessionOrigin {
-        provider: "test".to_owned(),
+        provider: MOCK_OAUTH_PROVIDER.to_owned(),
         description: (),
     }
 }
@@ -301,4 +301,111 @@ async fn accessor_returns_a_still_valid_token_unrefreshed() {
         Some("still-good"),
         "a valid token is returned without a refresh",
     );
+}
+
+/// The boxed future the object-safe provider methods answer.
+type Answer<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// A client of one shared issuer whose refresh answers an access token that
+/// names the client, so a test sees which client a refresh went through.
+struct SharedIssuerClient(&'static str);
+
+impl IdentityProvider for SharedIssuerClient {
+    fn name(&self) -> &str {
+        self.0
+    }
+
+    fn issuer(&self) -> &str {
+        TEST_ISSUER
+    }
+
+    fn begin_login(&self) -> Result<LoginRedirect, ProviderError> {
+        Err(ProviderError::Config("no login in this test".to_owned()))
+    }
+
+    fn complete_login<'a>(
+        &'a self,
+        _code: &'a str,
+        _pkce_verifier: &'a str,
+        _nonce: &'a str,
+    ) -> Answer<'a, Result<VerifiedLogin, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Config("no login in this test".to_owned())) })
+    }
+
+    fn refresh_provider_token<'a>(
+        &'a self,
+        _refresh_token: &'a str,
+    ) -> Answer<'a, Result<RetainedProviderToken, ProviderError>> {
+        Box::pin(async move {
+            Ok(RetainedProviderToken {
+                issuer: TEST_ISSUER.to_owned(),
+                access_token: format!("issued to {}", self.0),
+                refresh_token: None,
+                expires_in: Some(Duration::from_secs(3600)),
+            })
+        })
+    }
+}
+
+/// Two clients of one issuer, such as a web and a native Google client, each
+/// refresh the provider tokens of the sessions signed in through them, since
+/// the provider refuses a refresh token presented by another client.
+#[tokio::test]
+async fn a_refresh_goes_through_the_client_the_session_signed_in_with() {
+    let config = AuthConfig::default();
+    let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
+    let mut registry = ProviderRegistry::new();
+    for client in ["web", "native"] {
+        registry.register(Arc::new(SharedIssuerClient(client)));
+    }
+    let service = AuthService::new(
+        Arc::clone(&authority),
+        Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes())),
+        Arc::new(RequestGuard::default()),
+    )
+    .with_registry(Arc::new(registry));
+
+    for client in ["web", "native"] {
+        let login = VerifiedLogin {
+            identity: ResolvedIdentity {
+                issuer: TEST_ISSUER.to_owned(),
+                subject: "shared-user".to_owned(),
+                email: None,
+                name: None,
+                amr: Vec::new(),
+                acr: None,
+            },
+            retained: RetainedProviderToken {
+                issuer: TEST_ISSUER.to_owned(),
+                access_token: "expired".to_owned(),
+                refresh_token: Some("refresh".to_owned()),
+                expires_in: Some(Duration::ZERO),
+            },
+        };
+        let origin = connetto_server::SessionOrigin {
+            provider: client.to_owned(),
+            description: (),
+        };
+        let pair = service
+            .login_with_provider(&login, origin)
+            .await
+            .expect("login");
+        let Subject::Identity(verified) = authority
+            .check_grant::<String, String>(&Grant::new(&pair.access_token))
+            .expect("verify")
+            .subject
+        else {
+            panic!("expected identity subject");
+        };
+
+        let token = service
+            .provider_access_token(verified.session_id)
+            .await
+            .expect("accessor");
+        assert_eq!(
+            token,
+            Some(format!("issued to {client}")),
+            "a session signed in through {client} refreshes through {client}"
+        );
+    }
 }
