@@ -293,7 +293,7 @@
       <rect width="4" height="84" rx="1" fill="#4CAF50" />
       <text x="150" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">OAuth 2.0 / OIDC</text>
       <text x="150" y="40" text-anchor="middle" font-size="9" fill="#555">identity provider: login and token issuance</text>
-      <text x="150" y="56" text-anchor="middle" font-size="9" fill="#555">OIDC token verification on every session</text>
+      <text x="150" y="56" text-anchor="middle" font-size="9" fill="#555">OIDC ID tokens, plain OAuth 2.0 (GitHub), own providers</text>
       <text x="150" y="72" text-anchor="middle" font-size="9" fill="#555">each grant resolves into a Principal</text>
     </g>
 

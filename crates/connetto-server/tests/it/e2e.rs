@@ -1483,8 +1483,99 @@ async fn e2e_startup_refuses_a_reconnect_log_without_its_commit_table() {
     );
 }
 
+/// A provider kind the server does not know, or none at all, refuses boot
+/// naming the provider and listing the kinds it accepts.
 #[tokio::test]
 async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    for (kind, named) in [("frobnicate", "\"frobnicate\""), ("", "\"myprovider\"")] {
+        let output = run_server_exit_output(
+            &url,
+            Some(&reader_url),
+            &[
+                ("CONNETTO_AUTH", "database"),
+                ("CONNETTO_OIDC_PROVIDERS", "myprovider"),
+                ("CONNETTO_OIDC_MYPROVIDER_KIND", kind),
+                ("CONNETTO_OIDC_MYPROVIDER_CLIENT_ID", "unused"),
+                (
+                    "CONNETTO_OIDC_MYPROVIDER_REDIRECT_URL",
+                    "http://127.0.0.1/callback",
+                ),
+            ],
+        )
+        .await;
+        assert!(
+            !output.status.success(),
+            "expected nonzero exit for the provider kind {kind:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(named),
+            "expected {named} in stderr, got: {stderr}"
+        );
+        for kind in ["microsoft", "oauth", "github"] {
+            assert!(
+                stderr.contains(kind),
+                "expected {kind} in the recognised provider list in stderr, got: {stderr}"
+            );
+        }
+    }
+}
+
+/// A provider left without its client id or its redirect URL refuses boot
+/// naming the unset variable and the provider.
+#[tokio::test]
+async fn e2e_startup_refuses_a_provider_without_its_client_id_or_redirect_url() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let client_id = ("CONNETTO_OIDC_MYPROVIDER_CLIENT_ID", "unused");
+    let redirect_url = (
+        "CONNETTO_OIDC_MYPROVIDER_REDIRECT_URL",
+        "http://127.0.0.1/callback",
+    );
+    for (set, unset) in [(redirect_url, client_id.0), (client_id, redirect_url.0)] {
+        let output = run_server_exit_output(
+            &url,
+            Some(&reader_url),
+            &[
+                ("CONNETTO_AUTH", "database"),
+                ("CONNETTO_OIDC_PROVIDERS", "myprovider"),
+                ("CONNETTO_OIDC_MYPROVIDER_KIND", "generic"),
+                set,
+            ],
+        )
+        .await;
+        assert!(
+            !output.status.success(),
+            "expected nonzero exit without {unset}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(unset) && stderr.contains("\"myprovider\""),
+            "expected the refusal to name {unset} and the provider, got: {stderr}"
+        );
+    }
+}
+
+/// A plain OAuth provider cannot be discovered, so every endpoint is a
+/// setting, and one left unset refuses boot naming it.
+#[tokio::test]
+async fn e2e_startup_refuses_a_plain_oauth_provider_without_its_user_endpoint() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
     let fixture = Fixture::acquire().await;
@@ -1500,27 +1591,140 @@ async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
         &[
             ("CONNETTO_AUTH", "database"),
             ("CONNETTO_OIDC_PROVIDERS", "myprovider"),
-            ("CONNETTO_OIDC_MYPROVIDER_KIND", "frobnicate"),
+            ("CONNETTO_OIDC_MYPROVIDER_KIND", "oauth"),
             ("CONNETTO_OIDC_MYPROVIDER_CLIENT_ID", "unused"),
             (
                 "CONNETTO_OIDC_MYPROVIDER_REDIRECT_URL",
                 "http://127.0.0.1/callback",
             ),
+            ("CONNETTO_OIDC_MYPROVIDER_ISSUER", "https://idp.example"),
+            (
+                "CONNETTO_OIDC_MYPROVIDER_AUTHORIZE_URL",
+                "https://idp.example/authorize",
+            ),
+            (
+                "CONNETTO_OIDC_MYPROVIDER_TOKEN_URL",
+                "https://idp.example/token",
+            ),
+            ("CONNETTO_OIDC_MYPROVIDER_SUBJECT_POINTER", "/id"),
         ],
     )
     .await;
     assert!(
         !output.status.success(),
-        "expected nonzero exit for unrecognised provider"
+        "expected nonzero exit for a provider without its user endpoint"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("\"frobnicate\""),
-        "expected Debug-quoted provider name in stderr, got: {stderr}"
+        stderr.contains("CONNETTO_OIDC_MYPROVIDER_USER_URL"),
+        "expected the refusal to name the missing setting, got: {stderr}"
     );
+}
+
+/// A plain OAuth provider configured in full is built at boot, so a subject
+/// pointer that is no JSON pointer refuses boot naming it.
+#[tokio::test]
+async fn e2e_startup_refuses_a_plain_oauth_provider_with_a_bare_subject_key() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let output = run_server_exit_output(
+        &url,
+        Some(&reader_url),
+        &[
+            ("CONNETTO_AUTH", "database"),
+            ("CONNETTO_OIDC_PROVIDERS", "myprovider"),
+            ("CONNETTO_OIDC_MYPROVIDER_KIND", "oauth"),
+            ("CONNETTO_OIDC_MYPROVIDER_CLIENT_ID", "unused"),
+            (
+                "CONNETTO_OIDC_MYPROVIDER_REDIRECT_URL",
+                "http://127.0.0.1/callback",
+            ),
+            ("CONNETTO_OIDC_MYPROVIDER_ISSUER", "https://idp.example"),
+            (
+                "CONNETTO_OIDC_MYPROVIDER_AUTHORIZE_URL",
+                "https://idp.example/authorize",
+            ),
+            (
+                "CONNETTO_OIDC_MYPROVIDER_TOKEN_URL",
+                "https://idp.example/token",
+            ),
+            (
+                "CONNETTO_OIDC_MYPROVIDER_USER_URL",
+                "https://idp.example/user",
+            ),
+            ("CONNETTO_OIDC_MYPROVIDER_SUBJECT_POINTER", "id"),
+            ("CONNETTO_OIDC_MYPROVIDER_EMAIL_POINTER", "/email"),
+            ("CONNETTO_OIDC_MYPROVIDER_NAME_POINTER", "/name"),
+        ],
+    )
+    .await;
     assert!(
-        stderr.contains("microsoft"),
-        "expected recognised provider list in stderr, got: {stderr}"
+        !output.status.success(),
+        "expected nonzero exit for a bare subject key"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("\"id\""),
+        "expected the refusal to name the pointer, got: {stderr}"
+    );
+}
+
+/// Two GitHub providers share GitHub's issuer label, scopes named or not, so
+/// the boot refuses the later one rather than let it take the earlier one's
+/// users.
+#[tokio::test]
+async fn e2e_startup_refuses_two_github_providers() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    // The auth stack's keys and authorization store carry the boot to the build.
+    let auth_stack = build_auth_stack().await;
+    let auth_env = auth_stack.env_pairs("http://127.0.0.1:0");
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
+    let mut extra: Vec<(&str, &str)> = auth_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    extra.extend(authorization.env_pairs());
+    extra.extend([
+        ("CONNETTO_OIDC_PROVIDERS", "web,native"),
+        ("CONNETTO_OIDC_WEB_KIND", "github"),
+        ("CONNETTO_OIDC_WEB_CLIENT_ID", "web-client"),
+        (
+            "CONNETTO_OIDC_WEB_REDIRECT_URL",
+            "http://127.0.0.1/callback",
+        ),
+        ("CONNETTO_OIDC_NATIVE_KIND", "github"),
+        ("CONNETTO_OIDC_NATIVE_CLIENT_ID", "native-client"),
+        (
+            "CONNETTO_OIDC_NATIVE_REDIRECT_URL",
+            "http://127.0.0.1/callback",
+        ),
+        ("CONNETTO_OIDC_NATIVE_SCOPES", "read:user,user:email"),
+    ]);
+    let output = run_server_exit_output(&url, Some(&reader_url), &extra).await;
+    assert!(
+        !output.status.success(),
+        "expected nonzero exit for two GitHub providers"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("\"native\"") && stderr.contains("https://github.com"),
+        "expected the refusal to name the later provider and GitHub's label, got: {stderr}"
     );
 }
 

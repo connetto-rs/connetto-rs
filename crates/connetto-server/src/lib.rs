@@ -104,11 +104,11 @@ pub use authn::{
     AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthService, AuthStoreError,
     ConnettoHandshakeAuthority, DefaultUuidResolver, GenericOidcProvider, IdentityProvider,
     IdentityResolver, IssuedAuthCode, IssuedSession, LivenessError, LoginRedirect, LoginRequest,
-    OidcProviderConfig, PendingLogin, PendingLogins, ProviderError, ProviderRegistry,
-    RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture, ResolvedIdentity,
-    RetainedProviderToken, SessionDescriber, SessionOrigin, SessionRecord, SessionRow, SignInHook,
-    SignInNotice, StoredProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedClaims,
-    VerifiedLogin, VerifiedSession,
+    OAuthEndpoints, OAuthProvider, OAuthProviderConfig, OidcProviderConfig, PendingLogin,
+    PendingLogins, ProviderError, ProviderRegistry, RefreshLifetimes, RefreshOutcome, ResolveError,
+    ResolveFuture, ResolvedIdentity, RetainedProviderToken, SessionDescriber, SessionOrigin,
+    SessionRecord, SessionRow, SignInHook, SignInNotice, StoredProviderToken, TokenAuthority,
+    TokenError, TokenPair, VerifiedClaims, VerifiedLogin, VerifiedSession,
 };
 pub use authn::{ConnettoStoreSchema, DbAuthStore};
 pub use bots::InstalledApp;

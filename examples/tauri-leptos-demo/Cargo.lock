@@ -5141,6 +5141,7 @@ checksum = "051ccd27e3f7d4f8cffc9e6ad073e08920c0b88a4f061bb0620899034a95453a"
 dependencies = [
  "diesel",
  "getrandom 0.4.3",
+ "serde",
  "uuid",
 ]
 

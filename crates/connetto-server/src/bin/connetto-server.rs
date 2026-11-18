@@ -58,9 +58,16 @@
 //!   keeps the key on disk.
 //! - `CONNETTO_OIDC_PROVIDERS`: a comma-separated list of provider names,
 //!   each configured under its own `CONNETTO_OIDC_<NAME>_KIND`
-//!   (`google`, `microsoft` or `generic`), `_CLIENT_ID`, `_CLIENT_SECRET`,
-//!   `_REDIRECT_URL`, optional `_ISSUER` and `_SCOPES`, the name upper-cased
-//!   with everything outside letters and digits turned into underscores.
+//!   (`google`, `microsoft`, `generic`, `oauth` or `github`),
+//!   `_CLIENT_ID`, `_CLIENT_SECRET`, `_REDIRECT_URL` and optional
+//!   `_SCOPES`, the name upper-cased with everything outside letters and
+//!   digits turned into underscores. The three OIDC kinds read an optional
+//!   `_ISSUER`. `oauth`, a plain OAuth 2.0 provider that issues no ID
+//!   token, requires `_ISSUER` as the label its users are keyed under,
+//!   `_AUTHORIZE_URL`, `_TOKEN_URL`, `_USER_URL` and `_SUBJECT_POINTER`,
+//!   the JSON pointer of the stable account id in the user endpoint's
+//!   answer, and reads an optional `_EMAIL_POINTER` and `_NAME_POINTER`.
+//!   `github` presets all of those for GitHub.
 //! - `CONNETTO_BANS`: set to `database` to ban identities that cross an
 //!   abuse threshold.
 //! - `CONNETTO_FGA_URL` (default `http://127.0.0.1:8081`): the
@@ -122,6 +129,7 @@
 //! build or HTTP errors as failures.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -135,7 +143,8 @@ use connetto_server::builder::{
 };
 use connetto_server::device_cert::{AndroidStatus, AppAttestEnvironment, DeviceCertConfig};
 use connetto_server::{
-    AuthConfig, CookieSameSite, OidcProviderConfig, ReaderReserve, RuntimeWritableCatalog,
+    AuthConfig, CookieSameSite, OAuthEndpoints, OAuthProvider, OAuthProviderConfig,
+    OidcProviderConfig, ReaderReserve, RuntimeWritableCatalog,
 };
 use tokio::net::TcpListener;
 
@@ -244,38 +253,114 @@ fn env_prefix(name: &str) -> String {
         .collect()
 }
 
-/// One provider's configuration from its own `CONNETTO_OIDC_<NAME>_*` settings.
-fn oidc_config_from_env(
-    config: &AuthConfig,
-    name: &str,
-    prefix: &str,
-) -> Result<OidcProviderConfig> {
-    let scopes = var_or(&format!("CONNETTO_OIDC_{prefix}_SCOPES"), "")
-        .split(',')
-        .map(str::trim)
-        .filter(|scope| !scope.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let client_id = std::env::var(format!("CONNETTO_OIDC_{prefix}_CLIENT_ID"))
-        .with_context(|| format!("set CONNETTO_OIDC_{prefix}_CLIENT_ID for provider {name:?}"))?;
-    let redirect =
-        std::env::var(format!("CONNETTO_OIDC_{prefix}_REDIRECT_URL")).with_context(|| {
-            format!("set CONNETTO_OIDC_{prefix}_REDIRECT_URL for provider {name:?}")
-        })?;
-    Ok(OidcProviderConfig::new(
-        name,
-        client_id,
-        var_or(&format!("CONNETTO_OIDC_{prefix}_ISSUER"), config.issuer()),
-        redirect,
-    )
-    .with_client_secret(std::env::var(format!("CONNETTO_OIDC_{prefix}_CLIENT_SECRET")).ok())
-    .with_scopes(scopes))
+/// The settings every provider kind reads under `CONNETTO_OIDC_<NAME>_*`.
+struct ProviderEnv<'a> {
+    name: &'a str,
+    prefix: String,
+    client_id: String,
+    client_secret: Option<String>,
+    redirect_url: String,
+    scopes: Vec<String>,
 }
 
+impl<'a> ProviderEnv<'a> {
+    fn read(name: &'a str, prefix: String) -> Result<Self> {
+        let scopes = comma_list(&var_or(&format!("CONNETTO_OIDC_{prefix}_SCOPES"), ""));
+        let client_id =
+            std::env::var(format!("CONNETTO_OIDC_{prefix}_CLIENT_ID")).with_context(|| {
+                format!("set CONNETTO_OIDC_{prefix}_CLIENT_ID for provider {name:?}")
+            })?;
+        let redirect_url = std::env::var(format!("CONNETTO_OIDC_{prefix}_REDIRECT_URL"))
+            .with_context(|| {
+                format!("set CONNETTO_OIDC_{prefix}_REDIRECT_URL for provider {name:?}")
+            })?;
+        Ok(Self {
+            name,
+            client_secret: std::env::var(format!("CONNETTO_OIDC_{prefix}_CLIENT_SECRET")).ok(),
+            prefix,
+            client_id,
+            redirect_url,
+            scopes,
+        })
+    }
+
+    /// The value of this provider's `CONNETTO_OIDC_<NAME>_<setting>`, required.
+    fn required(&self, setting: &str) -> Result<String> {
+        let (prefix, name) = (&self.prefix, self.name);
+        var_nonempty(&format!("CONNETTO_OIDC_{prefix}_{setting}"))
+            .ok_or_else(|| anyhow!("set CONNETTO_OIDC_{prefix}_{setting} for provider {name:?}"))
+    }
+
+    /// The value of this provider's `CONNETTO_OIDC_<NAME>_<setting>`, when set.
+    fn optional(&self, setting: &str) -> Option<String> {
+        var_nonempty(&format!("CONNETTO_OIDC_{}_{setting}", self.prefix))
+    }
+
+    /// An OIDC provider's configuration, its issuer defaulting to the auth
+    /// config's.
+    fn oidc(self, config: &AuthConfig) -> OidcProviderConfig {
+        let issuer = var_or(
+            &format!("CONNETTO_OIDC_{}_ISSUER", self.prefix),
+            config.issuer(),
+        );
+        OidcProviderConfig::new(self.name, self.client_id, issuer, self.redirect_url)
+            .with_client_secret(self.client_secret)
+            .with_scopes(self.scopes)
+    }
+
+    /// A plain OAuth 2.0 provider's configuration, every endpoint, the issuer
+    /// label and the subject's pointer required.
+    fn oauth(self) -> Result<OAuthProviderConfig> {
+        let endpoints = OAuthEndpoints {
+            authorize_url: self.required("AUTHORIZE_URL")?,
+            token_url: self.required("TOKEN_URL")?,
+            user_url: self.required("USER_URL")?,
+        };
+        let issuer = self.required("ISSUER")?;
+        let subject_pointer = self.required("SUBJECT_POINTER")?;
+        let email_pointer = self.optional("EMAIL_POINTER");
+        let name_pointer = self.optional("NAME_POINTER");
+        let mut config = OAuthProviderConfig::new(
+            self.name,
+            self.client_id,
+            issuer,
+            self.redirect_url,
+            endpoints,
+            subject_pointer,
+        )
+        .with_client_secret(self.client_secret)
+        .with_scopes(self.scopes);
+        if let Some(pointer) = email_pointer {
+            config = config.with_email_pointer(pointer);
+        }
+        if let Some(pointer) = name_pointer {
+            config = config.with_name_pointer(pointer);
+        }
+        Ok(config)
+    }
+
+    /// The GitHub preset, its scopes replaced only when the setting names
+    /// some.
+    fn github(self) -> OAuthProviderConfig {
+        let config = OAuthProviderConfig::github(self.name, self.client_id, self.redirect_url)
+            .with_client_secret(self.client_secret);
+        if self.scopes.is_empty() {
+            config
+        } else {
+            config.with_scopes(self.scopes)
+        }
+    }
+}
+
+/// The kinds `CONNETTO_OIDC_<NAME>_KIND` accepts, for the refusals that list
+/// them.
+const PROVIDER_KINDS: &str = "google, microsoft, generic, oauth or github";
+
 /// The identity providers `CONNETTO_OIDC_PROVIDERS` names, each from its own
-/// `CONNETTO_OIDC_<NAME>_*` settings. Discovery happens in the build, so this
-/// reads settings only.
-fn oidc_providers() -> Result<Vec<OidcProvider>> {
+/// `CONNETTO_OIDC_<NAME>_*` settings, the OIDC ones as configurations the
+/// build discovers and the plain OAuth ones built here, since they publish
+/// nothing to discover.
+fn identity_providers() -> Result<(Vec<OidcProvider>, Vec<OAuthProvider>)> {
     let names = comma_list(&var_or("CONNETTO_OIDC_PROVIDERS", ""));
     if names.is_empty() {
         return Err(anyhow!(
@@ -284,7 +369,8 @@ fn oidc_providers() -> Result<Vec<OidcProvider>> {
         ));
     }
     let mut prefixes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut providers = Vec::with_capacity(names.len());
+    let mut discovered = Vec::new();
+    let mut built = Vec::new();
     let config = AuthConfig::default();
     for name in &names {
         let prefix = env_prefix(name);
@@ -294,27 +380,27 @@ fn oidc_providers() -> Result<Vec<OidcProvider>> {
             ));
         }
         let kind = var_or(&format!("CONNETTO_OIDC_{prefix}_KIND"), "");
-        let provider_config = oidc_config_from_env(&config, name, &prefix)?;
-        let provider = match kind.as_str() {
-            "google" => OidcProvider::Google(provider_config),
-            "microsoft" => OidcProvider::Microsoft(provider_config),
-            "generic" => OidcProvider::Generic(provider_config),
+        let settings = ProviderEnv::read(name, prefix.clone())?;
+        match kind.as_str() {
+            "google" => discovered.push(OidcProvider::Google(settings.oidc(&config))),
+            "microsoft" => discovered.push(OidcProvider::Microsoft(settings.oidc(&config))),
+            "generic" => discovered.push(OidcProvider::Generic(settings.oidc(&config))),
+            "oauth" => built.push(OAuthProvider::new(settings.oauth()?)?),
+            "github" => built.push(OAuthProvider::new(settings.github())?),
             "" => {
                 return Err(anyhow!(
-                    "set CONNETTO_OIDC_{prefix}_KIND for provider {name:?} to google, microsoft \
-                     or generic"
+                    "set CONNETTO_OIDC_{prefix}_KIND for provider {name:?} to {PROVIDER_KINDS}"
                 ));
             }
             other => {
                 return Err(anyhow!(
                     "unknown CONNETTO_OIDC_{prefix}_KIND {other:?} for provider {name:?}, \
-                     expected google, microsoft or generic"
+                     expected {PROVIDER_KINDS}"
                 ));
             }
-        };
-        providers.push(provider);
+        }
     }
-    Ok(providers)
+    Ok((discovered, built))
 }
 
 /// The persisted JWT keypair, both halves required.
@@ -575,7 +661,7 @@ async fn builder_from_env() -> Result<ServerBuilder> {
         std::env::var("CONNETTO_READER_ROLE")
             .context("set CONNETTO_READER_ROLE to the role the roles document creates")?,
     );
-    let providers = oidc_providers()?;
+    let (discovered, built) = identity_providers()?;
     let keys = jwt_keys()?;
     let content = content_settings().await?;
     let device_identity = device_certs()?;
@@ -587,7 +673,7 @@ async fn builder_from_env() -> Result<ServerBuilder> {
             anyhow!("set CONNETTO_FGA_STORE to the authorization store this deployment owns")
         })?,
     );
-    Ok(ServerBuilder::new(database, schema, keys, openfga)
+    let builder = ServerBuilder::new(database, schema, keys, openfga)
         .slot(var_or("CONNETTO_SLOT", "connetto_slot"))
         .publication(var_or("CONNETTO_PUBLICATION", "connetto_pub"))
         .oplog_table(var_or("CONNETTO_OPLOG_TABLE", "connetto_oplog"))
@@ -597,7 +683,7 @@ async fn builder_from_env() -> Result<ServerBuilder> {
             60,
         )?)))
         .reader_reserve(reader_reserve()?)
-        .oidc_providers(providers)
+        .oidc_providers(discovered)
         .bans(bans)
         .redirect_allowlist(comma_list(&var_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")))
         .cors_origins(comma_list(&var_or("CONNETTO_AUTH_CORS_ORIGINS", "")))
@@ -606,7 +692,10 @@ async fn builder_from_env() -> Result<ServerBuilder> {
         .content(content)
         .device_identity(device_identity)
         .sunset(sunset)
-        .courier(courier))
+        .courier(courier);
+    Ok(built.into_iter().fold(builder, |builder, provider| {
+        builder.identity_provider(Arc::new(provider))
+    }))
 }
 
 /// Resolve on the first SIGINT or SIGTERM. On a platform without SIGTERM only

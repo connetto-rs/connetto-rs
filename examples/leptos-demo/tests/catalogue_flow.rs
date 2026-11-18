@@ -30,8 +30,8 @@ use std::rc::Rc;
 
 use common::{connect_tab, glue_url, spawn_worker, stage, walk_login_as};
 use connetto_client::dsl::Watchable;
-use connetto_client::{ClientEvent, ConnettoClient, LiveQuery, StorageUse};
-use connetto_demo_support::{PRODUCT_QUERY, Product, products_by_name};
+use connetto_client::{ClientEvent, ConnettoClient, LiveQuery, LiveSpec, StorageUse};
+use connetto_demo_support::{PRODUCT_QUERY, Product, ProductsByName};
 use connetto_web::auth::{LOGIN_CHANNEL, LoginMessage, deliver_login_code};
 use connetto_web::{locks, workers};
 use futures_channel::oneshot;
@@ -102,7 +102,11 @@ async fn read_the_catalogue(client_id: &str) -> (Vec<Product>, StorageUse) {
         let _ = done_tx.send(());
     });
 
-    let mut live: LiveQuery<Product> = products_by_name().live(&client).await.expect("live query");
+    let mut live: LiveQuery<Product> = ProductsByName
+        .query()
+        .live(&client)
+        .await
+        .expect("live query");
     let rows = loop {
         if live.rows().len() == PRODUCT_ROWS {
             break live.rows().to_vec();

@@ -95,6 +95,7 @@ mod hotspot;
 #[cfg(feature = "native-auth")]
 mod keyring;
 pub mod live;
+mod live_spec;
 mod majors;
 #[cfg(feature = "peer")]
 pub mod media;
@@ -173,6 +174,7 @@ pub use live::{
     ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveValue,
     subscription_is_aggregate, subscription_tables,
 };
+pub use live_spec::{KeyedSpec, LiveSpec};
 pub use majors::HeldContent;
 pub use memory_stores::{MemoryKeyStore, MemoryRefreshStore};
 pub use pending::PendingWork;
@@ -1465,6 +1467,16 @@ pub enum ClientEvent {
         /// Why the rows had to be replaced, carried so a relay tells its own
         /// consumers the truth rather than restating one cause as another.
         reason: FullResyncReason,
+    },
+    /// The last live handle on a watch dropped, so its grace started (R116).
+    /// A watch is the subscription every handle on the same query shares, and
+    /// it is raised once per release, again after a re-watch inside the grace
+    /// is dropped. A handle served from the local tier alone holds no watch
+    /// and raises nothing.
+    WatchReleased {
+        /// The watch's subscription id, the one its snapshot and patch events
+        /// name.
+        sub_id: String,
     },
     /// The server opened a membership subscription on this client's behalf
     /// (R27): a filter narrowing through a membership table needs that

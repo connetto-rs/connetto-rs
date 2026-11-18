@@ -15,6 +15,7 @@
 pub mod http;
 pub mod identity;
 pub mod provider;
+pub mod provider_oauth;
 pub mod provider_oidc;
 pub mod schema;
 pub mod service;
@@ -30,6 +31,7 @@ pub use provider::{
     PendingLogins, ProviderError, ProviderRegistry, RetainedProviderToken, StoredProviderToken,
     VerifiedLogin,
 };
+pub use provider_oauth::{OAuthEndpoints, OAuthProvider, OAuthProviderConfig};
 pub use provider_oidc::{GenericOidcProvider, OidcProviderConfig};
 pub use service::{AuthError, AuthService, ConnettoHandshakeAuthority, LivenessError, TokenPair};
 pub use sign_in::{LoginRequest, SessionDescriber, SignInHook, SignInNotice};
