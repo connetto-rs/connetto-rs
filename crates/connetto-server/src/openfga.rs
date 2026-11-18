@@ -1906,8 +1906,9 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
         use subql::backend::CdcEvent as _;
 
         let catalog = self.shapes.catalog();
-        let arrived_on = subql::catalog_helpers::table_name(catalog, event.table_id(catalog))
-            .unwrap_or_default();
+        let arrived_on =
+            subql::catalog_helpers::table_name::<Postgres, _>(catalog, event.table_id(catalog))
+                .unwrap_or_default();
         let records = || diff.added.iter().chain(diff.removed.iter());
         let mut granted: BTreeMap<String, String> = replayed.clone();
         note_named_keys(&self.naming, records(), &mut granted);

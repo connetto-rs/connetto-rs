@@ -923,14 +923,15 @@ fn term_moves<DB: DatabaseLike>(
         .iter()
         .map(|narrowing| TermMove {
             sub_id: narrowing.subscription,
-            table: catalog_helpers::table_name(db, narrowing.table).unwrap_or_default(),
+            table: catalog_helpers::table_name::<Postgres, _>(db, narrowing.table)
+                .unwrap_or_default(),
             pairs: narrowing
                 .columns
                 .iter()
                 .zip(&narrowing.values)
                 .map(|(column, value)| {
                     (
-                        catalog_helpers::column_name(db, narrowing.table, *column)
+                        catalog_helpers::column_name::<Postgres, _>(db, narrowing.table, *column)
                             .unwrap_or_default(),
                         value.clone(),
                     )
@@ -2112,12 +2113,15 @@ where
         let adapter = SqliteAdapter::new(&self.catalog)
             .map_err(|e| MaterializerError::Catalog(e.to_string()))?;
         // No drift guard refuses tables on this path, so the view refuses none.
-        Ok(subql::patchset::apply_diffset_bytes_with_catalog(
-            &self.catalog,
-            &bytes,
-            &NoRefusals,
-            conn,
-            &adapter,
+        Ok(subql::patchset::apply_diffset_bytes_with_catalog::<
+            subql::backend::SQLite,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >(
+            &self.catalog, &bytes, &NoRefusals, conn, &adapter
         )?)
     }
 
@@ -2156,14 +2160,16 @@ where
         let bytes = decompress(payload_zstd)?;
         let adapter =
             PgAdapter::new(&self.catalog).map_err(|e| MaterializerError::Catalog(e.to_string()))?;
-        Ok(subql::patchset::apply_diffset_bytes_async_with_catalog(
-            &self.catalog,
-            &bytes,
-            &NoRefusals,
-            conn,
-            &adapter,
+        Ok(
+            subql::patchset::apply_diffset_bytes_async_with_catalog::<Postgres, _, _, _, _, _>(
+                &self.catalog,
+                &bytes,
+                &NoRefusals,
+                conn,
+                &adapter,
+            )
+            .await?,
         )
-        .await?)
     }
 
     /// What each membership term this subscription names needs seeded, as
@@ -2754,7 +2760,7 @@ fn column_name_at<DB: DatabaseLike>(
 ) -> Result<String, MaterializerError> {
     let column_id =
         u16::try_from(index).map_err(|_| MaterializerError::SchemaMismatch(index.to_string()))?;
-    catalog_helpers::column_name(db, table_id, column_id)
+    catalog_helpers::column_name::<Postgres, _>(db, table_id, column_id)
         .ok_or_else(|| MaterializerError::SchemaMismatch(format!("column {index}")))
 }
 

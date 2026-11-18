@@ -345,7 +345,9 @@ mod pg {
                 catalog_helpers::primary_key_columns(&self.catalog, table_id).unwrap_or_default();
             let names: Vec<String> = key
                 .iter()
-                .filter_map(|column| catalog_helpers::column_name(&self.catalog, table_id, *column))
+                .filter_map(|column| {
+                    catalog_helpers::column_name::<Postgres, _>(&self.catalog, table_id, *column)
+                })
                 .collect();
             // A wrap can only name what the inner query returns, so a
             // projection without the key is read as one capped page and
@@ -623,7 +625,8 @@ mod pg {
                 let Ok(column) = ColumnId::try_from(ordinal) else {
                     return Ok(None);
                 };
-                let Some(name) = catalog_helpers::column_name(&self.catalog, table_id, column)
+                let Some(name) =
+                    catalog_helpers::column_name::<Postgres, _>(&self.catalog, table_id, column)
                 else {
                     return Ok(None);
                 };

@@ -270,7 +270,16 @@ async fn apply_upload(
 ) -> Result<usize, CommitError> {
     let adapter = PgAdapter::new(catalog)
         .map_err(|e| CommitError::Probe(MaterializerError::Catalog(e.to_string())))?;
-    Ok(apply_diffset_bytes_async_with_catalog(catalog, bytes, &NoRefusals, conn, &adapter).await?)
+    Ok(
+        apply_diffset_bytes_async_with_catalog::<subql::backend::Postgres, _, _, _, _, _>(
+            catalog,
+            bytes,
+            &NoRefusals,
+            conn,
+            &adapter,
+        )
+        .await?,
+    )
 }
 
 /// Whether Postgres refused a statement with `42501` (`insufficient_privilege`).

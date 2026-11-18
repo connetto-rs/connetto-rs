@@ -596,7 +596,7 @@ fn validate_query(
     >(&pg_sql, &PostgreSqlDialect {}, catalog, &standins, None)
     .map_err(PortabilityError::Compile)?;
     let table_id = compiled.table_id;
-    let table = catalog_helpers::table_name(catalog, table_id)
+    let table = catalog_helpers::table_name::<Postgres, _>(catalog, table_id)
         .ok_or(PortabilityError::Unnamed { table_id })?;
     let key = catalog_helpers::primary_key_columns(catalog, table_id)
         .map_err(PortabilityError::Catalog)?;
@@ -622,7 +622,7 @@ fn validate_query(
         _ => return Err(PortabilityError::Projection),
     };
     let name = |column: ColumnId| {
-        catalog_helpers::column_name(catalog, table_id, column)
+        catalog_helpers::column_name::<Postgres, _>(catalog, table_id, column)
             .ok_or(PortabilityError::Unnamed { table_id })
     };
     Ok(ValidQuery {

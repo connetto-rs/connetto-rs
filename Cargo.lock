@@ -2745,7 +2745,7 @@ dependencies = [
  "num-traits",
  "serde_json",
  "sqlite-wasm-rs",
- "sqlstate",
+ "sqlstate 0.2.0 (git+https://github.com/diesel-rs/diesel)",
  "time",
  "uuid",
 ]
@@ -3249,7 +3249,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3606,7 +3606,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4095,8 +4095,9 @@ dependencies = [
 
 [[package]]
 name = "geometric-traits"
-version = "0.2.3"
-source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#2f2a39d9534bfeb115b0e489c7ba614e29fa3c48"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f03f88beed0b99cac4fa916335285dcdf03011f18dedcf9c0e4f9bd69f560e0f"
 dependencies = [
  "barnes-hut-tree",
  "hashbrown 0.17.1",
@@ -4940,7 +4941,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -6562,7 +6563,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.21",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6726,7 +6727,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6890,7 +6891,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http 1.5.0",
@@ -7541,7 +7542,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#8f94d59671d89c589a08e1d0a6f65185f48c311a"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#74f858fee0576a7614977a34a605d5022542f1c5"
 dependencies = [
  "recursive",
  "sql-traits",
@@ -8212,8 +8213,8 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -8232,7 +8233,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -8280,7 +8281,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb5cd191fad9142d096efc97c64715db73db4adb60c38ebdf22f5b54cd6ea712"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "prost",
  "prost-build",
  "prost-types",
@@ -8443,7 +8444,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9025,7 +9026,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#bc05696fa09c7405d6db7e5a2c640e260080060d"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#e7483cc359fc060a968f3fe0a038395120944286"
 dependencies = [
  "openfga-client",
  "prost",
@@ -9041,7 +9042,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#bc05696fa09c7405d6db7e5a2c640e260080060d"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#e7483cc359fc060a968f3fe0a038395120944286"
 dependencies = [
  "serde",
  "sql-values 0.6.0",
@@ -9211,7 +9212,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9270,7 +9271,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys 2.17.0",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10087,7 +10088,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -10111,7 +10112,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10172,7 +10173,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#42605ce3fb54e013338a32393e7cb82ea0d4acce"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#8357da400fa75be971af0fd3cafa7ac50af76fce"
 dependencies = [
  "geometric-traits",
  "once_cell",
@@ -10180,6 +10181,7 @@ dependencies = [
  "sha2 0.10.9",
  "sql-values 0.5.1",
  "sqlparser",
+ "sqlparser-canonicalize",
  "sqlparser-plpgsql",
  "thiserror 2.0.21",
  "unicode-normalization",
@@ -10210,7 +10212,7 @@ dependencies = [
 [[package]]
 name = "sql-values"
 version = "0.6.0"
-source = "git+https://github.com/connetto-rs/sql-values?branch=main#7c18726d135c2f8d685d3d89915bf6d228d84351"
+source = "git+https://github.com/connetto-rs/sql-values?branch=main#d599af64e6d73950e9f48c5a969a0bdfe9835247"
 dependencies = [
  "jiff",
  "thiserror 2.0.21",
@@ -10281,8 +10283,9 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.2.1"
-source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#be62ac98064b3b17f0479927d24df05c539dc96a"
+source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#07e59506f43915ac188a99ce0afa677f14ed82f4"
 dependencies = [
+ "recursive",
  "seahash",
  "sqlparser",
  "thiserror 2.0.21",
@@ -10291,21 +10294,28 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#131423cdac80ceadb72f6a72c9f9faad291fc5d3"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#f5ea51d2d98a1ce18fc47f74185836165fcac612"
 dependencies = [
  "sqlparser",
+ "sqlstate 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#96a5132234dda33aa75ab6d3ef045038f106703a"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9429cd30ce211eeb8676c81b685630560969c147"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
 ]
+
+[[package]]
+name = "sqlstate"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "858cea190fe7555971c35a5eb336858f1bf962a2bd7ceb8704fb1759b36af2cd"
 
 [[package]]
 name = "sqlstate"
@@ -10334,7 +10344,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10463,7 +10473,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#c78ce999e477ba1be3c2869338f98cc282776fd1"
+source = "git+https://github.com/connetto-rs/subql?branch=main#8ec76b670f5206716cd6f5243ab050c198499a05"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -10949,7 +10959,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11652,7 +11662,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -12310,7 +12320,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -12331,7 +12341,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-quartz-core",
  "raw-window-handle 0.6.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "windows-version",
 ]
 
@@ -12826,7 +12836,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
