@@ -22,7 +22,7 @@ pub trait LiveSpec: serde::Serialize + serde::de::DeserializeOwned + Send + Sync
     type Handle: LiveHandle<Snapshot: serde::Serialize + serde::de::DeserializeOwned>;
 
     /// Build the typed query this descriptor names.
-    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + use<Self, T>
     where
         T: Transport + MaybeSend + 'static,
         T::Error: core::fmt::Display;

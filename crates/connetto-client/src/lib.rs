@@ -95,6 +95,7 @@ mod hotspot;
 #[cfg(feature = "native-auth")]
 mod keyring;
 pub mod live;
+mod live_source;
 mod live_spec;
 mod majors;
 #[cfg(feature = "peer")]
@@ -174,6 +175,7 @@ pub use live::{
     ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveValue,
     subscription_is_aggregate, subscription_tables,
 };
+pub use live_source::{LiveSnapshot, LiveSource, follow};
 pub use live_spec::{KeyedSpec, LiveSpec};
 pub use majors::HeldContent;
 pub use memory_stores::{MemoryKeyStore, MemoryRefreshStore};
