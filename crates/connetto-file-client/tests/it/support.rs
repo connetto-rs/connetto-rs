@@ -430,13 +430,15 @@ where
 }
 
 /// The durable replica at `path` over `schema`, signed in as the suite's
-/// tester, with no transport attached.
+/// tester, with no transport attached, and the content layer's hooks named
+/// as a build that attaches content names them.
 pub async fn cold_over<T>(path: &std::path::Path, schema: SyncSchema) -> ConnettoConnection<T>
 where
     T: Transport + Send + 'static,
     T::Error: core::fmt::Display,
 {
     ClientBuilder::new(schema, || async { Err::<T, _>("no server") })
+        .with_content_hooks(connetto_file_client::content_hooks())
         .signed_in(
             HeldCredential::new(Grant::new("user:tester"), "tester")
                 .expect("a string identity serializes"),

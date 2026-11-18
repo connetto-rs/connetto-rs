@@ -21,6 +21,7 @@ pub mod registration;
 pub mod share_keys;
 pub mod storage;
 pub mod subscription;
+pub mod unsynced;
 pub mod writer;
 
 pub use crate::exchange::Verdict;
@@ -63,6 +64,10 @@ pub use storage::{
 pub use subscription::{
     BindValue, MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionSpec,
     Unsubscribe,
+};
+pub use unsynced::{
+    FileState, KeyValue, RowOp, TabDismissAnswer, TabDismissOutcome, TabDismissRefusal,
+    TrackedWrite, UnsyncedFile, UnsyncedWork, UnsyncedWrite, WriteState, WrittenRow,
 };
 pub use writer::{
     BindDevice, Provenance, RetireWriter, WRITER_BIND_DOMAIN, WriterAnswer, WriterGrant,

@@ -1,8 +1,9 @@
 #![doc = include_str!("../README.md")]
 
 pub use connetto_core::messages::{
-    FullResyncReason, Grant, PauseCause, SharedStoreUse, StorageUse, StoreBytes, SyncStatus,
-    WriterGrant, WriterRef, WriterRequest, WriterSecret,
+    FileState, FullResyncReason, Grant, KeyValue, PauseCause, RowOp, SharedStoreUse, StorageUse,
+    StoreBytes, SyncStatus, TrackedWrite, UnsyncedFile, UnsyncedWork, UnsyncedWrite, WriteState,
+    WriterGrant, WriterRef, WriterRequest, WriterSecret, WrittenRow,
 };
 pub use connetto_core::{Custody, NoGate};
 /// The peer link's close reasons, dial errors and chain refusals (R76).
@@ -24,9 +25,9 @@ use connetto_core::messages::{
     ControlMessage, CourierNotice, CourierNoticeAck, CourierNoticeRow, FatalErrorReason, GateState,
     Handshake, HeldWork, MutationHeader, MutationPatch, MutationReject, MutationRejectReason, Ping,
     PriorRefusal, Provenance, ReplaceShareKeys, RetireWriter, SUBSCRIPTION_REFUSED, ShareKeyChange,
-    Subscribe, SubscriptionSpec, TabIdentity, TabShareKeyAnswer, TabShareKeyChange,
-    TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse, Unsubscribe,
-    WriterAnswer,
+    Subscribe, SubscriptionSpec, TabDismissAnswer, TabDismissOutcome, TabDismissRefusal,
+    TabIdentity, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, TabStorageAnswer,
+    TabStorageOutcome, TabStorageUse, Unsubscribe, WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -173,13 +174,13 @@ pub use keyring::{Backend, KeyFile, LinuxStore};
 #[cfg(all(feature = "native-auth", target_os = "windows"))]
 pub use keyring::{HelloCancellation, HelloOwner, HelloWindow};
 pub use live::{
-    ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveValue,
+    ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveUnsynced, LiveValue,
     subscription_is_aggregate, subscription_tables,
 };
 pub use live_source::{LiveSnapshot, LiveSource, follow};
-pub use live_spec::{KeyedSpec, LiveSpec};
-pub use majors::HeldContent;
+pub use live_spec::{KeyedSpec, LiveSpec, Unsynced};
 pub use memory_stores::{MemoryKeyStore, MemoryRefreshStore};
+pub use pending::ContentHooks;
 pub use pending::PendingWork;
 #[cfg(feature = "native-transport")]
 pub use reconnect::TokioSleeper;
@@ -691,21 +692,6 @@ pub(crate) struct CourierWait {
     pub bound: Duration,
 }
 
-/// One queued write awaiting its final answer, named by the writer and the
-/// sequence it is the writer's, with the application schema major it was
-/// captured under.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct UnsyncedWrite {
-    /// The writer the entry is queued under.
-    pub writer: WriterRef,
-    /// The entry's sequence in that writer's queue.
-    pub seq: u64,
-    /// The major the write was captured under, absent for a build declaring
-    /// none. Only that major's server can apply it (R31).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub major: Option<Major>,
-}
-
 /// Why a sign-in switch was refused.
 ///
 /// Nothing has changed when this is returned: the run is still the one it was,
@@ -1187,11 +1173,11 @@ pub(crate) struct ClientConfig {
     /// Whether this connection mirrors a relay's worker, which holds the share
     /// keys, so a key change travels to the relay instead of committing here.
     relay_mirror: bool,
-    /// The content layer's hooks for an old major's unsent files across a
-    /// rebuild and its drain (R31): `hold` moves them aside, `count` says how
-    /// many remain, `forget` drops them. A build that attaches no content uses
-    /// [`HeldContent::NONE`].
-    held_content: HeldContent,
+    /// The content layer's hooks for its unsent files: an old major's across
+    /// a rebuild and its drain (R31), and every one for the unsynced
+    /// snapshot. A build that attaches no content uses
+    /// [`ContentHooks::NONE`].
+    content_hooks: ContentHooks,
     /// What brings an existing device-private tier to this build's major,
     /// `None` for a build declaring no major (R31).
     tier_plan: Option<TierPlan>,
@@ -1218,7 +1204,7 @@ impl ClientConfig {
             shared_tables: HashSet::new(),
             connection_ddl: None,
             relay_mirror: false,
-            held_content: HeldContent::NONE,
+            content_hooks: ContentHooks::NONE,
             tier_plan: None,
         }
     }
@@ -1385,12 +1371,12 @@ impl ClientConfig {
 
     /// The same, unchanged when nothing is named.
     #[must_use]
-    pub(crate) const fn with_optional_held_content(
+    pub(crate) const fn with_optional_content_hooks(
         mut self,
-        held_content: Option<HeldContent>,
+        content_hooks: Option<ContentHooks>,
     ) -> Self {
-        if let Some(held_content) = held_content {
-            self.held_content = held_content;
+        if let Some(content_hooks) = content_hooks {
+            self.content_hooks = content_hooks;
         }
         self
     }
@@ -1881,30 +1867,14 @@ pub enum ClientEvent {
     },
 }
 
-/// A primary-key column value carried on a mutation event.
-#[derive(Debug, Clone, PartialEq)]
-pub enum KeyValue {
-    /// SQL NULL.
-    Null,
-    /// Integer key column.
-    Int(i64),
-    /// Real key column.
-    Real(f64),
-    /// Text key column.
-    Text(String),
-    /// Blob key column.
-    Blob(Vec<u8>),
-}
-
-impl From<Value<String, Vec<u8>>> for KeyValue {
-    fn from(value: Value<String, Vec<u8>>) -> Self {
-        match value {
-            Value::Null => Self::Null,
-            Value::Integer(int) => Self::Int(int),
-            Value::Real(real) => Self::Real(real),
-            Value::Text(text) => Self::Text(text),
-            Value::Blob(blob) => Self::Blob(blob),
-        }
+/// One primary-key column value as the client names it.
+pub(crate) fn key_value(value: Value<String, Vec<u8>>) -> KeyValue {
+    match value {
+        Value::Null => KeyValue::Null,
+        Value::Integer(int) => KeyValue::Int(int),
+        Value::Real(real) => KeyValue::Real(real),
+        Value::Text(text) => KeyValue::Text(text),
+        Value::Blob(blob) => KeyValue::Blob(blob),
     }
 }
 
@@ -2318,41 +2288,63 @@ pub(crate) fn rename_diffset(
 
 /// Decode a pushed changeset into the rows it touched, each as its table and
 /// primary key, for reporting on a rejected or conflicting mutation.
+fn affected_rows(changeset: &[u8], tables: &PolicyTables) -> Result<Vec<AffectedRow>, ClientError> {
+    Ok(written_rows(changeset, tables)?
+        .into_iter()
+        .map(|WrittenRow { table, key, .. }| AffectedRow { table, key })
+        .collect())
+}
+
+/// Decode a queued changeset into the rows it touched, each named as the
+/// application writes it.
 ///
 /// `tables` maps a split table's backing name back to the logical one the
 /// application wrote against, because a capture records what SQLite actually
 /// changed and the `INSTEAD OF` triggers change the backing table.
-fn affected_rows(changeset: &[u8], tables: &PolicyTables) -> Result<Vec<AffectedRow>, ClientError> {
-    let rows = op_keys(changeset)
+fn written_rows(changeset: &[u8], tables: &PolicyTables) -> Result<Vec<WrittenRow>, ClientError> {
+    Ok(op_keys(changeset)
         .map_err(|err| ClientError::Apply(format!("parsing pushed changeset: {err:?}")))?
         .into_iter()
-        .map(|(table, key)| AffectedRow {
+        .map(|WrittenRow { table, key, op }| WrittenRow {
             table: tables.logical(&table).map(str::to_owned).unwrap_or(table),
             key,
+            op,
         })
-        .collect();
-    Ok(rows)
+        .collect())
 }
 
 /// Every op of a changeset or patchset as its table, named as the payload
-/// names it, and its primary key, in payload order.
-pub(crate) fn op_keys(
-    bytes: &[u8],
-) -> Result<Vec<(String, Vec<KeyValue>)>, sqlite_diff_rs::ParseError> {
-    fn keyed(table: &str, key: Vec<Value<String, Vec<u8>>>) -> (String, Vec<KeyValue>) {
-        (
-            table.to_owned(),
-            key.into_iter().map(KeyValue::from).collect(),
-        )
+/// names it, its primary key and what it did to the row, in payload order.
+pub(crate) fn op_keys(bytes: &[u8]) -> Result<Vec<WrittenRow>, sqlite_diff_rs::ParseError> {
+    fn written(table: &str, key: Vec<Value<String, Vec<u8>>>, op: RowOp) -> WrittenRow {
+        WrittenRow {
+            table: table.to_owned(),
+            key: key.into_iter().map(key_value).collect(),
+            op,
+        }
     }
     Ok(match ParsedDiffSet::parse(bytes)? {
         ParsedDiffSet::Changeset(diff) => diff
             .iter()
-            .map(|op| keyed(op.table().name(), op.primary_key()))
+            .map(|op| {
+                let kind = match op {
+                    sqlite_diff_rs::ChangesetOp::Insert { .. } => RowOp::Insert,
+                    sqlite_diff_rs::ChangesetOp::Update { .. } => RowOp::Update,
+                    sqlite_diff_rs::ChangesetOp::Delete { .. } => RowOp::Delete,
+                };
+                written(op.table().name(), op.primary_key(), kind)
+            })
             .collect(),
         ParsedDiffSet::Patchset(diff) => diff
             .iter()
-            .map(|op| keyed(op.table().name(), op.primary_key()))
+            .map(|op| {
+                let kind = match op {
+                    sqlite_diff_rs::PatchsetOp::Insert { .. } => RowOp::Insert,
+                    sqlite_diff_rs::PatchsetOp::Update { .. } => RowOp::Update,
+                    sqlite_diff_rs::PatchsetOp::Delete { .. } => RowOp::Delete,
+                };
+                written(op.table().name(), op.primary_key(), kind)
+            })
             .collect(),
     })
 }
@@ -3854,6 +3846,9 @@ struct WriterQueue {
     /// leaves the server a gap. Held in memory only, since a new transport
     /// starts from nothing sent.
     sent_through: u64,
+    /// The sequences the server deferred and this transport has not sent
+    /// again yet. Held in memory only, like `sent_through`.
+    deferred: BTreeSet<u64>,
 }
 
 impl WriterQueue {
@@ -3865,6 +3860,7 @@ impl WriterQueue {
             secret: None,
             pending: BTreeMap::new(),
             sent_through: 0,
+            deferred: BTreeSet::new(),
         }
     }
 }
@@ -3949,6 +3945,7 @@ fn load_writer_states(
                 secret: stored_secret(row.secret),
                 pending: BTreeMap::new(),
                 sent_through: 0,
+                deferred: BTreeSet::new(),
             };
             Some((writer_from_id(&row.id)?, queue))
         })
@@ -4581,19 +4578,28 @@ async fn timer_wait(remaining: Duration) {
 /// `staging`. `apply_patch` merges staging into `applied_rows` only after the
 /// transaction commits, so a rolled-back apply leaves no phantom counts.
 /// One atomic load and one map bump per row, the O(1) the decision asked for.
+///
+/// A change to a table in `outbox_tables` raises `unsynced_moved`, since the
+/// unsynced snapshot reads those tables and the live refresh never sees them.
 fn install_change_tracker(
     conn: &mut SqliteConnection,
     changed: &Arc<Mutex<HashSet<String>>>,
     staging: &Arc<Mutex<HashMap<String, u64>>>,
     counting: &Arc<AtomicBool>,
+    unsynced_moved: &Arc<AtomicBool>,
+    outbox_tables: Vec<&'static str>,
 ) {
     let sink = Arc::clone(changed);
     let rows = Arc::clone(staging);
     let gate = Arc::clone(counting);
+    let moved = Arc::clone(unsynced_moved);
     conn.on_update(
         SqliteUpdateRouter::new().on_any(SqliteChangeOps::ALL, move |event| {
             if let Ok(mut tables) = sink.lock() {
                 tables.insert(event.table_name.to_owned());
+            }
+            if outbox_tables.contains(&event.table_name) {
+                moved.store(true, Ordering::Relaxed);
             }
             if gate.load(Ordering::Relaxed)
                 && !is_internal_table(event.table_name)
@@ -4655,6 +4661,14 @@ fn share_key_request_id() -> String {
 fn storage_request_id() -> String {
     format!(
         "storage-{}",
+        NEXT_SHARE_KEY_REQUEST.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// A fresh request id for a relay tab's refusal dismissal.
+fn dismiss_request_id() -> String {
+    format!(
+        "dismiss-{}",
         NEXT_SHARE_KEY_REQUEST.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
     )
 }
@@ -5108,6 +5122,13 @@ pub struct ConnettoConnection<T: Transport> {
     /// Names of tables whose rows changed since the last drain, from the
     /// connection's update hook (local writes and server patches alike).
     changed: Arc<Mutex<HashSet<String>>>,
+    /// Raised whenever the unsynced snapshot may have moved: a write to a
+    /// table it reads, a send, a deferral or a relayed snapshot. Taken by
+    /// whoever follows the snapshot.
+    unsynced_moved: Arc<AtomicBool>,
+    /// The latest snapshot a relay mirror's worker stated, which a mirror
+    /// answers from since its worker owns the outbox.
+    relayed_unsynced: UnsyncedWork,
     /// Rows applied per application table since the last residual pass, the
     /// R60 measure. Accumulated via `apply_staging` during each apply and
     /// merged here only after the transaction commits.
@@ -5197,6 +5218,8 @@ pub struct ConnettoConnection<T: Transport> {
     relay_share_key_waits: RelayWaits<()>,
     /// A relay mirror's storage reads awaiting their answers.
     relay_storage_waits: RelayWaits<StorageUse>,
+    /// A relay mirror's refusal dismissals awaiting their answers.
+    relay_dismiss_waits: RelayWaits<()>,
     /// The earliest parsed expiry of a held key, refreshed at every set
     /// change, so an unrelated frame never parses a grant.
     share_key_expiry: Option<i64>,
@@ -5297,6 +5320,7 @@ fn install_replica_metadata(
         "ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB",
         "ALTER TABLE _connetto_pending ADD COLUMN major INTEGER",
         acked::VERSION_COLUMN,
+        acked::DISMISSED_COLUMN,
     ]
     .into_iter();
     #[cfg(feature = "peer")]
@@ -5380,7 +5404,7 @@ fn install_replica_schema<S: ReplicaStorage>(
             majors::Record::Current => Some(build),
             majors::Record::Unrecorded => None,
             majors::Record::Behind(from) => {
-                majors::prepare_rebuild(db, from, config.held_content)?;
+                majors::prepare_rebuild(db, from, config.content_hooks)?;
                 Some(from.major)
             }
         };
@@ -5590,7 +5614,19 @@ where
         }
         let schema_open = Arc::new(AtomicBool::new(false));
         outbox::guard_schema(&mut db, &schema_open);
-        install_change_tracker(&mut db, &changed, &apply_staging, &apply_counting);
+        let unsynced_moved = Arc::new(AtomicBool::new(true));
+        let outbox_tables = ["_connetto_pending", "_connetto_acked"]
+            .into_iter()
+            .chain(config.content_hooks.tables.iter().copied())
+            .collect();
+        install_change_tracker(
+            &mut db,
+            &changed,
+            &apply_staging,
+            &apply_counting,
+            &unsynced_moved,
+            outbox_tables,
+        );
         {
             let dirty = Arc::clone(&dirty);
             db.on_commit(move || {
@@ -5641,6 +5677,8 @@ where
             write_flags,
             schema_open,
             changed,
+            unsynced_moved,
+            relayed_unsynced: UnsyncedWork::default(),
             applied_rows,
             apply_counting,
             apply_staging,
@@ -5675,6 +5713,7 @@ where
             share_key_save_pending: false,
             relay_share_key_waits: HashMap::new(),
             relay_storage_waits: HashMap::new(),
+            relay_dismiss_waits: HashMap::new(),
             share_key_expiry: None,
             share_key_deadline: None,
             share_key_armed: 0,
@@ -8910,6 +8949,19 @@ where
         }
     }
 
+    /// Note that the server deferred the bound writer's pending `seq`, so
+    /// the unsynced snapshot shows it waiting for its resend.
+    fn mark_deferred(&mut self, seq: u64) {
+        if let Some(queue) = self
+            .bound_writer
+            .and_then(|writer| self.writers.get_mut(&writer))
+            .filter(|queue| queue.pending.contains_key(&seq))
+        {
+            queue.deferred.insert(seq);
+            self.unsynced_moved.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Arm a resend after the server deferred a pending write, `asked` being the wait it named.
     ///
     /// An armed resend stands, because it already sends every pending write.
@@ -9061,6 +9113,7 @@ where
         for queue in self.writers.values_mut() {
             queue.sent_through = 0;
         }
+        self.unsynced_moved.store(true, Ordering::Relaxed);
     }
 
     /// Drop the live socket and announce it, once.
@@ -9115,6 +9168,7 @@ where
         // A relay answer can no longer arrive, so each waiting tab call fails now.
         self.relay_share_key_waits.clear();
         self.relay_storage_waits.clear();
+        self.relay_dismiss_waits.clear();
         // Desired keys and durable coverage survive a transport failure.
         self.share_key_request = None;
         self.declaration_fence = None;
@@ -9303,6 +9357,7 @@ where
             .values()
             .map(|wait| wait.deadline)
             .chain(self.relay_storage_waits.values().map(|wait| wait.deadline))
+            .chain(self.relay_dismiss_waits.values().map(|wait| wait.deadline))
             .min()
         {
             deadline = Some(deadline.map_or(relay, |armed| armed.min(relay)));
@@ -9321,7 +9376,9 @@ where
             expire_relay_waits(&mut self.relay_share_key_waits, now, "the share-key change");
         let storage_expired =
             expire_relay_waits(&mut self.relay_storage_waits, now, "the storage read");
-        let expired = share_key_expired || storage_expired;
+        let dismiss_expired =
+            expire_relay_waits(&mut self.relay_dismiss_waits, now, "the refusal dismissal");
+        let expired = share_key_expired || storage_expired || dismiss_expired;
         if self
             .share_key_request
             .as_ref()
@@ -9626,6 +9683,31 @@ where
         Ok(receiver)
     }
 
+    /// Ask a relay tab's worker to dismiss `writer`'s refused write `seq`,
+    /// and the receiver its answer arrives on, within
+    /// [`SHARE_KEY_REQUEST_WAIT`].
+    ///
+    /// The receiver fails at once when the connection drops.
+    pub(crate) async fn ask_relay_dismiss(
+        &mut self,
+        writer: WriterRef,
+        seq: u64,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), ClientError>>, ClientError> {
+        let request_id = dismiss_request_id();
+        self.wire()?
+            .transport
+            .send_control(ControlMessage::TabDismissRefusal(TabDismissRefusal {
+                request_id: request_id.clone(),
+                writer,
+                seq,
+            }))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        let receiver = relay_wait(&mut self.relay_dismiss_waits, request_id);
+        self.recompute_share_key_deadline();
+        Ok(receiver)
+    }
+
     /// Hand a relay's answer to the change waiting on it. An answer nobody
     /// waits for arrived after its wait ended, and is dropped.
     fn settle_relay_share_key(&mut self, answer: TabShareKeyAnswer) {
@@ -9654,6 +9736,22 @@ where
             TabStorageOutcome::Use(used) => Ok(used),
             TabStorageOutcome::Locked => Err(ClientError::Locked),
             TabStorageOutcome::Refused(detail) => Err(ClientError::Session(detail)),
+        };
+        let _ = wait.answer.send(outcome);
+        self.recompute_share_key_deadline();
+    }
+
+    /// Hand a relay's dismissal answer to the call waiting on it. An answer
+    /// nobody waits for arrived after its wait ended, and is dropped.
+    fn settle_relay_dismiss(&mut self, answer: TabDismissAnswer) {
+        let Some(wait) = self.relay_dismiss_waits.remove(&answer.request_id) else {
+            tracing::debug!(request_id = %answer.request_id, "a dismissal answer arrived after its wait");
+            return;
+        };
+        let outcome = match answer.outcome {
+            TabDismissOutcome::Dismissed => Ok(()),
+            TabDismissOutcome::Locked => Err(ClientError::Locked),
+            TabDismissOutcome::Refused(detail) => Err(ClientError::Session(detail)),
         };
         let _ = wait.answer.send(outcome);
         self.recompute_share_key_deadline();
@@ -9993,6 +10091,78 @@ where
             .collect()
     }
 
+    /// Every write and staged file of this device that has not reached the
+    /// server, each with where it stands, and every refused write the
+    /// application has not dismissed.
+    ///
+    /// A relay tab's mirror holds no outbox, so it answers with the latest
+    /// snapshot its worker stated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if a queued changeset, a retained refusal or
+    /// the content outbox does not read back.
+    pub fn unsynced_work(&mut self) -> Result<UnsyncedWork, ClientError> {
+        if self.config.relay_mirror {
+            return Ok(self.relayed_unsynced.clone());
+        }
+        let mut writes = Vec::new();
+        for refusal in acked::refusals(&mut self.db)? {
+            writes.push(TrackedWrite {
+                write: UnsyncedWrite {
+                    writer: refusal.writer,
+                    seq: refusal.seq,
+                    major: refusal.major,
+                },
+                state: WriteState::Refused(refusal.refused),
+                rows: written_rows(&refusal.changeset, &self.config.policy_tables)?,
+            });
+        }
+        for (writer, queue) in &self.writers {
+            for (seq, entry) in &queue.pending {
+                let state = if queue.deferred.contains(seq) {
+                    WriteState::Deferred
+                } else if *seq <= queue.sent_through || self.drain_sent(writer, *seq) {
+                    WriteState::Sent
+                } else {
+                    WriteState::Queued
+                };
+                writes.push(TrackedWrite {
+                    write: UnsyncedWrite {
+                        writer: *writer,
+                        seq: *seq,
+                        major: entry.major,
+                    },
+                    state,
+                    rows: written_rows(&entry.changeset, &self.config.policy_tables)?,
+                });
+            }
+        }
+        let files = (self.config.content_hooks.unsynced)(&mut self.db)?;
+        Ok(UnsyncedWork { writes, files })
+    }
+
+    /// Whether [`unsynced_work`](Self::unsynced_work) may answer differently
+    /// since the last call, clearing the mark. A driver that follows the
+    /// snapshot rebuilds it only when this is true.
+    pub fn take_unsynced_moved(&self) -> bool {
+        self.unsynced_moved.swap(false, Ordering::Relaxed)
+    }
+
+    /// Dismiss `writer`'s refused write `seq`, so the unsynced snapshot no
+    /// longer lists it. Dismissing a write that is not refused, or was
+    /// dismissed before, changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the replica refuses the write, or on a
+    /// relay tab's mirror, whose worker holds the refusals.
+    pub fn dismiss_refusal(&mut self, writer: &WriterRef, seq: u64) -> Result<(), ClientError> {
+        self.refuse_relay_mirror_change()?;
+        let now = clock::now_secs(&mut self.db)?;
+        acked::dismiss(&mut self.db, writer, seq, now)
+    }
+
     /// The provenance of a peer-applied row, standing it back from the table,
     /// since the broadcast event stream can drop events (R77). The key is the
     /// row's primary-key column values, in key order, and the table is named
@@ -10149,11 +10319,13 @@ where
         entries.sort_unstable_by_key(|(position, _, _, _)| *position);
         let mut held = HeldKeys::new();
         for (_, writer, seq, entry) in entries {
-            for (table, key) in crate::op_keys(&entry.changeset).map_err(|err| {
-                ClientError::Apply(format!(
-                    "parsing a pending changeset to filter a peer apply: {err:?}"
-                ))
-            })? {
+            for WrittenRow { table, key, .. } in
+                crate::op_keys(&entry.changeset).map_err(|err| {
+                    ClientError::Apply(format!(
+                        "parsing a pending changeset to filter a peer apply: {err:?}"
+                    ))
+                })?
+            {
                 held.insert(
                     (table.to_lowercase(), provisional::encode_key(&key)),
                     (writer_id(writer), i64::try_from(seq).unwrap_or(i64::MAX)),
@@ -11029,11 +11201,13 @@ where
         }
         let mut frame = self.peer_apply_frame()?;
         for entry in &plan.archive.pending {
-            for (table, key) in crate::op_keys(&entry.changeset).map_err(|err| {
-                ClientError::Import(format!(
-                    "parsing a restored write to filter the peer apply: {err:?}"
-                ))
-            })? {
+            for WrittenRow { table, key, .. } in
+                crate::op_keys(&entry.changeset).map_err(|err| {
+                    ClientError::Import(format!(
+                        "parsing a restored write to filter the peer apply: {err:?}"
+                    ))
+                })?
+            {
                 frame.held.insert(
                     (table.to_lowercase(), provisional::encode_key(&key)),
                     (
@@ -11688,6 +11862,17 @@ where
                 self.settle_relay_storage(answer);
                 return Ok(None);
             }
+            Some(IncomingFrame::Control(ControlMessage::TabDismissAnswer(answer))) => {
+                self.settle_relay_dismiss(answer);
+                return Ok(None);
+            }
+            // The worker's snapshot of its outbox, which a mirror answers
+            // `unsynced_work` from.
+            Some(IncomingFrame::Control(ControlMessage::TabUnsynced(work))) => {
+                self.relayed_unsynced = work;
+                self.unsynced_moved.store(true, Ordering::Relaxed);
+                return Ok(None);
+            }
             Some(IncomingFrame::Control(ControlMessage::CourierAuditAnswer(answer))) => {
                 self.settle_courier_audit(&answer);
                 return Ok(None);
@@ -11967,7 +12152,9 @@ where
         .await?;
         if let Some(queue) = self.writers.get_mut(&writer) {
             queue.sent_through = queue.sent_through.max(seq);
+            queue.deferred.remove(&seq);
         }
+        self.unsynced_moved.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -12148,12 +12335,13 @@ where
             .related_to
             .as_deref()
             .and_then(|related| related.parse::<u64>().ok())
-            .is_some_and(|seq| {
+            .filter(|seq| {
                 self.writers
                     .values()
-                    .any(|queue| queue.pending.contains_key(&seq))
+                    .any(|queue| queue.pending.contains_key(seq))
             });
-        if throttled_write {
+        if let Some(seq) = throttled_write {
+            self.mark_deferred(seq);
             self.defer_pending(Some(Duration::from_millis(limited.retry_after_ms)));
         }
         // A swap its limit refused is deferred by the server's bound, not
@@ -12527,6 +12715,7 @@ where
                 .unwrap_or(false)
                 || self.restoring(client_seq);
             if held {
+                self.mark_deferred(client_seq);
                 self.defer_pending(None);
             }
             return Ok(ClientEvent::MutationDeferred { client_seq });

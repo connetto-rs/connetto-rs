@@ -372,14 +372,68 @@ pub(crate) fn forget_held(conn: &mut SqliteConnection, major: Major) -> Result<u
     Ok(u64::try_from(gone).expect("SQLite DELETE count is non-negative"))
 }
 
-/// The content layer's held-content hooks, one value for every platform
-/// (R31).
-pub fn held_content() -> connetto_client::HeldContent {
-    connetto_client::HeldContent {
+/// The content layer's hooks, one value for every platform: the held files
+/// of a rebuild (R31) and the unsynced files the snapshot lists.
+pub fn content_hooks() -> connetto_client::ContentHooks {
+    connetto_client::ContentHooks {
         hold,
         count: held_count,
         forget: forget_held,
+        unsynced: unsynced_files,
+        tables: &["_connetto_content_outbox", "_connetto_held_content_outbox"],
     }
+}
+
+/// Every authored file whose bytes have not reached the server, the ones a
+/// rebuild held for an older major included, in identity order. A heal and
+/// a file carried for another account are not this device's own work.
+fn unsynced_files(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<connetto_client::UnsyncedFile>, ClientError> {
+    use connetto_client::{FileState, UnsyncedFile};
+
+    let mut files = Vec::new();
+    if holds_table(conn, "_connetto_content_outbox")? {
+        let authored: Vec<(Vec<u8>, Option<String>)> = _connetto_content_outbox::table
+            .filter(_connetto_content_outbox::heal.eq(false))
+            .filter(_connetto_content_outbox::carried_for.is_null())
+            .select((
+                _connetto_content_outbox::file_id,
+                _connetto_content_outbox::refused,
+            ))
+            .load(conn)?;
+        for (file_id, refused) in authored {
+            files.push(UnsyncedFile {
+                file_id: hex_identity(&file_id)?,
+                major: None,
+                state: refused.map_or(FileState::Queued, FileState::Refused),
+            });
+        }
+    }
+    if holds_table(conn, "_connetto_held_content_outbox")? {
+        let held: Vec<(i64, Vec<u8>)> = _connetto_held_content_outbox::table
+            .select((
+                _connetto_held_content_outbox::major,
+                _connetto_held_content_outbox::file_id,
+            ))
+            .load(conn)?;
+        for (major, file_id) in held {
+            files.push(UnsyncedFile {
+                file_id: hex_identity(&file_id)?,
+                major: u32::try_from(major).ok().and_then(Major::new),
+                state: FileState::Queued,
+            });
+        }
+    }
+    files.sort_by(|left, right| (&left.file_id, left.major).cmp(&(&right.file_id, right.major)));
+    Ok(files)
+}
+
+/// A stored file identity as the hex the application names files by.
+fn hex_identity(stored: &[u8]) -> Result<String, ClientError> {
+    exactly_32(stored)
+        .map(|bytes| FileId::from_bytes(bytes).to_string())
+        .map_err(|err| ClientError::Session(format!("a stored file identity: {err}")))
 }
 
 /// The files held for `major`, in stored order (R31).
