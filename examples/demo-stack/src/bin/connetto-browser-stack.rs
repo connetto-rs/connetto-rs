@@ -761,6 +761,9 @@ async fn run_default_browser_suites(services: &Services, shard: Option<Shard>) -
     for test in test_files(&["crates", "connetto-web", "tests"])? {
         suite_args.push(per_test_args("crates/connetto-web", test));
     }
+    for test in test_files(&["crates", "connetto-leptos", "tests"])? {
+        suite_args.push(per_test_args("crates/connetto-leptos", test));
+    }
     for test in test_files(&["examples", "wasm-smoke", "tests"])? {
         suite_args.push(per_test_args("examples/wasm-smoke", test));
     }

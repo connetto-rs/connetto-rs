@@ -16,6 +16,10 @@ diesel::table! {
         id -> diesel::sql_types::Uuid,
         /// Ordered amount.
         quantity -> diesel::sql_types::BigInt,
+        /// Account owning the row.
+        owner_id -> diesel::sql_types::Text,
+        /// Creation time.
+        created_at -> diesel::sql_types::Timestamptz,
     }
 }
 

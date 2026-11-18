@@ -139,6 +139,9 @@ One Cargo workspace holds the crates, and each publishes independently so a down
 | `connetto-client` | The native client. The Diesel connection, its builder, the background sync, the live queries, and the archives |
 | `connetto-dioxus` | The Dioxus hooks that bind live queries to component scope |
 | `connetto-yew` | The same hooks for Yew, with the abort-on-unmount lifecycle suited to Yew's task model |
+| `connetto-leptos` | The same `use_live` hook for Leptos, ending with its reactive owner, and `keyed` rows that keep a row's DOM node across a change |
+| `connetto-tauri-page` | The live source a Tauri webview hands the hooks, reaching the client in the native core over Tauri's IPC |
+| `tauri-plugin-connetto` | The Tauri plugin that runs the live queries an application registers and streams their answers to the webview, one unacknowledged message per subscription |
 | `connetto-test-harness` | The in-process CDC-loop test harness over a real Postgres, and the browser stack runner. Test infrastructure, not a shipped component |
 | `connetto-file-core` | The chunking, the identity, the per-chunk encryption, and the `ChunkStore` and `ChunkInventory` seams. Builds for wasm |
 | `connetto-file-server` | The chunk storage on a filesystem or an object store, the two-phase upload, the ranged serving, the sweep, and the content-ticket minting |

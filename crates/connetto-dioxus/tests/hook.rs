@@ -10,18 +10,19 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use connetto_client::{
-    ClientEvent, ConnettoClient, Grant, HeldCredential, NativeClientBuilder, SyncSchema,
+    ClientEvent, ConnettoClient, Grant, HeldCredential, LiveQuery, LiveSpec, LiveValue,
+    NativeClientBuilder, SyncSchema, Watchable,
 };
+use connetto_core::traits::{MaybeSend, Transport};
 use connetto_core::{Cursor, HandshakeAuthority, test_support::TestGrantChecker};
-use connetto_dioxus::{use_live, use_live_fn};
+use connetto_dioxus::use_live;
 use connetto_server::{
-    ConnettoReadSetup, ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog,
+    ConnettoReadSetup, ManagerBuilder, Materializer, PageSpec, RuntimeWritableCatalog,
     SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use dioxus::prelude::*;
-use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
     AsyncConnector, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
@@ -64,12 +65,48 @@ diesel::table! {
     }
 }
 
-#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
     id: i64,
     quantity: i64,
+}
+
+/// Every order, by id.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AllOrders;
+
+impl LiveSpec for AllOrders {
+    const NAME: &'static str = "all_orders";
+    type Row = Order;
+    type Handle = LiveQuery<Order>;
+
+    fn query<T>(&self) -> impl Watchable<T, Order, Handle = LiveQuery<Order>> + use<T>
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: core::fmt::Display,
+    {
+        orders::table.order(orders::id)
+    }
+}
+
+/// The orders `COUNT(*)`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OrderCount;
+
+impl LiveSpec for OrderCount {
+    const NAME: &'static str = "order_count";
+    type Row = i64;
+    type Handle = LiveValue<i64>;
+
+    fn query<T>(&self) -> impl Watchable<T, i64, Handle = LiveValue<i64>> + use<T>
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: core::fmt::Display,
+    {
+        orders::table.count()
+    }
 }
 
 /// No initial rows: the replica fills from CDC alone in this test.
@@ -107,62 +144,6 @@ impl SnapshotSource for EmptySnapshot {
     ) -> Result<SnapshotPage, Self::Error> {
         Ok(SnapshotPage {
             patchset: Vec::new(),
-            cursor: Cursor::new(Vec::new()),
-            next: None,
-            filled: false,
-            widest_row: 0,
-            rows: 0,
-            bytes: 0,
-        })
-    }
-}
-
-/// Serves one `orders` row (id 1, quantity 3), so the boxed-query test starts
-/// from a non-empty replica and its first render proves the subscription is
-/// established before the CDC insert.
-struct SeedOneOrder;
-
-impl SnapshotSource for SeedOneOrder {
-    type Error = std::convert::Infallible;
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn estimate(
-        &self,
-        _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
-        _caller: &connetto_core::Principal,
-    ) -> Result<SnapshotEstimate, Self::Error> {
-        Ok(SnapshotEstimate {
-            rows: 0.0,
-            width: 0,
-        })
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn snapshot_page(
-        &self,
-        _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
-        _caller: &connetto_core::Principal,
-        _page: &PageSpec,
-    ) -> Result<SnapshotPage, Self::Error> {
-        let table = SimpleTable::new("orders", &[("id", ""), ("quantity", "")], &[0]);
-        let insert = Insert::<_, String, Vec<u8>>::from(table)
-            .set(0, Value::Integer(1))
-            .expect("set id")
-            .set(1, Value::Integer(3))
-            .expect("set quantity");
-        let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new()
-            .insert(insert)
-            .build();
-        Ok(SnapshotPage {
-            patchset,
             cursor: Cursor::new(Vec::new()),
             next: None,
             filled: false,
@@ -247,36 +228,12 @@ fn app() -> Element {
         .expect("client slot poisoned")
         .clone()
         .expect("client installed");
-    let rows = use_live::<_, _, Order>(&client, orders::table.order(orders::id));
-    let count = use_live(&client, orders::table.count());
+    let rows = use_live(&client, AllOrders);
+    let count = use_live(&client, OrderCount);
     let n = rows.value().read().len();
     let c = *count.value().read();
     rsx! {
         div { "rows:{n} count:{c:?}" }
-    }
-}
-
-/// A dedicated client slot for the boxed-query test, so the two hook tests do
-/// not race over one global.
-static CLIENT_FN: StdMutex<Option<ConnettoClient<Ws>>> = StdMutex::new(None);
-
-fn app_fn() -> Element {
-    let client = CLIENT_FN
-        .lock()
-        .expect("client slot poisoned")
-        .clone()
-        .expect("client installed");
-    // A boxed row query: not Clone, so use_live cannot take it. use_live_fn
-    // rebuilds it from the closure on every refresh.
-    let rows = use_live_fn::<_, _, _, Order>(&client, || {
-        orders::table
-            .filter(orders::quantity.gt(0))
-            .order(orders::id)
-            .into_boxed()
-    });
-    let n = rows.value().read().len();
-    rsx! {
-        div { "boxed-rows:{n}" }
     }
 }
 
@@ -407,78 +364,6 @@ async fn use_live_renders_and_follows_cdc() {
     // the handles and queues the unsubscribes through the pump.
     drop(vdom);
     CLIENT.lock().expect("client slot poisoned").take();
-    drop(client);
-    server.await.expect("join server");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn use_live_fn_follows_a_boxed_row_query() {
-    let fixture = Fixture::acquire().await;
-    let materializer = Materializer::builder(PG_DDL)
-        .build()
-        .expect("build materializer");
-    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
-        .expect("build write target");
-    let manager = ManagerBuilder::new(
-        materializer,
-        SeedOneOrder,
-        RosterAuth::granting("dioxus-fn-test").withholding(WITHHELD_ID),
-        test_verifier(),
-        NoConnector,
-        target,
-    )
-    .build();
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let serve_manager = manager.clone();
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
-        serve_manager.serve(transport).await.expect("session ok");
-    });
-
-    let client = NativeClientBuilder::new(format!("ws://{addr}/"), schema())
-        .signed_in(
-            HeldCredential::new(Grant::new("user:dioxus-fn-test"), "dioxus-fn-test")
-                .expect("a string identity serializes"),
-        )
-        .connect()
-        .await
-        .expect("client connect")
-        .client()
-        .clone();
-    *CLIENT_FN.lock().expect("client slot poisoned") = Some(client.clone());
-
-    let mut vdom = VirtualDom::new(app_fn);
-    vdom.rebuild(&mut dioxus_core::NoOpMutations);
-
-    // The snapshot seed row surfaces, which also proves the subscription is
-    // established before the CDC insert below.
-    render_until(&mut vdom, |html| html.contains("boxed-rows:1")).await;
-
-    // A second allowed row and one withheld row drive the change path. The
-    // withheld row has quantity=1 (matching the filter quantity > 0), so
-    // boxed-rows:2 (not boxed-rows:3) proves RosterAuth was consulted.
-    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
-    diesel::insert_into(orders::table)
-        .values((orders::id.eq(2_i64), orders::quantity.eq(5_i64)))
-        .execute(source.connection())
-        .expect("emu insert");
-    diesel::insert_into(orders::table)
-        .values((orders::id.eq(WITHHELD_ID), orders::quantity.eq(1_i64)))
-        .execute(source.connection())
-        .expect("emu insert withheld");
-    while let Some(item) = source.next_item().await.expect("poll source") {
-        let SourceItem::Event(event) = item else {
-            continue;
-        };
-        manager.dispatch_event(&event).await.expect("dispatch");
-    }
-    render_until(&mut vdom, |html| html.contains("boxed-rows:2")).await;
-
-    // Unmount: dropping the vdom drops the hook task, the handle, and the sub.
-    drop(vdom);
-    CLIENT_FN.lock().expect("client slot poisoned").take();
     drop(client);
     server.await.expect("join server");
 }

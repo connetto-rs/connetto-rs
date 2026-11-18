@@ -1,11 +1,11 @@
 //! The one view the screen renders and the one action set the controls send.
 //!
-//! The view is every line the screen shows and the action every control the
-//! user has. Both derive `serde`, so the Tauri layer sends the same two types
-//! over invoke unchanged, and file bytes travel in the action as `Vec<u8>`
-//! with the file name, so the web and Tauri layers take the same input.
-
-use std::collections::HashMap;
+//! The view is every line the screen shows that no live query answers, and
+//! the action every control the user has. The panes follow their live
+//! queries themselves. Both derive `serde`, so the Tauri layer sends the same
+//! two types between the page and the core unchanged, and file bytes travel
+//! in the action as `Vec<u8>` with the file name, so the web and Tauri layers
+//! take the same input.
 
 pub use crate::LogoutState;
 use serde::{Deserialize, Serialize};
@@ -25,34 +25,6 @@ pub enum Session {
     Restoring,
     /// A session is live and the dashboard shows.
     SignedIn,
-}
-
-/// One orders row as the pane shows it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OrderRow {
-    /// The row's key.
-    pub id: String,
-    /// The row's quantity.
-    pub quantity: i64,
-}
-
-/// One photos row as the pane shows it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PhotoRow {
-    /// The row's key.
-    pub id: String,
-    /// The content state the server reports, `pending` before it does.
-    pub state: String,
-}
-
-/// One notes row as the pane shows it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NoteRow {
-    /// The row's key in decimal. Note keys exceed the 2^53 a JavaScript
-    /// number holds exactly, so they cross invoke as text.
-    pub id: String,
-    /// The note's text.
-    pub body: String,
 }
 
 /// One catalogue row as the pane shows it.
@@ -77,53 +49,16 @@ pub struct AccountEntry {
 /// The team notes panel's standing (R77).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamView {
-    /// The team the panel reads and writes, the roster's first until the
-    /// user picks another, empty while the roster names none.
-    pub picked: String,
-    /// The teams the account's roster names.
-    pub teams: Vec<String>,
-    /// One `note: <body> by <author>` line per note of the picked team, a
-    /// peer row followed by `(provisional from <account>)`.
-    pub notes: Vec<String>,
-    /// The picked team's members, the roster rows its notes settle against.
-    pub members: Vec<String>,
     /// One line per applied, confirmed, rolled-back or refused peer write
     /// and per tidy pass, newest last.
     pub events: Vec<String>,
+    /// How many provisional events arrived, which the notes' provisional
+    /// accounts are read again on.
+    pub provisional_events: u64,
     /// The last note write's outcome, `idle` before the first.
     pub outcome: String,
-    /// The roster's or the notes' subscription error.
-    pub error: Option<String>,
     /// Whether this build carries the peer link, which offers the tidy pass.
     pub peer: bool,
-}
-
-impl TeamView {
-    /// Take the roster's teams, sorted once each, and pick the first while
-    /// the picker stands empty, so a roster landing after the panel shows
-    /// still fills it and a team the user picked stays picked.
-    pub fn set_teams(&mut self, mut teams: Vec<String>) {
-        teams.sort();
-        teams.dedup();
-        if self.picked.is_empty()
-            && let Some(first) = teams.first()
-        {
-            self.picked.clone_from(first);
-        }
-        self.teams = teams;
-    }
-
-    /// `team: <picked>`, or `team: none` while none is picked.
-    #[must_use]
-    pub fn team_line(&self) -> String {
-        team_line(&self.picked)
-    }
-
-    /// `teams: <a>, <b>`, or `teams: none` while the roster is empty.
-    #[must_use]
-    pub fn teams_line(&self) -> String {
-        teams_line(&self.teams)
-    }
 }
 
 /// `team: <team>`, or `team: none` for an empty one.
@@ -268,22 +203,14 @@ pub struct View {
     pub refused_pending: Option<u64>,
 
     // The orders pane.
-    /// The visible orders rows, newest first.
-    pub orders: Vec<OrderRow>,
-    /// The server's `COUNT(*)`, absent until its first push.
-    pub server_count: Option<i64>,
-    /// The server's grouped `COUNT(*)` line.
-    pub grouped: String,
     /// Whether the pane offers the insert through the backend writer, the
     /// phone proofs' Postgres path on the native build.
     pub backend_writer: bool,
 
     // The photos pane.
-    /// The photos rows, oldest first.
-    pub photos: Vec<PhotoRow>,
-    /// Each row's display source by row key, a server URL or a local `data:`
-    /// URL.
-    pub photo_thumbs: HashMap<String, String>,
+    /// How many pinned fetches finished, which the pane resolves its photos'
+    /// display sources again on, since a fetch changes no row.
+    pub pinned_fetches: u64,
     /// The refused uploads, each as an id and its refusal detail.
     pub refused_uploads: Vec<(String, String)>,
     /// The lost files, one id each, whose loss is unacknowledged.
@@ -293,15 +220,11 @@ pub struct View {
     /// The last staging line.
     pub stage_line: Option<String>,
 
-    // The catalogue pane.
-    /// The shared catalogue rows, by name.
-    pub products: Vec<ProductRow>,
+    // The header.
     /// The storage line, what this account and the shared store take.
     pub storage: String,
 
     // The notes pane.
-    /// The device-private notes rows, oldest first.
-    pub notes: Vec<NoteRow>,
     /// How many notes this window saved, which clears the draft on each.
     pub notes_saved: u64,
 
@@ -310,8 +233,6 @@ pub struct View {
     pub pages: i64,
     /// The pages a trim can reclaim.
     pub free_pages: i64,
-    /// The rows the live subscriptions cover.
-    pub covered_rows: usize,
 
     // The your-data pane.
     /// The last export line.
@@ -335,7 +256,6 @@ impl View {
         Self {
             status: "connecting to the connetto stack".to_owned(),
             device_line: "no device identity in this build".to_owned(),
-            grouped: crate::grouped_label(&HashMap::new()),
             storage: crate::STORAGE_UNREAD.to_owned(),
             ..Self::default()
         }
@@ -377,8 +297,11 @@ pub enum Action {
     CancelLogout,
     /// Insert one new order.
     AddOrder,
-    /// Remove the newest order row.
-    RemoveNewest,
+    /// Remove one order row, the one the pane shows newest.
+    RemoveOrder {
+        /// The row's id, as its `Uuid` displays.
+        id: String,
+    },
     /// Stage one picked image file as a photo.
     StagePhoto {
         /// The file's name, which the mime guess reads.
@@ -408,6 +331,9 @@ pub enum Action {
     },
     /// Run the replica's trim pass.
     FreeUpSpace,
+    /// Read the replica mirror's footprint and the storage line again, which
+    /// the panes ask for whenever the rows they show change.
+    RereadStorage,
     /// Export this device's local data.
     Export,
     /// Restore one archive.
@@ -446,13 +372,10 @@ pub enum Action {
         /// Whether nearby phones may link.
         on: bool,
     },
-    /// Read and write another team.
-    PickTeam {
+    /// Write one note into a team.
+    AddTeamNote {
         /// The team's id.
         team: String,
-    },
-    /// Write one note into the picked team.
-    AddTeamNote {
         /// The note's body.
         body: String,
     },
@@ -462,7 +385,7 @@ pub enum Action {
 
 #[cfg(test)]
 mod tests {
-    use super::{TeamView, offers_bluetooth_on};
+    use super::offers_bluetooth_on;
 
     /// The Bluetooth button stands only while the user can turn the radio on
     /// or grant its permission, and goes once Bluetooth is ready.
@@ -472,28 +395,5 @@ mod tests {
         assert!(offers_bluetooth_on("bluetooth: not permitted"));
         assert!(!offers_bluetooth_on("bluetooth: ready"));
         assert!(!offers_bluetooth_on("bluetooth: unsupported"));
-    }
-
-    /// A roster landing after the panel shows picks its first team, sorted,
-    /// which is what shows the note form.
-    #[test]
-    fn a_roster_landing_late_picks_its_first_team() {
-        let mut team = TeamView::default();
-        team.set_teams(Vec::new());
-        assert_eq!(team.team_line(), "team: none");
-        assert_eq!(team.teams_line(), "teams: none");
-        team.set_teams(vec!["T2".to_owned(), "T1".to_owned(), "T2".to_owned()]);
-        assert_eq!(team.picked, "T1");
-        assert_eq!(team.teams_line(), "teams: T1, T2");
-    }
-
-    /// A picked team stands when the roster changes afterwards.
-    #[test]
-    fn a_picked_team_stands_when_the_roster_changes() {
-        let mut team = TeamView::default();
-        team.set_teams(vec!["T1".to_owned()]);
-        team.set_teams(vec!["T0".to_owned(), "T1".to_owned()]);
-        assert_eq!(team.picked, "T1");
-        assert_eq!(team.team_line(), "team: T1");
     }
 }

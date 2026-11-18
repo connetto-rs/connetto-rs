@@ -42,7 +42,7 @@ bot = ["dep:ring"]
 # Native only, never wasm (the browser worker owns token custody there).
 # A device identity key for peer sync (R74): in the security chip, or a
 # software key in the plain secret store where no chip is usable.
-device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation", "dep:rmp-serde", "dep:serde_bytes", "dep:connetto-app-attest"]
+device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation", "dep:connetto-app-attest"]
 # The peer link (R76): the device serves its identity to other devices over
 # a second, server-independent channel, and dials them.
 peer = [
@@ -87,10 +87,14 @@ connetto-core = { workspace = true, features = ["sqlite-shape"] }
 # supplies the v4 randomness on wasm32-unknown-unknown (Web Crypto); on
 # native, v4 uses the platform RNG and `js` is inert.
 uuid = { version = "1", default-features = false, features = ["v4", "v5", "js"] }
-# The device descriptor goes to the server in MessagePack (R74).
-rmp-serde = { workspace = true, optional = true }
-# The certificate chain an enrolment grant carries.
-serde_bytes = { workspace = true, optional = true }
+# The device descriptor goes to the server in MessagePack (R74), and a live
+# subscription's rows cross a process boundary in it (R116).
+rmp-serde.workspace = true
+# The array header a page rebuilds a keyed answer's rows under.
+rmp = "0.8.15"
+# The certificate chain an enrolment grant carries, and the keys and rows of a
+# keyed live subscription.
+serde_bytes.workspace = true
 # Local store plus the SQLite session extension: the capture hook for local
 # writes and the native apply for server patches. The third-party-backend
 # feature lets `ConnettoConnection` implement diesel's sealed `Connection`.

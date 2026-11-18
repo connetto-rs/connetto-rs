@@ -20,12 +20,18 @@ web = [
     "dep:connetto-client",
     "dep:connetto-file-core",
     "dep:connetto-web",
-    "dep:futures-lite",
     "dep:rosetta-uuid",
 ]
 # The Tauri layer, which sends every action over invoke to the native core in
-# `examples/tauri-leptos-demo/src-tauri` and renders the view it emits.
-tauri = ["dep:serde", "dep:serde-wasm-bindgen"]
+# `examples/tauri-leptos-demo/src-tauri`, renders the view it sends, and
+# follows the panes' live queries through the page source. The panes name the
+# demo's query descriptors and rows, which the client feature holds.
+tauri = [
+    "connetto-demo-support/client",
+    "dep:connetto-tauri-page",
+    "dep:serde",
+    "dep:serde-wasm-bindgen",
+]
 
 [dependencies]
 # The shared demo core, holding the view and the actions, the schema rows and
@@ -42,6 +48,11 @@ connetto-client = { path = "../../crates/connetto-client", default-features = fa
 connetto-file-core = { path = "../../crates/connetto-file-core", optional = true }
 # The Leptos 0.8 csr build, as the Tauri UI uses.
 leptos = { version = "0.8", features = ["csr"] }
+# The panes' live queries, through `use_live` on the source either layer
+# gives, and their keyed rows.
+connetto-leptos = { path = "../../crates/connetto-leptos" }
+# The Tauri layer's live source, reaching the client in the native core.
+connetto-tauri-page = { path = "../../crates/connetto-tauri-page", optional = true }
 # Client-authored primary keys, one strongly typed `rosetta_uuid::Uuid` that
 # maps to SQLite BLOB and Postgres uuid from a single schema, minted with the
 # browser CSPRNG through getrandom's wasm_js backend.
@@ -52,9 +63,6 @@ base64 = { version = "0.22", optional = true }
 # The actions and the view cross invoke as plain JS objects.
 serde = { version = "1", features = ["derive"], optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
-# The team pane's park, which polls the rendezvous flag beside the
-# subscriptions' change futures.
-futures-lite = { version = "2.6", optional = true }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

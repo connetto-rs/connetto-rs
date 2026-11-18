@@ -736,7 +736,7 @@ pub(crate) struct OpsContext<'a> {
 /// The key the row `op` writes, in key order, the order every provenance
 /// record and every server write names it in.
 pub(crate) fn key_of(op: &crate::replay::PeerOp) -> Vec<KeyValue> {
-    op.primary_key().into_iter().map(KeyValue::from).collect()
+    op.primary_key().into_iter().map(crate::key_value).collect()
 }
 
 /// Apply an entry's ops as its author through the policy views, a shared

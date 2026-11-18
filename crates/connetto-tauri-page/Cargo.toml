@@ -1,0 +1,33 @@
+[package]
+name = "connetto-tauri-page"
+description = "The live source a Tauri webview follows connetto live queries through, served by tauri-plugin-connetto in the native core."
+categories = ["database", "gui", "wasm"]
+keywords = ["sync", "tauri", "sqlite", "offline", "live-query"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+connetto-client = { path = "../connetto-client", version = "0.0.0", default-features = false }
+connetto-core.workspace = true
+futures-channel = "0.3.32"
+futures-util = { version = "0.3.32", default-features = false }
+js-sys = "0.3.80"
+# The page's JS values are not `Send`, and a feed's `changed` future must be.
+send_wrapper = { version = "0.6.0", features = ["futures"] }
+serde_bytes.workspace = true
+wasm-bindgen = "0.2.130"
+wasm-bindgen-futures = "0.4.80"
+
+[dev-dependencies]
+connetto-client = { path = "../connetto-client" }
+diesel.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
