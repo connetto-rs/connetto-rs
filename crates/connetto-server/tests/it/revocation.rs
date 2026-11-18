@@ -17,6 +17,7 @@ use connetto_server::device_cert::{
     EnrolmentStore, KeyRecord, MemoryEnrolments, Recorded, Revocation,
 };
 use connetto_test_harness::Fixture;
+use futures_util::FutureExt as _;
 use parking_lot::Mutex;
 use rcgen::{KeyPair, PublicKeyData as _};
 
@@ -260,6 +261,11 @@ async fn reporting_a_device_lost_closes_it_lists_it_and_revokes_its_session() {
             request_id: "r".into()
         })
     );
+    assert_eq!(
+        revoked_sessions.lock().len(),
+        1,
+        "its auth-store session is revoked"
+    );
     let after = verified(&next_lists(&mut laptop).await, &root);
     assert!(
         after.number() > before.number(),
@@ -282,11 +288,6 @@ async fn reporting_a_device_lost_closes_it_lists_it_and_revokes_its_session() {
     .await
     .expect("the reported device is closed within the bound");
     assert_eq!(closed, FatalErrorReason::DeviceRevoked);
-    assert_eq!(
-        revoked_sessions.lock().len(),
-        1,
-        "its auth-store session is revoked"
-    );
 
     let ControlMessage::DevicesList(DevicesList { devices, .. }) = ask(
         &mut laptop,
@@ -518,6 +519,11 @@ async fn the_owners_second_revoke_still_closes_the_device() {
             request_id: "r2".into()
         })
     );
+    assert_eq!(
+        revoked_sessions.lock().len(),
+        1,
+        "the second revoke revokes the device's session"
+    );
     let pushed = verified(&next_lists(&mut watcher).await, &root);
     assert!(
         pushed.revokes(cert.serial()),
@@ -525,11 +531,6 @@ async fn the_owners_second_revoke_still_closes_the_device() {
     );
     let closed = closed_by(&mut device).await;
     assert_eq!(closed, FatalErrorReason::DeviceRevoked);
-    assert_eq!(
-        revoked_sessions.lock().len(),
-        1,
-        "the second revoke revokes the device's session"
-    );
 }
 
 /// An issuer as its certificate and its PKCS #8 key.
@@ -640,4 +641,67 @@ async fn a_retired_issuer_keeps_listing_its_certificates_beside_the_roots_list()
         "the new issuer signed none of it"
     );
     assert!(by_signer(root.certificate()).revokes(&[9; 16]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_revocation_acknowledges_completion_before_closing() {
+    let fixture = Fixture::acquire().await;
+    let store = Arc::new(MemoryEnrolments::<String>::default());
+    let (_, _, issuer) = rooted_issuer();
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    let pending = Mutex::new(Some((started, release_rx)));
+    let revoked = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&revoked);
+    let enrolment = DeviceEnrolment::new(DeviceCertConfig::new(issuer), store)
+        .with_session_revoker(Arc::new(move |session| {
+            let (started, release_rx) = pending.lock().take().expect("one revocation");
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                started.send(session).expect("revocation observer");
+                let released = tokio::time::timeout(BOUND, release_rx)
+                    .await
+                    .expect("revocation release within the bound")
+                    .expect("revocation release");
+                assert_eq!(released, session);
+                *seen.lock() = Some(session);
+            })
+        }));
+    let manager = enrolling_manager(&fixture, Some(enrolment)).await;
+    let mut device = connect(&manager, Some("alice")).await;
+    let key = device_key();
+    let _ = enrolled(&mut device, &key).await;
+    device
+        .send_control(ControlMessage::RevokeDeviceRequest(RevokeDeviceRequest {
+            request_id: "self-revoke".into(),
+            key_id: *key_id(&key).as_bytes(),
+        }))
+        .await
+        .expect("request self-revocation");
+    let session = tokio::time::timeout(BOUND, started_rx)
+        .await
+        .expect("revoker starts within the bound")
+        .expect("revoker started");
+    assert!(
+        device.recv().now_or_never().is_none(),
+        "neither acknowledgement nor closure precedes revoker completion"
+    );
+    release.send(session).expect("release the session revoker");
+    let reply = tokio::time::timeout(BOUND, device.recv())
+        .await
+        .expect("acknowledgement within the bound")
+        .expect("receive acknowledgement");
+    assert_eq!(
+        reply,
+        Some(IncomingFrame::Control(ControlMessage::DeviceRevokedAck(
+            DeviceRevokedAck {
+                request_id: "self-revoke".into()
+            }
+        )))
+    );
+    assert_eq!(*revoked.lock(), Some(session));
+    assert_eq!(
+        closed_by(&mut device).await,
+        FatalErrorReason::DeviceRevoked
+    );
 }
