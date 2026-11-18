@@ -21,8 +21,8 @@ use connetto_core::{DialError, NativeStream, WebSocketTransport, dial};
 
 #[cfg(feature = "device-identity")]
 use crate::ClientEvent;
+use crate::ContentHooks;
 use crate::GateMechanism;
-use crate::HeldContent;
 #[cfg(feature = "peer")]
 use crate::PeerError;
 use crate::TransportFactory;
@@ -169,7 +169,7 @@ impl NativeClientBuilder<NativeTransport> {
                 dialer: BoxedDialer::server(server.into()),
                 sleeper: None,
                 client_id: None,
-                held_content: None,
+                content_hooks: None,
             },
         }
     }

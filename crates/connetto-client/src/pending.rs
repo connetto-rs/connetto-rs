@@ -1,9 +1,43 @@
 //! The one queryable condition every platform reports for local work that
-//! has not reached the server (R31 step 2).
+//! has not reached the server (R31 step 2), and the hooks the content layer
+//! reports its own part of that work through.
 
+use connetto_core::Major;
+use diesel::sqlite::SqliteConnection;
 use serde::{Deserialize, Serialize};
 
-use crate::UnsyncedWrite;
+use crate::{ClientError, UnsyncedFile, UnsyncedWrite};
+
+/// What the content layer does with its unsent files: moves an old major's
+/// aside across a rebuild and its drain (R31), and lists them for the
+/// unsynced snapshot. The content layer owns its tables, so it supplies
+/// these, and a build that attaches no content uses [`ContentHooks::NONE`].
+#[derive(Clone, Copy, Debug)]
+pub struct ContentHooks {
+    /// Moves the unsent files of a major aside inside the rebuild
+    /// transaction, and says whether it held any.
+    pub hold: fn(&mut SqliteConnection, Major) -> Result<bool, ClientError>,
+    /// How many files are still held for a major.
+    pub count: fn(&mut SqliteConnection, Major) -> Result<u64, ClientError>,
+    /// Forgets a major's held files and says how many there were.
+    pub forget: fn(&mut SqliteConnection, Major) -> Result<u64, ClientError>,
+    /// Every staged file of this device whose bytes have not reached the
+    /// server, held ones included, in identity order.
+    pub unsynced: fn(&mut SqliteConnection) -> Result<Vec<UnsyncedFile>, ClientError>,
+    /// The tables whose change can move what `unsynced` answers.
+    pub tables: &'static [&'static str],
+}
+
+impl ContentHooks {
+    /// A build that attaches no content, which holds and stages no file.
+    pub const NONE: Self = Self {
+        hold: |_, _| Ok(false),
+        count: |_, _| Ok(0),
+        forget: |_, _| Ok(0),
+        unsynced: |_| Ok(Vec::new()),
+        tables: &[],
+    };
+}
 
 /// Local work that would become unrecoverable if this device's data were
 /// deleted.

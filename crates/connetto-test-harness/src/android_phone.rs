@@ -11,6 +11,7 @@ use anyhow::{Result, anyhow, bail};
 use tokio::process::Command;
 use tokio::time::{Instant, sleep, timeout};
 
+pub mod live;
 mod steps;
 
 pub use steps::{

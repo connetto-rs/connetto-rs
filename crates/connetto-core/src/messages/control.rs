@@ -102,6 +102,7 @@ use super::{
     share_keys::{ReplaceShareKeys, ShareKeysReplaced, TabShareKeyAnswer, TabShareKeyChange},
     storage::{TabStorageAnswer, TabStorageUse},
     subscription::{MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, Unsubscribe},
+    unsynced::{TabDismissAnswer, TabDismissRefusal, UnsyncedWork},
     writer::{BindDevice, RetireWriter, WriterAnswer},
 };
 
@@ -259,6 +260,15 @@ pub enum ControlMessage {
     /// Unix epoch, since the worker owns the announcement (R107). Never sent
     /// by a real server, which says it in its own acknowledgement.
     TabSunset(u64),
+    /// A relay tells a tab every write and file of the worker that has not
+    /// reached the server, and every refusal not yet dismissed, since the
+    /// worker owns the outbox. Never sent by a real server.
+    TabUnsynced(UnsyncedWork),
+    /// A relay tab asks its worker to dismiss a refused write. Never sent to
+    /// a real server, which ignores it.
+    TabDismissRefusal(TabDismissRefusal),
+    /// A relay answers a tab's dismissal. Never sent by a real server.
+    TabDismissAnswer(TabDismissAnswer),
     /// Session-terminating error.
     FatalError(FatalError),
     /// Server reports that live delivery is temporarily paused.

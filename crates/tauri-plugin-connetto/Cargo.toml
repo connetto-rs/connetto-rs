@@ -1,0 +1,40 @@
+[package]
+name = "tauri-plugin-connetto"
+description = "Tauri plugin serving connetto live queries from the native core to the webview over channels."
+categories = ["database", "gui"]
+keywords = ["sync", "tauri", "sqlite", "offline", "live-query"]
+links = "tauri-plugin-connetto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+connetto-client = { path = "../connetto-client", version = "0.0.0", default-features = false, features = ["native-transport"] }
+serde.workspace = true
+serde_bytes.workspace = true
+# No `wry`: the plugin is generic over the runtime the application picks, and
+# wry 0.57's exact webkit2gtk-sys 2.0.2 cannot share the root lockfile with
+# connetto-dioxus's wry 0.53 and its 2.0.1, both linking `web_kit2`.
+tauri = { version = "2.12.5", default-features = false }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "sync"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[build-dependencies]
+tauri-plugin = { version = "2.7.2", features = ["build"] }
+
+[dev-dependencies]
+connetto-core.workspace = true
+diesel.workspace = true
+glob = "0.3.4"
+serde_json = "1.0.154"
+# The mock runtime, and an ACL the tests grant the plugin's commands in.
+tauri = { version = "2.12.5", default-features = false, features = ["dynamic-acl", "test"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

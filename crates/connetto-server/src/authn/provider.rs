@@ -1,14 +1,14 @@
-//! Identity providers, the issuer-indexed registry, and MFA assurance.
+//! Identity providers, the name-keyed registry, and MFA assurance.
 //!
 //! One [`IdentityProvider`] per configured provider runs the Authorization Code
 //! plus PKCE flow against that provider, verifies its ID token, and maps the
 //! claims to a [`ResolvedIdentity`]. The enabled providers live in a runtime
-//! [`ProviderRegistry`] indexed by issuer, with a matcher fallback for a
-//! provider that accepts a pattern of issuers (any-tenant Microsoft). Routing on
-//! the unverified issuer only selects a provider, and nothing is trusted until
-//! the selected provider has cryptographically verified the token. The registry
-//! is a boxed trait object, not a static tuple: routing is a runtime match
-//! either way and every provider yields the same identity. See
+//! [`ProviderRegistry`] keyed by configured name. A login runs through the
+//! provider it names, and a session's provider token refreshes through the
+//! provider the session signed in with, so two clients of one issuer, a web
+//! and a native Google client for one, each keep their own tokens. The
+//! registry is a boxed trait object, not a static tuple, because the lookup is
+//! a runtime match either way and every provider yields the same identity. See
 //! `docs/architecture/11-authentication.md`.
 
 use std::collections::HashMap;
@@ -75,7 +75,8 @@ pub const PROVIDER_TOKEN_MARGIN: std::time::Duration = std::time::Duration::from
 /// because the store stamps the expiry from its own clock.
 #[derive(Debug, Clone)]
 pub struct RetainedProviderToken {
-    /// The issuer these tokens belong to, so a refresh routes to its provider.
+    /// The issuer these tokens belong to, the tenant's own for a Microsoft
+    /// login.
     pub issuer: String,
     /// The provider access token.
     pub access_token: String,
@@ -176,15 +177,9 @@ pub trait IdentityProvider: Send + Sync {
     /// The provider's configured name, for the by-name lookup that starts a flow.
     fn name(&self) -> &str;
 
-    /// The issuer used as the registry index key. For a pattern provider this is
-    /// a representative string, and [`matches_issuer`](Self::matches_issuer) does
-    /// the real check.
+    /// The issuer whose `(issuer, subject)` pairs this provider mints. For a
+    /// pattern provider this is a representative string.
     fn issuer(&self) -> &str;
-
-    /// Whether this provider verifies tokens from `issuer`. Default is exact.
-    fn matches_issuer(&self, issuer: &str) -> bool {
-        self.issuer() == issuer
-    }
 
     /// Build the authorize redirect: PKCE, scopes, and the assurance request
     /// parameters. Synchronous, no network.
@@ -218,13 +213,12 @@ pub trait IdentityProvider: Send + Sync {
     ) -> BoxFuture<'a, Result<RetainedProviderToken, ProviderError>>;
 }
 
-/// The enabled providers, indexed by issuer with a matcher fallback and a
-/// by-name lookup for starting a flow. A deployment composes the set it enables,
-/// with no blessed default.
+/// The enabled providers, by the configured name a flow starts with and a
+/// session's provider token refreshes through. A deployment composes the set
+/// it enables, with no blessed default.
 #[derive(Default)]
 pub struct ProviderRegistry {
     by_name: HashMap<String, Arc<dyn IdentityProvider>>,
-    by_issuer: HashMap<String, Arc<dyn IdentityProvider>>,
     all: Vec<Arc<dyn IdentityProvider>>,
 }
 
@@ -235,13 +229,11 @@ impl ProviderRegistry {
         Self::default()
     }
 
-    /// Enable a provider. A later registration under the same name or issuer
-    /// replaces the earlier index entry.
+    /// Enable a provider. A later registration under the same name replaces
+    /// the earlier index entry.
     pub fn register(&mut self, provider: Arc<dyn IdentityProvider>) {
         self.by_name
             .insert(provider.name().to_owned(), Arc::clone(&provider));
-        self.by_issuer
-            .insert(provider.issuer().to_owned(), Arc::clone(&provider));
         self.all.push(provider);
     }
 
@@ -249,17 +241,6 @@ impl ProviderRegistry {
     #[must_use]
     pub fn by_name(&self, name: &str) -> Option<&Arc<dyn IdentityProvider>> {
         self.by_name.get(name)
-    }
-
-    /// The provider that verifies tokens from `issuer`: the index first, then
-    /// the matcher fallback for a pattern provider.
-    #[must_use]
-    pub fn by_issuer(&self, issuer: &str) -> Option<&Arc<dyn IdentityProvider>> {
-        self.by_issuer.get(issuer).or_else(|| {
-            self.all
-                .iter()
-                .find(|provider| provider.matches_issuer(issuer))
-        })
     }
 
     /// The number of enabled providers.
@@ -497,107 +478,7 @@ impl<Id> Default for AuthCodes<Id> {
 
 #[cfg(test)]
 mod tests {
-    #![expect(
-        clippy::unnecessary_literal_bound,
-        reason = "the stand-in providers return literals from trait methods whose signature is fixed"
-    )]
     use super::*;
-
-    /// A provider whose issuer matches by prefix, standing in for a pattern
-    /// provider to exercise the registry's matcher fallback.
-    struct PatternProvider;
-
-    impl IdentityProvider for PatternProvider {
-        fn name(&self) -> &str {
-            "pattern"
-        }
-        fn issuer(&self) -> &str {
-            "pattern-index-key"
-        }
-        fn matches_issuer(&self, issuer: &str) -> bool {
-            issuer.starts_with("https://login.microsoftonline.com/")
-        }
-        fn begin_login(&self) -> Result<LoginRedirect, ProviderError> {
-            Err(ProviderError::Config("test".to_owned()))
-        }
-        fn complete_login<'a>(
-            &'a self,
-            _code: &'a str,
-            _pkce_verifier: &'a str,
-            _nonce: &'a str,
-        ) -> BoxFuture<'a, Result<VerifiedLogin, ProviderError>> {
-            Box::pin(async { Err(ProviderError::Config("test".to_owned())) })
-        }
-        fn refresh_provider_token<'a>(
-            &'a self,
-            _refresh_token: &'a str,
-        ) -> BoxFuture<'a, Result<RetainedProviderToken, ProviderError>> {
-            Box::pin(async { Err(ProviderError::Refresh("test".to_owned())) })
-        }
-    }
-
-    /// A provider with a fixed name and exact issuer, standing in for a
-    /// discovered provider so the by-name lookup and the exact-issuer index
-    /// are exercised against a concrete entry.
-    struct StaticProvider {
-        name: &'static str,
-        issuer: &'static str,
-    }
-
-    impl IdentityProvider for StaticProvider {
-        fn name(&self) -> &str {
-            self.name
-        }
-        fn issuer(&self) -> &str {
-            self.issuer
-        }
-        fn begin_login(&self) -> Result<LoginRedirect, ProviderError> {
-            Err(ProviderError::Config("test".to_owned()))
-        }
-        fn complete_login<'a>(
-            &'a self,
-            _code: &'a str,
-            _pkce_verifier: &'a str,
-            _nonce: &'a str,
-        ) -> BoxFuture<'a, Result<VerifiedLogin, ProviderError>> {
-            Box::pin(async { Err(ProviderError::Config("test".to_owned())) })
-        }
-        fn refresh_provider_token<'a>(
-            &'a self,
-            _refresh_token: &'a str,
-        ) -> BoxFuture<'a, Result<RetainedProviderToken, ProviderError>> {
-            Box::pin(async { Err(ProviderError::Refresh("test".to_owned())) })
-        }
-    }
-
-    #[test]
-    fn registry_routes_by_name_issuer_and_matcher() {
-        let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(StaticProvider {
-            name: "google",
-            issuer: "https://accounts.google.com",
-        }));
-        registry.register(Arc::new(PatternProvider));
-
-        assert_eq!(registry.len(), 2);
-        assert!(registry.by_name("google").is_some());
-        assert!(registry.by_name("absent").is_none());
-        // Exact issuer index hit.
-        assert_eq!(
-            registry
-                .by_issuer("https://accounts.google.com")
-                .map(|p| p.name()),
-            Some("google"),
-        );
-        // Index miss falls through to the pattern matcher.
-        assert_eq!(
-            registry
-                .by_issuer("https://login.microsoftonline.com/tenant-1/v2.0")
-                .map(|p| p.name()),
-            Some("pattern"),
-        );
-        assert!(registry.by_issuer("https://unknown.example").is_none());
-    }
 
     #[test]
     fn assurance_enforces_acr_allowlist_and_required_amr() {
