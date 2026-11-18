@@ -73,11 +73,11 @@ use tokio::io::AsyncWrite;
 
 use crate::{
     AbuseConfig, Artifact, AuthConfig, AuthService, CallerMappings, CookieSameSite, DbAuthStore,
-    DefaultUuidResolver, GenericOidcProvider, IdentityResolver, LivenessError, LoginRequest,
-    OidcProviderConfig, PgReadConnector, PgSnapshotSource, PgWriteTarget, ProviderRegistry,
-    RedirectPolicy, RequestGuard, RlsAuth, RuntimeWritableCatalog, SessionDescriber, SessionId,
-    SessionRecord, SignInHook, SignInNotice, TokenAuthority, VerifiedSession, auth_router,
-    is_loopback_host, pg_ban_store, pg_write_target, preflight,
+    DefaultUuidResolver, GenericOidcProvider, IdentityProvider, IdentityResolver, LivenessError,
+    LoginRequest, OidcProviderConfig, PgReadConnector, PgSnapshotSource, PgWriteTarget,
+    ProviderRegistry, RedirectPolicy, RequestGuard, RlsAuth, RuntimeWritableCatalog,
+    SessionDescriber, SessionId, SessionRecord, SignInHook, SignInNotice, TokenAuthority,
+    VerifiedSession, auth_router, is_loopback_host, pg_ban_store, pg_write_target, preflight,
 };
 
 /// The id-type marker a deployment's bot registry tables are declared with.
@@ -469,6 +469,24 @@ pub enum OidcProvider {
     Generic(OidcProviderConfig),
 }
 
+impl OidcProvider {
+    /// The configured name the login endpoints select this provider by.
+    fn name(&self) -> &str {
+        match self {
+            Self::Google(config) | Self::Microsoft(config) | Self::Generic(config) => config.name(),
+        }
+    }
+
+    /// Whether the provider this discovers verifies tokens from `issuer`.
+    fn claims_issuer(&self, issuer: &str) -> bool {
+        match self {
+            Self::Google(_) => crate::authn::provider_oidc::google_claims_issuer(issuer),
+            Self::Microsoft(_) => crate::authn::provider_oidc::microsoft_claims_issuer(issuer),
+            Self::Generic(config) => config.claims_issuer(issuer),
+        }
+    }
+}
+
 /// Why [`ServerBuilder::build`] refused to assemble the server.
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -497,6 +515,23 @@ pub enum BuildError {
     /// No identity provider is configured, so no client can log in.
     #[error("no identity providers configured, so no client can log in")]
     NoProviders,
+    /// Two identity providers share a name, so a login could not tell which
+    /// one it asked for.
+    #[error("two identity providers are named {name:?}")]
+    DuplicateProvider {
+        /// The name both providers carry.
+        name: String,
+    },
+    /// A provider the deployment built names an issuer an OIDC provider
+    /// verifies or an earlier built provider names, so its users would share
+    /// that provider's identities.
+    #[error("the identity provider {name:?} names the issuer {issuer:?} another provider verifies")]
+    ClaimedIssuer {
+        /// The provider the deployment built.
+        name: String,
+        /// The issuer it names.
+        issuer: String,
+    },
     /// The schema declares a session descriptor and no describe callback
     /// supplies one.
     #[error("the schema declares a session descriptor and no session_describer supplies it")]
@@ -1237,7 +1272,7 @@ pub struct ServerBuilder<D: ConnettoSchema = ConnettoDefaults> {
     throttle: ThrottleConfig,
     abuse: AbuseConfig,
     bans: bool,
-    oidc_providers: Vec<OidcProvider>,
+    providers: Providers,
     auth_config: AuthConfig,
     redirect_allowlist: Vec<String>,
     cors_origins: Vec<String>,
@@ -1262,6 +1297,101 @@ struct Resolver<Id>(Arc<dyn IdentityResolver<Id = Id>>);
 impl<Id> fmt::Debug for Resolver<Id> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Resolver(..)")
+    }
+}
+
+/// The identity providers the login endpoints serve, the OIDC ones the build
+/// discovers and the ones the deployment built itself, named in the
+/// builder's `Debug`.
+#[derive(Default)]
+struct Providers {
+    discovered: Vec<OidcProvider>,
+    built: Vec<Arc<dyn IdentityProvider>>,
+}
+
+impl fmt::Debug for Providers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Providers")
+            .field("discovered", &self.discovered)
+            .field(
+                "built",
+                &self
+                    .built
+                    .iter()
+                    .map(|provider| provider.name())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl Providers {
+    /// Refuse a set no client can log in through, one where a login could
+    /// not tell which of two providers it named, or one where a provider the
+    /// deployment built would mint identities another provider's users hold.
+    fn check(&self) -> Result<(), BuildError> {
+        if self.discovered.is_empty() && self.built.is_empty() {
+            return Err(BuildError::NoProviders);
+        }
+        let mut names = std::collections::HashSet::new();
+        let every_name = self
+            .discovered
+            .iter()
+            .map(OidcProvider::name)
+            .chain(self.built.iter().map(|provider| provider.name()));
+        for name in every_name {
+            if !names.insert(name) {
+                return Err(BuildError::DuplicateProvider {
+                    name: name.to_owned(),
+                });
+            }
+        }
+        for (index, provider) in self.built.iter().enumerate() {
+            let issuer = provider.issuer();
+            let claimed = self
+                .discovered
+                .iter()
+                .any(|oidc| oidc.claims_issuer(issuer))
+                || self.built[..index]
+                    .iter()
+                    .any(|earlier| earlier.issuer() == issuer);
+            if claimed {
+                return Err(BuildError::ClaimedIssuer {
+                    name: provider.name().to_owned(),
+                    issuer: issuer.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Discover each OIDC provider and register it beside the built ones.
+    async fn registry(self) -> Result<ProviderRegistry, BuildError> {
+        let http = openidconnect::reqwest::ClientBuilder::new()
+            .redirect(openidconnect::reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|err| BuildError::Providers(err.to_string()))?;
+        let mut registry = ProviderRegistry::new();
+        for provider in self.discovered {
+            let discovered = match provider {
+                OidcProvider::Google(config) => {
+                    GenericOidcProvider::google(config, http.clone()).await
+                }
+                OidcProvider::Microsoft(config) => {
+                    GenericOidcProvider::microsoft(config, http.clone()).await
+                }
+                OidcProvider::Generic(config) => {
+                    GenericOidcProvider::discover(config, http.clone()).await
+                }
+            }
+            .map_err(|err| BuildError::Providers(err.to_string()))?;
+            registry.register(Arc::new(discovered));
+        }
+        for provider in self.built {
+            registry.register(provider);
+        }
+        tracing::info!(providers = registry.len(), "identity providers registered");
+        Ok(registry)
     }
 }
 
@@ -1320,7 +1450,7 @@ impl ServerBuilder {
             throttle: ThrottleConfig::default(),
             abuse: AbuseConfig::default(),
             bans: false,
-            oidc_providers: Vec::new(),
+            providers: Providers::default(),
             auth_config: AuthConfig::default(),
             redirect_allowlist: Vec::new(),
             cors_origins: Vec::new(),
@@ -1369,7 +1499,7 @@ where
             throttle,
             abuse,
             bans,
-            oidc_providers,
+            providers,
             auth_config,
             redirect_allowlist,
             cors_origins,
@@ -1403,7 +1533,7 @@ where
             throttle,
             abuse,
             bans,
-            oidc_providers,
+            providers,
             auth_config,
             redirect_allowlist,
             cors_origins,
@@ -1530,10 +1660,23 @@ where
         self
     }
 
-    /// The identity providers the login endpoints serve, at least one.
+    /// The identity providers the builder discovers at
+    /// [`build`](Self::build), each from its configuration.
     #[must_use]
     pub fn oidc_providers(mut self, providers: Vec<OidcProvider>) -> Self {
-        self.oidc_providers = providers;
+        self.providers.discovered = providers;
+        self
+    }
+
+    /// Serve logins through `provider` as well, one the deployment built
+    /// itself, such as an [`OAuthProvider`](crate::OAuthProvider) or its own
+    /// [`IdentityProvider`]. The login endpoints select it by its name, which
+    /// no other provider may share, its issuer may be none an OIDC provider
+    /// verifies, and at least one provider is required across this and
+    /// [`oidc_providers`](Self::oidc_providers).
+    #[must_use]
+    pub fn identity_provider(mut self, provider: Arc<dyn IdentityProvider>) -> Self {
+        self.providers.built.push(provider);
         self
     }
 
@@ -1688,7 +1831,7 @@ where
             throttle,
             abuse,
             bans,
-            oidc_providers,
+            providers,
             auth_config,
             redirect_allowlist,
             cors_origins,
@@ -1707,9 +1850,7 @@ where
         } = self;
         let schema = schema.with_devices(device_identity.is_some());
 
-        if oidc_providers.is_empty() {
-            return Err(BuildError::NoProviders);
-        }
+        providers.check()?;
         if describer.is_none() && <D::Auth as ConnettoStoreSchema>::undescribed().is_none() {
             return Err(BuildError::Undescribed);
         }
@@ -1821,7 +1962,7 @@ where
             &pool,
             resolver.0,
             Arc::clone(&guard),
-            &oidc_providers,
+            providers,
             &keys,
             &auth_config,
             AuthHooks {
@@ -2226,7 +2367,7 @@ async fn build_auth<D: ConnettoSchema>(
     pool: &PgPool,
     resolver: Arc<dyn IdentityResolver<Id = D::Id>>,
     guard: Arc<RequestGuard<D::Id>>,
-    providers: &[OidcProvider],
+    providers: Providers,
     keys: &TokenKeys,
     config: &AuthConfig,
     hooks: AuthHooks<D>,
@@ -2234,28 +2375,7 @@ async fn build_auth<D: ConnettoSchema>(
     let store = DbAuthStore::<D>::new(pool.clone(), config.refresh_lifetimes(), resolver);
     let authority = TokenAuthority::from_ed_pem(&keys.private, &keys.public, config)
         .map_err(BuildError::TokenKeys)?;
-    let http = openidconnect::reqwest::ClientBuilder::new()
-        .redirect(openidconnect::reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|err| BuildError::Providers(err.to_string()))?;
-    let mut registry = ProviderRegistry::new();
-    for provider in providers {
-        let discovered = match provider {
-            OidcProvider::Google(config) => {
-                GenericOidcProvider::google(config.clone(), http.clone()).await
-            }
-            OidcProvider::Microsoft(config) => {
-                GenericOidcProvider::microsoft(config.clone(), http.clone()).await
-            }
-            OidcProvider::Generic(config) => {
-                GenericOidcProvider::discover(config.clone(), http.clone()).await
-            }
-        }
-        .map_err(|err| BuildError::Providers(err.to_string()))?;
-        registry.register(Arc::new(discovered));
-    }
-    tracing::info!(providers = providers.len(), "identity providers registered");
-    let registry = Arc::new(registry);
+    let registry = Arc::new(providers.registry().await?);
     let service = AuthService::new(Arc::new(authority), Arc::new(store), guard)
         .with_registry(Arc::clone(&registry));
     let service = Arc::new(match hooks.describer {
@@ -3099,8 +3219,8 @@ mod tests {
     }
 
     /// The settings a deployment hands the builder keep their passwords, key
-    /// material and client secret out of the `Debug` line the builder and its
-    /// pieces print.
+    /// material and client secrets out of the `Debug` line the builder and its
+    /// pieces print, which names a provider the deployment built.
     #[test]
     fn the_builder_pieces_keep_their_secrets_out_of_their_debug_line() {
         let database = Database::new(
@@ -3117,6 +3237,15 @@ mod tests {
             )
             .with_client_secret(Some("oidc-secret".to_owned())),
         );
+        let built = crate::OAuthProvider::new(
+            crate::OAuthProviderConfig::github(
+                "built-github",
+                "github-client",
+                "https://app.example/cb",
+            )
+            .with_client_secret(Some("oauth-secret".to_owned())),
+        )
+        .expect("build the GitHub provider");
         let settings = ContentSettings {
             base_url: "http://127.0.0.1:8099".to_owned(),
             ttl: Duration::from_secs(60),
@@ -3145,6 +3274,7 @@ mod tests {
             OpenFga::new("http://127.0.0.1:1", "store"),
         )
         .oidc_providers(vec![provider])
+        .identity_provider(Arc::new(built))
         .content(Some(settings));
         let shown = format!("{builder:?}");
         for secret in [
@@ -3153,6 +3283,7 @@ mod tests {
             "PRIVATE-PEM-BYTES",
             "PUBLIC-PEM-BYTES",
             "oidc-secret",
+            "oauth-secret",
             "[191, 208, 187]",
         ] {
             assert!(
@@ -3160,6 +3291,10 @@ mod tests {
                 "the Debug line keeps its secrets: {shown}"
             );
         }
+        assert!(
+            shown.contains("\"built-github\""),
+            "the Debug line names the built provider: {shown}"
+        );
     }
 
     /// Credentials ride only the origins `CONNETTO_AUTH_CORS_ORIGINS` lists. A

@@ -1,6 +1,7 @@
 //! The catalogue pane: the shared store's products, by name, every account
 //! on the device reading the one copy.
 
+use connetto_client::LiveSpec;
 use connetto_demo_support as support;
 use connetto_dioxus::use_live;
 use dioxus::prelude::*;
@@ -15,7 +16,8 @@ pub fn ProductsPane() -> Element {
     let ClientSlot(client_slot) = use_context::<ClientSlot>();
     let client = client_slot.read().clone().expect("mounted with a client");
 
-    let products_live = use_live::<_, _, support::Product>(&client, support::products_by_name());
+    let products_live =
+        use_live::<_, _, support::Product>(&client, support::ProductsByName.query());
     let rows: Vec<support::Product> = products_live.value().read().iter().cloned().collect();
     let rows_error = products_live.error().read().clone();
 

@@ -1,6 +1,7 @@
 //! The orders pane: the visible rows newest first, the count the server
 //! pushes, the add and remove buttons.
 
+use connetto_client::LiveSpec;
 use connetto_demo_support as support;
 use connetto_dioxus::use_live;
 use dioxus::prelude::*;
@@ -17,9 +18,9 @@ pub fn OrdersPane() -> Element {
     let UserId(user_id) = use_context::<UserId>();
     let uid = user_id.read().clone().unwrap_or_default();
 
-    let orders_live = use_live::<_, _, support::Order>(&client, support::orders_newest_first());
-    let count = use_live(&client, support::orders_count());
-    let counts_by_quantity = use_live(&client, support::orders_counts_by_quantity());
+    let orders_live = use_live::<_, _, support::Order>(&client, support::OrdersNewestFirst.query());
+    let count = use_live(&client, support::OrdersCount.query());
+    let counts_by_quantity = use_live(&client, support::OrdersCountsByQuantity.query());
 
     let rows: Vec<support::Order> = orders_live.value().read().iter().cloned().collect();
     let sum: i64 = rows.iter().map(|row| row.quantity).sum();

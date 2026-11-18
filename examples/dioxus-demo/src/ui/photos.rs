@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use connetto_client::LiveSpec;
 use connetto_demo_support as support;
 
 use dioxus::prelude::*;
@@ -34,7 +35,7 @@ pub fn PhotosPane() -> Element {
     let UserId(user_id) = use_context::<UserId>();
     let uid = user_id.read().clone().unwrap_or_default();
 
-    let photos_live = use_live::<_, _, support::Photo>(&client, support::photos_rows());
+    let photos_live = use_live::<_, _, support::Photo>(&client, support::PhotosRows.query());
     let rows: Vec<support::Photo> = photos_live.value().read().iter().cloned().collect();
     let photos_error = photos_live.error().read().clone();
 
