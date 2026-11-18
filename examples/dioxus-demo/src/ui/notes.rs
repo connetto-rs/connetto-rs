@@ -1,6 +1,5 @@
 //! The notes pane: the device-private rows, which never leave the device.
 
-use connetto_client::LiveSpec;
 use connetto_demo_support as support;
 use connetto_dioxus::use_live;
 use dioxus::prelude::*;
@@ -15,7 +14,7 @@ pub fn NotesPane() -> Element {
     let ClientSlot(client_slot) = use_context::<ClientSlot>();
     let client = client_slot.read().clone().expect("mounted with a client");
 
-    let notes_live = use_live::<_, _, support::Note>(&client, support::NotesRows.query());
+    let notes_live = use_live(&client, support::NotesRows);
     let rows: Vec<support::Note> = notes_live.value().read().iter().cloned().collect();
     let notes_error = notes_live.error().read().clone();
 

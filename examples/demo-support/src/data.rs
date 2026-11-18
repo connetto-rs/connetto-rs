@@ -504,7 +504,7 @@ impl LiveSpec for OrdersNewestFirst {
     type Row = Order;
     type Handle = LiveQuery<Order>;
 
-    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + use<T>
     where
         T: Transport + MaybeSend + 'static,
         T::Error: core::fmt::Display,
@@ -530,7 +530,7 @@ impl LiveSpec for OrdersCount {
     type Row = i64;
     type Handle = LiveValue<i64>;
 
-    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + use<T>
     where
         T: Transport + MaybeSend + 'static,
         T::Error: core::fmt::Display,
@@ -548,7 +548,7 @@ impl LiveSpec for OrdersCountsByQuantity {
     type Row = (i64, i64);
     type Handle = LiveGroups<i64, i64>;
 
-    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + use<T>
     where
         T: Transport + MaybeSend + 'static,
         T::Error: core::fmt::Display,
@@ -568,7 +568,7 @@ impl LiveSpec for NotesRows {
     type Row = Note;
     type Handle = LiveQuery<Note>;
 
-    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + use<T>
     where
         T: Transport + MaybeSend + 'static,
         T::Error: core::fmt::Display,
@@ -594,7 +594,7 @@ impl LiveSpec for PhotosRows {
     type Row = Photo;
     type Handle = LiveQuery<Photo>;
 
-    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + use<T>
     where
         T: Transport + MaybeSend + 'static,
         T::Error: core::fmt::Display,
@@ -620,7 +620,7 @@ impl LiveSpec for ProductsByName {
     type Row = Product;
     type Handle = LiveQuery<Product>;
 
-    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + use<T>
     where
         T: Transport + MaybeSend + 'static,
         T::Error: core::fmt::Display,
@@ -646,7 +646,7 @@ impl LiveSpec for TeamsOfAccount {
     type Row = String;
     type Handle = LiveQuery<String>;
 
-    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + use<T>
     where
         T: Transport + MaybeSend + 'static,
         T::Error: core::fmt::Display,
@@ -671,7 +671,7 @@ impl LiveSpec for TeamMembersOf {
     type Row = String;
     type Handle = LiveQuery<String>;
 
-    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + use<T>
     where
         T: Transport + MaybeSend + 'static,
         T::Error: core::fmt::Display,
@@ -695,7 +695,7 @@ impl LiveSpec for TeamNotesFor {
     type Row = TeamNote;
     type Handle = LiveQuery<TeamNote>;
 
-    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + 'static
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + use<T>
     where
         T: Transport + MaybeSend + 'static,
         T::Error: core::fmt::Display,

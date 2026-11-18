@@ -150,13 +150,13 @@ A connection is constructed without a transport and given one later. `open_drive
 
 ## Framework adapters
 
-Both crates wrap `ConnettoClient`'s live-query API as UI framework hooks. `use_live` takes a `Watchable` query and yields `UseLive<Vec<R>>` for a row projection or `UseLive<Option<V>>` for a scalar aggregate, chosen at compile time through `LiveHandle`. `use_live_fn` serves boxed or dynamically built queries, which are not `Clone`, taking a builder closure for the same lifecycle. Both hooks capture their arguments on first render, and re-rendering with a different query has no effect, remount to change it.
+Both crates give a component one hook, `use_live(&source, spec)`, which follows a `LiveSpec` descriptor from a `LiveSource` and yields the spec's snapshot, `Vec<R>` for a row query, `Option<V>` for a scalar aggregate and a map for a grouped one, beside the error that ended it. A `ConnettoClient` is a source. The hook captures its arguments on first render, so a component remounts to follow another spec.
 
-Dropping the `LiveHandle` releases the subscription, a row watch starting its grace countdown and an aggregate unsubscribing at the next pump step, and the hook ties the handle's lifetime to the component's. That wiring differs between the two crates, and the difference is why two crates exist.
+Both hooks run `follow` from `connetto-client`, the one loop over a source, and differ only in how the component's end cancels it. Cancelling drops the feed, which releases the subscription, a row watch starting its grace countdown and raising `ClientEvent::WatchReleased`, and an aggregate unsubscribing at the next pump step.
 
-**`connetto-dioxus`** in [lib.rs](../../crates/connetto-dioxus/src/lib.rs) owns the handle in a component-scoped Dioxus task, and Dioxus cancels scope-bound tasks on unmount, so the drop is implicit. `use_away_input` in [away.rs](../../crates/connetto-dioxus/src/away.rs) feeds the client's one away input from the platform's lifecycle, tao's `Suspended` and `Resumed` on iOS and Android and the window's focus on the desktop. `use_hello_owner` in [hello.rs](../../crates/connetto-dioxus/src/hello.rs) anchors the Windows Hello prompt over the application's desktop window, which Windows requires. The feeders sit behind the crate's `desktop` and `hello` features, the last one Windows-only.
+**`connetto-dioxus`** in [lib.rs](../../crates/connetto-dioxus/src/lib.rs) runs the loop as a component-scoped Dioxus task, and Dioxus cancels scope-bound tasks on unmount, so the drop is implicit. `use_away_input` in [away.rs](../../crates/connetto-dioxus/src/away.rs) feeds the client's one away input from the platform's lifecycle, tao's `Suspended` and `Resumed` on iOS and Android and the window's focus on the desktop. `use_hello_owner` in [hello.rs](../../crates/connetto-dioxus/src/hello.rs) anchors the Windows Hello prompt over the application's desktop window, which Windows requires. The feeders sit behind the crate's `desktop` and `hello` features, the last one Windows-only.
 
-**`connetto-yew`** in [lib.rs](../../crates/connetto-yew/src/lib.rs) wraps the driver future in `Abortable` and returns an effect cleanup that calls `abort()`, because Yew's `spawn_local` is detached and unmounting the component does not cancel it.
+**`connetto-yew`** in [lib.rs](../../crates/connetto-yew/src/lib.rs) wraps the loop in `Abortable` and returns an effect cleanup that calls `abort()`, because Yew's `spawn_local` is detached and unmounting the component does not cancel it.
 
 ## The device-private tier
 

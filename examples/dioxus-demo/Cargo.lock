@@ -1415,7 +1415,6 @@ version = "0.0.0"
 dependencies = [
  "connetto-client",
  "connetto-core",
- "diesel",
  "dioxus-core",
  "dioxus-desktop",
  "dioxus-hooks",

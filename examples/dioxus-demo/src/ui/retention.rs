@@ -1,6 +1,5 @@
 //! The retention pane: the replica mirror's footprint and the trim pass.
 
-use connetto_client::LiveSpec;
 use connetto_demo_support as support;
 use connetto_dioxus::use_live;
 use dioxus::prelude::*;
@@ -19,9 +18,9 @@ pub fn RetentionPane() -> Element {
     let (pages, free) = *footprint.read();
     let tidy_client = client.clone();
     // The rows the live subscriptions still cover, which the trim pass spares.
-    let orders_live = use_live(&client, support::OrdersNewestFirst.query());
-    let notes_live = use_live(&client, support::NotesRows.query());
-    let photos_live = use_live(&client, support::PhotosRows.query());
+    let orders_live = use_live(&client, support::OrdersNewestFirst);
+    let notes_live = use_live(&client, support::NotesRows);
+    let photos_live = use_live(&client, support::PhotosRows);
     let covered = orders_live.value().read().len()
         + notes_live.value().read().len()
         + photos_live.value().read().len();
