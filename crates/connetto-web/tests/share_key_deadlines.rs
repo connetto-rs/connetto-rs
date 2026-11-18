@@ -1719,7 +1719,7 @@ async fn held_major_file_after_expiry(hold_attach: bool) {
     };
     let expires = seconds_now() + 8;
     let worker = ClientBuilder::new(held_schema(2), factory.clone())
-        .with_held_content(connetto_file_client::held_content())
+        .with_content_hooks(connetto_file_client::content_hooks())
         .with_share_keys(vec![(
             mint(expires),
             CapabilitySubject::<String>::new(SKD_SUBJECT),

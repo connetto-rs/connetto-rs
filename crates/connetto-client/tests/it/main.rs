@@ -59,6 +59,10 @@ mod key_requirement;
 
 mod live_dispatch;
 
+mod live_source;
+
+mod live_wire;
+
 #[cfg(all(feature = "native-auth", target_os = "linux"))]
 mod linux_custody;
 
@@ -170,6 +174,9 @@ mod tier_majors;
 mod truncate_resync;
 
 mod two_majors;
+
+#[cfg(feature = "native-auth")]
+mod unsynced_live;
 
 mod uuid_rls_default;
 

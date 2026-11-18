@@ -266,12 +266,14 @@ async fn hub_enforces_the_per_tab_credit_window() {
             IncomingFrame::Control(ControlMessage::SnapshotBegin(_)) => {}
             IncomingFrame::Bulk(BulkMessage::SnapshotPatch(_)) => snapshot_patches += 1,
             IncomingFrame::Control(ControlMessage::SnapshotEnd(_)) => break,
-            // The hub states its reach, its identity and its gate to every
-            // tab, none of them bulk frames, so they spend no credit.
+            // The hub states its reach, its identity, its gate and its
+            // unsynced work to every tab, none of them bulk frames, so they
+            // spend no credit.
             IncomingFrame::Control(
                 ControlMessage::SyncStatus(_)
                 | ControlMessage::TabIdentity(_)
-                | ControlMessage::GateState(_),
+                | ControlMessage::GateState(_)
+                | ControlMessage::TabUnsynced(_),
             ) => {}
             other => panic!("unexpected frame during the snapshot: {other:?}"),
         }
@@ -340,15 +342,16 @@ async fn hub_enforces_the_per_tab_credit_window() {
 
 /// A short name for a frame, so an ordering failure reads as a sequence.
 ///
-/// The hub's statements of its reach, its identity and its gate are dropped
-/// rather than named, since the hub sends them on no schedule of this test's
-/// and they spend no credit.
+/// The hub's statements of its reach, its identity, its gate and its unsynced
+/// work are dropped rather than named, since the hub sends them on no
+/// schedule of this test's and they spend no credit.
 fn label(frame: &IncomingFrame) -> Option<String> {
     match frame {
         IncomingFrame::Control(
             ControlMessage::SyncStatus(_)
             | ControlMessage::TabIdentity(_)
-            | ControlMessage::GateState(_),
+            | ControlMessage::GateState(_)
+            | ControlMessage::TabUnsynced(_),
         ) => None,
         IncomingFrame::Control(ControlMessage::SnapshotBegin(begin)) => {
             Some(format!("SnapshotBegin {}", begin.sub_id))
@@ -476,7 +479,8 @@ async fn a_tabs_snapshot_end_waits_for_its_rows() {
             IncomingFrame::Control(
                 ControlMessage::SyncStatus(_)
                 | ControlMessage::TabIdentity(_)
-                | ControlMessage::GateState(_),
+                | ControlMessage::GateState(_)
+                | ControlMessage::TabUnsynced(_),
             ) => {}
             other => panic!("unexpected frame before the credit barrier: {other:?}"),
         }

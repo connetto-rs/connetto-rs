@@ -421,7 +421,7 @@ async fn a_user_endpoint_answering_nothing_usable_refuses_the_login() {
 }
 
 /// The retained refresh token buys a fresh access token at the token
-/// endpoint, kept under the issuer label so the next refresh routes back.
+/// endpoint, kept under the issuer label the login resolved.
 #[tokio::test]
 async fn the_retained_refresh_token_buys_a_fresh_access_token() {
     let idp = MockOauth::start().await;

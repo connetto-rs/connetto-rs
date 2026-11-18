@@ -21,7 +21,7 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, MAJOR_DIRECTIVE, Major, SchemaVersion, loopback};
 use connetto_file_client::{
     ContentArchive, ContentClient, ContentError, ContentEvent, ContentFlush, ContentFlushStart,
-    ContentFlushState, ContentHttp, ContentUpload, FsStore, HttpFailure, HttpReply, held_content,
+    ContentFlushState, ContentHttp, ContentUpload, FsStore, HttpFailure, HttpReply, content_hooks,
 };
 use connetto_file_core::{FileId, MimeClass};
 use tempfile::{TempDir, tempdir};
@@ -198,7 +198,7 @@ async fn reopen_held(dir: &TempDir) -> ConnettoConnection<LoopbackTransport> {
     ClientBuilder::new(schema(2), || async {
         Err::<LoopbackTransport, _>("no server")
     })
-    .with_held_content(held_content())
+    .with_content_hooks(content_hooks())
     .signed_in(credential)
     .durable(
         At(dir.path().join("replica.sqlite")),
@@ -1157,7 +1157,7 @@ async fn redialled(dir: &TempDir) -> Redialled {
         }
     };
     let (core, pump) = ClientBuilder::new(schema(2), factory)
-        .with_held_content(held_content())
+        .with_content_hooks(content_hooks())
         .signed_in(
             HeldCredential::new(Grant::new("user:tester"), "tester").expect("a string identity"),
         )

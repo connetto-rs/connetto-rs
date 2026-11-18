@@ -7,7 +7,7 @@ use connetto_core::Transport;
 use connetto_core::traits::MaybeSend;
 
 use crate::ClientError;
-use crate::HeldContent;
+use crate::ContentHooks;
 use crate::live::ConnettoClient;
 
 /// Where the content store sits, the builder's answer for a build.
@@ -49,8 +49,9 @@ pub trait AttachContent<T: Transport> {
         None
     }
 
-    /// What a rebuild holds of an older major's unsent files (R31).
-    fn held_content() -> HeldContent {
-        HeldContent::NONE
+    /// The content layer's hooks for its unsent files, which a rebuild holds
+    /// (R31) and the unsynced snapshot lists.
+    fn content_hooks() -> ContentHooks {
+        ContentHooks::NONE
     }
 }

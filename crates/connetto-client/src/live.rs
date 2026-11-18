@@ -59,7 +59,7 @@ use crate::away::{
 use crate::reconnect::{NoReconnect, NoSleep, ReconnectPolicy, Sleeper, TransportFactory};
 use crate::{
     ClientError, ClientEvent, ConnettoConnection, DrainTimer, KeepaliveTimer, ResendTimer,
-    ShareKeyTimer, StorageUse,
+    ShareKeyTimer, StorageUse, UnsyncedWork, WriterRef,
 };
 
 /// Render a typed diesel query to its SQLite SQL (with `?` placeholders) and
@@ -840,6 +840,14 @@ struct ComputedEntry {
     apply: ApplyComputed,
 }
 
+/// One unsynced handle's driver-side state: the snapshot it reads and the
+/// signal that wakes it.
+struct UnsyncedEntry {
+    sub_id: String,
+    work: Arc<RwLock<UnsyncedWork>>,
+    changed: watch::Sender<u64>,
+}
+
 /// One shared wire subscription: declared once on the wire under `wire_id`,
 /// reference counted across every row and value handle that resolved to the
 /// same `spec`. The last aggregate value no longer lives here: R83 rests it in
@@ -864,6 +872,8 @@ struct State<T: Transport> {
     /// Aggregate pushes a locked gate held, as the wire sub and whether the
     /// frame was scalar, fanned out once the gate opens.
     held: Vec<(String, bool)>,
+    /// The handles following this device's unsynced work.
+    unsynced: Vec<UnsyncedEntry>,
 }
 
 /// The pump's exit signal. The flag and the wake form a double-check, so a
@@ -1271,6 +1281,63 @@ impl<R> LiveRows<R> {
     }
 }
 
+/// This device's unsynced work kept fresh by the client's pump: every write
+/// and staged file that has not reached the server, each with where it
+/// stands, and every refused write the application has not dismissed.
+///
+/// Created by [`ConnettoClient::unsynced_live`]. The snapshot is rebuilt at
+/// the pump step after a write, a send, a server answer or a dismissal, and
+/// held while the gate is locked, like every live handle. Dropping the
+/// handle releases nothing on the server.
+pub struct LiveUnsynced {
+    handle: LiveHandleCore,
+    work: Arc<RwLock<UnsyncedWork>>,
+}
+
+impl LiveHandle for LiveUnsynced {
+    type Snapshot = UnsyncedWork;
+
+    fn snapshot(&self) -> UnsyncedWork {
+        self.work()
+    }
+
+    fn changed(&mut self) -> impl core::future::Future<Output = Result<(), ClientError>> + Send {
+        LiveUnsynced::changed(self)
+    }
+
+    fn sub_id(&self) -> &str {
+        LiveUnsynced::sub_id(self)
+    }
+}
+
+impl LiveUnsynced {
+    /// The current snapshot, as of the latest rebuild.
+    #[must_use]
+    pub fn work(&self) -> UnsyncedWork {
+        self.work.read().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |work| work.clone(),
+        )
+    }
+
+    /// The id backing this handle.
+    #[must_use]
+    pub fn sub_id(&self) -> &str {
+        self.handle.sub_id()
+    }
+
+    /// Wait until the snapshot changes. Resolves once per rebuild that
+    /// altered it, coalescing bursts.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Stopped`] or [`ClientError::Transport`] when the
+    /// driving [`ConnettoClient`] is gone.
+    pub async fn changed(&mut self) -> Result<(), ClientError> {
+        self.handle.changed().await
+    }
+}
+
 /// Liveness token every [`ConnettoClient`] clone holds. Dropping the last one
 /// wakes the pump, which then closes the connection gracefully and exits.
 struct ClientToken {
@@ -1466,6 +1533,7 @@ where
                 computed: Vec::new(),
                 wire,
                 held: Vec::new(),
+                unsynced: Vec::new(),
             }),
             wake: Arc::clone(&wake),
             reaper: Arc::new(Reaper {
@@ -2761,6 +2829,60 @@ where
         state.conn.storage_use()
     }
 
+    /// Follow this device's unsynced work, its writes and staged files that
+    /// have not reached the server and its undismissed refusals, as a live
+    /// handle.
+    ///
+    /// A relay tab's mirror holds no outbox, so in a tab the handle follows
+    /// the snapshot the worker states.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, or
+    /// [`ClientError`] if the outbox does not read back.
+    pub async fn unsynced_live(&self) -> Result<LiveUnsynced, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
+        let work = Arc::new(RwLock::new(state.conn.unsynced_work()?));
+        let seq = self.shared.next_live.fetch_add(1, Ordering::Relaxed);
+        let sub_id = format!("live-{seq}");
+        let (changed, receiver) = watch::channel(0_u64);
+        state.unsynced.push(UnsyncedEntry {
+            sub_id: sub_id.clone(),
+            work: Arc::clone(&work),
+            changed,
+        });
+        Ok(LiveUnsynced {
+            handle: LiveHandleCore::new(sub_id, receiver, &self.shared.reaper),
+            work,
+        })
+    }
+
+    /// Dismiss `writer`'s refused write `seq`, so the unsynced snapshot no
+    /// longer lists it, as [`ConnettoConnection::dismiss_refusal`] does.
+    ///
+    /// A relay tab's mirror holds no refusals, so in a tab the call asks the
+    /// worker and returns its answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the client is closed, locked, its replica
+    /// refuses the write, or a tab's worker does not answer in time.
+    pub async fn dismiss_refusal(&self, writer: WriterRef, seq: u64) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        self.allow_relay_request()?;
+        if state.conn.is_relay_mirror() {
+            let answer = state.conn.ask_relay_dismiss(writer, seq).await?;
+            drop(state);
+            return self.await_relay(answer, "the refusal dismissal").await;
+        }
+        state.conn.dismiss_refusal(&writer, seq)?;
+        refresh_changed(&mut state, &self.shared.events);
+        Ok(())
+    }
+
     /// Wait for the relay's answer to `request`, which the pump delivers or
     /// ends at its bound, so the pump is woken to arm that bound.
     async fn await_relay<A>(
@@ -3134,6 +3256,7 @@ where
             let entry = state.computed.remove(pos);
             release_wire(&mut state.wire, &entry.wire_id, &mut released);
         }
+        state.unsynced.retain(|entry| entry.sub_id != sub_id);
     }
     // The last handle dropping starts a countdown, it does not end the
     // subscription. Navigating away and back inside the grace re-claims the
@@ -4193,12 +4316,14 @@ where
     )
 }
 
-/// Fan out the aggregate pushes a lock held, then re-run every live query
-/// whose tables were touched since the last step.
+/// Fan out the aggregate pushes a lock held, rebuild the unsynced snapshot
+/// when it may have moved, then re-run every live query whose tables were
+/// touched since the last step.
 fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sender<ClientEvent>) {
     for (sub_id, scalar) in core::mem::take(&mut state.held) {
         route_aggregate(state, events, &sub_id, scalar);
     }
+    refresh_unsynced(state, events);
     let changed = state.conn.take_changed_unfiltered();
     if changed.is_empty() {
         return;
@@ -4211,6 +4336,7 @@ fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sende
         computed: _,
         wire: _,
         held: _,
+        unsynced: _,
     } = state;
     for entry in registry.iter_mut() {
         if entry.tables.is_disjoint(&changed) {
@@ -4222,6 +4348,37 @@ fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sende
                 detail: format!("live query refresh failed: {err}"),
             });
         }
+    }
+}
+
+/// Rebuild the unsynced snapshot once when it may have moved, and wake each
+/// handle following it whose snapshot it changed.
+fn refresh_unsynced<T: Transport>(state: &mut State<T>, events: &broadcast::Sender<ClientEvent>) {
+    if state.unsynced.is_empty() || !state.conn.take_unsynced_moved() {
+        return;
+    }
+    let fresh = match state.conn.unsynced_work() {
+        Ok(fresh) => fresh,
+        Err(err) => {
+            for entry in &state.unsynced {
+                let _ = events.send(ClientEvent::NonFatal {
+                    related_to: Some(entry.sub_id.clone()),
+                    detail: format!("reading the unsynced work failed: {err}"),
+                });
+            }
+            return;
+        }
+    };
+    for entry in &state.unsynced {
+        let unchanged = entry.work.read().is_ok_and(|current| *current == fresh);
+        if unchanged {
+            continue;
+        }
+        match entry.work.write() {
+            Ok(mut work) => work.clone_from(&fresh),
+            Err(poisoned) => poisoned.into_inner().clone_from(&fresh),
+        }
+        entry.changed.send_modify(|generation| *generation += 1);
     }
 }
 
@@ -4250,6 +4407,7 @@ fn route_aggregate<T>(
         computed,
         wire,
         held: _,
+        unsynced: _,
     } = state;
     let Some(target) = wire.iter().find(|w| w.wire_id == *sub_id) else {
         return;
