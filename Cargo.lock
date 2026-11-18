@@ -1657,6 +1657,7 @@ dependencies = [
  "jsonwebtoken",
  "keyring-core",
  "linux-keyutils-keyring-store",
+ "oauth2",
  "openfga-client",
  "openidconnect",
  "parking_lot",
