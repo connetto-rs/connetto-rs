@@ -29,10 +29,9 @@ qrcode = { version = "0.14.1", default-features = false, features = ["svg"], opt
 
 [features]
 default = ["web"]
-# The schema, its rows, queries and writes, and the lines client events
-# produce, all of which reach the connetto client and the replica. A UI that
-# renders a view another process computes leaves it off and compiles no
-# database engine.
+# The schema, its rows, queries and writes, the live query descriptors the
+# panes name, and the lines client events produce. A Tauri page turns it on
+# for the descriptors and rows its panes follow through the native core.
 client = [
   "dep:chrono",
   "dep:connetto-client",

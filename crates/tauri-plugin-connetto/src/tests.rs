@@ -510,6 +510,8 @@ fn a_page_that_stops_acknowledging_holds_one_message() {
             let _ = outlet.send(message);
         }),
         acknowledged,
+        1,
+        "main".to_owned(),
     ));
     settle(&mut forwarding);
     assert_eq!(messages.try_recv().map(|message| message.seq), Ok(1));

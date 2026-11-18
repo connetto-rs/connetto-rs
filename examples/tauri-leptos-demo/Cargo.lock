@@ -1210,6 +1210,7 @@ dependencies = [
  "serde",
  "tauri",
  "tauri-build",
+ "tauri-plugin-connetto",
  "tauri-plugin-dialog",
  "tauri-plugin-fs",
  "thiserror 2.0.21",
@@ -6371,6 +6372,20 @@ dependencies = [
  "serde_json",
  "tauri-utils",
  "walkdir",
+]
+
+[[package]]
+name = "tauri-plugin-connetto"
+version = "0.0.0"
+dependencies = [
+ "connetto-client",
+ "serde",
+ "serde_bytes",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -29,6 +29,8 @@ parking_lot = "0.12"
 rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "postgres"] }
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2.12", features = [] }
+# Live queries served from the native session to the page.
+tauri-plugin-connetto = { path = "../../../crates/tauri-plugin-connetto" }
 # The Save As window the export offers and the file write that follows it,
 # the route an Android content URI takes to the archive.
 tauri-plugin-dialog = "2"
