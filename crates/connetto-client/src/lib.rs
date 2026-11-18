@@ -1466,6 +1466,16 @@ pub enum ClientEvent {
         /// consumers the truth rather than restating one cause as another.
         reason: FullResyncReason,
     },
+    /// The last live handle on a watch dropped, so its grace started (R116).
+    /// A watch is the subscription every handle on the same query shares, and
+    /// it is raised once per release, again after a re-watch inside the grace
+    /// is dropped. A handle served from the local tier alone holds no watch
+    /// and raises nothing.
+    WatchReleased {
+        /// The watch's subscription id, the one its snapshot and patch events
+        /// name.
+        sub_id: String,
+    },
     /// The server opened a membership subscription on this client's behalf
     /// (R27): a filter narrowing through a membership table needs that
     /// table's rows on the replica for the offline answer and for the policy
