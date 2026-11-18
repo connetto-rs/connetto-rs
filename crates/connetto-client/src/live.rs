@@ -29,7 +29,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock, Weak};
 
 use connetto_core::auth::{CapabilityKey, CapabilitySubject};
 use connetto_core::messages::{
-    BindValue, ContentVerb, FatalErrorReason, Grant, SUBSCRIPTION_REFUSED, ShareKeyChange,
+    BindValue, ContentVerb, FatalErrorReason, Grant, SUBSCRIPTION_REFUSED,
+    SUBSCRIPTION_REFUSED_SCHEMA, ShareKeyChange,
     SubscriptionSpec,
 };
 use connetto_core::traits::{MaybeSend, Transport};
@@ -4155,7 +4156,7 @@ where
                 related_to: Some(wire_id),
                 detail,
             } = &event
-                && detail == SUBSCRIPTION_REFUSED
+                && (detail == SUBSCRIPTION_REFUSED || detail == SUBSCRIPTION_REFUSED_SCHEMA)
             {
                 note_wire_outcome(state, &shared.reaper, wire_id, true);
             }

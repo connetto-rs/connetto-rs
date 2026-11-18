@@ -40,6 +40,14 @@ pub enum FullResyncReason {
     SnapshotInterrupted,
     /// The client's cursor lies past where its timeline ended, naming changes a promotion lost, or the server cannot read it (R73).
     CursorBeyondHistory,
+    /// The named table was refused because its live schema stopped matching
+    /// the catalog, and the server dropped its changes from then on. Every row
+    /// of it the client holds may be stale, so the client deletes the whole of
+    /// this one, as for [`Self::TableTruncated`].
+    TableRefused {
+        /// The refused table, as the catalog names it.
+        table: String,
+    },
 }
 
 /// Server tells the client "throw away local state for this subscription and

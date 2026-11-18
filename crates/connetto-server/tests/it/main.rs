@@ -54,6 +54,8 @@ mod deployment_schema;
 
 mod device_identity;
 
+mod drift_refusal;
+
 mod e2e;
 
 mod enrolment;

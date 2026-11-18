@@ -51,6 +51,7 @@ pub mod courier;
 #[doc(hidden)]
 pub mod db_clock;
 pub mod defaults;
+pub mod drift;
 pub mod device_cert;
 pub mod epoch;
 pub mod fence;

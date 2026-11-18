@@ -9,13 +9,13 @@
 use std::time::{Duration, Instant};
 
 use connetto_core::messages::{
-    ControlMessage, FatalError, FatalErrorReason, Grant, Handshake, HandshakeAck, Subscribe,
-    SubscriptionSpec,
+    ControlMessage, FatalError, FatalErrorReason, Grant, Handshake, HandshakeAck,
+    SUBSCRIPTION_REFUSED_SCHEMA, Subscribe, SubscriptionSpec,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Major, PROTOCOL_VERSION};
 use connetto_server::builder::{
-    Database, OidcProvider, OpenFga, ServeError, ServerBuilder, ServerSchema, TokenKeys,
+    Database, OidcProvider, OpenFga, ServerBuilder, ServerSchema, TokenKeys,
 };
 use connetto_server::{OidcProviderConfig, RuntimeWritableCatalog, WebSocketTransport};
 use connetto_test_harness::{
@@ -320,13 +320,49 @@ async fn a_shutdown_signal_ends_serve_with_the_sessions_closed() {
     }
 }
 
-/// The terminal change-stream outcome (R6 decision 4): once a table the boot
-/// preflight saw recording full previous images is switched to
-/// `REPLICA IDENTITY DEFAULT`, the next delete carries the key alone and is
-/// undeliverable, `serve` returns the refusal after closing every session,
-/// and the runtime keeps working.
+/// The next refusal on `client`, past the snapshot's tail frames, asserted to
+/// be the schema refusal of `sub_id`.
+async fn expect_schema_refusal(client: &mut WebSocketTransport<TcpStream>, sub_id: &str) {
+    let refusal = loop {
+        if let ControlMessage::NonFatalError(refusal) = next_control(client).await {
+            break refusal;
+        }
+    };
+    assert_eq!(refusal.related_to.as_deref(), Some(sub_id));
+    assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED_SCHEMA);
+}
+
+/// Ask `client`'s server to subscribe to `table` again, which a refused
+/// table answers with the schema refusal, and then end `serve` cleanly.
+async fn still_serving_then_shut_down(
+    client: &mut WebSocketTransport<TcpStream>,
+    table: &str,
+    fire: tokio::sync::oneshot::Sender<()>,
+    serve: tokio::task::JoinHandle<Result<(), connetto_server::builder::ServeError>>,
+) {
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: "again".to_owned(),
+            spec: SubscriptionSpec::new(format!("SELECT * FROM {table}")),
+        }))
+        .await
+        .expect("send the second subscription");
+    expect_schema_refusal(client, "again").await;
+    fire.send(()).expect("fire the shutdown signal");
+    let outcome = tokio::time::timeout(BOUND, serve)
+        .await
+        .expect("serve ends on the signal")
+        .expect("serve joins");
+    assert!(outcome.is_ok(), "the refusal never ended serve: {outcome:?}");
+}
+
+/// A table the boot guard saw recording full previous images is switched to
+/// `REPLICA IDENTITY DEFAULT`. The stream's `Relation` message ahead of the
+/// next delete carries the weaker identity, so the guard refuses the table
+/// before its key-only delete reaches anything, and `serve` keeps running
+/// (R107 decision 10).
 #[tokio::test]
-async fn an_unusable_change_stream_ends_serve_with_the_sessions_closed() {
+async fn a_weakened_replica_identity_refuses_the_table_and_serve_keeps_running() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
     let fixture = Fixture::acquire().await;
@@ -341,8 +377,7 @@ async fn an_unusable_change_stream_ends_serve_with_the_sessions_closed() {
     let (builder, _idp, _keys) = builder_over(&fixture, port).await;
     let base = format!("http://127.0.0.1:{port}");
 
-    // A signal nobody fires, so only the change stream can end this serve.
-    let (_fire, signal) = tokio::sync::oneshot::channel::<()>();
+    let (fire, signal) = tokio::sync::oneshot::channel::<()>();
     let serve = tokio::spawn(async move {
         let shutdown = async move {
             let _ = signal.await;
@@ -374,42 +409,15 @@ async fn an_unusable_change_stream_ends_serve_with_the_sessions_closed() {
     exec(&pool, "ALTER TABLE orders REPLICA IDENTITY DEFAULT").await;
     exec(&pool, "DELETE FROM orders WHERE id = 1").await;
 
-    let outcome = tokio::time::timeout(BOUND, serve)
-        .await
-        .expect("serve ends on the refusal")
-        .expect("serve joins");
-    match outcome {
-        Err(ServeError::ChangeStreamUnusable(why)) => {
-            assert!(why.contains("orders"), "the refusal names the table: {why}");
-        }
-        other => panic!("serve answered {other:?}"),
-    }
-
-    // The snapshot's tail frames queue behind the fatal, so take controls
-    // until the shutdown arrives.
-    let last = loop {
-        if let fatal @ ControlMessage::FatalError(_) = next_control(&mut client).await {
-            break fatal;
-        }
-    };
-    match last {
-        ControlMessage::FatalError(FatalError {
-            reason: FatalErrorReason::ServerShuttingDown,
-        }) => {}
-        other => panic!("the session's last frame says {other:?}"),
-    }
-    // The refusal is an outcome for the embedder, not a crash: the test keeps
-    // running in the same runtime to the last line to prove the point.
+    expect_schema_refusal(&mut client, "orders").await;
+    still_serving_then_shut_down(&mut client, "orders", fire, serve).await;
 }
 
-/// The same terminal outcome on a table the model shapes, so the refusal
-/// arrives from the store's level step rather than the transition's. A
-/// key-only previous image on a shaped table is held by the upkeep's diff
-/// as a transient `AuthUnavailable` and retried for ever when it is not
-/// mapped to the terminal `ChangeStreamUnusable`, which this test would
-/// time out on (R6 decision 4).
+/// The same refusal on a table the model shapes. Without the guard, the
+/// key-only previous image reaches the upkeep's diff, which holds it as a
+/// transient `AuthUnavailable` and retries it for ever.
 #[tokio::test]
-async fn an_unusable_change_stream_on_a_model_table_refuses_to_serve() {
+async fn a_weakened_replica_identity_refuses_a_model_table() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
     let fixture = Fixture::acquire().await;
@@ -450,7 +458,7 @@ async fn an_unusable_change_stream_on_a_model_table_refuses_to_serve() {
     let (builder, _idp, _keys) = builder_over_owned(&fixture, port).await;
     let base = format!("http://127.0.0.1:{port}");
 
-    let (_fire, signal) = tokio::sync::oneshot::channel::<()>();
+    let (fire, signal) = tokio::sync::oneshot::channel::<()>();
     let serve = tokio::spawn(async move {
         let shutdown = async move {
             let _ = signal.await;
@@ -477,26 +485,6 @@ async fn an_unusable_change_stream_on_a_model_table_refuses_to_serve() {
     exec(&pool, "ALTER TABLE owned REPLICA IDENTITY DEFAULT").await;
     exec(&pool, "DELETE FROM owned WHERE id = 1").await;
 
-    let outcome = tokio::time::timeout(BOUND, serve)
-        .await
-        .expect("serve ends on the refusal")
-        .expect("serve joins");
-    match outcome {
-        Err(ServeError::ChangeStreamUnusable(why)) => {
-            assert!(why.contains("owned"), "the refusal names the table: {why}");
-        }
-        other => panic!("serve answered {other:?}"),
-    }
-
-    let last = loop {
-        if let fatal @ ControlMessage::FatalError(_) = next_control(&mut client).await {
-            break fatal;
-        }
-    };
-    match last {
-        ControlMessage::FatalError(FatalError {
-            reason: FatalErrorReason::ServerShuttingDown,
-        }) => {}
-        other => panic!("the session's last frame says {other:?}"),
-    }
+    expect_schema_refusal(&mut client, "owned").await;
+    still_serving_then_shut_down(&mut client, "owned", fire, serve).await;
 }

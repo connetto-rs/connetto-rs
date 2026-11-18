@@ -49,7 +49,8 @@ use connetto_core::messages::{
     MutationApplied, MutationConflict, MutationHeader, MutationPatch, MutationReject,
     MutationRejectReason, NonFatalError, PROVISIONAL_ASK_REFUSED, PauseCause, Pong, PriorRefusal,
     Provenance, ProvisionalStatus, ProvisionalVerdicts, RateLimited, RegisterBot, ReplaceShareKeys,
-    RetireWriter, RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED, ShareKeysReplaced,
+    RetireWriter, RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED,
+    SUBSCRIPTION_REFUSED_SCHEMA, ShareKeysReplaced,
     SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
     WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
     bot_registration_message, writer_bind_message,
@@ -78,10 +79,12 @@ use subql::term::{TermCaller, TermDescription};
 use subql::visibility::transition::{Transition, TransitionError, Transitions, transitions};
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
 use subql::{
-    AdvanceCursorError, CdcSource, Checkpoint, DatabaseLike, EventKind, OpaqueCheckpoint, ParserDB,
-    PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgXid, Seen, SourceItem, SubscriptionId,
-    TableLike,
+    AdvanceCursorError, CdcSource, Checkpoint, DatabaseLike, DriftSignal, EventKind,
+    Incompatibility, OpaqueCheckpoint, ParserDB, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn,
+    PgXid, RefusalView, RefusedTables, Seen, SourceItem, SubscriptionId, TableId, TableLike,
 };
+
+use crate::drift::{RefusedSet, StreamSignal};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::Instrument;
 use uuid::Uuid;
@@ -1065,6 +1068,11 @@ pub enum SessionError {
          ALTER TABLE {0} REPLICA IDENTITY FULL"
     )]
     ChangeStreamUnusable(String),
+    /// The drift guard reported a signal this server cannot serve through,
+    /// lost changes of a table or a signal it does not know, so it stops
+    /// serving instead of reconnecting into the same report.
+    #[error("the change stream reported {0}, which this server cannot serve through")]
+    DriftUnserved(String),
     /// The authorization path refused an event for a reason the deployment fixes, so the server stops serving instead of retrying.
     #[error(
         "the authorization path cannot answer for a change in {table}, and asking again \
@@ -1425,15 +1433,24 @@ pub(crate) fn reject_reason(err: &MaterializerError) -> MutationRejectReason {
         MaterializerError::Parse(detail) => MutationRejectReason::Malformed {
             detail: detail.clone(),
         },
-        MaterializerError::NotWritable(_) | MaterializerError::SchemaMismatch(_) => {
-            MutationRejectReason::SchemaMismatch
-        }
+        MaterializerError::NotWritable(_)
+        | MaterializerError::SchemaMismatch(_)
+        | MaterializerError::Refused(_) => MutationRejectReason::SchemaMismatch,
         MaterializerError::Apply(inner) => MutationRejectReason::Constraint {
             detail: inner.to_string(),
         },
         other => MutationRejectReason::Other {
             detail: other.to_string(),
         },
+    }
+}
+
+/// Why a catch-up member reached by the emptying `record` of `table` replaces it.
+fn resync_reason(record: &ChangeRecord, table: String) -> FullResyncReason {
+    if record.is_refusal() {
+        FullResyncReason::TableRefused { table }
+    } else {
+        FullResyncReason::TableTruncated { table }
     }
 }
 
@@ -1572,6 +1589,8 @@ enum Outbound {
     Refuse {
         /// The client-facing label of the subscription.
         sub_id: String,
+        /// The fixed phrase the refusal carries.
+        detail: &'static str,
     },
 }
 
@@ -1648,7 +1667,7 @@ impl Outbound {
                 connetto_core::codec::encode_control(msg).map_or(0, |frame| len_bytes(frame.len())),
             ),
             Self::Resnapshot { sub_id, .. }
-            | Self::Refuse { sub_id }
+            | Self::Refuse { sub_id, .. }
             | Self::ReservedResnapshot { sub_id, .. }
             | Self::Rebootstrap { sub_id, .. } => {
                 OUTBOUND_ITEM_BYTES.saturating_add(len_bytes(sub_id.len()))
@@ -2577,6 +2596,9 @@ pub struct SessionManager<
     /// The sessions bound to each device writer (R75), so a retirement can
     /// close every connection that writes as the retired writer.
     writer_sessions: Mutex<HashMap<i64, HashSet<SessionId>>>,
+    /// The tables this process refused, the materializer's own set, so the
+    /// ingest loop's gate reads it without the materializer lock.
+    refused: RefusedSet,
 }
 
 /// Keeps the open-run-loop count right while one `serve` is in flight.
@@ -2733,6 +2755,7 @@ where
     let has_major = config.schema_major.is_some();
     let manager = Arc::new(SessionManager {
         catalog: Arc::new(materializer.catalog().clone()),
+        refused: materializer.refused().clone(),
         materializer: Arc::new(Mutex::new(materializer)),
         routes: Mutex::new(HashMap::new()),
         dispatch_gate: Mutex::new(()),
@@ -4003,6 +4026,7 @@ where
                 );
                 let _ = route.tx.send(Outbound::Refuse {
                     sub_id: route.label.clone(),
+                    detail: SUBSCRIPTION_REFUSED,
                 });
             }
             applied.refused.clear();
@@ -4662,6 +4686,7 @@ where
     ) -> Result<(), SessionError>
     where
         Src: CdcSource<Event = PgChangeEvent, Commit = PgCommit>,
+        Src::Relation: StreamSignal,
         Src::Error: core::fmt::Display,
     {
         loop {
@@ -4677,6 +4702,13 @@ where
                     if let Some(commits) = self.ingested_commits.get() {
                         let _ = commits.send(commit);
                     }
+                }
+                Ok(Some(SourceItem::Event(event)))
+                    if self.refused.holds(&self.event_table(&event)) =>
+                {
+                    // A table this process refused stays refused when a later
+                    // guard accepts it again, until a restart (OPEN-D).
+                    self.resume.set(Some(event.position()));
                 }
                 Ok(Some(SourceItem::Event(event))) => {
                     // One hold loop for both pause causes (R89 decision 2):
@@ -4763,9 +4795,7 @@ where
                     // A row is acknowledged with its commit, since acknowledging it alone moves nothing.
                     self.resume.set(Some(event.position()));
                 }
-                // A relation message states a table's definition, which the
-                // ingest loop has no use for, its rows arriving as events.
-                Ok(Some(SourceItem::Relation(_))) => {}
+                Ok(Some(SourceItem::Relation(item))) => self.handle_drift(item).await?,
                 Ok(None) => return Ok(()),
                 Err(err) => return Err(SessionError::Transport(err.to_string())),
             }
@@ -4800,6 +4830,7 @@ where
     ) -> Result<(), SessionError>
     where
         Src: CdcSource<Event = PgChangeEvent, Commit = PgCommit>,
+        Src::Relation: StreamSignal,
         Src::Error: core::fmt::Display,
         Connect: FnMut(ResumePoint) -> F,
         F: core::future::Future<Output = Result<Src, E>>,
@@ -4819,6 +4850,7 @@ where
                         // The same event meets the same refusal after a reconnect (R6 decision 4).
                         Err(
                             err @ (SessionError::ChangeStreamUnusable(_)
+                            | SessionError::DriftUnserved(_)
                             | SessionError::AuthorizationUnanswerable { .. }),
                         ) => return Err(err),
                         Err(err) => {
@@ -4855,6 +4887,130 @@ where
             });
             tokio::time::sleep(backoff).await;
         }
+    }
+
+    /// The name the catalog stores for `table`, for a message a person reads.
+    fn table_name(&self, table: TableId) -> String {
+        subql::catalog_helpers::table_name::<subql::backend::Postgres, _>(
+            self.catalog.as_ref(),
+            table,
+        )
+        .unwrap_or_else(|| format!("table {table}"))
+    }
+
+    /// Refuse `table` for `reasons`, with every table whose policy reads it
+    /// when its identity weakened, and end every subscription reading one
+    /// with [`SUBSCRIPTION_REFUSED_SCHEMA`] (R107 decisions 6, 10 and 11).
+    ///
+    /// Each refusal is persisted before any subscription ends, so the process
+    /// that next serves the table resyncs every cursor older than its return.
+    /// A table already refused draws nothing, so a reconnect re-reporting it
+    /// sends no frame.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Oplog`] when a refusal could not be persisted.
+    pub async fn refuse_table(
+        &self,
+        table: TableId,
+        reasons: Vec<Incompatibility>,
+    ) -> Result<(), SessionError> {
+        let (refused, subscriptions) = {
+            let materializer = self.materializer.lock().await;
+            let refused = materializer.refuse_table(table, reasons.clone());
+            let subscriptions = materializer.subscriptions_reading(&refused);
+            (refused, subscriptions)
+        };
+        if refused.is_empty() {
+            return Ok(());
+        }
+        for name in &refused {
+            self.oplog.record_refusal(name).await.map_err(oplog_err)?;
+        }
+        tracing::error!(
+            tables = ?refused,
+            reasons = ?reasons,
+            "the live schema no longer matches the catalog, so these tables are refused \
+             until the server restarts on a matching schema"
+        );
+        let rows: Vec<(String, OutboundTx)> = self
+            .routes
+            .lock()
+            .await
+            .values()
+            .filter(|route| subscriptions.contains(&route.sub_id))
+            .map(|route| (route.label.clone(), route.tx.clone()))
+            .collect();
+        for (label, tx) in rows {
+            let _ = tx.send(Outbound::Refuse {
+                sub_id: label,
+                detail: SUBSCRIPTION_REFUSED_SCHEMA,
+            });
+        }
+        for subscription in subscriptions {
+            if self.fail_courier_audit_locked(subscription).await {
+                continue;
+            }
+            let route = { self.computed_routes.lock().await.remove(&subscription) };
+            let Some(route) = route else { continue };
+            self.materializer.lock().await.unregister(subscription);
+            let _ = route
+                .tx
+                .send(Outbound::Control(ControlMessage::NonFatalError(
+                    NonFatalError {
+                        related_to: Some(route.label),
+                        detail: SUBSCRIPTION_REFUSED_SCHEMA.to_owned(),
+                    },
+                )));
+        }
+        Ok(())
+    }
+
+    /// Act on one drift signal the stream carried.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::DriftUnserved`] for a signal connetto cannot serve,
+    /// which stops the stream, and whatever [`Self::refuse_table`] answers.
+    async fn handle_drift(&self, item: impl StreamSignal) -> Result<(), SessionError> {
+        match item.drift() {
+            None => Ok(()),
+            Some(DriftSignal::Refused { table, reasons }) => self.refuse_table(table, reasons).await,
+            Some(DriftSignal::ChangesLost { table }) => Err(SessionError::DriftUnserved(format!(
+                "lost changes of {}",
+                self.table_name(table)
+            ))),
+            Some(other) => Err(SessionError::DriftUnserved(format!("{other:?}"))),
+        }
+    }
+
+    /// Take a new guard's refusals for the stretch before the ingest loop
+    /// handles them, and serve again every table an earlier process refused
+    /// that neither this process nor the guard refuses (OPEN-H).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Oplog`] when the refusals could not be read or settled.
+    pub async fn watch_guard(&self, guard: RefusedTables) -> Result<(), SessionError> {
+        let readmitted: Vec<String> = self
+            .oplog
+            .refusals()
+            .await
+            .map_err(oplog_err)?
+            .into_iter()
+            .filter(|table| !self.refused.holds(table) && guard.refusal(table).is_none())
+            .collect();
+        self.refused.watch(guard);
+        if readmitted.is_empty() {
+            return Ok(());
+        }
+        self.oplog.readmit(&readmitted).await.map_err(oplog_err)?;
+        tracing::info!(
+            tables = ?readmitted,
+            "tables an earlier process refused match the catalog again, and every client \
+             resuming from before their return resyncs them"
+        );
+        Ok(())
     }
 
     /// Send one computed-result change to the session owning its
@@ -6103,8 +6259,9 @@ where
                 self.rebootstrap_computed(transport, state, sub_id, retired_id)
                     .await?;
             }
-            Outbound::Refuse { sub_id } => {
-                self.refuse_subscription(transport, state, &sub_id).await?;
+            Outbound::Refuse { sub_id, detail } => {
+                self.refuse_subscription(transport, state, &sub_id, detail)
+                    .await?;
             }
         }
         Ok(true)
@@ -6308,7 +6465,10 @@ where
                     }
                 }
             } else {
-                Outbound::Refuse { sub_id: label }
+                Outbound::Refuse {
+                    sub_id: label,
+                    detail: SUBSCRIPTION_REFUSED,
+                }
             };
             let _ = state.outbound.send(instruction);
         }
@@ -9528,6 +9688,18 @@ where
         let consumer_id = self.next_consumer_id();
         let registered = match self.register_subscription(consumer_id, &sub, state).await {
             Ok(registered) => registered,
+            Err(SubscribeRefusal::Materializer(MaterializerError::RefusedRead(table))) => {
+                // A table refused for its schema says nothing about what the caller named.
+                tracing::warn!(sub_id = %sub.sub_id, table = %table, "subscription reads a refused table");
+                transport
+                    .send_control(ControlMessage::NonFatalError(NonFatalError {
+                        related_to: Some(sub.sub_id),
+                        detail: SUBSCRIPTION_REFUSED_SCHEMA.to_owned(),
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                return Ok(());
+            }
             Err(err) => {
                 tracing::warn!(sub_id = %sub.sub_id, error = %err, "subscription registration refused");
                 // Naming something that does not resolve is one of the four
@@ -9657,7 +9829,9 @@ where
                         // Without its membership rows the term's local answer is wrong, so the two are refused as a unit.
                         Err(SessionError::Snapshot(detail) | SessionError::ReadRefused(detail)) => {
                             tracing::warn!(sub_id = %sub_label, error = %detail, "membership read failed, refusing the term");
-                            return self.refuse_subscription(transport, state, &sub_label).await;
+                            return self
+                                .refuse_subscription(transport, state, &sub_label, SUBSCRIPTION_REFUSED)
+                                .await;
                         }
                         Err(other) => return Err(other),
                     }
@@ -9964,7 +10138,9 @@ where
                         error = %detail,
                         "replacing a subscription was refused, ending it"
                     );
-                    return self.refuse_subscription(transport, state, sub_label).await;
+                    return self
+                        .refuse_subscription(transport, state, sub_label, SUBSCRIPTION_REFUSED)
+                        .await;
                 }
                 Err(other) => return Err(other),
             }
@@ -10134,6 +10310,7 @@ where
             let mut payloads = Vec::new();
             let mut truncated = false;
             let mut unencodable = false;
+            let mut refused_table = None;
             for record in records {
                 if replay.fence.seen(record.position()) != Seen::Missed {
                     continue;
@@ -10147,6 +10324,10 @@ where
                 let Some(departing) = matched else {
                     continue;
                 };
+                if record.is_refusal() {
+                    refused_table = Some(record.table().to_owned());
+                    break;
+                }
                 if record.event().kind() == EventKind::Truncate {
                     truncated = true;
                     break;
@@ -10164,12 +10345,23 @@ where
                     }
                 }
             }
+            if let Some(table) = refused_table {
+                self.resnapshot_row(
+                    transport,
+                    state,
+                    &replay.label,
+                    &FullResyncReason::TableRefused { table },
+                    None,
+                )
+                .await?;
+                continue;
+            }
             if truncated || unencodable {
                 tracing::warn!(
                     sub_id = %replay.label,
                     "a missed record the client cannot be sent is refused instead"
                 );
-                self.refuse_subscription(transport, state, &replay.label)
+                self.refuse_subscription(transport, state, &replay.label, SUBSCRIPTION_REFUSED)
                     .await?;
                 continue;
             }
@@ -10375,7 +10567,9 @@ where
         // A page above the ceiling is not a transient failure and a restart
         // would meet the same row, so this one ends the subscription.
         if admit_page(&label, &page, max_rows, average_width, limits).is_err() {
-            return self.refuse_subscription(transport, state, &label).await;
+            return self
+                .refuse_subscription(transport, state, &label, SUBSCRIPTION_REFUSED)
+                .await;
         }
         // Size the next page from what this one measured rather than from the
         // prediction, which cannot see the true size of a value stored out of
@@ -10431,7 +10625,9 @@ where
         let label = start.sub.sub_id.clone();
         if start.restarted {
             let _ = refuse_read(&label, &SubscribeRefusal::Interrupted(detail.to_owned()));
-            return self.refuse_subscription(transport, state, &label).await;
+            return self
+                .refuse_subscription(transport, state, &label, SUBSCRIPTION_REFUSED)
+                .await;
         }
         tracing::warn!(
             sub_id = %label,
@@ -10454,19 +10650,21 @@ where
             Ok(()) => Ok(()),
             Err(SessionError::Snapshot(detail) | SessionError::ReadRefused(detail)) => {
                 let _ = refuse_read(&label, &SubscribeRefusal::Interrupted(detail));
-                self.refuse_subscription(transport, state, &label).await
+                self.refuse_subscription(transport, state, &label, SUBSCRIPTION_REFUSED)
+                    .await
             }
             Err(other) => Err(other),
         }
     }
 
     /// Give up on one subscription: tear the registration down and answer with
-    /// the one fixed phrase (R38).
+    /// `detail`, one of the fixed phrases (R38).
     async fn refuse_subscription<T: Transport>(
         &self,
         transport: &mut T,
         state: &mut SessionState<Id, Key>,
         label: &str,
+        detail: &'static str,
     ) -> Result<(), SessionError> {
         for (consumer_id, sub_id) in take_row_subscription(state, label) {
             self.remove_route(consumer_id).await;
@@ -10475,7 +10673,7 @@ where
         transport
             .send_control(ControlMessage::NonFatalError(NonFatalError {
                 related_to: Some(label.to_owned()),
-                detail: SUBSCRIPTION_REFUSED.to_owned(),
+                detail: detail.to_owned(),
             }))
             .await
             .map_err(transport_err)
@@ -10579,7 +10777,7 @@ where
                     .await
             }
             CatchupWait::Ready(WaveEnd::Refused) => {
-                self.refuse_subscription(transport, state, &sub.sub_id)
+                self.refuse_subscription(transport, state, &sub.sub_id, SUBSCRIPTION_REFUSED)
                     .await
             }
             CatchupWait::Ready(WaveEnd::Failed(error)) => Err(error),
@@ -11018,11 +11216,9 @@ where
         let event = record.event();
         // A truncate replays as a patchset with no operations, so applying it would leave the emptied table populated (R48), and everything after it arrives again in the replacement.
         if event.kind() == EventKind::Truncate {
-            let table = self.event_table(event);
+            let reason = resync_reason(record, self.event_table(event));
             for (at, _) in reached {
-                members[at].end(WaveEnd::Resync(FullResyncReason::TableTruncated {
-                    table: table.clone(),
-                }));
+                members[at].end(WaveEnd::Resync(reason.clone()));
             }
             return;
         }
@@ -11598,6 +11794,22 @@ mod tests {
     use crate::timeline::{Position, TimelineHistory};
     use connetto_core::Cursor;
     use subql::{PgCommitPosition, PgLsn, PgXid};
+
+    /// A write to a table the drift guard refused is rejected as a schema
+    /// mismatch, which names nothing about the table (R107 decision 11, R38).
+    #[test]
+    fn a_write_to_a_refused_table_is_a_schema_mismatch() {
+        let refused = crate::materializer::MaterializerError::Refused(
+            subql::patchset::ApplyError::RefusedTable {
+                table: "docs".to_owned(),
+                reasons: vec![subql::Incompatibility::Unpublished],
+            },
+        );
+        assert_eq!(
+            super::reject_reason(&refused),
+            connetto_core::messages::MutationRejectReason::SchemaMismatch
+        );
+    }
 
     /// Bytes released by a sent patch make room again, and an overflow stays final even once the queue drains.
     #[test]

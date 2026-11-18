@@ -40,7 +40,7 @@ pub use enrolment::{
 };
 pub use error::{
     CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR, FatalError, FatalErrorReason,
-    NonFatalError, RateLimited, SUBSCRIPTION_REFUSED,
+    NonFatalError, RateLimited, SUBSCRIPTION_REFUSED, SUBSCRIPTION_REFUSED_SCHEMA,
 };
 pub use flow::{AckCredits, Ping, Pong};
 pub use handshake::{Grant, Handshake, HandshakeAck};

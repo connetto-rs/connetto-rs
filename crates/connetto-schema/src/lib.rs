@@ -335,10 +335,8 @@ pub fn with_registry<Id: BotRegistryIdSql>(schema_sql: &str) -> String {
 /// tables' and the enrolment base table's. The `user_id` column follows the
 /// deployment's id type `Id` the way the registry's id columns do, so the
 /// catalog decodes a non-text deployment's writer and enrolment rows as the
-/// deployment stores them. The settle-path column's enum type is declared by
-/// the deployment, and the catalog maps a column of an undeclared type to
-/// text, so the DDL here names the type without the `CREATE TYPE` that would
-/// redeclare it.
+/// deployment stores them. The settle-path enum is declared with the labels
+/// the server decodes, so the drift guard compares the live enum against them.
 #[must_use]
 pub fn with_bookkeeping<Id: BotRegistryIdSql>(schema_sql: &str, devices: bool) -> String {
     let mut out = schema_sql.trim_end().to_owned();
@@ -360,12 +358,14 @@ pub fn with_bookkeeping<Id: BotRegistryIdSql>(schema_sql: &str, devices: bool) -
     out
 }
 
-/// The writer and settled tables' DDL over the deployment's id type `Id`,
-/// `;`-terminated, the tables that stand with or without device identity.
+/// The settle-path enum, then the writer and settled tables' DDL over the
+/// deployment's id type `Id`, `;`-terminated, the tables that stand with or
+/// without device identity.
 #[must_use]
 pub fn bookkeeping_ddl<Id: BotRegistryIdSql>() -> String {
     format!(
-        "CREATE TABLE _connetto_writers \
+        "CREATE TYPE connetto_settle_path AS ENUM ('direct', 'restore', 'courier'); \
+         CREATE TABLE _connetto_writers \
          (writer BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY, \
           user_id {}, \
           session_id UUID, \

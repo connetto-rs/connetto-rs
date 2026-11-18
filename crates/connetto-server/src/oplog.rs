@@ -30,7 +30,7 @@
 //! All three are configurable per deployment, and the log names the bound
 //! that prunes whenever it changes.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::io::Write as _;
 use std::sync::Arc;
@@ -212,6 +212,8 @@ pub struct ChangeRecord {
     pk: Vec<u8>,
     event: PgChangeEvent,
     payload: Option<Vec<u8>>,
+    /// Whether this record marks a table serving again after a refusal.
+    refused: bool,
 }
 
 impl ChangeRecord {
@@ -234,6 +236,7 @@ impl ChangeRecord {
             pk,
             event,
             payload: Some(payload),
+            refused: false,
         }
     }
 
@@ -247,7 +250,38 @@ impl ChangeRecord {
             pk,
             event,
             payload: None,
+            refused: false,
         }
+    }
+
+    /// Build the record a table serving again after a drift refusal leaves
+    /// at `position`, so a catchup from any earlier cursor resyncs the table
+    /// (R107 decision 11).
+    ///
+    /// The event is the table's truncate, which names the table the way a
+    /// truncate does, and the record carries no payload.
+    #[must_use]
+    pub fn refusal(table: impl Into<String>, position: PgCommitPosition) -> Self {
+        let table = table.into();
+        let change = subql::ChangeEvent::truncate(
+            vec![Arc::from(table.as_str())],
+            false,
+            false,
+            pg_walstream::Lsn::new(position.commit_lsn().0),
+        );
+        Self {
+            table,
+            pk: Vec::new(),
+            event: PgChangeEvent::new(change, position),
+            payload: None,
+            refused: true,
+        }
+    }
+
+    /// Whether this record marks a table serving again after a refusal.
+    #[must_use]
+    pub const fn is_refusal(&self) -> bool {
+        self.refused
     }
 
     /// The change's commit position, the oplog key. The wire cursor is this
@@ -311,6 +345,9 @@ impl ChangeRecord {
     /// The change verb, for the Postgres oplog `op` column.
     #[must_use]
     pub fn op(&self) -> ChangeOp {
+        if self.refused {
+            return ChangeOp::Refused;
+        }
         ChangeOp::from(self.event.kind())
     }
 }
@@ -330,9 +367,8 @@ pub struct ChangeOpSql;
 
 /// The verb a retained change carries.
 ///
-/// A closed set of four, so it is an enum on both sides: a value outside it is
-/// unrepresentable in Rust and rejected by Postgres. The column used to be
-/// `TEXT` carrying one of four words, which is a contract nothing enforced.
+/// A closed set, so it is an enum on both sides: a value outside it is
+/// unrepresentable in Rust and rejected by Postgres.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AsExpression, FromSqlRow)]
 #[diesel(sql_type = ChangeOpSql)]
 pub enum ChangeOp {
@@ -344,6 +380,9 @@ pub enum ChangeOp {
     Delete,
     /// The whole table was emptied.
     Truncate,
+    /// The table serves again after a drift refusal, so every cursor before
+    /// this record resyncs it.
+    Refused,
 }
 
 impl ChangeOp {
@@ -356,6 +395,7 @@ impl ChangeOp {
             Self::Update => "update",
             Self::Delete => "delete",
             Self::Truncate => "truncate",
+            Self::Refused => "refused",
         }
     }
 }
@@ -385,6 +425,7 @@ impl FromSql<ChangeOpSql, Pg> for ChangeOp {
             b"update" => Ok(Self::Update),
             b"delete" => Ok(Self::Delete),
             b"truncate" => Ok(Self::Truncate),
+            b"refused" => Ok(Self::Refused),
             other => Err(format!(
                 "unrecognised connetto_change_op label {:?}",
                 String::from_utf8_lossy(other)
@@ -531,6 +572,50 @@ pub trait Oplog: Send + Sync {
     ///
     /// Implementation-defined: a backing-store write failure.
     async fn forget_through(&self, through: PgCommitPosition) -> Result<(), Self::Error>;
+
+    /// Remember that `table` is refused, so the process that next serves it
+    /// resyncs every cursor older than its return (R107, OPEN-H).
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backing-store write failure.
+    async fn record_refusal(&self, table: &str) -> Result<(), Self::Error>;
+
+    /// The tables a refusal left refused, by the names the catalog stores.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backing-store read failure.
+    async fn refusals(&self) -> Result<Vec<String>, Self::Error>;
+
+    /// Serve `tables` again: append one [`ChangeRecord::refusal`] each at the
+    /// position the change stream resumes from, then forget their refusals.
+    ///
+    /// A log that never recorded a commit gets no record, since every resume
+    /// from it resyncs.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backing-store write failure.
+    async fn readmit(&self, tables: &[String]) -> Result<(), Self::Error>;
+}
+
+/// Where the records of tables serving again go: ahead of the commit the
+/// change stream resumes after, one ordinal each, so they sort after every
+/// record already held and before every row the stream appends.
+fn readmission_records(last_commit: Option<PgCommit>, tables: &[String]) -> Vec<ChangeRecord> {
+    let Some(last_commit) = last_commit else {
+        return Vec::new();
+    };
+    (0_u64..)
+        .zip(tables)
+        .map(|(ordinal, table)| {
+            ChangeRecord::refusal(
+                table.clone(),
+                PgCommitPosition::new(last_commit.end_lsn(), PgXid::INVALID, ordinal),
+            )
+        })
+        .collect()
 }
 
 /// Decide whether a client resuming from `resume` can catch up from the
@@ -655,6 +740,8 @@ struct Inner {
     bytes: u64,
     /// The bound that pruned last, so the log names a bound only when it takes over.
     pruning_by: Option<RetentionBound>,
+    /// The tables a refusal left refused.
+    refused: BTreeSet<String>,
 }
 
 /// An in-memory ring-buffer [`Oplog`] for Docker-free tests and single-node use.
@@ -690,6 +777,7 @@ impl InMemoryOplog {
                 since_truncation: 0,
                 bytes: 0,
                 pruning_by: None,
+                refused: BTreeSet::new(),
             }),
             config,
             clock,
@@ -917,6 +1005,35 @@ impl Oplog for InMemoryOplog {
         }
         Ok(())
     }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn record_refusal(&self, table: &str) -> Result<(), Infallible> {
+        self.inner.lock().refused.insert(table.to_owned());
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn refusals(&self) -> Result<Vec<String>, Infallible> {
+        Ok(self.inner.lock().refused.iter().cloned().collect())
+    }
+
+    async fn readmit(&self, tables: &[String]) -> Result<(), Infallible> {
+        let last_commit = self.inner.lock().last_commit;
+        for record in readmission_records(last_commit, tables) {
+            self.append(&record).await?;
+        }
+        let mut inner = self.inner.lock();
+        for table in tables {
+            inner.refused.remove(table);
+        }
+        Ok(())
+    }
 }
 
 pub use pg::{PgOplog, PgOplogError};
@@ -995,6 +1112,15 @@ mod pg {
         event: Vec<u8>,
         #[diesel(sql_type = Binary)]
         payload: Vec<u8>,
+        #[diesel(sql_type = Text)]
+        op: String,
+    }
+
+    /// One table a refusal left refused, read back from the registry.
+    #[derive(QueryableByName)]
+    struct RefusalRow {
+        #[diesel(sql_type = Text)]
+        table_name: String,
     }
 
     /// The recorded commit, read back from the companion table.
@@ -1120,6 +1246,7 @@ mod pg {
                 ChangeOp::Update,
                 ChangeOp::Delete,
                 ChangeOp::Truncate,
+                ChangeOp::Refused,
             ]
             .map(|op| format!("'{}'", op.label()))
             .join(", ");
@@ -1128,6 +1255,12 @@ mod pg {
                  EXCEPTION WHEN duplicate_object THEN NULL; END $$"
             );
             sql_query(create_type).execute(&mut *conn).await?;
+            // A deployment whose type predates the label gains it here.
+            let refused_label = format!(
+                "ALTER TYPE {CHANGE_OP_TYPE} ADD VALUE IF NOT EXISTS '{}'",
+                ChangeOp::Refused.label()
+            );
+            sql_query(refused_label).execute(&mut *conn).await?;
             let ddl = format!(
                 "CREATE TABLE IF NOT EXISTS {table} (\
                      commit_lsn BIGINT NOT NULL, \
@@ -1174,14 +1307,28 @@ mod pg {
                 table = quote_ident(&Self::xid_table(&self.table)),
             );
             sql_query(xid_lsn_index).execute(&mut *conn).await?;
+            let refused_ddl = format!(
+                "CREATE TABLE IF NOT EXISTS {table} (table_name TEXT PRIMARY KEY)",
+                table = quote_ident(&Self::refused_table(&self.table)),
+            );
+            sql_query(refused_ddl).execute(&mut *conn).await?;
             Ok(())
+        }
+
+        /// The companion table naming every refused table, the log's name with `_refused` appended.
+        #[must_use]
+        pub fn refused_table(table: &str) -> String {
+            format!("{table}_refused")
         }
 
         /// A record read back from its row. An empty stored payload is the
         /// marker's form, because a zstd frame is never empty.
         fn record(row: OplogRow) -> Result<ChangeRecord, PgOplogError> {
-            let change: ChangeEvent = serde_json::from_slice(&row.event)?;
             let position = position_from_i64(row.commit_lsn, row.xid, row.ordinal);
+            if row.op == ChangeOp::Refused.label() {
+                return Ok(ChangeRecord::refusal(row.table_name, position));
+            }
+            let change: ChangeEvent = serde_json::from_slice(&row.event)?;
             if row.payload.is_empty() {
                 Ok(ChangeRecord::marker(
                     row.table_name,
@@ -1327,7 +1474,7 @@ mod pg {
             let (commit_lsn, xid, ordinal) = position_to_i64(after)?;
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "SELECT commit_lsn, xid, ordinal, table_name, pk, event, payload FROM {table} \
+                "SELECT commit_lsn, xid, ordinal, table_name, pk, event, payload, op::text AS op FROM {table} \
                  WHERE (commit_lsn, xid, ordinal) > ($1, $2, $3) ORDER BY commit_lsn, xid, ordinal",
                 table = quote_ident(&self.table),
             );
@@ -1351,7 +1498,7 @@ mod pg {
             let limit = i64::try_from(limit).unwrap_or(i64::MAX);
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "SELECT commit_lsn, xid, ordinal, table_name, pk, event, payload FROM {table} \
+                "SELECT commit_lsn, xid, ordinal, table_name, pk, event, payload, op::text AS op FROM {table} \
                  WHERE (commit_lsn, xid, ordinal) > ($1, $2, $3) \
                  AND (commit_lsn, xid, ordinal) <= ($4, $5, $6) \
                  ORDER BY commit_lsn, xid, ordinal LIMIT $7",
@@ -1383,7 +1530,7 @@ mod pg {
             };
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "SELECT commit_lsn, xid, ordinal, table_name, pk, event, payload FROM {table} \
+                "SELECT commit_lsn, xid, ordinal, table_name, pk, event, payload, op::text AS op FROM {table} \
                  WHERE xid = ANY($1) OR (xid >= $2 AND xid < $3) OR xid < $4 \
                  ORDER BY commit_lsn, xid, ordinal",
                 table = quote_ident(&self.table),
@@ -1508,6 +1655,48 @@ mod pg {
                 .bind::<BigInt, _>(commit_lsn)
                 .bind::<BigInt, _>(xid)
                 .bind::<BigInt, _>(ordinal)
+                .execute(&mut *conn)
+                .await?;
+            Ok(())
+        }
+
+        async fn record_refusal(&self, table: &str) -> Result<(), PgOplogError> {
+            let mut conn = self.pool.get().await.map_err(pool_err)?;
+            // The registry's name is the log's, chosen at runtime, which no `table!` can name.
+            let sql = format!(
+                "INSERT INTO {refused} (table_name) VALUES ($1) ON CONFLICT DO NOTHING",
+                refused = quote_ident(&Self::refused_table(&self.table)),
+            );
+            sql_query(sql)
+                .bind::<Text, _>(table)
+                .execute(&mut *conn)
+                .await?;
+            Ok(())
+        }
+
+        async fn refusals(&self) -> Result<Vec<String>, PgOplogError> {
+            let mut conn = self.pool.get().await.map_err(pool_err)?;
+            // The registry's name is the log's, chosen at runtime, which no `table!` can name.
+            let sql = format!(
+                "SELECT table_name FROM {refused} ORDER BY table_name",
+                refused = quote_ident(&Self::refused_table(&self.table)),
+            );
+            let rows: Vec<RefusalRow> = sql_query(sql).load(&mut *conn).await?;
+            Ok(rows.into_iter().map(|row| row.table_name).collect())
+        }
+
+        async fn readmit(&self, tables: &[String]) -> Result<(), PgOplogError> {
+            for record in super::readmission_records(self.last_commit().await?, tables) {
+                self.append(&record).await?;
+            }
+            let mut conn = self.pool.get().await.map_err(pool_err)?;
+            // The registry's name is the log's, chosen at runtime, which no `table!` can name.
+            let sql = format!(
+                "DELETE FROM {refused} WHERE table_name = ANY($1)",
+                refused = quote_ident(&Self::refused_table(&self.table)),
+            );
+            sql_query(sql)
+                .bind::<Array<Text>, _>(tables)
                 .execute(&mut *conn)
                 .await?;
             Ok(())

@@ -63,11 +63,13 @@ use subql::reexec::{
 use subql::{
     AggValue, AggregateBootstrap, AggregateResultValue, AggregateValueChange, AggregateValueUpdate,
     AsyncSubscriptionDispatch, Checkpoint, ColumnId, DatabaseLike, DefaultIds,
-    MaintenanceTransition, NoRefusals, NumericValue, OpaqueCheckpoint, ParserDB, PgChangeEvent,
+    Incompatibility, MaintenanceTransition, NoRefusals, NumericValue, OpaqueCheckpoint, ParserDB,
+    PgChangeEvent,
     SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableId, TableLike, Tier,
     catalog_helpers,
 };
 
+use crate::drift::{PolicyReaders, RefusedSet, weakens_identity};
 use crate::reexec::ReadBudget;
 
 use crate::oplog::ChangeRecord;
@@ -152,6 +154,10 @@ pub enum MaterializerError {
     /// A client subscription names a deployment-private audit table.
     #[error("subscription reads the server's audit table `{0}`")]
     AuditRead(String),
+    /// A client subscription reads a table the drift guard refused, whose
+    /// live shape no longer matches the catalog (R107 decision 6).
+    #[error("subscription reads the refused table `{0}`")]
+    RefusedRead(String),
     /// A database read the engine drove through its connector failed for one
     /// subscription, carrying the class the session's three dispositions act
     /// on (R89 decision 1).
@@ -592,6 +598,14 @@ where
     /// Per-viewer re-reads of an ungrouped aggregate, whose one-cell answer
     /// goes on the wire as that value, the shape a client reads a scalar in.
     scalar_rereads: HashSet<SubscriptionId>,
+    /// The tables refused while this process runs, which the apply path, the
+    /// subscribe gate and the ingest loop all consult.
+    refused: RefusedSet,
+    /// The tables whose policies read each table (R107 decision 10).
+    policy_readers: PolicyReaders,
+    /// The tables each registered subscription reads, for tearing down every
+    /// subscription a refusal reaches.
+    reads: HashMap<SubscriptionId, Vec<TableId>>,
 }
 
 /// How the client's caller functions reverse translate into the session
@@ -658,20 +672,23 @@ impl Materializer<ParserDB, RuntimeWritableCatalog> {
             caller: None,
             connector: crate::reexec::NoConnector,
             audit_tables: &[],
+            policy_reads: Vec::new(),
         }
     }
 }
 
 impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
-    fn build(
-        pg_ddl: &str,
-        write: W,
-        translator: Option<Translator>,
-        caller: Option<CallerMappings>,
-        connector: C,
-        audit_tables: &'static [&'static str],
-    ) -> Result<Self, MaterializerError> {
-        let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
+    fn build(builder: MaterializerBuilder<W, C>) -> Result<Self, MaterializerError> {
+        let MaterializerBuilder {
+            pg_ddl,
+            write,
+            translator,
+            caller,
+            connector,
+            audit_tables,
+            policy_reads,
+        } = builder;
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(&pg_ddl)
             .map_err(|err| MaterializerError::Catalog(format!("{err:?}")))?;
         let mut private_tables = Vec::with_capacity(audit_tables.len());
         for name in audit_tables {
@@ -680,6 +697,7 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             })?;
             private_tables.push((id, *name));
         }
+        let policy_readers = PolicyReaders::of(&policy_reads, &catalog);
         let mut engine = SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
         if let Some(translator) = translator {
             engine = engine.with_translator(translator);
@@ -691,6 +709,9 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             caller,
             audit_tables: private_tables,
             scalar_rereads: HashSet::new(),
+            refused: RefusedSet::default(),
+            policy_readers,
+            reads: HashMap::new(),
         })
     }
 
@@ -784,6 +805,7 @@ where
     caller: Option<CallerMappings>,
     connector: C,
     audit_tables: &'static [&'static str],
+    policy_reads: Vec<rls2fga::types::PolicyReads>,
 }
 
 impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
@@ -796,6 +818,7 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
             caller,
             connector,
             audit_tables,
+            policy_reads,
             ..
         } = self;
         MaterializerBuilder {
@@ -805,6 +828,7 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
             caller,
             connector,
             audit_tables,
+            policy_reads,
         }
     }
 
@@ -831,6 +855,15 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
         self
     }
 
+    /// The tables each of the deployment's policies reads, so a table whose
+    /// replica identity weakens is refused together with the tables whose
+    /// policies read it (R107 decision 10).
+    #[must_use]
+    pub fn with_policy_reads(mut self, reads: &[rls2fga::types::PolicyReads]) -> Self {
+        self.policy_reads = reads.to_vec();
+        self
+    }
+
     /// The connector the engine's computed tiers read through.
     #[must_use]
     pub fn with_read_connector<T: ReadConnector>(self, connector: T) -> MaterializerBuilder<W, T> {
@@ -840,6 +873,7 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
             translator,
             caller,
             audit_tables,
+            policy_reads,
             ..
         } = self;
         MaterializerBuilder {
@@ -849,6 +883,7 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
             caller,
             connector,
             audit_tables,
+            policy_reads,
         }
     }
 
@@ -858,14 +893,7 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
     ///
     /// [`MaterializerError::Catalog`] when the DDL does not parse.
     pub fn build(self) -> Result<Materializer<ParserDB, W, C>, MaterializerError> {
-        Materializer::<ParserDB, W, C>::build(
-            &self.pg_ddl,
-            self.write,
-            self.translator,
-            self.caller,
-            self.connector,
-            self.audit_tables,
-        )
+        Materializer::<ParserDB, W, C>::build(self)
     }
 }
 
@@ -1222,7 +1250,62 @@ where
     /// resolves whichever registry holds the id (U7).
     pub fn unregister(&mut self, sub_id: SubscriptionId) -> bool {
         self.scalar_rereads.remove(&sub_id);
+        self.reads.remove(&sub_id);
         self.engine.unregister_subscription(sub_id)
+    }
+
+    /// The tables this process refused, shared with the ingest loop that
+    /// refuses them and the guard each connect builds.
+    #[must_use]
+    pub fn refused(&self) -> &RefusedSet {
+        &self.refused
+    }
+
+    /// Refuse `table` for `reasons`, with every table whose policy reads it
+    /// when its replica identity weakened (R107 decision 10), answering the
+    /// names refused by this call.
+    ///
+    /// A table already refused is left as it is, so a reconnect re-reporting
+    /// it answers nothing.
+    pub fn refuse_table(&self, table: TableId, reasons: Vec<Incompatibility>) -> Vec<String> {
+        let readers: Vec<TableId> = if weakens_identity(&reasons) {
+            self.policy_readers.of_table(table).collect()
+        } else {
+            Vec::new()
+        };
+        let mut refused = Vec::new();
+        let mut refuse = |id: TableId, reasons: Vec<Incompatibility>| {
+            if let Some(name) = catalog_helpers::table_name::<Postgres, _>(&self.catalog, id)
+                && self.refused.insert(&name, reasons)
+            {
+                refused.push(name);
+            }
+        };
+        for reader in readers {
+            refuse(reader, reasons.clone());
+        }
+        refuse(table, reasons);
+        refused
+    }
+
+    /// The subscriptions reading any of `tables`, by the names the catalog
+    /// stores.
+    #[must_use]
+    pub fn subscriptions_reading(&self, tables: &[String]) -> Vec<SubscriptionId> {
+        let ids: Vec<TableId> = tables
+            .iter()
+            .filter_map(|name| {
+                catalog_helpers::table_id_for_name::<Postgres, _>(
+                    &self.catalog,
+                    TargetName::new(name, true),
+                )
+            })
+            .collect();
+        self.reads
+            .iter()
+            .filter(|(_, reads)| reads.iter().any(|read| ids.contains(read)))
+            .map(|(sub_id, _)| *sub_id)
+            .collect()
     }
 
     /// Install a fold's seed rows, read by the session through its own
@@ -1924,15 +2007,29 @@ where
             .ok_or_else(|| MaterializerError::SchemaMismatch(table.to_owned()))
     }
 
+    /// Whether a client may write `table` at all, judged before its op is planned.
+    fn write_target(&self, table: &str) -> Result<(), MaterializerError> {
+        if !self.write.is_writable(table) && !registry_table(table) {
+            return Err(MaterializerError::NotWritable(table.to_owned()));
+        }
+        match subql::RefusalView::refusal(&self.refused, table) {
+            Some(reasons) => Err(MaterializerError::Refused(
+                subql::patchset::ApplyError::RefusedTable {
+                    table: table.to_owned(),
+                    reasons,
+                },
+            )),
+            None => Ok(()),
+        }
+    }
+
     fn plan_changeset_op(
         &self,
         op: &ChangesetOp<'_, TableSchema<String>, String, Vec<u8>>,
     ) -> Result<PlannedOp, MaterializerError> {
         let schema = op.table();
         let table = schema.name().clone();
-        if !self.write.is_writable(&table) && !registry_table(&table) {
-            return Err(MaterializerError::NotWritable(table));
-        }
+        self.write_target(&table)?;
         let table_id = self.table_id(&table)?;
         let db = self.catalog();
         let pk_values = op.primary_key();
@@ -2021,9 +2118,7 @@ where
         op: &PatchsetOp<'_, TableSchema<String>, String, Vec<u8>>,
     ) -> Result<PlannedOp, MaterializerError> {
         let table = op.table().name().clone();
-        if !self.write.is_writable(&table) && !registry_table(&table) {
-            return Err(MaterializerError::NotWritable(table));
-        }
+        self.write_target(&table)?;
         match op {
             PatchsetOp::Insert { values, .. } => {
                 let table_id = self.table_id(&table)?;
@@ -2186,7 +2281,7 @@ where
             subql::patchset::apply_diffset_bytes_async_with_catalog::<Postgres, _, _, _, _, _>(
                 &self.catalog,
                 &bytes,
-                &NoRefusals,
+                &self.refused,
                 conn,
                 &adapter,
             )
@@ -2283,9 +2378,17 @@ where
             }
             request
         };
+        let reads = read_tables(&self.catalog, pg_sql);
+        if let Some(name) = reads
+            .iter()
+            .filter_map(|id| catalog_helpers::table_name::<Postgres, _>(&self.catalog, *id))
+            .find(|name| self.refused.refuses(name))
+        {
+            return Err(MaterializerError::RefusedRead(name));
+        }
         let retry_seed = viewer.as_ref().and_then(|_| seed.clone());
         let request = self.request(consumer_id, pg_sql).binds(wire_binds(binds));
-        match self.register_request(consumer_id, seeded(request, seed), budget) {
+        let registered = match self.register_request(consumer_id, seeded(request, seed), budget) {
             Err(MaterializerError::Register(subql::RegisterError::AggregatorOnRlsTable {
                 ..
             })) if viewer.is_some() => {
@@ -2303,10 +2406,16 @@ where
                         self.scalar_rereads.insert(capture.subscription_id);
                     }
                 }
-                Ok(registered)
+                registered
             }
-            other => other,
-        }
+            other => other?,
+        };
+        let sub_id = match &registered {
+            Registration::Row(sub_id) => *sub_id,
+            Registration::Computed(capture) => capture.subscription_id,
+        };
+        self.reads.insert(sub_id, reads);
+        Ok(registered)
     }
 }
 
@@ -2429,6 +2538,39 @@ fn answers_one_value(pg_sql: &str) -> bool {
             if exprs.is_empty() && mods.is_empty())
 }
 
+/// The catalog target a relation names, preserving schema and quoting, or
+/// `None` for a name no catalog table can carry.
+fn relation_target(name: &sqlparser::ast::ObjectName) -> Option<TargetName<'_>> {
+    let ident = name.0.last()?.as_ident()?;
+    let target = TargetName::new(&ident.value, ident.quote_style.is_some());
+    match name.0.as_slice() {
+        [_] => Some(target),
+        [schema, _] => {
+            let schema = schema.as_ident()?;
+            Some(target.with_schema(&schema.value, schema.quote_style.is_some()))
+        }
+        _ => None,
+    }
+}
+
+/// The catalog tables a Postgres `SELECT` names.
+fn read_tables<DB: DatabaseLike>(catalog: &DB, pg_sql: &str) -> Vec<TableId> {
+    let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, pg_sql) else {
+        return Vec::new();
+    };
+    let mut tables = Vec::new();
+    let _ = visit_relations(&statements, |name| {
+        if let Some(id) = relation_target(name)
+            .and_then(|target| catalog_helpers::table_id_for_name::<Postgres, _>(catalog, target))
+            && !tables.contains(&id)
+        {
+            tables.push(id);
+        }
+        core::ops::ControlFlow::<()>::Continue(())
+    });
+    tables
+}
+
 /// Resolve private reads to catalog identities, preserving schema and quoting.
 fn private_relations<DB: DatabaseLike, V: sqlparser::ast::Visit>(
     statements: &V,
@@ -2447,18 +2589,8 @@ fn private_relations<DB: DatabaseLike, V: sqlparser::ast::Visit>(
                 table.to_string(),
             ));
         }
-        let mut target = TargetName::new(&ident.value, ident.quote_style.is_some());
-        match name.0.as_slice() {
-            [_] => {}
-            [schema, _] => {
-                let Some(schema) = schema.as_ident() else {
-                    return core::ops::ControlFlow::Continue(());
-                };
-                target = target.with_schema(&schema.value, schema.quote_style.is_some());
-            }
-            _ => return core::ops::ControlFlow::Continue(()),
-        }
-        if let Some(id) = catalog_helpers::table_id_for_name::<Postgres, _>(catalog, target)
+        if let Some(id) = relation_target(name)
+            .and_then(|target| catalog_helpers::table_id_for_name::<Postgres, _>(catalog, target))
             && let Some(table) = audit_tables.iter().find(|(audit_id, _)| *audit_id == id)
         {
             return core::ops::ControlFlow::Break(MaterializerError::AuditRead(table.1.to_owned()));
@@ -3899,5 +4031,117 @@ mod write_column_tests {
         };
         assert_eq!(assigned, [1]);
         assert_eq!(read, [0], "no conflict probe runs without a version column");
+    }
+}
+
+#[cfg(test)]
+mod drift_refusal_tests {
+    //! What a drift refusal does to the materializer: which tables it refuses,
+    //! which registrations it reaches, and what a later registration meets.
+
+    use super::*;
+
+    const DDL: &str = "CREATE TABLE memberships (id BIGINT PRIMARY KEY, user_id TEXT);\n\
+         CREATE TABLE docs (id BIGINT PRIMARY KEY, team BIGINT);\n\
+         CREATE TABLE notes (id BIGINT PRIMARY KEY, body TEXT);";
+
+    /// The `docs` policy reads `memberships`, as rls2fga reports it.
+    fn materializer() -> Materializer {
+        let table = |name: &str| {
+            rls2fga::types::TableId::from_stored(Some("public".to_owned()), name.to_owned())
+        };
+        let reads = [rls2fga::types::PolicyReads {
+            name: "docs_read".to_owned(),
+            table: table("docs"),
+            command: rls2fga::types::PolicyCommand::Select,
+            reads: vec![table("docs"), table("memberships")],
+            unresolved: Vec::new(),
+        }];
+        Materializer::builder(DDL)
+            .with_policy_reads(&reads)
+            .build()
+            .expect("the catalog parses")
+    }
+
+    fn id(materializer: &Materializer, name: &str) -> TableId {
+        catalog_helpers::table_id::<Postgres, _>(&materializer.catalog, name).expect("a table")
+    }
+
+    fn sorted(mut names: Vec<String>) -> Vec<String> {
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_weakened_identity_refuses_the_tables_whose_policies_read_it() {
+        let materializer = materializer();
+        let weakened = vec![Incompatibility::IdentityWeakened {
+            identity: subql::drift::ReplicaIdentity::Default,
+        }];
+        assert_eq!(
+            sorted(materializer.refuse_table(id(&materializer, "memberships"), weakened)),
+            ["docs", "memberships"],
+            "a policy reading the weakened table can no longer be followed"
+        );
+        assert!(
+            materializer
+                .refuse_table(id(&materializer, "docs"), vec![Incompatibility::Unpublished])
+                .is_empty(),
+            "a table already refused draws nothing"
+        );
+    }
+
+    #[test]
+    fn another_reason_refuses_the_table_alone() {
+        let materializer = materializer();
+        assert_eq!(
+            materializer.refuse_table(
+                id(&materializer, "memberships"),
+                vec![Incompatibility::Unpublished]
+            ),
+            ["memberships"]
+        );
+        assert!(!materializer.refused().refuses("docs"));
+    }
+
+    /// Register `sql` the way a session's subscribe does.
+    fn subscribe(
+        materializer: &mut Materializer,
+        consumer_id: u64,
+        sql: &str,
+    ) -> Result<Registration, MaterializerError> {
+        materializer.register_translated(
+            consumer_id,
+            sql,
+            &[],
+            None,
+            ReadBudget::new(core::time::Duration::from_secs(5)),
+            None,
+        )
+    }
+
+    #[test]
+    fn a_refusal_reaches_the_registrations_reading_the_table_and_bars_new_ones() {
+        let mut materializer = materializer();
+        let Ok(Registration::Row(docs)) = subscribe(&mut materializer, 1, "SELECT * FROM docs")
+        else {
+            panic!("docs registers as a row subscription");
+        };
+        let Ok(Registration::Row(notes)) = subscribe(&mut materializer, 2, "SELECT * FROM notes")
+        else {
+            panic!("notes registers as a row subscription");
+        };
+        let refused = materializer.refuse_table(
+            id(&materializer, "docs"),
+            vec![Incompatibility::Unpublished],
+        );
+        assert_eq!(materializer.subscriptions_reading(&refused), [docs]);
+        assert!(materializer.unregister(docs));
+        assert_eq!(materializer.subscriptions_reading(&refused), [] as [SubscriptionId; 0]);
+        assert!(matches!(
+            subscribe(&mut materializer, 3, "SELECT * FROM docs"),
+            Err(MaterializerError::RefusedRead(table)) if table == "docs"
+        ));
+        assert!(materializer.unregister(notes));
     }
 }

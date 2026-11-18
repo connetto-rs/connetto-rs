@@ -287,6 +287,9 @@ pub fn resync_reason(reason: &FullResyncReason) -> String {
         FullResyncReason::CursorBeyondHistory => {
             "the cursor is past the retained history".to_owned()
         }
+        FullResyncReason::TableRefused { table } => {
+            format!("table {table} no longer matches its schema")
+        }
     }
 }
 
