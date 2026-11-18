@@ -25,7 +25,7 @@ use diesel::prelude::*;
 use dioxus::prelude::*;
 use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
-    AsyncConnector, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
+    AsyncConnector, FailureClass, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
 };
 use subql::{CdcSource, PgCommitPosition, PgLsn, PgSnapshotFence, PgSqliteEmuSource, SourceItem};
 use tokio::net::TcpListener;
@@ -169,6 +169,10 @@ impl AsyncConnector for SeedRows {
     type Error = std::io::Error;
     type Checkpoint = PgCommitPosition;
     type Backend = Postgres;
+
+    fn failure_class(&self, _error: &std::io::Error) -> FailureClass {
+        FailureClass::Transient
+    }
 
     fn execute_scalar(
         &self,

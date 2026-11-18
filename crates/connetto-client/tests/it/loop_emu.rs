@@ -40,7 +40,7 @@ use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
-    AsyncConnector, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
+    AsyncConnector, FailureClass, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
 };
 use subql::{CdcSource, PgCommitPosition, PgLsn, PgSnapshotFence, PgSqliteEmuSource, SourceItem};
 use tokio::net::{TcpListener, TcpStream};
@@ -1703,6 +1703,10 @@ impl AsyncConnector for QueuedConnector {
     type Checkpoint = PgCommitPosition;
     type Backend = Postgres;
 
+    fn failure_class(&self, _error: &std::io::Error) -> FailureClass {
+        FailureClass::Transient
+    }
+
     fn execute_scalar(
         &self,
         _query: &ReadQuery<'_, Postgres>,
@@ -2117,6 +2121,10 @@ impl AsyncConnector for GatedSeed {
     type Error = std::io::Error;
     type Checkpoint = PgCommitPosition;
     type Backend = Postgres;
+
+    fn failure_class(&self, _error: &std::io::Error) -> FailureClass {
+        FailureClass::Transient
+    }
 
     fn execute_scalar(
         &self,

@@ -85,8 +85,10 @@ type ScalarUpd = ScalarUpdate<DefaultIds, Postgres, subql::PgCommitPosition>;
 type RowsUpd = RowsUpdate<DefaultIds, Postgres, subql::PgCommitPosition>;
 /// Row-level keyed delta pinned to connetto's backend and default id set.
 type RowDlt = RowDelta<DefaultIds, Postgres, subql::PgCommitPosition>;
-/// Read deliveries pinned to connetto's backend and default id set.
-type ResolvedReads = subql::reexec::ResolvedReads<DefaultIds, Postgres, subql::PgCommitPosition>;
+/// Read deliveries pinned to connetto's backend and default id set, failing
+/// with the connector's error `E`.
+type ResolvedReads<E> =
+    subql::reexec::ResolvedReads<DefaultIds, Postgres, subql::PgCommitPosition, E>;
 /// The wire patchset one event folds into.
 type WirePatchSet = PatchSet<WireTable, String, Vec<u8>>;
 
@@ -469,6 +471,9 @@ pub struct Dispatched {
     pub record: Option<ChangeRecord>,
     /// The failure that stopped the queued reads, which stay queued for [`Materializer::resolve_reads`].
     pub failure: Option<MaterializerError>,
+    /// The reads subql ended for good, whose subscriptions the engine no
+    /// longer holds.
+    pub stopped: Vec<EndedRead>,
 }
 
 /// A matched consumer and whether the row left its window rather than changing in it.
@@ -494,6 +499,19 @@ pub struct Drained {
     pub computed: Vec<ComputedChange>,
     /// The failure that stopped the drain. Retryable reads stay queued.
     pub failure: Option<MaterializerError>,
+    /// The reads subql ended for good, whose subscriptions the engine no
+    /// longer holds.
+    pub stopped: Vec<EndedRead>,
+}
+
+/// A computed subscription whose read subql ended for good.
+pub struct EndedRead {
+    /// The subscription subql unregistered.
+    pub subscription: SubscriptionId,
+    /// The class of the failure that ended it.
+    pub class: crate::reexec::ReadFailure,
+    /// The failure, for the log.
+    pub detail: String,
 }
 
 /// One server-computed result movement, ready to frame on the wire.
@@ -1379,7 +1397,7 @@ where
         // captures, scalar extremes and keyed rows arrive as the read half,
         // everything the fold answered without a round trip as the other.
         // Every read that answered reaches the sink even when a sibling fails.
-        let mut reads = ResolvedReads::default();
+        let mut reads = ResolvedReads::<C::Error>::default();
         let settled = self
             .engine
             .consumers(event)
@@ -1389,6 +1407,7 @@ where
             .await;
         let notifications = settled.dispatched;
         let failure = settled.reads.err().map(reexec_error);
+        let stopped = stopped_reads(&mut reads);
         Self::log_transitions(&reads.transitions);
         Self::log_transitions(&notifications.transitions);
 
@@ -1448,12 +1467,13 @@ where
             narrowings,
             record,
             failure,
+            stopped,
         })
     }
 
     /// Drain the reads an earlier dispatch left queued, without applying any event.
     pub async fn resolve_reads(&mut self) -> Drained {
-        let mut reads = ResolvedReads::default();
+        let mut reads = ResolvedReads::<C::Error>::default();
         let failure = self
             .engine
             .resolve(|delivery| reads.push(delivery))
@@ -1461,6 +1481,7 @@ where
             .err()
             .map(reexec_error);
         Self::log_transitions(&reads.transitions);
+        let stopped = stopped_reads(&mut reads);
         Drained {
             computed: Self::computed_changes(
                 Vec::new(),
@@ -1472,6 +1493,7 @@ where
                 &self.scalar_rereads,
             ),
             failure,
+            stopped,
         }
     }
 
@@ -2297,6 +2319,29 @@ pub struct FoldSeeded {
     pub changes: Vec<ComputedChange>,
     /// Whether a demotion left the first answer to a follow-up read.
     pub needs_snapshot: bool,
+}
+
+/// The reads a drain ended for good, each classed as [`reexec_error`] classes
+/// a failure, so the session ends each subscription as it ends a refused read.
+fn stopped_reads<E>(reads: &mut ResolvedReads<E>) -> Vec<EndedRead>
+where
+    E: core::fmt::Display + crate::reexec::FailedRead,
+{
+    reads
+        .stopped
+        .drain(..)
+        .map(|stopped| {
+            let (class, detail) = match reexec_error(stopped.error) {
+                MaterializerError::Read { class, detail, .. } => (class, detail),
+                other => (crate::reexec::ReadFailure::Other, other.to_string()),
+            };
+            EndedRead {
+                subscription: stopped.subscription_id,
+                class,
+                detail,
+            }
+        })
+        .collect()
 }
 
 /// Map an engine drive failure onto the materializer's error, keeping the

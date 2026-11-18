@@ -31,8 +31,8 @@ use diesel::result::{SqlState, SqlStateClass};
 
 use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
-    AsyncConnector, DieselAsyncError, PgAsyncDieselConnector, ReadQuery, RowPage, SessionSetup,
-    Snapshot,
+    AsyncConnector, CursorError, CursorId, DieselAsyncError, FailureClass, PgAsyncDieselConnector,
+    ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot,
 };
 use subql::{PgCommitPosition, PgSnapshotFence};
 
@@ -102,9 +102,116 @@ impl SessionSetup for ConnettoReadSetup {
 }
 
 /// The connector connetto hands the engine and the session: subql's shipped
-/// async Postgres connector carrying connetto's setup. An alias rather than a
-/// wrapper, because the seam made the downstream reimplementation deletable.
-pub type PgReadConnector = PgAsyncDieselConnector<ConnettoReadSetup>;
+/// async Postgres connector carrying connetto's setup, with every failure
+/// classed by connetto's own list.
+///
+/// subql ends a subscription itself on a failure its connector calls
+/// permanent, and its shipped list ends some failures R106 retries, such as
+/// `25006` during a failover. Classing here keeps R106 the one rule.
+pub struct PgReadConnector(PgAsyncDieselConnector<ConnettoReadSetup>);
+
+impl PgReadConnector {
+    /// A connector over `pool` whose reads run each registration's setup.
+    #[must_use]
+    pub fn with_session_setup(
+        pool: diesel_async::pooled_connection::bb8::Pool<diesel_async::AsyncPgConnection>,
+    ) -> Self {
+        Self(PgAsyncDieselConnector::with_session_setup(pool))
+    }
+}
+
+/// How subql treats a failed read of class `class`.
+///
+/// A timeout and a deterministic code end the subscription at once, so subql
+/// may end it. A transient failure and one carrying no code reach connetto as
+/// an error, which pauses delivery or spends the one retry.
+const fn failure_class(class: ReadFailure) -> FailureClass {
+    match class {
+        ReadFailure::Timeout | ReadFailure::Deterministic => FailureClass::Permanent,
+        ReadFailure::Transient | ReadFailure::Other => FailureClass::Transient,
+    }
+}
+
+impl AsyncConnector for PgReadConnector {
+    type AuthContext = ConnettoReadSetup;
+    type Error = DieselAsyncError;
+    type Checkpoint = PgCommitPosition;
+    type Backend = Postgres;
+
+    fn failure_class(&self, error: &DieselAsyncError) -> FailureClass {
+        failure_class(error.read_failure())
+    }
+
+    fn execute_scalar(
+        &self,
+        query: &ReadQuery<'_, Postgres>,
+        kind: ScalarFamily,
+        setup: &ConnettoReadSetup,
+    ) -> impl Future<Output = Result<(PgValue<Postgres>, Option<PgSnapshotFence>), DieselAsyncError>>
+    + Send {
+        self.0.execute_scalar(query, kind, setup)
+    }
+
+    fn read_page(
+        &self,
+        query: &ReadQuery<'_, Postgres>,
+        max_bytes: usize,
+        setup: &ConnettoReadSetup,
+    ) -> impl Future<
+        Output = Result<Snapshot<RowPage<Postgres>, PgCommitPosition>, DieselAsyncError>,
+    > + Send {
+        self.0.read_page(query, max_bytes, setup)
+    }
+
+    fn open_cursor(
+        &self,
+        query: &ReadQuery<'_, Postgres>,
+        setup: &ConnettoReadSetup,
+    ) -> impl Future<Output = Result<CursorId, CursorError<DieselAsyncError>>> + Send {
+        self.0.open_cursor(query, setup)
+    }
+
+    fn fetch_cursor(
+        &self,
+        cursor: CursorId,
+        max_bytes: usize,
+    ) -> impl Future<
+        Output = Result<
+            Snapshot<RowPage<Postgres>, PgCommitPosition>,
+            CursorError<DieselAsyncError>,
+        >,
+    > + Send {
+        self.0.fetch_cursor(cursor, max_bytes)
+    }
+
+    fn close_cursor(
+        &self,
+        cursor: CursorId,
+    ) -> impl Future<Output = Result<(), CursorError<DieselAsyncError>>> + Send {
+        self.0.close_cursor(cursor)
+    }
+
+    fn read_fence(
+        &self,
+        setup: &ConnettoReadSetup,
+    ) -> impl Future<Output = Result<Option<PgSnapshotFence>, DieselAsyncError>> + Send {
+        self.0.read_fence(setup)
+    }
+
+    fn execute_scalar_row(
+        &self,
+        query: &ReadQuery<'_, Postgres>,
+        kinds: &[ScalarFamily],
+        setup: &ConnettoReadSetup,
+    ) -> impl Future<
+        Output = Result<
+            (Vec<PgValue<Postgres>>, Option<PgSnapshotFence>),
+            ScalarRowError<DieselAsyncError>,
+        >,
+    > + Send {
+        self.0.execute_scalar_row(query, kinds, setup)
+    }
+}
 
 /// The disposition one connector failure earns (R89 decision 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +406,10 @@ impl AsyncConnector for NoConnector {
     type Error = std::io::Error;
     type Checkpoint = PgCommitPosition;
     type Backend = Postgres;
+
+    fn failure_class(&self, error: &std::io::Error) -> FailureClass {
+        failure_class(error.read_failure())
+    }
 
     fn execute_scalar(
         &self,

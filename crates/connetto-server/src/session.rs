@@ -893,6 +893,8 @@ struct Applied {
     computed: VecDeque<ComputedChange>,
     /// The read failure still to be answered.
     failure: Option<MaterializerError>,
+    /// The reads subql ended for good, still to be told.
+    stopped: Vec<crate::materializer::EndedRead>,
     /// Whether queued reads remain to be drained.
     drain_due: bool,
     /// Unknown-class read failures counted per subscription.
@@ -908,6 +910,7 @@ impl Applied {
             narrowings: Some(dispatched.narrowings),
             computed: dispatched.computed.into(),
             failure: dispatched.failure,
+            stopped: dispatched.stopped,
             drain_due: false,
             unknown_attempts: HashMap::new(),
         }
@@ -4030,6 +4033,12 @@ where
     /// failure is one this path does not dispose of.
     async fn dispose_read_failure(&self, applied: &mut Applied) -> Result<(), SessionError> {
         loop {
+            // subql already unregistered each of these, so ending the route
+            // is all that remains.
+            for ended in core::mem::take(&mut applied.stopped) {
+                self.refuse_computed(ended.subscription, ended.class, 1, &ended.detail)
+                    .await;
+            }
             if let Some(failure) = applied.failure.take() {
                 applied.drain_due = true;
                 match failure {
@@ -4078,6 +4087,7 @@ where
             applied.drain_due = false;
             applied.computed.extend(drained.computed);
             applied.failure = drained.failure;
+            applied.stopped.extend(drained.stopped);
             self.deliver_owed(applied).await?;
         }
     }
