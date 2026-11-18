@@ -150,13 +150,15 @@ A connection is constructed without a transport and given one later. `open_drive
 
 ## Framework adapters
 
-Both crates give a component one hook, `use_live(&source, spec)`, which follows a `LiveSpec` descriptor from a `LiveSource` and yields the spec's snapshot, `Vec<R>` for a row query, `Option<V>` for a scalar aggregate and a map for a grouped one, beside the error that ended it. A `ConnettoClient` is a source. The hook captures its arguments on first render, so a component remounts to follow another spec.
+Every adapter crate gives a component one hook, `use_live(&source, spec)`, which follows a `LiveSpec` descriptor from a `LiveSource` and yields the spec's snapshot, `Vec<R>` for a row query, `Option<V>` for a scalar aggregate and a map for a grouped one, beside the error that ended it. A `ConnettoClient` is a source. The hook captures its arguments on first render, so a component remounts to follow another spec.
 
-Both hooks run `follow` from `connetto-client`, the one loop over a source, and differ only in how the component's end cancels it. Cancelling drops the feed, which releases the subscription, a row watch starting its grace countdown and raising `ClientEvent::WatchReleased`, and an aggregate unsubscribing at the next pump step.
+Every hook runs `follow` from `connetto-client`, the one loop over a source, and the hooks differ only in how the component's end cancels it. Cancelling drops the feed, which releases the subscription, a row watch starting its grace countdown and raising `ClientEvent::WatchReleased`, and an aggregate unsubscribing at the next pump step.
 
 **`connetto-dioxus`** in [lib.rs](../../crates/connetto-dioxus/src/lib.rs) runs the loop as a component-scoped Dioxus task, and Dioxus cancels scope-bound tasks on unmount, so the drop is implicit. `use_away_input` in [away.rs](../../crates/connetto-dioxus/src/away.rs) feeds the client's one away input from the platform's lifecycle, tao's `Suspended` and `Resumed` on iOS and Android and the window's focus on the desktop. `use_hello_owner` in [hello.rs](../../crates/connetto-dioxus/src/hello.rs) anchors the Windows Hello prompt over the application's desktop window, which Windows requires. The feeders sit behind the crate's `desktop` and `hello` features, the last one Windows-only.
 
 **`connetto-yew`** in [lib.rs](../../crates/connetto-yew/src/lib.rs) wraps the loop in `Abortable` and returns an effect cleanup that calls `abort()`, because Yew's `spawn_local` is detached and unmounting the component does not cancel it.
+
+**`connetto-leptos`** in [lib.rs](../../crates/connetto-leptos/src/lib.rs) starts the loop with `spawn_local_scoped_with_cancellation`, which aborts it when the reactive owner that called the hook is cleaned up, as a branch of the view that stops showing the component is. The snapshot and the error are Leptos signals. `keyed(rows, key)` turns a row snapshot into one `ArcRwSignal` per row beside its key, reusing a row's signal while its key stays in the result and setting it only when the row changed, so a `For` keyed on the key alone keeps the row's DOM node, its focus and its local state across an edit. Counts and groups never go through it, and the key comes from the application, never invented. Leptos requires its reactive closures to be `Send` and the wasm client is not, so an application moves the client into such a closure inside a `SendWrapper`.
 
 ## The device-private tier
 
