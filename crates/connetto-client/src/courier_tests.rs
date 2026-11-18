@@ -4486,7 +4486,7 @@ mod r78_4c {
     #[tokio::test]
     async fn a_courier_completes_beside_a_batch_drain_with_or_without_the_main_wire() {
         for keep_main in [true, false] {
-            timeout(BOUND, async {
+            Box::pin(timeout(BOUND, async {
                 let (cert, keys) = device_identity().await;
                 let mut conn = replica3();
                 conn.store_device_certificate(&cert)
@@ -4549,7 +4549,7 @@ mod r78_4c {
                 let (report, ()) = tokio::join!(finish, answer);
                 assert_eq!(report.settled, [2]);
                 assert!(report.refused.is_empty() && report.kept.is_empty());
-            })
+            }))
             .await
             .expect("the courier completes within the bound");
         }

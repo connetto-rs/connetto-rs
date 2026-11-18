@@ -3,7 +3,7 @@
 
 use connetto_client::live::ConnettoClient;
 use connetto_core::Major;
-use connetto_file_client::{FsStore, held_content};
+use connetto_file_client::{FsStore, content_hooks};
 use connetto_file_core::{ChunkHash, ChunkStore, EncryptingStore, MimeClass};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -33,7 +33,7 @@ struct HeldCount {
 
 /// Holds an authored file and asserts the hook held something.
 async fn hold(client: &ConnettoClient<Scripted>) {
-    let held = held_content();
+    let held = content_hooks();
     let did_hold = client
         .with_conn(|conn| (held.hold)(conn.conn(), major()))
         .await
@@ -90,7 +90,7 @@ async fn held_bytes_and_rows_survive_tidy() {
     );
 
     // The file is still held, so the drain can still send it.
-    let held = held_content();
+    let held = content_hooks();
     let count = client
         .with_conn(|conn| (held.count)(conn.conn(), major()))
         .await
@@ -112,7 +112,7 @@ async fn hold_counts_and_forget_clears() {
     )
     .await;
 
-    let held = held_content();
+    let held = content_hooks();
     let did_hold = client
         .with_conn(|conn| (held.hold)(conn.conn(), major()))
         .await
@@ -159,7 +159,7 @@ async fn hold_counts_and_forget_clears() {
 async fn hold_is_a_no_op_without_content() {
     let dir = tempdir().expect("a scratch directory");
     let client = crate::support::offline_client(&dir.path().join("replica.sqlite")).await;
-    let held = held_content();
+    let held = content_hooks();
     let did_hold = client
         .with_conn(|conn| (held.hold)(conn.conn(), major()))
         .await

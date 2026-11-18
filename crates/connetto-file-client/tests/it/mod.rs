@@ -33,3 +33,4 @@ mod staging;
 mod store;
 mod support;
 mod transport;
+mod unsynced_files;

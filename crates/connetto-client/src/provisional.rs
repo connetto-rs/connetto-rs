@@ -433,7 +433,7 @@ pub(crate) fn written_keys(bytes: &[u8]) -> Result<Vec<(String, Vec<KeyValue>)>,
     })?;
     Ok(ops
         .into_iter()
-        .map(|(table, key)| (table.to_lowercase(), key))
+        .map(|crate::WrittenRow { table, key, .. }| (table.to_lowercase(), key))
         .collect())
 }
 
