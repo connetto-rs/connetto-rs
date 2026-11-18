@@ -154,6 +154,27 @@ impl OidcProviderConfig {
         self.assurance = assurance;
         self
     }
+
+    /// The configured name the login endpoints select this provider by.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Whether the generic provider discovered from this configuration
+    /// verifies tokens from `issuer`.
+    pub(crate) fn claims_issuer(&self, issuer: &str) -> bool {
+        self.issuer == issuer
+    }
+}
+
+/// Whether the Google preset verifies tokens from `issuer`.
+pub(crate) fn google_claims_issuer(issuer: &str) -> bool {
+    issuer == GOOGLE_ISSUER
+}
+
+/// Whether the Microsoft preset verifies tokens from `issuer`, any tenant's.
+pub(crate) fn microsoft_claims_issuer(issuer: &str) -> bool {
+    IssuerMatch::MicrosoftAnyTenant.matches(issuer)
 }
 
 /// An OIDC identity provider driven by `openidconnect`.

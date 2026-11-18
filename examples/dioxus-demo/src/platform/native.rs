@@ -7,6 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use connetto_client::LiveSpec;
 use connetto_client::teardown::{ForgetError, expiry_warning};
 use connetto_client::{
     AccountChoice, Auth, ClientEvent, ConnettoClient, Custody, KeyringAuth, NativeAuthenticator,
@@ -485,7 +486,7 @@ fn Session(parts: SessionParts) -> Element {
     let StorageLine(mut storage_line) = use_context::<StorageLine>();
 
     use_away_input(&client);
-    let orders_rows = use_live::<_, _, support::Order>(&client, support::orders_newest_first());
+    let orders_rows = use_live::<_, _, support::Order>(&client, support::OrdersNewestFirst.query());
     let event_rx = client.events();
     use_hook(move || {
         spawn(async move {

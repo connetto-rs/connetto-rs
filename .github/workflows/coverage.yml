@@ -130,6 +130,7 @@ jobs:
       - uses: codecov/codecov-action@v7
         with:
           files: codecov.json
+          disable_search: true
           flags: ${{ matrix.name }}
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
@@ -270,6 +271,7 @@ jobs:
       - uses: codecov/codecov-action@v7
         with:
           files: codecov.json
+          disable_search: true
           flags: server
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
