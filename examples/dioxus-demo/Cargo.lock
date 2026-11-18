@@ -1283,7 +1283,6 @@ dependencies = [
  "pkcs8",
  "rand_core 0.6.4",
  "rcgen",
- "rpassword",
  "thiserror 2.0.21",
  "uuid",
  "zeroize",
@@ -1295,7 +1294,6 @@ version = "0.0.0"
 dependencies = [
  "android-native-keyring-store",
  "android_system_properties",
- "anyhow",
  "apple-native-keyring-store",
  "base64 0.22.1",
  "btleplug",
@@ -1402,6 +1400,7 @@ dependencies = [
  "qrcode",
  "rosetta-uuid",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -1616,7 +1615,6 @@ dependencies = [
 name = "connetto-server"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "axum",
  "axum-extra",
  "base64 0.22.1",
@@ -1633,6 +1631,7 @@ dependencies = [
  "diesel-async",
  "futures-util",
  "jsonwebtoken",
+ "oauth2",
  "openfga-client",
  "openidconnect",
  "parking_lot",
@@ -1671,13 +1670,9 @@ name = "connetto-test-harness"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "axum",
- "base64 0.22.1",
  "connetto-ca",
  "connetto-client",
  "connetto-core",
- "connetto-file-core",
- "connetto-file-server",
  "connetto-peer-apple",
  "connetto-schema",
  "connetto-server",
@@ -1700,12 +1695,12 @@ dependencies = [
  "sqlite-diff-rs",
  "sqlparser",
  "subql",
+ "tempfile",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.24.0",
- "tower-http",
  "tracing-subscriber",
  "uuid",
  "zstd",
@@ -8201,17 +8196,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rpassword"
-version = "7.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2da316a15f47e3d053de9cb2c439650bd8fa4aaeb9365f2e5f27f492ff73c196"
-dependencies = [
- "libc",
- "rtoolbox",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "rpds"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8250,16 +8234,6 @@ checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
 dependencies = [
  "hashbrown 0.16.1",
  "thiserror 2.0.21",
-]
-
-[[package]]
-name = "rtoolbox"
-version = "0.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a1efe12a1469752d0e6ff5ebec0b6ef4924cc5c4c71046b0ec730040535819d"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

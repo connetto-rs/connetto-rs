@@ -58,7 +58,7 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
                         .native
                         .linked_peers()
                         .iter()
-                        .map(|link| nearby::linked_line(&link.peer, link.remote))
+                        .map(|link| nearby::linked_peer(&link.peer, link.remote).line())
                         .collect();
                     lines.sort();
                     if *peers.peek() != lines {
@@ -186,11 +186,14 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
     let mut links_off: Signal<bool> = use_signal(|| false);
 
     let certificate = parts.0.native.device_certificate();
-    let peer_line = nearby::peer_line(
-        peer_port(),
-        certificate
-            .as_ref()
-            .map(|certificate| certificate.identity()),
+    let peer_line = connetto_demo_support::view::peer_line(
+        nearby::listening(
+            peer_port(),
+            certificate
+                .as_ref()
+                .map(|certificate| certificate.identity()),
+        )
+        .as_ref(),
     );
     let peers = peers();
     let nearby_lines: Vec<String> = nearby().iter().map(nearby::nearby_line).collect();

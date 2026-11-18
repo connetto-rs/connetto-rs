@@ -139,6 +139,9 @@ struct Platform {
 thread_local! {
     /// The page's platform, set once by [`run_page`].
     static PLATFORM: RefCell<Option<Platform>> = const { RefCell::new(None) };
+    /// The account whose own name the page follows, so a second trigger for
+    /// the same live account starts no second feed.
+    static NAMED: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Serve one user control. A control sent before [`run_page`] set the
@@ -216,7 +219,7 @@ fn boot_page() -> RwSignal<View> {
     if let Some(stored) = glue::read_stored_account() {
         view.update(|v| {
             v.session = Session::Restoring;
-            v.stored_account = Some(AccountEntry::new(stored));
+            v.stored_account = Some(AccountEntry::new(stored, &glue::read_stored_names()));
         });
     }
 
@@ -241,6 +244,7 @@ fn boot_page() -> RwSignal<View> {
             if view.with_untracked(logging_out) {
                 return;
             }
+            let live = uid.clone();
             view.update(|v| {
                 if let Some(uid) = uid {
                     v.identity = Some(uid);
@@ -248,7 +252,7 @@ fn boot_page() -> RwSignal<View> {
                 match account {
                     Some(account) => {
                         glue::save_stored_account(&account);
-                        let entry = AccountEntry::new(account);
+                        let entry = AccountEntry::new(account, &glue::read_stored_names());
                         v.account = Some(entry.clone());
                         v.stored_account = Some(entry);
                     }
@@ -256,6 +260,9 @@ fn boot_page() -> RwSignal<View> {
                 }
                 v.session = Session::SignedIn;
             });
+            if let (Some(account), Some(client)) = (live, source()) {
+                follow_own_name(view, client, account);
+            }
             // A signed-in session stands the team panel.
             stand_team(view);
             if let Some(secs) = expires_at {
@@ -278,8 +285,12 @@ fn boot_page() -> RwSignal<View> {
         serve_account_choice(move |accounts| {
             let answer_cell = Rc::clone(&answer_cell);
             async move {
+                let names = glue::read_stored_names();
                 view.update(|v| {
-                    v.known_accounts = accounts.iter().cloned().map(AccountEntry::new).collect();
+                    v.known_accounts = accounts
+                        .iter()
+                        .map(|key| AccountEntry::new(key.clone(), &names))
+                        .collect();
                 });
                 // A signed-in page ignores the question, but the worker still
                 // needs an answer to proceed with its boot.
@@ -292,8 +303,12 @@ fn boot_page() -> RwSignal<View> {
                     &accounts,
                     || {
                         view.update(|v| {
-                            v.picking =
-                                Some(accounts.iter().cloned().map(AccountEntry::new).collect());
+                            v.picking = Some(
+                                accounts
+                                    .iter()
+                                    .map(|key| AccountEntry::new(key.clone(), &names))
+                                    .collect(),
+                            );
                             v.session = Session::PickingAccount;
                         });
                     },
@@ -336,6 +351,9 @@ fn boot_page() -> RwSignal<View> {
                         v.status = "connected".to_owned();
                     });
                     stand_team(view);
+                    if let Some(account) = view.with_untracked(|v| v.identity.clone()) {
+                        follow_own_name(view, client.clone(), account);
+                    }
                     refresh_storage(&view, &client);
                     let mut events = client.events();
                     while let Ok(event) = events.recv().await {
@@ -421,6 +439,45 @@ fn refresh_storage(view: &RwSignal<View>, client: &Client) {
     spawn_local(async move {
         let line = support::storage_line(&client).await;
         view.update(|v| v.storage = line);
+    });
+}
+
+/// Follow `account`'s own `users` row on the tab's client, naming it in the
+/// view and in this origin's stored names, so Switch to names it once it is
+/// not live. The feed ends at an account switch, and the next account's
+/// session starts its own.
+fn follow_own_name(view: RwSignal<View>, client: Client, account: String) {
+    let fresh = NAMED.with(|named| {
+        let mut named = named.borrow_mut();
+        let fresh = named.as_deref() != Some(account.as_str());
+        if fresh {
+            *named = Some(account.clone());
+        }
+        fresh
+    });
+    if !fresh {
+        return;
+    }
+    spawn_local(async move {
+        support::follow_own_name(
+            client,
+            account.clone(),
+            |name| {
+                let mut names = glue::read_stored_names();
+                if names.remember(&account, name) {
+                    glue::save_stored_names(&names);
+                    view.update(|v| v.name_account(&account, name));
+                }
+            },
+            |_| {},
+        )
+        .await;
+        NAMED.with(|named| {
+            let mut named = named.borrow_mut();
+            if named.as_deref() == Some(account.as_str()) {
+                *named = None;
+            }
+        });
     });
 }
 

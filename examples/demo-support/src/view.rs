@@ -36,22 +36,139 @@ pub struct ProductRow {
     pub price: String,
 }
 
-/// One stored account, its credential-store key and the label the account
-/// bar shows for it.
+/// One stored account, its credential-store key, the label the account bar
+/// shows for it and the login name this device last saw for it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountEntry {
     /// The credential-store key.
     pub key: String,
     /// The decoded identity, or the raw key when the key does not decode.
     pub label: String,
+    /// The account's login name from the device's [`StoredNames`], absent
+    /// until the account was live once with its `users` row synced.
+    pub name: Option<String>,
+}
+
+/// The login name of each account this device stores, keyed by the account
+/// id, so an account that is not live shows its name. The demo writes an
+/// account's name whenever its own `users` row arrives while it is live.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StoredNames(std::collections::BTreeMap<String, String>);
+
+impl StoredNames {
+    /// The login name stored for `account`.
+    #[must_use]
+    pub fn name(&self, account: &str) -> Option<&str> {
+        self.0.get(account).map(String::as_str)
+    }
+
+    /// Store `name` for `account`, answering whether the map changed, so a
+    /// caller writes the map back only then.
+    pub fn remember(&mut self, account: &str, name: &str) -> bool {
+        if self.name(account) == Some(name) {
+            return false;
+        }
+        self.0.insert(account.to_owned(), name.to_owned());
+        true
+    }
+
+    /// Drop the name stored for `account`, answering whether the map changed.
+    pub fn forget(&mut self, account: &str) -> bool {
+        self.0.remove(account).is_some()
+    }
+}
+
+/// A device on the peer link, named by its account and the first eight
+/// characters of its device key.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PeerId {
+    /// The account the device is signed in as.
+    pub account: String,
+    /// The first eight characters of the device key.
+    pub key_prefix: String,
+}
+
+impl std::fmt::Display for PeerId {
+    /// `account/key prefix`, what the nearby panel names devices by.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/{}", self.account, self.key_prefix)
+    }
+}
+
+/// One linked peer, with the address it is linked through where known.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LinkedPeer {
+    /// The linked device.
+    pub peer: PeerId,
+    /// The address the link runs over, where known.
+    pub remote: Option<String>,
+}
+
+impl LinkedPeer {
+    /// `linked: <peer> via <address>`, or `linked: <peer>` with no address.
+    #[must_use]
+    pub fn line(&self) -> String {
+        match &self.remote {
+            Some(remote) => format!("linked: {} via {remote}", self.peer),
+            None => format!("linked: {}", self.peer),
+        }
+    }
+}
+
+/// The peer port this device listens on and the identity it links as.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Listening {
+    /// The peer port.
+    pub port: u16,
+    /// This device.
+    pub me: PeerId,
+}
+
+/// `peer: listening on <port> as <me>`, or `peer: not serving` while the
+/// device lacks a port or an identity.
+#[must_use]
+pub fn peer_line(listening: Option<&Listening>) -> String {
+    match listening {
+        Some(Listening { port, me }) => format!("peer: listening on {port} as {me}"),
+        None => "peer: not serving".to_owned(),
+    }
+}
+
+/// One line of the team panel's peer activity, with the account that wrote
+/// the row where the event names one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamEvent {
+    /// The event without its author, `provisional: applied <table> <key>`.
+    pub line: String,
+    /// The account the applied row came from.
+    pub by: Option<String>,
+}
+
+impl TeamEvent {
+    /// An event that names no account.
+    #[must_use]
+    pub fn plain(line: String) -> Self {
+        Self { line, by: None }
+    }
+
+    /// The line as the panel prints it, `<line> by <account>` where the
+    /// event names one.
+    #[must_use]
+    pub fn text(&self) -> String {
+        match &self.by {
+            Some(account) => format!("{} by {account}", self.line),
+            None => self.line.clone(),
+        }
+    }
 }
 
 /// The team notes panel's standing (R77).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamView {
-    /// One line per applied, confirmed, rolled-back or refused peer write
+    /// One event per applied, confirmed, rolled-back or refused peer write
     /// and per tidy pass, newest last.
-    pub events: Vec<String>,
+    pub events: Vec<TeamEvent>,
     /// How many provisional events arrived, which the notes' provisional
     /// accounts are read again on.
     pub provisional_events: u64,
@@ -92,11 +209,14 @@ pub fn members_line(members: &[String]) -> String {
 
 #[cfg(feature = "client")]
 impl AccountEntry {
-    /// The entry for `key`, labelled with its decoded identity.
+    /// The entry for `key`, labelled with its decoded identity and named
+    /// from `names`.
     #[must_use]
-    pub fn new(key: String) -> Self {
+    pub fn new(key: String, names: &StoredNames) -> Self {
+        let label = crate::account_label(&key);
         Self {
-            label: crate::account_label(&key),
+            name: names.name(&label).map(str::to_owned),
+            label,
             key,
         }
     }
@@ -120,14 +240,15 @@ pub struct OfferView {
 /// The nearby panel's standing, the peer link and the hotspot (R76).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NearbyView {
-    /// `peer: listening on <port> as <identity>` or `peer: not serving`.
-    pub peer_line: String,
+    /// The port and identity this device links as, absent while it lacks
+    /// either, shown through [`peer_line`].
+    pub listening: Option<Listening>,
     /// `bluetooth: <state>`.
     pub bluetooth_line: String,
     /// `beacon: advertising <prefix>` or `beacon: off (<reason>)`.
     pub beacon_line: String,
-    /// One `linked: <identity> via <address>` line per linked peer, sorted.
-    pub linked: Vec<String>,
+    /// Every linked peer, sorted.
+    pub linked: Vec<LinkedPeer>,
     /// One `nearby: <prefix> at <rssi> dBm` line per host whose beacon shows.
     pub nearby: Vec<String>,
     /// The offer this device hosts, until the hotspot stops.
@@ -260,6 +381,20 @@ impl View {
             ..Self::default()
         }
     }
+
+    /// Give every entry of `account` the login name `name`, the live one,
+    /// the stored ones and the picker's.
+    pub fn name_account(&mut self, account: &str, name: &str) {
+        let entries = self
+            .account
+            .iter_mut()
+            .chain(self.stored_account.iter_mut())
+            .chain(self.known_accounts.iter_mut())
+            .chain(self.picking.iter_mut().flatten());
+        for entry in entries.filter(|entry| entry.label == account) {
+            entry.name = Some(name.to_owned());
+        }
+    }
 }
 
 /// Every control the user has.
@@ -385,7 +520,76 @@ pub enum Action {
 
 #[cfg(test)]
 mod tests {
-    use super::offers_bluetooth_on;
+    use super::{
+        LinkedPeer, Listening, PeerId, StoredNames, TeamEvent, offers_bluetooth_on, peer_line,
+    };
+
+    fn alice_phone() -> PeerId {
+        PeerId {
+            account: "3f2a9c1e-0000-5000-8000-000000000001".to_owned(),
+            key_prefix: "a1b2c3d4".to_owned(),
+        }
+    }
+
+    /// The nearby lines the phone proof drivers read keep their words, so
+    /// the structured peers change nothing on the page.
+    #[test]
+    fn the_nearby_lines_keep_the_words_the_proof_drivers_read() {
+        let me = alice_phone();
+        assert_eq!(
+            peer_line(Some(&Listening {
+                port: 7000,
+                me: me.clone()
+            })),
+            "peer: listening on 7000 as 3f2a9c1e-0000-5000-8000-000000000001/a1b2c3d4"
+        );
+        assert_eq!(peer_line(None), "peer: not serving");
+        let linked = LinkedPeer {
+            peer: me.clone(),
+            remote: Some("192.168.49.1:7000".to_owned()),
+        };
+        assert_eq!(
+            linked.line(),
+            "linked: 3f2a9c1e-0000-5000-8000-000000000001/a1b2c3d4 via 192.168.49.1:7000"
+        );
+        let linked = LinkedPeer {
+            peer: me,
+            remote: None,
+        };
+        assert_eq!(
+            linked.line(),
+            "linked: 3f2a9c1e-0000-5000-8000-000000000001/a1b2c3d4"
+        );
+    }
+
+    /// A team event prints its author last, as the applied line always has.
+    #[test]
+    fn a_team_event_prints_its_author_last() {
+        let applied = TeamEvent {
+            line: "provisional: applied team_notes 9f1c".to_owned(),
+            by: Some("bob".to_owned()),
+        };
+        assert_eq!(
+            applied.text(),
+            "provisional: applied team_notes 9f1c by bob"
+        );
+        let tidy = TeamEvent::plain("tidy: 0 provisional row(s) remain".to_owned());
+        assert_eq!(tidy.text(), "tidy: 0 provisional row(s) remain");
+    }
+
+    /// The stored names change only on a new or different name, so the
+    /// demo writes its file or `localStorage` entry only then.
+    #[test]
+    fn the_stored_names_change_only_on_a_new_name() {
+        let mut names = StoredNames::default();
+        assert!(names.remember("alice-id", "alice"));
+        assert!(!names.remember("alice-id", "alice"));
+        assert!(names.remember("alice-id", "alice2"));
+        assert_eq!(names.name("alice-id"), Some("alice2"));
+        assert_eq!(names.name("bob-id"), None);
+        assert!(names.forget("alice-id"));
+        assert!(!names.forget("alice-id"));
+    }
 
     /// The Bluetooth button stands only while the user can turn the radio on
     /// or grant its permission, and goes once Bluetooth is ready.

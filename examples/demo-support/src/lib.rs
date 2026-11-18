@@ -11,6 +11,8 @@ mod data;
 #[cfg(feature = "client")]
 pub use data::*;
 
+pub mod badge;
+
 pub mod view;
 
 #[cfg(feature = "peer")]
