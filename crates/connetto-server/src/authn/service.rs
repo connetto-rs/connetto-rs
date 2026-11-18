@@ -411,13 +411,15 @@ impl<S: AuthStore> AuthService<S> {
     ///
     /// Returns `None` when the session retained no provider token. The refresh
     /// goes through the provider the session signed in with, by name, because
-    /// two clients of one issuer each refuse the other's refresh token. When no
-    /// registry is attached or no provider carries that name any longer, the
-    /// stored token is returned unrefreshed.
+    /// two clients of one issuer each refuse the other's refresh token.
     ///
     /// # Errors
     ///
-    /// [`AuthError`] if the store or the provider refresh fails.
+    /// [`AuthError`] if the store or the provider refresh fails, and
+    /// [`ProviderError::Refresh`] when the stored token has expired and
+    /// nothing can renew it, because the provider issued no refresh token, no
+    /// registry is attached, the session is gone, or no provider carries the
+    /// session's provider name any longer.
     pub async fn provider_access_token(
         &self,
         session_id: SessionId,
@@ -431,18 +433,26 @@ impl<S: AuthStore> AuthService<S> {
         if retained.still_valid {
             return Ok(Some(retained.access_token));
         }
-        let (Some(refresh_token), Some(registry)) =
-            (retained.refresh_token.as_deref(), self.registry.as_ref())
-        else {
-            return Ok(Some(retained.access_token));
-        };
-        let Some(record) = self.store.session_record(session_id).await? else {
-            return Ok(Some(retained.access_token));
-        };
-        let Some(provider) = registry.by_name(&record.provider) else {
-            return Ok(Some(retained.access_token));
-        };
-        let refreshed = provider.refresh_provider_token(refresh_token).await?;
+        let unrenewable = |reason: String| AuthError::Provider(ProviderError::Refresh(reason));
+        let refresh_token = retained
+            .refresh_token
+            .ok_or_else(|| unrenewable("the provider issued no refresh token".to_owned()))?;
+        let registry = self
+            .registry
+            .as_ref()
+            .ok_or_else(|| unrenewable("no provider registry is attached".to_owned()))?;
+        let record = self
+            .store
+            .session_record(session_id)
+            .await?
+            .ok_or_else(|| unrenewable("the session no longer exists".to_owned()))?;
+        let provider = registry.by_name(&record.provider).ok_or_else(|| {
+            unrenewable(format!(
+                "the session's provider {:?} is not configured",
+                record.provider
+            ))
+        })?;
+        let refreshed = provider.refresh_provider_token(&refresh_token).await?;
         // Preserve the tenant-specific issuer resolved at login.
         let refreshed = RetainedProviderToken {
             issuer: retained.issuer,

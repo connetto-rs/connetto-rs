@@ -12,9 +12,10 @@ use chrono::Utc;
 use connetto_core::Subject;
 use connetto_core::messages::Grant;
 use connetto_server::{
-    AssuranceRequirement, AuthConfig, AuthService, GenericOidcProvider, IdentityProvider,
-    InMemoryAuthStore, LoginRedirect, OidcProviderConfig, ProviderError, ProviderRegistry,
-    RequestGuard, ResolvedIdentity, RetainedProviderToken, TokenAuthority, VerifiedLogin,
+    AssuranceRequirement, AuthConfig, AuthError, AuthService, GenericOidcProvider,
+    IdentityProvider, InMemoryAuthStore, LoginRedirect, OidcProviderConfig, ProviderError,
+    ProviderRegistry, RequestGuard, ResolvedIdentity, RetainedProviderToken, SessionId,
+    TokenAuthority, VerifiedLogin,
 };
 use connetto_test_harness::{MOCK_OAUTH_PROVIDER, MockOauth};
 use openidconnect::core::{
@@ -347,65 +348,118 @@ impl IdentityProvider for SharedIssuerClient {
     }
 }
 
+/// A service over an in-memory store with these shared-issuer clients
+/// registered, or with no registry attached when `clients` is `None`.
+fn shared_issuer_service(
+    clients: Option<&[&'static str]>,
+) -> (Arc<TokenAuthority>, AuthService<InMemoryAuthStore>) {
+    let config = AuthConfig::default();
+    let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
+    let service = AuthService::new(
+        Arc::clone(&authority),
+        Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes())),
+        Arc::new(RequestGuard::default()),
+    );
+    let service = match clients {
+        Some(clients) => {
+            let mut registry = ProviderRegistry::new();
+            for client in clients {
+                registry.register(Arc::new(SharedIssuerClient(client)));
+            }
+            service.with_registry(Arc::new(registry))
+        }
+        None => service,
+    };
+    (authority, service)
+}
+
+/// A session signed in through `provider` whose retained provider access
+/// token has already expired.
+async fn expired_session(
+    authority: &TokenAuthority,
+    service: &AuthService<InMemoryAuthStore>,
+    provider: &str,
+    refresh_token: Option<&str>,
+) -> SessionId {
+    let login = VerifiedLogin {
+        identity: ResolvedIdentity {
+            issuer: TEST_ISSUER.to_owned(),
+            subject: "shared-user".to_owned(),
+            email: None,
+            name: None,
+            amr: Vec::new(),
+            acr: None,
+        },
+        retained: RetainedProviderToken {
+            issuer: TEST_ISSUER.to_owned(),
+            access_token: "expired".to_owned(),
+            refresh_token: refresh_token.map(str::to_owned),
+            expires_in: Some(Duration::ZERO),
+        },
+    };
+    let origin = connetto_server::SessionOrigin {
+        provider: provider.to_owned(),
+        description: (),
+    };
+    let pair = service
+        .login_with_provider(&login, origin)
+        .await
+        .expect("login");
+    let Subject::Identity(verified) = authority
+        .check_grant::<String, String>(&Grant::new(&pair.access_token))
+        .expect("verify")
+        .subject
+    else {
+        panic!("expected identity subject");
+    };
+    verified.session_id
+}
+
 /// Two clients of one issuer, such as a web and a native Google client, each
 /// refresh the provider tokens of the sessions signed in through them, since
 /// the provider refuses a refresh token presented by another client.
 #[tokio::test]
 async fn a_refresh_goes_through_the_client_the_session_signed_in_with() {
-    let config = AuthConfig::default();
-    let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let mut registry = ProviderRegistry::new();
+    let (authority, service) = shared_issuer_service(Some(&["web", "native"]));
     for client in ["web", "native"] {
-        registry.register(Arc::new(SharedIssuerClient(client)));
-    }
-    let service = AuthService::new(
-        Arc::clone(&authority),
-        Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes())),
-        Arc::new(RequestGuard::default()),
-    )
-    .with_registry(Arc::new(registry));
-
-    for client in ["web", "native"] {
-        let login = VerifiedLogin {
-            identity: ResolvedIdentity {
-                issuer: TEST_ISSUER.to_owned(),
-                subject: "shared-user".to_owned(),
-                email: None,
-                name: None,
-                amr: Vec::new(),
-                acr: None,
-            },
-            retained: RetainedProviderToken {
-                issuer: TEST_ISSUER.to_owned(),
-                access_token: "expired".to_owned(),
-                refresh_token: Some("refresh".to_owned()),
-                expires_in: Some(Duration::ZERO),
-            },
-        };
-        let origin = connetto_server::SessionOrigin {
-            provider: client.to_owned(),
-            description: (),
-        };
-        let pair = service
-            .login_with_provider(&login, origin)
-            .await
-            .expect("login");
-        let Subject::Identity(verified) = authority
-            .check_grant::<String, String>(&Grant::new(&pair.access_token))
-            .expect("verify")
-            .subject
-        else {
-            panic!("expected identity subject");
-        };
-
+        let session = expired_session(&authority, &service, client, Some("refresh")).await;
         let token = service
-            .provider_access_token(verified.session_id)
+            .provider_access_token(session)
             .await
             .expect("accessor");
         assert_eq!(
             token,
             Some(format!("issued to {client}")),
             "a session signed in through {client} refreshes through {client}"
+        );
+    }
+}
+
+/// An expired provider token nothing can renew is a refresh failure, never
+/// handed back as though the provider would still accept it.
+#[tokio::test]
+async fn an_expired_provider_token_nothing_can_renew_is_refused() {
+    for (case, clients, provider, refresh_token) in [
+        (
+            "the session's provider is not configured",
+            Some(&["web"][..]),
+            "retired",
+            Some("refresh"),
+        ),
+        (
+            "the provider issued no refresh token",
+            Some(&["web"][..]),
+            "web",
+            None,
+        ),
+        ("no registry is attached", None, "web", Some("refresh")),
+    ] {
+        let (authority, service) = shared_issuer_service(clients);
+        let session = expired_session(&authority, &service, provider, refresh_token).await;
+        let answer = service.provider_access_token(session).await;
+        assert!(
+            matches!(answer, Err(AuthError::Provider(ProviderError::Refresh(_)))),
+            "{case}: got {answer:?}"
         );
     }
 }
