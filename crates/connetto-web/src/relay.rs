@@ -88,8 +88,9 @@ use connetto_core::messages::{
     FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired, GateState, HandshakeAck,
     LivePatch, MutationApplied, MutationConflict, MutationReject, MutationRejectReason,
     NonFatalError, Pong, RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd,
-    SnapshotPatch, Subscribe, SubscriptionSpec, SyncStatus, TabShareKeyAnswer, TabShareKeyChange,
-    TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse,
+    SnapshotPatch, Subscribe, SubscriptionSpec, SyncStatus, TabDismissAnswer, TabDismissOutcome,
+    TabDismissRefusal, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, TabStorageAnswer,
+    TabStorageOutcome, TabStorageUse, UnsyncedWork,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Major, Transport};
@@ -610,6 +611,9 @@ struct HubState {
     /// hub knows it learns it from its own ack, and a tab already handshaken
     /// hears the relay frame the first time the hub learns it.
     sunset: Option<u64>,
+    /// The worker's unsynced work as the tabs were last told it, which a tab
+    /// handshaking later hears at once.
+    stated_unsynced: UnsyncedWork,
 }
 
 /// One resolve whose ticket request is in flight, kept in the hub state so
@@ -1644,6 +1648,7 @@ where
         // included, so the tabs hear about it once here.
         if matches!(served, Ok(true)) {
             restate_identity(&mut self.worker, &mut self.state)?;
+            restate_unsynced(&mut self.worker, &mut self.state);
         }
         served
     }
@@ -3266,7 +3271,9 @@ fn recovery_interrupts_attach(event: &HubEvent) -> bool {
             | HubEvent::Frame(
                 _,
                 IncomingFrame::Control(
-                    ControlMessage::TabShareKeyChange(_) | ControlMessage::TabStorageUse(_)
+                    ControlMessage::TabShareKeyChange(_)
+                        | ControlMessage::TabStorageUse(_)
+                        | ControlMessage::TabDismissRefusal(_)
                 )
             )
             | HubEvent::Export(_, _)
@@ -3545,6 +3552,7 @@ where
     U::Error: core::fmt::Display,
 {
     let refused_tables = fully_refused_tables(state);
+    let locked = hub_locked(state);
     let Some(tab) = state.tabs.get_mut(&id) else {
         return Ok(());
     };
@@ -3632,6 +3640,13 @@ where
                     .out
                     .send(TabOut::Control(ControlMessage::GateState(gate)));
             }
+            // The worker's unsynced work, which the tab's mirror holds no
+            // outbox to read, unless the gate hides the application's data.
+            if !locked {
+                let _ = tab.out.send(TabOut::Control(ControlMessage::TabUnsynced(
+                    state.stated_unsynced.clone(),
+                )));
+            }
             // The courier notices no tab has acked yet, the ones the boot
             // received before the hub existed among them (R78 decision 41 as
             // amended).
@@ -3690,6 +3705,10 @@ where
         }
         ControlMessage::TabStorageUse(request) if tab.handshaken => {
             serve_tab_storage_use(worker, state, id, request);
+            Ok(())
+        }
+        ControlMessage::TabDismissRefusal(request) if tab.handshaken => {
+            serve_tab_dismiss_refusal(worker, state, id, request);
             Ok(())
         }
         // A tab's receipt of a relayed courier notice frame, the first of
@@ -5022,6 +5041,66 @@ fn serve_tab_storage_use<U>(
                 },
             )));
     }
+}
+
+/// Dismiss a tab's refused write on the worker, which holds the refusals,
+/// and answer the tab. The next restate tells every tab the snapshot moved.
+fn serve_tab_dismiss_refusal<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &HubState,
+    id: TabId,
+    request: TabDismissRefusal,
+) where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let outcome = if hub_locked(state) {
+        TabDismissOutcome::Locked
+    } else {
+        match worker.dismiss_refusal(&request.writer, request.seq) {
+            Ok(()) => TabDismissOutcome::Dismissed,
+            Err(ClientError::Locked) => TabDismissOutcome::Locked,
+            Err(other) => TabDismissOutcome::Refused(other.to_string()),
+        }
+    };
+    if let Some(tab) = state.tabs.get(&id) {
+        let _ = tab
+            .out
+            .send(TabOut::Control(ControlMessage::TabDismissAnswer(
+                TabDismissAnswer {
+                    request_id: request.request_id,
+                    outcome,
+                },
+            )));
+    }
+}
+
+/// Tell every handshaken tab the worker's unsynced work when it moved, while
+/// the gate lets the application's data show. A locked gate keeps the mark,
+/// so the cycle that unlocks states it.
+fn restate_unsynced<U>(worker: &mut ConnettoConnection<U>, state: &mut HubState)
+where
+    U: Transport,
+{
+    if hub_locked(state) || !worker.take_unsynced_moved() {
+        return;
+    }
+    let work = match worker.unsynced_work() {
+        Ok(work) => work,
+        Err(err) => {
+            tracing::warn!(error = %err, "reading the worker's unsynced work failed");
+            return;
+        }
+    };
+    if work == state.stated_unsynced {
+        return;
+    }
+    for tab in state.tabs.values().filter(|tab| tab.handshaken) {
+        let _ = tab
+            .out
+            .send(TabOut::Control(ControlMessage::TabUnsynced(work.clone())));
+    }
+    state.stated_unsynced = work;
 }
 
 /// Answers `Unavailable` to every resolve whose wait ran out.

@@ -15,7 +15,7 @@ use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::{FaBroom, FaClockRotateLeft, FaPlus, FaUsers};
 
 use crate::platform::native::SessionParts;
-use connetto_client::{KeyValue, LiveSpec};
+use connetto_client::KeyValue;
 use connetto_demo_support as support;
 use connetto_dioxus::use_live;
 
@@ -60,7 +60,7 @@ pub(crate) fn TeamNotesPanel(parts: SessionParts) -> Element {
     let client = parts.0.client.clone();
 
     // The teams the account's roster names, the picker's source.
-    let teams_live = use_live::<_, _, String>(&client, support::TeamsOfAccount.query());
+    let teams_live = use_live(&client, support::TeamsOfAccount);
     let teams: Vec<String> = teams_live.value().read().iter().cloned().collect();
     let mut team = use_first_team(teams_live.value());
 
@@ -177,15 +177,9 @@ fn TeamNotes(parts: SessionParts, team: String) -> Element {
         .native
         .session()
         .map(|session| session.user_id().to_owned());
-    let notes_live = use_live::<_, _, support::TeamNote>(
-        &client,
-        support::TeamNotesFor { team: team.clone() }.query(),
-    );
+    let notes_live = use_live(&client, support::TeamNotesFor { team: team.clone() });
     // The team's roster rows, which the replica settles a peer's note against.
-    let members_live = use_live::<_, _, String>(
-        &client,
-        support::TeamMembersOf { team: team.clone() }.query(),
-    );
+    let members_live = use_live(&client, support::TeamMembersOf { team: team.clone() });
     // The notes' lines, the peer rows marked provisional off the provenance.
     let note_lines: Signal<Vec<String>> = use_signal(Vec::new);
     {

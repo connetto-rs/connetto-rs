@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use connetto_client::{AccountChoice, Auth, ClientEvent, ConnettoClient, LiveSpec, NoGate};
+use connetto_client::{AccountChoice, Auth, ClientEvent, ConnettoClient, NoGate};
 use connetto_core::custody::Custody;
 use connetto_demo_support as support;
 use connetto_demo_support::web as glue;
@@ -1004,12 +1004,12 @@ fn dashboard(props: &DashboardProps) -> Html {
     let client = (*props.client.0).clone();
     let identity = props.identity.clone();
 
-    let orders = use_live::<_, _, support::Order>(&client, support::OrdersNewestFirst.query());
-    let notes = use_live::<_, _, support::Note>(&client, support::NotesRows.query());
-    let photos = use_live::<_, _, support::Photo>(&client, support::PhotosRows.query());
-    let products = use_live::<_, _, support::Product>(&client, support::ProductsByName.query());
-    let count = use_live(&client, support::OrdersCount.query());
-    let counts_by_quantity = use_live(&client, support::OrdersCountsByQuantity.query());
+    let orders = use_live(&client, support::OrdersNewestFirst);
+    let notes = use_live(&client, support::NotesRows);
+    let photos = use_live(&client, support::PhotosRows);
+    let products = use_live(&client, support::ProductsByName);
+    let count = use_live(&client, support::OrdersCount);
+    let counts_by_quantity = use_live(&client, support::OrdersCountsByQuantity);
 
     let order_rows = orders.value();
     let note_rows = notes.value();

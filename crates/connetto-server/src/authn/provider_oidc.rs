@@ -398,10 +398,6 @@ impl IdentityProvider for GenericOidcProvider {
         self.issuer_match.index_key()
     }
 
-    fn matches_issuer(&self, issuer: &str) -> bool {
-        self.issuer_match.matches(issuer)
-    }
-
     fn begin_login(&self) -> Result<LoginRedirect, ProviderError> {
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
         let mut request = self.client.authorize_url(
