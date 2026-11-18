@@ -7,7 +7,9 @@
 
 use connetto_core::traits::{MaybeSend, Transport};
 
-use crate::{LiveHandle, LiveQuery, Watchable};
+use crate::{
+    ClientError, ConnettoClient, LiveHandle, LiveQuery, LiveUnsynced, UnsyncedWork, Watchable,
+};
 
 /// A serializable descriptor of a typed live query.
 pub trait LiveSpec: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static {
@@ -39,4 +41,46 @@ where
 
     /// The identity of `row`.
     fn key(row: &Self::Row) -> Self::Key;
+}
+
+/// The descriptor of this device's unsynced work, its writes and staged
+/// files that have not reached the server and its undismissed refusals, as
+/// [`ConnettoClient::unsynced_live`] follows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Unsynced;
+
+impl LiveSpec for Unsynced {
+    const NAME: &'static str = "connetto_unsynced";
+    type Row = UnsyncedWork;
+    type Handle = LiveUnsynced;
+
+    fn query<T>(&self) -> impl Watchable<T, UnsyncedWork, Handle = LiveUnsynced> + use<T>
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: core::fmt::Display,
+    {
+        UnsyncedQuery
+    }
+}
+
+/// What [`Unsynced`] builds, subscribing through
+/// [`ConnettoClient::unsynced_live`].
+struct UnsyncedQuery;
+
+impl<T> Watchable<T, UnsyncedWork> for UnsyncedQuery
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
+    type Handle = LiveUnsynced;
+
+    fn live<'a>(
+        self,
+        client: &'a ConnettoClient<T>,
+    ) -> impl Future<Output = Result<LiveUnsynced, ClientError>> + MaybeSend + 'a
+    where
+        Self: 'a,
+    {
+        client.unsynced_live()
+    }
 }
