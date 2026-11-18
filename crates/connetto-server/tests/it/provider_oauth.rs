@@ -11,12 +11,13 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use connetto_server::{
     AuthConfig, AuthService, AuthStore as _, CookieSameSite, IdentityProvider as _,
-    InMemoryAuthStore, OAuthProvider, ProviderError, ProviderRegistry, RedirectPolicy,
-    RequestGuard, VerifiedLogin, auth_router,
+    InMemoryAuthStore, OAuthEndpoints, OAuthProvider, OAuthProviderConfig, ProviderError,
+    ProviderRegistry, RedirectPolicy, RequestGuard, VerifiedLogin, auth_router,
 };
-use connetto_test_harness::{Fixture, MockOauth};
+use connetto_test_harness::{Fixture, MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET, MockOauth};
 use openidconnect::reqwest;
 use serde_json::json;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
@@ -258,6 +259,39 @@ async fn the_email_and_name_come_from_the_user_endpoint() {
     assert_eq!(login.identity.name.as_deref(), Some("The Octocat"));
 }
 
+/// A provider whose configuration names no email signs the user in without
+/// one, although its user endpoint reports an address.
+#[tokio::test]
+async fn a_provider_naming_no_email_signs_in_without_one() {
+    let idp = MockOauth::start().await;
+    let provider = OAuthProvider::new(
+        OAuthProviderConfig::new(
+            PROVIDER,
+            MOCK_OAUTH_CLIENT_ID,
+            ISSUER_LABEL,
+            CALLBACK,
+            OAuthEndpoints {
+                authorize_url: format!("{}/authorize", idp.issuer()),
+                token_url: format!("{}/token", idp.issuer()),
+                user_url: idp.user_url(),
+            },
+            "/id",
+        )
+        .with_client_secret(Some(MOCK_OAUTH_CLIENT_SECRET.to_owned()))
+        .with_scopes(["openid"]),
+    )
+    .expect("build the provider");
+
+    let login = log_in(&provider, &json!({ "id": 583_231 }))
+        .await
+        .expect("the login completes");
+    assert_eq!(login.identity.subject, "583231");
+    assert_eq!(
+        login.identity.email, None,
+        "the mock reports octocat@example.test, which no setting reads"
+    );
+}
+
 /// A loopback server standing in for an email list and for a user endpoint
 /// that answers no JSON. Any other path answers 404.
 async fn stand_in() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -284,6 +318,26 @@ async fn stand_in() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         axum::serve(listener, routes)
             .await
             .expect("serve the stand-in");
+    });
+    (at, server)
+}
+
+/// A loopback server whose every answer is a success that promises a longer
+/// body than it sends before it hangs up.
+async fn truncating() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the truncating server");
+    let at = listener.local_addr().expect("local address");
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("accept a request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n{\"id\":")
+                .await;
+        }
     });
     (at, server)
 }
@@ -331,16 +385,19 @@ async fn the_email_list_decides_the_email_and_never_the_login() {
     server.abort();
 }
 
-/// A user endpoint that answers no JSON, or cannot be reached at all,
-/// refuses the login as a failed exchange naming the endpoint.
+/// A user endpoint that answers no JSON, cannot be reached at all, or hangs
+/// up partway through its answer refuses the login as a failed exchange
+/// naming the endpoint.
 #[tokio::test]
 async fn a_user_endpoint_answering_nothing_usable_refuses_the_login() {
     let idp = MockOauth::start().await;
     let (at, server) = stand_in().await;
+    let (cut_at, cut) = truncating().await;
 
     for (user_url, detail) in [
         (format!("http://{at}/not-json"), "answered no JSON"),
         ("http://127.0.0.1:1/user".to_owned(), "reading"),
+        (format!("http://{cut_at}/user"), "reading"),
     ] {
         let provider = provider(&idp, user_url.clone());
         let refused = log_in(&provider, &json!({ "id": 583_231 }))
@@ -353,6 +410,7 @@ async fn a_user_endpoint_answering_nothing_usable_refuses_the_login() {
         );
     }
     server.abort();
+    cut.abort();
 }
 
 /// The retained refresh token buys a fresh access token at the token

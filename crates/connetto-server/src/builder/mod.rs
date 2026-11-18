@@ -3219,8 +3219,8 @@ mod tests {
     }
 
     /// The settings a deployment hands the builder keep their passwords, key
-    /// material and client secret out of the `Debug` line the builder and its
-    /// pieces print.
+    /// material and client secrets out of the `Debug` line the builder and its
+    /// pieces print, which names a provider the deployment built.
     #[test]
     fn the_builder_pieces_keep_their_secrets_out_of_their_debug_line() {
         let database = Database::new(
@@ -3237,6 +3237,15 @@ mod tests {
             )
             .with_client_secret(Some("oidc-secret".to_owned())),
         );
+        let built = crate::OAuthProvider::new(
+            crate::OAuthProviderConfig::github(
+                "built-github",
+                "github-client",
+                "https://app.example/cb",
+            )
+            .with_client_secret(Some("oauth-secret".to_owned())),
+        )
+        .expect("build the GitHub provider");
         let settings = ContentSettings {
             base_url: "http://127.0.0.1:8099".to_owned(),
             ttl: Duration::from_secs(60),
@@ -3265,6 +3274,7 @@ mod tests {
             OpenFga::new("http://127.0.0.1:1", "store"),
         )
         .oidc_providers(vec![provider])
+        .identity_provider(Arc::new(built))
         .content(Some(settings));
         let shown = format!("{builder:?}");
         for secret in [
@@ -3273,6 +3283,7 @@ mod tests {
             "PRIVATE-PEM-BYTES",
             "PUBLIC-PEM-BYTES",
             "oidc-secret",
+            "oauth-secret",
             "[191, 208, 187]",
         ] {
             assert!(
@@ -3280,6 +3291,10 @@ mod tests {
                 "the Debug line keeps its secrets: {shown}"
             );
         }
+        assert!(
+            shown.contains("\"built-github\""),
+            "the Debug line names the built provider: {shown}"
+        );
     }
 
     /// Credentials ride only the origins `CONNETTO_AUTH_CORS_ORIGINS` lists. A

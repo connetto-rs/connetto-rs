@@ -2091,6 +2091,34 @@ async fn a_built_provider_naming_a_claimed_issuer_refuses_the_build() {
     );
 }
 
+/// An OIDC provider whose issuer answers no discovery document refuses the
+/// build rather than assemble a deployment nobody can log in through.
+#[tokio::test]
+async fn an_undiscoverable_oidc_provider_refuses_the_build() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+
+    let (builder, _idp, _keys) = builder_over(&fixture, 1).await;
+    let builder = builder.oidc_providers(vec![OidcProvider::Generic(OidcProviderConfig::new(
+        "unreachable",
+        "client",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1/auth/callback",
+    ))]);
+    let err = refused(
+        builder.build().await,
+        "an undiscoverable provider is a refusal",
+    );
+    assert!(
+        matches!(&err, BuildError::Providers(_)),
+        "the refusal is the provider set's: {err}"
+    );
+}
+
 /// A pool named no connections, or a reader reserve that overruns the pool
 /// it reserves, is a refusal before anything starts, the content settings'
 /// pools included.

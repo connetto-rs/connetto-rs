@@ -659,6 +659,38 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_endpoint_or_redirect_url_is_refused() {
+        let malformed_endpoint = OAuthProviderConfig::new(
+            "idp",
+            "client",
+            "https://idp.example",
+            "https://app.example/callback",
+            OAuthEndpoints {
+                token_url: "no url at all".to_owned(),
+                ..endpoints()
+            },
+            "/id",
+        );
+        let malformed_redirect = OAuthProviderConfig::new(
+            "idp",
+            "client",
+            "https://idp.example",
+            "no url at all",
+            endpoints(),
+            "/id",
+        );
+        for config in [malformed_endpoint, malformed_redirect] {
+            let refused = OAuthProvider::new(config)
+                .err()
+                .expect("a provider needs URLs it can call");
+            assert!(
+                matches!(&refused, ProviderError::Config(detail) if detail.starts_with("provider idp: ")),
+                "the refusal names the provider: {refused}"
+            );
+        }
+    }
+
+    #[test]
     fn the_config_debug_line_keeps_the_secret_out() {
         let config = OAuthProviderConfig::github("github", "client", "https://app.example/cb")
             .with_client_secret(Some("planted-secret".to_owned()));

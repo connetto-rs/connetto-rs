@@ -1530,6 +1530,48 @@ async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
     }
 }
 
+/// A provider left without its client id or its redirect URL refuses boot
+/// naming the unset variable and the provider.
+#[tokio::test]
+async fn e2e_startup_refuses_a_provider_without_its_client_id_or_redirect_url() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let client_id = ("CONNETTO_OIDC_MYPROVIDER_CLIENT_ID", "unused");
+    let redirect_url = (
+        "CONNETTO_OIDC_MYPROVIDER_REDIRECT_URL",
+        "http://127.0.0.1/callback",
+    );
+    for (set, unset) in [(redirect_url, client_id.0), (client_id, redirect_url.0)] {
+        let output = run_server_exit_output(
+            &url,
+            Some(&reader_url),
+            &[
+                ("CONNETTO_AUTH", "database"),
+                ("CONNETTO_OIDC_PROVIDERS", "myprovider"),
+                ("CONNETTO_OIDC_MYPROVIDER_KIND", "generic"),
+                set,
+            ],
+        )
+        .await;
+        assert!(
+            !output.status.success(),
+            "expected nonzero exit without {unset}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(unset) && stderr.contains("\"myprovider\""),
+            "expected the refusal to name {unset} and the provider, got: {stderr}"
+        );
+    }
+}
+
 /// A plain OAuth provider cannot be discovered, so every endpoint is a
 /// setting, and one left unset refuses boot naming it.
 #[tokio::test]
