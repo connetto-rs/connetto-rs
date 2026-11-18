@@ -105,7 +105,7 @@ use connetto_test_harness::stack::{
 };
 use connetto_test_harness::step;
 
-#[path = "../android_phone/live.rs"]
+#[path = "connetto-android-proof/live.rs"]
 mod live;
 use std::ffi::OsString;
 use std::net::IpAddr;

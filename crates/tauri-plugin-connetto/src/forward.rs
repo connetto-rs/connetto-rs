@@ -40,13 +40,7 @@ impl Sent {
             (_, Answer::Whole(bytes)) => FeedBody::Whole(ByteBuf::from(bytes.clone())),
         };
         self.seq += 1;
-        let kind = match &body {
-            FeedBody::Whole(_) => "whole",
-            FeedBody::Keyed(_) => "keyed",
-            FeedBody::Diff(_) => "diff",
-            FeedBody::Failed(_) => "failed",
-        };
-        tracing::debug!(target: "tauri_plugin_connetto", subscription = self.subscription, webview = self.webview, seq = self.seq, kind, "message sent");
+        self.log_sent(&body);
         (self.outlet)(FeedMessage {
             seq: self.seq,
             body,
@@ -57,12 +51,24 @@ impl Sent {
     /// Send the error that ends the subscription.
     fn fail(&mut self, failure: &ClientError) {
         self.seq += 1;
-        tracing::debug!(target: "tauri_plugin_connetto", subscription = self.subscription, webview = self.webview, seq = self.seq, kind = "failed", "message sent");
+        let body = FeedBody::Failed(failure.to_string());
+        self.log_sent(&body);
         tracing::debug!(target: "tauri_plugin_connetto", subscription = self.subscription, webview = self.webview, error = %failure, "subscription ending");
         (self.outlet)(FeedMessage {
             seq: self.seq,
-            body: FeedBody::Failed(failure.to_string()),
+            body,
         });
+    }
+
+    /// Log the kind and sequence of one outgoing message.
+    fn log_sent(&self, body: &FeedBody) {
+        let kind = match body {
+            FeedBody::Whole(_) => "whole",
+            FeedBody::Keyed(_) => "keyed",
+            FeedBody::Diff(_) => "diff",
+            FeedBody::Failed(_) => "failed",
+        };
+        tracing::debug!(target: "tauri_plugin_connetto", subscription = self.subscription, webview = self.webview, seq = self.seq, kind, "message sent");
     }
 }
 

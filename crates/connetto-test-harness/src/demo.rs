@@ -48,64 +48,6 @@ pub async fn order_count(pg_url: &str) -> Result<i64> {
         .context("counting orders")
 }
 
-/// Read the order keys newest first.
-///
-/// # Errors
-///
-/// Returns an error when Postgres cannot read the orders.
-pub async fn order_ids(pg_url: &str) -> Result<Vec<String>> {
-    let pool = pool_for(pg_url).await;
-    let mut connection = pool.get().await.context("a Postgres connection")?;
-    let identifiers: Vec<uuid::Uuid> = orders::table
-        .select(orders::id)
-        .order((orders::created_at.desc(), orders::id.desc()))
-        .load(&mut connection)
-        .await?;
-    Ok(identifiers
-        .into_iter()
-        .map(|identifier| identifier.to_string())
-        .collect())
-}
-
-/// Move one order to the newest position without changing its key.
-///
-/// # Errors
-///
-/// Returns an error when the key is invalid or Postgres cannot update it.
-pub async fn move_order_first(pg_url: &str, identifier: &str) -> Result<()> {
-    let pool = pool_for(pg_url).await;
-    let mut connection = pool.get().await.context("a Postgres connection")?;
-    let changed = diesel::update(orders::table.find(uuid::Uuid::parse_str(identifier)?))
-        .set(orders::created_at.eq(diesel::dsl::now))
-        .execute(&mut connection)
-        .await?;
-    anyhow::ensure!(changed == 1, "the moved order must exist");
-    Ok(())
-}
-
-/// Insert an order for the account owning an existing order.
-///
-/// # Errors
-///
-/// Returns an error when no order exists or Postgres refuses the insert.
-pub async fn insert_proof_order(pg_url: &str) -> Result<()> {
-    let pool = pool_for(pg_url).await;
-    let mut connection = pool.get().await.context("a Postgres connection")?;
-    let owner: String = orders::table
-        .select(orders::owner_id)
-        .first(&mut connection)
-        .await?;
-    diesel::insert_into(orders::table)
-        .values((
-            orders::id.eq(uuid::Uuid::new_v4()),
-            orders::owner_id.eq(owner),
-            orders::quantity.eq(1_i64),
-        ))
-        .execute(&mut connection)
-        .await?;
-    Ok(())
-}
-
 /// Wait up to a minute for Postgres to hold `expected` orders.
 ///
 /// # Errors
