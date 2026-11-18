@@ -16,14 +16,11 @@ workspace = true
 
 [dependencies]
 connetto-client = { path = "../connetto-client", version = "0.0.0", default-features = false }
-connetto-core.workspace = true
+# The away feeder's transport bounds.
+connetto-core = { workspace = true, optional = true }
 dioxus-core = "0.7.9"
 dioxus-hooks = "0.7.9"
 dioxus-signals = "0.7.9"
-# The bounds of `use_live_fn` restate `watch_fn`'s diesel query traits
-# (`QueryFragment`, `LoadQuery`, `Sqlite`, `SqliteConnection`), so the adapter
-# names diesel directly. It is already in the graph through connetto-client.
-diesel.workspace = true
 # The desktop away/return feeder (R94 step 5) reads tao's lifecycle events,
 # so it pulls dioxus-desktop. Optional, keeping the wasm build clean.
 dioxus-desktop = { version = "0.7.9", optional = true }
@@ -33,7 +30,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"], optio
 # Feeds the client's away input from tao's Suspended and Resumed events on
 # iOS and Android and from window focus on the desktop (R94 decision 9). Off
 # by default, so the wasm build never pulls the native webview stack.
-desktop = ["dep:dioxus-desktop", "dep:tracing"]
+desktop = ["dep:connetto-core", "dep:dioxus-desktop", "dep:tracing"]
 # Lends the desktop window to connetto's Windows Hello prompt (R53), with the
 # keyring sign-in that takes it.
 hello = ["desktop", "connetto-client/native-auth"]
@@ -50,10 +47,7 @@ connetto-core = { workspace = true, features = ["test-support"] }
 diesel.workspace = true
 dioxus = { version = "0.7.9", default-features = false, features = ["lib"] }
 dioxus-ssr = "0.7.9"
-# The use_live_fn test seeds one snapshot row (so the first render proves the
-# subscription is established before the CDC insert) by building a patchset the
-# same way the server snapshot path does.
-sqlite-diff-rs = { version = "0.20", default-features = false }
+serde.workspace = true
 subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu"] }
 tempfile = "3.27.0"
 tokio.workspace = true

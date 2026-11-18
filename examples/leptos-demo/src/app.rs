@@ -1,30 +1,46 @@
 //! The screen. Every component reads the one view signal and sends its
-//! control through [`act`]. None of them touches the connetto client.
+//! control through [`act`]. The panes follow their live queries with
+//! `use_live` on the source the platform gives, the tab's client in a browser
+//! and the page source in Tauri, so one pane's code serves both.
 
 use connetto_demo_support as support;
+use connetto_leptos::{UseLive, keyed, use_live};
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::HtmlInputElement;
 
 use crate::icons::{Fa, Icon};
-use crate::platform::act;
+use crate::platform::{self, Source, act};
 use connetto_demo_support::view::{Action, LogoutState, Session, View};
 
 /// The whole page with the stylesheet, the header, the account bar, and the
 /// panes or their skeleton.
 #[component]
 pub fn App(view: RwSignal<View>) -> impl IntoView {
+    let nearby_stands = Memo::new(move |_| view.with(|v| v.nearby.is_some()));
+    let team_stands = Memo::new(move |_| view.with(|v| v.attached && v.team.is_some()));
     view! {
         <style>{support::CSS}</style>
         <div class="wrap">
             <Header view=view />
             <AccountBar view=view />
-            {move || view.with(|v| v.nearby.is_some()).then(|| view! { <NearbyPane view=view /> })}
-            {move || view.with(|v| v.team.is_some()).then(|| view! { <TeamNotesPane view=view /> })}
+            {move || nearby_stands.get().then(|| view! { <NearbyPane view=view /> })}
+            {move || {
+                team_stands
+                    .get()
+                    .then(platform::source)
+                    .flatten()
+                    .map(|source| view! { <TeamNotesPane view=view source=source /> })
+            }}
             <Dashboard view=view />
         </div>
     }
+}
+
+/// The error that ended a live query, nothing while it follows.
+fn live_error(error: ReadSignal<Option<String>>) -> impl IntoView {
+    move || error.get().map(|err| view! { <p class="error">{err}</p> })
 }
 
 /// A status paragraph for an optional line, nothing while it is absent.
@@ -290,28 +306,52 @@ fn LogoutControls(view: RwSignal<View>) -> impl IntoView {
 }
 
 /// The six panes once the tab attached, the skeleton while a stored session
-/// lands, or the connecting line before either.
+/// lands, or the connecting line before either. Only the standing it reads
+/// remounts the panes, so a view change leaves their live queries running.
 #[component]
 fn Dashboard(view: RwSignal<View>) -> impl IntoView {
+    let standing = Memo::new(move |_| view.with(|v| (v.attached, v.stored_account.is_some())));
     move || {
-        let (attached, restoring) = view.with(|v| (v.attached, v.stored_account.is_some()));
-        if attached {
-            view! {
-                <div class="panes">
-                    <OrdersPane view=view />
-                    <PhotosPane view=view />
-                    <ProductsPane view=view />
-                    <NotesPane view=view />
-                    <RetentionPane view=view />
-                    <YourDataPane view=view />
-                </div>
+        let (attached, restoring) = standing.get();
+        match attached.then(platform::source).flatten() {
+            Some(source) => view! { <Panes view=view source=source /> }.into_any(),
+            None if restoring => view! { <PanesSkeleton /> }.into_any(),
+            None => {
+                view! { <p class="status">"Connecting to the connetto stack..."</p> }.into_any()
             }
-            .into_any()
-        } else if restoring {
-            view! { <PanesSkeleton /> }.into_any()
-        } else {
-            view! { <p class="status">"Connecting to the connetto stack..."</p> }.into_any()
         }
+    }
+}
+
+/// The six panes over the lists they show, followed on `source`. The storage
+/// figures are read again whenever one of the lists changes, and the
+/// retention pane counts the rows the replica mirror holds, the catalogue
+/// living in the shared store.
+#[component]
+fn Panes(view: RwSignal<View>, source: Source) -> impl IntoView {
+    let orders = use_live(&source, support::OrdersNewestFirst);
+    let notes = use_live(&source, support::NotesRows);
+    let photos = use_live(&source, support::PhotosRows);
+    let products = use_live(&source, support::ProductsByName);
+    Effect::new(move |_| {
+        orders.value().track();
+        notes.value().track();
+        photos.value().track();
+        products.value().track();
+        act(Action::RereadStorage);
+    });
+    let covered = Signal::derive(move || {
+        orders.value().with(Vec::len) + notes.value().with(Vec::len) + photos.value().with(Vec::len)
+    });
+    view! {
+        <div class="panes">
+            <OrdersPane view=view source=source orders=orders />
+            <PhotosPane view=view photos=photos />
+            <ProductsPane products=products />
+            <NotesPane view=view notes=notes />
+            <RetentionPane view=view covered=covered />
+            <YourDataPane view=view />
+        </div>
     }
 }
 
@@ -402,36 +442,50 @@ fn PanesSkeleton() -> impl IntoView {
 /// The orders pane with the rows newest first, the server's pushed counts,
 /// and the pane's writes.
 #[component]
-fn OrdersPane(view: RwSignal<View>) -> impl IntoView {
+fn OrdersPane(
+    view: RwSignal<View>,
+    source: Source,
+    orders: UseLive<Vec<support::Order>>,
+) -> impl IntoView {
+    let count = use_live(&source, support::OrdersCount);
+    let groups = use_live(&source, support::OrdersCountsByQuantity);
+    let rows = keyed(orders.value(), |row: &support::Order| row.id);
     let no_identity = move || view.with(|v| v.identity.as_deref().is_none_or(str::is_empty));
+    let has_rows = move || orders.value().with(|rows| !rows.is_empty());
+    // The remove button names the row the pane shows newest.
+    let remove_newest = move |_| {
+        if let Some(id) = orders
+            .value()
+            .with_untracked(|rows| rows.first().map(|row| row.id))
+        {
+            act(Action::RemoveOrder { id: id.to_string() });
+        }
+    };
     view! {
         <div class="pane toned tone-orders">
             {pane_heading(Icon::CartShopping, support::ORDERS_PANE_TITLE, "badge synced", support::ORDERS_BADGE)}
             <p>
                 {move || {
-                    view.with(|v| {
-                        support::orders_readout(
-                            v.orders.len(),
-                            v.orders.iter().map(|row| row.quantity).sum(),
-                        )
+                    orders.value().with(|rows| {
+                        support::orders_readout(rows.len(), rows.iter().map(|row| row.quantity).sum())
                     })
                 }}
             </p>
             <p>
                 {support::ORDERS_COUNT_PREFIX}
-                <strong>{move || view.with(|v| support::orders_count_value(v.server_count))}</strong>
+                <strong>{move || support::orders_count_value(count.value().get())}</strong>
             </p>
             <p>
                 {support::ORDERS_GROUPED_PREFIX}
-                <strong>{move || view.with(|v| v.grouped.clone())}</strong>
+                <strong>{move || groups.value().with(support::grouped_label)}</strong>
             </p>
             <div class="row">
                 <button class="primary" disabled=no_identity on:click=move |_| act(Action::AddOrder)>
                     <Fa icon=Icon::Plus />
                     "Add order"
                 </button>
-                <Show when=move || view.with(|v| !v.orders.is_empty())>
-                    <button class="danger" on:click=move |_| act(Action::RemoveNewest)>
+                <Show when=has_rows>
+                    <button class="danger" on:click=remove_newest>
                         <Fa icon=Icon::Minus />
                         "Remove newest"
                     </button>
@@ -446,24 +500,23 @@ fn OrdersPane(view: RwSignal<View>) -> impl IntoView {
             <table>
                 <thead><tr><th>"id"</th><th>"quantity"</th></tr></thead>
                 <tbody>
-                    {move || {
-                        view.with(|v| {
-                            v.orders
-                                .iter()
-                                .map(|row| {
-                                    let quantity = row.quantity.to_string();
-                                    view! {
-                                        <tr>
-                                            <td>{short_code(row.id.clone())}</td>
-                                            <td>{quantity}</td>
-                                        </tr>
-                                    }
-                                })
-                                .collect_view()
-                        })
-                    }}
+                    <For
+                        each=move || rows.get()
+                        key=|(id, _)| *id
+                        children=move |(id, row)| {
+                            view! {
+                                <tr>
+                                    <td>{short_code(id.to_string())}</td>
+                                    <td>{move || row.with(|row| row.quantity.to_string())}</td>
+                                </tr>
+                            }
+                        }
+                    />
                 </tbody>
             </table>
+            {live_error(orders.error())}
+            {live_error(count.error())}
+            {live_error(groups.error())}
             <PaneInfo text=support::ORDERS_INFO />
         </div>
     }
@@ -493,13 +546,22 @@ async fn read_picked_file(file: web_sys::File) -> Option<(String, Vec<u8>)> {
 
 /// The photos pane with the rows and their display sources, the file pick
 /// that stages a photo, the storage controls, and the refused and lost files.
+/// The display sources are resolved again when the rows change or a pinned
+/// fetch finishes.
 #[component]
-fn PhotosPane(view: RwSignal<View>) -> impl IntoView {
+fn PhotosPane(view: RwSignal<View>, photos: UseLive<Vec<support::Photo>>) -> impl IntoView {
     let no_identity = move || view.with(|v| v.identity.as_deref().is_none_or(str::is_empty));
+    let rows = keyed(photos.value(), |row: &support::Photo| row.id);
+    let shown = Memo::new(move |_| photos.value().get());
+    let fetches = Memo::new(move |_| view.with(|v| v.pinned_fetches));
+    let sources = LocalResource::new(move || {
+        fetches.track();
+        platform::photo_sources(shown.get())
+    });
     view! {
         <div class="pane toned tone-photos">
             {pane_heading(Icon::Images, support::PHOTOS_PANE_TITLE, "badge synced", support::PHOTOS_BADGE)}
-            <p>{move || view.with(|v| support::photos_readout(v.photos.len()))}</p>
+            <p>{move || photos.value().with(|rows| support::photos_readout(rows.len()))}</p>
             <div class="row">
                 <input
                     id="photo-file-input"
@@ -515,28 +577,34 @@ fn PhotosPane(view: RwSignal<View>) -> impl IntoView {
             <table>
                 <thead><tr><th>"id"</th><th>"state"</th><th>"image"</th></tr></thead>
                 <tbody>
-                    {move || {
-                        view.with(|v| {
-                            v.photos
-                                .iter()
-                                .map(|row| {
-                                    let state = row.state.clone();
-                                    let thumb = v
-                                        .photo_thumbs
-                                        .get(&row.id)
-                                        .cloned()
-                                        .map(|src| view! { <img class="thumb" src=src /> });
-                                    view! {
-                                        <tr>
-                                            <td>{short_code(row.id.clone())}</td>
-                                            <td>{state}</td>
-                                            <td>{thumb}</td>
-                                        </tr>
-                                    }
-                                })
-                                .collect_view()
-                        })
-                    }}
+                    <For
+                        each=move || rows.get()
+                        key=|(id, _)| *id
+                        children=move |(id, row)| {
+                            let id = id.to_string();
+                            let thumb_id = id.clone();
+                            let thumb = move || {
+                                sources
+                                    .get()
+                                    .and_then(|sources| sources.get(&thumb_id).cloned())
+                                    .map(|src| view! { <img class="thumb" src=src /> })
+                            };
+                            view! {
+                                <tr>
+                                    <td>{short_code(id)}</td>
+                                    <td>
+                                        {move || {
+                                            row.with(|row| {
+                                                support::photo_state(row.content_state.as_deref())
+                                                    .to_owned()
+                                            })
+                                        }}
+                                    </td>
+                                    <td>{thumb}</td>
+                                </tr>
+                            }
+                        }
+                    />
                 </tbody>
             </table>
             <div class="row">
@@ -558,6 +626,7 @@ fn PhotosPane(view: RwSignal<View>) -> impl IntoView {
                 </button>
             </div>
             {move || status_line(view.with(|v| v.content_line.clone()))}
+            {live_error(photos.error())}
             <RefusedUploads view=view />
             <LostBytes view=view />
             <PaneInfo text=support::PHOTOS_INFO />
@@ -632,7 +701,8 @@ fn LostBytes(view: RwSignal<View>) -> impl IntoView {
 /// The catalogue pane with the shared rows in name order, read from the one
 /// copy the shared store keeps on this device.
 #[component]
-fn ProductsPane(view: RwSignal<View>) -> impl IntoView {
+fn ProductsPane(products: UseLive<Vec<support::Product>>) -> impl IntoView {
+    let rows = keyed(products.value(), |row: &support::Product| row.id);
     view! {
         <div class="pane toned tone-catalogue">
             {pane_heading(Icon::Tags, support::CATALOGUE_HEADING, "badge shared", "shared")}
@@ -640,25 +710,22 @@ fn ProductsPane(view: RwSignal<View>) -> impl IntoView {
             <table>
                 <thead><tr><th>"name"</th><th>"price"</th></tr></thead>
                 <tbody>
-                    {move || {
-                        view.with(|v| {
-                            v.products
-                                .iter()
-                                .map(|row| {
-                                    let name = row.name.clone();
-                                    let price = row.price.clone();
-                                    view! {
-                                        <tr>
-                                            <td>{name}</td>
-                                            <td>{price}</td>
-                                        </tr>
-                                    }
-                                })
-                                .collect_view()
-                        })
-                    }}
+                    <For
+                        each=move || rows.get()
+                        key=|(id, _)| *id
+                        children=move |(_, row)| {
+                            let price = row.clone();
+                            view! {
+                                <tr>
+                                    <td>{move || row.with(|row| row.name.clone())}</td>
+                                    <td>{move || price.with(|row| support::price_label(row.price_cents))}</td>
+                                </tr>
+                            }
+                        }
+                    />
                 </tbody>
             </table>
+            {live_error(products.error())}
             <PaneInfo text=support::CATALOGUE_INFO />
         </div>
     }
@@ -668,14 +735,15 @@ fn ProductsPane(view: RwSignal<View>) -> impl IntoView {
 /// clears once the platform reports the note saved, so a failed save keeps
 /// the text.
 #[component]
-fn NotesPane(view: RwSignal<View>) -> impl IntoView {
+fn NotesPane(view: RwSignal<View>, notes: UseLive<Vec<support::Note>>) -> impl IntoView {
     let draft = RwSignal::new(String::new());
     let saved = move || view.with(|v| v.notes_saved);
     Effect::watch(saved, move |_, _, _| draft.set(String::new()), false);
+    let rows = keyed(notes.value(), |row: &support::Note| row.id);
     view! {
         <div class="pane toned tone-notes">
             {pane_heading(Icon::NoteSticky, support::NOTES_PANE_TITLE, "badge local", support::NOTES_BADGE)}
-            <p>{move || view.with(|v| support::notes_readout(v.notes.len()))}</p>
+            <p>{move || notes.value().with(|rows| support::notes_readout(rows.len()))}</p>
             <div class="row">
                 <input
                     type="text"
@@ -699,37 +767,37 @@ fn NotesPane(view: RwSignal<View>) -> impl IntoView {
             <table>
                 <thead><tr><th>"id"</th><th>"body"</th></tr></thead>
                 <tbody>
-                    {move || {
-                        view.with(|v| {
-                            v.notes
-                                .iter()
-                                .map(|row| {
-                                    view! {
-                                        <tr>
-                                            <td>{row.id.clone()}</td>
-                                            <td>{row.body.clone()}</td>
-                                        </tr>
-                                    }
-                                })
-                                .collect_view()
-                        })
-                    }}
+                    <For
+                        each=move || rows.get()
+                        key=|(id, _)| *id
+                        children=move |(id, row)| {
+                            view! {
+                                <tr>
+                                    <td>{id.to_string()}</td>
+                                    <td>{move || row.with(|row| row.body.clone())}</td>
+                                </tr>
+                            }
+                        }
+                    />
                 </tbody>
             </table>
+            {live_error(notes.error())}
             <PaneInfo text=support::NOTES_INFO />
         </div>
     }
 }
 
-/// The retention pane with the replica mirror's footprint and the trim pass.
+/// The retention pane with the replica mirror's footprint, the rows it
+/// covers, and the trim pass.
 #[component]
-fn RetentionPane(view: RwSignal<View>) -> impl IntoView {
+fn RetentionPane(view: RwSignal<View>, covered: Signal<usize>) -> impl IntoView {
     view! {
         <div class="pane toned tone-retention">
             {pane_heading(Icon::Broom, support::RETENTION_PANE_TITLE, "badge trim", support::RETENTION_BADGE)}
             <p>
                 {move || {
-                    view.with(|v| support::retention_readout(v.pages, v.free_pages, v.covered_rows))
+                    let (pages, free) = view.with(|v| (v.pages, v.free_pages));
+                    support::retention_readout(pages, free, covered.get())
                 }}
             </p>
             <p>{support::RETENTION_EXPLAINER}</p>
@@ -986,30 +1054,25 @@ fn NearbyPane(view: RwSignal<View>) -> impl IntoView {
 /// and write, the team's notes, one line per peer write, and the tidy pass.
 /// It stands beside the nearby panel and syncs through the server.
 #[component]
-fn TeamNotesPane(view: RwSignal<View>) -> impl IntoView {
-    // The team picker and the note's field, the typed values the controls
-    // keep locally and send with their actions.
+fn TeamNotesPane(view: RwSignal<View>, source: Source) -> impl IntoView {
+    let roster = use_live(&source, support::TeamsOfAccount);
+    // The team picker's text, the team the panel reads and writes.
     let team_input = RwSignal::new(String::new());
-    let note_body = RwSignal::new(String::new());
-
-    // Fill the team picker from the view's picked while it stands empty, so a
-    // roster landing after the panel mounts still names its first team.
-    Effect::watch(
-        move || {
-            view.with(|v| {
-                v.team
-                    .as_ref()
-                    .map(|t| t.picked.clone())
-                    .unwrap_or_default()
-            })
-        },
-        move |picked, _, _| {
-            if team_input.get_untracked().is_empty() {
-                team_input.set(picked.clone());
+    // Fill the picker with the roster's first team while it stands empty, so
+    // a roster landing after the panel mounts still names one.
+    Effect::new(move |_| {
+        roster.value().with(|teams| {
+            if team_input.get_untracked().is_empty()
+                && let Some(first) = teams.iter().min()
+            {
+                team_input.set(first.clone());
             }
-        },
-        true,
-    );
+        });
+    });
+    let picked = Memo::new(move |_| team_input.get());
+    // A browser's client is no `Send` value, which a view's closure must be,
+    // so the closure reaches it through a local store.
+    let source = StoredValue::new_local(source);
 
     view! {
         <div class="panel toned tone-team">
@@ -1018,55 +1081,19 @@ fn TeamNotesPane(view: RwSignal<View>) -> impl IntoView {
                 "team notes "
                 <span class="badge synced">"synced + peer"</span>
             </h2>
-            <p>{move || view.with(|v| v.team.as_ref().map(|t| t.team_line()).unwrap_or_else(|| "team: none".to_owned()))}</p>
-            <p>{move || view.with(|v| v.team.as_ref().map(|t| t.teams_line()).unwrap_or_else(|| "teams: none".to_owned()))}</p>
-            <p>{move || view.with(|v| support::view::members_line(v.team.as_ref().map(|t| t.members.as_slice()).unwrap_or_default()))}</p>
+            <p>{move || support::view::team_line(&picked.get())}</p>
+            <p>{move || roster.value().with(|teams| support::view::teams_line(teams))}</p>
             <input
                 type="text"
                 name="team"
                 placeholder="the team to read and write"
                 prop:value=move || team_input.get()
-                on:input=move |ev| {
-                    let value = event_target_value(&ev);
-                    team_input.set(value.clone());
-                    act(Action::PickTeam { team: value });
-                }
-                on:change=move |ev| act(Action::PickTeam { team: event_target_value(&ev) })
+                on:input=move |ev| team_input.set(event_target_value(&ev))
             />
             {move || {
-                let (has_pick, notes, outcome) = view.with(|v| {
-                    v.team
-                        .as_ref()
-                        .map(|t| (!t.picked.is_empty(), t.notes.clone(), t.outcome.clone()))
-                        .unwrap_or((false, Vec::new(), String::new()))
-                });
-                has_pick.then(|| {
-                    let empty = notes.is_empty();
-                    view! {
-                        <div class="lines">
-                            {empty.then(|| view! { <p class="status">"no notes in this team yet"</p> })}
-                            {notes.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
-                        </div>
-                        <div class="row">
-                            <input
-                                type="text"
-                                name="note-body"
-                                placeholder="a note for the team"
-                                prop:value=move || note_body.get()
-                                on:input=move |ev| note_body.set(event_target_value(&ev))
-                            />
-                            <button class="primary" on:click=move |_| {
-                                let body = note_body.get_untracked().trim().to_owned();
-                                note_body.set(String::new());
-                                act(Action::AddTeamNote { body });
-                            }>
-                                <Fa icon=Icon::Plus />
-                                "Add note"
-                            </button>
-                        </div>
-                        <p class="status">{outcome}</p>
-                    }
-                })
+                let team = picked.get();
+                (!team.is_empty())
+                    .then(|| view! { <TeamNotes view=view source=source.get_value() team=team /> })
             }}
             {move || {
                 let events = view.with(|v| v.team.as_ref().map(|t| t.events.clone()).unwrap_or_default());
@@ -1094,11 +1121,83 @@ fn TeamNotesPane(view: RwSignal<View>) -> impl IntoView {
                     }
                 })
             }}
-            {move || {
-                view.with(|v| v.team.as_ref().and_then(|t| t.error.clone()))
-                    .map(|err| view! { <p class="error">{err}</p> })
-            }}
+            {live_error(roster.error())}
             <PaneInfo text=support::TEAM_INFO />
         </div>
+    }
+}
+
+/// One team's members, its notes and the note's write, mounted per picked
+/// team, so a new pick follows the new team's queries. Each note line names
+/// the account of a still-provisional row, read again when the notes change
+/// or a provisional event arrives.
+#[component]
+fn TeamNotes(view: RwSignal<View>, source: Source, team: String) -> impl IntoView {
+    let members = use_live(&source, support::TeamMembersOf { team: team.clone() });
+    let notes = use_live(&source, support::TeamNotesFor { team: team.clone() });
+    let note_body = RwSignal::new(String::new());
+    let ids = Memo::new(move |_| {
+        notes.value().with(|rows| {
+            rows.iter()
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>()
+        })
+    });
+    let provisional =
+        Memo::new(move |_| view.with(|v| v.team.as_ref().map_or(0, |t| t.provisional_events)));
+    let accounts = LocalResource::new(move || {
+        provisional.track();
+        platform::team_note_accounts(ids.get())
+    });
+    let outcome = Memo::new(move |_| {
+        view.with(|v| {
+            v.team
+                .as_ref()
+                .map(|t| t.outcome.clone())
+                .unwrap_or_default()
+        })
+    });
+    let lines = move || {
+        let accounts = accounts.get().unwrap_or_default();
+        notes.value().with(|rows| {
+            rows.iter()
+                .map(|note| {
+                    let account = accounts.get(&note.id.to_string()).map(String::as_str);
+                    view! { <p>{support::team_note_line(note, account)}</p> }
+                })
+                .collect_view()
+        })
+    };
+    view! {
+        <p>{move || members.value().with(|members| support::view::members_line(members))}</p>
+        <div class="lines">
+            {move || {
+                notes
+                    .value()
+                    .with(Vec::is_empty)
+                    .then(|| view! { <p class="status">"no notes in this team yet"</p> })
+            }}
+            {lines}
+        </div>
+        <div class="row">
+            <input
+                type="text"
+                name="note-body"
+                placeholder="a note for the team"
+                prop:value=move || note_body.get()
+                on:input=move |ev| note_body.set(event_target_value(&ev))
+            />
+            <button class="primary" on:click=move |_| {
+                let body = note_body.get_untracked().trim().to_owned();
+                note_body.set(String::new());
+                act(Action::AddTeamNote { team: team.clone(), body });
+            }>
+                <Fa icon=Icon::Plus />
+                "Add note"
+            </button>
+        </div>
+        <p class="status">{move || outcome.get()}</p>
+        {live_error(members.error())}
+        {live_error(notes.error())}
     }
 }

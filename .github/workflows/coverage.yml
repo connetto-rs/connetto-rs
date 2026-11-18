@@ -56,6 +56,8 @@ jobs:
               -p connetto-test-harness
               -p connetto-dioxus
               -p connetto-yew
+              -p tauri-plugin-connetto
+              -p connetto-tauri-page
               -p connetto-file-core
               -p connetto-file-server
               -p connetto-file-client

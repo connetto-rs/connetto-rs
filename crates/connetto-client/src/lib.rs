@@ -96,7 +96,9 @@ mod hotspot;
 #[cfg(feature = "native-auth")]
 mod keyring;
 pub mod live;
+mod live_source;
 mod live_spec;
+pub mod live_wire;
 mod majors;
 #[cfg(feature = "peer")]
 pub mod media;
@@ -175,6 +177,7 @@ pub use live::{
     ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveUnsynced, LiveValue,
     subscription_is_aggregate, subscription_tables,
 };
+pub use live_source::{LiveSnapshot, LiveSource, follow};
 pub use live_spec::{KeyedSpec, LiveSpec, Unsynced};
 pub use memory_stores::{MemoryKeyStore, MemoryRefreshStore};
 pub use pending::ContentHooks;
@@ -385,6 +388,11 @@ pub enum ClientError {
     /// The client's pump stopped on a fault no reconnect can cure, named here.
     #[error("the client stopped: {0}")]
     Stopped(String),
+    /// A client in another process ended the live subscription this one
+    /// follows, with the error named here, as a Tauri core does for its
+    /// webview.
+    #[error("the remote client failed: {0}")]
+    Remote(String),
     /// Acquiring or refreshing the access token failed.
     #[error("authentication error: {0}")]
     Auth(String),

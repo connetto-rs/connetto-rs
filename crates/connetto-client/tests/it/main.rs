@@ -59,6 +59,10 @@ mod key_requirement;
 
 mod live_dispatch;
 
+mod live_source;
+
+mod live_wire;
+
 #[cfg(all(feature = "native-auth", target_os = "linux"))]
 mod linux_custody;
 
