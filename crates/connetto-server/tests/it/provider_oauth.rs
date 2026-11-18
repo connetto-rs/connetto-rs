@@ -14,6 +14,7 @@ use connetto_server::{
     OAuthProvider, OAuthProviderConfig, ProviderError, ProviderRegistry, RedirectPolicy,
     RequestGuard, VerifiedLogin, auth_router,
 };
+use connetto_test_harness::server_fixture::{PG_SERIAL, reset_fixture};
 use connetto_test_harness::{
     ConnettoDefaults, Fixture, MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET, MockOauth,
 };
@@ -23,7 +24,6 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
-use super::e2e::{PG_SERIAL, reset_fixture};
 use super::lifecycle::{admin_pool, builder_over, wait_ready};
 
 const CALLBACK: &str = "http://127.0.0.1:1/auth/callback";
