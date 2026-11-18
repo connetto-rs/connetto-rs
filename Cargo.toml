@@ -9,6 +9,7 @@ members = [
   "crates/connetto-client",
   "crates/connetto-dioxus",
   "crates/connetto-yew",
+  "crates/connetto-leptos",
   "crates/connetto-test-harness",
   "crates/connetto-file-core",
   "crates/connetto-file-server",

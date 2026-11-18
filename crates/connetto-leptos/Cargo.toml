@@ -1,0 +1,44 @@
+[package]
+name = "connetto-leptos"
+description = "Leptos adapter for connetto live queries: one hook serving rows, scalars and groups alike."
+categories = ["database", "gui"]
+keywords = ["sync", "leptos", "sqlite", "offline", "live-query"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+connetto-client = { path = "../connetto-client", version = "0.0.0", default-features = false }
+reactive_graph = "0.2.16"
+
+# The hook tests mount components in a browser page over an in-memory client,
+# whose aggregates a scripted server on the loopback pair pushes.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+connetto-core = { workspace = true, features = ["loopback", "test-support"] }
+diesel.workspace = true
+futures-channel = "0.3.32"
+futures-util = { version = "0.3.32", default-features = false }
+js-sys = "0.3.80"
+leptos = { version = "0.8.23", features = ["csr"] }
+# Leptos's reactive closures are `Send`, and the wasm client is not.
+send_wrapper = "0.6.0"
+serde.workspace = true
+wasm-bindgen = "0.2.130"
+wasm-bindgen-futures = "0.4.80"
+wasm-bindgen-test = "0.3.80"
+web-sys = { version = "0.3.107", features = [
+  "Document",
+  "Element",
+  "HtmlElement",
+  "MutationObserver",
+  "MutationObserverInit",
+  "Node",
+  "Window",
+] }
