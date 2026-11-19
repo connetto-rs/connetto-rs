@@ -58,7 +58,7 @@ const KEYRING_SERVICE: &str = if cfg!(feature = "unattended") {
 /// iOS bundle identifier.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 const APP_REDIRECT: &str = "dev.connetto.tauridemo:/oauth2redirect";
-const LOG_FILTER: &str = "info,connetto_client::away=debug,connetto_tauri_demo::away=debug,tauri_plugin_connetto=debug,connetto_tauri_demo::live=info";
+const LOG_FILTER: &str = "info,connetto_client::away=debug,connetto_client::live=debug,connetto_tauri_demo::away=debug,tauri_plugin_connetto=debug,connetto_tauri_demo::live=info";
 
 type Ws = NativeTransport;
 type Content = Arc<ContentClient<Ws, FsStore, ReqwestHttp>>;
