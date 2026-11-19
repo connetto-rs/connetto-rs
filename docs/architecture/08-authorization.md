@@ -112,7 +112,7 @@ Row-level security cannot supply the previous-version answer, because the answer
 
 The previous version comes from the change log, which requires `REPLICA IDENTITY FULL` on the tables the publication carries, because `DEFAULT` records only the primary key columns and nothing at all when a table has no primary key. The preflight artifact `PreviousImages` checks it at startup and names every table to fix, scoped to the publication rather than the database, because connetto keeps its own bookkeeping tables in the same database and replicates none of them.
 
-A table altered after startup refuses to serve. The condition is permanent for that table, so the change path does not hold the event and retry. `SessionError::ChangeStreamUnusable` escapes the reconnect loop, every connection is closed and the process exits, and the restart meets the startup refusal naming the table.
+A table whose replica identity is weakened after startup is refused, and every other table keeps serving. The drift guard reports the change, so the table's events never reach the change path, its subscriptions and every subscription whose policy reads it are closed, and a write to it is answered `SchemaMismatch`. The table stays refused until the process restarts, and the restart meets the startup refusal naming the table.
 
 Reconnect catchup re-answers per client from connetto's own oplog rather than from the change stream, and the oplog stores the whole change event, so the previous image survives the round trip.
 

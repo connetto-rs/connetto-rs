@@ -4707,7 +4707,7 @@ where
                     if self.refused.holds(&self.event_table(&event)) =>
                 {
                     // A table this process refused stays refused when a later
-                    // guard accepts it again, until a restart (OPEN-D).
+                    // guard accepts it again, until a restart.
                     self.resume.set(Some(event.position()));
                 }
                 Ok(Some(SourceItem::Event(event))) => {
@@ -4986,7 +4986,7 @@ where
 
     /// Take a new guard's refusals for the stretch before the ingest loop
     /// handles them, and serve again every table an earlier process refused
-    /// that neither this process nor the guard refuses (OPEN-H).
+    /// that neither this process nor the guard refuses.
     ///
     /// # Errors
     ///

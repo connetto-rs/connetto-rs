@@ -574,7 +574,7 @@ pub trait Oplog: Send + Sync {
     async fn forget_through(&self, through: PgCommitPosition) -> Result<(), Self::Error>;
 
     /// Remember that `table` is refused, so the process that next serves it
-    /// resyncs every cursor older than its return (R107, OPEN-H).
+    /// resyncs every cursor older than its return (R107).
     ///
     /// # Errors
     ///

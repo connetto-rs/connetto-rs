@@ -1602,7 +1602,7 @@ where
     }
 
     /// How often the drift guard re-reads every table's live shape between
-    /// schema messages, catching a change no row has carried yet (OPEN-E).
+    /// schema messages, catching a change no row has carried yet.
     #[must_use]
     pub fn drift_reconciliation(mut self, every: Duration) -> Self {
         self.drift_reconciliation = every;

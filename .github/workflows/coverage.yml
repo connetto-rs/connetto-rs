@@ -85,10 +85,10 @@ jobs:
         with:
           components: llvm-tools-preview
 
-      - name: Install keyring helpers
+      - name: Install keyring helpers and libpq
         run: |
           sudo apt-get update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev libpq-dev pkg-config
 
       # --all-features turns on connetto-dioxus's desktop feature.
       - name: Install desktop dependencies
@@ -184,7 +184,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libdbus-1-dev libpq-dev pkg-config
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
@@ -232,10 +232,10 @@ jobs:
         with:
           components: llvm-tools-preview
 
-      - name: Install keyring helpers
+      - name: Install keyring helpers and libpq
         run: |
           sudo apt-get update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libpq5
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
