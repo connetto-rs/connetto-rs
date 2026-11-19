@@ -62,9 +62,8 @@ use subql::reexec::{
 };
 use subql::{
     AggValue, AggregateBootstrap, AggregateResultValue, AggregateValueChange, AggregateValueUpdate,
-    AsyncSubscriptionDispatch, Checkpoint, ColumnId, DatabaseLike, DefaultIds,
-    Incompatibility, MaintenanceTransition, NoRefusals, NumericValue, OpaqueCheckpoint, ParserDB,
-    PgChangeEvent,
+    AsyncSubscriptionDispatch, Checkpoint, ColumnId, DatabaseLike, DefaultIds, Incompatibility,
+    MaintenanceTransition, NoRefusals, NumericValue, OpaqueCheckpoint, ParserDB, PgChangeEvent,
     SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableId, TableLike, Tier,
     catalog_helpers,
 };
@@ -4085,7 +4084,10 @@ mod drift_refusal_tests {
         );
         assert!(
             materializer
-                .refuse_table(id(&materializer, "docs"), vec![Incompatibility::Unpublished])
+                .refuse_table(
+                    id(&materializer, "docs"),
+                    vec![Incompatibility::Unpublished]
+                )
                 .is_empty(),
             "a table already refused draws nothing"
         );
@@ -4137,7 +4139,10 @@ mod drift_refusal_tests {
         );
         assert_eq!(materializer.subscriptions_reading(&refused), [docs]);
         assert!(materializer.unregister(docs));
-        assert_eq!(materializer.subscriptions_reading(&refused), [] as [SubscriptionId; 0]);
+        assert_eq!(
+            materializer.subscriptions_reading(&refused),
+            [] as [SubscriptionId; 0]
+        );
         assert!(matches!(
             subscribe(&mut materializer, 3, "SELECT * FROM docs"),
             Err(MaterializerError::RefusedRead(table)) if table == "docs"

@@ -1707,7 +1707,9 @@ async fn a_client_resuming_across_a_refusal_resnapshots_the_table() {
             }
         }
     }
-    log.record_refusal("orders").await.expect("persist the refusal");
+    log.record_refusal("orders")
+        .await
+        .expect("persist the refusal");
     drop(before);
 
     // The restarted process's guard accepts the table again.

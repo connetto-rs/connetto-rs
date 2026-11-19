@@ -219,7 +219,9 @@ async fn a_refusal_outlives_a_reconnect_and_ends_with_the_process() {
     // The shape matches again. The terminate returns once the walsender has
     // exited, so the next live patch can only come over a new connect, whose
     // guard accepts the table.
-    fixture.exec("ALTER TABLE notes ADD COLUMN extra TEXT").await;
+    fixture
+        .exec("ALTER TABLE notes ADD COLUMN extra TEXT")
+        .await;
     fixture
         .exec(
             "SELECT pg_terminate_backend(active_pid, 30000) FROM pg_replication_slots \

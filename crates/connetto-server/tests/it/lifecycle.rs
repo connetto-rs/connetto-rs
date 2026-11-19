@@ -353,7 +353,10 @@ async fn still_serving_then_shut_down(
         .await
         .expect("serve ends on the signal")
         .expect("serve joins");
-    assert!(outcome.is_ok(), "the refusal never ended serve: {outcome:?}");
+    assert!(
+        outcome.is_ok(),
+        "the refusal never ended serve: {outcome:?}"
+    );
 }
 
 /// A table the boot guard saw recording full previous images is switched to

@@ -2856,8 +2856,8 @@ fn change_stream<D: ConnettoSchema>(
                 .await?;
                 // Read after the checks, which clear it on a changed timeline
                 // or a skipped stretch.
-                let config =
-                    PgStreamingConfig::new(url.clone(), slot, publication.clone()).start(resume.get());
+                let config = PgStreamingConfig::new(url.clone(), slot, publication.clone())
+                    .start(resume.get());
                 let source =
                     crate::drift::connect_guarded(config, &ddl, &url, &publication, every).await?;
                 manager

@@ -11,8 +11,7 @@ use connetto_client::{ClientBuilder, LiveQuery};
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, NonFatalError, SUBSCRIPTION_REFUSED,
-    SUBSCRIPTION_REFUSED_SCHEMA, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, WriterGrant,
+    SUBSCRIPTION_REFUSED_SCHEMA, SnapshotBegin, SnapshotEnd, SnapshotPatch, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};

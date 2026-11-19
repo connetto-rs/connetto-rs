@@ -25,10 +25,10 @@ use connetto_core::messages::{
     ControlMessage, CourierNotice, CourierNoticeAck, CourierNoticeRow, FatalErrorReason, GateState,
     Handshake, HeldWork, MutationHeader, MutationPatch, MutationReject, MutationRejectReason, Ping,
     PriorRefusal, Provenance, ReplaceShareKeys, RetireWriter, SUBSCRIPTION_REFUSED,
-    SUBSCRIPTION_REFUSED_SCHEMA, ShareKeyChange,
-    Subscribe, SubscriptionSpec, TabDismissAnswer, TabDismissOutcome, TabDismissRefusal,
-    TabIdentity, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, TabStorageAnswer,
-    TabStorageOutcome, TabStorageUse, Unsubscribe, WriterAnswer,
+    SUBSCRIPTION_REFUSED_SCHEMA, ShareKeyChange, Subscribe, SubscriptionSpec, TabDismissAnswer,
+    TabDismissOutcome, TabDismissRefusal, TabIdentity, TabShareKeyAnswer, TabShareKeyChange,
+    TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse, Unsubscribe,
+    WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -12516,7 +12516,8 @@ where
             })),
             ControlMessage::NonFatalError(err) => {
                 if let Some(id) = &err.related_to
-                    && (err.detail == SUBSCRIPTION_REFUSED || err.detail == SUBSCRIPTION_REFUSED_SCHEMA)
+                    && (err.detail == SUBSCRIPTION_REFUSED
+                        || err.detail == SUBSCRIPTION_REFUSED_SCHEMA)
                 {
                     self.refused.insert(id.clone());
                 }

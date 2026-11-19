@@ -30,8 +30,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock, Weak};
 use connetto_core::auth::{CapabilityKey, CapabilitySubject};
 use connetto_core::messages::{
     BindValue, ContentVerb, FatalErrorReason, Grant, SUBSCRIPTION_REFUSED,
-    SUBSCRIPTION_REFUSED_SCHEMA, ShareKeyChange,
-    SubscriptionSpec,
+    SUBSCRIPTION_REFUSED_SCHEMA, ShareKeyChange, SubscriptionSpec,
 };
 use connetto_core::traits::{MaybeSend, Transport};
 use connetto_core::{Major, quote_ident};

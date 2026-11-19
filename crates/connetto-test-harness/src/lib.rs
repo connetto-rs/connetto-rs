@@ -2079,7 +2079,8 @@ fn spawn_ingest_task(
     let catalog_ddl = engine_ddl(pg_ddl);
     tokio::spawn(async move {
         let connect = |resume: connetto_server::ResumePoint| {
-            let (url, ddl, manager) = (admin_url.clone(), catalog_ddl.clone(), Arc::clone(&manager));
+            let (url, ddl, manager) =
+                (admin_url.clone(), catalog_ddl.clone(), Arc::clone(&manager));
             async move {
                 let config =
                     PgStreamingConfig::new(url.clone(), SLOT.to_owned(), PUBLICATION.to_owned())

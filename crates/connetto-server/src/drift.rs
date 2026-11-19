@@ -132,7 +132,11 @@ impl RefusedSet {
     /// Record `table` as refused, answering whether it was served until now.
     pub(crate) fn insert(&self, table: &str, reasons: Vec<Incompatibility>) -> bool {
         let mut refused = self.write();
-        if refused.tables.keys().any(|name| name.eq_ignore_ascii_case(table)) {
+        if refused
+            .tables
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case(table))
+        {
             return false;
         }
         refused.tables.insert(table.to_owned(), reasons);

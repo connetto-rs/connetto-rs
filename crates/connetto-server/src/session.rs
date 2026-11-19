@@ -50,10 +50,9 @@ use connetto_core::messages::{
     MutationRejectReason, NonFatalError, PROVISIONAL_ASK_REFUSED, PauseCause, Pong, PriorRefusal,
     Provenance, ProvisionalStatus, ProvisionalVerdicts, RateLimited, RegisterBot, ReplaceShareKeys,
     RetireWriter, RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED,
-    SUBSCRIPTION_REFUSED_SCHEMA, ShareKeysReplaced,
-    SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
-    WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
-    bot_registration_message, writer_bind_message,
+    SUBSCRIPTION_REFUSED_SCHEMA, ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd,
+    SnapshotPatch, Subscribe, SubscriptionSpec, WriterAnswer, WriterGrant, WriterOutcome,
+    WriterRef, WriterRequest, WriterSecret, bot_registration_message, writer_bind_message,
 };
 use connetto_core::messages::{
     CourierAnswer, CourierBody, CourierNotice, CourierNoticeAck, CourierNoticeRow, CourierRange,
@@ -4975,7 +4974,9 @@ where
     async fn handle_drift(&self, item: impl StreamSignal) -> Result<(), SessionError> {
         match item.drift() {
             None => Ok(()),
-            Some(DriftSignal::Refused { table, reasons }) => self.refuse_table(table, reasons).await,
+            Some(DriftSignal::Refused { table, reasons }) => {
+                self.refuse_table(table, reasons).await
+            }
             Some(DriftSignal::ChangesLost { table }) => Err(SessionError::DriftUnserved(format!(
                 "lost changes of {}",
                 self.table_name(table)
@@ -9830,7 +9831,12 @@ where
                         Err(SessionError::Snapshot(detail) | SessionError::ReadRefused(detail)) => {
                             tracing::warn!(sub_id = %sub_label, error = %detail, "membership read failed, refusing the term");
                             return self
-                                .refuse_subscription(transport, state, &sub_label, SUBSCRIPTION_REFUSED)
+                                .refuse_subscription(
+                                    transport,
+                                    state,
+                                    &sub_label,
+                                    SUBSCRIPTION_REFUSED,
+                                )
                                 .await;
                         }
                         Err(other) => return Err(other),
