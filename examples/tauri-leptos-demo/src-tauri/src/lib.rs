@@ -9,7 +9,7 @@
 //! platform lifecycle drives the client's away input directly.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -58,7 +58,7 @@ const KEYRING_SERVICE: &str = if cfg!(feature = "unattended") {
 /// iOS bundle identifier.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 const APP_REDIRECT: &str = "dev.connetto.tauridemo:/oauth2redirect";
-const LOG_FILTER: &str = "info,connetto_client::away=debug,connetto_tauri_demo::away=debug,tauri_plugin_connetto=debug,connetto_tauri_demo::live=info";
+const LOG_FILTER: &str = "info,connetto_client::away=debug,connetto_client::live=debug,connetto_tauri_demo::away=debug,tauri_plugin_connetto=debug,connetto_tauri_demo::live=info";
 
 type Ws = NativeTransport;
 type Content = Arc<ContentClient<Ws, FsStore, ReqwestHttp>>;
@@ -494,10 +494,13 @@ async fn confirm_delete(app: &AppHandle, core: &Arc<Core>) -> Result<(), Command
 }
 
 /// Wipe the replica and start over, discarding the unsent work. A refused
-/// wipe keeps the session, and one that closed the client starts over.
+/// wipe keeps the session, and one that closed the client starts over. The
+/// account's stored name goes with its data.
 async fn wipe(app: &AppHandle, core: &Arc<Core>, session: Arc<Parts>, force: bool) {
+    let account = user_id(&session);
     match session.native.forget_device(force).await {
         Ok(()) => {
+            forget_name(app, &account);
             *core.slot.lock() = Slot::Empty;
             drop(session);
             start(app.clone(), core, AccountChoice::LastUsed);
@@ -517,11 +520,25 @@ async fn wipe(app: &AppHandle, core: &Arc<Core>, session: Arc<Parts>, force: boo
             });
         }
         Err(ForgetError::Incomplete(report)) => {
+            forget_name(app, &account);
             *core.slot.lock() = Slot::Empty;
             drop(session);
             tracing::error!(%report, "the wipe left a report");
             start(app.clone(), core, AccountChoice::LastUsed);
         }
+    }
+}
+
+/// Drop `account`'s login name from the device's stored names.
+fn forget_name(app: &AppHandle, account: &str) {
+    let Ok(data_dir) = demo_data_dir(app) else {
+        return;
+    };
+    let mut names = support::native::read_stored_names(&data_dir);
+    if names.forget(account)
+        && let Err(err) = support::native::write_stored_names(&data_dir, &names)
+    {
+        tracing::warn!(error = %err, "dropping the account's name");
     }
 }
 
@@ -727,7 +744,12 @@ async fn tidy_team(core: &Arc<Core>) {
                 .unwrap_or_default();
             core.update(|v| {
                 if let Some(team) = v.team.as_mut() {
-                    append_team_events(&mut team.events, vec![support::tidy_line(remaining)]);
+                    append_team_events(
+                        &mut team.events,
+                        vec![support::view::TeamEvent::plain(support::tidy_line(
+                            remaining,
+                        ))],
+                    );
                 }
             });
         }
@@ -737,7 +759,9 @@ async fn tidy_team(core: &Arc<Core>) {
                 if let Some(team) = v.team.as_mut() {
                     append_team_events(
                         &mut team.events,
-                        vec![format!("tidy: the pass failed: {err}")],
+                        vec![support::view::TeamEvent::plain(format!(
+                            "tidy: the pass failed: {err}"
+                        ))],
                     );
                 }
             });
@@ -1161,11 +1185,14 @@ mod android {
     }
 }
 
-/// The account chooser, parked in the view while it waits for the choice.
-fn account_chooser(core: &Arc<Core>) -> AccountChooser {
+/// The account chooser, parked in the view while it waits for the choice,
+/// naming each account from the stored names in `data_dir`.
+fn account_chooser(core: &Arc<Core>, data_dir: &Path) -> AccountChooser {
     let core = Arc::clone(core);
+    let data_dir = data_dir.to_owned();
     Arc::new(move |accounts: Vec<String>| {
         let core = Arc::clone(&core);
+        let names = support::native::read_stored_names(&data_dir);
         Box::pin(async move {
             if accounts.len() <= 1 {
                 return AccountChoice::LastUsed;
@@ -1174,7 +1201,12 @@ fn account_chooser(core: &Arc<Core>) -> AccountChooser {
             *core.picker.lock() = Some(answer);
             core.update(|v| {
                 v.session = Session::PickingAccount;
-                v.picking = Some(accounts.into_iter().map(AccountEntry::new).collect());
+                v.picking = Some(
+                    accounts
+                        .into_iter()
+                        .map(|key| AccountEntry::new(key, &names))
+                        .collect(),
+                );
             });
             match waiting.recv().await {
                 Some(Some(key)) => AccountChoice::Account(key),
@@ -1226,7 +1258,7 @@ async fn setup(core: Arc<Core>, data_dir: PathBuf, choice: AccountChoice) -> any
             .with_account(choice)
             .keyring(KEYRING_SERVICE)
             .with_browser_opener(opener)
-            .with_account_chooser(account_chooser(&core)),
+            .with_account_chooser(account_chooser(&core, &data_dir)),
     );
 
     #[cfg(feature = "device-identity")]
@@ -1273,7 +1305,7 @@ async fn setup(core: Arc<Core>, data_dir: PathBuf, choice: AccountChoice) -> any
             .as_ref()
             .map(|certificate| certificate.identity());
         support::view::NearbyView {
-            peer_line: support::nearby::peer_line(port, me),
+            listening: support::nearby::listening(port, me),
             bluetooth_line: format!("bluetooth: {}", native.bluetooth_state()),
             beacon_line: support::nearby::beacon_line(native.beacon_state()),
             outcome: "idle".to_owned(),
@@ -1281,14 +1313,18 @@ async fn setup(core: Arc<Core>, data_dir: PathBuf, choice: AccountChoice) -> any
             ..Default::default()
         }
     };
+    let names = support::native::read_stored_names(&data_dir);
     core.sources.set(Some(client.clone()));
     core.update(|v| {
         *v = View::initial();
         v.session = Session::SignedIn;
         v.attached = true;
         v.identity = Some(user.clone());
-        v.account = Some(AccountEntry::new(account));
-        v.known_accounts = accounts.into_iter().map(AccountEntry::new).collect();
+        v.account = Some(AccountEntry::new(account, &names));
+        v.known_accounts = accounts
+            .into_iter()
+            .map(|key| AccountEntry::new(key, &names))
+            .collect();
         v.status = "connected".to_owned();
         v.gate_line = Some(format!("gate: {gate}"));
         v.custody_line = Some(format!("custody: {custody}"));
@@ -1315,6 +1351,12 @@ async fn setup(core: Arc<Core>, data_dir: PathBuf, choice: AccountChoice) -> any
         let mut tasks = JoinSet::new();
         tasks.spawn(pump);
         tasks.spawn(feed_events(Arc::clone(&core), client.clone()));
+        tasks.spawn(feed_own_name(
+            Arc::clone(&core),
+            client.clone(),
+            data_dir.clone(),
+            user.clone(),
+        ));
         tasks.spawn(feed_device(Arc::clone(&core), parts.clone()));
         #[cfg(feature = "peer")]
         tasks.spawn(feed_nearby(Arc::clone(&core), parts.clone()));
@@ -1447,19 +1489,19 @@ async fn feed_nearby(core: Arc<Core>, session: Weak<Parts>) {
         let me = certificate
             .as_ref()
             .map(|certificate| certificate.identity());
-        let peer_line = support::nearby::peer_line(port, me);
+        let listening = support::nearby::listening(port, me);
         let bluetooth_line = format!("bluetooth: {}", session.native.bluetooth_state());
         let beacon_line = support::nearby::beacon_line(session.native.beacon_state());
-        let mut linked: Vec<String> = session
+        let mut linked: Vec<_> = session
             .native
             .linked_peers()
             .iter()
-            .map(|link| support::nearby::linked_line(&link.peer, link.remote))
+            .map(|link| support::nearby::linked_peer(&link.peer, link.remote))
             .collect();
         linked.sort();
         core.update(|v| {
             if let Some(panel) = v.nearby.as_mut() {
-                panel.peer_line = peer_line;
+                panel.listening = listening;
                 panel.bluetooth_line = bluetooth_line;
                 panel.beacon_line = beacon_line;
                 panel.linked = linked;
@@ -1533,7 +1575,7 @@ async fn feed_peer_events(core: Arc<Core>, session: Weak<Parts>, client: Connett
 async fn feed_team_events(core: Arc<Core>, client: ConnettoClient<Ws>) {
     let mut events = client.events();
     while let Ok(event) = events.recv().await {
-        let added = support::provisional_event_lines(&event);
+        let added = support::provisional_events(&event);
         if added.is_empty() {
             continue;
         }
@@ -1553,7 +1595,10 @@ const MAX_TEAM_EVENT_LINES: usize = 40;
 /// Append the lines to the team panel's standing, keeping the newest
 /// [`MAX_TEAM_EVENT_LINES`].
 #[cfg(feature = "peer")]
-fn append_team_events(events: &mut Vec<String>, added: Vec<String>) {
+fn append_team_events(
+    events: &mut Vec<support::view::TeamEvent>,
+    added: Vec<support::view::TeamEvent>,
+) {
     events.extend(added);
     let excess = events.len().saturating_sub(MAX_TEAM_EVENT_LINES);
     if excess > 0 {
@@ -1655,8 +1700,8 @@ fn start(app: AppHandle, core: &Arc<Core>, choice: AccountChoice) {
     });
     let core = Arc::clone(core);
     tauri::async_runtime::spawn(async move {
-        let data_dir = match app.path().app_data_dir() {
-            Ok(dir) => dir.join("connetto-tauri-demo"),
+        let data_dir = match demo_data_dir(&app) {
+            Ok(dir) => dir,
             Err(err) => {
                 fail(&core, &anyhow::Error::from(err));
                 core.starting.store(false, Ordering::Release);
@@ -1668,6 +1713,37 @@ fn start(app: AppHandle, core: &Arc<Core>, choice: AccountChoice) {
         }
         core.starting.store(false, Ordering::Release);
     });
+}
+
+/// The folder the replica, the parked login and the stored names live in.
+fn demo_data_dir(app: &AppHandle) -> tauri::Result<PathBuf> {
+    Ok(app.path().app_data_dir()?.join("connetto-tauri-demo"))
+}
+
+/// The live account's own `users` row names it in the view and in the
+/// device's stored names, so Switch to names it once it is not live.
+async fn feed_own_name(
+    core: Arc<Core>,
+    client: ConnettoClient<Ws>,
+    data_dir: PathBuf,
+    account: String,
+) {
+    support::follow_own_name(
+        client,
+        account.clone(),
+        |name| {
+            let mut names = support::native::read_stored_names(&data_dir);
+            if !names.remember(&account, name) {
+                return;
+            }
+            if let Err(err) = support::native::write_stored_names(&data_dir, &names) {
+                tracing::warn!(error = %err, "keeping the account's name");
+            }
+            core.update(|v| v.name_account(&account, name));
+        },
+        |err| tracing::warn!(error = %err, "the account's name feed ended"),
+    )
+    .await;
 }
 
 fn fail(core: &Arc<Core>, err: &anyhow::Error) {
@@ -1749,7 +1825,8 @@ pub fn run() {
             .register::<support::OrdersCount>()
             .register::<support::OrdersCountsByQuantity>()
             .register::<support::TeamsOfAccount>()
-            .register::<support::TeamMembersOf>(),
+            .register::<support::TeamMembersOf>()
+            .register_keyed::<support::UserNames>(),
     );
     let (parked, parked_rx) = watch::channel(None::<String>);
     let core = Arc::new(Core {

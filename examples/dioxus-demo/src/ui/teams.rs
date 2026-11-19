@@ -73,7 +73,10 @@ pub(crate) fn TeamNotesPanel(parts: SessionParts) -> Element {
             spawn(async move {
                 let mut rx = event_rx;
                 while let Ok(event) = rx.recv().await {
-                    let added = support::provisional_event_lines(&event);
+                    let added: Vec<String> = support::provisional_events(&event)
+                        .iter()
+                        .map(support::view::TeamEvent::text)
+                        .collect();
                     if !added.is_empty() {
                         append_lines(&mut lines, added);
                     }

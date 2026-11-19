@@ -61,12 +61,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "ar_archive_writer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -434,7 +428,6 @@ dependencies = [
 name = "connetto-client"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "base64 0.22.1",
  "connetto-core",
  "diesel",
@@ -483,7 +476,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
- "tracing-subscriber",
  "url",
  "uuid",
  "zeroize",
@@ -509,6 +501,7 @@ dependencies = [
  "js-sys",
  "rosetta-uuid",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tracing",
  "wasm-bindgen",
@@ -2143,15 +2136,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
-]
-
-[[package]]
-name = "matchers"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
-dependencies = [
- "regex-automata",
 ]
 
 [[package]]
@@ -4057,17 +4041,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
- "valuable",
-]
-
-[[package]]
-name = "tracing-serde"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
-dependencies = [
- "serde",
- "tracing-core",
 ]
 
 [[package]]
@@ -4076,16 +4049,9 @@ version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
- "matchers",
- "once_cell",
- "regex-automata",
- "serde",
- "serde_json",
  "sharded-slab",
  "thread_local",
- "tracing",
  "tracing-core",
- "tracing-serde",
 ]
 
 [[package]]
@@ -4216,12 +4182,6 @@ checksum = "cdf60f3d36825d0911af7e102da39cc817280560cad48e81df1eb5c4d7400f76"
 dependencies = [
  "getrandom 0.4.3",
 ]
-
-[[package]]
-name = "valuable"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcpkg"

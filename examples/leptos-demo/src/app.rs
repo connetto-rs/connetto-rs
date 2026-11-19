@@ -874,7 +874,7 @@ fn NearbyPane(view: RwSignal<View>) -> impl IntoView {
             {move || {
                 let near = view.with(|v| v.nearby.clone().unwrap_or_default());
                 let support::view::NearbyView {
-                    peer_line,
+                    listening,
                     bluetooth_line,
                     beacon_line,
                     linked,
@@ -893,11 +893,11 @@ fn NearbyPane(view: RwSignal<View>) -> impl IntoView {
                             <Fa icon=Icon::CircleInfo />
                             "Status"
                         </h4>
-                        <p>{peer_line}</p>
+                        <p>{support::view::peer_line(listening.as_ref())}</p>
                         <p>{bluetooth_line.clone()}</p>
                         <p>{beacon_line}</p>
                         <p>{support::view::links_line(links_off)}</p>
-                        {linked.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
+                        {linked.into_iter().map(|peer| view! { <p>{peer.line()}</p> }).collect_view()}
                         {nearby_lines.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
                         {offer.map(|offer| {
                             view! {
@@ -1104,7 +1104,7 @@ fn TeamNotesPane(view: RwSignal<View>, source: Source) -> impl IntoView {
                             "peer activity"
                         </h3>
                         <div class="lines">
-                            {events.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
+                            {events.into_iter().map(|event| view! { <p>{event.text()}</p> }).collect_view()}
                         </div>
                     }
                 })

@@ -10,7 +10,7 @@ use connetto_client::{
 };
 use connetto_core::device_cert::DeviceIdentity;
 
-use crate::view::OfferView;
+use crate::view::{LinkedPeer, Listening, OfferView, PeerId};
 
 /// The line a VPN refusing the joined hotspot's dial shows.
 pub const VPN_LINE: &str = "link: a VPN on this device blocks its own connections over the joined hotspot, only peers that connect to it can link";
@@ -23,33 +23,33 @@ pub const JOINING_NEARBY: &str = "joining the nearby host";
 /// it runs.
 pub const JOINING_HOTSPOT: &str = "joining the hotspot";
 
-/// A device identity as `account/key prefix`, what the panel names devices
-/// by, its own included.
+/// A device identity as the panel names devices, its own included.
 #[must_use]
-pub fn short_identity(identity: &DeviceIdentity) -> String {
+pub fn peer_id(identity: &DeviceIdentity) -> PeerId {
     let key = identity.key().to_string();
-    let prefix = key.get(..8).unwrap_or_default();
-    format!("{}/{prefix}", identity.account())
-}
-
-/// One linked peer's line, with the address it is linked through where
-/// known.
-#[must_use]
-pub fn linked_line(peer: &DeviceIdentity, remote: Option<SocketAddr>) -> String {
-    match remote {
-        Some(remote) => format!("linked: {} via {remote}", short_identity(peer)),
-        None => format!("linked: {}", short_identity(peer)),
+    PeerId {
+        account: identity.account().to_owned(),
+        key_prefix: key.get(..8).unwrap_or_default().to_owned(),
     }
 }
 
-/// The device's own peer line, the port it listens on and the identity it
-/// links as, or `not serving` while it lacks either.
+/// One linked peer, with the address it is linked through where known.
 #[must_use]
-pub fn peer_line(port: Option<u16>, me: Option<&DeviceIdentity>) -> String {
-    match (port, me) {
-        (Some(port), Some(me)) => format!("peer: listening on {port} as {}", short_identity(me)),
-        _ => "peer: not serving".to_owned(),
+pub fn linked_peer(peer: &DeviceIdentity, remote: Option<SocketAddr>) -> LinkedPeer {
+    LinkedPeer {
+        peer: peer_id(peer),
+        remote: remote.map(|remote| remote.to_string()),
     }
+}
+
+/// The port this device listens on and the identity it links as, or `None`
+/// while it lacks either.
+#[must_use]
+pub fn listening(port: Option<u16>, me: Option<&DeviceIdentity>) -> Option<Listening> {
+    Some(Listening {
+        port: port?,
+        me: peer_id(me?),
+    })
 }
 
 /// The host's beacon standing as the panel's line.
@@ -144,10 +144,7 @@ pub fn typed_offer(ssid: &str, passphrase: &str, port: &str) -> Result<HotspotOf
 /// The outcome a nearby join shows, the gateway and the host it reached.
 #[must_use]
 pub fn joined_nearby_outcome(gateway: IpAddr, host: &DeviceIdentity) -> String {
-    format!(
-        "joined through the gateway {gateway} as {}",
-        short_identity(host)
-    )
+    format!("joined through the gateway {gateway} as {}", peer_id(host))
 }
 
 /// The permission a refused nearby join misses, which the panel asks for.

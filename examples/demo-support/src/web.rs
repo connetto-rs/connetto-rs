@@ -397,6 +397,31 @@ pub fn clear_stored_account() {
     }
 }
 
+/// The `localStorage` entry the login names of this origin's stored accounts
+/// live in.
+pub const STORED_NAMES_KEY: &str = "connetto-demo-stored-names";
+
+/// The login names this origin keeps for its stored accounts, empty when
+/// none were kept or the entry does not decode.
+#[must_use]
+pub fn read_stored_names() -> crate::view::StoredNames {
+    web_sys::window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(STORED_NAMES_KEY).ok().flatten())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Keep `names` for the next load.
+pub fn save_stored_names(names: &crate::view::StoredNames) {
+    if let Some(window) = web_sys::window()
+        && let Some(storage) = window.local_storage().ok().flatten()
+        && let Ok(text) = serde_json::to_string(names)
+    {
+        let _ = storage.set_item(STORED_NAMES_KEY, &text);
+    }
+}
+
 /// Reload the page after logout, dropping the remembered account first.
 pub fn reload_page() {
     clear_stored_account();
@@ -565,6 +590,7 @@ pub async fn logout_delete() -> Result<DeleteOutcome, AuthError> {
             match connetto_web::auth::request_logout(true, false).await {
                 Ok(LogoutOutcome::Refused { pending }) => Ok(DeleteOutcome::Refused(pending)),
                 Ok(_) => {
+                    forget_stored_name();
                     reload_page();
                     Ok(DeleteOutcome::Reloaded)
                 }
@@ -584,10 +610,22 @@ pub async fn logout_delete() -> Result<DeleteOutcome, AuthError> {
 pub async fn logout_delete_confirmed() -> Result<(), AuthError> {
     match connetto_web::auth::request_logout(true, true).await {
         Ok(_) => {
+            forget_stored_name();
             reload_page();
             Ok(())
         }
         Err(err) => Err(err),
+    }
+}
+
+/// Drop the deleted account's login name from this origin's stored names.
+fn forget_stored_name() {
+    let Some(key) = read_stored_account() else {
+        return;
+    };
+    let mut names = read_stored_names();
+    if names.forget(&crate::account_label(&key)) {
+        save_stored_names(&names);
     }
 }
 
