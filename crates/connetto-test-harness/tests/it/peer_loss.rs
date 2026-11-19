@@ -1,6 +1,6 @@
 //! R79 slice 14 proof, the Done when's last clause. Four signed-in native
-//! clients of different accounts run against the demo deployment the real
-//! `connetto-server` binary serves with its courier path on, each with a
+//! clients of different accounts run against the demo deployment the demo's
+//! `demo-server` serves with its courier path on, each with a
 //! content client replicating the photo column to three copies.
 //!
 //! The server goes away. Alice takes a photo offline, posted to the team bob,

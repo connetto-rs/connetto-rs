@@ -110,7 +110,9 @@ pub enum ConfigError {
         ceiling: Duration,
     },
     /// The issuer's certificate has expired, so it can issue nothing.
-    #[error("the device certificate issuer has expired, sign a new one with connetto-ca")]
+    #[error(
+        "the device certificate issuer has expired, sign a new one with connetto_ca::sign_issuer"
+    )]
     IssuerExpired,
 }
 
@@ -171,7 +173,7 @@ impl DeviceCertConfig {
         self
     }
 
-    /// A list the root signed offline with `connetto-ca revoke-issuer`,
+    /// A list the root signed offline with `connetto_ca::revoke_issuer`,
     /// published beside the issuers' own lists.
     #[must_use]
     pub fn with_root_list(mut self, list: SignedList) -> Self {

@@ -62,6 +62,7 @@ pub mod peer_proof;
 pub mod relay;
 pub mod roster;
 pub mod router;
+pub mod server_fixture;
 pub mod stack;
 pub mod standby;
 pub mod star;
@@ -682,7 +683,7 @@ impl MockOauth {
         .with_name_pointer("/name")
     }
 
-    /// Environment variables consumed by `connetto-server`.
+    /// Environment variables consumed by `demo-server`.
     #[must_use]
     pub fn env_pairs(&self, name: &str, redirect_url: &str) -> Vec<(String, String)> {
         let prefix = env_prefix(name);

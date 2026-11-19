@@ -35,7 +35,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use sha2::{Digest, Sha256};
 
-use super::e2e::exec;
+use connetto_test_harness::server_fixture::exec;
 
 /// The one synced table a list entry may name.
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, label TEXT);";

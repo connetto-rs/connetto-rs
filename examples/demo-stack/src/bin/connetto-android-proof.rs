@@ -7,8 +7,8 @@
 //! and the environment naming it.
 //!
 //! ```text
-//! cargo build -p connetto-test-harness --bin connetto-android-proof
-//! cargo run -p connetto-test-harness --bin connetto-demo-stack -- \
+//! cargo build -p connetto-demo-stack --bin connetto-android-proof
+//! cargo run -p connetto-demo-stack --bin connetto-demo-stack -- \
 //!   target/debug/connetto-android-proof [--serial SERIAL] [--app dioxus|tauri] [--apk PATH] \
 //!     [--unlock-pin PIN] [--peer-serial SECOND]
 //! ```

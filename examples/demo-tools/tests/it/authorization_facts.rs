@@ -8,11 +8,11 @@
 
 use std::time::Duration;
 
+use connetto_test_harness::server_fixture::{Authorization, with_user_url};
 use connetto_test_harness::{Fixture, provision_cap_policies};
 
 use super::e2e::{
-    AuthStack, Authorization, ChildGuard, Ports, build_auth_stack, restart_server,
-    spawn_server_cfg, start_server, with_user_url,
+    AuthStack, ChildGuard, Ports, build_auth_stack, restart_server, spawn_server_cfg, start_server,
 };
 
 const SCHEMA: &str = "-- connetto:major 1\n\

@@ -49,15 +49,14 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::Instrument;
 
-use super::e2e::{
-    NO_POLICIES, OWNED_PG_DDL, OWNED_POLICIES, PG_DDL, PG_SERIAL, audit_ops, exec, mint_token,
-    mint_tokens, reset_fixture, signing_keys, token_body, with_user_url,
-};
 use super::lifecycle::{
-    BOUND, admin_pool, builder_over, live_session, live_session_as, next_control, served_major,
-    wait_ready,
+    BOUND, admin_pool, builder_over, live_session, live_session_as, next_control, wait_ready,
 };
 use super::logging::{record_logged, with_capture};
+use connetto_test_harness::server_fixture::{
+    NO_POLICIES, OWNED_PG_DDL, OWNED_POLICIES, PG_DDL, PG_SERIAL, audit_ops, exec, mint_token,
+    mint_tokens, reset_fixture, served_major, signing_keys, token_body, with_user_url,
+};
 
 /// The one-table schema the refusal tests hand the builder, with the major
 /// line the build's translation reads from it.
@@ -1636,7 +1635,7 @@ async fn insert_ingested_order(
     commits: &mut tokio::sync::broadcast::Receiver<subql::PgCommit>,
     id: i32,
 ) {
-    use super::e2e::orders;
+    use connetto_test_harness::server_fixture::orders;
 
     let xid: i64 = {
         let mut conn = pool.get().await.expect("a connection");

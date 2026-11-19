@@ -30,10 +30,6 @@ thiserror.workspace = true
 toml = "0.8"
 serde = { workspace = true }
 
-[[bin]]
-name = "connetto-schema"
-path = "src/bin/connetto-schema.rs"
-
 [dev-dependencies]
 connetto-demo-deployment = { path = "../../examples/deployment" }
 # The history directories the boundary and emit tests keep.

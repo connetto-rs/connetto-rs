@@ -27,8 +27,8 @@
 //! It runs on a Mac through a private driver script passed to `connetto-demo-stack`, which supplies the stack environment without logging the script's password arguments.
 //!
 //! ```text
-//! cargo build -p connetto-test-harness --bin connetto-ios-proof
-//! cargo run -p connetto-test-harness --bin connetto-demo-stack -- sh private-proof.sh
+//! cargo build -p connetto-demo-stack --bin connetto-ios-proof
+//! cargo run -p connetto-demo-stack --bin connetto-demo-stack -- sh private-proof.sh
 //!
 //! # Proof command usage
 //! target/debug/connetto-ios-proof [--simulator UDID | --device UDID --identity SHA1] \

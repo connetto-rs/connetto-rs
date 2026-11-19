@@ -1,16 +1,16 @@
 //! A standalone OIDC provider for local loops, standing in for Google or Entra.
 //!
-//! The `connetto-server` binary is a confidential OAuth client, so it needs a
-//! real provider to talk to. This starts the same containerised mock the
-//! tests use. The provider serves discovery, tokens and keys over HTTP, and
-//! its login form lets a browser choose the subject.
+//! `demo-server` is a confidential OAuth client, so it needs a real provider
+//! to talk to. This starts the same containerised mock the tests use. The
+//! provider serves discovery, tokens and keys over HTTP, and its login form
+//! lets a browser choose the subject.
 //!
 //! The helper writes the environment the server reads:
 //!
 //! ```text
-//! cargo run --example dev_idp
+//! cargo run -p connetto-demo-tools --bin demo-idp
 //! set -a && . target/dev-idp.env && set +a
-//! cargo run --bin connetto-server
+//! cargo run -p connetto-demo-tools --bin demo-server
 //! ```
 //!
 //! The redirect defaults to `http://$CONNETTO_BIND/auth/callback`, so the
@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use connetto_test_harness::{MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET, MockOauth};
 
-/// `connetto-server`'s own default for `CONNETTO_BIND`, mirrored so the
+/// `demo-server`'s own default for `CONNETTO_BIND`, mirrored so the
 /// callback lands where the server serves it.
 const DEFAULT_SERVER_BIND: &str = "127.0.0.1:8080";
 

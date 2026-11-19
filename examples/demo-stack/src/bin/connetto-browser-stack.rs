@@ -10,10 +10,10 @@
 //! credentials.
 //!
 //! ```text
-//! cargo run -p connetto-test-harness --bin connetto-browser-stack
-//! cargo run -p connetto-test-harness --bin connetto-browser-stack --shard I/N
-//! cargo run -p connetto-test-harness --bin connetto-browser-stack --build-only DIR
-//! cargo run -p connetto-test-harness --bin connetto-browser-stack -- <program> [args]
+//! cargo run -p connetto-demo-stack --bin connetto-browser-stack
+//! cargo run -p connetto-demo-stack --bin connetto-browser-stack --shard I/N
+//! cargo run -p connetto-demo-stack --bin connetto-browser-stack --build-only DIR
+//! cargo run -p connetto-demo-stack --bin connetto-browser-stack -- <program> [args]
 //! ```
 //!
 //! Bare, it runs the verified-topology step and then the default suites, one
@@ -42,6 +42,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use connetto_core::auth::CapabilitySubject;
+use connetto_demo_tools::users::DemoHooks;
 use connetto_server::builder::{
     ContentSettings, Database, OidcProvider, OpenFga, ServerBuilder, ServerHandle, ServerSchema,
     StoreSpec, TokenKeys,
@@ -174,6 +175,7 @@ impl ServerConfig {
         // `SameSite: Strict`, so a null-origin request carries none.
         .cors_origins(vec![self.page_origin.clone(), "null".to_owned()])
         .cookie_same_site(CookieSameSite::Strict)
+        .auth_hooks(Arc::new(DemoHooks))
     }
 }
 
@@ -564,7 +566,7 @@ async fn prebuild(dir: &Path) -> Result<()> {
         .await
         .with_context(|| format!("creating {}", dir.display()))?;
     let binaries = [
-        (ensure_server_bin().await?, "connetto-server"),
+        (ensure_server_bin().await?, "demo-server"),
         (build_topology().await?, "verified-topology"),
         (
             std::env::current_exe().context("locating this binary")?,

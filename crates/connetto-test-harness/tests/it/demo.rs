@@ -461,9 +461,12 @@ pub async fn wait_session<C>(client: &NativeClient<NativeTransport, C>) -> Strin
     }
 }
 
-/// Insert the two-account roster the membership rows hold, under the
-/// server-minted ids the policies compare.
+/// Insert the two teams and the two-account roster the membership rows hold,
+/// under the server-minted ids the policies compare.
 pub async fn seed_roster(fixture: &connetto_test_harness::Fixture, alice: &str, bob: &str) {
+    fixture
+        .exec("INSERT INTO teams (id) VALUES ('T1'), ('T2')")
+        .await;
     for row in [("T1", alice), ("T1", bob), ("T2", alice), ("T2", bob)] {
         fixture
             .exec(&format!(

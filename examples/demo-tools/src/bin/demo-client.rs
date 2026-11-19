@@ -1,4 +1,4 @@
-//! The connetto sync client as a runnable process.
+//! The demo's sync client, a process around the connetto client.
 //!
 //! Configuration comes from the environment:
 //!
@@ -49,7 +49,7 @@ use connetto_client::{
     HeldCredential, Located, NativeTransport, ReplicaPlace, SyncSchema,
 };
 use connetto_core::auth::CapabilitySubject;
-use connetto_core::env::{read_ddl, var_or};
+use connetto_demo_tools::env::{read_ddl, var_or};
 use diesel::connection::SimpleConnection;
 
 /// Keyring service holding this binary's replica keys, one entry per

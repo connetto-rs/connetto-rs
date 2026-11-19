@@ -17,14 +17,16 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
+use connetto_test_harness::server_fixture::{
+    Authorization, NO_POLICIES, PG_DDL, PG_SERIAL, QUERY, mint_refresh_token, mint_token, orders,
+    reset_fixture, with_user_url,
+};
 use connetto_test_harness::{Fixture, PUBLICATION, SLOT, provision_cap_policies};
 use openidconnect::reqwest;
 
 use super::e2e::{
-    Authorization, ChildGuard, NO_POLICIES, PG_DDL, PG_SERIAL, Ports, QUERY, ReplicaDir,
-    build_auth_stack, client_bin, mint_refresh_token, mint_token, open_replica, orders,
-    reset_fixture, restart_server, spawn_client_env, spawn_server_cfg, start_server, wait_for_rows,
-    with_user_url,
+    ChildGuard, Ports, ReplicaDir, build_auth_stack, open_replica, restart_server,
+    spawn_client_env, spawn_server_cfg, start_server, wait_for_rows,
 };
 
 /// How the deployment backs up and restores.
@@ -273,7 +275,6 @@ async fn seeded_primary(fixture: &Fixture, url: &str) -> Pool<AsyncPgConnection>
 
 async fn demonstrate(method: Method) -> Observation {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    assert!(client_bin().exists(), "build the client binary first");
     let _serial = PG_SERIAL.lock().await;
 
     let fixture = Fixture::acquire_restorable().await;
@@ -370,7 +371,7 @@ fn assert_recovered(observed: &Observation) {
 }
 
 #[tokio::test]
-#[ignore = "needs Docker and the release connetto-server and connetto-client binaries"]
+#[ignore = "needs Docker and the release demo-server and demo-client binaries"]
 async fn a_point_in_time_restore_resyncs_clients_and_revokes_sessions() {
     let observed = demonstrate(Method::PointInTime).await;
     assert!(observed.same_system_identifier, "{observed:#?}");
@@ -379,7 +380,7 @@ async fn a_point_in_time_restore_resyncs_clients_and_revokes_sessions() {
 }
 
 #[tokio::test]
-#[ignore = "needs Docker and the release connetto-server and connetto-client binaries"]
+#[ignore = "needs Docker and the release demo-server and demo-client binaries"]
 async fn a_dump_into_a_fresh_cluster_resyncs_clients_and_revokes_sessions() {
     let observed = demonstrate(Method::FreshCluster).await;
     assert!(
@@ -391,7 +392,7 @@ async fn a_dump_into_a_fresh_cluster_resyncs_clients_and_revokes_sessions() {
 }
 
 #[tokio::test]
-#[ignore = "needs Docker and the release connetto-server and connetto-client binaries"]
+#[ignore = "needs Docker and the release demo-server and demo-client binaries"]
 async fn a_dump_into_the_same_cluster_resyncs_clients_and_revokes_sessions() {
     let observed = demonstrate(Method::SameCluster).await;
     assert!(observed.same_system_identifier, "{observed:#?}");
@@ -500,10 +501,9 @@ fn number_of(db: &Path) -> u64 {
 /// knew moves its queue to a fresh number and its write acknowledged after
 /// the backup stays lost.
 #[tokio::test]
-#[ignore = "needs Docker and the release connetto-server and connetto-client binaries"]
+#[ignore = "needs Docker and the release demo-server and demo-client binaries"]
 async fn a_restore_takes_a_retained_run_back_and_moves_unknown_numbers() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    assert!(client_bin().exists(), "build the client binary first");
     let _serial = PG_SERIAL.lock().await;
 
     let fixture = Fixture::acquire_restorable().await;

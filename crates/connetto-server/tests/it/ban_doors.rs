@@ -20,8 +20,10 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
 use tokio::net::TcpListener;
 
-use super::e2e::{PG_SERIAL, audit_ops, exec, mint_tokens, reset_fixture};
 use super::lifecycle::{admin_pool, builder_over, live_session, next_control, wait_ready};
+use connetto_test_harness::server_fixture::{
+    PG_SERIAL, audit_ops, exec, mint_tokens, reset_fixture,
+};
 
 /// How long a ban's consequences may take to land.
 const SETTLE: Duration = Duration::from_secs(10);
