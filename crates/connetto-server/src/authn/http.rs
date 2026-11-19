@@ -53,7 +53,8 @@ use crate::authn::provider::{
 };
 use crate::authn::service::{AuthError, AuthService, TokenPair};
 use crate::authn::sign_in::LoginRequest;
-use crate::authn::store::{AuthStore, SessionOrigin, split_refresh};
+use crate::authn::store::{SessionOrigin, split_refresh};
+use crate::schema::ConnettoSchema;
 
 /// Which client redirect URIs the auth endpoints may deliver a minted
 /// authorization code to.
@@ -219,18 +220,18 @@ impl<Id> From<TokenPair<Id>> for TokenResponse<Id> {
 }
 
 /// Shared state for the auth endpoints. Cloned per request (all fields are
-/// `Arc`), so it is implemented by hand to avoid an `S: Clone` bound.
-pub struct AuthState<S: AuthStore> {
+/// `Arc`), so it is implemented by hand to avoid a `D: Clone` bound.
+pub struct AuthState<D: ConnettoSchema> {
     /// The `SameSite` attribute the refresh cookie renders with.
     cookie_same_site: CookieSameSite,
-    service: Arc<AuthService<S>>,
+    service: Arc<AuthService<D>>,
     registry: Arc<ProviderRegistry>,
     pending: Arc<PendingLogins>,
-    codes: Arc<AuthCodes<S::Id>>,
+    codes: Arc<AuthCodes<D::Id>>,
     redirect_policy: RedirectPolicy,
 }
 
-impl<S: AuthStore> Clone for AuthState<S> {
+impl<D: ConnettoSchema> Clone for AuthState<D> {
     fn clone(&self) -> Self {
         Self {
             service: Arc::clone(&self.service),
@@ -451,8 +452,8 @@ fn refresh_cookie(
 }
 
 /// Build the auth router over a shared service and provider registry.
-pub fn auth_router<S: AuthStore + 'static>(
-    service: Arc<AuthService<S>>,
+pub fn auth_router<D: ConnettoSchema>(
+    service: Arc<AuthService<D>>,
     registry: Arc<ProviderRegistry>,
     redirect_policy: RedirectPolicy,
     cookie_same_site: CookieSameSite,
@@ -466,16 +467,16 @@ pub fn auth_router<S: AuthStore + 'static>(
         codes: Arc::new(AuthCodes::default()),
     };
     Router::new()
-        .route("/auth/login", get(login_start::<S>))
-        .route("/auth/callback", get(callback::<S>))
-        .route("/auth/token", post(token::<S>))
-        .route("/auth/refresh", post(refresh::<S>))
-        .route("/auth/logout", post(logout::<S>))
+        .route("/auth/login", get(login_start::<D>))
+        .route("/auth/callback", get(callback::<D>))
+        .route("/auth/token", post(token::<D>))
+        .route("/auth/refresh", post(refresh::<D>))
+        .route("/auth/logout", post(logout::<D>))
         .with_state(state)
 }
 
-async fn login_start<S: AuthStore + 'static>(
-    State(state): State<AuthState<S>>,
+async fn login_start<D: ConnettoSchema>(
+    State(state): State<AuthState<D>>,
     Query(query): Query<StartQuery>,
 ) -> Result<Redirect, AuthApiError> {
     // A client redirect and its PKCE challenge must come as a pair, and the
@@ -505,8 +506,8 @@ async fn login_start<S: AuthStore + 'static>(
     Ok(Redirect::temporary(&redirect.authorize_url))
 }
 
-async fn callback<S: AuthStore + 'static>(
-    State(state): State<AuthState<S>>,
+async fn callback<D: ConnettoSchema>(
+    State(state): State<AuthState<D>>,
     Query(query): Query<CallbackQuery>,
     headers: HeaderMap,
     extensions: axum::http::Extensions,
@@ -580,12 +581,12 @@ async fn callback<S: AuthStore + 'static>(
     }
 }
 
-async fn token<S: AuthStore + 'static>(
-    State(state): State<AuthState<S>>,
+async fn token<D: ConnettoSchema>(
+    State(state): State<AuthState<D>>,
     jar: CookieJar,
     headers: HeaderMap,
     Json(request): Json<TokenExchangeRequest>,
-) -> Result<(CookieJar, Json<TokenResponse<S::Id>>), AuthApiError> {
+) -> Result<(CookieJar, Json<TokenResponse<D::Id>>), AuthApiError> {
     let marked = is_marked_request(&headers)?;
     let issued = state
         .codes
@@ -618,12 +619,12 @@ async fn token<S: AuthStore + 'static>(
     ))
 }
 
-async fn refresh<S: AuthStore + 'static>(
-    State(state): State<AuthState<S>>,
+async fn refresh<D: ConnettoSchema>(
+    State(state): State<AuthState<D>>,
     jar: CookieJar,
     headers: HeaderMap,
-    Json(request): Json<RefreshRequest<S::Id>>,
-) -> Result<(CookieJar, Json<TokenResponse<S::Id>>), AuthApiError> {
+    Json(request): Json<RefreshRequest<D::Id>>,
+) -> Result<(CookieJar, Json<TokenResponse<D::Id>>), AuthApiError> {
     let marked = is_marked_request(&headers)?;
     let presented = if marked {
         // The account names the cookie and the cookie carries the credential.
@@ -709,11 +710,11 @@ async fn refresh<S: AuthStore + 'static>(
 /// The marked path answers `204` whether or not a cookie rode the request,
 /// exactly as the native path answers it whether or not the token named a
 /// live session, and the account's cookie is cleared in the same response.
-async fn logout<S: AuthStore + 'static>(
-    State(state): State<AuthState<S>>,
+async fn logout<D: ConnettoSchema>(
+    State(state): State<AuthState<D>>,
     jar: CookieJar,
     headers: HeaderMap,
-    Json(request): Json<LogoutRequest<S::Id>>,
+    Json(request): Json<LogoutRequest<D::Id>>,
 ) -> Result<Response, AuthApiError> {
     let marked = is_marked_request(&headers)?;
     if marked {

@@ -2,7 +2,7 @@
 //! authority.
 //!
 //! [`AuthService`] mints connetto tokens at login and rotates them at refresh
-//! over an [`AuthStore`]. [`ConnettoHandshakeAuthority`] is the real
+//! over the [`DbAuthStore`]. [`ConnettoHandshakeAuthority`] is the real
 //! [`HandshakeAuthority`] the server injects: it checks each grant's signature
 //! locally, confirms in the same store that a login grant's run is still live,
 //! so a revoked run is refused on the next handshake even while its token is
@@ -24,13 +24,14 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::authn::provider::{
     ProviderError, ProviderRegistry, RetainedProviderToken, VerifiedLogin,
 };
-use crate::authn::schema::SessionRecord;
+use crate::authn::schema::{Desc, SessionRecord};
 use crate::authn::sign_in::{LoginRequest, SessionDescriber, SignInHook, SignInNotice};
 use crate::authn::store::{
-    AuthStore, AuthStoreError, IssuedSession, ResolvedIdentity, SessionOrigin, split_refresh,
+    AuthStoreError, DbAuthStore, IssuedSession, ResolvedIdentity, SessionOrigin, split_refresh,
 };
 use crate::authn::token::{TokenAuthority, TokenError};
 use crate::guard::RequestGuard;
+use crate::schema::ConnettoSchema;
 
 /// The access token plus its rotating refresh token, returned by login and
 /// refresh.
@@ -119,13 +120,11 @@ impl SessionLocks {
     }
 }
 
-/// Mints and rotates connetto tokens over an [`AuthStore`].
-///
-/// Generic over the store so the concrete choice (in-memory or database) is
-/// made once at startup, and every awaited store future stays `Send`.
-pub struct AuthService<S: AuthStore> {
+/// Mints and rotates connetto tokens over the [`DbAuthStore`] of the
+/// deployment's schema `D`.
+pub struct AuthService<D: ConnettoSchema> {
     authority: Arc<TokenAuthority>,
-    store: Arc<S>,
+    store: Arc<DbAuthStore<D>>,
     /// The provider registry, for the lazy retained-token refresh. `None`
     /// leaves retained tokens un-refreshable (returned as stored).
     registry: Option<Arc<ProviderRegistry>>,
@@ -138,18 +137,18 @@ pub struct AuthService<S: AuthStore> {
     /// session's live connection rather than only refusing its next handshake.
     revocation_hook: std::sync::OnceLock<SessionRevocationHook>,
     /// Sink for the durable record of access changes, set once at startup.
-    /// `None` records nothing, which is what an in-memory deployment wants.
-    audit_hook: std::sync::OnceLock<crate::audit::AuditHook<S::Id>>,
+    /// `None` records nothing.
+    audit_hook: std::sync::OnceLock<crate::audit::AuditHook<D::Id>>,
     /// The application's sign-in callback, set once at startup. `None`
     /// tells nobody.
-    sign_in_hook: std::sync::OnceLock<SignInHook<S::Id, S::Descriptor>>,
+    sign_in_hook: std::sync::OnceLock<SignInHook<D::Id, Desc<D>>>,
     /// The application's describe callback, `None` when the deployment
     /// declares no description.
-    describer: Option<SessionDescriber<S::Descriptor>>,
+    describer: Option<SessionDescriber<Desc<D>>>,
     /// Every counter connetto keeps about a caller, shared with the session
     /// manager because the failed-renewal signal fires here and the other three
     /// fire there.
-    guard: Arc<RequestGuard<S::Id>>,
+    guard: Arc<RequestGuard<D::Id>>,
 }
 
 /// Observes a session revocation. Fired synchronously after the store revoke
@@ -194,7 +193,7 @@ impl<Desc: Clone> Started<Desc> {
     }
 }
 
-impl<S: AuthStore> AuthService<S> {
+impl<D: ConnettoSchema> AuthService<D> {
     /// Build over a shared token authority and store, with no provider registry.
     ///
     /// The `guard` is the same instance the session manager holds, so a person's
@@ -202,8 +201,8 @@ impl<S: AuthStore> AuthService<S> {
     #[must_use]
     pub fn new(
         authority: Arc<TokenAuthority>,
-        store: Arc<S>,
-        guard: Arc<RequestGuard<S::Id>>,
+        store: Arc<DbAuthStore<D>>,
+        guard: Arc<RequestGuard<D::Id>>,
     ) -> Self {
         Self {
             authority,
@@ -228,14 +227,14 @@ impl<S: AuthStore> AuthService<S> {
     /// Attach the application's describe callback, which every sign-in asks
     /// for the session's description.
     #[must_use]
-    pub fn with_session_describer(mut self, describer: SessionDescriber<S::Descriptor>) -> Self {
+    pub fn with_session_describer(mut self, describer: SessionDescriber<Desc<D>>) -> Self {
         self.describer = Some(describer);
         self
     }
 
     /// The counters this service shares with the session manager.
     #[must_use]
-    pub fn guard(&self) -> &Arc<RequestGuard<S::Id>> {
+    pub fn guard(&self) -> &Arc<RequestGuard<D::Id>> {
         &self.guard
     }
 
@@ -251,18 +250,18 @@ impl<S: AuthStore> AuthService<S> {
     /// Unset, connetto records nothing, which is the right default: the table
     /// is the deployment's and connetto emits no DDL, so a deployment that has
     /// not created it must not have writes attempted against it.
-    pub fn set_audit_hook(&self, hook: crate::audit::AuditHook<S::Id>) {
+    pub fn set_audit_hook(&self, hook: crate::audit::AuditHook<D::Id>) {
         let _ = self.audit_hook.set(hook);
     }
 
     /// Attach the application's sign-in callback, once, after construction. A
     /// second call is ignored, matching the audit sink beside it.
-    pub fn set_sign_in_hook(&self, hook: SignInHook<S::Id, S::Descriptor>) {
+    pub fn set_sign_in_hook(&self, hook: SignInHook<D::Id, Desc<D>>) {
         let _ = self.sign_in_hook.set(hook);
     }
 
     /// Record one access change, if a sink is attached.
-    fn record(&self, event: crate::audit::AuthEvent<S::Id>) {
+    fn record(&self, event: crate::audit::AuthEvent<D::Id>) {
         if let Some(hook) = self.audit_hook.get() {
             hook(event);
         }
@@ -276,10 +275,10 @@ impl<S: AuthStore> AuthService<S> {
     ///
     /// [`AuthError::Undescribed`] when the deployment declares a description
     /// and no describe callback is attached.
-    pub async fn describe(&self, request: LoginRequest) -> Result<S::Descriptor, AuthError> {
+    pub async fn describe(&self, request: LoginRequest) -> Result<Desc<D>, AuthError> {
         match &self.describer {
             Some(describer) => Ok(describer(request).await),
-            None => S::undescribed().ok_or(AuthError::Undescribed),
+            None => DbAuthStore::<D>::undescribed().ok_or(AuthError::Undescribed),
         }
     }
 
@@ -288,7 +287,7 @@ impl<S: AuthStore> AuthService<S> {
     pub(crate) async fn session_record(
         &self,
         session_id: SessionId,
-    ) -> Result<Option<SessionRecord<S::Id, S::Descriptor>>, AuthError> {
+    ) -> Result<Option<SessionRecord<D::Id, Desc<D>>>, AuthError> {
         Ok(self.store.session_record(session_id).await?)
     }
 
@@ -300,8 +299,8 @@ impl<S: AuthStore> AuthService<S> {
     pub async fn login(
         &self,
         identity: &ResolvedIdentity,
-        origin: SessionOrigin<S::Descriptor>,
-    ) -> Result<TokenPair<S::Id>, AuthError> {
+        origin: SessionOrigin<Desc<D>>,
+    ) -> Result<TokenPair<D::Id>, AuthError> {
         let now = SystemTime::now();
         let started = Started::of(identity, &origin);
         let user_id = self.store.resolve(identity).await?;
@@ -330,8 +329,8 @@ impl<S: AuthStore> AuthService<S> {
     pub async fn login_with_provider(
         &self,
         login: &VerifiedLogin,
-        origin: SessionOrigin<S::Descriptor>,
-    ) -> Result<TokenPair<S::Id>, AuthError> {
+        origin: SessionOrigin<Desc<D>>,
+    ) -> Result<TokenPair<D::Id>, AuthError> {
         let now = SystemTime::now();
         let started = Started::of(&login.identity, &origin);
         let user_id = self.store.resolve(&login.identity).await?;
@@ -362,11 +361,11 @@ impl<S: AuthStore> AuthService<S> {
     /// through, so it must not fall off either login path.
     fn finish_login(
         &self,
-        issued: IssuedSession<S::Id>,
+        issued: IssuedSession<D::Id>,
         now: SystemTime,
-        started: Started<S::Descriptor>,
-        announce: impl FnOnce(&IssuedSession<S::Id>),
-    ) -> Result<TokenPair<S::Id>, AuthError> {
+        started: Started<Desc<D>>,
+        announce: impl FnOnce(&IssuedSession<D::Id>),
+    ) -> Result<TokenPair<D::Id>, AuthError> {
         let access_token = self
             .authority
             .mint_access(&issued.context, issued.session_id, now)?;
@@ -469,7 +468,7 @@ impl<S: AuthStore> AuthService<S> {
     /// # Errors
     ///
     /// [`AuthError`] if the token is invalid, expired, reused, or the mint fails.
-    pub async fn refresh(&self, refresh_token: &str) -> Result<TokenPair<S::Id>, AuthError> {
+    pub async fn refresh(&self, refresh_token: &str) -> Result<TokenPair<D::Id>, AuthError> {
         // Parse the session id before touching the store. A token that does not
         // parse names nothing, so skip all metering and let the store return its
         // own error unchanged.
@@ -584,8 +583,8 @@ impl<S: AuthStore> AuthService<S> {
     /// Every live session of `user`, oldest first.
     pub(crate) async fn sessions_of(
         &self,
-        user: &S::Id,
-    ) -> Result<Vec<SessionRecord<S::Id, S::Descriptor>>, AuthError> {
+        user: &D::Id,
+    ) -> Result<Vec<SessionRecord<D::Id, Desc<D>>>, AuthError> {
         Ok(self.store.sessions_of(user).await?)
     }
 
@@ -594,7 +593,7 @@ impl<S: AuthStore> AuthService<S> {
     /// session was `user`'s and still live.
     pub(crate) async fn end_session(
         &self,
-        user: &S::Id,
+        user: &D::Id,
         session: SessionId,
     ) -> Result<bool, AuthError> {
         if !self.store.end_owned(user, session).await? {
@@ -609,7 +608,7 @@ impl<S: AuthStore> AuthService<S> {
     /// is kept. Answers the sessions it ended.
     pub(crate) async fn end_sessions(
         &self,
-        user: &S::Id,
+        user: &D::Id,
         keep: Option<SessionId>,
     ) -> Result<Vec<SessionId>, AuthError> {
         let op = if keep.is_some() {
@@ -626,7 +625,7 @@ impl<S: AuthStore> AuthService<S> {
 
     /// End every session of the banned identity `user`, recording
     /// `ended_by_ban` for each (R105 decision 8).
-    pub(crate) async fn end_banned(&self, user: &S::Id) -> Result<Vec<SessionId>, AuthError> {
+    pub(crate) async fn end_banned(&self, user: &D::Id) -> Result<Vec<SessionId>, AuthError> {
         let ended = self.store.end_all_of(user, None).await?;
         for session in &ended {
             self.ended(user, *session, crate::audit::AuthOp::EndedByBan);
@@ -636,7 +635,7 @@ impl<S: AuthStore> AuthService<S> {
 
     /// Refuse `user` when the ban list holds a ban on it, and when the list
     /// cannot be read.
-    async fn refuse_banned(&self, user: &S::Id) -> Result<(), AuthError> {
+    async fn refuse_banned(&self, user: &D::Id) -> Result<(), AuthError> {
         match self.guard.banned(user).await {
             Ok(None) => Ok(()),
             Ok(Some(_)) => Err(AuthError::Banned),
@@ -648,7 +647,7 @@ impl<S: AuthStore> AuthService<S> {
     /// reasons, closing each live connection and recording
     /// `session_revoked`, the sign-out an erasure runs first. Answers the
     /// sessions it revoked.
-    pub(crate) async fn revoke_person(&self, user: &S::Id) -> Result<Vec<SessionId>, AuthError> {
+    pub(crate) async fn revoke_person(&self, user: &D::Id) -> Result<Vec<SessionId>, AuthError> {
         let revoked = self.store.end_all_of(user, None).await?;
         for session in &revoked {
             self.ended(user, *session, crate::audit::AuthOp::SessionRevoked);
@@ -657,7 +656,7 @@ impl<S: AuthStore> AuthService<S> {
     }
 
     /// Close an ended session's live connection and record why it ended.
-    fn ended(&self, user: &S::Id, session: SessionId, op: crate::audit::AuthOp) {
+    fn ended(&self, user: &D::Id, session: SessionId, op: crate::audit::AuthOp) {
         tracing::info!(session = %session, cause = op.label(), "session ended");
         self.notify_revoked(session);
         self.record(crate::audit::AuthEvent::new(
@@ -681,10 +680,10 @@ impl<S: AuthStore> AuthService<S> {
     pub(crate) async fn verify_live(
         &self,
         access_token: &str,
-    ) -> Result<VerifiedSession<S::Id>, LivenessError> {
+    ) -> Result<VerifiedSession<D::Id>, LivenessError> {
         let checked = self
             .authority
-            .check_grant::<S::Id, serde::de::IgnoredAny>(&Grant::new(access_token))
+            .check_grant::<D::Id, serde::de::IgnoredAny>(&Grant::new(access_token))
             .map_err(|_| LivenessError::Refused)?;
         let Subject::Identity(session) = checked.subject else {
             return Err(LivenessError::Refused);
@@ -773,7 +772,7 @@ impl<S: AuthStore> AuthService<S> {
     /// Build the handshake authority sharing this service's token authority
     /// and store.
     #[must_use]
-    pub fn handshake_authority(&self) -> ConnettoHandshakeAuthority<S> {
+    pub fn handshake_authority(&self) -> ConnettoHandshakeAuthority<D> {
         ConnettoHandshakeAuthority {
             authority: Arc::clone(&self.authority),
             store: Arc::clone(&self.store),
@@ -788,20 +787,20 @@ impl<S: AuthStore> AuthService<S> {
 /// It closes the spoofing hole because a caller is only ever whoever a token
 /// connetto signed says it is, and it closes the handle hole because a run with
 /// no identity resumes only on a blob connetto signed.
-pub struct ConnettoHandshakeAuthority<S: AuthStore> {
+pub struct ConnettoHandshakeAuthority<D: ConnettoSchema> {
     authority: Arc<TokenAuthority>,
-    store: Arc<S>,
+    store: Arc<DbAuthStore<D>>,
 }
 
-impl<S: AuthStore> ConnettoHandshakeAuthority<S> {
+impl<D: ConnettoSchema> ConnettoHandshakeAuthority<D> {
     /// Build over a shared token authority and store.
     #[must_use]
-    pub fn new(authority: Arc<TokenAuthority>, store: Arc<S>) -> Self {
+    pub fn new(authority: Arc<TokenAuthority>, store: Arc<DbAuthStore<D>>) -> Self {
         Self { authority, store }
     }
 }
 
-impl<S: AuthStore + 'static> connetto_core::SessionLiveness for ConnettoHandshakeAuthority<S> {
+impl<D: ConnettoSchema> connetto_core::SessionLiveness for ConnettoHandshakeAuthority<D> {
     fn session_is_live(&self, session_id: SessionId) -> connetto_core::LivenessFuture<'_> {
         Box::pin(async move {
             self.store
@@ -812,16 +811,16 @@ impl<S: AuthStore + 'static> connetto_core::SessionLiveness for ConnettoHandshak
     }
 }
 
-impl<S, Key> HandshakeAuthority<S::Id, Key> for ConnettoHandshakeAuthority<S>
+impl<D, Key> HandshakeAuthority<D::Id, Key> for ConnettoHandshakeAuthority<D>
 where
-    S: AuthStore + 'static,
+    D: ConnettoSchema,
     Key: DeserializeOwned + Send + 'static,
 {
-    fn check_grant<'a>(&'a self, grant: &'a Grant) -> GrantCheckFuture<'a, S::Id, Key> {
+    fn check_grant<'a>(&'a self, grant: &'a Grant) -> GrantCheckFuture<'a, D::Id, Key> {
         Box::pin(async move {
             let checked = self
                 .authority
-                .check_grant::<S::Id, Key>(grant)
+                .check_grant::<D::Id, Key>(grant)
                 .map_err(|err| GrantRefused::Invalid(err.to_string()))?;
             let subject = match checked.subject {
                 // Only a login has something to keep alive. A capability is

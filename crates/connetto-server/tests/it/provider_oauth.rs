@@ -10,11 +10,13 @@ use std::sync::Arc;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use connetto_server::{
-    AuthConfig, AuthService, AuthStore as _, CookieSameSite, IdentityProvider as _,
-    InMemoryAuthStore, OAuthEndpoints, OAuthProvider, OAuthProviderConfig, ProviderError,
-    ProviderRegistry, RedirectPolicy, RequestGuard, VerifiedLogin, auth_router,
+    AuthConfig, AuthService, CookieSameSite, DbAuthStore, IdentityProvider as _, OAuthEndpoints,
+    OAuthProvider, OAuthProviderConfig, ProviderError, ProviderRegistry, RedirectPolicy,
+    RequestGuard, VerifiedLogin, auth_router,
 };
-use connetto_test_harness::{Fixture, MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET, MockOauth};
+use connetto_test_harness::{
+    ConnettoDefaults, Fixture, MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET, MockOauth,
+};
 use openidconnect::reqwest;
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -34,11 +36,14 @@ fn provider(idp: &MockOauth, user_url: String) -> OAuthProvider {
         .expect("build the provider")
 }
 
-fn router(provider: OAuthProvider) -> (Arc<InMemoryAuthStore>, axum::Router) {
+async fn router(
+    fixture: &Fixture,
+    provider: OAuthProvider,
+) -> (Arc<DbAuthStore<ConnettoDefaults>>, axum::Router) {
     let config = AuthConfig::default();
     let authority =
         Arc::new(connetto_server::TokenAuthority::generate(&config).expect("generate the keypair"));
-    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(provider));
     let service = Arc::new(AuthService::new(
@@ -129,7 +134,8 @@ async fn sign_in(
 async fn a_plain_oauth_login_mints_a_session_under_the_issuer_label() {
     let idp = MockOauth::start().await;
     let user_url = idp.user_url();
-    let (store, router) = router(provider(&idp, user_url));
+    let fixture = Fixture::acquire().await;
+    let (store, router) = router(&fixture, provider(&idp, user_url)).await;
 
     let body = sign_in(
         &router,
@@ -154,7 +160,8 @@ async fn a_plain_oauth_login_mints_a_session_under_the_issuer_label() {
 async fn a_renamed_login_with_the_same_id_is_the_same_user() {
     let idp = MockOauth::start().await;
     let user_url = idp.user_url();
-    let (_store, router) = router(provider(&idp, user_url));
+    let fixture = Fixture::acquire().await;
+    let (_store, router) = router(&fixture, provider(&idp, user_url)).await;
 
     let before = sign_in(
         &router,

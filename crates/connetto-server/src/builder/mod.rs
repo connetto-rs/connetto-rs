@@ -28,7 +28,7 @@ use tokio::net::TcpListener;
 use tower_http::cors::{AllowCredentials, AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 use crate::audit::{AuthOp, ConnettoAuditSchema, MintedKey, pg_audit_hook, record_awaited};
-use crate::authn::schema::ConnettoStoreSchema;
+use crate::authn::schema::{ConnettoStoreSchema, Desc};
 use crate::ban::ConnettoBanSchema;
 use crate::bots::{ConnettoBotSchema, InstalledApp, pg_bot_registry};
 use crate::defaults::ConnettoDefaults;
@@ -94,13 +94,6 @@ pub const WRITER_SWEEP_CADENCE: Duration = Duration::from_secs(60);
 
 /// The file-serving half of the assembled server.
 pub use content::{ContentBuildError, ContentSettings, StoreSpec};
-
-/// The auth service the assembled server runs, over the database store of
-/// the deployment's auth tables.
-type Service<D> = AuthService<DbAuthStore<D>>;
-
-/// The application's session descriptor the deployment's schema declares.
-type Desc<D> = <<D as ConnettoSchema>::Auth as ConnettoStoreSchema>::Descriptor;
 
 /// The type the deployment's audit table stores a shared row's key as.
 type RowKey<D> = <<D as ConnettoSchema>::Audit as ConnettoAuditSchema>::RowKey;
@@ -787,7 +780,7 @@ where
     D: ConnettoSchema,
 {
     manager: Arc<ServerManager<D>>,
-    service: Arc<Service<D>>,
+    service: Arc<AuthService<D>>,
     pool: PgPool,
     lag_watch: Option<BackgroundTask>,
     sweep: Option<BackgroundTask>,
@@ -2218,7 +2211,7 @@ async fn require_cap_policies<D: ConnettoSchema>(
 /// enrolled with, so its live connection closes and it cannot enrol again.
 fn install_device_identity<D: ConnettoSchema>(
     manager: &ServerManager<D>,
-    service: &Arc<Service<D>>,
+    service: &Arc<AuthService<D>>,
     pool: &PgPool,
     config: DeviceCertConfig,
     sign_in: Option<SignInHook<D::Id, Desc<D>>>,
@@ -2250,7 +2243,7 @@ fn install_device_identity<D: ConnettoSchema>(
 /// enrolled during, read on a spawned task since the hook fires inside the
 /// enrolment.
 fn tell_first_enrolment<D: ConnettoSchema>(
-    service: &Arc<Service<D>>,
+    service: &Arc<AuthService<D>>,
     hook: SignInHook<D::Id, Desc<D>>,
 ) -> FirstEnrolmentHook<D::Id> {
     let service = Arc::clone(service);
@@ -2374,7 +2367,7 @@ async fn build_auth<D: ConnettoSchema>(
     keys: &TokenKeys,
     config: &AuthConfig,
     hooks: AuthHooks<D>,
-) -> Result<(Arc<Service<D>>, Arc<ProviderRegistry>), BuildError> {
+) -> Result<(Arc<AuthService<D>>, Arc<ProviderRegistry>), BuildError> {
     let store = DbAuthStore::<D>::new(pool.clone(), config.refresh_lifetimes(), resolver);
     let authority = TokenAuthority::from_ed_pem(&keys.private, &keys.public, config)
         .map_err(BuildError::TokenKeys)?;
@@ -2704,7 +2697,7 @@ fn log_reconnect(event: &ReconnectEvent<'_>) {
 /// and trim the log (R70 decisions 5, 10 and 18).
 async fn settle_epoch<D: ConnettoSchema>(
     manager: &ServerManager<D>,
-    service: &Service<D>,
+    service: &AuthService<D>,
     pool: &PgPool,
     check: StreamCheck,
     found: crate::epoch::Found,
@@ -2734,7 +2727,7 @@ async fn settle_epoch<D: ConnettoSchema>(
 /// settlement.
 async fn wire_manager<D: ConnettoSchema>(
     manager: &Arc<ServerManager<D>>,
-    service: &Service<D>,
+    service: &AuthService<D>,
     guard: &Arc<RequestGuard<D::Id>>,
     pool: &PgPool,
     feed: &Feed,
@@ -2815,7 +2808,7 @@ struct WriteSide<D: ConnettoSchema> {
 /// session before returning a terminal outcome.
 fn change_stream<D: ConnettoSchema>(
     manager: Arc<ServerManager<D>>,
-    service: Arc<Service<D>>,
+    service: Arc<AuthService<D>>,
     pool: PgPool,
     feed: Feed,
     policy: ReconnectPolicy,
@@ -2893,7 +2886,7 @@ struct StreamWiring {
 /// The assembled server's parts, the three routers and the change stream.
 fn assemble_parts<D: ConnettoSchema>(
     manager: Arc<ServerManager<D>>,
-    service: Arc<Service<D>>,
+    service: Arc<AuthService<D>>,
     pool: PgPool,
     portability: Option<Arc<PortabilityState>>,
     registry: Arc<ProviderRegistry>,

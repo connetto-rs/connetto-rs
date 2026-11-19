@@ -1,4 +1,4 @@
-//! Phase 3 provider verification and token-retention tests (Docker-free).
+//! Provider verification and token-retention tests.
 //!
 //! A locally minted, locally signed ID token exercises the real verification
 //! path: the mapping to a [`ResolvedIdentity`](connetto_server::ResolvedIdentity), the nonce and audience checks,
@@ -13,11 +13,11 @@ use connetto_core::Subject;
 use connetto_core::messages::Grant;
 use connetto_server::{
     AssuranceRequirement, AuthConfig, AuthError, AuthService, GenericOidcProvider,
-    IdentityProvider, InMemoryAuthStore, LoginRedirect, OidcProviderConfig, ProviderError,
-    ProviderRegistry, RequestGuard, ResolvedIdentity, RetainedProviderToken, SessionId,
-    TokenAuthority, VerifiedLogin,
+    IdentityProvider, LoginRedirect, OidcProviderConfig, ProviderError, ProviderRegistry,
+    RequestGuard, ResolvedIdentity, RetainedProviderToken, SessionId, TokenAuthority,
+    VerifiedLogin,
 };
-use connetto_test_harness::{MOCK_OAUTH_PROVIDER, MockOauth};
+use connetto_test_harness::{ConnettoDefaults, Fixture, MOCK_OAUTH_PROVIDER, MockOauth};
 use openidconnect::core::{
     CoreIdToken, CoreIdTokenClaims, CoreJsonWebKeySet, CoreJwsSigningAlgorithm,
     CoreRsaPrivateSigningKey,
@@ -179,9 +179,10 @@ fn mfa_assurance_requires_the_configured_amr() {
 
 async fn service_with_real_provider() -> (
     Arc<TokenAuthority>,
-    AuthService<InMemoryAuthStore>,
+    AuthService<ConnettoDefaults>,
     VerifiedLogin,
     MockOauth,
+    Fixture,
 ) {
     const CALLBACK: &str = "http://127.0.0.1:1/auth/callback";
     let idp = MockOauth::start().await;
@@ -221,7 +222,8 @@ async fn service_with_real_provider() -> (
     let provider: Arc<dyn IdentityProvider> = Arc::new(provider);
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let fixture = Fixture::acquire().await;
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::clone(&provider));
     let service = AuthService::new(
@@ -230,12 +232,12 @@ async fn service_with_real_provider() -> (
         Arc::new(RequestGuard::default()),
     )
     .with_registry(Arc::new(registry));
-    (authority, service, login, idp)
+    (authority, service, login, idp, fixture)
 }
 
 #[tokio::test]
 async fn accessor_refreshes_an_expired_provider_token() {
-    let (authority, service, mut login, _idp) = service_with_real_provider().await;
+    let (authority, service, mut login, _idp, _fixture) = service_with_real_provider().await;
     login.retained.access_token = "stale".to_owned();
     login.retained.expires_in = Some(Duration::ZERO);
     let pair = service
@@ -277,7 +279,7 @@ async fn accessor_refreshes_an_expired_provider_token() {
 
 #[tokio::test]
 async fn accessor_returns_a_still_valid_token_unrefreshed() {
-    let (authority, service, mut login, _idp) = service_with_real_provider().await;
+    let (authority, service, mut login, _idp, _fixture) = service_with_real_provider().await;
     login.retained.access_token = "still-good".to_owned();
     login.retained.expires_in = Some(Duration::from_secs(3600));
     let pair = service
@@ -348,16 +350,17 @@ impl IdentityProvider for SharedIssuerClient {
     }
 }
 
-/// A service over an in-memory store with these shared-issuer clients
+/// A service over the fixture's store with these shared-issuer clients
 /// registered, or with no registry attached when `clients` is `None`.
-fn shared_issuer_service(
+async fn shared_issuer_service(
     clients: Option<&[&'static str]>,
-) -> (Arc<TokenAuthority>, AuthService<InMemoryAuthStore>) {
+) -> (Arc<TokenAuthority>, AuthService<ConnettoDefaults>, Fixture) {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
+    let fixture = Fixture::acquire().await;
     let service = AuthService::new(
         Arc::clone(&authority),
-        Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes())),
+        fixture.auth_store(config.refresh_lifetimes()).await,
         Arc::new(RequestGuard::default()),
     );
     let service = match clients {
@@ -370,14 +373,14 @@ fn shared_issuer_service(
         }
         None => service,
     };
-    (authority, service)
+    (authority, service, fixture)
 }
 
 /// A session signed in through `provider` whose retained provider access
 /// token has already expired.
 async fn expired_session(
     authority: &TokenAuthority,
-    service: &AuthService<InMemoryAuthStore>,
+    service: &AuthService<ConnettoDefaults>,
     provider: &str,
     refresh_token: Option<&str>,
 ) -> SessionId {
@@ -420,7 +423,7 @@ async fn expired_session(
 /// the provider refuses a refresh token presented by another client.
 #[tokio::test]
 async fn a_refresh_goes_through_the_client_the_session_signed_in_with() {
-    let (authority, service) = shared_issuer_service(Some(&["web", "native"]));
+    let (authority, service, _fixture) = shared_issuer_service(Some(&["web", "native"])).await;
     for client in ["web", "native"] {
         let session = expired_session(&authority, &service, client, Some("refresh")).await;
         let token = service
@@ -454,7 +457,7 @@ async fn an_expired_provider_token_nothing_can_renew_is_refused() {
         ),
         ("no registry is attached", None, "web", Some("refresh")),
     ] {
-        let (authority, service) = shared_issuer_service(clients);
+        let (authority, service, _fixture) = shared_issuer_service(clients).await;
         let session = expired_session(&authority, &service, provider, refresh_token).await;
         let answer = service.provider_access_token(session).await;
         assert!(

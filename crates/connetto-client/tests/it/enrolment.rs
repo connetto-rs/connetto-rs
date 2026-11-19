@@ -32,10 +32,10 @@ use connetto_server::device_cert::{
     DeviceCertConfig, DeviceEnrolment, Enrolment, MemoryEnrolments,
 };
 use connetto_server::{
-    AbuseConfig, AuthConfig, AuthService, GenericOidcProvider, InMemoryAuthStore, ManagerBuilder,
-    Materializer, PgReadConnector, PgSnapshotSource, ProviderRegistry, RedirectPolicy,
-    RequestGuard, RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits,
-    TokenAuthority, WebSocketTransport, auth_router, loopback, pg_write_target,
+    AbuseConfig, AuthConfig, AuthService, GenericOidcProvider, ManagerBuilder, Materializer,
+    PgReadConnector, PgSnapshotSource, ProviderRegistry, RedirectPolicy, RequestGuard,
+    RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, TokenAuthority,
+    WebSocketTransport, auth_router, loopback, pg_write_target,
 };
 use connetto_test_harness::native_client;
 use connetto_test_harness::{
@@ -264,7 +264,7 @@ fn root() -> Vec<u8> {
 
 /// Serve the auth router with one containerised provider, returning the base
 /// URL, the service and the provider guard.
-async fn spawn_auth() -> (String, Arc<AuthService<InMemoryAuthStore>>, MockOauth) {
+async fn spawn_auth(fixture: &Fixture) -> (String, Arc<AuthService<ConnettoDefaults>>, MockOauth) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind the auth listener");
@@ -283,7 +283,7 @@ async fn spawn_auth() -> (String, Arc<AuthService<InMemoryAuthStore>>, MockOauth
     let config = AuthConfig::default();
     let service = Arc::new(AuthService::new(
         Arc::new(TokenAuthority::generate(&config).expect("token authority")),
-        Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes())),
+        fixture.auth_store(config.refresh_lifetimes()).await,
         Arc::new(RequestGuard::default()),
     ));
     let mut registry = ProviderRegistry::new();
@@ -303,7 +303,7 @@ async fn spawn_auth() -> (String, Arc<AuthService<InMemoryAuthStore>>, MockOauth
 }
 
 /// A manager whose handshake authority verifies `service`'s tokens.
-fn manager(fixture: &Fixture, service: &Arc<AuthService<InMemoryAuthStore>>) -> Arc<Manager> {
+fn manager(fixture: &Fixture, service: &Arc<AuthService<ConnettoDefaults>>) -> Arc<Manager> {
     let guard = Arc::new(RequestGuard::new(
         ThrottleConfig::default()
             .with_identified(TierLimits::identified().with_read_timeout(Duration::from_secs(30))),
@@ -363,7 +363,7 @@ async fn spawn_server(
 /// guard.
 async fn sync_server(
     fixture: &Fixture,
-    service: &Arc<AuthService<InMemoryAuthStore>>,
+    service: &Arc<AuthService<ConnettoDefaults>>,
     config: DeviceCertConfig,
     store: Arc<MemoryEnrolments<String>>,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -374,7 +374,7 @@ async fn sync_server(
 /// As [`sync_server`], also handing back the manager an operator revokes through.
 async fn sync_server_with_manager(
     fixture: &Fixture,
-    service: &Arc<AuthService<InMemoryAuthStore>>,
+    service: &Arc<AuthService<ConnettoDefaults>>,
     config: DeviceCertConfig,
     store: Arc<MemoryEnrolments<String>>,
 ) -> (
@@ -397,7 +397,7 @@ async fn sync_server_with_manager(
 /// a device whose clock differs from the server's.
 async fn skewed_server(
     fixture: &Fixture,
-    service: &Arc<AuthService<InMemoryAuthStore>>,
+    service: &Arc<AuthService<ConnettoDefaults>>,
     store: Arc<MemoryEnrolments<String>>,
     clock: fn() -> SystemTime,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -725,7 +725,7 @@ fn a_first_connect_enrols_and_records_the_descriptor() {
 
 async fn first_connect() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server) = sync_server(
         &fixture,
@@ -787,7 +787,7 @@ fn a_renewal_past_half_life_replaces_the_certificate() {
 
 async fn renewal() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server) = sync_server(
         &fixture,
@@ -866,7 +866,7 @@ fn a_reissue_grants_the_asked_lifetime_and_refuses_over_the_ceiling() {
 
 async fn reissue() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let config = DeviceCertConfig::new(issuer())
         .with_default_lifetime(Duration::from_secs(30))
@@ -942,7 +942,7 @@ fn a_builder_lifetime_over_the_ceiling_enrols_at_the_ceiling_and_says_so() {
 
 async fn cap() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let config = DeviceCertConfig::new(issuer())
         .with_default_lifetime(Duration::from_secs(3600))
@@ -1070,7 +1070,7 @@ async fn asks_for_login(addr: std::net::SocketAddr, base: &str, app_id: &str, di
 
 async fn revoke() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server) = sync_server(
         &fixture,
@@ -1180,7 +1180,7 @@ fn a_start_after_a_crash_mid_wipe_finishes_it() {
 
 async fn revoke_crashed() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server) = sync_server(
         &fixture,
@@ -1254,7 +1254,7 @@ fn a_failed_wipe_part_is_reported_and_completed_by_the_next_start() {
 
 async fn revoke_retry() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server) = sync_server(
         &fixture,
@@ -1353,7 +1353,7 @@ fn a_server_without_enrolment_stays_a_spectator() {
 
 async fn spectator() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let (addr, _server) = spawn_server(manager(&fixture, &service)).await;
     let dir = tempdir().expect("a data directory");
 
@@ -1397,7 +1397,7 @@ fn a_restarted_build_sees_its_certificate_before_the_connect() {
 
 async fn restart() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server) = sync_server(
         &fixture,
@@ -1457,7 +1457,8 @@ fn an_offline_build_refuses_the_reissue_as_offline() {
 }
 
 async fn offline() {
-    let (base, _service, _idp) = spawn_auth().await;
+    let fixture = Fixture::acquire().await;
+    let (base, _service, _idp) = spawn_auth(&fixture).await;
     let dir = tempdir().expect("a data directory");
 
     let client = Box::pin(
@@ -1489,7 +1490,7 @@ fn a_forget_deletes_the_device_key_record() {
 
 async fn forget() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server) = sync_server(
         &fixture,
@@ -1596,7 +1597,7 @@ fn reporting_a_device_lost_revokes_it_everywhere() {
 #[expect(clippy::too_many_lines, reason = "one phase scenario per body")]
 async fn report() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server) = sync_server(
         &fixture,
@@ -1710,7 +1711,7 @@ fn a_device_revoked_while_away_learns_it_at_connect() {
 
 async fn learned_at_connect() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server, manager) = sync_server_with_manager(
         &fixture,
@@ -1768,7 +1769,7 @@ fn a_grant_outside_the_roots_is_refused() {
 
 async fn untrusted() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server) = sync_server(
         &fixture,
@@ -1813,7 +1814,8 @@ fn a_build_without_roots_refuses_to_connect() {
 }
 
 async fn no_roots() {
-    let (base, _service, _idp) = spawn_auth().await;
+    let fixture = Fixture::acquire().await;
+    let (base, _service, _idp) = spawn_auth(&fixture).await;
     let dir = tempdir().expect("dir");
     let refused = Box::pin(
         NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
@@ -1850,7 +1852,7 @@ fn a_root_revoking_the_issuer_withdraws_and_re_enrols_the_key() {
 
 async fn rotation_withdraws() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (old_addr, _old_server) = sync_server(
         &fixture,
@@ -1957,7 +1959,7 @@ fn a_clock_behind_the_server_is_told_and_recovers_on_renewal() {
 
 async fn clock_behind() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (ahead, _ahead) = skewed_server(&fixture, &service, Arc::clone(&store), || {
         SystemTime::now() + Duration::from_hours(2)
@@ -2036,7 +2038,7 @@ fn a_clock_ahead_of_the_server_is_told() {
 
 async fn clock_ahead() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (behind, _server) = skewed_server(&fixture, &service, store, || {
         SystemTime::now() - Duration::from_hours(3)
@@ -2074,7 +2076,7 @@ fn a_lost_key_enrols_again_under_a_fresh_key() {
 
 async fn lost_key() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server) = sync_server(
         &fixture,
@@ -2141,7 +2143,7 @@ fn a_refused_attestation_is_raised_and_the_device_asks_again_on_the_next_connect
 
 async fn attestation() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let config =
         DeviceCertConfig::new(issuer()).with_accepted_attestation([AttestationLevel::ChipProven]);
@@ -2215,7 +2217,7 @@ fn a_reported_device_is_refused_by_a_peer_that_learned_it_from_a_peer() {
 )]
 async fn peer_report() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, server) = sync_server(
         &fixture,
@@ -2436,7 +2438,7 @@ fn a_number_tail_then_binds_the_key() {
 
 async fn wd_tail_bind() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server, _manager) = sync_server_with_manager(
         &fixture,
@@ -2501,7 +2503,7 @@ fn a_device_only_bind_reconciles() {
 
 async fn wd_device_bind() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server, _manager) = sync_server_with_manager(
         &fixture,
@@ -2601,7 +2603,7 @@ fn a_first_certificate_becomes_the_device() {
 
 async fn wd_first_cert() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server, _manager) = sync_server_with_manager(
         &fixture,
@@ -2665,7 +2667,7 @@ fn a_number_tail_settles_into_the_device() {
 
 async fn wd_tail_settles() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server, _manager) = sync_server_with_manager(
         &fixture,
@@ -2731,7 +2733,7 @@ fn a_retired_device_writer_reenrols_with_provenance() {
 #[expect(clippy::too_many_lines, reason = "one phase scenario per body")]
 async fn wd_retiring() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server, _manager) = sync_server_with_manager(
         &fixture,
@@ -2850,7 +2852,7 @@ fn a_device_revoked_while_away_loses_its_tail_with_the_replica() {
 
 async fn wd_revoked() {
     let fixture = Fixture::acquire().await;
-    let (base, service, _idp) = spawn_auth().await;
+    let (base, service, _idp) = spawn_auth(&fixture).await;
     let store = Arc::new(MemoryEnrolments::default());
     let (addr, _server, manager) = sync_server_with_manager(
         &fixture,

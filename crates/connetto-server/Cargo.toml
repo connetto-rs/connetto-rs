@@ -161,10 +161,14 @@ serde_bytes = { version = "0.11", features = ["std"] }
 [features]
 default = ["content"]
 content = ["dep:connetto-file-server", "dep:connetto-file-core"]
-# Gates the test-only assembly paths: `ManagerBuilder::new`, `Materializer::builder`, and the
-# in-memory auth store. Production builds leave the constructors crate-internal, so
-# `ServerBuilder` is the only way a dependent crate assembles a server.
+# Gates the test-only assembly paths: `ManagerBuilder::new` and
+# `Materializer::builder`. Production builds leave the constructors
+# crate-internal, so `ServerBuilder` is the only way a dependent crate
+# assembles a server.
 test-seams = []
+# Lets `connetto_schema!` take `rosetta_uuid::Uuid => rosetta_uuid::sql_types::Uuid`
+# as the deployment's id.
+rosetta-uuid = ["connetto-core/rosetta-uuid"]
 
 [dev-dependencies]
 # The device certificate settings tests create a root and issuer of their own.
@@ -174,7 +178,8 @@ rcgen = { version = "0.14.10", default-features = false, features = ["ring", "x5
 ring = "0.17"
 # The handshake authority is a required constructor argument with no production
 # default (R2), so the suites install the test-only stand-in from the core.
-connetto-core = { workspace = true, features = ["test-support"] }
+# authn_generic_id.rs keys its schema on `rosetta_uuid::Uuid`.
+connetto-core = { workspace = true, features = ["test-support", "rosetta-uuid"] }
 # Paused-clock reserve-gate tests: the over-share refusal waits out a real
 # queue window, which `start_paused` advances instantly.
 tokio = { workspace = true, features = ["test-util"] }
@@ -195,9 +200,9 @@ connetto-file-core = { path = "../connetto-file-core" }
 # The raw-frame WebSocket client the sync adapter tests drive over `/sync`.
 tokio-tungstenite = "0.24"
 http-body-util = "0.1"
-# The demo distributed id type, driving the generic in-memory auth store over a
-# typed user id (not a string) in authn_generic_id.rs.
-rosetta-uuid = { version = "0.2.0", features = ["serde"] }
+# The demo distributed id type, driving the database auth store over a typed
+# user id (not a string) in authn_generic_id.rs, stored as a Postgres `uuid`.
+rosetta-uuid = { version = "0.2.0", features = ["diesel", "postgres", "serde"] }
 # The in-process CDC-loop test harness over real Postgres. It depends on this
 # crate, so the harness-backed tests are Docker-gated (a dev-dependency cycle
 # Cargo permits).

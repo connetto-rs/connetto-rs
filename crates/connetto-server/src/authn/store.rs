@@ -1,15 +1,12 @@
-//! The pluggable auth store: identity mapping, connetto's sessions, and the
-//! rotating refresh tokens.
-//!
-//! Two variants ship. [`InMemoryAuthStore`] holds everything in the process,
-//! resolves identity deterministically from `(issuer, subject)`, and is
-//! single-server and ephemeral. The database store holds
-//! it in Postgres through typed diesel queries, resolves identity through a
-//! linking table so one human may hold several logins, and is durable. See `docs/architecture/11-authentication.md`.
+//! The auth store: identity mapping, connetto's sessions, and the rotating
+//! refresh tokens, held in Postgres through typed diesel queries over the
+//! deployment's [`ConnettoStoreSchema`](crate::authn::schema::ConnettoStoreSchema).
+//! See `docs/architecture/11-authentication.md`.
 //!
 //! The refresh token is `"<session_id>.<secret>"`. Only the SHA-256 of the
 //! secret is stored, and every rotation replaces it. A presented secret whose
-//! treated as reuse of a rotated-out token (theft) and revokes the session.
+//! hash is not the current one is treated as reuse of a rotated-out token
+//! (theft) and revokes the session.
 
 use std::time::SystemTime;
 
@@ -18,9 +15,7 @@ use connetto_core::auth::AuthContext;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::authn::identity::{IdentityResolver, ResolveError, VerifiedClaims};
-use crate::authn::schema::SessionRecord;
-use crate::authn::token::RefreshLifetimes;
+use crate::authn::identity::{ResolveError, VerifiedClaims};
 
 /// A caller identity resolved from a verified credential, ready to mint a
 /// session for. Human-readable fields never serve as identity: only the
@@ -42,7 +37,8 @@ pub struct ResolvedIdentity {
 }
 
 impl ResolvedIdentity {
-    /// The verified provider claims to hand the [`IdentityResolver`].
+    /// The verified provider claims to hand the
+    /// [`IdentityResolver`](crate::authn::identity::IdentityResolver).
     #[must_use]
     pub fn verified_claims(&self) -> VerifiedClaims {
         VerifiedClaims {
@@ -100,7 +96,7 @@ pub struct RefreshOutcome<Id = String> {
     pub session_expires_at: SystemTime,
 }
 
-/// Failure surfaced by an [`AuthStore`].
+/// Failure surfaced by a [`DbAuthStore`].
 #[derive(Debug, thiserror::Error)]
 pub enum AuthStoreError {
     /// No session matched, or the presented token was malformed.
@@ -134,161 +130,6 @@ impl From<diesel::result::Error> for AuthStoreError {
     fn from(err: diesel::result::Error) -> Self {
         Self::Backend(err.to_string())
     }
-}
-
-/// The identity mapping, connetto's sessions, and the rotating refresh tokens.
-///
-/// Methods return `impl Future + Send` (not `async fn`) so a generic caller
-/// (the session verifier boxed into a `Send` future, the async endpoints) stays
-/// `Send` on the multi-threaded runtime. The concrete store is chosen at
-/// startup, the same way the server binary chooses its visibility policy.
-pub trait AuthStore: Send + Sync {
-    /// The developer-defined distributed user id this store resolves identities
-    /// to and keys sessions on. connetto serializes it into the access-token
-    /// claim (both ways), renders it to the RLS GUC through `Display`, and
-    /// shares it across the runtime, so the full invariant lives here once.
-    type Id: serde::Serialize
-        + serde::de::DeserializeOwned
-        + Clone
-        + core::fmt::Display
-        + Send
-        + Sync
-        + 'static;
-
-    /// The application's description of a session, which every session row
-    /// carries.
-    type Descriptor: Clone + Send + Sync + 'static;
-
-    /// The description every session carries when the deployment declares
-    /// none, `None` when a describe callback must supply one.
-    fn undescribed() -> Option<Self::Descriptor>;
-
-    /// Resolve `identity` to the deployment's `user_id`, which sign-in reads
-    /// the ban list for before any session exists (R105 decision 8).
-    fn resolve(
-        &self,
-        identity: &ResolvedIdentity,
-    ) -> impl Future<Output = Result<Self::Id, AuthStoreError>> + Send;
-
-    /// Create a session for `user_id`, the person `identity` resolved to,
-    /// recording where it came from, and return it with its first refresh
-    /// token.
-    fn create_session_for(
-        &self,
-        user_id: Self::Id,
-        identity: &ResolvedIdentity,
-        origin: SessionOrigin<Self::Descriptor>,
-    ) -> impl Future<Output = Result<IssuedSession<Self::Id>, AuthStoreError>> + Send;
-
-    /// Resolve `identity` and create a session for it.
-    fn create_session(
-        &self,
-        identity: &ResolvedIdentity,
-        origin: SessionOrigin<Self::Descriptor>,
-    ) -> impl Future<Output = Result<IssuedSession<Self::Id>, AuthStoreError>> + Send {
-        async move {
-            let user_id = self.resolve(identity).await?;
-            self.create_session_for(user_id, identity, origin).await
-        }
-    }
-
-    /// How the session began and when it last refreshed, `None` when the id
-    /// names no session.
-    #[expect(
-        clippy::type_complexity,
-        reason = "the trait spells its future's output in full, as every method beside it does"
-    )]
-    fn session_record(
-        &self,
-        session_id: SessionId,
-    ) -> impl Future<
-        Output = Result<Option<SessionRecord<Self::Id, Self::Descriptor>>, AuthStoreError>,
-    > + Send;
-
-    /// Every live session of `user`, oldest first: not revoked, and neither
-    /// deadline passed.
-    #[expect(
-        clippy::type_complexity,
-        reason = "the trait spells its future's output in full, as every method beside it does"
-    )]
-    fn sessions_of(
-        &self,
-        user: &Self::Id,
-    ) -> impl Future<Output = Result<Vec<SessionRecord<Self::Id, Self::Descriptor>>, AuthStoreError>>
-    + Send;
-
-    /// Revoke `session` when it is `user`'s and not yet revoked, answering
-    /// whether it was.
-    fn end_owned(
-        &self,
-        user: &Self::Id,
-        session: SessionId,
-    ) -> impl Future<Output = Result<bool, AuthStoreError>> + Send;
-
-    /// Revoke every live session of `user` but `keep`, answering the ones it
-    /// revoked.
-    fn end_all_of(
-        &self,
-        user: &Self::Id,
-        keep: Option<SessionId>,
-    ) -> impl Future<Output = Result<Vec<SessionId>, AuthStoreError>> + Send;
-
-    /// Whether the session still exists, is not revoked, and is within both
-    /// its idle window and its absolute ceiling. This is the handshake
-    /// liveness check that makes revocation authoritative.
-    fn session_is_live(
-        &self,
-        session_id: SessionId,
-    ) -> impl Future<Output = Result<bool, AuthStoreError>> + Send;
-
-    /// Validate the presented refresh token, rotate it, extend the idle
-    /// window, and return the rotated token plus the identity to re-mint
-    /// access from.
-    fn rotate_refresh(
-        &self,
-        refresh_token: &str,
-    ) -> impl Future<Output = Result<RefreshOutcome<Self::Id>, AuthStoreError>> + Send;
-
-    /// Revoke the session, refusing it on the next handshake even while its
-    /// access token is still time-valid.
-    fn revoke_session(
-        &self,
-        session_id: SessionId,
-    ) -> impl Future<Output = Result<(), AuthStoreError>> + Send;
-
-    /// Revoke every session still live, returning how many were, the answer to a restore that revived rotated refresh tokens.
-    fn revoke_every_session(&self) -> impl Future<Output = Result<u64, AuthStoreError>> + Send;
-
-    /// The session a presented refresh token names, once its secret is
-    /// verified, or `None` when no live session matches.
-    ///
-    /// This is the authentication a logout needs: the caller holds the
-    /// credential it wants torn down, and nothing else identifies the session
-    /// to revoke. Unlike [`rotate_refresh`](Self::rotate_refresh) it does not
-    /// rotate, and a mismatched secret is `None` rather than a theft signal,
-    /// because an endpoint whose only effect is revocation must not become an
-    /// oracle for guessed session ids.
-    fn session_for_refresh(
-        &self,
-        refresh_token: &str,
-    ) -> impl Future<Output = Result<Option<SessionId>, AuthStoreError>> + Send;
-
-    /// Store the retained provider tokens for a session, replacing any
-    /// existing.
-    fn set_retained_provider_token(
-        &self,
-        session_id: SessionId,
-        token: &crate::authn::provider::RetainedProviderToken,
-    ) -> impl Future<Output = Result<(), AuthStoreError>> + Send;
-
-    /// Read a session's retained provider tokens, if any were stored, with
-    /// the store's verdict on the access token's lifetime.
-    fn retained_provider_token(
-        &self,
-        session_id: SessionId,
-    ) -> impl Future<
-        Output = Result<Option<crate::authn::provider::StoredProviderToken>, AuthStoreError>,
-    > + Send;
 }
 
 /// A fresh 256-bit refresh secret as hex.
@@ -337,387 +178,6 @@ pub(crate) fn split_refresh(token: &str) -> Option<(SessionId, &str)> {
     Some((id.parse().ok()?, secret))
 }
 
-/// The in-memory auth store. Single-server and ephemeral: a restart drops every
-/// session and forces re-login. Identity resolves through a supplied resolver
-/// (deterministic UUID v5 by default), so no lookup and no linking table.
-///
-/// It serves one process, so its deadlines live on the process clock, held
-/// in a seam that defaults to `SystemTime::now` (chapter 21). Its sessions
-/// carry no application description.
-pub struct InMemoryAuthStore<Id = String> {
-    lifetimes: RefreshLifetimes,
-    sessions: std::sync::Mutex<std::collections::HashMap<SessionId, StoredSession<Id>>>,
-    resolver: std::sync::Arc<dyn IdentityResolver<Id = Id>>,
-    clock: std::sync::Arc<dyn Fn() -> SystemTime + Send + Sync>,
-}
-
-struct StoredSession<Id> {
-    context: AuthContext<Id>,
-    current_refresh_hash: [u8; 32],
-    idle_deadline: SystemTime,
-    absolute_deadline: SystemTime,
-    revoked: bool,
-    retained: Option<RetainedRecord>,
-    provider: String,
-    issuer: String,
-    created_at: SystemTime,
-    refreshed_at: Option<SystemTime>,
-}
-
-impl<Id: Clone> StoredSession<Id> {
-    /// The session as its record shows it.
-    fn record(&self, session_id: SessionId) -> SessionRecord<Id, ()> {
-        SessionRecord {
-            session_id,
-            user_id: self.context.user_id.clone(),
-            provider: self.provider.clone(),
-            issuer: self.issuer.clone(),
-            description: (),
-            created_at: self.created_at,
-            refreshed_at: self.refreshed_at,
-        }
-    }
-
-    /// Whether the session is still a place someone is signed in at `now`.
-    fn live_at(&self, now: SystemTime) -> bool {
-        !self.revoked && now <= self.idle_deadline && now <= self.absolute_deadline
-    }
-}
-
-/// The store's own copy of a session's retained provider tokens, stamped with
-/// the expiry the process clock projects.
-struct RetainedRecord {
-    issuer: String,
-    access_token: String,
-    refresh_token: Option<String>,
-    expires_at: Option<SystemTime>,
-}
-
-#[cfg(feature = "test-seams")]
-impl InMemoryAuthStore<String> {
-    /// Build an empty store enforcing `lifetimes`, resolving identity to a
-    /// deterministic UUID v5 string over `(issuer, subject)`.
-    #[must_use]
-    pub fn new(lifetimes: RefreshLifetimes) -> Self {
-        Self::with_resolver(
-            lifetimes,
-            std::sync::Arc::new(crate::authn::identity::DefaultUuidResolver),
-        )
-    }
-}
-
-#[cfg(feature = "test-seams")]
-impl<Id> InMemoryAuthStore<Id> {
-    /// Build an empty store enforcing `lifetimes`, resolving each verified
-    /// identity to a typed `Id` through `resolver`. This is the in-memory
-    /// path for the developer's [`IdentityResolver`].
-    #[must_use]
-    pub fn with_resolver(
-        lifetimes: RefreshLifetimes,
-        resolver: std::sync::Arc<dyn IdentityResolver<Id = Id>>,
-    ) -> Self {
-        Self {
-            lifetimes,
-            sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
-            resolver,
-            clock: std::sync::Arc::new(SystemTime::now),
-        }
-    }
-}
-
-impl<
-    Id: serde::Serialize
-        + serde::de::DeserializeOwned
-        + Clone
-        + PartialEq
-        + core::fmt::Display
-        + Send
-        + Sync
-        + 'static,
-> AuthStore for InMemoryAuthStore<Id>
-{
-    type Id = Id;
-    type Descriptor = ();
-
-    fn undescribed() -> Option<()> {
-        Some(())
-    }
-
-    async fn resolve(&self, identity: &ResolvedIdentity) -> Result<Id, AuthStoreError> {
-        Ok(self.resolver.resolve(&identity.verified_claims()).await?)
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn create_session_for(
-        &self,
-        user_id: Id,
-        identity: &ResolvedIdentity,
-        origin: SessionOrigin<()>,
-    ) -> Result<IssuedSession<Id>, AuthStoreError> {
-        let now = (self.clock)();
-        let context = AuthContext { user_id };
-        let session_id = new_session_id();
-        let secret = new_refresh_secret();
-        let record = StoredSession {
-            context: context.clone(),
-            current_refresh_hash: hash_secret(&secret),
-            idle_deadline: now + self.lifetimes.idle_window(),
-            absolute_deadline: now + self.lifetimes.absolute_ceiling(),
-            revoked: false,
-            retained: None,
-            provider: origin.provider,
-            issuer: identity.issuer.clone(),
-            created_at: now,
-            refreshed_at: None,
-        };
-        self.sessions
-            .lock()
-            .expect("auth store lock")
-            .insert(session_id, record);
-        let refresh_token = format_refresh(session_id, &secret);
-        Ok(IssuedSession {
-            session_id,
-            context,
-            refresh_token,
-            session_expires_at: (now + self.lifetimes.idle_window())
-                .min(now + self.lifetimes.absolute_ceiling()),
-            created_at: now,
-        })
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn session_record(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<SessionRecord<Id, ()>>, AuthStoreError> {
-        let sessions = self.sessions.lock().expect("auth store lock");
-        Ok(sessions
-            .get(&session_id)
-            .map(|stored| stored.record(session_id)))
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn sessions_of(&self, user: &Id) -> Result<Vec<SessionRecord<Id, ()>>, AuthStoreError> {
-        let now = (self.clock)();
-        let sessions = self.sessions.lock().expect("auth store lock");
-        let mut records: Vec<_> = sessions
-            .iter()
-            .filter(|(_, stored)| stored.context.user_id == *user && stored.live_at(now))
-            .map(|(session_id, stored)| stored.record(*session_id))
-            .collect();
-        records.sort_by_key(|record| record.created_at);
-        Ok(records)
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn end_owned(&self, user: &Id, session: SessionId) -> Result<bool, AuthStoreError> {
-        let mut sessions = self.sessions.lock().expect("auth store lock");
-        Ok(match sessions.get_mut(&session) {
-            Some(stored) if stored.context.user_id == *user && !stored.revoked => {
-                stored.revoked = true;
-                stored.retained = None;
-                true
-            }
-            _ => false,
-        })
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn end_all_of(
-        &self,
-        user: &Id,
-        keep: Option<SessionId>,
-    ) -> Result<Vec<SessionId>, AuthStoreError> {
-        let now = (self.clock)();
-        let mut sessions = self.sessions.lock().expect("auth store lock");
-        let mut ended = Vec::new();
-        for (session_id, stored) in sessions.iter_mut() {
-            if stored.context.user_id == *user && stored.live_at(now) && keep != Some(*session_id) {
-                stored.revoked = true;
-                stored.retained = None;
-                ended.push(*session_id);
-            }
-        }
-        Ok(ended)
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn session_is_live(&self, session_id: SessionId) -> Result<bool, AuthStoreError> {
-        let now = (self.clock)();
-        let sessions = self.sessions.lock().expect("auth store lock");
-        Ok(sessions
-            .get(&session_id)
-            .is_some_and(|record| record.live_at(now)))
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn rotate_refresh(
-        &self,
-        refresh_token: &str,
-    ) -> Result<RefreshOutcome<Id>, AuthStoreError> {
-        let now = (self.clock)();
-        let (session_id, secret) = split_refresh(refresh_token).ok_or(AuthStoreError::NotFound)?;
-        let mut sessions = self.sessions.lock().expect("auth store lock");
-        let record = sessions
-            .get_mut(&session_id)
-            .ok_or(AuthStoreError::NotFound)?;
-        if record.revoked {
-            return Err(AuthStoreError::NotFound);
-        }
-        if now > record.absolute_deadline || now > record.idle_deadline {
-            return Err(AuthStoreError::Expired);
-        }
-        if !hashes_match(&hash_secret(secret), &record.current_refresh_hash) {
-            // A rotated-out token for a live session: treat as theft.
-            record.revoked = true;
-            record.retained = None;
-            return Err(AuthStoreError::Reuse { session_id });
-        }
-        let new_secret = new_refresh_secret();
-        record.current_refresh_hash = hash_secret(&new_secret);
-        record.idle_deadline = (now + self.lifetimes.idle_window()).min(record.absolute_deadline);
-        record.refreshed_at = Some(now);
-        Ok(RefreshOutcome {
-            session_id,
-            context: record.context.clone(),
-            refresh_token: format_refresh(session_id, &new_secret),
-            session_expires_at: record.idle_deadline,
-        })
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn revoke_session(&self, session_id: SessionId) -> Result<(), AuthStoreError> {
-        if let Some(record) = self
-            .sessions
-            .lock()
-            .expect("auth store lock")
-            .get_mut(&session_id)
-        {
-            record.revoked = true;
-            record.retained = None;
-        }
-        Ok(())
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
-        let mut revoked = 0;
-        for record in self
-            .sessions
-            .lock()
-            .expect("auth store lock")
-            .values_mut()
-            .filter(|record| !record.revoked)
-        {
-            record.revoked = true;
-            record.retained = None;
-            revoked += 1;
-        }
-        Ok(revoked)
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn session_for_refresh(
-        &self,
-        refresh_token: &str,
-    ) -> Result<Option<SessionId>, AuthStoreError> {
-        let Some((session_id, secret)) = split_refresh(refresh_token) else {
-            return Ok(None);
-        };
-        let sessions = self.sessions.lock().expect("auth store lock");
-        let Some(record) = sessions.get(&session_id) else {
-            return Ok(None);
-        };
-        if record.revoked || !hashes_match(&hash_secret(secret), &record.current_refresh_hash) {
-            return Ok(None);
-        }
-        Ok(Some(session_id))
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn set_retained_provider_token(
-        &self,
-        session_id: SessionId,
-        token: &crate::authn::provider::RetainedProviderToken,
-    ) -> Result<(), AuthStoreError> {
-        let now = (self.clock)();
-        let expires_at = token.expires_in.map(|lifetime| now + lifetime);
-        if let Some(record) = self
-            .sessions
-            .lock()
-            .expect("auth store lock")
-            .get_mut(&session_id)
-        {
-            record.retained = Some(RetainedRecord {
-                issuer: token.issuer.clone(),
-                access_token: token.access_token.clone(),
-                refresh_token: token.refresh_token.clone(),
-                expires_at,
-            });
-        }
-        Ok(())
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn retained_provider_token(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<crate::authn::provider::StoredProviderToken>, AuthStoreError> {
-        let now = (self.clock)();
-        let sessions = self.sessions.lock().expect("auth store lock");
-        let Some(record) = sessions.get(&session_id) else {
-            return Ok(None);
-        };
-        Ok(record.retained.as_ref().map(|retained| {
-            let still_valid = retained.expires_at.is_none_or(|deadline| {
-                deadline > now + crate::authn::provider::PROVIDER_TOKEN_MARGIN
-            });
-            crate::authn::provider::StoredProviderToken {
-                issuer: retained.issuer.clone(),
-                access_token: retained.access_token.clone(),
-                refresh_token: retained.refresh_token.clone(),
-                still_valid,
-            }
-        }))
-    }
-}
-
 pub use db::DbAuthStore;
 
 mod db {
@@ -729,14 +189,14 @@ mod db {
     use diesel_async::{AsyncConnection, AsyncPgConnection};
 
     use super::{
-        AuthStore, AuthStoreError, IssuedSession, RefreshOutcome, ResolvedIdentity, SessionOrigin,
+        AuthStoreError, IssuedSession, RefreshOutcome, ResolvedIdentity, SessionOrigin,
         format_refresh, hash_secret, hashes_match, new_refresh_secret, new_session_id,
         split_refresh,
     };
     use crate::authn::identity::IdentityResolver;
     use crate::authn::provider::RetainedProviderToken;
     use crate::authn::schema::{
-        ConnettoStoreSchema, NewSession, SessionRecord, SessionRow, SessionStamps,
+        ConnettoStoreSchema, Desc, NewSession, SessionRecord, SessionRow, SessionStamps,
     };
     use crate::authn::token::RefreshLifetimes;
     use crate::schema::ConnettoSchema;
@@ -780,24 +240,51 @@ mod db {
         AuthStoreError::Backend(err.to_string())
     }
 
-    impl<D: ConnettoSchema> AuthStore for DbAuthStore<D> {
-        type Id = <D::Auth as ConnettoStoreSchema>::Id;
-        type Descriptor = <D::Auth as ConnettoStoreSchema>::Descriptor;
-
-        fn undescribed() -> Option<Self::Descriptor> {
+    impl<D: ConnettoSchema> DbAuthStore<D> {
+        /// The description every session carries when the deployment declares
+        /// none, `None` when a describe callback must supply one.
+        #[must_use]
+        pub fn undescribed() -> Option<Desc<D>> {
             <D::Auth as ConnettoStoreSchema>::undescribed()
         }
 
-        async fn resolve(&self, identity: &ResolvedIdentity) -> Result<Self::Id, AuthStoreError> {
+        /// Resolve `identity` to the deployment's `user_id`, which sign-in
+        /// reads the ban list for before any session exists (R105 decision 8).
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError::Resolve`] when the resolver refuses the identity.
+        pub async fn resolve(&self, identity: &ResolvedIdentity) -> Result<D::Id, AuthStoreError> {
             Ok(self.resolver.resolve(&identity.verified_claims()).await?)
         }
 
-        async fn create_session_for(
+        /// Resolve `identity` and create a session for it.
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError`] when resolution or the session insert fails.
+        pub async fn create_session(
             &self,
-            user_id: Self::Id,
             identity: &ResolvedIdentity,
-            origin: SessionOrigin<Self::Descriptor>,
-        ) -> Result<IssuedSession<Self::Id>, AuthStoreError> {
+            origin: SessionOrigin<Desc<D>>,
+        ) -> Result<IssuedSession<D::Id>, AuthStoreError> {
+            let user_id = self.resolve(identity).await?;
+            self.create_session_for(user_id, identity, origin).await
+        }
+
+        /// Create a session for `user_id`, the person `identity` resolved to,
+        /// recording where it came from, and return it with its first refresh
+        /// token.
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError::Backend`] when the insert fails.
+        pub async fn create_session_for(
+            &self,
+            user_id: D::Id,
+            identity: &ResolvedIdentity,
+            origin: SessionOrigin<Desc<D>>,
+        ) -> Result<IssuedSession<D::Id>, AuthStoreError> {
             let secret = new_refresh_secret();
             let session_id = new_session_id();
             let mut conn = self.pool.get().await.map_err(backend)?;
@@ -831,29 +318,47 @@ mod db {
             })
         }
 
-        async fn session_record(
+        /// How the session began and when it last refreshed, `None` when the
+        /// id names no session.
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError::Backend`] when the read fails.
+        pub async fn session_record(
             &self,
             session_id: SessionId,
-        ) -> Result<Option<SessionRecord<Self::Id, Self::Descriptor>>, AuthStoreError> {
+        ) -> Result<Option<SessionRecord<D::Id, Desc<D>>>, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
             <D::Auth as ConnettoStoreSchema>::session_record(&mut conn, session_id)
                 .await
                 .map_err(backend)
         }
 
-        async fn sessions_of(
+        /// Every live session of `user`, oldest first: not revoked, and
+        /// neither deadline passed.
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError::Backend`] when the read fails.
+        pub async fn sessions_of(
             &self,
-            user: &Self::Id,
-        ) -> Result<Vec<SessionRecord<Self::Id, Self::Descriptor>>, AuthStoreError> {
+            user: &D::Id,
+        ) -> Result<Vec<SessionRecord<D::Id, Desc<D>>>, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
             <D::Auth as ConnettoStoreSchema>::sessions_of(&mut conn, user.clone())
                 .await
                 .map_err(backend)
         }
 
-        async fn end_owned(
+        /// Revoke `session` when it is `user`'s and not yet revoked,
+        /// answering whether it was.
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError::Backend`] when the update fails.
+        pub async fn end_owned(
             &self,
-            user: &Self::Id,
+            user: &D::Id,
             session: SessionId,
         ) -> Result<bool, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
@@ -870,9 +375,15 @@ mod db {
             .await
         }
 
-        async fn end_all_of(
+        /// Revoke every live session of `user` but `keep`, answering the ones
+        /// it revoked.
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError::Backend`] when the update fails.
+        pub async fn end_all_of(
             &self,
-            user: &Self::Id,
+            user: &D::Id,
             keep: Option<SessionId>,
         ) -> Result<Vec<SessionId>, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
@@ -887,7 +398,14 @@ mod db {
             .await
         }
 
-        async fn session_is_live(&self, session_id: SessionId) -> Result<bool, AuthStoreError> {
+        /// Whether the session still exists, is not revoked, and is within
+        /// both its idle window and its absolute ceiling. This is the
+        /// handshake liveness check that makes revocation authoritative.
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError::Backend`] when the read fails.
+        pub async fn session_is_live(&self, session_id: SessionId) -> Result<bool, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
             let live = <D::Auth as ConnettoStoreSchema>::live_session(&mut conn, session_id)
                 .await
@@ -895,10 +413,20 @@ mod db {
             Ok(live.is_some_and(|revoked| !revoked))
         }
 
-        async fn rotate_refresh(
+        /// Validate the presented refresh token, rotate it, extend the idle
+        /// window, and return the rotated token plus the identity to re-mint
+        /// access from.
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError::NotFound`] for an unknown or revoked session,
+        /// [`AuthStoreError::Expired`] past a deadline,
+        /// [`AuthStoreError::Reuse`] for a rotated-out secret, which revokes
+        /// the session, and [`AuthStoreError::Backend`] when a statement fails.
+        pub async fn rotate_refresh(
             &self,
             refresh_token: &str,
-        ) -> Result<RefreshOutcome<<D::Auth as ConnettoStoreSchema>::Id>, AuthStoreError> {
+        ) -> Result<RefreshOutcome<D::Id>, AuthStoreError> {
             let (session_id, secret) =
                 split_refresh(refresh_token).ok_or(AuthStoreError::NotFound)?;
             let presented_hash = hash_secret(secret).to_vec();
@@ -909,7 +437,7 @@ mod db {
                 conn.transaction::<_, AuthStoreError, _>(async move |conn| {
                     // The lapsed verdict is the database's, judged in the
                     // statement (chapter 21).
-                    let row: Option<SessionRow<<D::Auth as ConnettoStoreSchema>::Id>> =
+                    let row: Option<SessionRow<D::Id>> =
                         <D::Auth as ConnettoStoreSchema>::session_row_for_update(conn, session_id)
                             .await
                             .map_err(backend)?;
@@ -963,7 +491,13 @@ mod db {
             outcome
         }
 
-        async fn revoke_session(&self, session_id: SessionId) -> Result<(), AuthStoreError> {
+        /// Revoke the session, refusing it on the next handshake even while
+        /// its access token is still time-valid.
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError::Backend`] when the update fails.
+        pub async fn revoke_session(&self, session_id: SessionId) -> Result<(), AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
             conn.transaction::<_, AuthStoreError, _>(async move |conn| {
                 <D::Auth as ConnettoStoreSchema>::revoke_update(conn, session_id)
@@ -974,7 +508,13 @@ mod db {
             .await
         }
 
-        async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
+        /// Revoke every session still live, returning how many were, the
+        /// answer to a restore that revived rotated refresh tokens.
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError::Backend`] when the update fails.
+        pub async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
             let revoked = conn
                 .transaction::<_, AuthStoreError, _>(async move |conn| {
@@ -990,7 +530,20 @@ mod db {
             Ok(u64::try_from(revoked).unwrap_or(u64::MAX))
         }
 
-        async fn session_for_refresh(
+        /// The session a presented refresh token names, once its secret is
+        /// verified, or `None` when no live session matches.
+        ///
+        /// This is the authentication a logout needs, since the caller holds
+        /// the credential it wants torn down and nothing else identifies the
+        /// session to revoke. Unlike [`rotate_refresh`](Self::rotate_refresh)
+        /// it does not rotate, and a mismatched secret is `None` rather than a
+        /// theft signal, because an endpoint whose only effect is revocation
+        /// must not become an oracle for guessed session ids.
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError::Backend`] when the read fails.
+        pub async fn session_for_refresh(
             &self,
             refresh_token: &str,
         ) -> Result<Option<SessionId>, AuthStoreError> {
@@ -1018,7 +571,13 @@ mod db {
             Ok(Some(session_id))
         }
 
-        async fn set_retained_provider_token(
+        /// Store the retained provider tokens for a session, replacing any
+        /// existing.
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError::Backend`] when the write fails.
+        pub async fn set_retained_provider_token(
             &self,
             session_id: SessionId,
             token: &RetainedProviderToken,
@@ -1037,7 +596,13 @@ mod db {
             Ok(())
         }
 
-        async fn retained_provider_token(
+        /// Read a session's retained provider tokens, if any were stored, with
+        /// the store's verdict on the access token's lifetime.
+        ///
+        /// # Errors
+        ///
+        /// [`AuthStoreError::Backend`] when the read fails.
+        pub async fn retained_provider_token(
             &self,
             session_id: SessionId,
         ) -> Result<Option<crate::authn::provider::StoredProviderToken>, AuthStoreError> {

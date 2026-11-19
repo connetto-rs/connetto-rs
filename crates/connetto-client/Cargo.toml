@@ -332,7 +332,7 @@ connetto-core = { workspace = true, features = ["test-support"] }
 # Postgres path now (pg-async), so the harness supplies the fixture. The CDC
 # source stays the SQLite emulator, so reads are Docker-free and only the
 # write-path assertions need Postgres.
-connetto-server = { path = "../connetto-server", features = ["test-seams"] }
+connetto-server = { path = "../connetto-server", features = ["test-seams", "rosetta-uuid"] }
 connetto-test-harness = { path = "../connetto-test-harness" }
 # The loop and handshake tests derive the schema version the server compares
 # against, through the same translated-bundle step the server itself runs.
@@ -364,9 +364,10 @@ pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main",
 # The watch_fn boxed-row test drives a live query whose row type carries a
 # strongly typed `rosetta_uuid::Uuid` primary key (stored as a SQLite BLOB) and
 # a `bool` column, the same key strategy the demos use, rather than raw bytes.
-# The native-auth test additionally serves it as the project's typed user id
-# across the token endpoint, which needs serde both ways.
-rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "serde"] }
+# The native-auth test additionally serves it as the project's typed user id,
+# stored as a Postgres `uuid` on the server and carried across the token
+# endpoint, which needs serde both ways.
+rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "postgres", "serde"] }
 # The native-auth test serves connetto-server's auth router on a real port and
 # drives the browser round-trip with a redirect-following-disabled HTTP client.
 axum = { workspace = true }
