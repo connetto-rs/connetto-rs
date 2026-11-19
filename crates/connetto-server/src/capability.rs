@@ -19,6 +19,7 @@ use core::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use connetto_core::SessionId;
 use connetto_core::auth::{
     CapabilityKey, CapabilitySubject, ContentCaller, Principal, absent_marker,
 };
@@ -76,9 +77,9 @@ pub(crate) async fn bind_writer<W: crate::writer_schema::ConnettoWriterSchema>(
     .map(drop)
 }
 
-/// Render the caller for a transaction or a ticket: the identity, the share
-/// keys packed by the deployment's [`CapabilityKey`], and the bot list the
-/// caller's connection binds.
+/// Render the caller for a transaction or a ticket: the identity, the login's
+/// session, the share keys packed by the deployment's [`CapabilityKey`], and
+/// the bot list the caller's connection binds.
 ///
 /// The one renderer of a caller's values. A half the caller does not hold
 /// stays absent, never `""`, so an owner comparison is NULL and hides the row
@@ -90,9 +91,20 @@ pub(crate) fn rendered_caller<Id: Display, Key: CapabilityKey>(
         caller
             .identity()
             .map(|identity| identity.user_id.to_string()),
+        login_session(caller),
         Key::subjects(caller.capabilities()),
         bot_list_for(caller),
     )
+}
+
+/// The session of the login the caller's identity came from, the one the auth
+/// store keeps live, or `None` for a caller holding no login.
+///
+/// An identity resolves only from a login, whose handle the auth store minted
+/// and keeps. A share key's run has a handle minted for it and never stored,
+/// so it names none.
+pub(crate) fn login_session<Id, Key>(caller: &Principal<Id, Key>) -> Option<SessionId> {
+    caller.identity().map(|_| caller.session_id())
 }
 
 /// The bot list one caller's connections carry in `app.bot_list`, the value
@@ -627,6 +639,7 @@ mod tests {
         assert!(
             ContentCaller::new(
                 None,
+                None,
                 String::subjects(&[]),
                 connetto_core::BOT_LIST_WILDCARD.to_owned()
             )
@@ -643,6 +656,7 @@ mod tests {
             CapabilitySubject::new("key:a"),
         ];
         let caller = ContentCaller::new(
+            None,
             None,
             String::subjects(&keys),
             connetto_core::BOT_LIST_WILDCARD.to_owned(),

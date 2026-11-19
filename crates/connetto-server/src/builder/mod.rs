@@ -1980,7 +1980,10 @@ where
             &schema,
             &publication,
             content,
-            audit,
+            content::FileHooks {
+                audit,
+                sessions: Arc::clone(&authority) as Arc<dyn connetto_core::SessionLiveness>,
+            },
         )
         .await?;
         completion.sweep = reader.sweep.as_ref().map(BackgroundTask::completion);
@@ -2420,7 +2423,7 @@ async fn build_reader_side<D: ConnettoSchema>(
     schema: &ServerSchema,
     publication: &str,
     content: Option<ContentSettings>,
-    audit: crate::audit::AuditHook<D::Id>,
+    hooks: content::FileHooks<D::Id>,
 ) -> Result<ReaderSide, BuildError> {
     let content::FileHalf {
         signer,
@@ -2432,7 +2435,7 @@ async fn build_reader_side<D: ConnettoSchema>(
         &database.owner_url,
         &database.reader_url,
         reader_pool_size,
-        audit,
+        hooks,
     )
     .await?;
     let snapshot = PgSnapshotSource::from_ddl(pool.clone(), &schema.engine_ddl::<D>())?
@@ -2982,6 +2985,7 @@ mod tests {
     fn identified(user_id: &str) -> connetto_core::auth::ContentCaller {
         connetto_core::auth::ContentCaller::new(
             Some(user_id.to_owned()),
+            Some(connetto_core::SessionId::from_token_hash(user_id)),
             None,
             connetto_core::BOT_LIST_WILDCARD.to_owned(),
         )
