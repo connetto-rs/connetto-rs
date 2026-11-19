@@ -1278,6 +1278,7 @@ async fn queue_write(
 /// shared store attached, reading that row.
 struct SharedAccounts {
     _idp: MockOauth,
+    _fixture: connetto_test_harness::Fixture,
     _keyring: connetto_test_harness::SessionKeyringGuard,
     store: SharedRefreshStore,
     dir: tempfile::TempDir,
@@ -1292,7 +1293,7 @@ impl SharedAccounts {
         use super::shared_coverage::schema;
 
         let keyring = connetto_test_harness::isolated_session_keyring();
-        let (base, idp) = spawn_auth_server().await;
+        let (base, idp, fixture) = spawn_auth_server().await;
         let store = SharedRefreshStore::default();
         let dir = tempfile::tempdir().expect("a temporary directory");
         let keys = super::support::SharedKeys::default();
@@ -1326,6 +1327,7 @@ impl SharedAccounts {
         .await;
         let accounts = Self {
             _idp: idp,
+            _fixture: fixture,
             _keyring: keyring,
             store,
             dir,
@@ -1448,6 +1450,7 @@ async fn a_refused_shared_departure_refuses_the_delete() {
 struct TwoAccounts {
     base: String,
     _idp: MockOauth,
+    _fixture: connetto_test_harness::Fixture,
     _keyring: connetto_test_harness::SessionKeyringGuard,
     store: SharedRefreshStore,
     dir: tempfile::TempDir,
@@ -1465,7 +1468,7 @@ struct TwoAccounts {
 impl TwoAccounts {
     async fn signed_in() -> Self {
         let keyring = connetto_test_harness::isolated_session_keyring();
-        let (base, idp) = spawn_auth_server().await;
+        let (base, idp, fixture) = spawn_auth_server().await;
         let store = SharedRefreshStore::default();
         let dir = tempfile::tempdir().expect("a temporary directory");
         let keys = super::support::SharedKeys::default();
@@ -1521,6 +1524,7 @@ impl TwoAccounts {
         Self {
             base,
             _idp: idp,
+            _fixture: fixture,
             _keyring: keyring,
             store,
             dir,
