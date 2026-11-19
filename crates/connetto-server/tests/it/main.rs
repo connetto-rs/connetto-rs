@@ -24,6 +24,10 @@ mod ticket_mint;
 
 mod ticket_carried;
 
+mod ticket_session;
+
+mod ticket_logout;
+
 mod audit_catalog;
 
 mod audit_producers;

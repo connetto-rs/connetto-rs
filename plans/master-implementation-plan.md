@@ -68,7 +68,6 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | [R80](#r80-peer-sync-in-every-demo) | not started |  | The camp flow in every native-capable demo on Android, iOS, iPadOS, macOS and Linux, and the grown phone and home runs. Windows is outside it |  |  |
 | [R107](#r107-schema-changes-under-running-servers) | in progress | subql passing pgoutput `Relation` messages to consumers (slice 2) | The expand and contract procedure with the sunset, the table refusal when a running server notices a change, and the two-model boot check |  |  |
 | [R108](#r108-caller-kinds-as-database-roles) | in progress | sql-traits answering the caller contract, privileges and effective policies for both translators, and rls2fga translating R107's live model, for slices 2 to 5. R99, for the bot kinds | Caller kinds as database roles, every startup refusal before OpenFGA, four flat kind roles switched per transaction, grants per kind read from the live database, and a client copy per kind |  |  |
-| [R109](#r109-content-tickets-bound-to-their-session) | not started |  | Content tickets carry their session, and every fetch confirms the session is live, so a ticket dies with the session that minted it |  |  |
 | [R110](#r110-a-session-bound-by-provider-staleness) | not started |  | Session lifetime bounded by the time since the identity provider last confirmed the user, replacing the fixed idle window and ceiling |  |  |
 | [R111](#r111-a-durable-replica-where-opfs-is-refused) | blocked | the JSPI IndexedDB VFS upstream in `sqlite-wasm-rs` | A durable browser replica on IndexedDB through JSPI where OPFS is refused, memory kept only where JSPI is missing |  |  |
 | [R112](#r112-an-apple-peer-to-peer-link) | not started |  | A link between Apple devices over Apple's peer-to-peer Wi-Fi, for an all-Apple group with no hotspot host and no shared network, after its gate run and open points |  |  |
@@ -168,6 +167,7 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | R98 | done |  | One schema contract, `ConnettoSchema` with its members and the startup preflight that refuses a missing member | [builder_coverage.rs](../crates/connetto-server/tests/it/builder_coverage.rs) | [#126](https://github.com/connetto-rs/connetto-rs/pull/126) |
 | R105 | done |  | Answering a stolen account, the session record, the session surfaces, the revocation of a second session and the `auth_events` rows |  | [#262](https://github.com/connetto-rs/connetto-rs/pull/262), [#268](https://github.com/connetto-rs/connetto-rs/pull/268), [#274](https://github.com/connetto-rs/connetto-rs/pull/274), [#283](https://github.com/connetto-rs/connetto-rs/pull/283), [#287](https://github.com/connetto-rs/connetto-rs/pull/287), [#289](https://github.com/connetto-rs/connetto-rs/pull/289) |
 | R106 | done |  | Database failures classified by their SQLSTATE, the named transient list for reads, writes and the oplog, the `Deterministic` class and the `42501` refusal as `Unauthorized` | [reexec_failure.rs](../crates/connetto-server/tests/it/reexec_failure.rs) | [#343](https://github.com/connetto-rs/connetto-rs/pull/343), [#356](https://github.com/connetto-rs/connetto-rs/pull/356) |
+| R109 | done |  | A login's content ticket names its session, and the mint and every read and upload request confirm the session is live, so a ticket dies with the session that minted it, and reads are cached privately | [ticket_logout.rs](../crates/connetto-server/tests/it/ticket_logout.rs), [ticket_session.rs](../crates/connetto-server/tests/it/ticket_session.rs), [session_bound.rs](../crates/connetto-file-server/tests/it/session_bound.rs) | [#583](https://github.com/connetto-rs/connetto-rs/pull/583) |
 | R114 | done |  | Every session asks the server about its retained rows, so a `Pending` candidacy outlives a restart, and an `Abandoned` verdict deletes the retained rows it names | [courier_tests.rs](../crates/connetto-client/src/courier_tests.rs), [courier_restore.rs](../crates/connetto-test-harness/tests/it/courier_restore.rs) | [#492](https://github.com/connetto-rs/connetto-rs/pull/492), [#493](https://github.com/connetto-rs/connetto-rs/pull/493) |
 | R115 | done |  | Every session asks about provisional records and stored entries up to each author's signed offer frontier, including provisional entries with no records | [provisional_adjudication.rs](../crates/connetto-client/tests/it/provisional_adjudication.rs), [courier_tests.rs](../crates/connetto-client/src/courier_tests.rs), [courier_restore.rs](../crates/connetto-test-harness/tests/it/courier_restore.rs) | [#495](https://github.com/connetto-rs/connetto-rs/pull/495), [#496](https://github.com/connetto-rs/connetto-rs/pull/496) |
 | R116 | done |  | One live-query hook, `use_live(&source, spec)`, in `connetto-yew`, `connetto-dioxus` and `connetto-leptos` over one loop in `connetto-client`, the Tauri plugin and page source that serve it in a webview, and every demo on it with no hand-written subscription loop | [live_source.rs](../crates/connetto-client/tests/it/live_source.rs), [hook.rs](../crates/connetto-leptos/tests/hook.rs), [tests.rs](../crates/tauri-plugin-connetto/src/tests.rs), [tests.rs](../crates/connetto-tauri-page/src/tests.rs), [live.rs](../crates/connetto-test-harness/src/android_phone/live.rs) | [#563](https://github.com/connetto-rs/connetto-rs/pull/563), [#564](https://github.com/connetto-rs/connetto-rs/pull/564), [#568](https://github.com/connetto-rs/connetto-rs/pull/568), [#569](https://github.com/connetto-rs/connetto-rs/pull/569), [#570](https://github.com/connetto-rs/connetto-rs/pull/570), [#572](https://github.com/connetto-rs/connetto-rs/pull/572) |
@@ -181,12 +181,6 @@ Defects and unowned risks with no phase yet. Each states what the code does and 
 **Browser tabs do not receive membership rows.** The relay in [relay.rs](../crates/connetto-web/src/relay.rs) neither forwards `MembershipOpened` nor opens tab-level membership subscriptions, so a tab reading through a membership-shaped policy sees empty results.
 
 Fixed in one pull request in `relay.rs`. The hub forwards `MembershipOpened`, mirrors membership tables into tab snapshots, live routing and resync, proven by a tab reading the demo's membership-shaped `team_notes_p` policy.
-
-### G5
-
-**A content ticket outlives the session that minted it.** Every fetch rechecks the file's visibility to the ticket's caller (`file_visible_to_caller` in [serve.rs](../crates/connetto-file-server/src/serve.rs)), so a revoked share, a revoked grant or an erased row denies at once. What outlives the session is the caller's identity. After a logout or a revoked session, a cached ticket keeps reading the files that identity can still see until its expiry, `CONNETTO_CONTENT_TICKET_TTL_SECS` (default 3600 s) plus the server skew.
-
-Taken by [R109](#r109-content-tickets-bound-to-their-session).
 
 ### G6
 
@@ -417,6 +411,7 @@ A registered bot connects, for one installation or as itself, proves its key, an
 4. **Removal, a ban on the bot or on one installation, a deleted bot and a key rotation close the affected connections at once.** Deleting an installation closes its connection with `SessionRevoked`, a ban of the bot or of one installation id refuses the logins it names and closes the connections, and deleting the bot refuses everything and closes its connections. A key rotation registers the new key through a fresh one-time code and stops the old one at once, so the connections the old key held close and re-login under the new key. A woken bot costs one signature per wake and catches up from its cursor, kept per installation. R19's throttle counts failed logins per bot id after the signature verifies and per connection before it.
 5. **Metering.** An installation connection bills the owner it serves (`owner:<id>`), a bot-level connection the bot's owner. The bot identity holds no bucket.
 6. **Audit.** `BotRegistered`, `BotListRegistered`, `BotKeyRotated`, `BotRemoved` and `BotLoginRefused`. Successful logins are not audited, since a woken bot logs in on every wake. Adding and accepting are the installation row's own changes.
+7. **A key login's principal says so.** The principal a key login yields is marked as holding no stored session, so the content ticket mint names no session for it and the file server never asks the auth store about a session it never held, as [18-file-handling.md](../docs/architecture/18-file-handling.md#the-wire-tickets-and-the-mint) states for every ticket minted with no login.
 
 ### Lifetime, every event against every situation
 
@@ -1228,38 +1223,6 @@ Docker-gated. A deployment refused at startup leaves the OpenFGA store untouched
 ### Done when
 
 A deployment can name connetto's kinds in its policies and grant each kind its own table privileges, a policy for a role outside connetto serves none of connetto's callers, every refusal comes before anything is written, and Postgres, OpenFGA and each kind's client copy agree on what each kind may read and write.
-
-## R109: content tickets bound to their session
-
-**Blocked on** nothing.
-
-**Changes state.** Client tables, none. Server tables, none. Wire messages, the content ticket gains the minting session. Archive format, none.
-
-### Purpose
-
-Every fetch already rechecks that the ticket's caller may see the file, so a revoked share or an erased row denies at once. What a ticket outlives is its session, [G5](#g5). After a logout or a revoked session, a cached ticket keeps reading the files that identity can still see until it expires. This phase makes the session's end the ticket's end.
-
-### Decisions, taken with the maintainer
-
-1. **The ticket names its session and every fetch confirms it is live.** The signed payload gains the session that minted it, and the file server consults the session's liveness on every read through a check the server builder wires to `AuthService::session_is_live`, so a logout or a revocation cuts every cached ticket of that session at its next request.
-
-### Open points
-
-1. **A ticket minted by a share key alone**, with no session behind it. Whether it binds to the share key's own liveness or keeps the expiry as its only bound.
-2. **The cost of the check.** One store read per fetch, or a short-lived cache of live sessions, and what the cache's lifetime adds to the lag.
-
-### Steps
-
-1. The ticket payload carries the minting session, signed with the rest.
-2. The file server's configuration takes a liveness check, the builder wires it to the auth store, and every read refuses a ticket whose session is not live, answering as it answers a file the caller may not see.
-
-### Proof
-
-Docker-gated. A ticket minted in a session reads a file, the session logs out, and the same ticket is refused at once, while a ticket of another live session of the same identity keeps reading.
-
-### Done when
-
-No content read succeeds for a ticket whose session has ended.
 
 ---
 

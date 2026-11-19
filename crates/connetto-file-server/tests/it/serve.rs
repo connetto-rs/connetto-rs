@@ -392,6 +392,7 @@ async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
         on_carried: None,
+        sessions: std::sync::Arc::new(crate::fixture::Sessions::default()),
         _schema: std::marker::PhantomData,
     })
     .await
@@ -783,6 +784,7 @@ async fn short_store_read_terminates_stream_with_error() {
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
         on_carried: None,
+        sessions: std::sync::Arc::new(crate::fixture::Sessions::default()),
         _schema: std::marker::PhantomData,
     })
     .await

@@ -55,8 +55,17 @@ pub fn replica_key() -> ReplicaKey {
 /// login resolves them, with the identity before the `#` and the effective
 /// list after it as `table:verb` entries joined by commas, and any other shape
 /// is refused like a bad grant.
+///
+/// It keeps no store, so every session it is asked about is live, the way a
+/// login stays live in a real store until something ends it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TestGrantChecker;
+
+impl crate::traits::SessionLiveness for TestGrantChecker {
+    fn session_is_live(&self, _session_id: crate::SessionId) -> crate::traits::LivenessFuture<'_> {
+        Box::pin(core::future::ready(Ok(true)))
+    }
+}
 
 impl crate::traits::HandshakeAuthority<String> for TestGrantChecker {
     fn check_grant<'a>(
