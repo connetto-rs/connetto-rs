@@ -2503,7 +2503,7 @@ dependencies = [
 [[package]]
 name = "rsqlite-vfs"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/sqlite-wasm-rs?branch=upstream%2Fsingle-thread-safe-memvfs#2af4f6ca8d3995930163bfbd3dc0a3d473be2f49"
+source = "git+https://github.com/LucaCappelletti94/sqlite-wasm-rs?branch=upstream%2Fsingle-thread-safe-memvfs#59217e6c0a1251ee9902d324908b82a509b60835"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -2939,8 +2939,8 @@ dependencies = [
 
 [[package]]
 name = "sqlite-wasm-rs"
-version = "0.6.2"
-source = "git+https://github.com/LucaCappelletti94/sqlite-wasm-rs?branch=upstream%2Fsingle-thread-safe-memvfs#2af4f6ca8d3995930163bfbd3dc0a3d473be2f49"
+version = "0.6.3"
+source = "git+https://github.com/LucaCappelletti94/sqlite-wasm-rs?branch=upstream%2Fsingle-thread-safe-memvfs#59217e6c0a1251ee9902d324908b82a509b60835"
 dependencies = [
  "cc",
  "js-sys",
@@ -2952,7 +2952,7 @@ dependencies = [
 [[package]]
 name = "sqlite-wasm-vfs"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/sqlite-wasm-rs?branch=upstream%2Fsingle-thread-safe-memvfs#2af4f6ca8d3995930163bfbd3dc0a3d473be2f49"
+source = "git+https://github.com/LucaCappelletti94/sqlite-wasm-rs?branch=upstream%2Fsingle-thread-safe-memvfs#59217e6c0a1251ee9902d324908b82a509b60835"
 dependencies = [
  "futures-util",
  "js-sys",

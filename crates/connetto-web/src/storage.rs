@@ -30,8 +30,9 @@ use indexed_db_futures::object_store::ObjectStore;
 use indexed_db_futures::prelude::*;
 use indexed_db_futures::transaction::TransactionMode;
 use serde::{Deserialize, Serialize};
+use sqlite_wasm_rs::host::memvfs_util;
 use sqlite_wasm_rs::vfs::VfsFilesManager as _;
-use sqlite_wasm_rs::vfs::memvfs::{MemVfsContext, MemVfsUtil};
+use sqlite_wasm_rs::vfs::memvfs::MemVfsUtil;
 use sqlite_wasm_vfs::sahpool::{OpfsSAHPoolCfg, OpfsSAHPoolUtil};
 use wasm_bindgen::JsCast;
 
@@ -73,9 +74,7 @@ impl ReplicaStorage {
                     "db worker: OPFS unavailable, using an in-memory replica with no persistence \
                      and no cross-window OPFS sharing this session"
                 );
-                let context = MemVfsContext::try_new()
-                    .map_err(|err| AuthError::Store(format!("initialise SQLite: {err}")))?;
-                let util = MemVfsUtil::get(&context)
+                let util = memvfs_util()
                     .map_err(|err| AuthError::Store(format!("find the in-memory VFS: {err}")))?;
                 Ok(Self::Memory(util))
             }
