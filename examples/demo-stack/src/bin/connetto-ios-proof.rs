@@ -4413,13 +4413,13 @@ mod tests {
         let outcome = super::observe_star_link(
             async |_| {
                 [
-                    Ok("linked: b via 10.42.0.7:1\nlinked: c via 10.42.0.1:1".to_owned()),
-                    Ok("hotspot: joined through the gateway 10.42.0.1\nlinked: a via 10.42.0.9:1\nlinked: c via 10.42.0.1:1".to_owned()),
-                    Ok("linked: a via 10.42.0.9:1\nlinked: b via 10.42.0.7:1".to_owned()),
+                    Ok("linked: bob 89abcdef/89abcdef via 10.42.0.7:1\nlinked: carol cc072008/12345678 via 10.42.0.1:1".to_owned()),
+                    Ok("hotspot: joined through the gateway 10.42.0.1\nlinked: alice d5e24135/01234567 via 10.42.0.9:1\nlinked: carol cc072008/12345678 via 10.42.0.1:1".to_owned()),
+                    Ok("linked: alice d5e24135/01234567 via 10.42.0.9:1\nlinked: bob 89abcdef/89abcdef via 10.42.0.7:1".to_owned()),
                 ]
             },
             ["iphone", "ipad", "android"],
-            ["a", "b", "c"],
+            ["d5e24135/01234567", "89abcdef/89abcdef", "cc072008/12345678"],
             evidence.path(),
             connetto_test_harness::star::Round::AndroidHosts,
             &mut None,
@@ -4437,16 +4437,16 @@ mod tests {
             async |_| {
                 [
                     if started.elapsed() < std::time::Duration::from_secs(30) {
-                        Ok("linked: b via 10.42.0.7:1\nlinked: c via 10.42.0.1:1".to_owned())
+                        Ok("linked: bob 89abcdef/89abcdef via 10.42.0.7:1\nlinked: carol cc072008/12345678 via 10.42.0.1:1".to_owned())
                     } else {
                         Err(anyhow::anyhow!("the iphone inspector is unavailable"))
                     },
-                    Ok("hotspot: joined through the gateway 10.42.0.1\nlinked: a via 10.42.0.9:1\nlinked: c via 10.42.0.1:1".to_owned()),
-                    Ok("linked: a via 10.42.0.9:1\nlinked: b via 10.42.0.7:1".to_owned()),
+                    Ok("hotspot: joined through the gateway 10.42.0.1\nlinked: alice d5e24135/01234567 via 10.42.0.9:1\nlinked: carol cc072008/12345678 via 10.42.0.1:1".to_owned()),
+                    Ok("linked: alice d5e24135/01234567 via 10.42.0.9:1\nlinked: bob 89abcdef/89abcdef via 10.42.0.7:1".to_owned()),
                 ]
             },
             ["iphone", "ipad", "android"],
-            ["a", "b", "c"],
+            ["d5e24135/01234567", "89abcdef/89abcdef", "cc072008/12345678"],
             evidence.path(),
             connetto_test_harness::star::Round::AndroidHosts,
             &mut None,

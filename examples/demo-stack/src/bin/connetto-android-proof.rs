@@ -91,7 +91,7 @@ use connetto_test_harness::android_phone::{
     restore_joiner_networks, sign_in_phone, submit_login, wait_for_rebuild,
 };
 use connetto_test_harness::demo::{order_count, wait_for_count};
-use connetto_test_harness::inspector::PageSession;
+use connetto_test_harness::inspector::{PageSession, REPLY_BOUND};
 use connetto_test_harness::leg::{LegClient, run_leg};
 use connetto_test_harness::leg_wire::{
     ADAPTER_OFF_BOUND, LegOffer, in_hotspot_subnet, parse_station_name, ss_remote_address,
@@ -587,13 +587,19 @@ async fn second_account_shares_catalogue(
     device.screenshot(evidence, "second-account-deleted").await
 }
 
-/// Delete the stored account through its controls and observe its switch disappear.
+/// Delete the stored account through its controls and observe its switch
+/// disappear. The page answers within the inspector's reply bound, failing at
+/// once with the controls' text when the deletion asks for anything other
+/// than the confirmation of unsent writes.
 async fn delete_stored_account(app: &mut PageSession, signed_in: &str) -> Result<()> {
     let badge = signed_in
         .strip_prefix(SIGNED_IN_LINE)
         .map(str::trim)
         .filter(|badge| !badge.is_empty())
         .context("the stored account has no badge")?;
+    let limit = REPLY_BOUND
+        .saturating_sub(Duration::from_secs(1))
+        .as_millis();
     let script = format!(
         r"new Promise(resolve => {{
             const badge = {};
@@ -610,16 +616,20 @@ async fn delete_stored_account(app: &mut PageSession, signed_in: &str) -> Result
                 const current = buttons().find(button => button.textContent.trim().startsWith('Switch to ') &&
                     button.querySelector('[data-account]')?.getAttribute('data-account') === account);
                 if (!current) {{ finish(true); return; }}
-                const confirm = [...current.parentElement.querySelectorAll('button')].find(button => button.textContent.trim() === 'Confirm: delete this account');
-                if (confirm && !confirm.disabled && !confirmed) {{ confirmed = true; confirm.click(); }}
+                const controls = current.parentElement;
+                const confirm = [...controls.querySelectorAll('button')].find(button => button.textContent.trim() === 'Confirm: delete this account');
+                if (confirm && !confirm.disabled && !confirmed) {{ confirmed = true; confirm.click(); return; }}
+                if (controls.querySelector('.confirm') && !confirm || controls.querySelector('.error')) {{
+                    finish('stored account deletion stopped at ' + controls.innerText);
+                }}
             }};
             const observer = new MutationObserver(check);
-            const timer = setTimeout(() => finish('stored account switch remains ' + section.innerText), 30000);
+            const timer = setTimeout(() => finish('stored account switch remains ' + section.innerText), {limit});
             observer.observe(document.body, {{ childList: true, subtree: true, characterData: true, attributes: true }});
             deletes[0].click();
             check();
         }})",
-        serde_json::Value::String(badge.to_owned())
+        serde_json::Value::String(badge.to_owned()),
     );
     let result = app
         .call(

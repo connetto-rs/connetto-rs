@@ -2204,9 +2204,7 @@ fn stored_unsynced<T: Transport>(
         tier.as_ref(),
         opening.shared,
     )?;
-    let config = crate::ClientConfig::new(name.to_owned())
-        .with_storage_schema(schema)
-        .with_sql_functions(schema.sql_functions().clone());
+    let config = crate::builder::core::storage_config(schema, name);
     let conn = crate::ConnettoConnection::<T>::open_existing(
         &replica,
         schema.replica_ddl(),
@@ -2337,9 +2335,7 @@ impl SharedStore {
         Some(Self {
             path: dir.join(&record),
             record,
-            config: crate::ClientConfig::new(name.to_owned())
-                .with_storage_schema(schema)
-                .with_sql_functions(schema.sql_functions().clone()),
+            config: crate::builder::core::storage_config(schema, name),
         })
     }
 

@@ -1467,6 +1467,11 @@ struct TwoAccounts {
 
 impl TwoAccounts {
     async fn signed_in() -> Self {
+        Self::signed_in_with(|| super::support::bundle(BUILDER_DDL)).await
+    }
+
+    /// The two accounts on builds of the schema `schema` makes.
+    async fn signed_in_with(schema: fn() -> connetto_client::SyncSchema) -> Self {
         let keyring = connetto_test_harness::isolated_session_keyring();
         let (base, idp, fixture) = spawn_auth_server().await;
         let store = SharedRefreshStore::default();
@@ -1479,7 +1484,7 @@ impl TwoAccounts {
             dir.path(),
             &keys,
             "bob",
-            super::support::bundle(BUILDER_DDL),
+            schema(),
         ))
         .await;
         let bob_session = bob_client.session().expect("bob's session");
@@ -1508,7 +1513,7 @@ impl TwoAccounts {
             dir.path(),
             &keys,
             "alice",
-            super::support::bundle(BUILDER_DDL),
+            schema(),
         ))
         .await;
         let alice_session = alice_client.session().expect("alice's session");
@@ -1595,6 +1600,46 @@ async fn deleting_a_stored_account_refuses_without_destroying_anything() {
         accounts.dir.path().join(&accounts.alice_replica).exists(),
         "and alice's replica"
     );
+}
+
+/// The schema [`BUILDER_DDL`] declares, its `items` behind a translated
+/// policy, so the replica holds the policy views the build's map names.
+fn policy_schema() -> connetto_client::SyncSchema {
+    connetto_client::SyncSchema::new(
+        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
+            connetto_schema::Documents::new(
+                "-- connetto:major 1\nCREATE TABLE items (id INT PRIMARY KEY, label TEXT);",
+                "ALTER TABLE items ENABLE ROW LEVEL SECURITY; \
+                 CREATE POLICY items_p ON items USING (true) WITH CHECK (true);",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+        )
+        .expect("translate the sources"),
+    )
+}
+
+/// A build whose tables carry translated policies reads a stored account's
+/// closed replica as the live build opens it, so the delete names the
+/// account's unsent writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_policy_build_names_a_stored_accounts_unsent_writes() {
+    use connetto_client::teardown::{ForgetError, ForgetRefusal};
+
+    let accounts = Box::pin(TwoAccounts::signed_in_with(policy_schema)).await;
+    match accounts
+        .alice_client
+        .forget_stored_account(&accounts.bob, false)
+        .await
+    {
+        Err(ForgetError::Refused(ForgetRefusal::Unsynced(blocked))) => {
+            assert_eq!(
+                blocked, accounts.bob_queued,
+                "the refusal names bob's unsent writes"
+            );
+        }
+        other => panic!("expected bob's unsent writes to refuse the delete, got {other:?}"),
+    }
 }
 
 /// Forced, the delete revokes the stored account's session at the server and

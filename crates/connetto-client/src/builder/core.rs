@@ -360,17 +360,24 @@ pub(crate) fn build_config(
     caller: Option<&str>,
     custody: Custody,
 ) -> ClientConfig {
-    ClientConfig::new(client_id.to_owned())
+    storage_config(schema, client_id)
         .with_login(login)
         .with_caller(CALLER_FUNCTION, caller)
+        .with_tuning(*tuning)
+        .with_custody(custody)
+}
+
+/// The config every replica of `schema` opens under as `client_id`, made of
+/// the parts the schema decides. A replica opened without the live build,
+/// such as a stored account's, opens under it so its checks agree.
+pub(crate) fn storage_config(schema: &SyncSchema, client_id: &str) -> ClientConfig {
+    ClientConfig::new(client_id.to_owned())
         .with_schema_version(Some(schema.version()))
         .with_schema_major(Some(schema.major()))
         .with_tier_plan(schema.tier_plan())
         .with_sql_functions(schema.sql_functions().clone())
         .with_policy_tables(schema.policy_tables().clone())
         .with_unrecorded_tables(schema.unrecorded_tables().iter().cloned())
-        .with_tuning(*tuning)
-        .with_custody(custody)
         .with_storage_schema(schema)
         .with_relay_mirror(schema.is_relay_mirror())
 }

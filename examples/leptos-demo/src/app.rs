@@ -115,26 +115,31 @@ fn StoredDeleteControls(view: RwSignal<View>, account: String) -> impl IntoView 
                 .filter(|delete| delete.account == account)
                 .map(|delete| delete.state.clone())
         });
-        let account_key = account.clone();
+        let confirm = |line: String, button: &'static str| {
+            let account_key = account.clone();
+            view! {
+                <div class="confirm">
+                    <p>{line}</p>
+                    <button class="danger" on:click=move |_| act(Action::DeleteStoredAccount { account: account_key.clone(), force: true })>{button}</button>
+                    <button on:click=move |_| act(Action::CancelStoredDelete)>"Cancel"</button>
+                </div>
+            }.into_any()
+        };
         state.map(|state| match state {
             StoredDeleteState::Working => view! { <p>"Working..."</p> }.into_any(),
             StoredDeleteState::Error(error) => view! {
                 <p class="error">"Error: " {error}</p>
                 <button on:click=move |_| act(Action::CancelStoredDelete)>"Cancel"</button>
-            }.into_any(),
-            state => {
-                let (line, button) = match state {
-                    StoredDeleteState::Confirm { unsynced_count } => (support::logout_confirm_line(u64::try_from(unsynced_count).unwrap_or(u64::MAX)), "Confirm: delete this account"),
-                    _ => ("This account's local data cannot be read.".to_owned(), "Delete anyway"),
-                };
-                view! {
-                    <div class="confirm">
-                        <p>{line}</p>
-                        <button class="danger" on:click=move |_| act(Action::DeleteStoredAccount { account: account_key.clone(), force: true })>{button}</button>
-                        <button on:click=move |_| act(Action::CancelStoredDelete)>"Cancel"</button>
-                    </div>
-                }.into_any()
             }
+            .into_any(),
+            StoredDeleteState::Confirm { unsynced_count } => confirm(
+                support::logout_confirm_line(u64::try_from(unsynced_count).unwrap_or(u64::MAX)),
+                "Confirm: delete this account",
+            ),
+            StoredDeleteState::Unreadable(reason) => confirm(
+                format!("This account's local data cannot be read: {reason}"),
+                "Delete anyway",
+            ),
         })
     }
 }
@@ -163,16 +168,17 @@ const APP_TITLE: &str = "connetto demo";
 #[cfg(not(feature = "tauri"))]
 const APP_TITLE: &str = "connetto web demo (Leptos)";
 
-/// The status and account security controls.
+/// The status and account security controls. The device line stands here
+/// whenever the page has no nearby panel to carry it.
 #[component]
 fn AccountStatus(view: RwSignal<View>) -> impl IntoView {
     view! {
         <div>
             <p class="status">"status: " {move || view.with(|v| v.status.clone())}</p>
             {move || status_line(view.with(|v| v.gate_line.clone()))}
-            {cfg!(feature = "web").then(|| view! {
+            <Show when=move || view.with(|state| state.nearby.is_none())>
                 <p class="status">"device: " {move || view.with(|state| state.device_line.clone())}</p>
-            })}
+            </Show>
             <p class="status">{move || view.with(|v| v.storage.clone())}</p>
             <Show when=move || view.with(|v| v.offers_unlock)>
                 <button on:click=move |_| act(Action::Unlock)>
