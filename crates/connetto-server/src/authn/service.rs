@@ -766,6 +766,17 @@ impl<D: ConnettoSchema> ConnettoHandshakeAuthority<D> {
     }
 }
 
+impl<D: ConnettoSchema> connetto_core::SessionLiveness for ConnettoHandshakeAuthority<D> {
+    fn session_is_live(&self, session_id: SessionId) -> connetto_core::LivenessFuture<'_> {
+        Box::pin(async move {
+            self.store
+                .session_is_live(session_id)
+                .await
+                .map_err(|err| connetto_core::LivenessUnknown(err.to_string()))
+        })
+    }
+}
+
 impl<D, Key> HandshakeAuthority<D::Id, Key> for ConnettoHandshakeAuthority<D>
 where
     D: ConnettoSchema,

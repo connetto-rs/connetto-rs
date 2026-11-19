@@ -195,6 +195,8 @@ tower = { version = "0.5", features = ["util"] }
 axum = { workspace = true, features = ["ws"] }
 # The content deployment's DDL, applied by the sweep and reconcile tests.
 connetto-file-server = { path = "../connetto-file-server" }
+# The photograph the logout ticket test splits into chunks and uploads.
+connetto-file-core = { path = "../connetto-file-core" }
 # The raw-frame WebSocket client the sync adapter tests drive over `/sync`.
 tokio-tungstenite = "0.24"
 http-body-util = "0.1"
