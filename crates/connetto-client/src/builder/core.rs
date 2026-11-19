@@ -1115,7 +1115,7 @@ async fn mint_key<KS>(_key_store: &KS, _name: &str) -> Result<ReplicaKey, Client
 /// Open the replica file at `location` under `key`, with the device-private
 /// tier when the build has one. The replica owns its copy of the key, and
 /// the caller keeps its own for the content root key.
-fn open_encrypted_replica<'a>(
+pub(crate) fn open_encrypted_replica<'a>(
     location: &'a str,
     key: &ReplicaKey,
     fresh: bool,

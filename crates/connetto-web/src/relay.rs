@@ -282,6 +282,12 @@ enum HubEvent {
             Result<connetto_client::SharedDeparture, connetto_client::ClientError>,
         >,
     ),
+    /// Undo a closed account's queued shared writes and release its holdings.
+    ForgetShared(
+        String,
+        Vec<Vec<u8>>,
+        futures_channel::oneshot::Sender<Result<(), connetto_client::ClientError>>,
+    ),
     /// Export the worker's local tiers as an archive. Same reason as
     /// [`Unsynced`](Self::Unsynced): only the core can reach the connection.
     Export(
@@ -1003,6 +1009,23 @@ impl RelayHub {
         Ok(self
             .ask(|reply| HubEvent::LeaveShared(discard_unsent, reply))
             .await??)
+    }
+
+    /// Undo a closed account's queued shared writes and remove its presence.
+    ///
+    /// Changesets must be supplied newest first.
+    ///
+    /// # Errors
+    ///
+    /// [`LeaveSharedRefused`] when the hub is gone or the shared transaction fails.
+    pub async fn forget_shared_identity(
+        &self,
+        identity: String,
+        changesets: Vec<Vec<u8>>,
+    ) -> Result<(), LeaveSharedRefused> {
+        self.ask(|reply| HubEvent::ForgetShared(identity, changesets, reply))
+            .await??;
+        Ok(())
     }
 
     /// A zip archive of the worker's local data, scoped as requested.
@@ -2545,6 +2568,10 @@ where
                 state.audits.end(&state.tabs);
             }
             let _ = reply.send(outcome);
+        }
+        HubEvent::ForgetShared(identity, changesets, reply) => {
+            let changesets = changesets.iter().map(Vec::as_slice);
+            let _ = reply.send(worker.forget_shared_identity(&identity, changesets));
         }
         HubEvent::ForgetRetired(files, reply) => {
             let answer = match content {
