@@ -300,6 +300,42 @@ pub enum LoginMessage {
 
 pub use connetto_client::PendingWork;
 
+/// Why a stored account's local data was kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StoredForgetRefusal {
+    /// The account owns the running connection.
+    LiveAccount,
+    /// The account is absent from the stored account index.
+    UnknownAccount,
+    /// Local work would be lost without explicit permission.
+    Pending(PendingWork),
+    /// The stored replica or account index could not be read.
+    Unreadable(String),
+    /// Shared rows could not be undone and the transaction was rolled back.
+    Shared(String),
+}
+
+/// A part of stored account deletion that did not finish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StoredForgetFailure {
+    /// The server did not acknowledge revocation.
+    Revoke(String),
+    /// Local deletion or its durable marker failed.
+    Storage(String),
+}
+
+/// The result of deleting a stored account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredForgetOutcome {
+    /// No data or credentials were destroyed.
+    Refused(StoredForgetRefusal),
+    /// The deletion ran, with any incomplete parts listed.
+    Done {
+        /// Parts that could not finish.
+        failed: Vec<StoredForgetFailure>,
+    },
+}
+
 /// A logout message on [`LOGOUT_CHANNEL`], tokenless for the same reason
 /// [`LoginMessage`] is: no variant can carry a credential, so a tab still cannot
 /// reach the worker's token custody by speaking on this channel.
@@ -311,6 +347,27 @@ pub use connetto_client::PendingWork;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum LogoutMessage {
+    /// Delete an account whose replica is closed.
+    ForgetStored {
+        /// The stored account to delete.
+        account: String,
+        /// Permit discarding local work.
+        force: bool,
+    },
+    /// Keep the named account and all its data.
+    StoredRefused {
+        /// The account from the request.
+        account: String,
+        /// Why deletion did not start.
+        refusal: StoredForgetRefusal,
+    },
+    /// Report deletion of the named account.
+    StoredDone {
+        /// The account from the request.
+        account: String,
+        /// Parts that could not finish.
+        failed: Vec<StoredForgetFailure>,
+    },
     /// Tab to worker: how much local work has not reached the server? Asking
     /// changes nothing, so a tab can offer an honest prompt before the user
     /// commits to anything.
@@ -1554,6 +1611,7 @@ pub async fn await_login_code(login_url: &str) -> Result<(String, String), AuthE
         &LoginMessage::Request {
             url: login_url.to_owned(),
         },
+        None,
         |message| match message {
             LoginMessage::Code { code, state } => Some((code, state)),
             LoginMessage::Request { .. } => None,
@@ -1606,6 +1664,7 @@ pub enum LogoutOutcome {
 async fn ask<M, T>(
     channel: &str,
     request: &M,
+    bound: Option<core::time::Duration>,
     reply: impl Fn(M) -> Option<T> + 'static,
 ) -> Result<T, AuthError>
 where
@@ -1637,7 +1696,18 @@ where
         .post_message(&JsValue::from_str(&encoded))
         .map_err(|err| js_error(&format!("broadcast on {channel}"), &err))?;
 
-    let outcome = receiver.await.map_err(|_| AuthError::Cancelled);
+    let outcome = if let Some(bound) = bound {
+        let timeout = crate::workers::sleep(bound);
+        futures_util::pin_mut!(receiver, timeout);
+        match futures_util::future::select(receiver, timeout).await {
+            futures_util::future::Either::Left((answer, _)) => {
+                answer.map_err(|_| AuthError::Cancelled)
+            }
+            futures_util::future::Either::Right(_) => Err(AuthError::Cancelled),
+        }
+    } else {
+        receiver.await.map_err(|_| AuthError::Cancelled)
+    };
     broadcast.set_onmessage(None);
     broadcast.close();
     drop(on_message);
@@ -1653,6 +1723,7 @@ pub async fn request_unsynced() -> Result<PendingWork, AuthError> {
     ask(
         LOGOUT_CHANNEL,
         &LogoutMessage::Unsynced,
+        None,
         |message| match message {
             LogoutMessage::Pending { pending } => Some(pending),
             _ => None,
@@ -1676,6 +1747,7 @@ pub async fn forget_retired_content(files: Vec<String>) -> Result<(), AuthError>
     ask(
         LOGOUT_CHANNEL,
         &LogoutMessage::ForgetRetired { files },
+        None,
         move |message| match message {
             LogoutMessage::Forgot { files } if files == asked => Some(Ok(())),
             LogoutMessage::ForgetFailed { files, detail } if files == asked => {
@@ -1696,6 +1768,7 @@ pub async fn refused_content() -> Result<Vec<(String, String)>, AuthError> {
     ask(
         LOGOUT_CHANNEL,
         &LogoutMessage::RefusedContent,
+        None,
         |message| match message {
             LogoutMessage::RefusedFiles { files } => Some(files),
             _ => None,
@@ -1718,6 +1791,7 @@ pub async fn retry_refused(file_id: String) -> Result<(), AuthError> {
     ask(
         LOGOUT_CHANNEL,
         &LogoutMessage::RetryRefused { file_id },
+        None,
         move |message| match message {
             LogoutMessage::RefusalCleared { file_id } if file_id == asked => Some(Ok(())),
             LogoutMessage::RetryRefusalFailed { file_id, detail } if file_id == asked => {
@@ -1743,6 +1817,7 @@ pub async fn request_logout(delete: bool, force: bool) -> Result<LogoutOutcome, 
     ask(
         LOGOUT_CHANNEL,
         &LogoutMessage::Logout { delete, force },
+        None,
         |message| match message {
             LogoutMessage::Done { deleted } => Some(if deleted {
                 LogoutOutcome::Deleted
@@ -1750,6 +1825,38 @@ pub async fn request_logout(delete: bool, force: bool) -> Result<LogoutOutcome, 
                 LogoutOutcome::Kept
             }),
             LogoutMessage::Refused { pending } => Some(LogoutOutcome::Refused { pending }),
+            _ => None,
+        },
+    )
+    .await
+}
+
+/// Delete a stored account without ending the live session.
+///
+/// Replies are matched by account. A missing worker fails after thirty seconds.
+///
+/// # Errors
+///
+/// [`AuthError`] when the request cannot be sent or no worker answers.
+pub async fn request_forget_stored(
+    account: &str,
+    force: bool,
+) -> Result<StoredForgetOutcome, AuthError> {
+    let expected = account.to_owned();
+    ask(
+        LOGOUT_CHANNEL,
+        &LogoutMessage::ForgetStored {
+            account: account.to_owned(),
+            force,
+        },
+        Some(core::time::Duration::from_secs(30)),
+        move |message| match message {
+            LogoutMessage::StoredRefused { account, refusal } if account == expected => {
+                Some(StoredForgetOutcome::Refused(refusal))
+            }
+            LogoutMessage::StoredDone { account, failed } if account == expected => {
+                Some(StoredForgetOutcome::Done { failed })
+            }
             _ => None,
         },
     )
