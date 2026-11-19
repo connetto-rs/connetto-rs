@@ -1538,7 +1538,7 @@ where
     ///
     /// # Errors
     ///
-    /// [`CertificateError::Offline`] without a server connection, [`CertificateError::OverCeiling`] for a refused lifetime, [`CertificateError::Revoked`] when revocation deletes the key and prevents enrolment until the next build, [`CertificateError::Refused`] for another refusal, and [`CertificateError::NoIdentity`] without a device identity.
+    /// [`CertificateError::Offline`] without a server connection, [`CertificateError::OverCeiling`] for a refused lifetime, [`CertificateError::Revoked`] when revocation deletes the key and prevents enrolment until the next build, [`CertificateError::ApplicationRefused`] when the deployment's application refuses the enrolment, [`CertificateError::Refused`] for another refusal, and [`CertificateError::NoIdentity`] without a device identity.
     #[cfg(feature = "device-identity")]
     pub async fn reissue_certificate(
         &self,
@@ -1583,8 +1583,10 @@ where
     /// # Errors
     ///
     /// [`CertificateError::Offline`] with no server reachable,
-    /// [`CertificateError::Refused`] for a key that is not the account's, and
-    /// [`CertificateError::NoIdentity`] for a build without a device identity.
+    /// [`CertificateError::ApplicationRefused`] when the deployment's
+    /// application refuses the revocation, [`CertificateError::Refused`] for
+    /// a key that is not the account's, and [`CertificateError::NoIdentity`]
+    /// for a build without a device identity.
     #[cfg(feature = "device-identity")]
     pub async fn revoke_device(
         &self,

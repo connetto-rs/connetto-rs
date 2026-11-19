@@ -44,7 +44,7 @@ use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
 use connetto_server::ban::{Ban, BanError, BanFuture, BanStore, NewBan};
 use connetto_server::courier::CourierEntry;
 use connetto_server::defaults::{_connetto_courier_notices, _connetto_settled, _connetto_writers};
-use connetto_server::device_cert::{DeviceEnrolment, Enrolment, EnrolmentStore};
+use connetto_server::device_cert::{DeviceEnrolment, Enrolment};
 use connetto_server::writer_schema::{SettlePath, SettledOutcome};
 use connetto_server::{
     AbuseConfig, FailedAuthorization, ManagerBuilder, Materializer, NoConnector, PageSpec,
@@ -255,17 +255,21 @@ impl Enrolments {
         let record = Enrolment {
             user: user.to_owned(),
             key: KeyId::from_bytes(key_id),
-            serial: [8; 16],
+            serial: *uuid::Uuid::new_v4().as_bytes(),
             issuer: KeyId::from_bytes([9; 32]),
             issued_at: SystemTime::now(),
             expires_at,
             session: SessionId::from_uuid(uuid::Uuid::new_v4()),
             public_key: key.subject_public_key_info().clone(),
-            descriptor: vec![0x91, 0x01],
+            descriptor: vec![0xc0],
             attestation: AttestationLevel::Unproven,
             bot_list: connetto_core::BOT_LIST_WILDCARD.to_owned(),
         };
-        self.store.record(record).await.expect("record the renewal");
+        let mut connection = self.pool.get().await.expect("admin connection");
+        self.store
+            .record(&mut connection, record)
+            .await
+            .expect("record the renewal");
     }
 }
 
@@ -529,7 +533,7 @@ pub(super) fn roster() -> RosterAuth {
 pub(super) fn writing_manager(
     pool: &Pool<AsyncPgConnection>,
     guard: Arc<RequestGuard<String>>,
-    enrolment: Option<DeviceEnrolment<String>>,
+    enrolment: Option<DeviceEnrolment<ConnettoDefaults>>,
     session: SessionConfig,
 ) -> Manager {
     manager_over(pool, guard, enrolment, session, roster())
@@ -539,7 +543,7 @@ pub(super) fn writing_manager(
 pub(super) fn manager_over<A>(
     pool: &Pool<AsyncPgConnection>,
     guard: Arc<RequestGuard<String>>,
-    enrolment: Option<DeviceEnrolment<String>>,
+    enrolment: Option<DeviceEnrolment<ConnettoDefaults>>,
     session: SessionConfig,
     auth: A,
 ) -> Arc<SessionManager<NoSnapshot, A, ConnettoDefaults>>
@@ -825,7 +829,7 @@ impl VisibilityPolicy for Faulting {
 async fn a_good_courier_range_settles_the_authors_entries_under_courier() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
 
@@ -890,7 +894,7 @@ async fn a_good_courier_range_settles_the_authors_entries_under_courier() {
 async fn a_forged_offer_is_refused_before_anything_settles() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (forger, _) = store.enrol("bob", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
@@ -984,7 +988,7 @@ async fn settled_camp(
 async fn a_settled_bounded_range_past_the_bound_or_forged_is_refused() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
     let ((key, key_id), writer, range) = settled_camp(&manager, &fixture, &store).await;
     let author = KeyId::from_bytes(key_id);
@@ -1059,7 +1063,7 @@ async fn a_settled_bounded_range_past_the_bound_or_forged_is_refused() {
 async fn a_range_bounded_by_the_settled_frontier_verifies_and_settles() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
     let ((key, key_id), writer, range) = settled_camp(&manager, &fixture, &store).await;
     let author = KeyId::from_bytes(key_id);
@@ -1110,7 +1114,7 @@ async fn a_range_bounded_by_the_settled_frontier_verifies_and_settles() {
 async fn a_malformed_range_is_refused_before_anything_settles() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
     let range = chain(vec![
@@ -1207,7 +1211,7 @@ async fn a_malformed_range_is_refused_before_anything_settles() {
 async fn a_broken_body_fails_the_range_and_what_settled_stands() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
     let range = chain(vec![
@@ -1264,7 +1268,7 @@ async fn a_broken_body_fails_the_range_and_what_settled_stands() {
 async fn a_courier_range_past_the_authors_frontier_is_refused() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
     let range = chain(vec![
@@ -1305,7 +1309,7 @@ async fn a_courier_range_past_the_authors_frontier_is_refused() {
 async fn a_courier_range_skips_the_settled_prefix_with_its_verdicts() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (captured, manager) = courier_manager(&fixture, &store);
     let range = chain(vec![
@@ -1375,7 +1379,7 @@ async fn a_courier_range_skips_the_settled_prefix_with_its_verdicts() {
 async fn a_courier_range_for_a_retired_author_is_refused() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
     let range = chain(vec![
@@ -1420,7 +1424,7 @@ async fn a_courier_range_for_a_retired_author_is_refused() {
 async fn a_revoked_or_long_expired_author_is_refused_and_one_within_skew_delivers() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (revoked, revoked_id) = store.enrol("alice", tomorrow()).await;
     let (expired, expired_id) = store
         .enrol(
@@ -1432,7 +1436,7 @@ async fn a_revoked_or_long_expired_author_is_refused_and_one_within_skew_deliver
         .enrol("alice", SystemTime::now() - DEVICE_SKEW / 2)
         .await;
     let (_captured, manager) = courier_manager(&fixture, &store);
-    store.revoke(revoked_id);
+    store.revoke(revoked_id).await;
 
     let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
     assert_eq!(
@@ -1460,7 +1464,7 @@ async fn a_revoked_or_long_expired_author_is_refused_and_one_within_skew_deliver
 async fn a_banned_authors_range_is_refused_unsettled() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let guard = Arc::new(
         RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
@@ -1499,7 +1503,7 @@ async fn a_couriered_entry_binds_the_authors_certificate_bot_list() {
              FOR EACH ROW EXECUTE FUNCTION stamp_bot_list()",
         ])
         .await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (bot, bot_id) = store
         .enrol_listing("alice", tomorrow(), "notes:read,notes:insert")
         .await;
@@ -1536,7 +1540,7 @@ async fn a_couriered_entry_binds_the_authors_certificate_bot_list() {
 async fn a_range_stops_at_a_digest_only_row_and_at_a_number_original() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (number_key, number_key_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
@@ -1598,7 +1602,7 @@ async fn a_range_stops_at_a_digest_only_row_and_at_a_number_original() {
 async fn a_body_of_another_major_is_not_couriered_on_this_connection() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
 
@@ -1629,7 +1633,7 @@ async fn a_body_of_another_major_is_not_couriered_on_this_connection() {
 async fn a_direct_reupload_of_a_courier_settled_entry_is_answered_from_the_record_and_audited() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (captured, manager) = courier_manager(&fixture, &store);
 
@@ -1693,7 +1697,7 @@ async fn a_direct_reupload_of_a_courier_settled_entry_is_answered_from_the_recor
 async fn a_sweep_prunes_a_revoked_writers_settled_rows_and_keeps_its_row() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (k1, k1_id) = store.enrol("alice", tomorrow()).await;
     let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
@@ -1715,7 +1719,7 @@ async fn a_sweep_prunes_a_revoked_writers_settled_rows_and_keeps_its_row() {
     .await;
 
     // The revocation of the first key makes its writer sweepable.
-    store.revoke(k1_id);
+    store.revoke(k1_id).await;
     let pruned = manager.sweep_writer_rows().await.expect("sweep the rows");
     assert_eq!(pruned, 1, "one writer's rows pruned");
 
@@ -1752,7 +1756,7 @@ async fn a_sweep_prunes_a_revoked_writers_settled_rows_and_keeps_its_row() {
 async fn a_sweep_keeps_an_expired_writers_records_and_a_renewed_key_keeps_delivering() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     // The certificate expired an hour ago, the enrolment still stands.
     let (key, key_id) = store
         .enrol("alice", SystemTime::now() - Duration::from_hours(1))
@@ -1836,7 +1840,7 @@ async fn a_sweep_keeps_an_expired_writers_records_and_a_renewed_key_keeps_delive
 async fn a_courier_restore_answers_a_settled_original_without_reapplying() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (k1, k1_id) = store.enrol("alice", tomorrow()).await;
     let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
@@ -1886,7 +1890,7 @@ async fn a_courier_restore_answers_a_settled_original_without_reapplying() {
 async fn a_courier_restore_settles_the_unsettled_original_with_the_copy() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     // The original's key enrolled but never bound, so it holds no writer row.
     let (_k1, k1_id) = store.enrol("alice", tomorrow()).await;
     let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
@@ -1927,7 +1931,7 @@ async fn a_courier_restore_settles_the_unsettled_original_with_the_copy() {
 async fn a_courier_restore_keeps_a_refused_original_outcome() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (k1, k1_id) = store.enrol("alice", tomorrow()).await;
     let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
     let (captured, manager) = courier_manager(&fixture, &store);
@@ -1981,7 +1985,7 @@ async fn a_courier_restore_keeps_a_refused_original_outcome() {
 async fn the_offer_covers_the_entries_provenance() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (_k1, k1_id) = store.enrol("alice", tomorrow()).await;
     let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
@@ -2030,7 +2034,7 @@ async fn the_offer_covers_the_entries_provenance() {
 async fn a_courier_restore_of_a_foreign_original_applies_plain() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
     let (k3, k3_id) = store.enrol("bob", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
@@ -2079,7 +2083,7 @@ async fn a_courier_restore_of_a_foreign_original_applies_plain() {
 async fn a_courier_restore_with_a_provenance_gap_settles_neither() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (k1, k1_id) = store.enrol("alice", tomorrow()).await;
     let (k2, k2_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
@@ -2129,7 +2133,7 @@ async fn a_courier_restore_with_a_provenance_gap_settles_neither() {
 async fn a_refused_courier_restore_settles_the_unsettled_original() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (_, original_key) = store.enrol("alice", tomorrow()).await;
     let (author, author_key) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
@@ -2202,7 +2206,7 @@ async fn concurrent_courier_restores_reserve_the_original_before_applying() {
 
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (_, original_key) = store.enrol("alice", tomorrow()).await;
     let authors = [
         store.enrol("alice", tomorrow()).await,
@@ -2286,7 +2290,7 @@ async fn concurrent_courier_restores_reserve_the_original_before_applying() {
 async fn a_row_that_settles_nothing_is_offered_again_from_it() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, guard) = audited_guard();
     let faulting = manager_over(
@@ -2342,7 +2346,7 @@ async fn a_row_that_settles_nothing_is_offered_again_from_it() {
 async fn a_range_stops_at_a_sequence_settled_under_another_entry() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (captured, manager) = courier_manager(&fixture, &store);
     settle_directly(&manager, "alice", &key, key_id, Vec::new()).await;
@@ -2390,7 +2394,7 @@ async fn a_range_stops_at_a_sequence_settled_under_another_entry() {
 async fn an_unreadable_settled_record_fails_the_range() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
     let range = chain(vec![
@@ -2432,7 +2436,7 @@ async fn an_unreadable_settled_record_fails_the_range() {
 async fn an_unreadable_ban_list_fails_the_range_closed() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let guard = Arc::new(
         RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default()).with_bans(
@@ -2464,7 +2468,7 @@ async fn an_unreadable_ban_list_fails_the_range_closed() {
 async fn a_writer_table_failure_fails_the_range() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
     let range = chain(vec![
@@ -2516,7 +2520,7 @@ async fn a_writer_table_failure_fails_the_range() {
 async fn a_writer_row_that_will_not_stand_fails_the_range() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
     let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
@@ -2565,7 +2569,7 @@ async fn a_writer_row_that_will_not_stand_fails_the_range() {
 async fn a_fresh_couriered_settle_writes_one_write_couriered_row_naming_both_accounts() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (captured, manager) = courier_manager(&fixture, &store);
     let caller = courier_caller("bob");
@@ -2602,7 +2606,7 @@ async fn a_fresh_couriered_settle_writes_one_write_couriered_row_naming_both_acc
 async fn a_refused_couriered_settle_writes_its_write_couriered_row() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (captured, guard) = audited_guard();
     let manager = manager_over(
@@ -2645,7 +2649,7 @@ async fn a_refused_couriered_settle_writes_its_write_couriered_row() {
 async fn the_settled_prefix_earns_no_write_couriered_rows() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (captured, manager) = courier_manager(&fixture, &store);
     let range = chain(vec![
@@ -2691,7 +2695,7 @@ async fn the_settled_prefix_earns_no_write_couriered_rows() {
 async fn an_already_settled_sequence_keeps_its_own_audit_rows() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (captured, manager) = courier_manager(&fixture, &store);
     let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);
@@ -2757,7 +2761,7 @@ async fn an_already_settled_sequence_keeps_its_own_audit_rows() {
 async fn a_failed_notice_insert_rolls_back_the_settle() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
     fixture
@@ -2794,7 +2798,7 @@ async fn a_failed_notice_insert_rolls_back_the_settle() {
 async fn a_couriered_settle_writes_its_notice_row() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
     let range = chain(vec![plain(insert_changeset(2, "two", "t1"))]);

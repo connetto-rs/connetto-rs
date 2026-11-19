@@ -201,11 +201,18 @@ pub trait ConnettoStoreSchema: Send + Sync + 'static {
         idle_window: Duration,
     ) -> Statement<'_, (Instant, Instant)>;
 
-    /// Mark the session revoked.
-    fn revoke_update(conn: &mut AsyncPgConnection, session_id: SessionId) -> Statement<'_, ()>;
+    /// Mark the session revoked when it is not yet, answering its account
+    /// when it was not.
+    fn revoke_update(
+        conn: &mut AsyncPgConnection,
+        session_id: SessionId,
+    ) -> Statement<'_, Option<Self::Id>>;
 
-    /// Mark every session not yet revoked as revoked, returning how many were.
-    fn revoke_every_update(conn: &mut AsyncPgConnection) -> Statement<'_, usize>;
+    /// Mark every session not yet revoked as revoked, answering each one
+    /// with its account.
+    fn revoke_every_update(
+        conn: &mut AsyncPgConnection,
+    ) -> Statement<'_, Vec<(Self::Id, SessionId)>>;
 
     /// Store a session's retained provider tokens, stamping the expiry from
     /// the database's clock when the provider stated a lifetime, replacing
@@ -705,33 +712,41 @@ macro_rules! connetto_auth_tables {
             fn revoke_update(
                 conn: &mut diesel_async::AsyncPgConnection,
                 session_id: $crate::SessionId,
-            ) -> $crate::authn::schema::Statement<'_, ()> {
+            ) -> $crate::authn::schema::Statement<'_, Option<Self::Id>> {
                 Box::pin(async move {
-                    use diesel::ExpressionMethods;
-                    use diesel_async::RunQueryDsl as _;
-                    diesel::update(diesel::QueryDsl::filter(
-                        connetto_sessions::table,
-                        connetto_sessions::session_id.eq(session_id),
-                    ))
-                    .set(connetto_sessions::revoked.eq(true))
-                    .execute(conn)
-                    .await?;
-                    Ok(())
+                    use diesel::BoolExpressionMethods as _;
+                    use diesel::ExpressionMethods as _;
+                    use diesel::OptionalExtension as _;
+                    diesel_async::RunQueryDsl::get_result(
+                        diesel::update(diesel::QueryDsl::filter(
+                            connetto_sessions::table,
+                            connetto_sessions::session_id
+                                .eq(session_id)
+                                .and(connetto_sessions::revoked.eq(false)),
+                        ))
+                        .set(connetto_sessions::revoked.eq(true))
+                        .returning(connetto_sessions::user_id),
+                        conn,
+                    )
+                    .await
+                    .optional()
                 })
             }
 
             fn revoke_every_update(
                 conn: &mut diesel_async::AsyncPgConnection,
-            ) -> $crate::authn::schema::Statement<'_, usize> {
+            ) -> $crate::authn::schema::Statement<'_, Vec<(Self::Id, $crate::SessionId)>> {
                 Box::pin(async move {
-                    use diesel::ExpressionMethods;
-                    use diesel_async::RunQueryDsl as _;
-                    diesel::update(diesel::QueryDsl::filter(
-                        connetto_sessions::table,
-                        connetto_sessions::revoked.eq(false),
-                    ))
-                    .set(connetto_sessions::revoked.eq(true))
-                    .execute(conn)
+                    use diesel::ExpressionMethods as _;
+                    diesel_async::RunQueryDsl::get_results(
+                        diesel::update(diesel::QueryDsl::filter(
+                            connetto_sessions::table,
+                            connetto_sessions::revoked.eq(false),
+                        ))
+                        .set(connetto_sessions::revoked.eq(true))
+                        .returning((connetto_sessions::user_id, connetto_sessions::session_id)),
+                        conn,
+                    )
                     .await
                 })
             }

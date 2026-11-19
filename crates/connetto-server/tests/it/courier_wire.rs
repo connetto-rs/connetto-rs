@@ -311,7 +311,7 @@ async fn camp() -> (
 ) {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let author = store.enrol("alice", tomorrow()).await;
     let courier = store.enrol("bob", tomorrow()).await;
     let manager = courier_on(&fixture, &store);
@@ -324,7 +324,7 @@ async fn camp() -> (
 async fn a_range_answers_after_its_last_body_and_the_connection_takes_another() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (author, author_id) = store.enrol("alice", tomorrow()).await;
     let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
     let manager = courier_on(&fixture, &store);
@@ -380,7 +380,7 @@ async fn a_range_answers_after_its_last_body_and_the_connection_takes_another() 
 async fn a_range_counting_no_bodies_answers_at_once() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (author, author_id) = store.enrol("alice", tomorrow()).await;
     let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
     let manager = courier_on(&fixture, &store);
@@ -409,7 +409,7 @@ async fn a_range_counting_no_bodies_answers_at_once() {
 async fn a_body_for_a_settled_row_is_consumed_and_applies_nothing() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (author, author_id) = store.enrol("alice", tomorrow()).await;
     let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
     let manager = courier_on(&fixture, &store);
@@ -549,7 +549,7 @@ async fn the_last_body_leaves_the_next_row_not_couriered() {
 async fn a_row_that_settles_nothing_stops_the_range_and_the_rest_drain() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (author, author_id) = store.enrol("alice", tomorrow()).await;
     let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
     let (_captured, guard) = audited_guard();
@@ -596,7 +596,7 @@ async fn a_row_that_settles_nothing_stops_the_range_and_the_rest_drain() {
 async fn a_disabled_server_drains_the_range_and_answers_once() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (author, author_id) = store.enrol("alice", tomorrow()).await;
     let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
     let (_captured, manager) = courier_manager(&fixture, &store);
@@ -999,7 +999,7 @@ async fn a_store_failure_in_a_range_ends_the_connection() {
     // The ban list cannot be read when the range opens.
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (author, author_id) = store.enrol("alice", tomorrow()).await;
     let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
     let unreadable_bans = writing_manager(
@@ -1101,7 +1101,7 @@ fn budget_manager(fixture: &Fixture, store: &Enrolments, limit: u64) -> Manager 
 async fn a_body_past_its_courier_bucket_earns_retries() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (author, author_id) = store.enrol("alice", tomorrow()).await;
     let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
     let range = three();
@@ -1151,7 +1151,7 @@ async fn a_body_past_its_courier_bucket_earns_retries() {
 async fn drained_bodies_draw_on_the_courier_bucket() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (author, author_id) = store.enrol("alice", tomorrow()).await;
     let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
     let range = three();
@@ -1194,7 +1194,7 @@ async fn drained_bodies_draw_on_the_courier_bucket() {
 async fn a_body_wider_than_its_courier_bucket_settles_nothing() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (author, author_id) = store.enrol("alice", tomorrow()).await;
     let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
     let manager = budget_manager(&fixture, &store, 8);
@@ -1222,7 +1222,7 @@ async fn a_body_wider_than_its_courier_bucket_settles_nothing() {
 async fn an_identified_handshake_carries_the_standing_courier_notices() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (_author, author_id) = store.enrol("alice", tomorrow()).await;
     let manager = courier_on(&fixture, &store);
     let cap = connetto_core::exchange::MAX_MANIFEST_ROWS;
@@ -1263,7 +1263,7 @@ async fn an_identified_handshake_carries_the_standing_courier_notices() {
 async fn malformed_courier_notices_stand_and_the_rest_go_out() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (_author, author_id) = store.enrol("alice", tomorrow()).await;
     let manager = courier_on(&fixture, &store);
     let applied = connetto_server::writer_schema::SettledOutcome::Applied.json();
@@ -1306,7 +1306,7 @@ async fn malformed_courier_notices_stand_and_the_rest_go_out() {
 async fn a_failed_notice_delete_keeps_the_rows_for_the_next_handshake() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (_author, author_id) = store.enrol("alice", tomorrow()).await;
     let manager = courier_on(&fixture, &store);
     seed_notices(&fixture, "alice", author_id, "bob", 2).await;
@@ -1347,7 +1347,7 @@ async fn a_failed_notice_delete_keeps_the_rows_for_the_next_handshake() {
 async fn an_anonymous_session_carries_no_courier_notices() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (_author, author_id) = store.enrol("alice", tomorrow()).await;
     let manager = courier_on(&fixture, &store);
     seed_notices(&fixture, "alice", author_id, "bob", 2).await;
@@ -1368,7 +1368,7 @@ async fn an_anonymous_session_carries_no_courier_notices() {
 async fn a_courier_notice_ack_deletes_only_its_frames_rows() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (_author, author_id) = store.enrol("alice", tomorrow()).await;
     let manager = courier_on(&fixture, &store);
     let cap = connetto_core::exchange::MAX_MANIFEST_ROWS;
@@ -1404,7 +1404,7 @@ async fn a_courier_notice_ack_deletes_only_its_frames_rows() {
 async fn an_unacked_courier_notice_outlives_a_close() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (_author, author_id) = store.enrol("alice", tomorrow()).await;
     let manager = courier_on(&fixture, &store);
     seed_notices(&fixture, "alice", author_id, "bob", 2).await;
@@ -1430,7 +1430,7 @@ async fn an_unacked_courier_notice_outlives_a_close() {
 async fn two_sessions_both_receive_a_courier_notice() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (_author, author_id) = store.enrol("alice", tomorrow()).await;
     let manager = courier_on(&fixture, &store);
     seed_notices(&fixture, "alice", author_id, "bob", 2).await;
@@ -1465,7 +1465,7 @@ async fn two_sessions_both_receive_a_courier_notice() {
 async fn a_courier_settle_pushes_no_live_notice_to_the_author() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (author, author_id) = store.enrol("alice", tomorrow()).await;
     let (courier, courier_id) = store.enrol("bob", tomorrow()).await;
     let manager = courier_on(&fixture, &store);

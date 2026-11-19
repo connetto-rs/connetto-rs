@@ -88,7 +88,7 @@ pub use capability::{CapabilityIssuer, IssuedCapability, ShareError, ShareLevel}
 pub use connetto_core::auth::CapabilityKey;
 pub use courier::CourierEntry;
 pub use fence::{ReadFence, Unseen, UnseenIds, snapshot_cursor, split_snapshot_cursor};
-pub use guard::{BanHook, PersonCloseHook, RequestGuard};
+pub use guard::{BannedSessions, PersonCloseHook, RequestGuard};
 // Re-exported because `ShareError::NotWritable` names one, so an application
 // matching on a refused verb can spell its type.
 pub use subql::visibility::WriteOp;
@@ -102,13 +102,14 @@ pub use authn::http::{
 };
 pub use authn::{
     AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthHooks, AuthService, AuthStoreError,
-    CommittedNotice, ConnettoHandshakeAuthority, DefaultAuthHooks, GenericOidcProvider, HookError,
-    HookFuture, IdentityProvider, IssuedAuthCode, IssuedSession, LivenessError, LoginRedirect,
-    LoginRequest, OAuthEndpoints, OAuthProvider, OAuthProviderConfig, OidcProviderConfig,
-    PendingLogin, PendingLogins, ProviderError, ProviderRegistry, RefreshLifetimes, RefreshOutcome,
-    ResolvedIdentity, RetainedProviderToken, SessionDescriber, SessionOrigin, SessionRecord,
-    SessionRow, SignedIn, StoredProviderToken, TokenAuthority, TokenError, TokenPair,
-    VerifiedClaims, VerifiedLogin, VerifiedSession, deterministic_uuid,
+    CommittedNotice, ConnettoHandshakeAuthority, DefaultAuthHooks, DeviceEnrolled, DeviceRevoked,
+    EndCause, GenericOidcProvider, HookError, HookFuture, IdentityProvider, IssuedAuthCode,
+    IssuedSession, LivenessError, LoginRedirect, LoginRequest, OAuthEndpoints, OAuthProvider,
+    OAuthProviderConfig, OidcProviderConfig, PendingLogin, PendingLogins, ProviderError,
+    ProviderRegistry, RefreshLifetimes, RefreshOutcome, ResolvedIdentity, RetainedProviderToken,
+    SessionDescriber, SessionOrigin, SessionRecord, SessionRow, SessionsEnded, SignedIn,
+    StoredProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedClaims, VerifiedLogin,
+    VerifiedSession, deterministic_uuid,
 };
 pub use authn::{ConnettoStoreSchema, DbAuthStore};
 pub use bots::InstalledApp;

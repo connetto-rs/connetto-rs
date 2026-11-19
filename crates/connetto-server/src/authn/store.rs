@@ -191,6 +191,7 @@ pub(crate) fn split_refresh(token: &str) -> Option<(SessionId, &str)> {
 pub use db::DbAuthStore;
 
 mod db {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use connetto_core::SessionId;
@@ -203,7 +204,7 @@ mod db {
         format_refresh, hash_secret, hashes_match, new_refresh_secret, new_session_id,
         split_refresh,
     };
-    use crate::authn::hooks::{AuthHooks, SignedIn};
+    use crate::authn::hooks::{AuthHooks, CommittedNotice, EndCause, SessionsEnded, SignedIn};
     use crate::authn::provider::RetainedProviderToken;
     use crate::authn::schema::{
         ConnettoStoreSchema, Desc, NewSession, SessionRecord, SessionRow, SessionStamps,
@@ -243,6 +244,12 @@ mod db {
             &*self.hooks
         }
 
+        /// The owner pool the store's transactions run on, for a caller that
+        /// owns a transaction spanning the store and its own tables.
+        pub(crate) fn pool(&self) -> &Pool<AsyncPgConnection> {
+            &self.pool
+        }
+
         /// Delete the retained provider tokens of `sessions`, which were just
         /// revoked in the same transaction (R105 decision 5).
         async fn forget(
@@ -252,6 +259,105 @@ mod db {
             <D::Auth as ConnettoStoreSchema>::forget_provider_tokens(conn, sessions)
                 .await
                 .map_err(backend)
+        }
+
+        /// Finish ending `sessions` of `user` inside the transaction that
+        /// revoked them: forget their provider tokens and run
+        /// [`sessions_ended`](AuthHooks::sessions_ended). Nothing when no
+        /// session ended.
+        async fn ended_in(
+            &self,
+            conn: &mut AsyncPgConnection,
+            user: &D::Id,
+            sessions: &[SessionId],
+            cause: EndCause,
+        ) -> Result<(), AuthStoreError> {
+            if sessions.is_empty() {
+                return Ok(());
+            }
+            Self::forget(conn, sessions.to_vec()).await?;
+            self.hooks
+                .sessions_ended(
+                    conn,
+                    &SessionsEnded {
+                        user_id: user,
+                        sessions,
+                        cause,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+
+        /// Tell [`committed`](AuthHooks::committed) that `sessions` of `user`
+        /// ended, once their transaction committed. Nothing when none did.
+        pub(crate) fn tell_ended(&self, user: &D::Id, sessions: &[SessionId], cause: EndCause) {
+            if sessions.is_empty() {
+                return;
+            }
+            self.hooks.committed(CommittedNotice::SessionsEnded {
+                user_id: user.clone(),
+                sessions: sessions.to_vec(),
+                cause,
+            });
+        }
+
+        /// Revoke every live session of `user` but `keep` on `conn`, inside
+        /// the caller's transaction, running
+        /// [`sessions_ended`](AuthHooks::sessions_ended) with `cause`.
+        /// Answers the sessions it revoked, which the caller tells
+        /// [`tell_ended`](Self::tell_ended) once it commits.
+        pub(crate) async fn end_all_of_in(
+            &self,
+            conn: &mut AsyncPgConnection,
+            user: &D::Id,
+            keep: Option<SessionId>,
+            cause: EndCause,
+        ) -> Result<Vec<SessionId>, AuthStoreError> {
+            let ended = <D::Auth as ConnettoStoreSchema>::end_all_of(conn, user.clone(), keep)
+                .await
+                .map_err(backend)?;
+            self.ended_in(conn, user, &ended, cause).await?;
+            Ok(ended)
+        }
+
+        /// End `user`'s live session `session` on `conn`, inside the caller's
+        /// transaction, running [`sessions_ended`](AuthHooks::sessions_ended)
+        /// with `cause`. Answers whether it was `user`'s and live, which the
+        /// caller tells [`tell_ended`](Self::tell_ended) once it commits.
+        pub(crate) async fn end_owned_in(
+            &self,
+            conn: &mut AsyncPgConnection,
+            user: &D::Id,
+            session: SessionId,
+            cause: EndCause,
+        ) -> Result<bool, AuthStoreError> {
+            let ended = <D::Auth as ConnettoStoreSchema>::end_owned(conn, user.clone(), session)
+                .await
+                .map_err(backend)?;
+            if ended {
+                self.ended_in(conn, user, &[session], cause).await?;
+            }
+            Ok(ended)
+        }
+
+        /// Revoke `session` on `conn` when it is not yet, inside the caller's
+        /// transaction, running [`sessions_ended`](AuthHooks::sessions_ended)
+        /// with `cause`. Answers its account when it was live, which the
+        /// caller tells [`tell_ended`](Self::tell_ended) once it commits.
+        pub(crate) async fn revoke_in(
+            &self,
+            conn: &mut AsyncPgConnection,
+            session: SessionId,
+            cause: EndCause,
+        ) -> Result<Option<D::Id>, AuthStoreError> {
+            let user = <D::Auth as ConnettoStoreSchema>::revoke_update(conn, session)
+                .await
+                .map_err(backend)?;
+            if let Some(user) = &user {
+                self.ended_in(conn, user, &[session], cause).await?;
+            }
+            Ok(user)
         }
     }
 
@@ -397,52 +503,56 @@ mod db {
                 .map_err(backend)
         }
 
-        /// Revoke `session` when it is `user`'s and not yet revoked,
-        /// answering whether it was.
+        /// Revoke `session` when it is `user`'s and not yet revoked, running
+        /// [`sessions_ended`](AuthHooks::sessions_ended) with `cause` in the
+        /// same transaction, answering whether it was.
         ///
         /// # Errors
         ///
-        /// [`AuthStoreError::Backend`] when the update fails.
+        /// [`AuthStoreError::Hook`] when the hook refuses or fails, which
+        /// leaves the session standing, and [`AuthStoreError::Backend`] when
+        /// the update fails.
         pub async fn end_owned(
             &self,
             user: &D::Id,
             session: SessionId,
+            cause: EndCause,
         ) -> Result<bool, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let user = user.clone();
-            conn.transaction::<_, AuthStoreError, _>(async move |conn| {
-                let ended = <D::Auth as ConnettoStoreSchema>::end_owned(conn, user, session)
-                    .await
-                    .map_err(backend)?;
-                if ended {
-                    Self::forget(conn, vec![session]).await?;
-                }
-                Ok(ended)
-            })
-            .await
+            let ended = conn
+                .transaction::<_, AuthStoreError, _>(async move |conn| {
+                    self.end_owned_in(conn, user, session, cause).await
+                })
+                .await?;
+            if ended {
+                self.tell_ended(user, &[session], cause);
+            }
+            Ok(ended)
         }
 
-        /// Revoke every live session of `user` but `keep`, answering the ones
-        /// it revoked.
+        /// Revoke every live session of `user` but `keep`, running
+        /// [`sessions_ended`](AuthHooks::sessions_ended) with `cause` in the
+        /// same transaction, answering the ones it revoked.
         ///
         /// # Errors
         ///
-        /// [`AuthStoreError::Backend`] when the update fails.
+        /// [`AuthStoreError::Hook`] when the hook refuses or fails, which
+        /// leaves every session standing, and [`AuthStoreError::Backend`]
+        /// when the update fails.
         pub async fn end_all_of(
             &self,
             user: &D::Id,
             keep: Option<SessionId>,
+            cause: EndCause,
         ) -> Result<Vec<SessionId>, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let user = user.clone();
-            conn.transaction::<_, AuthStoreError, _>(async move |conn| {
-                let ended = <D::Auth as ConnettoStoreSchema>::end_all_of(conn, user, keep)
-                    .await
-                    .map_err(backend)?;
-                Self::forget(conn, ended.clone()).await?;
-                Ok(ended)
-            })
-            .await
+            let ended = conn
+                .transaction::<_, AuthStoreError, _>(async move |conn| {
+                    self.end_all_of_in(conn, user, keep, cause).await
+                })
+                .await?;
+            self.tell_ended(user, &ended, cause);
+            Ok(ended)
         }
 
         /// Whether the session still exists, is not revoked, and is within
@@ -469,7 +579,10 @@ mod db {
         /// [`AuthStoreError::NotFound`] for an unknown or revoked session,
         /// [`AuthStoreError::Expired`] past a deadline,
         /// [`AuthStoreError::Reuse`] for a rotated-out secret, which revokes
-        /// the session, and [`AuthStoreError::Backend`] when a statement fails.
+        /// the session with [`EndCause::TokenReplayed`],
+        /// [`AuthStoreError::Hook`] when that revocation's hook refuses or
+        /// fails, which leaves the session standing, and
+        /// [`AuthStoreError::Backend`] when a statement fails.
         pub async fn rotate_refresh(
             &self,
             refresh_token: &str,
@@ -527,43 +640,61 @@ mod db {
                 .await
             };
             if matches!(outcome, Err(AuthStoreError::Reuse { .. })) {
-                conn.transaction::<_, AuthStoreError, _>(async move |conn| {
-                    <D::Auth as ConnettoStoreSchema>::revoke_update(conn, session_id)
-                        .await
-                        .map_err(backend)?;
-                    Self::forget(conn, vec![session_id]).await
-                })
-                .await?;
+                let cause = EndCause::TokenReplayed;
+                let ended = conn
+                    .transaction::<_, AuthStoreError, _>(async move |conn| {
+                        self.revoke_in(conn, session_id, cause).await
+                    })
+                    .await?;
+                if let Some(user) = ended {
+                    self.tell_ended(&user, &[session_id], cause);
+                }
             }
             outcome
         }
 
         /// Revoke the session, refusing it on the next handshake even while
-        /// its access token is still time-valid.
+        /// its access token is still time-valid, running
+        /// [`sessions_ended`](AuthHooks::sessions_ended) with `cause` in the
+        /// same transaction when it was live. Answers its account when it was.
         ///
         /// # Errors
         ///
-        /// [`AuthStoreError::Backend`] when the update fails.
-        pub async fn revoke_session(&self, session_id: SessionId) -> Result<(), AuthStoreError> {
+        /// [`AuthStoreError::Hook`] when the hook refuses or fails, which
+        /// leaves the session standing, and [`AuthStoreError::Backend`] when
+        /// the update fails.
+        pub async fn revoke_session(
+            &self,
+            session_id: SessionId,
+            cause: EndCause,
+        ) -> Result<Option<D::Id>, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            conn.transaction::<_, AuthStoreError, _>(async move |conn| {
-                <D::Auth as ConnettoStoreSchema>::revoke_update(conn, session_id)
-                    .await
-                    .map_err(backend)?;
-                Self::forget(conn, vec![session_id]).await
-            })
-            .await
+            let ended = conn
+                .transaction::<_, AuthStoreError, _>(async move |conn| {
+                    self.revoke_in(conn, session_id, cause).await
+                })
+                .await?;
+            if let Some(user) = &ended {
+                self.tell_ended(user, &[session_id], cause);
+            }
+            Ok(ended)
         }
 
-        /// Revoke every session still live, returning how many were, the
-        /// answer to a restore that revived rotated refresh tokens.
+        /// Revoke every session still live, the answer to a restore that
+        /// revived rotated refresh tokens, running
+        /// [`sessions_ended`](AuthHooks::sessions_ended) once per account with
+        /// [`EndCause::DatabaseRestored`] in the same transaction. Answers
+        /// how many sessions were live.
         ///
         /// # Errors
         ///
-        /// [`AuthStoreError::Backend`] when the update fails.
+        /// [`AuthStoreError::Hook`] when a hook refuses or fails, which leaves
+        /// every session standing, and [`AuthStoreError::Backend`] when the
+        /// update fails.
         pub async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
+            let cause = EndCause::DatabaseRestored;
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let revoked = conn
+            let accounts = conn
                 .transaction::<_, AuthStoreError, _>(async move |conn| {
                     let revoked = <D::Auth as ConnettoStoreSchema>::revoke_every_update(conn)
                         .await
@@ -571,9 +702,36 @@ mod db {
                     <D::Auth as ConnettoStoreSchema>::forget_every_provider_token(conn)
                         .await
                         .map_err(backend)?;
-                    Ok(revoked)
+                    // `D::Id` is neither `Ord` nor `Hash`, and its text form
+                    // is the identity it parses back from.
+                    let mut accounts: BTreeMap<String, (D::Id, Vec<SessionId>)> = BTreeMap::new();
+                    for (user, session) in revoked {
+                        accounts
+                            .entry(user.to_string())
+                            .or_insert_with(|| (user, Vec::new()))
+                            .1
+                            .push(session);
+                    }
+                    for (user, sessions) in accounts.values() {
+                        self.hooks
+                            .sessions_ended(
+                                conn,
+                                &SessionsEnded {
+                                    user_id: user,
+                                    sessions,
+                                    cause,
+                                },
+                            )
+                            .await?;
+                    }
+                    Ok(accounts)
                 })
                 .await?;
+            let mut revoked = 0_usize;
+            for (user, sessions) in accounts.values() {
+                revoked += sessions.len();
+                self.tell_ended(user, sessions, cause);
+            }
             Ok(u64::try_from(revoked).unwrap_or(u64::MAX))
         }
 

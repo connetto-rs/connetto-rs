@@ -8,6 +8,7 @@
 use core::pin::Pin;
 use std::time::SystemTime;
 
+use connetto_core::SessionId;
 use connetto_core::device_cert::KeyId;
 use diesel_async::AsyncPgConnection;
 
@@ -41,6 +42,64 @@ pub struct SignedIn<'a, Id, Desc> {
     pub session: &'a SessionRecord<Id, Desc>,
 }
 
+/// A device key the account never had, enrolled during a session, handed to
+/// [`AuthHooks::device_enrolled`] before it commits.
+#[derive(Debug)]
+pub struct DeviceEnrolled<'a, Id, Desc> {
+    /// The session the key enrolled during.
+    pub session: &'a SessionRecord<Id, Desc>,
+    /// The enrolled key.
+    pub key: KeyId,
+    /// The device's descriptor, the `MessagePack` the device sent.
+    pub device: &'a [u8],
+}
+
+/// An enrolled device key revoked, handed to [`AuthHooks::device_revoked`]
+/// before it commits.
+#[derive(Debug)]
+pub struct DeviceRevoked<'a, Id> {
+    /// The account the key was enrolled under.
+    pub user_id: &'a Id,
+    /// The revoked key.
+    pub key: KeyId,
+}
+
+/// Live sessions of one account ended together, handed to
+/// [`AuthHooks::sessions_ended`] before it commits.
+#[derive(Debug)]
+pub struct SessionsEnded<'a, Id> {
+    /// The account the sessions belong to.
+    pub user_id: &'a Id,
+    /// The sessions that were live and are now ended.
+    pub sessions: &'a [SessionId],
+    /// Why they ended.
+    pub cause: EndCause,
+}
+
+/// Why sessions ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EndCause {
+    /// The session's holder logged out.
+    LoggedOut,
+    /// The deployment revoked it, or the device enrolled during it was
+    /// revoked.
+    Revoked,
+    /// A refresh token rotated away was presented again, which reads as theft.
+    TokenReplayed,
+    /// The person ended this one session of theirs.
+    EndedByOwner,
+    /// The person signed out everywhere else.
+    EndedOthers,
+    /// The person signed out everywhere.
+    EndedAll,
+    /// The account is banned.
+    Banned,
+    /// The person is erased.
+    Erased,
+    /// The server found the database restored or replaced at boot.
+    DatabaseRestored,
+}
+
 /// An event whose transaction committed, handed to [`AuthHooks::committed`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommittedNotice<Id, Desc> {
@@ -65,6 +124,27 @@ pub enum CommittedNotice<Id, Desc> {
         /// When the enrolment was issued.
         at: SystemTime,
     },
+    /// An enrolled device key was revoked.
+    DeviceRevoked {
+        /// The account the key was enrolled under.
+        user_id: Id,
+        /// The revoked key.
+        key: KeyId,
+    },
+    /// Live sessions of one account ended.
+    SessionsEnded {
+        /// The account the sessions belong to.
+        user_id: Id,
+        /// The sessions that ended.
+        sessions: Vec<SessionId>,
+        /// Why they ended.
+        cause: EndCause,
+    },
+    /// A person was erased, every session and device key of theirs revoked.
+    PersonErased {
+        /// The erased person.
+        person: Id,
+    },
 }
 
 /// The application's subscription to connetto's auth events. A method left at
@@ -84,6 +164,44 @@ pub trait AuthHooks<D: ConnettoSchema>: Send + Sync + 'static {
         &'a self,
         _transaction: &'a mut AsyncPgConnection,
         _signed_in: &'a SignedIn<'a, D::Id, Desc<D>>,
+    ) -> HookFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// A key the account never had enrolled is enrolled, its rows written
+    /// and not yet committed.
+    fn device_enrolled<'a>(
+        &'a self,
+        _transaction: &'a mut AsyncPgConnection,
+        _enrolled: &'a DeviceEnrolled<'a, D::Id, Desc<D>>,
+    ) -> HookFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// An enrolled key is revoked and not yet committed.
+    fn device_revoked<'a>(
+        &'a self,
+        _transaction: &'a mut AsyncPgConnection,
+        _revoked: &'a DeviceRevoked<'a, D::Id>,
+    ) -> HookFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Live sessions of one account are ended and not yet committed.
+    fn sessions_ended<'a>(
+        &'a self,
+        _transaction: &'a mut AsyncPgConnection,
+        _ended: &'a SessionsEnded<'a, D::Id>,
+    ) -> HookFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// A person is erased, every session and device key of theirs revoked
+    /// in this transaction, where the application deletes its own rows.
+    fn person_erased<'a>(
+        &'a self,
+        _transaction: &'a mut AsyncPgConnection,
+        _person: &'a D::Id,
     ) -> HookFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }

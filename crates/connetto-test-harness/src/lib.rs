@@ -18,11 +18,11 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::CallerMappings;
 use connetto_server::openfga::{Counted, FgaAuth, StoreUpkeep};
 use connetto_server::{
-    AuthHooks, DbAuthStore, DefaultAuthHooks, InMemoryOplog, LoopbackTransport, ManagerBuilder,
-    Materializer, NoSigner, OAuthEndpoints, OAuthProviderConfig, OidcProviderConfig,
-    PgReadConnector, PgSnapshotSource, ReconnectEvent, ReconnectPolicy, RefreshLifetimes,
-    RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager,
-    loopback, pg_write_target,
+    AuthConfig, AuthHooks, AuthService, DbAuthStore, DefaultAuthHooks, InMemoryOplog,
+    LoopbackTransport, ManagerBuilder, Materializer, NoSigner, OAuthEndpoints, OAuthProviderConfig,
+    OidcProviderConfig, PgReadConnector, PgSnapshotSource, ReconnectEvent, ReconnectPolicy,
+    RefreshLifetimes, RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, TokenAuthority, loopback, pg_write_target,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -1475,6 +1475,43 @@ impl Fixture {
     ) -> Arc<DbAuthStore<ConnettoDefaults>> {
         self.provision_auth_tables().await;
         Arc::new(DbAuthStore::new(self.admin.clone(), lifetimes, hooks))
+    }
+
+    /// Create the auth and enrolment tables and an auth service over them
+    /// running `hooks`, the service a device enrolment's transactions join.
+    ///
+    /// # Panics
+    ///
+    /// When a table cannot be created or the token keypair cannot be
+    /// generated.
+    pub async fn enrolment_auth(
+        &self,
+        hooks: Arc<dyn AuthHooks<ConnettoDefaults>>,
+    ) -> Arc<AuthService<ConnettoDefaults>> {
+        let config = AuthConfig::default();
+        let store = self
+            .auth_store_with(config.refresh_lifetimes(), hooks)
+            .await;
+        stack::provision_enrolment_tables(self).await;
+        Arc::new(AuthService::new(
+            Arc::new(TokenAuthority::generate(&config).expect("generate the token keypair")),
+            store,
+            Arc::new(RequestGuard::default()),
+        ))
+    }
+
+    /// Record `session` as a live session of `user`, the session a device
+    /// enrolling during it names, without a sign-in.
+    pub async fn live_session(&self, user: &str, session: connetto_core::SessionId) {
+        self.exec(&format!(
+            "INSERT INTO connetto_sessions (session_id, user_id, current_refresh_hash, \
+             idle_deadline, absolute_deadline, created_at, provider, issuer) \
+             VALUES ('{session}', '{user}', '\\x00', now() + interval '1 day', \
+             now() + interval '30 days', now(), 'test', 'https://issuer.example')",
+            session = session.as_uuid(),
+            user = user.replace('\'', "''"),
+        ))
+        .await;
     }
 
     /// Fail every later statement of the auth store, the way a database

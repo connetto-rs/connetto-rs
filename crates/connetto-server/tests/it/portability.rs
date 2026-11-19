@@ -2098,7 +2098,8 @@ async fn end_person_fails_when_the_session_store_cannot_answer() {
 }
 
 /// A sign-out whose enrolment table cannot be read fails rather than report
-/// that the person enrolled no device.
+/// that the person enrolled no device, and leaves the person's sessions
+/// standing, since the erasure is one transaction.
 #[tokio::test]
 async fn end_person_fails_when_the_enrolments_cannot_be_read() {
     let _keyring = isolated_session_keyring();
@@ -2128,7 +2129,7 @@ async fn end_person_fails_when_the_enrolments_cannot_be_read() {
         "the failure is the enrolment table's: {err}"
     );
     assert!(
-        session_revoked(&pool, session).await,
-        "the sessions, revoked first, stay revoked"
+        !session_revoked(&pool, session).await,
+        "the failed erasure rolls the session revocation back"
     );
 }
