@@ -68,6 +68,7 @@ pub(crate) struct IntentResponse {
 /// Refuses when:
 /// - any declared chunk hash is in `deleting` state (503 retry later)
 /// - the chunk count exceeds the ceiling-derived cap (413)
+/// - the ticket's login session ended (404), as at every upload stage
 ///
 /// A re-declaration for the same (`file_id`, `caller`) pair returns 200 with
 /// needed hashes computed from the declared chunks.
@@ -77,7 +78,7 @@ pub(crate) async fn post_intent<S: ConnettoFileSchema>(
     Query(q): Query<TicketQuery>,
     Json(body): Json<IntentRequest>,
 ) -> Result<(StatusCode, Json<IntentResponse>), ServerError> {
-    let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
+    let ticket = state.admit(&q.t, Verb::Write).await?;
     let file_id = parse_file_id(&id)?;
     check_ids_match(&file_id, &ticket.file_id)?;
     // Cap chunk count to prevent the zero-length-chunk DoS under a zero ceiling.
@@ -137,7 +138,7 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
     Query(q): Query<TicketQuery>,
     body: Bytes,
 ) -> Result<StatusCode, ServerError> {
-    let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
+    let ticket = state.admit(&q.t, Verb::Write).await?;
     let chunk_hash = parse_chunk_hash(&hash_hex)?;
     let file_id = FileId::from_bytes(ticket.file_id);
     let caller = upload_key(&state.caller_settings, &ticket)?;
@@ -207,7 +208,7 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     Path(id): Path<String>,
     Query(q): Query<TicketQuery>,
 ) -> Result<StatusCode, ServerError> {
-    let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
+    let ticket = state.admit(&q.t, Verb::Write).await?;
     let file_id = parse_file_id(&id)?;
     check_ids_match(&file_id, &ticket.file_id)?;
     let key = upload_key(&state.caller_settings, &ticket)?;
@@ -351,11 +352,12 @@ fn carried_commit(
         return Ok((None, None));
     };
     let carrier = ticket.caller.identity().ok_or(ServerError::NotFound)?;
+    let session = ticket.caller.session().ok_or(ServerError::NotFound)?;
     let commit = crate::router::CarriedCommit {
         file_id: *file_id.as_bytes(),
         owner: carry.owner.clone(),
         carrier: carrier.to_owned(),
-        session: carry.session,
+        session,
     };
     Ok((Some(commit), Some(manifest_key(settings, &ticket.caller)?)))
 }
