@@ -1633,6 +1633,7 @@ dependencies = [
  "diesel-async",
  "futures-util",
  "jsonwebtoken",
+ "oauth2",
  "openfga-client",
  "openidconnect",
  "parking_lot",
