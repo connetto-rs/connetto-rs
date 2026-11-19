@@ -381,7 +381,8 @@ async fn pause(
     Ok(())
 }
 
-/// Check a reload releases every old subscription and wire watch.
+/// Check a reload releases every old subscription and the wire watch each
+/// held, while the watches the application core keeps for itself stay.
 async fn reload(
     device: &Device,
     app: &mut PageSession,
@@ -392,7 +393,7 @@ async fn reload(
     step("a reload releases every watch");
     let after = trace.mark(device).await?;
     let open = trace.model.subscriptions.open.clone();
-    let watches = trace.model.subscriptions.watches.clone();
+    let watches = trace.model.subscriptions.page_watches();
     ensure!(
         !open.is_empty() && !watches.is_empty(),
         "reload has no subscriptions or wire watches"
