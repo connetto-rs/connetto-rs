@@ -246,6 +246,21 @@ impl FileHalf {
     }
 }
 
+/// What the file routes report to and ask of the rest of the server.
+#[cfg_attr(
+    not(feature = "content"),
+    expect(dead_code, reason = "only the file routes read the hooks")
+)]
+pub(crate) struct FileHooks<Id> {
+    /// The server's one audit hook, so a carried commit's row lands in
+    /// emission order beside every other access change.
+    pub(crate) audit: crate::audit::AuditHook<Id>,
+    /// The handshake's own authority, which answers whether a ticket's login
+    /// session is still live, so a logout or a revocation ends the session's
+    /// tickets at their next request.
+    pub(crate) sessions: std::sync::Arc<dyn connetto_core::SessionLiveness>,
+}
+
 /// The file-serving half of the deployment.
 ///
 /// `settings` absent answers no signer and no router, which is the
@@ -264,7 +279,7 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     owner_url: &str,
     reader_url: &str,
     reader_pool_size: u32,
-    audit: crate::audit::AuditHook<D::Id>,
+    hooks: FileHooks<D::Id>,
 ) -> Result<FileHalf, ContentBuildError> {
     let Some(settings) = settings else {
         return Ok(FileHalf::none());
@@ -293,9 +308,8 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
             refresh: settings.ceiling_refresh,
         },
         ceilings: files::CeilingCache::default(),
-        // The server's one audit hook, so a carried commit's row lands in
-        // emission order beside every other access change.
-        on_carried: Some(carried_audit::<D>(audit)),
+        on_carried: Some(carried_audit::<D>(hooks.audit)),
+        sessions: hooks.sessions,
         _schema: std::marker::PhantomData,
     })
     .await?;
@@ -380,7 +394,7 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     _owner_url: &str,
     _reader_url: &str,
     _reader_pool_size: u32,
-    _audit: crate::audit::AuditHook<D::Id>,
+    _hooks: FileHooks<D::Id>,
 ) -> Result<FileHalf, ContentBuildError> {
     if settings.is_some() {
         tracing::warn!(
@@ -401,6 +415,7 @@ mod tests {
     fn identified(user_id: &str) -> connetto_core::auth::ContentCaller {
         connetto_core::auth::ContentCaller::new(
             Some(user_id.to_owned()),
+            Some(connetto_core::SessionId::from_token_hash(user_id)),
             None,
             connetto_core::BOT_LIST_WILDCARD.to_owned(),
         )
@@ -499,10 +514,13 @@ mod tests {
              LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ SELECT NULL::text $$",
     ];
 
-    /// An audit hook that records nothing, for builds whose carried commits
-    /// no test reads.
-    fn no_audit() -> crate::audit::AuditHook<String> {
-        std::sync::Arc::new(|_| {})
+    /// Hooks that record nothing and find every session live, for builds whose
+    /// carried commits and session checks no test reads.
+    fn no_hooks() -> FileHooks<String> {
+        FileHooks {
+            audit: std::sync::Arc::new(|_| {}),
+            sessions: std::sync::Arc::new(connetto_core::test_support::TestGrantChecker),
+        }
     }
 
     /// A carried commit becomes one `content_carried` row naming the owner as
@@ -544,7 +562,7 @@ mod tests {
             "postgres://unused",
             "postgres://unused",
             1,
-            no_audit(),
+            no_hooks(),
         )
         .await
         .expect("no settings is a valid deployment");
@@ -637,7 +655,7 @@ mod tests {
             &admin_url,
             &reader_url,
             2,
-            no_audit(),
+            no_hooks(),
         )
         .await
         .expect("a configured deployment builds");

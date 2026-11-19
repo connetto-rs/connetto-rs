@@ -419,6 +419,7 @@ async fn serve_refuses_when_chunk_registry_absent() {
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
         on_carried: None,
+        sessions: std::sync::Arc::new(crate::fixture::Sessions::default()),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -463,6 +464,7 @@ async fn serve_refuses_when_sweep_index_absent() {
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
         on_carried: None,
+        sessions: std::sync::Arc::new(crate::fixture::Sessions::default()),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -505,6 +507,7 @@ async fn serve_refuses_when_grace_index_absent() {
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
         on_carried: None,
+        sessions: std::sync::Arc::new(crate::fixture::Sessions::default()),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -554,6 +557,7 @@ async fn serve_refuses_a_degenerate_partial_grace_index() {
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
         on_carried: None,
+        sessions: std::sync::Arc::new(crate::fixture::Sessions::default()),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -590,6 +594,7 @@ async fn serve_refuses_superuser_reader_role() {
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
         on_carried: None,
+        sessions: std::sync::Arc::new(crate::fixture::Sessions::default()),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -650,6 +655,7 @@ async fn serve_refuses_bypassrls_reader_role() {
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
         on_carried: None,
+        sessions: std::sync::Arc::new(crate::fixture::Sessions::default()),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -714,6 +720,7 @@ async fn serve_refuses_table_owner_reader_role() {
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
         on_carried: None,
+        sessions: std::sync::Arc::new(crate::fixture::Sessions::default()),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -747,6 +754,7 @@ async fn serve_accepts_correctly_configured_reader_role() {
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
         on_carried: None,
+        sessions: std::sync::Arc::new(crate::fixture::Sessions::default()),
         _schema: std::marker::PhantomData,
     };
     let _router = serve(cfg)
@@ -785,6 +793,7 @@ async fn serve_refuses_when_content_state_fn_absent() {
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
         on_carried: None,
+        sessions: std::sync::Arc::new(crate::fixture::Sessions::default()),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -818,6 +827,7 @@ async fn serve_accepts_when_content_state_fn_valid() {
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
         on_carried: None,
+        sessions: std::sync::Arc::new(crate::fixture::Sessions::default()),
         _schema: std::marker::PhantomData,
     };
     let _router = serve(cfg)

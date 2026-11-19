@@ -82,6 +82,12 @@ impl SnapshotSource for CapturingSnapshot {
 /// than the client-supplied id.
 struct FixedVerifier(AuthContext);
 
+impl connetto_core::SessionLiveness for FixedVerifier {
+    fn session_is_live(&self, _session_id: SessionId) -> connetto_core::LivenessFuture<'_> {
+        Box::pin(core::future::ready(Ok(true)))
+    }
+}
+
 impl HandshakeAuthority for FixedVerifier {
     fn check_grant<'a>(&'a self, _grant: &'a Grant) -> GrantCheckFuture<'a> {
         let context = self.0.clone();
@@ -113,6 +119,13 @@ impl HandshakeAuthority for FixedVerifier {
 /// An authority that refuses every grant, standing in for a real authority
 /// rejecting a forged credential.
 struct AlwaysReject;
+
+/// It resolves no login, so it keeps no session live.
+impl connetto_core::SessionLiveness for AlwaysReject {
+    fn session_is_live(&self, _session_id: SessionId) -> connetto_core::LivenessFuture<'_> {
+        Box::pin(core::future::ready(Ok(false)))
+    }
+}
 
 impl HandshakeAuthority for AlwaysReject {
     fn check_grant<'a>(&'a self, _grant: &'a Grant) -> GrantCheckFuture<'a> {
