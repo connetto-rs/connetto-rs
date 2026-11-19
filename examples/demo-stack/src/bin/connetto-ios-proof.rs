@@ -1501,7 +1501,7 @@ async fn one_mac_join(
         eprintln!("the leg joined through the gateway {gateway}");
         step("link through the hotspot");
         android_app
-            .wait_for_text(&format!("linked: {leg_identity}"), Duration::from_secs(90))
+            .wait_for_link(leg_identity, Duration::from_secs(90))
             .await
             .context("the Android never named the leg as linked")?;
         leg.wait_linked(host_identity, Duration::from_secs(30))
@@ -1634,7 +1634,11 @@ async fn wait_link_ends(android: &StarAndroid, leg: &LegClient, host_identity: &
         let mut android_app = android.device.app().await?;
         let page = android_app.page_text().await?;
         let linked = leg.linked().await?;
-        if !page.contains("linked: ") && !linked.iter().any(|held| held == host_identity) {
+        if !page.contains("linked: ")
+            && !linked
+                .iter()
+                .any(|held| connetto_test_harness::peer_devices::same_peer(held, host_identity))
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -1800,10 +1804,7 @@ async fn wait_linked(
     joiner_identity: &str,
 ) -> Result<()> {
     if host_app
-        .wait_for_text(
-            &format!("linked: {joiner_identity}"),
-            Duration::from_secs(90),
-        )
+        .wait_for_link(joiner_identity, Duration::from_secs(90))
         .await
         .is_err()
     {
@@ -1814,7 +1815,7 @@ async fn wait_linked(
         );
     }
     peer_app
-        .wait_for_text(&format!("linked: {host_identity}"), Duration::from_secs(30))
+        .wait_for_link(host_identity, Duration::from_secs(30))
         .await?;
     Ok(())
 }

@@ -181,6 +181,10 @@ impl Core {
     /// Move a ready session to signing out and hand it over, or `None` when
     /// no session is ready, a sign-out already in progress included.
     fn begin_sign_out(&self) -> Option<Arc<Parts>> {
+        let view = self.view.lock();
+        if view.stored_delete_working() {
+            return None;
+        }
         let mut slot = self.slot.lock();
         let Slot::Ready(session) = &*slot else {
             return None;
@@ -268,6 +272,9 @@ async fn act(
 }
 
 async fn serve(app: &AppHandle, core: &Arc<Core>, action: Action) -> Result<(), CommandError> {
+    if core.view.lock().stored_delete_working() {
+        return Ok(());
+    }
     match action {
         Action::SignIn => sign_in(app, core).await,
         Action::Unlock => unlock(core).await,
@@ -283,6 +290,17 @@ async fn serve(app: &AppHandle, core: &Arc<Core>, action: Action) -> Result<(), 
         Action::LogOutDelete => log_out_delete(app, core).await,
         Action::ConfirmDelete => confirm_delete(app, core).await,
         Action::ForceDelete => Ok(()),
+        Action::DeleteStoredAccount { account, force } => {
+            delete_stored_account(app, core, account, force).await
+        }
+        Action::CancelStoredDelete => {
+            core.update(|view| {
+                if !view.stored_delete_working() {
+                    view.stored_delete = None;
+                }
+            });
+            Ok(())
+        }
         Action::AddOrder => add_order(core).await,
         Action::RemoveOrder { id } => remove_order(core, &id).await,
         Action::CancelLogout => {
@@ -540,6 +558,38 @@ fn forget_name(app: &AppHandle, account: &str) {
     {
         tracing::warn!(error = %err, "dropping the account's name");
     }
+}
+
+/// Delete a closed replica while preserving the live session.
+async fn delete_stored_account(
+    app: &AppHandle,
+    core: &Arc<Core>,
+    account: String,
+    force: bool,
+) -> Result<(), CommandError> {
+    use support::view::{StoredDelete, StoredDeleteOutcome, StoredDeleteState};
+    let mut session = None;
+    core.update(|view| {
+        if !view.stored_delete_working() && !matches!(view.logout, LogoutState::Working) {
+            session = core.session();
+            if session.is_some() {
+                view.stored_delete = Some(StoredDelete {
+                    account: account.clone(),
+                    state: StoredDeleteState::Working,
+                });
+            }
+        }
+    });
+    let Some(session) = session else {
+        return Ok(());
+    };
+    let outcome =
+        StoredDeleteOutcome::from(session.native.forget_stored_account(&account, force).await);
+    if matches!(outcome, StoredDeleteOutcome::Done(_)) {
+        forget_name(app, &support::account_label(&account));
+    }
+    core.update(|view| view.finish_stored_delete(&account, outcome));
+    Ok(())
 }
 
 fn cancel_logout(core: &Arc<Core>) {

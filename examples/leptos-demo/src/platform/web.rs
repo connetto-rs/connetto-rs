@@ -627,6 +627,9 @@ impl Platform {
 
     /// Serve one user control, answering with the same calls the Yew demo makes.
     fn act(self, action: Action) {
+        if self.view.with_untracked(View::stored_delete_working) {
+            return;
+        }
         match action {
             Action::SignIn => self.sign_in(),
             // The browser has no native gate to unlock and no backend writer,
@@ -639,6 +642,10 @@ impl Platform {
             Action::LogOutKeep => self.logout_keep(),
             Action::LogOutDelete => self.logout_delete(),
             Action::ConfirmDelete | Action::ForceDelete => self.delete_confirmed(),
+            Action::DeleteStoredAccount { account, force } => {
+                self.delete_stored_account(account, force)
+            }
+            Action::CancelStoredDelete => self.view.update(|view| view.stored_delete = None),
             Action::CancelLogout => {
                 self.view.update(|v| {
                     v.logout = LogoutState::Idle;
@@ -843,6 +850,27 @@ impl Platform {
             if let Err(err) = glue::logout_delete_confirmed().await {
                 view.update(|v| v.logout = LogoutState::Error(err.to_string()));
             }
+        });
+    }
+
+    /// Delete an account whose replica the worker has closed.
+    fn delete_stored_account(&self, account: String, force: bool) {
+        use support::view::{StoredDelete, StoredDeleteState};
+        if self.view.with_untracked(|view| {
+            view.stored_delete_working() || matches!(view.logout, LogoutState::Working)
+        }) {
+            return;
+        }
+        let view = self.view;
+        view.update(|view| {
+            view.stored_delete = Some(StoredDelete {
+                account: account.clone(),
+                state: StoredDeleteState::Working,
+            })
+        });
+        spawn_local(async move {
+            let outcome = glue::forget_stored_account(&account, force).await;
+            view.update(|view| view.finish_stored_delete(&account, outcome));
         });
     }
 
