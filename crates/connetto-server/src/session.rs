@@ -6407,21 +6407,29 @@ where
             .map_err(transport_err)
     }
 
-    /// Answer one content ticket request: check visibility, call the signer,
-    /// charge the write budget after a successful mint, and send the grant.
+    /// Answer one content ticket request: confirm the login is still live,
+    /// check visibility, call the signer, charge the write budget after a
+    /// successful mint, and send the grant.
     ///
-    /// Visibility runs first on the reader pool, behind the same reader-share
+    /// A connection can stay open after its session ended, past the idle
+    /// window or before this server hears of a revocation, so a login's
+    /// session is asked about first and an ended one refused with the
+    /// invisible file's detail, rather than handed a ticket the file server
+    /// refuses (R109). A caller holding no login has no session to ask about.
+    ///
+    /// Visibility runs next on the reader pool, behind the same reader-share
     /// permit that subscription and mutation reads hold (R39), so an anonymous
     /// caller cannot starve identified callers. Invisibility and a budget
     /// refusal carry the same byte-identical detail so a caller cannot learn
-    /// that a file it cannot see exists. A signer fault carries a distinct
-    /// detail because it discloses nothing about data and a retry is
-    /// meaningful. The budget is charged after a successful mint, so a signer
-    /// failure never consumes the caller's upload window.
+    /// that a file it cannot see exists. A signer fault, or a session store
+    /// that cannot answer, carries a distinct detail because it discloses
+    /// nothing about data and a retry is meaningful. The budget is charged
+    /// after a successful mint, so a signer failure never consumes the
+    /// caller's upload window.
     ///
     /// A request naming `for_owner` carries the file for that account (R79
-    /// decision 17). It is minted only for a write by a caller holding an
-    /// account, and only when the deployment's `connetto_file_owner`, read
+    /// decision 17). It is minted only for a write by a caller holding a
+    /// login, and only when the deployment's `connetto_file_owner`, read
     /// with the caller's own rights, answers that account. Every other answer
     /// is refused with the invisible file's detail.
     async fn handle_content_ticket<T: Transport>(
@@ -6433,6 +6441,19 @@ where
         let request_id = req.request_id;
         let caller = crate::capability::rendered_caller(&state.principal);
         let budget_key = crate::capability::meter_key(&state.principal, state.session_id);
+
+        if let Some(session) = caller.session() {
+            match self.authority.session_is_live(session).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return refuse_ticket(transport, request_id, CONTENT_TICKET_REFUSED).await;
+                }
+                Err(err) => {
+                    tracing::warn!(request_id, %err, "content ticket session check failed");
+                    return refuse_ticket(transport, request_id, CONTENT_TICKET_SIGNER_ERROR).await;
+                }
+            }
+        }
 
         // Reader permit: visibility checks out a reader-pool connection, so
         // the same gate that protects subscriptions and mutations applies here.
@@ -6503,9 +6524,10 @@ where
     /// What a content ticket carries for the account `for_owner` names,
     /// `None` when it names none, or the refusal detail to answer.
     ///
-    /// Only a write by a caller holding an account may carry, and only when
-    /// the deployment's `connetto_file_owner`, read with the caller's own
-    /// rights, answers that account (R79 decision 17).
+    /// Only a write by a caller holding a login may carry, the carry audited
+    /// under the login's session the ticket names, and only when the
+    /// deployment's `connetto_file_owner`, read with the caller's own rights,
+    /// answers that account (R79 decision 17).
     async fn ticket_carry(
         &self,
         for_owner: Option<String>,
@@ -6517,7 +6539,9 @@ where
         let Some(for_owner) = for_owner else {
             return Ok(None);
         };
-        if !matches!(verb, ContentVerb::Write { .. }) || state.principal.identity().is_none() {
+        if !matches!(verb, ContentVerb::Write { .. })
+            || crate::capability::login_session(&state.principal).is_none()
+        {
             return Err(CONTENT_TICKET_REFUSED);
         }
         let answered = self
@@ -6531,10 +6555,7 @@ where
         if answered.as_deref() != Some(for_owner.as_str()) {
             return Err(CONTENT_TICKET_REFUSED);
         }
-        Ok(Some(ContentCarry {
-            owner: for_owner,
-            session: state.session_id,
-        }))
+        Ok(Some(ContentCarry { owner: for_owner }))
     }
 
     /// Answer a device list request with the caller's devices.
