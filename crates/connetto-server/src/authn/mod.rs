@@ -12,6 +12,7 @@
 //! ([`store`]), the login and refresh service plus the real session verifier
 //! ([`service`]), and the HTTP endpoints ([`http`]).
 
+pub mod hooks;
 pub mod http;
 pub mod identity;
 pub mod provider;
@@ -23,9 +24,8 @@ pub mod sign_in;
 pub mod store;
 pub mod token;
 
-pub use identity::{
-    DefaultUuidResolver, IdentityResolver, ResolveError, ResolveFuture, VerifiedClaims,
-};
+pub use hooks::{AuthHooks, CommittedNotice, DefaultAuthHooks, HookError, HookFuture, SignedIn};
+pub use identity::{VerifiedClaims, deterministic_uuid};
 pub use provider::{
     AssuranceRequirement, AuthCodes, IdentityProvider, IssuedAuthCode, LoginRedirect, PendingLogin,
     PendingLogins, ProviderError, ProviderRegistry, RetainedProviderToken, StoredProviderToken,
@@ -34,7 +34,7 @@ pub use provider::{
 pub use provider_oauth::{OAuthEndpoints, OAuthProvider, OAuthProviderConfig};
 pub use provider_oidc::{GenericOidcProvider, OidcProviderConfig};
 pub use service::{AuthError, AuthService, ConnettoHandshakeAuthority, LivenessError, TokenPair};
-pub use sign_in::{LoginRequest, SessionDescriber, SignInHook, SignInNotice};
+pub use sign_in::{LoginRequest, SessionDescriber};
 pub use store::{AuthStoreError, IssuedSession, RefreshOutcome, ResolvedIdentity, SessionOrigin};
 pub use token::{AuthConfig, RefreshLifetimes, TokenAuthority, TokenError, VerifiedSession};
 

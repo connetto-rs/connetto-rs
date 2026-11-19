@@ -4,13 +4,13 @@
 //! decisions 1, 2 and 9). The describe callback reads the request the server
 //! saw, its address among it, and the session row keeps the description, the
 //! provider, the issuer and the times, never the address. A refresh stamps the
-//! last refresh, the login row names the provider, and the sign-in callback
-//! hears of the sign-in.
+//! last refresh, the login row names the provider, and the application's
+//! hooks hear of the sign-in.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use connetto_server::{BuildError, DefaultUuidResolver, LoginRequest, SignInNotice};
+use connetto_server::{BuildError, CommittedNotice, DefaultAuthHooks, LoginRequest};
 use connetto_test_harness::{Fixture, MOCK_OAUTH_PROVIDER, isolated_session_keyring};
 use diesel::{ExpressionMethods as _, QueryDsl as _};
 use diesel_async::AsyncPgConnection;
@@ -96,10 +96,9 @@ async fn a_sign_in_records_where_it_came_from_and_tells_the_application() {
         .expect("bind a listener");
     let port = listener.local_addr().expect("local address").port();
     let (builder, idp, _keys) = builder_over(&fixture, port).await;
-    let told = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let sink = Arc::clone(&told);
+    let (told, mut notices) = crate::auth_hooks::Told::<app::Described>::channel();
     let builder = builder
-        .deployment_schema::<app::Described>(Arc::new(DefaultUuidResolver))
+        .deployment_schema::<app::Described>(told)
         .session_describer(|request: LoginRequest| async move {
             app::Place {
                 place: format!(
@@ -110,8 +109,7 @@ async fn a_sign_in_records_where_it_came_from_and_tells_the_application() {
                     request.provider
                 ),
             }
-        })
-        .on_sign_in(move |notice| sink.lock().push(notice));
+        });
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(builder.serve(listener, async move {
         let _ = stopped.await;
@@ -152,10 +150,15 @@ async fn a_sign_in_records_where_it_came_from_and_tells_the_application() {
     );
     assert_eq!(refreshed_at, None, "never refreshed yet");
 
-    let notices = told.lock().clone();
-    let [SignInNotice::SignedIn(signed_in)] = notices.as_slice() else {
-        panic!("expected one sign-in notice, got {notices:?}");
+    // The notice is told before the sign-in answers.
+    let notice = notices.try_recv().expect("the sign-in was told");
+    let CommittedNotice::SignedIn {
+        session: signed_in, ..
+    } = notice
+    else {
+        panic!("expected a sign-in notice");
     };
+    assert!(notices.try_recv().is_err(), "one sign-in, one notice");
     assert_eq!(*signed_in.session_id.as_uuid(), session);
     assert_eq!(signed_in.user_id, user_id);
     assert_eq!(signed_in.provider, MOCK_OAUTH_PROVIDER);
@@ -196,7 +199,7 @@ async fn a_described_schema_without_a_describer_refuses_to_start() {
     let fixture = Fixture::acquire().await;
     let (builder, _idp, _keys) = builder_over(&fixture, 0).await;
     let refused = builder
-        .deployment_schema::<app::Described>(Arc::new(DefaultUuidResolver))
+        .deployment_schema::<app::Described>(Arc::new(DefaultAuthHooks))
         .build()
         .await;
     assert!(

@@ -1005,8 +1005,10 @@ async fn a_store_failure_in_a_range_ends_the_connection() {
     let unreadable_bans = writing_manager(
         fixture.admin(),
         Arc::new(
-            RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
-                .with_bans(Arc::new(Bans::Unreachable("alice"))),
+            RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default()).with_bans(
+                fixture.admin().clone(),
+                Arc::new(Bans::Unreachable("alice")),
+            ),
         ),
         Some(store.installable()),
         SessionConfig::default().with_courier(true),

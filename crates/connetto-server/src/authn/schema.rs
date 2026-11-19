@@ -255,7 +255,7 @@ pub trait ConnettoStoreSchema: Send + Sync + 'static {
 ///
 /// ```ignore
 /// connetto_server::connetto_auth_tables!(String, diesel::sql_types::Text;);
-/// let store = DbAuthStore::<ConnettoAuthSchema>::new(pool, lifetimes, resolver);
+/// let store = DbAuthStore::<ConnettoAuthSchema>::new(pool, lifetimes, hooks);
 /// ```
 #[doc(hidden)]
 #[macro_export]

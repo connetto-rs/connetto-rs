@@ -32,6 +32,8 @@ mod audit_catalog;
 
 mod audit_producers;
 
+mod auth_hooks;
+
 mod audit_table;
 
 mod courier_audit;

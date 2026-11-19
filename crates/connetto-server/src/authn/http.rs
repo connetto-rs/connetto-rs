@@ -312,8 +312,15 @@ impl IntoResponse for AuthApiError {
         };
         let status = match self {
             Self::Service(AuthError::RateLimited(_)) => StatusCode::TOO_MANY_REQUESTS,
+            Self::Service(AuthError::Refused(reason)) => {
+                tracing::warn!(detail = %detail, "the application refused the sign-in");
+                return (StatusCode::FORBIDDEN, reason).into_response();
+            }
             Self::Service(
-                AuthError::Store(crate::authn::store::AuthStoreError::Backend(_))
+                AuthError::Store(
+                    crate::authn::store::AuthStoreError::Backend(_)
+                    | crate::authn::store::AuthStoreError::Hook(_),
+                )
                 | AuthError::Token(_)
                 | AuthError::Undescribed
                 | AuthError::BanList(_),

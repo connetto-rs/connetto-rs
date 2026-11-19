@@ -697,7 +697,11 @@ pub(super) enum Bans {
 }
 
 impl BanStore<String> for Bans {
-    fn check<'a>(&'a self, user_id: &'a String) -> BanFuture<'a, Option<Ban>> {
+    fn check<'a>(
+        &'a self,
+        _connection: &'a mut AsyncPgConnection,
+        user_id: &'a String,
+    ) -> BanFuture<'a, Option<Ban>> {
         let answer = match self {
             Self::Refusing(banned) => Ok((user_id == banned).then(|| Ban {
                 session: SessionId::from_uuid(uuid::Uuid::nil()),
@@ -714,11 +718,19 @@ impl BanStore<String> for Bans {
         Box::pin(core::future::ready(answer))
     }
 
-    fn impose(&self, _ban: NewBan<String>) -> BanFuture<'_, ()> {
+    fn impose<'a>(
+        &'a self,
+        _connection: &'a mut AsyncPgConnection,
+        _ban: NewBan<String>,
+    ) -> BanFuture<'a, ()> {
         Box::pin(core::future::ready(Ok(())))
     }
 
-    fn lift<'a>(&'a self, _user_id: &'a String) -> BanFuture<'a, bool> {
+    fn lift<'a>(
+        &'a self,
+        _connection: &'a mut AsyncPgConnection,
+        _user_id: &'a String,
+    ) -> BanFuture<'a, bool> {
         Box::pin(core::future::ready(Ok(false)))
     }
 }
@@ -1452,7 +1464,7 @@ async fn a_banned_authors_range_is_refused_unsettled() {
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let guard = Arc::new(
         RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
-            .with_bans(Arc::new(Bans::Refusing("alice"))),
+            .with_bans(fixture.admin().clone(), Arc::new(Bans::Refusing("alice"))),
     );
     let manager = writing_manager(
         fixture.admin(),
@@ -2423,8 +2435,10 @@ async fn an_unreadable_ban_list_fails_the_range_closed() {
     let store = Enrolments::new();
     let (key, key_id) = store.enrol("alice", tomorrow()).await;
     let guard = Arc::new(
-        RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
-            .with_bans(Arc::new(Bans::Unreachable("alice"))),
+        RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default()).with_bans(
+            fixture.admin().clone(),
+            Arc::new(Bans::Unreachable("alice")),
+        ),
     );
     let manager = writing_manager(
         fixture.admin(),

@@ -21,13 +21,14 @@ use connetto_core::traits::{
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::authn::hooks::{AuthHooks, CommittedNotice, HookError};
 use crate::authn::provider::{
     ProviderError, ProviderRegistry, RetainedProviderToken, VerifiedLogin,
 };
 use crate::authn::schema::{Desc, SessionRecord};
-use crate::authn::sign_in::{LoginRequest, SessionDescriber, SignInHook, SignInNotice};
+use crate::authn::sign_in::{LoginRequest, SessionDescriber};
 use crate::authn::store::{
-    AuthStoreError, DbAuthStore, IssuedSession, ResolvedIdentity, SessionOrigin, split_refresh,
+    AuthStoreError, DbAuthStore, ResolvedIdentity, SessionOrigin, split_refresh,
 };
 use crate::authn::token::{TokenAuthority, TokenError};
 use crate::guard::RequestGuard;
@@ -69,7 +70,7 @@ fn unix_secs(time: SystemTime) -> u64 {
 pub enum AuthError {
     /// The auth store rejected the operation.
     #[error(transparent)]
-    Store(#[from] AuthStoreError),
+    Store(AuthStoreError),
     /// Minting the access token failed.
     #[error(transparent)]
     Token(#[from] TokenError),
@@ -91,6 +92,22 @@ pub enum AuthError {
     /// than let through (R36 fails closed).
     #[error("the ban list could not be read: {0}")]
     BanList(String),
+    /// The application's hook refused the sign-in, with its reason.
+    #[error("refused by the application: {0}")]
+    Refused(String),
+}
+
+/// A ban and an application's refusal read inside the store's transaction
+/// answer as the service's own.
+impl From<AuthStoreError> for AuthError {
+    fn from(error: AuthStoreError) -> Self {
+        match error {
+            AuthStoreError::Banned => Self::Banned,
+            AuthStoreError::BanList(error) => Self::BanList(error.detail().to_owned()),
+            AuthStoreError::Hook(HookError::Refused(reason)) => Self::Refused(reason),
+            error => Self::Store(error),
+        }
+    }
 }
 
 /// One async lock per session that callers currently hold, so a map entry
@@ -139,9 +156,6 @@ pub struct AuthService<D: ConnettoSchema> {
     /// Sink for the durable record of access changes, set once at startup.
     /// `None` records nothing.
     audit_hook: std::sync::OnceLock<crate::audit::AuditHook<D::Id>>,
-    /// The application's sign-in callback, set once at startup. `None`
-    /// tells nobody.
-    sign_in_hook: std::sync::OnceLock<SignInHook<D::Id, Desc<D>>>,
     /// The application's describe callback, `None` when the deployment
     /// declares no description.
     describer: Option<SessionDescriber<Desc<D>>>,
@@ -175,24 +189,6 @@ pub enum LivenessError {
     BanList(String),
 }
 
-/// What a login row and a sign-in notice say about how a session began,
-/// taken before the store consumes the origin.
-struct Started<Desc> {
-    provider: String,
-    issuer: String,
-    description: Desc,
-}
-
-impl<Desc: Clone> Started<Desc> {
-    fn of(identity: &ResolvedIdentity, origin: &SessionOrigin<Desc>) -> Self {
-        Self {
-            provider: origin.provider.clone(),
-            issuer: identity.issuer.clone(),
-            description: origin.description.clone(),
-        }
-    }
-}
-
 impl<D: ConnettoSchema> AuthService<D> {
     /// Build over a shared token authority and store, with no provider registry.
     ///
@@ -211,7 +207,6 @@ impl<D: ConnettoSchema> AuthService<D> {
             refresh_locks: SessionLocks::default(),
             revocation_hook: std::sync::OnceLock::new(),
             audit_hook: std::sync::OnceLock::new(),
-            sign_in_hook: std::sync::OnceLock::new(),
             describer: None,
             guard,
         }
@@ -238,6 +233,11 @@ impl<D: ConnettoSchema> AuthService<D> {
         &self.guard
     }
 
+    /// The application's hooks, told once an event's transaction committed.
+    pub(crate) fn hooks(&self) -> &dyn AuthHooks<D> {
+        self.store.hooks()
+    }
+
     /// Attach the revocation observer, once, after construction. A second call
     /// is ignored, which suits the one startup wiring point this exists for.
     pub fn set_revocation_hook(&self, hook: SessionRevocationHook) {
@@ -252,12 +252,6 @@ impl<D: ConnettoSchema> AuthService<D> {
     /// not created it must not have writes attempted against it.
     pub fn set_audit_hook(&self, hook: crate::audit::AuditHook<D::Id>) {
         let _ = self.audit_hook.set(hook);
-    }
-
-    /// Attach the application's sign-in callback, once, after construction. A
-    /// second call is ignored, matching the audit sink beside it.
-    pub fn set_sign_in_hook(&self, hook: SignInHook<D::Id, Desc<D>>) {
-        let _ = self.sign_in_hook.set(hook);
     }
 
     /// Record one access change, if a sink is attached.
@@ -301,21 +295,7 @@ impl<D: ConnettoSchema> AuthService<D> {
         identity: &ResolvedIdentity,
         origin: SessionOrigin<Desc<D>>,
     ) -> Result<TokenPair<D::Id>, AuthError> {
-        let now = SystemTime::now();
-        let started = Started::of(identity, &origin);
-        let user_id = self.store.resolve(identity).await?;
-        self.refuse_banned(&user_id).await?;
-        let issued = self
-            .store
-            .create_session_for(user_id, identity, origin)
-            .await?;
-        self.finish_login(issued, now, started, |issued| {
-            tracing::info!(
-                session = %issued.session_id,
-                user = %issued.context.user_id,
-                "login succeeded, session created"
-            );
-        })
+        self.sign_in(identity, origin, None).await
     }
 
     /// Create a session for a verified login and retain its provider tokens.
@@ -331,45 +311,37 @@ impl<D: ConnettoSchema> AuthService<D> {
         login: &VerifiedLogin,
         origin: SessionOrigin<Desc<D>>,
     ) -> Result<TokenPair<D::Id>, AuthError> {
-        let now = SystemTime::now();
-        let started = Started::of(&login.identity, &origin);
-        let user_id = self.store.resolve(&login.identity).await?;
-        self.refuse_banned(&user_id).await?;
-        let issued = self
-            .store
-            .create_session_for(user_id, &login.identity, origin)
-            .await?;
-        self.store
-            .set_retained_provider_token(issued.session_id, &login.retained)
-            .await?;
-        self.finish_login(issued, now, started, |issued| {
-            tracing::info!(
-                session = %issued.session_id,
-                user = %issued.context.user_id,
-                issuer = %login.retained.issuer,
-                "login succeeded, session created with retained provider tokens"
-            );
-        })
+        self.sign_in(&login.identity, origin, Some(&login.retained))
+            .await
     }
 
-    /// Mint the first token pair for a freshly created session, register its
-    /// owner with the guard, record the login, tell the application, and
-    /// assemble the response.
+    /// Sign `identity` in through the store's one transaction, then mint the
+    /// first token pair, register the owner with the guard, record the login
+    /// and tell the application it committed.
     ///
-    /// `announce` runs once the mint has succeeded, so a failed mint still
-    /// logs nothing. The owner registration is what R19 attributes later abuse
-    /// through, so it must not fall off either login path.
-    fn finish_login(
+    /// The owner registration is what R19 attributes later abuse through, so
+    /// it must not fall off either login path.
+    async fn sign_in(
         &self,
-        issued: IssuedSession<D::Id>,
-        now: SystemTime,
-        started: Started<Desc<D>>,
-        announce: impl FnOnce(&IssuedSession<D::Id>),
+        identity: &ResolvedIdentity,
+        origin: SessionOrigin<Desc<D>>,
+        retained: Option<&RetainedProviderToken>,
     ) -> Result<TokenPair<D::Id>, AuthError> {
+        let now = SystemTime::now();
+        let (issued, record) = self
+            .store
+            .sign_in(identity, origin, retained, self.guard.ban_store())
+            .await?;
         let access_token = self
             .authority
             .mint_access(&issued.context, issued.session_id, now)?;
-        announce(&issued);
+        tracing::info!(
+            session = %issued.session_id,
+            user = %issued.context.user_id,
+            issuer = %record.issuer,
+            retained = retained.is_some(),
+            "login succeeded, session created"
+        );
         self.guard
             .learn_owner(issued.session_id, &issued.context.user_id);
         self.record(
@@ -378,19 +350,13 @@ impl<D: ConnettoSchema> AuthService<D> {
                 Some(issued.context.user_id.clone()),
                 crate::audit::AuthOp::LoggedIn,
             )
-            .about_login(started.provider.clone(), started.issuer.clone()),
+            .about_login(record.provider.clone(), record.issuer.clone()),
         );
-        if let Some(hook) = self.sign_in_hook.get() {
-            hook(SignInNotice::SignedIn(SessionRecord {
-                session_id: issued.session_id,
-                user_id: issued.context.user_id.clone(),
-                provider: started.provider,
-                issuer: started.issuer,
-                description: started.description,
-                created_at: issued.created_at,
-                refreshed_at: None,
-            }));
-        }
+        self.store.hooks().committed(CommittedNotice::SignedIn {
+            user_id: record.user_id.clone(),
+            claims: identity.verified_claims(),
+            session: record,
+        });
         Ok(TokenPair {
             access_token,
             refresh_token: issued.refresh_token,

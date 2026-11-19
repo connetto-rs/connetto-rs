@@ -18,7 +18,7 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::CallerMappings;
 use connetto_server::openfga::{Counted, FgaAuth, StoreUpkeep};
 use connetto_server::{
-    DbAuthStore, DefaultUuidResolver, InMemoryOplog, LoopbackTransport, ManagerBuilder,
+    AuthHooks, DbAuthStore, DefaultAuthHooks, InMemoryOplog, LoopbackTransport, ManagerBuilder,
     Materializer, NoSigner, OAuthEndpoints, OAuthProviderConfig, OidcProviderConfig,
     PgReadConnector, PgSnapshotSource, ReconnectEvent, ReconnectPolicy, RefreshLifetimes,
     RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager,
@@ -1463,12 +1463,18 @@ impl Fixture {
         &self,
         lifetimes: RefreshLifetimes,
     ) -> Arc<DbAuthStore<ConnettoDefaults>> {
+        self.auth_store_with(lifetimes, Arc::new(DefaultAuthHooks))
+            .await
+    }
+
+    /// [`auth_store`](Self::auth_store) running `hooks` at each auth event.
+    pub async fn auth_store_with(
+        &self,
+        lifetimes: RefreshLifetimes,
+        hooks: Arc<dyn AuthHooks<ConnettoDefaults>>,
+    ) -> Arc<DbAuthStore<ConnettoDefaults>> {
         self.provision_auth_tables().await;
-        Arc::new(DbAuthStore::new(
-            self.admin.clone(),
-            lifetimes,
-            Arc::new(DefaultUuidResolver),
-        ))
+        Arc::new(DbAuthStore::new(self.admin.clone(), lifetimes, hooks))
     }
 
     /// Fail every later statement of the auth store, the way a database

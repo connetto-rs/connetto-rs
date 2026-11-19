@@ -5,7 +5,7 @@ use connetto_server::builder::{
 };
 use connetto_server::defaults::ConnettoDefaults;
 use connetto_server::openfga::{SetupError, Translated};
-use connetto_server::{DefaultUuidResolver, Materializer, OidcProviderConfig, Registration};
+use connetto_server::{DefaultAuthHooks, Materializer, OidcProviderConfig, Registration};
 use connetto_test_harness::{
     FIXTURE_READER, FIXTURE_ROLES, Fixture, MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET,
     MOCK_OAUTH_PROVIDER, MockOauth, OPLOG_TABLE, PUBLICATION, SLOT, isolated_session_keyring,
@@ -119,7 +119,7 @@ async fn a_malformed_audit_declaration_refuses_server_startup() {
     let refused = tokio::time::timeout(
         BOUND,
         builder
-            .deployment_schema::<malformed::Deployment>(Arc::new(DefaultUuidResolver))
+            .deployment_schema::<malformed::Deployment>(Arc::new(DefaultAuthHooks))
             .build(),
     )
     .await
