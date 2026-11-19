@@ -12,6 +12,7 @@ use connetto_core::traits::Transport;
 use connetto_file_core::{ChunkStore, Manifest, MemStore, MimeClass, process_file};
 use connetto_server::WebSocketTransport;
 use connetto_server::builder::{ContentSettings, StoreSpec};
+use connetto_test_harness::server_fixture::{PG_SERIAL, exec, mint_tokens, reset_fixture};
 use connetto_test_harness::{Fixture, isolated_session_keyring};
 use openidconnect::reqwest;
 use serde_json::json;
@@ -19,7 +20,6 @@ use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 
 use super::builder_coverage::apply_content_deployment;
-use super::e2e::{PG_SERIAL, exec, mint_tokens, reset_fixture};
 use super::lifecycle::{admin_pool, builder_over, live_session_as, next_control, wait_ready};
 
 /// The photograph every case uploads and reads.

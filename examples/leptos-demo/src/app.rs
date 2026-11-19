@@ -163,16 +163,17 @@ const APP_TITLE: &str = "connetto demo";
 #[cfg(not(feature = "tauri"))]
 const APP_TITLE: &str = "connetto web demo (Leptos)";
 
-/// The status and account security controls.
+/// The status and account security controls. The device line stands here
+/// whenever the page has no nearby panel to carry it.
 #[component]
 fn AccountStatus(view: RwSignal<View>) -> impl IntoView {
     view! {
         <div>
             <p class="status">"status: " {move || view.with(|v| v.status.clone())}</p>
             {move || status_line(view.with(|v| v.gate_line.clone()))}
-            {cfg!(feature = "web").then(|| view! {
+            <Show when=move || view.with(|state| state.nearby.is_none())>
                 <p class="status">"device: " {move || view.with(|state| state.device_line.clone())}</p>
-            })}
+            </Show>
             <p class="status">{move || view.with(|v| v.storage.clone())}</p>
             <Show when=move || view.with(|v| v.offers_unlock)>
                 <button on:click=move |_| act(Action::Unlock)>
