@@ -309,8 +309,8 @@ pub enum StoredDeleteState {
         /// The number of pending writes.
         unsynced_count: usize,
     },
-    /// Ask permission to delete an unreadable replica.
-    Unreadable,
+    /// Ask permission to delete a replica that could not be read, and why.
+    Unreadable(String),
     /// A deletion is running.
     Working,
     /// The deletion's failure.
@@ -324,8 +324,8 @@ pub enum StoredDeleteOutcome {
     Done(Option<String>),
     /// Keep the account pending permission to discard writes.
     Pending(usize),
-    /// Keep an unreadable account pending explicit permission.
-    Unreadable,
+    /// Keep an unreadable account pending explicit permission, with the reason.
+    Unreadable(String),
     /// Keep the account and show the failure.
     Error(String),
 }
@@ -340,7 +340,9 @@ impl From<Result<(), connetto_client::teardown::ForgetError>> for StoredDeleteOu
             Err(ForgetError::Refused(ForgetRefusal::Unsynced(writes))) => {
                 Self::Pending(writes.len())
             }
-            Err(ForgetError::Refused(ForgetRefusal::Unreadable(_))) => Self::Unreadable,
+            Err(ForgetError::Refused(ForgetRefusal::Unreadable(error))) => {
+                Self::Unreadable(error.to_string())
+            }
             Err(ForgetError::Refused(refusal)) => Self::Error(refusal.to_string()),
         }
     }
@@ -361,8 +363,8 @@ impl From<Result<connetto_web::auth::StoredForgetOutcome, connetto_web::auth::Au
             Ok(StoredForgetOutcome::Refused(StoredForgetRefusal::Pending(pending))) => {
                 Self::Pending(usize::try_from(pending.len()).unwrap_or(usize::MAX))
             }
-            Ok(StoredForgetOutcome::Refused(StoredForgetRefusal::Unreadable(_))) => {
-                Self::Unreadable
+            Ok(StoredForgetOutcome::Refused(StoredForgetRefusal::Unreadable(reason))) => {
+                Self::Unreadable(reason)
             }
             Ok(StoredForgetOutcome::Refused(refusal)) => Self::Error(format!("{refusal:?}")),
             Err(error) => Self::Error(error.to_string()),
@@ -490,7 +492,7 @@ impl View {
             StoredDeleteOutcome::Pending(unsynced_count) => {
                 Some(StoredDeleteState::Confirm { unsynced_count })
             }
-            StoredDeleteOutcome::Unreadable => Some(StoredDeleteState::Unreadable),
+            StoredDeleteOutcome::Unreadable(reason) => Some(StoredDeleteState::Unreadable(reason)),
             StoredDeleteOutcome::Error(error) => Some(StoredDeleteState::Error(error)),
         };
         self.stored_delete = state.map(|state| StoredDelete {
@@ -677,9 +679,9 @@ mod tests {
                 Some(StoredDeleteState::Confirm { unsynced_count: 3 }),
             ),
             (
-                StoredDeleteOutcome::Unreadable,
+                StoredDeleteOutcome::Unreadable("no replica key".into()),
                 false,
-                Some(StoredDeleteState::Unreadable),
+                Some(StoredDeleteState::Unreadable("no replica key".into())),
             ),
             (
                 StoredDeleteOutcome::Error("shared".into()),
@@ -815,7 +817,7 @@ mod native_delete_tests {
             StoredDeleteOutcome::from(Err(ForgetError::Refused(ForgetRefusal::Unreadable(
                 ClientError::Session("unreadable".into())
             )))),
-            StoredDeleteOutcome::Unreadable
+            StoredDeleteOutcome::Unreadable(ClientError::Session("unreadable".into()).to_string())
         );
         for refusal in [
             ForgetRefusal::NoReplica,
@@ -868,7 +870,7 @@ mod browser_delete_tests {
             StoredDeleteOutcome::from(Ok(StoredForgetOutcome::Refused(
                 StoredForgetRefusal::Unreadable("unreadable".into())
             ))),
-            StoredDeleteOutcome::Unreadable
+            StoredDeleteOutcome::Unreadable("unreadable".into())
         );
         for refusal in [
             StoredForgetRefusal::LiveAccount,
