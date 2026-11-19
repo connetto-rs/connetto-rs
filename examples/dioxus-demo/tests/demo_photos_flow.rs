@@ -405,6 +405,8 @@ async fn start_file_server(
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
         on_carried: None,
+        // The sync server's own checker, which keeps every login it granted live.
+        sessions: std::sync::Arc::new(connetto_core::test_support::TestGrantChecker),
         _schema: PhantomData,
     })
     .await
