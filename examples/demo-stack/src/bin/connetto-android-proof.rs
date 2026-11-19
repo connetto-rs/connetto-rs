@@ -576,11 +576,63 @@ async fn second_account_shares_catalogue(
     let trace = live_trace.context("Tauri live trace")?;
     step("an account switch releases the old subscriptions before the new panes subscribe");
     let before = trace.before_switch(device).await?;
+    let second = app.line_starting_with(SIGNED_IN_LINE).await?;
     app.switch_to_account(&first).await?;
     app.wait_for_text(&first, Duration::from_secs(90)).await?;
     live::equal_rows(app, &stack.pg_url).await?;
     trace.after_switch(device, before).await?;
-    device.screenshot(evidence, "back-to-first-account").await
+    device.screenshot(evidence, "back-to-first-account").await?;
+    step("delete the stored second account");
+    delete_stored_account(app, &second).await?;
+    device.screenshot(evidence, "second-account-deleted").await
+}
+
+/// Delete the stored account through its controls and observe its switch disappear.
+async fn delete_stored_account(app: &mut PageSession, signed_in: &str) -> Result<()> {
+    let badge = signed_in
+        .strip_prefix(SIGNED_IN_LINE)
+        .map(str::trim)
+        .filter(|badge| !badge.is_empty())
+        .context("the stored account has no badge")?;
+    let script = format!(
+        r"new Promise(resolve => {{
+            const badge = {};
+            const buttons = () => [...document.querySelectorAll('button')];
+            const switches = buttons().filter(button => button.textContent.trim() === 'Switch to ' + badge);
+            if (switches.length !== 1) {{ resolve('stored account switch is missing or ambiguous'); return; }}
+            const account = switches[0].querySelector('[data-account]').getAttribute('data-account');
+            const section = switches[0].parentElement;
+            const deletes = [...section.querySelectorAll('button[aria-label]')].filter(button => button.getAttribute('aria-label') === 'Delete ' + badge);
+            if (deletes.length !== 1) {{ resolve('stored account delete is missing or ambiguous'); return; }}
+            let confirmed = false;
+            const finish = result => {{ observer.disconnect(); clearTimeout(timer); resolve(result); }};
+            const check = () => {{
+                const current = buttons().find(button => button.textContent.trim().startsWith('Switch to ') &&
+                    button.querySelector('[data-account]')?.getAttribute('data-account') === account);
+                if (!current) {{ finish(true); return; }}
+                const confirm = [...current.parentElement.querySelectorAll('button')].find(button => button.textContent.trim() === 'Confirm: delete this account');
+                if (confirm && !confirm.disabled && !confirmed) {{ confirmed = true; confirm.click(); }}
+            }};
+            const observer = new MutationObserver(check);
+            const timer = setTimeout(() => finish('stored account switch remains ' + section.innerText), 30000);
+            observer.observe(document.body, {{ childList: true, subtree: true, characterData: true, attributes: true }});
+            deletes[0].click();
+            check();
+        }})",
+        serde_json::Value::String(badge.to_owned())
+    );
+    let result = app
+        .call(
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": script, "returnByValue": true, "awaitPromise": true,
+            }),
+        )
+        .await?;
+    if result["result"]["value"] != true {
+        bail!("stored account deletion failed {result}");
+    }
+    Ok(())
 }
 
 /// The system setting whose change rebuilds the demo's screen, which the
@@ -1179,10 +1231,7 @@ async fn host_and_link(
 
     step("link through the hotspot");
     if app
-        .wait_for_text(
-            &format!("linked: {joiner_identity}"),
-            Duration::from_secs(90),
-        )
+        .wait_for_link(joiner_identity, Duration::from_secs(90))
         .await
         .is_err()
     {
@@ -1192,7 +1241,7 @@ async fn host_and_link(
         );
     }
     peer_app
-        .wait_for_text(&format!("linked: {host_identity}"), Duration::from_secs(30))
+        .wait_for_link(host_identity, Duration::from_secs(30))
         .await?;
     host.screenshot(evidence, &shot("host-linked")).await?;
     joiner.screenshot(evidence, &shot("peer-linked")).await?;
@@ -1787,10 +1836,7 @@ async fn phone_hosts_walk(
     };
     step("link through the hotspot");
     if app
-        .wait_for_text(
-            &format!("linked: {linux_identity}"),
-            Duration::from_secs(90),
-        )
+        .wait_for_link(linux_identity, Duration::from_secs(90))
         .await
         .is_err()
     {
@@ -1975,10 +2021,7 @@ async fn linux_hosts_join(
     leg.wait_linked(phone_identity, Duration::from_secs(90))
         .await?;
     if app
-        .wait_for_text(
-            &format!("linked: {linux_identity}"),
-            Duration::from_secs(30),
-        )
+        .wait_for_link(linux_identity, Duration::from_secs(30))
         .await
         .is_err()
     {
@@ -2050,7 +2093,11 @@ async fn wait_link_ends_leg(app: &mut PageSession, leg: &LegClient, peer: &str) 
     loop {
         let page = app.page_text().await?;
         let linked = leg.linked().await?;
-        if !page.contains("linked: ") && !linked.iter().any(|held| held == peer) {
+        if !page.contains("linked: ")
+            && !linked
+                .iter()
+                .any(|held| connetto_test_harness::peer_devices::same_peer(held, peer))
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {

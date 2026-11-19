@@ -254,6 +254,18 @@ impl Restart {
     }
 }
 
+/// Reads this device's stored account names.
+pub(crate) fn read_badge_names() -> support::view::StoredNames {
+    support::native::read_stored_names(&data_dir())
+}
+
+/// Persists the signed-in account's name.
+pub(crate) fn save_badge_names(names: &support::view::StoredNames) {
+    if let Err(error) = support::native::write_stored_names(&data_dir(), names) {
+        tracing::warn!(%error, "could not store account names");
+    }
+}
+
 /// The native entry: renders the shared page at once and runs the connection
 /// behind it, parking the loopback login URL instead of opening a browser.
 /// Android calls `main` from the activity's start, so nothing there may wait

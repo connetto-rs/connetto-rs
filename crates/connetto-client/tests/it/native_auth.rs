@@ -1209,3 +1209,482 @@ async fn an_ask_build_without_an_answer_is_refused() {
         "a chooser answering Ask is refused"
     );
 }
+
+diesel::table! {
+    /// The table [`BUILDER_DDL`] creates.
+    items (id) {
+        /// The item's key.
+        id -> Integer,
+        /// Its label.
+        label -> Nullable<Text>,
+    }
+}
+
+/// A durable provider build of `schema` over `dir` that signs `subject` in
+/// through a fresh login and opens offline.
+async fn durable_login(
+    base: &str,
+    store: &SharedRefreshStore,
+    dir: &std::path::Path,
+    keys: &super::support::SharedKeys,
+    subject: &str,
+    schema: connetto_client::SyncSchema,
+) -> connetto_client::NativeClient<FakeTransport> {
+    Box::pin(
+        NativeClientBuilder::new("ws://127.0.0.1:1/", schema)
+            .with_dialer(super::support::NeverDial::<FakeTransport>::default())
+            .signed_in(
+                provider(base, store, AccountChoice::New)
+                    .with_browser_opener(fake_browser(subject)),
+            )
+            .durable(dir, keys.clone())
+            .with_gate(Gate::off())
+            .connect(),
+    )
+    .await
+    .expect("the durable provider build signs in and opens offline")
+}
+
+/// Run the write `sql` through `client` and return the unsynced writes once
+/// the outbox lists it, which it does because the build never reaches a
+/// server.
+async fn queue_write(
+    client: &connetto_client::NativeClient<FakeTransport>,
+    sql: &'static str,
+) -> Vec<connetto_client::UnsyncedWrite> {
+    use diesel::connection::SimpleConnection as _;
+    let mut outbox = client
+        .client()
+        .unsynced_live()
+        .await
+        .expect("follow the outbox");
+    client
+        .client()
+        .with_conn(move |conn| conn.conn().batch_execute(sql).expect("write offline"))
+        .await
+        .expect("the gate is off");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while outbox.work().writes.is_empty() {
+            outbox.changed().await.expect("the outbox stays followed");
+        }
+    })
+    .await
+    .expect("the outbox lists the offline write");
+    client.client().unsynced().await.expect("read the outbox")
+}
+
+/// A build sharing tables with two accounts on one data directory: `bob`
+/// stored with an unsent shared insert of row 5, `alice` live with the
+/// shared store attached, reading that row.
+struct SharedAccounts {
+    _idp: MockOauth,
+    _fixture: connetto_test_harness::Fixture,
+    _keyring: connetto_test_harness::SessionKeyringGuard,
+    store: SharedRefreshStore,
+    dir: tempfile::TempDir,
+    keys: super::support::SharedKeys,
+    alice_client: connetto_client::NativeClient<FakeTransport>,
+    bob: String,
+    bob_replica: String,
+}
+
+impl SharedAccounts {
+    async fn signed_in() -> Self {
+        use super::shared_coverage::schema;
+
+        let keyring = connetto_test_harness::isolated_session_keyring();
+        let (base, idp, fixture) = spawn_auth_server().await;
+        let store = SharedRefreshStore::default();
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let keys = super::support::SharedKeys::default();
+        let bob_client = Box::pin(durable_login(
+            &base,
+            &store,
+            dir.path(),
+            &keys,
+            "bob",
+            schema(),
+        ))
+        .await;
+        let bob_session = bob_client.session().expect("bob's session");
+        let bob = bob_session.account().to_owned();
+        let bob_replica = replica_db_name(connetto_client::REPLICA_PREFIX, &bob_session.user_id())
+            .expect("bob's replica name");
+        Box::pin(queue_write(
+            &bob_client,
+            "INSERT INTO tags VALUES (5, 'never sent')",
+        ))
+        .await;
+        bob_client.close().await;
+        let alice_client = Box::pin(durable_login(
+            &base,
+            &store,
+            dir.path(),
+            &keys,
+            "alice",
+            schema(),
+        ))
+        .await;
+        let accounts = Self {
+            _idp: idp,
+            _fixture: fixture,
+            _keyring: keyring,
+            store,
+            dir,
+            keys,
+            alice_client,
+            bob,
+            bob_replica,
+        };
+        assert_eq!(
+            accounts.shared_ids().await,
+            [5],
+            "bob's unsent insert is in the store alice reads"
+        );
+        accounts
+    }
+
+    /// The shared rows `alice` reads.
+    async fn shared_ids(&self) -> Vec<i64> {
+        self.alice_client
+            .client()
+            .with_conn(super::shared_coverage::ids)
+            .await
+            .expect("the gate is off")
+    }
+}
+
+/// A build sharing tables deletes a stored account while the live account's
+/// connection holds the shared store attached. The stored account's unsent
+/// shared insert is undone in the store the live account reads, and the
+/// store stays, since the live account is still in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_stored_account_undoes_its_unsent_shared_writes() {
+    let accounts = Box::pin(SharedAccounts::signed_in()).await;
+    accounts
+        .alice_client
+        .forget_stored_account(&accounts.bob, true)
+        .await
+        .expect("the forced delete removes bob");
+    assert!(
+        accounts.shared_ids().await.is_empty(),
+        "bob's unsent insert is undone"
+    );
+    assert!(
+        accounts
+            .dir
+            .path()
+            .join(connetto_client::shared_store_name(
+                connetto_client::REPLICA_PREFIX
+            ))
+            .exists(),
+        "alice keeps the shared store"
+    );
+}
+
+/// A departure the shared store refuses refuses the delete. Nothing of the
+/// stored account goes, so the changesets the undo needs stay in its replica
+/// for the next try.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_shared_departure_refuses_the_delete() {
+    use connetto_client::teardown::{ForgetError, ForgetRefusal};
+    use diesel::connection::SimpleConnection as _;
+
+    let accounts = Box::pin(SharedAccounts::signed_in()).await;
+    accounts
+        .alice_client
+        .client()
+        .with_conn(|conn| {
+            conn.conn()
+                .batch_execute(
+                    "CREATE TRIGGER connetto_shared.refuse_departures \
+                     BEFORE DELETE ON _connetto_identity \
+                     BEGIN SELECT RAISE(ABORT, 'the store refuses'); END",
+                )
+                .expect("make the store refuse departures");
+        })
+        .await
+        .expect("the gate is off");
+
+    assert!(
+        matches!(
+            accounts
+                .alice_client
+                .forget_stored_account(&accounts.bob, true)
+                .await,
+            Err(ForgetError::Refused(ForgetRefusal::Shared(_)))
+        ),
+        "the refused departure refuses the delete"
+    );
+    assert!(
+        accounts.dir.path().join(&accounts.bob_replica).exists(),
+        "bob's replica stays"
+    );
+    assert!(
+        accounts
+            .keys
+            .load(&accounts.bob_replica)
+            .await
+            .expect("load")
+            .is_some(),
+        "and its key"
+    );
+    assert!(
+        accounts
+            .store
+            .load(&accounts.bob)
+            .await
+            .expect("load")
+            .is_some(),
+        "and bob's sign-in"
+    );
+    assert_eq!(
+        accounts.shared_ids().await,
+        [5],
+        "and his unsent insert, which a later try undoes"
+    );
+}
+
+/// Two accounts signed in on one data directory: `bob` stored with one
+/// unsent write in his closed replica, `alice` live with one of her own.
+struct TwoAccounts {
+    base: String,
+    _idp: MockOauth,
+    _fixture: connetto_test_harness::Fixture,
+    _keyring: connetto_test_harness::SessionKeyringGuard,
+    store: SharedRefreshStore,
+    dir: tempfile::TempDir,
+    keys: super::support::SharedKeys,
+    alice_client: connetto_client::NativeClient<FakeTransport>,
+    alice: String,
+    alice_replica: String,
+    alice_queued: Vec<connetto_client::UnsyncedWrite>,
+    bob: String,
+    bob_replica: String,
+    bob_queued: Vec<connetto_client::UnsyncedWrite>,
+    bob_token: String,
+}
+
+impl TwoAccounts {
+    async fn signed_in() -> Self {
+        let keyring = connetto_test_harness::isolated_session_keyring();
+        let (base, idp, fixture) = spawn_auth_server().await;
+        let store = SharedRefreshStore::default();
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let keys = super::support::SharedKeys::default();
+
+        let bob_client = Box::pin(durable_login(
+            &base,
+            &store,
+            dir.path(),
+            &keys,
+            "bob",
+            super::support::bundle(BUILDER_DDL),
+        ))
+        .await;
+        let bob_session = bob_client.session().expect("bob's session");
+        let bob = bob_session.account().to_owned();
+        let bob_replica = replica_db_name(connetto_client::REPLICA_PREFIX, &bob_session.user_id())
+            .expect("bob's replica name");
+        let bob_queued = Box::pin(queue_write(
+            &bob_client,
+            "INSERT INTO items VALUES (1, 'bob-offline')",
+        ))
+        .await;
+        bob_client.close().await;
+        let bob_token = store
+            .load(&bob)
+            .await
+            .expect("load")
+            .expect("bob's sign-in is stored");
+        assert!(
+            dir.path().join(&bob_replica).exists(),
+            "bob's replica is on the device"
+        );
+
+        let alice_client = Box::pin(durable_login(
+            &base,
+            &store,
+            dir.path(),
+            &keys,
+            "alice",
+            super::support::bundle(BUILDER_DDL),
+        ))
+        .await;
+        let alice_session = alice_client.session().expect("alice's session");
+        let alice = alice_session.account().to_owned();
+        let alice_replica =
+            replica_db_name(connetto_client::REPLICA_PREFIX, &alice_session.user_id())
+                .expect("alice's replica name");
+        let alice_queued = Box::pin(queue_write(
+            &alice_client,
+            "INSERT INTO items VALUES (1, 'alice-offline')",
+        ))
+        .await;
+        Self {
+            base,
+            _idp: idp,
+            _fixture: fixture,
+            _keyring: keyring,
+            store,
+            dir,
+            keys,
+            alice_client,
+            alice,
+            alice_replica,
+            alice_queued,
+            bob,
+            bob_replica,
+            bob_queued,
+            bob_token,
+        }
+    }
+
+    /// Whether bob's replica, its key and his stored sign-in are all on the
+    /// device.
+    async fn bob_is_stored(&self) -> bool {
+        self.dir.path().join(&self.bob_replica).exists()
+            && self
+                .keys
+                .load(&self.bob_replica)
+                .await
+                .expect("load")
+                .is_some()
+            && self.store.load(&self.bob).await.expect("load").as_deref()
+                == Some(self.bob_token.as_str())
+    }
+}
+
+/// The delete refuses the live account, an account the device does not
+/// store, and a stored account whose closed replica holds unsent writes,
+/// naming them. None of the refusals destroys anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_stored_account_refuses_without_destroying_anything() {
+    use connetto_client::teardown::{ForgetError, ForgetRefusal};
+
+    let accounts = Box::pin(TwoAccounts::signed_in()).await;
+    let client = &accounts.alice_client;
+    assert!(
+        matches!(
+            client.forget_stored_account(&accounts.alice, true).await,
+            Err(ForgetError::Refused(ForgetRefusal::LiveAccount))
+        ),
+        "the live account is forgotten through forget_device"
+    );
+    assert!(
+        matches!(
+            client.forget_stored_account("nobody", true).await,
+            Err(ForgetError::Refused(ForgetRefusal::UnknownAccount))
+        ),
+        "an account the device does not store is refused"
+    );
+    match client.forget_stored_account(&accounts.bob, false).await {
+        Err(ForgetError::Refused(ForgetRefusal::Unsynced(blocked))) => {
+            assert_eq!(
+                blocked, accounts.bob_queued,
+                "the refusal names bob's unsent writes"
+            );
+        }
+        other => panic!("expected bob's unsent writes to refuse the delete, got {other:?}"),
+    }
+    assert!(
+        accounts.bob_is_stored().await,
+        "the refusals leave bob's replica, key and sign-in"
+    );
+    assert!(
+        accounts.dir.path().join(&accounts.alice_replica).exists(),
+        "and alice's replica"
+    );
+}
+
+/// Forced, the delete revokes the stored account's session at the server and
+/// removes its replica, key and stored credential, while the live account
+/// keeps its replica, key, sign-in, unsent write and rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_live_account_deletes_another_stored_account() {
+    use diesel::prelude::*;
+
+    let accounts = Box::pin(TwoAccounts::signed_in()).await;
+    let TwoAccounts {
+        base,
+        store,
+        dir,
+        keys,
+        alice_client,
+        alice,
+        alice_replica,
+        alice_queued,
+        bob,
+        bob_replica,
+        bob_token,
+        ..
+    } = &accounts;
+    alice_client
+        .forget_stored_account(bob, true)
+        .await
+        .expect("the forced delete removes bob");
+    assert!(
+        !dir.path().join(bob_replica).exists(),
+        "bob's replica is gone"
+    );
+    assert!(
+        keys.load(bob_replica).await.expect("load").is_none(),
+        "and its key record"
+    );
+    assert_eq!(
+        store.load(bob).await.expect("load"),
+        None,
+        "and bob's sign-in"
+    );
+    assert!(
+        !store.accounts().await.expect("accounts").contains(bob),
+        "the device no longer lists bob"
+    );
+    let replay: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    replay.store(bob, bob_token).await.expect("store");
+    let refused = NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, replay, Some(bob.clone()))
+        .with_browser_opener(no_browser())
+        .refresh_access::<String>()
+        .await;
+    assert!(
+        refused.is_err(),
+        "the server refuses bob's revoked refresh token"
+    );
+
+    assert!(
+        dir.path().join(alice_replica).exists(),
+        "alice's replica stays"
+    );
+    assert!(
+        keys.load(alice_replica).await.expect("load").is_some(),
+        "and its key"
+    );
+    assert!(
+        store.load(alice).await.expect("load").is_some(),
+        "and alice's sign-in"
+    );
+    assert_eq!(
+        &alice_client
+            .client()
+            .unsynced()
+            .await
+            .expect("read the outbox"),
+        alice_queued,
+        "alice's unsent write is untouched"
+    );
+    let labels = alice_client
+        .client()
+        .with_conn(|conn| {
+            items::table
+                .select(items::label)
+                .load::<Option<String>>(conn.conn())
+                .expect("read alice's items")
+        })
+        .await
+        .expect("the gate is off");
+    assert_eq!(
+        labels,
+        vec![Some("alice-offline".to_owned())],
+        "alice still reads her own row"
+    );
+}

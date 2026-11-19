@@ -290,6 +290,29 @@ impl PageSession {
         refusals: &[&str],
         limit: Duration,
     ) -> Result<()> {
+        self.wait_for_match(text, refusals, limit, |page| page.contains(text))
+            .await
+    }
+
+    /// Wait for a linked peer by short account id and key prefix.
+    ///
+    /// # Errors
+    ///
+    /// When the peer is absent past `limit` or the page does not answer.
+    pub async fn wait_for_link(&mut self, peer: &str, limit: Duration) -> Result<()> {
+        self.wait_for_match(peer, &[], limit, |page| {
+            crate::peer_devices::page_names_peer(page, peer)
+        })
+        .await
+    }
+
+    async fn wait_for_match(
+        &mut self,
+        text: &str,
+        refusals: &[&str],
+        limit: Duration,
+        matches: impl Fn(&str) -> bool,
+    ) -> Result<()> {
         let deadline = Instant::now() + limit;
         loop {
             let page = match self.page_text().await {
@@ -303,7 +326,7 @@ impl PageSession {
                 }
                 Err(error) => return Err(error),
             };
-            if page.contains(text) {
+            if matches(&page) {
                 return Ok(());
             }
             if let Some(refusal) = refusals.iter().find(|refusal| page.contains(**refusal)) {
@@ -378,11 +401,7 @@ impl PageSession {
         }
     }
 
-    /// Switch the account bar back to the account `signed_in_line` named,
-    /// the page's `Signed in as <short identity>` line. Each switch button
-    /// names its account by the full identity, which starts with the short
-    /// one, so the button is found among any others a kept keychain still
-    /// holds.
+    /// Switch to the account named by a `Signed in as <badge>` line.
     ///
     /// # Errors
     ///
@@ -391,7 +410,8 @@ impl PageSession {
     pub async fn switch_to_account(&mut self, signed_in_line: &str) -> Result<()> {
         let identity = signed_in_line
             .strip_prefix("Signed in as ")
-            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::trim)
+            .filter(|badge| !badge.is_empty())
             .ok_or_else(|| anyhow!("the signed-in line {signed_in_line:?} names no identity"))?;
         self.click_starting_with(&format!("Switch to {identity}"))
             .await
@@ -613,7 +633,7 @@ mod tests {
                 let request: serde_json::Value = serde_json::from_str(&text).unwrap();
                 let script = request["params"]["expression"].as_str().unwrap_or_default();
                 // One button starts with the asked prefix, any other finds none.
-                let found = if script.contains("\"Switch to d5e24135\"") {
+                let found = if script.contains("\"Switch to alice d5e24135\"") {
                     serde_json::Value::Bool(true)
                 } else {
                     serde_json::json!(0)
@@ -631,16 +651,32 @@ mod tests {
         let mut page = PageSession::devtools(&format!("ws://{address}"))
             .await
             .unwrap();
-        page.switch_to_account("Signed in as d5e24135 (alice)")
+        page.switch_to_account("Signed in as alice d5e24135")
             .await
             .unwrap();
         let unknown = page
-            .switch_to_account("Signed in as cc072008 (bob)")
+            .switch_to_account("Signed in as bob cc072008")
             .await
             .unwrap_err();
         assert!(unknown.to_string().contains("0 buttons"), "{unknown:#}");
         let error = page.switch_to_account("Signed in as ").await.unwrap_err();
         assert!(error.to_string().contains("names no identity"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn linked_wait_matches_names_independently() {
+        let url = endpoint(vec![Ok("linked: bob 89abcdef/01234567 via 10.42.0.7:4431")]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.wait_for_link("89abcdef/01234567", Duration::ZERO)
+            .await
+            .unwrap();
+        let url = endpoint(vec![Ok("linked: bob 89abcdef/76543210")]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        assert!(
+            page.wait_for_link("89abcdef/01234567", Duration::ZERO)
+                .await
+                .is_err()
+        );
     }
 
     /// A line is found by its prefix among the page's trimmed lines, and a

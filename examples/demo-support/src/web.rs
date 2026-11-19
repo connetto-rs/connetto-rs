@@ -590,7 +590,7 @@ pub async fn logout_delete() -> Result<DeleteOutcome, AuthError> {
             match connetto_web::auth::request_logout(true, false).await {
                 Ok(LogoutOutcome::Refused { pending }) => Ok(DeleteOutcome::Refused(pending)),
                 Ok(_) => {
-                    forget_stored_name();
+                    forget_live_stored_name();
                     reload_page();
                     Ok(DeleteOutcome::Reloaded)
                 }
@@ -610,7 +610,7 @@ pub async fn logout_delete() -> Result<DeleteOutcome, AuthError> {
 pub async fn logout_delete_confirmed() -> Result<(), AuthError> {
     match connetto_web::auth::request_logout(true, true).await {
         Ok(_) => {
-            forget_stored_name();
+            forget_live_stored_name();
             reload_page();
             Ok(())
         }
@@ -618,13 +618,28 @@ pub async fn logout_delete_confirmed() -> Result<(), AuthError> {
     }
 }
 
-/// Drop the deleted account's login name from this origin's stored names.
-fn forget_stored_name() {
-    let Some(key) = read_stored_account() else {
-        return;
-    };
+/// Delete a stored account and remove its saved name when teardown starts.
+pub async fn forget_stored_account(account: &str, force: bool) -> crate::view::StoredDeleteOutcome {
+    let outcome = crate::view::StoredDeleteOutcome::from(
+        connetto_web::auth::request_forget_stored(account, force).await,
+    );
+    if matches!(outcome, crate::view::StoredDeleteOutcome::Done(_)) {
+        forget_stored_name(account);
+    }
+    outcome
+}
+
+/// Drop the live account's stored name.
+fn forget_live_stored_name() {
+    if let Some(account) = read_stored_account() {
+        forget_stored_name(&account);
+    }
+}
+
+/// Drop an account's login name from this origin's stored names.
+pub fn forget_stored_name(account: &str) {
     let mut names = read_stored_names();
-    if names.forget(&crate::account_label(&key)) {
+    if names.forget(&crate::account_label(account)) {
         save_stored_names(&names);
     }
 }

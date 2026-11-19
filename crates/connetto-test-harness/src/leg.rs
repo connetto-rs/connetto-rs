@@ -686,7 +686,9 @@ fn pump_event(event: ClientEvent, fatal: &tokio::sync::mpsc::UnboundedSender<Str
 fn short_identity(identity: &connetto_core::device_cert::DeviceIdentity) -> String {
     let key = identity.key().to_string();
     let prefix = key.get(..8).unwrap_or_default();
-    format!("{}/{prefix}", identity.account())
+    let account = identity.account();
+    let short = account.split('-').next().unwrap_or(account);
+    format!("{short}/{prefix}")
 }
 
 /// The beacon's answer fields, advertising with its prefix or off with its
@@ -1168,7 +1170,10 @@ impl LegClient {
         let deadline = Instant::now() + bound;
         loop {
             let linked = self.linked().await?;
-            if linked.iter().any(|held| held == peer) {
+            if linked
+                .iter()
+                .any(|held| crate::peer_devices::same_peer(held, peer))
+            {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -1188,7 +1193,10 @@ impl LegClient {
         let deadline = Instant::now() + LINK_END_BOUND;
         loop {
             let linked = self.linked().await?;
-            if !linked.iter().any(|held| held == peer) {
+            if !linked
+                .iter()
+                .any(|held| crate::peer_devices::same_peer(held, peer))
+            {
                 return Ok(());
             }
             if Instant::now() >= deadline {

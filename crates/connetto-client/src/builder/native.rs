@@ -586,6 +586,37 @@ const DESCRIPTOR_LIMIT: usize = 4096;
 impl DeviceSetup {
     /// The account's key on this platform's chip, else in the keyring under `service`.
     fn keys(&self, service: &str, account: &str) -> Result<Arc<dyn DeviceKeys>, ClientError> {
+        self.keys_for(service).keys(account)
+    }
+
+    /// What makes any account's device keys under `service`, kept by the
+    /// teardown for a stored account that is not the live one.
+    fn keys_for(&self, service: &str) -> DeviceKeysFor {
+        DeviceKeysFor {
+            refused: self.refused.clone(),
+            roots: self.roots.clone(),
+            service: service.to_owned(),
+            #[cfg(target_os = "android")]
+            java: self.java.clone(),
+        }
+    }
+}
+
+/// What makes the device keys of any account on this device.
+#[cfg(feature = "device-identity")]
+#[derive(Clone)]
+struct DeviceKeysFor {
+    refused: Option<String>,
+    roots: Vec<Vec<u8>>,
+    service: String,
+    #[cfg(target_os = "android")]
+    java: Option<Arc<dyn crate::device_key::JavaAccess>>,
+}
+
+#[cfg(feature = "device-identity")]
+impl DeviceKeysFor {
+    /// The account's key on this platform's chip, else in the keyring.
+    fn keys(&self, account: &str) -> Result<Arc<dyn DeviceKeys>, ClientError> {
         if let Some(reason) = &self.refused {
             return Err(ClientError::DeviceDescriptor(reason.clone()));
         }
@@ -616,8 +647,8 @@ impl DeviceSetup {
         let chip = Arc::new(crate::device_key::NoChip);
         Ok(Arc::new(PlatformKeys {
             chip,
-            records: crate::keyring::Keyring::new(service),
-            service: service.to_owned(),
+            records: crate::keyring::Keyring::new(&self.service),
+            service: self.service.clone(),
             account: account.to_owned(),
         }))
     }
@@ -899,8 +930,11 @@ where
         );
         let (core, resolved, key_store) = this.into_core().await?;
         #[cfg(feature = "device-identity")]
-        let keys = service
-            .map(|service| device.keys(&service, resolved.credential.replica_name()))
+        let device_keys = service.as_deref().map(|service| device.keys_for(service));
+        #[cfg(feature = "device-identity")]
+        let keys = device_keys
+            .as_ref()
+            .map(|keys_for| keys_for.keys(resolved.credential.replica_name()))
             .transpose()?;
         #[cfg(feature = "native-auth")]
         let (session, teardown) = {
@@ -919,6 +953,9 @@ where
                 share_record,
                 hook,
                 shared,
+                schema: core.base.schema.clone(),
+                #[cfg(feature = "device-identity")]
+                device_keys,
             });
             (session, Some(teardown))
         };
@@ -1386,53 +1423,16 @@ where
     KS: ReplicaKeyStore<Error = ClientError> + Send + Sync + 'static,
 {
     for prepared in pending {
-        let PreparedWipe {
-            wipe,
-            refresh,
-            share_keys,
-            #[cfg(feature = "device-identity")]
-            device_keys,
-            shared,
-        } = prepared;
+        let wipe = prepared.wipe.clone();
         let mut report = ForgetIncomplete::default();
-        // Out of the shared store before anything of the replica goes, its
-        // queued shared writes undone while it still exists (R11 slice 6, Q6
-        // and Q7).
         let last_out = SharedStore::leave(
-            shared.as_ref(),
+            prepared.shared.as_ref(),
             &dir.join(&wipe.name),
             key_store,
             &mut report,
         )
         .await;
-        if let (Some(account), Some(store)) = (&wipe.account, refresh) {
-            report.credential = store.clear(account).await.err();
-        }
-        report.wipe = wipe_replica(&dir.join(&wipe.name), key_store, &wipe.name, &[], true)
-            .await
-            .err();
-        if report.wipe.is_none() {
-            report.share_keys = match share_keys {
-                Ok(store) => store.clear(&share_key_record(&wipe.name)).await.err(),
-                Err(err) => Some(err),
-            };
-            if last_out && let Some(shared) = &shared {
-                shared.remove(key_store, &mut report).await;
-            }
-            #[cfg(feature = "device-identity")]
-            if let Some(keys) = device_keys {
-                report.device_key = match keys {
-                    Ok(keys) => keys.delete().await.err(),
-                    Err(err) => Some(err),
-                };
-            }
-        }
-        if let Some(hook) = hook {
-            report.application = hook(wipe.name.clone())
-                .await
-                .err()
-                .map(ApplicationWipeError);
-        }
+        wipe_closed_account(prepared, last_out, dir, key_store, hook, &mut report).await;
         if !report.is_complete() {
             return Err(ClientError::WipePending(Box::new(report)));
         }
@@ -1441,6 +1441,59 @@ where
         })?;
     }
     Ok(())
+}
+
+/// Wipe the account `prepared` names, whose client is not open and which
+/// already left the shared store, as the last identity in it when
+/// `last_out`, filling in the parts of `report` that fail. Each part is
+/// idempotent.
+#[cfg(feature = "native-auth")]
+async fn wipe_closed_account<KS>(
+    prepared: PreparedWipe,
+    last_out: bool,
+    dir: &std::path::Path,
+    key_store: &KS,
+    hook: Option<&DeviceWipeHook>,
+    report: &mut ForgetIncomplete,
+) where
+    KS: ReplicaKeyStore<Error = ClientError> + Send + Sync + 'static,
+{
+    let PreparedWipe {
+        wipe,
+        refresh,
+        share_keys,
+        #[cfg(feature = "device-identity")]
+        device_keys,
+        shared,
+    } = prepared;
+    if let (Some(account), Some(store)) = (&wipe.account, refresh) {
+        report.credential = store.clear(account).await.err();
+    }
+    report.wipe = wipe_replica(&dir.join(&wipe.name), key_store, &wipe.name, &[], true)
+        .await
+        .err();
+    if report.wipe.is_none() {
+        report.share_keys = match share_keys {
+            Ok(store) => store.clear(&share_key_record(&wipe.name)).await.err(),
+            Err(err) => Some(err),
+        };
+        if last_out && let Some(shared) = &shared {
+            shared.remove(key_store, report).await;
+        }
+        #[cfg(feature = "device-identity")]
+        if let Some(keys) = device_keys {
+            report.device_key = match keys {
+                Ok(keys) => keys.delete().await.err(),
+                Err(err) => Some(err),
+            };
+        }
+    }
+    if let Some(hook) = hook {
+        report.application = hook(wipe.name.clone())
+            .await
+            .err()
+            .map(ApplicationWipeError);
+    }
 }
 
 /// The share-key store a durable build names, the refresh store standing in
@@ -2054,6 +2107,113 @@ where
             Err(ForgetError::Incomplete(Box::new(report)))
         }
     }
+
+    /// Delete `account`, a stored account that is not the live one: revoke
+    /// its session at the server, then wipe its replica, its tier, its
+    /// content, its key, its share keys and its device key, and clear its
+    /// stored credential. The live client and everything of the live account
+    /// stay.
+    ///
+    /// The account's replica is opened offline first, and the writes in it
+    /// the server has not acknowledged block the delete unless `force` is
+    /// set, since once its credential is gone they can never be uploaded. A
+    /// build that shares tables first takes the account out of the shared
+    /// store, undoing the shared writes a forced delete discards, and only
+    /// then revokes and wipes. A wipe marker stands until every part did, so
+    /// a start after a crash midway finishes the delete.
+    ///
+    /// # Errors
+    ///
+    /// [`ForgetError::Refused`] when nothing was destroyed: the build kept no
+    /// replica on this device, `account` is the live one, the device stores
+    /// no such account, the account's unsynced writes cannot be read or
+    /// block the delete, or the shared store refused its departure.
+    /// [`ForgetError::Incomplete`] when part of the delete failed, naming
+    /// each part.
+    pub async fn forget_stored_account(
+        &self,
+        account: &str,
+        force: bool,
+    ) -> Result<(), ForgetError> {
+        let teardown = self.teardown.as_ref().ok_or(ForgetRefusal::NoReplica)?;
+        let StoredAccount {
+            account,
+            name,
+            path,
+            opening,
+        } = teardown.stored(account).await?;
+        match opening
+            .and_then(|opening| stored_unsynced::<T>(&path, &name, opening, teardown.schema()))
+        {
+            Ok(unsynced) if !unsynced.is_empty() && !force => {
+                return Err(ForgetRefusal::Unsynced(unsynced).into());
+            }
+            Err(err) if !force => return Err(ForgetRefusal::Unreadable(err).into()),
+            _ => {}
+        }
+        let report = teardown.forget_stored(account, name).await?;
+        if report.is_complete() {
+            Ok(())
+        } else {
+            Err(ForgetError::Incomplete(Box::new(report)))
+        }
+    }
+}
+
+/// A stored account that is not the live one, with what opening its replica
+/// offline needs.
+#[cfg(feature = "native-auth")]
+struct StoredAccount {
+    account: String,
+    name: String,
+    path: PathBuf,
+    opening: Result<ReplicaOpening, ClientError>,
+}
+
+/// The keys a stored account's replica opens under.
+#[cfg(feature = "native-auth")]
+struct ReplicaOpening {
+    /// The replica's key, `None` when the store holds none.
+    key: Option<ReplicaKey>,
+    /// The shared store and its key, when the build shares tables.
+    shared: Option<(Located, ReplicaKey)>,
+}
+
+/// The writes in the replica `name` at `path` the server has not
+/// acknowledged, read on a connection of its own that closes before the
+/// answer returns. A replica that was never opened holds none.
+#[cfg(feature = "native-auth")]
+fn stored_unsynced<T: Transport>(
+    path: &std::path::Path,
+    name: &str,
+    opening: ReplicaOpening,
+    schema: &SyncSchema,
+) -> Result<Vec<crate::UnsyncedWrite>, ClientError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let key = opening.key.ok_or(ClientError::ReplicaKeyMissing)?;
+    let location = path
+        .to_str()
+        .ok_or_else(|| ClientError::Session("the replica path is not valid UTF-8".to_owned()))?;
+    let tier = schema.local_tier_ddl().map(str::to_owned);
+    let replica = crate::builder::core::open_encrypted_replica(
+        location,
+        &key,
+        false,
+        tier.as_ref(),
+        opening.shared,
+    )?;
+    let config = crate::ClientConfig::new(name.to_owned())
+        .with_storage_schema(schema)
+        .with_sql_functions(schema.sql_functions().clone());
+    let conn = crate::ConnettoConnection::<T>::open_existing(
+        &replica,
+        schema.replica_ddl(),
+        &config,
+        None,
+    )?;
+    Ok(conn.unsynced())
 }
 
 /// The session a provider sign-in acquired.
@@ -2118,6 +2278,21 @@ trait Forget: Send + Sync {
     fn pending(&self) -> PendingWipe;
     /// The directory the replica and that record live in.
     fn dir(&self) -> &std::path::Path;
+    /// The schema the build opens its replicas with.
+    fn schema(&self) -> &SyncSchema;
+    /// `account`, when the device stores it and it is not the live one.
+    fn stored<'a>(
+        &'a self,
+        account: &'a str,
+    ) -> core::pin::Pin<Box<dyn Future<Output = Result<StoredAccount, ForgetRefusal>> + Send + 'a>>;
+    /// Take the stored `account` out of the shared store, then revoke its
+    /// session and wipe its replica `name`, past its unsynced guard. A
+    /// departure that fails refuses the delete with nothing destroyed.
+    fn forget_stored(
+        &self,
+        account: String,
+        name: String,
+    ) -> core::pin::Pin<Box<dyn Future<Output = Result<ForgetIncomplete, ForgetRefusal>> + Send + '_>>;
 }
 
 /// The replica a durable build wrote, and what revokes its session.
@@ -2133,6 +2308,12 @@ struct ReplicaTeardown<KS> {
     hook: Option<DeviceWipeHook>,
     /// The shared store, when the build shares tables.
     shared: Option<SharedStore>,
+    /// The schema the build opens its replicas with.
+    schema: SyncSchema,
+    /// What makes the device keys of a stored account, when the build has a
+    /// device identity.
+    #[cfg(feature = "device-identity")]
+    device_keys: Option<DeviceKeysFor>,
 }
 
 /// The shared store a durable build's identity leaves when it is wiped, and
@@ -2297,6 +2478,122 @@ where
 
     fn dir(&self) -> &std::path::Path {
         &self.dir
+    }
+
+    fn schema(&self) -> &SyncSchema {
+        &self.schema
+    }
+
+    fn stored<'a>(
+        &'a self,
+        account: &'a str,
+    ) -> core::pin::Pin<Box<dyn Future<Output = Result<StoredAccount, ForgetRefusal>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let authenticator = self
+                .authenticator
+                .as_ref()
+                .ok_or(ForgetRefusal::UnknownAccount)?;
+            if authenticator.account().as_deref() == Some(account) {
+                return Err(ForgetRefusal::LiveAccount);
+            }
+            let listed = authenticator
+                .stored_accounts()
+                .await
+                .map_err(ForgetRefusal::Unreadable)?;
+            if !listed.iter().any(|listed| listed == account) {
+                return Err(ForgetRefusal::UnknownAccount);
+            }
+            let name = crate::replica::replica_name_of_account(crate::REPLICA_PREFIX, account);
+            let opening = async {
+                let key = self.key_store.load(&name).await?;
+                let shared = match &self.shared {
+                    Some(shared) => match self.key_store.load(&shared.record).await? {
+                        Some(key) => Some((DataDir(self.dir.clone()).locate(&shared.record)?, key)),
+                        None => None,
+                    },
+                    None => None,
+                };
+                Ok(ReplicaOpening { key, shared })
+            }
+            .await;
+            Ok(StoredAccount {
+                account: account.to_owned(),
+                path: self.dir.join(&name),
+                name,
+                opening,
+            })
+        })
+    }
+
+    fn forget_stored(
+        &self,
+        account: String,
+        name: String,
+    ) -> core::pin::Pin<Box<dyn Future<Output = Result<ForgetIncomplete, ForgetRefusal>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let wipe = PendingWipe {
+                name: name.clone(),
+                account: Some(account.clone()),
+            };
+            if let Err(err) = wipe.mark(&self.dir) {
+                tracing::warn!(error = %err, "the stored account's wipe could not be marked pending");
+            }
+            let mut report = ForgetIncomplete::default();
+            // The departure undoes the queued shared writes the replica
+            // still holds, so the replica stays until it stood. The marker
+            // is already down, so a crash past a departure that stood
+            // finishes the delete at the next start.
+            let shared = SharedStore::of(&self.schema, &self.dir, &name);
+            let last_out = SharedStore::leave(
+                shared.as_ref(),
+                &self.dir.join(&name),
+                self.key_store.as_ref(),
+                &mut report,
+            )
+            .await;
+            if let Some(departure) = report.shared.take() {
+                if let Err(err) = wipe.clear(&self.dir) {
+                    tracing::warn!(error = %err, "the refused delete's wipe marker could not be removed");
+                }
+                return Err(ForgetRefusal::Shared(departure));
+            }
+            // The revoke clears the stored credential whether or not the
+            // server answers, so the wipe below has no credential left to
+            // clear.
+            if let Some(authenticator) = &self.authenticator {
+                let signed_out = authenticator.for_account(account).sign_out().await;
+                report.credential = signed_out.credential.err();
+                report.revoke = signed_out.revoke.err();
+            }
+            let prepared = PreparedWipe {
+                wipe: wipe.clone(),
+                refresh: None,
+                share_keys: Ok(self.share_key_store.clone()),
+                #[cfg(feature = "device-identity")]
+                device_keys: self
+                    .device_keys
+                    .as_ref()
+                    .map(|keys_for| keys_for.keys(&name)),
+                shared,
+            };
+            wipe_closed_account(
+                prepared,
+                last_out,
+                &self.dir,
+                self.key_store.as_ref(),
+                self.hook.as_ref(),
+                &mut report,
+            )
+            .await;
+            if report.is_complete()
+                && let Err(err) = wipe.clear(&self.dir)
+            {
+                tracing::warn!(error = %err, "the deleted account's wipe marker could not be removed");
+            }
+            Ok(report)
+        })
     }
 }
 
