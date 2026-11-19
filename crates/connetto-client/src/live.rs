@@ -1759,7 +1759,7 @@ where
         });
         let mut wire_ids = Vec::with_capacity(specs.len());
         for spec in specs {
-            let wire_id = attach_wire(state, &self.shared.next_wire, spec, grace).await?;
+            let wire_id = attach_wire(state, &self.shared, &sub_id, spec, grace).await?;
             wire_ids.push(wire_id);
         }
         let reads_synced = !wire_ids.is_empty();
@@ -1887,7 +1887,8 @@ where
         let spec = SubscriptionSpec::new(sql).with_binds(binds);
         let wire_id = attach_wire(
             &mut state,
-            &self.shared.next_wire,
+            &self.shared,
+            name,
             spec.clone(),
             self.shared.grace,
         )
@@ -2151,7 +2152,7 @@ where
         // its value rests durably in `_connetto_aggregates`, so keeping the
         // subscription alive across a drop would buy nothing the resting table
         // does not already give.
-        let wire_id = attach_wire(&mut state, &self.shared.next_wire, spec, Duration::ZERO).await?;
+        let wire_id = attach_wire(&mut state, &self.shared, &sub_id, spec, Duration::ZERO).await?;
         state.values.push(ValueEntry {
             sub_id: sub_id.clone(),
             wire_id,
@@ -2330,7 +2331,7 @@ where
         let spec = SubscriptionSpec::new(sql).with_binds(binds);
         // No grace, as for the scalar watch: the map rests durably in
         // `_connetto_aggregates` and the handle holds no replica rows.
-        let wire_id = attach_wire(&mut state, &self.shared.next_wire, spec, Duration::ZERO).await?;
+        let wire_id = attach_wire(&mut state, &self.shared, &sub_id, spec, Duration::ZERO).await?;
         state.computed.push(ComputedEntry {
             sub_id: sub_id.clone(),
             wire_id,
@@ -2456,7 +2457,7 @@ where
         let spec = SubscriptionSpec::new(sql).with_binds(binds);
         // No grace, as for the other computed watches: the answer rests
         // durably and the handle holds no replica rows.
-        let wire_id = attach_wire(&mut state, &self.shared.next_wire, spec, Duration::ZERO).await?;
+        let wire_id = attach_wire(&mut state, &self.shared, &sub_id, spec, Duration::ZERO).await?;
         state.computed.push(ComputedEntry {
             sub_id: sub_id.clone(),
             wire_id,
@@ -3002,7 +3003,8 @@ where
         let spec = SubscriptionSpec::new(query);
         let wire_id = attach_wire(
             &mut state,
-            &self.shared.next_wire,
+            &self.shared,
+            name,
             spec.clone(),
             self.shared.grace,
         )
@@ -3175,16 +3177,20 @@ fn release_wire(wire: &mut [WireSub], wire_id: &str, released: &mut Vec<String>)
     }
 }
 
+/// The id space for shared wire subscriptions, distinct from handle ids.
+const WIRE_PREFIX: &str = "wire-";
+
 /// Attach a handle to the wire subscription for `spec`, sharing an existing
 /// one (increment its ref count) or declaring a new one (subscribe once, ref
 /// count 1). Returns the wire id. An aggregate handle bootstraps from the
 /// resting table rather than from a cached last value here (R83).
-/// The id space for shared wire subscriptions, distinct from handle ids.
-const WIRE_PREFIX: &str = "wire-";
-
+///
+/// `holder` names the handle id or pin name that holds the watch, and the
+/// debug trace pairs it with the wire id.
 async fn attach_wire<T>(
     state: &mut State<T>,
-    next_wire: &AtomicU64,
+    shared: &Shared<T>,
+    holder: &str,
     spec: SubscriptionSpec,
     grace: Duration,
 ) -> Result<String, ClientError>
@@ -3192,7 +3198,7 @@ where
     T: Transport,
     T::Error: core::fmt::Display,
 {
-    if let Some(existing) = state.wire.iter_mut().find(|w| w.spec == spec) {
+    let wire_id = if let Some(existing) = state.wire.iter_mut().find(|w| w.spec == spec) {
         let reclaimed = existing.refs == 0;
         existing.refs += 1;
         let wire_id = existing.wire_id.clone();
@@ -3202,19 +3208,22 @@ where
             // paid, which is the whole point of the grace.
             state.conn.hold_subscription(&wire_id)?;
         }
-        return Ok(wire_id);
-    }
-    let seq = next_wire.fetch_add(1, Ordering::Relaxed);
-    let wire_id = format!("{WIRE_PREFIX}{seq}");
-    state
-        .conn
-        .subscribe_spec_with_grace(&wire_id, spec.clone(), grace)
-        .await?;
-    state.wire.push(WireSub {
-        wire_id: wire_id.clone(),
-        spec,
-        refs: 1,
-    });
+        wire_id
+    } else {
+        let seq = shared.next_wire.fetch_add(1, Ordering::Relaxed);
+        let wire_id = format!("{WIRE_PREFIX}{seq}");
+        state
+            .conn
+            .subscribe_spec_with_grace(&wire_id, spec.clone(), grace)
+            .await?;
+        state.wire.push(WireSub {
+            wire_id: wire_id.clone(),
+            spec,
+            refs: 1,
+        });
+        wire_id
+    };
+    tracing::debug!(holder, wire_id, "watch attached");
     Ok(wire_id)
 }
 
