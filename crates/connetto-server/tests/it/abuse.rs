@@ -25,7 +25,6 @@
 //! Needs Docker: the fixture starts its own Postgres.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use connetto_core::SessionId;
@@ -58,6 +57,7 @@ use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::Postgres as PgBackend;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
+use tokio::sync::watch;
 
 // The default schema is over `Id = String`, which is what `TestGrantChecker`
 // resolves a `user:` grant to.
@@ -192,18 +192,18 @@ impl VisibilityPolicy for DenyAll {
     }
 }
 
-/// Answers every crossing with a fixed verdict and counts how many it was asked
-/// about, so a test can assert the application was never consulted.
+/// Reports each crossing answered with its fixed verdict.
 struct Recording {
     verdict: Enforcement,
-    asked: Arc<AtomicUsize>,
+    asked: watch::Sender<usize>,
 }
 
 impl EnforcementPolicy<String> for Recording {
     fn on_threshold<'a>(&'a self, _crossing: &'a Crossing<String>) -> EnforcementFuture<'a> {
-        self.asked.fetch_add(1, Ordering::Relaxed);
-        let verdict = self.verdict;
-        Box::pin(async move { verdict })
+        Box::pin(async move {
+            self.asked.send_modify(|count| *count += 1);
+            self.verdict
+        })
     }
 }
 
@@ -314,11 +314,6 @@ where
 struct Live {
     client: LoopbackTransport,
     server: tokio::task::JoinHandle<()>,
-}
-
-/// Read a counter without meeting the diesel prelude's blanket `load`.
-fn times_asked(counter: &AtomicUsize) -> usize {
-    AtomicUsize::load(counter, Ordering::Relaxed)
 }
 
 /// Open a connection presenting `grants`, expecting the handshake to succeed.
@@ -607,13 +602,13 @@ async fn the_application_decides_the_outcome_and_silence_takes_the_proposal() {
     reset_tables(&fixture).await;
 
     // Overriding with a bounded ban.
-    let asked = Arc::new(AtomicUsize::new(0));
+    let (asked, calls) = watch::channel(0);
     let bounded = guard(
         &fixture,
         limits(2, 1),
         Some(Arc::new(Recording {
             verdict: Enforcement::BanFor(Duration::from_secs(3600)),
-            asked: Arc::clone(&asked),
+            asked,
         })),
     );
     let bounded_manager = manager(&fixture, silent_policy(), &bounded);
@@ -625,31 +620,33 @@ async fn the_application_decides_the_outcome_and_silence_takes_the_proposal() {
         expires_at.is_some(),
         "the application's duration replaced the permanent proposal"
     );
-    assert_eq!(times_asked(&asked), 1, "asked once, for one crossing");
+    assert_eq!(*calls.borrow(), 1, "asked once, for one crossing");
     expect_dropped(live).await;
 
     // Declining leaves nothing behind, and the connection stays open.
-    let declined = Arc::new(AtomicUsize::new(0));
+    let (declined, mut declined_calls) = watch::channel(0);
     let lenient = guard(
         &fixture,
         limits(2, 1),
         Some(Arc::new(Recording {
             verdict: Enforcement::Ignore,
-            asked: Arc::clone(&declined),
+            asked: declined,
         })),
     );
     let lenient_manager = manager(&fixture, silent_policy(), &lenient);
     let mut tolerated = connect(&lenient_manager, "lenient", &["user:dave#one"]).await;
     probe(&mut tolerated.client, "ghost-0").await;
     probe(&mut tolerated.client, "ghost-1").await;
-    // The refusal below both proves the session survived and orders the assert
-    // after the crossing was handled.
+    tokio::time::timeout(SETTLE, declined_calls.wait_for(|count| *count >= 1))
+        .await
+        .expect("the application answers within the bound")
+        .expect("the policy keeps its observation channel open");
+    // A later refusal proves the session remains usable after the policy answers.
     probe(&mut tolerated.client, "ghost-2").await;
     assert!(
         ban_row(fixture.admin(), "dave").await.is_none(),
         "the application declined, so no ban was written"
     );
-    assert!(times_asked(&declined) >= 1, "the application was asked");
     tolerated.client.close().await.expect("close");
     tolerated.server.await.expect("join server");
 }
@@ -803,13 +800,13 @@ async fn filtered_reads_drive_no_counter() {
 async fn an_unidentified_caller_is_closed_and_the_application_is_not_asked() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
-    let asked = Arc::new(AtomicUsize::new(0));
+    let (asked, calls) = watch::channel(0);
     let guard = guard(
         &fixture,
         limits(4, 1),
         Some(Arc::new(Recording {
             verdict: Enforcement::BanPermanently,
-            asked: Arc::clone(&asked),
+            asked,
         })),
     );
     let manager = manager(&fixture, silent_policy(), &guard);
@@ -819,7 +816,7 @@ async fn an_unidentified_caller_is_closed_and_the_application_is_not_asked() {
     expect_dropped(live).await;
 
     assert_eq!(
-        times_asked(&asked),
+        *calls.borrow(),
         0,
         "the trait only ever receives a caller that can actually be banned"
     );
