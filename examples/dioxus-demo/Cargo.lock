@@ -615,7 +615,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "457d7ed3f888dfd2c7af56d4975cade43c622f74bdcddfed6d4352f57acc6310"
 dependencies = [
  "futures-util",
- "parking_lot",
+ "parking_lot 0.12.5",
  "portable-atomic",
  "tokio",
 ]
@@ -1259,7 +1259,7 @@ dependencies = [
  "block2",
  "objc2-device-check",
  "objc2-foundation",
- "parking_lot",
+ "parking_lot 0.12.5",
  "thiserror 2.0.21",
 ]
 
@@ -1318,7 +1318,7 @@ dependencies = [
  "linux-keyutils-keyring-store",
  "oo7",
  "open",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pg2sqlite",
  "reqwest 0.12.28",
  "ring",
@@ -1489,7 +1489,7 @@ dependencies = [
  "js-sys",
  "objc2",
  "objc2-foundation",
- "parking_lot",
+ "parking_lot 0.12.5",
  "reqwest 0.12.28",
  "rustix",
  "serde",
@@ -1553,7 +1553,7 @@ dependencies = [
  "futures-util",
  "mdns-sd",
  "nix",
- "parking_lot",
+ "parking_lot 0.12.5",
  "ring",
  "rmp-serde",
  "rustls",
@@ -1593,7 +1593,7 @@ dependencies = [
  "objc2-core-wlan",
  "objc2-foundation",
  "objc2-network-extension",
- "parking_lot",
+ "parking_lot 0.12.5",
  "thiserror 2.0.21",
 ]
 
@@ -1634,7 +1634,7 @@ dependencies = [
  "oauth2",
  "openfga-client",
  "openidconnect",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pem",
  "pg2sqlite",
  "pg_walstream",
@@ -1683,7 +1683,7 @@ dependencies = [
  "keyutils",
  "openfga-client",
  "openidconnect",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pg2sqlite",
  "reqwest 0.13.5",
  "ring",
@@ -2276,9 +2276,9 @@ dependencies = [
  "cfg-if",
  "crossbeam-utils",
  "hashbrown 0.14.5",
- "lock_api",
+ "lock_api 0.4.14",
  "once_cell",
- "parking_lot_core",
+ "parking_lot_core 0.9.12",
 ]
 
 [[package]]
@@ -2426,11 +2426,15 @@ dependencies = [
  "chrono",
  "diesel_derives",
  "downcast-rs",
+ "ipnetwork",
  "itoa",
+ "libc",
  "libsqlite3-sys",
  "num-bigint",
  "num-integer",
  "num-traits",
+ "pq-sys",
+ "r2d2",
  "serde_json",
  "sqlite-wasm-rs",
  "sqlstate 0.2.0 (git+https://github.com/diesel-rs/diesel)",
@@ -2832,7 +2836,7 @@ dependencies = [
  "generational-box",
  "http",
  "inventory",
- "parking_lot",
+ "parking_lot 0.12.5",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2974,7 +2978,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "generational-box",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rustc-hash 2.1.3",
  "tracing",
  "warnings",
@@ -3833,7 +3837,7 @@ version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8b2dc9b873cd1a8adb80aa5dcef9a8205f781a8a313d5ffb867248cb3bcb764"
 dependencies = [
- "parking_lot",
+ "parking_lot 0.12.5",
  "tracing",
 ]
 
@@ -4828,6 +4832,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
+name = "ipnetwork"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "iroh-io"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5361,6 +5374,15 @@ name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
+name = "lock_api"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
 dependencies = [
  "scopeguard",
 ]
@@ -6450,7 +6472,7 @@ dependencies = [
  "hyper",
  "itertools 0.13.0",
  "md-5 0.10.6",
- "parking_lot",
+ "parking_lot 0.12.5",
  "percent-encoding",
  "quick-xml",
  "rand 0.8.8",
@@ -6725,8 +6747,18 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api",
- "parking_lot_core",
+ "lock_api 0.4.14",
+ "parking_lot_core 0.9.12",
+]
+
+[[package]]
+name = "parking_lot"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
+dependencies = [
+ "lock_api 0.5.0",
+ "parking_lot_core 0.10.0",
 ]
 
 [[package]]
@@ -6737,7 +6769,19 @@ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall",
+ "redox_syscall 0.5.18",
+ "smallvec",
+ "windows-link 0.2.1",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
+dependencies = [
+ "libc",
+ "redox_syscall 0.9.5",
  "smallvec",
  "windows-link 0.2.1",
 ]
@@ -6828,14 +6872,93 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#bc84c0c3c2b4d334dc3a2b3e38b37f2ec5c87bbb"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#04f601c467cbf57a84232b4762538f2c18b7fb75"
 dependencies = [
  "recursive",
  "sql-traits",
  "sql-values 0.5.1",
+ "sql-values 0.6.0",
  "sqlparser",
  "sqlparser-plpgsql",
+ "sqlstate 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "pg_diesel"
+version = "0.1.0"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#1fc5a6e844f51ae94d786262244d9f51de194f56"
+dependencies = [
+ "diesel",
+ "pg_diesel_core",
+ "pg_diesel_pg14",
+ "pg_diesel_pg15",
+ "pg_diesel_pg16",
+ "pg_diesel_pg17",
+ "pg_diesel_pg18",
+]
+
+[[package]]
+name = "pg_diesel_core"
+version = "0.1.0"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#1fc5a6e844f51ae94d786262244d9f51de194f56"
+dependencies = [
+ "bigdecimal",
+ "diesel",
+ "ipnetwork",
+ "sql-traits",
+ "sqlparser",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "pg_diesel_pg14"
+version = "0.1.0"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#1fc5a6e844f51ae94d786262244d9f51de194f56"
+dependencies = [
+ "bigdecimal",
+ "diesel",
+ "pg_diesel_core",
+]
+
+[[package]]
+name = "pg_diesel_pg15"
+version = "0.1.0"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#1fc5a6e844f51ae94d786262244d9f51de194f56"
+dependencies = [
+ "bigdecimal",
+ "diesel",
+ "pg_diesel_core",
+]
+
+[[package]]
+name = "pg_diesel_pg16"
+version = "0.1.0"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#1fc5a6e844f51ae94d786262244d9f51de194f56"
+dependencies = [
+ "bigdecimal",
+ "diesel",
+ "pg_diesel_core",
+]
+
+[[package]]
+name = "pg_diesel_pg17"
+version = "0.1.0"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#1fc5a6e844f51ae94d786262244d9f51de194f56"
+dependencies = [
+ "bigdecimal",
+ "diesel",
+ "pg_diesel_core",
+]
+
+[[package]]
+name = "pg_diesel_pg18"
+version = "0.1.0"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#1fc5a6e844f51ae94d786262244d9f51de194f56"
+dependencies = [
+ "bigdecimal",
+ "diesel",
+ "pg_diesel_core",
 ]
 
 [[package]]
@@ -7224,6 +7347,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
+]
+
+[[package]]
+name = "pq-sys"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "297a95d6f2378891f949d9556723e15140e50d29eac07458dabcee8688995b1d"
+dependencies = [
+ "libc",
+ "pkg-config",
+ "vcpkg",
 ]
 
 [[package]]
@@ -7652,6 +7786,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "r2d2"
+version = "0.8.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51de85fb3fb6524929c8a2eb85e6b6d363de4e8c48f9e2c2eac4944abc181c93"
+dependencies = [
+ "log",
+ "parking_lot 0.12.5",
+ "scheduled-thread-pool",
+]
+
+[[package]]
 name = "rand"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7939,6 +8084,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_syscall"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
 name = "redox_users"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8140,7 +8294,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#e7483cc359fc060a968f3fe0a038395120944286"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#51a2ae034a1bd6120875e80afc752efbeb568cee"
 dependencies = [
  "openfga-client",
  "prost",
@@ -8156,7 +8310,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#e7483cc359fc060a968f3fe0a038395120944286"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#51a2ae034a1bd6120875e80afc752efbeb568cee"
 dependencies = [
  "serde",
  "sql-values 0.6.0",
@@ -8429,6 +8583,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9cb23c424d8ee841bb4d813677ca237e2a610067d594fec130f87d6093495ab5"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "scheduled-thread-pool"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f304b290c05b371b2aa1e8718242ff0394530f9334ecedcb9ae51330f37fc1ba"
+dependencies = [
+ "parking_lot 0.13.0",
 ]
 
 [[package]]
@@ -9071,7 +9234,7 @@ version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
- "lock_api",
+ "lock_api 0.4.14",
 ]
 
 [[package]]
@@ -9087,7 +9250,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#8357da400fa75be971af0fd3cafa7ac50af76fce"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#b7e8a175b3a1cdebc32b6d89b610a353e8cc9bc0"
 dependencies = [
  "geometric-traits",
  "once_cell",
@@ -9186,7 +9349,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.64.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9429cd30ce211eeb8676c81b685630560969c147"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#2ff068b30954e1d67889550fae8539640422c61a"
 dependencies = [
  "log",
  "recursive",
@@ -9218,7 +9381,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9429cd30ce211eeb8676c81b685630560969c147"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#2ff068b30954e1d67889550fae8539640422c61a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9274,7 +9437,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf776ba3fa74f83bf4b63c3dcbbf82173db2632ed8452cb2d891d33f459de70f"
 dependencies = [
  "new_debug_unreachable",
- "parking_lot",
+ "parking_lot 0.12.5",
  "phf_shared 0.11.3",
  "precomputed-hash",
  "serde",
@@ -9357,7 +9520,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#aeb08b1ac35e5fb9722885f35361e7a9e258d5e7"
+source = "git+https://github.com/connetto-rs/subql?branch=main#6def6fbd935b64ad2aeaaec24171e45581b7212e"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -9375,8 +9538,9 @@ dependencies = [
  "lz4",
  "maxwell-cdc",
  "openfga-client",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pg2sqlite",
+ "pg_diesel",
  "pg_walstream",
  "postcard",
  "postgres-jsonb-canonical",
@@ -9538,7 +9702,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "once_cell",
- "parking_lot",
+ "parking_lot 0.12.5",
  "raw-window-handle 0.5.2",
  "raw-window-handle 0.6.2",
  "tao-macros",
@@ -9743,7 +9907,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
@@ -9776,7 +9940,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "log",
- "parking_lot",
+ "parking_lot 0.12.5",
  "percent-encoding",
  "phf 0.13.1",
  "pin-project-lite",
@@ -11011,7 +11175,7 @@ dependencies = [
  "getrandom 0.4.3",
  "keyring-core",
  "libloading 0.9.0",
- "parking_lot",
+ "parking_lot 0.12.5",
  "regex",
  "sha2 0.11.1",
  "thiserror 2.0.21",

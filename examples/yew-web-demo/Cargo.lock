@@ -2167,6 +2167,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
+]
+
+[[package]]
 name = "maxwell-cdc"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2438,13 +2447,15 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#bc84c0c3c2b4d334dc3a2b3e38b37f2ec5c87bbb"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#04f601c467cbf57a84232b4762538f2c18b7fb75"
 dependencies = [
  "recursive",
  "sql-traits",
  "sql-values 0.5.1",
+ "sql-values 0.6.0",
  "sqlparser",
  "sqlparser-plpgsql",
+ "sqlstate 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.21",
 ]
 
@@ -2972,7 +2983,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#e7483cc359fc060a968f3fe0a038395120944286"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#51a2ae034a1bd6120875e80afc752efbeb568cee"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -2986,7 +2997,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#e7483cc359fc060a968f3fe0a038395120944286"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#51a2ae034a1bd6120875e80afc752efbeb568cee"
 dependencies = [
  "serde",
  "sql-values 0.6.0",
@@ -3464,7 +3475,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#8357da400fa75be971af0fd3cafa7ac50af76fce"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#b7e8a175b3a1cdebc32b6d89b610a353e8cc9bc0"
 dependencies = [
  "geometric-traits",
  "once_cell",
@@ -3560,7 +3571,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.64.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9429cd30ce211eeb8676c81b685630560969c147"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#2ff068b30954e1d67889550fae8539640422c61a"
 dependencies = [
  "log",
  "recursive",
@@ -3592,7 +3603,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9429cd30ce211eeb8676c81b685630560969c147"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#2ff068b30954e1d67889550fae8539640422c61a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3644,7 +3655,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#aeb08b1ac35e5fb9722885f35361e7a9e258d5e7"
+source = "git+https://github.com/connetto-rs/subql?branch=main#6def6fbd935b64ad2aeaaec24171e45581b7212e"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -4101,16 +4112,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tracing-serde"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
-dependencies = [
- "serde",
- "tracing-core",
-]
-
-[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4120,14 +4121,12 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
- "serde",
- "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
+ "tracing",
  "tracing-core",
  "tracing-log",
- "tracing-serde",
 ]
 
 [[package]]
@@ -4258,6 +4257,12 @@ checksum = "cdf60f3d36825d0911af7e102da39cc817280560cad48e81df1eb5c4d7400f76"
 dependencies = [
  "getrandom 0.4.3",
 ]
+
+[[package]]
+name = "valuable"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcpkg"
