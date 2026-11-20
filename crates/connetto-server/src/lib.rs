@@ -44,6 +44,7 @@ pub mod ban;
 pub mod bots;
 pub mod builder;
 pub mod capability;
+mod catalog_shapes;
 pub mod counters;
 pub mod courier;
 #[doc(hidden)]

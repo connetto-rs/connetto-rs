@@ -39,7 +39,6 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
-use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, SimpleTable, Update, Value};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,7 +46,7 @@ use subql::backend::Postgres;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 
 use super::writer_shared::{
-    PG_DDL, insert_changeset, note_table, notes, seed_notes, writable_catalog,
+    PG_DDL, insert_changeset, notes, seed_notes, update_changeset, writable_catalog,
 };
 
 fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
@@ -166,34 +165,6 @@ async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
         .load(&mut *conn)
         .await
         .expect("read notes")
-}
-
-/// A changeset that updates one row, carrying the old image (the version basis).
-fn update_changeset(
-    id: i64,
-    old_body: &str,
-    new_body: &str,
-    old_edited_at: &str,
-    new_edited_at: &str,
-) -> Vec<u8> {
-    let update = Update::<_, ChangesetFormat, String, Vec<u8>>::from(note_table())
-        .set(0, Value::Integer(id), Value::Integer(id))
-        .expect("set id")
-        .set(
-            1,
-            Value::Text(old_body.to_owned()),
-            Value::Text(new_body.to_owned()),
-        )
-        .expect("set body")
-        .set(
-            2,
-            Value::Text(old_edited_at.to_owned()),
-            Value::Text(new_edited_at.to_owned()),
-        )
-        .expect("set edited_at");
-    ChangeSet::<SimpleTable, String, Vec<u8>>::new()
-        .update(update)
-        .build()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

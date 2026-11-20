@@ -236,6 +236,7 @@ mod pg {
         RowSource, SnapshotError, SourceRow, page_sql, projection_exposes, table_from_select,
     };
     use crate::capability::CallerBinding;
+    use crate::catalog_shapes::CatalogShapes;
     use crate::key_filter::KeyFilter;
     use crate::session::{
         PageKey, PageSpec, SnapshotEstimate, SnapshotPage, SnapshotSource, TermSeedRead,
@@ -248,6 +249,8 @@ mod pg {
     pub struct PgSnapshotSource<DB = ParserDB> {
         pool: Pool<AsyncPgConnection>,
         catalog: DB,
+        /// Every catalog table's columns, which a row read projects.
+        shapes: CatalogShapes,
         /// The setting a policy reads the caller's identity from.
         user_setting: std::sync::Arc<str>,
         /// The publication the change stream reads, when the deployment named
@@ -261,19 +264,15 @@ mod pg {
         ///
         /// # Errors
         ///
-        /// [`SnapshotError::Catalog`] when the DDL does not parse.
+        /// [`SnapshotError::Catalog`] when the DDL does not parse or cannot
+        /// name a table's columns.
         pub fn from_ddl(
             pool: Pool<AsyncPgConnection>,
             pg_ddl: &str,
         ) -> Result<Self, SnapshotError> {
             let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
                 .map_err(|err| SnapshotError::Catalog(format!("{err:?}")))?;
-            Ok(Self {
-                pool,
-                catalog,
-                user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
-                publication: None,
-            })
+            Self::new(pool, catalog)
         }
     }
 
@@ -296,19 +295,6 @@ mod pg {
             self.publication = Some(publication.into());
             self
         }
-
-        /// Build over a connection pool and an existing catalog.
-        ///
-        /// Not `const`: the default identity setting is a shared string, which
-        /// cannot be built in a constant. This runs once at startup.
-        pub fn new(pool: Pool<AsyncPgConnection>, catalog: DB) -> Self {
-            Self {
-                pool,
-                catalog,
-                user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
-                publication: None,
-            }
-        }
     }
 
     /// One page's read, resolved: the table it names, the key it resumes on,
@@ -328,6 +314,24 @@ mod pg {
     }
 
     impl<DB: DatabaseLike> PgSnapshotSource<DB> {
+        /// Build over a connection pool and an existing catalog.
+        ///
+        /// # Errors
+        ///
+        /// [`SnapshotError::Catalog`] when the catalog cannot name a table's
+        /// columns.
+        pub fn new(pool: Pool<AsyncPgConnection>, catalog: DB) -> Result<Self, SnapshotError> {
+            let shapes = CatalogShapes::of(&catalog)
+                .map_err(|err| SnapshotError::Catalog(err.to_string()))?;
+            Ok(Self {
+                pool,
+                catalog,
+                shapes,
+                user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
+                publication: None,
+            })
+        }
+
         /// Resolve one page's read: the key it orders and resumes on, and the
         /// wrap around the subscription's own query.
         fn plan_page<'a>(
@@ -619,28 +623,12 @@ mod pg {
             let Some(filter) = filter else {
                 return Ok(None);
             };
-            let arity = catalog_helpers::table_arity(&self.catalog, table_id).unwrap_or_default();
-            let mut columns = Vec::with_capacity(arity);
-            for ordinal in 0..arity {
-                let Ok(column) = ColumnId::try_from(ordinal) else {
-                    return Ok(None);
-                };
-                let Some(name) =
-                    catalog_helpers::column_name::<Postgres, _>(&self.catalog, table_id, column)
-                else {
-                    return Ok(None);
-                };
-                columns.push(quote_ident(&name));
-            }
-            if columns.is_empty() {
-                return Ok(None);
-            }
             // Raw SQL for the same reason the read filter is: the table and its
             // columns come from the deployment's runtime DDL, so no `table!`
-            // schema names them.
+            // schema names them. The projection is the catalog's columns.
             let sql = format!(
                 "SELECT {} FROM {} WHERE {}",
-                columns.join(", "),
+                self.shapes.select_list(table_id),
                 quote_ident(table),
                 filter.predicate(),
             );
@@ -1025,7 +1013,19 @@ mod pg {
 
 #[cfg(test)]
 mod tests {
-    use super::{page_sql, projection_exposes};
+    use super::{PgSnapshotSource, SnapshotError, page_sql, projection_exposes};
+    use crate::catalog_shapes::{unconnected_pool, unnameable_column, unnameable_columns_ddl};
+
+    #[tokio::test]
+    async fn a_catalog_that_cannot_name_its_columns_refuses_the_snapshot_source() {
+        let refusal = PgSnapshotSource::from_ddl(unconnected_pool(), &unnameable_columns_ddl())
+            .err()
+            .map(|err| err.to_string());
+        assert_eq!(
+            refusal,
+            Some(SnapshotError::Catalog(unnameable_column()).to_string())
+        );
+    }
 
     /// A page is cut by a keyset comparison, never by an offset, because the
     /// cost of an offset grows with the page's position: measured at 703 ms for
