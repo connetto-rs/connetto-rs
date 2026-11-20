@@ -2511,7 +2511,9 @@ fn value_json(value: &PgValue<Postgres>) -> serde_json::Value {
         PgValue::Bytes(b) => serde_json::Value::String(String::from_utf8_lossy(b).into_owned()),
         PgValue::Uuid(u) => serde_json::Value::String(u.to_string()),
         PgValue::Timestamp(t) => serde_json::Value::String(t.to_string()),
-        PgValue::TimestampTz(t) => serde_json::Value::String(t.to_string()),
+        PgValue::TimestampTz(t) => {
+            serde_json::Value::String(t.format("%Y-%m-%d %H:%M:%S%.6f+00:00").to_string())
+        }
         PgValue::Date(d) => serde_json::Value::String(d.to_string()),
         PgValue::Time(t) => serde_json::Value::String(t.to_string()),
         PgValue::Interval(i) => serde_json::Value::String(i.to_string()),
@@ -2959,7 +2961,15 @@ mod wire_contract {
         );
         assert_eq!(
             value_to_json(&PgValue::<Postgres>::TimestampTz(stamp.and_utc())),
-            "\"2020-01-02 03:04:05 UTC\"",
+            "\"2020-01-02 03:04:05.000000+00:00\"",
+        );
+        let fractional = chrono::NaiveDate::from_ymd_opt(2020, 1, 2)
+            .expect("valid date")
+            .and_hms_micro_opt(3, 4, 5, 678_900)
+            .expect("valid time");
+        assert_eq!(
+            value_to_json(&PgValue::<Postgres>::TimestampTz(fractional.and_utc())),
+            "\"2020-01-02 03:04:05.678900+00:00\"",
         );
         assert_eq!(
             value_to_json(&PgValue::<Postgres>::Date(

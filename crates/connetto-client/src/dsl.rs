@@ -227,8 +227,9 @@ fn bool_from_json(value: &serde_json::Value) -> Option<bool> {
 }
 
 /// Decode a string push. The temporal types, `Uuid`, and `Binary` all arrive
-/// as JSON strings (the server renders them through `to_string` or a lossy
-/// UTF-8 conversion, never as numbers or base64), so they share this decoder.
+/// as JSON strings (the server renders them as text, `timestamptz` in the
+/// replica's canonical form, or through a lossy UTF-8 conversion, never as
+/// numbers or base64), so they share this decoder.
 fn decode_string(json: &str) -> Result<String, ClientError> {
     match wire::json_value(json)? {
         serde_json::Value::String(s) => Ok(s),
@@ -430,7 +431,8 @@ group_key_wire!(
 // postgres_backend, and the orphan rule forbids a downstream crate from
 // mapping them, so this crate maps them behind an opt-in feature that keeps
 // diesel's Postgres backend off every SQLite-only client. Both render as JSON
-// strings on the wire (`Uuid` and `Timestamptz` through `to_string`).
+// strings on the wire, `Uuid` hyphenated and `Timestamptz` in the replica's
+// canonical `YYYY-MM-DD HH:MM:SS.ffffff+00:00` text.
 #[cfg(feature = "postgres-types")]
 aggregate_wire!(sql_types::Uuid => String, decode_string);
 #[cfg(feature = "postgres-types")]
@@ -798,7 +800,7 @@ mod tests {
     }
 
     // The Postgres-only types decode as string passthroughs under the opt-in
-    // feature, matching value_to_json's to_string rendering.
+    // feature, matching value_to_json's rendering.
     #[cfg(feature = "postgres-types")]
     #[test]
     fn decodes_postgres_types() {
@@ -809,10 +811,10 @@ mod tests {
         );
         assert_eq!(
             <sql_types::Nullable<sql_types::Timestamptz> as AggregateWire>::decode(
-                "\"2020-01-02 03:04:05 UTC\"",
+                "\"2020-01-02 03:04:05.000000+00:00\"",
             )
             .expect("timestamptz"),
-            Some("2020-01-02 03:04:05 UTC".to_owned()),
+            Some("2020-01-02 03:04:05.000000+00:00".to_owned()),
         );
     }
 }

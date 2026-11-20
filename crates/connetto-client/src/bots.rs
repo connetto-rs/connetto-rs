@@ -211,7 +211,7 @@ pub fn create_registration_code<T: ClientBotTables, C: Connection<Backend = Sqli
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| ClientError::Session(err.to_string()))?;
-    let expires_at = rfc3339(now.as_secs() + valid_for.as_secs());
+    let expires_at = timestamptz_text(now.as_secs() + valid_for.as_secs());
     T::write_code(
         conn,
         code_hash,
@@ -258,15 +258,17 @@ fn base32_groups(input: &[u8]) -> String {
 }
 
 #[cfg(any(feature = "native-transport", feature = "native-auth"))]
-/// Format a unix timestamp as RFC 3339, the replica's `timestamptz` form.
-fn rfc3339(secs: u64) -> String {
+/// Format a unix timestamp as the replica's canonical `timestamptz` text,
+/// `YYYY-MM-DD HH:MM:SS.ffffff+00:00`, which text comparison orders as the
+/// instants are ordered.
+fn timestamptz_text(secs: u64) -> String {
     let days = secs / 86_400;
     let rem = secs % 86_400;
     let (year, month, day) = civil_from_days(days);
     let hour = rem / 3_600;
     let min = (rem % 3_600) / 60;
     let s = rem % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{s:02}Z")
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{min:02}:{s:02}.000000+00:00")
 }
 
 #[cfg(any(feature = "native-transport", feature = "native-auth"))]
@@ -311,20 +313,27 @@ mod tests {
         }
     }
 
-    /// The timestamp formatter matches known RFC 3339 values.
+    /// The timestamp formatter writes the replica's canonical `timestamptz`
+    /// text, which sorts as the instants do.
     #[test]
-    fn the_timestamp_formatter_matches_rfc3339() {
-        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339(86_400), "1970-01-02T00:00:00Z");
+    fn the_timestamp_formatter_writes_the_canonical_text() {
+        assert_eq!(timestamptz_text(0), "1970-01-01 00:00:00.000000+00:00");
+        assert_eq!(timestamptz_text(86_400), "1970-01-02 00:00:00.000000+00:00");
         // The day after a leap day, so a dropped 29th would surface.
-        assert_eq!(rfc3339(1_709_251_200), "2024-03-01T00:00:00Z");
-        assert_eq!(rfc3339(1_791_590_400), "2026-10-10T00:00:00Z");
+        assert_eq!(
+            timestamptz_text(1_709_251_200),
+            "2024-03-01 00:00:00.000000+00:00"
+        );
+        assert_eq!(
+            timestamptz_text(1_791_590_400),
+            "2026-10-10 00:00:00.000000+00:00"
+        );
     }
 
     /// A whole second of expiry lands in the format, not clipped.
     #[test]
     fn the_timestamp_formatter_keeps_the_time_of_day() {
-        assert_eq!(rfc3339(86_399), "1970-01-01T23:59:59Z");
-        assert_eq!(rfc3339(86_400), "1970-01-02T00:00:00Z");
+        assert_eq!(timestamptz_text(86_399), "1970-01-01 23:59:59.000000+00:00");
+        assert_eq!(timestamptz_text(86_400), "1970-01-02 00:00:00.000000+00:00");
     }
 }
