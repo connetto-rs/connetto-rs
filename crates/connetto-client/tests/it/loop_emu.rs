@@ -3505,18 +3505,17 @@ async fn watch_fn_drives_a_boxed_row_query() {
         .execute(source.connection())
         .expect("emu insert gadget");
     drain_events(&manager, &mut source).await;
-    tokio::time::timeout(Duration::from_secs(5), live.changed())
-        .await
-        .expect("live refresh timed out")
-        .expect("driver alive");
-    assert_eq!(
-        live.rows(),
-        vec![
+    // The seed wait may return without consuming the snapshot's refresh, so one
+    // `changed()` here could still report the seed. The wait is for the rows.
+    until_rows(
+        &mut live,
+        &[
             gadget(alpha_id, true, "alpha"),
             gadget(beta_id, true, "beta"),
             gadget(inactive_id, false, "zulu"),
         ],
-    );
+    )
+    .await;
 
     drop(client);
     server.await.expect("join server");
