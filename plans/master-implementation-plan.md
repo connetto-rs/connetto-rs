@@ -73,6 +73,7 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | [R112](#r112-an-apple-peer-to-peer-link) | not started |  | A link between Apple devices over Apple's peer-to-peer Wi-Fi, for an all-Apple group with no hotspot host and no shared network, after its gate run and open points |  |  |
 | [R113](#r113-tests-that-wait-on-events) | blocked | Refreshed dependency graph | CI-backed sequential test and event-hook fixes, ranked by downstream impact and observed flakiness, with targeted repetition only | | |
 | [R21](#r21-one-page-codec-on-both-backends) | in progress |  | Slices 2 to 5, the browser on `sqlite-wasm-rs` 0.6 and then on SQLCipher, one open contract, the capability and hardening proof, and SQLCipher 4.20.0 |  | [#402](https://github.com/connetto-rs/connetto-rs/pull/402) |
+| [R117](#r117-typed-aggregate-wire) | not started |  | Aggregate values, group keys and computed rows carried and rested in the replica's storage encoding, one `STRICT` table per statistic, decoded through diesel's `FromSql` into any type a generated model loads |  |  |
 | R0 | done | | The always-on change-path counters in `counters.rs` and the `fanout_load` harness that priced the dispatch loop, with the ceiling measured as one sequential visibility round trip per subscriber per event and the lock wait at zero | [fanout_counters.rs](../crates/connetto-test-harness/tests/it/fanout_counters.rs), [fanout_load.rs](../crates/connetto-test-harness/tests/it/fanout_load.rs) | |
 | R1 | done | | The three permissive stand-ins reachable from configuration alone are gone, and the reference binary refuses to start without a reader role and a recognised `CONNETTO_OIDC_PROVIDER` | [e2e.rs](../examples/demo-tools/tests/it/e2e.rs) | |
 | R2 | done | | The durable session handle is the operational key. Cursors and the `_connetto_mutations` watermark key on `session_id`, the connection registry serves revocation and supersession, and `TrustingSessionVerifier` is deleted with the verifier a required constructor argument | [session_handle.rs](../crates/connetto-test-harness/tests/it/session_handle.rs), [authn_flow.rs](../crates/connetto-server/tests/it/authn_flow.rs) | |
@@ -219,6 +220,8 @@ A diverging note from `rls2fga` for a policy translated to no access is an upstr
 4. **The keyring store pins, R51, R52 and R53, done phases whose patches retire when a release carries the change.** The R51 pin waits on the shared-authentication change, [`apple-native-keyring-store` #26](https://github.com/open-source-cooperative/apple-native-keyring-store/pull/26), which stands on `rust-security-framework`'s typed authentication context, [#263](https://github.com/kornelski/rust-security-framework/pull/263) and [#264](https://github.com/kornelski/rust-security-framework/pull/264), all open, and the keychain crate cannot release while it depends on the unreviewed `security-framework` pull requests, so those decide when the patch goes. The R52 pin carries the unlock-once store option, requested as [`android-native-keyring-store` issue #16](https://github.com/open-source-cooperative/android-native-keyring-store/issues/16), open, and the release behind it waits on [`rust-mobile/ndk-context` #6](https://github.com/rust-mobile/ndk-context/pull/6) and [#7](https://github.com/rust-mobile/ndk-context/pull/7), open. The R53 pin, shared with R74's TPM signing key, waits on [`windows-native-keyring-store` #19](https://github.com/open-source-cooperative/windows-native-keyring-store/pull/19), open.
 
 5. **Merged and pinned, holding no build.** `diesel`'s SQLSTATE stack, #5332 to #5336, and `diesel_async`'s half, [#306](https://github.com/diesel-rs/diesel_async/pull/306) and [#307](https://github.com/diesel-rs/diesel_async/pull/307), are merged on their `main` branches and unreleased, and the root workspace follows both through its `[patch.crates-io]` entries for R106. `diesel_async` `main` also carries #214, the async DSL bound to diesel's marked types, and `sqlite-diff-rs` 0.18.1 carries the adjustment that bound needed. `pg_walstream` #141 and #142, the startup metadata API and `AlignedSnapshot::capture`, are merged on `isdaniel/pg-walstream` `main` and unreleased, and the subql durable engine and replication reader, `LucaCappelletti94/subql` #207 and #208 and `connetto-rs/subql` #223 and #224, are merged on `connetto-rs/subql` `main` and unreleased. None of these gates a build step, and each pin retires when a release carries the change.
+
+6. **R117, typed aggregate wire.** Slice 1 needs subql to answer the `WireType` of every group column, aggregate output and computed-row column and to encode evaluated values in the storage form `pgoutput_patchset` uses for rows, requested as `upstream/storage-encoded-results` on `connetto-rs/subql`. `max` and `min` over a `TimestampUTC` column need a `rosetta-utc` release carrying [#23](https://github.com/connetto-rs/rosetta-utc/pull/23), merged on `main` with [#22](https://github.com/connetto-rs/rosetta-utc/pull/22) and [#24](https://github.com/connetto-rs/rosetta-utc/pull/24).
 
 # Designs without a phase
 
@@ -1387,6 +1390,41 @@ Use CI history as the source of flakiness evidence. After an edit, hammer only t
 ### Done when
 
 No wait in the workspace synchronises on a timer except sites carrying an `expect` and a reason, the clippy guard refuses a new one, and each converted test passes its targeted repetition run.
+
+---
+
+## R117: typed aggregate wire
+
+**Status.** NOT STARTED. Every design point is decided with the maintainer.
+
+**Changes state.** Client tables, `_connetto_aggregates` is dropped and each statistic rests in its own `STRICT` table `_connetto_stat_<query_id>`. Server tables, none. Wire messages, `AggregateUpdate` carries typed SQLite values in place of `group_values_json` and `result_json`, and a new `AggregateColumns` frame carries each output's SQLite type, with `PROTOCOL_VERSION` at 7. Archive format, none.
+
+### Purpose
+
+The server renders every aggregate value and group value as JSON from its own value type, so two `BYTEA` group values can reach the client as one key, and a uuid or `timestamptz` arrives in a form that neither compares with nor decodes like the replica's own rows. The client decodes through a connetto trait implemented only for diesel's own types, so a `rosetta_uuid::Uuid`, a `TimestampUTC` or a synql enum cannot be an aggregate value or a group key without per-type code in connetto.
+
+### Decisions, taken with the maintainer
+
+1. **One encoding.** Every value an aggregate frame carries is encoded as the replica stores the column it comes from, by subql's encoder beside `pgoutput_patchset`, so rows and aggregates share one definition of every storage form.
+2. **Column types from the server.** subql answers each output's `WireType`. An output with no catalog column behind it has none, its cells are encoded in their value family's default form and its column is declared `ANY`. The server sends the types once at each registration in `AggregateColumns`, before any update and also when the result is empty.
+3. **One `STRICT` table per statistic**, keyed by `(binds, group_key)`, created at registration, written with `sql_query` and read with `sql::<ST>(..).bind(..)`, so `V: Queryable<ST, Sqlite>` and `K` likewise are the only bounds. A type mismatch at a later registration drops and recreates the table. The forget sweep drops it with its query row. `_connetto_aggregates` is dropped on first start, its values returning with the next push.
+4. **Per-group updates.** A push reads and decodes its own group only.
+5. **Local tier.** `watch_groups` over local tables re-executes the query on each change and diffs into the same `LiveGroups` map, and local `watch_value` decodes through diesel.
+6. **Webview.** The native core decodes into `K` and `V` and sends those over IPC with serde.
+
+### Steps
+
+1. Protocol 7 end to end in one slice, since the frame change compiles only with server and client together. `AggregateWire`, `GroupKeyWire`, `GroupedProjectionWire` and the `postgres-types` feature go.
+2. The local tier.
+3. The Tauri page, unless slice 1 must carry it.
+
+### Proof
+
+A group keyed on a uuid, one keyed on a `BYTEA` column holding two values that differ only in invalid UTF-8, and a `max` over a `TimestampUTC` column each decode into the application's own types on a fresh subscribe, after an offline restart and after a reconnect, with the stored values byte-identical to the replica's rows of the same columns.
+
+### Done when
+
+Any type a generated model loads from the replica works as an aggregate value, a group key and a computed-row column, with no per-type code in connetto and no Cargo feature.
 
 ---
 
