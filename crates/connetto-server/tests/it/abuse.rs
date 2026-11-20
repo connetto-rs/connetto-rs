@@ -46,6 +46,7 @@ use connetto_server::{
     SnapshotPage, SnapshotSource, ThrottleConfig, TierLimits, loopback, pg_ban_store,
     pg_write_target,
 };
+use connetto_test_harness::wire_tables::orders_table;
 use connetto_test_harness::{
     ConnettoDefaults, Fixture, RosterAuth, RowValue, WITHHELD_ID, insert_changeset,
 };
@@ -124,11 +125,7 @@ impl SnapshotSource for KeyedSnapshot {
                 bytes: 0,
             });
         }
-        let table = SimpleTable::new(
-            "orders",
-            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-            &[0],
-        );
+        let table = orders_table();
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
             .expect("set id")

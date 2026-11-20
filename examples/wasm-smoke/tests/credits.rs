@@ -24,6 +24,8 @@
 
 #![cfg(target_arch = "wasm32")]
 
+mod uuid_orders;
+
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::messages::{
@@ -36,14 +38,12 @@ use connetto_wasm_smoke::RelayHub;
 use connetto_wasm_smoke::build::{Once, raw_schema};
 use connetto_web::relay::HubReconnect;
 use futures_channel::oneshot;
-use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
+use uuid_orders::{DDL, QUERY, orders_payload};
 use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
-const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The worker's upstream subscription id: it must match the hub's reconnect
 /// spec so the upstream `NonFatalError` maps to the tab subscriptions reading
 /// those tables.
@@ -60,18 +60,6 @@ fn unique_base() -> i64 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let millis = js_sys::Date::now() as i64;
     93_000_000_000 + millis
-}
-
-/// Build the compressed insert-patchset the wire carries for one row.
-fn insert_payload(id: rosetta_uuid::Uuid, quantity: i64) -> Vec<u8> {
-    let table = SimpleTable::new("orders", &[("id", ""), ("quantity", "")], &[0]);
-    let insert = Insert::<_, String, Vec<u8>>::from(table)
-        .set(0, Value::Blob(<[u8; 16]>::from(id).to_vec()))
-        .expect("set id")
-        .set(1, Value::Integer(quantity))
-        .expect("set quantity");
-    let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new().insert(insert);
-    zstd::encode_all(patchset.build().as_slice(), 3).expect("compress patch")
 }
 
 /// The order index encoded in a cursor by the fake upstream, recovered from its
@@ -97,7 +85,7 @@ async fn send_snapshot(
     server
         .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch::new(
             UPSTREAM_SUB.to_owned(),
-            insert_payload(id, quantity),
+            orders_payload(&[(id, quantity)]),
         )))
         .await
         .expect("snapshot patch");
@@ -152,7 +140,7 @@ async fn fake_upstream(mut server: LoopbackTransport, trigger: oneshot::Receiver
             .send_bulk(BulkMessage::LivePatch(LivePatch::new(
                 UPSTREAM_SUB.to_owned(),
                 Cursor::new(i.to_be_bytes().to_vec()),
-                insert_payload(rosetta_uuid::Uuid::new_v4(), 5),
+                orders_payload(&[(rosetta_uuid::Uuid::new_v4(), 5)]),
             )))
             .await
             .expect("live patch");
