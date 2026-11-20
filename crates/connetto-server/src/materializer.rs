@@ -3985,8 +3985,8 @@ mod audit_privacy_tests {
     }
 
     #[test]
-    fn a_catalog_that_cannot_name_its_columns_refuses_construction() {
-        let ddl = crate::catalog_shapes::unnameable_columns_ddl();
+    fn a_catalog_with_an_unresolvable_key_refuses_construction() {
+        let ddl = crate::catalog_shapes::unresolvable_key_ddl();
         let refusal = Materializer::builder(&ddl)
             .build()
             .err()
@@ -3994,7 +3994,8 @@ mod audit_privacy_tests {
         assert_eq!(
             refusal,
             Some(
-                MaterializerError::Catalog(crate::catalog_shapes::unnameable_column()).to_string()
+                MaterializerError::Catalog(crate::catalog_shapes::unresolvable_key_column())
+                    .to_string()
             )
         );
     }
