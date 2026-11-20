@@ -25,7 +25,7 @@ pub mod unsynced;
 pub mod writer;
 
 pub use crate::exchange::Verdict;
-pub use aggregate::AggregateUpdate;
+pub use aggregate::{AggregateChange, AggregateColumns, AggregateUpdate, ColumnType};
 pub use bulk::{BulkMessage, CourierBody, LivePatch, MutationPatch, SnapshotPatch};
 pub use content::{ContentTicketGrant, ContentTicketRequest, ContentVerb};
 pub use control::{ControlMessage, GateState, PauseCause, SyncStatus, TabIdentity};
@@ -62,7 +62,7 @@ pub use storage::{
     SharedStoreUse, StorageUse, StoreBytes, TabStorageAnswer, TabStorageOutcome, TabStorageUse,
 };
 pub use subscription::{
-    BindValue, MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionSpec,
+    MembershipOpened, SnapshotBegin, SnapshotEnd, SqliteValue, Subscribe, SubscriptionSpec,
     Unsubscribe,
 };
 pub use unsynced::{

@@ -27,6 +27,7 @@
 
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::Transport;
+use connetto_core::messages::{AggregateChange, SqliteValue};
 use connetto_wasm_smoke::build::{self, Once};
 use connetto_wasm_smoke::leader::Membership;
 use connetto_wasm_smoke::locks::HeldLock;
@@ -385,10 +386,11 @@ impl ParityFixture {
 }
 
 /// Pump `conn` until it delivers the next aggregate value for `sub_id`,
-/// returning the parsed scalar. Frames for other subscriptions are applied
-/// and skipped. The harness timeout bounds the wait, so a relay that serves
-/// an aggregate query as a row snapshot (delivering no `AggregateUpdate`)
-/// surfaces as a timeout, which is exactly the pre-parity failure.
+/// returning the scalar's integer cell. Frames for other subscriptions are
+/// applied and skipped. The harness timeout bounds the wait, so a relay that
+/// serves an aggregate query as a row snapshot (delivering no
+/// `AggregateUpdate`) surfaces as a timeout, which is exactly the pre-parity
+/// failure.
 pub async fn pump_aggregate<T>(conn: &mut ConnettoConnection<T>, sub_id: &str) -> i64
 where
     T: Transport,
@@ -397,20 +399,24 @@ where
     loop {
         let event = conn.pump_one().await.expect("pump");
         assert_ne!(event, ClientEvent::Closed, "connection closed early");
-        if let ClientEvent::Aggregate {
+        let ClientEvent::Aggregate {
             sub_id: got,
-            result_json,
-            ..
+            change,
         } = &event
-            && got == sub_id
-        {
-            return result_json
-                .as_deref()
-                .expect("aggregate value present")
-                .trim()
-                .trim_matches('"')
-                .parse()
-                .expect("aggregate scalar int");
+        else {
+            continue;
+        };
+        if got != sub_id {
+            continue;
         }
+        let row = match change {
+            AggregateChange::Replace { rows } => rows.first(),
+            AggregateChange::Upsert { row, .. } => Some(row),
+            AggregateChange::Remove { .. } => None,
+        };
+        let Some([SqliteValue::Integer(value)]) = row.map(Vec::as_slice) else {
+            panic!("a scalar answer is one integer cell: {change:?}");
+        };
+        return *value;
     }
 }

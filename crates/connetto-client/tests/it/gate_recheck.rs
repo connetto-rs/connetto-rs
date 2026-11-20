@@ -10,7 +10,10 @@ use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, Clock, ConnettoClient, DataDir, Gate, GateAskFuture,
     GateAskOutcome, GateMechanism, MemoryRefreshStore, Moment,
 };
-use connetto_core::messages::{AggregateUpdate, BulkMessage, ControlMessage, GateState, LivePatch};
+use connetto_core::messages::{
+    AggregateChange, AggregateColumns, AggregateUpdate, BulkMessage, ColumnType, ControlMessage,
+    GateState, LivePatch, SqliteValue,
+};
 use connetto_core::traits::{IncomingFrame, Transport};
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -1071,14 +1074,22 @@ async fn a_prompt_pending_across_a_dropped_connection_still_unlocks() {
     );
 }
 
+/// The declared columns of a scalar count, which a server sends at
+/// registration ahead of any value.
+fn scalar_columns(sub_id: &str) -> IncomingFrame {
+    IncomingFrame::Control(ControlMessage::AggregateColumns(AggregateColumns {
+        sub_id: sub_id.to_owned(),
+        columns: vec![ColumnType::Integer],
+    }))
+}
+
 /// The scalar aggregate push a server sends.
-fn scalar_push(sub_id: &str, value: &str) -> IncomingFrame {
+fn scalar_push(sub_id: &str, value: i64) -> IncomingFrame {
     IncomingFrame::Control(ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: sub_id.to_owned(),
-        group_key: None,
-        group_values_json: None,
-        result_json: Some(value.to_owned()),
-        is_full_result: true,
+        change: AggregateChange::Replace {
+            rows: vec![vec![SqliteValue::Integer(value)]],
+        },
     }))
 }
 
@@ -1113,7 +1124,8 @@ async fn a_locked_value_handle_keeps_its_value_until_the_unlock() {
         .await
         .expect("watch the count");
     let wire = script.last_subscribed();
-    script.say(scalar_push(&wire, "1"));
+    script.say(scalar_columns(&wire));
+    script.say(scalar_push(&wire, 1));
     tokio::time::timeout(Duration::from_secs(5), count.changed())
         .await
         .expect("the push wakes the handle in time")
@@ -1131,7 +1143,7 @@ async fn a_locked_value_handle_keeps_its_value_until_the_unlock() {
         ClientEvent::UnlockDismissed
     );
 
-    script.say(scalar_push(&wire, "2"));
+    script.say(scalar_push(&wire, 2));
     until_aggregate(&mut events, &wire).await;
     assert!(
         tokio::time::timeout(Duration::from_millis(500), count.changed())

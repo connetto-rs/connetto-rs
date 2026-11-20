@@ -11,7 +11,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use connetto_core::PROTOCOL_VERSION;
-use connetto_core::messages::{ControlMessage, Handshake, Subscribe, SubscriptionSpec};
+use connetto_core::messages::{
+    AggregateChange, ControlMessage, Handshake, SqliteValue, Subscribe, SubscriptionSpec,
+};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
@@ -107,7 +109,7 @@ impl SnapshotSource for NoSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -123,7 +125,7 @@ impl SnapshotSource for NoSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _auth: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -148,12 +150,24 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
     }
 }
 
-fn aggregate_value(msg: ControlMessage) -> String {
+pub(super) fn integer(update: &connetto_core::messages::AggregateUpdate) -> i64 {
+    let AggregateChange::Replace { rows } = &update.change else {
+        panic!("expected whole answer");
+    };
+    let [row] = rows.as_slice() else {
+        panic!("expected one row")
+    };
+    let [SqliteValue::Integer(value)] = row.as_slice() else {
+        panic!("expected integer")
+    };
+    *value
+}
+
+fn aggregate_value(msg: ControlMessage) -> i64 {
     match msg {
         ControlMessage::AggregateUpdate(update) => {
             assert_eq!(update.sub_id, "cheapest");
-            assert!(update.is_full_result);
-            update.result_json.expect("non-null aggregate result")
+            integer(&update)
         }
         other => panic!("expected aggregate update, got {other:?}"),
     }
@@ -221,7 +235,12 @@ async fn reexec_bootstraps_folds_and_retriggers() {
         }))
         .await
         .expect("send subscribe");
-    assert_eq!(aggregate_value(next_control(&mut client).await), "10");
+    let ControlMessage::AggregateColumns(columns) = next_control(&mut client).await else {
+        panic!("expected columns before first answer");
+    };
+    assert_eq!(columns.sub_id, "cheapest");
+    assert_eq!(columns.columns.len(), 1);
+    assert_eq!(aggregate_value(next_control(&mut client).await), 10);
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
 
@@ -232,12 +251,94 @@ async fn reexec_bootstraps_folds_and_retriggers() {
         "INSERT INTO orders (id, amount) VALUES (1, 5)",
     )
     .await;
-    assert_eq!(aggregate_value(next_control(&mut client).await), "5");
+    assert_eq!(aggregate_value(next_control(&mut client).await), 5);
 
     // Deleting the current extreme forces a re-execution through the connector.
     drive(&mut source, &manager, "DELETE FROM orders WHERE id = 1").await;
-    assert_eq!(aggregate_value(next_control(&mut client).await), "20");
+    assert_eq!(aggregate_value(next_control(&mut client).await), 20);
 
     client.close().await.expect("close client");
     server.await.expect("join server").expect("session ok");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maximum_timestamptz_uses_replica_text() {
+    const DDL: &str = "CREATE TABLE aggregate_stamps (id INT PRIMARY KEY, observed TIMESTAMPTZ);";
+    const SEED: &str = "INSERT INTO aggregate_stamps VALUES (1, '2026-09-23 15:42:07.957522+02'), (2, '2026-09-22 13:42:07.957522+00')";
+    let fixture = Fixture::acquire().await;
+    fixture
+        .exec("DROP TABLE IF EXISTS aggregate_stamps CASCADE")
+        .await;
+    fixture.exec(DDL).await;
+    fixture.exec(SEED).await;
+    // Two connectors over one pool, one for the engine and one for the
+    // session, reading through the same connections.
+    let connector = connetto_server::PgReadConnector::with_session_setup(fixture.admin().clone());
+    let materializer = Materializer::builder(DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(connetto_server::PgReadConnector::with_session_setup(
+            fixture.admin().clone(),
+        ))
+        .build()
+        .expect("materializer");
+    let manager = ManagerBuilder::new(
+        materializer,
+        NoSnapshot,
+        RosterAuth::granting_nobody(),
+        Arc::new(TestGrantChecker),
+        connector,
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), DDL).expect("write target"),
+    )
+    .build();
+    let mut client =
+        super::loopback_session::connect(|transport| Arc::clone(&manager).serve(transport));
+    client.handshake_with("stamps", "user:stamps").await;
+    client
+        .subscribe("latest", "SELECT MAX(observed) FROM aggregate_stamps")
+        .await;
+    let columns = client.expect_aggregate_columns("latest").await;
+    assert_eq!(columns.columns.len(), 1);
+    let ControlMessage::AggregateUpdate(answer) = client.next_control().await else {
+        panic!("expected timestamp answer");
+    };
+    assert_eq!(answer.sub_id, "latest");
+    assert_eq!(
+        answer.change,
+        AggregateChange::Replace {
+            rows: vec![vec![SqliteValue::Text(
+                "2026-09-23 13:42:07.957522+00:00".to_owned()
+            )]],
+        }
+    );
+    let mut source = PgSqliteEmuSource::open_in_memory(DDL).expect("source");
+    source.execute_sql(SEED).expect("seed source");
+    source.drain().expect("drain source");
+    fixture
+        .exec("DELETE FROM aggregate_stamps WHERE id = 1")
+        .await;
+    source
+        .execute_sql("DELETE FROM aggregate_stamps WHERE id = 1")
+        .expect("delete extreme");
+    let committed = fixture.commit_now().await;
+    while let Some(item) = source.next_item().await.expect("source item") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
+        manager
+            .dispatch_event(&connetto_test_harness::committed_at(event, committed))
+            .await
+            .expect("dispatch");
+    }
+    let ControlMessage::AggregateUpdate(answer) = client.next_control().await else {
+        panic!("expected reexecuted timestamp");
+    };
+    assert_eq!(answer.sub_id, "latest");
+    assert_eq!(
+        answer.change,
+        AggregateChange::Replace {
+            rows: vec![vec![SqliteValue::Text(
+                "2026-09-22 13:42:07.957522+00:00".to_owned()
+            )]],
+        }
+    );
 }

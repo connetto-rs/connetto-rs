@@ -29,7 +29,7 @@ Planned in [the shared frame design](../../plans/master-implementation-plan.md#s
 - Bot registration. [`connetto_core::messages::RegisterBot`], [`connetto_core::messages::BotRegistered`], [`connetto_core::messages::ControlMessage::RegistrationRefused`]
 - Subscription. [`connetto_core::messages::Subscribe`], [`connetto_core::messages::Unsubscribe`], [`connetto_core::messages::MembershipOpened`]
 - Snapshot and catch-up. [`connetto_core::messages::SnapshotBegin`], [`connetto_core::messages::SnapshotEnd`], [`connetto_core::messages::SnapshotPatch`] on the bulk plane
-- Live delivery. [`connetto_core::messages::LivePatch`] on the bulk plane, [`connetto_core::messages::AggregateUpdate`], [`connetto_core::messages::FullResyncRequired`]
+- Live delivery. [`connetto_core::messages::LivePatch`] on the bulk plane, [`connetto_core::messages::AggregateColumns`], [`connetto_core::messages::AggregateUpdate`], [`connetto_core::messages::FullResyncRequired`]
 - Mutation. [`connetto_core::messages::MutationHeader`], [`connetto_core::messages::MutationPatch`] on the bulk plane, [`connetto_core::messages::MutationApplied`], [`connetto_core::messages::MutationReject`], [`connetto_core::messages::MutationConflict`]
 - Writer. [`connetto_core::messages::BindDevice`], [`connetto_core::messages::RetireWriter`], [`connetto_core::messages::WriterAnswer`], [`connetto_core::messages::Provenance`]
 - Courier. [`connetto_core::messages::CourierRange`], [`connetto_core::messages::CourierBody`] on the bulk plane, [`connetto_core::messages::CourierAnswer`], [`connetto_core::messages::CourierNotice`], [`connetto_core::messages::CourierNoticeAck`]

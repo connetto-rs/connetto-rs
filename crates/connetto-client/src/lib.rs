@@ -21,14 +21,14 @@ use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::device_cert::DeviceKey;
 use connetto_core::exchange::Origin;
 use connetto_core::messages::{
-    AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
-    ControlMessage, CourierNotice, CourierNoticeAck, CourierNoticeRow, FatalErrorReason, GateState,
-    Handshake, HeldWork, MutationHeader, MutationPatch, MutationReject, MutationRejectReason, Ping,
+    AckCredits, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb, ControlMessage,
+    CourierNotice, CourierNoticeAck, CourierNoticeRow, FatalErrorReason, GateState, Handshake,
+    HeldWork, MutationHeader, MutationPatch, MutationReject, MutationRejectReason, Ping,
     PriorRefusal, Provenance, ReplaceShareKeys, RetireWriter, SUBSCRIPTION_REFUSED,
-    SUBSCRIPTION_REFUSED_SCHEMA, ShareKeyChange, Subscribe, SubscriptionSpec, TabDismissAnswer,
-    TabDismissOutcome, TabDismissRefusal, TabIdentity, TabShareKeyAnswer, TabShareKeyChange,
-    TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse, Unsubscribe,
-    WriterAnswer,
+    SUBSCRIPTION_REFUSED_SCHEMA, ShareKeyChange, SqliteValue, Subscribe, SubscriptionSpec,
+    TabDismissAnswer, TabDismissOutcome, TabDismissRefusal, TabIdentity, TabShareKeyAnswer,
+    TabShareKeyChange, TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse,
+    Unsubscribe, WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -120,6 +120,7 @@ pub mod share_keys;
 mod subscriptions;
 mod tier_migration;
 
+pub use aggregates::RestedAnswer;
 #[cfg(feature = "peer")]
 pub use bluetooth::{
     BeaconState, BluetoothError, BluetoothState, HostId, Hosted, JoinNearbyError, NearbyHost,
@@ -175,7 +176,7 @@ pub use keyring::{Backend, KeyFile, LinuxStore};
 #[cfg(all(feature = "native-auth", target_os = "windows"))]
 pub use keyring::{HelloCancellation, HelloOwner, HelloWindow};
 pub use live::{
-    ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveUnsynced, LiveValue,
+    ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveUnsynced, LiveValue, Loadable,
     subscription_is_aggregate, subscription_tables,
 };
 pub use live_source::{LiveSnapshot, LiveSource, follow};
@@ -1436,24 +1437,25 @@ pub enum ClientEvent {
         /// mirrors) without re-encoding.
         patchset_zstd: Arc<[u8]>,
     },
-    /// An aggregate result update, mirroring the wire
-    /// [`AggregateUpdate`](connetto_core::messages::AggregateUpdate) field for
-    /// field so a relay can rebuild a faithful frame for a downstream tab.
+    /// The declared columns of a computed subscription's answer, mirroring the
+    /// wire [`AggregateColumns`](connetto_core::messages::AggregateColumns)
+    /// so a relay can rebuild a faithful frame for a downstream tab. The
+    /// replica has already declared the answer's resting table with them.
+    AggregateColumns {
+        /// Subscription id.
+        sub_id: String,
+        /// One declared type per select-list item, in select order.
+        columns: Vec<connetto_core::messages::ColumnType>,
+    },
+    /// One movement of a computed subscription's answer, mirroring the wire
+    /// [`AggregateUpdate`](connetto_core::messages::AggregateUpdate) so a
+    /// relay can rebuild a faithful frame for a downstream tab. The replica
+    /// has already rested it.
     Aggregate {
         /// Subscription id.
         sub_id: String,
-        /// JSON-encoded aggregate value, or `None` when this key was removed
-        /// from the result set (the group or keyed row departed).
-        result_json: Option<String>,
-        /// Opaque group key, or `None` for a single-group aggregate.
-        group_key: Option<Vec<u8>>,
-        /// The decoded group values as a JSON array in `GROUP BY` order,
-        /// present exactly when `group_key` is. A typed keyed handle decodes
-        /// its public map key from these, never from the key bytes (R84).
-        group_values_json: Option<String>,
-        /// Whether this update replaces the entire result set or upserts a
-        /// single group.
-        is_full_result: bool,
+        /// What moved.
+        change: connetto_core::messages::AggregateChange,
     },
     /// The server requires a full resync for this subscription.
     FullResync {
@@ -5378,8 +5380,8 @@ fn install_replica_metadata(
     }
     subscriptions::install(db)?;
     db.batch_execute(holdings::HOLDING_DDL)?;
-    // After the subscription tables, since it references `_connetto_query`.
-    db.batch_execute(aggregates::AGGREGATE_DDL)?;
+    // Each statistic's resting table is created when its columns arrive.
+    db.batch_execute(aggregates::LEGACY_DDL)?;
     #[cfg(feature = "device-identity")]
     db.batch_execute(enrolment::CERTIFICATE_DDL)?;
     #[cfg(feature = "peer")]
@@ -11478,11 +11480,34 @@ where
         clock::now_secs(&mut self.db)
     }
 
-    /// Rest one server aggregate frame in `_connetto_aggregates`, then evict
-    /// down to the configured cap.
+    /// Declare the resting table of a computed subscription's answer with the
+    /// columns the server sent.
+    ///
+    /// The frame carries only its run-local subscription id, so the statistic
+    /// is resolved from the persisted subscription record that same id names.
+    /// A frame whose subscription is not on record declares nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica rejects the statements.
+    fn declare_aggregate(
+        &mut self,
+        sub_id: &str,
+        columns: &[connetto_core::messages::ColumnType],
+    ) -> Result<(), ClientError> {
+        let Some((query_id, _)) = subscriptions::identity_of(&mut self.db, sub_id)? else {
+            return Ok(());
+        };
+        let _suspended = ExemptWrites::raise(&self.write_flags);
+        aggregates::declare(&mut self.db, query_id, columns)?;
+        Ok(())
+    }
+
+    /// Rest one movement of a server-computed answer in its statistic's
+    /// resting table, then evict down to the configured cap.
     ///
     /// The frame carries only its run-local subscription id, so the query
-    /// identity that keys the rested row (query text and binds) is resolved
+    /// identity that keys the rested rows (query text and binds) is resolved
     /// from the persisted subscription record that same id names. A frame
     /// whose subscription is not on record rests nothing: there is no identity
     /// to key it on, and a live frame always has one. The write is a
@@ -11491,11 +11516,12 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Session`] when the replica rejects the write.
+    /// [`ClientError::Session`] when the replica rejects the write, or when the
+    /// answer's columns never arrived.
     fn rest_aggregate(
         &mut self,
         sub_id: &str,
-        frame: &aggregates::AggregateFrame<'_>,
+        change: &connetto_core::messages::AggregateChange,
     ) -> Result<(), ClientError> {
         let Some((query_id, binds)) = subscriptions::identity_of(&mut self.db, sub_id)? else {
             return Ok(());
@@ -11505,9 +11531,12 @@ where
         // so the cap never evicts a value in use.
         let protected = subscriptions::live_identities(&mut self.db)?;
         let _suspended = ExemptWrites::raise(&self.write_flags);
-        aggregates::apply_frame(&mut self.db, query_id, &binds, frame, now)?;
+        aggregates::apply(&mut self.db, query_id, &binds, change, now)?;
         // A removal cannot add a statistic, so only a write needs the cap.
-        if frame.result_json.is_some() {
+        if !matches!(
+            change,
+            connetto_core::messages::AggregateChange::Remove { .. }
+        ) {
             aggregates::enforce_cap(
                 &mut self.db,
                 self.config.tuning.rested_statistics_cap(),
@@ -11517,36 +11546,20 @@ where
         Ok(())
     }
 
-    /// The rested scalar value and its as-of time for a subscription's query
-    /// and binds, or `None` when none rests. The scalar watch bootstraps from
-    /// this on an offline restart, and a relay answers a tab's aggregate watch
-    /// from it while its worker is offline.
+    /// The rested answer of a computed subscription's query and binds as the
+    /// server sent it, or `None` when its columns never arrived. A relay
+    /// answers a tab's watch from it while its worker is offline, replaying
+    /// the frames the server would have sent.
     ///
     /// # Errors
     ///
     /// [`ClientError::Session`] when the replica cannot be read.
-    pub fn rested_scalar(
+    pub fn rested_answer(
         &mut self,
         query: &str,
-        binds: &[BindValue],
-    ) -> Result<Option<(String, i64)>, ClientError> {
-        aggregates::lookup_scalar(&mut self.db, query, binds)
-    }
-
-    /// Every rested group row for a subscription's query and binds, the
-    /// scalar row excluded, in stored-key order. A keyed or row-shaped handle
-    /// bootstraps from these on an offline restart and a late join, whichever
-    /// resting shape it finds (R84).
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Session`] when the replica cannot be read.
-    pub(crate) fn rested_groups(
-        &mut self,
-        query: &str,
-        binds: &[BindValue],
-    ) -> Result<Vec<aggregates::RestedGroup>, ClientError> {
-        aggregates::lookup_groups(&mut self.db, query, binds)
+        binds: &[SqliteValue],
+    ) -> Result<Option<aggregates::RestedAnswer>, ClientError> {
+        aggregates::answer(&mut self.db, query, binds)
     }
 
     /// Every subscription this replica has declared and not dropped, whether
@@ -12456,26 +12469,22 @@ where
                 self.publish_coverage()?;
                 Ok(Some(ClientEvent::SnapshotEnd { sub_id: end.sub_id }))
             }
+            ControlMessage::AggregateColumns(columns) => {
+                self.declare_aggregate(&columns.sub_id, &columns.columns)?;
+                Ok(Some(ClientEvent::AggregateColumns {
+                    sub_id: columns.sub_id,
+                    columns: columns.columns,
+                }))
+            }
             ControlMessage::AggregateUpdate(update) => {
                 // Resting is a durable consequence of receiving a server frame,
                 // the same class as the cursor and patch writes above, so it
                 // happens here on the one frame-application path every pump
                 // driver shares, not in a driver's own loop (R83).
-                self.rest_aggregate(
-                    &update.sub_id,
-                    &aggregates::AggregateFrame {
-                        group_key: update.group_key.as_deref(),
-                        group_values_json: update.group_values_json.as_deref(),
-                        result_json: update.result_json.as_deref(),
-                        is_full_result: update.is_full_result,
-                    },
-                )?;
+                self.rest_aggregate(&update.sub_id, &update.change)?;
                 Ok(Some(ClientEvent::Aggregate {
                     sub_id: update.sub_id,
-                    result_json: update.result_json,
-                    group_key: update.group_key,
-                    group_values_json: update.group_values_json,
-                    is_full_result: update.is_full_result,
+                    change: update.change,
                 }))
             }
             ControlMessage::FullResyncRequired(resync) => {

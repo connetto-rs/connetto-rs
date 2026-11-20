@@ -517,7 +517,8 @@ pub(crate) fn remember_shared_generation(
     if saved.is_some_and(|saved| saved.generation == attached.generation) {
         return Ok(false);
     }
-    db.batch_execute("DELETE FROM _connetto_meta; DELETE FROM _connetto_aggregates")?;
+    db.batch_execute("DELETE FROM _connetto_meta")?;
+    crate::aggregates::drop_all(db)?;
     crate::holdings::release_account(db)?;
     diesel::sql_query(
         "INSERT INTO _connetto_shared_generation (id, generation) VALUES (1, ?) \

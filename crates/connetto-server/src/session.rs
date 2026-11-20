@@ -41,18 +41,19 @@ use connetto_core::exchange::{
     CourierEntryOutcome, CourierOutcome, CourierRefusal, ManifestRow, Origin, SignedOffer,
 };
 use connetto_core::messages::{
-    AggregateUpdate, BindDevice, BindValue, BotRegistered, BulkMessage, CONTENT_TICKET_REFUSED,
-    CONTENT_TICKET_SIGNER_ERROR, Challenge, ConflictRow, ContentTicketGrant, ContentTicketRequest,
-    ContentVerb, ControlMessage, DeviceRevokedAck, DevicesList, DevicesRequest, EnrolChallenge,
-    EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
-    FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MembershipOpened,
-    MutationApplied, MutationConflict, MutationHeader, MutationPatch, MutationReject,
-    MutationRejectReason, NonFatalError, PROVISIONAL_ASK_REFUSED, PauseCause, Pong, PriorRefusal,
-    Provenance, ProvisionalStatus, ProvisionalVerdicts, RateLimited, RegisterBot, ReplaceShareKeys,
-    RetireWriter, RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED,
-    SUBSCRIPTION_REFUSED_SCHEMA, ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd,
-    SnapshotPatch, Subscribe, SubscriptionSpec, WriterAnswer, WriterGrant, WriterOutcome,
-    WriterRef, WriterRequest, WriterSecret, bot_registration_message, writer_bind_message,
+    AggregateChange, AggregateColumns, AggregateUpdate, BindDevice, BotRegistered, BulkMessage,
+    CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR, Challenge, ConflictRow,
+    ContentTicketGrant, ContentTicketRequest, ContentVerb, ControlMessage, DeviceRevokedAck,
+    DevicesList, DevicesRequest, EnrolChallenge, EnrolRefusal, EnrolRefused, EnrolRequest,
+    FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired, Grant, Handshake,
+    HandshakeAck, LivePatch, MembershipOpened, MutationApplied, MutationConflict, MutationHeader,
+    MutationPatch, MutationReject, MutationRejectReason, NonFatalError, PROVISIONAL_ASK_REFUSED,
+    PauseCause, Pong, PriorRefusal, Provenance, ProvisionalStatus, ProvisionalVerdicts,
+    RateLimited, RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate,
+    RevokeDeviceRequest, SUBSCRIPTION_REFUSED, SUBSCRIPTION_REFUSED_SCHEMA, ShareKeysReplaced,
+    SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, SqliteValue, Subscribe,
+    SubscriptionSpec, WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest,
+    WriterSecret, bot_registration_message, writer_bind_message,
 };
 use connetto_core::messages::{
     CourierAnswer, CourierBody, CourierNotice, CourierNoticeAck, CourierNoticeRow, CourierRange,
@@ -461,7 +462,7 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     async fn estimate(
         &self,
         select_sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         caller: &Principal<Id, Key>,
     ) -> Result<SnapshotEstimate, Self::Error>;
 
@@ -492,7 +493,7 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     async fn snapshot_page(
         &self,
         select_sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         caller: &Principal<Id, Key>,
         page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error>;
@@ -893,6 +894,8 @@ struct Applied {
     narrowings: Option<Vec<TermMove>>,
     /// Computed changes not yet delivered, in delivery order.
     computed: VecDeque<ComputedChange>,
+    /// Computed subscriptions whose values cannot be encoded.
+    computed_refused: Vec<SubscriptionId>,
     /// The read failure still to be answered.
     failure: Option<MaterializerError>,
     /// The reads subql ended for good, still to be told.
@@ -911,6 +914,7 @@ impl Applied {
             refused: dispatched.refused,
             narrowings: Some(dispatched.narrowings),
             computed: dispatched.computed.into(),
+            computed_refused: dispatched.computed_refused,
             failure: dispatched.failure,
             stopped: dispatched.stopped,
             drain_due: false,
@@ -1615,7 +1619,7 @@ struct Route<Id, Key> {
     /// per subscriber per event.
     pg_sql: std::sync::Arc<str>,
     /// The subscription's bind values, paired with `pg_sql`'s placeholders.
-    binds: std::sync::Arc<[BindValue]>,
+    binds: std::sync::Arc<[SqliteValue]>,
     /// The membership tables this subscription's terms watch, empty for a
     /// filter naming none. A grant moved by a change to one of these tables is
     /// served incrementally by the term's own move (R27 decision 2), so the
@@ -1644,6 +1648,19 @@ fn budgeted_bytes(patch: &LivePatch) -> u64 {
         .saturating_add(len_bytes(patch.patchset_zstd.len()))
 }
 
+/// The bytes occupied by typed row values and their variable payloads.
+fn aggregate_row_bytes(row: &[SqliteValue]) -> u64 {
+    row.iter().fold(0_u64, |bytes, value| {
+        bytes
+            .saturating_add(len_bytes(std::mem::size_of::<SqliteValue>()))
+            .saturating_add(match value {
+                SqliteValue::Text(text) => len_bytes(text.len()),
+                SqliteValue::Blob(blob) => len_bytes(blob.len()),
+                SqliteValue::Null | SqliteValue::Integer(_) | SqliteValue::Real(_) => 0,
+            })
+    })
+}
+
 impl Outbound {
     /// The bytes this item counts against the connection's send budget while it waits.
     ///
@@ -1653,13 +1670,17 @@ impl Outbound {
             Self::Live(patch) => budgeted_bytes(patch),
             Self::Aggregate(update) => OUTBOUND_ITEM_BYTES
                 .saturating_add(len_bytes(update.sub_id.len()))
-                .saturating_add(len_bytes(update.group_key.as_ref().map_or(0, Vec::len)))
-                .saturating_add(len_bytes(
-                    update.group_values_json.as_ref().map_or(0, String::len),
-                ))
-                .saturating_add(len_bytes(
-                    update.result_json.as_ref().map_or(0, String::len),
-                )),
+                .saturating_add(match &update.change {
+                    AggregateChange::Upsert { key, row } => {
+                        len_bytes(key.len()).saturating_add(aggregate_row_bytes(row))
+                    }
+                    AggregateChange::Remove { key } => len_bytes(key.len()),
+                    AggregateChange::Replace { rows } => rows.iter().fold(0_u64, |bytes, row| {
+                        bytes
+                            .saturating_add(len_bytes(std::mem::size_of::<Vec<SqliteValue>>()))
+                            .saturating_add(aggregate_row_bytes(row))
+                    }),
+                }),
             Self::Fatal(_) | Self::Drop => 0,
             // Rare and of any shape, so it is measured by its encoding.
             Self::Control(msg) => OUTBOUND_ITEM_BYTES.saturating_add(
@@ -3599,7 +3620,7 @@ where
     async fn register_settled_filter(&self, session_id: SessionId, key: &[u8], writer: i64) {
         let consumer_id = self.next_consumer_id();
         let sql = "SELECT seq FROM _connetto_settled WHERE writer = $1";
-        let binds = [BindValue::Integer(writer)];
+        let binds = [SqliteValue::Integer(writer)];
         let mut materializer = self.materializer.lock().await;
         match materializer.register_translated(
             consumer_id,
@@ -3719,11 +3740,11 @@ where
         let (writers_sql, writers_bind) = match writer {
             Some(writer) => (
                 "SELECT frontier, retired_at FROM _connetto_writers WHERE writer = $1",
-                BindValue::Integer(writer),
+                SqliteValue::Integer(writer),
             ),
             None => (
                 "SELECT frontier, retired_at FROM _connetto_writers WHERE device_key = $1",
-                BindValue::Blob(key.to_vec()),
+                SqliteValue::Blob(key.to_vec()),
             ),
         };
         let mut consumers = Vec::new();
@@ -3739,7 +3760,7 @@ where
             .register_one_filter(
                 enrolment_consumer,
                 "SELECT revoked_at FROM connetto_device_enrolments WHERE key_id = $1",
-                &[BindValue::Blob(key.to_vec())],
+                &[SqliteValue::Blob(key.to_vec())],
             )
             .await
         {
@@ -3813,7 +3834,7 @@ where
         &self,
         consumer_id: u64,
         sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
     ) -> Option<SubscriptionId> {
         let mut materializer = self.materializer.lock().await;
         match materializer.register_translated(
@@ -4109,6 +4130,7 @@ where
                 .await;
             applied.drain_due = false;
             applied.computed.extend(drained.computed);
+            applied.computed_refused.extend(drained.computed_refused);
             applied.failure = drained.failure;
             applied.stopped.extend(drained.stopped);
             self.deliver_owed(applied).await?;
@@ -4117,6 +4139,15 @@ where
 
     /// Revalidate private audit observers before consuming each computed delivery.
     async fn deliver_owed(&self, applied: &mut Applied) -> Result<(), SessionError> {
+        for subscription_id in applied.computed_refused.drain(..) {
+            self.refuse_computed(
+                subscription_id,
+                ReadFailure::Deterministic,
+                1,
+                &"computed values cannot be encoded",
+            )
+            .await;
+        }
         while let Some(change) = applied.computed.front() {
             self.wake_courier_audit_locked(change.consumer_id).await?;
             if let Some(change) = applied.computed.pop_front() {
@@ -4369,7 +4400,7 @@ where
         &self,
         source: &Snap,
         sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         route: &Route<Id, Key>,
     ) -> Option<SnapshotPage> {
         let limits = self.guard.read_limits(Tier::of(&route.principal));
@@ -5027,10 +5058,7 @@ where
         let Some(route) = route else { return };
         let update = AggregateUpdate {
             sub_id: route.label,
-            group_key: change.group_key,
-            group_values_json: change.group_values_json,
-            result_json: change.result_json,
-            is_full_result: change.is_full_result,
+            change: change.change,
         };
         let _ = route.tx.send(Outbound::Aggregate(update));
     }
@@ -11548,8 +11576,9 @@ where
     /// the shared re-execution bound, because that path holds the
     /// materializer lock.
     ///
-    /// `resync` goes out once the answer exists and ahead of it, so a client
-    /// replacing an answer drops the old one only for a new one.
+    /// `resync` goes out once the answer exists and ahead of its column
+    /// declaration and rows, so a client replacing an answer drops the old
+    /// one only for a new one.
     async fn subscribe_computed<T: Transport>(
         &self,
         transport: &mut T,
@@ -11567,6 +11596,21 @@ where
                     .refuse_computed_subscribe(transport, sub.sub_id, subscription_id, &err)
                     .await;
             }
+        };
+        let columns = self
+            .materializer
+            .lock()
+            .await
+            .computed_columns(subscription_id);
+        let Some(columns) = columns else {
+            return self
+                .refuse_computed_subscribe(
+                    transport,
+                    sub.sub_id,
+                    subscription_id,
+                    &"computed columns are unavailable",
+                )
+                .await;
         };
 
         self.add_computed_route(
@@ -11586,14 +11630,18 @@ where
                 .await
                 .map_err(transport_err)?;
         }
+        transport
+            .send_control(ControlMessage::AggregateColumns(AggregateColumns {
+                sub_id: sub.sub_id.clone(),
+                columns,
+            }))
+            .await
+            .map_err(transport_err)?;
         for change in changes {
             transport
                 .send_control(ControlMessage::AggregateUpdate(AggregateUpdate {
                     sub_id: sub.sub_id.clone(),
-                    group_key: change.group_key,
-                    group_values_json: change.group_values_json,
-                    result_json: change.result_json,
-                    is_full_result: change.is_full_result,
+                    change: change.change,
                 }))
                 .await
                 .map_err(transport_err)?;
@@ -12113,6 +12161,49 @@ mod tests {
         assert!(concerns(&caller(Some("alice"), &[]), &holder));
         assert!(concerns(&caller(None, &["key:a"]), &holder));
         assert!(concerns(&caller(None, &[]), &holder));
+    }
+
+    #[test]
+    fn aggregate_budget_counts_typed_values_and_payloads() {
+        use super::{AggregateChange, AggregateUpdate, OUTBOUND_ITEM_BYTES, Outbound, SqliteValue};
+
+        let row = vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(7),
+            SqliteValue::Real(1.5),
+            SqliteValue::Text("text".to_owned()),
+            SqliteValue::Blob(vec![1, 2, 3]),
+        ];
+        let row_bytes =
+            u64::try_from(5 * std::mem::size_of::<SqliteValue>() + 7).expect("row size fits");
+        let base = OUTBOUND_ITEM_BYTES + 4;
+        let update = |change| {
+            Outbound::Aggregate(AggregateUpdate {
+                sub_id: "stat".to_owned(),
+                change,
+            })
+        };
+        assert_eq!(
+            update(AggregateChange::Upsert {
+                key: vec![1, 2],
+                row: row.clone(),
+            })
+            .budgeted(),
+            base + 2 + row_bytes,
+        );
+        assert_eq!(
+            update(AggregateChange::Replace { rows: vec![row] }).budgeted(),
+            base + row_bytes
+                + u64::try_from(std::mem::size_of::<Vec<SqliteValue>>()).expect("vector size fits"),
+        );
+        assert_eq!(
+            update(AggregateChange::Remove { key: vec![1, 2] }).budgeted(),
+            base + 2,
+        );
+        assert_eq!(
+            update(AggregateChange::Replace { rows: Vec::new() }).budgeted(),
+            base,
+        );
     }
 
     /// The failed connect that opened the episode is itself one of the

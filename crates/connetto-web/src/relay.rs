@@ -84,13 +84,13 @@ use connetto_client::{
     replay_aborting, replica_schema, subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
-    AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, CourierAuditRequest, CourierNotice,
-    FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired, GateState, HandshakeAck,
-    LivePatch, MutationApplied, MutationConflict, MutationReject, MutationRejectReason,
-    NonFatalError, Pong, RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd,
-    SnapshotPatch, Subscribe, SubscriptionSpec, SyncStatus, TabDismissAnswer, TabDismissOutcome,
-    TabDismissRefusal, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, TabStorageAnswer,
-    TabStorageOutcome, TabStorageUse, UnsyncedWork,
+    AggregateChange, AggregateColumns, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage,
+    CourierAuditRequest, CourierNotice, FatalError, FatalErrorReason, FullResyncReason,
+    FullResyncRequired, GateState, HandshakeAck, LivePatch, MutationApplied, MutationConflict,
+    MutationReject, MutationRejectReason, NonFatalError, Pong, RateLimited, SUBSCRIPTION_REFUSED,
+    SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec, SyncStatus,
+    TabDismissAnswer, TabDismissOutcome, TabDismissRefusal, TabShareKeyAnswer, TabShareKeyChange,
+    TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse, UnsyncedWork,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Major, Transport};
@@ -505,8 +505,9 @@ struct TabSub {
 /// The worker replica holds only authorized rows, so a global aggregate
 /// cannot be computed from it: the hub registers a private upstream
 /// subscription on the worker connection and demultiplexes each pushed
-/// [`AggregateUpdate`] back to the owning tab under its own sub id. The spec
-/// is retained so [`hub_recover`] re-declares the upstream after a resume.
+/// [`AggregateColumns`] and [`AggregateUpdate`] back to the owning tab under
+/// its own sub id. The spec is retained so [`hub_recover`] re-declares the
+/// upstream after a resume.
 struct AggRoute {
     tab: TabId,
     tab_sub: String,
@@ -569,7 +570,7 @@ struct HubState {
     /// Aggregate subscriptions multiplexed onto the worker connection,
     /// keyed by the private upstream sub id the hub registered
     /// (`agg-{tab}-{sub}`). Each entry demuxes the worker's
-    /// [`AggregateUpdate`] back to the owning tab.
+    /// [`AggregateColumns`] and [`AggregateUpdate`] back to the owning tab.
     agg_routes: HashMap<String, AggRoute>,
     /// Tables backing each row upstream subscription, keyed by the worker's
     /// upstream sub id, from the reconnect specs. Used to fan an upstream
@@ -3417,25 +3418,33 @@ where
         .map_err(RelayError::from)?;
     // While the worker is offline the server sends no bootstrap, so a tab would
     // otherwise show nothing until the worker connects. Answer the watch from
-    // the resting table the worker keeps, synthesizing the scalar frame the
-    // server would have sent. The worker's next connect delivers the
-    // authoritative value and overwrites it (R83 decision 7).
+    // the resting table the worker keeps, replaying the frames the server
+    // would have sent, the columns and then each rested row under its key.
+    // The worker's next connect delivers the authoritative answer and
+    // overwrites it (R83 decision 7).
     if !worker.is_connected()
-        && let Some((result_json, _)) = worker
-            .rested_scalar(&subscribe.spec.query, &subscribe.spec.binds)
+        && let Some(rested) = worker
+            .rested_answer(&subscribe.spec.query, &subscribe.spec.binds)
             .map_err(RelayError::from)?
     {
         let _ = tab
             .out
-            .send(TabOut::Control(ControlMessage::AggregateUpdate(
-                AggregateUpdate {
+            .send(TabOut::Control(ControlMessage::AggregateColumns(
+                AggregateColumns {
                     sub_id: subscribe.sub_id.clone(),
-                    group_key: None,
-                    group_values_json: None,
-                    result_json: Some(result_json),
-                    is_full_result: true,
+                    columns: rested.columns,
                 },
             )));
+        for (key, row) in rested.rows {
+            let _ = tab
+                .out
+                .send(TabOut::Control(ControlMessage::AggregateUpdate(
+                    AggregateUpdate {
+                        sub_id: subscribe.sub_id.clone(),
+                        change: AggregateChange::Upsert { key, row },
+                    },
+                )));
+        }
     }
     agg_routes.insert(
         upstream_id,
@@ -5214,31 +5223,14 @@ fn rename_to_physical(changeset: &[u8], map: &PolicyTables) -> Result<Vec<u8>, R
     Ok(parsed.into())
 }
 
-/// Demux one worker aggregate push to the tab that owns its multiplexed
-/// subscription, rebuilding the frame under the tab's own id.
-fn forward_aggregate(
-    state: &HubState,
-    sub_id: &str,
-    group_key: Option<Vec<u8>>,
-    group_values_json: Option<String>,
-    result_json: Option<String>,
-    is_full_result: bool,
-) {
+/// Demux one worker aggregate frame to the tab that owns its multiplexed
+/// subscription, rebuilding it under the tab's own id with `frame`.
+fn forward_aggregate(state: &HubState, sub_id: &str, frame: impl FnOnce(String) -> ControlMessage) {
     let Some(route) = state.agg_routes.get(sub_id) else {
         return;
     };
     if let Some(tab) = state.tabs.get(&route.tab) {
-        let _ = tab
-            .out
-            .send(TabOut::Control(ControlMessage::AggregateUpdate(
-                AggregateUpdate {
-                    sub_id: route.tab_sub.clone(),
-                    group_key,
-                    group_values_json,
-                    result_json,
-                    is_full_result,
-                },
-            )));
+        let _ = tab.out.send(TabOut::Control(frame(route.tab_sub.clone())));
     }
 }
 
@@ -5323,21 +5315,22 @@ where
             rows,
             server_row,
         } => conflict_tab_mutation(state, client_seq, &rows, server_row),
-        ClientEvent::Aggregate {
-            sub_id,
-            result_json,
-            group_key,
-            group_values_json,
-            is_full_result,
-        } => {
-            forward_aggregate(
-                state,
-                &sub_id,
-                group_key,
-                group_values_json,
-                result_json,
-                is_full_result,
-            );
+        ClientEvent::AggregateColumns { sub_id, columns } => {
+            forward_aggregate(state, &sub_id, |tab_sub| {
+                ControlMessage::AggregateColumns(AggregateColumns {
+                    sub_id: tab_sub,
+                    columns,
+                })
+            });
+            Ok(())
+        }
+        ClientEvent::Aggregate { sub_id, change } => {
+            forward_aggregate(state, &sub_id, |tab_sub| {
+                ControlMessage::AggregateUpdate(AggregateUpdate {
+                    sub_id: tab_sub,
+                    change,
+                })
+            });
             Ok(())
         }
         ClientEvent::FullResync { sub_id, reason } => {
@@ -7211,14 +7204,15 @@ mod tests {
     /// resting table while the worker is offline, so the tab shows the last
     /// synced value through the DB worker rather than nothing.
     ///
-    /// The worker rests the value on the connection's own frame path, the same
-    /// path the native client uses, which is what lets the hub answer with no
-    /// server: it reads the rested scalar and synthesizes the bootstrap frame
-    /// the server would have sent.
+    /// The worker rests the answer on the connection's own frame path, the
+    /// same path the native client uses, which is what lets the hub answer
+    /// with no server: it reads the rested answer and replays the frames the
+    /// server would have sent, the columns and then each row under its key.
     #[wasm_bindgen_test]
     async fn a_tab_aggregate_watch_is_answered_from_rest_while_offline() {
         use connetto_core::messages::{
-            AggregateUpdate, ControlMessage, Subscribe, SubscriptionSpec,
+            AggregateChange, AggregateColumns, AggregateUpdate, ColumnType, ControlMessage,
+            SqliteValue, Subscribe, SubscriptionSpec,
         };
         use connetto_core::test_support::FakeTransport;
         use connetto_core::traits::IncomingFrame;
@@ -7229,18 +7223,21 @@ mod tests {
         let query = "SELECT COUNT(*) FROM orders";
         let spec = SubscriptionSpec::new(query);
 
-        // A fake server that acks the handshake, delivers one scalar bootstrap
-        // for the worker's upstream subscription, then drains so the worker
-        // goes offline with the value on record.
-        let transport = FakeTransport::accepting_then_delivering([IncomingFrame::Control(
-            ControlMessage::AggregateUpdate(AggregateUpdate {
+        // A fake server that acks the handshake, declares the scalar's column
+        // and delivers its answer for the worker's upstream subscription, then
+        // drains so the worker goes offline with the answer on record.
+        let transport = FakeTransport::accepting_then_delivering([
+            IncomingFrame::Control(ControlMessage::AggregateColumns(AggregateColumns {
                 sub_id: "wire-0".to_owned(),
-                group_key: None,
-                group_values_json: None,
-                result_json: Some("7".to_owned()),
-                is_full_result: true,
-            }),
-        )]);
+                columns: vec![ColumnType::Integer],
+            })),
+            IncomingFrame::Control(ControlMessage::AggregateUpdate(AggregateUpdate {
+                sub_id: "wire-0".to_owned(),
+                change: AggregateChange::Replace {
+                    rows: vec![vec![SqliteValue::Integer(7)]],
+                },
+            })),
+        ]);
         // Subscribe offline first, so the frame's sub id resolves to a query
         // identity the instant it lands, then attach the fake server and pump
         // until it drains, which drains the connect notice, rests the
@@ -7287,20 +7284,36 @@ mod tests {
 
         match out_rx
             .try_recv()
-            .expect("a synthesized frame reaches the tab")
+            .expect("the replayed columns reach the tab")
         {
+            super::TabOut::Control(ControlMessage::AggregateColumns(columns)) => {
+                assert_eq!(columns.sub_id, "s1", "under the tab's own sub id");
+                assert_eq!(
+                    columns.columns,
+                    vec![ColumnType::Integer],
+                    "the declared type, from rest"
+                );
+            }
+            _ => panic!("expected the replayed aggregate columns toward the tab"),
+        }
+        match out_rx.try_recv().expect("the replayed row reaches the tab") {
             super::TabOut::Control(ControlMessage::AggregateUpdate(update)) => {
                 assert_eq!(update.sub_id, "s1", "under the tab's own sub id");
                 assert_eq!(
-                    update.result_json.as_deref(),
-                    Some("7"),
-                    "the last synced value, from rest"
+                    update.change,
+                    AggregateChange::Upsert {
+                        key: 0_u64.to_be_bytes().to_vec(),
+                        row: vec![SqliteValue::Integer(7)],
+                    },
+                    "the last synced value under the scalar's key, from rest"
                 );
-                assert_eq!(update.group_key, None, "a scalar answer addresses no group");
-                assert!(update.is_full_result, "a bootstrap is a full result");
             }
-            _ => panic!("expected a synthesized aggregate frame toward the tab"),
+            _ => panic!("expected the replayed aggregate row toward the tab"),
         }
+        assert!(
+            out_rx.try_recv().is_err(),
+            "a scalar answer replays as one row"
+        );
     }
 
     /// A committed import stays a success when the post-commit replay fails, because the

@@ -4346,7 +4346,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#04f601c467cbf57a84232b4762538f2c18b7fb75"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#7876feab980742b2e40e371f804c88cffb9b41b1"
 dependencies = [
  "recursive",
  "sql-traits",
@@ -5126,7 +5126,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#51a2ae034a1bd6120875e80afc752efbeb568cee"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#aa79f3277170fe77c49b8c26aab6ada861e109a5"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -5140,7 +5140,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#51a2ae034a1bd6120875e80afc752efbeb568cee"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#aa79f3277170fe77c49b8c26aab6ada861e109a5"
 dependencies = [
  "serde",
  "sql-values 0.6.0",
@@ -5920,7 +5920,7 @@ dependencies = [
 [[package]]
 name = "sql-values"
 version = "0.6.0"
-source = "git+https://github.com/connetto-rs/sql-values?branch=main#d599af64e6d73950e9f48c5a969a0bdfe9835247"
+source = "git+https://github.com/connetto-rs/sql-values?branch=main#bee0f26da9575f1f0ab38550e3188cb25590058e"
 dependencies = [
  "jiff",
  "thiserror 2.0.21",
@@ -5935,8 +5935,7 @@ checksum = "ab732d48ebf2a1449e94d071b26544f99845834c75c3c210e927ace097b49aa4"
 [[package]]
 name = "sqlite-diff-rs"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78a7a2aee7a9f88fa70ffd9582541d8d392b4ebf2eedf71c54633da3cac74841"
+source = "git+https://github.com/connetto-rs/sqlite-diff-rs?branch=main#1d704201ff7df2e1fa7c385e0d6e2b43e875d30f"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap 2.14.2",
@@ -6114,7 +6113,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#6def6fbd935b64ad2aeaaec24171e45581b7212e"
+source = "git+https://github.com/connetto-rs/subql?branch=main#79892d171395d8263ae4ca789c52169ce1b9d23e"
 dependencies = [
  "arc-swap",
  "async-lock",

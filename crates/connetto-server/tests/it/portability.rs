@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use connetto_core::device_cert::KeyId;
-use connetto_core::messages::{BindValue, ControlMessage, FatalError, FatalErrorReason};
+use connetto_core::messages::{ControlMessage, FatalError, FatalErrorReason, SqliteValue};
 use connetto_server::builder::{
     BuildError, ContentSettings, Database, OidcProvider, OpenFga, ServerBuilder, ServerSchema,
     StoreSpec, TokenKeys,
@@ -873,7 +873,7 @@ async fn an_owner_query_failing_at_read_time_fails_the_download() {
                 "SELECT * FROM mod_notes WHERE id / ? = 1",
                 "notes divided by zero",
             )
-            .binds(vec![PortabilityBind::Value(BindValue::Integer(0))])
+            .binds(vec![PortabilityBind::Value(SqliteValue::Integer(0))])
             .read_as_owner(),
         );
 
@@ -1357,7 +1357,7 @@ async fn a_download_binds_fixed_values_and_keeps_each_value_typed() {
             "SELECT id, owner, body, score, avatar FROM records WHERE score >= ?",
             "scored records",
         )
-        .binds(vec![PortabilityBind::Value(BindValue::Real(1.0))]),
+        .binds(vec![PortabilityBind::Value(SqliteValue::Real(1.0))]),
     );
 
     let (builder, _idp, _keys) = portability_builder(&fixture, list).await;

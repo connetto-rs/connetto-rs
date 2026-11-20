@@ -7,7 +7,7 @@ use std::time::Duration;
 use connetto_core::SessionId;
 use connetto_core::auth::{CapabilityKey, Principal};
 use connetto_core::messages::{
-    BindValue, ControlMessage, CourierAuditAnswer, CourierAuditOutcome, CourierAuditRequest,
+    ControlMessage, CourierAuditAnswer, CourierAuditOutcome, CourierAuditRequest, SqliteValue,
 };
 use connetto_core::traits::ContentTicketSigner;
 use subql::SubscriptionId;
@@ -451,8 +451,8 @@ where
                     consumer,
                     D::Audit::COURIER_RECEIPT_FILTER_SQL,
                     &[
-                        BindValue::Integer(question.writer),
-                        BindValue::Integer(*sequence),
+                        SqliteValue::Integer(question.writer),
+                        SqliteValue::Integer(*sequence),
                     ],
                     None,
                     budget,
