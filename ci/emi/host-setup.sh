@@ -42,9 +42,13 @@ EMI_CPUS=88
 COMMONS_MEMORY_GIB=200
 COMMONS_VMS=16
 COMMONS_CPUS=64
-# The largest flavor, which a VM still being created is counted as.
-LARGEST_GIB=32
-LARGEST_CPUS=8
+# The two runner flavors. A cold build of the dioxus demo for Android peaked at 13.7 GiB
+# and was killed at 15.9 GiB on a 16 GiB light VM, and a heavy VM's largest measured peak is 21.8 GiB.
+LIGHT_GIB=24
+LIGHT_CPUS=4
+# Heavy is the largest flavor, which a VM still being created is counted as.
+HEAVY_GIB=32
+HEAVY_CPUS=8
 # The member the CI phones are plugged into, the profile its phone VM uses, and the
 # emi account that enrols and holds the phones with its own Incus certificate.
 PHONE_MEMBER=emi
@@ -445,12 +449,10 @@ if [ "$MEMBER" = emi ]; then
     incus profile device show "$name" --project "$PROJECT" | grep -q "^actions:" \
       || incus profile device add "$name" actions disk source="$CACHE_ROOT/actions" path=/srv/cache/actions readonly=true --project "$PROJECT"
   }
-  # The largest measured peaks are 21.8 GiB on a heavy VM, and on a light one
-  # 8.7 GiB for a browser shard's cold wasm build alone, beside the shard's services.
-  make_profile ci-light 4 16GiB
-  make_profile ci-heavy "$LARGEST_CPUS" "${LARGEST_GIB}GiB"
+  make_profile ci-light "$LIGHT_CPUS" "${LIGHT_GIB}GiB"
+  make_profile ci-heavy "$HEAVY_CPUS" "${HEAVY_GIB}GiB"
   # The phone VM, sized as a heavy one. Its phones are usb devices sync-phones.sh adds from ci/emi/phones.
-  make_profile "$PHONE_PROFILE" "$LARGEST_CPUS" "${LARGEST_GIB}GiB"
+  make_profile "$PHONE_PROFILE" "$HEAVY_CPUS" "${HEAVY_GIB}GiB"
   make_profile "$HANDS_ON_PROFILE" "$HANDS_ON_CPUS" "${HANDS_ON_GIB}GiB"
   for name in "$PHONE_PROFILE" "$HANDS_ON_PROFILE"; do
     incus profile device show "$name" --project "$PROJECT" | grep -q '^android-adb:' \
@@ -512,8 +514,8 @@ if [ "$MEMBER" = emi ]; then
 
   log "Placement: each new CI VM goes to the member with the most CI memory left, within the share ci-share.sh set, and a phone or hands-on VM to the member the phones are plugged into, where runners leave their room free"
   incus config set instances.placement.scriptlet="$(cat <<EOF
-LARGEST = $LARGEST_GIB
-LARGEST_CPUS = $LARGEST_CPUS
+LARGEST = $HEAVY_GIB
+LARGEST_CPUS = $HEAVY_CPUS
 GIB = 1024 * 1024 * 1024
 
 def share(member, key):
@@ -657,8 +659,8 @@ done
 log "$PHONE_MEMBER holds the CI phones, so the placement scriptlet sends the phone and hands-on VMs there and keeps their room free of runners"
 if incus cluster list --format csv --columns n | grep -qx "$PHONE_MEMBER"; then
   incus cluster set "$PHONE_MEMBER" user.ci.phones=true
-  incus cluster set "$PHONE_MEMBER" user.ci.reserved_memory_gib=$((LARGEST_GIB + HANDS_ON_GIB))
-  incus cluster set "$PHONE_MEMBER" user.ci.reserved_cpus=$((LARGEST_CPUS + HANDS_ON_CPUS))
+  incus cluster set "$PHONE_MEMBER" user.ci.reserved_memory_gib=$((HEAVY_GIB + HANDS_ON_GIB))
+  incus cluster set "$PHONE_MEMBER" user.ci.reserved_cpus=$((HEAVY_CPUS + HANDS_ON_CPUS))
   incus cluster set "$PHONE_MEMBER" user.ci.reserved_vms=2
 fi
 
