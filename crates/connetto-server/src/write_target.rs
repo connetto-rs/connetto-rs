@@ -871,7 +871,7 @@ fn commit_failure(err: CommitError) -> WriteError {
 #[cfg(test)]
 mod tests {
     use super::{CommitError, MaterializerError, WriteError, commit_failure, pg_write_target};
-    use crate::catalog_shapes::{unconnected_pool, unnameable_column, unnameable_columns_ddl};
+    use crate::catalog_shapes::{unconnected_pool, unresolvable_key_column, unresolvable_key_ddl};
     use crate::defaults::ConnettoDefaults;
     use crate::reexec::coded_error;
     use crate::writer_schema::StoredValue;
@@ -880,14 +880,14 @@ mod tests {
     use diesel::result::{DatabaseErrorKind, Error};
 
     #[tokio::test]
-    async fn a_catalog_that_cannot_name_its_columns_refuses_the_write_target() {
+    async fn a_catalog_with_an_unresolvable_key_refuses_the_write_target() {
         let refusal =
-            pg_write_target::<ConnettoDefaults>(unconnected_pool(), &unnameable_columns_ddl())
+            pg_write_target::<ConnettoDefaults>(unconnected_pool(), &unresolvable_key_ddl())
                 .err()
                 .map(|err| err.to_string());
         assert_eq!(
             refusal,
-            Some(MaterializerError::Catalog(unnameable_column()).to_string())
+            Some(MaterializerError::Catalog(unresolvable_key_column()).to_string())
         );
     }
 
