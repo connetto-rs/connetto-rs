@@ -8,12 +8,12 @@
 
 use std::time::{Duration, Instant};
 
+use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{
     ControlMessage, FatalError, FatalErrorReason, Grant, Handshake, HandshakeAck,
     SUBSCRIPTION_REFUSED_SCHEMA, Subscribe, SubscriptionSpec,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Major, PROTOCOL_VERSION};
 use connetto_server::builder::{
     Database, OidcProvider, OpenFga, ServerBuilder, ServerSchema, TokenKeys,
 };
@@ -29,20 +29,15 @@ use openidconnect::reqwest;
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 
-use super::e2e::{
+use connetto_test_harness::server_fixture::{
     NO_POLICIES, OWNED_PG_DDL, OWNED_POLICIES, PG_DDL, PG_SERIAL, exec, mint_token, reset_fixture,
-    signing_keys, with_user_url,
+    served_major, signing_keys, with_user_url,
 };
 
 /// How long the readiness probe and the frame waits give the server.
 pub(super) const BOUND: Duration = Duration::from_secs(30);
 
-/// The major both `PG_DDL` and `OWNED_PG_DDL` declare, for hand-built handshakes.
-pub(super) fn served_major() -> Major {
-    Major::declared_in(PG_DDL).expect("the served schema declares its major")
-}
-
-/// The one-construction-path server over `fixture`, the way the binary
+/// The one-construction-path server over `fixture`, the way `demo-server`
 /// translates its environment: the owner and reader roles, the schema
 /// documents, the persisted JWT keypair, the loopback identity provider and
 /// the fixture's authorization store.

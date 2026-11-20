@@ -23,8 +23,15 @@ GRANT SELECT ON products TO connetto_reader;
 
 -- The team tables the demo's accounts share through the membership rows, the
 -- rows the reader role only reads and the notes it writes like the orders.
-GRANT SELECT ON team_members TO connetto_reader;
+GRANT SELECT ON teams, team_members TO connetto_reader;
+-- The teams and their membership rows decide what the team_notes, photos and
+-- users policies let through, so no client role may change them, whatever
+-- default privileges a database grants.
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON teams, team_members FROM PUBLIC, connetto_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON team_notes TO connetto_reader;
+
+-- The account names, which only the server's sign-in writes, as the owner.
+GRANT SELECT ON users TO connetto_reader;
 
 -- The bot registry. A person's app writes registration codes and the
 -- installations of the bots it adds, and reads the bots and their lists.

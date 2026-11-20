@@ -5,11 +5,9 @@ use std::time::SystemTime;
 
 use connetto_core::SessionId;
 use connetto_core::device_cert::{AttestationLevel, KeyId};
-use connetto_server::RuntimeWritableCatalog;
-use connetto_server::defaults::_connetto_writers;
-use connetto_server::device_cert::{
-    DeviceCertConfig, DeviceEnrolment, Enrolment, EnrolmentStore, MemoryEnrolments,
-};
+use connetto_server::defaults::{_connetto_writers, ConnettoDefaults};
+use connetto_server::device_cert::{DeviceCertConfig, DeviceEnrolment, Enrolment, EnrolmentStore};
+use connetto_server::{AuthService, DefaultAuthHooks, RuntimeWritableCatalog};
 use connetto_test_harness::{Fixture, provision_writers};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::bb8::Pool;
@@ -102,16 +100,20 @@ pub(super) async fn writer_for_key(pool: &Pool<AsyncPgConnection>, key_id: [u8; 
         .expect("read the device writer")
 }
 
-/// The device key enrolments the tests install on their managers, in memory.
+/// The device enrolments installed on a test's managers.
 pub(super) struct Enrolments {
-    pub(super) store: Arc<MemoryEnrolments<String>>,
+    pub(super) store: EnrolmentStore<ConnettoDefaults>,
+    pub(super) pool: Pool<AsyncPgConnection>,
+    auth: Arc<AuthService<ConnettoDefaults>>,
 }
 
 impl Enrolments {
-    /// An empty store, fresh per test.
-    pub(super) fn new() -> Self {
+    /// Provision the fixture's enrolment and auth tables.
+    pub(super) async fn new(fixture: &Fixture) -> Self {
         Self {
-            store: Arc::new(MemoryEnrolments::default()),
+            store: EnrolmentStore::default(),
+            pool: fixture.admin().clone(),
+            auth: fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await,
         }
     }
 
@@ -135,33 +137,41 @@ impl Enrolments {
         let record = Enrolment {
             user: user.to_owned(),
             key: KeyId::from_bytes(key_id),
-            serial: [7; 16],
+            serial: *uuid::Uuid::new_v4().as_bytes(),
             issuer: KeyId::from_bytes([9; 32]),
             issued_at: SystemTime::now(),
             expires_at,
             session: SessionId::from_uuid(uuid::Uuid::new_v4()),
             public_key: key.subject_public_key_info().clone(),
-            descriptor: vec![0x91, 0x01],
+            descriptor: vec![0xc0],
             attestation: AttestationLevel::Unproven,
             bot_list: bot_list.to_owned(),
         };
+        let mut connection = self.pool.get().await.expect("admin connection");
         self.store
-            .record(record)
+            .record(&mut connection, record)
             .await
             .expect("record the certificate");
         (key, key_id)
     }
 
     /// Revoke `key_id` whoever enrolled it, as an operator would.
-    pub(super) fn revoke(&self, key_id: [u8; 32]) {
-        self.store.revoke_key(KeyId::from_bytes(key_id));
+    pub(super) async fn revoke(&self, key_id: [u8; 32]) {
+        let mut connection = self.pool.get().await.expect("admin connection");
+        self.store
+            .revoke(
+                &mut connection,
+                None,
+                KeyId::from_bytes(key_id),
+                SystemTime::now(),
+            )
+            .await
+            .expect("revoke the device");
     }
 
     /// The enrolment the manager takes, over this store and a fresh issuer.
-    pub(super) fn installable(&self) -> DeviceEnrolment<String> {
+    pub(super) fn installable(&self) -> DeviceEnrolment<ConnettoDefaults> {
         let (_, _, issuer) = rooted_issuer();
-        let store = Arc::clone(&self.store);
-        let store: Arc<dyn EnrolmentStore<String>> = store;
-        DeviceEnrolment::new(DeviceCertConfig::new(issuer), store)
+        DeviceEnrolment::new(DeviceCertConfig::new(issuer), Arc::clone(&self.auth))
     }
 }

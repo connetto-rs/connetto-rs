@@ -11,6 +11,13 @@ pub mod web;
 pub use native::Ops;
 #[cfg(target_arch = "wasm32")]
 pub use web::Ops;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use native::{read_badge_names, save_badge_names};
+#[cfg(target_arch = "wasm32")]
+pub(crate) use support::web::{
+    read_stored_names as read_badge_names, save_stored_names as save_badge_names,
+};
 #[cfg(target_arch = "wasm32")]
 mod inner {
     use std::rc::Rc;

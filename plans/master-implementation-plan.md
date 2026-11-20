@@ -68,14 +68,14 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | [R80](#r80-peer-sync-in-every-demo) | not started |  | The camp flow in every native-capable demo on Android, iOS, iPadOS, macOS and Linux, and the grown phone and home runs. Windows is outside it |  |  |
 | [R107](#r107-schema-changes-under-running-servers) | in progress | subql passing pgoutput `Relation` messages to consumers (slice 2) | The expand and contract procedure with the sunset, the table refusal when a running server notices a change, and the two-model boot check |  |  |
 | [R108](#r108-caller-kinds-as-database-roles) | in progress | sql-traits answering the caller contract, privileges and effective policies for both translators, and rls2fga translating R107's live model, for slices 2 to 5. R99, for the bot kinds | Caller kinds as database roles, every startup refusal before OpenFGA, four flat kind roles switched per transaction, grants per kind read from the live database, and a client copy per kind |  |  |
-| [R109](#r109-content-tickets-bound-to-their-session) | not started |  | Content tickets carry their session, and every fetch confirms the session is live, so a ticket dies with the session that minted it |  |  |
 | [R110](#r110-a-session-bound-by-provider-staleness) | not started |  | Session lifetime bounded by the time since the identity provider last confirmed the user, replacing the fixed idle window and ceiling |  |  |
 | [R111](#r111-a-durable-replica-where-opfs-is-refused) | blocked | the JSPI IndexedDB VFS upstream in `sqlite-wasm-rs` | A durable browser replica on IndexedDB through JSPI where OPFS is refused, memory kept only where JSPI is missing |  |  |
 | [R112](#r112-an-apple-peer-to-peer-link) | not started |  | A link between Apple devices over Apple's peer-to-peer Wi-Fi, for an all-Apple group with no hotspot host and no shared network, after its gate run and open points |  |  |
 | [R113](#r113-tests-that-wait-on-events) | blocked | Refreshed dependency graph | CI-backed sequential test and event-hook fixes, ranked by downstream impact and observed flakiness, with targeted repetition only | | |
 | [R21](#r21-one-page-codec-on-both-backends) | in progress |  | Slices 2 to 5, the browser on `sqlite-wasm-rs` 0.6 and then on SQLCipher, one open contract, the capability and hardening proof, and SQLCipher 4.20.0 |  | [#402](https://github.com/connetto-rs/connetto-rs/pull/402) |
+| [R117](#r117-typed-aggregate-wire) | not started |  | Aggregate values, group keys and computed rows carried and rested in the replica's storage encoding, one `STRICT` table per statistic, decoded through diesel's `FromSql` into any type a generated model loads |  |  |
 | R0 | done | | The always-on change-path counters in `counters.rs` and the `fanout_load` harness that priced the dispatch loop, with the ceiling measured as one sequential visibility round trip per subscriber per event and the lock wait at zero | [fanout_counters.rs](../crates/connetto-test-harness/tests/it/fanout_counters.rs), [fanout_load.rs](../crates/connetto-test-harness/tests/it/fanout_load.rs) | |
-| R1 | done | | The three permissive stand-ins reachable from configuration alone are gone, and the reference binary refuses to start without a reader role and a recognised `CONNETTO_OIDC_PROVIDER` | [e2e.rs](../crates/connetto-server/tests/it/e2e.rs) | |
+| R1 | done | | The three permissive stand-ins reachable from configuration alone are gone, and the reference binary refuses to start without a reader role and a recognised `CONNETTO_OIDC_PROVIDER` | [e2e.rs](../examples/demo-tools/tests/it/e2e.rs) | |
 | R2 | done | | The durable session handle is the operational key. Cursors and the `_connetto_mutations` watermark key on `session_id`, the connection registry serves revocation and supersession, and `TrustingSessionVerifier` is deleted with the verifier a required constructor argument | [session_handle.rs](../crates/connetto-test-harness/tests/it/session_handle.rs), [authn_flow.rs](../crates/connetto-server/tests/it/authn_flow.rs) | |
 | R3 | done | | The handshake carries a grant list instead of a single credential, `HandshakeAuthority` checks each grant into a `Principal` with a non-optional handle, a refused grant is logged and silent on the wire, and the type guard keeps an ephemeral replica paired only with an ephemeral tier | [grants.rs](../crates/connetto-server/tests/it/grants.rs), [verified_topology.rs](../crates/connetto-client/tests/it/verified_topology.rs) | |
 | R4 | done | | Capabilities as connetto-signed tokens naming subjects that are not people, the `CapabilityIssuer` mint that asks the read question through the same seam, the `app.subjects` binding every transaction applies, the expiry bounds, and the permission as a relation in the model | [capabilities.rs](../crates/connetto-server/tests/it/capabilities.rs), [capability_live.rs](../crates/connetto-test-harness/tests/it/capability_live.rs) | |
@@ -124,8 +124,8 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | R48 | done | | A `TRUNCATE` empties the client's copy. The `TableTruncated` resync reason clears the table unconditionally, catchup abandons the replay on a truncate it meets, and the pending local writes reapply after every resync | [truncate_resync.rs](../crates/connetto-client/tests/it/truncate_resync.rs), [truncate.rs](../crates/connetto-test-harness/tests/it/truncate.rs) | |
 | R49 | done | | The startup refusal for a policy shape whose withdrawal cannot reach the authorization store, the upstream finding, and the deletion of the re-run machinery the refusal made unreachable, with the shape booting again after R86 adopted the upstream repair | [openfga.rs](../crates/connetto-server/src/openfga.rs) | |
 | R50 | done | | The row-level-security policy answers the write question from the database. `RlsAuth::may_write` asks the two verbs a share can certify through a locking read, refuses the delete verb where the schema writes a separate rule, and maps a failed question to `ShareError::WriteUndecidable` | [rls_write_question.rs](../crates/connetto-server/tests/it/rls_write_question.rs) | |
-| R51 | done | | The native Apple gate on the two keychain items, gated through `AccessPolicy::RequireUserPresence` behind one shared `LAContext` unlock per launch, macOS joins the protected store under the provisioned app, and custody reports `Verified` | [gate_recheck.rs](../crates/connetto-client/tests/it/gate_recheck.rs), [connetto-ios-proof.rs](../crates/connetto-test-harness/src/bin/connetto-ios-proof.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
-| R52 | done | | The native Android gate through the unlock-once store option. One approval opens the store until connetto locks it, the `BiometricPrompt` waits for the app's window focus, and a lost store key wipes and resyncs | [gate_recheck.rs](../crates/connetto-client/tests/it/gate_recheck.rs), [connetto-android-proof.rs](../crates/connetto-test-harness/src/bin/connetto-android-proof.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
+| R51 | done | | The native Apple gate on the two keychain items, gated through `AccessPolicy::RequireUserPresence` behind one shared `LAContext` unlock per launch, macOS joins the protected store under the provisioned app, and custody reports `Verified` | [gate_recheck.rs](../crates/connetto-client/tests/it/gate_recheck.rs), [connetto-ios-proof.rs](../examples/demo-stack/src/bin/connetto-ios-proof.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
+| R52 | done | | The native Android gate through the unlock-once store option. One approval opens the store until connetto locks it, the `BiometricPrompt` waits for the app's window focus, and a lost store key wipes and resyncs | [gate_recheck.rs](../crates/connetto-client/tests/it/gate_recheck.rs), [connetto-android-proof.rs](../examples/demo-stack/src/bin/connetto-android-proof.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
 | R53 | done | | The Windows gate through the `HelloStore`, sealing each secret under a key derived from a Windows Hello passkey PRF. One approval unlocks each launch, and whether the credential survives a fingerprint re-enrolment is measured in R76 slice 9d | [gate.rs](../crates/connetto-client/src/keyring/gate.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
 | R54 | done | | Every demo carries every application-visible feature. The multi-account picker and switch, the passkey gate with its custody display, the session expiry warning, the over-limit signal, the several-provider `CONNETTO_OIDC_PROVIDERS` environment, and the parity fills | [browser_auth.rs](../examples/wasm-smoke/tests/browser_auth.rs) | |
 | R55 | done | | Containerised test services and the CI that runs them. `testcontainers` behind the service-backed suites, `connetto-browser-stack` driving the browser gates, the `ci.yml` workflow as the gate, and `docs/devstack-local.md` deleted | [ci.yml](../.github/workflows/ci.yml) | |
@@ -142,7 +142,7 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | R67 | done |  | The native file client, the encrypted chunk store, the manifests and outbox committed with the entry row, the boot integrity pass, the resolver and `tidy_content` |  |  |
 | R68 | done |  | The browser file client, worker-owned encrypted OPFS with memory fallback, reference-counted object URLs and the version 3 archive that restores unsent content |  |  |
 | R69 | done |  | Files in every demo, the offline and online photo flows on the browser stack and the native photos surface in the desktop demo | [photo_flow.rs](../examples/wasm-smoke/tests/photo_flow.rs), [photo_offline.rs](../examples/wasm-smoke/tests/photo_offline.rs), [photo_visibility.rs](../examples/wasm-smoke/tests/photo_visibility.rs), [demo_photos_flow.rs](../examples/dioxus-demo/tests/demo_photos_flow.rs) | [#28](https://github.com/connetto-rs/connetto-rs/pull/28), [#29](https://github.com/connetto-rs/connetto-rs/pull/29), [#30](https://github.com/connetto-rs/connetto-rs/pull/30), [#31](https://github.com/connetto-rs/connetto-rs/pull/31), [#34](https://github.com/connetto-rs/connetto-rs/pull/34), [#35](https://github.com/connetto-rs/connetto-rs/pull/35) |
-| R70 | done |  | The backup and restore story, the `connetto-local-data` archive at version 6 with each queued write carrying its number's secret, the restore procedure in chapter 20 | [restore.rs](../crates/connetto-server/tests/it/restore.rs) | [#59](https://github.com/connetto-rs/connetto-rs/pull/59), [#131](https://github.com/connetto-rs/connetto-rs/pull/131), [#302](https://github.com/connetto-rs/connetto-rs/pull/302), [#306](https://github.com/connetto-rs/connetto-rs/pull/306), [#317](https://github.com/connetto-rs/connetto-rs/pull/317) |
+| R70 | done |  | The backup and restore story, the `connetto-local-data` archive at version 6 with each queued write carrying its number's secret, the restore procedure in chapter 20 | [restore.rs](../examples/demo-tools/tests/it/restore.rs) | [#59](https://github.com/connetto-rs/connetto-rs/pull/59), [#131](https://github.com/connetto-rs/connetto-rs/pull/131), [#302](https://github.com/connetto-rs/connetto-rs/pull/302), [#306](https://github.com/connetto-rs/connetto-rs/pull/306), [#317](https://github.com/connetto-rs/connetto-rs/pull/317) |
 | R71 | done |  | Linux key custody across a reboot, the sealed records, the sandbox keyring, the systemd credential, the wrap key and the desktop proofs | [linux_custody.rs](../crates/connetto-client/tests/it/linux_custody.rs), [desktop-proofs](../scripts/desktop-proofs/) |  |
 | R72 | done |  | Clock discipline, the wall-clock rule per timer class, chapter 21 states it and X6 is closed |  | [#211](https://github.com/connetto-rs/connetto-rs/pull/211), [#212](https://github.com/connetto-rs/connetto-rs/pull/212), [#214](https://github.com/connetto-rs/connetto-rs/pull/214), [#215](https://github.com/connetto-rs/connetto-rs/pull/215) |
 | R73 | done |  | Failover verification, every cursor carries its timeline and one past where that timeline ended resyncs, X7 closed | [failover.rs](../crates/connetto-server/tests/it/failover.rs) | [#55](https://github.com/connetto-rs/connetto-rs/pull/55) |
@@ -155,7 +155,7 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | R85 | done |  | Per-viewer RLS re-execution, the computed subscription's per-viewer identity on the reader pool | [rls_computed.rs](../crates/connetto-server/tests/it/rls_computed.rs) |  |
 | R86 | done |  | The re-run path, the boot refusal asks the real question and the composite-join grading is adopted | [openfga_live.rs](../crates/connetto-server/tests/it/openfga_live.rs), [grant_withdrawal.rs](../crates/connetto-test-harness/tests/it/grant_withdrawal.rs) |  |
 | R87 | done |  | The per-identity commit quota answered `507` under a per-uploader advisory lock, the cached deployment storage and bandwidth ceilings answered `503` with `Retry-After`, the per-day `_cfs_traffic` ledger, one warning and one error per crossing and the client treating `507` as permanent and `503` as transient | [quotas.rs](../crates/connetto-file-server/tests/it/quotas.rs) | [#46](https://github.com/connetto-rs/connetto-rs/pull/46), [#47](https://github.com/connetto-rs/connetto-rs/pull/47), [#49](https://github.com/connetto-rs/connetto-rs/pull/49) |
-| R88 | done |  | The mobile build of a demo, the dioxus demo on Android and iOS through the proof drivers, the emulator and simulator legs on the Tauri demo | [connetto-android-proof.rs](../crates/connetto-test-harness/src/bin/connetto-android-proof.rs), [connetto-ios-proof.rs](../crates/connetto-test-harness/src/bin/connetto-ios-proof.rs) | [#58](https://github.com/connetto-rs/connetto-rs/pull/58), [#60](https://github.com/connetto-rs/connetto-rs/pull/60), [#66](https://github.com/connetto-rs/connetto-rs/pull/66), [#73](https://github.com/connetto-rs/connetto-rs/pull/73), [#165](https://github.com/connetto-rs/connetto-rs/pull/165) |
+| R88 | done |  | The mobile build of a demo, the dioxus demo on Android and iOS through the proof drivers, the emulator and simulator legs on the Tauri demo | [connetto-android-proof.rs](../examples/demo-stack/src/bin/connetto-android-proof.rs), [connetto-ios-proof.rs](../examples/demo-stack/src/bin/connetto-ios-proof.rs) | [#58](https://github.com/connetto-rs/connetto-rs/pull/58), [#60](https://github.com/connetto-rs/connetto-rs/pull/60), [#66](https://github.com/connetto-rs/connetto-rs/pull/66), [#73](https://github.com/connetto-rs/connetto-rs/pull/73), [#165](https://github.com/connetto-rs/connetto-rs/pull/165) |
 | R89 | done |  | A failing re-execution read ends its subscription, the `ReadFailure` three classes with the one retry for the codeless error | [reexec_failure.rs](../crates/connetto-server/tests/it/reexec_failure.rs) | [#51](https://github.com/connetto-rs/connetto-rs/pull/51) |
 | R90 | done |  | The browser's refresh token in an `HttpOnly` cookie, the websocket keeps its bearer, the cross-site refusal proven |  | [#53](https://github.com/connetto-rs/connetto-rs/pull/53) |
 | R91 | done |  | The bot registry and the list cap, the five registry tables, the four `AS RESTRICTIVE` cap policies per synced and registry table and the registration over the connection's challenge | [bot_cap.rs](../crates/connetto-server/tests/it/bot_cap.rs), [bot_registration.rs](../crates/connetto-server/tests/it/bot_registration.rs) | [#152](https://github.com/connetto-rs/connetto-rs/pull/152), [#153](https://github.com/connetto-rs/connetto-rs/pull/153), [#154](https://github.com/connetto-rs/connetto-rs/pull/154) |
@@ -168,6 +168,7 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | R98 | done |  | One schema contract, `ConnettoSchema` with its members and the startup preflight that refuses a missing member | [builder_coverage.rs](../crates/connetto-server/tests/it/builder_coverage.rs) | [#126](https://github.com/connetto-rs/connetto-rs/pull/126) |
 | R105 | done |  | Answering a stolen account, the session record, the session surfaces, the revocation of a second session and the `auth_events` rows |  | [#262](https://github.com/connetto-rs/connetto-rs/pull/262), [#268](https://github.com/connetto-rs/connetto-rs/pull/268), [#274](https://github.com/connetto-rs/connetto-rs/pull/274), [#283](https://github.com/connetto-rs/connetto-rs/pull/283), [#287](https://github.com/connetto-rs/connetto-rs/pull/287), [#289](https://github.com/connetto-rs/connetto-rs/pull/289) |
 | R106 | done |  | Database failures classified by their SQLSTATE, the named transient list for reads, writes and the oplog, the `Deterministic` class and the `42501` refusal as `Unauthorized` | [reexec_failure.rs](../crates/connetto-server/tests/it/reexec_failure.rs) | [#343](https://github.com/connetto-rs/connetto-rs/pull/343), [#356](https://github.com/connetto-rs/connetto-rs/pull/356) |
+| R109 | done |  | A login's content ticket names its session, and the mint and every read and upload request confirm the session is live, so a ticket dies with the session that minted it, and reads are cached privately | [ticket_logout.rs](../crates/connetto-server/tests/it/ticket_logout.rs), [ticket_session.rs](../crates/connetto-server/tests/it/ticket_session.rs), [session_bound.rs](../crates/connetto-file-server/tests/it/session_bound.rs) | [#583](https://github.com/connetto-rs/connetto-rs/pull/583) |
 | R114 | done |  | Every session asks the server about its retained rows, so a `Pending` candidacy outlives a restart, and an `Abandoned` verdict deletes the retained rows it names | [courier_tests.rs](../crates/connetto-client/src/courier_tests.rs), [courier_restore.rs](../crates/connetto-test-harness/tests/it/courier_restore.rs) | [#492](https://github.com/connetto-rs/connetto-rs/pull/492), [#493](https://github.com/connetto-rs/connetto-rs/pull/493) |
 | R115 | done |  | Every session asks about provisional records and stored entries up to each author's signed offer frontier, including provisional entries with no records | [provisional_adjudication.rs](../crates/connetto-client/tests/it/provisional_adjudication.rs), [courier_tests.rs](../crates/connetto-client/src/courier_tests.rs), [courier_restore.rs](../crates/connetto-test-harness/tests/it/courier_restore.rs) | [#495](https://github.com/connetto-rs/connetto-rs/pull/495), [#496](https://github.com/connetto-rs/connetto-rs/pull/496) |
 | R116 | done |  | One live-query hook, `use_live(&source, spec)`, in `connetto-yew`, `connetto-dioxus` and `connetto-leptos` over one loop in `connetto-client`, the Tauri plugin and page source that serve it in a webview, and every demo on it with no hand-written subscription loop | [live_source.rs](../crates/connetto-client/tests/it/live_source.rs), [hook.rs](../crates/connetto-leptos/tests/hook.rs), [tests.rs](../crates/tauri-plugin-connetto/src/tests.rs), [tests.rs](../crates/connetto-tauri-page/src/tests.rs), [live.rs](../crates/connetto-test-harness/src/android_phone/live.rs) | [#563](https://github.com/connetto-rs/connetto-rs/pull/563), [#564](https://github.com/connetto-rs/connetto-rs/pull/564), [#568](https://github.com/connetto-rs/connetto-rs/pull/568), [#569](https://github.com/connetto-rs/connetto-rs/pull/569), [#570](https://github.com/connetto-rs/connetto-rs/pull/570), [#572](https://github.com/connetto-rs/connetto-rs/pull/572) |
@@ -181,12 +182,6 @@ Defects and unowned risks with no phase yet. Each states what the code does and 
 **Browser tabs do not receive membership rows.** The relay in [relay.rs](../crates/connetto-web/src/relay.rs) neither forwards `MembershipOpened` nor opens tab-level membership subscriptions, so a tab reading through a membership-shaped policy sees empty results.
 
 Fixed in one pull request in `relay.rs`. The hub forwards `MembershipOpened`, mirrors membership tables into tab snapshots, live routing and resync, proven by a tab reading the demo's membership-shaped `team_notes_p` policy.
-
-### G5
-
-**A content ticket outlives the session that minted it.** Every fetch rechecks the file's visibility to the ticket's caller (`file_visible_to_caller` in [serve.rs](../crates/connetto-file-server/src/serve.rs)), so a revoked share, a revoked grant or an erased row denies at once. What outlives the session is the caller's identity. After a logout or a revoked session, a cached ticket keeps reading the files that identity can still see until its expiry, `CONNETTO_CONTENT_TICKET_TTL_SECS` (default 3600 s) plus the server skew.
-
-Taken by [R109](#r109-content-tickets-bound-to-their-session).
 
 ### G6
 
@@ -225,6 +220,8 @@ A diverging note from `rls2fga` for a policy translated to no access is an upstr
 4. **The keyring store pins, R51, R52 and R53, done phases whose patches retire when a release carries the change.** The R51 pin waits on the shared-authentication change, [`apple-native-keyring-store` #26](https://github.com/open-source-cooperative/apple-native-keyring-store/pull/26), which stands on `rust-security-framework`'s typed authentication context, [#263](https://github.com/kornelski/rust-security-framework/pull/263) and [#264](https://github.com/kornelski/rust-security-framework/pull/264), all open, and the keychain crate cannot release while it depends on the unreviewed `security-framework` pull requests, so those decide when the patch goes. The R52 pin carries the unlock-once store option, requested as [`android-native-keyring-store` issue #16](https://github.com/open-source-cooperative/android-native-keyring-store/issues/16), open, and the release behind it waits on [`rust-mobile/ndk-context` #6](https://github.com/rust-mobile/ndk-context/pull/6) and [#7](https://github.com/rust-mobile/ndk-context/pull/7), open. The R53 pin, shared with R74's TPM signing key, waits on [`windows-native-keyring-store` #19](https://github.com/open-source-cooperative/windows-native-keyring-store/pull/19), open.
 
 5. **Merged and pinned, holding no build.** `diesel`'s SQLSTATE stack, #5332 to #5336, and `diesel_async`'s half, [#306](https://github.com/diesel-rs/diesel_async/pull/306) and [#307](https://github.com/diesel-rs/diesel_async/pull/307), are merged on their `main` branches and unreleased, and the root workspace follows both through its `[patch.crates-io]` entries for R106. `diesel_async` `main` also carries #214, the async DSL bound to diesel's marked types, and `sqlite-diff-rs` 0.18.1 carries the adjustment that bound needed. `pg_walstream` #141 and #142, the startup metadata API and `AlignedSnapshot::capture`, are merged on `isdaniel/pg-walstream` `main` and unreleased, and the subql durable engine and replication reader, `LucaCappelletti94/subql` #207 and #208 and `connetto-rs/subql` #223 and #224, are merged on `connetto-rs/subql` `main` and unreleased. None of these gates a build step, and each pin retires when a release carries the change.
+
+6. **R117, typed aggregate wire.** Slice 1 needs subql to answer the `WireType` of every group column, aggregate output and computed-row column and to encode evaluated values in the storage form `pgoutput_patchset` uses for rows, requested as `upstream/storage-encoded-results` on `connetto-rs/subql`. `max` and `min` over a `TimestampUTC` column need a `rosetta-utc` release carrying [#23](https://github.com/connetto-rs/rosetta-utc/pull/23), merged on `main` with [#22](https://github.com/connetto-rs/rosetta-utc/pull/22) and [#24](https://github.com/connetto-rs/rosetta-utc/pull/24).
 
 # Designs without a phase
 
@@ -417,6 +414,7 @@ A registered bot connects, for one installation or as itself, proves its key, an
 4. **Removal, a ban on the bot or on one installation, a deleted bot and a key rotation close the affected connections at once.** Deleting an installation closes its connection with `SessionRevoked`, a ban of the bot or of one installation id refuses the logins it names and closes the connections, and deleting the bot refuses everything and closes its connections. A key rotation registers the new key through a fresh one-time code and stops the old one at once, so the connections the old key held close and re-login under the new key. A woken bot costs one signature per wake and catches up from its cursor, kept per installation. R19's throttle counts failed logins per bot id after the signature verifies and per connection before it.
 5. **Metering.** An installation connection bills the owner it serves (`owner:<id>`), a bot-level connection the bot's owner. The bot identity holds no bucket.
 6. **Audit.** `BotRegistered`, `BotListRegistered`, `BotKeyRotated`, `BotRemoved` and `BotLoginRefused`. Successful logins are not audited, since a woken bot logs in on every wake. Adding and accepting are the installation row's own changes.
+7. **A key login's principal says so.** The principal a key login yields is marked as holding no stored session, so the content ticket mint names no session for it and the file server never asks the auth store about a session it never held, as [18-file-handling.md](../docs/architecture/18-file-handling.md#the-wire-tickets-and-the-mint) states for every ticket minted with no login.
 
 ### Lifetime, every event against every situation
 
@@ -1229,38 +1227,6 @@ Docker-gated. A deployment refused at startup leaves the OpenFGA store untouched
 
 A deployment can name connetto's kinds in its policies and grant each kind its own table privileges, a policy for a role outside connetto serves none of connetto's callers, every refusal comes before anything is written, and Postgres, OpenFGA and each kind's client copy agree on what each kind may read and write.
 
-## R109: content tickets bound to their session
-
-**Blocked on** nothing.
-
-**Changes state.** Client tables, none. Server tables, none. Wire messages, the content ticket gains the minting session. Archive format, none.
-
-### Purpose
-
-Every fetch already rechecks that the ticket's caller may see the file, so a revoked share or an erased row denies at once. What a ticket outlives is its session, [G5](#g5). After a logout or a revoked session, a cached ticket keeps reading the files that identity can still see until it expires. This phase makes the session's end the ticket's end.
-
-### Decisions, taken with the maintainer
-
-1. **The ticket names its session and every fetch confirms it is live.** The signed payload gains the session that minted it, and the file server consults the session's liveness on every read through a check the server builder wires to `AuthService::session_is_live`, so a logout or a revocation cuts every cached ticket of that session at its next request.
-
-### Open points
-
-1. **A ticket minted by a share key alone**, with no session behind it. Whether it binds to the share key's own liveness or keeps the expiry as its only bound.
-2. **The cost of the check.** One store read per fetch, or a short-lived cache of live sessions, and what the cache's lifetime adds to the lag.
-
-### Steps
-
-1. The ticket payload carries the minting session, signed with the rest.
-2. The file server's configuration takes a liveness check, the builder wires it to the auth store, and every read refuses a ticket whose session is not live, answering as it answers a file the caller may not see.
-
-### Proof
-
-Docker-gated. A ticket minted in a session reads a file, the session logs out, and the same ticket is refused at once, while a ticket of another live session of the same identity keeps reading.
-
-### Done when
-
-No content read succeeds for a ticket whose session has ended.
-
 ---
 
 ## R110: a session bound by provider staleness
@@ -1424,6 +1390,41 @@ Use CI history as the source of flakiness evidence. After an edit, hammer only t
 ### Done when
 
 No wait in the workspace synchronises on a timer except sites carrying an `expect` and a reason, the clippy guard refuses a new one, and each converted test passes its targeted repetition run.
+
+---
+
+## R117: typed aggregate wire
+
+**Status.** NOT STARTED. Every design point is decided with the maintainer.
+
+**Changes state.** Client tables, `_connetto_aggregates` is dropped and each statistic rests in its own `STRICT` table `_connetto_stat_<query_id>`. Server tables, none. Wire messages, `AggregateUpdate` carries typed SQLite values in place of `group_values_json` and `result_json`, and a new `AggregateColumns` frame carries each output's SQLite type, with `PROTOCOL_VERSION` at 7. Archive format, none.
+
+### Purpose
+
+The server renders every aggregate value and group value as JSON from its own value type, so two `BYTEA` group values can reach the client as one key, and a uuid or `timestamptz` arrives in a form that neither compares with nor decodes like the replica's own rows. The client decodes through a connetto trait implemented only for diesel's own types, so a `rosetta_uuid::Uuid`, a `TimestampUTC` or a synql enum cannot be an aggregate value or a group key without per-type code in connetto.
+
+### Decisions, taken with the maintainer
+
+1. **One encoding.** Every value an aggregate frame carries is encoded as the replica stores the column it comes from, by subql's encoder beside `pgoutput_patchset`, so rows and aggregates share one definition of every storage form.
+2. **Column types from the server.** subql answers each output's `WireType`. An output with no catalog column behind it has none, its cells are encoded in their value family's default form and its column is declared `ANY`. The server sends the types once at each registration in `AggregateColumns`, before any update and also when the result is empty.
+3. **One `STRICT` table per statistic**, keyed by `(binds, group_key)`, created at registration, written with `sql_query` and read with `sql::<ST>(..).bind(..)`, so `V: Queryable<ST, Sqlite>` and `K` likewise are the only bounds. A type mismatch at a later registration drops and recreates the table. The forget sweep drops it with its query row. `_connetto_aggregates` is dropped on first start, its values returning with the next push.
+4. **Per-group updates.** A push reads and decodes its own group only.
+5. **Local tier.** `watch_groups` over local tables re-executes the query on each change and diffs into the same `LiveGroups` map, and local `watch_value` decodes through diesel.
+6. **Webview.** The native core decodes into `K` and `V` and sends those over IPC with serde.
+
+### Steps
+
+1. Protocol 7 end to end in one slice, since the frame change compiles only with server and client together. `AggregateWire`, `GroupKeyWire`, `GroupedProjectionWire` and the `postgres-types` feature go.
+2. The local tier.
+3. The Tauri page, unless slice 1 must carry it.
+
+### Proof
+
+A group keyed on a uuid, one keyed on a `BYTEA` column holding two values that differ only in invalid UTF-8, and a `max` over a `TimestampUTC` column each decode into the application's own types on a fresh subscribe, after an offline restart and after a reconnect, with the stored values byte-identical to the replica's rows of the same columns.
+
+### Done when
+
+Any type a generated model loads from the replica works as an aggregate value, a group key and a computed-row column, with no per-type code in connetto and no Cargo feature.
 
 ---
 

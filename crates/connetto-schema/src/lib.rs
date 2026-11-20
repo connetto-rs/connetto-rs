@@ -27,11 +27,10 @@
 //! current major holds no export, when that export is stale, or when its
 //! majors hold a gap.
 //!
-//! The `connetto-schema export-tier` command, the crate's binary
-//! `connetto-schema`, writes that current export instead. It translates the
+//! [`export_tier`] writes that current export instead. It translates the
 //! tier over the major the schema source declares and writes that major's
 //! `<N>.sql` alone, so it never rewrites the exports of the majors below
-//! the current one. With `--check` it writes nothing and fails instead when
+//! the current one. In `check` mode it writes nothing and fails instead when
 //! the current export is missing or stale, the gate a CI run adds to keep a
 //! history fresh.
 
@@ -109,7 +108,7 @@ pub enum SchemaError {
         dir: std::path::PathBuf,
     },
     /// The tier history holds no export for the build's own major.
-    #[error("the tier history holds no export for major {major}, run `connetto-schema export-tier --schema <schema> --tier <tier> --dir {dir}`", dir = .dir.display())]
+    #[error("the tier history holds no export for major {major}, write it with `connetto_schema::export_tier` into {dir}", dir = .dir.display())]
     MissingExport {
         /// The major the export is missing for.
         major: u32,
@@ -120,7 +119,7 @@ pub enum SchemaError {
     },
     /// The tier history's export for the build's major differs from the
     /// translation the build just computed.
-    #[error("the export {path} for major {major} is stale against the current sources, run `connetto-schema export-tier` over them", path = .path.display())]
+    #[error("the export {path} for major {major} is stale against the current sources, rewrite it with `connetto_schema::export_tier`", path = .path.display())]
     StaleExport {
         /// The major the export is stale for.
         major: u32,

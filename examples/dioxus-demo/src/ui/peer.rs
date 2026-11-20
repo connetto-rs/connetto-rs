@@ -30,7 +30,7 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
     let mut peer_port: Signal<Option<u16>> = use_signal(|| None);
     // One line per linked peer, read off the node on the same pace, so a
     // replaced link never leaves its old address on the page.
-    let mut peers: Signal<Vec<String>> = use_signal(Vec::new);
+    let mut peers: Signal<Vec<connetto_demo_support::view::LinkedPeer>> = use_signal(Vec::new);
     // The Bluetooth standing and the host's beacon, read on the same pace.
     let mut bluetooth_line: Signal<String> = use_signal(|| "bluetooth: unsupported".to_owned());
     let mut beacon_line: Signal<String> =
@@ -53,14 +53,20 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
                     if *beacon_line.peek() != line {
                         beacon_line.set(line);
                     }
-                    let mut lines: Vec<String> = parts
+                    let mut lines: Vec<_> = parts
                         .0
                         .native
                         .linked_peers()
                         .iter()
-                        .map(|link| nearby::linked_line(&link.peer, link.remote))
+                        .map(|link| nearby::linked_peer(&link.peer, link.remote))
                         .collect();
-                    lines.sort();
+                    lines.sort_by(|left, right| {
+                        (&left.peer.account, &left.peer.key_prefix, &left.remote).cmp(&(
+                            &right.peer.account,
+                            &right.peer.key_prefix,
+                            &right.remote,
+                        ))
+                    });
                     if *peers.peek() != lines {
                         peers.set(lines);
                     }
@@ -186,7 +192,7 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
     let mut links_off: Signal<bool> = use_signal(|| false);
 
     let certificate = parts.0.native.device_certificate();
-    let peer_line = nearby::peer_line(
+    let listening = nearby::listening(
         peer_port(),
         certificate
             .as_ref()
@@ -219,12 +225,27 @@ pub(crate) fn PeerPanel(parts: SessionParts) -> Element {
                     Icon { icon: FaCircleInfo, width: 14, height: 14 }
                     "Status"
                 }
-                p { {peer_line} }
+                p {
+                    if let Some(listening) = listening {
+                        "peer: listening on {listening.port} as "
+                        super::Badge { account: listening.me.account }
+                        "/{listening.me.key_prefix}"
+                    } else {
+                        "peer: not serving"
+                    }
+                }
                 p { {bluetooth_line()} }
                 p { {beacon_line()} }
                 p { {connetto_demo_support::view::links_line(links_off())} }
-                for line in peers.iter().cloned() {
-                    p { {line} }
+                for link in peers {
+                    p {
+                        "linked: "
+                        super::Badge { account: link.peer.account }
+                        "/{link.peer.key_prefix}"
+                        if let Some(remote) = link.remote {
+                            " via {remote}"
+                        }
+                    }
                 }
                 for line in nearby_lines {
                     p { {line} }

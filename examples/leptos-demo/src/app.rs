@@ -18,12 +18,38 @@ use connetto_demo_support::view::{Action, LogoutState, Session, View};
 /// panes or their skeleton.
 #[component]
 pub fn App(view: RwSignal<View>) -> impl IntoView {
-    let nearby_stands = Memo::new(move |_| view.with(|v| v.nearby.is_some()));
-    let team_stands = Memo::new(move |_| view.with(|v| v.attached && v.team.is_some()));
+    provide_context(view);
+    let standing = Memo::new(move |_| view.with(|state| (state.identity.clone(), state.attached)));
     view! {
         <style>{support::CSS}</style>
         <div class="wrap">
-            <Header view=view />
+            <header><h1>{APP_TITLE}</h1></header>
+            {move || {
+                standing.track();
+                view! { <Screen view=view /> }
+            }}
+        </div>
+    }
+}
+
+/// The account and panes sharing one live names subscription.
+#[component]
+fn Screen(view: RwSignal<View>) -> impl IntoView {
+    if view.with_untracked(|state| state.attached && state.identity.is_some())
+        && let Some(source) = platform::source()
+    {
+        let names = use_live(&source, support::UserNames);
+        provide_context(Memo::new(move |_| {
+            names.value().with(|rows| {
+                rows.iter()
+                    .map(|user| (user.id.to_string(), user.login_name.clone()))
+                    .collect::<std::collections::BTreeMap<String, String>>()
+            })
+        }));
+    }
+    let nearby_stands = Memo::new(move |_| view.with(|state| state.nearby.is_some()));
+    let team_stands = Memo::new(move |_| view.with(|state| state.attached && state.team.is_some()));
+    view! {
             <AccountBar view=view />
             {move || nearby_stands.get().then(|| view! { <NearbyPane view=view /> })}
             {move || {
@@ -34,7 +60,87 @@ pub fn App(view: RwSignal<View>) -> impl IntoView {
                     .map(|source| view! { <TeamNotesPane view=view source=source /> })
             }}
             <Dashboard view=view />
-        </div>
+
+    }
+}
+
+/// Resolve a synced name before the device's stored name.
+fn badge_name(account: String) -> Memo<Option<String>> {
+    let names = use_context::<Memo<std::collections::BTreeMap<String, String>>>();
+    let state = expect_context::<RwSignal<View>>();
+    Memo::new(move |_| {
+        names
+            .and_then(|names| names.with(|names| names.get(&account).cloned()))
+            .or_else(|| {
+                state.with(|state| {
+                    state
+                        .account
+                        .iter()
+                        .chain(state.stored_account.iter())
+                        .chain(state.known_accounts.iter())
+                        .chain(state.picking.iter().flatten())
+                        .find_map(|entry| {
+                            (entry.label == account)
+                                .then(|| entry.name.clone())
+                                .flatten()
+                        })
+                })
+            })
+    })
+}
+
+/// The account glyph, name and short identity.
+#[component]
+fn Badge(account: String) -> impl IntoView {
+    let name = badge_name(account.clone());
+    let badge = support::badge::AccountBadge::of(&account);
+    view! {
+        <span class="badge" data-account=account style=format!("--badge-hue: {}", badge.hue)>
+            <Fa icon=Icon::Animal(badge.animal) />
+            {move || name.get().map(|name| view! { <span class="badge-name">{name}</span> " " })}
+            <span class="badge-short">{badge.short}</span>
+        </span>
+    }
+}
+
+/// The confirmation or failure for one stored account.
+#[component]
+fn StoredDeleteControls(view: RwSignal<View>, account: String) -> impl IntoView {
+    use support::view::StoredDeleteState;
+    move || {
+        let state = view.with(|state| {
+            state
+                .stored_delete
+                .as_ref()
+                .filter(|delete| delete.account == account)
+                .map(|delete| delete.state.clone())
+        });
+        let confirm = |line: String, button: &'static str| {
+            let account_key = account.clone();
+            view! {
+                <div class="confirm">
+                    <p>{line}</p>
+                    <button class="danger" on:click=move |_| act(Action::DeleteStoredAccount { account: account_key.clone(), force: true })>{button}</button>
+                    <button on:click=move |_| act(Action::CancelStoredDelete)>"Cancel"</button>
+                </div>
+            }.into_any()
+        };
+        state.map(|state| match state {
+            StoredDeleteState::Working => view! { <p>"Working..."</p> }.into_any(),
+            StoredDeleteState::Error(error) => view! {
+                <p class="error">"Error: " {error}</p>
+                <button on:click=move |_| act(Action::CancelStoredDelete)>"Cancel"</button>
+            }
+            .into_any(),
+            StoredDeleteState::Confirm { unsynced_count } => confirm(
+                support::logout_confirm_line(u64::try_from(unsynced_count).unwrap_or(u64::MAX)),
+                "Confirm: delete this account",
+            ),
+            StoredDeleteState::Unreadable(reason) => confirm(
+                format!("This account's local data cannot be read: {reason}"),
+                "Delete anyway",
+            ),
+        })
     }
 }
 
@@ -62,16 +168,17 @@ const APP_TITLE: &str = "connetto demo";
 #[cfg(not(feature = "tauri"))]
 const APP_TITLE: &str = "connetto web demo (Leptos)";
 
-/// The app name, and the status, gate, device, storage, custody and expiry
-/// lines.
+/// The status and account security controls. The device line stands here
+/// whenever the page has no nearby panel to carry it.
 #[component]
-fn Header(view: RwSignal<View>) -> impl IntoView {
+fn AccountStatus(view: RwSignal<View>) -> impl IntoView {
     view! {
-        <header>
-            <h1>{APP_TITLE}</h1>
+        <div>
             <p class="status">"status: " {move || view.with(|v| v.status.clone())}</p>
             {move || status_line(view.with(|v| v.gate_line.clone()))}
-            <p class="status">"device: " {move || view.with(|v| v.device_line.clone())}</p>
+            <Show when=move || view.with(|state| state.nearby.is_none())>
+                <p class="status">"device: " {move || view.with(|state| state.device_line.clone())}</p>
+            </Show>
             <p class="status">{move || view.with(|v| v.storage.clone())}</p>
             <Show when=move || view.with(|v| v.offers_unlock)>
                 <button on:click=move |_| act(Action::Unlock)>
@@ -84,7 +191,7 @@ fn Header(view: RwSignal<View>) -> impl IntoView {
                 view.with(|v| v.expiry_warning.clone())
                     .map(|warn| view! { <p class="warn">{warn}</p> })
             }}
-        </header>
+        </div>
     }
 }
 
@@ -107,6 +214,9 @@ fn AccountBar(view: RwSignal<View>) -> impl IntoView {
                     view! { <SignIn view=view /> }.into_any()
                 }
             }}
+            <Show when=move || session() != Session::SignedIn>
+                <AccountStatus view=view />
+            </Show>
         </section>
     }
 }
@@ -129,12 +239,8 @@ fn SignIn(view: RwSignal<View>) -> impl IntoView {
 /// The stored account a restoring page is signing back in as.
 #[component]
 fn Restoring(view: RwSignal<View>) -> impl IntoView {
-    let label = move || {
-        view.with(|v| v.stored_account.as_ref().map(|entry| entry.label.clone()))
-            .unwrap_or_default()
-    };
     view! {
-        <p>"Signed in as " {move || short_code(label())}</p>
+        <p>"Signed in as " {move || view.with(|state| state.stored_account.as_ref().map(|entry| view! { <Badge account=entry.label.clone() /> }))}</p>
     }
 }
 
@@ -158,7 +264,7 @@ fn Picker(view: RwSignal<View>) -> impl IntoView {
                                     })
                                 }>
                                     <Fa icon=Icon::RightToBracket />
-                                    "Sign in as " {label}
+                                    "Sign in as " <Badge account=label />
                                 </button>
                             }
                         })
@@ -177,15 +283,7 @@ fn Picker(view: RwSignal<View>) -> impl IntoView {
 /// logout controls.
 #[component]
 fn SignedIn(view: RwSignal<View>) -> impl IntoView {
-    let uid = move || view.with(|v| v.identity.clone().unwrap_or_default());
-    let account_tag = move || {
-        view.with(|v| {
-            v.account
-                .as_ref()
-                .map(|entry| entry.label.clone())
-                .filter(|label| Some(label) != v.identity.as_ref())
-        })
-    };
+    let identity = move || view.with(|state| state.identity.clone().unwrap_or_default());
     let switches = move || {
         view.with(|v| {
             v.known_accounts
@@ -198,25 +296,33 @@ fn SignedIn(view: RwSignal<View>) -> impl IntoView {
     view! {
         <p>
             "Signed in as "
-            {move || short_code(uid())}
-            {move || {
-                account_tag().map(|label| view! { " (account: " {short_code(label)} ")" })
-            }}
+            {move || view! { <Badge account=identity() /> }}
         </p>
+        <AccountStatus view=view />
         <div class="row">
             {move || {
                 switches()
                     .into_iter()
                     .map(|(key, label)| {
+                        let delete_key = key.clone();
+                        let controls_key = key.clone();
+                        let badge_label = label.clone();
+                        let name = badge_name(label.clone());
                         view! {
-                            <button on:click=move |_| {
-                                act(Action::SwitchAccount {
-                                    account: key.clone(),
-                                })
-                            }>
-                                <Fa icon=Icon::ArrowRightArrowLeft />
-                                "Switch to " {label}
-                            </button>
+                            <div>
+                                <button on:click=move |_| {
+                                    act(Action::SwitchAccount { account: key.clone() })
+                                }>
+                                    <Fa icon=Icon::ArrowRightArrowLeft />
+                                    "Switch to " <Badge account=label />
+                                </button>
+                                <button class="danger"
+                                    aria-label=move || format!("Delete {}", support::view::badge_text(&badge_label, name.get().as_deref()))
+                                    on:click=move |_| act(Action::DeleteStoredAccount { account: delete_key.clone(), force: false })>
+                                    <Fa icon=Icon::TrashCan />
+                                </button>
+                                <StoredDeleteControls view=view account=controls_key />
+                            </div>
                         }
                     })
                     .collect_view()
@@ -232,6 +338,9 @@ fn SignedIn(view: RwSignal<View>) -> impl IntoView {
                 </button>
             </Show>
         </div>
+        {move || view.with(|state| state.stored_delete.as_ref()
+            .filter(|delete| !state.known_accounts.iter().any(|entry| entry.key == delete.account))
+            .map(|delete| view! { <StoredDeleteControls view=view account=delete.account.clone() /> }))}
         <LogoutControls view=view />
     }
 }
@@ -874,7 +983,7 @@ fn NearbyPane(view: RwSignal<View>) -> impl IntoView {
             {move || {
                 let near = view.with(|v| v.nearby.clone().unwrap_or_default());
                 let support::view::NearbyView {
-                    peer_line,
+                    listening,
                     bluetooth_line,
                     beacon_line,
                     linked,
@@ -893,11 +1002,21 @@ fn NearbyPane(view: RwSignal<View>) -> impl IntoView {
                             <Fa icon=Icon::CircleInfo />
                             "Status"
                         </h4>
-                        <p>{peer_line}</p>
+                        {cfg!(feature = "tauri").then(|| view! {
+                            <p class="status">"device: " {move || view.with(|state| state.device_line.clone())}</p>
+                        })}
+                        <p>{match listening {
+                            Some(listening) => view! { "peer: listening on " {listening.port} " as " <Badge account=listening.me.account /> "/" {listening.me.key_prefix} }.into_any(),
+                            None => "peer: not serving".into_any(),
+                        }}</p>
                         <p>{bluetooth_line.clone()}</p>
                         <p>{beacon_line}</p>
                         <p>{support::view::links_line(links_off)}</p>
-                        {linked.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
+                        {linked.into_iter().map(|peer| view! {
+                            <p>"linked: " <Badge account=peer.peer.account /> "/" {peer.peer.key_prefix}
+                                {peer.remote.map(|remote| format!(" via {remote}"))}
+                            </p>
+                        }).collect_view()}
                         {nearby_lines.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
                         {offer.map(|offer| {
                             view! {
@@ -1104,7 +1223,7 @@ fn TeamNotesPane(view: RwSignal<View>, source: Source) -> impl IntoView {
                             "peer activity"
                         </h3>
                         <div class="lines">
-                            {events.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
+                            {events.into_iter().map(|event| view! { <p>{event.line}{event.by.map(|account| view! { " by " <Badge account=account /> })}</p> }).collect_view()}
                         </div>
                     }
                 })
@@ -1163,7 +1282,7 @@ fn TeamNotes(view: RwSignal<View>, source: Source, team: String) -> impl IntoVie
             rows.iter()
                 .map(|note| {
                     let account = accounts.get(&note.id.to_string()).map(String::as_str);
-                    view! { <p>{support::team_note_line(note, account)}</p> }
+                    view! { <p>"note: " {note.body.clone()} " by " <Badge account=note.author_id.to_string() /> {account.map(|account| format!(" (provisional from {account})"))}</p> }
                 })
                 .collect_view()
         })

@@ -6,8 +6,8 @@ use std::time::SystemTime;
 
 use connetto_client::teardown::ExpiryWarning;
 use connetto_client::{
-    ClientError, ClientEvent, ConnettoClient, KeyedSpec, LiveGroups, LiveQuery, LiveSpec,
-    LiveValue, StorageUse, SyncSchema, Watchable,
+    ClientError, ClientEvent, ConnettoClient, KeyedSpec, LiveGroups, LiveQuery, LiveSource,
+    LiveSpec, LiveValue, StorageUse, SyncSchema, Watchable,
 };
 use connetto_core::messages::{FatalErrorReason, FullResyncReason, SyncStatus};
 use connetto_core::traits::{MaybeSend, Transport};
@@ -112,6 +112,17 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// Each account's login name, synced for the caller's own account and
+    /// everyone sharing a team with it.
+    users (id) {
+        /// The account id.
+        id -> diesel::sql_types::Text,
+        /// The login name, the identity provider's subject.
+        login_name -> diesel::sql_types::Text,
+    }
+}
+
 diesel::define_sql_function! {
     /// The signed-in account's id, the replica's answer for the caller, which
     /// the roster's membership filter compares against.
@@ -204,6 +215,19 @@ pub struct TeamNote {
     pub author_id: String,
     /// The note's body.
     pub body: String,
+}
+
+/// One row of the synced `users` table.
+#[derive(
+    Queryable, Selectable, Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = users)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct User {
+    /// The account id.
+    pub id: String,
+    /// The login name.
+    pub login_name: String,
 }
 
 /// The one sync schema the worker, every tab and every device build from.
@@ -717,6 +741,55 @@ impl KeyedSpec for TeamNotesFor {
     }
 }
 
+/// Every `users` row this account reads, its own and its teammates', the
+/// names every badge shows.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UserNames;
+
+impl LiveSpec for UserNames {
+    const NAME: &'static str = "user_names";
+    type Row = User;
+    type Handle = LiveQuery<User>;
+
+    fn query<T>(&self) -> impl Watchable<T, Self::Row, Handle = Self::Handle> + use<T>
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: core::fmt::Display,
+    {
+        users::table.order(users::id.asc())
+    }
+}
+
+impl KeyedSpec for UserNames {
+    type Key = String;
+
+    fn key(row: &User) -> String {
+        row.id.clone()
+    }
+}
+
+/// Follow the live `account`'s own login name from `source`, passing it to
+/// `name` on every snapshot that holds the account's row, until the feed
+/// fails with the error passed to `fail` or this future drops.
+pub async fn follow_own_name<Source: LiveSource>(
+    source: Source,
+    account: String,
+    mut name: impl FnMut(&str),
+    fail: impl FnOnce(ClientError),
+) {
+    connetto_client::follow(
+        source,
+        UserNames,
+        |rows| {
+            if let Some(row) = rows.iter().find(|row| row.id == account) {
+                name(&row.login_name);
+            }
+        },
+        fail,
+    )
+    .await;
+}
+
 /// Insert one team note the pane's add button names, the replica minting its
 /// id the way the deployment's key default does.
 ///
@@ -916,58 +989,57 @@ pub fn retract_cause(cause: &connetto_core::exchange::RetractCause) -> String {
     }
 }
 
-/// The panel's one line per R77 event, `applied` rows naming the author's
-/// account, the rest the table and key, or `None` for the events the panel
-/// shows no line for.
+/// The panel's one event per row an R77 event names, `applied` rows with the
+/// author's account, the rest the table and key alone, and none for the
+/// events the panel shows nothing for.
 #[cfg(feature = "peer")]
 #[must_use]
-pub fn provisional_event_lines(event: &ClientEvent) -> Vec<String> {
+pub fn provisional_events(event: &ClientEvent) -> Vec<crate::view::TeamEvent> {
+    use crate::view::TeamEvent;
     match event {
         ClientEvent::ProvisionalApplied { rows, .. } => rows
             .iter()
-            .map(|row| {
-                format!(
-                    "provisional: applied {} {} by {}",
-                    row.table,
-                    key_text(&row.key),
-                    row.account
-                )
+            .map(|row| TeamEvent {
+                line: format!("provisional: applied {} {}", row.table, key_text(&row.key)),
+                by: Some(row.account.clone()),
             })
             .collect(),
         ClientEvent::ProvisionalConfirmed { rows } => rows
             .iter()
             .map(|row| {
-                format!(
+                TeamEvent::plain(format!(
                     "provisional: confirmed {} {}",
                     row.table,
                     key_text(&row.key)
-                )
+                ))
             })
             .collect(),
         ClientEvent::ProvisionalRetracted { cause, rows, .. } => rows
             .iter()
             .map(|(table, key)| {
-                format!(
+                TeamEvent::plain(format!(
                     "provisional: rolled back {table} {} because {}",
                     key_text(key),
                     retract_cause(cause)
-                )
+                ))
             })
             .collect(),
         ClientEvent::PeerWriteRefused { rows, .. } => rows
             .iter()
-            .map(|(table, key)| format!("provisional: refused {table} {}", key_text(key)))
+            .map(|(table, key)| {
+                TeamEvent::plain(format!("provisional: refused {table} {}", key_text(key)))
+            })
             .collect(),
         // The device's own offline write the server refused, which its peers
         // see rolled back through the verdicts, stands as the same line.
         ClientEvent::MutationRejected { reason, rows, .. } => rows
             .iter()
             .map(|row| {
-                format!(
+                TeamEvent::plain(format!(
                     "provisional: rolled back {} {} because {reason}",
                     row.table,
                     key_text(&row.key)
-                )
+                ))
             })
             .collect(),
         _ => Vec::new(),
@@ -1073,7 +1145,16 @@ mod team_lines_tests {
         );
     }
 
-    /// Each R77 event stands one line per row it names, the other events none.
+    /// The panel's text of each event `provisional_events` stands.
+    fn provisional_event_lines(event: &ClientEvent) -> Vec<String> {
+        provisional_events(event)
+            .iter()
+            .map(crate::view::TeamEvent::text)
+            .collect()
+    }
+
+    /// Each R77 event stands one line per row it names, the other events
+    /// none, and an applied row names its author's account apart.
     #[test]
     fn each_event_stands_its_lines() {
         let id: Uuid = NOTE_ID.into();
@@ -1087,6 +1168,10 @@ mod team_lines_tests {
             [format!(
                 "provisional: applied team_notes {id} by bob@demo.dev"
             )]
+        );
+        assert_eq!(
+            provisional_events(&applied)[0].by.as_deref(),
+            Some("bob@demo.dev")
         );
         let confirmed = ClientEvent::ProvisionalConfirmed {
             rows: vec![record("team_notes", "bob@demo.dev")],

@@ -646,6 +646,9 @@ fn every_enrol_refusal() -> Vec<EnrolRefusal> {
         },
         EnrolRefusal::Revoked,
         EnrolRefusal::AttestationRequired,
+        EnrolRefusal::Refused {
+            reason: "the account is closed".into(),
+        },
     ];
     for reason in &all {
         match reason {
@@ -655,7 +658,8 @@ fn every_enrol_refusal() -> Vec<EnrolRefusal> {
             | EnrolRefusal::InvalidRequest
             | EnrolRefusal::OverCeiling { .. }
             | EnrolRefusal::Revoked
-            | EnrolRefusal::AttestationRequired => {}
+            | EnrolRefusal::AttestationRequired
+            | EnrolRefusal::Refused { .. } => {}
         }
     }
     all

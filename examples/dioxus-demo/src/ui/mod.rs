@@ -2,6 +2,9 @@
 //! shared bits of the panes. It is platform-free, and reaches the platform
 //! only through the contexts the platform's app provides.
 
+mod badge;
+use badge::Badge;
+
 mod notes;
 mod orders;
 mod photos;
@@ -188,7 +191,6 @@ fn Header() -> Element {
 #[component]
 fn AccountBar() -> Element {
     let UserId(user_id) = use_context::<UserId>();
-    let AccountKey(account_key) = use_context::<AccountKey>();
     let Accounts(accounts) = use_context::<Accounts>();
     let PickerActive(picker_active) = use_context::<PickerActive>();
     let AccountAnswer(account_answer) = use_context::<AccountAnswer>();
@@ -203,16 +205,7 @@ fn AccountBar() -> Element {
 
     let uid = user_id.read().clone().unwrap_or_default();
     let signed_in = !uid.is_empty();
-    let account = account_key.read().clone();
-    let dup = account
-        .as_deref()
-        .map(support::account_label)
-        .filter(|label| *label == uid);
     let accounts_now = accounts.read().clone();
-    let account_tag: Option<String> = account
-        .as_deref()
-        .filter(|_| dup.is_none())
-        .map(support::account_label);
     let picker_now = *picker_active.read();
 
     let picker_html: Element = if picker_now {
@@ -230,7 +223,8 @@ fn AccountBar() -> Element {
                                 }
                             },
                             Icon { icon: FaRightToBracket, width: 14, height: 14 }
-                            "Sign in as {acc_label}"
+                            "Sign in as "
+                            Badge { account: acc_label }
                             if is_current { " (current)" }
                         }
                     }
@@ -280,12 +274,7 @@ fn AccountBar() -> Element {
                 }
                 p {
                     "Signed in as "
-                    code { class: "id", title: uid.clone(), {support::short_id(&uid)} }
-                    if let Some(label) = account_tag.clone() {
-                        " (account: "
-                        code { class: "id", title: label.clone(), {support::short_id(&label)} }
-                        ")"
-                    }
+                    Badge { account: uid.clone() }
                 }
                 div { class: "row",
                     for (acc_key, acc_label, _) in accounts_now.iter().filter(|(_, _, current)| !*current) {
@@ -301,7 +290,8 @@ fn AccountBar() -> Element {
                                 }
                             },
                             Icon { icon: FaArrowRightArrowLeft, width: 14, height: 14 }
-                            "Switch to {acc_label}"
+                            "Switch to "
+                            Badge { account: acc_label.clone() }
                         }
                     }
                     button {
@@ -568,7 +558,13 @@ pub fn Page(
     peer: Option<Element>,
     teams: Option<Element>,
 ) -> Element {
-    rsx! {
+    let stored = use_signal(crate::platform::read_badge_names);
+    use_context_provider(|| badge::StoredNames(stored));
+    let UserId(identity) = use_context::<UserId>();
+    let ClientSlot(client) = use_context::<ClientSlot>();
+    let account = identity.read().clone();
+    let named = ready && client.read().is_some() && account.is_some();
+    let page = rsx! {
         style { {support::CSS} }
         div { class: "wrap",
             Header {}
@@ -587,5 +583,10 @@ pub fn Page(
                 p { class: "status", "Connecting to the connetto stack..." }
             }
         }
+    };
+    if named {
+        rsx! { badge::NamedScreen { key: "{account:?}", children: page } }
+    } else {
+        page
     }
 }

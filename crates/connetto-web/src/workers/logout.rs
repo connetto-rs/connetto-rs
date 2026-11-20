@@ -18,8 +18,14 @@ pub struct LogoutConfig {
     pub auth_db_name: String,
     /// Name of the replica database.
     pub replica_db_name: String,
+    /// Prefix used to derive stored accounts' replica names.
+    pub replica_db_prefix: String,
+    /// The worker's unlocked key store.
+    pub key_store: std::rc::Rc<crate::auth::IdbKeyStore>,
     /// Content-file wipe namespace, if any.
     pub content_namespace: Option<String>,
+    /// Seed used to derive each stored account's content namespace.
+    pub content_namespace_seed: Option<String>,
     /// Authenticated account identifier, if any.
     pub account: Option<String>,
 }
@@ -42,6 +48,7 @@ pub fn serve_logout_requests(
         }
     })?;
     let listener = {
+        let requests = std::rc::Rc::new(tokio::sync::Mutex::new(()));
         let channel = channel.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             let Some(text) = event.data().as_string() else {
@@ -53,7 +60,9 @@ pub fn serve_logout_requests(
             let channel = channel.clone();
             let hub = hub.clone();
             let config = config.clone();
+            let requests = std::rc::Rc::clone(&requests);
             spawn_local(async move {
+                let _request = requests.lock().await;
                 if let Some(reply) = serve_logout(&request, &hub, &config).await {
                     post_logout_reply(&channel, &reply);
                 }
@@ -228,6 +237,13 @@ async fn serve_logout(
             return Some(LogoutMessage::Pending { pending });
         }
         LogoutMessage::Logout { delete, force } => (*delete, *force),
+        LogoutMessage::ForgetStored { account, force } => {
+            let account = account.clone();
+            return Some(match forget_stored(&account, *force, hub, config).await {
+                Ok(failed) => LogoutMessage::StoredDone { account, failed },
+                Err(refusal) => LogoutMessage::StoredRefused { account, refusal },
+            });
+        }
         LogoutMessage::ForgetRetired { files } => {
             return handle_forget_retired(files, hub).await;
         }
@@ -238,6 +254,8 @@ async fn serve_logout(
             return handle_retry_refused(file_id, hub).await;
         }
         LogoutMessage::Pending { .. }
+        | LogoutMessage::StoredRefused { .. }
+        | LogoutMessage::StoredDone { .. }
         | LogoutMessage::Done { .. }
         | LogoutMessage::Refused { .. }
         | LogoutMessage::Forgot { .. }
@@ -302,4 +320,144 @@ async fn logout_locally(
     crate::auth::BrowserAuthenticator::new(&auth, redirect_uri, account.map(ToOwned::to_owned))
         .logout(&store)
         .await
+}
+
+/// Read a closed replica without attaching the live shared store.
+async fn stored_work(
+    storage: &crate::storage::ReplicaStorage,
+    keys: &crate::auth::IdbKeyStore,
+    name: &str,
+) -> Result<(crate::auth::PendingWork, Vec<Vec<u8>>), crate::auth::AuthError> {
+    use connetto_core::traits::ReplicaKeyStore;
+    use diesel::Connection;
+
+    if !storage.exists(name) {
+        return Ok((crate::auth::PendingWork::default(), Vec::new()));
+    }
+    let key = keys
+        .load(name)
+        .await?
+        .ok_or_else(|| crate::auth::AuthError::Store("replica key is missing".to_owned()))?;
+    let mut connection = diesel::SqliteConnection::establish(&storage.db_url(name))
+        .map_err(|error| crate::auth::AuthError::Store(error.to_string()))?;
+    connetto_client::cipher::unlock(&mut connection, &key)
+        .map_err(|error| crate::auth::AuthError::Store(error.to_string()))?;
+    let work = connetto_client::stored_replica_work(&mut connection)
+        .map_err(|error| crate::auth::AuthError::Store(error.to_string()))?;
+    let files = (connetto_file_client::content_hooks().unsynced)(&mut connection)
+        .map_err(|error| crate::auth::AuthError::Store(error.to_string()))?;
+    let mut pending = crate::auth::PendingWork {
+        unsynced: work.unsynced,
+        ..crate::auth::PendingWork::default()
+    };
+    for file in files {
+        if file.major.is_some() {
+            pending.held_files += 1;
+        } else {
+            pending.content_files += 1;
+        }
+    }
+    Ok((pending, work.changesets))
+}
+
+/// Depart a stored account before destroying any of its recoverable state.
+async fn forget_stored(
+    account: &str,
+    force: bool,
+    hub: &crate::relay::RelayHub,
+    config: &LogoutConfig,
+) -> Result<Vec<crate::auth::StoredForgetFailure>, crate::auth::StoredForgetRefusal> {
+    use crate::auth::{AccountStore, StoredForgetFailure, StoredForgetRefusal};
+    use crate::storage::{PendingWipe, WipeProgress};
+
+    if config.account.as_deref() == Some(account) {
+        return Err(StoredForgetRefusal::LiveAccount);
+    }
+    let unreadable =
+        |error: crate::auth::AuthError| StoredForgetRefusal::Unreadable(error.to_string());
+    let storage = crate::storage::ReplicaStorage::install().await;
+    storage.reserve(2).await.map_err(unreadable)?;
+    {
+        let accounts =
+            AccountStore::open(&storage.db_url(&config.auth_db_name)).map_err(unreadable)?;
+        if !accounts
+            .accounts()
+            .map_err(unreadable)?
+            .iter()
+            .any(|stored| stored == account)
+        {
+            return Err(StoredForgetRefusal::UnknownAccount);
+        }
+    }
+    let identity: serde_json::Value = connetto_client::decode_identity(account)
+        .map_err(|error| StoredForgetRefusal::Unreadable(error.to_string()))?;
+    let name = connetto_client::replica_db_name(&config.replica_db_prefix, &identity)
+        .map_err(|error| StoredForgetRefusal::Unreadable(error.to_string()))?;
+    let keys = config.key_store.as_ref();
+    let (pending, changesets) = match stored_work(&storage, keys, &name).await {
+        Ok(work) => work,
+        Err(error) if !force => return Err(unreadable(error)),
+        Err(_) => (crate::auth::PendingWork::default(), Vec::new()),
+    };
+    if !pending.is_empty() && !force {
+        return Err(StoredForgetRefusal::Pending(pending));
+    }
+    hub.forget_shared_identity(name.clone(), changesets)
+        .await
+        .map_err(|error| StoredForgetRefusal::Shared(error.to_string()))?;
+    let mut failed = Vec::new();
+    let mut index_cleared = true;
+    if let Err(error) = logout_locally(
+        &config.auth_base_url,
+        config.login_base_url.as_deref(),
+        &config.provider,
+        &config.redirect_uri,
+        &config.auth_db_name,
+        Some(account),
+    )
+    .await
+    {
+        index_cleared = !matches!(error, crate::auth::AuthError::Store(_));
+        failed.push(if index_cleared {
+            StoredForgetFailure::Revoke(error.to_string())
+        } else {
+            StoredForgetFailure::Storage(error.to_string())
+        });
+    }
+    let namespace = config
+        .content_namespace_seed
+        .as_deref()
+        .map(|seed| super::helpers::content_store_namespace(seed, &name));
+    let wipe = PendingWipe::new(&name, namespace).with_account(account);
+    if let Err(error) = crate::storage::mark_wipe_pending(&wipe, &pending, force).await {
+        failed.push(StoredForgetFailure::Storage(error.to_string()));
+        return Ok(failed);
+    }
+    let result = match crate::storage::wipe_replica(
+        &storage,
+        keys,
+        &name,
+        wipe.content_namespace.as_deref(),
+        &pending,
+        force,
+    )
+    .await
+    {
+        Ok(_) if !index_cleared => return Ok(failed),
+        Ok(WipeProgress::Complete) => crate::storage::acknowledge_pending_wipe(&wipe).await,
+        Ok(WipeProgress::ContentPending) => {
+            failed.push(StoredForgetFailure::Storage(
+                "content deletion remains pending".to_owned(),
+            ));
+            crate::storage::defer_pending_content_wipe(&wipe).await
+        }
+        Err(error) => {
+            failed.push(StoredForgetFailure::Storage(error.to_string()));
+            return Ok(failed);
+        }
+    };
+    if let Err(error) = result {
+        failed.push(StoredForgetFailure::Storage(error.to_string()));
+    }
+    Ok(failed)
 }

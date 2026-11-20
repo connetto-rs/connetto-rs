@@ -10,8 +10,9 @@ use connetto_core::messages::{
     EnrolRefusal, EnrolRequest,
 };
 use connetto_core::traits::Transport;
+use connetto_server::defaults::ConnettoDefaults;
 use connetto_server::device_cert::{AndroidStatus, DeviceCertConfig};
-use connetto_server::{SignInNotice, WebSocketTransport};
+use connetto_server::{CommittedNotice, WebSocketTransport};
 use connetto_test_harness::{Fixture, isolated_session_keyring};
 use diesel::QueryableByName;
 use diesel::{ExpressionMethods as _, OptionalExtension as _, QueryDsl as _};
@@ -19,9 +20,9 @@ use diesel_async::RunQueryDsl as _;
 use rcgen::PublicKeyData as _;
 use tokio::net::{TcpListener, TcpStream};
 
-use super::e2e::{PG_SERIAL, mint_token, reset_fixture};
 use super::enrolment::{android_evidence, chip_attestation, device_key, rooted_issuer};
 use super::lifecycle::{admin_pool, builder_over, live_session, next_control, wait_ready};
+use connetto_test_harness::server_fixture::{PG_SERIAL, mint_token, reset_fixture};
 
 #[derive(QueryableByName)]
 struct Count {
@@ -214,11 +215,10 @@ async fn a_built_server_tells_the_application_of_a_first_enrolment() {
     let port = listener.local_addr().expect("local address").port();
     let (builder, _idp, _keys) = builder_over(&fixture, port).await;
     let (_, _, issuer) = rooted_issuer();
-    let told = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let sink = std::sync::Arc::clone(&told);
+    let (told, mut notices) = crate::auth_hooks::Told::<ConnettoDefaults>::channel();
     let parts = builder
         .device_identity(Some(DeviceCertConfig::new(issuer)))
-        .on_sign_in(move |notice| sink.lock().push(notice))
+        .auth_hooks(told)
         .build()
         .await
         .expect("the deployment with device identity assembles");
@@ -234,28 +234,30 @@ async fn a_built_server_tells_the_application_of_a_first_enrolment() {
     let reply = enrol_request(&mut client, &key, nonce, None).await;
     assert!(matches!(reply, ControlMessage::EnrolGrant(_)), "{reply:?}");
 
-    // The enrolment notice reads the session on a spawned task.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while told.lock().len() < 2 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the first enrolment went untold: {:?}",
-            told.lock()
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    let told = told.lock().clone();
-    let [
-        SignInNotice::SignedIn(signed_in),
-        SignInNotice::DeviceEnrolled {
-            session,
-            key: enrolled,
-            device,
-            ..
-        },
-    ] = told.as_slice()
+    let bound = std::time::Duration::from_secs(10);
+    let signed_in = tokio::time::timeout(bound, notices.recv())
+        .await
+        .expect("the sign-in is told within the bound")
+        .expect("the server keeps its hooks");
+    let CommittedNotice::SignedIn {
+        session: signed_in, ..
+    } = signed_in
     else {
-        panic!("expected the sign-in and then the enrolment, got {told:?}");
+        panic!("expected the sign-in first");
+    };
+    // The enrolment notice reads the session on a spawned task.
+    let enrolled = tokio::time::timeout(bound, notices.recv())
+        .await
+        .expect("the first enrolment is told within the bound")
+        .expect("the server keeps its hooks");
+    let CommittedNotice::DeviceEnrolled {
+        session,
+        key: enrolled,
+        device,
+        ..
+    } = enrolled
+    else {
+        panic!("expected the enrolment after the sign-in");
     };
     assert_eq!(
         session, signed_in,
@@ -263,11 +265,11 @@ async fn a_built_server_tells_the_application_of_a_first_enrolment() {
     );
     assert_eq!(session.user_id, user_id);
     assert_eq!(
-        *enrolled,
+        enrolled,
         KeyId::of_public_key(&key.subject_public_key_info())
     );
     assert_eq!(
-        *device,
+        device,
         rmp_serde::to_vec_named(&()).expect("encode"),
         "the device's own descriptor"
     );
@@ -390,156 +392,4 @@ async fn a_chip_proven_enrolment_records_its_level_and_a_renewal_keeps_it() {
 
     stream.abort();
     http.abort();
-}
-
-/// What `connetto-ca init` and `connetto-ca issuer` leave on disk, as the
-/// operator copies it to the server: `root.der` beside an issuer directory.
-fn ca_output(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
-    use connetto_core::device_cert::layout::{ISSUER_CERTIFICATE, ISSUER_KEY, ROOT_CERTIFICATE};
-    use connetto_core::device_cert::{CertificateSerial, DeploymentId, RootCa};
-    use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
-    use std::time::{Duration, SystemTime};
-
-    let day = Duration::from_hours(24);
-    let now = SystemTime::now();
-    let root = RootCa::create(
-        DeploymentId::from_uuid(uuid::Uuid::from_u128(7)),
-        now - day,
-        3650 * day,
-    )
-    .expect("root");
-    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
-    let certificate = root
-        .sign_issuer(
-            &key.subject_public_key_info(),
-            now - day,
-            395 * day,
-            CertificateSerial::new([2; 16]).expect("the serial is positive"),
-        )
-        .expect("issuer");
-    let issuer_dir = dir.join("issuer-2026");
-    std::fs::create_dir(&issuer_dir).expect("issuer dir");
-    std::fs::write(issuer_dir.join(ISSUER_CERTIFICATE), certificate).expect("issuer.der");
-    std::fs::write(issuer_dir.join(ISSUER_KEY), key.serialize_der()).expect("issuer.key");
-    let root_path = dir.join(ROOT_CERTIFICATE);
-    std::fs::write(&root_path, root.certificate()).expect("root.der");
-    (root_path, issuer_dir)
-}
-
-/// The binary reads the device settings from `connetto-ca`'s directories: a
-/// root without an issuer directory refuses naming the setting, and an issuer
-/// directory turns device identity on, so a deployment without the enrolment
-/// tables refuses naming the first.
-#[tokio::test]
-async fn the_binary_turns_device_identity_on_from_the_issuer_directory() {
-    use super::e2e::{
-        Authorization, NO_POLICIES, build_auth_stack, run_server_exit_output, with_user_url,
-    };
-
-    let _keyring = isolated_session_keyring();
-    let _serial = PG_SERIAL.lock().await;
-    let fixture = Fixture::acquire().await;
-    let pool = admin_pool(&fixture).await;
-    reset_fixture(&pool, &fixture).await;
-    fixture.provision_auth_tables().await;
-    let url = fixture.admin_url().to_owned();
-    let reader_url = with_user_url(&url, "app_reader", "app_reader");
-    let auth_stack = build_auth_stack().await;
-    let auth_env = auth_stack.env_pairs("http://127.0.0.1:0");
-    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
-    let ca = tempfile::TempDir::new().expect("ca dir");
-    let (root, issuer_dir) = ca_output(ca.path());
-    let (root, issuer_dir) = (root.display().to_string(), issuer_dir.display().to_string());
-    let base: Vec<(&str, &str)> = auth_env
-        .iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .chain(authorization.env_pairs())
-        .collect();
-
-    let mut root_only = base.clone();
-    root_only.push(("CONNETTO_DEVICE_ROOT", &root));
-    let output = run_server_exit_output(&url, Some(&reader_url), &root_only).await;
-    assert!(!output.status.success(), "a root alone refuses");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("CONNETTO_DEVICE_ROOT is set without CONNETTO_DEVICE_ISSUER_DIR"),
-        "{stderr}"
-    );
-
-    let mut on = base;
-    on.push(("CONNETTO_DEVICE_ROOT", &root));
-    on.push(("CONNETTO_DEVICE_ISSUER_DIR", &issuer_dir));
-    // The publication setup creates the enrolment base table, so the first
-    // enrolment table the boot names is the certificate one (R77 decision 11).
-    let output = run_server_exit_output(&url, Some(&reader_url), &on).await;
-    assert!(!output.status.success(), "no enrolment tables refuses");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("table connetto_device_certificates does not exist"),
-        "{stderr}"
-    );
-}
-
-/// A device setting the binary cannot use refuses boot naming the setting it
-/// choked on, every refusal before the server binds.
-#[tokio::test]
-async fn the_binary_refuses_unusable_device_settings() {
-    use super::e2e::{build_auth_stack, run_server_exit_output, with_user_url};
-
-    let _keyring = isolated_session_keyring();
-    let _serial = PG_SERIAL.lock().await;
-    let fixture = Fixture::acquire().await;
-    let url = fixture.admin_url().to_owned();
-    let reader_url = with_user_url(&url, "app_reader", "app_reader");
-    let auth_stack = build_auth_stack().await;
-    let auth_env = auth_stack.env_pairs("http://127.0.0.1:0");
-    let base: Vec<(&str, &str)> = auth_env
-        .iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
-    let ca = tempfile::TempDir::new().expect("ca dir");
-    let (root, issuer_dir) = ca_output(ca.path());
-    let (root, issuer_dir) = (root.display().to_string(), issuer_dir.display().to_string());
-    let missing = |name: &str| ca.path().join(name).display().to_string();
-    let retired_dir = missing("no-such-issuer");
-    let root_list = missing("no-such-list");
-    let cases: Vec<(Vec<(&str, &str)>, &str)> = vec![
-        (
-            vec![("CONNETTO_DEVICE_ACCEPTED_ATTESTATION", "chip-proven,bogus")],
-            "CONNETTO_DEVICE_ACCEPTED_ATTESTATION names \"bogus\"",
-        ),
-        (
-            vec![
-                ("CONNETTO_DEVICE_APP_ATTEST_APP_IDS", "TEAMID.bundle.id"),
-                ("CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT", "staging"),
-            ],
-            "CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT is \"staging\"",
-        ),
-        (
-            vec![("CONNETTO_DEVICE_CERT_CEILING_SECS", "soon")],
-            "parsing CONNETTO_DEVICE_CERT_CEILING_SECS",
-        ),
-        (
-            vec![("CONNETTO_DEVICE_RETIRED_ISSUER_DIRS", &retired_dir)],
-            "reading the issuer certificate",
-        ),
-        (
-            vec![("CONNETTO_DEVICE_ROOT_LIST", &root_list)],
-            "reading the root's list",
-        ),
-    ];
-
-    for (extra, expected) in cases {
-        let mut envs = base.clone();
-        envs.push(("CONNETTO_DEVICE_ROOT", root.as_str()));
-        envs.push(("CONNETTO_DEVICE_ISSUER_DIR", issuer_dir.as_str()));
-        envs.extend(extra);
-        let output = run_server_exit_output(&url, Some(&reader_url), &envs).await;
-        assert!(!output.status.success(), "{expected} refuses");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(expected),
-            "the refusal names the setting, got: {stderr}"
-        );
-    }
 }

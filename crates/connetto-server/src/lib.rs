@@ -16,15 +16,13 @@
 //! * The assembled server authorizes every row through OpenFGA. Row-level
 //!   security stays available as the optional second opinion that counts and
 //!   names divergences.
-//! * The production build takes the database auth store and the persisted JWT
-//!   keypair. The in-memory store and ephemeral key generation exist only
-//!   behind the `test-seams` feature.
+//! * The production build takes the Postgres auth store and the persisted JWT
+//!   keypair. Ephemeral key generation exists only behind the `test-seams`
+//!   feature.
 //! * The serving lifecycle closes every session when the shutdown signal or a
 //!   terminal change-stream outcome arrives, and the library never ends the
-//!   process, installs no signal handler and initializes no logging. The
-//!   binary is a translation from its environment into the builder, and its
-//!   contract is documented in `src/bin/connetto-server.rs`. A program that
-//!   embeds the server follows `examples/embed.rs`.
+//!   process, installs no signal handler and initializes no logging. Those
+//!   belong to the program that embeds the [`ServerBuilder`].
 //! * [`materializer`] holds the session-agnostic [`Materializer`] core that
 //!   wraps one `subql` engine.
 //! * the native [`Transport`](connetto_core::traits::Transport) implementations
@@ -89,7 +87,7 @@ pub use capability::{CapabilityIssuer, IssuedCapability, ShareError, ShareLevel}
 pub use connetto_core::auth::CapabilityKey;
 pub use courier::CourierEntry;
 pub use fence::{ReadFence, Unseen, UnseenIds, snapshot_cursor, split_snapshot_cursor};
-pub use guard::{BanHook, PersonCloseHook, RequestGuard};
+pub use guard::{BannedSessions, PersonCloseHook, RequestGuard};
 // Re-exported because `ShareError::NotWritable` names one, so an application
 // matching on a refused verb can spell its type.
 pub use subql::visibility::WriteOp;
@@ -102,15 +100,15 @@ pub use authn::http::{
     is_loopback_host,
 };
 pub use authn::{
-    AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
-    ConnettoHandshakeAuthority, DefaultUuidResolver, GenericOidcProvider, IdentityProvider,
-    IdentityResolver, InMemoryAuthStore, IssuedAuthCode, IssuedSession, LivenessError,
-    LoginRedirect, LoginRequest, OAuthEndpoints, OAuthProvider, OAuthProviderConfig,
-    OidcProviderConfig, PendingLogin, PendingLogins, ProviderError, ProviderRegistry,
-    RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture, ResolvedIdentity,
-    RetainedProviderToken, SessionDescriber, SessionOrigin, SessionRecord, SessionRow, SignInHook,
-    SignInNotice, StoredProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedClaims,
-    VerifiedLogin, VerifiedSession,
+    AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthHooks, AuthService, AuthStoreError,
+    CommittedNotice, ConnettoHandshakeAuthority, DefaultAuthHooks, DeviceEnrolled, DeviceRevoked,
+    EndCause, GenericOidcProvider, HookError, HookFuture, IdentityProvider, IssuedAuthCode,
+    IssuedSession, LivenessError, LoginRedirect, LoginRequest, OAuthEndpoints, OAuthProvider,
+    OAuthProviderConfig, OidcProviderConfig, PendingLogin, PendingLogins, ProviderError,
+    ProviderRegistry, RefreshLifetimes, RefreshOutcome, ResolvedIdentity, RetainedProviderToken,
+    SessionDescriber, SessionOrigin, SessionRecord, SessionRow, SessionsEnded, SignedIn,
+    StoredProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedClaims, VerifiedLogin,
+    VerifiedSession, deterministic_uuid,
 };
 pub use authn::{ConnettoStoreSchema, DbAuthStore};
 pub use bots::InstalledApp;

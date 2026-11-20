@@ -173,20 +173,24 @@ mod tests {
         for caller in [
             ContentCaller::new(
                 Some("alice".to_owned()),
+                Some(connetto_core::SessionId::from_token_hash("alice")),
                 None,
                 connetto_core::BOT_LIST_WILDCARD.to_owned(),
             ),
             ContentCaller::new(
                 Some("keys:user:a,b".to_owned()),
                 None,
+                None,
                 connetto_core::BOT_LIST_WILDCARD.to_owned(),
             ),
             ContentCaller::new(
+                None,
                 None,
                 ["key:k1".to_owned()],
                 connetto_core::BOT_LIST_WILDCARD.to_owned(),
             ),
             ContentCaller::new(
+                None,
                 None,
                 ["key:k1".to_owned(), "key:k2".to_owned()],
                 connetto_core::BOT_LIST_WILDCARD.to_owned(),

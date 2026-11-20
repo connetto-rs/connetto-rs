@@ -50,16 +50,38 @@ CREATE TABLE photos (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), order_id UUI
 -- write and no writer lists it.
 CREATE TABLE products (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL, price_cents BIGINT NOT NULL CHECK (price_cents >= 0));
 
+-- The demo's teams, one row per team, which the server seeds and no client
+-- writes. The row is what a membership names, so the authorization model
+-- reads a team as a type of its own, whose members are the rows below.
+CREATE TABLE teams (id TEXT PRIMARY KEY CHECK (id <> '' AND length(id) <= 64));
+
 -- The team's membership rows, one per account in a team. The rows are what
 -- the team_notes policy reads, the membership that gates the note rows, and
 -- they sync to every replica of the demo, so a replica can settle a member's
 -- write from the rows alone. member_id repeats the demo's account ids, the
 -- identity a replica settles an author against when the author carries no
 -- subjects (R77).
-CREATE TABLE team_members (team_id TEXT NOT NULL, member_id TEXT NOT NULL, PRIMARY KEY (team_id, member_id));
+CREATE TABLE team_members (team_id TEXT NOT NULL REFERENCES teams(id), member_id TEXT NOT NULL, PRIMARY KEY (team_id, member_id));
+-- The policies on team_notes, photos and users look up the caller's teams by
+-- member_id, which the key does not lead with.
+CREATE INDEX team_members_member_id ON team_members (member_id);
 
 -- A note any member of its team reads and writes, the row the team's
 -- membership rows settle in policies.sql. author_id repeats who wrote the row
 -- the way owner_id repeats who an order belongs to, so the replica that
 -- settles the row against its author knows the author from the row itself.
 CREATE TABLE team_notes (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), team_id TEXT NOT NULL, author_id TEXT NOT NULL, body TEXT NOT NULL);
+
+-- One row per account that ever signed in, written by the demo server's
+-- sign-in hooks in the login's own transaction (CONNETTO_USERS=database), so
+-- a failed write fails the sign-in and a failed sign-in leaves no row.
+-- id is the account id every other table names, the textual v5 UUID of 36
+-- characters, and login_name the subject the account signed in as, which
+-- OpenID Connect bounds at 255 ASCII characters. No client writes it, since
+-- no grant admits a write and no writer lists it. Row-level security is not
+-- forced because the sign-in writes as the owner and every client reads as
+-- connetto_reader.
+CREATE TABLE users (
+  id TEXT PRIMARY KEY CHECK (id <> '' AND length(id) <= 36),
+  login_name TEXT NOT NULL CHECK (login_name <> '' AND length(login_name) <= 255)
+);

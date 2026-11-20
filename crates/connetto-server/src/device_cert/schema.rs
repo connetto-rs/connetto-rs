@@ -4,7 +4,7 @@
 //! through [`ConnettoEnrolmentSchema`], by hand or through
 //! [`connetto_schema!`](crate::connetto_schema), as the `Enrolments` member of
 //! its [`ConnettoSchema`](crate::schema::ConnettoSchema). The member runs one
-//! statement per function, and [`pg_enrolment_store`] composes them inside one
+//! statement per function, and [`EnrolmentStore`] composes them inside one
 //! transaction and takes every decision itself.
 //!
 //! ```sql
@@ -35,19 +35,15 @@
 
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::SystemTime;
 
 use connetto_core::SessionId;
 use connetto_core::device_cert::{AttestationLevel, DeviceDescriptor, KeyId, Revoked};
 use diesel::QueryResult;
-use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncConnection as _, AsyncPgConnection};
 
-use super::enrolment::{
-    Device, Enrolment, EnrolmentError, EnrolmentFuture, EnrolmentStore, KeyRecord, Recorded,
-    Revocation,
-};
+use super::enrolment::{Device, Enrolment, EnrolmentError, KeyRecord, Recorded, Revocation};
+use crate::schema::ConnettoSchema;
 
 /// One statement of a [`ConnettoEnrolmentSchema`], run on a borrowed
 /// connection.
@@ -173,12 +169,13 @@ pub trait ConnettoEnrolmentSchema: Send + Sync + 'static {
         certificate: NewCertificate,
     ) -> Statement<'_, ()>;
 
-    /// Mark `key` revoked at `at`, answering the session that last enrolled it.
+    /// Mark `key` revoked at `at`, answering the account it is enrolled under
+    /// and the session that last enrolled it.
     fn revoke_key(
         conn: &mut AsyncPgConnection,
         key: KeyId,
         at: SystemTime,
-    ) -> Statement<'_, SessionId>;
+    ) -> Statement<'_, (Self::Id, SessionId)>;
 
     /// Every enrolment of `user`, revoked ones included.
     fn devices<'c>(
@@ -214,36 +211,51 @@ pub trait ConnettoEnrolmentSchema: Send + Sync + 'static {
     ) -> Statement<'c, Option<super::enrolment::KeyRecord<Self::Id>>>;
 }
 
-/// An [`EnrolmentStore`] over the deployment's enrolment tables, `D`'s
-/// [`Enrolments`] member, on the owner pool.
+/// The deployment's enrolment tables, `D`'s [`Enrolments`] member, read and
+/// written on the caller's owner connection, so an enrolment or a revocation
+/// runs in the transaction that also runs the application's auth hooks.
+///
+/// Each write opens its own transaction on the connection it is handed,
+/// which is a savepoint inside the caller's.
 ///
 /// [`Enrolments`]: crate::schema::ConnettoSchema::Enrolments
-#[must_use]
-pub fn pg_enrolment_store<D>(pool: Pool<AsyncPgConnection>) -> Arc<dyn EnrolmentStore<D::Id>>
-where
-    D: crate::schema::ConnettoSchema,
-{
-    Arc::new(PgEnrolments::<D::Enrolments> {
-        pool,
-        schema: PhantomData,
-    })
+pub struct EnrolmentStore<D> {
+    schema: PhantomData<fn() -> D>,
 }
 
-/// The Postgres [`EnrolmentStore`], generic over the deployment's member.
-struct PgEnrolments<S> {
-    pool: Pool<AsyncPgConnection>,
-    schema: PhantomData<fn() -> S>,
+impl<D> Default for EnrolmentStore<D> {
+    fn default() -> Self {
+        Self {
+            schema: PhantomData,
+        }
+    }
 }
 
-impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
-    fn record(&self, enrolment: Enrolment<S::Id>) -> EnrolmentFuture<'_, Recorded> {
-        Box::pin(async move {
-            let Ok(descriptor) = rmp_serde::from_slice::<S::Descriptor>(&enrolment.descriptor)
-            else {
-                return Ok(Recorded::UnreadableDescriptor);
-            };
-            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
-            conn.transaction::<_, diesel::result::Error, _>(async move |c| {
+impl<D> core::fmt::Debug for EnrolmentStore<D> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EnrolmentStore").finish()
+    }
+}
+
+impl<D: ConnettoSchema> EnrolmentStore<D> {
+    /// Record `enrolment` unless its key's enrolment is revoked or belongs to
+    /// another account, deciding in one step.
+    ///
+    /// # Errors
+    ///
+    /// [`EnrolmentError::Query`] when a statement fails.
+    pub async fn record(
+        &self,
+        connection: &mut AsyncPgConnection,
+        enrolment: Enrolment<D::Id>,
+    ) -> Result<Recorded, EnrolmentError> {
+        let Ok(descriptor) = rmp_serde::from_slice::<
+            <D::Enrolments as ConnettoEnrolmentSchema>::Descriptor,
+        >(&enrolment.descriptor) else {
+            return Ok(Recorded::UnreadableDescriptor);
+        };
+        connection
+            .transaction::<_, diesel::result::Error, _>(async move |c| {
                 let Enrolment {
                     user,
                     key,
@@ -257,9 +269,10 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                     attestation,
                     bot_list,
                 } = enrolment;
-                let mut facts = S::key_facts(c, key, Some(&user)).await?;
+                let mut facts = D::Enrolments::key_facts(c, key, Some(&user)).await?;
+                let mut first = false;
                 if facts.is_none() {
-                    let first = NewEnrolment {
+                    let new = NewEnrolment {
                         key,
                         user: &user,
                         session,
@@ -271,9 +284,10 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                     };
                     // A concurrent first enrolment of the same key inserted
                     // its row between the read and the insert.
-                    if !S::insert_enrolment(c, first).await? {
+                    first = D::Enrolments::insert_enrolment(c, new).await?;
+                    if !first {
                         facts = Some(
-                            S::key_facts(c, key, Some(&user))
+                            D::Enrolments::key_facts(c, key, Some(&user))
                                 .await?
                                 .ok_or(diesel::result::Error::NotFound)?,
                         );
@@ -290,7 +304,7 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                             descriptor,
                             bot_list,
                         };
-                        S::renew_enrolment(c, renewal).await?;
+                        D::Enrolments::renew_enrolment(c, renewal).await?;
                     }
                     None => {}
                 }
@@ -300,111 +314,149 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                     issuer,
                     expires_at,
                 };
-                S::insert_certificate(c, certificate).await?;
-                Ok(Recorded::Granted)
+                D::Enrolments::insert_certificate(c, certificate).await?;
+                Ok(Recorded::Granted { first })
             })
             .await
             .map_err(EnrolmentError::Query)
-        })
     }
 
-    fn devices<'a>(&'a self, user: &'a S::Id) -> EnrolmentFuture<'a, Vec<Device>> {
-        Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
-            let rows = S::devices(&mut conn, user)
-                .await
-                .map_err(EnrolmentError::Query)?;
-            rows.into_iter()
-                .map(|row| {
-                    Ok(Device {
-                        key: row.key,
-                        enrolled_at: row.enrolled_at,
-                        last_seen: row.last_seen,
-                        revoked_at: row.revoked_at,
-                        session: row.session,
-                        descriptor: rmp_serde::to_vec_named(&row.descriptor)
-                            .map_err(EnrolmentError::Descriptor)?,
-                    })
+    /// `user`'s devices, revoked ones included.
+    ///
+    /// # Errors
+    ///
+    /// [`EnrolmentError::Query`] when the read fails and
+    /// [`EnrolmentError::Descriptor`] when a stored descriptor will not
+    /// encode.
+    pub async fn devices(
+        &self,
+        connection: &mut AsyncPgConnection,
+        user: &D::Id,
+    ) -> Result<Vec<Device>, EnrolmentError> {
+        let rows = D::Enrolments::devices(connection, user)
+            .await
+            .map_err(EnrolmentError::Query)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(Device {
+                    key: row.key,
+                    enrolled_at: row.enrolled_at,
+                    last_seen: row.last_seen,
+                    revoked_at: row.revoked_at,
+                    session: row.session,
+                    descriptor: rmp_serde::to_vec_named(&row.descriptor)
+                        .map_err(EnrolmentError::Descriptor)?,
                 })
-                .collect()
-        })
+            })
+            .collect()
     }
 
-    fn revoke<'a>(
-        &'a self,
-        user: Option<&'a S::Id>,
+    /// Revoke `key` at `at`, only when it is `user`'s when a user is named.
+    ///
+    /// # Errors
+    ///
+    /// [`EnrolmentError::Query`] when a statement fails.
+    pub async fn revoke(
+        &self,
+        connection: &mut AsyncPgConnection,
+        user: Option<&D::Id>,
         key: KeyId,
         at: SystemTime,
-    ) -> EnrolmentFuture<'a, Revocation> {
-        Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
-            conn.transaction::<_, diesel::result::Error, _>(async move |c| {
-                match S::key_facts(c, key, user).await? {
+    ) -> Result<Revocation<D::Id>, EnrolmentError> {
+        connection
+            .transaction::<_, diesel::result::Error, _>(async move |c| {
+                match D::Enrolments::key_facts(c, key, user).await? {
                     None | Some(KeyFacts { owned: false, .. }) => Ok(Revocation::NotFound),
                     Some(KeyFacts {
                         revoked: true,
                         session,
                         ..
                     }) => Ok(Revocation::AlreadyRevoked { session }),
-                    Some(_) => Ok(Revocation::Revoked {
-                        session: S::revoke_key(c, key, at).await?,
-                    }),
+                    Some(_) => {
+                        let (user, session) = D::Enrolments::revoke_key(c, key, at).await?;
+                        Ok(Revocation::Revoked { user, session })
+                    }
                 }
             })
             .await
             .map_err(EnrolmentError::Query)
-        })
     }
 
-    fn revoked_serials(&self, issuer: KeyId) -> EnrolmentFuture<'_, Vec<Revoked>> {
-        Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
-            S::revoked_serials(&mut conn, issuer)
-                .await
-                .map_err(EnrolmentError::Query)
-        })
+    /// Every serial `issuer` signed for a revoked key, whose certificate has
+    /// not lapsed more than `DEVICE_SKEW` ago, the window a peer still accepts
+    /// it (chapter 21, class G).
+    ///
+    /// # Errors
+    ///
+    /// [`EnrolmentError::Query`] when the read fails.
+    pub async fn revoked_serials(
+        &self,
+        connection: &mut AsyncPgConnection,
+        issuer: KeyId,
+    ) -> Result<Vec<Revoked>, EnrolmentError> {
+        D::Enrolments::revoked_serials(connection, issuer)
+            .await
+            .map_err(EnrolmentError::Query)
     }
 
-    fn next_list_number(&self, issuer: KeyId) -> EnrolmentFuture<'_, u64> {
-        Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
-            let number = S::next_list_number(&mut conn, issuer)
-                .await
-                .map_err(EnrolmentError::Query)?;
-            u64::try_from(number).map_err(EnrolmentError::ListNumber)
-        })
+    /// The next CRL Number of the issuer `issuer`, above every number handed
+    /// out before, across restarts.
+    ///
+    /// # Errors
+    ///
+    /// [`EnrolmentError::Query`] when the update fails and
+    /// [`EnrolmentError::ListNumber`] when the number does not fit.
+    pub async fn next_list_number(
+        &self,
+        connection: &mut AsyncPgConnection,
+        issuer: KeyId,
+    ) -> Result<u64, EnrolmentError> {
+        let number = D::Enrolments::next_list_number(connection, issuer)
+            .await
+            .map_err(EnrolmentError::Query)?;
+        u64::try_from(number).map_err(EnrolmentError::ListNumber)
     }
 
-    fn stored_attestation<'a>(
-        &'a self,
-        user: &'a S::Id,
+    /// The level the key's first enrolment under `user` recorded, `None`
+    /// when the key has no enrolment under `user`.
+    ///
+    /// # Errors
+    ///
+    /// [`EnrolmentError::Query`] when the read fails and
+    /// [`EnrolmentError::StoredLevel`] when the stored level is not one.
+    pub async fn stored_attestation(
+        &self,
+        connection: &mut AsyncPgConnection,
+        user: &D::Id,
         key: KeyId,
-    ) -> EnrolmentFuture<'a, Option<AttestationLevel>> {
-        Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
-            match S::stored_attestation(&mut conn, key, user)
-                .await
-                .map_err(EnrolmentError::Query)?
-            {
-                Some(spelled) => AttestationLevel::parse(&spelled)
-                    .map(Some)
-                    .ok_or(EnrolmentError::StoredLevel),
-                None => Ok(None),
-            }
-        })
+    ) -> Result<Option<AttestationLevel>, EnrolmentError> {
+        match D::Enrolments::stored_attestation(connection, key, user)
+            .await
+            .map_err(EnrolmentError::Query)?
+        {
+            Some(spelled) => AttestationLevel::parse(&spelled)
+                .map(Some)
+                .ok_or(EnrolmentError::StoredLevel),
+            None => Ok(None),
+        }
     }
 
-    fn key_record<'a>(
-        &'a self,
-        user: Option<&'a S::Id>,
+    /// The enrolment of `key`, with the account that holds it and whether its
+    /// certificate is still live, when `user` names no account or names the
+    /// account the key is enrolled under, `None` otherwise (R75).
+    ///
+    /// # Errors
+    ///
+    /// [`EnrolmentError::Query`] when the read fails.
+    pub async fn key_record(
+        &self,
+        connection: &mut AsyncPgConnection,
+        user: Option<&D::Id>,
         key: KeyId,
-    ) -> EnrolmentFuture<'a, Option<KeyRecord<S::Id>>> {
-        Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
-            S::key_record(&mut conn, key, user)
-                .await
-                .map_err(EnrolmentError::Query)
-        })
+    ) -> Result<Option<KeyRecord<D::Id>>, EnrolmentError> {
+        D::Enrolments::key_record(connection, key, user)
+            .await
+            .map_err(EnrolmentError::Query)
     }
 }
 
@@ -663,7 +715,7 @@ macro_rules! connetto_enrolment_tables {
                 conn: &mut diesel_async::AsyncPgConnection,
                 key: $crate::device_cert::KeyId,
                 at: std::time::SystemTime,
-            ) -> $crate::device_cert::Statement<'_, $crate::SessionId> {
+            ) -> $crate::device_cert::Statement<'_, (Self::Id, $crate::SessionId)> {
                 Box::pin(async move {
                     use diesel::{ExpressionMethods as _, QueryDsl};
                     use diesel_async::RunQueryDsl as _;
@@ -672,7 +724,10 @@ macro_rules! connetto_enrolment_tables {
                         connetto_device_enrolments::key_id.eq(key.as_bytes().to_vec()),
                     ))
                     .set(connetto_device_enrolments::revoked_at.eq(Some($crate::ban::Instant::from(at))))
-                    .returning(connetto_device_enrolments::session_id)
+                    .returning((
+                        connetto_device_enrolments::user_id,
+                        connetto_device_enrolments::session_id,
+                    ))
                     .get_result(conn)
                     .await
                 })

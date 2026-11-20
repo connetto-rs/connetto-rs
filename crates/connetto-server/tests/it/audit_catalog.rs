@@ -5,15 +5,17 @@ use connetto_server::builder::{
 };
 use connetto_server::defaults::ConnettoDefaults;
 use connetto_server::openfga::{SetupError, Translated};
-use connetto_server::{DefaultUuidResolver, Materializer, OidcProviderConfig, Registration};
+use connetto_server::{DefaultAuthHooks, Materializer, OidcProviderConfig, Registration};
 use connetto_test_harness::{
     FIXTURE_READER, FIXTURE_ROLES, Fixture, MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET,
     MOCK_OAUTH_PROVIDER, MockOauth, OPLOG_TABLE, PUBLICATION, SLOT, isolated_session_keyring,
 };
 use tempfile::TempDir;
 
-use super::e2e::{PG_DDL, PG_SERIAL, reset_fixture, signing_keys, with_user_url};
 use super::lifecycle::BOUND;
+use connetto_test_harness::server_fixture::{
+    PG_DDL, PG_SERIAL, reset_fixture, signing_keys, with_user_url,
+};
 
 mod unterminated {
     const AUDIT_DDL: &str = connetto_server::connetto_audit_ddl!("TEXT", "UUID");
@@ -119,7 +121,7 @@ async fn a_malformed_audit_declaration_refuses_server_startup() {
     let refused = tokio::time::timeout(
         BOUND,
         builder
-            .deployment_schema::<malformed::Deployment>(Arc::new(DefaultUuidResolver))
+            .deployment_schema::<malformed::Deployment>(Arc::new(DefaultAuthHooks))
             .build(),
     )
     .await

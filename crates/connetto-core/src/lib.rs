@@ -10,8 +10,6 @@ pub mod cursor;
 pub mod custody;
 #[cfg(feature = "device-cert")]
 pub mod device_cert;
-#[cfg(feature = "env")]
-pub mod env;
 pub mod error;
 pub mod exchange;
 #[cfg(feature = "logging")]
@@ -57,8 +55,8 @@ pub use tier_shape::{
 };
 pub use traits::{
     CheckedGrant, ContentTicketSigner, GrantCheckFuture, GrantRefused, HandleError,
-    HandshakeAuthority, IncomingFrame, PendingMutation, RefreshFuture, RefreshTokenStore,
-    ReplicaKeyStore, Store, Transport,
+    HandshakeAuthority, IncomingFrame, LivenessFuture, LivenessUnknown, PendingMutation,
+    RefreshFuture, RefreshTokenStore, ReplicaKeyStore, SessionLiveness, Store, Transport,
 };
 #[cfg(feature = "native-transport")]
 pub use transport::{
