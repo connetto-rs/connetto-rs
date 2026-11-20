@@ -70,8 +70,8 @@ use subql::{
     catalog_helpers,
 };
 
-use crate::drift::{PolicyReaders, RefusedSet, weakens_identity};
 use crate::catalog_shapes::CatalogShapes;
+use crate::drift::{PolicyReaders, RefusedSet, weakens_identity};
 use crate::reexec::ReadBudget;
 
 use crate::oplog::ChangeRecord;
