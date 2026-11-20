@@ -16,6 +16,7 @@ use connetto_core::messages::{
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
+use connetto_test_harness::wire_tables::orders_table;
 use diesel::prelude::*;
 use diesel::sqlite::AutoVacuumMode;
 use diesel::sqlite::pragma::{AutoVacuum, PageCount, SchemaPragma};
@@ -52,14 +53,6 @@ diesel::table! {
         /// Free-text body.
         body -> Text,
     }
-}
-
-fn orders_table() -> SimpleTable {
-    SimpleTable::new(
-        "orders",
-        &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-        &[0],
-    )
 }
 
 /// Compressed insert-patchset bytes for one snapshot's rows.

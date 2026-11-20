@@ -16,6 +16,8 @@ mod bots_client;
 
 mod builder_coverage;
 
+mod catalog_reads;
+
 mod ticket_shared;
 
 mod ticket_budget;

@@ -66,6 +66,7 @@ pub mod server_fixture;
 pub mod stack;
 pub mod standby;
 pub mod star;
+pub mod wire_tables;
 
 mod container_slot;
 pub use container_slot::{CONTAINER_SLOTS, ContainerSlot, container_slot};
