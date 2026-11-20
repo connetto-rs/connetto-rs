@@ -141,16 +141,17 @@ fn expanded_update_changeset() -> Vec<u8> {
         .build()
 }
 
-/// A patchset that inserts one full row. A patchset carries no prior image,
-/// so no conflict is planned for it.
-fn patchset_insert(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
-    let insert = Insert::<_, String, Vec<u8>>::from(note_table())
-        .set(0, Value::Integer(id))
-        .expect("set id")
-        .set(1, Value::Text(body.to_owned()))
-        .expect("set body")
-        .set(2, Value::Text(edited_at.to_owned()))
-        .expect("set edited_at");
+/// A patchset that inserts one full row of `table`. A patchset carries no
+/// prior image, so no conflict is planned for it.
+fn patchset_insert(table: SimpleTable, values: Vec<Value<String, Vec<u8>>>) -> Vec<u8> {
+    let insert = values.into_iter().enumerate().fold(
+        Insert::<_, String, Vec<u8>>::from(table),
+        |insert, (ordinal, value)| {
+            insert
+                .set(ordinal, value)
+                .expect("the value fits the table")
+        },
+    );
     PatchSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(insert)
         .build()
@@ -334,37 +335,44 @@ async fn an_upload_naming_the_added_column_is_refused_as_a_schema_mismatch() {
     let mut client = server.connect();
     client.handshake_with("alice", "user:alice").await;
 
-    client.upload(1, expanded_insert_changeset()).await;
-    let ControlMessage::MutationReject(reject) = client.next_control().await else {
-        panic!("expected a refusal of the upload that names the added column");
-    };
-    assert_eq!(reject.client_seq, 1);
-    assert_eq!(
-        reject.reason,
-        MutationRejectReason::SchemaMismatch,
-        "a shape the catalog does not know is a schema mismatch"
-    );
+    for (seq, upload, op) in [
+        (1, expanded_insert_changeset(), "insert"),
+        (2, expanded_update_changeset(), "update"),
+        (
+            3,
+            patchset_insert(
+                expanded_table(),
+                vec![
+                    Value::Integer(4),
+                    Value::Text("new".to_owned()),
+                    Value::Text("t1".to_owned()),
+                    Value::Text("added".to_owned()),
+                ],
+            ),
+            "patchset insert",
+        ),
+    ] {
+        client.upload(seq, upload).await;
+        let ControlMessage::MutationReject(reject) = client.next_control().await else {
+            panic!("expected a refusal of the {op} that names the added column");
+        };
+        assert_eq!(reject.client_seq, seq);
+        assert_eq!(
+            reject.reason,
+            MutationRejectReason::SchemaMismatch,
+            "a shape the catalog does not know is a schema mismatch"
+        );
+    }
 
-    client.upload(2, expanded_update_changeset()).await;
-    let ControlMessage::MutationReject(reject) = client.next_control().await else {
-        panic!("expected a refusal of the update that names the added column");
-    };
-    assert_eq!(reject.client_seq, 2);
-    assert_eq!(
-        reject.reason,
-        MutationRejectReason::SchemaMismatch,
-        "a shape the catalog does not know is a schema mismatch"
-    );
-
-    // Neither op landed, and the refused entry does not hold the frontier.
+    // No op landed, and the refused entries do not hold the frontier.
     assert_eq!(extras(&fixture).await, vec![None]);
     client
-        .upload(3, update_changeset(1, "hello", "after", "t0", "t1"))
+        .upload(4, update_changeset(1, "hello", "after", "t0", "t1"))
         .await;
     let ControlMessage::MutationApplied(ack) = client.next_control().await else {
         panic!("the write applies");
     };
-    assert_eq!(ack.client_seq, 3);
+    assert_eq!(ack.client_seq, 4);
     client.close().await;
     drop_slot(fixture.admin()).await;
 }
@@ -381,7 +389,19 @@ async fn a_patchset_insert_lands_in_the_catalog_shape() {
     let mut client = server.connect();
     client.handshake_with("alice", "user:alice").await;
 
-    client.upload(1, patchset_insert(2, "new", "t1")).await;
+    client
+        .upload(
+            1,
+            patchset_insert(
+                note_table(),
+                vec![
+                    Value::Integer(2),
+                    Value::Text("new".to_owned()),
+                    Value::Text("t1".to_owned()),
+                ],
+            ),
+        )
+        .await;
     let ControlMessage::MutationApplied(ack) = client.next_control().await else {
         panic!("the patchset's insert applies");
     };
