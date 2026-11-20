@@ -244,9 +244,8 @@ pub trait FailedRead {
     fn read_failure(&self) -> ReadFailure;
 }
 
-/// upstream's `#[non_exhaustive]` forces the catch-all, so rows-unsupported
-/// and future variants arrive as `Other`, the class that costs one retry and
-/// no stall.
+/// A connector error variant added later lands in the catch-all `Other`, the
+/// class that costs one retry and no stall.
 impl FailedRead for DieselAsyncError {
     fn read_failure(&self) -> ReadFailure {
         match self {
@@ -597,10 +596,6 @@ mod tests {
     fn errors_outside_the_database_are_other() {
         let builder = Error::QueryBuilderError(Box::new(std::io::Error::other("nope")));
         assert_eq!(class_of(builder), ReadFailure::Other);
-        assert_eq!(
-            DieselAsyncError::RowsUnsupported.read_failure(),
-            ReadFailure::Other
-        );
         let err = std::io::Error::other("no re-execution connector configured");
         assert_eq!(err.read_failure(), ReadFailure::Other);
         assert_eq!("boom".to_owned().read_failure(), ReadFailure::Other);

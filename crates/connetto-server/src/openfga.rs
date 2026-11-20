@@ -657,6 +657,7 @@ impl Translated {
         warn_outside_policies(&catalog, documents.reader_role());
         let relations = translation.relations().to_vec();
         let naming = translation.row_naming().to_vec();
+        let resulting = translation.resulting_rows().to_vec();
         let notes = translation.notes().to_vec();
         let answers = translation.action_relations();
         let policy_reads = translation.policy_reads().to_vec();
@@ -705,6 +706,7 @@ impl Translated {
         let shapes = Arc::new(
             Shapes::new::<Postgres>(catalog, &relations, &enumerations)
                 .with_row_naming(&naming)
+                .with_resulting_rows(&resulting)
                 .with_action_relations(answers)
                 .with_required_parameters(&notes),
         );
