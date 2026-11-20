@@ -4191,6 +4191,48 @@ fn load_pending(
     Ok(queues)
 }
 
+/// Queued writes read from a closed account's replica.
+#[derive(Debug, Default)]
+pub struct StoredReplicaWork {
+    /// Writes the server has not acknowledged.
+    pub unsynced: Vec<UnsyncedWrite>,
+    /// Their changesets ordered newest first for rollback.
+    pub changesets: Vec<Vec<u8>>,
+}
+
+/// Read queued writes without installing a schema or attaching shared storage.
+///
+/// The caller opens and unlocks the account replica before calling this.
+///
+/// # Errors
+///
+/// [`ClientError`] when the pending queue cannot be read.
+pub fn stored_replica_work(
+    connection: &mut SqliteConnection,
+) -> Result<StoredReplicaWork, ClientError> {
+    let queued = load_pending(connection)?;
+    let mut unsynced = Vec::new();
+    let mut changesets = Vec::new();
+    for (writer, entries) in queued {
+        for entry in entries {
+            unsynced.push(UnsyncedWrite {
+                writer,
+                seq: entry.seq,
+                major: entry.major,
+            });
+            changesets.push((entry.position, entry.changeset));
+        }
+    }
+    changesets.sort_unstable_by_key(|(position, _)| core::cmp::Reverse(*position));
+    Ok(StoredReplicaWork {
+        unsynced,
+        changesets: changesets
+            .into_iter()
+            .map(|(_, changeset)| changeset)
+            .collect(),
+    })
+}
+
 /// Remember a writer to retire on the next connection, with the secret a
 /// number writer was issued under.
 fn persist_retire(
@@ -13140,6 +13182,35 @@ where
         self.db
             .immediate_transaction(|db| presence::depart(db, config, identity))
             .map(drop)
+    }
+
+    /// Undo a closed identity's queued shared writes and remove its holdings.
+    ///
+    /// Supply changesets newest first. A failed transaction preserves the
+    /// identity and all shared rows. The live identity cannot be removed.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the identity is live or the shared transaction fails.
+    pub fn forget_shared_identity<'changeset>(
+        &mut self,
+        identity: &str,
+        newest_first: impl IntoIterator<Item = &'changeset [u8]>,
+    ) -> Result<(), ClientError> {
+        if identity == self.config.client_id {
+            return Err(ClientError::Session(
+                "cannot forget the live shared identity".to_owned(),
+            ));
+        }
+        if self.config.shared_tables.is_empty() {
+            return Ok(());
+        }
+        let _suspended = ExemptWrites::raise(&self.write_flags);
+        let config = &self.config;
+        self.db.immediate_transaction(|database| {
+            undo_shared(database, &config.shared_tables, newest_first)?;
+            presence::depart(database, config, identity).map(drop)
+        })
     }
 
     /// Return freelist pages to the filesystem: reclaim in

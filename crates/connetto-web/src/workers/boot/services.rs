@@ -71,7 +71,13 @@ pub(super) async fn prepare_boot_storage(
             .map_err(BootError::KeyStore)?,
     );
     // Wipes run before custody so a pending deletion applies even when the unlock is refused or unconfigured.
-    apply_pending_wipes(&storage, &key_store, config.replica_db_prefix).await?;
+    apply_pending_wipes(
+        &storage,
+        &key_store,
+        config.replica_db_prefix,
+        config.auth_db_name,
+    )
+    .await?;
     let was_enrolled = super::replica::setup_custody(config, &key_store).await?;
     // After wipes (which free slots) and before login (which reads the account index).
     storage
@@ -85,12 +91,13 @@ pub(super) async fn apply_pending_wipes(
     storage: &crate::storage::ReplicaStorage,
     key_store: &crate::auth::IdbKeyStore,
     prefix: Option<&str>,
+    auth_db_name: &str,
 ) -> Result<(), BootError> {
     for pending in crate::storage::pending_wipes()
         .await
         .map_err(BootError::KeyStore)?
     {
-        apply_pending_wipe(storage, key_store, prefix, &pending).await?;
+        apply_pending_wipe(storage, key_store, prefix, &pending, auth_db_name).await?;
     }
     Ok(())
 }
@@ -100,6 +107,7 @@ async fn apply_pending_wipe(
     key_store: &crate::auth::IdbKeyStore,
     prefix: Option<&str>,
     pending: &crate::storage::PendingWipe,
+    auth_db_name: &str,
 ) -> Result<(), BootError> {
     let progress = if pending.replica_deleted() {
         // The replica and key went on an earlier boot, and a fresh login may
@@ -126,6 +134,13 @@ async fn apply_pending_wipe(
         )
         .await?
     };
+    if let Some(account) = pending.account() {
+        let accounts = crate::auth::AccountStore::open(&storage.db_url(auth_db_name))
+            .map_err(BootError::SessionAcquisition)?;
+        accounts
+            .forget(account)
+            .map_err(BootError::SessionAcquisition)?;
+    }
     // A departure still owed keeps the record until this boot's worker,
     // once its own connection is open, takes the identity out of the store.
     let departing = pending.shared() == crate::storage::SharedWipe::Depart;
@@ -186,6 +201,7 @@ pub(super) async fn start_boot_services<Id>(
     spec: &BootReplicaSpec<Id>,
     worker: ConnettoConnection<BrowserSocket>,
     content_root_key: Option<[u8; 32]>,
+    key_store: &std::rc::Rc<crate::auth::IdbKeyStore>,
 ) -> Result<(RelayHub, Option<bool>), BootError> {
     let ws_url = config.ws_url;
     let connect_gate = match config.connect_gate {
@@ -228,6 +244,7 @@ pub(super) async fn start_boot_services<Id>(
         &spec.replica_db_name,
         content_wipe_namespace,
         spec.active_account.as_deref(),
+        key_store,
     )?;
     super::super::intake::install_hello_intake(hub.clone())?;
     Ok((hub, content_persistent))
@@ -312,6 +329,7 @@ fn install_tab_services(
     replica_db_name: &str,
     content_wipe_namespace: Option<String>,
     active_account: Option<&str>,
+    key_store: &std::rc::Rc<crate::auth::IdbKeyStore>,
 ) -> Result<(), BootError> {
     if let Some(connetto_client::builder::sign_in::SignInKind::Provider {
         origin,
@@ -328,7 +346,13 @@ fn install_tab_services(
                 redirect_uri: config.redirect_uri.clone().unwrap_or_default(),
                 auth_db_name: config.auth_db_name.to_owned(),
                 replica_db_name: replica_db_name.to_owned(),
+                replica_db_prefix: config
+                    .replica_db_prefix
+                    .unwrap_or(connetto_client::REPLICA_PREFIX)
+                    .to_owned(),
+                key_store: std::rc::Rc::clone(key_store),
                 content_namespace: content_wipe_namespace,
+                content_namespace_seed: config.content_namespace.map(str::to_owned),
                 account: active_account.map(ToOwned::to_owned),
             },
             hub.clone(),
@@ -381,7 +405,7 @@ mod tests {
         mark_wipe_pending(&wipe, &PendingWork::default(), false)
             .await
             .expect("mark");
-        apply_pending_wipes(&storage, &keys, Some(prefix))
+        apply_pending_wipes(&storage, &keys, Some(prefix), "last-out-auth")
             .await
             .expect("the boot applies the wipe");
         assert!(!storage.exists(&shared), "the shared store is gone");
@@ -403,7 +427,7 @@ mod tests {
         mark_wipe_pending(&wipe, &PendingWork::default(), false)
             .await
             .expect("mark");
-        apply_pending_wipes(&storage, &keys, Some(prefix))
+        apply_pending_wipes(&storage, &keys, Some(prefix), "departure-auth")
             .await
             .expect("the boot applies the wipe");
         assert!(!storage.exists(&replica), "the replica is wiped");
@@ -411,12 +435,47 @@ mod tests {
         let owed = pending_wipes().await.expect("list");
         assert_eq!(owed.len(), 1, "the wipe stays until the departure lands");
         settle_shared_departure(&owed[0]).await.expect("settle");
-        apply_pending_wipes(&storage, &keys, Some(prefix))
+        apply_pending_wipes(&storage, &keys, Some(prefix), "departure-auth")
             .await
             .expect("the next boot");
         assert!(
             pending_wipes().await.expect("list").is_empty(),
             "a settled wipe is acknowledged"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_pending_account_wipe_clears_its_index_row_before_acknowledgement() {
+        let storage = ReplicaStorage::install().await;
+        storage.reserve(4).await.unwrap();
+        let keys = IdbKeyStore::open().await.unwrap();
+        let account = "\"pending-account\"";
+        let index = "pending-account-auth";
+        let replica = "pending-account-replica";
+        {
+            let accounts = crate::auth::AccountStore::open(&storage.db_url(index)).unwrap();
+            accounts.remember(account).unwrap();
+        }
+        seed(&storage, &keys, replica).await;
+        let wipe = PendingWipe::new(replica, None).with_account(account);
+        mark_wipe_pending(&wipe, &PendingWork::default(), false)
+            .await
+            .unwrap();
+        apply_pending_wipes(&storage, &keys, None, index)
+            .await
+            .unwrap();
+        assert!(!storage.exists(replica));
+        assert!(keys.load(replica).await.unwrap().is_none());
+        let accounts = crate::auth::AccountStore::open(&storage.db_url(index)).unwrap();
+        assert_eq!(accounts.accounts().unwrap(), Vec::<String>::new());
+        assert!(!pending_wipes().await.unwrap().contains(&wipe));
+        drop(accounts);
+        mark_wipe_pending(&wipe, &PendingWork::default(), false)
+            .await
+            .unwrap();
+        apply_pending_wipes(&storage, &keys, None, index)
+            .await
+            .unwrap();
+        assert!(!pending_wipes().await.unwrap().contains(&wipe));
     }
 }

@@ -2550,7 +2550,7 @@ pub struct SessionManager<
     withdrawal_source: OnceLock<Snap>,
     /// Issues device certificates (R74). Without one, every enrolment is
     /// refused as [`EnrolRefusal::IssuerUnavailable`].
-    device_enrolment: OnceLock<Arc<crate::device_cert::DeviceEnrolment<Id>>>,
+    device_enrolment: OnceLock<Arc<crate::device_cert::DeviceEnrolment<D>>>,
     /// The deployment's content ticket signer, called after a successful
     /// visibility check to mint a signed URL the caller may use at the file
     /// server. Generic rather than boxed so a deployment wires it at compile
@@ -2854,8 +2854,8 @@ where
     /// The enrolment handed over, when one is already installed.
     pub fn install_device_enrolment(
         &self,
-        enrolment: Arc<crate::device_cert::DeviceEnrolment<Id>>,
-    ) -> Result<(), Arc<crate::device_cert::DeviceEnrolment<Id>>> {
+        enrolment: Arc<crate::device_cert::DeviceEnrolment<D>>,
+    ) -> Result<(), Arc<crate::device_cert::DeviceEnrolment<D>>> {
         self.device_enrolment.set(enrolment)
     }
 
@@ -6417,21 +6417,29 @@ where
             .map_err(transport_err)
     }
 
-    /// Answer one content ticket request: check visibility, call the signer,
-    /// charge the write budget after a successful mint, and send the grant.
+    /// Answer one content ticket request: confirm the login is still live,
+    /// check visibility, call the signer, charge the write budget after a
+    /// successful mint, and send the grant.
     ///
-    /// Visibility runs first on the reader pool, behind the same reader-share
+    /// A connection can stay open after its session ended, past the idle
+    /// window or before this server hears of a revocation, so a login's
+    /// session is asked about first and an ended one refused with the
+    /// invisible file's detail, rather than handed a ticket the file server
+    /// refuses (R109). A caller holding no login has no session to ask about.
+    ///
+    /// Visibility runs next on the reader pool, behind the same reader-share
     /// permit that subscription and mutation reads hold (R39), so an anonymous
     /// caller cannot starve identified callers. Invisibility and a budget
     /// refusal carry the same byte-identical detail so a caller cannot learn
-    /// that a file it cannot see exists. A signer fault carries a distinct
-    /// detail because it discloses nothing about data and a retry is
-    /// meaningful. The budget is charged after a successful mint, so a signer
-    /// failure never consumes the caller's upload window.
+    /// that a file it cannot see exists. A signer fault, or a session store
+    /// that cannot answer, carries a distinct detail because it discloses
+    /// nothing about data and a retry is meaningful. The budget is charged
+    /// after a successful mint, so a signer failure never consumes the
+    /// caller's upload window.
     ///
     /// A request naming `for_owner` carries the file for that account (R79
-    /// decision 17). It is minted only for a write by a caller holding an
-    /// account, and only when the deployment's `connetto_file_owner`, read
+    /// decision 17). It is minted only for a write by a caller holding a
+    /// login, and only when the deployment's `connetto_file_owner`, read
     /// with the caller's own rights, answers that account. Every other answer
     /// is refused with the invisible file's detail.
     async fn handle_content_ticket<T: Transport>(
@@ -6443,6 +6451,19 @@ where
         let request_id = req.request_id;
         let caller = crate::capability::rendered_caller(&state.principal);
         let budget_key = crate::capability::meter_key(&state.principal, state.session_id);
+
+        if let Some(session) = caller.session() {
+            match self.authority.session_is_live(session).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return refuse_ticket(transport, request_id, CONTENT_TICKET_REFUSED).await;
+                }
+                Err(err) => {
+                    tracing::warn!(request_id, %err, "content ticket session check failed");
+                    return refuse_ticket(transport, request_id, CONTENT_TICKET_SIGNER_ERROR).await;
+                }
+            }
+        }
 
         // Reader permit: visibility checks out a reader-pool connection, so
         // the same gate that protects subscriptions and mutations applies here.
@@ -6513,9 +6534,10 @@ where
     /// What a content ticket carries for the account `for_owner` names,
     /// `None` when it names none, or the refusal detail to answer.
     ///
-    /// Only a write by a caller holding an account may carry, and only when
-    /// the deployment's `connetto_file_owner`, read with the caller's own
-    /// rights, answers that account (R79 decision 17).
+    /// Only a write by a caller holding a login may carry, the carry audited
+    /// under the login's session the ticket names, and only when the
+    /// deployment's `connetto_file_owner`, read with the caller's own rights,
+    /// answers that account (R79 decision 17).
     async fn ticket_carry(
         &self,
         for_owner: Option<String>,
@@ -6527,7 +6549,9 @@ where
         let Some(for_owner) = for_owner else {
             return Ok(None);
         };
-        if !matches!(verb, ContentVerb::Write { .. }) || state.principal.identity().is_none() {
+        if !matches!(verb, ContentVerb::Write { .. })
+            || crate::capability::login_session(&state.principal).is_none()
+        {
             return Err(CONTENT_TICKET_REFUSED);
         }
         let answered = self
@@ -6541,10 +6565,7 @@ where
         if answered.as_deref() != Some(for_owner.as_str()) {
             return Err(CONTENT_TICKET_REFUSED);
         }
-        Ok(Some(ContentCarry {
-            owner: for_owner,
-            session: state.session_id,
-        }))
+        Ok(Some(ContentCarry { owner: for_owner }))
     }
 
     /// Answer a device list request with the caller's devices.
@@ -6589,6 +6610,7 @@ where
                 .map_err(|err| match err {
                     RevokeError::NotFound => EnrolRefusal::InvalidRequest,
                     RevokeError::NotInstalled => EnrolRefusal::IssuerUnavailable,
+                    RevokeError::Refused(reason) => EnrolRefusal::Refused { reason },
                     RevokeError::Unavailable(source) => {
                         tracing::warn!(error = %source, "a device could not be revoked");
                         EnrolRefusal::IssuerUnavailable
@@ -6597,8 +6619,8 @@ where
             Err(refusal) => Err(refusal),
         };
         match revoked {
-            Ok((enrolment, (_, session, lists))) => {
-                self.after_revocation(&enrolment, session, lists).await;
+            Ok((enrolment, revoked)) => {
+                self.after_revocation(&enrolment, revoked).await;
                 transport
                     .send_control(ControlMessage::DeviceRevokedAck(DeviceRevokedAck {
                         request_id,
@@ -6720,20 +6742,23 @@ where
     }
 
     /// Close the revoked device's connection, push the new lists to every
-    /// identified connection, and revoke the auth-store session.
+    /// identified connection, then close and record the auth-store session
+    /// the revocation ended.
     async fn after_revocation(
         &self,
-        enrolment: &crate::device_cert::DeviceEnrolment<Id>,
-        session: SessionId,
-        lists: Vec<SignedList>,
+        enrolment: &crate::device_cert::DeviceEnrolment<D>,
+        revoked: crate::device_cert::KeyRevoked<Id>,
     ) {
-        self.announce_revocation(session, lists).await;
-        enrolment.revoke_session(session).await;
+        self.announce_revocation(revoked.session, revoked.lists)
+            .await;
+        if let Some(user) = &revoked.ended {
+            enrolment.session_ended(user, revoked.session);
+        }
     }
 
     /// Close the revoked device's connection with `DeviceRevoked` and push
     /// the new lists to every identified connection.
-    async fn announce_revocation(&self, session: SessionId, lists: Vec<SignedList>) {
+    pub(crate) async fn announce_revocation(&self, session: SessionId, lists: Vec<SignedList>) {
         self.close_session(session, FatalErrorReason::DeviceRevoked)
             .await;
         let update = ControlMessage::RevocationUpdate(RevocationUpdate { lists });
@@ -6752,48 +6777,30 @@ where
     /// # Errors
     ///
     /// [`RevokeError::NotFound`] for a key never enrolled,
-    /// [`RevokeError::NotInstalled`] when no enrolment is installed, and
+    /// [`RevokeError::NotInstalled`] when no enrolment is installed,
+    /// [`RevokeError::Refused`] when the application's hook refuses, and
     /// [`RevokeError::Unavailable`] when the table or the issuer fails.
     pub async fn revoke_device(&self, key: KeyId) -> Result<bool, RevokeError> {
         let enrolment = self
             .device_enrolment
             .get()
             .ok_or(RevokeError::NotInstalled)?;
-        let (fresh, session, lists) = enrolment.revoke(None, key).await?;
-        self.after_revocation(enrolment, session, lists).await;
+        let revoked = enrolment.revoke(None, key).await?;
+        let fresh = revoked.fresh;
+        self.after_revocation(enrolment, revoked).await;
         Ok(fresh)
     }
 
-    /// `user`'s enrolled devices with the session each last enrolled under,
-    /// none when no enrolment is installed.
-    pub(crate) async fn devices_of(
-        &self,
-        user: &Id,
-    ) -> Result<Vec<crate::device_cert::Device>, crate::device_cert::EnrolmentError> {
-        match self.device_enrolment.get() {
-            Some(enrolment) => enrolment.enrolled(user).await,
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// Revoke `user`'s device key `key`, publishing the list and closing its
-    /// connection with `DeviceRevoked`, and leave its auth-store session to
-    /// the caller, which ends it with its own cause.
-    pub(crate) async fn revoke_device_of(&self, user: &Id, key: KeyId) -> Result<(), RevokeError> {
-        let enrolment = self
-            .device_enrolment
-            .get()
-            .ok_or(RevokeError::NotInstalled)?;
-        let (_, session, lists) = enrolment.revoke(Some(user), key).await?;
-        self.announce_revocation(session, lists).await;
-        Ok(())
+    /// The installed device enrolment, none when device identity is off.
+    pub(crate) fn device_enrolment(&self) -> Option<&Arc<crate::device_cert::DeviceEnrolment<D>>> {
+        self.device_enrolment.get()
     }
 
     /// The installed enrolment and the account enrolling, or why this session cannot enrol.
     fn enrolling(
         &self,
         state: &SessionState<Id, Key>,
-    ) -> Result<(Arc<crate::device_cert::DeviceEnrolment<Id>>, Id), EnrolRefusal> {
+    ) -> Result<(Arc<crate::device_cert::DeviceEnrolment<D>>, Id), EnrolRefusal> {
         let user = state
             .principal
             .identity()

@@ -254,7 +254,7 @@ impl Enrolments {
 fn manager(
     pool: &Pool<AsyncPgConnection>,
     guard: Arc<RequestGuard<String>>,
-    enrolment: Option<DeviceEnrolment<String>>,
+    enrolment: Option<DeviceEnrolment<ConnettoDefaults>>,
 ) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>> {
     let manager = ManagerBuilder::new(
         Materializer::builder(PG_DDL)
@@ -321,11 +321,11 @@ async fn a_ruling_answers_every_row_of_the_verdict_table() {
         AbuseConfig::default(),
     ));
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (alice, alice_id) = enrol.enrol_key("alice", live).await;
     let (carol, carol_id) = enrol.enrol_key("carol", live).await;
     let (dave, dave_id) = enrol.enrol_key("dave", live).await;
-    enrol.revoke(carol_id);
+    enrol.revoke(carol_id).await;
     let manager = manager(fixture.admin(), guard, Some(enrol.installable()));
 
     // alice binds her device writer and settles one applied entry, sequence 1.
@@ -500,7 +500,7 @@ async fn an_overbound_or_forged_ask_is_refused() {
         AbuseConfig::default(),
     ));
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (x1, x1_id) = enrol.enrol_key("x1", live).await;
     let (x2, x2_id) = enrol.enrol_key("x2", live).await;
     let (x3, x3_id) = enrol.enrol_key("x3", live).await;
@@ -626,7 +626,7 @@ async fn an_unreadable_record_table_fails_the_ask() {
         AbuseConfig::default(),
     ));
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (x1, x1_id) = enrol.enrol_key("x1", live).await;
     let manager = manager(fixture.admin(), guard, Some(enrol.installable()));
     insert_writer_row(fixture.admin(), "x1", x1_id, 2).await;
@@ -669,7 +669,7 @@ async fn a_follow_up_ask_for_the_same_author_gets_its_own_verdicts() {
         AbuseConfig::default(),
     ));
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (x1, x1_id) = enrol.enrol_key("x1", live).await;
     let manager = manager(fixture.admin(), guard, Some(enrol.installable()));
 
@@ -730,7 +730,7 @@ async fn a_prune_keeps_the_refusals_while_the_writer_row_stands() {
         AbuseConfig::default(),
     ));
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (alice, alice_id) = enrol.enrol_key("alice", live).await;
     let manager = manager(fixture.admin(), guard, Some(enrol.installable()));
     let admin = fixture.admin();
@@ -822,7 +822,7 @@ async fn a_prune_keeps_the_refusals_while_the_writer_row_stands() {
     .await;
     set_frontier(admin, device_writer, 3).await;
 
-    enrol.revoke(alice_id);
+    enrol.revoke(alice_id).await;
     let pruned = manager.sweep_writer_rows().await.expect("sweep the rows");
     assert_eq!(pruned, 1, "the sweep pruned the dead device writer");
 

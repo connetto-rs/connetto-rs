@@ -7,10 +7,9 @@
 //! authenticator exchanges the code with its PKCE verifier, stores the refresh
 //! token, and silently refreshes.
 //!
-//! It also proves the typed `user_id` boundary: a project whose id is a
-//! `rosetta_uuid::Uuid` gets that value back from the token endpoint as its own
-//! type, with no `Display` or `FromStr` anywhere on the path, and the replica
-//! file the client opens is named from it.
+//! It also proves that a typed `rosetta_uuid::Uuid` identity, the one id type
+//! the server's Postgres tables and the client's SQLite replica share, crosses
+//! the token endpoint as itself and names the client's replica file.
 
 use std::sync::Arc;
 
@@ -25,50 +24,64 @@ use connetto_core::traits::{
     GrantRefused, HandshakeAuthority, RefreshFuture, RefreshTokenStore, ReplicaKeyStore,
 };
 use connetto_server::{
-    AuthConfig, AuthService, GenericOidcProvider, IdentityResolver, InMemoryAuthStore,
-    ProviderRegistry, RedirectPolicy, RequestGuard, ResolveFuture, TokenAuthority, VerifiedClaims,
-    auth_router,
+    AuthConfig, AuthHooks, AuthService, DbAuthStore, GenericOidcProvider, HookFuture,
+    ProviderRegistry, RedirectPolicy, RequestGuard, TokenAuthority, VerifiedClaims, auth_router,
 };
-use connetto_test_harness::{MOCK_OAUTH_PROVIDER, MockOauth};
+use connetto_test_harness::{ConnettoDefaults, Fixture, MOCK_OAUTH_PROVIDER, MockOauth};
+use diesel_async::AsyncPgConnection;
 use openidconnect::reqwest;
 use rosetta_uuid::Uuid;
 
+connetto_server::connetto_schema! {
+    struct TypedAuthSchema;
+    id: Uuid => rosetta_uuid::sql_types::Uuid,
+    audit_row_key: Uuid => rosetta_uuid::sql_types::Uuid,
+    audit_ddl: connetto_server::connetto_audit_ddl!("UUID", "UUID"),
+}
+
 /// A fixed namespace for the deterministic `subject` to `Uuid` mapping,
-/// standing in for an app's own [`IdentityResolver`].
+/// standing in for an app's own [`AuthHooks::user_for`].
 const NS: uuid::Uuid = uuid::Uuid::from_u128(0x2b7e_1516_28ae_d2a6_abf7_1588_09cf_4f3c);
 
-/// The typed id the resolver below mints for `subject`.
+/// The typed id the hooks below answer for `subject`.
 ///
 /// Keys on the subject alone because the test idp mints a fresh issuer per run.
 fn typed_id(subject: &str) -> Uuid {
     uuid::Uuid::new_v5(&NS, subject.as_bytes()).into()
 }
 
-/// A resolver mapping verified claims to its own typed id.
-struct TypedResolver;
+/// Hooks mapping verified claims to their own typed id.
+struct TypedHooks;
 
-impl IdentityResolver for TypedResolver {
-    type Id = Uuid;
-
-    fn resolve<'a>(&'a self, claims: &'a VerifiedClaims) -> ResolveFuture<'a, Uuid> {
-        // Key on the subject alone: the test idp mints a fresh issuer per run.
-        let id: Uuid = uuid::Uuid::new_v5(&NS, claims.subject.as_bytes()).into();
+impl AuthHooks<TypedAuthSchema> for TypedHooks {
+    fn user_for<'a>(
+        &'a self,
+        _transaction: &'a mut AsyncPgConnection,
+        claims: &'a VerifiedClaims,
+    ) -> HookFuture<'a, Uuid> {
+        // The test provider mints a fresh issuer per run.
+        let id = typed_id(&claims.subject);
         Box::pin(async move { Ok(id) })
     }
 }
 
-/// Serve the auth router on an ephemeral port and return the base URL and idp
-/// guard.
-async fn spawn_auth_server() -> (String, MockOauth) {
-    let (base, _service, idp) = spawn_auth_server_with_service(Vec::new()).await;
-    (base, idp)
+/// Serve the auth router and retain its provider and database fixtures.
+async fn spawn_auth_server() -> (String, MockOauth, Fixture) {
+    let (base, _service, idp, fixture) = spawn_auth_server_with_service(Vec::new()).await;
+    (base, idp, fixture)
 }
 
 /// As [`spawn_auth_server`], also handing back the service so a test can ask the
 /// real handshake verifier what it makes of a token.
 async fn spawn_auth_server_with_service(
     redirect_allowlist: Vec<String>,
-) -> (String, Arc<AuthService<InMemoryAuthStore>>, MockOauth) {
+) -> (
+    String,
+    Arc<AuthService<ConnettoDefaults>>,
+    MockOauth,
+    Fixture,
+) {
+    let fixture = Fixture::acquire().await;
     // Bind connetto's listener first so the callback URL is known.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -87,7 +100,7 @@ async fn spawn_auth_server_with_service(
 
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let service = Arc::new(AuthService::new(
         authority,
         store,
@@ -104,12 +117,14 @@ async fn spawn_auth_server_with_service(
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("serve");
     });
-    (base, service, idp)
+    (base, service, idp, fixture)
 }
 
-/// Serve an auth router whose store resolves identity to a typed
-/// `rosetta_uuid::Uuid`, with one containerised provider.
-async fn spawn_typed_auth_server() -> (String, MockOauth) {
+/// Serve an auth router with `rosetta_uuid::Uuid` identities and retain its
+/// fixtures.
+async fn spawn_typed_auth_server() -> (String, MockOauth, Fixture) {
+    let fixture = Fixture::acquire().await;
+    fixture.provision_auth_tables_over("UUID").await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind typed auth server");
@@ -119,9 +134,10 @@ async fn spawn_typed_auth_server() -> (String, MockOauth) {
 
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let store = Arc::new(InMemoryAuthStore::<Uuid>::with_resolver(
+    let store = Arc::new(DbAuthStore::<TypedAuthSchema>::new(
+        fixture.admin().clone(),
         config.refresh_lifetimes(),
-        Arc::new(TypedResolver),
+        Arc::new(TypedHooks),
     ));
     let service = Arc::new(AuthService::new(
         authority,
@@ -148,7 +164,7 @@ async fn spawn_typed_auth_server() -> (String, MockOauth) {
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("serve");
     });
-    (base, idp)
+    (base, idp, fixture)
 }
 
 /// Drive the full loopback login against `base` as `subject`.
@@ -215,7 +231,7 @@ fn fake_browser(subject: &str) -> BrowserOpener {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_login_refreshes_and_silently_reacquires() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _idp) = spawn_auth_server().await;
+    let (base, _idp, _fixture) = spawn_auth_server().await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
 
     // Interactive login: no account stored yet, so nothing to try silently.
@@ -297,7 +313,7 @@ async fn native_login_refreshes_and_silently_reacquires() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_first_login_refreshes_for_its_own_reconnect() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _idp) = spawn_auth_server().await;
+    let (base, _idp, _fixture) = spawn_auth_server().await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let authenticator = Arc::new(
         NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, Arc::clone(&store), None)
@@ -325,13 +341,11 @@ async fn a_first_login_refreshes_for_its_own_reconnect() {
     assert_ne!(issued, rotated, "the refresh rotated that account's token");
 }
 
-/// A project whose `Id` is a typed uuid, not a string. The token endpoint
-/// serializes that id and the client deserializes it straight back into the
-/// same type, so nothing on the `user_id` path is text.
+/// A typed `rosetta_uuid::Uuid` identity round-trips from server to client.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_typed_user_id_round_trips_and_names_the_replica() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _idp) = spawn_typed_auth_server().await;
+    let (base, _idp, _fixture) = spawn_typed_auth_server().await;
 
     let alice = login_as(&base, "alice").await;
     let bob = login_as(&base, "bob").await;
@@ -367,7 +381,7 @@ async fn a_typed_user_id_round_trips_and_names_the_replica() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _idp) = spawn_typed_auth_server().await;
+    let (base, _idp, _fixture) = spawn_typed_auth_server().await;
     let keys = MemoryKeyStore::default();
 
     let alice = login_as(&base, "alice").await;
@@ -432,7 +446,7 @@ async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, service, _idp) = spawn_auth_server_with_service(Vec::new()).await;
+    let (base, service, _idp, _fixture) = spawn_auth_server_with_service(Vec::new()).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
 
     let login =
@@ -521,7 +535,7 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_first_login_logout_revokes_its_own_session() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, service, _idp) = spawn_auth_server_with_service(Vec::new()).await;
+    let (base, service, _idp, _fixture) = spawn_auth_server_with_service(Vec::new()).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let authenticator =
         NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, Arc::clone(&store), None)
@@ -714,7 +728,7 @@ fn claimed(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_claimed_redirect_login_completes_through_the_apps_session() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let authenticator = Arc::new(claimed(
@@ -749,7 +763,7 @@ async fn a_claimed_redirect_login_completes_through_the_apps_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_claimed_redirect_with_a_foreign_state_is_refused() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let mut session = ScriptedSession::new("mobile-user");
@@ -771,7 +785,7 @@ async fn a_claimed_redirect_with_a_foreign_state_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_login_finishes_in_the_process_its_redirect_restarts() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let mut dying = ScriptedSession::new("mobile-user");
@@ -817,7 +831,7 @@ async fn a_login_finishes_in_the_process_its_redirect_restarts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_process_starts_over_on_a_foreign_redirect() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let mut dying = ScriptedSession::new("mobile-user");
@@ -847,7 +861,7 @@ async fn a_restarted_process_starts_over_on_a_foreign_redirect() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_process_starts_over_when_the_resumed_code_is_refused() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let mut dying = ScriptedSession::new("mobile-user");
@@ -885,7 +899,7 @@ async fn a_restarted_process_starts_over_when_the_resumed_code_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_process_without_a_redirect_starts_over() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let mut dying = ScriptedSession::new("mobile-user");
@@ -992,7 +1006,7 @@ async fn builder_login(base: &str, store: &SharedRefreshStore, subject: &str) ->
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_provider_build_reports_its_session_and_forgets_its_device() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _idp) = spawn_auth_server().await;
+    let (base, _idp, _fixture) = spawn_auth_server().await;
     let store = SharedRefreshStore::default();
     let dir = tempfile::tempdir().expect("a temporary directory");
 
@@ -1073,7 +1087,7 @@ async fn a_provider_build_reports_its_session_and_forgets_its_device() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_last_used_build_signs_back_in_without_a_browser() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _idp) = spawn_auth_server().await;
+    let (base, _idp, _fixture) = spawn_auth_server().await;
     let store = SharedRefreshStore::default();
     let account = Box::pin(builder_login(&base, &store, "returning-user")).await;
 
@@ -1100,7 +1114,7 @@ async fn a_last_used_build_signs_back_in_without_a_browser() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ask_build_signs_in_as_the_account_the_chooser_picks() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, _service, _idp) =
+    let (base, _service, _idp, _fixture) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store = SharedRefreshStore::default();
     let first = Box::pin(builder_login(&base, &store, "first-user")).await;
@@ -1193,5 +1207,529 @@ async fn an_ask_build_without_an_answer_is_refused() {
     assert!(
         matches!(refused, Err(ClientError::Auth(_))),
         "a chooser answering Ask is refused"
+    );
+}
+
+diesel::table! {
+    /// The table [`BUILDER_DDL`] creates.
+    items (id) {
+        /// The item's key.
+        id -> Integer,
+        /// Its label.
+        label -> Nullable<Text>,
+    }
+}
+
+/// A durable provider build of `schema` over `dir` that signs `subject` in
+/// through a fresh login and opens offline.
+async fn durable_login(
+    base: &str,
+    store: &SharedRefreshStore,
+    dir: &std::path::Path,
+    keys: &super::support::SharedKeys,
+    subject: &str,
+    schema: connetto_client::SyncSchema,
+) -> connetto_client::NativeClient<FakeTransport> {
+    Box::pin(
+        NativeClientBuilder::new("ws://127.0.0.1:1/", schema)
+            .with_dialer(super::support::NeverDial::<FakeTransport>::default())
+            .signed_in(
+                provider(base, store, AccountChoice::New)
+                    .with_browser_opener(fake_browser(subject)),
+            )
+            .durable(dir, keys.clone())
+            .with_gate(Gate::off())
+            .connect(),
+    )
+    .await
+    .expect("the durable provider build signs in and opens offline")
+}
+
+/// Run the write `sql` through `client` and return the unsynced writes once
+/// the outbox lists it, which it does because the build never reaches a
+/// server.
+async fn queue_write(
+    client: &connetto_client::NativeClient<FakeTransport>,
+    sql: &'static str,
+) -> Vec<connetto_client::UnsyncedWrite> {
+    use diesel::connection::SimpleConnection as _;
+    let mut outbox = client
+        .client()
+        .unsynced_live()
+        .await
+        .expect("follow the outbox");
+    client
+        .client()
+        .with_conn(move |conn| conn.conn().batch_execute(sql).expect("write offline"))
+        .await
+        .expect("the gate is off");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while outbox.work().writes.is_empty() {
+            outbox.changed().await.expect("the outbox stays followed");
+        }
+    })
+    .await
+    .expect("the outbox lists the offline write");
+    client.client().unsynced().await.expect("read the outbox")
+}
+
+/// A build sharing tables with two accounts on one data directory: `bob`
+/// stored with an unsent shared insert of row 5, `alice` live with the
+/// shared store attached, reading that row.
+struct SharedAccounts {
+    _idp: MockOauth,
+    _fixture: connetto_test_harness::Fixture,
+    _keyring: connetto_test_harness::SessionKeyringGuard,
+    store: SharedRefreshStore,
+    dir: tempfile::TempDir,
+    keys: super::support::SharedKeys,
+    alice_client: connetto_client::NativeClient<FakeTransport>,
+    bob: String,
+    bob_replica: String,
+}
+
+impl SharedAccounts {
+    async fn signed_in() -> Self {
+        use super::shared_coverage::schema;
+
+        let keyring = connetto_test_harness::isolated_session_keyring();
+        let (base, idp, fixture) = spawn_auth_server().await;
+        let store = SharedRefreshStore::default();
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let keys = super::support::SharedKeys::default();
+        let bob_client = Box::pin(durable_login(
+            &base,
+            &store,
+            dir.path(),
+            &keys,
+            "bob",
+            schema(),
+        ))
+        .await;
+        let bob_session = bob_client.session().expect("bob's session");
+        let bob = bob_session.account().to_owned();
+        let bob_replica = replica_db_name(connetto_client::REPLICA_PREFIX, &bob_session.user_id())
+            .expect("bob's replica name");
+        Box::pin(queue_write(
+            &bob_client,
+            "INSERT INTO tags VALUES (5, 'never sent')",
+        ))
+        .await;
+        bob_client.close().await;
+        let alice_client = Box::pin(durable_login(
+            &base,
+            &store,
+            dir.path(),
+            &keys,
+            "alice",
+            schema(),
+        ))
+        .await;
+        let accounts = Self {
+            _idp: idp,
+            _fixture: fixture,
+            _keyring: keyring,
+            store,
+            dir,
+            keys,
+            alice_client,
+            bob,
+            bob_replica,
+        };
+        assert_eq!(
+            accounts.shared_ids().await,
+            [5],
+            "bob's unsent insert is in the store alice reads"
+        );
+        accounts
+    }
+
+    /// The shared rows `alice` reads.
+    async fn shared_ids(&self) -> Vec<i64> {
+        self.alice_client
+            .client()
+            .with_conn(super::shared_coverage::ids)
+            .await
+            .expect("the gate is off")
+    }
+}
+
+/// A build sharing tables deletes a stored account while the live account's
+/// connection holds the shared store attached. The stored account's unsent
+/// shared insert is undone in the store the live account reads, and the
+/// store stays, since the live account is still in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_stored_account_undoes_its_unsent_shared_writes() {
+    let accounts = Box::pin(SharedAccounts::signed_in()).await;
+    accounts
+        .alice_client
+        .forget_stored_account(&accounts.bob, true)
+        .await
+        .expect("the forced delete removes bob");
+    assert!(
+        accounts.shared_ids().await.is_empty(),
+        "bob's unsent insert is undone"
+    );
+    assert!(
+        accounts
+            .dir
+            .path()
+            .join(connetto_client::shared_store_name(
+                connetto_client::REPLICA_PREFIX
+            ))
+            .exists(),
+        "alice keeps the shared store"
+    );
+}
+
+/// A departure the shared store refuses refuses the delete. Nothing of the
+/// stored account goes, so the changesets the undo needs stay in its replica
+/// for the next try.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_shared_departure_refuses_the_delete() {
+    use connetto_client::teardown::{ForgetError, ForgetRefusal};
+    use diesel::connection::SimpleConnection as _;
+
+    let accounts = Box::pin(SharedAccounts::signed_in()).await;
+    accounts
+        .alice_client
+        .client()
+        .with_conn(|conn| {
+            conn.conn()
+                .batch_execute(
+                    "CREATE TRIGGER connetto_shared.refuse_departures \
+                     BEFORE DELETE ON _connetto_identity \
+                     BEGIN SELECT RAISE(ABORT, 'the store refuses'); END",
+                )
+                .expect("make the store refuse departures");
+        })
+        .await
+        .expect("the gate is off");
+
+    assert!(
+        matches!(
+            accounts
+                .alice_client
+                .forget_stored_account(&accounts.bob, true)
+                .await,
+            Err(ForgetError::Refused(ForgetRefusal::Shared(_)))
+        ),
+        "the refused departure refuses the delete"
+    );
+    assert!(
+        accounts.dir.path().join(&accounts.bob_replica).exists(),
+        "bob's replica stays"
+    );
+    assert!(
+        accounts
+            .keys
+            .load(&accounts.bob_replica)
+            .await
+            .expect("load")
+            .is_some(),
+        "and its key"
+    );
+    assert!(
+        accounts
+            .store
+            .load(&accounts.bob)
+            .await
+            .expect("load")
+            .is_some(),
+        "and bob's sign-in"
+    );
+    assert_eq!(
+        accounts.shared_ids().await,
+        [5],
+        "and his unsent insert, which a later try undoes"
+    );
+}
+
+/// Two accounts signed in on one data directory: `bob` stored with one
+/// unsent write in his closed replica, `alice` live with one of her own.
+struct TwoAccounts {
+    base: String,
+    _idp: MockOauth,
+    _fixture: connetto_test_harness::Fixture,
+    _keyring: connetto_test_harness::SessionKeyringGuard,
+    store: SharedRefreshStore,
+    dir: tempfile::TempDir,
+    keys: super::support::SharedKeys,
+    alice_client: connetto_client::NativeClient<FakeTransport>,
+    alice: String,
+    alice_replica: String,
+    alice_queued: Vec<connetto_client::UnsyncedWrite>,
+    bob: String,
+    bob_replica: String,
+    bob_queued: Vec<connetto_client::UnsyncedWrite>,
+    bob_token: String,
+}
+
+impl TwoAccounts {
+    async fn signed_in() -> Self {
+        Self::signed_in_with(|| super::support::bundle(BUILDER_DDL)).await
+    }
+
+    /// The two accounts on builds of the schema `schema` makes.
+    async fn signed_in_with(schema: fn() -> connetto_client::SyncSchema) -> Self {
+        let keyring = connetto_test_harness::isolated_session_keyring();
+        let (base, idp, fixture) = spawn_auth_server().await;
+        let store = SharedRefreshStore::default();
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let keys = super::support::SharedKeys::default();
+
+        let bob_client = Box::pin(durable_login(
+            &base,
+            &store,
+            dir.path(),
+            &keys,
+            "bob",
+            schema(),
+        ))
+        .await;
+        let bob_session = bob_client.session().expect("bob's session");
+        let bob = bob_session.account().to_owned();
+        let bob_replica = replica_db_name(connetto_client::REPLICA_PREFIX, &bob_session.user_id())
+            .expect("bob's replica name");
+        let bob_queued = Box::pin(queue_write(
+            &bob_client,
+            "INSERT INTO items VALUES (1, 'bob-offline')",
+        ))
+        .await;
+        bob_client.close().await;
+        let bob_token = store
+            .load(&bob)
+            .await
+            .expect("load")
+            .expect("bob's sign-in is stored");
+        assert!(
+            dir.path().join(&bob_replica).exists(),
+            "bob's replica is on the device"
+        );
+
+        let alice_client = Box::pin(durable_login(
+            &base,
+            &store,
+            dir.path(),
+            &keys,
+            "alice",
+            schema(),
+        ))
+        .await;
+        let alice_session = alice_client.session().expect("alice's session");
+        let alice = alice_session.account().to_owned();
+        let alice_replica =
+            replica_db_name(connetto_client::REPLICA_PREFIX, &alice_session.user_id())
+                .expect("alice's replica name");
+        let alice_queued = Box::pin(queue_write(
+            &alice_client,
+            "INSERT INTO items VALUES (1, 'alice-offline')",
+        ))
+        .await;
+        Self {
+            base,
+            _idp: idp,
+            _fixture: fixture,
+            _keyring: keyring,
+            store,
+            dir,
+            keys,
+            alice_client,
+            alice,
+            alice_replica,
+            alice_queued,
+            bob,
+            bob_replica,
+            bob_queued,
+            bob_token,
+        }
+    }
+
+    /// Whether bob's replica, its key and his stored sign-in are all on the
+    /// device.
+    async fn bob_is_stored(&self) -> bool {
+        self.dir.path().join(&self.bob_replica).exists()
+            && self
+                .keys
+                .load(&self.bob_replica)
+                .await
+                .expect("load")
+                .is_some()
+            && self.store.load(&self.bob).await.expect("load").as_deref()
+                == Some(self.bob_token.as_str())
+    }
+}
+
+/// The delete refuses the live account, an account the device does not
+/// store, and a stored account whose closed replica holds unsent writes,
+/// naming them. None of the refusals destroys anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_stored_account_refuses_without_destroying_anything() {
+    use connetto_client::teardown::{ForgetError, ForgetRefusal};
+
+    let accounts = Box::pin(TwoAccounts::signed_in()).await;
+    let client = &accounts.alice_client;
+    assert!(
+        matches!(
+            client.forget_stored_account(&accounts.alice, true).await,
+            Err(ForgetError::Refused(ForgetRefusal::LiveAccount))
+        ),
+        "the live account is forgotten through forget_device"
+    );
+    assert!(
+        matches!(
+            client.forget_stored_account("nobody", true).await,
+            Err(ForgetError::Refused(ForgetRefusal::UnknownAccount))
+        ),
+        "an account the device does not store is refused"
+    );
+    match client.forget_stored_account(&accounts.bob, false).await {
+        Err(ForgetError::Refused(ForgetRefusal::Unsynced(blocked))) => {
+            assert_eq!(
+                blocked, accounts.bob_queued,
+                "the refusal names bob's unsent writes"
+            );
+        }
+        other => panic!("expected bob's unsent writes to refuse the delete, got {other:?}"),
+    }
+    assert!(
+        accounts.bob_is_stored().await,
+        "the refusals leave bob's replica, key and sign-in"
+    );
+    assert!(
+        accounts.dir.path().join(&accounts.alice_replica).exists(),
+        "and alice's replica"
+    );
+}
+
+/// The schema [`BUILDER_DDL`] declares, its `items` behind a translated
+/// policy, so the replica holds the policy views the build's map names.
+fn policy_schema() -> connetto_client::SyncSchema {
+    connetto_client::SyncSchema::new(
+        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
+            connetto_schema::Documents::new(
+                "-- connetto:major 1\nCREATE TABLE items (id INT PRIMARY KEY, label TEXT);",
+                "ALTER TABLE items ENABLE ROW LEVEL SECURITY; \
+                 CREATE POLICY items_p ON items USING (true) WITH CHECK (true);",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+        )
+        .expect("translate the sources"),
+    )
+}
+
+/// A build whose tables carry translated policies reads a stored account's
+/// closed replica as the live build opens it, so the delete names the
+/// account's unsent writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_policy_build_names_a_stored_accounts_unsent_writes() {
+    use connetto_client::teardown::{ForgetError, ForgetRefusal};
+
+    let accounts = Box::pin(TwoAccounts::signed_in_with(policy_schema)).await;
+    match accounts
+        .alice_client
+        .forget_stored_account(&accounts.bob, false)
+        .await
+    {
+        Err(ForgetError::Refused(ForgetRefusal::Unsynced(blocked))) => {
+            assert_eq!(
+                blocked, accounts.bob_queued,
+                "the refusal names bob's unsent writes"
+            );
+        }
+        other => panic!("expected bob's unsent writes to refuse the delete, got {other:?}"),
+    }
+}
+
+/// Forced, the delete revokes the stored account's session at the server and
+/// removes its replica, key and stored credential, while the live account
+/// keeps its replica, key, sign-in, unsent write and rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_live_account_deletes_another_stored_account() {
+    use diesel::prelude::*;
+
+    let accounts = Box::pin(TwoAccounts::signed_in()).await;
+    let TwoAccounts {
+        base,
+        store,
+        dir,
+        keys,
+        alice_client,
+        alice,
+        alice_replica,
+        alice_queued,
+        bob,
+        bob_replica,
+        bob_token,
+        ..
+    } = &accounts;
+    alice_client
+        .forget_stored_account(bob, true)
+        .await
+        .expect("the forced delete removes bob");
+    assert!(
+        !dir.path().join(bob_replica).exists(),
+        "bob's replica is gone"
+    );
+    assert!(
+        keys.load(bob_replica).await.expect("load").is_none(),
+        "and its key record"
+    );
+    assert_eq!(
+        store.load(bob).await.expect("load"),
+        None,
+        "and bob's sign-in"
+    );
+    assert!(
+        !store.accounts().await.expect("accounts").contains(bob),
+        "the device no longer lists bob"
+    );
+    let replay: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    replay.store(bob, bob_token).await.expect("store");
+    let refused = NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, replay, Some(bob.clone()))
+        .with_browser_opener(no_browser())
+        .refresh_access::<String>()
+        .await;
+    assert!(
+        refused.is_err(),
+        "the server refuses bob's revoked refresh token"
+    );
+
+    assert!(
+        dir.path().join(alice_replica).exists(),
+        "alice's replica stays"
+    );
+    assert!(
+        keys.load(alice_replica).await.expect("load").is_some(),
+        "and its key"
+    );
+    assert!(
+        store.load(alice).await.expect("load").is_some(),
+        "and alice's sign-in"
+    );
+    assert_eq!(
+        &alice_client
+            .client()
+            .unsynced()
+            .await
+            .expect("read the outbox"),
+        alice_queued,
+        "alice's unsent write is untouched"
+    );
+    let labels = alice_client
+        .client()
+        .with_conn(|conn| {
+            items::table
+                .select(items::label)
+                .load::<Option<String>>(conn.conn())
+                .expect("read alice's items")
+        })
+        .await
+        .expect("the gate is off");
+    assert_eq!(
+        labels,
+        vec![Some("alice-offline".to_owned())],
+        "alice still reads her own row"
     );
 }

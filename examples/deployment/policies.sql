@@ -66,10 +66,27 @@ CREATE POLICY photos_delete ON photos FOR DELETE USING (
 -- member, and PostgreSQL refuses that loop for a reader the table does not
 -- own. The roster is the demo's shared reference data, and the note rows are
 -- what the membership gates.
+
+-- Every account reads every team row, the shared reference data a membership
+-- names. No policy admits a write, and roles.sql revokes them besides.
+ALTER TABLE teams ENABLE ROW LEVEL SECURITY;
+CREATE POLICY teams_read ON teams FOR SELECT USING (true);
+
 -- The notes of a team settle from the membership rows the replica syncs, so
 -- the write of an author the replica knows only through those rows settles
 -- the same way on every end of the team.
 ALTER TABLE team_notes ENABLE ROW LEVEL SECURITY;
 CREATE POLICY team_notes_p ON team_notes USING (
   team_id IN (SELECT team_id FROM team_members WHERE member_id = current_setting('app.user_id', true))
+);
+
+-- An account reads its own name and the names of everyone sharing a team
+-- with it, read through the membership rows the replica syncs. No subquery
+-- names a column of the row, so PostgreSQL computes each set once per
+-- statement, and the caller is read once as a scalar subquery.
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY users_read ON users FOR SELECT USING (
+  id = (SELECT current_setting('app.user_id', true))
+  OR id IN (SELECT member_id FROM team_members WHERE team_id IN (
+    SELECT team_id FROM team_members WHERE member_id = (SELECT current_setting('app.user_id', true))))
 );

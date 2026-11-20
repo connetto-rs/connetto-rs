@@ -524,7 +524,6 @@ dependencies = [
 name = "connetto-client"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "base64 0.22.1",
  "connetto-core",
  "diesel",
@@ -573,7 +572,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
- "tracing-subscriber",
  "url",
  "uuid",
  "zeroize",
@@ -599,6 +597,7 @@ dependencies = [
  "js-sys",
  "rosetta-uuid",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tracing",
  "wasm-bindgen",
@@ -2389,15 +2388,6 @@ dependencies = [
  "proc-macro-utils",
  "proc-macro2",
  "quote",
-]
-
-[[package]]
-name = "matchers"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
-dependencies = [
- "regex-automata",
 ]
 
 [[package]]
@@ -4520,7 +4510,6 @@ dependencies = [
  "sharded-slab",
  "smallvec",
  "thread_local",
- "tracing",
  "tracing-core",
  "tracing-log",
  "tracing-serde",
@@ -4680,12 +4669,6 @@ checksum = "cdf60f3d36825d0911af7e102da39cc817280560cad48e81df1eb5c4d7400f76"
 dependencies = [
  "getrandom 0.4.3",
 ]
-
-[[package]]
-name = "valuable"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcpkg"

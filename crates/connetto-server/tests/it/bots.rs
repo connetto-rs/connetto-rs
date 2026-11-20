@@ -16,7 +16,7 @@ use diesel_async::RunQueryDsl as _;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 
-use super::e2e::exec;
+use connetto_test_harness::server_fixture::exec;
 
 /// The store over the fixture's registry tables, re-created from the shipped
 /// DDL so a drift between it and the columns the store reads shows up here,

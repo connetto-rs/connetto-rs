@@ -39,10 +39,11 @@ pub struct TicketPayload {
     pub ceiling: u64,
     /// Unix timestamp (seconds) after which the ticket is expired.
     pub expiry: i64,
-    /// The caller this ticket binds to, both halves of it.
+    /// The caller this ticket binds to, every value of it, its login session
+    /// included.
     pub caller: ContentCaller,
-    /// The account a write uploads the file for and the session that minted
-    /// it, when the caller carries another account's file (R79 decision 17).
+    /// The account a write uploads the file for, when the caller carries
+    /// another account's file (R79 decision 17).
     pub carry: Option<ContentCarry>,
 }
 

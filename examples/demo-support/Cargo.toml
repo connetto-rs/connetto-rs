@@ -10,6 +10,9 @@ publish = false
 [dependencies]
 # The view and the actions cross a process boundary in the Tauri build.
 serde = { version = "1", features = ["derive"] }
+# The device's stored login names, as a JSON file natively and a
+# `localStorage` entry in the browser.
+serde_json = { version = "1", optional = true }
 # The deployment every demo here runs against, documents and all.
 connetto-demo-deployment = { path = "../deployment", optional = true }
 connetto-core = { path = "../../crates/connetto-core", optional = true }
@@ -55,6 +58,7 @@ native = [
   "dep:connetto-auth-session",
   "dep:connetto-file-client",
   "dep:manganis",
+  "dep:serde_json",
   "dep:tokio",
 ]
 # A build for the unattended proof runs, its gate off so no launch asks for
@@ -74,7 +78,7 @@ device-identity = [
 peer = ["client", "connetto-client/peer", "connetto-file-client?/peer", "dep:qrcode"]
 # The browser platform, meaning the transport, the leader election, the relay
 # hub and the DB worker, reached through its WebClientBuilder.
-web = ["client", "dep:connetto-web", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
+web = ["client", "dep:connetto-web", "dep:serde_json", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
 
 # The browser clock and random source the wasm client reads, and the browser
 # platform behind the `web` feature.

@@ -207,6 +207,110 @@ impl PartialEq for ContentHandle {
     }
 }
 
+#[derive(Clone, PartialEq)]
+struct Names(Rc<Vec<support::User>>);
+
+#[derive(Properties, PartialEq)]
+struct BadgeProps {
+    account: String,
+}
+
+/// Chooses a synced name before a stored account's name.
+fn preferred_name<'name>(
+    account: &str,
+    rows: &'name [support::User],
+    stored: &'name support::view::StoredNames,
+) -> Option<&'name str> {
+    rows.iter()
+        .find(|row| row.id == account)
+        .map(|row| row.login_name.as_str())
+        .or_else(|| stored.name(account))
+}
+
+/// Draws an account's animal, preferred name and short identifier.
+#[function_component(Badge)]
+fn badge(props: &BadgeProps) -> Html {
+    let names = use_context::<Names>();
+    let stored =
+        use_context::<UseStateHandle<support::view::StoredNames>>().expect("stored account names");
+    let name = preferred_name(
+        &props.account,
+        names.as_ref().map_or(&[], |names| names.0.as_slice()),
+        &stored,
+    );
+    let badge = support::badge::AccountBadge::of(&props.account);
+    html! {
+        <span class="badge" data-account={props.account.clone()} style={format!("--badge-hue: {}", badge.hue)}>
+            <Icon data={animal_icon(badge.animal)} width={"14"} height={"14"} />
+            if let Some(name) = name {
+                <span class="badge-name">{ name.to_owned() }</span>
+                { " " }
+            }
+            <span class="badge-short">{ badge.short }</span>
+        </span>
+    }
+}
+
+/// Selects the Font Awesome glyph for each badge animal.
+fn animal_icon(animal: support::badge::Animal) -> IconData {
+    use support::badge::Animal;
+    match animal {
+        Animal::Cat => IconData::FONT_AWESOME_SOLID_CAT,
+        Animal::Cow => IconData::FONT_AWESOME_SOLID_COW,
+        Animal::Crow => IconData::FONT_AWESOME_SOLID_CROW,
+        Animal::Dog => IconData::FONT_AWESOME_SOLID_DOG,
+        Animal::Dove => IconData::FONT_AWESOME_SOLID_DOVE,
+        Animal::Dragon => IconData::FONT_AWESOME_SOLID_DRAGON,
+        Animal::Fish => IconData::FONT_AWESOME_SOLID_FISH,
+        Animal::Frog => IconData::FONT_AWESOME_SOLID_FROG,
+        Animal::Hippo => IconData::FONT_AWESOME_SOLID_HIPPO,
+        Animal::Horse => IconData::FONT_AWESOME_SOLID_HORSE,
+        Animal::KiwiBird => IconData::FONT_AWESOME_SOLID_KIWI_BIRD,
+        Animal::Otter => IconData::FONT_AWESOME_SOLID_OTTER,
+        Animal::Shrimp => IconData::FONT_AWESOME_SOLID_SHRIMP,
+        Animal::Spider => IconData::FONT_AWESOME_SOLID_SPIDER,
+        Animal::Worm => IconData::FONT_AWESOME_SOLID_WORM,
+        Animal::Locust => IconData::FONT_AWESOME_SOLID_LOCUST,
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct NamedScreenProps {
+    client: ClientHandle,
+    identity: String,
+    children: Children,
+}
+
+/// Follows names once for the signed-in component tree.
+#[function_component(NamedScreen)]
+fn named_screen(props: &NamedScreenProps) -> Html {
+    let names = use_live(&*props.client.0, support::UserNames).value();
+    let stored =
+        use_context::<UseStateHandle<support::view::StoredNames>>().expect("stored account names");
+    let own_name = names
+        .iter()
+        .find(|row| row.id == props.identity)
+        .map(|row| row.login_name.clone());
+    use_effect_with(
+        (props.identity.clone(), own_name),
+        move |(identity, name)| {
+            if let Some(name) = name
+                && stored.name(identity) != Some(name.as_str())
+            {
+                let mut updated = (*stored).clone();
+                updated.remember(identity, name);
+                glue::save_stored_names(&updated);
+                stored.set(updated);
+            }
+        },
+    );
+    html! {
+        <ContextProvider<Names> context={Names(Rc::new(names))}>
+            { props.children.clone() }
+        </ContextProvider<Names>>
+    }
+}
+
 /// Registers the account chooser callback the worker calls when it needs the user to pick an
 /// account. Called on every render so the closure captures the current render's state handles.
 fn register_account_chooser(
@@ -365,6 +469,7 @@ fn app() -> Html {
 
     // The account a reload restores; the session broadcast refreshes it.
     let stored_account = use_state(glue::read_stored_account);
+    let stored_names = use_state(glue::read_stored_names);
 
     // The passkey custody level, unknown until boot_window returns, so the header shows no gate
     // or custody line before the worker has said which it is.
@@ -523,7 +628,7 @@ fn app() -> Html {
                     })}>
                         <Icon data={IconData::FONT_AWESOME_SOLID_ARROW_RIGHT_ARROW_LEFT} width={"14"} height={"14"} />
                         { "Sign in as " }
-                        <code class="id" title={label.clone()}>{ support::short_id(&label) }</code>
+                        <Badge account={label} />
                     </button>
                 }
             })
@@ -561,27 +666,12 @@ fn app() -> Html {
         let stored = (*stored_account).clone();
         if signed_in {
             let account_line = {
-                let uid = (*identity).clone().unwrap_or_default();
-                let decoded = (*booted_account)
-                    .clone()
-                    .map(|acc| support::account_label(&acc));
-                match decoded {
-                    Some(acc) if acc != uid => html! {
-                        <span>
-                            { "Signed in as " }
-                            <code class="id" title={uid.clone()}>{ support::short_id(&uid) }</code>
-                            { " (account: " }
-                            <code class="id" title={acc.clone()}>{ support::short_id(&acc) }</code>
-                            { ")." }
-                        </span>
-                    },
-                    _ => html! {
-                        <span>
-                            { "Signed in as " }
-                            <code class="id" title={uid.clone()}>{ support::short_id(&uid) }</code>
-                            { "." }
-                        </span>
-                    },
+                let account = (*identity).clone().unwrap_or_default();
+                html! {
+                    <span>
+                        { "Signed in as " }
+                        <Badge {account} />
+                    </span>
                 }
             };
 
@@ -613,7 +703,7 @@ fn app() -> Html {
                         })}>
                             <Icon data={IconData::FONT_AWESOME_SOLID_ARROW_RIGHT_ARROW_LEFT} width={"14"} height={"14"} />
                             { "Switch to " }
-                            <code class="id" title={label.clone()}>{ support::short_id(&label) }</code>
+                            <Badge account={label} />
                         </button>
                     }
                 })
@@ -777,8 +867,7 @@ fn app() -> Html {
                     </h2>
                     <span>
                         { "Signed in as " }
-                        <code class="id" title={identity.clone()}>{ support::short_id(&identity) }</code>
-                        { "." }
+                        <Badge account={identity} />
                     </span>
                 </div>
             }
@@ -810,7 +899,7 @@ fn app() -> Html {
         None => html! {},
     };
 
-    html! {
+    let page = html! {
         <>
             <style>{ support::CSS }</style>
             <div class="wrap">
@@ -826,6 +915,20 @@ fn app() -> Html {
                 { dashboard }
             </div>
         </>
+    };
+    let page = if let (Some(handle), Some(account)) = (&*client, &*identity) {
+        html! {
+            <NamedScreen key={account.clone()} client={handle.clone()} identity={account.clone()}>
+                { page }
+            </NamedScreen>
+        }
+    } else {
+        page
+    };
+    html! {
+        <ContextProvider<UseStateHandle<support::view::StoredNames>> context={stored_names}>
+            { page }
+        </ContextProvider<UseStateHandle<support::view::StoredNames>>>
     }
 }
 
@@ -1410,5 +1513,30 @@ fn dashboard(props: &DashboardProps) -> Html {
                 }
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod badge_tests {
+    use super::*;
+
+    #[test]
+    fn synced_name_precedes_stored_name() {
+        let mut stored = support::view::StoredNames::default();
+        stored.remember("alice", "stored");
+        let rows = vec![support::User {
+            id: "alice".to_owned(),
+            login_name: "synced".to_owned(),
+        }];
+        assert_eq!(preferred_name("alice", &rows, &stored), Some("synced"));
+        assert_eq!(preferred_name("alice", &[], &stored), Some("stored"));
+        assert_eq!(preferred_name("bob", &rows, &stored), None);
+    }
+
+    #[test]
+    fn every_animal_has_a_glyph() {
+        for animal in support::badge::Animal::ALL {
+            let _ = animal_icon(animal);
+        }
     }
 }

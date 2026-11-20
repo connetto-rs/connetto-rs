@@ -107,6 +107,35 @@ async fn a_forced_departure_undoes_its_unsent_shared_writes() {
 }
 
 #[tokio::test]
+async fn a_live_identity_undoes_a_closed_identitys_shared_queue() {
+    let directory = tempfile::tempdir().unwrap();
+    let keys = super::support::SharedKeys::default();
+    let mut alice = connect(
+        directory.path(),
+        keys.clone(),
+        "alice",
+        vec![snapshot("a", &[1])],
+    )
+    .await;
+    subscribe(&mut alice, "a", "SELECT * FROM tags").await;
+    let mut bob = connect(directory.path(), keys, "bob", Vec::new()).await;
+    bob.conn()
+        .batch_execute("INSERT INTO tags VALUES (5, 'never sent')")
+        .unwrap();
+    assert!(bob.push().await.unwrap().is_some());
+    let pending = connetto_client::stored_replica_work(bob.conn()).unwrap();
+    drop(bob);
+    assert_eq!(ids(&mut alice), [1, 5]);
+    alice
+        .forget_shared_identity(
+            &connetto_client::replica_db_name(REPLICA_PREFIX, &"bob").unwrap(),
+            pending.changesets.iter().map(Vec::as_slice),
+        )
+        .unwrap();
+    assert_eq!(ids(&mut alice), [1]);
+}
+
+#[tokio::test]
 async fn forgetting_the_last_identity_removes_the_store_and_its_key() {
     let directory = tempfile::tempdir().unwrap();
     let keys = super::support::SharedKeys::default();

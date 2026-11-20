@@ -136,7 +136,7 @@ impl Key {
 /// so the open question's row filters register.
 fn manager(
     pool: &Pool<AsyncPgConnection>,
-    enrolment: Option<connetto_server::device_cert::DeviceEnrolment<String>>,
+    enrolment: Option<connetto_server::device_cert::DeviceEnrolment<ConnettoDefaults>>,
 ) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>> {
     let ddl = engine_ddl(PG_DDL);
     let manager = ManagerBuilder::new(
@@ -347,7 +347,7 @@ async fn a_settled_write_pushes_the_verdict_to_the_open_ask() {
     fixture.start_replication(&["notes"]).await;
 
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (dave_pair, dave_id) = enrol.enrol("dave", live).await;
     let dave = Key {
         pair: dave_pair,
@@ -374,7 +374,7 @@ async fn a_refused_write_pushes_its_cause_to_the_open_ask() {
     fixture.start_replication(&["notes"]).await;
 
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (dave_pair, dave_id) = enrol.enrol("dave", live).await;
     let dave = Key {
         pair: dave_pair,
@@ -506,7 +506,7 @@ async fn a_final_answer_opens_no_question() {
     fixture.start_replication(&["notes"]).await;
 
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (dave_pair, dave_id) = enrol.enrol("dave", live).await;
     let dave = Key {
         pair: dave_pair,
@@ -551,7 +551,7 @@ async fn a_pruned_record_pushes_settled_to_the_open_ask() {
     fixture.start_replication(&["notes"]).await;
 
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (dave_pair, dave_id) = enrol.enrol("dave", live).await;
     let dave = Key {
         pair: dave_pair,
@@ -579,7 +579,7 @@ async fn a_retired_writer_pushes_abandoned_to_the_open_ask() {
     fixture.start_replication(&["notes"]).await;
 
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (dave_pair, dave_id) = enrol.enrol("dave", live).await;
     let dave = Key {
         pair: dave_pair,
@@ -617,7 +617,7 @@ async fn a_lapsing_certificate_pushes_abandoned_when_its_deadline_passes() {
     // The certificate expired ten seconds before its tolerance window closes,
     // so the ask still reads the author live and its deadline passes shortly.
     let lapsing = SystemTime::now() - connetto_core::clock::DEVICE_SKEW + Duration::from_secs(10);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (dave_pair, dave_id) = enrol.enrol("dave", lapsing).await;
     let dave = Key {
         pair: dave_pair,
@@ -646,7 +646,7 @@ async fn a_closed_author_pushes_nothing_when_its_deadline_passes() {
     // The certificate's tolerance window closes twenty seconds after the ask,
     // so its timer would push `Abandoned` if close did not abort it.
     let lapsing = SystemTime::now() - connetto_core::clock::DEVICE_SKEW + Duration::from_secs(20);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (dave_pair, dave_id) = enrol.enrol("dave", lapsing).await;
     let dave = Key {
         pair: dave_pair,
@@ -797,7 +797,9 @@ async fn a_revoked_enrolment_pushes_abandoned_to_the_open_ask() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
     fixture.start_replication(&["notes"]).await;
-    provision_enrolment_tables(&fixture).await;
+    let auth = fixture
+        .enrolment_auth(Arc::new(connetto_server::authn::DefaultAuthHooks))
+        .await;
 
     // The enrolment stands in the deployment's own tables, so the revocation
     // the stream carries and the record the server reads are one row.
@@ -826,14 +828,11 @@ async fn a_revoked_enrolment_pushes_abandoned_to_the_open_ask() {
         .await;
 
     let (_, _, issuer) = rooted_issuer();
-    let store = connetto_server::device_cert::pg_enrolment_store::<ConnettoDefaults>(
-        fixture.admin().clone(),
-    );
     let manager = manager(
         fixture.admin(),
         Some(connetto_server::device_cert::DeviceEnrolment::new(
             connetto_server::device_cert::DeviceCertConfig::new(issuer),
-            store,
+            auth,
         )),
     );
     start_ingest(manager.clone(), fixture.admin_url().to_owned());
@@ -868,7 +867,7 @@ async fn an_ask_beyond_the_open_bound_is_refused_naming_the_ask() {
     let frame = u64::try_from(MAX_MANIFEST_ROWS).expect("the manifest bound fits a sequence");
     let newest = frame * 9;
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (dave_pair, dave_id) = enrol.enrol("dave", live).await;
     let dave = Key {
         pair: dave_pair,
@@ -939,7 +938,7 @@ async fn a_closed_session_drops_its_open_question() {
     fixture.start_replication(&["notes"]).await;
 
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (dave_pair, dave_id) = enrol.enrol("dave", live).await;
     let dave = Key {
         pair: dave_pair,
@@ -1076,7 +1075,7 @@ async fn a_reconnect_pushes_what_settled_while_the_stream_was_down() {
     fixture.start_replication(&["notes"]).await;
 
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (dave_pair, dave_id) = enrol.enrol("dave", live).await;
     let dave = Key {
         pair: dave_pair,

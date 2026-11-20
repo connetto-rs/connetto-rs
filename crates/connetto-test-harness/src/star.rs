@@ -232,7 +232,8 @@ impl LinkMatrix {
                 if i == j {
                     continue;
                 }
-                seen[i][j] = hotspot_links(pages[i], gateway).any(|peer| peer == identities[j]);
+                seen[i][j] = hotspot_links(pages[i], gateway)
+                    .any(|peer| crate::peer_devices::same_peer(peer, identities[j]));
             }
         }
         Self { seen }
@@ -294,7 +295,7 @@ pub fn names_hotspot_link(page: &str, gateway: Option<Ipv4Addr>) -> bool {
 fn hotspot_links(page: &str, gateway: Option<Ipv4Addr>) -> impl Iterator<Item = &str> {
     page.lines().filter_map(move |line| {
         let gateway = gateway?;
-        let (peer, address) = line.trim().strip_prefix("linked: ")?.split_once(" via ")?;
+        let (peer, address) = line.trim().strip_prefix("linked: ")?.rsplit_once(" via ")?;
         let IpAddr::V4(remote) = address.parse::<SocketAddr>().ok()?.ip() else {
             return None;
         };
@@ -340,9 +341,7 @@ pub enum ProvisionalLine {
     },
 }
 
-/// One `provisional:` line as the panel stands it, `None` where the line is not
-/// one. The table and the key are single tokens, the applied line's account the
-/// field's last token, and the rolled-back line's cause everything after `because`.
+/// Parse a provisional event, preserving the author's complete badge text.
 fn parse_provisional_line(line: &str) -> Option<ProvisionalLine> {
     let table_key = |fields: &str| -> Option<(String, String)> {
         let mut parts = fields.split(' ');
@@ -353,7 +352,7 @@ fn parse_provisional_line(line: &str) -> Option<ProvisionalLine> {
     };
     let rest = line.trim().strip_prefix("provisional: ")?;
     if let Some(rest) = rest.strip_prefix("applied ") {
-        let (fields, account) = rest.rsplit_once(" by ")?;
+        let (fields, account) = rest.split_once(" by ")?;
         let (table, key) = table_key(fields)?;
         return Some(ProvisionalLine::Applied {
             table,
@@ -470,8 +469,9 @@ mod tests {
 
     use super::{
         Device, Join, LinkMatrix, NoteLine, ProvisionalLine, Round, RoundReport, StarError,
-        StepReport, hotspot_gateway, names_hotspot_link, note_lines, plan, provisional_lines,
-        summary, tailscale_holds_vpn, tidy_remaining,
+        StepReport, hotspot_gateway, hotspot_links, names_hotspot_link, note_lines,
+        parse_provisional_line, plan, provisional_lines, summary, tailscale_holds_vpn,
+        tidy_remaining,
     };
 
     /// The M52's VPN agent line, trimmed to the fields the read uses.
@@ -523,18 +523,42 @@ mod tests {
 
     const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 42, 0, 1);
 
+    #[test]
+    fn badge_names_preserve_words_used_by_line_delimiters() {
+        assert_eq!(
+            hotspot_links(
+                "linked: bob via radio 89abcdef/01234567 via 10.42.0.7:4431",
+                Some(GATEWAY)
+            )
+            .collect::<Vec<_>>(),
+            ["bob via radio 89abcdef/01234567"]
+        );
+        assert_eq!(
+            parse_provisional_line("provisional: applied team_notes 9f1c by stand by bob 89abcdef"),
+            Some(ProvisionalLine::Applied {
+                table: "team_notes".to_owned(),
+                key: "9f1c".to_owned(),
+                account: "stand by bob 89abcdef".to_owned(),
+            })
+        );
+    }
+
     fn pages() -> [&'static str; 3] {
         [
-            "peer: listening on 4431 as alice/01234567\nlinked: bob/89abcdef via 10.42.0.7:4432\nlinked: carol/12345678 via 10.42.0.1:4433\n",
-            "peer: listening on 4432 as bob/89abcdef\nlinked: alice/01234567 via 10.42.0.9:4431\nlinked: carol/12345678 via 10.42.0.1:4433\n",
-            "peer: listening on 4433 as carol/12345678\nlinked: alice/01234567 via 10.42.0.9:51000\nlinked: bob/89abcdef via 10.42.0.7:51001\n",
+            "peer: listening on 4431 as alice d5e24135/01234567\nlinked: bob 89abcdef/89abcdef via 10.42.0.7:4432\nlinked: carol cc072008/12345678 via 10.42.0.1:4433\n",
+            "peer: listening on 4432 as bob 89abcdef/89abcdef\nlinked: alice d5e24135/01234567 via 10.42.0.9:4431\nlinked: carol cc072008/12345678 via 10.42.0.1:4433\n",
+            "peer: listening on 4433 as carol cc072008/12345678\nlinked: alice d5e24135/01234567 via 10.42.0.9:51000\nlinked: bob 89abcdef/89abcdef via 10.42.0.7:51001\n",
         ]
     }
 
     /// The matrix holds once every device named the other two through the hotspot.
     #[test]
     fn the_matrix_holds_when_every_device_names_the_other_two() {
-        let identities = ["alice/01234567", "bob/89abcdef", "carol/12345678"];
+        let identities = [
+            "d5e24135/01234567",
+            "89abcdef/89abcdef",
+            "cc072008/12345678",
+        ];
         let pages = pages();
         let matrix = LinkMatrix::from_pages(identities, pages, Some(GATEWAY));
         assert!(matrix.holds());
@@ -547,10 +571,13 @@ mod tests {
     /// A missing link fails the matrix and names the pair that is missing.
     #[test]
     fn a_missing_link_fails_the_matrix_and_names_the_pair() {
-        let identities = ["alice/01234567", "bob/89abcdef", "carol/12345678"];
+        let identities = [
+            "alice d5e24135/01234567",
+            "bob 89abcdef/89abcdef",
+            "carol cc072008/12345678",
+        ];
         let mut pages = pages();
-        pages[0] =
-            "peer: listening on 4431 as alice/01234567\nlinked: bob/89abcdef via 10.42.0.7:4432\n";
+        pages[0] = "peer: listening on 4431 as alice d5e24135/01234567\nlinked: bob 89abcdef/89abcdef via 10.42.0.7:4432\n";
         let matrix = LinkMatrix::from_pages(identities, pages, Some(GATEWAY));
         assert!(!matrix.holds());
         assert_eq!(
@@ -562,9 +589,13 @@ mod tests {
     /// A link over any network but the round's hotspot counts for no edge.
     #[test]
     fn a_link_outside_the_hotspot_subnet_counts_for_nothing() {
-        let identities = ["alice/01234567", "bob/89abcdef", "carol/12345678"];
+        let identities = [
+            "d5e24135/01234567",
+            "89abcdef/89abcdef",
+            "cc072008/12345678",
+        ];
         let mut pages = pages();
-        pages[0] = "linked: bob/89abcdef via 192.168.1.7:4432\nlinked: carol/12345678 via [fe80::1%7]:4433\n";
+        pages[0] = "linked: bob 89abcdef/89abcdef via 192.168.1.7:4432\nlinked: carol cc072008/12345678 via [fe80::1%7]:4433\n";
         let matrix = LinkMatrix::from_pages(identities, pages, Some(GATEWAY));
         assert_eq!(
             matrix.missing(["iphone", "ipad", "android"]),
@@ -580,7 +611,11 @@ mod tests {
     /// Without a known gateway no edge counts, and no hotspot link stands.
     #[test]
     fn without_a_gateway_no_edge_counts() {
-        let identities = ["alice/01234567", "bob/89abcdef", "carol/12345678"];
+        let identities = [
+            "d5e24135/01234567",
+            "89abcdef/89abcdef",
+            "cc072008/12345678",
+        ];
         let matrix = LinkMatrix::from_pages(identities, pages(), None);
         assert_eq!(matrix.missing(["iphone", "ipad", "android"]).len(), 6);
         assert!(!names_hotspot_link(pages()[0], None));
@@ -603,11 +638,15 @@ mod tests {
     /// A device's own line names itself, which no cell counts.
     #[test]
     fn a_page_naming_its_own_identity_names_no_peer() {
-        let identities = ["alice/01234567", "bob/89abcdef", "carol/12345678"];
+        let identities = [
+            "d5e24135/01234567",
+            "89abcdef/89abcdef",
+            "cc072008/12345678",
+        ];
         let pages: [&str; 3] = [
-            "linked: alice/01234567 via 10.42.0.9:1\n",
-            "linked: bob/89abcdef via 10.42.0.7:1\n",
-            "linked: carol/12345678 via 10.42.0.1:1\n",
+            "linked: alice d5e24135/01234567 via 10.42.0.9:1\n",
+            "linked: bob 89abcdef/89abcdef via 10.42.0.7:1\n",
+            "linked: carol cc072008/12345678 via 10.42.0.1:1\n",
         ];
         let matrix = LinkMatrix::from_pages(identities, pages, Some(GATEWAY));
         assert!(!matrix.holds());
@@ -617,7 +656,11 @@ mod tests {
     /// The matrix's text names, per device, the peers its page named.
     #[test]
     fn the_matrix_text_names_each_devices_linked_peers() {
-        let identities = ["alice/01234567", "bob/89abcdef", "carol/12345678"];
+        let identities = [
+            "d5e24135/01234567",
+            "89abcdef/89abcdef",
+            "cc072008/12345678",
+        ];
         let matrix = LinkMatrix::from_pages(identities, pages(), Some(GATEWAY));
         assert_eq!(
             matrix.text(["iphone", "ipad", "android"]),
@@ -706,7 +749,7 @@ mod tests {
              teams: camp\n\
              note: head to the ridge by bob (provisional from bob@demo.dev)\n\
              note: pack the rope by alice\n\
-             provisional: applied team_notes {NOTE_KEY} by bob@demo.dev\n\
+             provisional: applied team_notes {NOTE_KEY} by bob 89abcdef\n\
              provisional: confirmed team_notes {NOTE_KEY}\n\
              provisional: rolled back team_notes {NOTE_KEY} because unauthorized\n\
              provisional: refused team_notes {NOTE_KEY}\n\
@@ -726,7 +769,7 @@ mod tests {
                 ProvisionalLine::Applied {
                     table: "team_notes".to_owned(),
                     key: NOTE_KEY.to_owned(),
-                    account: "bob@demo.dev".to_owned(),
+                    account: "bob 89abcdef".to_owned(),
                 },
                 ProvisionalLine::Confirmed {
                     table: "team_notes".to_owned(),

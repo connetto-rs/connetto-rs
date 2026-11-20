@@ -11,6 +11,8 @@ mod data;
 #[cfg(feature = "client")]
 pub use data::*;
 
+pub mod badge;
+
 pub mod view;
 
 #[cfg(feature = "peer")]
@@ -60,6 +62,12 @@ h1, h2 { display: flex; align-items: center; gap: 8px; }
 .pane { flex: 1 1 300px; border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: #fff; }
 .pane h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 1.05em; }
 .badge { font-size: 0.7em; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+.badge[data-account] { font-size: 1em; padding: 0; white-space: nowrap; }
+.badge[data-account] svg { color: hsl(var(--badge-hue) 65% 35%); vertical-align: -0.1em; margin-right: .3em; }
+.badge-short { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8em; color: var(--muted); }
+@media (prefers-color-scheme: dark) {
+  .badge[data-account] svg { color: hsl(var(--badge-hue) 70% 70%); }
+}
 .synced { background: #ddf4ff; color: #0a3069; }
 .local { background: #ffebe9; color: #82071e; }
 .trim { background: #dafbe1; color: #116329; }

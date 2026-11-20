@@ -27,7 +27,6 @@
 //! found by reading live in that gap: the deleted permissive stand-in's
 //! authorize URL, and the same-origin constraint on the worker's `fetch` calls.
 
-use core::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,14 +34,13 @@ use connetto_core::HandshakeAuthority;
 use connetto_core::messages::Grant;
 use connetto_server::authn::identity::deterministic_uuid;
 use connetto_server::{
-    AbuseConfig, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError, CookieSameSite,
-    GenericOidcProvider, InMemoryAuthStore, ProviderRegistry, RedirectPolicy, RequestGuard,
-    ThrottleConfig, TokenAuthority, auth_router,
+    AbuseConfig, AuthConfig, AuthError, AuthService, CookieSameSite, GenericOidcProvider,
+    ProviderRegistry, RedirectPolicy, RequestGuard, ThrottleConfig, TokenAuthority, auth_router,
 };
 // The same path `provider_oidc.rs` uses: `reqwest` is not a direct dependency of
 // this crate, it arrives through `openidconnect`, so the test client is built
 // from the very client type the provider is handed.
-use connetto_test_harness::{MOCK_OAUTH_PROVIDER, MockOauth};
+use connetto_test_harness::{ConnettoDefaults, Fixture, MOCK_OAUTH_PROVIDER, MockOauth};
 use openidconnect::reqwest;
 use serde_json::json;
 
@@ -97,7 +95,8 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 struct Stack {
     connetto_base: String,
     idp_issuer: String,
-    service: Arc<AuthService<InMemoryAuthStore>>,
+    service: Arc<AuthService<ConnettoDefaults>>,
+    _fixture: Fixture,
     /// Held so the provider stays alive for the test's duration.
     _idp: MockOauth,
 }
@@ -129,7 +128,8 @@ impl Stack {
 
         let config = AuthConfig::default();
         let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-        let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+        let fixture = Fixture::acquire().await;
+        let store = fixture.auth_store(config.refresh_lifetimes()).await;
         let service = Arc::new(AuthService::new(
             authority,
             store,
@@ -152,6 +152,7 @@ impl Stack {
             idp_issuer,
             service,
             _idp: idp,
+            _fixture: fixture,
         }
     }
 
@@ -414,7 +415,8 @@ async fn the_login_endpoint_refuses_an_unknown_provider_and_an_offsite_redirect(
 
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let fixture = Fixture::acquire().await;
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let service = Arc::new(AuthService::new(
         authority,
         store,
@@ -479,7 +481,8 @@ async fn a_guessed_refresh_token_is_rate_limited_after_its_session_runs_out() {
 
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let fixture = Fixture::acquire().await;
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let guard = Arc::new(RequestGuard::new(
         ThrottleConfig::new().with_refresh_failures_per_session(1, Duration::from_secs(300)),
         AbuseConfig::default(),
@@ -551,123 +554,6 @@ async fn a_guessed_refresh_token_is_rate_limited_after_its_session_runs_out() {
     );
 }
 
-/// A store whose rotation is broken the way a database outage breaks it, and
-/// which behaves normally otherwise.
-struct OutageStore(InMemoryAuthStore);
-
-impl AuthStore for OutageStore {
-    type Id = String;
-    type Descriptor = ();
-
-    fn undescribed() -> Option<()> {
-        Some(())
-    }
-
-    fn resolve(
-        &self,
-        identity: &connetto_server::ResolvedIdentity,
-    ) -> impl Future<Output = Result<String, AuthStoreError>> + Send {
-        self.0.resolve(identity)
-    }
-
-    fn create_session_for(
-        &self,
-        user_id: String,
-        identity: &connetto_server::ResolvedIdentity,
-        origin: connetto_server::SessionOrigin<()>,
-    ) -> impl Future<Output = Result<connetto_server::IssuedSession<Self::Id>, AuthStoreError>> + Send
-    {
-        self.0.create_session_for(user_id, identity, origin)
-    }
-
-    fn session_record(
-        &self,
-        session_id: connetto_server::SessionId,
-    ) -> impl Future<
-        Output = Result<Option<connetto_server::SessionRecord<Self::Id, ()>>, AuthStoreError>,
-    > + Send {
-        self.0.session_record(session_id)
-    }
-
-    fn sessions_of(
-        &self,
-        user: &Self::Id,
-    ) -> impl Future<
-        Output = Result<Vec<connetto_server::SessionRecord<Self::Id, ()>>, AuthStoreError>,
-    > + Send {
-        self.0.sessions_of(user)
-    }
-
-    fn end_owned(
-        &self,
-        user: &Self::Id,
-        session: connetto_server::SessionId,
-    ) -> impl Future<Output = Result<bool, AuthStoreError>> + Send {
-        self.0.end_owned(user, session)
-    }
-
-    fn end_all_of(
-        &self,
-        user: &Self::Id,
-        keep: Option<connetto_server::SessionId>,
-    ) -> impl Future<Output = Result<Vec<connetto_server::SessionId>, AuthStoreError>> + Send {
-        self.0.end_all_of(user, keep)
-    }
-
-    fn session_is_live(
-        &self,
-        session_id: connetto_server::SessionId,
-    ) -> impl Future<Output = Result<bool, AuthStoreError>> + Send {
-        self.0.session_is_live(session_id)
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn rotate_refresh(
-        &self,
-        _refresh_token: &str,
-    ) -> Result<connetto_server::RefreshOutcome<Self::Id>, AuthStoreError> {
-        Err(AuthStoreError::Backend("connection refused".to_owned()))
-    }
-
-    fn revoke_session(
-        &self,
-        session_id: connetto_server::SessionId,
-    ) -> impl Future<Output = Result<(), AuthStoreError>> + Send {
-        self.0.revoke_session(session_id)
-    }
-
-    fn revoke_every_session(&self) -> impl Future<Output = Result<u64, AuthStoreError>> + Send {
-        self.0.revoke_every_session()
-    }
-
-    fn session_for_refresh(
-        &self,
-        refresh_token: &str,
-    ) -> impl Future<Output = Result<Option<connetto_server::SessionId>, AuthStoreError>> + Send
-    {
-        self.0.session_for_refresh(refresh_token)
-    }
-
-    fn set_retained_provider_token(
-        &self,
-        session_id: connetto_server::SessionId,
-        token: &connetto_server::RetainedProviderToken,
-    ) -> impl Future<Output = Result<(), AuthStoreError>> + Send {
-        self.0.set_retained_provider_token(session_id, token)
-    }
-
-    fn retained_provider_token(
-        &self,
-        session_id: connetto_server::SessionId,
-    ) -> impl Future<Output = Result<Option<connetto_server::StoredProviderToken>, AuthStoreError>> + Send
-    {
-        self.0.retained_provider_token(session_id)
-    }
-}
-
 /// A store outage must not spend anybody's refresh allowance.
 ///
 /// The counter exists to slow credential guessing. A database that is down
@@ -678,14 +564,14 @@ impl AuthStore for OutageStore {
 async fn a_store_outage_does_not_spend_the_refresh_allowance() {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("keypair"));
-    let store = Arc::new(OutageStore(InMemoryAuthStore::new(
-        config.refresh_lifetimes(),
-    )));
+    let fixture = Fixture::acquire().await;
+    let store = fixture.auth_store(config.refresh_lifetimes()).await;
     let guard = Arc::new(RequestGuard::new(
         ThrottleConfig::new().with_refresh_failures_per_session(1, Duration::from_secs(300)),
         AbuseConfig::default(),
     ));
     let service = AuthService::new(authority, store, guard);
+    fixture.break_auth_store().await;
 
     let token = format!("{}.secret", uuid::Uuid::new_v4());
     for attempt in 0..4 {

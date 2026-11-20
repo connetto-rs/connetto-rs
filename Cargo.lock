@@ -1442,7 +1442,6 @@ dependencies = [
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
  "rcgen",
- "rpassword",
  "tempfile",
  "thiserror 2.0.21",
  "uuid",
@@ -1455,7 +1454,6 @@ version = "0.0.0"
 dependencies = [
  "android-native-keyring-store",
  "android_system_properties",
- "anyhow",
  "apple-native-keyring-store",
  "axum",
  "base64 0.22.1",
@@ -1532,6 +1530,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rmp-serde",
+ "rosetta-uuid",
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
@@ -1558,6 +1557,34 @@ name = "connetto-demo-deployment"
 version = "0.0.0"
 
 [[package]]
+name = "connetto-demo-stack"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "connetto-client",
+ "connetto-core",
+ "connetto-demo-tools",
+ "connetto-file-core",
+ "connetto-file-server",
+ "connetto-peer-apple",
+ "connetto-server",
+ "connetto-test-harness",
+ "diesel",
+ "diesel-async",
+ "openidconnect",
+ "parking_lot",
+ "reqwest 0.13.5",
+ "ring",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower-http",
+ "uuid",
+]
+
+[[package]]
 name = "connetto-demo-support"
 version = "0.0.0"
 dependencies = [
@@ -1579,12 +1606,45 @@ dependencies = [
  "rmp-serde",
  "rosetta-uuid",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "connetto-demo-tools"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "connetto-ca",
+ "connetto-client",
+ "connetto-core",
+ "connetto-file-server",
+ "connetto-schema",
+ "connetto-server",
+ "connetto-test-harness",
+ "diesel",
+ "diesel-async",
+ "keyring-core",
+ "linux-keyutils-keyring-store",
+ "openfga-client",
+ "openidconnect",
+ "rcgen",
+ "ring",
+ "rpassword",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1813,7 +1873,6 @@ dependencies = [
 name = "connetto-server"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "axum",
  "axum-extra",
  "base64 0.22.1",
@@ -1833,8 +1892,6 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "jsonwebtoken",
- "keyring-core",
- "linux-keyutils-keyring-store",
  "oauth2",
  "openfga-client",
  "openidconnect",
@@ -1897,16 +1954,12 @@ name = "connetto-test-harness"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "axum",
- "base64 0.22.1",
  "chrono",
  "connetto-ca",
  "connetto-client",
  "connetto-core",
  "connetto-demo-support",
  "connetto-file-client",
- "connetto-file-core",
- "connetto-file-server",
  "connetto-peer-apple",
  "connetto-schema",
  "connetto-server",
@@ -1936,7 +1989,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.24.0",
- "tower-http",
  "tracing-subscriber",
  "uuid",
  "zstd",
@@ -4955,7 +5007,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -8242,8 +8294,8 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -8262,7 +8314,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -8310,7 +8362,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb5cd191fad9142d096efc97c64715db73db4adb60c38ebdf22f5b54cd6ea712"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "prost",
  "prost-build",
  "prost-types",
@@ -10123,7 +10175,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",

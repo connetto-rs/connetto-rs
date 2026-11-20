@@ -20,7 +20,9 @@ use crate::{db, error::ServerError, ticket::Verb, upload::parse_file_id};
 /// Response codes:
 /// - 200 full fetch
 /// - 206 ranged fetch
-/// - 404 absent, uncommitted, wrong verb, bad ticket, unauthorized, or response too large
+/// - 404 absent, uncommitted, wrong verb, bad ticket, unauthorized, a ticket
+///   whose login session ended, or response too large
+/// - 500 the session store could not say whether the ticket's session is live
 /// - 416 range outside the file
 ///
 /// Every response carries `Content-Length: <bytes_to_serve>` and
@@ -52,7 +54,7 @@ pub(crate) async fn get_file<S: ConnettoFileSchema>(
     Query(q): Query<TicketQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ServerError> {
-    let ticket = state.verifier.verify_verb(&q.t, Verb::Read)?;
+    let ticket = state.admit(&q.t, Verb::Read).await?;
     // R87: a deployment over its bandwidth window refuses reads with 503
     // before touching the database or the store.  A ceiling is a deployment
     // fact, not a fact about the file, so this reveals nothing the refusal
@@ -120,7 +122,10 @@ pub(crate) async fn get_file<S: ConnettoFileSchema>(
     let mut builder = Response::builder()
         .status(status)
         .header(header::ETAG, &etag)
-        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .header(
+            header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable",
+        )
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_LENGTH, bytes_to_serve)
         .header(header::ACCEPT_RANGES, "bytes");

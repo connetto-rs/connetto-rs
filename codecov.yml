@@ -1,6 +1,6 @@
 # Codecov configuration. The coverage workflow instruments the root
-# workspace's tests and every binary it or those tests spawn. The harness
-# binaries are outside that set: the browser stack only ever runs inside the
+# workspace's tests and every binary it or those tests spawn. The demo
+# launchers are outside that set. The browser stack only ever runs inside the
 # browser test workflow, which compiles for wasm and reports no native
 # coverage at all, and the demo stack and Android proof need a device. Their
 # shared provisioning module and phone-driving steps are reached from nothing
@@ -8,7 +8,7 @@
 # or wasm are outside it too. So these lines are unreachable by any instrument, not missing tests.
 coverage:
   ignore:
-    - crates/connetto-test-harness/src/bin/**
+    - examples/demo-stack/src/bin/**
     - crates/connetto-test-harness/src/leg.rs
     - crates/connetto-test-harness/src/stack.rs
     - crates/connetto-test-harness/src/peer_devices.rs

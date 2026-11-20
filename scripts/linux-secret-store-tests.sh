@@ -11,12 +11,12 @@ set -euo pipefail
 profile="${CARGO_TEST_PROFILE:-release}"
 nextest=(cargo +stable nextest run --cargo-profile "$profile" --all-features -p connetto-client --run-ignored ignored-only)
 
-# The secret_store_probe example, built under the profile, printed as a path.
+# The demo's secret-store-probe, built under the profile, printed as a path.
 build_probe() {
-  cargo +stable build --profile "$profile" --all-features -p connetto-client --example secret_store_probe >&2
+  cargo +stable build --profile "$profile" -p connetto-demo-tools --bin secret-store-probe >&2
   local target
   target="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
-  echo "$target/$profile/examples/secret_store_probe"
+  echo "$target/$profile/secret-store-probe"
 }
 
 case "${1:-}" in

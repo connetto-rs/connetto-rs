@@ -19,12 +19,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use connetto_core::SessionId;
+use diesel_async::pooled_connection::bb8::Pool;
+use diesel_async::{AsyncConnection as _, AsyncPgConnection};
 
 use crate::abuse::{
     AbuseConfig, Caller, Crossing, Enforcement, EnforcementPolicy, Reaction, Signal,
 };
 use crate::audit::{AuditHook, AuthEvent, AuthOp};
-use crate::ban::{Ban, BanError, BanStore, NewBan};
+use crate::ban::{Ban, BanError, BanFuture, BanStore, NewBan};
 use crate::reserve::{ReaderGate, ReaderPermit};
 use crate::throttle::{AuthThrottle, ByteThrottle, Counters, HandleThrottle, ThrottleConfig, Tier};
 
@@ -37,10 +39,21 @@ use crate::throttle::{AuthThrottle, ByteThrottle, Counters, HandleThrottle, Thro
 /// registry holds.
 pub type PersonCloseHook = Arc<dyn Fn(String) + Send + Sync>;
 
-/// Told the identity a ban was just written for, so the server ends every
-/// session of it (R105 decision 8). Fired synchronously on the ban's task,
-/// so async work belongs on a spawned task inside the hook.
-pub type BanHook<Id> = Arc<dyn Fn(Id) + Send + Sync>;
+/// Ends a banned identity's sessions inside the ban's own transaction, and
+/// closes them once it commits, so the server ends every session of it
+/// (R105 decision 8). The deployment points it at its auth service.
+pub trait BannedSessions<Id>: Send + Sync {
+    /// End every live session of `user_id` on `transaction`, the ban's,
+    /// answering the sessions ended. An error rolls the ban back.
+    fn end<'a>(
+        &'a self,
+        transaction: &'a mut AsyncPgConnection,
+        user_id: &'a Id,
+    ) -> BanFuture<'a, Vec<SessionId>>;
+
+    /// The ban's transaction committed, with `sessions` of `user_id` ended.
+    fn ended(&self, user_id: &Id, sessions: &[SessionId]);
+}
 
 /// Who a session belongs to, as this process saw it succeed.
 ///
@@ -111,6 +124,57 @@ impl ConnectionTallies {
     }
 }
 
+/// The ban list and the owner pool its reads and writes run on.
+struct BanList<Id> {
+    pool: Pool<AsyncPgConnection>,
+    store: Arc<dyn BanStore<Id>>,
+}
+
+impl<Id> Clone for BanList<Id> {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            store: Arc::clone(&self.store),
+        }
+    }
+}
+
+impl<Id: 'static> BanList<Id> {
+    /// An owner connection for one read or write of the list.
+    async fn connection(
+        &self,
+    ) -> Result<
+        diesel_async::pooled_connection::bb8::PooledConnection<'_, AsyncPgConnection>,
+        BanError,
+    > {
+        self.pool.get().await.map_err(BanError::new)
+    }
+
+    /// Write `ban` on an owner connection of its own, ending the identity's
+    /// sessions through `banned` in the same transaction. Answers the
+    /// sessions ended.
+    async fn impose(
+        &self,
+        ban: NewBan<Id>,
+        banned: Option<&dyn BannedSessions<Id>>,
+    ) -> Result<Vec<SessionId>, BanError>
+    where
+        Id: Clone + Send + Sync,
+    {
+        let user_id = ban.user_id.clone();
+        let mut connection = self.connection().await?;
+        connection
+            .transaction::<_, BanError, _>(async move |connection| {
+                self.store.impose(connection, ban).await?;
+                match banned {
+                    Some(banned) => banned.end(connection, &user_id).await,
+                    None => Ok(Vec::new()),
+                }
+            })
+            .await
+    }
+}
+
 /// Owns every counter connetto keeps about a caller.
 ///
 /// Built before the session manager and the auth service and handed to both.
@@ -128,11 +192,11 @@ pub struct RequestGuard<Id> {
     key_cap: usize,
     person: PersonTallies,
     connection: ConnectionTallies,
-    bans: Option<Arc<dyn BanStore<Id>>>,
+    bans: Option<BanList<Id>>,
     enforcement: Option<Arc<dyn EnforcementPolicy<Id>>>,
     audit: OnceLock<AuditHook<Id>>,
     close: OnceLock<PersonCloseHook>,
-    ban: OnceLock<BanHook<Id>>,
+    banned: OnceLock<Arc<dyn BannedSessions<Id>>>,
     reader: Option<ReaderGate>,
 }
 
@@ -182,7 +246,7 @@ where
             enforcement: None,
             audit: OnceLock::new(),
             close: OnceLock::new(),
-            ban: OnceLock::new(),
+            banned: OnceLock::new(),
             reader: None,
         }
     }
@@ -193,11 +257,12 @@ where
         &self.bytes
     }
 
-    /// Attach the ban list. Without one connetto cannot ban and cannot refuse a
-    /// banned caller at the handshake, so a crossing is only logged.
+    /// Attach the ban list, read and written on `pool`, the owner pool. Without
+    /// one connetto cannot ban and cannot refuse a banned caller at the
+    /// handshake, so a crossing is only logged.
     #[must_use]
-    pub fn with_bans(mut self, bans: Arc<dyn BanStore<Id>>) -> Self {
-        self.bans = Some(bans);
+    pub fn with_bans(mut self, pool: Pool<AsyncPgConnection>, bans: Arc<dyn BanStore<Id>>) -> Self {
+        self.bans = Some(BanList { pool, store: bans });
         self
     }
 
@@ -266,10 +331,10 @@ where
         let _ = self.close.set(hook);
     }
 
-    /// Attach the observer told each banned identity, once, after the auth
-    /// service exists, so a ban ends every session of the identity.
-    pub fn set_ban_hook(&self, hook: BanHook<Id>) {
-        let _ = self.ban.set(hook);
+    /// Attach what ends each banned identity's sessions in the ban's
+    /// transaction, once, after the auth service exists.
+    pub fn set_banned_sessions(&self, banned: Arc<dyn BannedSessions<Id>>) {
+        let _ = self.banned.set(banned);
     }
 
     /// Whether a ban list is attached, which is whether banning is possible.
@@ -386,7 +451,18 @@ where
         let Some(bans) = self.bans.as_ref() else {
             return Ok(None);
         };
-        Ok(bans.check(user_id).await?.filter(|ban| ban.applies))
+        let mut connection = bans.connection().await?;
+        Ok(bans
+            .store
+            .check(&mut connection, user_id)
+            .await?
+            .filter(|ban| ban.applies))
+    }
+
+    /// The ban list a sign-in reads inside its own transaction, `None` when
+    /// none is attached.
+    pub(crate) fn ban_store(&self) -> Option<&dyn BanStore<Id>> {
+        self.bans.as_ref().map(|bans| &*bans.store)
     }
 
     /// Lift the ban on `user_id`, recording it, and report whether there was one.
@@ -402,10 +478,11 @@ where
         let Some(bans) = self.bans.as_ref() else {
             return Ok(false);
         };
-        let Some(ban) = bans.check(user_id).await? else {
+        let mut connection = bans.connection().await?;
+        let Some(ban) = bans.store.check(&mut connection, user_id).await? else {
             return Ok(false);
         };
-        if !bans.lift(user_id).await? {
+        if !bans.store.lift(&mut connection, user_id).await? {
             return Ok(false);
         }
         tracing::info!(user = %user_id, reason = %ban.reason, "ban lifted");
@@ -529,7 +606,7 @@ where
         let policy = self.enforcement.clone();
         let audit = self.audit.get().cloned();
         let close = self.close.get().cloned();
-        let ended = self.ban.get().cloned();
+        let banned = self.banned.get().cloned();
         tokio::spawn(async move {
             let verdict = match policy {
                 Some(policy) => policy.on_threshold(&crossing).await,
@@ -555,14 +632,17 @@ where
                 crossing.window.as_secs()
             );
             let ban = NewBan::starting_now(crossing.user_id.clone(), crossing.session, reason, ttl);
-            if let Err(error) = bans.impose(ban).await {
-                tracing::error!(
-                    %error,
-                    user = %crossing.user_id,
-                    "the ban could not be written, so the caller is not banned"
-                );
-                return;
-            }
+            let ended = match bans.impose(ban, banned.as_deref()).await {
+                Ok(ended) => ended,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        user = %crossing.user_id,
+                        "the ban could not be written, so the caller is not banned"
+                    );
+                    return;
+                }
+            };
             tracing::warn!(
                 user = %crossing.user_id,
                 session = %crossing.session,
@@ -578,8 +658,8 @@ where
                     AuthOp::Banned,
                 ));
             }
-            if let Some(ended) = ended {
-                ended(crossing.user_id.clone());
+            if let Some(banned) = banned {
+                banned.ended(&crossing.user_id, &ended);
             }
             // Without the hook the ban is durable but the caller keeps whatever
             // connections it holds until they end on their own, which defeats

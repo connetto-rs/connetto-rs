@@ -25,7 +25,10 @@ const MAX_EVENT_LINES: usize = 40;
 /// Appends the lines to the panel's standing, keeping the newest
 /// [`MAX_EVENT_LINES`].
 #[cfg(feature = "peer")]
-fn append_lines(lines: &mut Signal<Vec<String>>, added: Vec<String>) {
+fn append_lines(
+    lines: &mut Signal<Vec<support::view::TeamEvent>>,
+    added: Vec<support::view::TeamEvent>,
+) {
     let mut held = lines.write();
     held.extend(added);
     if held.len() > MAX_EVENT_LINES {
@@ -65,7 +68,7 @@ pub(crate) fn TeamNotesPanel(parts: SessionParts) -> Element {
     let mut team = use_first_team(teams_live.value());
 
     // One line per R77 event, the panel's standing the run reads off the page.
-    let events: Signal<Vec<String>> = use_signal(Vec::new);
+    let events: Signal<Vec<support::view::TeamEvent>> = use_signal(Vec::new);
     let event_rx = client.events();
     {
         let mut lines = events;
@@ -73,7 +76,7 @@ pub(crate) fn TeamNotesPanel(parts: SessionParts) -> Element {
             spawn(async move {
                 let mut rx = event_rx;
                 while let Ok(event) = rx.recv().await {
-                    let added = support::provisional_event_lines(&event);
+                    let added = support::provisional_events(&event);
                     if !added.is_empty() {
                         append_lines(&mut lines, added);
                     }
@@ -87,7 +90,7 @@ pub(crate) fn TeamNotesPanel(parts: SessionParts) -> Element {
     let tidy_events = events;
 
     let picked = team.read().clone();
-    let event_lines: Vec<String> = events.read().iter().cloned().collect();
+    let event_lines = events.read().clone();
     rsx! {
         div { class: "panel toned tone-team",
             h2 {
@@ -117,8 +120,14 @@ pub(crate) fn TeamNotesPanel(parts: SessionParts) -> Element {
                     "peer activity"
                 }
                 div { class: "lines",
-                    for line in event_lines {
-                        p { {line} }
+                    for event in event_lines {
+                        p {
+                            "{event.line}"
+                            if let Some(account) = event.by {
+                                " by "
+                                super::Badge { account }
+                            }
+                        }
                     }
                 }
             }
@@ -142,13 +151,20 @@ pub(crate) fn TeamNotesPanel(parts: SessionParts) -> Element {
                                                 .count()
                                         })
                                         .unwrap_or_default();
-                                    append_lines(&mut lines, vec![support::tidy_line(remaining)]);
+                                    append_lines(
+                                        &mut lines,
+                                        vec![support::view::TeamEvent::plain(
+                                            support::tidy_line(remaining),
+                                        )],
+                                    );
                                 }
                                 Err(err) => {
                                     tracing::error!(error = %err, "the tidy pass failed");
                                     append_lines(
                                         &mut lines,
-                                        vec![format!("tidy: the pass failed: {err}")],
+                                        vec![support::view::TeamEvent::plain(format!(
+                                            "tidy: the pass failed: {err}"
+                                        ))],
                                     );
                                 }
                             }
@@ -181,7 +197,7 @@ fn TeamNotes(parts: SessionParts, team: String) -> Element {
     // The team's roster rows, which the replica settles a peer's note against.
     let members_live = use_live(&client, support::TeamMembersOf { team: team.clone() });
     // The notes' lines, the peer rows marked provisional off the provenance.
-    let note_lines: Signal<Vec<String>> = use_signal(Vec::new);
+    let note_lines: Signal<Vec<(support::TeamNote, Option<String>)>> = use_signal(Vec::new);
     {
         let marks_client = client.clone();
         let mut lines = note_lines;
@@ -192,7 +208,7 @@ fn TeamNotes(parts: SessionParts, team: String) -> Element {
                     let rows: Vec<support::TeamNote> =
                         notes_live.value().peek().iter().cloned().collect();
                     let mut held = Vec::with_capacity(rows.len());
-                    for row in &rows {
+                    for row in rows {
                         let key = vec![KeyValue::Blob(row.id.as_bytes().to_vec())];
                         let account = marks_client
                             .provenance("team_notes", &key)
@@ -204,7 +220,7 @@ fn TeamNotes(parts: SessionParts, team: String) -> Element {
                                     == connetto_client::provisional::ProvisionalState::Provisional
                             })
                             .map(|record| record.account);
-                        held.push(support::team_note_line(row, account.as_deref()));
+                        held.push((row, account));
                     }
                     if *lines.peek() != held {
                         lines.set(held);
@@ -223,16 +239,27 @@ fn TeamNotes(parts: SessionParts, team: String) -> Element {
 
     let notes_error = notes_live.error().read().clone();
     let members: Vec<String> = members_live.value().read().iter().cloned().collect();
-    let lines: Vec<String> = note_lines.read().iter().cloned().collect();
+    let lines = note_lines.read().clone();
     let outcome = outcome.read().clone();
     rsx! {
         p { {support::view::members_line(&members)} }
+        div { class: "members",
+            for member in members {
+                super::Badge { account: member }
+            }
+        }
         div { class: "lines",
             if lines.is_empty() {
                 p { class: "status", "no notes in this team yet" }
             }
-            for line in lines {
-                p { {line} }
+            for (note, provisional) in lines {
+                p {
+                    "note: {note.body} by "
+                    super::Badge { account: note.author_id }
+                    if let Some(account) = provisional {
+                        " (provisional from {account})"
+                    }
+                }
             }
         }
         if let Some(err) = notes_error {

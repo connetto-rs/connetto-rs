@@ -47,8 +47,7 @@ use std::time::Duration;
 
 use connetto_core::SessionId;
 use diesel::QueryResult;
-use diesel_async::AsyncPgConnection;
-use diesel_async::pooled_connection::bb8::Pool;
+use diesel_async::{AsyncConnection as _, AsyncPgConnection};
 
 pub use crate::authn::schema::Instant;
 
@@ -127,11 +126,18 @@ impl BanError {
     }
 }
 
+impl From<diesel::result::Error> for BanError {
+    fn from(error: diesel::result::Error) -> Self {
+        Self::new(error)
+    }
+}
+
 /// The answer to one ban-list operation.
 pub type BanFuture<'a, T> =
     core::pin::Pin<Box<dyn core::future::Future<Output = Result<T, BanError>> + Send + 'a>>;
 
-/// Reads and writes the identities a deployment is refusing.
+/// Reads and writes the identities a deployment is refusing, on the caller's
+/// connection, so a login reads the ban inside its own transaction.
 ///
 /// A trait object rather than a type parameter on the session manager, which
 /// already carries seven. The schema trait behind it carries associated
@@ -140,16 +146,57 @@ pub type BanFuture<'a, T> =
 pub trait BanStore<Id>: Send + Sync + 'static {
     /// The ban on `user_id`, as stored, with the read's verdict on whether it
     /// still applies.
-    fn check<'a>(&'a self, user_id: &'a Id) -> BanFuture<'a, Option<Ban>>;
+    fn check<'a>(
+        &'a self,
+        connection: &'a mut AsyncPgConnection,
+        user_id: &'a Id,
+    ) -> BanFuture<'a, Option<Ban>>;
 
     /// Write `ban`, replacing whatever ban that identity already had.
-    fn impose(&self, ban: NewBan<Id>) -> BanFuture<'_, ()>;
+    ///
+    /// The Postgres store takes the account's lock first, the one a sign-in
+    /// holds from before its ban read until it commits, and holds it until the
+    /// caller's outermost transaction on `connection` ends. A ban landing
+    /// during a sign-in therefore commits after it, and the session it created
+    /// is live when the ban's sessions are ended.
+    fn impose<'a>(
+        &'a self,
+        connection: &'a mut AsyncPgConnection,
+        ban: NewBan<Id>,
+    ) -> BanFuture<'a, ()>;
 
     /// Remove the ban on `user_id`, returning whether there was one.
     ///
     /// Every lift goes through here and every lift is recorded, which is why an
     /// expiry that simply lapses produces no record.
-    fn lift<'a>(&'a self, user_id: &'a Id) -> BanFuture<'a, bool>;
+    fn lift<'a>(
+        &'a self,
+        connection: &'a mut AsyncPgConnection,
+        user_id: &'a Id,
+    ) -> BanFuture<'a, bool>;
+}
+
+/// The advisory key space of [`lock_account`], apart from the file quota's.
+const ACCOUNT_LOCK_SEED: i64 = 0x636f_6e6e_6574_746f;
+
+/// Take the transaction-scoped lock on `user_id`'s account, which a sign-in
+/// and a ban write both hold, so a ban landing mid-sign-in either commits
+/// before it and refuses it, or waits for its commit.
+///
+/// # Errors
+///
+/// The statement's error when the lock cannot be taken.
+pub(crate) async fn lock_account<Id: core::fmt::Display>(
+    connection: &mut AsyncPgConnection,
+    user_id: &Id,
+) -> QueryResult<()> {
+    use diesel_async::RunQueryDsl as _;
+    diesel::sql_query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
+        .bind::<diesel::sql_types::Text, _>(user_id.to_string())
+        .bind::<diesel::sql_types::BigInt, _>(ACCOUNT_LOCK_SEED)
+        .execute(connection)
+        .await?;
+    Ok(())
 }
 
 /// The statements a [`BanStore`] runs over the deployment's ban table.
@@ -184,55 +231,63 @@ pub trait ConnettoBanSchema: Send + Sync + 'static {
     ) -> Statement<'c, usize>;
 }
 
-/// A [`BanStore`] over the deployment's ban table, `D`'s [`Bans`] member, on
-/// the given pool.
+/// A [`BanStore`] over the deployment's ban table, `D`'s [`Bans`] member.
 ///
-/// **The owner pool, never the reader pool.** The reader pool connects as a role
-/// row-level security applies to, and an invisible row there is not an error but
-/// zero rows, so the fail-closed read would never fire and the ban would
-/// silently not apply. The owner pool bypasses policies by construction and is
-/// already where the auth store reads. The accepted cost is that a deployment
-/// cannot use row-level security to partition bans between its own tenants and
-/// must express that in the query instead.
+/// **The owner connection, never the reader's.** The reader pool connects as a
+/// role row-level security applies to, and an invisible row there is not an
+/// error but zero rows, so the fail-closed read would never fire and the ban
+/// would silently not apply. The owner pool bypasses policies by construction
+/// and is already where the auth store reads. The accepted cost is that a
+/// deployment cannot use row-level security to partition bans between its own
+/// tenants and must express that in the query instead.
 ///
 /// [`Bans`]: crate::schema::ConnettoSchema::Bans
 #[must_use]
-pub fn pg_ban_store<D>(pool: Pool<AsyncPgConnection>) -> Arc<dyn BanStore<D::Id>>
+pub fn pg_ban_store<D>() -> Arc<dyn BanStore<D::Id>>
 where
     D: crate::schema::ConnettoSchema,
 {
     Arc::new(PgBanStore::<D::Bans> {
-        pool,
         schema: PhantomData,
     })
 }
 
 /// The Postgres [`BanStore`], generic over the deployment's schema.
 struct PgBanStore<B> {
-    pool: Pool<AsyncPgConnection>,
     schema: PhantomData<fn() -> B>,
 }
 
 impl<B: ConnettoBanSchema> BanStore<B::Id> for PgBanStore<B> {
-    fn check<'a>(&'a self, user_id: &'a B::Id) -> BanFuture<'a, Option<Ban>> {
+    fn check<'a>(
+        &'a self,
+        connection: &'a mut AsyncPgConnection,
+        user_id: &'a B::Id,
+    ) -> BanFuture<'a, Option<Ban>> {
+        Box::pin(async move { B::ban_row(connection, user_id).await.map_err(BanError::new) })
+    }
+
+    fn impose<'a>(
+        &'a self,
+        connection: &'a mut AsyncPgConnection,
+        ban: NewBan<B::Id>,
+    ) -> BanFuture<'a, ()> {
         Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(BanError::new)?;
-            B::ban_row(&mut conn, user_id).await.map_err(BanError::new)
+            connection
+                .transaction::<(), BanError, _>(async move |connection| {
+                    lock_account(connection, &ban.user_id).await?;
+                    B::ban_upsert(connection, ban).await.map_err(BanError::new)
+                })
+                .await
         })
     }
 
-    fn impose(&self, ban: NewBan<B::Id>) -> BanFuture<'_, ()> {
+    fn lift<'a>(
+        &'a self,
+        connection: &'a mut AsyncPgConnection,
+        user_id: &'a B::Id,
+    ) -> BanFuture<'a, bool> {
         Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(BanError::new)?;
-            B::ban_upsert(&mut conn, ban).await.map_err(BanError::new)?;
-            Ok(())
-        })
-    }
-
-    fn lift<'a>(&'a self, user_id: &'a B::Id) -> BanFuture<'a, bool> {
-        Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(BanError::new)?;
-            let removed = B::ban_delete(&mut conn, user_id)
+            let removed = B::ban_delete(connection, user_id)
                 .await
                 .map_err(BanError::new)?;
             Ok(removed > 0)

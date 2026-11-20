@@ -1,7 +1,7 @@
 //! R78 slice 4a proof, a device's writes reaching the server through a
 //! different account's session. Two signed-in native clients of different
-//! accounts run against the demo deployment the real `connetto-server`
-//! binary serves with its courier path on.
+//! accounts run against the demo deployment the demo's `demo-server` serves
+//! with its courier path on.
 //!
 //! The server goes away for both. Alice writes two team notes, and bob links
 //! her offline and applies them as her. Alice's device then stays away for
