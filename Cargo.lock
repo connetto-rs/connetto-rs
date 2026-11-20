@@ -6664,7 +6664,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.21",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7665,7 +7665,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#86893f83a654fac688bdc4f45eed4a9577f85e9b"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#50b596e642bbf0ad724b6b46cfc6da46e1a49cf9"
 dependencies = [
  "recursive",
  "sql-traits",
@@ -7680,7 +7680,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#a83030be7adc40a1ea78e260ad761833ac522f05"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#45b60861d74e09a28f52f05eb26bb7dd636b7218"
 dependencies = [
  "diesel",
  "pg_diesel_core",
@@ -7694,7 +7694,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel_core"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#a83030be7adc40a1ea78e260ad761833ac522f05"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#45b60861d74e09a28f52f05eb26bb7dd636b7218"
 dependencies = [
  "bigdecimal",
  "diesel",
@@ -7707,7 +7707,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel_pg14"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#a83030be7adc40a1ea78e260ad761833ac522f05"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#45b60861d74e09a28f52f05eb26bb7dd636b7218"
 dependencies = [
  "bigdecimal",
  "diesel",
@@ -7717,7 +7717,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel_pg15"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#a83030be7adc40a1ea78e260ad761833ac522f05"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#45b60861d74e09a28f52f05eb26bb7dd636b7218"
 dependencies = [
  "bigdecimal",
  "diesel",
@@ -7727,7 +7727,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel_pg16"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#a83030be7adc40a1ea78e260ad761833ac522f05"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#45b60861d74e09a28f52f05eb26bb7dd636b7218"
 dependencies = [
  "bigdecimal",
  "diesel",
@@ -7737,7 +7737,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel_pg17"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#a83030be7adc40a1ea78e260ad761833ac522f05"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#45b60861d74e09a28f52f05eb26bb7dd636b7218"
 dependencies = [
  "bigdecimal",
  "diesel",
@@ -7747,7 +7747,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel_pg18"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#a83030be7adc40a1ea78e260ad761833ac522f05"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#45b60861d74e09a28f52f05eb26bb7dd636b7218"
 dependencies = [
  "bigdecimal",
  "diesel",
@@ -10362,7 +10362,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10423,7 +10423,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#b7e8a175b3a1cdebc32b6d89b610a353e8cc9bc0"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#a31e374f6b3860b9abffd54a993cba07eb84bbb6"
 dependencies = [
  "geometric-traits",
  "once_cell",
@@ -10521,7 +10521,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.64.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#2ff068b30954e1d67889550fae8539640422c61a"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#298b4bdf660d250a07aee620120bfb2d5c7c60ff"
 dependencies = [
  "log",
  "recursive",
@@ -10553,7 +10553,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#2ff068b30954e1d67889550fae8539640422c61a"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#298b4bdf660d250a07aee620120bfb2d5c7c60ff"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10593,7 +10593,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -11926,7 +11926,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -12605,7 +12605,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-quartz-core",
  "raw-window-handle 0.6.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "windows-version",
 ]
 
