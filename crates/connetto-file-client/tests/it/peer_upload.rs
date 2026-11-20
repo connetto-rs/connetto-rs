@@ -204,7 +204,8 @@ impl Holder {
         tokio::select! {
             biased;
             () = self.device.drive_media(port(node, events)) => panic!("the port ended under the proof"),
-            () = self.device.drive_outbox(never) => panic!("the outbox driver ended"),
+            // Another copy can become sendable while the preceding walk finishes.
+            () = self.device.drive_outbox(tokio::time::sleep) => panic!("the outbox driver ended"),
             () = proof => {}
         }
     }
@@ -289,12 +290,6 @@ impl Holder {
             .map(|ticket| ticket.for_owner)
             .collect()
     }
-}
-
-/// A sleeper that never ends a wait, so the outbox driver only ever waits on
-/// events.
-fn never(_: Duration) -> std::future::Pending<()> {
-    std::future::pending()
 }
 
 /// Stores anna's cursor with an offer whose frontier is her entry 1 and a
