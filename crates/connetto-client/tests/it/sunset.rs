@@ -125,8 +125,8 @@ async fn the_ack_carries_the_configured_sunset_and_raises_the_event() {
         .await
         .expect("a sunset that has not been reached still serves");
     let client = core.client();
-    let _pump = tokio::spawn(pump);
     let mut events = client.events();
+    let _pump = tokio::spawn(pump);
     await_event(
         &mut events,
         deadline(),

@@ -30,10 +30,12 @@ use diesel::{Connection, SqliteConnection, sql_query};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, ParsedDiffSet, PatchsetOp, SimpleTable, Value};
+use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
 use subql::{
     CdcSource, PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource, PgXid, Seen, SourceItem,
 };
+
+use super::writer_shared::{PG_DDL, insert_changeset};
 
 diesel::table! {
     /// Row from the notes test fixture.
@@ -76,26 +78,6 @@ diesel::table! {
         /// Integer value.
         n -> diesel::sql_types::BigInt,
     }
-}
-
-const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
-
-fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
-    let table = SimpleTable::new(
-        "notes",
-        &[("id", ""), ("body", ""), ("edited_at", "")],
-        &[0],
-    );
-    let insert = Insert::<_, String, Vec<u8>>::from(table)
-        .set(0, Value::Integer(id))
-        .expect("set id")
-        .set(1, Value::Text(body.to_owned()))
-        .expect("set body")
-        .set(2, Value::Text(edited_at.to_owned()))
-        .expect("set edited_at");
-    ChangeSet::<SimpleTable, String, Vec<u8>>::new()
-        .insert(insert)
-        .build()
 }
 
 #[tokio::test]

@@ -24,6 +24,7 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
+use connetto_test_harness::wire_tables::orders_table;
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
@@ -42,14 +43,6 @@ diesel::table! {
         /// Order state.
         status -> Text,
     }
-}
-
-fn orders_table() -> SimpleTable {
-    SimpleTable::new(
-        "orders",
-        &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-        &[0],
-    )
 }
 
 /// Raw insert-patchset bytes for one snapshot's rows, compressed the way the

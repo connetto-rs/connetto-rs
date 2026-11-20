@@ -32,6 +32,7 @@ use connetto_server::{
     RuntimeWritableCatalog, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
     loopback, pg_write_target,
 };
+use connetto_test_harness::wire_tables::orders_table;
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
@@ -77,11 +78,7 @@ impl SnapshotSource for SeedSnapshot {
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
-        let table = SimpleTable::new(
-            "orders",
-            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-            &[0],
-        );
+        let table = orders_table();
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
             .expect("set id")

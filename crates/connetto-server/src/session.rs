@@ -93,6 +93,7 @@ use crate::abuse::{Caller, Reaction};
 use crate::bots::schema::{ListEntry, PgBotRegistry, RegistryError, Verb};
 
 use crate::audit::{AuthEvent, AuthOp};
+use crate::catalog_shapes::CatalogShapes;
 use crate::counters;
 use crate::courier::{
     Admitted, Applier, CourierAuthor, CourierEntry, CourierRun, CourierViolation, Settling, Slot,
@@ -2519,6 +2520,9 @@ pub struct SessionManager<
     /// The visibility question holds a row view across an await, so it cannot
     /// borrow one through the materializer's mutex.
     catalog: Arc<ParserDB>,
+    /// Every catalog table's columns, shared with the materializer, which the
+    /// session's own reads project without the materializer's mutex.
+    shapes: Arc<CatalogShapes>,
     routes: Mutex<HashMap<u64, Route<Id, Key>>>,
     /// Held across one event's dispatch and fan-out, and by a session swapping
     /// its share keys, so no patch filtered under the old keys is queued behind
@@ -2776,6 +2780,7 @@ where
     let manager = Arc::new(SessionManager {
         catalog: Arc::new(materializer.catalog().clone()),
         refused: materializer.refused().clone(),
+        shapes: Arc::clone(materializer.shapes()),
         materializer: Arc::new(Mutex::new(materializer)),
         routes: Mutex::new(HashMap::new()),
         dispatch_gate: Mutex::new(()),
@@ -4478,8 +4483,12 @@ where
         let Some(source) = self.withdrawal_source.get() else {
             return false;
         };
+        let table_id = term_move.table_id;
+        // Project the catalog's columns so a column the live table gained
+        // under the running server stays out of the move-out read.
         let base = format!(
-            "SELECT * FROM {}",
+            "SELECT {} FROM {}",
+            self.shapes.select_list(table_id),
             connetto_core::quote_ident(&term_move.table)
         );
         let Some(sql) = narrowed_sql(&base, &term_move.pairs) else {
@@ -4489,12 +4498,6 @@ where
             return false;
         };
         let Ok(ParsedDiffSet::Patchset(set)) = ParsedDiffSet::parse(&snapshot.patchset) else {
-            return false;
-        };
-        let Some(table_id) = subql::catalog_helpers::table_id::<Postgres, _>(
-            self.catalog.as_ref(),
-            &term_move.table,
-        ) else {
             return false;
         };
         let mut deletes = PatchSet::<TableSchema<String>, String, Vec<u8>>::new();
@@ -10009,6 +10012,12 @@ where
             )
         };
         let table = connetto_core::quote_ident(&member.table);
+        // Project the catalog's columns so a column the live table gained
+        // under the running server stays out of the mirror read.
+        let columns = self
+            .shapes
+            .select_list_named(self.catalog.as_ref(), &member.table)
+            .map_err(|err| SessionError::Snapshot(err.to_string()))?;
         let predicate = mirror_predicate(
             member,
             identity_function.as_deref(),
@@ -10025,7 +10034,7 @@ where
                     .to_owned(),
             })
         })?;
-        let query = format!("SELECT * FROM {table} WHERE {predicate}");
+        let query = format!("SELECT {columns} FROM {table} WHERE {predicate}");
         let hidden = Subscribe {
             sub_id: label.clone(),
             spec: SubscriptionSpec::new(query),

@@ -67,6 +67,7 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | R79 | done |  | A device's files over the peer link, each range verified against the file id through BLAKE3 outboards, the media frames and the port, the holder and the receiver judged through the policy views, a file kept while a provisional row names it and swept on retraction, thumbnails fetched unasked, and opt-in replication, with holder reports and link rates, copies placed across linked devices within their budgets, holders asked fastest first, a held copy uploaded credited to its file's owner, and custody copies carried in the device archive | The Docker-gated [peer_media.rs](../crates/connetto-test-harness/tests/it/peer_media.rs), a photo crossing the camp and its retraction sweeping it, and [peer_loss.rs](../crates/connetto-test-harness/tests/it/peer_loss.rs), a lost author's photo reaching the server through its teammates | [#371](https://github.com/connetto-rs/connetto-rs/pull/371), [#373](https://github.com/connetto-rs/connetto-rs/pull/373), [#376](https://github.com/connetto-rs/connetto-rs/pull/376), [#379](https://github.com/connetto-rs/connetto-rs/pull/379), [#383](https://github.com/connetto-rs/connetto-rs/pull/383), [#385](https://github.com/connetto-rs/connetto-rs/pull/385), [#388](https://github.com/connetto-rs/connetto-rs/pull/388), [#394](https://github.com/connetto-rs/connetto-rs/pull/394), [#415](https://github.com/connetto-rs/connetto-rs/pull/415), [#490](https://github.com/connetto-rs/connetto-rs/pull/490), [#491](https://github.com/connetto-rs/connetto-rs/pull/491), [#503](https://github.com/connetto-rs/connetto-rs/pull/503), [#530](https://github.com/connetto-rs/connetto-rs/pull/530), [#531](https://github.com/connetto-rs/connetto-rs/pull/531), [#532](https://github.com/connetto-rs/connetto-rs/pull/532), [#533](https://github.com/connetto-rs/connetto-rs/pull/533), [#538](https://github.com/connetto-rs/connetto-rs/pull/538), [#540](https://github.com/connetto-rs/connetto-rs/pull/540), [#543](https://github.com/connetto-rs/connetto-rs/pull/543), [#544](https://github.com/connetto-rs/connetto-rs/pull/544), [#546](https://github.com/connetto-rs/connetto-rs/pull/546), [#547](https://github.com/connetto-rs/connetto-rs/pull/547) |
 | [R80](#r80-peer-sync-in-every-demo) | not started |  | The camp flow in every native-capable demo on Android, iOS, iPadOS, macOS and Linux, and the grown phone and home runs. Windows is outside it |  |  |
 | [R107](#r107-schema-changes-under-running-servers) | in progress | subql passing pgoutput `Relation` messages to consumers (slice 2) | The expand and contract procedure with the sunset, the table refusal when a running server notices a change, and the two-model boot check |  |  |
+| [R107-MySQL](#r107-mysql-refused-tables-on-mysql-and-mariadb) | not started |  | subql's drift guard on MySQL and MariaDB, through a Maxwell change source and a live read over `my_diesel` |  |  |
 | [R108](#r108-caller-kinds-as-database-roles) | in progress | sql-traits answering the caller contract, privileges and effective policies for both translators, and rls2fga translating R107's live model, for slices 2 to 5. R99, for the bot kinds | Caller kinds as database roles, every startup refusal before OpenFGA, four flat kind roles switched per transaction, grants per kind read from the live database, and a client copy per kind |  |  |
 | [R110](#r110-a-session-bound-by-provider-staleness) | not started |  | Session lifetime bounded by the time since the identity provider last confirmed the user, replacing the fixed idle window and ceiling |  |  |
 | [R111](#r111-a-durable-replica-where-opfs-is-refused) | blocked | the JSPI IndexedDB VFS upstream in `sqlite-wasm-rs` | A durable browser replica on IndexedDB through JSPI where OPFS is refused, memory kept only where JSPI is missing |  |  |
@@ -1089,6 +1090,39 @@ Docker-gated, against two servers of consecutive majors on one database. The exp
 ### Done when
 
 A deployment can move between majors by the documented procedure with old clients working through the window, an old client learns its sunset before its server goes away, and a change the procedure does not allow refuses only the tables it touched, whether it arrives while the server runs or before it boots.
+
+---
+
+## R107-MySQL: refused tables on MySQL and MariaDB
+
+**Status.** NOT STARTED. Parked by the maintainer until resumed, since other work is more pressing. Which Maxwell producer the source reads is open.
+
+**Changes state.** None. The phase builds in subql, and connetto's server reads PostgreSQL only.
+
+### Purpose
+
+R107 slice 2 rests on subql's drift guard, which refuses only the tables whose live shape no longer matches the catalog. The guard covers subql's PostgreSQL and SQLite sources. subql folds Maxwell's JSON for MySQL and MariaDB, but no `CdcSource` reads it and no `LiveCatalog` loads a MySQL table, so a subql consumer on MySQL or MariaDB has no guard.
+
+### Decisions, taken with the maintainer
+
+1. **A Maxwell source in subql.** MySQL and MariaDB get a `CdcSource` reading Maxwell's JSON from a producer, so the drift guard covers them unchanged. Maxwell's `table-alter`, `table-create` and `table-drop` messages are its schema signals.
+2. **The live read over `my_diesel`.** A MySQL table's live shape loads through subql's diesel-based `LiveCatalog` implemented over `my_diesel`, as PostgreSQL's loads over `pg_diesel`, never through a hand-typed `information_schema` query.
+3. **The row image is checked at connect.** MySQL's `binlog_row_image` is a server and session setting with no per-table counterpart, so the Maxwell source checks it once when it connects.
+4. **Collations compare under MySQL's rule.** A column's catalog and live collations compare through sql-traits' MySQL rule, [sql-traits #514](https://github.com/connetto-rs/sql-traits/pull/514).
+
+### Steps
+
+1. The Maxwell `CdcSource` in subql.
+2. The `LiveCatalog` over `my_diesel` in subql, once `my_diesel` exists.
+3. The MySQL collation verdict, over step 2's live read.
+
+### Proof
+
+Against MySQL and MariaDB servers streamed through Maxwell, a column dropped under a running subql consumer refuses that table while another table keeps flowing, on the `table-alter` message, at reconciliation and again at the next start.
+
+### Done when
+
+A subql consumer on MySQL or MariaDB refuses only the tables a schema change touched, as it does on PostgreSQL and SQLite.
 
 ---
 
