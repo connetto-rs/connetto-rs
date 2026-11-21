@@ -10722,7 +10722,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#79892d171395d8263ae4ca789c52169ce1b9d23e"
+source = "git+https://github.com/connetto-rs/subql?branch=main#f0da28cb3a2b78e236aac4e199be79ab8b1a6ac3"
 dependencies = [
  "arc-swap",
  "async-lock",
