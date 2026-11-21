@@ -230,6 +230,24 @@ async fn a_truncate_empties_the_replica_even_under_an_overlapping_subscription()
     );
 }
 
+/// A refused table's changes stopped reaching the client, so every row it holds
+/// of the table may be stale and goes as soon as the first empty replacement
+/// ends, though the other subscription still claims them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_table_empties_the_replica_even_under_an_overlapping_subscription() {
+    let mut conn = seeded(FullResyncReason::TableRefused {
+        table: "orders".to_owned(),
+    })
+    .await;
+
+    pump_to_snapshot_end(&mut conn).await;
+    assert_eq!(
+        replica_ids(&mut conn),
+        Vec::<i64>::new(),
+        "the server dropped the table's changes, so no filter entitles a row to stay",
+    );
+}
+
 /// The same sequence under the reason that has to keep sparing siblings, which
 /// is what says the emptying above comes from the truncate and not from the
 /// resync itself: once the low subscription's empty replacement ends, the

@@ -36,10 +36,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaError;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
-use subql::{
-    ParserDB, PgChangeEvent, PgCommitPosition, PgLsn, PgStreamingCdcSource, PgStreamingConfig,
-    PgXid,
-};
+use subql::{PgChangeEvent, PgCommitPosition, PgLsn, PgStreamingConfig, PgXid};
 use testcontainers::core::logs::LogFrame;
 use testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers::core::{CmdWaitFor, ExecCommand, IntoContainerPort, WaitFor};
@@ -1877,6 +1874,8 @@ pub struct ServerConfig {
     replication_tables: Vec<String>,
     /// The signer the session loop calls when a client requests a content ticket.
     signer: BoxSigner,
+    /// How often the drift guard re-reads every table's live shape.
+    drift_reconciliation: Duration,
 }
 
 impl ServerConfig {
@@ -1894,6 +1893,7 @@ impl ServerConfig {
             caller: None,
             replication_tables: Vec::new(),
             signer: BoxSigner::noop(),
+            drift_reconciliation: Duration::from_secs(60),
         }
     }
 
@@ -1943,6 +1943,14 @@ impl ServerConfig {
     #[must_use]
     pub fn with_replication(mut self, tables: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.replication_tables = tables.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// How often the drift guard re-reads every table's live shape, so a test
+    /// can see a change no row has carried yet without waiting a minute.
+    #[must_use]
+    pub fn with_drift_reconciliation(mut self, every: Duration) -> Self {
+        self.drift_reconciliation = every;
         self
     }
 
@@ -2074,6 +2082,7 @@ pub async fn spawn_server(
         caller,
         replication_tables,
         signer,
+        drift_reconciliation,
     } = config;
     if !replication_tables.is_empty() {
         let admin_pool = pool_for(&admin_url).await;
@@ -2127,6 +2136,7 @@ pub async fn spawn_server(
         &pg_ddl,
         Arc::clone(&manager),
         Arc::clone(&restarts),
+        drift_reconciliation,
     );
 
     Server {
@@ -2141,19 +2151,31 @@ fn spawn_ingest_task(
     pg_ddl: &str,
     manager: Arc<HarnessManager>,
     restarts: Arc<AtomicU64>,
+    drift_reconciliation: Duration,
 ) -> JoinHandle<()> {
     let catalog_ddl = engine_ddl(pg_ddl);
     tokio::spawn(async move {
         let connect = |resume: connetto_server::ResumePoint| {
-            let (url, ddl) = (admin_url.clone(), catalog_ddl.clone());
+            let (url, ddl, manager) =
+                (admin_url.clone(), catalog_ddl.clone(), Arc::clone(&manager));
             async move {
-                let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
-                    .map_err(|err| format!("parsing catalog DDL: {err:?}"))?;
-                let config = PgStreamingConfig::new(url, SLOT.to_owned(), PUBLICATION.to_owned())
-                    .start(resume.get());
-                PgStreamingCdcSource::connect(config, catalog)
+                let config =
+                    PgStreamingConfig::new(url.clone(), SLOT.to_owned(), PUBLICATION.to_owned())
+                        .start(resume.get());
+                let source = connetto_server::drift::connect_guarded(
+                    config,
+                    &ddl,
+                    &url,
+                    PUBLICATION,
+                    drift_reconciliation,
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+                manager
+                    .watch_guard(source.refusals())
                     .await
-                    .map_err(|err| format!("opening CDC stream: {err}"))
+                    .map_err(|err| format!("settling earlier refusals: {err}"))?;
+                Ok::<_, String>(source)
             }
         };
         let _ = manager

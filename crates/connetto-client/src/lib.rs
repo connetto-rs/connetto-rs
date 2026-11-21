@@ -24,10 +24,11 @@ use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
     ControlMessage, CourierNotice, CourierNoticeAck, CourierNoticeRow, FatalErrorReason, GateState,
     Handshake, HeldWork, MutationHeader, MutationPatch, MutationReject, MutationRejectReason, Ping,
-    PriorRefusal, Provenance, ReplaceShareKeys, RetireWriter, SUBSCRIPTION_REFUSED, ShareKeyChange,
-    Subscribe, SubscriptionSpec, TabDismissAnswer, TabDismissOutcome, TabDismissRefusal,
-    TabIdentity, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, TabStorageAnswer,
-    TabStorageOutcome, TabStorageUse, Unsubscribe, WriterAnswer,
+    PriorRefusal, Provenance, ReplaceShareKeys, RetireWriter, SUBSCRIPTION_REFUSED,
+    SUBSCRIPTION_REFUSED_SCHEMA, ShareKeyChange, Subscribe, SubscriptionSpec, TabDismissAnswer,
+    TabDismissOutcome, TabDismissRefusal, TabIdentity, TabShareKeyAnswer, TabShareKeyChange,
+    TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse, Unsubscribe,
+    WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -12557,7 +12558,8 @@ where
             })),
             ControlMessage::NonFatalError(err) => {
                 if let Some(id) = &err.related_to
-                    && err.detail == SUBSCRIPTION_REFUSED
+                    && (err.detail == SUBSCRIPTION_REFUSED
+                        || err.detail == SUBSCRIPTION_REFUSED_SCHEMA)
                 {
                     self.refused.insert(id.clone());
                 }
@@ -12967,7 +12969,8 @@ where
         // Compared case-insensitively because the server names it from the
         // catalog, and a split table's holdings name its backing table.
         let truncated = match reason {
-            FullResyncReason::TableTruncated { table } => {
+            FullResyncReason::TableTruncated { table }
+            | FullResyncReason::TableRefused { table } => {
                 let table = table.to_lowercase();
                 Some(
                     self.config

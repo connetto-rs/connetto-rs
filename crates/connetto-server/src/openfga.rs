@@ -611,6 +611,9 @@ pub struct Translated {
     tuples: Vec<rls2fga::generator::tuple_generator::TupleQuery>,
     policy_tables: Vec<String>,
     reach: GrantReach,
+    /// The tables each policy reads, which a weakened replica identity
+    /// refuses together with the table it weakened on (R107 decision 10).
+    policy_reads: Vec<rls2fga::types::PolicyReads>,
 }
 
 impl Translated {
@@ -654,8 +657,10 @@ impl Translated {
         warn_outside_policies(&catalog, documents.reader_role());
         let relations = translation.relations().to_vec();
         let naming = translation.row_naming().to_vec();
+        let resulting = translation.resulting_rows().to_vec();
         let notes = translation.notes().to_vec();
         let answers = translation.action_relations();
+        let policy_reads = translation.policy_reads().to_vec();
         // **`outputs()` alone is not step 6's refusal, and believing it was is
         // the defect this guard exists for.** It blocks only the `Unhandled`
         // severity. A policy the classifier read but graded below the caller's
@@ -701,6 +706,7 @@ impl Translated {
         let shapes = Arc::new(
             Shapes::new::<Postgres>(catalog, &relations, &enumerations)
                 .with_row_naming(&naming)
+                .with_resulting_rows(&resulting)
                 .with_action_relations(answers)
                 .with_required_parameters(&notes),
         );
@@ -728,7 +734,14 @@ impl Translated {
             tuples,
             policy_tables,
             reach,
+            policy_reads,
         })
+    }
+
+    /// The tables each policy reads, by the translation's own account.
+    #[must_use]
+    pub fn policy_reads(&self) -> &[rls2fga::types::PolicyReads] {
+        &self.policy_reads
     }
 
     /// The tables the policies read, for the publication check.

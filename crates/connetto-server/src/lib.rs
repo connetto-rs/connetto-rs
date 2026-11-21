@@ -51,6 +51,7 @@ pub mod courier;
 pub mod db_clock;
 pub mod defaults;
 pub mod device_cert;
+pub mod drift;
 pub mod epoch;
 pub mod fence;
 pub mod guard;

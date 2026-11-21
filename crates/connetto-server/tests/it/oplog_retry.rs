@@ -184,6 +184,24 @@ impl Oplog for FlakyAppend {
             .await
             .map_err(|never| match never {})
     }
+
+    async fn record_refusal(&self, table: &str) -> Result<(), AppendRefused> {
+        self.inner
+            .record_refusal(table)
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn refusals(&self) -> Result<Vec<String>, AppendRefused> {
+        self.inner.refusals().await.map_err(|never| match never {})
+    }
+
+    async fn readmit(&self, tables: &[String]) -> Result<(), AppendRefused> {
+        self.inner
+            .readmit(tables)
+            .await
+            .map_err(|never| match never {})
+    }
 }
 
 /// A change source that replays exactly the items it was handed, then ends

@@ -353,6 +353,11 @@ fn every_resync_reason() -> Vec<FullResyncReason> {
         // SessionManager::subscribe_row, when the resume cursor lies beyond
         // where its timeline ended in the database's history (R73).
         FullResyncReason::CursorBeyondHistory,
+        // SessionManager catchup, when a missed record says the table was
+        // refused because its live schema drifted from the catalog.
+        FullResyncReason::TableRefused {
+            table: "orders".to_owned(),
+        },
     ];
     for reason in &reasons {
         match reason {
@@ -360,7 +365,8 @@ fn every_resync_reason() -> Vec<FullResyncReason> {
             | FullResyncReason::AuthorizationChange
             | FullResyncReason::SnapshotInterrupted
             | FullResyncReason::CursorBeyondHistory
-            | FullResyncReason::TableTruncated { .. } => {}
+            | FullResyncReason::TableTruncated { .. }
+            | FullResyncReason::TableRefused { .. } => {}
         }
     }
     reasons

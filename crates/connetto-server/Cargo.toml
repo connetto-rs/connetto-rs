@@ -19,7 +19,9 @@ connetto-core = { workspace = true, features = ["native-transport", "diesel-pg",
 # Derives the schema version it presents at handshake, hashing the translated
 # bundle rather than the source documents alone.
 connetto-schema = { workspace = true }
-subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit", "apply-patchset-postgres-async", "executor-diesel-async-postgres", "pg-streaming", "visibility-openfga", "membership-term"] }
+# Each `postgres-N` compiles one server major's catalog into the drift guard's
+# live reader, which reads with the one matching the server it reaches.
+subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit", "apply-patchset-postgres-async", "executor-diesel-async-postgres", "pg-streaming", "visibility-openfga", "membership-term", "postgres-14", "postgres-15", "postgres-16", "postgres-17", "postgres-18"] }
 # The policy text this server is given is translated here, and the model it
 # produces is written to the authorization server here. subql takes the same
 # crate with default features off and re-exports none of it, so the types
@@ -41,7 +43,8 @@ sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main
 # Read local attestation status lists.
 tokio = { workspace = true, features = ["fs"] }
 thiserror.workspace = true
-diesel = { workspace = true, features = ["postgres_backend", "serde_json", "uuid", "chrono"] }
+# `postgres` for the drift guard's live catalog, which reads over diesel's blocking connection.
+diesel = { workspace = true, features = ["postgres", "postgres_backend", "serde_json", "uuid", "chrono"] }
 # Session deadlines and provider-token expiries are zone-aware timestamp columns,
 # and diesel maps those to chrono rather than to `std::time::SystemTime`, which it
 # only offers for a zone-less timestamp. Already in the build through subql.

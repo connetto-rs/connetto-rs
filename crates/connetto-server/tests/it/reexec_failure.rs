@@ -79,6 +79,7 @@ impl WatchedIngest {
     fn spawn<Src>(manager: &Arc<Manager>, mut source: Src) -> Self
     where
         Src: CdcSource<Event = PgChangeEvent, Commit = PgCommit> + 'static,
+        Src::Relation: connetto_server::drift::StreamSignal,
         Src::Error: core::fmt::Display,
     {
         let read_retrying = Arc::new(AtomicBool::new(false));

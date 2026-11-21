@@ -400,11 +400,12 @@ jobs:
       - name: Install stable toolchain
         uses: $/.github/actions/install-rust
 
-      # dbus-daemon backs the fake Secret portal the client suite starts.
-      - name: Install keyring helpers
+      # dbus-daemon backs the fake Secret portal the client suite starts, and
+      # the server links libpq for the drift guard's live catalog reads.
+      - name: Install keyring helpers and libpq
         run: |
           sudo apt-get update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev libpq-dev pkg-config
 
       # --all-features turns on connetto-dioxus's desktop feature.
       - name: Install desktop dependencies
@@ -500,10 +501,10 @@ jobs:
       - name: Install stable toolchain
         uses: $/.github/actions/install-rust
 
-      - name: Install keyring helpers
+      - name: Install keyring helpers and libpq
         run: |
           sudo apt-get update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev libpq-dev pkg-config
 
       - uses: taiki-e/install-action@nextest
 
@@ -611,7 +612,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libdbus-1-dev libpq-dev pkg-config
 
       - name: Build the browser stack
         run: |
@@ -729,6 +730,11 @@ jobs:
       - name: Mark the prebuilt binaries executable
         run: chmod +x browser-bins/*
 
+      - name: Install the libpq the prebuilt server links
+        run: |
+          sudo apt-get update
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libpq5
+
       - name: Install stable browser toolchain with the wasm target
         uses: $/.github/actions/install-rust
         with:
@@ -825,6 +831,11 @@ jobs:
       # Artifacts drop the executable bit.
       - name: Mark the prebuilt binaries executable
         run: chmod +x browser-bins/* android-bins/*
+
+      - name: Install the libpq the prebuilt server links
+        run: |
+          sudo apt-get update
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libpq5
 
       - name: Install stable toolchain with the emulator's target
         uses: $/.github/actions/install-rust

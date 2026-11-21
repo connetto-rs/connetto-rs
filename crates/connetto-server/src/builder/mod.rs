@@ -68,7 +68,7 @@ use rls2fga::translator::Translator;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaPolicy;
-use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
+use subql::{ParserDB, PgStreamingConfig};
 use tokio::io::AsyncWrite;
 
 use crate::{
@@ -612,18 +612,18 @@ pub enum SettleError {
 /// Why reconnecting the change stream could not open a source.
 #[derive(Debug, Error)]
 pub enum StreamConnectError {
-    /// The catalog DDL did not parse.
-    #[error("parsing catalog DDL: {0}")]
-    Catalog(String),
     /// The change feed could not be checked.
     #[error(transparent)]
     Check(#[from] StreamCheckError),
     /// The cluster and slot could not be settled.
     #[error(transparent)]
     Settle(#[from] SettleError),
-    /// The CDC stream would not open.
-    #[error("opening the CDC stream: {0}")]
-    Open(String),
+    /// The guarded CDC stream would not open.
+    #[error(transparent)]
+    Guard(#[from] crate::drift::GuardConnectError),
+    /// The refusals an earlier process persisted could not be settled.
+    #[error("settling earlier refusals: {0}")]
+    Refusals(#[source] SessionError),
 }
 
 /// Why [`ServerBuilder::serve`] stopped.
@@ -1340,6 +1340,7 @@ pub struct ServerBuilder<D: ConnettoSchema = ConnettoDefaults> {
     oplog_table: String,
     owner_pool_size: u32,
     slot_lag_watch: Duration,
+    drift_reconciliation: Duration,
     sunset: Option<time::OffsetDateTime>,
     courier: bool,
     oplog_config: OplogConfig,
@@ -1508,6 +1509,7 @@ impl ServerBuilder {
             oplog_table: "connetto_oplog".to_owned(),
             owner_pool_size: 10,
             slot_lag_watch: Duration::from_secs(60),
+            drift_reconciliation: Duration::from_secs(60),
             sunset: None,
             courier: false,
             oplog_config: OplogConfig::default(),
@@ -1556,6 +1558,7 @@ where
             oplog_table,
             owner_pool_size,
             slot_lag_watch,
+            drift_reconciliation,
             sunset,
             courier,
             oplog_config,
@@ -1589,6 +1592,7 @@ where
             oplog_table,
             owner_pool_size,
             slot_lag_watch,
+            drift_reconciliation,
             sunset,
             courier,
             oplog_config,
@@ -1656,6 +1660,14 @@ where
     #[must_use]
     pub fn slot_lag_watch(mut self, every: Duration) -> Self {
         self.slot_lag_watch = every;
+        self
+    }
+
+    /// How often the drift guard re-reads every table's live shape between
+    /// schema messages, catching a change no row has carried yet.
+    #[must_use]
+    pub fn drift_reconciliation(mut self, every: Duration) -> Self {
+        self.drift_reconciliation = every;
         self
     }
 
@@ -1873,6 +1885,7 @@ where
             oplog_table,
             owner_pool_size,
             slot_lag_watch,
+            drift_reconciliation,
             sunset,
             courier,
             oplog_config,
@@ -2052,6 +2065,7 @@ where
             slot,
             publication,
             pg_ddl: schema.engine_ddl::<D>(),
+            drift_reconciliation,
         };
         let file_router = reader.file_router;
         let sweep = reader.sweep;
@@ -2639,6 +2653,7 @@ async fn build_write_side<D: ConnettoSchema>(
         .with_audit_schema::<D::Audit>()
         .with_write_catalog(writable)
         .with_translator(translated.translator().clone())
+        .with_policy_reads(translated.policy_reads())
         .with_caller(CallerMappings::of::<String>(&schema.reader_role)?)
         .with_read_connector(engine_connector)
         .build()?;
@@ -2788,6 +2803,7 @@ struct Feed {
     slot: String,
     publication: String,
     pg_ddl: String,
+    drift_reconciliation: Duration,
 }
 
 /// The two pools the write side takes over.
@@ -2840,17 +2856,16 @@ fn change_stream<D: ConnettoSchema>(
 ) -> ChangeStream {
     Box::pin(async move {
         let connect = |resume: ResumePoint| {
-            let (url, slot, publication, ddl) = (
+            let (url, slot, publication, ddl, every) = (
                 feed.database_url.clone(),
                 feed.slot.clone(),
                 feed.publication.clone(),
                 feed.pg_ddl.clone(),
+                feed.drift_reconciliation,
             );
             let (pool, manager, service) =
                 (pool.clone(), Arc::clone(&manager), Arc::clone(&service));
             async move {
-                let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
-                    .map_err(|err| StreamConnectError::Catalog(format!("{err:?}")))?;
                 let check = manager.check_before_stream(&url, &pool, &slot).await?;
                 settle_epoch(
                     &manager,
@@ -2862,10 +2877,15 @@ fn change_stream<D: ConnettoSchema>(
                 .await?;
                 // Read after the checks, which clear it on a changed timeline
                 // or a skipped stretch.
-                let config = PgStreamingConfig::new(url, slot, publication).start(resume.get());
-                PgStreamingCdcSource::connect(config, catalog)
+                let config = PgStreamingConfig::new(url.clone(), slot, publication.clone())
+                    .start(resume.get());
+                let source =
+                    crate::drift::connect_guarded(config, &ddl, &url, &publication, every).await?;
+                manager
+                    .watch_guard(source.refusals())
                     .await
-                    .map_err(|err| StreamConnectError::Open(err.to_string()))
+                    .map_err(StreamConnectError::Refusals)?;
+                Ok::<_, StreamConnectError>(source)
             }
         };
         match manager
@@ -2884,6 +2904,7 @@ fn change_stream<D: ConnettoSchema>(
             // No restart of the stream changes what the deployment fixed (R6 decision 4).
             Err(
                 err @ (SessionError::ChangeStreamUnusable(_)
+                | SessionError::DriftUnserved(_)
                 | SessionError::AuthorizationUnanswerable { .. }),
             ) => {
                 close_every_session(&manager).await;
