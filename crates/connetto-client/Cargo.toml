@@ -348,6 +348,9 @@ pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main",
 # stored as a Postgres `uuid` on the server and carried across the token
 # endpoint, which needs serde both ways.
 rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "postgres", "serde"] }
+# The typed aggregate proof watches the maximum of a `timestamptz` column
+# decoded into `rosetta_utc::TimestampUTC`.
+rosetta-utc = { version = "0.2.0", features = ["diesel", "sqlite"] }
 # The native-auth test serves connetto-server's auth router on a real port and
 # drives the browser round-trip with a redirect-following-disabled HTTP client.
 axum = { workspace = true }
