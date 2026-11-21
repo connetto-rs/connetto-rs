@@ -3555,7 +3555,13 @@ mod membership_term_tests {
             panic!("expected a membership term");
         };
         assert_eq!(membership.pairs[0].column, "project_id");
-        assert_eq!(membership.member_table, "project_members");
+        assert_eq!(
+            membership.member_table,
+            subql::catalog_helpers::StoredTableName {
+                schema: None,
+                name: "project_members".into(),
+            }
+        );
         assert_eq!(membership.pairs[0].member_key, "project_id");
         assert_eq!(membership.subject_kind, ScalarFamily::String);
         assert_eq!(membership.member_subject, "user_id");

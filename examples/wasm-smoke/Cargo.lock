@@ -3313,7 +3313,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#79892d171395d8263ae4ca789c52169ce1b9d23e"
+source = "git+https://github.com/connetto-rs/subql?branch=main#2794426cbe07c1bc72a53a5c655cd0ce273d4bb9"
 dependencies = [
  "arc-swap",
  "async-lock",
